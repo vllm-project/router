@@ -1,0 +1,19 @@
+[package]
+name = "router"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+hyper = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["full"] }
+http-body-util = "0.1"
+hyper-util = { version = "0.1", features = ["full"] }
+log = { version = "0.4", features = ["max_level_debug", "release_max_level_warn"] }
+nix = { version = "0.30.1", features = ["process"] }
+chrono = { version = "0.4" }
+bytes = "1.10.1"
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.141"
+reqwest = { version = "0.12.22", features = ["json"] }
+thiserror = "2.0.12"
+clap = { version = "4.5.42", features = ["derive"] }
