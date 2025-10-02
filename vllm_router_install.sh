@@ -508,31 +508,18 @@ deploy_router() {
         exit 1
     fi
 
-    # Step 1: Clone and install router repository locally
-    log "Checking for router repository..."
-    if [ -d "vllm-router" ]; then
-        log "Router directory exists, skipping clone and proceeding with build..."
-    else
-        log "Cloning vLLM router repository locally..."
-        if ! git clone https://github.com/Prowindy/vllm-router; then
-            error "Failed to clone router repository from https://github.com/Prowindy/vllm-router"
-            log "Please check your network connection and try again"
-            exit 1
-        fi
+    # Step 1: Use the existing router directory (this script should be run from ~/router)
+    log "Using current directory as router repository..."
+    ROUTER_DIR="$HOME/router"
 
-        log "Installing router dependencies..."
-        cd vllm-router
-        if [ -f "./scripts/install.sh" ]; then
-            ./scripts/install.sh
-        else
-            warn "Install script not found, skipping installation step"
-        fi
-        cd ..
+    if [ ! -d "$ROUTER_DIR" ]; then
+        error "Router directory not found at $ROUTER_DIR"
+        exit 1
     fi
 
     # Step 2: Build router Docker image
     log "Building router Docker image..."
-    cd vllm-router
+    cd "$ROUTER_DIR"
 
     if [ ! -f "Dockerfile" ] && [ ! -f "Dockerfile.router" ]; then
         error "Dockerfile or Dockerfile.router not found in vllm-router directory"
@@ -632,29 +619,18 @@ EOF
 deploy_router_local() {
     log "Deploying vLLM router locally..."
 
-    # Step 1: Check if router directory exists or clone it
-    log "Checking for router repository..."
-    if [ ! -d "vllm-router" ]; then
-        log "Cloning vLLM router repository locally..."
-        if ! git clone https://github.com/Prowindy/vllm-router; then
-            error "Failed to clone router repository from https://github.com/Prowindy/vllm-router"
-            log "Please check your network connection and try again"
-            exit 1
-        fi
+    # Step 1: Use the existing router directory (this script should be run from ~/router)
+    log "Using current directory as router repository..."
+    ROUTER_DIR="$HOME/router"
 
-        log "Installing router dependencies..."
-        cd vllm-router
-        if [ -f "./scripts/install.sh" ]; then
-            ./scripts/install.sh
-        else
-            warn "Install script not found, skipping installation step"
-        fi
-        cd ..
+    if [ ! -d "$ROUTER_DIR" ]; then
+        error "Router directory not found at $ROUTER_DIR"
+        exit 1
     fi
 
     # Step 2: Build router Docker image
     log "Building router Docker image..."
-    cd vllm-router
+    cd "$ROUTER_DIR"
 
     if [ ! -f "Dockerfile" ] && [ ! -f "Dockerfile.router" ]; then
         error "Dockerfile or Dockerfile.router not found in vllm-router directory"
