@@ -131,19 +131,16 @@ clone_vllm() {
     log "Cloning vLLM repository..."
 
     if [ -d "vllm/.git" ]; then
-        log "vLLM directory exists, skipping clone/checkout to preserve local changes..."
+        log "vLLM directory exists, skipping clone to preserve local changes..."
     else
         if [ -d "vllm" ]; then
             log "vLLM directory exists but is not a git repo, removing..."
             rm -rf vllm
         fi
         git clone $VLLM_REPO
-        cd vllm
-        git checkout $VLLM_COMMIT
-        cd ..
     fi
 
-    success "vLLM repository ready at commit $VLLM_COMMIT"
+    success "vLLM repository ready"
 }
 
 # Function to build Docker image
@@ -1080,6 +1077,8 @@ for cmd in "${COMMANDS[@]}"; do
             setup_docker_storage
             ;;
         all)
+            setup_ssh
+            setup_docker_storage
             clone_vllm
             build_docker
             upload_ecr
@@ -1091,7 +1090,3 @@ for cmd in "${COMMANDS[@]}"; do
 done
 
 success "All operations completed successfully!"
-
-
-
-
