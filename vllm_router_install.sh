@@ -42,17 +42,17 @@ TP_SIZE="8"
 # Remote hosts configuration (space-separated)
 # AWS EC2 instances for deployment
 # Prefill hosts (nodes 1 and 2)
-PREFILL_REMOTE_HOSTS="congc@ec2-35-87-224-19.us-west-2.compute.amazonaws.com congc@ec2-44-249-71-122.us-west-2.compute.amazonaws.com"
+PREFILL_REMOTE_HOSTS="congc@ec2-44-253-89-231.us-west-2.compute.amazonaws.com congc@ec2-44-232-228-156.us-west-2.compute.amazonaws.com"
 # Decode hosts (nodes 3 and 4)
-DECODE_REMOTE_HOSTS="congc@ec2-35-80-5-118.us-west-2.compute.amazonaws.com congc@ec2-44-252-57-95.us-west-2.compute.amazonaws.com"
+DECODE_REMOTE_HOSTS="congc@ec2-35-164-240-36.us-west-2.compute.amazonaws.com congc@ec2-44-228-181-2.us-west-2.compute.amazonaws.com"
 # Backward compatibility - all hosts combined
 REMOTE_HOSTS="$PREFILL_REMOTE_HOSTS $DECODE_REMOTE_HOSTS"
 
 # SSH host aliases (for reference):
-# aws-ec2-node1: ec2-35-87-224-19.us-west-2.compute.amazonaws.com
-# aws-ec2-node2: ec2-44-249-71-122.us-west-2.compute.amazonaws.com
-# aws-ec2-node3: ec2-35-80-5-118.us-west-2.compute.amazonaws.com
-# aws-ec2-node4: ec2-44-252-57-95.us-west-2.compute.amazonaws.com
+# aws-ec2-node1: ec2-44-253-89-231.us-west-2.compute.amazonaws.com
+# aws-ec2-node2: ec2-44-232-228-156.us-west-2.compute.amazonaws.com
+# aws-ec2-node3: ec2-35-164-240-36.us-west-2.compute.amazonaws.com
+# aws-ec2-node4: ec2-44-228-181-2.us-west-2.compute.amazonaws.com
 # User: congc
 # SSH Key: ~/.ssh/ec2_instance_private_key.pem
 
@@ -97,6 +97,7 @@ Commands:
     deploy_decode_local Deploy vLLM decode server locally
     benchmark           Run vLLM benchmark against the router
     setup_ssh           Setup SSH key for remote deployment
+    setup_docker_storage Setup Docker to use largest available storage (run on remote hosts)
     all                 Run all steps: clone, build, upload, deploy_router, deploy_remote_prefill, deploy_remote_decode
 
 Options:
@@ -129,20 +130,20 @@ EOF
 clone_vllm() {
     log "Cloning vLLM repository..."
 
-    if [ -d "vllm" ]; then
-        log "vLLM directory exists, updating..."
-        cd vllm
-        git fetch origin
-        git checkout $VLLM_COMMIT
-        cd ..
+    if [ -d "vllm/.git" ]; then
+        log "vLLM directory exists, skipping clone/checkout to preserve local changes..."
     else
+        if [ -d "vllm" ]; then
+            log "vLLM directory exists but is not a git repo, removing..."
+            rm -rf vllm
+        fi
         git clone $VLLM_REPO
         cd vllm
         git checkout $VLLM_COMMIT
         cd ..
     fi
 
-    success "vLLM cloned and checked out to commit $VLLM_COMMIT"
+    success "vLLM repository ready at commit $VLLM_COMMIT"
 }
 
 # Function to build Docker image
@@ -181,6 +182,99 @@ build_docker() {
     fi
 
     cd ..
+}
+
+# Function to get largest available mount point for Docker storage
+get_largest_mount() {
+    # Find the largest mount point by available space, excluding tmpfs, devtmpfs, and NFS
+    # Works across AWS, GCP, Azure, and other cloud providers
+    local largest_mount=$(df -h | grep -vE 'tmpfs|devtmpfs|:/|loop|udev' | awk 'NR>1 {print $4, $6}' | sort -hr | head -1 | awk '{print $2}')
+
+    # Fallback to root if nothing found
+    if [[ -z "$largest_mount" ]]; then
+        largest_mount="/"
+    fi
+
+    echo "$largest_mount"
+}
+
+# Function to setup Docker to use largest storage mount
+setup_docker_storage() {
+    log "Configuring Docker to use largest available storage..."
+
+    # Detect largest mount point
+    local largest_mount=$(get_largest_mount)
+    local docker_data_root="${largest_mount}/docker"
+
+    log "Largest mount detected: $largest_mount"
+    log "Docker data-root will be: $docker_data_root"
+
+    # Create Docker daemon.json configuration script
+    cat << 'DOCKER_SETUP_EOF'
+#!/bin/bash
+
+# Get the largest mount point
+LARGEST_MOUNT=$(df -h | grep -vE 'tmpfs|devtmpfs|:/|loop|udev' | awk 'NR>1 {print $4, $6}' | sort -hr | head -1 | awk '{print $2}')
+if [[ -z "$LARGEST_MOUNT" ]]; then
+    LARGEST_MOUNT="/"
+fi
+
+DOCKER_DATA_ROOT="${LARGEST_MOUNT}/docker"
+
+echo "Configuring Docker to use: $DOCKER_DATA_ROOT"
+
+# Stop Docker service
+sudo systemctl stop docker 2>/dev/null || sudo service docker stop 2>/dev/null || true
+
+# Backup existing Docker data if it exists
+if [ -d /var/lib/docker ] && [ "$(ls -A /var/lib/docker)" ]; then
+    echo "Backing up existing Docker data..."
+    sudo mkdir -p "${DOCKER_DATA_ROOT}_backup"
+    sudo rsync -av /var/lib/docker/ "${DOCKER_DATA_ROOT}_backup/" || true
+fi
+
+# Create new Docker data directory
+sudo mkdir -p "$DOCKER_DATA_ROOT"
+
+# Read existing Docker daemon.json if it exists
+if [ -f /etc/docker/daemon.json ]; then
+    # Backup existing config
+    sudo cp /etc/docker/daemon.json /etc/docker/daemon.json.bak
+
+    # Merge with existing config using jq if available, otherwise overwrite
+    if command -v jq &> /dev/null; then
+        echo "$(sudo cat /etc/docker/daemon.json | jq --arg dataroot "$DOCKER_DATA_ROOT" '. + {"data-root": $dataroot}')" | sudo tee /etc/docker/daemon.json > /dev/null
+    else
+        # No jq, read existing config and append data-root
+        sudo bash -c "cat /etc/docker/daemon.json | sed 's/}$/,\"data-root\":\"'$DOCKER_DATA_ROOT'\"}/' > /etc/docker/daemon.json.tmp && mv /etc/docker/daemon.json.tmp /etc/docker/daemon.json"
+    fi
+else
+    # Create new daemon.json
+    sudo mkdir -p /etc/docker
+    echo "{\"data-root\":\"$DOCKER_DATA_ROOT\"}" | sudo tee /etc/docker/daemon.json > /dev/null
+fi
+
+# If backup exists, move it to new location
+if [ -d "${DOCKER_DATA_ROOT}_backup" ] && [ "$(ls -A ${DOCKER_DATA_ROOT}_backup)" ]; then
+    echo "Moving Docker data to new location..."
+    sudo rsync -av "${DOCKER_DATA_ROOT}_backup/" "$DOCKER_DATA_ROOT/" || true
+    sudo rm -rf "${DOCKER_DATA_ROOT}_backup"
+fi
+
+# Start Docker service
+sudo systemctl start docker 2>/dev/null || sudo service docker start 2>/dev/null || true
+
+# Wait for Docker to be ready
+sleep 5
+
+# Verify Docker is running
+if docker info &> /dev/null; then
+    echo "Docker successfully reconfigured!"
+    echo "Docker Root Dir: $(docker info 2>/dev/null | grep 'Docker Root Dir' | awk '{print $4}')"
+else
+    echo "WARNING: Docker may not be running properly. Check with: sudo systemctl status docker"
+fi
+DOCKER_SETUP_EOF
 }
 
 # Function to get local IP address
@@ -233,9 +327,9 @@ sudo mkdir -p /opt/dlami/nvme/huggingface_cache
 sudo chown -R \$(id -u):\$(id -g) /opt/dlami/nvme/huggingface_cache
 
 # Run vLLM container
-docker run --runtime nvidia --gpus all \
+docker run -d --restart unless-stopped --runtime nvidia --gpus all \
     -v /opt/dlami/nvme/huggingface_cache:/root/.cache/huggingface \
-    -v /tmp:/dev/shm \
+    --shm-size=1000g \
     --env "HUGGING_FACE_HUB_TOKEN=$HF_TOKEN" \
     --env "VLLM_MOE_DP_CHUNK_SIZE=512" \
     --env "TRITON_LIBCUDA_PATH=/usr/lib64" \
@@ -263,14 +357,14 @@ docker run --runtime nvidia --gpus all \
     $ECR_REPO:$ECR_TAG \
     --model $MODEL \
     --enforce-eager \
+    --host 0.0.0.0 \
     --port $DECODE_PORT \
     --disable-log-requests \
     --disable-uvicorn-access-log \
     --enable-expert-parallel \
     --tensor-parallel-size $TP_SIZE \
     --trust-remote-code \
-    --kv-transfer-config "{\"kv_connector\":\"P2pNcclConnector\",\"kv_role\":\"kv_consumer\",\"kv_buffer_size\":\"8e9\",\"kv_port\":\"22001\",\"kv_connector_extra_config\":{\"proxy_ip\":\"$ROUTER_IP\",\"proxy_port\":\"30001\",\"http_port\":\"$DECODE_PORT\",\"external_ip\":\"$EXTERNAL_IP\",\"send_type\":\"PUT_ASYNC\",\"nccl_num_channels\":\"16\"}}" \
-    > decode.log 2>&1 &
+    --kv-transfer-config "{\"kv_connector\":\"P2pNcclConnector\",\"kv_role\":\"kv_consumer\",\"kv_buffer_size\":\"8e9\",\"kv_port\":\"22001\",\"kv_connector_extra_config\":{\"proxy_ip\":\"$ROUTER_IP\",\"proxy_port\":\"30001\",\"http_port\":\"$DECODE_PORT\",\"send_type\":\"PUT_ASYNC\",\"nccl_num_channels\":\"16\"}}"
 
 echo "vLLM started in background. Check logs with: docker logs -f vllm-deepseek"
 echo "API available at: http://localhost:$DECODE_PORT"
@@ -300,9 +394,9 @@ sudo mkdir -p /opt/dlami/nvme/huggingface_cache
 sudo chown -R \$(id -u):\$(id -g) /opt/dlami/nvme/huggingface_cache
 
 # Run vLLM prefill container
-docker run --runtime nvidia --gpus all \\
+docker run -d --restart unless-stopped --runtime nvidia --gpus all \\
     -v /opt/dlami/nvme/huggingface_cache:/root/.cache/huggingface \\
-    -v /tmp:/dev/shm \\
+    --shm-size=1000g \\
     --env "HUGGING_FACE_HUB_TOKEN=$HF_TOKEN" \
     --env "VLLM_MOE_DP_CHUNK_SIZE=512" \
     --env "TRITON_LIBCUDA_PATH=/usr/lib64" \
@@ -339,8 +433,7 @@ docker run --runtime nvidia --gpus all \\
     --gpu-memory-utilization 0.9 \\
     --enable-prefix-caching \\
     --disable-log-stats \\
-    --kv_transfer_config "{\"kv_connector\":\"P2pNcclConnector\",\"kv_role\":\"kv_producer\",\"kv_buffer_size\":\"1e1\",\"kv_port\":\"$PREFILL_KV_PORT\",\"kv_connector_extra_config\":{\"proxy_ip\":\"$ROUTER_IP\",\"proxy_port\":\"30001\",\"http_port\":\"$PREFILL_PORT\",\"external_ip\":\"$EXTERNAL_IP\",\"send_type\":\"PUT_ASYNC\",\"nccl_num_channels\":\"16\"}}" \\
-    > prefill.log 2>&1 &
+    --kv_transfer_config "{\"kv_connector\":\"P2pNcclConnector\",\"kv_role\":\"kv_producer\",\"kv_buffer_size\":\"1e1\",\"kv_port\":\"$PREFILL_KV_PORT\",\"kv_connector_extra_config\":{\"proxy_ip\":\"$ROUTER_IP\",\"proxy_port\":\"30001\",\"http_port\":\"$PREFILL_PORT\",\"send_type\":\"PUT_ASYNC\",\"nccl_num_channels\":\"16\"}}"
 
 echo "vLLM prefill started in background. Check logs with: docker logs -f vllm-deepseek-prefill"
 echo "Prefill API available at: http://localhost:$PREFILL_PORT"
@@ -432,6 +525,15 @@ deploy_remote_decode() {
         if [ "$DRY_RUN" = "true" ]; then
             echo "Would deploy decode script to $host with external IP detection"
         else
+            # First, setup Docker storage on the remote host (skip if already configured)
+            DOCKER_ROOT=$(ssh -i "$HOME/.ssh/ec2_instance_private_key.pem" -o StrictHostKeyChecking=no $host "docker info 2>/dev/null | grep 'Docker Root Dir' | grep -v '/var/lib/docker' || true")
+            if [ -z "$DOCKER_ROOT" ]; then
+                log "Setting up Docker storage on $host..."
+                setup_docker_storage | ssh -i "$HOME/.ssh/ec2_instance_private_key.pem" -o StrictHostKeyChecking=no $host "bash"
+            else
+                log "Docker storage already configured on $host"
+            fi
+
             # Get the internal IP of the remote host for AWS VPC communication
             EXTERNAL_IP=$(ssh -i "$HOME/.ssh/ec2_instance_private_key.pem" -o StrictHostKeyChecking=no $host "curl -s http://169.254.169.254/latest/meta-data/local-ipv4 2>/dev/null || ip route get 8.8.8.8 | grep -oP 'src \K\S+'")
             log "Internal IP for $host: $EXTERNAL_IP"
@@ -475,6 +577,15 @@ deploy_remote_prefill() {
         if [ "$DRY_RUN" = "true" ]; then
             echo "Would deploy prefill script to $host with external IP detection"
         else
+            # First, setup Docker storage on the remote host (skip if already configured)
+            DOCKER_ROOT=$(ssh -i "$HOME/.ssh/ec2_instance_private_key.pem" -o StrictHostKeyChecking=no $host "docker info 2>/dev/null | grep 'Docker Root Dir' | grep -v '/var/lib/docker' || true")
+            if [ -z "$DOCKER_ROOT" ]; then
+                log "Setting up Docker storage on $host..."
+                setup_docker_storage | ssh -i "$HOME/.ssh/ec2_instance_private_key.pem" -o StrictHostKeyChecking=no $host "bash"
+            else
+                log "Docker storage already configured on $host"
+            fi
+
             # Get the internal IP of the remote host for AWS VPC communication
             EXTERNAL_IP=$(ssh -i "$HOME/.ssh/ec2_instance_private_key.pem" -o StrictHostKeyChecking=no $host "curl -s http://169.254.169.254/latest/meta-data/local-ipv4 2>/dev/null || ip route get 8.8.8.8 | grep -oP 'src \K\S+'")
             log "Internal IP for $host: $EXTERNAL_IP"
@@ -849,13 +960,13 @@ setup_ssh() {
 
     # Add all EC2 hosts to known_hosts
     log "Adding EC2 hosts to known_hosts..."
-    for host in ec2-35-87-224-19.us-west-2.compute.amazonaws.com ec2-44-249-71-122.us-west-2.compute.amazonaws.com ec2-35-80-5-118.us-west-2.compute.amazonaws.com ec2-44-252-57-95.us-west-2.compute.amazonaws.com; do
+    for host in ec2-44-253-89-231.us-west-2.compute.amazonaws.com ec2-44-232-228-156.us-west-2.compute.amazonaws.com ec2-35-164-240-36.us-west-2.compute.amazonaws.com ec2-44-228-181-2.us-west-2.compute.amazonaws.com; do
         ssh-keyscan -H "$host" >> ~/.ssh/known_hosts 2>/dev/null
     done
 
     # Test SSH connection to the first host
     log "Testing SSH connection..."
-    if ssh -i "$SSH_KEY_FILE" -o ConnectTimeout=10 -o StrictHostKeyChecking=no congc@ec2-35-87-224-19.us-west-2.compute.amazonaws.com "echo 'SSH connection successful'" 2>/dev/null; then
+    if ssh -i "$SSH_KEY_FILE" -o ConnectTimeout=10 -o StrictHostKeyChecking=no congc@ec2-44-253-89-231.us-west-2.compute.amazonaws.com "echo 'SSH connection successful'" 2>/dev/null; then
         success "SSH key setup completed successfully!"
         log "You can now use deploy_remote and deploy_remote_prefill commands"
     else
@@ -895,7 +1006,7 @@ while [[ $# -gt 0 ]]; do
             DRY_RUN="true"
             shift
             ;;
-        clone|build|upload|deploy_local|deploy_remote_decode|deploy_remote_prefill|deploy_router|deploy_router_local|deploy_prefill_local|deploy_decode_local|benchmark|setup_ssh|all)
+        clone|build|upload|deploy_local|deploy_remote_decode|deploy_remote_prefill|deploy_router|deploy_router_local|deploy_prefill_local|deploy_decode_local|benchmark|setup_ssh|setup_docker_storage|all)
             COMMANDS+=("$1")
             shift
             ;;
@@ -964,6 +1075,9 @@ for cmd in "${COMMANDS[@]}"; do
             ;;
         setup_ssh)
             setup_ssh
+            ;;
+        setup_docker_storage)
+            setup_docker_storage
             ;;
         all)
             clone_vllm
