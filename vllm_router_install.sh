@@ -11,6 +11,10 @@ VLLM_COMMIT="9fac6aa30b669de75d8718164cd99676d3530e7d"
 ECR_REPO="584868043064.dkr.ecr.us-west-2.amazonaws.com/dev-vllm-repo"
 ECR_REGION="us-west-2"
 DOCKER_TAG="vllm/vllm-openai"
+
+# SSH Configuration (REQUIRED - must be set via environment variables)
+SSH_KEY_FILE="${SSH_KEY_FILE}"
+SSH_USER="${SSH_USER:-congc}"
 # Function to get or generate ECR tag
 get_ecr_tag() {
     local tag_file="/tmp/vllm_ecr_tag"
@@ -29,8 +33,8 @@ save_ecr_tag() {
 
 ECR_TAG=${ECR_TAG:-$(get_ecr_tag)}
 
-# vLLM Configuration
-HF_TOKEN="YOUR_HUGGING_FACE_TOKEN_HERE"
+# vLLM Configuration (REQUIRED - must be set via environment variables)
+HF_TOKEN="${HF_TOKEN}"
 GPU_ID="0,1,2,3,4,5,6,7"
 MODEL="deepseek-ai/DeepSeek-V3-0324"
 DECODE_PORT="20005"
@@ -40,19 +44,17 @@ PREFILL_KV_PORT="21001"
 TP_SIZE="8"
 
 # Remote hosts configuration (space-separated)
-# AWS EC2 instances for deployment
-# Prefill hosts (nodes 1 and 2)
-PREFILL_REMOTE_HOSTS="congc@ec2-44-253-89-231.us-west-2.compute.amazonaws.com congc@ec2-44-232-228-156.us-west-2.compute.amazonaws.com"
-# Decode hosts (nodes 3 and 4)
-DECODE_REMOTE_HOSTS="congc@ec2-35-164-240-36.us-west-2.compute.amazonaws.com congc@ec2-44-228-181-2.us-west-2.compute.amazonaws.com"
+# AWS EC2 instances for deployment (US-WEST-1)
+# GPU instance 1 - for prefill
+PREFILL_REMOTE_HOSTS="congc@ec2-13-57-84-212.us-west-1.compute.amazonaws.com"
+# GPU instance 2 - for decode
+DECODE_REMOTE_HOSTS="congc@ec2-54-183-209-205.us-west-1.compute.amazonaws.com"
 # Backward compatibility - all hosts combined
 REMOTE_HOSTS="$PREFILL_REMOTE_HOSTS $DECODE_REMOTE_HOSTS"
 
 # SSH host aliases (for reference):
-# aws-ec2-node1: ec2-44-253-89-231.us-west-2.compute.amazonaws.com
-# aws-ec2-node2: ec2-44-232-228-156.us-west-2.compute.amazonaws.com
-# aws-ec2-node3: ec2-35-164-240-36.us-west-2.compute.amazonaws.com
-# aws-ec2-node4: ec2-44-228-181-2.us-west-2.compute.amazonaws.com
+# aws-gpu-node1: ec2-13-57-84-212.us-west-1.compute.amazonaws.com (prefill)
+# aws-gpu-node2: ec2-54-183-209-205.us-west-1.compute.amazonaws.com (decode)
 # User: congc
 # SSH Key: ~/.ssh/ec2_instance_private_key.pem
 
@@ -79,6 +81,58 @@ warn() {
     echo -e "${YELLOW}[WARNING] $1${NC}"
 }
 
+# Function to validate required environment variables
+validate_env() {
+    local missing_vars=()
+    local need_ssh=false
+    local need_hf=false
+
+    # Check if any command requires SSH
+    for cmd in "${COMMANDS[@]}"; do
+        case $cmd in
+            deploy_remote_decode|deploy_remote_prefill|deploy_router|all)
+                need_ssh=true
+                need_hf=true
+                ;;
+            deploy_local|deploy_prefill_local|deploy_decode_local)
+                need_hf=true
+                ;;
+        esac
+    done
+
+    # Validate SSH_KEY_FILE if needed
+    if [ "$need_ssh" = true ]; then
+        if [ -z "$SSH_KEY_FILE" ]; then
+            missing_vars+=("SSH_KEY_FILE")
+        elif [ ! -f "$SSH_KEY_FILE" ]; then
+            error "SSH key file not found: $SSH_KEY_FILE"
+            exit 1
+        fi
+    fi
+
+    # Validate HF_TOKEN if needed
+    if [ "$need_hf" = true ]; then
+        if [ -z "$HF_TOKEN" ]; then
+            missing_vars+=("HF_TOKEN")
+        fi
+    fi
+
+    # Report missing variables
+    if [ ${#missing_vars[@]} -gt 0 ]; then
+        error "Missing required environment variables:"
+        for var in "${missing_vars[@]}"; do
+            echo "  - $var"
+        done
+        echo ""
+        error "Please set the required environment variables and try again."
+        echo ""
+        echo "Example usage:"
+        echo "  HF_TOKEN=hf_xxxxx SSH_KEY_FILE=~/.ssh/mykey.pem $0 all"
+        echo ""
+        exit 1
+    fi
+}
+
 # Function to show usage
 usage() {
     cat << EOF
@@ -88,17 +142,16 @@ Commands:
     clone               Clone vLLM repository
     build               Build Docker image
     upload              Upload image to ECR
-    deploy_local        Deploy and run vLLM locally
-    deploy_remote_decode Deploy decode instances to decode hosts
-    deploy_remote_prefill Deploy prefill instances to prefill hosts
-    deploy_router       Deploy vLLM router to remote hosts
+    deploy_local        Deploy and run vLLM locally (requires HF_TOKEN)
+    deploy_remote_decode Deploy decode instances to decode hosts (requires HF_TOKEN, SSH_KEY_FILE)
+    deploy_remote_prefill Deploy prefill instances to prefill hosts (requires HF_TOKEN, SSH_KEY_FILE)
+    deploy_router       Deploy vLLM router to remote hosts (requires SSH_KEY_FILE)
     deploy_router_local Deploy vLLM router locally (ports 10001, 30001)
-    deploy_prefill_local Deploy vLLM prefill server locally
-    deploy_decode_local Deploy vLLM decode server locally
+    deploy_prefill_local Deploy vLLM prefill server locally (requires HF_TOKEN)
+    deploy_decode_local Deploy vLLM decode server locally (requires HF_TOKEN)
     benchmark           Run vLLM benchmark against the router
-    setup_ssh           Setup SSH key for remote deployment
-    setup_docker_storage Setup Docker to use largest available storage (run on remote hosts)
-    all                 Run all steps: clone, build, upload, deploy_router, deploy_remote_prefill, deploy_remote_decode
+    setup_docker_storage Setup Docker to use largest available storage (run directly on target host)
+    all                 Run all steps: verify env, clone, build, upload, deploy (requires HF_TOKEN, SSH_KEY_FILE)
 
 Options:
     -h, --help              Show this help message
@@ -108,7 +161,16 @@ Options:
     --no-precompiled        Build from source instead of using precompiled
     --dry-run               Show what would be done without executing
 
-Benchmark Environment Variables:
+REQUIRED Environment Variables (for deployment commands):
+    HF_TOKEN               Hugging Face API token (required for model access)
+                          Get your token from: https://huggingface.co/settings/tokens
+
+    SSH_KEY_FILE          Path to SSH private key for remote hosts
+                          Example: ~/.ssh/ec2_instance_private_key.pem
+
+OPTIONAL Environment Variables:
+    SSH_USER              SSH username (default: congc)
+    ECR_TAG               Custom ECR tag (default: auto-generated)
     BENCHMARK_NUM_PROMPTS      Number of prompts (default: 10000)
     BENCHMARK_INPUT_LEN        Input token length (default: 2000)
     BENCHMARK_OUTPUT_LEN       Output token length (default: 2000)
@@ -117,12 +179,30 @@ Benchmark Environment Variables:
     BENCHMARK_ROUTER_PORT      Router port (default: 10001)
 
 Examples:
-    $0 all                              # Full deployment
-    $0 build upload                     # Just build and upload
-    $0 deploy -r "user@host1.com"       # Deploy to specific host
-    $0 benchmark                        # Run benchmark against router
-    BENCHMARK_NUM_PROMPTS=1000 $0 benchmark  # Run shorter benchmark
-    $0 --dry-run all                    # Preview all steps
+    # Full deployment (RECOMMENDED - sets up everything)
+    HF_TOKEN=hf_xxxxx SSH_KEY_FILE=~/.ssh/mykey.pem $0 all
+
+    # Local deployment only
+    HF_TOKEN=hf_xxxxx $0 deploy_prefill_local deploy_decode_local
+
+    # Build and upload only (no env vars needed)
+    $0 build upload
+
+    # Deploy to specific remote hosts
+    HF_TOKEN=hf_xxxxx SSH_KEY_FILE=~/.ssh/mykey.pem \\
+        $0 -r "user@host1.com user@host2.com" deploy_remote_decode
+
+    # Run benchmark
+    BENCHMARK_NUM_PROMPTS=1000 $0 benchmark
+
+    # Preview all steps without executing
+    HF_TOKEN=hf_xxxxx SSH_KEY_FILE=~/.ssh/mykey.pem $0 --dry-run all
+
+IMPORTANT NOTES:
+    - HF_TOKEN is REQUIRED for all deployment commands (local and remote)
+    - SSH_KEY_FILE is REQUIRED for remote deployment commands
+    - The script will validate these variables before proceeding
+    - For 'all' command, both HF_TOKEN and SSH_KEY_FILE are required
 EOF
 }
 
@@ -197,14 +277,14 @@ get_largest_mount() {
 
 # Function to setup Docker to use largest storage mount
 setup_docker_storage() {
-    log "Configuring Docker to use largest available storage..."
+    log "Configuring Docker to use largest available storage..." >&2
 
     # Detect largest mount point
     local largest_mount=$(get_largest_mount)
     local docker_data_root="${largest_mount}/docker"
 
-    log "Largest mount detected: $largest_mount"
-    log "Docker data-root will be: $docker_data_root"
+    log "Largest mount detected: $largest_mount" >&2
+    log "Docker data-root will be: $docker_data_root" >&2
 
     # Create Docker daemon.json configuration script
     cat << 'DOCKER_SETUP_EOF'
@@ -234,21 +314,44 @@ fi
 sudo mkdir -p "$DOCKER_DATA_ROOT"
 
 # Read existing Docker daemon.json if it exists
-if [ -f /etc/docker/daemon.json ]; then
+sudo mkdir -p /etc/docker
+if [ -f /etc/docker/daemon.json ] && [ -s /etc/docker/daemon.json ]; then
     # Backup existing config
     sudo cp /etc/docker/daemon.json /etc/docker/daemon.json.bak
 
-    # Merge with existing config using jq if available, otherwise overwrite
-    if command -v jq &> /dev/null; then
-        echo "$(sudo cat /etc/docker/daemon.json | jq --arg dataroot "$DOCKER_DATA_ROOT" '. + {"data-root": $dataroot}')" | sudo tee /etc/docker/daemon.json > /dev/null
+    # Check if data-root already exists
+    if sudo cat /etc/docker/daemon.json | grep -q '"data-root"'; then
+        echo "data-root already configured, skipping..."
     else
-        # No jq, read existing config and append data-root
-        sudo bash -c "cat /etc/docker/daemon.json | sed 's/}$/,\"data-root\":\"'$DOCKER_DATA_ROOT'\"}/' > /etc/docker/daemon.json.tmp && mv /etc/docker/daemon.json.tmp /etc/docker/daemon.json"
+        # Merge with existing config using jq if available
+        if command -v jq &> /dev/null; then
+            sudo jq --arg dataroot "$DOCKER_DATA_ROOT" '. + {"data-root": $dataroot}' /etc/docker/daemon.json | sudo tee /etc/docker/daemon.json.tmp > /dev/null
+            sudo mv /etc/docker/daemon.json.tmp /etc/docker/daemon.json
+        else
+            # No jq available, use python to merge JSON properly
+            sudo python3 -c "
+import json
+with open('/etc/docker/daemon.json', 'r') as f:
+    config = json.load(f)
+config['data-root'] = '$DOCKER_DATA_ROOT'
+with open('/etc/docker/daemon.json', 'w') as f:
+    json.dump(config, f, indent=2)
+"
+        fi
     fi
 else
-    # Create new daemon.json
-    sudo mkdir -p /etc/docker
-    echo "{\"data-root\":\"$DOCKER_DATA_ROOT\"}" | sudo tee /etc/docker/daemon.json > /dev/null
+    # Create new daemon.json with NVIDIA runtime and data-root
+    sudo tee /etc/docker/daemon.json > /dev/null << DAEMON_JSON
+{
+  "runtimes": {
+    "nvidia": {
+      "args": [],
+      "path": "nvidia-container-runtime"
+    }
+  },
+  "data-root": "$DOCKER_DATA_ROOT"
+}
+DAEMON_JSON
 fi
 
 # If backup exists, move it to new location
@@ -391,9 +494,9 @@ sudo mkdir -p /opt/dlami/nvme/huggingface_cache
 sudo chown -R \$(id -u):\$(id -g) /opt/dlami/nvme/huggingface_cache
 
 # Run vLLM prefill container
-docker run -d --restart unless-stopped --runtime nvidia --gpus all \\
-    -v /opt/dlami/nvme/huggingface_cache:/root/.cache/huggingface \\
-    --shm-size=1000g \\
+docker run -d --restart unless-stopped --runtime nvidia --gpus all \
+    -v /opt/dlami/nvme/huggingface_cache:/root/.cache/huggingface \
+    --shm-size=1000g \
     --env "HUGGING_FACE_HUB_TOKEN=$HF_TOKEN" \
     --env "VLLM_MOE_DP_CHUNK_SIZE=512" \
     --env "TRITON_LIBCUDA_PATH=/usr/lib64" \
@@ -416,20 +519,19 @@ docker run -d --restart unless-stopped --runtime nvidia --gpus all \\
     --env "VLLM_WORKER_RPC_TIMEOUT=300" \
     --env "HF_HUB_CACHE=/root/.cache/huggingface/hub" \
     --env "CUDA_VISIBLE_DEVICES=$GPU_ID" \
-    --network host \\
-    --name vllm-deepseek-prefill \\
-    $ECR_REPO:$ECR_TAG \\
-    --model $MODEL \\
-    --enforce-eager \\
-\
-    --host 0.0.0.0 \\
-    --port $PREFILL_PORT \\
-    --tensor-parallel-size $TP_SIZE \\
-    --enable-expert-parallel \\
-    --trust-remote-code \\
-    --gpu-memory-utilization 0.9 \\
-    --enable-prefix-caching \\
-    --disable-log-stats \\
+    --network host \
+    --name vllm-deepseek-prefill \
+    $ECR_REPO:$ECR_TAG \
+    --model $MODEL \
+    --enforce-eager \
+    --host 0.0.0.0 \
+    --port $PREFILL_PORT \
+    --tensor-parallel-size $TP_SIZE \
+    --enable-expert-parallel \
+    --trust-remote-code \
+    --gpu-memory-utilization 0.9 \
+    --enable-prefix-caching \
+    --disable-log-stats \
     --kv_transfer_config "{\"kv_connector\":\"P2pNcclConnector\",\"kv_role\":\"kv_producer\",\"kv_buffer_size\":\"1e1\",\"kv_port\":\"$PREFILL_KV_PORT\",\"kv_connector_extra_config\":{\"proxy_ip\":\"$ROUTER_IP\",\"proxy_port\":\"30001\",\"http_port\":\"$PREFILL_PORT\",\"send_type\":\"PUT_ASYNC\",\"nccl_num_channels\":\"16\"}}"
 
 echo "vLLM prefill started in background. Check logs with: docker logs -f vllm-deepseek-prefill"
@@ -505,13 +607,7 @@ deploy_local() {
 deploy_remote_decode() {
     log "Deploying decode instances to remote hosts..."
 
-    # Check if SSH key exists
-    if [ ! -f "$HOME/.ssh/ec2_instance_private_key.pem" ]; then
-        error "SSH private key not found at $HOME/.ssh/ec2_instance_private_key.pem"
-        log "Please run: $0 setup_ssh"
-        log "Or set the PRIVATE_KEY environment variable and run setup_ssh"
-        exit 1
-    fi
+    # Validation is already done by validate_env()
 
     # Deploy to each host with its specific external IP
     ROUTER_IP=$(get_local_ip)
@@ -523,16 +619,16 @@ deploy_remote_decode() {
             echo "Would deploy decode script to $host with external IP detection"
         else
             # First, setup Docker storage on the remote host (skip if already configured)
-            DOCKER_ROOT=$(ssh -i "$HOME/.ssh/ec2_instance_private_key.pem" -o StrictHostKeyChecking=no $host "docker info 2>/dev/null | grep 'Docker Root Dir' | grep -v '/var/lib/docker' || true")
+            DOCKER_ROOT=$(ssh -i "$SSH_KEY_FILE" -o StrictHostKeyChecking=no $host "docker info 2>/dev/null | grep 'Docker Root Dir' | grep -v '/var/lib/docker' || true")
             if [ -z "$DOCKER_ROOT" ]; then
-                log "Setting up Docker storage on $host..."
-                setup_docker_storage | ssh -i "$HOME/.ssh/ec2_instance_private_key.pem" -o StrictHostKeyChecking=no $host "bash"
+                log "Setting up Docker storage on $host..." >&2
+                setup_docker_storage | ssh -i "$SSH_KEY_FILE" -o StrictHostKeyChecking=no $host "bash"
             else
-                log "Docker storage already configured on $host"
+                log "Docker storage already configured on $host" >&2
             fi
 
             # Get the internal IP of the remote host for AWS VPC communication
-            EXTERNAL_IP=$(ssh -i "$HOME/.ssh/ec2_instance_private_key.pem" -o StrictHostKeyChecking=no $host "curl -s http://169.254.169.254/latest/meta-data/local-ipv4 2>/dev/null || ip route get 8.8.8.8 | grep -oP 'src \K\S+'")
+            EXTERNAL_IP=$(ssh -i "$SSH_KEY_FILE" -o StrictHostKeyChecking=no $host "curl -s http://169.254.169.254/latest/meta-data/local-ipv4 2>/dev/null || ip route get 8.8.8.8 | grep -oP 'src \K\S+'")
             log "Internal IP for $host: $EXTERNAL_IP"
 
             # Generate script with host-specific external IP
@@ -540,10 +636,10 @@ deploy_remote_decode() {
             chmod +x /tmp/vllm_run_remote_${EXTERNAL_IP}.sh
 
             # Copy script to remote host
-            scp -i "$HOME/.ssh/ec2_instance_private_key.pem" -o StrictHostKeyChecking=no /tmp/vllm_run_remote_${EXTERNAL_IP}.sh $host:/tmp/vllm_run_remote.sh
+            scp -i "$SSH_KEY_FILE" -o StrictHostKeyChecking=no /tmp/vllm_run_remote_${EXTERNAL_IP}.sh $host:/tmp/vllm_run_remote.sh
 
             # Execute on remote host
-            ssh -i "$HOME/.ssh/ec2_instance_private_key.pem" -o StrictHostKeyChecking=no $host "bash /tmp/vllm_run_remote.sh"
+            ssh -i "$SSH_KEY_FILE" -o StrictHostKeyChecking=no $host "bash /tmp/vllm_run_remote.sh"
 
             # Clean up host-specific temp file
             rm -f /tmp/vllm_run_remote_${EXTERNAL_IP}.sh
@@ -557,13 +653,7 @@ deploy_remote_decode() {
 deploy_remote_prefill() {
     log "Deploying vLLM prefill to remote hosts..."
 
-    # Check if SSH key exists
-    if [ ! -f "$HOME/.ssh/ec2_instance_private_key.pem" ]; then
-        error "SSH private key not found at $HOME/.ssh/ec2_instance_private_key.pem"
-        log "Please run: $0 setup_ssh"
-        log "Or set the PRIVATE_KEY environment variable and run setup_ssh"
-        exit 1
-    fi
+    # Validation is already done by validate_env()
 
     # Deploy to each host with its specific external IP
     ROUTER_IP=$(get_local_ip)
@@ -575,16 +665,16 @@ deploy_remote_prefill() {
             echo "Would deploy prefill script to $host with external IP detection"
         else
             # First, setup Docker storage on the remote host (skip if already configured)
-            DOCKER_ROOT=$(ssh -i "$HOME/.ssh/ec2_instance_private_key.pem" -o StrictHostKeyChecking=no $host "docker info 2>/dev/null | grep 'Docker Root Dir' | grep -v '/var/lib/docker' || true")
+            DOCKER_ROOT=$(ssh -i "$SSH_KEY_FILE" -o StrictHostKeyChecking=no $host "docker info 2>/dev/null | grep 'Docker Root Dir' | grep -v '/var/lib/docker' || true")
             if [ -z "$DOCKER_ROOT" ]; then
-                log "Setting up Docker storage on $host..."
-                setup_docker_storage | ssh -i "$HOME/.ssh/ec2_instance_private_key.pem" -o StrictHostKeyChecking=no $host "bash"
+                log "Setting up Docker storage on $host..." >&2
+                setup_docker_storage | ssh -i "$SSH_KEY_FILE" -o StrictHostKeyChecking=no $host "bash"
             else
-                log "Docker storage already configured on $host"
+                log "Docker storage already configured on $host" >&2
             fi
 
             # Get the internal IP of the remote host for AWS VPC communication
-            EXTERNAL_IP=$(ssh -i "$HOME/.ssh/ec2_instance_private_key.pem" -o StrictHostKeyChecking=no $host "curl -s http://169.254.169.254/latest/meta-data/local-ipv4 2>/dev/null || ip route get 8.8.8.8 | grep -oP 'src \K\S+'")
+            EXTERNAL_IP=$(ssh -i "$SSH_KEY_FILE" -o StrictHostKeyChecking=no $host "curl -s http://169.254.169.254/latest/meta-data/local-ipv4 2>/dev/null || ip route get 8.8.8.8 | grep -oP 'src \K\S+'")
             log "Internal IP for $host: $EXTERNAL_IP"
 
             # Generate script with host-specific external IP
@@ -592,10 +682,10 @@ deploy_remote_prefill() {
             chmod +x /tmp/vllm_run_remote_prefill_${EXTERNAL_IP}.sh
 
             # Copy script to remote host
-            scp -i "$HOME/.ssh/ec2_instance_private_key.pem" -o StrictHostKeyChecking=no /tmp/vllm_run_remote_prefill_${EXTERNAL_IP}.sh $host:/tmp/vllm_run_remote_prefill.sh
+            scp -i "$SSH_KEY_FILE" -o StrictHostKeyChecking=no /tmp/vllm_run_remote_prefill_${EXTERNAL_IP}.sh $host:/tmp/vllm_run_remote_prefill.sh
 
             # Execute on remote host
-            ssh -i "$HOME/.ssh/ec2_instance_private_key.pem" -o StrictHostKeyChecking=no $host "bash /tmp/vllm_run_remote_prefill.sh"
+            ssh -i "$SSH_KEY_FILE" -o StrictHostKeyChecking=no $host "bash /tmp/vllm_run_remote_prefill.sh"
 
             # Clean up host-specific temp file
             rm -f /tmp/vllm_run_remote_prefill_${EXTERNAL_IP}.sh
@@ -708,10 +798,10 @@ EOF
             echo "Would copy router deployment script to $host and execute"
         else
             # Copy script to remote host
-            scp -i "$HOME/.ssh/ec2_instance_private_key.pem" -o StrictHostKeyChecking=no /tmp/router_deploy.sh $host:/tmp/
+            scp -i "$SSH_KEY_FILE" -o StrictHostKeyChecking=no /tmp/router_deploy.sh $host:/tmp/
 
             # Execute on remote host
-            ssh -i "$HOME/.ssh/ec2_instance_private_key.pem" -o StrictHostKeyChecking=no $host "bash /tmp/router_deploy.sh"
+            ssh -i "$SSH_KEY_FILE" -o StrictHostKeyChecking=no $host "bash /tmp/router_deploy.sh"
 
             success "Router deployed to $host"
         fi
@@ -916,60 +1006,60 @@ benchmark() {
     fi
 }
 
-# Function to setup SSH key for remote deployment
-setup_ssh() {
-    log "Setting up SSH key for remote deployment..."
+# Function to verify environment setup
+verify_environment() {
+    log "Verifying environment setup..."
 
-    # Check if SSH directory exists
-    if [ ! -d ~/.ssh ]; then
-        mkdir -p ~/.ssh
-        chmod 700 ~/.ssh
+    # Verify HF_TOKEN is set
+    if [ -z "$HF_TOKEN" ]; then
+        error "HF_TOKEN is not set. This should not happen - validation failed!"
+        exit 1
     fi
+    success "HF_TOKEN: Configured"
 
-    SSH_KEY_FILE="$HOME/.ssh/ec2_instance_private_key.pem"
-
-    if [ -f "$SSH_KEY_FILE" ]; then
-        warn "SSH key already exists at $SSH_KEY_FILE"
-        read -p "Do you want to overwrite it? (y/N): " -n 1 -r
-        echo
-        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-            log "SSH key setup cancelled"
-            return 0
-        fi
-    fi
-
-    log "Please provide your EC2 private key content."
-    log "You can either:"
-    log "1. Set the PRIVATE_KEY environment variable with your key content"
-    log "2. Enter the key content when prompted"
-    echo
-
-    if [ -n "$PRIVATE_KEY" ]; then
-        log "Using PRIVATE_KEY environment variable..."
-        echo -e "$PRIVATE_KEY" > "$SSH_KEY_FILE"
-    else
-        log "Please paste your private key content (press Ctrl+D when done):"
-        cat > "$SSH_KEY_FILE"
-    fi
-
-    # Set proper permissions
-    chmod 600 "$SSH_KEY_FILE"
-
-    # Add all EC2 hosts to known_hosts
-    log "Adding EC2 hosts to known_hosts..."
-    for host in ec2-44-253-89-231.us-west-2.compute.amazonaws.com ec2-44-232-228-156.us-west-2.compute.amazonaws.com ec2-35-164-240-36.us-west-2.compute.amazonaws.com ec2-44-228-181-2.us-west-2.compute.amazonaws.com; do
-        ssh-keyscan -H "$host" >> ~/.ssh/known_hosts 2>/dev/null
+    # Verify SSH key if needed for remote operations
+    local need_ssh=false
+    for cmd in "${COMMANDS[@]}"; do
+        case $cmd in
+            deploy_remote_decode|deploy_remote_prefill|deploy_router|all)
+                need_ssh=true
+                ;;
+        esac
     done
 
-    # Test SSH connection to the first host
-    log "Testing SSH connection..."
-    if ssh -i "$SSH_KEY_FILE" -o ConnectTimeout=10 -o StrictHostKeyChecking=no congc@ec2-44-253-89-231.us-west-2.compute.amazonaws.com "echo 'SSH connection successful'" 2>/dev/null; then
-        success "SSH key setup completed successfully!"
-        log "You can now use deploy_remote and deploy_remote_prefill commands"
-    else
-        error "SSH connection test failed. Please check your private key"
-        log "Make sure the key corresponds to the EC2 instances and the 'congc' user has access"
+    if [ "$need_ssh" = true ]; then
+        if [ -z "$SSH_KEY_FILE" ]; then
+            error "SSH_KEY_FILE is not set. This should not happen - validation failed!"
+            exit 1
+        fi
+
+        if [ ! -f "$SSH_KEY_FILE" ]; then
+            error "SSH key file not found: $SSH_KEY_FILE"
+            exit 1
+        fi
+
+        # Test SSH connection to the first remote host
+        local first_host=$(echo $PREFILL_REMOTE_HOSTS | awk '{print $1}')
+        if [ -n "$first_host" ]; then
+            log "Testing SSH connection to $first_host..."
+            if ssh -i "$SSH_KEY_FILE" -o ConnectTimeout=10 -o StrictHostKeyChecking=no "$first_host" "echo 'SSH connection successful'" 2>/dev/null; then
+                success "SSH connection: Verified"
+            else
+                warn "SSH connection test failed to $first_host"
+                warn "Proceeding anyway - deployment may fail if SSH is not properly configured"
+            fi
+        fi
+
+        # Add all EC2 hosts to known_hosts
+        log "Adding EC2 hosts to known_hosts..."
+        for host_spec in $PREFILL_REMOTE_HOSTS $DECODE_REMOTE_HOSTS; do
+            # Extract just the hostname part (remove username@)
+            local hostname=$(echo "$host_spec" | sed 's/.*@//')
+            ssh-keyscan -H "$hostname" >> ~/.ssh/known_hosts 2>/dev/null
+        done
     fi
+
+    success "Environment verification completed"
 }
 
 # Parse command line arguments
@@ -1003,7 +1093,7 @@ while [[ $# -gt 0 ]]; do
             DRY_RUN="true"
             shift
             ;;
-        clone|build|upload|deploy_local|deploy_remote_decode|deploy_remote_prefill|deploy_router|deploy_router_local|deploy_prefill_local|deploy_decode_local|benchmark|setup_ssh|setup_docker_storage|all)
+        clone|build|upload|deploy_local|deploy_remote_decode|deploy_remote_prefill|deploy_router|deploy_router_local|deploy_prefill_local|deploy_decode_local|benchmark|setup_docker_storage|all)
             COMMANDS+=("$1")
             shift
             ;;
@@ -1020,6 +1110,9 @@ if [ ${#COMMANDS[@]} -eq 0 ]; then
     usage
     exit 1
 fi
+
+# Validate required environment variables
+validate_env
 
 # Show configuration
 log "Configuration:"
@@ -1077,8 +1170,8 @@ for cmd in "${COMMANDS[@]}"; do
             setup_docker_storage
             ;;
         all)
-            setup_ssh
-            setup_docker_storage
+            log "Running full deployment pipeline..."
+            verify_environment
             clone_vllm
             build_docker
             upload_ecr
