@@ -151,6 +151,7 @@ Commands:
     deploy_decode_local Deploy vLLM decode server locally (requires HF_TOKEN)
     benchmark           Run vLLM benchmark against the router
     setup_docker_storage Setup Docker to use largest available storage (run directly on target host)
+    install_gdrcopy     Install gdrcopy for optimal NIXL performance (run on target host)
     all                 Run all steps: verify env, clone, build, upload, deploy (requires HF_TOKEN, SSH_KEY_FILE)
 
 Options:
@@ -241,7 +242,7 @@ build_docker() {
 
     cd vllm
 
-    BUILD_ARGS="--target vllm-openai --tag $DOCKER_TAG --build-arg torch_cuda_arch_list=\"\" --file docker/Dockerfile"
+    BUILD_ARGS="--target vllm-openai --tag $DOCKER_TAG --build-arg torch_cuda_arch_list=\"\" --build-arg INSTALL_KV_CONNECTORS=true --file docker/Dockerfile"
 
     if [ "$USE_PRECOMPILED" = "true" ]; then
         BUILD_ARGS="$BUILD_ARGS --build-arg VLLM_USE_PRECOMPILED=1"
@@ -377,6 +378,49 @@ fi
 DOCKER_SETUP_EOF
 }
 
+# Function to show gdrcopy installation instructions
+install_gdrcopy() {
+    cat << 'GDRCOPY_HELP_EOF'
+================================================================================
+gdrcopy Installation Instructions (Optional but Recommended)
+================================================================================
+
+For optimal NIXL performance, install gdrcopy on both prefill and decode hosts.
+If gdrcopy is not installed, NIXL will still work but with lower performance.
+
+Installation Steps:
+-------------------
+
+1. Clone vLLM repository (if not already cloned):
+   git clone https://github.com/vllm-project/vllm.git
+   cd vllm
+
+2. Run the install_gdrcopy.sh script:
+
+   For Ubuntu 20.04:
+   sudo tools/install_gdrcopy.sh "ubuntu2004" "12.8" "x64"
+
+   For Ubuntu 22.04:
+   sudo tools/install_gdrcopy.sh "ubuntu2204" "12.8" "x64"
+
+   For Ubuntu 24.04:
+   sudo tools/install_gdrcopy.sh "ubuntu2404" "12.8" "x64"
+
+   For ARM64 (aarch64) systems, replace "x64" with "aarch64"
+
+3. Verify installation:
+   dpkg -l | grep libgdrapi
+
+Available OS versions can be found here:
+https://developer.download.nvidia.com/compute/redist/gdrcopy/CUDA%2012.8/
+
+Note: This command requires sudo privileges and will download and install
+the appropriate gdrcopy package for your system.
+
+================================================================================
+GDRCOPY_HELP_EOF
+}
+
 # Function to get local IP address
 get_local_ip() {
     # Try to get the primary interface IP (not localhost)
@@ -426,8 +470,24 @@ docker pull $ECR_REPO:$ECR_TAG
 sudo mkdir -p /opt/dlami/nvme/huggingface_cache
 sudo chown -R \$(id -u):\$(id -g) /opt/dlami/nvme/huggingface_cache
 
-# Run vLLM container
+# Run vLLM container with EFA support (EFA libraries built into image)
 docker run -d --restart unless-stopped --runtime nvidia --gpus all \
+    --device /dev/infiniband/uverbs0 \
+    --device /dev/infiniband/uverbs1 \
+    --device /dev/infiniband/uverbs2 \
+    --device /dev/infiniband/uverbs3 \
+    --device /dev/infiniband/uverbs4 \
+    --device /dev/infiniband/uverbs5 \
+    --device /dev/infiniband/uverbs6 \
+    --device /dev/infiniband/uverbs7 \
+    --device /dev/infiniband/uverbs8 \
+    --device /dev/infiniband/uverbs9 \
+    --device /dev/infiniband/uverbs10 \
+    --device /dev/infiniband/uverbs11 \
+    --device /dev/infiniband/uverbs12 \
+    --device /dev/infiniband/uverbs13 \
+    --device /dev/infiniband/uverbs14 \
+    --device /dev/infiniband/uverbs15 \
     -v /opt/dlami/nvme/huggingface_cache:/root/.cache/huggingface \
     --shm-size=1000g \
     --env "HUGGING_FACE_HUB_TOKEN=$HF_TOKEN" \
@@ -439,12 +499,15 @@ docker run -d --restart unless-stopped --runtime nvidia --gpus all \
     --env "VLLM_USE_DEEP_GEMM=1" \
     --env "VLLM_ALL2ALL_BACKEND=deepep_low_latency" \
     --env "NVIDIA_GDRCOPY=enabled" \
+    --env "UCX_TLS=all" \
+    --env "UCX_NET_DEVICES=all" \
     --env "NVSHMEM_DEBUG=INFO" \
     --env "NVSHMEM_REMOTE_TRANSPORT=ibgda" \
     --env "NVSHMEM_IB_ENABLE_IBGDA=true" \
     --env "GLOO_SOCKET_IFNAME=" \
     --env "NCCL_SOCKET_IFNAME=" \
     --env "NCCL_IB_HCA=ibp" \
+    --env "FI_EFA_USE_DEVICE_RDMA=1" \
     --env "VLLM_LOGGING_LEVEL=DEBUG" \
     --env "VLLM_TRACE_FUNCTION=1" \
     --env "VLLM_LOG_REQUESTS=1" \
@@ -452,6 +515,7 @@ docker run -d --restart unless-stopped --runtime nvidia --gpus all \
     --env "VLLM_WORKER_RPC_TIMEOUT=300" \
     --env "HF_HUB_CACHE=/root/.cache/huggingface/hub" \
     --env "CUDA_VISIBLE_DEVICES=$GPU_ID" \
+    --env "VLLM_USE_V1=1" \
     --network host \
     --name vllm-deepseek \
     $ECR_REPO:$ECR_TAG \
@@ -464,7 +528,7 @@ docker run -d --restart unless-stopped --runtime nvidia --gpus all \
     --enable-expert-parallel \
     --tensor-parallel-size $TP_SIZE \
     --trust-remote-code \
-    --kv-transfer-config "{\"kv_connector\":\"P2pNcclConnector\",\"kv_role\":\"kv_consumer\",\"kv_buffer_size\":\"8e9\",\"kv_port\":\"22001\",\"kv_connector_extra_config\":{\"proxy_ip\":\"$ROUTER_IP\",\"proxy_port\":\"30001\",\"http_port\":\"$DECODE_PORT\",\"send_type\":\"PUT_ASYNC\",\"nccl_num_channels\":\"16\"}}"
+    --kv-transfer-config "{\"kv_connector\":\"NixlConnector\",\"kv_role\":\"kv_both\",\"kv_connector_extra_config\":{\"backends\":[\"UCX\",\"GDS\"]}}"
 
 echo "vLLM started in background. Check logs with: docker logs -f vllm-deepseek"
 echo "API available at: http://localhost:$DECODE_PORT"
@@ -493,8 +557,24 @@ docker pull $ECR_REPO:$ECR_TAG
 sudo mkdir -p /opt/dlami/nvme/huggingface_cache
 sudo chown -R \$(id -u):\$(id -g) /opt/dlami/nvme/huggingface_cache
 
-# Run vLLM prefill container
+# Run vLLM prefill container with EFA support (EFA libraries built into image)
 docker run -d --restart unless-stopped --runtime nvidia --gpus all \
+    --device /dev/infiniband/uverbs0 \
+    --device /dev/infiniband/uverbs1 \
+    --device /dev/infiniband/uverbs2 \
+    --device /dev/infiniband/uverbs3 \
+    --device /dev/infiniband/uverbs4 \
+    --device /dev/infiniband/uverbs5 \
+    --device /dev/infiniband/uverbs6 \
+    --device /dev/infiniband/uverbs7 \
+    --device /dev/infiniband/uverbs8 \
+    --device /dev/infiniband/uverbs9 \
+    --device /dev/infiniband/uverbs10 \
+    --device /dev/infiniband/uverbs11 \
+    --device /dev/infiniband/uverbs12 \
+    --device /dev/infiniband/uverbs13 \
+    --device /dev/infiniband/uverbs14 \
+    --device /dev/infiniband/uverbs15 \
     -v /opt/dlami/nvme/huggingface_cache:/root/.cache/huggingface \
     --shm-size=1000g \
     --env "HUGGING_FACE_HUB_TOKEN=$HF_TOKEN" \
@@ -504,14 +584,17 @@ docker run -d --restart unless-stopped --runtime nvidia --gpus all \
     --env "VLLM_SKIP_P2P_CHECK=1" \
     --env "VLLM_RANDOMIZE_DP_DUMMY_INPUTS=1" \
     --env "VLLM_USE_DEEP_GEMM=1" \
-    --env "VLLM_ALL2ALL_BACKEND=deepep_low_latency" \
+    --env "VLLM_ALL2ALL_BACKEND=deepep_high_throughput" \
     --env "NVIDIA_GDRCOPY=enabled" \
+    --env "UCX_TLS=all" \
+    --env "UCX_NET_DEVICES=all" \
     --env "NVSHMEM_DEBUG=INFO" \
     --env "NVSHMEM_REMOTE_TRANSPORT=ibgda" \
     --env "NVSHMEM_IB_ENABLE_IBGDA=true" \
     --env "GLOO_SOCKET_IFNAME=" \
     --env "NCCL_SOCKET_IFNAME=" \
     --env "NCCL_IB_HCA=ibp" \
+    --env "FI_EFA_USE_DEVICE_RDMA=1" \
     --env "VLLM_LOGGING_LEVEL=DEBUG" \
     --env "VLLM_TRACE_FUNCTION=1" \
     --env "VLLM_LOG_REQUESTS=1" \
@@ -519,6 +602,7 @@ docker run -d --restart unless-stopped --runtime nvidia --gpus all \
     --env "VLLM_WORKER_RPC_TIMEOUT=300" \
     --env "HF_HUB_CACHE=/root/.cache/huggingface/hub" \
     --env "CUDA_VISIBLE_DEVICES=$GPU_ID" \
+    --env "VLLM_USE_V1=1" \
     --network host \
     --name vllm-deepseek-prefill \
     $ECR_REPO:$ECR_TAG \
@@ -526,13 +610,13 @@ docker run -d --restart unless-stopped --runtime nvidia --gpus all \
     --enforce-eager \
     --host 0.0.0.0 \
     --port $PREFILL_PORT \
-    --tensor-parallel-size $TP_SIZE \
     --enable-expert-parallel \
+    --tensor-parallel-size $TP_SIZE \
     --trust-remote-code \
     --gpu-memory-utilization 0.9 \
     --enable-prefix-caching \
     --disable-log-stats \
-    --kv_transfer_config "{\"kv_connector\":\"P2pNcclConnector\",\"kv_role\":\"kv_producer\",\"kv_buffer_size\":\"1e1\",\"kv_port\":\"$PREFILL_KV_PORT\",\"kv_connector_extra_config\":{\"proxy_ip\":\"$ROUTER_IP\",\"proxy_port\":\"30001\",\"http_port\":\"$PREFILL_PORT\",\"send_type\":\"PUT_ASYNC\",\"nccl_num_channels\":\"16\"}}"
+    --kv-transfer-config "{\"kv_connector\":\"NixlConnector\",\"kv_role\":\"kv_both\",\"kv_connector_extra_config\":{\"backends\":[\"UCX\",\"GDS\"]}}"
 
 echo "vLLM prefill started in background. Check logs with: docker logs -f vllm-deepseek-prefill"
 echo "Prefill API available at: http://localhost:$PREFILL_PORT"
@@ -791,6 +875,8 @@ EOF
 
     chmod +x /tmp/router_deploy.sh
 
+    warn "NOTE: deploy_router deploys to remote hosts. Use deploy_router_local for localhost deployment."
+
     for host in $REMOTE_HOSTS; do
         log "Deploying router to $host..."
 
@@ -859,16 +945,48 @@ deploy_router_local() {
 
     # Step 4: Run router container locally with correct ports
     log "Starting router container locally..."
+
+    # Get internal IPs from all prefill and decode hosts
+    log "Getting internal IP addresses from remote hosts..."
+    PREFILL_ARGS=""
+    DECODE_ARGS=""
+
+    # Build --prefill arguments for each prefill host
+    for host in $PREFILL_REMOTE_HOSTS; do
+        INTERNAL_IP=$(ssh -i "$SSH_KEY_FILE" -o StrictHostKeyChecking=no $host "hostname -I | awk '{print \$1}'" 2>/dev/null || echo "")
+        if [ -z "$INTERNAL_IP" ]; then
+            error "Failed to get internal IP from prefill host: $host"
+            exit 1
+        fi
+        log "Prefill host $host -> Internal IP: $INTERNAL_IP"
+        PREFILL_ARGS="$PREFILL_ARGS --prefill http://$INTERNAL_IP:$PREFILL_PORT"
+    done
+
+    # Build --decode arguments for each decode host
+    for host in $DECODE_REMOTE_HOSTS; do
+        INTERNAL_IP=$(ssh -i "$SSH_KEY_FILE" -o StrictHostKeyChecking=no $host "hostname -I | awk '{print \$1}'" 2>/dev/null || echo "")
+        if [ -z "$INTERNAL_IP" ]; then
+            error "Failed to get internal IP from decode host: $host"
+            exit 1
+        fi
+        log "Decode host $host -> Internal IP: $INTERNAL_IP"
+        DECODE_ARGS="$DECODE_ARGS --decode http://$INTERNAL_IP:$DECODE_PORT"
+    done
+
     if [ "$DRY_RUN" = "true" ]; then
-        echo "Would run router container with ports 10001:10001 and 30001:30001"
+        echo "Would run router container with:"
+        echo "  Prefill args: $PREFILL_ARGS"
+        echo "  Decode args: $DECODE_ARGS"
     else
         docker run -d \
             --name vllm-router-local \
             -p 10001:10001 \
-            -p 30001:30001 \
             --restart unless-stopped \
             $ROUTER_DOCKER_TAG \
-            vllm-router --vllm-pd-disaggregation --vllm-discovery-address 0.0.0.0:30001 --host 0.0.0.0 --port 10001
+            vllm-router --pd-disaggregation \
+            $PREFILL_ARGS \
+            $DECODE_ARGS \
+            --host 0.0.0.0 --port 10001
 
         # Wait a moment and check if container started successfully
         sleep 2
@@ -1093,7 +1211,7 @@ while [[ $# -gt 0 ]]; do
             DRY_RUN="true"
             shift
             ;;
-        clone|build|upload|deploy_local|deploy_remote_decode|deploy_remote_prefill|deploy_router|deploy_router_local|deploy_prefill_local|deploy_decode_local|benchmark|setup_docker_storage|all)
+        clone|build|upload|deploy_local|deploy_remote_decode|deploy_remote_prefill|deploy_router|deploy_router_local|deploy_prefill_local|deploy_decode_local|benchmark|setup_docker_storage|install_gdrcopy|all)
             COMMANDS+=("$1")
             shift
             ;;
@@ -1169,13 +1287,16 @@ for cmd in "${COMMANDS[@]}"; do
         setup_docker_storage)
             setup_docker_storage
             ;;
+        install_gdrcopy)
+            install_gdrcopy
+            ;;
         all)
             log "Running full deployment pipeline..."
             verify_environment
             clone_vllm
             build_docker
             upload_ecr
-            deploy_router
+            deploy_router_local
             deploy_remote_prefill
             deploy_remote_decode
             ;;
