@@ -198,11 +198,24 @@ impl VllmPDRouter {
             prefill_request["max_completion_tokens"] = serde_json::Value::Number(serde_json::Number::from(1));
         }
 
+        // Add kv_transfer_params for NixlConnector support via extra_body
+        // This enables the prefill instance to prepare for remote decode
+        if !prefill_request.get("extra_body").is_some() {
+            prefill_request["extra_body"] = json!({});
+        }
+        prefill_request["extra_body"]["kv_transfer_params"] = json!({
+            "do_remote_decode": true,
+            "do_remote_prefill": false,
+            "remote_engine_id": serde_json::Value::Null,
+            "remote_block_ids": serde_json::Value::Null,
+            "remote_host": serde_json::Value::Null,
+            "remote_port": serde_json::Value::Null
+        });
+
+        info!("Added kv_transfer_params to prefill request extra_body for NixlConnector support");
+
         let prefill_request_str = serde_json::to_string(&prefill_request)
             .map_err(|e| format!("Failed to serialize prefill request: {}", e))?;
-
-        let decode_request_str = serde_json::to_string(&request_json)
-            .map_err(|e| format!("Failed to serialize decode request: {}", e))?;
 
         // Stage 1: Send to prefill server with max_tokens=1 and P2P coordination header
         info!("Stage 1: Sending prefill-only request (max_tokens=1) to prefill server at http://{}", prefill_http);
@@ -222,6 +235,38 @@ impl VllmPDRouter {
             let error_body = prefill_response.text().await.unwrap_or_default();
             return Err(format!("Prefill server error {}: {}", prefill_status, error_body));
         }
+
+        // Extract kv_transfer_params from prefill response
+        let prefill_response_text = prefill_response.text().await
+            .map_err(|e| format!("Failed to read prefill response: {}", e))?;
+
+        info!("Prefill response body: {}", prefill_response_text);
+
+        let prefill_response_json: Value = serde_json::from_str(&prefill_response_text)
+            .map_err(|e| format!("Failed to parse prefill response as JSON: {}", e))?;
+
+        // Extract kv_transfer_params from prefill response if present
+        let kv_transfer_params = prefill_response_json.get("kv_transfer_params").cloned();
+
+        if let Some(ref params) = kv_transfer_params {
+            info!("Extracted kv_transfer_params from prefill response: {}",
+                  serde_json::to_string_pretty(params).unwrap_or_default());
+        } else {
+            info!("No kv_transfer_params found in prefill response, will proceed without them");
+        }
+
+        // Prepare decode request with kv_transfer_params from prefill response via extra_body
+        let mut decode_request = request_json.clone();
+        if let Some(params) = kv_transfer_params {
+            if !decode_request.get("extra_body").is_some() {
+                decode_request["extra_body"] = json!({});
+            }
+            decode_request["extra_body"]["kv_transfer_params"] = params;
+            info!("Added kv_transfer_params to decode request extra_body");
+        }
+
+        let decode_request_str = serde_json::to_string(&decode_request)
+            .map_err(|e| format!("Failed to serialize decode request: {}", e))?;
 
         // Stage 2: Send to decode server with original request and same P2P coordination header
         info!("Stage 2: Sending original request to decode server at http://{}", decode_http);
