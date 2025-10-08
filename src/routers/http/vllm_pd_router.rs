@@ -29,6 +29,10 @@ pub struct VllmPDRouter {
     http_client: reqwest::Client,
     /// Policy registry for load balancing
     policy_registry: Arc<PolicyRegistry>,
+    /// Whether this router uses service discovery (true) or direct URLs (false)
+    use_discovery: bool,
+    /// Profiling timeout in seconds
+    profile_timeout_secs: u64,
 }
 
 impl VllmPDRouter {
@@ -54,12 +58,24 @@ impl VllmPDRouter {
         http_address
     }
 
+    /// Helper: Start profiling on a backend server
+    async fn start_profiling(&self, worker_url: &str) {
+        self.pd_router.start_profiling(worker_url).await;
+    }
+
+    /// Helper: Stop profiling on a backend server
+    async fn stop_profiling(&self, worker_url: &str) {
+        self.pd_router.stop_profiling(worker_url).await;
+    }
+
     /// Modify request for prefill stage (set max_tokens=1)
     fn prepare_prefill_request(mut request: Value) -> Value {
         request["max_tokens"] = json!(1);
         if request.get("max_completion_tokens").is_some() {
             request["max_completion_tokens"] = json!(1);
         }
+        // Force non-streaming for prefill to get JSON response with kv_transfer_params
+        request["stream"] = json!(false);
         request
     }
 
@@ -197,13 +213,12 @@ impl VllmPDRouter {
         if prefill_request.get("max_completion_tokens").is_some() {
             prefill_request["max_completion_tokens"] = serde_json::Value::Number(serde_json::Number::from(1));
         }
+        // Force non-streaming for prefill to get JSON response with kv_transfer_params
+        prefill_request["stream"] = serde_json::Value::Bool(false);
 
-        // Add kv_transfer_params for NixlConnector support via extra_body
+        // Add kv_transfer_params for NixlConnector support at top level
         // This enables the prefill instance to prepare for remote decode
-        if !prefill_request.get("extra_body").is_some() {
-            prefill_request["extra_body"] = json!({});
-        }
-        prefill_request["extra_body"]["kv_transfer_params"] = json!({
+        prefill_request["kv_transfer_params"] = json!({
             "do_remote_decode": true,
             "do_remote_prefill": false,
             "remote_engine_id": serde_json::Value::Null,
@@ -212,13 +227,17 @@ impl VllmPDRouter {
             "remote_port": serde_json::Value::Null
         });
 
-        info!("Added kv_transfer_params to prefill request extra_body for NixlConnector support");
+        info!("Added kv_transfer_params to prefill request for NixlConnector support");
 
         let prefill_request_str = serde_json::to_string(&prefill_request)
             .map_err(|e| format!("Failed to serialize prefill request: {}", e))?;
 
         // Stage 1: Send to prefill server with max_tokens=1 and P2P coordination header
         info!("Stage 1: Sending prefill-only request (max_tokens=1) to prefill server at http://{}", prefill_http);
+
+        // Start profiling on prefill server
+        self.start_profiling(&format!("http://{}", prefill_http)).await;
+
         let prefill_response = self.http_client
             .post(&format!("http://{}{}", prefill_http, path))
             .header("Content-Type", "application/json")
@@ -255,21 +274,25 @@ impl VllmPDRouter {
             info!("No kv_transfer_params found in prefill response, will proceed without them");
         }
 
-        // Prepare decode request with kv_transfer_params from prefill response via extra_body
+        // Prepare decode request with kv_transfer_params from prefill response at top level
         let mut decode_request = request_json.clone();
         if let Some(params) = kv_transfer_params {
-            if !decode_request.get("extra_body").is_some() {
-                decode_request["extra_body"] = json!({});
-            }
-            decode_request["extra_body"]["kv_transfer_params"] = params;
-            info!("Added kv_transfer_params to decode request extra_body");
+            decode_request["kv_transfer_params"] = params;
+            info!("Added kv_transfer_params to decode request");
         }
 
         let decode_request_str = serde_json::to_string(&decode_request)
             .map_err(|e| format!("Failed to serialize decode request: {}", e))?;
 
+        // Stop profiling on prefill server after its work is done
+        self.stop_profiling(&format!("http://{}", prefill_http)).await;
+
         // Stage 2: Send to decode server with original request and same P2P coordination header
         info!("Stage 2: Sending original request to decode server at http://{}", decode_http);
+
+        // Start profiling on decode server
+        self.start_profiling(&format!("http://{}", decode_http)).await;
+
         let decode_response = self.http_client
             .post(&format!("http://{}{}", decode_http, path))
             .header("Content-Type", "application/json")
@@ -280,6 +303,9 @@ impl VllmPDRouter {
             .map_err(|e| format!("Decode request failed: {}", e))?;
 
         info!("Decode server responded with status: {}", decode_response.status());
+
+        // Stop profiling on decode server after response received
+        self.stop_profiling(&format!("http://{}", decode_http)).await;
 
         // Convert reqwest::Response to axum::Response
         let status = decode_response.status();
@@ -322,13 +348,30 @@ impl VllmPDRouter {
         info!("  📋 vLLM Proxy headers: Authorization: Bearer $OPENAI_API_KEY, X-Request-Id: {{request_id}}");
         info!("  📋 Our headers: Authorization: Bearer $OPENAI_API_KEY, X-Request-Id: {{request_id}}");
 
-        // Stage 1: Send prefill request with max_tokens=1
-        let prefill_request = Self::prepare_prefill_request(original_request.clone());
+        // Stage 1: Prepare prefill request with max_tokens=1 and kv_transfer_params
+        let mut prefill_request = Self::prepare_prefill_request(original_request.clone());
+
+        // Add kv_transfer_params for NixlConnector support at top level
+        // This enables the prefill instance to prepare for remote decode
+        prefill_request["kv_transfer_params"] = json!({
+            "do_remote_decode": true,
+            "do_remote_prefill": false,
+            "remote_engine_id": serde_json::Value::Null,
+            "remote_block_ids": serde_json::Value::Null,
+            "remote_host": serde_json::Value::Null,
+            "remote_port": serde_json::Value::Null
+        });
+
+        info!("Added kv_transfer_params to prefill request for NixlConnector support");
+
         let prefill_url = format!("{}{}", prefill_worker.url(), path);
 
         info!("🚀 vLLM Stage 1 - Prefill: {} with request_id: {}", prefill_url, request_id);
         info!("📤 Prefill request headers: Authorization=Bearer [REDACTED], X-Request-Id={}", request_id);
         info!("📤 Prefill request payload: {}", serde_json::to_string_pretty(&prefill_request).unwrap_or_default());
+
+        // Start profiling on prefill server
+        self.start_profiling(prefill_worker.url()).await;
 
         let prefill_response = self.pd_router.client
             .post(&prefill_url)
@@ -345,7 +388,7 @@ impl VllmPDRouter {
         info!("📥 Prefill response status: {}", prefill_response.status());
         info!("📥 Prefill response headers: {:?}", prefill_response.headers());
 
-        // Drain prefill response (we don't need the content, just the KV cache transfer)
+        // Extract prefill response body to get kv_transfer_params
         let prefill_bytes = prefill_response.bytes().await.map_err(|e| PDRouterError::NetworkError {
             message: format!("Failed to read prefill response from {}: {}", prefill_url, e),
         })?;
@@ -355,26 +398,57 @@ impl VllmPDRouter {
             info!("📥 Prefill response body content: {}", String::from_utf8_lossy(&prefill_bytes));
         }
 
+        // Parse prefill response to extract kv_transfer_params
+        let prefill_response_json: Value = serde_json::from_slice(&prefill_bytes)
+            .map_err(|e| PDRouterError::NetworkError {
+                message: format!("Failed to parse prefill response as JSON: {}", e),
+            })?;
+
+        // Extract kv_transfer_params from prefill response if present
+        let kv_transfer_params = prefill_response_json.get("kv_transfer_params").cloned();
+
+        if let Some(ref params) = kv_transfer_params {
+            info!("Extracted kv_transfer_params from prefill response: {}",
+                  serde_json::to_string_pretty(params).unwrap_or_default());
+        } else {
+            info!("No kv_transfer_params found in prefill response, will proceed without them");
+        }
+
+        // Stop profiling on prefill server after its work is done
+        self.stop_profiling(prefill_worker.url()).await;
+
         info!("✅ vLLM Stage 1 completed, starting Stage 2 - Decode");
 
-        // Stage 2: Send original request to decode worker with same request_id
+        // Stage 2: Prepare decode request with kv_transfer_params from prefill response at top level
+        let mut decode_request = original_request.clone();
+        if let Some(params) = kv_transfer_params {
+            decode_request["kv_transfer_params"] = params;
+            info!("Added kv_transfer_params to decode request");
+        }
+
         let decode_url = format!("{}{}", decode_worker.url(), path);
 
         info!("🚀 vLLM Stage 2 - Decode: {} with request_id: {}", decode_url, request_id);
         info!("📤 Decode request headers: Authorization=Bearer [REDACTED], X-Request-Id={}", request_id);
-        info!("📤 Decode request payload: {}", serde_json::to_string_pretty(&original_request).unwrap_or_default());
+        info!("📤 Decode request payload: {}", serde_json::to_string_pretty(&decode_request).unwrap_or_default());
+
+        // Start profiling on decode server
+        self.start_profiling(decode_worker.url()).await;
 
         let decode_response = self.pd_router.client
             .post(&decode_url)
             .header("Content-Type", "application/json")
             .header("Authorization", format!("Bearer {}", std::env::var("OPENAI_API_KEY").unwrap_or_default()))
             .header("X-Request-Id", &request_id)
-            .json(&original_request)
+            .json(&decode_request)
             .send()
             .await
             .map_err(|e| PDRouterError::NetworkError {
                 message: format!("Decode request failed to {}: {}", decode_url, e),
             })?;
+
+        // Stop profiling on decode server after response received
+        self.stop_profiling(decode_worker.url()).await;
 
         // Convert reqwest::Response to axum::Response
         let status = decode_response.status();
@@ -399,31 +473,62 @@ impl VllmPDRouter {
         })
     }
 
-    /// Create a new vLLM PD router with pure service discovery
+    /// Create a new vLLM PD router
+    /// Supports two modes:
+    /// 1. Discovery mode: discovery_address is Some, prefill_urls and decode_urls are empty
+    /// 2. Direct URL mode: discovery_address is None, prefill_urls and decode_urls are provided
     pub async fn new(
-        discovery_address: String,
+        prefill_urls: Vec<(String, Option<u16>)>,
+        decode_urls: Vec<String>,
+        discovery_address: Option<String>,
         ctx: &Arc<crate::server::AppContext>,
     ) -> Result<Self, String> {
-        info!("VllmPDRouter::new called with discovery_address: {}", discovery_address);
+        if let Some(ref addr) = discovery_address {
+            // Discovery mode
+            info!("VllmPDRouter::new called in discovery mode with address: {}", addr);
 
-        // Create underlying PD router with empty worker lists (they'll be discovered dynamically)
-        let pd_router = PDRouter::new(vec![], vec![], ctx).await?;
+            // Create underlying PD router with empty worker lists (they'll be discovered dynamically)
+            let pd_router = PDRouter::new(vec![], vec![], ctx).await?;
 
-        // Initialize service discovery
-        let mut service_registry = ServiceRegistry::new();
+            // Initialize service discovery
+            let mut service_registry = ServiceRegistry::new();
 
-        info!("Starting vLLM service discovery on {}", discovery_address);
-        service_registry.start_listener(&discovery_address).await
-            .map_err(|e| format!("Failed to start service discovery: {}", e))?;
+            info!("Starting vLLM service discovery on {}", addr);
+            service_registry.start_listener(addr).await
+                .map_err(|e| format!("Failed to start service discovery: {}", e))?;
 
-        info!("VllmPDRouter created successfully with pure service discovery");
+            info!("VllmPDRouter created successfully with pure service discovery");
 
-        Ok(Self {
-            pd_router,
-            service_registry: Arc::new(service_registry),
-            http_client: reqwest::Client::new(),
-            policy_registry: ctx.policy_registry.clone(),
-        })
+            Ok(Self {
+                pd_router,
+                service_registry: Arc::new(service_registry),
+                http_client: reqwest::Client::new(),
+                policy_registry: ctx.policy_registry.clone(),
+                use_discovery: true,
+                profile_timeout_secs: ctx.router_config.profile_timeout_secs,
+            })
+        } else {
+            // Direct URL mode (same as PDRouter)
+            info!("VllmPDRouter::new called in direct URL mode with {} prefill, {} decode workers",
+                  prefill_urls.len(), decode_urls.len());
+
+            // Create underlying PD router with provided worker lists
+            let pd_router = PDRouter::new(prefill_urls, decode_urls, ctx).await?;
+
+            // No service discovery in direct URL mode
+            let service_registry = ServiceRegistry::new();
+
+            info!("VllmPDRouter created successfully with direct URLs");
+
+            Ok(Self {
+                pd_router,
+                service_registry: Arc::new(service_registry),
+                http_client: reqwest::Client::new(),
+                policy_registry: ctx.policy_registry.clone(),
+                use_discovery: false,
+                profile_timeout_secs: ctx.router_config.profile_timeout_secs,
+            })
+        }
     }
 
 }
@@ -468,23 +573,101 @@ impl RouterTrait for VllmPDRouter {
     // Override OpenAI-compatible routes for vLLM two-stage processing
     async fn route_chat(
         &self,
-        _headers: Option<&HeaderMap>,
+        headers: Option<&HeaderMap>,
         body: &crate::protocols::spec::ChatCompletionRequest,
-        _model_id: Option<&str>,
+        model_id: Option<&str>,
     ) -> Response {
-        info!("vLLM route_chat called");
+        info!("vLLM route_chat called, use_discovery={}", self.use_discovery);
 
-        // Convert to generic request and use vLLM processing
-        let request_json = match serde_json::to_value(body) {
-            Ok(json) => {
-                info!("Serialized chat request: {}", serde_json::to_string_pretty(&json).unwrap_or_default());
-                json
-            },
-            Err(e) => return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, format!("Serialization error: {}", e)).into_response(),
-        };
+        if self.use_discovery {
+            // Discovery mode - use vLLM-specific two-stage processing
+            info!("Using service discovery mode, processing vLLM two-stage request");
 
-        // Process vLLM two-stage request directly (no need for manual body parsing)
-        self.process_vllm_request(request_json, "/v1/chat/completions").await
+            // Convert to generic request and use vLLM processing
+            let request_json = match serde_json::to_value(body) {
+                Ok(json) => {
+                    info!("Serialized chat request: {}", serde_json::to_string_pretty(&json).unwrap_or_default());
+                    json
+                },
+                Err(e) => return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, format!("Serialization error: {}", e)).into_response(),
+            };
+
+            // Process vLLM two-stage request with service discovery
+            self.process_vllm_request(request_json, "/v1/chat/completions").await
+        } else {
+            // Direct URL mode - implement routing logic here (not delegating to PDRouter)
+            info!("Using direct URL mode with VllmPDRouter's own routing logic");
+
+            // Convert request to JSON
+            let request_json = match serde_json::to_value(body) {
+                Ok(json) => {
+                    info!("Serialized chat request: {}", serde_json::to_string_pretty(&json).unwrap_or_default());
+                    json
+                },
+                Err(e) => return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, format!("Serialization error: {}", e)).into_response(),
+            };
+
+            // Get prefill and decode workers from worker_registry
+            let prefill_workers = self.pd_router.worker_registry.get_prefill_workers();
+            let decode_workers = self.pd_router.worker_registry.get_decode_workers();
+
+            info!("Found {} prefill workers, {} decode workers from worker_registry",
+                  prefill_workers.len(), decode_workers.len());
+
+            if prefill_workers.is_empty() || decode_workers.is_empty() {
+                return (axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                       format!("No workers available: {} prefill, {} decode",
+                              prefill_workers.len(), decode_workers.len())).into_response();
+            }
+
+            // Select workers using policy
+            let request_text = serde_json::to_string(&request_json).ok();
+            let request_str = request_text.as_deref();
+
+            let prefill_policy = self.policy_registry.get_prefill_policy();
+            let decode_policy = self.policy_registry.get_decode_policy();
+
+            let prefill_idx = match prefill_policy.select_worker(&prefill_workers, request_str) {
+                Some(idx) => idx,
+                None => {
+                    return (axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                           "Prefill policy failed to select a worker".to_string()).into_response();
+                }
+            };
+
+            let decode_idx = match decode_policy.select_worker(&decode_workers, request_str) {
+                Some(idx) => idx,
+                None => {
+                    return (axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                           "Decode policy failed to select a worker".to_string()).into_response();
+                }
+            };
+
+            let prefill_worker = &prefill_workers[prefill_idx];
+            let decode_worker = &decode_workers[decode_idx];
+
+            info!("Selected prefill={} [policy:{}], decode={} [policy:{}]",
+                  prefill_worker.url(), prefill_policy.name(),
+                  decode_worker.url(), decode_policy.name());
+
+            // Execute dual dispatch with vLLM two-stage processing
+            match self.process_vllm_two_stage_request(
+                request_json,
+                prefill_worker.clone(),
+                decode_worker.clone(),
+                "/v1/chat/completions"
+            ).await {
+                Ok(response) => {
+                    info!("Two-stage processing completed successfully");
+                    response
+                },
+                Err(e) => {
+                    info!("Two-stage processing failed: {}", e);
+                    (axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                     format!("Request processing failed: {}", e)).into_response()
+                },
+            }
+        }
     }
 
     async fn route_completion(
@@ -493,19 +676,97 @@ impl RouterTrait for VllmPDRouter {
         body: &crate::protocols::spec::CompletionRequest,
         _model_id: Option<&str>,
     ) -> Response {
-        info!("vLLM route_completion called");
+        info!("vLLM route_completion called, use_discovery={}", self.use_discovery);
 
-        // Convert to generic request and use vLLM processing
-        let request_json = match serde_json::to_value(body) {
-            Ok(json) => {
-                info!("Serialized completion request: {}", serde_json::to_string_pretty(&json).unwrap_or_default());
-                json
-            },
-            Err(e) => return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, format!("Serialization error: {}", e)).into_response(),
-        };
+        if self.use_discovery {
+            // Discovery mode - use vLLM-specific two-stage processing
+            info!("Using service discovery mode, processing vLLM two-stage request");
 
-        // Process vLLM two-stage request directly (no need for manual body parsing)
-        self.process_vllm_request(request_json, "/v1/completions").await
+            // Convert to generic request and use vLLM processing
+            let request_json = match serde_json::to_value(body) {
+                Ok(json) => {
+                    info!("Serialized completion request: {}", serde_json::to_string_pretty(&json).unwrap_or_default());
+                    json
+                },
+                Err(e) => return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, format!("Serialization error: {}", e)).into_response(),
+            };
+
+            // Process vLLM two-stage request with service discovery
+            self.process_vllm_request(request_json, "/v1/completions").await
+        } else {
+            // Direct URL mode - implement routing logic here (not delegating to PDRouter)
+            info!("Using direct URL mode with VllmPDRouter's own routing logic");
+
+            // Convert request to JSON
+            let request_json = match serde_json::to_value(body) {
+                Ok(json) => {
+                    info!("Serialized completion request: {}", serde_json::to_string_pretty(&json).unwrap_or_default());
+                    json
+                },
+                Err(e) => return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, format!("Serialization error: {}", e)).into_response(),
+            };
+
+            // Get prefill and decode workers from worker_registry
+            let prefill_workers = self.pd_router.worker_registry.get_prefill_workers();
+            let decode_workers = self.pd_router.worker_registry.get_decode_workers();
+
+            info!("Found {} prefill workers, {} decode workers from worker_registry",
+                  prefill_workers.len(), decode_workers.len());
+
+            if prefill_workers.is_empty() || decode_workers.is_empty() {
+                return (axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                       format!("No workers available: {} prefill, {} decode",
+                              prefill_workers.len(), decode_workers.len())).into_response();
+            }
+
+            // Select workers using policy
+            let request_text = serde_json::to_string(&request_json).ok();
+            let request_str = request_text.as_deref();
+
+            let prefill_policy = self.policy_registry.get_prefill_policy();
+            let decode_policy = self.policy_registry.get_decode_policy();
+
+            let prefill_idx = match prefill_policy.select_worker(&prefill_workers, request_str) {
+                Some(idx) => idx,
+                None => {
+                    return (axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                           "Prefill policy failed to select a worker".to_string()).into_response();
+                }
+            };
+
+            let decode_idx = match decode_policy.select_worker(&decode_workers, request_str) {
+                Some(idx) => idx,
+                None => {
+                    return (axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                           "Decode policy failed to select a worker".to_string()).into_response();
+                }
+            };
+
+            let prefill_worker = &prefill_workers[prefill_idx];
+            let decode_worker = &decode_workers[decode_idx];
+
+            info!("Selected prefill={} [policy:{}], decode={} [policy:{}]",
+                  prefill_worker.url(), prefill_policy.name(),
+                  decode_worker.url(), decode_policy.name());
+
+            // Execute dual dispatch with vLLM two-stage processing
+            match self.process_vllm_two_stage_request(
+                request_json,
+                prefill_worker.clone(),
+                decode_worker.clone(),
+                "/v1/completions"
+            ).await {
+                Ok(response) => {
+                    info!("Two-stage processing completed successfully");
+                    response
+                },
+                Err(e) => {
+                    info!("Two-stage processing failed: {}", e);
+                    (axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                     format!("Request processing failed: {}", e)).into_response()
+                },
+            }
+        }
     }
 
     async fn route_responses(

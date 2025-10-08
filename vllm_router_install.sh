@@ -35,13 +35,15 @@ ECR_TAG=${ECR_TAG:-$(get_ecr_tag)}
 
 # vLLM Configuration (REQUIRED - must be set via environment variables)
 HF_TOKEN="${HF_TOKEN}"
-GPU_ID="0,1,2,3,4,5,6,7"
-MODEL="deepseek-ai/DeepSeek-V3-0324"
+GPU_ID="${GPU_ID:-0,1,2,3,4,5,6,7}"
+MODEL="${MODEL:-deepseek-ai/DeepSeek-V3-0324}"
 DECODE_PORT="20005"
 KV_PORT="22001"
 PREFILL_PORT="20003"
 PREFILL_KV_PORT="21001"
-TP_SIZE="8"
+TP_SIZE="${TP_SIZE:-8}"
+ENABLE_PROFILING="${ENABLE_PROFILING:-false}"
+PROFILING_DIR="${PROFILING_DIR:-/opt/dlami/nvme/vllm_profiles}"
 
 # Remote hosts configuration (space-separated)
 # AWS EC2 instances for deployment (US-WEST-1)
@@ -172,6 +174,9 @@ REQUIRED Environment Variables (for deployment commands):
 OPTIONAL Environment Variables:
     SSH_USER              SSH username (default: congc)
     ECR_TAG               Custom ECR tag (default: auto-generated)
+    ENABLE_PROFILING      Enable PyTorch profiling (default: false)
+                          Set to "true" to enable profiling with VLLM_TORCH_PROFILER_DIR
+    PROFILING_DIR         Directory for profiling traces (default: /opt/dlami/nvme/vllm_profiles)
     BENCHMARK_NUM_PROMPTS      Number of prompts (default: 10000)
     BENCHMARK_INPUT_LEN        Input token length (default: 2000)
     BENCHMARK_OUTPUT_LEN       Output token length (default: 2000)
@@ -451,7 +456,7 @@ get_router_container_ip() {
 # Shared function to generate vLLM run script
 generate_vllm_run_script() {
     local ROUTER_IP=${1:-$(get_local_ip)}
-    local EXTERNAL_IP=${2:-$(get_local_ip)}
+    local INTERNAL_IP=${2:-$(get_local_ip)}
     cat << EOF
 #!/bin/bash
 
@@ -469,6 +474,12 @@ docker pull $ECR_REPO:$ECR_TAG
 # Create huggingface cache directory if it doesn't exist
 sudo mkdir -p /opt/dlami/nvme/huggingface_cache
 sudo chown -R \$(id -u):\$(id -g) /opt/dlami/nvme/huggingface_cache
+
+# Create profiling directory if profiling is enabled
+if [ "$ENABLE_PROFILING" = "true" ]; then
+    sudo mkdir -p $PROFILING_DIR
+    sudo chown -R \$(id -u):\$(id -g) $PROFILING_DIR
+fi
 
 # Run vLLM container with EFA support (EFA libraries built into image)
 docker run -d --restart unless-stopped --runtime nvidia --gpus all \
@@ -488,7 +499,7 @@ docker run -d --restart unless-stopped --runtime nvidia --gpus all \
     --device /dev/infiniband/uverbs13 \
     --device /dev/infiniband/uverbs14 \
     --device /dev/infiniband/uverbs15 \
-    -v /opt/dlami/nvme/huggingface_cache:/root/.cache/huggingface \
+    -v /opt/dlami/nvme/huggingface_cache:/root/.cache/huggingface \$(if [ "$ENABLE_PROFILING" = "true" ]; then echo " -v $PROFILING_DIR:/vllm_profiles"; fi) \
     --shm-size=1000g \
     --env "HUGGING_FACE_HUB_TOKEN=$HF_TOKEN" \
     --env "VLLM_MOE_DP_CHUNK_SIZE=512" \
@@ -511,11 +522,12 @@ docker run -d --restart unless-stopped --runtime nvidia --gpus all \
     --env "VLLM_LOGGING_LEVEL=DEBUG" \
     --env "VLLM_TRACE_FUNCTION=1" \
     --env "VLLM_LOG_REQUESTS=1" \
-    --env "VLLM_RPC_TIMEOUT=300" \
+    --env "VLLM_RPC_TIMEOUT=\$(if [ "$ENABLE_PROFILING" = "true" ]; then echo "1800"; else echo "300"; fi)" \
     --env "VLLM_WORKER_RPC_TIMEOUT=300" \
     --env "HF_HUB_CACHE=/root/.cache/huggingface/hub" \
     --env "CUDA_VISIBLE_DEVICES=$GPU_ID" \
     --env "VLLM_USE_V1=1" \
+    --env "VLLM_NIXL_SIDE_CHANNEL_HOST=$INTERNAL_IP" \$(if [ "$ENABLE_PROFILING" = "true" ]; then echo " --env VLLM_TORCH_PROFILER_DIR=/vllm_profiles --env VLLM_TORCH_PROFILER_WITH_STACK=1"; fi) \
     --network host \
     --name vllm-deepseek \
     $ECR_REPO:$ECR_TAG \
@@ -538,7 +550,7 @@ EOF
 # Shared function to generate vLLM prefill run script
 generate_vllm_prefill_run_script() {
     local ROUTER_IP=${1:-$(get_local_ip)}
-    local EXTERNAL_IP=${2:-$(get_local_ip)}
+    local INTERNAL_IP=${2:-$(get_local_ip)}
     cat << EOF
 #!/bin/bash
 
@@ -556,6 +568,12 @@ docker pull $ECR_REPO:$ECR_TAG
 # Create huggingface cache directory if it doesn't exist
 sudo mkdir -p /opt/dlami/nvme/huggingface_cache
 sudo chown -R \$(id -u):\$(id -g) /opt/dlami/nvme/huggingface_cache
+
+# Create profiling directory if profiling is enabled
+if [ "$ENABLE_PROFILING" = "true" ]; then
+    sudo mkdir -p $PROFILING_DIR
+    sudo chown -R \$(id -u):\$(id -g) $PROFILING_DIR
+fi
 
 # Run vLLM prefill container with EFA support (EFA libraries built into image)
 docker run -d --restart unless-stopped --runtime nvidia --gpus all \
@@ -575,7 +593,7 @@ docker run -d --restart unless-stopped --runtime nvidia --gpus all \
     --device /dev/infiniband/uverbs13 \
     --device /dev/infiniband/uverbs14 \
     --device /dev/infiniband/uverbs15 \
-    -v /opt/dlami/nvme/huggingface_cache:/root/.cache/huggingface \
+    -v /opt/dlami/nvme/huggingface_cache:/root/.cache/huggingface \$(if [ "$ENABLE_PROFILING" = "true" ]; then echo " -v $PROFILING_DIR:/vllm_profiles"; fi) \
     --shm-size=1000g \
     --env "HUGGING_FACE_HUB_TOKEN=$HF_TOKEN" \
     --env "VLLM_MOE_DP_CHUNK_SIZE=512" \
@@ -598,11 +616,12 @@ docker run -d --restart unless-stopped --runtime nvidia --gpus all \
     --env "VLLM_LOGGING_LEVEL=DEBUG" \
     --env "VLLM_TRACE_FUNCTION=1" \
     --env "VLLM_LOG_REQUESTS=1" \
-    --env "VLLM_RPC_TIMEOUT=300" \
+    --env "VLLM_RPC_TIMEOUT=\$(if [ "$ENABLE_PROFILING" = "true" ]; then echo "1800"; else echo "300"; fi)" \
     --env "VLLM_WORKER_RPC_TIMEOUT=300" \
     --env "HF_HUB_CACHE=/root/.cache/huggingface/hub" \
     --env "CUDA_VISIBLE_DEVICES=$GPU_ID" \
     --env "VLLM_USE_V1=1" \
+    --env "VLLM_NIXL_SIDE_CHANNEL_HOST=$INTERNAL_IP" \$(if [ "$ENABLE_PROFILING" = "true" ]; then echo " --env VLLM_TORCH_PROFILER_DIR=/vllm_profiles --env VLLM_TORCH_PROFILER_WITH_STACK=1"; fi) \
     --network host \
     --name vllm-deepseek-prefill \
     $ECR_REPO:$ECR_TAG \
@@ -712,23 +731,23 @@ deploy_remote_decode() {
             fi
 
             # Get the internal IP of the remote host for AWS VPC communication
-            EXTERNAL_IP=$(ssh -i "$SSH_KEY_FILE" -o StrictHostKeyChecking=no $host "curl -s http://169.254.169.254/latest/meta-data/local-ipv4 2>/dev/null || ip route get 8.8.8.8 | grep -oP 'src \K\S+'")
-            log "Internal IP for $host: $EXTERNAL_IP"
+            INTERNAL_IP=$(ssh -i "$SSH_KEY_FILE" -o StrictHostKeyChecking=no $host "ip route get 8.8.8.8 | grep -oP 'src \K\S+'")
+            log "Internal IP for $host: $INTERNAL_IP"
 
-            # Generate script with host-specific external IP
-            generate_vllm_run_script $ROUTER_IP $EXTERNAL_IP > /tmp/vllm_run_remote_${EXTERNAL_IP}.sh
-            chmod +x /tmp/vllm_run_remote_${EXTERNAL_IP}.sh
+            # Generate script with host-specific internal IP
+            generate_vllm_run_script $ROUTER_IP $INTERNAL_IP > /tmp/vllm_run_remote_${INTERNAL_IP}.sh
+            chmod +x /tmp/vllm_run_remote_${INTERNAL_IP}.sh
 
             # Copy script to remote host
-            scp -i "$SSH_KEY_FILE" -o StrictHostKeyChecking=no /tmp/vllm_run_remote_${EXTERNAL_IP}.sh $host:/tmp/vllm_run_remote.sh
+            scp -i "$SSH_KEY_FILE" -o StrictHostKeyChecking=no /tmp/vllm_run_remote_${INTERNAL_IP}.sh $host:/tmp/vllm_run_remote.sh
 
             # Execute on remote host
             ssh -i "$SSH_KEY_FILE" -o StrictHostKeyChecking=no $host "bash /tmp/vllm_run_remote.sh"
 
             # Clean up host-specific temp file
-            rm -f /tmp/vllm_run_remote_${EXTERNAL_IP}.sh
+            rm -f /tmp/vllm_run_remote_${INTERNAL_IP}.sh
 
-            success "Decode deployed to $host (Internal IP: $EXTERNAL_IP)"
+            success "Decode deployed to $host (Internal IP: $INTERNAL_IP)"
         fi
     done
 }
@@ -758,23 +777,23 @@ deploy_remote_prefill() {
             fi
 
             # Get the internal IP of the remote host for AWS VPC communication
-            EXTERNAL_IP=$(ssh -i "$SSH_KEY_FILE" -o StrictHostKeyChecking=no $host "curl -s http://169.254.169.254/latest/meta-data/local-ipv4 2>/dev/null || ip route get 8.8.8.8 | grep -oP 'src \K\S+'")
-            log "Internal IP for $host: $EXTERNAL_IP"
+            INTERNAL_IP=$(ssh -i "$SSH_KEY_FILE" -o StrictHostKeyChecking=no $host "ip route get 8.8.8.8 | grep -oP 'src \K\S+'")
+            log "Internal IP for $host: $INTERNAL_IP"
 
-            # Generate script with host-specific external IP
-            generate_vllm_prefill_run_script $ROUTER_IP $EXTERNAL_IP > /tmp/vllm_run_remote_prefill_${EXTERNAL_IP}.sh
-            chmod +x /tmp/vllm_run_remote_prefill_${EXTERNAL_IP}.sh
+            # Generate script with host-specific internal IP
+            generate_vllm_prefill_run_script $ROUTER_IP $INTERNAL_IP > /tmp/vllm_run_remote_prefill_${INTERNAL_IP}.sh
+            chmod +x /tmp/vllm_run_remote_prefill_${INTERNAL_IP}.sh
 
             # Copy script to remote host
-            scp -i "$SSH_KEY_FILE" -o StrictHostKeyChecking=no /tmp/vllm_run_remote_prefill_${EXTERNAL_IP}.sh $host:/tmp/vllm_run_remote_prefill.sh
+            scp -i "$SSH_KEY_FILE" -o StrictHostKeyChecking=no /tmp/vllm_run_remote_prefill_${INTERNAL_IP}.sh $host:/tmp/vllm_run_remote_prefill.sh
 
             # Execute on remote host
             ssh -i "$SSH_KEY_FILE" -o StrictHostKeyChecking=no $host "bash /tmp/vllm_run_remote_prefill.sh"
 
             # Clean up host-specific temp file
-            rm -f /tmp/vllm_run_remote_prefill_${EXTERNAL_IP}.sh
+            rm -f /tmp/vllm_run_remote_prefill_${INTERNAL_IP}.sh
 
-            success "Prefill deployed to $host (Internal IP: $EXTERNAL_IP)"
+            success "Prefill deployed to $host (Internal IP: $INTERNAL_IP)"
         fi
     done
 }
@@ -866,7 +885,7 @@ docker run -d \\
     -p 30001:30001 \\
     --restart unless-stopped \\
     $ECR_REPO:$ROUTER_ECR_TAG \\
-    vllm-router --vllm-pd-disaggregation --vllm-discovery-address 0.0.0.0:30001 --host 0.0.0.0 --port 10001
+    vllm-router --vllm-pd-disaggregation --vllm-discovery-address 0.0.0.0:30001 --host 0.0.0.0 --port 10001 \\\$(if [ "\$ENABLE_PROFILING" = "true" ]; then echo " --profile"; fi)
 
 echo "Router started. Check logs with: docker logs vllm-router"
 echo "Router HTTP available at: http://localhost:10001"
@@ -983,10 +1002,11 @@ deploy_router_local() {
             -p 10001:10001 \
             --restart unless-stopped \
             $ROUTER_DOCKER_TAG \
-            vllm-router --pd-disaggregation \
+            vllm-router --vllm-pd-disaggregation \
             $PREFILL_ARGS \
             $DECODE_ARGS \
-            --host 0.0.0.0 --port 10001
+            --host 0.0.0.0 --port 10001 \
+            $(if [ "$ENABLE_PROFILING" = "true" ]; then echo "--profile"; fi)
 
         # Wait a moment and check if container started successfully
         sleep 2
