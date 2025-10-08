@@ -754,7 +754,7 @@ impl Router {
             };
 
             // Parse the request body
-            let mut json_val = match serde_json::to_value(typed_req) {
+            let json_val = match serde_json::to_value(typed_req) {
                 Ok(j) => j,
                 Err(e) => {
                     return (

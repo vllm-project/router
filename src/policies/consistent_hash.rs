@@ -151,7 +151,6 @@ impl ConsistentHashPolicy {
     fn furc_hash(key: &str, m: u32) -> u32 {
         const MAX_TRIES: u32 = 32;
         const FURC_SHIFT: u32 = 23;
-        const SEED: u32 = 4193360111;
         const FURC_CACHE_SIZE: usize = 1024;
 
         if m <= 1 {

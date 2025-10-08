@@ -443,42 +443,40 @@ impl CliArgs {
                 decode_policy: self.decode_policy.as_ref().map(|p| self.parse_policy(p)),
             }
         } else if self.vllm_pd_disaggregation {
-            // Parse decode URLs to check for unused parameters
+            // Parse decode URLs to check for mixed mode (both URLs and service discovery)
             let decode_urls = parse_decode_args();
 
-            // Warn about unused parameters in vLLM pure service discovery mode
-            if !prefill_urls.is_empty() {
-                eprintln!("⚠️  WARNING: --prefill parameters are ignored in vLLM mode. Workers register via service discovery.");
-                for (url, port) in &prefill_urls {
-                    match port {
-                        Some(p) => eprintln!("   Ignored: --prefill {} {}", url, p),
-                        None => eprintln!("   Ignored: --prefill {}", url),
-                    }
-                }
-            }
-            if !decode_urls.is_empty() {
-                eprintln!("⚠️  WARNING: --decode parameters are ignored in vLLM mode. Workers register via service discovery.");
-                for url in &decode_urls {
-                    eprintln!("   Ignored: --decode {}", url);
-                }
-            }
-            if !self.decode.is_empty() {
-                eprintln!("⚠️  WARNING: --decode parameters are ignored in vLLM mode. Workers register via service discovery.");
-                for url in &self.decode {
-                    eprintln!("   Ignored: --decode {}", url);
-                }
-            }
+            // Support both pure service discovery mode and hybrid mode with static URLs
+            let use_static_urls = !prefill_urls.is_empty() || !decode_urls.is_empty() || !self.decode.is_empty();
+            let use_discovery = self.vllm_discovery_address.is_some();
 
-            // Require discovery address for vLLM mode
-            if self.vllm_discovery_address.is_none() {
+            if !use_static_urls && !use_discovery {
                 return Err(ConfigError::ValidationFailed {
-                    reason: "vLLM PD disaggregation mode requires --vllm-discovery-address for pure service discovery".to_string(),
+                    reason: "vLLM PD disaggregation mode requires either --vllm-discovery-address or --prefill/--decode URLs".to_string(),
                 });
             }
 
+            // Combine decode URLs from both sources
+            let mut final_decode_urls = decode_urls.clone();
+            final_decode_urls.extend(self.decode.clone());
+
+            if use_static_urls && use_discovery {
+                eprintln!("ℹ️  INFO: Using hybrid mode - static URLs as fallback, service discovery for dynamic workers.");
+                eprintln!("   Prefill URLs: {:?}", prefill_urls);
+                eprintln!("   Decode URLs: {:?}", final_decode_urls);
+                eprintln!("   Discovery address: {:?}", self.vllm_discovery_address);
+            } else if use_static_urls {
+                eprintln!("ℹ️  INFO: Using static URL mode without service discovery.");
+                eprintln!("   Prefill URLs: {:?}", prefill_urls);
+                eprintln!("   Decode URLs: {:?}", final_decode_urls);
+            } else {
+                eprintln!("ℹ️  INFO: Using pure service discovery mode.");
+                eprintln!("   Discovery address: {:?}", self.vllm_discovery_address);
+            }
+
             RoutingMode::VllmPrefillDecode {
-                prefill_urls: vec![], // Always empty in pure service discovery mode
-                decode_urls: vec![],  // Always empty in pure service discovery mode
+                prefill_urls: prefill_urls.clone(),
+                decode_urls: final_decode_urls,
                 prefill_policy: self.prefill_policy.as_ref().map(|p| self.parse_policy(p)),
                 decode_policy: self.decode_policy.as_ref().map(|p| self.parse_policy(p)),
                 discovery_address: self.vllm_discovery_address.clone(),

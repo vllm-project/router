@@ -40,10 +40,10 @@ impl RouterFactory {
                         .await
                     }
                     RoutingMode::VllmPrefillDecode {
-                        prefill_urls,
-                        decode_urls,
-                        prefill_policy,
-                        decode_policy,
+                        prefill_urls: _,
+                        decode_urls: _,
+                        prefill_policy: _,
+                        decode_policy: _,
                         discovery_address: _,
                     } => {
                         Err("vLLM PD mode requires HTTP connection_mode".to_string())
@@ -77,28 +77,24 @@ impl RouterFactory {
                         .await
                     }
                     RoutingMode::VllmPrefillDecode {
-                        prefill_urls: _,
-                        decode_urls: _,
+                        prefill_urls,
+                        decode_urls,
                         prefill_policy,
                         decode_policy,
                         discovery_address,
                     } => {
-                        match discovery_address {
-                            Some(addr) => {
-                                tracing::info!("Creating VllmPDRouter with pure service discovery on: {}", addr);
-                                Self::create_vllm_pd_router(
-                                    addr.clone(),
-                                    prefill_policy.as_ref(),
-                                    decode_policy.as_ref(),
-                                    &ctx.router_config.policy,
-                                    ctx,
-                                )
-                                .await
-                            }
-                            None => {
-                                Err("vLLM PD mode requires --vllm-discovery-address for service discovery".to_string())
-                            }
-                        }
+                        tracing::info!("Creating VllmPDRouter with prefill_urls: {:?}, decode_urls: {:?}, discovery: {:?}",
+                                      prefill_urls, decode_urls, discovery_address);
+                        Self::create_vllm_pd_router(
+                            prefill_urls,
+                            decode_urls,
+                            discovery_address.clone(),
+                            prefill_policy.as_ref(),
+                            decode_policy.as_ref(),
+                            &ctx.router_config.policy,
+                            ctx,
+                        )
+                        .await
                     }
                     RoutingMode::OpenAI { worker_urls, .. } => {
                         Self::create_openai_router(worker_urls.clone(), ctx).await
@@ -144,9 +140,11 @@ impl RouterFactory {
         Ok(Box::new(router))
     }
 
-    /// Create a vLLM PD router with pure service discovery
+    /// Create a vLLM PD router with service discovery and/or static URLs
     pub async fn create_vllm_pd_router(
-        discovery_address: String,
+        prefill_urls: &[(String, Option<u16>)],
+        decode_urls: &[String],
+        discovery_address: Option<String>,
         prefill_policy_config: Option<&PolicyConfig>,
         decode_policy_config: Option<&PolicyConfig>,
         main_policy_config: &PolicyConfig,
@@ -162,9 +160,15 @@ impl RouterFactory {
         ctx.policy_registry.set_prefill_policy(prefill_policy);
         ctx.policy_registry.set_decode_policy(decode_policy);
 
-        // Create vLLM PD router with pure service discovery
-        tracing::info!("About to create VllmPDRouter instance with pure service discovery");
-        let router = VllmPDRouter::new(discovery_address, ctx).await?;
+        // Create vLLM PD router with both static URLs and service discovery support
+        if discovery_address.is_some() {
+            tracing::info!("Creating VllmPDRouter with service discovery at: {:?}", discovery_address);
+        }
+        if !prefill_urls.is_empty() || !decode_urls.is_empty() {
+            tracing::info!("Creating VllmPDRouter with static URLs - prefill: {:?}, decode: {:?}", prefill_urls, decode_urls);
+        }
+
+        let router = VllmPDRouter::new(prefill_urls.to_vec(), decode_urls.to_vec(), discovery_address, ctx).await?;
         tracing::info!("VllmPDRouter instance created successfully");
 
         Ok(Box::new(router))
