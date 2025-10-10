@@ -231,6 +231,8 @@ impl Router {
             model_path: self.model_path.clone(),
             tokenizer_path: self.tokenizer_path.clone(),
             history_backend: config::HistoryBackend::Memory,
+            enable_profiling: false, // Profiling disabled in Python binding by default
+            profile_timeout_secs: 10, // Default profiling timeout
         })
     }
 }

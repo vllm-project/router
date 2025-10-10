@@ -70,6 +70,16 @@ pub struct RouterConfig {
     /// History backend configuration (memory or none, default: memory)
     #[serde(default = "default_history_backend")]
     pub history_backend: HistoryBackend,
+    /// Enable profiling calls to vLLM workers
+    #[serde(default)]
+    pub enable_profiling: bool,
+    /// Profiling timeout in seconds (for vLLM profiling endpoints)
+    #[serde(default = "default_profile_timeout_secs")]
+    pub profile_timeout_secs: u64,
+}
+
+fn default_profile_timeout_secs() -> u64 {
+    10
 }
 
 fn default_history_backend() -> HistoryBackend {
@@ -419,6 +429,8 @@ impl Default for RouterConfig {
             model_path: None,
             tokenizer_path: None,
             history_backend: default_history_backend(),
+            enable_profiling: false,
+            profile_timeout_secs: default_profile_timeout_secs(),
         }
     }
 }
@@ -987,6 +999,8 @@ mod tests {
             model_path: None,
             tokenizer_path: None,
             history_backend: default_history_backend(),
+            enable_profiling: false,
+            profile_timeout_secs: default_profile_timeout_secs(),
         };
 
         assert!(config.mode.is_pd_mode());
@@ -1051,6 +1065,8 @@ mod tests {
             model_path: None,
             tokenizer_path: None,
             history_backend: default_history_backend(),
+            enable_profiling: false,
+            profile_timeout_secs: default_profile_timeout_secs(),
         };
 
         assert!(!config.mode.is_pd_mode());
@@ -1111,6 +1127,8 @@ mod tests {
             model_path: None,
             tokenizer_path: None,
             history_backend: default_history_backend(),
+            enable_profiling: false,
+            profile_timeout_secs: default_profile_timeout_secs(),
         };
 
         assert!(config.has_service_discovery());

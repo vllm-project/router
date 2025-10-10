@@ -33,7 +33,7 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, error, info, warn};
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct PDRouter {
     pub worker_registry: Arc<WorkerRegistry>,
     pub policy_registry: Arc<PolicyRegistry>,
@@ -129,6 +129,38 @@ impl PDRouter {
             .iter()
             .map(|w| w.url().to_string())
             .collect()
+    }
+
+    /// Start profiling on a backend server
+    pub async fn start_profiling(&self, worker_url: &str) {
+        let url = format!("{}/start_profile", worker_url);
+        match self.client.post(&url).send().await {
+            Ok(res) if res.status().is_success() => {
+                info!("Started profiling on {}", worker_url);
+            }
+            Ok(res) => {
+                warn!("Failed to start profiling on {}: status {}", worker_url, res.status());
+            }
+            Err(e) => {
+                warn!("Error starting profiling on {}: {}", worker_url, e);
+            }
+        }
+    }
+
+    /// Stop profiling on a backend server
+    pub async fn stop_profiling(&self, worker_url: &str) {
+        let url = format!("{}/stop_profile", worker_url);
+        match self.client.post(&url).send().await {
+            Ok(res) if res.status().is_success() => {
+                info!("Stopped profiling on {}", worker_url);
+            }
+            Ok(res) => {
+                warn!("Failed to stop profiling on {}: status {}", worker_url, res.status());
+            }
+            Err(e) => {
+                warn!("Error stopping profiling on {}: {}", worker_url, e);
+            }
+        }
     }
 
     // Helper for proxying requests to the first prefill worker

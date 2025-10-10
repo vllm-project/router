@@ -353,6 +353,10 @@ struct CliArgs {
     /// History backend configuration (memory or none)
     #[arg(long, default_value = "memory", value_parser = ["memory", "none"])]
     history_backend: String,
+
+    /// Enable profiling calls to vLLM workers
+    #[arg(long, default_value_t = false)]
+    profile: bool,
 }
 
 impl CliArgs {
@@ -610,6 +614,8 @@ impl CliArgs {
                 "none" => HistoryBackend::None,
                 _ => HistoryBackend::Memory,
             },
+            enable_profiling: self.profile,
+            profile_timeout_secs: 10, // Default profiling timeout
         })
     }
 

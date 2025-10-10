@@ -14,7 +14,9 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::sync::Arc;
+use tokio::sync::Mutex;
 use tracing::info;
 use uuid::Uuid;
 
@@ -31,6 +33,12 @@ pub struct VllmPDRouter {
     policy_registry: Arc<PolicyRegistry>,
     /// Whether this router uses service discovery (true) or direct URLs (false)
     use_discovery: bool,
+    /// Enable profiling calls to vLLM workers
+    enable_profiling: bool,
+    /// Profiling timeout in seconds
+    profile_timeout_secs: u64,
+    /// Active profiling timeout tasks keyed by worker URL
+    profiling_tasks: Arc<Mutex<HashMap<String, tokio::task::AbortHandle>>>,
 }
 
 impl VllmPDRouter {
@@ -56,6 +64,58 @@ impl VllmPDRouter {
         http_address
     }
 
+    /// Helper: Start profiling on a backend server with timeout
+    async fn start_profiling(&self, worker_url: &str) {
+        // Only profile if enabled
+        if !self.enable_profiling {
+            return;
+        }
+
+        // Start profiling on the worker
+        self.pd_router.start_profiling(worker_url).await;
+
+        // Spawn a timeout task that will call stop_profiling if timeout is reached
+        let timeout_secs = self.profile_timeout_secs;
+        let worker_url_owned = worker_url.to_string();
+        let pd_router_clone = self.pd_router.clone();
+        let profiling_tasks_clone = self.profiling_tasks.clone();
+
+        let task_handle = tokio::spawn(async move {
+            tokio::time::sleep(tokio::time::Duration::from_secs(timeout_secs)).await;
+
+            info!("Profiling timeout reached for {}, stopping profiling", worker_url_owned);
+            pd_router_clone.stop_profiling(&worker_url_owned).await;
+
+            // Remove ourselves from the tasks map
+            let mut tasks = profiling_tasks_clone.lock().await;
+            tasks.remove(&worker_url_owned);
+        });
+
+        // Store the abort handle
+        let mut tasks = self.profiling_tasks.lock().await;
+        if let Some(old_handle) = tasks.insert(worker_url.to_string(), task_handle.abort_handle()) {
+            // Cancel any existing timeout task for this worker
+            old_handle.abort();
+        }
+    }
+
+    /// Helper: Stop profiling on a backend server and cancel timeout task
+    async fn stop_profiling(&self, worker_url: &str) {
+        // Only stop profiling if it was enabled
+        if !self.enable_profiling {
+            return;
+        }
+
+        // Cancel the timeout task if it exists
+        let mut tasks = self.profiling_tasks.lock().await;
+        if let Some(handle) = tasks.remove(worker_url) {
+            handle.abort();
+            info!("Cancelled profiling timeout task for {}", worker_url);
+        }
+
+        // Stop profiling on the worker
+        self.pd_router.stop_profiling(worker_url).await;
+    }
 
     /// Modify request for prefill stage (set max_tokens=1)
     fn prepare_prefill_request(mut request: Value) -> Value {
@@ -179,7 +239,7 @@ impl VllmPDRouter {
     /// Two-stage request processing for vLLM disaggregated mode using discovered endpoints
     async fn process_vllm_two_stage_request_discovered(
         &self,
-        request_json: Value,
+        mut request_json: Value,
         prefill_http: &str,
         prefill_zmq: &str,
         decode_http: &str,
@@ -223,6 +283,9 @@ impl VllmPDRouter {
 
         // Stage 1: Send to prefill server with max_tokens=1 and P2P coordination header
         info!("Stage 1: Sending prefill-only request (max_tokens=1) to prefill server at http://{}", prefill_http);
+
+        // Start profiling on prefill server
+        self.start_profiling(&format!("http://{}", prefill_http)).await;
 
         let prefill_response = self.http_client
             .post(&format!("http://{}{}", prefill_http, path))
@@ -270,8 +333,14 @@ impl VllmPDRouter {
         let decode_request_str = serde_json::to_string(&decode_request)
             .map_err(|e| format!("Failed to serialize decode request: {}", e))?;
 
+        // Stop profiling on prefill server after its work is done
+        self.stop_profiling(&format!("http://{}", prefill_http)).await;
+
         // Stage 2: Send to decode server with original request and same P2P coordination header
         info!("Stage 2: Sending original request to decode server at http://{}", decode_http);
+
+        // Start profiling on decode server
+        self.start_profiling(&format!("http://{}", decode_http)).await;
 
         let decode_response = self.http_client
             .post(&format!("http://{}{}", decode_http, path))
@@ -283,6 +352,9 @@ impl VllmPDRouter {
             .map_err(|e| format!("Decode request failed: {}", e))?;
 
         info!("Decode server responded with status: {}", decode_response.status());
+
+        // Stop profiling on decode server after response received
+        self.stop_profiling(&format!("http://{}", decode_http)).await;
 
         // Convert reqwest::Response to axum::Response
         let status = decode_response.status();
@@ -347,6 +419,9 @@ impl VllmPDRouter {
         info!("📤 Prefill request headers: Authorization=Bearer [REDACTED], X-Request-Id={}", request_id);
         info!("📤 Prefill request payload: {}", serde_json::to_string_pretty(&prefill_request).unwrap_or_default());
 
+        // Start profiling on prefill server
+        self.start_profiling(prefill_worker.url()).await;
+
         let prefill_response = self.pd_router.client
             .post(&prefill_url)
             .header("Content-Type", "application/json")
@@ -385,8 +460,11 @@ impl VllmPDRouter {
             info!("Extracted kv_transfer_params from prefill response: {}",
                   serde_json::to_string_pretty(params).unwrap_or_default());
         } else {
-              info!("No kv_transfer_params found in prefill response, will proceed without them");
+            info!("No kv_transfer_params found in prefill response, will proceed without them");
         }
+
+        // Stop profiling on prefill server after its work is done
+        self.stop_profiling(prefill_worker.url()).await;
 
         info!("✅ vLLM Stage 1 completed, starting Stage 2 - Decode");
 
@@ -403,6 +481,9 @@ impl VllmPDRouter {
         info!("📤 Decode request headers: Authorization=Bearer [REDACTED], X-Request-Id={}", request_id);
         info!("📤 Decode request payload: {}", serde_json::to_string_pretty(&decode_request).unwrap_or_default());
 
+        // Start profiling on decode server
+        self.start_profiling(decode_worker.url()).await;
+
         let decode_response = self.pd_router.client
             .post(&decode_url)
             .header("Content-Type", "application/json")
@@ -414,6 +495,9 @@ impl VllmPDRouter {
             .map_err(|e| PDRouterError::NetworkError {
                 message: format!("Decode request failed to {}: {}", decode_url, e),
             })?;
+
+        // Stop profiling on decode server after response received
+        self.stop_profiling(decode_worker.url()).await;
 
         // Convert reqwest::Response to axum::Response
         let status = decode_response.status();
@@ -470,6 +554,9 @@ impl VllmPDRouter {
                 http_client: reqwest::Client::new(),
                 policy_registry: ctx.policy_registry.clone(),
                 use_discovery: true,
+                enable_profiling: ctx.router_config.enable_profiling,
+                profile_timeout_secs: ctx.router_config.profile_timeout_secs,
+                profiling_tasks: Arc::new(Mutex::new(HashMap::new())),
             })
         } else {
             // Direct URL mode (same as PDRouter)
@@ -490,6 +577,9 @@ impl VllmPDRouter {
                 http_client: reqwest::Client::new(),
                 policy_registry: ctx.policy_registry.clone(),
                 use_discovery: false,
+                enable_profiling: ctx.router_config.enable_profiling,
+                profile_timeout_secs: ctx.router_config.profile_timeout_secs,
+                profiling_tasks: Arc::new(Mutex::new(HashMap::new())),
             })
         }
     }
@@ -536,9 +626,9 @@ impl RouterTrait for VllmPDRouter {
     // Override OpenAI-compatible routes for vLLM two-stage processing
     async fn route_chat(
         &self,
-        _headers: Option<&HeaderMap>,
+        headers: Option<&HeaderMap>,
         body: &crate::protocols::spec::ChatCompletionRequest,
-        _model_id: Option<&str>,
+        model_id: Option<&str>,
     ) -> Response {
         info!("vLLM route_chat called, use_discovery={}", self.use_discovery);
 
@@ -751,20 +841,20 @@ impl RouterTrait for VllmPDRouter {
 
     async fn route_embeddings(
         &self,
-        _headers: Option<&HeaderMap>,
+        headers: Option<&HeaderMap>,
         body: &crate::protocols::spec::EmbeddingRequest,
-        _model_id: Option<&str>,
+        model_id: Option<&str>,
     ) -> Response {
-        self.pd_router.route_embeddings(_headers, body, _model_id).await
+        self.pd_router.route_embeddings(headers, body, model_id).await
     }
 
     async fn route_rerank(
         &self,
-        _headers: Option<&HeaderMap>,
+        headers: Option<&HeaderMap>,
         body: &crate::protocols::spec::RerankRequest,
-        _model_id: Option<&str>,
+        model_id: Option<&str>,
     ) -> Response {
-        self.pd_router.route_rerank(_headers, body, _model_id).await
+        self.pd_router.route_rerank(headers, body, model_id).await
     }
 
     async fn flush_cache(&self) -> Response {
