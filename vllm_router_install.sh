@@ -534,7 +534,6 @@ docker run -d --runtime nvidia --gpus all \
     --name vllm-deepseek \
     $ECR_REPO:$ECR_TAG \
     --model $MODEL \
-    --enforce-eager \
     --host 0.0.0.0 \
     --port $DECODE_PORT \
     --disable-log-requests \
@@ -542,6 +541,8 @@ docker run -d --runtime nvidia --gpus all \
     --enable-expert-parallel \
     --tensor-parallel-size $TP_SIZE \
     --trust-remote-code \
+    --async-scheduling \
+    --compilation-config "{\"cudagraph_mode\":\"FULL_DECODE_ONLY\"}" \
     --kv-transfer-config "{\"kv_connector\":\"NixlConnector\",\"kv_role\":\"kv_both\",\"kv_connector_extra_config\":{\"backends\":[\"UCX\",\"GDS\"]}}"
 
 echo "vLLM started in background. Check logs with: docker logs -f vllm-deepseek"
