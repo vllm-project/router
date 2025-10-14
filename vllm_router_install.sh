@@ -482,7 +482,7 @@ if [ "$ENABLE_PROFILING" = "true" ]; then
 fi
 
 # Run vLLM container with EFA support (EFA libraries built into image)
-docker run -d --restart unless-stopped --runtime nvidia --gpus all \
+docker run -d --runtime nvidia --gpus all \
     --device /dev/infiniband/uverbs0 \
     --device /dev/infiniband/uverbs1 \
     --device /dev/infiniband/uverbs2 \
@@ -519,8 +519,10 @@ docker run -d --restart unless-stopped --runtime nvidia --gpus all \
     --env "NCCL_SOCKET_IFNAME=" \
     --env "NCCL_IB_HCA=ibp" \
     --env "FI_EFA_USE_DEVICE_RDMA=1" \
+    --env "NCCL_DEBUG=INFO" \
+    --env "NCCL_DEBUG_SUBSYS=INIT,GRAPH,NET,P2P" \
+    --env "NCCL_DEBUG_FILE=/tmp/nccl_debug_%h_%p.log" \
     --env "VLLM_LOGGING_LEVEL=DEBUG" \
-    --env "VLLM_TRACE_FUNCTION=1" \
     --env "VLLM_LOG_REQUESTS=1" \
     --env "VLLM_RPC_TIMEOUT=\$(if [ "$ENABLE_PROFILING" = "true" ]; then echo "1800"; else echo "300"; fi)" \
     --env "VLLM_WORKER_RPC_TIMEOUT=300" \
@@ -576,7 +578,7 @@ if [ "$ENABLE_PROFILING" = "true" ]; then
 fi
 
 # Run vLLM prefill container with EFA support (EFA libraries built into image)
-docker run -d --restart unless-stopped --runtime nvidia --gpus all \
+docker run -d --runtime nvidia --gpus all \
     --device /dev/infiniband/uverbs0 \
     --device /dev/infiniband/uverbs1 \
     --device /dev/infiniband/uverbs2 \
@@ -613,8 +615,10 @@ docker run -d --restart unless-stopped --runtime nvidia --gpus all \
     --env "NCCL_SOCKET_IFNAME=" \
     --env "NCCL_IB_HCA=ibp" \
     --env "FI_EFA_USE_DEVICE_RDMA=1" \
+    --env "NCCL_DEBUG=INFO" \
+    --env "NCCL_DEBUG_SUBSYS=INIT,GRAPH,NET,P2P" \
+    --env "NCCL_DEBUG_FILE=/tmp/nccl_debug_%h_%p.log" \
     --env "VLLM_LOGGING_LEVEL=DEBUG" \
-    --env "VLLM_TRACE_FUNCTION=1" \
     --env "VLLM_LOG_REQUESTS=1" \
     --env "VLLM_RPC_TIMEOUT=\$(if [ "$ENABLE_PROFILING" = "true" ]; then echo "1800"; else echo "300"; fi)" \
     --env "VLLM_WORKER_RPC_TIMEOUT=300" \
