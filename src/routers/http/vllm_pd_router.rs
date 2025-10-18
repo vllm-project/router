@@ -1,5 +1,6 @@
 // vLLM PD (Prefill-Decode) Router Implementation
 // This module extends PDRouter to handle vLLM-specific two-stage processing
+use super::dp_utils;
 use super::pd_router::PDRouter;
 use super::pd_types::PDRouterError;
 use super::vllm_service_discovery::{ServiceRegistry, ServiceType};
@@ -39,6 +40,10 @@ pub struct VllmPDRouter {
     profile_timeout_secs: u64,
     /// Active profiling timeout tasks keyed by worker URL
     profiling_tasks: Arc<Mutex<HashMap<String, tokio::task::AbortHandle>>>,
+    /// Whether DP-aware routing is enabled
+    dp_aware: bool,
+    /// API key for worker authentication
+    api_key: Option<String>,
 }
 
 impl VllmPDRouter {
@@ -239,7 +244,7 @@ impl VllmPDRouter {
     /// Two-stage request processing for vLLM disaggregated mode using discovered endpoints
     async fn process_vllm_two_stage_request_discovered(
         &self,
-        mut request_json: Value,
+        request_json: Value,
         prefill_http: &str,
         prefill_zmq: &str,
         decode_http: &str,
@@ -284,13 +289,38 @@ impl VllmPDRouter {
         // Stage 1: Send to prefill server with max_tokens=1 and P2P coordination header
         info!("Stage 1: Sending prefill-only request (max_tokens=1) to prefill server at http://{}", prefill_http);
 
-        // Start profiling on prefill server
-        self.start_profiling(&format!("http://{}", prefill_http)).await;
+        // Extract dp_rank from prefill_http if dp_aware is enabled
+        let (prefill_base_http, prefill_dp_rank) = if self.dp_aware {
+            let prefill_url = format!("http://{}", prefill_http);
+            match dp_utils::extract_dp_rank(&prefill_url) {
+                Ok((base, rank)) => {
+                    let base_http = base.replace("http://", "").replace("https://", "");
+                    (base_http, Some(rank))
+                }
+                Err(_) => {
+                    // Not in DP-aware format, use as-is
+                    (prefill_http.to_string(), None)
+                }
+            }
+        } else {
+            (prefill_http.to_string(), None)
+        };
 
-        let prefill_response = self.http_client
-            .post(&format!("http://{}{}", prefill_http, path))
+        // Start profiling on prefill server
+        self.start_profiling(&format!("http://{}", prefill_base_http)).await;
+
+        let mut prefill_request_builder = self.http_client
+            .post(&format!("http://{}{}", prefill_base_http, path))
             .header("Content-Type", "application/json")
-            .header("X-Request-Id", &request_id)  // P2P coordination metadata in header
+            .header("X-Request-Id", &request_id);  // P2P coordination metadata in header
+
+        // Add X-data-parallel-rank header if dp_aware is enabled and rank was extracted
+        if let Some(rank) = prefill_dp_rank {
+            prefill_request_builder = prefill_request_builder.header("X-data-parallel-rank", rank.to_string());
+            info!("Added X-data-parallel-rank={} header to prefill request", rank);
+        }
+
+        let prefill_response = prefill_request_builder
             .body(prefill_request_str)
             .send()
             .await
@@ -334,18 +364,43 @@ impl VllmPDRouter {
             .map_err(|e| format!("Failed to serialize decode request: {}", e))?;
 
         // Stop profiling on prefill server after its work is done
-        self.stop_profiling(&format!("http://{}", prefill_http)).await;
+        self.stop_profiling(&format!("http://{}", prefill_base_http)).await;
 
         // Stage 2: Send to decode server with original request and same P2P coordination header
         info!("Stage 2: Sending original request to decode server at http://{}", decode_http);
 
-        // Start profiling on decode server
-        self.start_profiling(&format!("http://{}", decode_http)).await;
+        // Extract dp_rank from decode_http if dp_aware is enabled
+        let (decode_base_http, decode_dp_rank) = if self.dp_aware {
+            let decode_url = format!("http://{}", decode_http);
+            match dp_utils::extract_dp_rank(&decode_url) {
+                Ok((base, rank)) => {
+                    let base_http = base.replace("http://", "").replace("https://", "");
+                    (base_http, Some(rank))
+                }
+                Err(_) => {
+                    // Not in DP-aware format, use as-is
+                    (decode_http.to_string(), None)
+                }
+            }
+        } else {
+            (decode_http.to_string(), None)
+        };
 
-        let decode_response = self.http_client
-            .post(&format!("http://{}{}", decode_http, path))
+        // Start profiling on decode server
+        self.start_profiling(&format!("http://{}", decode_base_http)).await;
+
+        let mut decode_request_builder = self.http_client
+            .post(&format!("http://{}{}", decode_base_http, path))
             .header("Content-Type", "application/json")
-            .header("X-Request-Id", &request_id)  // Same P2P coordination metadata in header
+            .header("X-Request-Id", &request_id);  // Same P2P coordination metadata in header
+
+        // Add X-data-parallel-rank header if dp_aware is enabled and rank was extracted
+        if let Some(rank) = decode_dp_rank {
+            decode_request_builder = decode_request_builder.header("X-data-parallel-rank", rank.to_string());
+            info!("Added X-data-parallel-rank={} header to decode request", rank);
+        }
+
+        let decode_response = decode_request_builder
             .body(decode_request_str)
             .send()
             .await
@@ -354,7 +409,7 @@ impl VllmPDRouter {
         info!("Decode server responded with status: {}", decode_response.status());
 
         // Stop profiling on decode server after response received
-        self.stop_profiling(&format!("http://{}", decode_http)).await;
+        self.stop_profiling(&format!("http://{}", decode_base_http)).await;
 
         // Convert reqwest::Response to axum::Response
         let status = decode_response.status();
@@ -413,20 +468,45 @@ impl VllmPDRouter {
 
         info!("Added kv_transfer_params to prefill request for NixlConnector support");
 
-        let prefill_url = format!("{}{}", prefill_worker.url(), path);
+        // Extract base URL and dp_rank if dp_aware is enabled
+        let (prefill_base_url, prefill_dp_rank) = if self.dp_aware {
+            match dp_utils::extract_dp_rank(prefill_worker.url()) {
+                Ok((base, rank)) => (base.to_string(), Some(rank)),
+                Err(e) => {
+                    return Err(PDRouterError::NetworkError {
+                        message: format!("Failed to extract dp_rank from prefill worker URL {}: {}", prefill_worker.url(), e),
+                    });
+                }
+            }
+        } else {
+            (prefill_worker.url().to_string(), None)
+        };
+
+        let prefill_url = format!("{}{}", prefill_base_url, path);
 
         info!("🚀 vLLM Stage 1 - Prefill: {} with request_id: {}", prefill_url, request_id);
-        info!("📤 Prefill request headers: Authorization=Bearer [REDACTED], X-Request-Id={}", request_id);
+        if let Some(rank) = prefill_dp_rank {
+            info!("📤 Prefill request headers: Authorization=Bearer [REDACTED], X-Request-Id={}, X-data-parallel-rank={}", request_id, rank);
+        } else {
+            info!("📤 Prefill request headers: Authorization=Bearer [REDACTED], X-Request-Id={}", request_id);
+        }
         info!("📤 Prefill request payload: {}", serde_json::to_string_pretty(&prefill_request).unwrap_or_default());
 
         // Start profiling on prefill server
-        self.start_profiling(prefill_worker.url()).await;
+        self.start_profiling(&prefill_base_url).await;
 
-        let prefill_response = self.pd_router.client
+        let mut prefill_request_builder = self.pd_router.client
             .post(&prefill_url)
             .header("Content-Type", "application/json")
             .header("Authorization", format!("Bearer {}", std::env::var("OPENAI_API_KEY").unwrap_or_default()))
-            .header("X-Request-Id", &request_id)
+            .header("X-Request-Id", &request_id);
+
+        // Add X-data-parallel-rank header if dp_aware is enabled
+        if let Some(rank) = prefill_dp_rank {
+            prefill_request_builder = prefill_request_builder.header("X-data-parallel-rank", rank.to_string());
+        }
+
+        let prefill_response = prefill_request_builder
             .json(&prefill_request)
             .send()
             .await
@@ -464,7 +544,7 @@ impl VllmPDRouter {
         }
 
         // Stop profiling on prefill server after its work is done
-        self.stop_profiling(prefill_worker.url()).await;
+        self.stop_profiling(&prefill_base_url).await;
 
         info!("✅ vLLM Stage 1 completed, starting Stage 2 - Decode");
 
@@ -475,20 +555,45 @@ impl VllmPDRouter {
             info!("Added kv_transfer_params to decode request");
         }
 
-        let decode_url = format!("{}{}", decode_worker.url(), path);
+        // Extract base URL and dp_rank if dp_aware is enabled
+        let (decode_base_url, decode_dp_rank) = if self.dp_aware {
+            match dp_utils::extract_dp_rank(decode_worker.url()) {
+                Ok((base, rank)) => (base.to_string(), Some(rank)),
+                Err(e) => {
+                    return Err(PDRouterError::NetworkError {
+                        message: format!("Failed to extract dp_rank from decode worker URL {}: {}", decode_worker.url(), e),
+                    });
+                }
+            }
+        } else {
+            (decode_worker.url().to_string(), None)
+        };
+
+        let decode_url = format!("{}{}", decode_base_url, path);
 
         info!("🚀 vLLM Stage 2 - Decode: {} with request_id: {}", decode_url, request_id);
-        info!("📤 Decode request headers: Authorization=Bearer [REDACTED], X-Request-Id={}", request_id);
+        if let Some(rank) = decode_dp_rank {
+            info!("📤 Decode request headers: Authorization=Bearer [REDACTED], X-Request-Id={}, X-data-parallel-rank={}", request_id, rank);
+        } else {
+            info!("📤 Decode request headers: Authorization=Bearer [REDACTED], X-Request-Id={}", request_id);
+        }
         info!("📤 Decode request payload: {}", serde_json::to_string_pretty(&decode_request).unwrap_or_default());
 
         // Start profiling on decode server
-        self.start_profiling(decode_worker.url()).await;
+        self.start_profiling(&decode_base_url).await;
 
-        let decode_response = self.pd_router.client
+        let mut decode_request_builder = self.pd_router.client
             .post(&decode_url)
             .header("Content-Type", "application/json")
             .header("Authorization", format!("Bearer {}", std::env::var("OPENAI_API_KEY").unwrap_or_default()))
-            .header("X-Request-Id", &request_id)
+            .header("X-Request-Id", &request_id);
+
+        // Add X-data-parallel-rank header if dp_aware is enabled
+        if let Some(rank) = decode_dp_rank {
+            decode_request_builder = decode_request_builder.header("X-data-parallel-rank", rank.to_string());
+        }
+
+        let decode_response = decode_request_builder
             .json(&decode_request)
             .send()
             .await
@@ -497,7 +602,7 @@ impl VllmPDRouter {
             })?;
 
         // Stop profiling on decode server after response received
-        self.stop_profiling(decode_worker.url()).await;
+        self.stop_profiling(&decode_base_url).await;
 
         // Convert reqwest::Response to axum::Response
         let status = decode_response.status();
@@ -557,6 +662,8 @@ impl VllmPDRouter {
                 enable_profiling: ctx.router_config.enable_profiling,
                 profile_timeout_secs: ctx.router_config.profile_timeout_secs,
                 profiling_tasks: Arc::new(Mutex::new(HashMap::new())),
+                dp_aware: ctx.router_config.dp_aware,
+                api_key: ctx.router_config.api_key.clone(),
             })
         } else {
             // Direct URL mode (same as PDRouter)
@@ -580,6 +687,8 @@ impl VllmPDRouter {
                 enable_profiling: ctx.router_config.enable_profiling,
                 profile_timeout_secs: ctx.router_config.profile_timeout_secs,
                 profiling_tasks: Arc::new(Mutex::new(HashMap::new())),
+                dp_aware: ctx.router_config.dp_aware,
+                api_key: ctx.router_config.api_key.clone(),
             })
         }
     }
@@ -626,9 +735,9 @@ impl RouterTrait for VllmPDRouter {
     // Override OpenAI-compatible routes for vLLM two-stage processing
     async fn route_chat(
         &self,
-        headers: Option<&HeaderMap>,
+        _headers: Option<&HeaderMap>,
         body: &crate::protocols::spec::ChatCompletionRequest,
-        model_id: Option<&str>,
+        _model_id: Option<&str>,
     ) -> Response {
         info!("vLLM route_chat called, use_discovery={}", self.use_discovery);
 

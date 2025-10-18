@@ -10,6 +10,7 @@ use crate::protocols::spec::{
     RerankRequest, RerankResponse, RerankResult, ResponsesRequest,
 };
 use crate::routers::header_utils;
+use crate::routers::http::dp_utils;
 use crate::routers::{RouterTrait, WorkerManagement};
 use axum::body::to_bytes;
 use axum::{
@@ -67,7 +68,7 @@ impl Router {
 
         let worker_urls = if ctx.router_config.dp_aware {
             // worker address now in the format of "http://host:port@dp_rank"
-            Self::get_dp_aware_workers(&worker_urls, &ctx.router_config.api_key)
+            dp_utils::get_dp_aware_workers(&worker_urls, &ctx.router_config.api_key)
                 .await
                 .map_err(|e| format!("Failed to get dp-aware workers: {}", e))?
         } else {
@@ -285,63 +286,6 @@ impl Router {
         }
     }
 
-    async fn get_worker_dp_size(worker_url: &str, api_key: &Option<String>) -> Result<usize, String> {
-        let client = reqwest::Client::new();
-        let mut req_builder = client.get(format!("{}/get_server_info", worker_url));
-        if let Some(key) = api_key {
-            req_builder = req_builder.bearer_auth(key);
-        }
-
-        match req_builder.send().await {
-            Ok(res) => {
-                if res.status().is_success() {
-                    let server_info = res
-                        .text()
-                        .await
-                        .map_err(|e| format!("failed to read text from response: {}", e))?;
-
-                    let server_info: serde_json::Value = serde_json::from_str(&server_info)
-                        .map_err(|e| format!("failed to decode JSON: {}", e))?;
-
-                    let dp_size = server_info
-                        .get("dp_size")
-                        .and_then(|v| v.as_u64())
-                        .ok_or_else(|| String::from("dp_size not found or not an u64"))?;
-
-                    Ok(if dp_size > usize::MAX as u64 {
-                        return Err(format!("dp_size is too large: {}", dp_size));
-                    } else {
-                        dp_size as usize
-                    })
-                } else {
-                    Err(format!("unexpected status code: {}", res.status()))
-                }
-            }
-            Err(e) => Err(format!("error response: {}", e)),
-        }
-    }
-
-    // Given a list of workers, return a list of workers with dp_rank as suffix
-    async fn get_dp_aware_workers(
-        worker_urls: &[String],
-        api_key: &Option<String>,
-    ) -> Result<Vec<String>, String> {
-        let mut dp_aware_workers: Vec<String> = Vec::new();
-
-        for url in worker_urls {
-            match Self::get_worker_dp_size(url, api_key).await {
-                Ok(dp_size) => {
-                    // Use all available DP ranks for consistent hashing validation
-                    for rank in 0..dp_size {
-                        dp_aware_workers.push(format!("{}@{}", url, rank));
-                    }
-                }
-                Err(e) => return Err(format!("Failed to get DP size for {}: {}", url, e)),
-            }
-        }
-
-        Ok(dp_aware_workers)
-    }
 
     fn select_first_worker(&self) -> Result<String, String> {
         let workers = self.worker_registry.get_all();
@@ -371,7 +315,7 @@ impl Router {
     pub async fn send_health_check(&self, worker_url: &str) -> Response {
         let health_url = if self.dp_aware {
             // Need to extract the URL from "http://host:port@dp_rank"
-            match Self::extract_dp_rank(worker_url) {
+            match dp_utils::extract_dp_rank(worker_url) {
                 Ok((worker_url_prefix, _dp_rank)) => worker_url_prefix,
                 Err(e) => {
                     error!("Failed to extract dp_rank for health check: {}", e);
@@ -608,7 +552,7 @@ impl Router {
     // Helper: return base worker URL (strips DP suffix when enabled)
     fn worker_base_url(&self, worker_url: &str) -> String {
         if self.dp_aware {
-            if let Ok((prefix, _)) = Self::extract_dp_rank(worker_url) {
+            if let Ok((prefix, _)) = dp_utils::extract_dp_rank(worker_url) {
                 return prefix.to_string();
             }
         }
@@ -713,22 +657,6 @@ impl Router {
             .await
     }
 
-    // TODO (rui): Better accommodate to the Worker abstraction
-    fn extract_dp_rank(worker_url: &str) -> Result<(&str, usize), String> {
-        let parts: Vec<&str> = worker_url.split('@').collect();
-        if parts.len() != 2 {
-            return Err(format!("invalid worker_url format: {}", worker_url));
-        }
-
-        // Parse the second part (dp_rank) into an integer
-        match parts[1].parse::<usize>() {
-            Ok(dp_rank) => Ok((parts[0], dp_rank)),
-            Err(_) => Err(format!(
-                "failed to parse dp_rank from worker_url: {}",
-                worker_url
-            )),
-        }
-    }
 
     // Send typed request directly without conversion
     async fn send_typed_request<T: serde::Serialize>(
@@ -741,7 +669,7 @@ impl Router {
         load_incremented: bool, // Whether load was incremented for this request
     ) -> Response {
         let (mut request_builder, extracted_dp_rank) = if self.dp_aware {
-            let (worker_url_prefix, dp_rank) = match Self::extract_dp_rank(worker_url) {
+            let (worker_url_prefix, dp_rank) = match dp_utils::extract_dp_rank(worker_url) {
                 Ok(tup) => tup,
                 Err(e) => {
                     error!("Failed to extract dp_rank: {}", e);
@@ -974,7 +902,7 @@ impl Router {
                             // Need to contact the worker to extract the dp_size,
                             // and add them as multiple workers
                             let url_vec = vec![String::from(worker_url)];
-                            let dp_url_vec = Self::get_dp_aware_workers(&url_vec, &self.api_key)
+                            let dp_url_vec = dp_utils::get_dp_aware_workers(&url_vec, &self.api_key)
                                 .await
                                 .map_err(|e| format!("Failed to get dp-aware workers: {}", e))?;
                             let mut worker_added: bool = false;
@@ -1167,7 +1095,7 @@ impl Router {
     async fn get_worker_load(&self, worker_url: &str) -> Option<isize> {
         let worker_url = if self.dp_aware {
             // Need to extract the URL from "http://host:port@dp_rank"
-            let (worker_url_prefix, _dp_rank) = match Self::extract_dp_rank(worker_url) {
+            let (worker_url_prefix, _dp_rank) = match dp_utils::extract_dp_rank(worker_url) {
                 Ok(tup) => tup,
                 Err(e) => {
                     error!("Failed to extract dp_rank: {}", e);
@@ -1252,7 +1180,7 @@ impl Router {
     async fn get_worker_load_static(client: &reqwest::Client, worker_url: &str) -> Option<isize> {
         let worker_url = if worker_url.contains("@") {
             // Need to extract the URL from "http://host:port@dp_rank"
-            let (worker_url_prefix, _dp_rank) = match Self::extract_dp_rank(worker_url) {
+            let (worker_url_prefix, _dp_rank) = match dp_utils::extract_dp_rank(worker_url) {
                 Ok(tup) => tup,
                 Err(e) => {
                     debug!("Failed to extract dp_rank: {}", e);
@@ -1486,7 +1414,7 @@ impl RouterTrait for Router {
         for worker_url in &worker_urls {
             let worker_url = if self.dp_aware {
                 // Need to extract the URL from "http://host:port@dp_rank"
-                let (worker_url_prefix, _dp_rank) = match Self::extract_dp_rank(worker_url) {
+                let (worker_url_prefix, _dp_rank) = match dp_utils::extract_dp_rank(worker_url) {
                     Ok(tup) => tup,
                     Err(e) => {
                         error!("Failed to extract dp_rank: {}", e);
