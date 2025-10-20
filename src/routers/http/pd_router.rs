@@ -133,32 +133,38 @@ impl PDRouter {
 
     /// Start profiling on a backend server
     pub async fn start_profiling(&self, worker_url: &str) {
-        let url = format!("{}/start_profile", worker_url);
+        // Extract base URL if worker_url is in DP-aware format (e.g., http://127.0.0.1:8081@2)
+        let (base_url, _) = super::dp_utils::parse_worker_url(worker_url);
+
+        let url = format!("{}/start_profile", base_url);
         match self.client.post(&url).send().await {
             Ok(res) if res.status().is_success() => {
-                info!("Started profiling on {}", worker_url);
+                info!("Started profiling on {}", base_url);
             }
             Ok(res) => {
-                warn!("Failed to start profiling on {}: status {}", worker_url, res.status());
+                warn!("Failed to start profiling on {}: status {}", base_url, res.status());
             }
             Err(e) => {
-                warn!("Error starting profiling on {}: {}", worker_url, e);
+                warn!("Error starting profiling on {}: {}", base_url, e);
             }
         }
     }
 
     /// Stop profiling on a backend server
     pub async fn stop_profiling(&self, worker_url: &str) {
-        let url = format!("{}/stop_profile", worker_url);
+        // Extract base URL if worker_url is in DP-aware format (e.g., http://127.0.0.1:8081@2)
+        let (base_url, _) = super::dp_utils::parse_worker_url(worker_url);
+
+        let url = format!("{}/stop_profile", base_url);
         match self.client.post(&url).send().await {
             Ok(res) if res.status().is_success() => {
-                info!("Stopped profiling on {}", worker_url);
+                info!("Stopped profiling on {}", base_url);
             }
             Ok(res) => {
-                warn!("Failed to stop profiling on {}: status {}", worker_url, res.status());
+                warn!("Failed to stop profiling on {}: status {}", base_url, res.status());
             }
             Err(e) => {
-                warn!("Error stopping profiling on {}: {}", worker_url, e);
+                warn!("Error stopping profiling on {}: {}", base_url, e);
             }
         }
     }
@@ -419,8 +425,46 @@ impl PDRouter {
             window_duration: Duration::from_secs(circuit_breaker_config.window_duration_secs),
         };
 
+        // Expand URLs to DP-aware format if dp_aware is enabled
+        let (expanded_prefill_urls, expanded_decode_urls) = if ctx.router_config.dp_aware {
+            info!("DP-aware mode enabled, expanding worker URLs");
+
+            // Extract base URLs from prefill_urls (url, port) tuples
+            let prefill_base_urls: Vec<String> = prefill_urls.iter().map(|(url, _)| url.clone()).collect();
+
+            // Expand prefill URLs with DP ranks
+            let expanded_prefill = super::dp_utils::get_dp_aware_workers(
+                &prefill_base_urls,
+                &ctx.router_config.api_key,
+            ).await.map_err(|e| format!("Failed to expand prefill workers: {}", e))?;
+
+            // Expand decode URLs with DP ranks
+            let expanded_decode = super::dp_utils::get_dp_aware_workers(
+                &decode_urls,
+                &ctx.router_config.api_key,
+            ).await.map_err(|e| format!("Failed to expand decode workers: {}", e))?;
+
+            info!("Expanded {} prefill URLs to {} DP-aware URLs", prefill_base_urls.len(), expanded_prefill.len());
+            info!("Expanded {} decode URLs to {} DP-aware URLs", decode_urls.len(), expanded_decode.len());
+
+            // Keep the bootstrap_port from the original URLs, apply to all expanded URLs
+            let prefill_with_ports: Vec<(String, Option<u16>)> = expanded_prefill
+                .into_iter()
+                .map(|url| {
+                    // Use the port from the first original URL (all DP replicas share the same port config)
+                    let port = prefill_urls.first().and_then(|(_, p)| *p);
+                    (url, port)
+                })
+                .collect();
+
+            (prefill_with_ports, expanded_decode)
+        } else {
+            info!("DP-aware mode disabled, using original worker URLs");
+            (prefill_urls, decode_urls)
+        };
+
         // Register prefill workers in the registry
-        for (url, port) in prefill_urls {
+        for (url, port) in expanded_prefill_urls {
             let worker = BasicWorker::new(
                 url,
                 WorkerType::Prefill {
@@ -439,7 +483,7 @@ impl PDRouter {
         }
 
         // Register decode workers in the registry
-        for url in decode_urls {
+        for url in expanded_decode_urls {
             let worker = BasicWorker::new(url, WorkerType::Decode)
                 .with_circuit_breaker_config(core_cb_config.clone())
                 .with_health_config(HealthConfig {
@@ -1527,7 +1571,17 @@ impl PDRouter {
         headers: Option<&HeaderMap>,
         connection_close: bool,
     ) -> reqwest::RequestBuilder {
-        let mut request = client.post(api_path(url, route)).json(json_request);
+        // Extract base URL and dp_rank using shared utility
+        let (base_url, dp_rank) = super::dp_utils::parse_worker_url(url);
+
+        let mut request = client.post(api_path(&base_url, route)).json(json_request);
+
+        // Add X-data-parallel-rank header using shared utility
+        request = super::dp_utils::add_dp_rank_header(request, dp_rank);
+        if dp_rank.is_some() {
+            debug!("Added X-data-parallel-rank={} header to request for {}", dp_rank.unwrap(), base_url);
+        }
+
         if connection_close {
             request = request.header("Connection", "close");
         }

@@ -201,8 +201,30 @@ impl Router {
         worker_startup_timeout_secs: u64,
         worker_startup_check_interval_secs: u64,
     ) -> Result<(), String> {
+        // Extract unique base URLs (hosts) for health checks
+        // This deduplicates DP-aware URLs like http://host:8081@0, @1, @2, @3
+        // to only check http://host:8081 once
+        use std::collections::HashSet;
+        let mut unique_hosts = HashSet::new();
+        let mut host_to_workers: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+
+        for url in worker_urls {
+            // Extract base URL by removing @rank suffix if present
+            let base_url = if let Some(at_pos) = url.rfind('@') {
+                url[..at_pos].to_string()
+            } else {
+                url.clone()
+            };
+
+            unique_hosts.insert(base_url.clone());
+            host_to_workers.entry(base_url).or_insert_with(Vec::new).push(url.clone());
+        }
+
+        let unique_hosts_vec: Vec<String> = unique_hosts.into_iter().collect();
+
         info!(
-            "Waiting for {} workers to become healthy (timeout: {}s)",
+            "Waiting for {} unique hosts (representing {} workers) to become healthy (timeout: {}s)",
+            unique_hosts_vec.len(),
             worker_urls.len(),
             worker_startup_timeout_secs
         );
@@ -216,20 +238,20 @@ impl Router {
         loop {
             if start_time.elapsed() > Duration::from_secs(worker_startup_timeout_secs) {
                 error!(
-                    "Timeout {}s waiting for workers {:?} to become healthy. Please set --router-worker-startup-timeout-secs (sglang_router.launch_server) or --worker-startup-timeout-secs (sglang_worker.router) to a larger value",
-                    worker_startup_timeout_secs, worker_urls
+                    "Timeout {}s waiting for hosts {:?} to become healthy. Please set --router-worker-startup-timeout-secs (sglang_router.launch_server) or --worker-startup-timeout-secs (sglang_worker.router) to a larger value",
+                    worker_startup_timeout_secs, unique_hosts_vec
                 );
                 return Err(format!(
-                    "Timeout {}s waiting for workers {:?} to become healthy. Please set --router-worker-startup-timeout-secs (sglang_router.launch_server) or --worker-startup-timeout-secs (sglang_worker.router) to a larger value",
-                    worker_startup_timeout_secs, worker_urls
+                    "Timeout {}s waiting for hosts {:?} to become healthy. Please set --router-worker-startup-timeout-secs (sglang_router.launch_server) or --worker-startup-timeout-secs (sglang_worker.router) to a larger value",
+                    worker_startup_timeout_secs, unique_hosts_vec
                 ));
             }
 
-            // Perform all health checks concurrently
+            // Perform health checks only on unique hosts (not per DP rank)
             let mut health_checks = Vec::new();
-            for url in worker_urls {
+            for base_url in &unique_hosts_vec {
                 let client_clone = client.clone();
-                let url_clone = url.clone();
+                let url_clone = base_url.clone();
 
                 let check_health = tokio::spawn(async move {
                     let health_url = format!("{}/health", url_clone);
@@ -252,34 +274,34 @@ impl Router {
             let results = futures::future::join_all(health_checks).await;
 
             let mut all_healthy = true;
-            let mut unhealthy_workers = Vec::new();
+            let mut unhealthy_hosts = Vec::new();
 
             for result in results {
                 match result {
                     Ok(None) => {
-                        // Worker is healthy
+                        // Host is healthy
                     }
                     Ok(Some((url, reason))) => {
                         all_healthy = false;
-                        unhealthy_workers.push((url, reason));
+                        unhealthy_hosts.push((url, reason));
                     }
                     Err(e) => {
                         all_healthy = false;
-                        unhealthy_workers
+                        unhealthy_hosts
                             .push(("unknown".to_string(), format!("task error: {}", e)));
                     }
                 }
             }
 
             if all_healthy {
-                info!("All {} workers are healthy", worker_urls.len());
+                info!("All {} unique hosts are healthy (representing {} workers)", unique_hosts_vec.len(), worker_urls.len());
                 return Ok(());
             } else {
                 debug!(
-                    "Waiting for {} workers to become healthy ({} unhealthy: {:?})",
-                    worker_urls.len(),
-                    unhealthy_workers.len(),
-                    unhealthy_workers
+                    "Waiting for {} unique hosts to become healthy ({} unhealthy: {:?})",
+                    unique_hosts_vec.len(),
+                    unhealthy_hosts.len(),
+                    unhealthy_hosts
                 );
                 tokio::time::sleep(Duration::from_secs(worker_startup_check_interval_secs)).await;
             }

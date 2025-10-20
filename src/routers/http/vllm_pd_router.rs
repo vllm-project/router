@@ -42,8 +42,6 @@ pub struct VllmPDRouter {
     profiling_tasks: Arc<Mutex<HashMap<String, tokio::task::AbortHandle>>>,
     /// Whether DP-aware routing is enabled
     dp_aware: bool,
-    /// API key for worker authentication
-    api_key: Option<String>,
 }
 
 impl VllmPDRouter {
@@ -289,19 +287,12 @@ impl VllmPDRouter {
         // Stage 1: Send to prefill server with max_tokens=1 and P2P coordination header
         info!("Stage 1: Sending prefill-only request (max_tokens=1) to prefill server at http://{}", prefill_http);
 
-        // Extract dp_rank from prefill_http if dp_aware is enabled
+        // Extract dp_rank from prefill_http if dp_aware is enabled using shared utility
         let (prefill_base_http, prefill_dp_rank) = if self.dp_aware {
             let prefill_url = format!("http://{}", prefill_http);
-            match dp_utils::extract_dp_rank(&prefill_url) {
-                Ok((base, rank)) => {
-                    let base_http = base.replace("http://", "").replace("https://", "");
-                    (base_http, Some(rank))
-                }
-                Err(_) => {
-                    // Not in DP-aware format, use as-is
-                    (prefill_http.to_string(), None)
-                }
-            }
+            let (base, rank) = dp_utils::parse_worker_url(&prefill_url);
+            let base_http = base.replace("http://", "").replace("https://", "");
+            (base_http, rank)
         } else {
             (prefill_http.to_string(), None)
         };
@@ -314,10 +305,10 @@ impl VllmPDRouter {
             .header("Content-Type", "application/json")
             .header("X-Request-Id", &request_id);  // P2P coordination metadata in header
 
-        // Add X-data-parallel-rank header if dp_aware is enabled and rank was extracted
-        if let Some(rank) = prefill_dp_rank {
-            prefill_request_builder = prefill_request_builder.header("X-data-parallel-rank", rank.to_string());
-            info!("Added X-data-parallel-rank={} header to prefill request", rank);
+        // Add X-data-parallel-rank header using shared utility
+        prefill_request_builder = dp_utils::add_dp_rank_header(prefill_request_builder, prefill_dp_rank);
+        if prefill_dp_rank.is_some() {
+            info!("Added X-data-parallel-rank={} header to prefill request", prefill_dp_rank.unwrap());
         }
 
         let prefill_response = prefill_request_builder
@@ -369,19 +360,12 @@ impl VllmPDRouter {
         // Stage 2: Send to decode server with original request and same P2P coordination header
         info!("Stage 2: Sending original request to decode server at http://{}", decode_http);
 
-        // Extract dp_rank from decode_http if dp_aware is enabled
+        // Extract dp_rank from decode_http if dp_aware is enabled using shared utility
         let (decode_base_http, decode_dp_rank) = if self.dp_aware {
             let decode_url = format!("http://{}", decode_http);
-            match dp_utils::extract_dp_rank(&decode_url) {
-                Ok((base, rank)) => {
-                    let base_http = base.replace("http://", "").replace("https://", "");
-                    (base_http, Some(rank))
-                }
-                Err(_) => {
-                    // Not in DP-aware format, use as-is
-                    (decode_http.to_string(), None)
-                }
-            }
+            let (base, rank) = dp_utils::parse_worker_url(&decode_url);
+            let base_http = base.replace("http://", "").replace("https://", "");
+            (base_http, rank)
         } else {
             (decode_http.to_string(), None)
         };
@@ -394,10 +378,10 @@ impl VllmPDRouter {
             .header("Content-Type", "application/json")
             .header("X-Request-Id", &request_id);  // Same P2P coordination metadata in header
 
-        // Add X-data-parallel-rank header if dp_aware is enabled and rank was extracted
-        if let Some(rank) = decode_dp_rank {
-            decode_request_builder = decode_request_builder.header("X-data-parallel-rank", rank.to_string());
-            info!("Added X-data-parallel-rank={} header to decode request", rank);
+        // Add X-data-parallel-rank header using shared utility
+        decode_request_builder = dp_utils::add_dp_rank_header(decode_request_builder, decode_dp_rank);
+        if decode_dp_rank.is_some() {
+            info!("Added X-data-parallel-rank={} header to decode request", decode_dp_rank.unwrap());
         }
 
         let decode_response = decode_request_builder
@@ -663,7 +647,6 @@ impl VllmPDRouter {
                 profile_timeout_secs: ctx.router_config.profile_timeout_secs,
                 profiling_tasks: Arc::new(Mutex::new(HashMap::new())),
                 dp_aware: ctx.router_config.dp_aware,
-                api_key: ctx.router_config.api_key.clone(),
             })
         } else {
             // Direct URL mode (same as PDRouter)
@@ -688,7 +671,6 @@ impl VllmPDRouter {
                 profile_timeout_secs: ctx.router_config.profile_timeout_secs,
                 profiling_tasks: Arc::new(Mutex::new(HashMap::new())),
                 dp_aware: ctx.router_config.dp_aware,
-                api_key: ctx.router_config.api_key.clone(),
             })
         }
     }

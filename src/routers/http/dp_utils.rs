@@ -112,6 +112,64 @@ pub fn extract_dp_rank(worker_url: &str) -> Result<(&str, usize), String> {
     }
 }
 
+/// Parse a worker URL and extract base URL and optional dp_rank
+///
+/// This is a convenience function that handles both DP-aware URLs (with @rank suffix)
+/// and regular URLs (without @rank suffix).
+///
+/// # Arguments
+/// * `worker_url` - Worker URL which may or may not have @rank suffix
+///
+/// # Returns
+/// * `(String, Option<usize>)` - Tuple of (base_url, optional_dp_rank)
+///   - For DP-aware URL "http://host:8000@3": returns ("http://host:8000", Some(3))
+///   - For regular URL "http://host:8000": returns ("http://host:8000", None)
+///
+/// # Example
+/// ```
+/// let (base, rank) = parse_worker_url("http://worker:8000@3");
+/// assert_eq!(base, "http://worker:8000");
+/// assert_eq!(rank, Some(3));
+///
+/// let (base, rank) = parse_worker_url("http://worker:8000");
+/// assert_eq!(base, "http://worker:8000");
+/// assert_eq!(rank, None);
+/// ```
+pub fn parse_worker_url(worker_url: &str) -> (String, Option<usize>) {
+    match extract_dp_rank(worker_url) {
+        Ok((base, rank)) => (base.to_string(), Some(rank)),
+        Err(_) => (worker_url.to_string(), None),
+    }
+}
+
+/// Add X-data-parallel-rank header to a reqwest RequestBuilder if dp_rank is present
+///
+/// This is a utility function to standardize how DP rank headers are added to HTTP requests.
+///
+/// # Arguments
+/// * `request` - The reqwest RequestBuilder to add headers to
+/// * `dp_rank` - Optional DP rank to add as a header
+///
+/// # Returns
+/// * The RequestBuilder with the header added (if dp_rank was Some)
+///
+/// # Example
+/// ```
+/// let client = reqwest::Client::new();
+/// let mut request = client.post("http://worker:8000/v1/generate");
+/// request = add_dp_rank_header(request, Some(3));
+/// // Request now has "X-data-parallel-rank: 3" header
+/// ```
+pub fn add_dp_rank_header(
+    mut request: reqwest::RequestBuilder,
+    dp_rank: Option<usize>,
+) -> reqwest::RequestBuilder {
+    if let Some(rank) = dp_rank {
+        request = request.header("X-data-parallel-rank", rank.to_string());
+    }
+    request
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
