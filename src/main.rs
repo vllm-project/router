@@ -44,25 +44,6 @@ fn parse_prefill_args() -> Vec<(String, Option<u16>)> {
     prefill_entries
 }
 
-/// Parse decode arguments
-fn parse_decode_args() -> Vec<String> {
-    let args: Vec<String> = std::env::args().collect();
-    let mut decode_entries = Vec::new();
-    let mut i = 0;
-
-    while i < args.len() {
-        if args[i] == "--decode" && i + 1 < args.len() {
-            let url = args[i + 1].clone();
-            decode_entries.push(url);
-            i += 2; // Skip --decode and URL
-        } else {
-            i += 1;
-        }
-    }
-
-    decode_entries
-}
-
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
 pub enum Backend {
     #[value(name = "vllm")]
@@ -447,11 +428,11 @@ impl CliArgs {
                 decode_policy: self.decode_policy.as_ref().map(|p| self.parse_policy(p)),
             }
         } else if self.vllm_pd_disaggregation {
-            // Parse decode URLs to check for mixed mode (both URLs and service discovery)
-            let decode_urls = parse_decode_args();
+            // Use decode URLs from CLI arguments (already parsed by clap)
+            let decode_urls = &self.decode;
 
             // Support both pure service discovery mode and hybrid mode with static URLs
-            let use_static_urls = !prefill_urls.is_empty() || !decode_urls.is_empty() || !self.decode.is_empty();
+            let use_static_urls = !prefill_urls.is_empty() || !decode_urls.is_empty();
             let use_discovery = self.vllm_discovery_address.is_some();
 
             if !use_static_urls && !use_discovery {
@@ -460,9 +441,8 @@ impl CliArgs {
                 });
             }
 
-            // Combine decode URLs from both sources
-            let mut final_decode_urls = decode_urls.clone();
-            final_decode_urls.extend(self.decode.clone());
+            // Use decode URLs directly from CLI
+            let final_decode_urls = decode_urls.clone();
 
             if use_static_urls && use_discovery {
                 eprintln!("ℹ️  INFO: Using hybrid mode - static URLs as fallback, service discovery for dynamic workers.");
