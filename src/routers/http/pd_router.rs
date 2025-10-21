@@ -697,13 +697,25 @@ impl PDRouter {
 
     // Helper to determine batch size from a CompletionRequest
     fn get_completion_batch_size(req: &CompletionRequest) -> Option<usize> {
-        // Check prompt array
-        if let StringOrArray::Array(arr) = &req.prompt {
-            if !arr.is_empty() {
-                return Some(arr.len());
+        // Check prompt type and return batch size
+        use crate::protocols::spec::PromptInput;
+        match &req.prompt {
+            PromptInput::StringArray(arr) => {
+                if !arr.is_empty() {
+                    Some(arr.len())
+                } else {
+                    None
+                }
             }
+            PromptInput::IntBatch(batch) => {
+                if !batch.is_empty() {
+                    Some(batch.len())
+                } else {
+                    None
+                }
+            }
+            _ => None, // Single string or single int array = batch size 1 (not batched)
         }
-        None
     }
 
     // Helper to inject bootstrap fields into an existing JSON request value
@@ -1970,10 +1982,7 @@ impl RouterTrait for PDRouter {
 
         // Extract text for cache-aware routing
         let request_text = if self.policies_need_request_text() {
-            match &body.prompt {
-                StringOrArray::String(s) => Some(s.clone()),
-                StringOrArray::Array(v) => v.first().map(|s| s.to_string()),
-            }
+            Some(body.prompt.extract_text_for_routing())
         } else {
             None
         };

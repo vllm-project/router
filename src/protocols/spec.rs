@@ -433,7 +433,8 @@ pub struct CompletionRequest {
     pub model: String,
 
     /// The prompt(s) to generate completions for
-    pub prompt: StringOrArray,
+    /// Supports: str, list[str], list[int], list[list[int]]
+    pub prompt: PromptInput,
 
     /// The suffix that comes after a completion of inserted text
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -572,10 +573,7 @@ impl GenerationRequest for CompletionRequest {
     }
 
     fn extract_text_for_routing(&self) -> String {
-        match &self.prompt {
-            StringOrArray::String(s) => s.clone(),
-            StringOrArray::Array(v) => v.join(" "),
-        }
+        self.prompt.extract_text_for_routing()
     }
 }
 
@@ -2097,6 +2095,84 @@ impl StringOrArray {
         match self {
             StringOrArray::String(s) => vec![s.clone()],
             StringOrArray::Array(arr) => arr.clone(),
+        }
+    }
+}
+
+/// Prompt input type supporting both text and token IDs
+/// Compatible with vLLM's prompt field format
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(untagged)]
+pub enum PromptInput {
+    /// Batch of token ID sequences: list[list[int]]
+    /// This must come first due to serde untagged matching order
+    IntBatch(Vec<Vec<i32>>),
+    /// Array of strings: list[str]
+    StringArray(Vec<String>),
+    /// Single token ID sequence: list[int]
+    IntArray(Vec<i32>),
+    /// Single string: str
+    String(String),
+}
+
+impl PromptInput {
+    /// Get the number of items in the PromptInput
+    pub fn len(&self) -> usize {
+        match self {
+            PromptInput::String(_) => 1,
+            PromptInput::StringArray(arr) => arr.len(),
+            PromptInput::IntArray(_) => 1,
+            PromptInput::IntBatch(batch) => batch.len(),
+        }
+    }
+
+    /// Check if the PromptInput is empty
+    pub fn is_empty(&self) -> bool {
+        match self {
+            PromptInput::String(s) => s.is_empty(),
+            PromptInput::StringArray(arr) => arr.is_empty(),
+            PromptInput::IntArray(arr) => arr.is_empty(),
+            PromptInput::IntBatch(batch) => batch.is_empty(),
+        }
+    }
+
+    /// Extract text representation for routing decisions
+    /// For token IDs, converts to a string representation
+    pub fn extract_text_for_routing(&self) -> String {
+        match self {
+            PromptInput::String(s) => s.clone(),
+            PromptInput::StringArray(arr) => arr.join(" "),
+            PromptInput::IntArray(ids) => {
+                // Convert token IDs to string representation for routing
+                // Format: "token_ids:<count>" to indicate this is a token-based prompt
+                format!("token_ids:{}", ids.len())
+            }
+            PromptInput::IntBatch(batches) => {
+                // For batches, use total token count
+                let total_tokens: usize = batches.iter().map(|b| b.len()).sum();
+                format!("token_ids_batch:{}:{}", batches.len(), total_tokens)
+            }
+        }
+    }
+
+    /// Check if this prompt is token-based (not text)
+    pub fn is_token_based(&self) -> bool {
+        matches!(self, PromptInput::IntArray(_) | PromptInput::IntBatch(_))
+    }
+
+    /// Get the total token count if token-based, otherwise estimate from text
+    pub fn estimated_token_count(&self) -> usize {
+        match self {
+            PromptInput::String(s) => {
+                // Rough estimate: ~4 chars per token on average
+                s.len() / 4
+            }
+            PromptInput::StringArray(arr) => {
+                // Sum estimated tokens for all strings
+                arr.iter().map(|s| s.len() / 4).sum()
+            }
+            PromptInput::IntArray(ids) => ids.len(),
+            PromptInput::IntBatch(batches) => batches.iter().map(|b| b.len()).sum(),
         }
     }
 }
