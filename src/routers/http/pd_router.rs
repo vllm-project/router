@@ -1617,6 +1617,9 @@ impl PDRouter {
 
     // Helper to merge logprobs from prefill and decode responses
     fn merge_logprobs_in_json(prefill_json: &Value, decode_json: &mut Value) -> bool {
+        let mut merged = false;
+
+        // 1. Try to merge meta_info/input_token_logprobs (for Generate API)
         if let (Some(prefill_meta), Some(decode_meta)) = (
             prefill_json.get("meta_info"),
             decode_json.get_mut("meta_info"),
@@ -1628,14 +1631,50 @@ impl PDRouter {
                 if let (Some(prefill_arr), Some(decode_arr)) =
                     (prefill_logprobs.as_array(), decode_logprobs.as_array_mut())
                 {
-                    let mut merged = prefill_arr.clone();
-                    merged.extend(decode_arr.clone());
-                    decode_meta["input_token_logprobs"] = Value::Array(merged);
-                    return true;
+                    let mut merged_logprobs = prefill_arr.clone();
+                    merged_logprobs.extend(decode_arr.clone());
+                    decode_meta["input_token_logprobs"] = Value::Array(merged_logprobs);
+                    merged = true;
                 }
             }
         }
-        false
+
+        // 2. Try to merge prompt_logprobs (for Chat Completions API)
+        // Chat Completions: prompt_logprobs is at top level
+        if let Some(prefill_prompt_logprobs) = prefill_json.get("prompt_logprobs") {
+            // Insert into decode response at top level
+            if let Some(decode_obj) = decode_json.as_object_mut() {
+                decode_obj.insert(
+                    "prompt_logprobs".to_string(),
+                    prefill_prompt_logprobs.clone(),
+                );
+                merged = true;
+            }
+        }
+
+        // 3. Try to merge prompt_logprobs in choices (for Completions API)
+        // Completions: prompt_logprobs is inside each choice
+        if let Some(choices) = decode_json.get_mut("choices").and_then(|v| v.as_array_mut()) {
+            if let Some(prefill_choices) = prefill_json.get("choices").and_then(|v| v.as_array()) {
+                // Merge prompt_logprobs from prefill choices into decode choices
+                for (decode_choice, prefill_choice) in choices.iter_mut().zip(prefill_choices.iter()) {
+                    if let (Some(decode_obj), Some(prefill_obj)) = (
+                        decode_choice.as_object_mut(),
+                        prefill_choice.as_object(),
+                    ) {
+                        if let Some(prefill_prompt_logprobs) = prefill_obj.get("prompt_logprobs") {
+                            decode_obj.insert(
+                                "prompt_logprobs".to_string(),
+                                prefill_prompt_logprobs.clone(),
+                            );
+                            merged = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        merged
     }
 
     // Simple helper to merge logprobs in streaming responses
@@ -1655,6 +1694,7 @@ impl PDRouter {
 
         // Merge prefill logprobs if available
         if let Some(ref p_logprobs) = prefill_logprobs {
+            // 1. Try to merge meta_info/input_token_logprobs (for Generate API)
             if let Some(meta) = decode_json.get_mut("meta_info") {
                 if let Some(d_logprobs) = meta.get_mut("input_token_logprobs") {
                     if let (Some(p_arr), Some(d_arr)) =
@@ -1663,6 +1703,33 @@ impl PDRouter {
                         let mut merged = p_arr.clone();
                         merged.extend(d_arr.clone());
                         *d_logprobs = Value::Array(merged);
+                    }
+                }
+            }
+
+            // 2. Try to merge prompt_logprobs at top level (for Chat Completions API)
+            // In streaming, only add on the first chunk to avoid duplication
+            if let Some(decode_obj) = decode_json.as_object_mut() {
+                if !decode_obj.contains_key("prompt_logprobs") {
+                    decode_obj.insert(
+                        "prompt_logprobs".to_string(),
+                        p_logprobs.clone(),
+                    );
+                }
+            }
+
+            // 3. Try to merge prompt_logprobs in choices (for Completions API)
+            if let Some(choices) = decode_json.get_mut("choices").and_then(|v| v.as_array_mut()) {
+                for choice in choices.iter_mut() {
+                    if let Some(choice_obj) = choice.as_object_mut() {
+                        // For streaming, only merge if the choice doesn't already have prompt_logprobs
+                        // This prevents duplication across multiple chunks
+                        if !choice_obj.contains_key("prompt_logprobs") {
+                            choice_obj.insert(
+                                "prompt_logprobs".to_string(),
+                                p_logprobs.clone(),
+                            );
+                        }
                     }
                 }
             }
