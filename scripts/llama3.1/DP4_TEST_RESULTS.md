@@ -104,6 +104,18 @@ curl -X POST http://127.0.0.1:8090/v1/completions \
 3. Verify load balancing across DP replicas
 4. Compare performance vs baseline (without --dp-aware)
 
+### Prerequisites
+Before running the commands, please update the path variables in the startup scripts:
+
+1. **Identify your repository path:**
+   - Find the path for the cloned `router` repository
+   - Example: `/data/users/nlalit/gitrepos/router`
+
+2. **Update script paths:**
+   - Open each script (`start_prefill.sh`, `start_decode.sh`, `start_router.sh`)
+   - Update the `cd` command with your actual router repository path
+   - Example: Change `cd ~/gitrepos/router` to `cd /data/users/nlalit/gitrepos/router`
+
 ### Commands to Run
 ```bash
 # Start prefill server
