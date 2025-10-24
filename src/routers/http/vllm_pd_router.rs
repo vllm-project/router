@@ -128,7 +128,7 @@ impl VllmPDRouter {
         }
         // Force non-streaming for prefill to get JSON response with kv_transfer_params
         request["stream"] = json!(false);
-        // Remove stream_options since we're setting stream=false (vLLM requires stream=true for stream_options)
+        // Remove stream_options since we're setting stream=false
         if let Some(obj) = request.as_object_mut() {
             obj.remove("stream_options");
         }
@@ -271,7 +271,7 @@ impl VllmPDRouter {
         }
         // Force non-streaming for prefill to get JSON response with kv_transfer_params
         prefill_request["stream"] = serde_json::Value::Bool(false);
-        // Remove stream_options since we're setting stream=false (vLLM requires stream=true for stream_options)
+        // Remove stream_options since we're setting stream=false
         prefill_request.as_object_mut().and_then(|obj| obj.remove("stream_options"));
 
         // Add kv_transfer_params for NixlConnector support at top level
