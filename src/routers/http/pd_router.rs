@@ -1,5 +1,6 @@
 // PD (Prefill-Decode) Router Implementation
 // This module handles routing for disaggregated prefill-decode systems
+use super::logprobs_merge;
 use super::pd_types::{api_path, PDRouterError};
 use crate::config::types::RetryConfig;
 use crate::core::{
@@ -1616,65 +1617,9 @@ impl PDRouter {
     }
 
     // Helper to merge logprobs from prefill and decode responses
+    // This is now a thin wrapper around the utility function in logprobs_merge module
     fn merge_logprobs_in_json(prefill_json: &Value, decode_json: &mut Value) -> bool {
-        let mut merged = false;
-
-        // 1. Try to merge meta_info/input_token_logprobs (for Generate API)
-        if let (Some(prefill_meta), Some(decode_meta)) = (
-            prefill_json.get("meta_info"),
-            decode_json.get_mut("meta_info"),
-        ) {
-            if let (Some(prefill_logprobs), Some(decode_logprobs)) = (
-                prefill_meta.get("input_token_logprobs"),
-                decode_meta.get_mut("input_token_logprobs"),
-            ) {
-                if let (Some(prefill_arr), Some(decode_arr)) =
-                    (prefill_logprobs.as_array(), decode_logprobs.as_array_mut())
-                {
-                    let mut merged_logprobs = prefill_arr.clone();
-                    merged_logprobs.extend(decode_arr.clone());
-                    decode_meta["input_token_logprobs"] = Value::Array(merged_logprobs);
-                    merged = true;
-                }
-            }
-        }
-
-        // 2. Try to merge prompt_logprobs (for Chat Completions API)
-        // Chat Completions: prompt_logprobs is at top level
-        if let Some(prefill_prompt_logprobs) = prefill_json.get("prompt_logprobs") {
-            // Insert into decode response at top level
-            if let Some(decode_obj) = decode_json.as_object_mut() {
-                decode_obj.insert(
-                    "prompt_logprobs".to_string(),
-                    prefill_prompt_logprobs.clone(),
-                );
-                merged = true;
-            }
-        }
-
-        // 3. Try to merge prompt_logprobs in choices (for Completions API)
-        // Completions: prompt_logprobs is inside each choice
-        if let Some(choices) = decode_json.get_mut("choices").and_then(|v| v.as_array_mut()) {
-            if let Some(prefill_choices) = prefill_json.get("choices").and_then(|v| v.as_array()) {
-                // Merge prompt_logprobs from prefill choices into decode choices
-                for (decode_choice, prefill_choice) in choices.iter_mut().zip(prefill_choices.iter()) {
-                    if let (Some(decode_obj), Some(prefill_obj)) = (
-                        decode_choice.as_object_mut(),
-                        prefill_choice.as_object(),
-                    ) {
-                        if let Some(prefill_prompt_logprobs) = prefill_obj.get("prompt_logprobs") {
-                            decode_obj.insert(
-                                "prompt_logprobs".to_string(),
-                                prefill_prompt_logprobs.clone(),
-                            );
-                            merged = true;
-                        }
-                    }
-                }
-            }
-        }
-
-        merged
+        logprobs_merge::merge_logprobs_in_json(prefill_json, decode_json)
     }
 
     // Simple helper to merge logprobs in streaming responses
