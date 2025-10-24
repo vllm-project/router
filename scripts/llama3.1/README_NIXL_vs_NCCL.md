@@ -81,6 +81,7 @@ export VLLM_LOGGING_LEVEL=DEBUG                   # For debugging
 
 #### NIXL Connector Issues
 - Verify UCX installation: `ucx_info -v`
+- Install nixl if not already installed or getting "NIXL is not available" errors: `uv pip install nixl`
 - Check gdrcopy: `dpkg -l | grep libgdrapi`
 - Verify `VLLM_NIXL_SIDE_CHANNEL_HOST` is set to correct IP
 - Check NIXL handshake logs for connection issues
