@@ -2,7 +2,7 @@
 
 A high-performance request routing system for vLLM deployments, providing advanced load balancing and specialized routing for modern LLM serving architectures.
 
-## 🚀 Release Roadmap
+## Release Roadmap
 
 - **September 2025**: Internal testing with select vLLM developers. Core features implemented and tested:
   - Data Parallelism-aware Routing
@@ -11,26 +11,18 @@ A high-performance request routing system for vLLM deployments, providing advanc
 - **October 2025**: Development and testing of remaining functionalities ([progress tracking](https://docs.google.com/document/d/1d1gi5ex7yCpfMtmCQtwVcsmtOjDIevIOp8HLiA_WlPk/edit?tab=t.0))
 - **November 2025**: Evaluation for potential integration into vLLM core repository
 
-## 🏗️ Built on SGLang Router Foundation
+### Key Features
 
-This router is adapted from the excellent [SGLang router](https://github.com/sgl-project/sglang/tree/main/sgl-router), enabling data parallelism across vLLM instances with enterprise-grade reliability and performance.
+- **Core Architecture**: Request routing framework and async processing patterns
+- **API Compatibility**: Seamless migration path between SGLang and vLLM ecosystems
+- **Load Balancing**: Multiple algorithms (cache-aware, power of two, consistent hashing, random, round robin)
+- **Prefill-Decode Disaggregation**: Specialized routing for separated processing phases
+- **Service Discovery**: Kubernetes-native worker management and health monitoring
+- **Enterprise Features**: Circuit breakers, retry logic, metrics collection, and tool parsing
 
-## 🙏 Attribution and Acknowledgments
+This router adapted the [SGLang router](https://github.com/sgl-project/sglang/tree/main/sgl-router) API design and implementation for those sharing functionalities. Both SGLang and vLLM projects use the Apache-2.0 license, enabling this collaborative adaptation. This router maintains API compatibility with SGLang router and minimizes code changes to facilitate easy ecosystem transitions and foster potential future unification.
 
-This project builds upon the foundational work of the SGLang router developed by the SGLang team. We deeply appreciate their innovative design and open-source contribution to the LLM serving ecosystem.
-
-### Key Features Adapted from SGLang Router
-
-- **🏛️ Core Architecture**: Request routing framework and async processing patterns
-- **🔌 API Compatibility**: Seamless migration path between SGLang and vLLM ecosystems
-- **⚖️ Load Balancing**: Multiple algorithms (cache-aware, power of two, consistent hashing, random, round robin)
-- **🔀 Prefill-Decode Disaggregation**: Specialized routing for separated processing phases
-- **☸️ Service Discovery**: Kubernetes-native worker management and health monitoring
-- **🛡️ Enterprise Features**: Circuit breakers, retry logic, metrics collection, and tool parsing
-
-Both SGLang and vLLM projects use the Apache-2.0 license, enabling this collaborative adaptation. This router maintains API compatibility with SGLang router and minimizes code changes to facilitate easy ecosystem transitions and foster potential future unification.
-
-## 🚀 Quick Start
+## Quick Start
 
 ### Prerequisites
 
@@ -51,12 +43,23 @@ cargo --version
 
 ### Installation & Basic Usage
 
+#### Rust Binary
 ```bash
 # Build Rust components
 cargo build --release
 ```
 
-### 🔧 Usage Examples
+#### Python Package
+```bash
+pip install setuptools-rust wheel build
+python -m build
+pip install dist/*.whl
+
+# Rebuild & reinstall in one step during development
+python -m build && pip install --force-reinstall dist/*.whl
+```
+
+### Usage Examples
 
 #### Standard Data Parallelism Routing
 ```bash
@@ -69,6 +72,11 @@ cargo build --release
 cargo run --release -- \
     --worker-urls http://0.0.0.0:8000 \
     --dp-aware --policy consistent_hash
+
+# Alternative: using python launcher
+vllm-router \
+  --worker-urls http://worker1:8000 http://worker2:8000 \
+  --policy cache_aware
 ```
 
 #### Prefill-Decode Disaggregation with ZMQ Service Discovery
@@ -83,9 +91,9 @@ cargo run --release -- \
     --decode-policy consistent_hash
 ```
 
-## ⚙️ Configuration
+## Configuration
 
-### 📝 Logging
+### Logging
 
 Enable structured logging with optional file output:
 
@@ -104,25 +112,25 @@ router = Router(
 
 Set log level with `--log-level` flag ([documentation](https://docs.vllm.ai/backend/server_arguments.html#logging)).
 
-### 📊 Metrics
+### Metrics
 
 Prometheus metrics endpoint available at `127.0.0.1:29000` by default.
 
 ```bash
 # Custom metrics configuration
-python -m vllm_router.launch_router \
+vllm-router \
     --worker-urls http://localhost:8080 http://localhost:8081 \
     --prometheus-host 0.0.0.0 \
     --prometheus-port 9000
 ```
 
-### 🔄 Retries and Circuit Breakers
+### Retries and Circuit Breakers
 
 #### Retry Configuration
 Retries are enabled by default with exponential backoff and jitter:
 
 ```bash
-python -m vllm_router.launch_router \
+vllm-router \
   --worker-urls http://localhost:8080 http://localhost:8081 \
   --retry-max-retries 3 \
   --retry-initial-backoff-ms 100 \
@@ -135,7 +143,7 @@ python -m vllm_router.launch_router \
 Circuit breakers protect workers and provide automatic recovery:
 
 ```bash
-python -m vllm_router.launch_router \
+vllm-router \
   --worker-urls http://localhost:8080 http://localhost:8081 \
   --cb-failure-threshold 5 \
   --cb-success-threshold 2 \
@@ -151,29 +159,29 @@ python -m vllm_router.launch_router \
 
 **Retry Policy:** Retries on HTTP status codes 408/429/500/502/503/504, with backoff/jitter between attempts.
 
-### 🔍 Request ID Tracking
+### Request ID Tracking
 
 Track requests across distributed systems with configurable headers:
 
 ```bash
 # Use custom request ID headers
-python -m vllm_router.launch_router \
+vllm-router \
     --worker-urls http://localhost:8080 \
     --request-id-headers x-trace-id x-request-id
 ```
 
 **Default headers:** `x-request-id`, `x-correlation-id`, `x-trace-id`, `request-id`
 
-## 🚀 Advanced Features
+## Advanced Features
 
-### ☸️ Kubernetes Service Discovery
+### Kubernetes Service Discovery
 
 Automatic worker discovery and management in Kubernetes environments.
 
 #### Basic Service Discovery
 
 ```bash
-python -m vllm_router.launch_router \
+vllm-router \
     --service-discovery \
     --selector app=vllm-worker role=inference \
     --service-discovery-namespace default
@@ -214,7 +222,7 @@ roleRef:
   apiGroup: rbac.authorization.k8s.io
 ```
 
-### 📋 Command Line Arguments Reference
+### Command Line Arguments Reference
 
 #### Service Discovery
 - `--service-discovery`: Enable Kubernetes service discovery
@@ -222,7 +230,7 @@ roleRef:
 - `--service-discovery-namespace`: Kubernetes namespace to watch
 - `--selector`: Label selectors for regular mode (format: `key1=value1 key2=value2`)
 
-## 🛠️ Development
+## Development
 
 ### Troubleshooting
 
@@ -235,40 +243,40 @@ Set `rust-analyzer.linkedProjects` to the absolute path of `Cargo.toml`:
 }
 ```
 
-### 🔄 CI/CD Pipeline
+### CI/CD Pipeline
 
 The continuous integration pipeline includes comprehensive testing, benchmarking, and publishing:
 
 #### Build & Test
-1. **🏗️ Build Wheels**: Uses `cibuildwheel` for manylinux x86_64 packages
-2. **📦 Build Source Distribution**: Creates source distribution for pip fallback
-3. **⚡ Rust HTTP Server Benchmarking**: Performance testing of router overhead
-4. **🧪 Basic Inference Testing**: End-to-end validation through the router
-5. **🔀 PD Disaggregation Testing**: Benchmark and sanity checks for prefill-decode load balancing
+1. **Build Wheels**: Uses `cibuildwheel` for manylinux x86_64 packages
+2. **Build Source Distribution**: Creates source distribution for pip fallback
+3. **Rust HTTP Server Benchmarking**: Performance testing of router overhead
+4. **Basic Inference Testing**: End-to-end validation through the router
+5. **PD Disaggregation Testing**: Benchmark and sanity checks for prefill-decode load balancing
 
 #### Publishing
-- **🐍 PyPI Publishing**: Wheels and source distributions published when version changes in `pyproject.toml`
-- **🐳 Container Images**: Docker images published using `/docker/Dockerfile.router`
+- **PyPI Publishing**: Wheels and source distributions published when version changes in `pyproject.toml`
+- **Container Images**: Docker images published using `/docker/Dockerfile.router`
 
-## ✨ Key Features
+## Key Features
 
-### 🚀 Performance & Scalability
+### Performance & Scalability
 - **High Performance**: Rust-based routing with connection pooling and optimized request handling
 - **Scalability**: Handles thousands of concurrent connections with efficient resource utilization
 
-### ⚖️ Advanced Load Balancing
-- **🧠 Cache-Aware**: Intelligent routing based on cache locality for optimal performance
-- **⚡ Power of Two**: Chooses the less loaded of two randomly selected workers
-- **🎲 Random**: Distributes requests randomly across available workers
-- **🔄 Round Robin**: Sequential distribution across workers in rotation
-- **🏗️ Consistent Hash**: Session-aware routing for stateful workloads
+### Advanced Load Balancing
+- **Cache-Aware**: Intelligent routing based on cache locality for optimal performance
+- **Power of Two**: Chooses the less loaded of two randomly selected workers
+- **Random**: Distributes requests randomly across available workers
+- **Round Robin**: Sequential distribution across workers in rotation
+- **Consistent Hash**: Session-aware routing for stateful workloads
 
-### 🔀 Specialized Routing
+### Specialized Routing
 - **Prefill-Decode Disaggregation**: Specialized load balancing for separated prefill and decode servers
 - **Data Parallelism Awareness**: Optimized routing for distributed training and inference
 
-### 🛡️ Enterprise Grade
-- **☸️ Service Discovery**: Automatic Kubernetes worker discovery and health management
-- **📊 Monitoring**: Comprehensive Prometheus metrics and structured logging
-- **🔧 Circuit Breakers**: Automatic fault tolerance and recovery
-- **🔄 Retry Logic**: Intelligent request retry with exponential backoff
+### Enterprise Grade
+- **Service Discovery**: Automatic Kubernetes worker discovery and health management
+- **Monitoring**: Comprehensive Prometheus metrics and structured logging
+- **Circuit Breakers**: Automatic fault tolerance and recovery
+- **Retry Logic**: Intelligent request retry with exponential backoff

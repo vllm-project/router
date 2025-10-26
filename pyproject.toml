@@ -29,6 +29,9 @@ dev = [
     "requests>=2.25.0",
 ]
 
+[project.scripts]
+vllm-router = "vllm_router.launch_router:main"
+
 
 # https://github.com/PyO3/setuptools-rust?tab=readme-ov-file
 [tool.setuptools.packages]
