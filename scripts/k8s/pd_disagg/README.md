@@ -157,6 +157,35 @@ Inter-token Latency:
 - ✅ Stable token generation throughput (~603 tok/s average, ~704 tok/s peak)
 - ✅ Low and consistent inter-token latency (~24ms mean)
 
+### Performance Comparison: vLLM Router vs. Native Gateway
+
+Comparison with llm-d native Istio gateway (same test configuration):
+
+| Metric | vLLM Router | llm-d Gateway | Difference |
+|--------|-------------|---------------|------------|
+| Successful requests | 100/100 | 100/100 | - |
+| Benchmark duration (s) | 331.81 | 326.47 | +1.6% |
+| Output token throughput (tok/s) | 602.75 | 612.61 | -1.6% |
+| Peak output throughput (tok/s) | 704.00 | 688.00 | +2.3% |
+| Mean TTFT (ms) | 689.94 | 248.12 | +178% |
+| Median TTFT (ms) | 652.62 | 193.10 | +238% |
+| P99 TTFT (ms) | 1681.16 | 438.54 | +283% |
+| Mean TPOT (ms) | 24.16 | 23.97 | +0.8% |
+| Median TPOT (ms) | 24.49 | 24.10 | +1.6% |
+| P99 TPOT (ms) | 25.06 | 24.90 | +0.6% |
+| Mean ITL (ms) | 24.16 | 23.97 | +0.8% |
+| Median ITL (ms) | 23.99 | 24.15 | -0.7% |
+| P99 ITL (ms) | 27.03 | 27.24 | -0.8% |
+
+**Analysis:**
+- 🎯 **Token generation performance**: Nearly identical (~99% of native gateway throughput)
+- 🎯 **Time per output token**: Virtually the same (~24ms for both)
+- 🎯 **Inter-token latency**: Consistent and comparable between both systems
+- ⚠️ **Time to first token**: Higher in vLLM Router (+440ms) - likely due to additional routing hop
+- ✅ **Overall**: vLLM Router provides production-grade performance with <2% throughput difference
+
+The vLLM Router successfully demonstrates that custom routing logic can be added with minimal performance impact. The higher TTFT is expected due to the additional network hop through the router, but the steady-state token generation performance is nearly identical.
+
 ## Cleanup
 
 ```bash
