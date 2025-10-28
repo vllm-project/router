@@ -39,6 +39,7 @@ pub struct Router {
     worker_startup_timeout_secs: u64,
     worker_startup_check_interval_secs: u64,
     dp_aware: bool,
+    data_parallel_size: usize,
     api_key: Option<String>,
     retry_config: RetryConfig,
     circuit_breaker_config: CircuitBreakerConfig,
@@ -68,9 +69,13 @@ impl Router {
 
         let worker_urls = if ctx.router_config.dp_aware {
             // worker address now in the format of "http://host:port@dp_rank"
-            dp_utils::get_dp_aware_workers(&worker_urls, &ctx.router_config.api_key)
-                .await
-                .map_err(|e| format!("Failed to get dp-aware workers: {}", e))?
+            dp_utils::get_dp_aware_workers(
+                &worker_urls,
+                &ctx.router_config.api_key,
+                ctx.router_config.data_parallel_size,
+            )
+            .await
+            .map_err(|e| format!("Failed to get dp-aware workers: {}", e))?
         } else {
             worker_urls
         };
@@ -154,6 +159,7 @@ impl Router {
                 .router_config
                 .worker_startup_check_interval_secs,
             dp_aware: ctx.router_config.dp_aware,
+            data_parallel_size: ctx.router_config.data_parallel_size,
             api_key: ctx.router_config.api_key.clone(),
             retry_config: ctx.router_config.effective_retry_config(),
             circuit_breaker_config: core_cb_config,
@@ -924,9 +930,13 @@ impl Router {
                             // Need to contact the worker to extract the dp_size,
                             // and add them as multiple workers
                             let url_vec = vec![String::from(worker_url)];
-                            let dp_url_vec = dp_utils::get_dp_aware_workers(&url_vec, &self.api_key)
-                                .await
-                                .map_err(|e| format!("Failed to get dp-aware workers: {}", e))?;
+                            let dp_url_vec = dp_utils::get_dp_aware_workers(
+                                &url_vec,
+                                &self.api_key,
+                                self.data_parallel_size,
+                            )
+                            .await
+                            .map_err(|e| format!("Failed to get dp-aware workers: {}", e))?;
                             let mut worker_added: bool = false;
                             for dp_url in &dp_url_vec {
                                 if self.worker_registry.get_by_url(dp_url).is_some() {

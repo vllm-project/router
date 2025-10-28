@@ -437,12 +437,14 @@ impl PDRouter {
             let expanded_prefill = super::dp_utils::get_dp_aware_workers(
                 &prefill_base_urls,
                 &ctx.router_config.api_key,
+                ctx.router_config.data_parallel_size,
             ).await.map_err(|e| format!("Failed to expand prefill workers: {}", e))?;
 
             // Expand decode URLs with DP ranks
             let expanded_decode = super::dp_utils::get_dp_aware_workers(
                 &decode_urls,
                 &ctx.router_config.api_key,
+                ctx.router_config.data_parallel_size,
             ).await.map_err(|e| format!("Failed to expand decode workers: {}", e))?;
 
             info!("Expanded {} prefill URLs to {} DP-aware URLs", prefill_base_urls.len(), expanded_prefill.len());

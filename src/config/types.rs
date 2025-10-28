@@ -26,6 +26,9 @@ pub struct RouterConfig {
     pub worker_startup_check_interval_secs: u64,
     /// Enable data parallelism aware schedule
     pub dp_aware: bool,
+    /// Fallback data parallel size when API call fails (default: 1)
+    #[serde(default = "default_data_parallel_size")]
+    pub data_parallel_size: usize,
     /// The api key used for the authorization with the worker
     pub api_key: Option<String>,
     /// Service discovery configuration (optional)
@@ -84,6 +87,10 @@ fn default_profile_timeout_secs() -> u64 {
 
 fn default_history_backend() -> HistoryBackend {
     HistoryBackend::Memory
+}
+
+fn default_data_parallel_size() -> usize {
+    1
 }
 
 /// History backend configuration
@@ -408,6 +415,7 @@ impl Default for RouterConfig {
             worker_startup_timeout_secs: 600,
             worker_startup_check_interval_secs: 30,
             dp_aware: false,
+            data_parallel_size: 1,
             api_key: None,
             discovery: None,
             metrics: None,
@@ -971,6 +979,7 @@ mod tests {
             worker_startup_timeout_secs: 60,
             worker_startup_check_interval_secs: 5,
             dp_aware: false,
+            data_parallel_size: 1,
             api_key: None,
             discovery: Some(DiscoveryConfig {
                 enabled: true,
@@ -1037,6 +1046,7 @@ mod tests {
             worker_startup_timeout_secs: 180,
             worker_startup_check_interval_secs: 15,
             dp_aware: false,
+            data_parallel_size: 1,
             api_key: None,
             discovery: Some(DiscoveryConfig {
                 enabled: true,
@@ -1094,6 +1104,7 @@ mod tests {
             worker_startup_timeout_secs: 600,
             worker_startup_check_interval_secs: 20,
             dp_aware: false,
+            data_parallel_size: 1,
             api_key: None,
             discovery: Some(DiscoveryConfig {
                 enabled: true,

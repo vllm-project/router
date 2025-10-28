@@ -34,6 +34,7 @@ class RouterArgs:
     max_tree_size: int = 2**26
     max_payload_size: int = 512 * 1024 * 1024  # 512MB default for large batches
     dp_aware: bool = False
+    data_parallel_size: int = 1  # Fallback DP size when API call fails
     enable_igw: bool = False  # Enable IGW (Inter-Gateway) mode for multi-model support
     api_key: Optional[str] = None
     log_dir: Optional[str] = None
@@ -227,6 +228,12 @@ class RouterArgs:
             f"--{prefix}dp-aware",
             action="store_true",
             help="Enable data parallelism aware schedule",
+        )
+        parser.add_argument(
+            f"--{prefix}data-parallel-size",
+            type=int,
+            default=RouterArgs.data_parallel_size,
+            help="Fallback data parallel size to use when API call to get DP size fails (default: 1)",
         )
         parser.add_argument(
             f"--{prefix}enable-igw",

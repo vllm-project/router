@@ -186,6 +186,10 @@ struct CliArgs {
     #[arg(long, default_value_t = false)]
     dp_aware: bool,
 
+    /// Fallback data parallel size when API call fails
+    #[arg(long, default_value_t = 1)]
+    data_parallel_size: usize,
+
     /// API key for worker authorization
     #[arg(long)]
     api_key: Option<String>,
@@ -550,6 +554,7 @@ impl CliArgs {
             worker_startup_timeout_secs: self.worker_startup_timeout_secs,
             worker_startup_check_interval_secs: self.worker_startup_check_interval,
             dp_aware: self.dp_aware,
+            data_parallel_size: self.data_parallel_size,
             api_key: self.api_key.clone(),
             discovery,
             metrics,

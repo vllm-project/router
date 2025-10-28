@@ -188,13 +188,15 @@ show_usage_examples() {
     print_info "1. Standard Data Parallelism Routing:"
     echo "   ./target/release/vllm-router \\"
     echo "       --worker-urls http://0.0.0.0:8000 \\"
-    echo "       --dp-aware --policy consistent_hash"
+    echo "       --dp-aware --policy consistent_hash \\"
+    echo "       --data-parallel-size 1"
     echo
 
     print_info "2. Using cargo run (development):"
     echo "   cargo run --release -- \\"
     echo "       --worker-urls http://0.0.0.0:8000 \\"
-    echo "       --dp-aware --policy consistent_hash"
+    echo "       --dp-aware --policy consistent_hash \\"
+    echo "       --data-parallel-size 1"
     echo
 
     print_info "3. Python module usage:"

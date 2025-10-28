@@ -66,12 +66,14 @@ python -m build && pip install --force-reinstall dist/*.whl
 # Launch router with data parallelism awareness
 ./target/release/vllm-router \
     --worker-urls http://0.0.0.0:8000 \
-    --dp-aware --policy consistent_hash
+    --dp-aware --policy consistent_hash \
+    --data-parallel-size 1
 
 # Alternative: using cargo run
 cargo run --release -- \
     --worker-urls http://0.0.0.0:8000 \
-    --dp-aware --policy consistent_hash
+    --dp-aware --policy consistent_hash \
+    --data-parallel-size 1
 
 # Alternative: using python launcher
 vllm-router \

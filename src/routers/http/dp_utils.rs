@@ -55,6 +55,7 @@ pub async fn get_worker_dp_size(worker_url: &str, api_key: &Option<String>) -> R
 /// # Arguments
 /// * `worker_urls` - List of base worker URLs
 /// * `api_key` - Optional API key for authentication
+/// * `fallback_dp_size` - Fallback DP size to use when API call fails
 ///
 /// # Returns
 /// * `Ok(Vec<String>)` - List of expanded worker URLs with dp_rank suffixes
@@ -62,6 +63,7 @@ pub async fn get_worker_dp_size(worker_url: &str, api_key: &Option<String>) -> R
 pub async fn get_dp_aware_workers(
     worker_urls: &[String],
     api_key: &Option<String>,
+    fallback_dp_size: usize,
 ) -> Result<Vec<String>, String> {
     let mut dp_aware_workers: Vec<String> = Vec::new();
 
@@ -74,7 +76,18 @@ pub async fn get_dp_aware_workers(
                     dp_aware_workers.push(format!("{}@{}", url, rank));
                 }
             }
-            Err(e) => return Err(format!("Failed to get DP size for {}: {}", url, e)),
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to get DP size for {} ({}), using fallback dp_size={}",
+                    url,
+                    e,
+                    fallback_dp_size
+                );
+                // Use fallback DP size instead of crashing
+                for rank in 0..fallback_dp_size {
+                    dp_aware_workers.push(format!("{}@{}", url, rank));
+                }
+            }
         }
     }
 
