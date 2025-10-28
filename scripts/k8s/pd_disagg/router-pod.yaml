@@ -1,0 +1,45 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: vllm-router-pd
+  namespace: llm-d-pd
+  labels:
+    app: vllm-router
+    mode: pd-disaggregation
+spec:
+  # Deploy on same node as prefill server for network connectivity
+  nodeName: ip-10-2-1-129.us-west-1.compute.internal
+  containers:
+  - name: router
+    image: 584868043064.dkr.ecr.us-west-2.amazonaws.com/dev-vllm-repo:router-dp-fallback
+    command:
+      - vllm-router
+      - --pd-disaggregation
+      - --prefill
+      - http://10.2.1.155:8000
+      - --decode
+      - http://10.2.1.168:8000
+      - --host
+      - "0.0.0.0"
+      - --port
+      - "10001"
+      - --dp-aware
+      - --data-parallel-size
+      - "1"
+      - --log-level
+      - info
+    ports:
+    - containerPort: 10001
+      name: router
+      protocol: TCP
+    - containerPort: 29000
+      name: metrics
+      protocol: TCP
+    resources:
+      requests:
+        cpu: "2"
+        memory: "4Gi"
+      limits:
+        cpu: "4"
+        memory: "8Gi"
+  restartPolicy: Never
