@@ -1,0 +1,34 @@
+inferenceExtension:
+  replicas: 1
+  image:
+    name: llm-d-inference-scheduler
+    hub: ghcr.io/llm-d
+    tag: v0.3.2
+    pullPolicy: Always
+  extProcPort: 9002
+  pluginsConfigFile: "pd-config.yaml"
+  pluginsCustomConfig:
+    pd-config.yaml: |
+      # Simple load balancing (no P/D logic)
+      apiVersion: inference.networking.x-k8s.io/v1alpha1
+      kind: EndpointPickerConfig
+      plugins:
+      - type: max-score-picker  # Simple load balancing across 2 decode pods
+
+  # Monitoring configuration for EPP
+  monitoring:
+    interval: "10s"
+    # Service account token secret for authentication
+    secret:
+      name: llama31-gateway-sa-metrics-reader-secret
+    # Prometheus ServiceMonitor will be created when enabled for EPP metrics collection
+    prometheus:
+      enabled: true
+
+inferencePool:
+  apiVersion: inference.networking.x-k8s.io/v1alpha2 # use old API version for inference
+  targetPortNumber: 8000
+  modelServerType: vllm
+  modelServers:
+    matchLabels:
+      llm-d.ai/inferenceServing: "true"
