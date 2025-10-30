@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Run LM evaluation using lm_eval harness
+# Run LM evaluation using lm_eval harness against multi-node DP deployment
 # Usage: ./run-eval.sh [task] [num_concurrent] [limit]
 #
 # Examples:
@@ -16,9 +16,9 @@ LIMIT="${3:-}"
 MODEL="meta-llama/Llama-3.1-8B-Instruct"
 BASE_URL="http://localhost:8000/v1/completions"
 
-echo "==================================="
-echo "Running LM Eval - Llama 3.1 Native"
-echo "==================================="
+echo "============================================"
+echo "Running LM Eval - Llama 3.1 Multi-Node DP"
+echo "============================================"
 echo "Task: $TASK"
 echo "Model: $MODEL"
 echo "Base URL: $BASE_URL"
@@ -26,6 +26,9 @@ echo "Concurrent Requests: $NUM_CONCURRENT"
 if [ -n "$LIMIT" ]; then
     echo "Sample Limit: $LIMIT"
 fi
+echo ""
+echo "Note: Requests go to Rank 0 (Master)"
+echo "      DP Coordinator distributes work to all ranks"
 echo ""
 
 # Check if lm_eval is installed
@@ -55,14 +58,15 @@ if ! curl -s -f "$BASE_URL/../models" > /dev/null 2>&1; then
     echo ""
     echo "Error: Cannot connect to $BASE_URL"
     echo ""
-    echo "Make sure port-forward is running:"
-    echo "  kubectl port-forward -n llm-d-llama31-native \\"
-    echo "    svc/infra-llama31-inference-gateway-istio 8000:80"
+    echo "Make sure port-forward is running to Rank 0 (decode pod):"
+    echo "  kubectl port-forward -n llm-d-llama31-multinode \\"
+    echo "    \$(kubectl get pod -n llm-d-llama31-multinode -l llm-d.ai/role=decode -o jsonpath='{.items[0].metadata.name}') \\"
+    echo "    8000:8000"
     echo ""
     exit 1
 fi
 
-echo "✓ Connection successful"
+echo "✓ Connection successful to Rank 0 (Master)"
 echo ""
 echo "Starting evaluation..."
 echo "This may take a while depending on the task size..."
@@ -82,6 +86,12 @@ fi
 eval "$EVAL_CMD"
 
 echo ""
-echo "==================================="
+echo "============================================"
 echo "Evaluation completed!"
-echo "==================================="
+echo "============================================"
+echo ""
+echo "Multi-Node DP Info:"
+echo "  - All requests sent to Rank 0 (Master)"
+echo "  - DP Coordinator distributed work across all ranks"
+echo "  - Both Rank 0 and Rank 1 GPUs were utilized"
+echo ""
