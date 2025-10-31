@@ -308,9 +308,13 @@ mod tests {
             .as_array()
             .unwrap();
         assert_eq!(merged_offsets.len(), 5);
-        // Last prompt offset is 16, last token " test" has length 5, so base is 21
-        assert_eq!(merged_offsets[3].as_i64().unwrap(), 21); // 0 + 21
-        assert_eq!(merged_offsets[4].as_i64().unwrap(), 28); // 7 + 21
+        // We take first 3 prompt offsets [0, 5, 11]. Last prompt offset is 11,
+        // last prompt token " test" has length 5, so base is 11 + 5 = 16
+        assert_eq!(merged_offsets[0].as_i64().unwrap(), 0);   // Prompt token "Hello"
+        assert_eq!(merged_offsets[1].as_i64().unwrap(), 5);   // Prompt token " world"
+        assert_eq!(merged_offsets[2].as_i64().unwrap(), 11);  // Prompt token " test"
+        assert_eq!(merged_offsets[3].as_i64().unwrap(), 16);  // Decode token " output" (0 + 16)
+        assert_eq!(merged_offsets[4].as_i64().unwrap(), 23);  // Decode token " token" (7 + 16)
     }
 
     #[test]

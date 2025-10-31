@@ -260,9 +260,9 @@ class TestRouterConfigValidation:
 
     def test_dp_aware_config_validation(self):
         """Test data parallelism aware configuration validation."""
-        # Valid DP aware config
-        args = RouterArgs(dp_aware=True, api_key="test-api-key")
-        assert args.dp_aware is True
+        # Valid DP-aware routing config (enabled when data_parallel_size > 1)
+        args = RouterArgs(data_parallel_size=2, api_key="test-api-key")
+        assert args.data_parallel_size == 2
         assert args.api_key == "test-api-key"
 
     def test_request_id_headers_validation(self):

@@ -127,7 +127,7 @@ def create_app(args: argparse.Namespace) -> FastAPI:
 
     @app.get("/get_server_info")
     async def get_server_info(request: Request):
-        # Enforce API key on server info when required (used by dp_aware probing)
+        # Enforce API key on server info when required (used by router for worker discovery)
         check_api_key(request)
         return JSONResponse(
             {

@@ -75,7 +75,7 @@ class RouterManager:
         if extra:
             flag_map = {
                 "max_payload_size": "--max-payload-size",
-                "dp_aware": "--dp-aware",
+                "data_parallel_size": "--data-parallel-size",
                 "api_key": "--api-key",
                 # Health/monitoring
                 "worker_startup_check_interval": "--worker-startup-check-interval",

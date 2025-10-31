@@ -44,7 +44,6 @@ vllm-router \
     --decode http://10.2.1.133:8200 \
     --host 0.0.0.0 \
     --port 10001 \
-    --dp-aware \
     --data-parallel-size 8 \
     --policy <POLICY_NAME>  # Varied across tests
 ```
@@ -334,7 +333,6 @@ vllm-router \
     --decode http://10.2.1.133:8200 \
     --host 0.0.0.0 \
     --port 10001 \
-    --dp-aware \
     --data-parallel-size 8 \
     --policy consistent_hash  # ⭐ RECOMMENDED
 ```

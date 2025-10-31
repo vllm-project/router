@@ -426,9 +426,9 @@ impl PDRouter {
             window_duration: Duration::from_secs(circuit_breaker_config.window_duration_secs),
         };
 
-        // Expand URLs to DP-aware format if dp_aware is enabled
-        let (expanded_prefill_urls, expanded_decode_urls) = if ctx.router_config.dp_aware {
-            info!("DP-aware mode enabled, expanding worker URLs");
+        // Automatically expand to DP-aware format when data_parallel_size > 1
+        let (expanded_prefill_urls, expanded_decode_urls) = if ctx.router_config.data_parallel_size > 1 {
+            info!("DP-aware mode enabled (data_parallel_size={}), expanding worker URLs", ctx.router_config.data_parallel_size);
 
             // Extract base URLs from prefill_urls (url, port) tuples
             let prefill_base_urls: Vec<String> = prefill_urls.iter().map(|(url, _)| url.clone()).collect();

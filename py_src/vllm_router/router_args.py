@@ -33,8 +33,7 @@ class RouterArgs:
     eviction_interval_secs: int = 120
     max_tree_size: int = 2**26
     max_payload_size: int = 512 * 1024 * 1024  # 512MB default for large batches
-    dp_aware: bool = False
-    data_parallel_size: int = 1  # Fallback DP size when API call fails
+    data_parallel_size: int = 1  # Data parallel size (DP-aware routing automatically enabled when > 1)
     enable_igw: bool = False  # Enable IGW (Inter-Gateway) mode for multi-model support
     api_key: Optional[str] = None
     log_dir: Optional[str] = None
@@ -225,15 +224,10 @@ class RouterArgs:
             help="Maximum payload size in bytes",
         )
         parser.add_argument(
-            f"--{prefix}dp-aware",
-            action="store_true",
-            help="Enable data parallelism aware schedule",
-        )
-        parser.add_argument(
             f"--{prefix}data-parallel-size",
             type=int,
             default=RouterArgs.data_parallel_size,
-            help="Fallback data parallel size to use when API call to get DP size fails (default: 1)",
+            help="Data parallel size for DP-aware routing (automatically enabled when > 1, default: 1)",
         )
         parser.add_argument(
             f"--{prefix}enable-igw",
@@ -244,7 +238,7 @@ class RouterArgs:
             f"--{prefix}api-key",
             type=str,
             default=None,
-            help="The api key used for the authorization with the worker.  Useful when the dp aware scheduling strategy is enaled.",
+            help="The API key used for authorization with workers. Required when using data parallel routing (data_parallel_size > 1).",
         )
         parser.add_argument(
             f"--{prefix}log-dir",

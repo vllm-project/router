@@ -30,7 +30,7 @@ def popen_launch_router(
     service_discovery_namespace: str = None,
     prometheus_port: int = None,
     prometheus_host: str = None,
-    dp_aware: bool = False,
+    data_parallel_size: int = 1,
     # Router retry/CB tuning (optional)
     router_retry_max_retries: int = None,
     router_retry_initial_backoff_ms: int = None,
@@ -60,7 +60,7 @@ def popen_launch_router(
         service_discovery_namespace: Kubernetes namespace to watch for pods. If None, watches all namespaces.
         prometheus_port: Port to expose Prometheus metrics. If None, Prometheus metrics are disabled.
         prometheus_host: Host address to bind the Prometheus metrics server.
-        dp_aware: Enable data parallelism aware routing strategy.
+        data_parallel_size: Data parallel size for DP-aware routing (automatically enabled when > 1).
     """
     _, host, port = base_url.split(":")
     host = host[2:]
@@ -114,8 +114,8 @@ def popen_launch_router(
     if log_dir is not None:
         command.extend(["--log-dir", log_dir])
 
-    if dp_aware:
-        command.append("--router-dp-aware")
+    if data_parallel_size > 1:
+        command.extend(["--router-data-parallel-size", str(data_parallel_size)])
 
     # Append router retry/CB tuning flags if provided
     def _add(flag: str, val):
@@ -464,14 +464,14 @@ class TestLaunchServer(unittest.TestCase):
 
     def test_6_mmlu_with_dp_aware(self):
         print("Running test_6_mmlu_with_dp_aware...")
-        # DP size = 2
+        # DP size = 2, DP-aware routing automatically enabled
         self.process = popen_launch_router(
             self.model,
             self.base_url,
             dp_size=2,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             policy="cache_aware",
-            dp_aware=True,
+            data_parallel_size=2,
         )
 
         args = SimpleNamespace(
@@ -493,14 +493,14 @@ class TestLaunchServer(unittest.TestCase):
     def test_7_add_and_remove_worker_with_dp_aware(self):
         print("Running test_7_add_and_remove_worker_with_dp_aware...")
 
-        # Set dp_size = 1
+        # Set dp_size = 1, but enable DP-aware routing with data_parallel_size=2
         self.process = popen_launch_router(
             self.model,
             self.base_url,
             dp_size=1,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             policy="round_robin",  # make sure every worker processes requests
-            dp_aware=True,  # dp aware strategy should work well with RR
+            data_parallel_size=2,  # DP-aware routing automatically enabled when > 1
         )
 
         # 1. Start a worker
@@ -561,9 +561,7 @@ class TestLaunchServer(unittest.TestCase):
         self.other_process.append(worker_process)
 
         # 7. Use the /add_worker API to add it to the router
-        # Should fail since the router would contact the worker's
-        # /get_server_info endpoint for the dp_size info, but it
-        # has no knowledge of the api key
+        # Should fail since the worker requires API key but router doesn't have it
         with requests.Session() as session:
             response = session.post(f"{self.base_url}/add_worker?url={worker_url}")
             print(f"status code: {response.status_code}, response: {response.text}")
@@ -572,14 +570,14 @@ class TestLaunchServer(unittest.TestCase):
     def test_8_lazy_fault_tolerance_with_dp_aware(self):
         print("Running test_8_lazy_fault_tolerance_with_dp_aware...")
 
-        # Set dp_size = 1
+        # Set dp_size = 1, enable DP-aware routing with data_parallel_size=2
         self.process = popen_launch_router(
             self.model,
             self.base_url,
             dp_size=1,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             policy="round_robin",
-            dp_aware=True,
+            data_parallel_size=2,
         )
 
         # 1. Start a worker
@@ -637,7 +635,7 @@ class TestLaunchServer(unittest.TestCase):
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             policy="round_robin",
             max_payload_size=1 * 1024 * 1024,  # 1MB limit
-            dp_aware=True,
+            data_parallel_size=2,
         )
 
         # Test case 1: Payload just under 1MB should succeed
@@ -686,7 +684,7 @@ class TestLaunchServer(unittest.TestCase):
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             policy="round_robin",
             api_key="correct_api_key",
-            dp_aware=True,
+            data_parallel_size=2,
         )
 
         # Test case 1: request without api key should fail

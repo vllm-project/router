@@ -63,17 +63,18 @@ python -m build && pip install --force-reinstall dist/*.whl
 
 #### Standard Data Parallelism Routing
 ```bash
-# Launch router with data parallelism awareness
+# Launch router with data parallelism (8 replicas per worker URL)
+# When data-parallel-size > 1, the router automatically creates DP-aware workers
 ./target/release/vllm-router \
     --worker-urls http://0.0.0.0:8000 \
-    --dp-aware --policy consistent_hash \
-    --data-parallel-size 1
+    --policy consistent_hash \
+    --data-parallel-size 8
 
 # Alternative: using cargo run
 cargo run --release -- \
     --worker-urls http://0.0.0.0:8000 \
-    --dp-aware --policy consistent_hash \
-    --data-parallel-size 1
+    --policy consistent_hash \
+    --data-parallel-size 8
 
 # Alternative: using python launcher
 vllm-router \
