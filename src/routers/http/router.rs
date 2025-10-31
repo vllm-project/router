@@ -38,7 +38,6 @@ pub struct Router {
     client: Client,
     worker_startup_timeout_secs: u64,
     worker_startup_check_interval_secs: u64,
-    dp_aware: bool,
     data_parallel_size: usize,
     api_key: Option<String>,
     retry_config: RetryConfig,
@@ -67,7 +66,8 @@ impl Router {
             .await?;
         }
 
-        let worker_urls = if ctx.router_config.dp_aware {
+        // Automatically expand to DP-aware workers when data_parallel_size > 1
+        let worker_urls = if ctx.router_config.data_parallel_size > 1 {
             // worker address now in the format of "http://host:port@dp_rank"
             dp_utils::get_dp_aware_workers(
                 &worker_urls,
@@ -158,7 +158,6 @@ impl Router {
             worker_startup_check_interval_secs: ctx
                 .router_config
                 .worker_startup_check_interval_secs,
-            dp_aware: ctx.router_config.dp_aware,
             data_parallel_size: ctx.router_config.data_parallel_size,
             api_key: ctx.router_config.api_key.clone(),
             retry_config: ctx.router_config.effective_retry_config(),
@@ -341,7 +340,7 @@ impl Router {
     }
 
     pub async fn send_health_check(&self, worker_url: &str) -> Response {
-        let health_url = if self.dp_aware {
+        let health_url = if self.data_parallel_size > 1 {
             // Need to extract the URL from "http://host:port@dp_rank"
             match dp_utils::extract_dp_rank(worker_url) {
                 Ok((worker_url_prefix, _dp_rank)) => worker_url_prefix,
@@ -579,7 +578,7 @@ impl Router {
 
     // Helper: return base worker URL (strips DP suffix when enabled)
     fn worker_base_url(&self, worker_url: &str) -> String {
-        if self.dp_aware {
+        if self.data_parallel_size > 1 {
             if let Ok((prefix, _)) = dp_utils::extract_dp_rank(worker_url) {
                 return prefix.to_string();
             }
@@ -696,7 +695,7 @@ impl Router {
         is_stream: bool,
         load_incremented: bool, // Whether load was incremented for this request
     ) -> Response {
-        let (mut request_builder, extracted_dp_rank) = if self.dp_aware {
+        let (mut request_builder, extracted_dp_rank) = if self.data_parallel_size > 1 {
             let (worker_url_prefix, dp_rank) = match dp_utils::extract_dp_rank(worker_url) {
                 Ok(tup) => tup,
                 Err(e) => {
@@ -926,9 +925,10 @@ impl Router {
             match client.get(format!("{}/health", worker_url)).send().await {
                 Ok(res) => {
                     if res.status().is_success() {
-                        if self.dp_aware {
-                            // Need to contact the worker to extract the dp_size,
-                            // and add them as multiple workers
+                        if self.data_parallel_size > 1 {
+                            // Expand worker URL into multiple DP-aware URLs based on configured data_parallel_size
+                            // (e.g., "http://host:8000" → "http://host:8000@0", "@1", etc.)
+                            // without querying the worker
                             let url_vec = vec![String::from(worker_url)];
                             let dp_url_vec = dp_utils::get_dp_aware_workers(
                                 &url_vec,
@@ -1050,7 +1050,7 @@ impl Router {
     }
 
     pub fn remove_worker(&self, worker_url: &str) {
-        if self.dp_aware {
+        if self.data_parallel_size > 1 {
             // remove dp-aware workers in a prefix-matching fashion
             // without contacting the remote worker
             let mut removed_workers: Vec<String> = Vec::new();
@@ -1125,7 +1125,7 @@ impl Router {
     }
 
     async fn get_worker_load(&self, worker_url: &str) -> Option<isize> {
-        let worker_url = if self.dp_aware {
+        let worker_url = if self.data_parallel_size > 1 {
             // Need to extract the URL from "http://host:port@dp_rank"
             let (worker_url_prefix, _dp_rank) = match dp_utils::extract_dp_rank(worker_url) {
                 Ok(tup) => tup,
@@ -1444,7 +1444,7 @@ impl RouterTrait for Router {
         // Send requests to all workers concurrently without headers
         let mut tasks = Vec::new();
         for worker_url in &worker_urls {
-            let worker_url = if self.dp_aware {
+            let worker_url = if self.data_parallel_size > 1 {
                 // Need to extract the URL from "http://host:port@dp_rank"
                 let (worker_url_prefix, _dp_rank) = match dp_utils::extract_dp_rank(worker_url) {
                     Ok(tup) => tup,
@@ -1560,7 +1560,7 @@ mod tests {
             policy_registry,
             worker_startup_timeout_secs: 5,
             worker_startup_check_interval_secs: 1,
-            dp_aware: false,
+            data_parallel_size: 1,
             api_key: None,
             client: Client::new(),
             retry_config: RetryConfig::default(),

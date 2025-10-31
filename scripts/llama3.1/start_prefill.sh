@@ -27,11 +27,11 @@ echo "  Side channel base port: $VLLM_NIXL_SIDE_CHANNEL_PORT (will use 8083-8086
 echo "  Data parallel size: 4"
 echo "  NIXL HTTP port: 8097"
 
-CUDA_VISIBLE_DEVICES=0,1,2,3 vllm serve meta-llama/Llama-3.1-8B-Instruct \
+CUDA_VISIBLE_DEVICES=0,1 vllm serve meta-llama/Llama-3.1-8B-Instruct \
     --host 0.0.0.0 \
     --port 8081 \
     --tensor-parallel-size 1 \
-    --data-parallel-size 4 \
+    --data-parallel-size 2 \
     --enforce-eager \
     --enable-prefix-caching \
     --gpu-memory-utilization 0.9 \

@@ -836,120 +836,26 @@ impl WorkerFactory {
         Box::new(DPAwareWorker::new(base_url, dp_rank, dp_size, worker_type))
     }
 
-    /// Get DP size from a worker
-    async fn get_worker_dp_size(url: &str, api_key: &Option<String>) -> WorkerResult<usize> {
-        let mut req_builder = WORKER_CLIENT.get(format!("{}/get_server_info", url));
-
-        if let Some(key) = api_key {
-            req_builder = req_builder.bearer_auth(key);
-        }
-
-        let response = req_builder
-            .send()
-            .await
-            .map_err(|e| WorkerError::NetworkError {
-                url: url.to_string(),
-                error: e.to_string(),
-            })?;
-
-        if !response.status().is_success() {
-            return Err(WorkerError::NetworkError {
-                url: url.to_string(),
-                error: format!("Server returned: {}", response.status()),
-            });
-        }
-
-        let info: serde_json::Value =
-            response
-                .json()
-                .await
-                .map_err(|e| WorkerError::NetworkError {
-                    url: url.to_string(),
-                    error: format!("Failed to parse JSON: {}", e),
-                })?;
-
-        let dp_size = info
-            .get("dp_size")
-            .and_then(|v| v.as_u64())
-            .ok_or_else(|| WorkerError::InvalidConfiguration {
-                message: "dp_size not found in server info".to_string(),
-            })?;
-
-        if dp_size > usize::MAX as u64 {
-            return Err(WorkerError::InvalidConfiguration {
-                message: format!("dp_size is too large: {}", dp_size),
-            });
-        }
-
-        Ok(dp_size as usize)
-    }
-
-    /// Private helper to create DP-aware workers of any type
-    async fn create_dp_aware_workers_of_type(
-        url: &str,
-        api_key: &Option<String>,
-        worker_type: WorkerType,
-    ) -> WorkerResult<Vec<Box<dyn Worker>>> {
-        let dp_size = Self::get_worker_dp_size(url, api_key).await?;
-
-        let workers = (0..dp_size)
-            .map(|rank| Self::create_dp_aware(url.to_string(), rank, dp_size, worker_type.clone()))
-            .collect();
-
-        Ok(workers)
-    }
-
-    /// Create DP-aware regular workers from a single URL
-    pub async fn create_dp_aware_regular_workers(
-        url: &str,
-        api_key: &Option<String>,
-    ) -> WorkerResult<Vec<Box<dyn Worker>>> {
-        Self::create_dp_aware_workers_of_type(url, api_key, WorkerType::Regular).await
-    }
-
-    /// Create DP-aware prefill workers from a single URL
-    pub async fn create_dp_aware_prefill_workers(
-        url: &str,
-        bootstrap_port: Option<u16>,
-        api_key: &Option<String>,
-    ) -> WorkerResult<Vec<Box<dyn Worker>>> {
-        Self::create_dp_aware_workers_of_type(url, api_key, WorkerType::Prefill { bootstrap_port })
-            .await
-    }
-
-    /// Create DP-aware decode workers from a single URL
-    pub async fn create_dp_aware_decode_workers(
-        url: &str,
-        api_key: &Option<String>,
-    ) -> WorkerResult<Vec<Box<dyn Worker>>> {
-        Self::create_dp_aware_workers_of_type(url, api_key, WorkerType::Decode).await
-    }
-
-    /// Create workers based on configuration (for regular router)
-    pub async fn create_workers(
+    /// Create workers based on configuration, expanding to DP replicas if data_parallel_size > 1
+    pub fn create_workers(
         urls: Vec<String>,
-        dp_aware: bool,
-        api_key: &Option<String>,
-    ) -> WorkerResult<Vec<Box<dyn Worker>>> {
-        if dp_aware {
-            // Create futures for all worker creations
-            let worker_futs = urls
-                .iter()
-                .map(|url| Self::create_dp_aware_regular_workers(url, api_key));
-
-            // Execute all futures concurrently and flatten results
-            let all_workers = futures::future::try_join_all(worker_futs)
-                .await?
-                .into_iter()
-                .flatten()
-                .collect();
-
-            Ok(all_workers)
+        data_parallel_size: usize,
+    ) -> Vec<Box<dyn Worker>> {
+        if data_parallel_size > 1 {
+            // Create DP-aware workers: one worker per URL per DP rank
+            urls.into_iter()
+                .flat_map(|url| {
+                    (0..data_parallel_size)
+                        .map(move |rank| {
+                            Self::create_dp_aware(url.clone(), rank, data_parallel_size, WorkerType::Regular)
+                        })
+                })
+                .collect()
         } else {
-            Ok(urls
-                .into_iter()
+            // Create regular workers (one per URL)
+            urls.into_iter()
                 .map(|url| Self::create_regular(url))
-                .collect())
+                .collect()
         }
     }
 }
@@ -1858,19 +1764,44 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_factory_create_workers_regular() {
+    #[test]
+    fn test_factory_create_workers_regular() {
         let urls = vec!["http://w1:8080".to_string(), "http://w2:8080".to_string()];
 
-        let workers = WorkerFactory::create_workers(urls, false, &None)
-            .await
-            .unwrap();
+        // Test with data_parallel_size=1 (no DP expansion)
+        let workers = WorkerFactory::create_workers(urls, 1);
 
         assert_eq!(workers.len(), 2);
         assert!(!workers[0].is_dp_aware());
         assert!(!workers[1].is_dp_aware());
         assert_eq!(workers[0].url(), "http://w1:8080");
         assert_eq!(workers[1].url(), "http://w2:8080");
+    }
+
+    #[test]
+    fn test_factory_create_workers_with_dp() {
+        let urls = vec!["http://w1:8080".to_string(), "http://w2:8080".to_string()];
+
+        // Test with data_parallel_size=4 (should create 4 replicas per URL)
+        let workers = WorkerFactory::create_workers(urls, 4);
+
+        assert_eq!(workers.len(), 8); // 2 URLs × 4 replicas = 8 workers
+
+        // First 4 workers should be for w1:8080
+        for i in 0..4 {
+            assert!(workers[i].is_dp_aware());
+            assert_eq!(workers[i].base_url(), "http://w1:8080");
+            assert_eq!(workers[i].dp_rank(), Some(i));
+            assert_eq!(workers[i].dp_size(), Some(4));
+        }
+
+        // Next 4 workers should be for w2:8080
+        for i in 4..8 {
+            assert!(workers[i].is_dp_aware());
+            assert_eq!(workers[i].base_url(), "http://w2:8080");
+            assert_eq!(workers[i].dp_rank(), Some(i - 4));
+            assert_eq!(workers[i].dp_size(), Some(4));
+        }
     }
 
     // ===== Circuit Breaker Integration Tests =====

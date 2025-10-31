@@ -23,9 +23,8 @@ spec:
       - "0.0.0.0"
       - --port
       - "10001"
-      - --dp-aware
       - --data-parallel-size
-      - "1"
+      - "8"
       - --log-level
       - info
     ports:

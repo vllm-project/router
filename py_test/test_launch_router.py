@@ -43,7 +43,7 @@ class TestLaunchRouter(unittest.TestCase):
             selector=None,
             service_discovery_port=80,
             service_discovery_namespace=None,
-            dp_aware=False,
+            data_parallel_size=1,
             prometheus_port=None,
             prometheus_host=None,
             request_timeout_secs=60,
@@ -129,23 +129,23 @@ class TestLaunchRouter(unittest.TestCase):
     def test_launch_router_common_with_dp_aware(self):
         args = self.create_router_args(
             worker_urls=["http://localhost:8000"],
-            dp_aware=True,
+            data_parallel_size=2,
         )
         self.run_router_process(args)
 
     def test_launch_router_with_empty_worker_urls_with_dp_aware(self):
         args = self.create_router_args(
             worker_urls=[],
-            dp_aware=True,
+            data_parallel_size=2,
         )
         self.run_router_process(args)
 
     def test_launch_router_common_with_dp_aware_service_discovery(self):
-        # Test launch router with bot srevice_discovery and dp_aware enabled
-        # Should fail since service_discovery and dp_aware is conflict
+        # Test launch router with both service_discovery and data_parallel_size > 1 enabled
+        # Should fail since service_discovery and DP-aware routing (data_parallel_size > 1) is conflict
         args = self.create_router_args(
             worker_urls=["http://localhost:8000"],
-            dp_aware=True,
+            data_parallel_size=2,
             service_discovery=True,
             selector=["app=test-worker"],
         )
@@ -167,7 +167,7 @@ class TestLaunchRouter(unittest.TestCase):
             process.start()
             # Wait 3 seconds
             time.sleep(3)
-            # Should fail since service_discovery and dp_aware is conflict
+            # Should fail since service_discovery and DP-aware routing (data_parallel_size > 1) is conflict
             self.assertFalse(process.is_alive())
         finally:
             terminate_process(process)
