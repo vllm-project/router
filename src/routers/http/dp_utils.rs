@@ -4,90 +4,38 @@
 
 use tracing::info;
 
-/// Query a worker's /get_server_info endpoint to get its dp_size
-///
-/// # Arguments
-/// * `worker_url` - Base URL of the worker (e.g., "http://host:port")
-/// * `api_key` - Optional API key for authentication
-///
-/// # Returns
-/// * `Ok(usize)` - The dp_size value from the worker
-/// * `Err(String)` - Error message if the request fails or dp_size is not found
-pub async fn get_worker_dp_size(worker_url: &str, api_key: &Option<String>) -> Result<usize, String> {
-    let client = reqwest::Client::new();
-    let mut req_builder = client.get(format!("{}/get_server_info", worker_url));
-    if let Some(key) = api_key {
-        req_builder = req_builder.bearer_auth(key);
-    }
-
-    match req_builder.send().await {
-        Ok(res) => {
-            if res.status().is_success() {
-                let server_info = res
-                    .text()
-                    .await
-                    .map_err(|e| format!("failed to read text from response: {}", e))?;
-
-                let server_info: serde_json::Value = serde_json::from_str(&server_info)
-                    .map_err(|e| format!("failed to decode JSON: {}", e))?;
-
-                let dp_size = server_info
-                    .get("dp_size")
-                    .and_then(|v| v.as_u64())
-                    .ok_or_else(|| String::from("dp_size not found or not an u64"))?;
-
-                Ok(if dp_size > usize::MAX as u64 {
-                    return Err(format!("dp_size is too large: {}", dp_size));
-                } else {
-                    dp_size as usize
-                })
-            } else {
-                Err(format!("unexpected status code: {}", res.status()))
-            }
-        }
-        Err(e) => Err(format!("error response: {}", e)),
-    }
-}
-
 /// Given a list of worker URLs, expand them into DP-aware URLs
 /// with dp_rank as suffix (format: "http://host:port@rank")
 ///
+/// This function does NOT query the workers - it uses the provided dp_size
+/// to expand each worker URL into multiple DP-aware URLs with rank suffixes.
+///
 /// # Arguments
 /// * `worker_urls` - List of base worker URLs
-/// * `api_key` - Optional API key for authentication
-/// * `fallback_dp_size` - Fallback DP size to use when API call fails
+/// * `_api_key` - Unused, kept for API compatibility
+/// * `dp_size` - Number of DP ranks to create for each worker
 ///
 /// # Returns
 /// * `Ok(Vec<String>)` - List of expanded worker URLs with dp_rank suffixes
-/// * `Err(String)` - Error message if any worker query fails
+///
+/// # Example
+/// ```
+/// // For worker "http://host:8000" with dp_size=2:
+/// // Returns: ["http://host:8000@0", "http://host:8000@1"]
+/// ```
 pub async fn get_dp_aware_workers(
     worker_urls: &[String],
-    api_key: &Option<String>,
-    fallback_dp_size: usize,
+    _api_key: &Option<String>,
+    dp_size: usize,
 ) -> Result<Vec<String>, String> {
     let mut dp_aware_workers: Vec<String> = Vec::new();
 
     for url in worker_urls {
-        match get_worker_dp_size(url, api_key).await {
-            Ok(dp_size) => {
-                info!("Worker {} has dp_size={}, expanding to {} DP-aware URLs", url, dp_size, dp_size);
-                // Use all available DP ranks for load balancing
-                for rank in 0..dp_size {
-                    dp_aware_workers.push(format!("{}@{}", url, rank));
-                }
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "Failed to get DP size for {} ({}), using fallback dp_size={}",
-                    url,
-                    e,
-                    fallback_dp_size
-                );
-                // Use fallback DP size instead of crashing
-                for rank in 0..fallback_dp_size {
-                    dp_aware_workers.push(format!("{}@{}", url, rank));
-                }
-            }
+        info!("Expanding worker {} to {} DP-aware URLs (ranks 0..{})", url, dp_size, dp_size - 1);
+
+        // Expand each worker URL to multiple DP-aware URLs
+        for rank in 0..dp_size {
+            dp_aware_workers.push(format!("{}@{}", url, rank));
         }
     }
 

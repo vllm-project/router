@@ -92,7 +92,9 @@ impl PDRouter {
 
         // Process each worker
         for worker_url in urls {
-            let url = format!("{}/{}", worker_url, endpoint);
+            // Extract base URL if DP-aware format (e.g., http://127.0.0.1:8081@0 → http://127.0.0.1:8081)
+            let (base_url, _) = super::dp_utils::parse_worker_url(&worker_url);
+            let url = format!("{}/{}", base_url, endpoint);
             match self.client.post(&url).send().await {
                 Ok(res) if res.status().is_success() => {
                     results.push(format!("{} {}: OK", worker_type, worker_url));
@@ -197,7 +199,9 @@ impl PDRouter {
         endpoint: &str,
         headers: Option<Vec<(String, String)>>,
     ) -> Response {
-        let url = format!("{}/{}", worker_url, endpoint);
+        // Extract base URL if DP-aware format (e.g., http://127.0.0.1:8081@0 → http://127.0.0.1:8081)
+        let (base_url, _) = super::dp_utils::parse_worker_url(&worker_url);
+        let url = format!("{}/{}", base_url, endpoint);
         let mut request_builder = self.client.get(&url);
 
         // Add headers if provided
@@ -427,20 +431,22 @@ impl PDRouter {
         };
 
         // Automatically expand to DP-aware format when data_parallel_size > 1
+        // This creates multiple worker URLs with @rank suffixes (e.g., "http://host:8000@0", "@1", etc.)
+        // without querying the workers. The router will add X-data-parallel-rank headers to route to specific ranks.
         let (expanded_prefill_urls, expanded_decode_urls) = if ctx.router_config.data_parallel_size > 1 {
             info!("DP-aware mode enabled (data_parallel_size={}), expanding worker URLs", ctx.router_config.data_parallel_size);
 
             // Extract base URLs from prefill_urls (url, port) tuples
             let prefill_base_urls: Vec<String> = prefill_urls.iter().map(|(url, _)| url.clone()).collect();
 
-            // Expand prefill URLs with DP ranks
+            // Expand prefill URLs with DP ranks (0..data_parallel_size-1)
             let expanded_prefill = super::dp_utils::get_dp_aware_workers(
                 &prefill_base_urls,
                 &ctx.router_config.api_key,
                 ctx.router_config.data_parallel_size,
             ).await.map_err(|e| format!("Failed to expand prefill workers: {}", e))?;
 
-            // Expand decode URLs with DP ranks
+            // Expand decode URLs with DP ranks (0..data_parallel_size-1)
             let expanded_decode = super::dp_utils::get_dp_aware_workers(
                 &decode_urls,
                 &ctx.router_config.api_key,
@@ -1811,11 +1817,15 @@ impl RouterTrait for PDRouter {
         };
 
         // Test prefill server's health_generate
-        let prefill_url = format!("{}/health_generate", prefill.url());
+        // Extract base URLs if DP-aware format (e.g., http://127.0.0.1:8081@0 → http://127.0.0.1:8081)
+        let (prefill_base_url, _) = super::dp_utils::parse_worker_url(prefill.url());
+        let (decode_base_url, _) = super::dp_utils::parse_worker_url(decode.url());
+
+        let prefill_url = format!("{}/health_generate", prefill_base_url);
         let (prefill_result, decode_result) = tokio::join!(
             self.client.get(&prefill_url).send(),
             self.client
-                .get(format!("{}/health_generate", decode.url()))
+                .get(format!("{}/health_generate", decode_base_url))
                 .send()
         );
 

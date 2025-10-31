@@ -926,8 +926,9 @@ impl Router {
                 Ok(res) => {
                     if res.status().is_success() {
                         if self.data_parallel_size > 1 {
-                            // Need to contact the worker to extract the dp_size,
-                            // and add them as multiple workers
+                            // Expand worker URL into multiple DP-aware URLs based on configured data_parallel_size
+                            // (e.g., "http://host:8000" → "http://host:8000@0", "@1", etc.)
+                            // without querying the worker
                             let url_vec = vec![String::from(worker_url)];
                             let dp_url_vec = dp_utils::get_dp_aware_workers(
                                 &url_vec,
