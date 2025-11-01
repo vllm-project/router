@@ -1,0 +1,21 @@
+---
+# Headless service for decode backends (for pod discovery)
+apiVersion: v1
+kind: Service
+metadata:
+  name: ms-llama31-llm-d-modelservice-decode
+  namespace: vllm-router-llama31
+  labels:
+    app: vllm-backend
+    role: decode
+spec:
+  type: ClusterIP
+  clusterIP: None  # Headless service - creates DNS records for each pod
+  ports:
+  - port: 8000
+    targetPort: 8000
+    protocol: TCP
+    name: http
+  selector:
+    llm-d.ai/role: decode
+    llm-d.ai/inferenceServing: "true"
