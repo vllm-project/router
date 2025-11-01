@@ -1,0 +1,14 @@
+repositories:
+  - name: llm-d-modelservice
+    url: https://llm-d-incubation.github.io/llm-d-modelservice/
+
+releases:
+  - name: ms-llama31
+    namespace: vllm-router-pd-llama31
+    chart: llm-d-modelservice/llm-d-modelservice
+    version: v0.2.11
+    installed: true
+    values:
+      - values.yaml
+    labels:
+      kind: vllm-backends
