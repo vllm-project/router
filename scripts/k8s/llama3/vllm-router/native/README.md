@@ -107,15 +107,17 @@ decode:
 
 ### router-deployment.yaml
 
-Router points to backend services:
+Router uses headless service with data-parallel-size for load balancing:
 ```yaml
 command:
   - vllm-router
-  - --backend
-  - http://ms-llama31-llm-d-modelservice-decode-0.vllm-router-llama31.svc.cluster.local:8000
-  - --backend
-  - http://ms-llama31-llm-d-modelservice-decode-1.vllm-router-llama31.svc.cluster.local:8000
+  - --worker-urls
+  - http://ms-llama31-llm-d-modelservice-decode.vllm-router-llama31.svc.cluster.local:8000
+  - --data-parallel-size
+  - "8"
 ```
+
+This configuration creates 8 logical workers (one per DP rank). The router establishes multiple HTTP connections (one per DP rank), and Kubernetes DNS round-robin distributes these connections across both backend pods.
 
 ## Monitoring
 
