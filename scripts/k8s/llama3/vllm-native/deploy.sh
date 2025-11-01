@@ -99,30 +99,6 @@ kubectl get pods -n "$NAMESPACE" -o wide
 
 echo ""
 echo "==========================================="
-echo "Verifying DP Coordination"
-echo "==========================================="
-echo ""
-
-# Check rank 0 logs
-RANK0_POD=$(kubectl get pod -n "$NAMESPACE" -l app=ms-llama31-multinode-llm-d-modelservice-decode -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
-if [ -n "$RANK0_POD" ]; then
-    echo "Rank 0 (Master) Pod: $RANK0_POD"
-    echo "Last 20 lines:"
-    kubectl logs -n "$NAMESPACE" "$RANK0_POD" -c vllm --tail=20 2>/dev/null || echo "  (logs not available yet)"
-fi
-
-echo ""
-
-# Check rank 1 logs
-RANK1_POD=$(kubectl get pod -n "$NAMESPACE" -l app=ms-llama31-multinode-llm-d-modelservice-prefill -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
-if [ -n "$RANK1_POD" ]; then
-    echo "Rank 1 (Worker) Pod: $RANK1_POD"
-    echo "Last 20 lines:"
-    kubectl logs -n "$NAMESPACE" "$RANK1_POD" -c vllm --tail=20 2>/dev/null || echo "  (logs not available yet)"
-fi
-
-echo ""
-echo "==========================================="
 echo "Next Steps"
 echo "==========================================="
 echo ""

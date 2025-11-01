@@ -127,7 +127,7 @@ prefill:
         - key: app
           operator: In
           values:
-          - ms-llama31-llm-d-modelservice-decode  # Anti-affinity with decode (rank 0)
+          - ms-llama31-multinode-llm-d-modelservice-decode  # Anti-affinity with decode (rank 0)
       topologyKey: "kubernetes.io/hostname"
 
   monitoring:
