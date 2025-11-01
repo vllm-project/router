@@ -7,7 +7,6 @@ use crate::core::{
 use crate::grpc::VllmSchedulerClient;
 use crate::metrics::RouterMetrics;
 use crate::policies::LoadBalancingPolicy;
-use crate::reasoning_parser::ParserFactory;
 use crate::routers::{RouterTrait, WorkerManagement};
 use crate::tokenizer::traits::Tokenizer;
 use crate::tool_parser::ParserRegistry;
@@ -34,8 +33,6 @@ pub struct GrpcRouter {
     policy: Arc<dyn LoadBalancingPolicy>,
     /// Tokenizer for handling text encoding/decoding
     tokenizer: Arc<dyn Tokenizer>,
-    /// Reasoning parser factory for structured reasoning outputs
-    reasoning_parser_factory: ParserFactory,
     /// Tool parser registry for function/tool calls
     tool_parser_registry: &'static ParserRegistry,
     /// Worker health checker
@@ -64,11 +61,6 @@ impl GrpcRouter {
             .tokenizer
             .as_ref()
             .ok_or_else(|| "gRPC router requires tokenizer".to_string())?
-            .clone();
-        let reasoning_parser_factory = ctx
-            .reasoning_parser_factory
-            .as_ref()
-            .ok_or_else(|| "gRPC router requires reasoning parser factory".to_string())?
             .clone();
         let tool_parser_registry = ctx
             .tool_parser_registry
@@ -148,7 +140,6 @@ impl GrpcRouter {
             grpc_clients: Arc::new(RwLock::new(grpc_clients)),
             policy,
             tokenizer,
-            reasoning_parser_factory,
             tool_parser_registry,
             _health_checker: Some(health_checker),
             timeout_secs: ctx.router_config.worker_startup_timeout_secs,

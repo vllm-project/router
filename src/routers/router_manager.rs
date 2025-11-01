@@ -195,10 +195,6 @@ impl RouterManager {
             labels.insert("tokenizer_path".to_string(), tokenizer_path);
         }
 
-        if let Some(reasoning_parser) = config.reasoning_parser {
-            labels.insert("reasoning_parser".to_string(), reasoning_parser);
-        }
-
         if let Some(tool_parser) = config.tool_parser {
             labels.insert("tool_parser".to_string(), tool_parser);
         }
@@ -376,7 +372,6 @@ impl RouterManager {
             load: worker.load(),
             connection_mode: format!("{:?}", worker.connection_mode()),
             tokenizer_path: worker.tokenizer_path().map(|s| s.to_string()),
-            reasoning_parser: worker.reasoning_parser().map(|s| s.to_string()),
             tool_parser: worker.tool_parser().map(|s| s.to_string()),
             chat_template: worker.chat_template().map(|s| s.to_string()),
             metadata: metadata.labels.clone(),
@@ -481,7 +476,6 @@ impl WorkerManagement for RouterManager {
             labels: std::collections::HashMap::new(),
             bootstrap_port: None,
             tokenizer_path: None,
-            reasoning_parser: None,
             tool_parser: None,
             chat_template: None,
         };

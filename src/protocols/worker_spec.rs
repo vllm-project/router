@@ -36,10 +36,6 @@ pub struct WorkerConfigRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tokenizer_path: Option<String>,
 
-    /// Reasoning parser type for gRPC mode
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reasoning_parser: Option<String>,
-
     /// Tool parser type for gRPC mode
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_parser: Option<String>,
@@ -86,9 +82,6 @@ pub struct WorkerInfo {
     // gRPC-specific fields (None for HTTP workers)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tokenizer_path: Option<String>,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reasoning_parser: Option<String>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_parser: Option<String>,
@@ -186,9 +179,6 @@ pub struct ServerInfo {
     // gRPC-specific
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tokenizer_path: Option<String>,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reasoning_parser: Option<String>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_parser: Option<String>,

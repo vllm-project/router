@@ -205,14 +205,6 @@ pub trait Worker: Send + Sync + fmt::Debug {
             .map(|s| s.as_str())
     }
 
-    /// Get the reasoning parser type for this worker (gRPC mode only)
-    fn reasoning_parser(&self) -> Option<&str> {
-        self.metadata()
-            .labels
-            .get("reasoning_parser")
-            .map(|s| s.as_str())
-    }
-
     /// Get the tool parser type for this worker (gRPC mode only)
     fn tool_parser(&self) -> Option<&str> {
         self.metadata()

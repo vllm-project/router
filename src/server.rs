@@ -13,7 +13,6 @@ use crate::{
         },
         worker_spec::{WorkerApiResponse, WorkerConfigRequest, WorkerErrorResponse},
     },
-    reasoning_parser::ParserFactory,
     routers::{
         router_manager::{RouterId, RouterManager},
         RouterFactory, RouterTrait,
@@ -46,7 +45,6 @@ pub struct AppContext {
     pub router_config: RouterConfig,
     pub rate_limiter: Arc<TokenBucket>,
     pub tokenizer: Option<Arc<dyn Tokenizer>>,
-    pub reasoning_parser_factory: Option<ParserFactory>,
     pub tool_parser_registry: Option<&'static ParserRegistry>,
     pub worker_registry: Arc<WorkerRegistry>,
     pub policy_registry: Arc<PolicyRegistry>,
@@ -65,7 +63,7 @@ impl AppContext {
         let rate_limiter = Arc::new(TokenBucket::new(max_concurrent_requests, rate_limit_tokens));
 
         // Initialize gRPC-specific components only when in gRPC mode
-        let (tokenizer, reasoning_parser_factory, tool_parser_registry) =
+        let (tokenizer, tool_parser_registry) =
             if router_config.connection_mode == ConnectionMode::Grpc {
                 // Get tokenizer path (required for gRPC mode)
                 let tokenizer_path = router_config
@@ -82,13 +80,12 @@ impl AppContext {
                     tokenizer_factory::create_tokenizer(&tokenizer_path)
                         .map_err(|e| format!("Failed to create tokenizer: {e}"))?,
                 );
-                let reasoning_parser_factory = Some(ParserFactory::new());
                 let tool_parser_registry = Some(ParserRegistry::new());
 
-                (tokenizer, reasoning_parser_factory, tool_parser_registry)
+                (tokenizer, tool_parser_registry)
             } else {
                 // HTTP mode doesn't need these components
-                (None, None, None)
+                (None, None)
             };
 
         let worker_registry = Arc::new(WorkerRegistry::new());
@@ -107,7 +104,6 @@ impl AppContext {
             router_config,
             rate_limiter,
             tokenizer,
-            reasoning_parser_factory,
             tool_parser_registry,
             worker_registry,
             policy_registry,
