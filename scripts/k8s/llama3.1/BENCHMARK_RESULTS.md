@@ -30,7 +30,6 @@ vllm-router \
     --pd-disaggregation \
     --prefill http://10.2.1.187:8000 \
     --decode http://10.2.1.133:8200 \
-    --dp-aware \
     --data-parallel-size 8 \
     --host 0.0.0.0 \
     --port 10001
@@ -185,7 +184,7 @@ The Llama 3.1 8B deployment with DP8TP1 configuration demonstrates:
 - ✓ **Stable Latency**: Consistent TPOT around 7.25ms
 - ✓ **Efficient P/D**: Mean TTFT of 280ms, fast prefill processing
 
-**Recommendation**: For DP-based deployments with P/D disaggregation, use the vLLM router with `--dp-aware` flag to ensure correct KV cache affinity and prevent response corruption.
+**Recommendation**: For DP-based deployments with P/D disaggregation, use the vLLM router with `--data-parallel-size` set to match your workers' DP size to ensure correct KV cache affinity and prevent response corruption.
 
 ## Test Date
 **Benchmark Run**: October 28, 2025

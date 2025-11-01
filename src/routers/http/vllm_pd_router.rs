@@ -41,8 +41,8 @@ pub struct VllmPDRouter {
     profile_timeout_secs: u64,
     /// Active profiling timeout tasks keyed by worker URL
     profiling_tasks: Arc<Mutex<HashMap<String, tokio::task::AbortHandle>>>,
-    /// Whether DP-aware routing is enabled
-    dp_aware: bool,
+    /// Data parallel size for DP-aware routing (automatically enabled when > 1)
+    data_parallel_size: usize,
 }
 
 impl VllmPDRouter {
@@ -294,8 +294,8 @@ impl VllmPDRouter {
         // Stage 1: Send to prefill server with max_tokens=1 and P2P coordination header
         info!("Stage 1: Sending prefill-only request (max_tokens=1) to prefill server at http://{}", prefill_http);
 
-        // Extract dp_rank from prefill_http if dp_aware is enabled using shared utility
-        let (prefill_base_http, prefill_dp_rank) = if self.dp_aware {
+        // Extract dp_rank from prefill_http if data_parallel_size > 1
+        let (prefill_base_http, prefill_dp_rank) = if self.data_parallel_size > 1 {
             let prefill_url = format!("http://{}", prefill_http);
             let (base, rank) = dp_utils::parse_worker_url(&prefill_url);
             let base_http = base.replace("http://", "").replace("https://", "");
@@ -367,8 +367,8 @@ impl VllmPDRouter {
         // Stage 2: Send to decode server with original request and same P2P coordination header
         info!("Stage 2: Sending original request to decode server at http://{}", decode_http);
 
-        // Extract dp_rank from decode_http if dp_aware is enabled using shared utility
-        let (decode_base_http, decode_dp_rank) = if self.dp_aware {
+        // Extract dp_rank from decode_http if data_parallel_size > 1
+        let (decode_base_http, decode_dp_rank) = if self.data_parallel_size > 1 {
             let decode_url = format!("http://{}", decode_http);
             let (base, rank) = dp_utils::parse_worker_url(&decode_url);
             let base_http = base.replace("http://", "").replace("https://", "");
@@ -500,8 +500,8 @@ impl VllmPDRouter {
 
         info!("Added kv_transfer_params to prefill request for NixlConnector support");
 
-        // Extract base URL and dp_rank if dp_aware is enabled
-        let (prefill_base_url, prefill_dp_rank) = if self.dp_aware {
+        // Extract base URL and dp_rank if data_parallel_size > 1
+        let (prefill_base_url, prefill_dp_rank) = if self.data_parallel_size > 1 {
             match dp_utils::extract_dp_rank(prefill_worker.url()) {
                 Ok((base, rank)) => (base.to_string(), Some(rank)),
                 Err(e) => {
@@ -533,7 +533,7 @@ impl VllmPDRouter {
             .header("Authorization", format!("Bearer {}", std::env::var("OPENAI_API_KEY").unwrap_or_default()))
             .header("X-Request-Id", &request_id);
 
-        // Add X-data-parallel-rank header if dp_aware is enabled
+        // Add X-data-parallel-rank header if data_parallel_size > 1
         if let Some(rank) = prefill_dp_rank {
             prefill_request_builder = prefill_request_builder.header("X-data-parallel-rank", rank.to_string());
         }
@@ -587,8 +587,8 @@ impl VllmPDRouter {
             info!("Added kv_transfer_params to decode request");
         }
 
-        // Extract base URL and dp_rank if dp_aware is enabled
-        let (decode_base_url, decode_dp_rank) = if self.dp_aware {
+        // Extract base URL and dp_rank if data_parallel_size > 1
+        let (decode_base_url, decode_dp_rank) = if self.data_parallel_size > 1 {
             match dp_utils::extract_dp_rank(decode_worker.url()) {
                 Ok((base, rank)) => (base.to_string(), Some(rank)),
                 Err(e) => {
@@ -620,7 +620,7 @@ impl VllmPDRouter {
             .header("Authorization", format!("Bearer {}", std::env::var("OPENAI_API_KEY").unwrap_or_default()))
             .header("X-Request-Id", &request_id);
 
-        // Add X-data-parallel-rank header if dp_aware is enabled
+        // Add X-data-parallel-rank header if data_parallel_size > 1
         if let Some(rank) = decode_dp_rank {
             decode_request_builder = decode_request_builder.header("X-data-parallel-rank", rank.to_string());
         }
@@ -739,7 +739,7 @@ impl VllmPDRouter {
                 enable_profiling: ctx.router_config.enable_profiling,
                 profile_timeout_secs: ctx.router_config.profile_timeout_secs,
                 profiling_tasks: Arc::new(Mutex::new(HashMap::new())),
-                dp_aware: ctx.router_config.dp_aware,
+                data_parallel_size: ctx.router_config.data_parallel_size,
             })
         } else {
             // Direct URL mode (same as PDRouter)
@@ -763,7 +763,7 @@ impl VllmPDRouter {
                 enable_profiling: ctx.router_config.enable_profiling,
                 profile_timeout_secs: ctx.router_config.profile_timeout_secs,
                 profiling_tasks: Arc::new(Mutex::new(HashMap::new())),
-                dp_aware: ctx.router_config.dp_aware,
+                data_parallel_size: ctx.router_config.data_parallel_size,
             })
         }
     }

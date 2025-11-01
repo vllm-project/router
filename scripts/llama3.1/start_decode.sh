@@ -27,11 +27,11 @@ echo "  Side channel base port: $VLLM_NIXL_SIDE_CHANNEL_PORT (will use 8093-8096
 echo "  Data parallel size: 4"
 echo "  NIXL HTTP port: 8098"
 
-CUDA_VISIBLE_DEVICES=4,5,6,7 vllm serve meta-llama/Llama-3.1-8B-Instruct \
+CUDA_VISIBLE_DEVICES=2,3 vllm serve meta-llama/Llama-3.1-8B-Instruct \
     --host 0.0.0.0 \
     --port 8082 \
     --tensor-parallel-size 1 \
-    --data-parallel-size 4 \
+    --data-parallel-size 2 \
     --async-scheduling \
     --compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY"}' \
     --kv-transfer-config '{"kv_connector":"NixlConnector","kv_role":"kv_both","kv_connector_extra_config":{"backends":["UCX","GDS"],"http_port":8098}}' \

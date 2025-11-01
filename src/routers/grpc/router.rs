@@ -43,7 +43,7 @@ pub struct GrpcRouter {
     /// Configuration
     timeout_secs: u64,
     interval_secs: u64,
-    dp_aware: bool,
+    data_parallel_size: usize,
     api_key: Option<String>,
     retry_config: RetryConfig,
     circuit_breaker_config: CircuitBreakerConfig,
@@ -153,7 +153,7 @@ impl GrpcRouter {
             _health_checker: Some(health_checker),
             timeout_secs: ctx.router_config.worker_startup_timeout_secs,
             interval_secs: ctx.router_config.worker_startup_check_interval_secs,
-            dp_aware: ctx.router_config.dp_aware,
+            data_parallel_size: ctx.router_config.data_parallel_size,
             api_key: ctx.router_config.api_key.clone(),
             retry_config: ctx.router_config.effective_retry_config(),
             circuit_breaker_config: core_cb_config,
@@ -167,7 +167,7 @@ impl std::fmt::Debug for GrpcRouter {
             .field("workers_count", &self.workers.read().unwrap().len())
             .field("timeout_secs", &self.timeout_secs)
             .field("interval_secs", &self.interval_secs)
-            .field("dp_aware", &self.dp_aware)
+            .field("data_parallel_size", &self.data_parallel_size)
             .finish()
     }
 }

@@ -24,9 +24,7 @@ pub struct RouterConfig {
     pub worker_startup_timeout_secs: u64,
     /// Worker health check interval in seconds
     pub worker_startup_check_interval_secs: u64,
-    /// Enable data parallelism aware schedule
-    pub dp_aware: bool,
-    /// Fallback data parallel size when API call fails (default: 1)
+    /// Data parallel size (number of DP replicas per worker URL). When > 1, the router will create multiple worker instances per URL, one for each DP rank.
     #[serde(default = "default_data_parallel_size")]
     pub data_parallel_size: usize,
     /// The api key used for the authorization with the worker
@@ -414,7 +412,6 @@ impl Default for RouterConfig {
             request_timeout_secs: 1800,    // 30 minutes
             worker_startup_timeout_secs: 600,
             worker_startup_check_interval_secs: 30,
-            dp_aware: false,
             data_parallel_size: 1,
             api_key: None,
             discovery: None,
@@ -978,7 +975,6 @@ mod tests {
             request_timeout_secs: 120,
             worker_startup_timeout_secs: 60,
             worker_startup_check_interval_secs: 5,
-            dp_aware: false,
             data_parallel_size: 1,
             api_key: None,
             discovery: Some(DiscoveryConfig {
@@ -1045,7 +1041,6 @@ mod tests {
             request_timeout_secs: 300,
             worker_startup_timeout_secs: 180,
             worker_startup_check_interval_secs: 15,
-            dp_aware: false,
             data_parallel_size: 1,
             api_key: None,
             discovery: Some(DiscoveryConfig {
@@ -1103,7 +1098,6 @@ mod tests {
             request_timeout_secs: 900,
             worker_startup_timeout_secs: 600,
             worker_startup_check_interval_secs: 20,
-            dp_aware: false,
             data_parallel_size: 1,
             api_key: None,
             discovery: Some(DiscoveryConfig {

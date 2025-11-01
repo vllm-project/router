@@ -119,7 +119,7 @@ This will:
 - Max Concurrency: 16
 - Prefill Server: http://10.2.1.155:8000
 - Decode Server: http://10.2.1.168:8000
-- Router Configuration: `--dp-aware --data-parallel-size 1`
+- Router Configuration: `--data-parallel-size 1`
 
 **Performance Metrics:**
 ```

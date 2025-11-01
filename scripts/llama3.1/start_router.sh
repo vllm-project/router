@@ -5,29 +5,29 @@
 #
 # Testing DP=4 configuration:
 # - Prefill and Decode servers are running with --data-parallel-size 4
-# - Baseline test completed successfully WITHOUT --dp-aware flag
-# - Now testing WITH --dp-aware flag enabled
+# - Router uses --data-parallel-size 4 to automatically create DP-aware workers
 
 cd /home/congc/gitrepos/router
 
-echo "Starting router with DP-aware scheduling enabled"
+echo "Starting router with data parallelism (DP=4)"
 echo "Configuration:"
 echo "  Policy: consistent_hash"
-echo "  DP-aware: ENABLED"
+echo "  Data Parallel Size: 4"
 echo "  Prefill: http://127.0.0.1:8081 (DP=4)"
 echo "  Decode: http://127.0.0.1:8082 (DP=4)"
 echo "  Router port: 8090"
 echo ""
 
-# Start the router with static prefill/decode URLs and DP-aware flag
+# Start the router with static prefill/decode URLs
+# When data-parallel-size > 1, router automatically creates DP-aware workers
 # Using pre-built binary directly instead of "cargo run --release"
-# cargo run --release -- \
- ./target/release/vllm-router \
+#  ./target/release/vllm-router \
+cargo run --release -- \
     --policy round_robin \
     --vllm-pd-disaggregation \
     --prefill http://127.0.0.1:8081 \
     --decode http://127.0.0.1:8082 \
     --host 127.0.0.1 \
     --port 8090 \
-    --dp-aware \
+    --data-parallel-size 2 \
     --log-level debug

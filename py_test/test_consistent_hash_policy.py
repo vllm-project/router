@@ -438,7 +438,7 @@ def main():
         "--test",
         choices=[
             "session", "user", "priority", "distribution",
-            "fallback", "dp_aware", "concurrent", "formats", "all"
+            "fallback", "dp_routing", "concurrent", "formats", "all"
         ],
         default="all",
         help="Run specific test (default: all)"
@@ -459,7 +459,7 @@ def main():
             "priority": tester.test_session_priority_over_user,
             "distribution": lambda: tester.test_distribution_across_workers(20),
             "fallback": tester.test_fallback_without_session_or_user,
-            "dp_aware": tester.test_dp_aware_routing,
+            "dp_routing": tester.test_dp_aware_routing,
             "concurrent": lambda: tester.test_concurrent_requests(10),
             "formats": tester.test_different_request_formats,
         }
