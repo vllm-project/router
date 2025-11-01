@@ -205,14 +205,6 @@ pub trait Worker: Send + Sync + fmt::Debug {
             .map(|s| s.as_str())
     }
 
-    /// Get the tool parser type for this worker (gRPC mode only)
-    fn tool_parser(&self) -> Option<&str> {
-        self.metadata()
-            .labels
-            .get("tool_parser")
-            .map(|s| s.as_str())
-    }
-
     /// Get the chat template for this worker (gRPC mode only)
     fn chat_template(&self) -> Option<&str> {
         self.metadata()

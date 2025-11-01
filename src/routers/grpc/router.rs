@@ -9,7 +9,6 @@ use crate::metrics::RouterMetrics;
 use crate::policies::LoadBalancingPolicy;
 use crate::routers::{RouterTrait, WorkerManagement};
 use crate::tokenizer::traits::Tokenizer;
-use crate::tool_parser::ParserRegistry;
 use async_trait::async_trait;
 use axum::{
     body::Body,
@@ -33,8 +32,6 @@ pub struct GrpcRouter {
     policy: Arc<dyn LoadBalancingPolicy>,
     /// Tokenizer for handling text encoding/decoding
     tokenizer: Arc<dyn Tokenizer>,
-    /// Tool parser registry for function/tool calls
-    tool_parser_registry: &'static ParserRegistry,
     /// Worker health checker
     _health_checker: Option<HealthChecker>,
     /// Configuration
@@ -62,9 +59,6 @@ impl GrpcRouter {
             .as_ref()
             .ok_or_else(|| "gRPC router requires tokenizer".to_string())?
             .clone();
-        let tool_parser_registry = ctx
-            .tool_parser_registry
-            .ok_or_else(|| "gRPC router requires tool parser registry".to_string())?;
 
         // Convert config CircuitBreakerConfig to core CircuitBreakerConfig
         let circuit_breaker_config = ctx.router_config.effective_circuit_breaker_config();
@@ -140,7 +134,6 @@ impl GrpcRouter {
             grpc_clients: Arc::new(RwLock::new(grpc_clients)),
             policy,
             tokenizer,
-            tool_parser_registry,
             _health_checker: Some(health_checker),
             timeout_secs: ctx.router_config.worker_startup_timeout_secs,
             interval_secs: ctx.router_config.worker_startup_check_interval_secs,

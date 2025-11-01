@@ -9,7 +9,6 @@ use crate::metrics::RouterMetrics;
 use crate::policies::LoadBalancingPolicy;
 use crate::routers::{RouterTrait, WorkerManagement};
 use crate::tokenizer::traits::Tokenizer;
-use crate::tool_parser::ParserRegistry;
 use async_trait::async_trait;
 use axum::{
     body::Body,
@@ -39,8 +38,6 @@ pub struct GrpcPDRouter {
     decode_policy: Arc<dyn LoadBalancingPolicy>,
     /// Tokenizer for handling text encoding/decoding
     tokenizer: Arc<dyn Tokenizer>,
-    /// Tool parser registry for function/tool calls
-    tool_parser_registry: &'static ParserRegistry,
     /// Worker health checkers
     _prefill_health_checker: Option<HealthChecker>,
     _decode_health_checker: Option<HealthChecker>,
@@ -71,9 +68,6 @@ impl GrpcPDRouter {
             .as_ref()
             .ok_or_else(|| "gRPC PD router requires tokenizer".to_string())?
             .clone();
-        let tool_parser_registry = ctx
-            .tool_parser_registry
-            .ok_or_else(|| "gRPC PD router requires tool parser registry".to_string())?;
 
         // Convert config CircuitBreakerConfig to core CircuitBreakerConfig
         let circuit_breaker_config = ctx.router_config.effective_circuit_breaker_config();
@@ -199,7 +193,6 @@ impl GrpcPDRouter {
             prefill_policy,
             decode_policy,
             tokenizer,
-            tool_parser_registry,
             _prefill_health_checker: Some(prefill_health_checker),
             _decode_health_checker: Some(decode_health_checker),
             timeout_secs: ctx.router_config.worker_startup_timeout_secs,
