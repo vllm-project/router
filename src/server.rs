@@ -19,7 +19,6 @@ use crate::{
     },
     service_discovery::{start_service_discovery, ServiceDiscoveryConfig},
     tokenizer::{factory as tokenizer_factory, traits::Tokenizer},
-    tool_parser::ParserRegistry,
 };
 use axum::{
     extract::{Path, Query, Request, State},
@@ -45,7 +44,6 @@ pub struct AppContext {
     pub router_config: RouterConfig,
     pub rate_limiter: Arc<TokenBucket>,
     pub tokenizer: Option<Arc<dyn Tokenizer>>,
-    pub tool_parser_registry: Option<&'static ParserRegistry>,
     pub worker_registry: Arc<WorkerRegistry>,
     pub policy_registry: Arc<PolicyRegistry>,
     pub router_manager: Option<Arc<RouterManager>>,
@@ -63,30 +61,26 @@ impl AppContext {
         let rate_limiter = Arc::new(TokenBucket::new(max_concurrent_requests, rate_limit_tokens));
 
         // Initialize gRPC-specific components only when in gRPC mode
-        let (tokenizer, tool_parser_registry) =
-            if router_config.connection_mode == ConnectionMode::Grpc {
-                // Get tokenizer path (required for gRPC mode)
-                let tokenizer_path = router_config
-                    .tokenizer_path
-                    .clone()
-                    .or_else(|| router_config.model_path.clone())
-                    .ok_or_else(|| {
-                        "gRPC mode requires either --tokenizer-path or --model-path to be specified"
-                            .to_string()
-                    })?;
+        let tokenizer = if router_config.connection_mode == ConnectionMode::Grpc {
+            // Get tokenizer path (required for gRPC mode)
+            let tokenizer_path = router_config
+                .tokenizer_path
+                .clone()
+                .or_else(|| router_config.model_path.clone())
+                .ok_or_else(|| {
+                    "gRPC mode requires either --tokenizer-path or --model-path to be specified"
+                        .to_string()
+                })?;
 
-                // Initialize all gRPC components
-                let tokenizer = Some(
-                    tokenizer_factory::create_tokenizer(&tokenizer_path)
-                        .map_err(|e| format!("Failed to create tokenizer: {e}"))?,
-                );
-                let tool_parser_registry = Some(ParserRegistry::new());
-
-                (tokenizer, tool_parser_registry)
-            } else {
-                // HTTP mode doesn't need these components
-                (None, None)
-            };
+            // Initialize tokenizer
+            Some(
+                tokenizer_factory::create_tokenizer(&tokenizer_path)
+                    .map_err(|e| format!("Failed to create tokenizer: {e}"))?,
+            )
+        } else {
+            // HTTP mode doesn't need tokenizer
+            None
+        };
 
         let worker_registry = Arc::new(WorkerRegistry::new());
         let policy_registry = Arc::new(PolicyRegistry::new(router_config.policy.clone()));
@@ -104,7 +98,6 @@ impl AppContext {
             router_config,
             rate_limiter,
             tokenizer,
-            tool_parser_registry,
             worker_registry,
             policy_registry,
             router_manager,
