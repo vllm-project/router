@@ -164,7 +164,6 @@ command:
   - http://ms-llama31-llm-d-modelservice-prefill.vllm-router-pd-llama31.svc.cluster.local:8000
   - --decode
   - http://ms-llama31-llm-d-modelservice-decode.vllm-router-pd-llama31.svc.cluster.local:8200
-  - --dp-aware
   - --data-parallel-size
   - "8"
   - --policy
