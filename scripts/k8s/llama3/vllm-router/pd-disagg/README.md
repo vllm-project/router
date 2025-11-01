@@ -29,7 +29,7 @@ Prefill handles initial token generation, transfers KV cache to decode for conti
 3. **HuggingFace Token**:
 ```bash
 kubectl create secret generic llm-d-hf-token \
-  --from-literal=HF_TOKEN=yourhf_LgywCRhBOzWMUOhrIZPIPnNtFPWgKtQlWU_token_here \
+  --from-literal=HF_TOKEN=hf_token \
   -n vllm-router-pd-llama31
 ```
 
