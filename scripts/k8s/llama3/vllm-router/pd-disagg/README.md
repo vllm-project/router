@@ -26,16 +26,26 @@ Prefill handles initial token generation, transfers KV cache to decode for conti
 
 1. **Kubernetes Cluster** with 16 GPUs + RDMA support
 2. **Tools**: kubectl, helm, helmfile
-3. **HuggingFace Token**:
-```bash
-kubectl create secret generic llm-d-hf-token \
-  --from-literal=HF_TOKEN=hf_token \
-  -n vllm-router-pd-llama31
-```
+3. **HuggingFace Token**: Set as environment variable before deploying
 
 ## Deployment Steps
 
-### 1. Deploy Everything
+### 1. Set HuggingFace Token
+
+Export your HuggingFace token as an environment variable:
+
+```bash
+export HF_TOKEN=hf_your_token_here
+```
+
+Example:
+```bash
+export HF_TOKEN=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
+```
+
+The `deploy.sh` script will automatically create the Kubernetes secret from this environment variable.
+
+### 2. Deploy Everything
 
 ```bash
 cd scripts/k8s/llama3/vllm-router/pd-disagg
@@ -44,14 +54,14 @@ cd scripts/k8s/llama3/vllm-router/pd-disagg
 
 This single command deploys:
 - Namespace creation (if needed)
-- HuggingFace token (auto-copied from llm-d-llama31 if available)
+- HuggingFace token secret (from HF_TOKEN environment variable)
 - 1 prefill pod with KV transfer enabled (8 GPUs DP8)
 - 1 decode pod with KV transfer enabled (8 GPUs DP8)
 - Backend Kubernetes Services (prefill & decode)
 - vllm-router deployment
 - vllm-router service
 
-### 2. Verify Deployment
+### 3. Verify Deployment
 
 ```bash
 # Check all pods are running

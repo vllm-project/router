@@ -24,24 +24,24 @@ if ! kubectl get secret llm-d-hf-token -n "$NAMESPACE" &> /dev/null; then
     echo ""
     echo "HuggingFace token secret 'llm-d-hf-token' not found in namespace $NAMESPACE"
 
-    # Try to copy from llm-d-llama31 namespace if it exists there
-    if kubectl get secret llm-d-hf-token -n llm-d-llama31 &> /dev/null; then
-        echo "Copying HF token from llm-d-llama31 namespace..."
-        kubectl get secret llm-d-hf-token -n llm-d-llama31 -o yaml | \
-          sed "s/namespace: llm-d-llama31/namespace: $NAMESPACE/" | \
-          kubectl apply -f -
-        echo "✓ HF token copied successfully"
-    else
-        echo "WARNING: Could not find HF token in llm-d-llama31 namespace either"
-        echo "Please create it with:"
-        echo "  kubectl create secret generic llm-d-hf-token --from-literal=HF_TOKEN=your_token_here -n $NAMESPACE"
+    # Check if HF_TOKEN environment variable is set
+    if [ -z "$HF_TOKEN" ]; then
+        echo "ERROR: HF_TOKEN environment variable is not set"
         echo ""
-        read -p "Continue anyway? (y/N) " -n 1 -r
-        echo
-        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-            exit 1
-        fi
+        echo "Please set your HuggingFace token as an environment variable:"
+        echo "  export HF_TOKEN=hf_your_token_here"
+        echo ""
+        echo "Example:"
+        echo "  export HF_TOKEN=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"
+        echo ""
+        exit 1
     fi
+
+    echo "Creating HF token secret from environment variable..."
+    kubectl create secret generic llm-d-hf-token \
+        --from-literal=HF_TOKEN="$HF_TOKEN" \
+        -n "$NAMESPACE"
+    echo "✓ HF token secret created successfully"
 fi
 
 # Deploy using helmfile
