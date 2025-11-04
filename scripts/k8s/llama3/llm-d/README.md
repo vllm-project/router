@@ -112,7 +112,7 @@ decode/prefill:
 kubectl create namespace llm-d-llama31
 
 kubectl create secret generic llm-d-hf-token \
-  --from-literal=HF_TOKEN=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 \
+  --from-literal=HF_TOKEN=hf_xxxxxxxxxxxxx \
   -n llm-d-llama31
 ```
 
