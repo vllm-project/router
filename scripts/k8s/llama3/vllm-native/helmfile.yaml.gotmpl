@@ -49,10 +49,9 @@ releases:
     values:
       - base-values.yaml
       - master-values.yaml
-    {{- if or (eq .Environment.Name "istioBench") (eq .Environment.Name "default") }}
-      - routing:
-          {{ .Environment.Values.routing | toYaml | nindent 10 }}
-    {{- end }}
+{{- if or (eq .Environment.Name "istioBench") (eq .Environment.Name "default") }}
+      - gateway-configs/benchmarking.yaml
+{{- end }}
     set:
       - name: "routing.parentRefs[0].name"
         value: {{ printf "infra-%s-inference-gateway" $rn | quote }}
