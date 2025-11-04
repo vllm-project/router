@@ -23,11 +23,8 @@ routing:
     create: false
 
 decode:
-  parallelism:
-    tensor: 8
-    data: 1
   create: true
-  replicas: 1
+  replicas: 8  # 8 independent pods with 1 GPU each (matches llm-d)
   monitoring:
     podmonitor:
       enabled: true
@@ -44,10 +41,6 @@ decode:
     args:
       - "--model"
       - "meta-llama/Llama-3.1-8B-Instruct"
-      - "--tensor-parallel-size"
-      - "1"
-      - "--data-parallel-size"
-      - "8"
       - "--host"
       - "0.0.0.0"
       - "--port"
@@ -57,7 +50,11 @@ decode:
       - "--kv-transfer-config"
       - '{"kv_connector":"NixlConnector", "kv_role":"kv_both"}'
       - "--disable-log-requests"
+      - "--block-size"
+      - "128"
     env:
+      - name: CUDA_VISIBLE_DEVICES
+        value: "0"
       - name: VLLM_NIXL_SIDE_CHANNEL_HOST
         valueFrom:
           fieldRef:
@@ -75,13 +72,13 @@ decode:
         protocol: TCP
     resources:
       limits:
-        memory: 800Gi
-        cpu: "180"
-        nvidia.com/gpu: "8"
+        memory: 100Gi
+        cpu: "22"
+        nvidia.com/gpu: "1"
       requests:
-        memory: 800Gi
-        cpu: "180"
-        nvidia.com/gpu: "8"
+        memory: 100Gi
+        cpu: "22"
+        nvidia.com/gpu: "1"
     mountModelVolume: false
     volumeMounts:
     - name: metrics-volume
@@ -101,11 +98,8 @@ decode:
     emptyDir: {}
 
 prefill:
-  parallelism:
-    tensor: 8
-    data: 1
   create: true
-  replicas: 1
+  replicas: 8  # 8 independent pods with 1 GPU each (matches llm-d)
   monitoring:
     podmonitor:
       enabled: true
@@ -122,10 +116,6 @@ prefill:
     args:
       - "--model"
       - "meta-llama/Llama-3.1-8B-Instruct"
-      - "--tensor-parallel-size"
-      - "1"
-      - "--data-parallel-size"
-      - "8"
       - "--host"
       - "0.0.0.0"
       - "--port"
@@ -135,7 +125,11 @@ prefill:
       - "--kv-transfer-config"
       - '{"kv_connector":"NixlConnector", "kv_role":"kv_both"}'
       - "--disable-log-requests"
+      - "--block-size"
+      - "128"
     env:
+      - name: CUDA_VISIBLE_DEVICES
+        value: "0"
       - name: VLLM_NIXL_SIDE_CHANNEL_HOST
         valueFrom:
           fieldRef:
@@ -153,13 +147,13 @@ prefill:
         protocol: TCP
     resources:
       limits:
-        memory: 800Gi
-        cpu: "180"
-        nvidia.com/gpu: "8"
+        memory: 100Gi
+        cpu: "22"
+        nvidia.com/gpu: "1"
       requests:
-        memory: 800Gi
-        cpu: "180"
-        nvidia.com/gpu: "8"
+        memory: 100Gi
+        cpu: "22"
+        nvidia.com/gpu: "1"
     mountModelVolume: false
     volumeMounts:
     - name: metrics-volume

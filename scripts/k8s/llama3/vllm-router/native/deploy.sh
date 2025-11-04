@@ -32,7 +32,7 @@ if ! kubectl get secret llm-d-hf-token -n "$NAMESPACE" &> /dev/null; then
         echo "  export HF_TOKEN=hf_your_token_here"
         echo ""
         echo "Example:"
-        echo "  export HF_TOKEN=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"
+        echo "  export HF_TOKEN=test"
         echo ""
         exit 1
     fi
