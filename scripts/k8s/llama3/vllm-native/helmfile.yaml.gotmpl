@@ -62,6 +62,7 @@ releases:
 {{- range $i, $_ := until 15 }}
 {{- $rank := add $i 1 -}}
 {{- $workerCtx := dict "rank" $rank "dpSize" $dpSize "decodeAddress" $decodeFqdn "rpcPort" $rpcPort -}}
+{{- $workerValues := tpl (readFile "worker-values.yaml.gotmpl") $workerCtx | fromYaml -}}
   - name: {{ printf "ms-%s-worker-rank-%02d" $rn $rank | quote }}
     namespace: {{ $ns }}
     chart: llm-d-modelservice/llm-d-modelservice
@@ -72,7 +73,7 @@ releases:
       - {{ printf "ms-%s" $rn | quote }}
     values:
       - base-values.yaml
-      - {{ tpl (readFile "worker-values.yaml.gotmpl") $workerCtx }}
+      - {{ toYaml $workerValues | nindent 8 }}
     labels:
       kind: inference-stack
 {{- end }}
