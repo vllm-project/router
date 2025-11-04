@@ -1,0 +1,23 @@
+multinode: false  # Not using chart's multinode, doing manual
+
+modelArtifacts:
+  uri: "hf://meta-llama/Llama-3.1-8B-Instruct"
+  size: 200Gi
+  authSecretName: "llm-d-hf-token"
+  name: "meta-llama/Llama-3.1-8B-Instruct"
+
+routing:
+  servicePort: 8000
+  proxy:
+    image: ghcr.io/llm-d/llm-d-routing-sidecar:v0.3.0
+    connector: nixlv2
+    secure: false
+
+  inferencePool:
+    create: false
+
+  httpRoute:
+    create: false
+
+  epp:
+    create: false

@@ -1,271 +1,133 @@
-# Llama 3.1 8B Multi-Node Data Parallelism
+# Llama 3.1 8B – 16 GPU vLLM Data Parallel Deployment
 
-Production-ready vLLM multi-node data parallelism (DP) deployment with explicit master-worker coordination.
+This directory contains a Kubernetes + Helmfile deployment that follows the
+[vLLM external load balancing topology](https://docs.vllm.ai/en/latest/serving/data_parallel_deployment.html#external-load-balancing)
+with **one rank-0 master** that exposes the public API and **15 worker ranks**
+that serve requests over the data-parallel (DP) RPC mesh. Every pod owns a
+single GPU so the full cluster delivers throughput from all 16 devices.
 
-## Overview
-
-This setup implements **vLLM's multi-node DP pattern** where:
-- **Rank 0 (Master)**: Receives ALL client requests and runs DP Coordinator
-- **Rank 1 (Worker)**: Connects to master via RPC, provides additional compute
-- **Total capacity**: 2 ranks with 16 GPUs total (8 per node)
-- **Request flow**: Client → Rank 0 → DP Coordinator → All workers across both ranks
-
-## Architecture
+## Topology
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                         Client                               │
-└────────────────────────┬────────────────────────────────────┘
-                         │
-                         ▼
-┌─────────────────────────────────────────────────────────────┐
-│            Rank 0 Service (Port 8000 + RPC 13345)            │
-└────────────────────────┬────────────────────────────────────┘
-                         │
-                         ▼
-┌─────────────────────────────────────────────────────────────┐
-│                    Rank 0 Pod (Master)                       │
-│  ┌─────────────────────────────────────────────────────────┐│
-│  │             vLLM DP Coordinator                          ││
-│  │  • Receives all HTTP requests                            ││
-│  │  • Distributes work across all 16 workers               ││
-│  │  • 8 local GPU workers                                   ││
-│  └─────────────────────────────────┬───────────────────────┘│
-│                                     │ RPC Port 13345          │
-└─────────────────────────────────────┼───────────────────────┘
-                                      │
-                                      ▼
-┌─────────────────────────────────────────────────────────────┐
-│                    Rank 1 Pod (Worker)                       │
-│  ┌─────────────────────────────────────────────────────────┐│
-│  │              vLLM Worker Process                         ││
-│  │  • Connects to rank 0 via RPC                            ││
-│  │  • No HTTP API (work received via RPC only)              ││
-│  │  • 8 remote GPU workers                                  ││
-│  └─────────────────────────────────────────────────────────┘│
-└─────────────────────────────────────────────────────────────┘
+Client traffic
+     │
+     ▼
+┌──────────────────────────────────────────────────────────────┐
+│ Rank 0 pod (decode)                                           │
+│  • 1× GPU, exposes HTTP :8000 and DP RPC :13345               │
+│  • Runs the DP coordinator / router                          │
+└──────────────┬───────────────────────────────────────────────┘
+               │ gRPC (port 13345)
+               ▼
+┌──────────────────────────────────────────────────────────────┐
+│ Ranks 1-15 pods (prefill workers)                             │
+│  • 1× GPU per pod                                             │
+│  • vLLM engine only, no public HTTP endpoint                  │
+│  • Register with the coordinator via the decode service       │
+└──────────────────────────────────────────────────────────────┘
 ```
 
-## How It Works
+* Rank 0 advertises `--data-parallel-size 16` and routes requests across all
+  ranks once each worker registers.
+* Workers are independent Helm releases so Kubernetes schedules up to 15 pods
+  across the available GPU nodes.
+* The shared PVC stores the model weights so redeployments skip the download.
 
-1. **Client sends request** → HTTP request to rank 0 on port 8000
-2. **Rank 0 receives request** → Logged in rank 0's HTTP API layer
-3. **DP Coordinator distributes work** → Splits work across all 16 GPU workers (8 local + 8 remote)
-4. **Rank 1 processes work** → Receives work via RPC (no HTTP logs), GPUs at 80%+ utilization
-5. **Response aggregated** → Rank 0 collects results and returns to client
+## Prerequisites
 
-## Quick Start
+* Kubernetes cluster with at least 16 visible NVIDIA GPUs.
+* [`kubectl`](https://kubernetes.io/docs/tasks/tools/) and
+  [`helmfile`](https://github.com/helmfile/helmfile#installation) installed.
+* HuggingFace token with access to `meta-llama/Llama-3.1-8B-Instruct` stored as
+  a Kubernetes secret named `llm-d-hf-token`.
 
-### Prerequisites
-
-- Kubernetes cluster with 2 nodes (8 GPUs each)
-- `kubectl` and `helmfile` installed
-- HuggingFace token with Llama 3.1 access
-
-### 1. Create Secret
-
-```bash
+```
 kubectl create namespace llm-d-llama31-multinode
 kubectl create secret generic llm-d-hf-token \
   --from-literal=HF_TOKEN=hf_xxxxxxxxxxxxx \
   -n llm-d-llama31-multinode
 ```
 
-### 2. Deploy
+## Deployment
 
 ```bash
-cd /data/users/nlalit/gitrepos/router/scripts/k8s/llama3.1_multinode
-./deploy.sh
+cd scripts/k8s/llama3/vllm-native
+./deploy.sh [namespace] [gateway-provider]
 ```
 
-Wait for pods to be ready (5-10 minutes first time for model download, ~2 minutes after).
+Defaults are `namespace=llm-d-llama31-multinode` and
+`gateway-provider=default` (Istio benchmarking config). The script:
 
-### 3. Port Forward (Required for Testing)
+1. Applies the Helmfile which creates
+   * one `ms-<release>` chart instance for the master pod, and
+   * fifteen `ms-<release>-worker-rank-XX` releases for the worker pods.
+2. Ensures the decode service exists so workers can reach the coordinator.
+3. Waits for the gateway, rank-0 pod, and all worker pods to become Ready.
 
-In a separate terminal, set up port forwarding to rank 0:
+### Verifying the rollout
+
+```bash
+# All 16 pods (1 decode + 15 prefill) should report Ready
+kubectl get pods -n llm-d-llama31-multinode -o wide
+
+# Rank 0 exposes the HTTP API
+kubectl logs -n llm-d-llama31-multinode -l llm-d.ai/role=decode -c vllm | tail
+
+# Workers only emit DP connection logs
+kubectl logs -n llm-d-llama31-multinode -l llm-d.ai/role=prefill -c vllm | grep "Connected to data parallel coordinator"
+```
+
+To run ad-hoc tests, port-forward the decode service and issue OpenAI-compatible
+requests:
 
 ```bash
 kubectl port-forward -n llm-d-llama31-multinode \
-  $(kubectl get pod -n llm-d-llama31-multinode -l llm-d.ai/role=decode -o jsonpath='{.items[0].metadata.name}') \
-  8000:8000
-```
+  svc/ms-llama31-multinode-llm-d-modelservice-decode 8000:8000
 
-Keep this running while you test, benchmark, or evaluate.
-
-### 4. Verify Deployment
-
-```bash
-# Check pods are on different nodes
-kubectl get pods -n llm-d-llama31-multinode -o wide
-
-# Test connection
 curl http://localhost:8000/v1/models
 ```
 
-### 5. Run Benchmark
+## Benchmarking & evaluation
+
+The existing helper scripts continue to work unchanged and always hit the rank-0
+endpoint:
 
 ```bash
-# Basic benchmark (100 prompts, concurrency 16)
-./run-benchmark.sh
+# Throughput benchmark (defaults: 100 prompts, concurrency 16)
+./run-benchmark.sh [namespace]
 
-# Custom configuration
-./run-benchmark.sh 1000 32
+# Eval harness wrapper
+./run-eval.sh [task] [namespace] [concurrency]
 ```
 
-### 6. Run Evaluation
+Monitor GPU utilization to confirm that traffic reaches all DP ranks:
 
 ```bash
-# Run gsm8k (default)
-./run-eval.sh
-
-# Run specific task with concurrency
-./run-eval.sh mmlu 4
-
-# Quick test with limited samples
-./run-eval.sh hellaswag 2 50
+kubectl exec -n llm-d-llama31-multinode -l llm-d.ai/role=prefill -c vllm -- \
+  nvidia-smi --query-gpu=index,utilization.gpu --format=csv
 ```
 
-## Deployment Flow Summary
-
-```bash
-# 1. Deploy
-./deploy.sh
-
-# 2. Wait for ready
-kubectl get pods -n llm-d-llama31-multinode -w
-
-# 3. Port forward (in separate terminal)
-kubectl port-forward -n llm-d-llama31-multinode \
-  $(kubectl get pod -n llm-d-llama31-multinode -l llm-d.ai/role=decode -o jsonpath='{.items[0].metadata.name}') \
-  8000:8000
-
-# 4. Benchmark
-./run-benchmark.sh
-
-# 5. Evaluate
-./run-eval.sh gsm8k 1
-```
-
-## Debugging
-
-### Check Pods are on Different Nodes
-
-```bash
-kubectl get pods -n llm-d-llama31-multinode -o wide
-```
-
-**Expected**: 2 pods (decode and prefill) on different nodes
-
-### Check Service Was Created
-
-```bash
-kubectl get svc -n llm-d-llama31-multinode ms-llama31-multinode-llm-d-modelservice-decode
-```
-
-**Expected**: Service with ports `8000/TCP,13345/TCP`
-
-### Check Service Has Endpoint
-
-```bash
-kubectl get endpoints -n llm-d-llama31-multinode ms-llama31-multinode-llm-d-modelservice-decode
-```
-
-**Expected**: One endpoint pointing to decode pod IP
-
-### Check Rank 0 (Master) Logs
-
-```bash
-kubectl logs -n llm-d-llama31-multinode \
-  $(kubectl get pod -n llm-d-llama31-multinode -l llm-d.ai/role=decode -o jsonpath='{.items[0].metadata.name}') \
-  -c vllm | tail -50
-```
-
-**Expected**: Should see "Uvicorn running" or "Application startup complete" (NOT stuck waiting)
-
-### Check Rank 1 (Worker) Logs
-
-```bash
-kubectl logs -n llm-d-llama31-multinode \
-  $(kubectl get pod -n llm-d-llama31-multinode -l llm-d.ai/role=prefill -o jsonpath='{.items[0].metadata.name}') \
-  -c vllm | tail -50
-```
-
-**Expected**: Should see successful connection to rank 0
-
-### Verify Multi-Node DP is Working
-
-Check GPU utilization on both pods during benchmark/eval:
-
-```bash
-# Get pod names
-DECODE_POD=$(kubectl get pod -n llm-d-llama31-multinode -l llm-d.ai/role=decode -o jsonpath='{.items[0].metadata.name}')
-PREFILL_POD=$(kubectl get pod -n llm-d-llama31-multinode -l llm-d.ai/role=prefill -o jsonpath='{.items[0].metadata.name}')
-
-# Check GPU usage on rank 0
-kubectl exec -n llm-d-llama31-multinode $DECODE_POD -c vllm -- \
-  nvidia-smi --query-gpu=utilization.gpu --format=csv
-
-# Check GPU usage on rank 1
-kubectl exec -n llm-d-llama31-multinode $PREFILL_POD -c vllm -- \
-  nvidia-smi --query-gpu=utilization.gpu --format=csv
-```
-
-**Expected**: Both pods should show GPU utilization > 0% (typically 60-90%) during workload
-
-**Important Note**: Rank 1 will NOT show HTTP request logs (normal behavior). It only processes work via RPC. GPU utilization is the proof that multi-node DP is working.
+You should see activity on every GPU once load is applied.
 
 ## Cleanup
 
 ```bash
-./cleanup.sh
+./cleanup.sh [namespace] [gateway-provider]
+```
 
-# To delete everything including cached model
+The script tears down the Helmfile releases (master + workers + infra), removes
+any straggling Helm releases, and deletes the decode service. The namespace is
+left intact so the PVC with the downloaded model can be reused. Delete the
+namespace manually if you want to reclaim the cache.
+
+```bash
 kubectl delete namespace llm-d-llama31-multinode
 ```
 
-## Troubleshooting
+## Reference
 
-### Pods Not Scheduling
+* vLLM external load balancing guide – rank-0 coordinator with external router.
+* Helm charts: `llm-d-modelservice` v0.2.11 and `llm-d-infra` v1.3.3.
 
-```bash
-kubectl describe pod -n llm-d-llama31-multinode <pod-name>
-```
-
-Check for: GPU availability, node resources, anti-affinity conflicts
-
-### Rank 1 Can't Connect to Rank 0
-
-```bash
-# Verify service exists
-kubectl get svc -n llm-d-llama31-multinode ms-llama31-multinode-llm-d-modelservice-decode
-
-# Check rank 1 logs for connection errors
-kubectl logs -n llm-d-llama31-multinode \
-  $(kubectl get pod -n llm-d-llama31-multinode -l llm-d.ai/role=prefill -o jsonpath='{.items[0].metadata.name}') \
-  -c vllm | grep -i "error\|connection"
-```
-
-### vLLM Not Ready
-
-```bash
-kubectl logs -n llm-d-llama31-multinode \
-  $(kubectl get pod -n llm-d-llama31-multinode -l llm-d.ai/role=decode -o jsonpath='{.items[0].metadata.name}') \
-  -c vllm | grep -i error
-```
-
-## Key Configuration
-
-- **2 ranks** (pods): Each pod is a separate vLLM instance
-- **8 GPUs per rank**: Configured via `parallelism.data: 8`
-- **Total**: 16 GPUs coordinated across 2 nodes
-- **Load balancing**: vLLM DP coordinator distributes work automatically
-- **Model caching**: PVC shared between pods for fast redeployment
-
-## References
-
-- [vLLM Multi-Node DP Documentation](https://docs.vllm.ai/en/latest/serving/data_parallel_deployment.html)
-- Helm chart: `llm-d-modelservice` v0.2.11
-
----
-
-**Built for production-grade multi-node vLLM deployments with true master-worker coordination.**
+This configuration ensures all 16 GPUs participate in inference while keeping a
+single public endpoint for clients.

@@ -13,6 +13,8 @@ set -e
 NAMESPACE="${1:-llm-d-llama31-multinode}"
 GATEWAY_PROVIDER="${2:-default}"
 
+TOTAL_RANKS=16
+
 echo "==========================================="
 echo "Cleaning up Llama 3.1 8B Multi-Node DP"
 echo "==========================================="
@@ -49,6 +51,11 @@ echo "Cleaning up any remaining resources..."
 # Remove helm releases directly if helmfile didn't work
 helm uninstall ms-llama31-multinode -n "$NAMESPACE" 2>/dev/null || echo "ms-llama31-multinode not found"
 helm uninstall infra-llama31-multinode -n "$NAMESPACE" 2>/dev/null || echo "infra-llama31-multinode not found"
+
+for rank in $(seq 1 $((TOTAL_RANKS - 1))); do
+    release="ms-llama31-multinode-worker-rank-$(printf "%02d" "$rank")"
+    helm uninstall "$release" -n "$NAMESPACE" 2>/dev/null || echo "$release not found"
+done
 
 echo ""
 echo "==========================================="

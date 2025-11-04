@@ -13,6 +13,9 @@ set -e
 NAMESPACE="${1:-llm-d-llama31-multinode}"
 GATEWAY_PROVIDER="${2:-default}"
 
+TOTAL_RANKS=16
+WORKER_RANKS=$((TOTAL_RANKS - 1))
+
 echo "==========================================="
 echo "Deploying Llama 3.1 8B Multi-Node DP"
 echo "==========================================="
@@ -20,10 +23,10 @@ echo "Namespace: $NAMESPACE"
 echo "Gateway Provider: $GATEWAY_PROVIDER"
 echo ""
 echo "Architecture:"
-echo "  - Rank 0 (Master): 8 GPUs on Node 1"
-echo "  - Rank 1 (Worker): 8 GPUs on Node 2"
-echo "  - Total: 16 DP workers across 2 nodes"
-echo "  - All requests → Rank 0 → DP Coordinator"
+echo "  - Rank 0 (Master): 1 GPU (DP coordinator + router)"
+echo "  - Ranks 1-$WORKER_RANKS (Workers): 1 GPU each"
+echo "  - Total GPUs: $TOTAL_RANKS"
+echo "  - All requests → Rank 0 → DP Coordinator → Workers"
 echo ""
 
 # Check if namespace exists, create if not
@@ -58,7 +61,7 @@ echo "==========================================="
 echo "Creating Decode Service (for RPC)"
 echo "==========================================="
 echo ""
-echo "Applying decode service to expose port 13345 for rank 1 connection..."
+echo "Applying decode service to expose port 13345 for worker registration..."
 kubectl apply -f decode-service.yaml
 
 echo ""
@@ -86,10 +89,10 @@ kubectl wait --for=condition=ready --timeout=900s \
     echo "⚠️  Rank 0 not ready yet. This may take 5-10 minutes for first-time model download."
 
 echo ""
-echo "Waiting for Rank 1 (Worker) pod..."
-kubectl wait --for=condition=ready --timeout=900s \
-    pod -l app=ms-llama31-multinode-llm-d-modelservice-prefill -n "$NAMESPACE" 2>/dev/null || \
-    echo "⚠️  Rank 1 not ready yet. This may take 5-10 minutes for first-time model download."
+echo "Waiting for all worker pods ($WORKER_RANKS total)..."
+kubectl wait --for=condition=ready --timeout=1200s \
+    pod -l llm-d.ai/role=prefill -n "$NAMESPACE" 2>/dev/null || \
+    echo "⚠️  Some worker pods are not ready yet. They may still be downloading the model."
 
 echo ""
 echo "==========================================="
@@ -103,8 +106,8 @@ echo "Next Steps"
 echo "==========================================="
 echo ""
 echo "1. Check full logs:"
-echo "   kubectl logs -n $NAMESPACE -l app=ms-llama31-multinode-llm-d-modelservice-decode -c vllm -f  # Rank 0"
-echo "   kubectl logs -n $NAMESPACE -l app=ms-llama31-multinode-llm-d-modelservice-prefill -c vllm -f  # Rank 1"
+echo "   kubectl logs -n $NAMESPACE -l app=ms-llama31-multinode-llm-d-modelservice-decode -c vllm -f        # Rank 0"
+echo "   kubectl logs -n $NAMESPACE -l llm-d.ai/role=prefill -c vllm -f                                    # All workers"
 echo ""
 echo "2. Verify DP coordination:"
 echo "   kubectl logs -n $NAMESPACE -l app=ms-llama31-multinode-llm-d-modelservice-decode -c vllm | grep 'data-parallel'"
@@ -116,5 +119,6 @@ echo ""
 echo "4. Get gateway external IP:"
 echo "   kubectl get svc -n $NAMESPACE infra-llama31-multinode-inference-gateway-istio"
 echo ""
-echo "5. Monitor with ./monitor.sh (if available)"
+echo "5. Run the benchmarking harness:"
+echo "   ./run-benchmark.sh $NAMESPACE"
 echo ""

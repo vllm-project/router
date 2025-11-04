@@ -1,0 +1,77 @@
+{{- $rank := .rank -}}
+{{- $dpSize := .dpSize -}}
+{{- $decodeAddress := .decodeAddress -}}
+{{- $rpcPort := .rpcPort -}}
+decode:
+  create: false
+
+prefill:
+  parallelism:
+    tensor: 1  # No tensor parallelism (TP=1)
+    data: {{ $dpSize }}  # Total data parallel ranks advertised by the coordinator
+  create: true
+  replicas: 1  # One pod per worker rank
+
+  monitoring:
+    podmonitor:
+      enabled: true
+      portName: "metrics"
+      path: "/metrics"
+      interval: "30s"
+
+  containers:
+  - name: "vllm"
+    image: ghcr.io/llm-d/llm-d-cuda:v0.3.0
+    modelCommand: vllmServe
+    args:
+      - "--tensor-parallel-size"
+      - "1"
+      - "--data-parallel-size"
+      - "{{ printf "%d" $dpSize }}"
+      - "--data-parallel-rank"
+      - "{{ printf "%d" $rank }}"
+      - "--data-parallel-address"
+      - "{{ $decodeAddress }}"
+      - "--data-parallel-rpc-port"
+      - "{{ $rpcPort }}"
+      - "--block-size"
+      - "128"
+      - "--max-model-len"
+      - "32000"
+      - "--disable-uvicorn-access-log"
+    env:
+      - name: VLLM_LOGGING_LEVEL
+        value: DEBUG
+    ports:
+      - containerPort: 8000
+        name: http
+        protocol: TCP
+      - containerPort: {{ $rpcPort | int }}
+        name: rpc
+        protocol: TCP
+    resources:
+      limits:
+        memory: 400Gi
+        cpu: "90"
+        nvidia.com/gpu: "1"
+      requests:
+        memory: 400Gi
+        cpu: "90"
+        nvidia.com/gpu: "1"
+    mountModelVolume: true  # Share the PVC with other ranks
+    volumeMounts:
+    - name: metrics-volume
+      mountPath: /.config
+    - name: shm
+      mountPath: /dev/shm
+    - name: torch-compile-cache
+      mountPath: /.cache
+  volumes:
+  - name: metrics-volume
+    emptyDir: {}
+  - name: shm
+    emptyDir:
+      medium: Memory
+      sizeLimit: "16Gi"
+  - name: torch-compile-cache
+    emptyDir: {}

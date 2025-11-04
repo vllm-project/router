@@ -16,6 +16,9 @@ environments:
 
 {{- $ns := .Namespace | default "llm-d-llama31-multinode" -}}
 {{- $rn := (env "RELEASE_NAME_POSTFIX") | default "llama31-multinode" -}}
+{{- $dpSize := 16 -}}
+{{- $rpcPort := "13345" -}}
+{{- $decodeFqdn := printf "ms-%s-llm-d-modelservice-decode.%s.svc.cluster.local" $rn $ns -}}
 
 repositories:
   - name: llm-d-modelservice
@@ -44,14 +47,32 @@ releases:
     needs:
       - {{ printf "infra-%s" $rn | quote }}
     values:
-      - values.yaml
+      - base-values.yaml
+      - master-values.yaml
     {{- if or (eq .Environment.Name "istioBench") (eq .Environment.Name "default") }}
       - routing:
           {{ .Environment.Values.routing | toYaml | nindent 10 }}
     {{- end }}
     set:
-    # apply release name derived values
       - name: "routing.parentRefs[0].name"
         value: {{ printf "infra-%s-inference-gateway" $rn | quote }}
     labels:
       kind: inference-stack
+
+{{- range $i, $_ := until 15 }}
+{{- $rank := add $i 1 -}}
+{{- $workerCtx := dict "rank" $rank "dpSize" $dpSize "decodeAddress" $decodeFqdn "rpcPort" $rpcPort -}}
+  - name: {{ printf "ms-%s-worker-rank-%02d" $rn $rank | quote }}
+    namespace: {{ $ns }}
+    chart: llm-d-modelservice/llm-d-modelservice
+    version: v0.2.11
+    installed: true
+    needs:
+      - {{ printf "infra-%s" $rn | quote }}
+      - {{ printf "ms-%s" $rn | quote }}
+    values:
+      - base-values.yaml
+      - {{ tpl (readFile "worker-values.yaml.gotmpl") $workerCtx }}
+    labels:
+      kind: inference-stack
+{{- end }}
