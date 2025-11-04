@@ -35,8 +35,21 @@ releases:
     labels:
       type: infrastructure
       kind: inference-stack
+{{- if or (eq .Environment.Name "istioBench") (eq .Environment.Name "default") }}
+    {{- $istioConfig := readFile "gateway-configs/istio.yaml" | fromYaml }}
+    {{- $benchConfig := readFile "gateway-configs/benchmarking.yaml" | fromYaml }}
     values:
-      {{- toYaml .Environment.Values | nindent 6 }}
+      - {{- toYaml $istioConfig.infra | nindent 8 }}
+      - {{- toYaml $benchConfig.infra | nindent 8 }}
+{{- else if eq .Environment.Name "istio" }}
+    {{- $istioConfig := readFile "gateway-configs/istio.yaml" | fromYaml }}
+    values:
+      - {{- toYaml $istioConfig.infra | nindent 8 }}
+{{- else if eq .Environment.Name "kgateway" }}
+    {{- $kgatewayConfig := readFile "gateway-configs/kgateway.yaml" | fromYaml }}
+    values:
+      - {{- toYaml $kgatewayConfig.infra | nindent 8 }}
+{{- end }}
 
   - name: {{ printf "ms-%s" $rn | quote }}
     namespace: {{ $ns }}
@@ -49,7 +62,16 @@ releases:
       - base-values.yaml
       - master-values.yaml
 {{- if or (eq .Environment.Name "istioBench") (eq .Environment.Name "default") }}
-      - gateway-configs/benchmarking.yaml
+    {{- $istioConfig := readFile "gateway-configs/istio.yaml" | fromYaml }}
+    {{- $benchConfig := readFile "gateway-configs/benchmarking.yaml" | fromYaml }}
+      - {{- toYaml $istioConfig.ms | nindent 8 }}
+      - {{- toYaml $benchConfig.ms | nindent 8 }}
+{{- else if eq .Environment.Name "istio" }}
+    {{- $istioConfig := readFile "gateway-configs/istio.yaml" | fromYaml }}
+      - {{- toYaml $istioConfig.ms | nindent 8 }}
+{{- else if eq .Environment.Name "kgateway" }}
+    {{- $kgatewayConfig := readFile "gateway-configs/kgateway.yaml" | fromYaml }}
+      - {{- toYaml $kgatewayConfig.ms | nindent 8 }}
 {{- end }}
     set:
       - name: "routing.parentRefs[0].name"
