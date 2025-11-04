@@ -36,8 +36,7 @@ releases:
       type: infrastructure
       kind: inference-stack
     values:
-      - gateway:
-          {{ .Environment.Values.gateway | toYaml | nindent 10 }}
+      {{- toYaml .Environment.Values | nindent 6 }}
 
   - name: {{ printf "ms-%s" $rn | quote }}
     namespace: {{ $ns }}
