@@ -73,7 +73,7 @@ releases:
       - {{ printf "ms-%s" $rn | quote }}
     values:
       - base-values.yaml
-      - {{ toYaml $workerValues | nindent 8 }}
+{{ toYaml (list $workerValues) | indent 6 }}
     labels:
       kind: inference-stack
 {{- end }}
