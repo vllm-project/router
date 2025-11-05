@@ -1,4 +1,4 @@
-multinode: false  # Not using chart's multinode, doing manual
+multinode: false
 
 modelArtifacts:
   uri: "hf://meta-llama/Llama-3.1-8B-Instruct"
@@ -25,10 +25,10 @@ routing:
 # RANK 0 - MASTER (using "decode" section)
 decode:
   parallelism:
-    tensor: 1  # No tensor parallelism (TP=1)
-    data: 8    # 8 data parallel workers (one per GPU)
+    tensor: 8  # TP=8 (8 GPUs per pod)
+    data: 2    # DP=2 (2 pods total)
   create: true
-  replicas: 1  # Only 1 master pod
+  replicas: 1  # Only 1 master pod with 8 GPUs
 
   # Service configuration - CRITICAL for rank 1 to connect
   service:
@@ -56,7 +56,7 @@ decode:
     modelCommand: vllmServe
     args:
       - "--tensor-parallel-size"
-      - "1"
+      - "8"                    # Use 8 GPUs per pod via TP
       - "--data-parallel-size"
       - "2"                    # 2 ranks (2 pods)
       - "--data-parallel-rank"
@@ -69,14 +69,14 @@ decode:
       - "128"
       - "--max-model-len"
       - "32000"
-      - "--disable-uvicorn-access-log"
+      - "--disable-log-requests"
     env:
       - name: POD_IP
         valueFrom:
           fieldRef:
             fieldPath: status.podIP
       - name: VLLM_LOGGING_LEVEL
-        value: DEBUG
+        value: INFO
     ports:
       - containerPort: 8000
         name: http
@@ -88,12 +88,12 @@ decode:
       limits:
         memory: 800Gi
         cpu: "180"
-        nvidia.com/gpu: "8"
+        nvidia.com/gpu: "8"  # 8 GPUs on this pod
       requests:
         memory: 800Gi
         cpu: "180"
         nvidia.com/gpu: "8"
-    mountModelVolume: true  # Uses PVC - model cached!
+    mountModelVolume: true  # Helm handles PVC automatically
     volumeMounts:
     - name: metrics-volume
       mountPath: /.config
@@ -114,10 +114,10 @@ decode:
 # RANK 1 - WORKER (cleverly using "prefill" section)
 prefill:
   parallelism:
-    tensor: 1  # No tensor parallelism (TP=1)
-    data: 8    # 8 data parallel workers (one per GPU)
+    tensor: 8  # TP=8 (8 GPUs per pod)
+    data: 2    # DP=2 (2 pods total)
   create: true
-  replicas: 1  # Only 1 worker pod
+  replicas: 1  # Only 1 worker pod with 8 GPUs
 
   # Ensure this goes to different node than rank 0
   podAntiAffinity:
@@ -143,9 +143,9 @@ prefill:
     modelCommand: vllmServe
     args:
       - "--tensor-parallel-size"
-      - "1"
+      - "8"                    # Use 8 GPUs per pod via TP
       - "--data-parallel-size"
-      - "2"                    # 2 ranks (same as rank 0)
+      - "2"                    # 2 ranks (2 pods)
       - "--data-parallel-rank"
       - "1"                    # THIS IS RANK 1 (WORKER)
       - "--data-parallel-address"
@@ -158,10 +158,10 @@ prefill:
       - "128"
       - "--max-model-len"
       - "32000"
-      - "--disable-uvicorn-access-log"
+      - "--disable-log-requests"
     env:
       - name: VLLM_LOGGING_LEVEL
-        value: DEBUG
+        value: INFO
     ports:
       - containerPort: 8000
         name: http
@@ -173,7 +173,7 @@ prefill:
       limits:
         memory: 800Gi
         cpu: "180"
-        nvidia.com/gpu: "8"
+        nvidia.com/gpu: "8"  # 8 GPUs on this pod
       requests:
         memory: 800Gi
         cpu: "180"
