@@ -10,6 +10,30 @@ This deployment implements **DP8TP1** (8-way data parallelism, 1-way tensor para
 - **Total**: 16 GPUs across 16 pods
 - **Routing**: GAIE (Gateway API Inference Extension) with EPP (Endpoint Picker Plugin) for intelligent P/D routing
 
+## Quick Start (3 Commands)
+
+```bash
+# 1. Set HuggingFace token and navigate to directory
+export HF_TOKEN=hf_xxxxxxxxxxxxx
+cd /data/users/nlalit/gitrepos/router/scripts/k8s/llama3/llm-d
+
+# 2. Deploy everything
+./deploy.sh
+
+# 3. Run benchmark (waits for pods, verifies setup, runs benchmark)
+./run-benchmark.sh 200 32  # 200 prompts, concurrency 32
+```
+
+**That's it!** The scripts automatically handle:
+- ✅ Namespace and secret creation
+- ✅ Deploying infrastructure (Gateway, GAIE EPP)
+- ✅ Deploying 16 vLLM pods (8 prefill + 8 decode)
+- ✅ Creating InferencePool and HTTPRoute for GAIE routing
+- ✅ Waiting for all pods to be ready
+- ✅ Verifying routing is configured correctly
+- ✅ Testing the inference endpoint
+- ✅ Running benchmarks with proper parameters
+
 ## Architecture
 
 ```
@@ -147,6 +171,32 @@ Performance with 1K input / 1K output tokens:
 
 ## Running Benchmarks
 
+### Automated Benchmark (Recommended)
+
+The benchmark script handles everything automatically:
+
+```bash
+cd /data/users/nlalit/gitrepos/router/scripts/k8s/llama3/llm-d
+
+# Run with defaults (200 prompts, concurrency 32)
+./run-benchmark.sh
+
+# Run with custom parameters
+./run-benchmark.sh 200 64     # 200 prompts, concurrency 64
+./run-benchmark.sh 200 128    # 200 prompts, concurrency 128
+```
+
+The script will:
+1. Wait for all pods to be ready
+2. Verify GAIE components are working
+3. Test the inference endpoint
+4. Run the benchmark
+5. Display results
+
+### Manual Benchmark (Advanced)
+
+If you want to run benchmarks manually:
+
 ```bash
 # Get a decode pod to run benchmark from
 DECODE_POD=$(kubectl get pods -n llm-d-llama31 -l llm-d.ai/role=decode -o jsonpath='{.items[0].metadata.name}')
@@ -227,26 +277,34 @@ kubectl logs -n llm-d-llama31 <pod-name> -c vllm --tail=100
 
 ### InferencePool Not Found
 
-```bash
-# Check if InferencePool exists
-kubectl get inferencepool -n llm-d-llama31
+**Note**: There are two InferencePool CRD versions. Always use the correct one:
 
-# If not found, manually create it
-kubectl apply -f - <<EOF
-apiVersion: inference.networking.x-k8s.io/v1alpha2
-kind: InferencePool
-metadata:
-  name: gaie-llama31
-  namespace: llm-d-llama31
-spec:
-  targetPortNumber: 8000
-  selector:
-    llm-d.ai/inferenceServing: "true"
-  extensionRef:
-    name: gaie-llama31-epp
-    portNumber: 9002
-    failureMode: FailClose
-EOF
+```bash
+# Check if InferencePool exists (use correct API version)
+kubectl get inferencepool.inference.networking.x-k8s.io -n llm-d-llama31
+
+# If not found, it should be created automatically by deploy.sh
+# But if needed, manually create it:
+kubectl apply -f inferencepool.yaml
+```
+
+### Benchmark Script Fails at Step 4 (Testing inference endpoint)
+
+This usually means HTTPRoute is missing. Check and fix:
+
+```bash
+# Check if HTTPRoute exists
+kubectl get httproute -n llm-d-llama31
+
+# If not found, create it
+kubectl apply -f httproute.yaml
+
+# Verify it's working
+PREFILL_POD=$(kubectl get pods -n llm-d-llama31 -l llm-d.ai/role=prefill -o jsonpath='{.items[0].metadata.name}')
+kubectl exec -n llm-d-llama31 $PREFILL_POD -c vllm -- \
+  curl -s http://infra-llama31-inference-gateway-istio/v1/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model": "meta-llama/Llama-3.1-8B-Instruct", "prompt": "Test", "max_tokens": 5}'
 ```
 
 ### No Inference Response / Gateway Timeout

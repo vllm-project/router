@@ -6,21 +6,31 @@ Kubernetes deployment for Llama 3.1 8B with vllm-router handling Prefill-Decode 
 
 - **Model**: meta-llama/Llama-3.1-8B-Instruct
 - **Docker Image**: vllm/vllm-openai:latest
-- **Parallelism**: DP8 (Data Parallel 8, 8 workers across 8 GPUs)
+- **Parallelism**: Pure Kubernetes pod replication (8 independent prefill pods + 8 independent decode pods)
 - **Architecture**: P-D disaggregation with NIXL KV cache transfer
-- **Replicas**: 1 prefill pod, 1 decode pod
-- **Resources per pod**: 8 GPUs, 800Gi memory, 180 CPUs
+- **Replicas**: 8 prefill pods, 8 decode pods
+- **Resources per pod**: 1 GPU, 100Gi memory, 22 CPUs
+- **Total**: 16 GPUs across 16 pods
 - **Namespace**: vllm-router-pd-llama31
 
 ## Architecture
 
 ```
-Client → vllm-router (P-D aware) → Prefill (8 GPUs DP8)
-                                   ↓ KV transfer (NIXL)
-                                   Decode (8 GPUs DP8)
+Client → vllm-router (P-D aware, consistent hashing)
+              ↓
+      ┌───────┴───────┐
+      ▼               ▼
+  Prefill Pods (×8)  Decode Pods (×8)
+  • 1 GPU each       • 1 GPU each
+  • Port 8000        • Port 8200
+  • Prompt proc.     • Token gen.
+      └───────────────┘
+       KV Transfer (NIXL)
 ```
 
-Prefill handles initial token generation, transfers KV cache to decode for continuation.
+This architecture matches llm-d's pod-level parallelism (8+8 pods) for fair comparison of routing algorithms:
+- **vllm-router**: Consistent hashing load balancing
+- **llm-d (GAIE EPP)**: Queue scoring + prefix cache matching
 
 ## Prerequisites
 
@@ -40,7 +50,7 @@ export HF_TOKEN=hf_your_token_here
 
 Example:
 ```bash
-export HF_TOKEN=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
+export HF_TOKEN=test
 ```
 
 The `deploy.sh` script will automatically create the Kubernetes secret from this environment variable.
@@ -55,10 +65,10 @@ cd scripts/k8s/llama3/vllm-router/pd-disagg
 This single command deploys:
 - Namespace creation (if needed)
 - HuggingFace token secret (from HF_TOKEN environment variable)
-- 1 prefill pod with KV transfer enabled (8 GPUs DP8)
-- 1 decode pod with KV transfer enabled (8 GPUs DP8)
+- 8 prefill pods with KV transfer enabled (1 GPU each)
+- 8 decode pods with KV transfer enabled (1 GPU each)
 - Backend Kubernetes Services (prefill & decode)
-- vllm-router deployment
+- vllm-router deployment (with consistent hashing)
 - vllm-router service
 
 ### 3. Verify Deployment
@@ -119,49 +129,55 @@ The eval script:
 
 Key configuration points:
 
-**Prefill configuration**:
+**Prefill configuration** (8 independent pods):
 ```yaml
 prefill:
-  parallelism:
-    tensor: 8  # Allocates 8 GPUs
-    data: 1
-  replicas: 1
+  replicas: 8  # 8 Kubernetes pods
   containers:
   - name: "vllm"
     image: vllm/vllm-openai:latest
     args:
-      - "--tensor-parallel-size"
-      - "1"
-      - "--data-parallel-size"
-      - "8"  # 8 data-parallel workers
+      - "--model"
+      - "meta-llama/Llama-3.1-8B-Instruct"
       - "--kv-transfer-config"
       - '{"kv_connector":"NixlConnector", "kv_role":"kv_both"}'
-    ports:
-      - containerPort: 8000
+      - "--block-size"
+      - "128"
+    env:
+      - name: CUDA_VISIBLE_DEVICES
+        value: "0"  # Single GPU per pod
+    resources:
+      limits:
+        nvidia.com/gpu: "1"  # 1 GPU per pod
+        memory: 100Gi
+        cpu: "22"
 ```
 
-**Decode configuration**:
+**Decode configuration** (8 independent pods):
 ```yaml
 decode:
-  parallelism:
-    tensor: 8  # Allocates 8 GPUs
-    data: 1
-  replicas: 1
+  replicas: 8  # 8 Kubernetes pods
   containers:
   - name: "vllm"
     image: vllm/vllm-openai:latest
     args:
-      - "--tensor-parallel-size"
-      - "1"
-      - "--data-parallel-size"
-      - "8"  # 8 data-parallel workers
+      - "--model"
+      - "meta-llama/Llama-3.1-8B-Instruct"
       - "--kv-transfer-config"
       - '{"kv_connector":"NixlConnector", "kv_role":"kv_both"}'
-    ports:
-      - containerPort: 8200
+      - "--block-size"
+      - "128"
+    env:
+      - name: CUDA_VISIBLE_DEVICES
+        value: "0"  # Single GPU per pod
+    resources:
+      limits:
+        nvidia.com/gpu: "1"  # 1 GPU per pod
+        memory: 100Gi
+        cpu: "22"
 ```
 
-**Note**: The helm chart uses `parallelism.tensor` to allocate GPUs, even for data parallelism.
+**Note**: This uses pure Kubernetes replication (NOT vLLM's internal `--data-parallel-size`), matching llm-d's architecture.
 
 ### router-deployment.yaml
 
@@ -235,10 +251,23 @@ kubectl delete namespace vllm-router-pd-llama31
 ## How P-D Disaggregation Works
 
 1. **Request arrives** at vllm-router
-2. **Prefill phase**: Router sends to prefill pod
-3. **KV transfer**: Prefill transfers KV cache to decode via NIXL
-4. **Decode phase**: Router sends subsequent tokens to decode pod
-5. **Response**: Decode streams tokens back to client
+2. **Worker selection**: Router uses consistent hashing to select prefill and decode workers
+3. **Prefill phase**: Router sends to selected prefill pod (1 of 8)
+4. **KV transfer**: Prefill pod transfers KV cache to paired decode pod via NIXL
+5. **Decode phase**: Router sends subsequent tokens to selected decode pod (1 of 8)
+6. **Response**: Decode pod streams tokens back to client
+
+## Key Differences vs llm-d
+
+| Aspect | vllm-router (This Setup) | llm-d with GAIE EPP |
+|--------|-------------------------|---------------------|
+| **Pod Architecture** | 8 prefill + 8 decode pods | 8 prefill + 8 decode pods |
+| **Load Balancing** | Consistent hashing | Queue scoring + prefix matching |
+| **Routing Intelligence** | Hash-based affinity | Queue depth + KV cache awareness |
+| **Gateway** | vllm-router (stateless) | GAIE EPP (stateful scheduling) |
+| **P/D Coordination** | Router-managed | GAIE-managed with InferencePool |
+
+Both use identical pod configurations (1 GPU per pod, same resources) for fair performance comparison.
 
 ## Troubleshooting
 

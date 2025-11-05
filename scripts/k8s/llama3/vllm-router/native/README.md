@@ -38,7 +38,7 @@ export HF_TOKEN=hf_your_token_here
 
 Example:
 ```bash
-export HF_TOKEN=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
+export HF_TOKEN=test
 ```
 
 The `deploy.sh` script will automatically create the Kubernetes secret from this environment variable.
