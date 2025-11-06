@@ -1,0 +1,95 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: ms-llama31-multinode-llm-d-modelservice-workers
+  namespace: llm-d-llama31-multinode
+  labels:
+    app: ms-llama31-multinode-llm-d-modelservice
+    component: vllm-worker
+spec:
+  serviceName: "vllm-workers"
+  replicas: 15  # Ranks 1-15 (rank 0 is the master)
+  selector:
+    matchLabels:
+      app: ms-llama31-multinode-llm-d-modelservice
+      component: vllm-worker
+  template:
+    metadata:
+      labels:
+        app: ms-llama31-multinode-llm-d-modelservice
+        component: vllm-worker
+        llm-d.ai/model: ms-llama31-multinode-llm-d-modelservice
+        llm-d.ai/role: worker
+    spec:
+      containers:
+      - name: vllm
+        image: ghcr.io/llm-d/llm-d-cuda:v0.3.0
+        command:
+          - /bin/bash
+          - -c
+          - |
+            # Extract pod ordinal from pod name (e.g., pod-0, pod-1, etc.)
+            POD_ORDINAL=$(echo $HOSTNAME | grep -o '[0-9]*$')
+            # Rank = ordinal + 1 (since rank 0 is the master)
+            RANK=$((POD_ORDINAL + 1))
+            echo "Starting vLLM worker with rank $RANK"
+
+            # Start vLLM with the computed rank (using vllm serve command like master)
+            vllm serve meta-llama/Llama-3.1-8B-Instruct \
+              --port 8000 \
+              --served-model-name meta-llama/Llama-3.1-8B-Instruct \
+              --tensor-parallel-size 1 \
+              --data-parallel-size 16 \
+              --data-parallel-rank $RANK \
+              --data-parallel-address ms-llama31-multinode-llm-d-modelservice-decode.llm-d-llama31-multinode.svc.cluster.local \
+              --data-parallel-rpc-port 13345 \
+              --block-size 128 \
+              --max-model-len 32000 \
+              --disable-log-requests
+        env:
+        - name: VLLM_LOGGING_LEVEL
+          value: INFO
+        - name: CUDA_VISIBLE_DEVICES
+          value: "0"
+        - name: HF_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: llm-d-hf-token
+              key: HF_TOKEN
+        ports:
+        - containerPort: 8000
+          name: http
+          protocol: TCP
+        - containerPort: 13345
+          name: rpc
+          protocol: TCP
+        resources:
+          limits:
+            memory: 100Gi
+            cpu: "22"
+            nvidia.com/gpu: "1"
+          requests:
+            memory: 100Gi
+            cpu: "22"
+            nvidia.com/gpu: "1"
+        volumeMounts:
+        - name: model-storage
+          mountPath: /model-cache
+        - name: metrics-volume
+          mountPath: /.config
+        - name: shm
+          mountPath: /dev/shm
+        - name: torch-compile-cache
+          mountPath: /.cache
+      volumes:
+      - name: model-storage
+        emptyDir:
+          sizeLimit: 200Gi
+      - name: metrics-volume
+        emptyDir: {}
+      - name: shm
+        emptyDir:
+          medium: Memory
+          sizeLimit: "16Gi"
+      - name: torch-compile-cache
+        emptyDir: {}

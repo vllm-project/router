@@ -26,10 +26,15 @@ if ! kubectl get namespace "$NAMESPACE" &> /dev/null; then
     exit 0
 fi
 
-# Remove decode service first
+# Remove worker StatefulSet first
+echo ""
+echo "Removing worker StatefulSet..."
+cd "$(dirname "$0")"
+kubectl delete -f workers-statefulset.yaml --ignore-not-found=true
+
+# Remove decode service
 echo ""
 echo "Removing decode service..."
-cd "$(dirname "$0")"
 kubectl delete -f decode-service.yaml --ignore-not-found=true
 
 # Use helmfile to destroy

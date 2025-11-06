@@ -20,10 +20,10 @@ echo "Namespace: $NAMESPACE"
 echo "Gateway Provider: $GATEWAY_PROVIDER"
 echo ""
 echo "Architecture:"
-echo "  - Rank 0 (Master): 8 GPUs on Node 1"
-echo "  - Rank 1 (Worker): 8 GPUs on Node 2"
-echo "  - Total: 16 DP workers across 2 nodes"
-echo "  - All requests → Rank 0 → DP Coordinator"
+echo "  - Rank 0 (Master): 1 GPU - handles HTTP + DP coordination"
+echo "  - Ranks 1-15 (Workers): 15 pods x 1 GPU each"
+echo "  - Total: 16 pods, 16 GPUs, DP=16"
+echo "  - All requests → Rank 0 → DP Coordinator → distributes to all ranks"
 echo ""
 
 # Check if namespace exists, create if not
@@ -58,12 +58,24 @@ echo "==========================================="
 echo "Creating Decode Service (for RPC)"
 echo "==========================================="
 echo ""
-echo "Applying decode service to expose port 13345 for rank 1 connection..."
+echo "Applying decode service to expose ports 8000 (HTTP) and 13345 (RPC)..."
 kubectl apply -f decode-service.yaml
 
 echo ""
 echo "Verifying service was created..."
 kubectl get svc -n "$NAMESPACE" ms-llama31-multinode-llm-d-modelservice-decode
+
+echo ""
+echo "==========================================="
+echo "Deploying Worker StatefulSet (Ranks 1-15)"
+echo "==========================================="
+echo ""
+echo "Applying worker StatefulSet..."
+kubectl apply -f workers-statefulset.yaml
+
+echo ""
+echo "Verifying StatefulSet was created..."
+kubectl get statefulset -n "$NAMESPACE" ms-llama31-multinode-llm-d-modelservice-workers
 
 echo ""
 echo "==========================================="
@@ -86,10 +98,10 @@ kubectl wait --for=condition=ready --timeout=900s \
     echo "⚠️  Rank 0 not ready yet. This may take 5-10 minutes for first-time model download."
 
 echo ""
-echo "Waiting for Rank 1 (Worker) pod..."
+echo "Waiting for Worker pods (Ranks 1-15)..."
 kubectl wait --for=condition=ready --timeout=900s \
-    pod -l app=ms-llama31-multinode-llm-d-modelservice-prefill -n "$NAMESPACE" 2>/dev/null || \
-    echo "⚠️  Rank 1 not ready yet. This may take 5-10 minutes for first-time model download."
+    pod -l component=vllm-worker -n "$NAMESPACE" 2>/dev/null || \
+    echo "⚠️  Workers not ready yet. This may take 5-10 minutes for first-time model download."
 
 echo ""
 echo "==========================================="
@@ -103,11 +115,13 @@ echo "Next Steps"
 echo "==========================================="
 echo ""
 echo "1. Check full logs:"
-echo "   kubectl logs -n $NAMESPACE -l app=ms-llama31-multinode-llm-d-modelservice-decode -c vllm -f  # Rank 0"
-echo "   kubectl logs -n $NAMESPACE -l app=ms-llama31-multinode-llm-d-modelservice-prefill -c vllm -f  # Rank 1"
+echo "   kubectl logs -n $NAMESPACE -l app=ms-llama31-multinode-llm-d-modelservice-decode -c vllm -f  # Rank 0 (Master)"
+echo "   kubectl logs -n $NAMESPACE -l component=vllm-worker -c vllm -f  # All workers (Ranks 1-15)"
+echo "   kubectl logs -n $NAMESPACE ms-llama31-multinode-llm-d-modelservice-workers-0 -c vllm -f  # Specific worker (Rank 1)"
 echo ""
 echo "2. Verify DP coordination:"
 echo "   kubectl logs -n $NAMESPACE -l app=ms-llama31-multinode-llm-d-modelservice-decode -c vllm | grep 'data-parallel'"
+echo "   kubectl logs -n $NAMESPACE -l component=vllm-worker -c vllm | grep 'data-parallel'"
 echo ""
 echo "3. Test the deployment:"
 echo "   kubectl port-forward -n $NAMESPACE svc/ms-llama31-multinode-llm-d-modelservice-decode 8000:8000"
@@ -116,5 +130,8 @@ echo ""
 echo "4. Get gateway external IP:"
 echo "   kubectl get svc -n $NAMESPACE infra-llama31-multinode-inference-gateway-istio"
 echo ""
-echo "5. Monitor with ./monitor.sh (if available)"
+echo "5. Check worker pods:"
+echo "   kubectl get pods -n $NAMESPACE -l component=vllm-worker"
+echo ""
+echo "6. Monitor with ./monitor.sh (if available)"
 echo ""
