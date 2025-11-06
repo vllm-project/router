@@ -4,7 +4,8 @@ metadata:
   name: ms-llama31-multinode-llm-d-modelservice-decode
   namespace: llm-d-llama31-multinode
   labels:
-    app: ms-llama31-multinode-llm-d-modelservice-decode
+    app: ms-llama31-multinode-llm-d-modelservice
+    component: decode
 spec:
   type: ClusterIP
   ports:
@@ -12,10 +13,6 @@ spec:
     port: 8000
     targetPort: 8000
     protocol: TCP
-  - name: rpc
-    port: 13345
-    targetPort: 13345
-    protocol: TCP
   selector:
-    llm-d.ai/model: ms-llama31-multinode-llm-d-modelservice
     llm-d.ai/role: decode
+    llm-d.ai/inferenceServing: "true"

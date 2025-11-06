@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Deploy Llama 3.1 8B Multi-Node DP using helmfile
+# Deploy Llama 3.1 8B with Kubernetes Native Load Balancing
 # Usage: ./deploy.sh [namespace] [gateway-provider]
 #
 # Examples:
@@ -14,16 +14,16 @@ NAMESPACE="${1:-llm-d-llama31-multinode}"
 GATEWAY_PROVIDER="${2:-default}"
 
 echo "==========================================="
-echo "Deploying Llama 3.1 8B Multi-Node DP"
+echo "Deploying Llama 3.1 8B (K8s Native LB)"
 echo "==========================================="
 echo "Namespace: $NAMESPACE"
 echo "Gateway Provider: $GATEWAY_PROVIDER"
 echo ""
 echo "Architecture:"
-echo "  - Rank 0 (Master): 1 GPU - handles HTTP + DP coordination"
-echo "  - Ranks 1-15 (Workers): 15 pods x 1 GPU each"
-echo "  - Total: 16 pods, 16 GPUs, DP=16"
-echo "  - All requests → Rank 0 → DP Coordinator → distributes to all ranks"
+echo "  - 16 independent vLLM pods (1 GPU each)"
+echo "  - No DP coordinator - pure K8s load balancing"
+echo "  - Total: 16 pods, 16 GPUs"
+echo "  - Kubernetes service distributes requests across all pods"
 echo ""
 
 # Check if namespace exists, create if not
@@ -54,28 +54,12 @@ else
 fi
 
 echo ""
-echo "==========================================="
-echo "Creating Decode Service (for RPC)"
-echo "==========================================="
-echo ""
-echo "Applying decode service to expose ports 8000 (HTTP) and 13345 (RPC)..."
-kubectl apply -f decode-service.yaml
+echo "Creating vLLM service for load balancing..."
+kubectl apply -f vllm-service.yaml
 
 echo ""
 echo "Verifying service was created..."
 kubectl get svc -n "$NAMESPACE" ms-llama31-multinode-llm-d-modelservice-decode
-
-echo ""
-echo "==========================================="
-echo "Deploying Worker StatefulSet (Ranks 1-15)"
-echo "==========================================="
-echo ""
-echo "Applying worker StatefulSet..."
-kubectl apply -f workers-statefulset.yaml
-
-echo ""
-echo "Verifying StatefulSet was created..."
-kubectl get statefulset -n "$NAMESPACE" ms-llama31-multinode-llm-d-modelservice-workers
 
 echo ""
 echo "==========================================="
@@ -92,16 +76,10 @@ kubectl wait --for=condition=available --timeout=300s \
     echo "Gateway deployment not ready yet, continuing..."
 
 echo ""
-echo "Waiting for Rank 0 (Master) pod..."
+echo "Waiting for vLLM pods..."
 kubectl wait --for=condition=ready --timeout=900s \
-    pod -l app=ms-llama31-multinode-llm-d-modelservice-decode -n "$NAMESPACE" 2>/dev/null || \
-    echo "⚠️  Rank 0 not ready yet. This may take 5-10 minutes for first-time model download."
-
-echo ""
-echo "Waiting for Worker pods (Ranks 1-15)..."
-kubectl wait --for=condition=ready --timeout=900s \
-    pod -l component=vllm-worker -n "$NAMESPACE" 2>/dev/null || \
-    echo "⚠️  Workers not ready yet. This may take 5-10 minutes for first-time model download."
+    pod -l llm-d.ai/role=decode -n "$NAMESPACE" 2>/dev/null || \
+    echo "⚠️  Pods not ready yet. This may take 10-15 minutes for first-time model download."
 
 echo ""
 echo "==========================================="
@@ -114,24 +92,24 @@ echo "==========================================="
 echo "Next Steps"
 echo "==========================================="
 echo ""
-echo "1. Check full logs:"
-echo "   kubectl logs -n $NAMESPACE -l app=ms-llama31-multinode-llm-d-modelservice-decode -c vllm -f  # Rank 0 (Master)"
-echo "   kubectl logs -n $NAMESPACE -l component=vllm-worker -c vllm -f  # All workers (Ranks 1-15)"
-echo "   kubectl logs -n $NAMESPACE ms-llama31-multinode-llm-d-modelservice-workers-0 -c vllm -f  # Specific worker (Rank 1)"
+echo "1. Check pod logs:"
+echo "   kubectl logs -n $NAMESPACE -l llm-d.ai/role=decode -c vllm -f"
 echo ""
-echo "2. Verify DP coordination:"
-echo "   kubectl logs -n $NAMESPACE -l app=ms-llama31-multinode-llm-d-modelservice-decode -c vllm | grep 'data-parallel'"
-echo "   kubectl logs -n $NAMESPACE -l component=vllm-worker -c vllm | grep 'data-parallel'"
-echo ""
-echo "3. Test the deployment:"
+echo "2. Test the deployment:"
 echo "   kubectl port-forward -n $NAMESPACE svc/ms-llama31-multinode-llm-d-modelservice-decode 8000:8000"
 echo "   curl http://localhost:8000/v1/models"
+echo ""
+echo "3. Send a test request:"
+echo "   curl -X POST http://localhost:8000/v1/completions \\"
+echo "     -H \"Content-Type: application/json\" \\"
+echo "     -d '{\"model\": \"meta-llama/Llama-3.1-8B-Instruct\", \"prompt\": \"Hello\", \"max_tokens\": 50}'"
 echo ""
 echo "4. Get gateway external IP:"
 echo "   kubectl get svc -n $NAMESPACE infra-llama31-multinode-inference-gateway-istio"
 echo ""
-echo "5. Check worker pods:"
-echo "   kubectl get pods -n $NAMESPACE -l component=vllm-worker"
+echo "5. Check all pods:"
+echo "   kubectl get pods -n $NAMESPACE -l llm-d.ai/role=decode"
 echo ""
-echo "6. Monitor with ./monitor.sh (if available)"
+echo "6. Run benchmarks:"
+echo "   ./run-benchmark.sh"
 echo ""

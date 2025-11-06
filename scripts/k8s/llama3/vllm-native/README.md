@@ -1,14 +1,14 @@
-# Llama 3.1 8B Multi-Node Data Parallelism (16 Pods)
+# Llama 3.1 8B with Kubernetes Native Load Balancing
 
-Production-ready vLLM multi-node data parallelism (DP) deployment with 16 independent GPU workers.
+vLLM deployment with 16 independent pods using Kubernetes native load balancing.
 
 ## Overview
 
-This setup implements **vLLM's native DP coordinator pattern** where:
-- **Rank 0 (Master)**: Receives ALL client requests and runs DP Coordinator (1 GPU)
-- **Ranks 1-15 (Workers)**: Connect to master via RPC, provide distributed compute (15 pods × 1 GPU each)
-- **Total capacity**: 16 ranks with 16 GPUs total (1 GPU per pod)
-- **Request flow**: Client → Rank 0 → DP Coordinator → All 16 workers via RPC
+This setup implements **Kubernetes-native load balancing** where:
+- **16 independent vLLM pods**: Each pod runs a complete vLLM instance (1 GPU)
+- **No DP coordinator**: Pods operate independently without coordination
+- **Kubernetes Service**: Load balances requests across all 16 pods
+- **Total capacity**: 16 pods with 16 GPUs total (1 GPU per pod)
 
 ## Architecture
 
@@ -19,67 +19,47 @@ This setup implements **vLLM's native DP coordinator pattern** where:
                          │
                          ▼
 ┌─────────────────────────────────────────────────────────────┐
-│         Rank 0 Service (HTTP 8000 + RPC 13345)               │
-└────────────────────────┬────────────────────────────────────┘
-                         │
-                         ▼
+│           Kubernetes Service (Port 8000)                     │
+│        Native Round-Robin Load Balancing                     │
+└───┬────┬────┬────┬────┬────┬────┬────┬────┬────┬────┬────┬─┘
+    │    │    │    │    │    │    │    │    │    │    │    │
+    ▼    ▼    ▼    ▼    ▼    ▼    ▼    ▼    ▼    ▼    ▼    ▼
 ┌─────────────────────────────────────────────────────────────┐
-│              Rank 0 Pod (Master) - 1 GPU                     │
-│  ┌─────────────────────────────────────────────────────────┐│
-│  │             vLLM DP Coordinator                          ││
-│  │  • Receives all HTTP requests                            ││
-│  │  • Distributes work across 16 ranks                      ││
-│  │  • Processes on 1 local GPU (TP=1)                       ││
-│  └─────────────────────────────────┬───────────────────────┘│
-│                                     │ RPC Port 13345          │
-└─────────────────────────────────────┼───────────────────────┘
-                                      │
-                                      ▼
-┌─────────────────────────────────────────────────────────────┐
-│           Worker StatefulSet (Ranks 1-15)                    │
-│  ┌─────────────────────────────────────────────────────────┐│
-│  │  workers-0 (Rank 1) → 1 GPU                              ││
-│  │  workers-1 (Rank 2) → 1 GPU                              ││
-│  │  workers-2 (Rank 3) → 1 GPU                              ││
-│  │  ...                                                      ││
-│  │  workers-14 (Rank 15) → 1 GPU                            ││
-│  │                                                           ││
-│  │  • Each connects to Rank 0 via RPC                       ││
-│  │  • No HTTP API (work received via RPC only)              ││
-│  │  • Dynamic rank calculation from pod ordinal             ││
-│  └─────────────────────────────────────────────────────────┘│
+│              16 Independent vLLM Pods                        │
+│  ┌─────┐ ┌─────┐ ┌─────┐       ┌─────┐ ┌─────┐ ┌─────┐    │
+│  │Pod 1│ │Pod 2│ │Pod 3│  ...  │Pod14│ │Pod15│ │Pod16│    │
+│  │1 GPU│ │1 GPU│ │1 GPU│       │1 GPU│ │1 GPU│ │1 GPU│    │
+│  └─────┘ └─────┘ └─────┘       └─────┘ └─────┘ └─────┘    │
+│                                                              │
+│  • Each pod: standalone vLLM server                         │
+│  • No inter-pod communication                               │
+│  • Independent request processing                           │
 └─────────────────────────────────────────────────────────────┘
 ```
 
 ## Configuration Summary
 
-**Pods:** 16 pods total
-- 1 master pod (Rank 0) - deployed via Helm chart
-- 15 worker pods (Ranks 1-15) - deployed via StatefulSet
+**Pods:** 16 independent pods
+- Each pod: 1 GPU, complete vLLM instance
+- No master/worker relationship
+- All pods are identical
 
 **Resources:**
 - 16 GPUs total (1 GPU per pod)
-- TP=1 (no tensor parallelism, 1 GPU per pod)
-- DP=16 (16 data parallel ranks)
+- No tensor parallelism (TP=1)
+- No data parallelism (no DP flags)
 
-**Deployment:**
-```
-Rank 0: --tensor-parallel-size 1 --data-parallel-size 16 --data-parallel-rank 0
-        --data-parallel-address $(POD_IP) --data-parallel-rpc-port 13345
-
-Ranks 1-15: --tensor-parallel-size 1 --data-parallel-size 16
-            --data-parallel-rank <1-15>
-            --data-parallel-address ms-llama31-multinode-llm-d-modelservice-decode.llm-d-llama31-multinode.svc.cluster.local
-            --data-parallel-rpc-port 13345
-```
+**Load Balancing:**
+- Kubernetes Service handles request distribution
+- Round-robin or session-affinity based
+- Not queue-aware (limitation)
 
 ## How It Works
 
-1. **Client sends request** → HTTP request to Rank 0 service on port 8000
-2. **Rank 0 receives request** → Logged in Rank 0's HTTP API layer
-3. **DP Coordinator distributes work** → Splits work across all 16 GPU workers
-4. **Workers process work** → Ranks 1-15 receive work via RPC (no HTTP logs), GPUs process independently
-5. **Response aggregated** → Rank 0 collects results and returns to client
+1. **Client sends request** → Kubernetes Service on port 8000
+2. **K8s Service load balances** → Routes to one of 16 pods (round-robin)
+3. **Pod processes independently** → No coordination with other pods
+4. **Response returned** → Direct from the pod that processed the request
 
 ## Quick Start
 
@@ -106,9 +86,9 @@ cd scripts/k8s/llama3/vllm-native
 ```
 
 This will:
-- Deploy Rank 0 (master) via Helmfile
-- Create service for Rank 0 (ports 8000 + 13345)
-- Deploy StatefulSet for workers (Ranks 1-15)
+- Deploy 16 independent vLLM pods via Helmfile
+- Create Kubernetes service for load balancing
+- Each pod downloads model independently
 
 Wait for pods to be ready (10-15 minutes first time for model download).
 
@@ -116,15 +96,12 @@ Wait for pods to be ready (10-15 minutes first time for model download).
 
 ```bash
 # Check all pods are running
-kubectl get pods -n llm-d-llama31-multinode
+kubectl get pods -n llm-d-llama31-multinode -l llm-d.ai/role=decode
 
-# Expected output: 16+ pods
-# - 1 gateway pod
-# - 1 master pod (decode)
-# - 15 worker pods (workers-0 through workers-14)
+# Expected output: 16 pods in Running state
 ```
 
-### 4. Port Forward (Required for Testing)
+### 4. Port Forward
 
 ```bash
 kubectl port-forward -n llm-d-llama31-multinode \
@@ -159,10 +136,10 @@ curl -X POST http://localhost:8000/v1/completions \
 # 1. Deploy
 ./deploy.sh
 
-# 2. Wait for all pods ready (16 worker pods + 1 master)
+# 2. Wait for all pods ready (16 pods)
 kubectl get pods -n llm-d-llama31-multinode -w
 
-# 3. Port forward (in separate terminal)
+# 3. Port forward
 kubectl port-forward -n llm-d-llama31-multinode \
   svc/ms-llama31-multinode-llm-d-modelservice-decode 8000:8000
 
@@ -178,13 +155,10 @@ curl http://localhost:8000/v1/models
 ### Check All Pods
 
 ```bash
-kubectl get pods -n llm-d-llama31-multinode
+kubectl get pods -n llm-d-llama31-multinode -l llm-d.ai/role=decode
 ```
 
-**Expected**:
-- 1 gateway pod
-- 1 master pod (`ms-llama31-multinode-llm-d-modelservice-decode-*`)
-- 15 worker pods (`ms-llama31-multinode-llm-d-modelservice-workers-0` through `workers-14`)
+**Expected**: 16 pods in Running/Ready state
 
 ### Check Service
 
@@ -192,86 +166,36 @@ kubectl get pods -n llm-d-llama31-multinode
 kubectl get svc -n llm-d-llama31-multinode ms-llama31-multinode-llm-d-modelservice-decode
 ```
 
-**Expected**: Service with ports `8000/TCP,13345/TCP`
+**Expected**: Service with port 8000/TCP and 16 endpoints
 
-### Check Master (Rank 0) Logs
-
-```bash
-kubectl logs -n llm-d-llama31-multinode \
-  -l app=ms-llama31-multinode-llm-d-modelservice-decode \
-  -c vllm -f
-```
-
-**Look for**:
-- `Started DP Coordinator process`
-- `Rank 0 is connected to 15 peer ranks`
-- `Uvicorn running on http://0.0.0.0:8000`
-
-### Check Worker Logs
+### Check Service Endpoints
 
 ```bash
-# Check specific worker (e.g., Rank 1)
-kubectl logs -n llm-d-llama31-multinode \
-  ms-llama31-multinode-llm-d-modelservice-workers-0 -f
-
-# Check specific worker (e.g., Rank 15)
-kubectl logs -n llm-d-llama31-multinode \
-  ms-llama31-multinode-llm-d-modelservice-workers-14 -f
+kubectl get endpoints -n llm-d-llama31-multinode ms-llama31-multinode-llm-d-modelservice-decode
 ```
 
-**Look for**:
-- `Starting vLLM worker with rank <N>`
-- `Rank <N> is connected to 15 peer ranks`
-- `rank <N> in world size 16 is assigned as DP rank <N>`
+**Expected**: 16 pod IPs listed as endpoints
 
-### Verify DP Coordination
-
-Check that all ranks are connected:
+### Check Pod Logs
 
 ```bash
-# Check master logs for peer connections
-kubectl logs -n llm-d-llama31-multinode \
-  -l app=ms-llama31-multinode-llm-d-modelservice-decode \
-  -c vllm | grep "Rank 0 is connected"
+# Check logs from all pods
+kubectl logs -n llm-d-llama31-multinode -l llm-d.ai/role=decode -c vllm --tail=50
 
-# Check worker logs for peer connections
-kubectl logs -n llm-d-llama31-multinode \
-  ms-llama31-multinode-llm-d-modelservice-workers-0 | grep "Rank 1 is connected"
+# Check specific pod
+kubectl logs -n llm-d-llama31-multinode <pod-name> -c vllm -f
 ```
 
-**Expected**: Each rank should report being connected to 15 peer ranks.
+**Look for**: `Uvicorn running on http://0.0.0.0:8000`
 
 ### Check GPU Utilization
 
 ```bash
-# Check master GPU usage
-kubectl exec -n llm-d-llama31-multinode \
-  $(kubectl get pod -n llm-d-llama31-multinode -l app=ms-llama31-multinode-llm-d-modelservice-decode -o jsonpath='{.items[0].metadata.name}') \
-  -c vllm -- nvidia-smi
-
-# Check worker GPU usage
-kubectl exec -n llm-d-llama31-multinode \
-  ms-llama31-multinode-llm-d-modelservice-workers-0 -- nvidia-smi
+# Check GPU usage on a specific pod
+kubectl exec -n llm-d-llama31-multinode <pod-name> -c vllm -- nvidia-smi
 ```
 
-**Expected**: During load, all GPUs should show utilization > 0%
-
-### Test Direct Worker Access
-
-You can verify workers are fully functional by accessing them directly:
-
-```bash
-# Port forward to a specific worker
-kubectl port-forward -n llm-d-llama31-multinode \
-  ms-llama31-multinode-llm-d-modelservice-workers-10 8001:8000
-
-# Send request (bypasses DP coordinator, uses only 1 GPU)
-curl -X POST http://localhost:8001/v1/completions \
-  -H "Content-Type: application/json" \
-  -d '{"model": "meta-llama/Llama-3.1-8B-Instruct", "prompt": "Test", "max_tokens": 20}'
-```
-
-**Note**: This bypasses the DP coordinator and only uses that single worker's GPU. For production, always use Rank 0.
+**Expected**: During load, GPUs should show utilization > 0%
 
 ## Cleanup
 
@@ -292,52 +216,79 @@ kubectl describe pod -n llm-d-llama31-multinode <pod-name>
 
 Check for: GPU availability, node resources, insufficient GPUs
 
-### Workers Can't Connect to Rank 0
+### Service Has No Endpoints
 
 ```bash
-# Verify service exists
-kubectl get svc -n llm-d-llama31-multinode ms-llama31-multinode-llm-d-modelservice-decode
-
-# Check worker logs for connection errors
-kubectl logs -n llm-d-llama31-multinode \
-  ms-llama31-multinode-llm-d-modelservice-workers-0 | grep -i "error\|connection"
+kubectl get endpoints -n llm-d-llama31-multinode
 ```
+
+If no endpoints, check that pods have `llm-d.ai/role: decode` label
 
 ### Model Download Issues
 
-Each pod downloads the model independently (EmptyDir storage). First deployment takes longer:
-- Rank 0: ~4-5 minutes
-- Workers: 5-10 minutes (downloads happen in parallel)
+Each pod downloads the model independently (EmptyDir storage):
+- First deployment: 10-15 minutes per pod (parallel downloads)
+- Subsequent deployments: Still need to download (no shared cache)
 
-### StatefulSet Issues
+### Uneven Load Distribution
 
-```bash
-# Check StatefulSet status
-kubectl get statefulset -n llm-d-llama31-multinode
-
-# Check events
-kubectl describe statefulset -n llm-d-llama31-multinode \
-  ms-llama31-multinode-llm-d-modelservice-workers
-```
+K8s service load balancing is simple round-robin:
+- Not queue-aware
+- Doesn't consider pod load
+- May result in uneven distribution under high load
 
 ## Key Architecture Decisions
 
-1. **Why 16 pods × 1 GPU instead of 2 pods × 8 GPUs?**
-   - Matches vllm-router and llm-d deployment patterns for fair comparison
-   - Better resource distribution across cluster
-   - Easier horizontal scaling
+### Why K8s Load Balancing?
 
-2. **Why StatefulSet for workers?**
-   - Provides stable pod names with ordinals (workers-0, workers-1, etc.)
-   - Enables dynamic rank calculation from pod ordinal
-   - Better suited for stateful workloads like DP workers
+Per vLLM expert recommendation for non-MoE models like Llama 3.1:
+- **DP coordinator not needed** for non-MoE models
+- **DP has overhead** that makes it slower than external routing (#24461)
+- **K8s native LB** is simpler and more performant
+
+### Comparison with Other Approaches
+
+| Aspect | vLLM-Native (K8s LB) | vllm-router | llm-d |
+|--------|---------------------|-------------|-------|
+| **Pods** | 16 independent | 8 prefill + 8 decode | 8 prefill + 8 decode |
+| **Load balancing** | K8s service | External router | Gateway + sidecar |
+| **Queue awareness** | No | Yes | Yes |
+| **P/D disaggregation** | No | Yes | Yes |
+| **Complexity** | Lowest | Medium | Highest |
+
+### Limitations
+
+1. **Not queue-aware**: K8s doesn't know pod queue lengths
+2. **No P/D disaggregation**: All pods do both prefill and decode
+3. **No shared model cache**: Each pod downloads independently
+
+### When to Use This
+
+✅ **Good for:**
+- Simple deployments
+- Testing vLLM native performance
+- Comparing against external routing approaches
+
+❌ **Not recommended for:**
+- MoE models (use DP coordinator instead)
+- Scenarios requiring P/D disaggregation
+- Production with strict SLA requirements
 
 ## Files
 
-- `values.yaml` - Helm values for Rank 0 (master)
-- `workers-statefulset.yaml` - StatefulSet for Ranks 1-15
-- `decode-service.yaml` - Service for Rank 0
+- `values.yaml` - Helm values for 16 independent pods
+- `vllm-service.yaml` - Kubernetes service for load balancing
 - `helmfile.yaml.gotmpl` - Helmfile configuration
 - `deploy.sh` - Deployment script
 - `cleanup.sh` - Cleanup script
 - `run-benchmark.sh` - Benchmark script
+
+## References
+
+- [vLLM Issue #24461](https://github.com/vllm-project/vllm/issues/24461) - DP overhead for non-MoE models
+- [Kubernetes Service Documentation](https://kubernetes.io/docs/concepts/services-networking/service/)
+- Helm chart: `llm-d-modelservice` v0.2.11
+
+---
+
+**Simple, performant vLLM deployment with Kubernetes native load balancing.**

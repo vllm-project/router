@@ -22,26 +22,19 @@ routing:
   epp:
     create: false
 
-# RANK 0 - MASTER (using "decode" section)
-# This is the master node that handles HTTP requests and coordinates DP
+# 16 independent vLLM pods - Kubernetes native load balancing
+# No DP coordinator - each pod is fully independent
 decode:
-  parallelism:
-    tensor: 1  # TP=1 (1 GPU per pod)
-    data: 16   # DP=16 (16 pods total)
   create: true
-  replicas: 1  # Only 1 master pod with 1 GPU
+  replicas: 16  # 16 independent pods with 1 GPU each
 
-  # Service configuration - CRITICAL for workers (ranks 1-15) to connect
+  # Service configuration - K8s will load balance across all 16 pods
   service:
     type: ClusterIP
     ports:
       - name: http
         port: 8000
         targetPort: 8000
-        protocol: TCP
-      - name: rpc
-        port: 13345
-        targetPort: 13345
         protocol: TCP
 
   monitoring:
@@ -53,50 +46,33 @@ decode:
 
   containers:
   - name: "vllm"
-    image: ghcr.io/llm-d/llm-d-cuda:v0.3.0
+    image: vllm/vllm-openai:latest
     modelCommand: vllmServe
     args:
-      - "--tensor-parallel-size"
-      - "1"                    # Use 1 GPU per pod (no TP)
-      - "--data-parallel-size"
-      - "16"                   # 16 ranks (16 pods total)
-      - "--data-parallel-rank"
-      - "0"                    # THIS IS RANK 0 (MASTER)
-      - "--data-parallel-address"
-      - "$(POD_IP)"            # Use own IP for master
-      - "--data-parallel-rpc-port"
-      - "13345"
       - "--block-size"
       - "128"
       - "--max-model-len"
       - "32000"
       - "--disable-log-requests"
     env:
-      - name: POD_IP
-        valueFrom:
-          fieldRef:
-            fieldPath: status.podIP
-      - name: VLLM_LOGGING_LEVEL
-        value: INFO
       - name: CUDA_VISIBLE_DEVICES
         value: "0"
+      - name: VLLM_LOGGING_LEVEL
+        value: INFO
     ports:
       - containerPort: 8000
         name: http
-        protocol: TCP
-      - containerPort: 13345
-        name: rpc
         protocol: TCP
     resources:
       limits:
         memory: 100Gi
         cpu: "22"
-        nvidia.com/gpu: "1"  # 1 GPU on this pod
+        nvidia.com/gpu: "1"  # 1 GPU per pod
       requests:
         memory: 100Gi
         cpu: "22"
         nvidia.com/gpu: "1"
-    mountModelVolume: true  # Helm handles PVC automatically
+    mountModelVolume: true
     volumeMounts:
     - name: metrics-volume
       mountPath: /.config
@@ -114,6 +90,6 @@ decode:
   - name: torch-compile-cache
     emptyDir: {}
 
-# WORKERS (ranks 1-15) - Disabled in Helm, will use separate StatefulSet
+# Prefill disabled - not using P/D disaggregation
 prefill:
   create: false

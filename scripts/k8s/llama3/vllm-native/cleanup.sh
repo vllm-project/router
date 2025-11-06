@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Cleanup Llama 3.1 8B Multi-Node DP deployment
+# Cleanup Llama 3.1 8B deployment
 # Usage: ./cleanup.sh [namespace] [gateway-provider]
 #
 # Examples:
@@ -14,7 +14,7 @@ NAMESPACE="${1:-llm-d-llama31-multinode}"
 GATEWAY_PROVIDER="${2:-default}"
 
 echo "==========================================="
-echo "Cleaning up Llama 3.1 8B Multi-Node DP"
+echo "Cleaning up Llama 3.1 8B Deployment"
 echo "==========================================="
 echo "Namespace: $NAMESPACE"
 echo "Gateway Provider: $GATEWAY_PROVIDER"
@@ -26,20 +26,16 @@ if ! kubectl get namespace "$NAMESPACE" &> /dev/null; then
     exit 0
 fi
 
-# Remove worker StatefulSet first
+# Remove vLLM service
 echo ""
-echo "Removing worker StatefulSet..."
+echo "Removing vLLM service..."
 cd "$(dirname "$0")"
-kubectl delete -f workers-statefulset.yaml --ignore-not-found=true
-
-# Remove decode service
-echo ""
-echo "Removing decode service..."
-kubectl delete -f decode-service.yaml --ignore-not-found=true
+kubectl delete -f vllm-service.yaml --ignore-not-found=true
 
 # Use helmfile to destroy
 echo ""
 echo "Destroying helmfile releases..."
+cd "$(dirname "$0")"
 
 if [ "$GATEWAY_PROVIDER" = "default" ]; then
     helmfile destroy -n "$NAMESPACE"
@@ -60,9 +56,6 @@ echo "==========================================="
 echo "Cleanup completed!"
 echo "==========================================="
 echo ""
-echo "To delete the namespace entirely (including PVC with cached model):"
+echo "To delete the namespace entirely:"
 echo "  kubectl delete namespace $NAMESPACE"
-echo ""
-echo "Note: Keeping the namespace preserves the PVC, so next deployment"
-echo "      won't need to re-download the model!"
 echo ""
