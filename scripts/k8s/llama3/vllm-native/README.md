@@ -1,14 +1,14 @@
-# Llama 3.1 8B Multi-Node Data Parallelism
+# Llama 3.1 8B Multi-Node Data Parallelism (16 Pods)
 
-Production-ready vLLM multi-node data parallelism (DP) deployment with explicit master-worker coordination.
+Production-ready vLLM multi-node data parallelism (DP) deployment with 16 independent GPU workers.
 
 ## Overview
 
-This setup implements **vLLM's multi-node DP pattern** where:
-- **Rank 0 (Master)**: Receives ALL client requests and runs DP Coordinator
-- **Rank 1 (Worker)**: Connects to master via RPC, provides additional compute
-- **Total capacity**: 2 ranks with 16 GPUs total (8 per node)
-- **Request flow**: Client → Rank 0 → DP Coordinator → All workers across both ranks
+This setup implements **vLLM's native DP coordinator pattern** where:
+- **Rank 0 (Master)**: Receives ALL client requests and runs DP Coordinator (1 GPU)
+- **Ranks 1-15 (Workers)**: Connect to master via RPC, provide distributed compute (15 pods × 1 GPU each)
+- **Total capacity**: 16 ranks with 16 GPUs total (1 GPU per pod)
+- **Request flow**: Client → Rank 0 → DP Coordinator → All 16 workers via RPC
 
 ## Architecture
 
@@ -19,46 +19,73 @@ This setup implements **vLLM's multi-node DP pattern** where:
                          │
                          ▼
 ┌─────────────────────────────────────────────────────────────┐
-│            Rank 0 Service (Port 8000 + RPC 13345)            │
+│         Rank 0 Service (HTTP 8000 + RPC 13345)               │
 └────────────────────────┬────────────────────────────────────┘
                          │
                          ▼
 ┌─────────────────────────────────────────────────────────────┐
-│                    Rank 0 Pod (Master)                       │
+│              Rank 0 Pod (Master) - 1 GPU                     │
 │  ┌─────────────────────────────────────────────────────────┐│
 │  │             vLLM DP Coordinator                          ││
 │  │  • Receives all HTTP requests                            ││
-│  │  • Distributes work across all 16 workers               ││
-│  │  • 8 local GPU workers                                   ││
+│  │  • Distributes work across 16 ranks                      ││
+│  │  • Processes on 1 local GPU (TP=1)                       ││
 │  └─────────────────────────────────┬───────────────────────┘│
 │                                     │ RPC Port 13345          │
 └─────────────────────────────────────┼───────────────────────┘
                                       │
                                       ▼
 ┌─────────────────────────────────────────────────────────────┐
-│                    Rank 1 Pod (Worker)                       │
+│           Worker StatefulSet (Ranks 1-15)                    │
 │  ┌─────────────────────────────────────────────────────────┐│
-│  │              vLLM Worker Process                         ││
-│  │  • Connects to rank 0 via RPC                            ││
+│  │  workers-0 (Rank 1) → 1 GPU                              ││
+│  │  workers-1 (Rank 2) → 1 GPU                              ││
+│  │  workers-2 (Rank 3) → 1 GPU                              ││
+│  │  ...                                                      ││
+│  │  workers-14 (Rank 15) → 1 GPU                            ││
+│  │                                                           ││
+│  │  • Each connects to Rank 0 via RPC                       ││
 │  │  • No HTTP API (work received via RPC only)              ││
-│  │  • 8 remote GPU workers                                  ││
+│  │  • Dynamic rank calculation from pod ordinal             ││
 │  └─────────────────────────────────────────────────────────┘│
 └─────────────────────────────────────────────────────────────┘
 ```
 
+## Configuration Summary
+
+**Pods:** 16 pods total
+- 1 master pod (Rank 0) - deployed via Helm chart
+- 15 worker pods (Ranks 1-15) - deployed via StatefulSet
+
+**Resources:**
+- 16 GPUs total (1 GPU per pod)
+- TP=1 (no tensor parallelism, 1 GPU per pod)
+- DP=16 (16 data parallel ranks)
+
+**Deployment:**
+```
+Rank 0: --tensor-parallel-size 1 --data-parallel-size 16 --data-parallel-rank 0
+        --data-parallel-address $(POD_IP) --data-parallel-rpc-port 13345
+
+Ranks 1-15: --tensor-parallel-size 1 --data-parallel-size 16
+            --data-parallel-rank <1-15>
+            --data-parallel-address ms-llama31-multinode-llm-d-modelservice-decode.llm-d-llama31-multinode.svc.cluster.local
+            --data-parallel-rpc-port 13345
+```
+
 ## How It Works
 
-1. **Client sends request** → HTTP request to rank 0 on port 8000
-2. **Rank 0 receives request** → Logged in rank 0's HTTP API layer
-3. **DP Coordinator distributes work** → Splits work across all 16 GPU workers (8 local + 8 remote)
-4. **Rank 1 processes work** → Receives work via RPC (no HTTP logs), GPUs at 80%+ utilization
+1. **Client sends request** → HTTP request to Rank 0 service on port 8000
+2. **Rank 0 receives request** → Logged in Rank 0's HTTP API layer
+3. **DP Coordinator distributes work** → Splits work across all 16 GPU workers
+4. **Workers process work** → Ranks 1-15 receive work via RPC (no HTTP logs), GPUs process independently
 5. **Response aggregated** → Rank 0 collects results and returns to client
 
 ## Quick Start
 
 ### Prerequisites
 
-- Kubernetes cluster with 2 nodes (8 GPUs each)
+- Kubernetes cluster with GPU nodes (16 GPUs total)
 - `kubectl` and `helmfile` installed
 - HuggingFace token with Llama 3.1 access
 
@@ -74,55 +101,56 @@ kubectl create secret generic llm-d-hf-token \
 ### 2. Deploy
 
 ```bash
-cd /data/users/nlalit/gitrepos/router/scripts/k8s/llama3.1_multinode
+cd scripts/k8s/llama3/vllm-native
 ./deploy.sh
 ```
 
-Wait for pods to be ready (5-10 minutes first time for model download, ~2 minutes after).
+This will:
+- Deploy Rank 0 (master) via Helmfile
+- Create service for Rank 0 (ports 8000 + 13345)
+- Deploy StatefulSet for workers (Ranks 1-15)
 
-### 3. Port Forward (Required for Testing)
+Wait for pods to be ready (10-15 minutes first time for model download).
 
-In a separate terminal, set up port forwarding to rank 0:
+### 3. Verify Deployment
+
+```bash
+# Check all pods are running
+kubectl get pods -n llm-d-llama31-multinode
+
+# Expected output: 16+ pods
+# - 1 gateway pod
+# - 1 master pod (decode)
+# - 15 worker pods (workers-0 through workers-14)
+```
+
+### 4. Port Forward (Required for Testing)
 
 ```bash
 kubectl port-forward -n llm-d-llama31-multinode \
-  $(kubectl get pod -n llm-d-llama31-multinode -l llm-d.ai/role=decode -o jsonpath='{.items[0].metadata.name}') \
-  8000:8000
+  svc/ms-llama31-multinode-llm-d-modelservice-decode 8000:8000
 ```
 
-Keep this running while you test, benchmark, or evaluate.
-
-### 4. Verify Deployment
+### 5. Test Connection
 
 ```bash
-# Check pods are on different nodes
-kubectl get pods -n llm-d-llama31-multinode -o wide
-
-# Test connection
+# Check models endpoint
 curl http://localhost:8000/v1/models
+
+# Send a test request
+curl -X POST http://localhost:8000/v1/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "meta-llama/Llama-3.1-8B-Instruct",
+    "prompt": "Hello, how are you?",
+    "max_tokens": 50
+  }'
 ```
 
-### 5. Run Benchmark
+### 6. Run Benchmark
 
 ```bash
-# Basic benchmark (100 prompts, concurrency 16)
 ./run-benchmark.sh
-
-# Custom configuration
-./run-benchmark.sh 1000 32
-```
-
-### 6. Run Evaluation
-
-```bash
-# Run gsm8k (default)
-./run-eval.sh
-
-# Run specific task with concurrency
-./run-eval.sh mmlu 4
-
-# Quick test with limited samples
-./run-eval.sh hellaswag 2 50
 ```
 
 ## Deployment Flow Summary
@@ -131,32 +159,34 @@ curl http://localhost:8000/v1/models
 # 1. Deploy
 ./deploy.sh
 
-# 2. Wait for ready
+# 2. Wait for all pods ready (16 worker pods + 1 master)
 kubectl get pods -n llm-d-llama31-multinode -w
 
 # 3. Port forward (in separate terminal)
 kubectl port-forward -n llm-d-llama31-multinode \
-  $(kubectl get pod -n llm-d-llama31-multinode -l llm-d.ai/role=decode -o jsonpath='{.items[0].metadata.name}') \
-  8000:8000
+  svc/ms-llama31-multinode-llm-d-modelservice-decode 8000:8000
 
-# 4. Benchmark
+# 4. Test
+curl http://localhost:8000/v1/models
+
+# 5. Benchmark
 ./run-benchmark.sh
-
-# 5. Evaluate
-./run-eval.sh gsm8k 1
 ```
 
-## Debugging
+## Monitoring & Debugging
 
-### Check Pods are on Different Nodes
+### Check All Pods
 
 ```bash
-kubectl get pods -n llm-d-llama31-multinode -o wide
+kubectl get pods -n llm-d-llama31-multinode
 ```
 
-**Expected**: 2 pods (decode and prefill) on different nodes
+**Expected**:
+- 1 gateway pod
+- 1 master pod (`ms-llama31-multinode-llm-d-modelservice-decode-*`)
+- 15 worker pods (`ms-llama31-multinode-llm-d-modelservice-workers-0` through `workers-14`)
 
-### Check Service Was Created
+### Check Service
 
 ```bash
 kubectl get svc -n llm-d-llama31-multinode ms-llama31-multinode-llm-d-modelservice-decode
@@ -164,62 +194,91 @@ kubectl get svc -n llm-d-llama31-multinode ms-llama31-multinode-llm-d-modelservi
 
 **Expected**: Service with ports `8000/TCP,13345/TCP`
 
-### Check Service Has Endpoint
-
-```bash
-kubectl get endpoints -n llm-d-llama31-multinode ms-llama31-multinode-llm-d-modelservice-decode
-```
-
-**Expected**: One endpoint pointing to decode pod IP
-
-### Check Rank 0 (Master) Logs
+### Check Master (Rank 0) Logs
 
 ```bash
 kubectl logs -n llm-d-llama31-multinode \
-  $(kubectl get pod -n llm-d-llama31-multinode -l llm-d.ai/role=decode -o jsonpath='{.items[0].metadata.name}') \
-  -c vllm | tail -50
+  -l app=ms-llama31-multinode-llm-d-modelservice-decode \
+  -c vllm -f
 ```
 
-**Expected**: Should see "Uvicorn running" or "Application startup complete" (NOT stuck waiting)
+**Look for**:
+- `Started DP Coordinator process`
+- `Rank 0 is connected to 15 peer ranks`
+- `Uvicorn running on http://0.0.0.0:8000`
 
-### Check Rank 1 (Worker) Logs
+### Check Worker Logs
 
 ```bash
+# Check specific worker (e.g., Rank 1)
 kubectl logs -n llm-d-llama31-multinode \
-  $(kubectl get pod -n llm-d-llama31-multinode -l llm-d.ai/role=prefill -o jsonpath='{.items[0].metadata.name}') \
-  -c vllm | tail -50
+  ms-llama31-multinode-llm-d-modelservice-workers-0 -f
+
+# Check specific worker (e.g., Rank 15)
+kubectl logs -n llm-d-llama31-multinode \
+  ms-llama31-multinode-llm-d-modelservice-workers-14 -f
 ```
 
-**Expected**: Should see successful connection to rank 0
+**Look for**:
+- `Starting vLLM worker with rank <N>`
+- `Rank <N> is connected to 15 peer ranks`
+- `rank <N> in world size 16 is assigned as DP rank <N>`
 
-### Verify Multi-Node DP is Working
+### Verify DP Coordination
 
-Check GPU utilization on both pods during benchmark/eval:
+Check that all ranks are connected:
 
 ```bash
-# Get pod names
-DECODE_POD=$(kubectl get pod -n llm-d-llama31-multinode -l llm-d.ai/role=decode -o jsonpath='{.items[0].metadata.name}')
-PREFILL_POD=$(kubectl get pod -n llm-d-llama31-multinode -l llm-d.ai/role=prefill -o jsonpath='{.items[0].metadata.name}')
+# Check master logs for peer connections
+kubectl logs -n llm-d-llama31-multinode \
+  -l app=ms-llama31-multinode-llm-d-modelservice-decode \
+  -c vllm | grep "Rank 0 is connected"
 
-# Check GPU usage on rank 0
-kubectl exec -n llm-d-llama31-multinode $DECODE_POD -c vllm -- \
-  nvidia-smi --query-gpu=utilization.gpu --format=csv
-
-# Check GPU usage on rank 1
-kubectl exec -n llm-d-llama31-multinode $PREFILL_POD -c vllm -- \
-  nvidia-smi --query-gpu=utilization.gpu --format=csv
+# Check worker logs for peer connections
+kubectl logs -n llm-d-llama31-multinode \
+  ms-llama31-multinode-llm-d-modelservice-workers-0 | grep "Rank 1 is connected"
 ```
 
-**Expected**: Both pods should show GPU utilization > 0% (typically 60-90%) during workload
+**Expected**: Each rank should report being connected to 15 peer ranks.
 
-**Important Note**: Rank 1 will NOT show HTTP request logs (normal behavior). It only processes work via RPC. GPU utilization is the proof that multi-node DP is working.
+### Check GPU Utilization
+
+```bash
+# Check master GPU usage
+kubectl exec -n llm-d-llama31-multinode \
+  $(kubectl get pod -n llm-d-llama31-multinode -l app=ms-llama31-multinode-llm-d-modelservice-decode -o jsonpath='{.items[0].metadata.name}') \
+  -c vllm -- nvidia-smi
+
+# Check worker GPU usage
+kubectl exec -n llm-d-llama31-multinode \
+  ms-llama31-multinode-llm-d-modelservice-workers-0 -- nvidia-smi
+```
+
+**Expected**: During load, all GPUs should show utilization > 0%
+
+### Test Direct Worker Access
+
+You can verify workers are fully functional by accessing them directly:
+
+```bash
+# Port forward to a specific worker
+kubectl port-forward -n llm-d-llama31-multinode \
+  ms-llama31-multinode-llm-d-modelservice-workers-10 8001:8000
+
+# Send request (bypasses DP coordinator, uses only 1 GPU)
+curl -X POST http://localhost:8001/v1/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model": "meta-llama/Llama-3.1-8B-Instruct", "prompt": "Test", "max_tokens": 20}'
+```
+
+**Note**: This bypasses the DP coordinator and only uses that single worker's GPU. For production, always use Rank 0.
 
 ## Cleanup
 
 ```bash
 ./cleanup.sh
 
-# To delete everything including cached model
+# To delete everything including namespace
 kubectl delete namespace llm-d-llama31-multinode
 ```
 
@@ -231,41 +290,54 @@ kubectl delete namespace llm-d-llama31-multinode
 kubectl describe pod -n llm-d-llama31-multinode <pod-name>
 ```
 
-Check for: GPU availability, node resources, anti-affinity conflicts
+Check for: GPU availability, node resources, insufficient GPUs
 
-### Rank 1 Can't Connect to Rank 0
+### Workers Can't Connect to Rank 0
 
 ```bash
 # Verify service exists
 kubectl get svc -n llm-d-llama31-multinode ms-llama31-multinode-llm-d-modelservice-decode
 
-# Check rank 1 logs for connection errors
+# Check worker logs for connection errors
 kubectl logs -n llm-d-llama31-multinode \
-  $(kubectl get pod -n llm-d-llama31-multinode -l llm-d.ai/role=prefill -o jsonpath='{.items[0].metadata.name}') \
-  -c vllm | grep -i "error\|connection"
+  ms-llama31-multinode-llm-d-modelservice-workers-0 | grep -i "error\|connection"
 ```
 
-### vLLM Not Ready
+### Model Download Issues
+
+Each pod downloads the model independently (EmptyDir storage). First deployment takes longer:
+- Rank 0: ~4-5 minutes
+- Workers: 5-10 minutes (downloads happen in parallel)
+
+### StatefulSet Issues
 
 ```bash
-kubectl logs -n llm-d-llama31-multinode \
-  $(kubectl get pod -n llm-d-llama31-multinode -l llm-d.ai/role=decode -o jsonpath='{.items[0].metadata.name}') \
-  -c vllm | grep -i error
+# Check StatefulSet status
+kubectl get statefulset -n llm-d-llama31-multinode
+
+# Check events
+kubectl describe statefulset -n llm-d-llama31-multinode \
+  ms-llama31-multinode-llm-d-modelservice-workers
 ```
 
-## Key Configuration
+## Key Architecture Decisions
 
-- **2 ranks** (pods): Each pod is a separate vLLM instance
-- **8 GPUs per rank**: Configured via `parallelism.data: 8`
-- **Total**: 16 GPUs coordinated across 2 nodes
-- **Load balancing**: vLLM DP coordinator distributes work automatically
-- **Model caching**: PVC shared between pods for fast redeployment
+1. **Why 16 pods × 1 GPU instead of 2 pods × 8 GPUs?**
+   - Matches vllm-router and llm-d deployment patterns for fair comparison
+   - Better resource distribution across cluster
+   - Easier horizontal scaling
 
-## References
+2. **Why StatefulSet for workers?**
+   - Provides stable pod names with ordinals (workers-0, workers-1, etc.)
+   - Enables dynamic rank calculation from pod ordinal
+   - Better suited for stateful workloads like DP workers
 
-- [vLLM Multi-Node DP Documentation](https://docs.vllm.ai/en/latest/serving/data_parallel_deployment.html)
-- Helm chart: `llm-d-modelservice` v0.2.11
+## Files
 
----
-
-**Built for production-grade multi-node vLLM deployments with true master-worker coordination.**
+- `values.yaml` - Helm values for Rank 0 (master)
+- `workers-statefulset.yaml` - StatefulSet for Ranks 1-15
+- `decode-service.yaml` - Service for Rank 0
+- `helmfile.yaml.gotmpl` - Helmfile configuration
+- `deploy.sh` - Deployment script
+- `cleanup.sh` - Cleanup script
+- `run-benchmark.sh` - Benchmark script
