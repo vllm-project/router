@@ -1,0 +1,8 @@
+setproctitle
+aiohttp
+orjson
+uvicorn
+fastapi
+
+[dev]
+requests>=2.25.0

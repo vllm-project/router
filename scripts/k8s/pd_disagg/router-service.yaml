@@ -1,0 +1,47 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-router-pd
+  namespace: llm-d-pd
+  labels:
+    app: vllm-router
+    mode: pd-disaggregation
+spec:
+  selector:
+    app: vllm-router
+    mode: pd-disaggregation
+  ports:
+  - name: router
+    port: 10001
+    targetPort: 10001
+    protocol: TCP
+  - name: metrics
+    port: 29000
+    targetPort: 29000
+    protocol: TCP
+  type: ClusterIP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-router-pd-nodeport
+  namespace: llm-d-pd
+  labels:
+    app: vllm-router
+    mode: pd-disaggregation
+spec:
+  selector:
+    app: vllm-router
+    mode: pd-disaggregation
+  ports:
+  - name: router
+    port: 10001
+    targetPort: 10001
+    nodePort: 30001
+    protocol: TCP
+  - name: metrics
+    port: 29000
+    targetPort: 29000
+    nodePort: 30002
+    protocol: TCP
+  type: NodePort

@@ -1,0 +1,166 @@
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: vllm-router-sa
+  namespace: llm-d-llama31
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: vllm-router-role
+  namespace: llm-d-llama31
+rules:
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: vllm-router-rolebinding
+  namespace: llm-d-llama31
+subjects:
+- kind: ServiceAccount
+  name: vllm-router-sa
+  namespace: llm-d-llama31
+roleRef:
+  kind: Role
+  name: vllm-router-role
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm-router-llama31
+  namespace: llm-d-llama31
+  labels:
+    app: vllm-router
+    mode: pd-disaggregation
+    model: llama31
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: vllm-router
+      mode: pd-disaggregation
+      model: llama31
+  template:
+    metadata:
+      labels:
+        app: vllm-router
+        mode: pd-disaggregation
+        model: llama31
+    spec:
+      serviceAccountName: vllm-router-sa
+      initContainers:
+      - name: discover-pods
+        image: bitnami/kubectl:latest
+        command: ["/bin/sh", "-c"]
+        args:
+          - |
+            set -e
+            echo "Discovering prefill pods..."
+            kubectl get pods -n llm-d-llama31 -l llm-d.ai/role=prefill -o jsonpath='{range .items[*]}{.status.podIP}{"\n"}{end}' > /config/prefill-ips.txt
+
+            echo "Discovering decode pods..."
+            kubectl get pods -n llm-d-llama31 -l llm-d.ai/role=decode -o jsonpath='{range .items[*]}{.status.podIP}{"\n"}{end}' > /config/decode-ips.txt
+
+            echo "Discovered prefill IPs:"
+            cat /config/prefill-ips.txt
+            echo "Discovered decode IPs:"
+            cat /config/decode-ips.txt
+        volumeMounts:
+        - name: config
+          mountPath: /config
+      containers:
+      - name: router
+        image: 584868043064.dkr.ecr.us-west-2.amazonaws.com/dev-vllm-repo:router-dp-fallback
+        command: ["/bin/sh", "-c"]
+        args:
+          - |
+            set -e
+            echo "Building prefill endpoints..."
+            PREFILL_ARGS=""
+            while IFS= read -r ip; do
+              [ -z "$ip" ] && continue
+              PREFILL_ARGS="$PREFILL_ARGS --prefill http://$ip:8000"
+            done < /config/prefill-ips.txt
+
+            echo "Building decode endpoints..."
+            DECODE_ARGS=""
+            while IFS= read -r ip; do
+              [ -z "$ip" ] && continue
+              DECODE_ARGS="$DECODE_ARGS --decode http://$ip:8200"
+            done < /config/decode-ips.txt
+
+            echo "Starting vllm-router with discovered endpoints..."
+            echo "Prefill endpoints: $PREFILL_ARGS"
+            echo "Decode endpoints: $DECODE_ARGS"
+
+            exec vllm-router \
+              --pd-disaggregation \
+              $PREFILL_ARGS \
+              $DECODE_ARGS \
+              --host 0.0.0.0 \
+              --port 10001 \
+              --data-parallel-size 1 \
+              --policy consistent_hash \
+              --log-level info
+        volumeMounts:
+        - name: config
+          mountPath: /config
+        ports:
+        - containerPort: 10001
+          name: router
+          protocol: TCP
+        - containerPort: 29000
+          name: metrics
+          protocol: TCP
+        resources:
+          requests:
+            cpu: "2"
+            memory: "4Gi"
+          limits:
+            cpu: "4"
+            memory: "8Gi"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 10001
+          initialDelaySeconds: 15
+          periodSeconds: 30
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 10001
+          initialDelaySeconds: 10
+          periodSeconds: 10
+      volumes:
+      - name: config
+        emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-router-llama31
+  namespace: llm-d-llama31
+  labels:
+    app: vllm-router
+    mode: pd-disaggregation
+    model: llama31
+spec:
+  type: ClusterIP
+  selector:
+    app: vllm-router
+    mode: pd-disaggregation
+    model: llama31
+  ports:
+  - name: router
+    port: 10001
+    targetPort: 10001
+    protocol: TCP
+  - name: metrics
+    port: 29000
+    targetPort: 29000
+    protocol: TCP
