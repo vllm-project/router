@@ -1,0 +1,18 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: ms-deepseek-v31-native-llm-d-modelservice-decode
+  namespace: llm-d-deepseek-v31-native
+  labels:
+    app: ms-deepseek-v31-native-llm-d-modelservice
+    component: decode
+spec:
+  type: ClusterIP
+  ports:
+  - name: http
+    port: 8000
+    targetPort: 8000
+    protocol: TCP
+  selector:
+    llm-d.ai/role: decode
+    llm-d.ai/inferenceServing: "true"

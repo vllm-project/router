@@ -1,0 +1,54 @@
+environments:
+  istio: &I
+    values:
+      - gateway-configs/istio.yaml
+  istioBench: &IB
+    values:
+      - gateway-configs/istio.yaml
+      - gateway-configs/benchmarking.yaml
+  default:
+    <<: *IB
+
+---
+
+{{- $ns := .Namespace | default "llm-d-deepseek-v31-native" -}}
+{{- $rn := (env "RELEASE_NAME_POSTFIX") | default "deepseek-v31-native" -}}
+
+repositories:
+  - name: llm-d-modelservice
+    url: https://llm-d-incubation.github.io/llm-d-modelservice/
+  - name: llm-d-infra
+    url: https://llm-d-incubation.github.io/llm-d-infra/
+
+releases:
+  - name: {{ printf "infra-%s" $rn | quote }}
+    namespace: {{ $ns }}
+    chart: llm-d-infra/llm-d-infra
+    version: v1.3.3
+    installed: true
+    labels:
+      type: infrastructure
+      kind: inference-stack
+    values:
+      - gateway:
+          {{ .Environment.Values.gateway | toYaml | nindent 10 }}
+
+  - name: {{ printf "ms-%s" $rn | quote }}
+    namespace: {{ $ns }}
+    chart: llm-d-modelservice/llm-d-modelservice
+    version: v0.2.11
+    installed: true
+    needs:
+      - {{ printf "infra-%s" $rn | quote }}
+    values:
+      - values.yaml
+    {{- if or (eq .Environment.Name "istioBench") (eq .Environment.Name "default") }}
+      - routing:
+          {{ .Environment.Values.routing | toYaml | nindent 10 }}
+    {{- end }}
+    set:
+    # apply release name derived values
+      - name: "routing.parentRefs[0].name"
+        value: {{ printf "infra-%s-inference-gateway" $rn | quote }}
+    labels:
+      kind: inference-stack
