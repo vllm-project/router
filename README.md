@@ -2,7 +2,7 @@
 
 A high-performance and light-weight request forwarding system for vLLM large scale deployments, providing advanced load balancing methods and prefill/decode disaggregation support.
 
-### Key Features
+## Key Features
 
 - **Core Architecture**: Request routing framework and async processing patterns
 - **Load Balancing**: Multiple algorithms (cache-aware, power of two, consistent hashing, random, round robin)
@@ -12,161 +12,78 @@ A high-performance and light-weight request forwarding system for vLLM large sca
 
 ## Quick Start
 
-### Prerequisites
+### Installation
 
-**Rust and Cargo:**
 ```bash
-# Install rustup (Rust installer and version manager)
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+# One-command installation
+make install
 
-# Follow the installation prompts, then reload your shell
-source $HOME/.cargo/env
-
-# Verify installation
-rustc --version
-cargo --version
-
-# Install protobuf compiler (on Ubuntu/Debian)
-sudo apt-get update
-sudo apt-get install -y protobuf-compiler libprotobuf-dev
+# Or step-by-step
+make check-deps        # Check dependencies
+make install-deps      # Install system dependencies
+make build             # Build Rust binary and Python package
+make install-python    # Install Python package
 ```
 
-**Python with pip installed**
+**Supported Systems:** Linux (Ubuntu/Debian, RHEL/CentOS/Fedora) and macOS
 
-### Installation & Basic Usage
+**Prerequisites:** Rust, Protocol Buffers compiler, Python 3.8+
 
-#### Rust Binary
+📖 **Detailed installation guide:** [docs/installation.md](docs/installation.md)
+
+### Basic Usage
+
+#### Standard Routing
+
 ```bash
-# Build Rust components
-cargo build --release
+# Using the binary
+./target/release/vllm-router \
+    --worker-urls http://localhost:8000 http://localhost:8001 \
+    --policy round_robin \
+    --host 0.0.0.0 \
+    --port 8080
+
+# Using Python launcher (after make install-python)
+vllm-router \
+    --worker-urls http://localhost:8000 http://localhost:8001 \
+    --policy consistent_hash
 ```
 
-#### Python Package
+#### Data Parallelism
+
 ```bash
-pip install setuptools-rust wheel build
-python -m build
-pip install dist/*.whl
-
-# Rebuild & reinstall in one step during development
-python -m build && pip install --force-reinstall dist/*.whl
-```
-
-### Usage Examples
-
-#### Standard Data Parallelism Routing
-```bash
-# Launch router with data parallelism (8 replicas per worker URL)
-# When data-parallel-size > 1, the router automatically creates DP-aware workers
 ./target/release/vllm-router \
     --worker-urls http://worker1:8000 http://worker2:8000 \
-    --policy consistent_hash \
-    --intra-node-data-parallel-size 8
-
-# Alternative: using cargo run
-cargo run --release -- \
-    --worker-urls http://worker1:8000 http://worker2:8000 \
-    --policy consistent_hash \
-    --intra-node-data-parallel-size 8
-
-# Alternative: using python launcher
-vllm-router \
-  --worker-urls http://worker1:8000 http://worker2:8000 \
     --policy consistent_hash \
     --intra-node-data-parallel-size 8
 ```
 
 #### Prefill-Decode Disaggregation
+
 ```bash
-# When vLLM runs the NIXL connector, prefill/decode URLs are required.
-# See a working example in scripts/llama3.1/ folder.
-cargo run --release -- \
-    --policy consistent_hash \
+# NIXL connector mode
+./target/release/vllm-router \
     --vllm-pd-disaggregation \
     --prefill http://127.0.0.1:8081 \
     --prefill http://127.0.0.1:8082 \
     --decode http://127.0.0.1:8083 \
     --decode http://127.0.0.1:8084 \
-    --decode http://127.0.0.1:8085 \
-    --decode http://127.0.0.1:8086 \
-    --host 127.0.0.1 \
-    --port 8090 \
-    --intra-node-data-parallel-size 1 \
+    --policy cache_aware
 
-
-# When vLLM runs the NCCL connector, ZMQ based discovery is supported.
-# See a working example in scripts/install.sh
-cargo run --release -- \
-    --policy consistent_hash \
+# NCCL connector mode (ZMQ discovery)
+./target/release/vllm-router \
     --vllm-pd-disaggregation \
     --vllm-discovery-address 0.0.0.0:30001 \
-    --host 0.0.0.0 \
-    --port 10001 \
     --prefill-policy consistent_hash \
-    --decode-policy consistent_hash
+    --decode-policy power_of_two
 ```
 
-## Configuration
+📖 **Usage guides:**
+- [Basic Routing](docs/model-routing/basic-routing.md)
+- [Prefill-Decode Disaggregation](docs/model-routing/pd-disaggregation.md)
+- [Kubernetes Deployment](docs/environment/kubernetes.md)
 
-### Metrics
-
-Prometheus metrics endpoint available at `127.0.0.1:29000` by default.
-
-```bash
-# Custom metrics configuration
-vllm-router \
-    --worker-urls http://localhost:8080 http://localhost:8081 \
-    --prometheus-host 0.0.0.0 \
-    --prometheus-port 9000
-```
-
-### Retries and Circuit Breakers
-
-#### Retry Configuration
-Retries are enabled by default with exponential backoff and jitter:
-
-```bash
-vllm-router \
-  --worker-urls http://localhost:8080 http://localhost:8081 \
-  --retry-max-retries 3 \
-  --retry-initial-backoff-ms 100 \
-  --retry-max-backoff-ms 10000 \
-  --retry-backoff-multiplier 2.0 \
-  --retry-jitter-factor 0.1
-```
-
-#### Circuit Breaker Configuration
-Circuit breakers protect workers and provide automatic recovery:
-
-```bash
-vllm-router \
-  --worker-urls http://localhost:8080 http://localhost:8081 \
-  --cb-failure-threshold 5 \
-  --cb-success-threshold 2 \
-  --cb-timeout-duration-secs 30 \
-  --cb-window-duration-secs 60
-```
-
-**Circuit Breaker State Machine:**
-- `Closed` → `Open` after N consecutive failures (failure-threshold)
-- `Open` → `HalfOpen` after timeout (timeout-duration-secs)
-- `HalfOpen` → `Closed` after M consecutive successes (success-threshold)
-
-**Retry Policy:** Retries on HTTP status codes 408/429/500/502/503/504, with backoff/jitter between attempts.
-
-### Request ID Tracking
-
-Track requests across distributed systems with configurable headers:
-
-```bash
-# Use custom request ID headers
-vllm-router \
-    --worker-urls http://localhost:8080 \
-    --request-id-headers x-trace-id x-request-id
-```
-
-**Default headers:** `x-request-id`, `x-correlation-id`, `x-trace-id`, `request-id`
-
-### Load Balancing Policies
+## Load Balancing Policies
 
 The router supports multiple load balancing policies:
 
@@ -178,66 +95,30 @@ The router supports multiple load balancing policies:
 | `power_of_two` | Picks least loaded of two random workers | No | Load-sensitive workloads |
 | `cache_aware` | Optimizes for prefix cache hits | Yes | Repeated prompts, few-shot |
 
+**Example:** Using `consistent_hash` with session affinity:
+
 ```bash
-# Example: Using consistent_hash with HTTP header for session affinity
-curl -X POST http://router:8000/v1/chat/completions \
-  -H "X-Session-ID: my-session-123" \
+curl -X POST http://localhost:8080/v1/chat/completions \
+  -H "X-Session-ID: user-123" \
   -H "Content-Type: application/json" \
   -d '{"model": "llama-3", "messages": [{"role": "user", "content": "Hello!"}]}'
 ```
 
-For detailed configuration options, hash key priorities, and usage examples, see [Load Balancing Documentation](docs/load_balancing/README.md).
+📖 **Learn more:** [Load Balancing Documentation](docs/model-routing/load-balancing.md)
 
-## Advanced Features
+## Documentation
 
-### Kubernetes Service Discovery
-
-Automatic worker discovery and management in Kubernetes environments.
-
-#### Basic Service Discovery
-
-```bash
-vllm-router \
-    --service-discovery \
-    --selector app=vllm-worker role=inference \
-    --service-discovery-namespace default
-```
-
-### Command Line Arguments Reference
-
-#### Service Discovery
-- `--service-discovery`: Enable Kubernetes service discovery
-- `--service-discovery-port`: Port for worker URLs (default: 8000)
-- `--service-discovery-namespace`: Kubernetes namespace to watch
-- `--selector`: Label selectors for regular mode (format: `key1=value1 key2=value2`)
+- **[Installation Guide](docs/installation.md)** - Detailed installation instructions
+- **[Basic Routing](docs/model-routing/basic-routing.md)** - Standard routing configuration
+- **[Load Balancing](docs/model-routing/load-balancing.md)** - Policy details and comparison
+- **[Prefill-Decode Disaggregation](docs/model-routing/pd-disaggregation.md)** - P/D separation
+- **[Kubernetes Deployment](docs/environment/kubernetes.md)** - K8s service discovery
+- **[Model Protection](docs/model-protection/README.md)** - Retries and circuit breakers
+- **[Model Monitoring](docs/model-monitoring/configuration.md)** - Metrics and observability
 
 ## Development
 
-### Troubleshooting
-
-**VSCode Rust Analyzer Issues:**
-Set `rust-analyzer.linkedProjects` to the absolute path of `Cargo.toml`:
-
-```json
-{
-  "rust-analyzer.linkedProjects": ["/workspaces/vllm/vllm-router/Cargo.toml"]
-}
-```
-
-### CI/CD Pipeline
-
-The continuous integration pipeline includes comprehensive testing, benchmarking, and publishing:
-
-#### Build & Test
-1. **Build Wheels**: Uses `cibuildwheel` for manylinux x86_64 packages
-2. **Build Source Distribution**: Creates source distribution for pip fallback
-3. **Rust HTTP Server Benchmarking**: Performance testing of router overhead
-4. **Basic Inference Testing**: End-to-end validation through the router
-5. **PD Disaggregation Testing**: Benchmark and sanity checks for prefill-decode load balancing
-
-#### Publishing
-- **PyPI Publishing**: Wheels and source distributions published when version changes in `pyproject.toml`
-- **Container Images**: Docker images published using `/docker/Dockerfile.router`
+For development setup, build instructions, and contribution guidelines, see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Acknowledgement
 
