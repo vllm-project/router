@@ -58,6 +58,7 @@ struct Router {
     request_timeout_secs: u64,
     request_id_headers: Option<Vec<String>>,
     pd_disaggregation: bool,
+    vllm_pd_disaggregation: bool,
     prefill_urls: Option<Vec<(String, Option<u16>)>>,
     decode_urls: Option<Vec<String>>,
     prefill_policy: Option<PolicyType>,
@@ -139,7 +140,7 @@ impl Router {
             RoutingMode::Regular {
                 worker_urls: vec![],
             }
-        } else if self.pd_disaggregation {
+        } else if self.pd_disaggregation || self.vllm_pd_disaggregation {
             RoutingMode::PrefillDecode {
                 prefill_urls: self.prefill_urls.clone().unwrap_or_default(),
                 decode_urls: self.decode_urls.clone().unwrap_or_default(),
@@ -266,6 +267,7 @@ impl Router {
         request_timeout_secs = 1800,  // Add configurable request timeout
         request_id_headers = None,  // Custom request ID headers
         pd_disaggregation = false,  // New flag for PD mode
+        vllm_pd_disaggregation = false,  // New flag for PD mode
         prefill_urls = None,
         decode_urls = None,
         prefill_policy = None,
@@ -330,6 +332,7 @@ impl Router {
         request_timeout_secs: u64,
         request_id_headers: Option<Vec<String>>,
         pd_disaggregation: bool,
+        vllm_pd_disaggregation: bool,
         prefill_urls: Option<Vec<(String, Option<u16>)>>,
         decode_urls: Option<Vec<String>>,
         prefill_policy: Option<PolicyType>,
@@ -405,6 +408,7 @@ impl Router {
             request_timeout_secs,
             request_id_headers,
             pd_disaggregation,
+            vllm_pd_disaggregation,
             prefill_urls,
             decode_urls,
             prefill_policy,

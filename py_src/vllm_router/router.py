@@ -68,6 +68,7 @@ class Router:
         prometheus_port: Port to expose Prometheus metrics. Default: None
         prometheus_host: Host address to bind the Prometheus metrics server. Default: None
         pd_disaggregation: Enable PD (Prefill-Decode) disaggregated mode. Default: False
+        vllm_pd_disaggregation: Enable vLLM PD (Prefill-Decode) disaggregated mode. Default: False
         prefill_urls: List of (url, bootstrap_port) tuples for prefill servers (PD mode only)
         decode_urls: List of URLs for decode servers (PD mode only)
         prefill_policy: Specific load balancing policy for prefill nodes (PD mode only).
@@ -115,15 +116,15 @@ class Router:
         # Convert RouterArgs to _Router parameters
         args_dict["worker_urls"] = (
             []
-            if args_dict["service_discovery"] or args_dict["pd_disaggregation"]
+            if args_dict["service_discovery"] or args_dict["pd_disaggregation"] or args_dict["vllm_pd_disaggregation"]
             else args_dict["worker_urls"]
         )
         args_dict["policy"] = policy_from_str(args_dict["policy"])
         args_dict["prefill_urls"] = (
-            args_dict["prefill_urls"] if args_dict["pd_disaggregation"] else None
+            args_dict["prefill_urls"] if args_dict["pd_disaggregation"] or args_dict["vllm_pd_disaggregation"] else None
         )
         args_dict["decode_urls"] = (
-            args_dict["decode_urls"] if args_dict["pd_disaggregation"] else None
+            args_dict["decode_urls"] if args_dict["pd_disaggregation"] or args_dict["vllm_pd_disaggregation"] else None
         )
         args_dict["prefill_policy"] = policy_from_str(args_dict["prefill_policy"])
         args_dict["decode_policy"] = policy_from_str(args_dict["decode_policy"])
