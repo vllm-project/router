@@ -62,9 +62,12 @@
 use super::{get_healthy_worker_indices, CacheAwareConfig, LoadBalancingPolicy, RequestHeaders};
 use crate::core::Worker;
 use crate::metrics::RouterMetrics;
+use crate::policies::normalize_model_key;
 use crate::tree::Tree;
+use dashmap::DashMap;
+use rand::Rng;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 use tracing::debug;
@@ -77,7 +80,7 @@ use tracing::debug;
 #[derive(Debug)]
 pub struct CacheAwarePolicy {
     config: CacheAwareConfig,
-    trees: Arc<Mutex<HashMap<String, Tree>>>, // model_id -> Tree
+    trees: Arc<DashMap<String, Arc<Tree>>>, // model_id -> Arc<Tree>
     eviction_handle: Option<thread::JoinHandle<()>>,
 }
 
@@ -87,7 +90,7 @@ impl CacheAwarePolicy {
     }
 
     pub fn with_config(config: CacheAwareConfig) -> Self {
-        let trees = Arc::new(Mutex::new(HashMap::<String, Tree>::new()));
+        let trees = Arc::new(DashMap::<String, Arc<Tree>>::new());
 
         // Start background eviction thread if configured
         let eviction_handle = if config.eviction_interval_secs > 0 {
@@ -98,15 +101,15 @@ impl CacheAwarePolicy {
             Some(thread::spawn(move || loop {
                 thread::sleep(Duration::from_secs(interval));
 
-                if let Ok(mut trees_guard) = trees_clone.lock() {
-                    // Evict for all model trees
-                    for (model_id, tree) in trees_guard.iter_mut() {
-                        tree.evict_tenant_by_size(max_tree_size);
-                        debug!(
-                            "Cache eviction completed for model {}, max_size: {}",
-                            model_id, max_tree_size
-                        );
-                    }
+                // Evict for all model trees
+                for entry in trees_clone.iter() {
+                    let model_id = entry.key();
+                    let tree = entry.value();
+                    tree.evict_tenant_by_size(max_tree_size);
+                    debug!(
+                        "Cache eviction completed for model {}, max_size: {}",
+                        model_id, max_tree_size
+                    );
                 }
             }))
         } else {
@@ -122,91 +125,128 @@ impl CacheAwarePolicy {
 
     /// Initialize the tree with worker URLs (used only during initial setup)
     pub fn init_workers(&self, workers: &[Arc<dyn Worker>]) {
-        if let Ok(mut trees) = self.trees.lock() {
-            // Group workers by model
-            let mut model_workers: HashMap<String, Vec<&Arc<dyn Worker>>> = HashMap::new();
-            for worker in workers {
-                // Use "default" for unknown/empty model_ids for backward compatibility
-                let model_id = worker.model_id();
-                let tree_key = if model_id.is_empty() || model_id == "unknown" {
-                    "default".to_string()
-                } else {
-                    model_id.to_string()
-                };
-                model_workers.entry(tree_key).or_default().push(worker);
-            }
+        // Group workers by model
+        let mut model_workers: HashMap<String, Vec<&Arc<dyn Worker>>> = HashMap::new();
+        for worker in workers {
+            let tree_key = normalize_model_key(worker.model_id());
+            model_workers
+                .entry(tree_key.to_string())
+                .or_default()
+                .push(worker);
+        }
 
-            // Initialize tree for each model
-            for (tree_key, model_workers) in model_workers {
-                let tree = trees.entry(tree_key).or_insert_with(Tree::new);
-                for worker in model_workers {
-                    tree.insert("", worker.url());
-                }
+        // Initialize tree for each model
+        for (tree_key, model_workers) in model_workers {
+            let tree = self
+                .trees
+                .entry(tree_key)
+                .or_insert_with(|| Arc::new(Tree::new()))
+                .clone();
+            for worker in model_workers {
+                tree.insert("", worker.url());
             }
         }
     }
 
     /// Add a single worker to the tree (incremental update)
     pub fn add_worker(&self, worker: &dyn Worker) {
-        if let Ok(mut trees) = self.trees.lock() {
-            // For backward compatibility: if model_id is "unknown" or empty,
-            // use a default tree. This preserves existing behavior for single-model routers.
-            let model_id = worker.model_id();
-            let tree_key = if model_id.is_empty() || model_id == "unknown" {
-                "default".to_string()
-            } else {
-                model_id.to_string()
-            };
-            let tree = trees.entry(tree_key).or_insert_with(Tree::new);
-            tree.insert("", worker.url());
-        }
+        let tree_key = normalize_model_key(worker.model_id());
+        let tree = self
+            .trees
+            .entry(tree_key.to_string())
+            .or_insert_with(|| Arc::new(Tree::new()));
+        tree.insert("", worker.url());
     }
 
     /// Add a worker by URL and model (for backward compatibility)
     pub fn add_worker_by_url(&self, url: &str, model_id: &str) {
-        if let Ok(mut trees) = self.trees.lock() {
-            let tree = trees.entry(model_id.to_string()).or_insert_with(Tree::new);
-            tree.insert("", url);
-        }
+        let tree = self
+            .trees
+            .entry(model_id.to_string())
+            .or_insert_with(|| Arc::new(Tree::new()));
+        tree.insert("", url);
     }
 
     /// Remove a worker from the tree
     pub fn remove_worker(&self, worker: &dyn Worker) {
-        if let Ok(mut trees) = self.trees.lock() {
-            // Use same logic as add_worker for consistency
-            let model_id = worker.model_id();
-            let tree_key = if model_id.is_empty() || model_id == "unknown" {
-                "default".to_string()
-            } else {
-                model_id.to_string()
-            };
-            if let Some(tree) = trees.get_mut(&tree_key) {
-                tree.remove_tenant(worker.url());
-            }
+        let tree_key = normalize_model_key(worker.model_id());
+        if let Some(tree) = self.trees.get(tree_key) {
+            tree.remove_tenant(worker.url());
         }
     }
 
     /// Remove a worker by URL (removes from all model trees for backward compatibility)
     pub fn remove_worker_by_url(&self, url: &str) {
-        if let Ok(mut trees) = self.trees.lock() {
-            // Remove from all trees since we don't know which model it belongs to
-            for (_model_id, tree) in trees.iter_mut() {
-                tree.remove_tenant(url);
-            }
+        // Remove from all trees since we don't know which model it belongs to
+        for tree_ref in self.trees.iter() {
+            tree_ref.value().remove_tenant(url);
         }
     }
 
     /// Run cache eviction to prevent unbounded growth
     pub fn evict_cache(&self, max_size: usize) {
-        if let Ok(mut trees) = self.trees.lock() {
-            for (model_id, tree) in trees.iter_mut() {
-                tree.evict_tenant_by_size(max_size);
+        for tree_ref in self.trees.iter() {
+            let model_id = tree_ref.key();
+            let tree = tree_ref.value();
+            tree.evict_tenant_by_size(max_size);
+            debug!(
+                "Cache eviction for model {}, max_size: {}",
+                model_id, max_size
+            );
+        }
+    }
+
+    fn select_worker_min_load(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        request_text: Option<&str>,
+        healthy_indices: &[usize],
+        model_id: &str,
+        max_load: usize,
+        min_load: usize,
+    ) -> Option<usize> {
+        // Log load balancing trigger (only compute worker loads if debug enabled)
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            let worker_loads: Vec<(&str, usize)> =
+                workers.iter().map(|w| (w.url(), w.load())).collect();
+            debug!(
+                "Load balancing triggered | max: {} | min: {} | workers: {:?}",
+                max_load, min_load, worker_loads
+            );
+        }
+
+        RouterMetrics::record_load_balancing_event();
+        RouterMetrics::set_load_range(max_load, min_load);
+
+        // Use shortest queue when imbalanced
+        let min_load_idx = healthy_indices
+            .iter()
+            .min_by_key(|&&idx| workers[idx].load())
+            .copied()?;
+
+        // Even in imbalanced mode, update the tree to maintain cache state
+        if let Some(text) = request_text {
+            // Get the tree reference without locking the entire HashMap
+            // DashMap only locks the specific shard containing this key
+            let tree = self.trees.get(model_id).map(|entry| entry.value().clone());
+
+            if let Some(tree) = tree {
+                let worker_url = workers[min_load_idx].url();
+                tree.insert(text, worker_url);
+            } else {
                 debug!(
-                    "Cache eviction for model {}, max_size: {}",
-                    model_id, max_size
+                    "Warning: No tree found for model '{}', skipping cache update",
+                    model_id
                 );
             }
         }
+
+        // Increment processed counter
+        workers[min_load_idx].increment_processed();
+        RouterMetrics::record_processed_request(workers[min_load_idx].url());
+        RouterMetrics::record_policy_decision(self.name(), workers[min_load_idx].url());
+
+        Some(min_load_idx)
     }
 }
 
@@ -223,156 +263,111 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
             return None;
         }
 
-        // Group workers by model (using "default" for unknown/empty model_ids)
-        let mut model_workers: HashMap<String, Vec<usize>> = HashMap::new();
-        for idx in &healthy_indices {
-            let model_id = workers[*idx].model_id();
-            let tree_key = if model_id.is_empty() || model_id == "unknown" {
-                "default".to_string()
-            } else {
-                model_id.to_string()
-            };
-            model_workers.entry(tree_key).or_default().push(*idx);
-        }
+        // Determine the model for this set of workers (router pre-filters by model)
+        // All workers should be from the same model
+        let model_id = normalize_model_key(workers[healthy_indices[0]].model_id());
 
-        // Get current load statistics
-        let loads: Vec<usize> = workers.iter().map(|w| w.load()).collect();
-        let max_load = *loads.iter().max().unwrap_or(&0);
-        let min_load = *loads.iter().min().unwrap_or(&0);
+        // Get current load statistics - compute min/max in single pass without allocation
+        let (min_load, max_load) = workers.iter().fold((usize::MAX, 0usize), |(min, max), w| {
+            let load = w.load();
+            (min.min(load), max.max(load))
+        });
+        let min_load = if min_load == usize::MAX { 0 } else { min_load };
 
         // Check if load is imbalanced
         let is_imbalanced = max_load.saturating_sub(min_load) > self.config.balance_abs_threshold
             && (max_load as f32) > (min_load as f32 * self.config.balance_rel_threshold);
 
         if is_imbalanced {
-            // Log load balancing trigger
-            let worker_loads: Vec<(String, usize)> = workers
-                .iter()
-                .map(|w| (w.url().to_string(), w.load()))
-                .collect();
-
-            debug!(
-                "Load balancing triggered | max: {} | min: {} | workers: {:?}",
-                max_load, min_load, worker_loads
+            return self.select_worker_min_load(
+                workers,
+                request_text,
+                &healthy_indices,
+                model_id,
+                max_load,
+                min_load,
             );
-
-            RouterMetrics::record_load_balancing_event();
-            RouterMetrics::set_load_range(max_load, min_load);
-
-            // Use shortest queue when imbalanced
-            let min_load_idx = healthy_indices
-                .iter()
-                .min_by_key(|&&idx| workers[idx].load())
-                .copied()?;
-
-            // Even in imbalanced mode, update the tree to maintain cache state
-            if let Some(text) = request_text {
-                if let Ok(mut trees) = self.trees.lock() {
-                    let model_id = workers[min_load_idx].model_id();
-                    let tree_key = if model_id.is_empty() || model_id == "unknown" {
-                        "default".to_string()
-                    } else {
-                        model_id.to_string()
-                    };
-                    let tree = trees.entry(tree_key).or_insert_with(Tree::new);
-                    tree.insert(text, workers[min_load_idx].url());
-                }
-            }
-
-            // Increment processed counter
-            workers[min_load_idx].increment_processed();
-            RouterMetrics::record_processed_request(workers[min_load_idx].url());
-            RouterMetrics::record_policy_decision(self.name(), workers[min_load_idx].url());
-
-            return Some(min_load_idx);
         }
 
         // Use cache-aware routing when balanced
         let text = request_text.unwrap_or("");
 
-        if let Ok(mut trees) = self.trees.lock() {
-            let mut best_match_idx: Option<usize> = None;
-            let mut best_match_rate: f32 = 0.0;
+        // Get the tree reference without locking the entire HashMap
+        // DashMap only locks the specific shard containing this key
+        let tree = self.trees.get(model_id).map(|entry| entry.value().clone());
 
-            // Find best match across all models
-            for (model_id, worker_indices) in &model_workers {
-                let tree = trees.entry(model_id.clone()).or_insert_with(Tree::new);
+        let Some(tree) = tree else {
+            // No tree for this model, log warning and use random selection
+            debug!(
+                "Warning: No tree found for model '{}', using random worker selection",
+                model_id
+            );
+            // Return a random healthy worker
+            let mut rng = rand::rng();
+            let random_idx = rng.random_range(0..healthy_indices.len());
+            let selected_idx = healthy_indices[random_idx];
 
-                let (matched_text, matched_worker) = tree.prefix_match(text);
-                let match_rate = if text.is_empty() {
-                    0.0
-                } else {
-                    matched_text.chars().count() as f32 / text.chars().count() as f32
-                };
-
-                // Check if this model has the best match
-                if match_rate > best_match_rate {
-                    // Find the worker index for this URL
-                    if let Some(idx) = worker_indices
-                        .iter()
-                        .find(|&&idx| workers[idx].url() == matched_worker)
-                    {
-                        best_match_idx = Some(*idx);
-                        best_match_rate = match_rate;
-                    }
-                }
-            }
-
-            // Select worker based on cache threshold
-            let selected_idx = if let (Some(idx), true) = (
-                best_match_idx,
-                best_match_rate > self.config.cache_threshold,
-            ) {
-                RouterMetrics::record_cache_hit();
-                idx
-            } else {
-                RouterMetrics::record_cache_miss();
-
-                // Find model with smallest tree (most cache capacity)
-                let mut smallest_tree_model = String::new();
-                let mut smallest_tree_size = usize::MAX;
-
-                for model_id in model_workers.keys() {
-                    let tree = trees.entry(model_id.clone()).or_insert_with(Tree::new);
-                    let size = tree.get_used_size_per_tenant().values().sum::<usize>();
-                    if size < smallest_tree_size {
-                        smallest_tree_size = size;
-                        smallest_tree_model = model_id.clone();
-                    }
-                }
-
-                // Select least loaded worker from model with most cache capacity
-                if let Some(worker_indices) = model_workers.get(&smallest_tree_model) {
-                    worker_indices
-                        .iter()
-                        .min_by_key(|&&idx| workers[idx].load())
-                        .copied()
-                        .unwrap_or(healthy_indices[0])
-                } else {
-                    healthy_indices[0]
-                }
-            };
-
-            // Update the tree with this request
-            let model_id = workers[selected_idx].model_id();
-            let tree_key = if model_id.is_empty() || model_id == "unknown" {
-                "default".to_string()
-            } else {
-                model_id.to_string()
-            };
-            let tree = trees.entry(tree_key).or_insert_with(Tree::new);
-            tree.insert(text, workers[selected_idx].url());
-
-            // Increment processed counter
             workers[selected_idx].increment_processed();
             RouterMetrics::record_processed_request(workers[selected_idx].url());
             RouterMetrics::record_policy_decision(self.name(), workers[selected_idx].url());
 
             return Some(selected_idx);
+        };
+
+        // Now we work with the tree without holding the HashMap lock
+        // Use prefix_match_with_counts to avoid redundant chars().count() calls
+        let result = tree.prefix_match_with_counts(text);
+        let match_rate = if result.input_char_count == 0 {
+            0.0
+        } else {
+            result.matched_char_count as f32 / result.input_char_count as f32
+        };
+
+        // Select worker without String allocation
+        let selected_idx = if match_rate > self.config.cache_threshold {
+            // Cache hit path: find worker by URL (compare &str directly, no allocation)
+            let tenant_url: &str = &result.tenant;
+            workers
+                .iter()
+                .position(|w| w.url() == tenant_url)
+                .filter(|&idx| workers[idx].is_healthy())
+        } else {
+            // Low cache match: use worker with minimum load
+            healthy_indices
+                .iter()
+                .min_by_key(|&&idx| workers[idx].load())
+                .copied()
+        };
+
+        if let Some(idx) = selected_idx {
+            // Update the tree with this request (use worker URL directly, no allocation)
+            tree.insert(text, workers[idx].url());
+
+            // Increment processed counter
+            workers[idx].increment_processed();
+            RouterMetrics::record_processed_request(workers[idx].url());
+            RouterMetrics::record_policy_decision(self.name(), workers[idx].url());
+
+            return Some(idx);
         }
 
-        // Fallback to first healthy worker if tree operations fail
-        healthy_indices.first().copied()
+        // Selected worker no longer exists or unhealthy, remove stale tenant from tree
+        if match_rate > self.config.cache_threshold {
+            let tenant_url: &str = &result.tenant;
+            tree.remove_tenant(tenant_url);
+            debug!("Removed stale worker {} from cache tree", tenant_url);
+        }
+
+        // Fallback to first healthy worker
+        if let Some(idx) = healthy_indices.first().copied() {
+            workers[idx].increment_processed();
+            RouterMetrics::record_processed_request(workers[idx].url());
+            RouterMetrics::record_policy_decision(self.name(), workers[idx].url());
+
+            Some(idx)
+        } else {
+            None
+        }
     }
 
     fn name(&self) -> &'static str {
