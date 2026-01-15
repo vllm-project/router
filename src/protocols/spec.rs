@@ -340,6 +340,18 @@ pub struct ChatCompletionRequest {
     /// Return model hidden states
     #[serde(default)]
     pub return_hidden_states: bool,
+
+    /// Echo back the prompt in addition to the completion
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub echo: Option<bool>,
+
+    /// Reasoning effort level for reasoning models (low, medium, high)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+
+    /// Whether to include reasoning in the response
+    #[serde(default = "default_true")]
+    pub include_reasoning: bool,
 }
 
 impl GenerationRequest for ChatCompletionRequest {
