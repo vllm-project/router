@@ -910,7 +910,7 @@ mod tests {
                 stop_token_ids: None,
                 echo: None,
                 reasoning_effort: None,
-                include_reasoning: None,
+                include_reasoning: true,
                 no_stop_trim: false,
                 ignore_eos: false,
                 continue_final_message: false,
@@ -1205,14 +1205,15 @@ mod tests {
             let mut request = create_valid_chat_request();
 
             // include_reasoning defaults to true
+            assert!(request.include_reasoning);
             assert!(request.validate().is_ok());
 
             // include_reasoning = true should be valid
-            request.include_reasoning = Some(true);
+            request.include_reasoning = true;
             assert!(request.validate().is_ok());
 
             // include_reasoning = false should be valid
-            request.include_reasoning = Some(false);
+            request.include_reasoning = false;
             assert!(request.validate().is_ok());
         }
     }
