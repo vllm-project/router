@@ -93,6 +93,9 @@ fn default_chat_completion_request() -> ChatCompletionRequest {
         stream_reasoning: true,
         chat_template_kwargs: None,
         return_hidden_states: false,
+        echo: None,
+        reasoning_effort: None,
+        include_reasoning: true,
     }
 }
 
