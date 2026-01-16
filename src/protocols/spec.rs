@@ -347,7 +347,7 @@ pub struct ChatCompletionRequest {
 
     /// Reasoning effort level for reasoning models (low, medium, high)
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub reasoning_effort: Option<String>,
+    pub reasoning_effort: Option<ReasoningEffort>,
 
     /// Whether to include reasoning in the response
     #[serde(default = "default_true")]
