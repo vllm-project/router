@@ -908,6 +908,9 @@ mod tests {
                 regex: None,
                 ebnf: None,
                 stop_token_ids: None,
+                echo: None,
+                reasoning_effort: None,
+                include_reasoning: None,
                 no_stop_trim: false,
                 ignore_eos: false,
                 continue_final_message: false,
@@ -1159,6 +1162,58 @@ mod tests {
             // min_tokens > max_completion_tokens should fail
             request.min_tokens = Some(250);
             assert!(request.validate().is_err());
+        }
+
+        #[test]
+        fn test_echo_field() {
+            let mut request = create_valid_chat_request();
+
+            // echo is None by default, should be valid
+            assert!(request.echo.is_none());
+            assert!(request.validate().is_ok());
+
+            // echo = Some(true) should be valid
+            request.echo = Some(true);
+            assert!(request.validate().is_ok());
+
+            // echo = Some(false) should be valid
+            request.echo = Some(false);
+            assert!(request.validate().is_ok());
+        }
+
+        #[test]
+        fn test_reasoning_effort_field() {
+            let mut request = create_valid_chat_request();
+
+            // reasoning_effort is None by default, should be valid
+            assert!(request.reasoning_effort.is_none());
+            assert!(request.validate().is_ok());
+
+            // Valid reasoning_effort values: "low", "medium", "high"
+            request.reasoning_effort = Some("low".to_string());
+            assert!(request.validate().is_ok());
+
+            request.reasoning_effort = Some("medium".to_string());
+            assert!(request.validate().is_ok());
+
+            request.reasoning_effort = Some("high".to_string());
+            assert!(request.validate().is_ok());
+        }
+
+        #[test]
+        fn test_include_reasoning_field() {
+            let mut request = create_valid_chat_request();
+
+            // include_reasoning defaults to true
+            assert!(request.validate().is_ok());
+
+            // include_reasoning = true should be valid
+            request.include_reasoning = Some(true);
+            assert!(request.validate().is_ok());
+
+            // include_reasoning = false should be valid
+            request.include_reasoning = Some(false);
+            assert!(request.validate().is_ok());
         }
     }
 }
