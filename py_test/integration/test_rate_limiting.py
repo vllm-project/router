@@ -6,8 +6,9 @@ import requests
 
 @pytest.mark.integration
 def test_rate_limit_and_queue(router_manager, mock_workers):
-    # One fast backend
-    _, urls, _ = mock_workers(n=1)
+    # Add latency to ensure requests overlap and trigger rate limiting
+    # Without latency, requests may complete too fast to trigger concurrency limits
+    _, urls, _ = mock_workers(n=1, args=["--latency-ms", "100"])
     rh = router_manager.start_router(
         worker_urls=urls,
         policy="round_robin",
