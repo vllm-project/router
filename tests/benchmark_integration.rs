@@ -73,6 +73,9 @@ fn default_chat_completion_request() -> ChatCompletionRequest {
         separate_reasoning: true,
         stream_reasoning: true,
         return_hidden_states: false,
+        echo: None,
+        reasoning_effort: None,
+        include_reasoning: true,
     }
 }
 
