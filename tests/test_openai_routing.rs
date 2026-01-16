@@ -447,11 +447,11 @@ async fn test_openai_router_chat_with_reasoning_fields() {
 
     // Verify the fields are correctly deserialized
     assert_eq!(chat_request.echo, Some(true));
-    assert_eq!(chat_request.include_reasoning, false);
-
-    // Verify reasoning_effort by serializing back to JSON
-    let serialized = serde_json::to_value(&chat_request).unwrap();
-    assert_eq!(serialized["reasoning_effort"], "low");
+    assert!(!chat_request.include_reasoning);
+    assert!(matches!(
+        chat_request.reasoning_effort,
+        Some(vllm_router_rs::protocols::spec::ReasoningEffort::Low)
+    ));
 
     // Route the request to mock server
     let response = router.route_chat(None, &chat_request, None).await;
