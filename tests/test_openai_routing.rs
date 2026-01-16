@@ -422,3 +422,48 @@ async fn test_openai_router_models_auth_forwarding() {
     let models: serde_json::Value = serde_json::from_str(&body_str).unwrap();
     assert_eq!(models["object"], "list");
 }
+
+// ============= Reasoning Effort Integration Tests =============
+
+/// Test chat completion with the new reasoning fields (echo, reasoning_effort, include_reasoning)
+#[tokio::test]
+async fn test_openai_router_chat_with_reasoning_fields() {
+    let mock_server = MockOpenAIServer::new().await;
+    let base_url = mock_server.base_url();
+    let router = OpenAIRouter::new(base_url, None).await.unwrap();
+
+    // Create a chat request with all three new reasoning fields
+    let val = json!({
+        "model": "gpt-3.5-turbo",
+        "messages": [
+            {"role": "user", "content": "What is 2+2?"}
+        ],
+        "max_tokens": 100,
+        "echo": true,
+        "reasoning_effort": "low",
+        "include_reasoning": false
+    });
+    let chat_request: ChatCompletionRequest = serde_json::from_value(val).unwrap();
+
+    // Verify the fields are correctly deserialized
+    assert_eq!(chat_request.echo, Some(true));
+    assert_eq!(chat_request.include_reasoning, false);
+
+    // Verify reasoning_effort by serializing back to JSON
+    let serialized = serde_json::to_value(&chat_request).unwrap();
+    assert_eq!(serialized["reasoning_effort"], "low");
+
+    // Route the request to mock server
+    let response = router.route_chat(None, &chat_request, None).await;
+
+    // Should get a successful response
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let (_, body) = response.into_parts();
+    let body_bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+    let body_str = String::from_utf8(body_bytes.to_vec()).unwrap();
+    let chat_response: serde_json::Value = serde_json::from_str(&body_str).unwrap();
+
+    // Verify it's a valid chat completion response
+    assert_eq!(chat_response["object"], "chat.completion");
+}
