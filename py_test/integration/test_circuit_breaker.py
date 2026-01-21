@@ -189,3 +189,49 @@ def test_circuit_breaker_with_retries(router_manager, mock_workers):
         timeout=5,
     )
     assert r.status_code == 200
+
+
+@pytest.mark.integration
+def test_circuit_breaker_ignores_4xx_client_errors(router_manager, mock_workers):
+    """
+    4xx client errors (e.g., 400 Bad Request) should NOT count as circuit breaker
+    failures. Only 5xx server errors indicate worker health issues.
+
+    This test ensures that many 400 responses do not trip the circuit breaker,
+    while 500 responses still do.
+    """
+    # Worker that returns 400 Bad Request for all requests
+    _, [client_error_url], _ = mock_workers(n=1, args=["--status-code", "400"])
+    rh = router_manager.start_router(
+        worker_urls=[client_error_url],
+        policy="round_robin",
+        extra={
+            "cb_failure_threshold": 2,  # Low threshold - would trip quickly if 400s counted
+            "cb_success_threshold": 1,
+            "cb_timeout_duration_secs": 2,
+            "cb_window_duration_secs": 10,
+            "disable_retries": True,
+        },
+    )
+
+    def post_once():
+        return requests.post(
+            f"{rh.url}/v1/completions",
+            json={
+                "model": "test-model",
+                "prompt": "test",
+                "max_tokens": 1,
+                "stream": False,
+            },
+            timeout=3,
+        )
+
+    # Send many requests that return 400
+    # If 4xx counted as failures, circuit would open after 2 requests
+    for i in range(10):
+        r = post_once()
+        # Should get 400 from worker, NOT 503 from circuit breaker
+        assert r.status_code == 400, (
+            f"Request {i+1}: Expected 400 (client error passthrough), "
+            f"got {r.status_code}. Circuit breaker incorrectly opened on 4xx errors."
+        )
