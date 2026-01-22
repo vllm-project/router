@@ -139,7 +139,6 @@ pub struct StructuredOutputsParams {
     pub whitespace_pattern: Option<String>,
 }
 
-
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(untagged)]
 pub enum UserMessageContent {
@@ -3177,7 +3176,6 @@ mod tests {
         assert_eq!(deserialized.choice, Some(vec![]));
     }
 
-
     #[test]
     fn test_structured_outputs_params_in_chat_completion_request() {
         let json = r#"{
@@ -3208,5 +3206,4 @@ mod tests {
 
         assert!(request.structured_outputs.is_none());
     }
-
 }
