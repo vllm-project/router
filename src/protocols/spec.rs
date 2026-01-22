@@ -312,6 +312,10 @@ pub struct ChatCompletionRequest {
     #[serde(default)]
     pub continue_final_message: bool,
 
+    /// Add generation prompt into to the chat template
+    #[serde(default = "default_true")]
+    pub add_generation_prompt: bool,
+
     /// Skip special tokens during detokenization
     #[serde(default = "default_true")]
     pub skip_special_tokens: bool,
