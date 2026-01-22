@@ -914,6 +914,7 @@ mod tests {
                 include_reasoning: true,
                 no_stop_trim: false,
                 ignore_eos: false,
+                add_generation_prompt: true,
                 continue_final_message: false,
                 skip_special_tokens: true,
                 lora_path: None,
