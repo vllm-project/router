@@ -76,6 +76,7 @@ fn default_chat_completion_request() -> ChatCompletionRequest {
         echo: None,
         reasoning_effort: None,
         include_reasoning: true,
+        structured_outputs: None,
     }
 }
 
@@ -171,6 +172,17 @@ fn test_benchmark_request_creation() {
         presence_penalty: Some(0.0),
         frequency_penalty: Some(0.0),
         parallel_tool_calls: Some(true),
+        structured_outputs: Some(vllm_router_rs::protocols::spec::StructuredOutputsParams {
+            json: Some(serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "age": {"type": "integer"}
+                },
+                "required": ["name", "age"]
+            })),
+            ..Default::default()
+        }),
         ..default_chat_completion_request()
     };
 

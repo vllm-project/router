@@ -96,6 +96,50 @@ pub enum ChatMessage {
     },
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct StructuredOutputsParams {
+    /// JSON schema for structured output (mutually exclusive with other constraints)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub json: Option<serde_json::Value>,
+
+    /// Regex pattern for structured output (mutually exclusive with other constraints)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub regex: Option<String>,
+
+    /// List of choices for structured output (mutually exclusive with other constraints)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub choice: Option<Vec<String>>,
+
+    /// Grammar for structured output (mutually exclusive with other constraints)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub grammar: Option<String>,
+
+    /// JSON object mode (mutually exclusive with other constraints)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub json_object: Option<bool>,
+
+    /// Structural tag (mutually exclusive with other constraints)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub structural_tag: Option<String>,
+
+    /// Disable fallback to non-structured output
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disable_fallback: Option<bool>,
+
+    /// Disable any whitespace in structured output
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disable_any_whitespace: Option<bool>,
+
+    /// Disable additional properties in JSON schema
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disable_additional_properties: Option<bool>,
+
+    /// Whitespace pattern for structured output
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub whitespace_pattern: Option<String>,
+}
+
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(untagged)]
 pub enum UserMessageContent {
@@ -352,6 +396,9 @@ pub struct ChatCompletionRequest {
     /// Whether to include reasoning in the response
     #[serde(default = "default_true")]
     pub include_reasoning: bool,
+    /// Structured outputs parameters
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub structured_outputs: Option<StructuredOutputsParams>,
 }
 
 impl GenerationRequest for ChatCompletionRequest {
@@ -2927,4 +2974,239 @@ mod tests {
         // Only top-level string elements are extracted
         assert_eq!(req.extract_text_for_routing(), "a");
     }
+
+    // ==================================================================
+    // =            STRUCTURED OUTPUTS PARAMS TESTS                      =
+    // ==================================================================
+
+    #[test]
+    fn test_structured_outputs_params_default() {
+        let params = StructuredOutputsParams::default();
+
+        assert!(params.json.is_none());
+        assert!(params.regex.is_none());
+        assert!(params.choice.is_none());
+        assert!(params.grammar.is_none());
+        assert!(params.json_object.is_none());
+        assert!(params.structural_tag.is_none());
+        assert!(params.disable_fallback.is_none());
+        assert!(params.disable_any_whitespace.is_none());
+        assert!(params.disable_additional_properties.is_none());
+        assert!(params.whitespace_pattern.is_none());
+    }
+
+    #[test]
+    fn test_structured_outputs_params_with_json_schema() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "age": {"type": "integer"}
+            },
+            "required": ["name", "age"]
+        });
+
+        let params = StructuredOutputsParams {
+            json: Some(schema.clone()),
+            ..Default::default()
+        };
+
+        assert_eq!(params.json, Some(schema));
+        assert!(params.regex.is_none());
+    }
+
+    #[test]
+    fn test_structured_outputs_params_with_regex() {
+        let params = StructuredOutputsParams {
+            regex: Some(r"^\d{3}-\d{2}-\d{4}$".to_string()),
+            ..Default::default()
+        };
+
+        assert!(params.json.is_none());
+        assert_eq!(params.regex, Some(r"^\d{3}-\d{2}-\d{4}$".to_string()));
+    }
+
+    #[test]
+    fn test_structured_outputs_params_with_choice() {
+        let choices = vec!["yes".to_string(), "no".to_string(), "maybe".to_string()];
+
+        let params = StructuredOutputsParams {
+            choice: Some(choices.clone()),
+            ..Default::default()
+        };
+
+        assert_eq!(params.choice, Some(choices));
+    }
+
+    #[test]
+    fn test_structured_outputs_params_with_grammar() {
+        let grammar = r#"
+            root ::= sentence
+            sentence ::= subject " " verb " " object
+            subject ::= "I" | "You" | "They"
+            verb ::= "eat" | "drink" | "see"
+            object ::= "apple" | "water" | "sky"
+        "#
+        .to_string();
+
+        let params = StructuredOutputsParams {
+            grammar: Some(grammar.clone()),
+            ..Default::default()
+        };
+
+        assert_eq!(params.grammar, Some(grammar));
+    }
+
+    #[test]
+    fn test_structured_outputs_params_with_json_object_mode() {
+        let params = StructuredOutputsParams {
+            json_object: Some(true),
+            ..Default::default()
+        };
+
+        assert_eq!(params.json_object, Some(true));
+    }
+
+    #[test]
+    fn test_structured_outputs_params_with_structural_tag() {
+        let params = StructuredOutputsParams {
+            structural_tag: Some("<output>".to_string()),
+            ..Default::default()
+        };
+
+        assert_eq!(params.structural_tag, Some("<output>".to_string()));
+    }
+
+    #[test]
+    fn test_structured_outputs_params_with_all_flags() {
+        let params = StructuredOutputsParams {
+            disable_fallback: Some(true),
+            disable_any_whitespace: Some(true),
+            disable_additional_properties: Some(false),
+            whitespace_pattern: Some(r"\s*".to_string()),
+            ..Default::default()
+        };
+
+        assert_eq!(params.disable_fallback, Some(true));
+        assert_eq!(params.disable_any_whitespace, Some(true));
+        assert_eq!(params.disable_additional_properties, Some(false));
+        assert_eq!(params.whitespace_pattern, Some(r"\s*".to_string()));
+    }
+
+    #[test]
+    fn test_structured_outputs_params_serialization_empty() {
+        let params = StructuredOutputsParams::default();
+
+        let serialized = serde_json::to_string(&params).unwrap();
+        // All fields should be skipped when None
+        assert_eq!(serialized, "{}");
+    }
+
+    #[test]
+    fn test_structured_outputs_params_deserialization_partial() {
+        let json = r#"{
+            "regex": "^[a-z]+$",
+            "disable_fallback": true
+        }"#;
+
+        let params: StructuredOutputsParams = serde_json::from_str(json).unwrap();
+
+        assert!(params.json.is_none());
+        assert_eq!(params.regex, Some("^[a-z]+$".to_string()));
+        assert!(params.choice.is_none());
+        assert!(params.grammar.is_none());
+        assert!(params.json_object.is_none());
+        assert!(params.structural_tag.is_none());
+        assert_eq!(params.disable_fallback, Some(true));
+        assert!(params.disable_any_whitespace.is_none());
+        assert!(params.disable_additional_properties.is_none());
+        assert!(params.whitespace_pattern.is_none());
+    }
+
+    #[test]
+    fn test_structured_outputs_params_complex_json_schema() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "user": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string", "minLength": 1},
+                        "email": {"type": "string", "format": "email"},
+                        "age": {"type": "integer", "minimum": 0, "maximum": 150}
+                    },
+                    "required": ["name", "email"]
+                },
+                "items": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "id": {"type": "integer"},
+                            "value": {"type": "number"}
+                        }
+                    }
+                }
+            },
+            "required": ["user"]
+        });
+
+        let params = StructuredOutputsParams {
+            json: Some(schema.clone()),
+            disable_additional_properties: Some(true),
+            ..Default::default()
+        };
+
+        let serialized = serde_json::to_string(&params).unwrap();
+        let deserialized: StructuredOutputsParams = serde_json::from_str(&serialized).unwrap();
+
+        assert_eq!(deserialized.json, Some(schema));
+        assert_eq!(deserialized.disable_additional_properties, Some(true));
+    }
+
+    #[test]
+    fn test_structured_outputs_params_empty_choice_array() {
+        let params = StructuredOutputsParams {
+            choice: Some(vec![]),
+            ..Default::default()
+        };
+
+        let serialized = serde_json::to_string(&params).unwrap();
+        let deserialized: StructuredOutputsParams = serde_json::from_str(&serialized).unwrap();
+
+        assert_eq!(deserialized.choice, Some(vec![]));
+    }
+
+
+    #[test]
+    fn test_structured_outputs_params_in_chat_completion_request() {
+        let json = r#"{
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "Generate JSON"}],
+            "structured_outputs": {
+                "json": {"type": "object"},
+                "disable_fallback": true
+            }
+        }"#;
+
+        let request: ChatCompletionRequest = serde_json::from_str(json).unwrap();
+
+        assert!(request.structured_outputs.is_some());
+        let structured_outputs = request.structured_outputs.unwrap();
+        assert!(structured_outputs.json.is_some());
+        assert_eq!(structured_outputs.disable_fallback, Some(true));
+    }
+
+    #[test]
+    fn test_structured_outputs_params_in_chat_completion_request_none() {
+        let json = r#"{
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "Hello"}]
+        }"#;
+
+        let request: ChatCompletionRequest = serde_json::from_str(json).unwrap();
+
+        assert!(request.structured_outputs.is_none());
+    }
+
 }
