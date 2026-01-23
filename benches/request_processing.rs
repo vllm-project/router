@@ -96,6 +96,7 @@ fn default_chat_completion_request() -> ChatCompletionRequest {
         echo: None,
         reasoning_effort: None,
         include_reasoning: true,
+        structured_output: None,
     }
 }
 
