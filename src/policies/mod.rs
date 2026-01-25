@@ -123,7 +123,15 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
     /// Get as Any for downcasting
     fn as_any(&self) -> &dyn std::any::Any;
 
-    /// Initialize the policy with a set of workers
+    /// Returns true if this policy requires init_workers() to be called before use.
+    /// Override to return true for stateful policies like cache-aware routing.
+    fn requires_initialization(&self) -> bool {
+        false // Default: most policies don't need initialization
+    }
+
+    /// Initialize the policy with a set of workers.
+    /// Override for stateful policies that need to set up internal data structures.
+    /// Default is no-op for stateless policies like round-robin.
     fn init_workers(&self, _workers: &[Arc<dyn Worker>]) {
         // Default: no-op for policies that don't need initialization
     }

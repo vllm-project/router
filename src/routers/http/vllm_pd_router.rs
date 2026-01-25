@@ -967,12 +967,6 @@ impl VllmPDRouter {
 
             info!("VllmPDRouter created successfully with pure service discovery");
 
-            info!("Cache Aware Policy Initializing prefill and decode policies with workers.");
-            let prefill_workers = pd_router.worker_registry.get_prefill_workers();
-            let decode_workers = pd_router.worker_registry.get_decode_workers();
-            ctx.policy_registry.get_prefill_policy().init_workers(&prefill_workers);
-            ctx.policy_registry.get_decode_policy().init_workers(&decode_workers);
-
             Ok(Self {
                 pd_router,
                 service_registry: Arc::new(service_registry),

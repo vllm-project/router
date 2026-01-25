@@ -123,31 +123,6 @@ impl CacheAwarePolicy {
         }
     }
 
-    /// Initialize the tree with worker URLs (used only during initial setup)
-    pub fn init_workers(&self, workers: &[Arc<dyn Worker>]) {
-        // Group workers by model
-        let mut model_workers: HashMap<String, Vec<&Arc<dyn Worker>>> = HashMap::new();
-        for worker in workers {
-            let tree_key = normalize_model_key(worker.model_id());
-            model_workers
-                .entry(tree_key.to_string())
-                .or_default()
-                .push(worker);
-        }
-
-        // Initialize tree for each model
-        for (tree_key, model_workers) in model_workers {
-            let tree = self
-                .trees
-                .entry(tree_key)
-                .or_insert_with(|| Arc::new(Tree::new()))
-                .clone();
-            for worker in model_workers {
-                tree.insert("", worker.url());
-            }
-        }
-    }
-
     /// Add a single worker to the tree (incremental update)
     pub fn add_worker(&self, worker: &dyn Worker) {
         let tree_key = normalize_model_key(worker.model_id());
@@ -299,7 +274,7 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         let tree = self.trees.get(model_id).map(|entry| entry.value().clone());
 
         let keys: Vec<_> = self.trees.iter().map(|entry| entry.key().clone()).collect();
-        println!("Keys: {:?}", keys);
+        debug!("Available tree keys: {:?}", keys);
 
         let Some(tree) = tree else {
             // No tree for this model, log warning and use random selection
@@ -434,6 +409,43 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
             .copied()?;
 
         Some((prefill_idx, decode_idx))
+    }
+
+    fn requires_initialization(&self) -> bool {
+        true // Cache-aware policy requires init_workers() to set up trees
+    }
+
+    fn init_workers(&self, workers: &[Arc<dyn Worker>]) {
+        // Group workers by model
+        info!(
+            "Initializing workers for cache-aware policy: {}",
+            workers.iter().map(|w| w.url()).collect::<Vec<_>>().join(", ")
+        );
+        let mut model_workers: HashMap<String, Vec<&Arc<dyn Worker>>> = HashMap::new();
+        for worker in workers {
+            let tree_key = normalize_model_key(worker.model_id());
+            model_workers
+                .entry(tree_key.to_string())
+                .or_default()
+                .push(worker);
+        }
+
+        // Initialize tree for each model
+        for (tree_key, model_workers) in model_workers {
+            info!(
+                "Creating tree for model key: '{}' with {} workers",
+                tree_key,
+                model_workers.len()
+            );
+            let tree = self
+                .trees
+                .entry(tree_key)
+                .or_insert_with(|| Arc::new(Tree::new()))
+                .clone();
+            for worker in model_workers {
+                tree.insert("", worker.url());
+            }
+        }
     }
 }
 
