@@ -1724,11 +1724,12 @@ mod pd_mode_tests {
             .unwrap_or(9000);
 
         let config = RouterConfig {
-            mode: RoutingMode::PrefillDecode {
+            mode: RoutingMode::VllmPrefillDecode {
                 prefill_urls: vec![(prefill_url, Some(prefill_port))],
                 decode_urls: vec![decode_url],
                 prefill_policy: None,
                 decode_policy: None,
+                discovery_address: None,
             },
             policy: PolicyConfig::Random,
             host: "127.0.0.1".to_string(),

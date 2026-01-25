@@ -79,7 +79,7 @@ mod test_pd_routing {
     #[test]
     fn test_pd_selection_policies() {
         // Test all PD selection policy variants
-        // Note: These policies are only used when pd_disaggregation=true
+        // Note: These policies are only used when vllm_pd_disaggregation=true
         let policies = vec![
             PDSelectionPolicy::Random,
             PDSelectionPolicy::PowerOfTwo,
@@ -114,7 +114,7 @@ mod test_pd_routing {
         // In the new structure, RoutingMode and PolicyConfig are separate
         let test_cases = vec![
             (
-                RoutingMode::PrefillDecode {
+                RoutingMode::VllmPrefillDecode {
                     prefill_urls: vec![
                         ("http://prefill1:8080".to_string(), Some(9000)),
                         ("http://prefill2:8080".to_string(), None),
@@ -125,22 +125,24 @@ mod test_pd_routing {
                     ],
                     prefill_policy: None,
                     decode_policy: None,
+                    discovery_address: None,
                 },
                 PolicyConfig::Random,
             ),
             (
-                RoutingMode::PrefillDecode {
+                RoutingMode::VllmPrefillDecode {
                     prefill_urls: vec![("http://prefill:8080".to_string(), Some(9000))],
                     decode_urls: vec!["http://decode:8080".to_string()],
                     prefill_policy: None,
                     decode_policy: None,
+                    discovery_address: None,
                 },
                 PolicyConfig::PowerOfTwo {
                     load_check_interval_secs: 5,
                 },
             ),
             (
-                RoutingMode::PrefillDecode {
+                RoutingMode::VllmPrefillDecode {
                     prefill_urls: vec![
                         ("http://p1:8080".to_string(), Some(9000)),
                         ("http://p2:8080".to_string(), Some(9001)),
@@ -149,6 +151,7 @@ mod test_pd_routing {
                     decode_urls: vec!["http://d1:8080".to_string(), "http://d2:8080".to_string()],
                     prefill_policy: None,
                     decode_policy: None,
+                    discovery_address: None,
                 },
                 PolicyConfig::CacheAware {
                     cache_threshold: 0.7,

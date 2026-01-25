@@ -827,10 +827,11 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
                 }
             }
 
-            // 2. HTTP PD Router
-            match RouterFactory::create_pd_router(
+            // 2. HTTP vLLM PD Router
+            match RouterFactory::create_vllm_pd_router(
                 &[],
                 &[],
+                None, // discovery_address
                 None,
                 None,
                 &config.router_config.policy,
@@ -839,7 +840,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
             .await
             {
                 Ok(http_pd) => {
-                    info!("Created HTTP PD router");
+                    info!("Created HTTP vLLM PD router");
                     router_manager
                         .register_router(RouterId::new("http-pd".to_string()), Arc::from(http_pd));
                 }

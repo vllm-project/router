@@ -382,11 +382,11 @@ async fn handle_pod_event(
 
             // Handle PD mode with specific pod types
             let result = if pd_mode && pod_info.pod_type.is_some() {
-                // Need to import PDRouter type
-                use crate::routers::http::pd_router::PDRouter;
+                // Need to import VllmPDRouter type
+                use crate::routers::http::vllm_pd_router::VllmPDRouter;
 
-                // Try to downcast to PDRouter
-                if let Some(pd_router) = router.as_any().downcast_ref::<PDRouter>() {
+                // Try to downcast to VllmPDRouter
+                if let Some(pd_router) = router.as_any().downcast_ref::<VllmPDRouter>() {
                     match &pod_info.pod_type {
                         Some(PodType::Prefill) => pd_router
                             .add_prefill_server(worker_url.clone(), pod_info.bootstrap_port)
@@ -402,7 +402,7 @@ async fn handle_pod_event(
                         }
                     }
                 } else {
-                    Err("PD mode enabled but router is not a PDRouter".to_string())
+                    Err("PD mode enabled but router is not a VllmPDRouter".to_string())
                 }
             } else {
                 // Regular mode or no pod type specified
@@ -453,10 +453,10 @@ async fn handle_pod_deletion(
 
         // Handle PD mode removal
         if pd_mode && pod_info.pod_type.is_some() {
-            use crate::routers::http::pd_router::PDRouter;
+            use crate::routers::http::vllm_pd_router::VllmPDRouter;
 
-            // Try to downcast to PDRouter for PD-specific removal
-            if let Some(pd_router) = router.as_any().downcast_ref::<PDRouter>() {
+            // Try to downcast to VllmPDRouter for PD-specific removal
+            if let Some(pd_router) = router.as_any().downcast_ref::<VllmPDRouter>() {
                 match &pod_info.pod_type {
                     Some(PodType::Prefill) => {
                         if let Err(e) = pd_router.remove_prefill_server(&worker_url).await {
@@ -474,7 +474,7 @@ async fn handle_pod_deletion(
                     }
                 }
             } else {
-                // PD mode but not a PDRouter, use generic removal
+                // PD mode but not a VllmPDRouter, use generic removal
                 router.remove_worker(&worker_url);
             }
         } else {
