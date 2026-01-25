@@ -165,6 +165,17 @@ impl RouterFactory {
         ctx.policy_registry.set_prefill_policy(prefill_policy);
         ctx.policy_registry.set_decode_policy(decode_policy);
 
+        // // Init workers to create the prefix tree.
+        // ctx.policy_registry.get_prefill_policy().init_workers(
+        //     &prefill_urls
+        //         .iter()
+        //         .map(|(url, _)| url.clone())
+        //         .collect::<Vec<String>>(),
+        // );
+        // ctx.policy_registry.get_decode_policy().init_workers(
+        //     &decode_urls.to_vec(),
+        // );
+
         // Create vLLM PD router with both static URLs and service discovery support
         if discovery_address.is_some() {
             tracing::info!(

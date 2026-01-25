@@ -70,7 +70,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
-use tracing::debug;
+use tracing::{debug, info};
 
 /// Cache-aware routing policy
 ///
@@ -278,6 +278,8 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         let is_imbalanced = max_load.saturating_sub(min_load) > self.config.balance_abs_threshold
             && (max_load as f32) > (min_load as f32 * self.config.balance_rel_threshold);
 
+        info!("Load status for model: max_load={}, min_load={}, is_imbalanced={}", max_load, min_load, is_imbalanced);
+
         if is_imbalanced {
             return self.select_worker_min_load(
                 workers,
@@ -296,9 +298,12 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         // DashMap only locks the specific shard containing this key
         let tree = self.trees.get(model_id).map(|entry| entry.value().clone());
 
+        let keys: Vec<_> = self.trees.iter().map(|entry| entry.key().clone()).collect();
+        println!("Keys: {:?}", keys);
+
         let Some(tree) = tree else {
             // No tree for this model, log warning and use random selection
-            debug!(
+            info!(
                 "Warning: No tree found for model '{}', using random worker selection",
                 model_id
             );
@@ -313,7 +318,7 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
 
             return Some(selected_idx);
         };
-
+        info!("Using cache-aware routing for model '{}'", model_id);
         // Now we work with the tree without holding the HashMap lock
         // Use prefix_match_with_counts to avoid redundant chars().count() calls
         let result = tree.prefix_match_with_counts(text);
@@ -323,6 +328,10 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
             result.matched_char_count as f32 / result.input_char_count as f32
         };
 
+        info!(
+            "Cache match for model '{}': matched_chars={}, input_chars={}, match_rate={:.2}",
+            model_id, result.matched_char_count, result.input_char_count, match_rate
+        );
         // Select worker without String allocation
         let selected_idx = if match_rate > self.config.cache_threshold {
             // Cache hit path: find worker by URL (compare &str directly, no allocation)

@@ -193,12 +193,12 @@ impl VllmPDRouter {
     }
 
     /// Process vLLM request using pure service discovery
-    async fn process_vllm_request(&self, request_json: Value, path: &str) -> Response {
+    async fn process_vllm_request(&self, request_json: Value, path: &str, headers: Option<&HeaderMap>) -> Response {
         debug!("Processing vLLM request for path: {}", path);
-        debug!(
-            "Request JSON: {}",
-            serde_json::to_string_pretty(&request_json).unwrap_or_default()
-        );
+        // debug!(
+        //     "Request JSON: {}",
+        //     serde_json::to_string_pretty(&request_json).unwrap_or_default()
+        // );
 
         // Get available instances from service discovery
         let prefill_instances = self.service_registry.get_prefill_instances();
@@ -275,6 +275,7 @@ impl VllmPDRouter {
                 decode_http,
                 decode_zmq,
                 path,
+                headers,
             )
             .await
         {
@@ -302,6 +303,7 @@ impl VllmPDRouter {
         decode_http: &str,
         decode_zmq: &str,
         path: &str,
+        headers: Option<&HeaderMap>,
     ) -> Result<Response, String> {
         debug!("ENTERED process_vllm_two_stage_request_discovered method");
         debug!(
@@ -373,6 +375,15 @@ impl VllmPDRouter {
             .post(format!("http://{}{}", prefill_base_http, path))
             .header("Content-Type", "application/json")
             .header("X-Request-Id", &request_id); // P2P coordination metadata in header
+
+        // Propagate trace headers
+        if let Some(h) = headers {
+            for (k, v) in h.iter() {
+                if k.as_str() == "traceparent" || k.as_str() == "tracestate" || k.as_str() == "baggage" {
+                    prefill_request_builder = prefill_request_builder.header(k, v);
+                }
+            }
+        }
 
         // Add X-data-parallel-rank header using shared utility
         prefill_request_builder =
@@ -463,6 +474,15 @@ impl VllmPDRouter {
             .post(format!("http://{}{}", decode_base_http, path))
             .header("Content-Type", "application/json")
             .header("X-Request-Id", &request_id); // Same P2P coordination metadata in header
+
+        // Propagate trace headers
+        if let Some(h) = headers {
+            for (k, v) in h.iter() {
+                if k.as_str() == "traceparent" || k.as_str() == "tracestate" || k.as_str() == "baggage" {
+                    decode_request_builder = decode_request_builder.header(k, v);
+                }
+            }
+        }
 
         // Add X-data-parallel-rank header using shared utility
         decode_request_builder =
@@ -572,6 +592,7 @@ impl VllmPDRouter {
         prefill_worker: Arc<dyn Worker>,
         decode_worker: Arc<dyn Worker>,
         path: &str,
+        headers: Option<&HeaderMap>,
     ) -> Result<Response, PDRouterError> {
         debug!("ENTERED process_vllm_two_stage_request method");
         debug!(
@@ -642,10 +663,10 @@ impl VllmPDRouter {
                 request_id
             );
         }
-        debug!(
-            "📤 Prefill request payload: {}",
-            serde_json::to_string_pretty(&prefill_request).unwrap_or_default()
-        );
+        // debug!(
+        //     "📤 Prefill request payload: {}",
+        //     serde_json::to_string_pretty(&prefill_request).unwrap_or_default()
+        // );
 
         // Start profiling on prefill server
         self.start_profiling(&prefill_base_url).await;
@@ -663,6 +684,15 @@ impl VllmPDRouter {
                 ),
             )
             .header("X-Request-Id", &request_id);
+
+        // Propagate trace headers
+        if let Some(h) = headers {
+            for (k, v) in h.iter() {
+                if k.as_str() == "traceparent" || k.as_str() == "tracestate" || k.as_str() == "baggage" {
+                    prefill_request_builder = prefill_request_builder.header(k, v);
+                }
+            }
+        }
 
         // Add X-data-parallel-rank header if intra_node_data_parallel_size > 1
         if let Some(rank) = prefill_dp_rank {
@@ -769,10 +799,10 @@ impl VllmPDRouter {
                 request_id
             );
         }
-        debug!(
-            "📤 Decode request payload: {}",
-            serde_json::to_string_pretty(&decode_request).unwrap_or_default()
-        );
+        // debug!(
+        //     "📤 Decode request payload: {}",
+        //     serde_json::to_string_pretty(&decode_request).unwrap_or_default()
+        // );
 
         // Start profiling on decode server
         self.start_profiling(&decode_base_url).await;
@@ -790,6 +820,15 @@ impl VllmPDRouter {
                 ),
             )
             .header("X-Request-Id", &request_id);
+
+        // Propagate trace headers
+        if let Some(h) = headers {
+            for (k, v) in h.iter() {
+                if k.as_str() == "traceparent" || k.as_str() == "tracestate" || k.as_str() == "baggage" {
+                    decode_request_builder = decode_request_builder.header(k, v);
+                }
+            }
+        }
 
         // Add X-data-parallel-rank header if intra_node_data_parallel_size > 1
         if let Some(rank) = decode_dp_rank {
@@ -928,6 +967,12 @@ impl VllmPDRouter {
 
             info!("VllmPDRouter created successfully with pure service discovery");
 
+            info!("Cache Aware Policy Initializing prefill and decode policies with workers.");
+            let prefill_workers = pd_router.worker_registry.get_prefill_workers();
+            let decode_workers = pd_router.worker_registry.get_decode_workers();
+            ctx.policy_registry.get_prefill_policy().init_workers(&prefill_workers);
+            ctx.policy_registry.get_decode_policy().init_workers(&decode_workers);
+
             Ok(Self {
                 pd_router,
                 service_registry: Arc::new(service_registry),
@@ -954,6 +999,14 @@ impl VllmPDRouter {
             let service_registry = ServiceRegistry::new();
 
             info!("VllmPDRouter created successfully with direct URLs");
+
+            // Create and initialize a policy registry.
+            let prefill_workers = pd_router.worker_registry.get_prefill_workers();
+            let decode_workers = pd_router.worker_registry.get_decode_workers();
+
+            info!("Cache Aware Policy Initializing prefill and decode policies with workers.");
+            ctx.policy_registry.get_prefill_policy().init_workers(&prefill_workers);
+            ctx.policy_registry.get_decode_policy().init_workers(&decode_workers);
 
             Ok(Self {
                 pd_router,
@@ -1044,7 +1097,7 @@ impl RouterTrait for VllmPDRouter {
     // Override OpenAI-compatible routes for vLLM two-stage processing
     async fn route_chat(
         &self,
-        _headers: Option<&HeaderMap>,
+        headers: Option<&HeaderMap>,
         body: &crate::protocols::spec::ChatCompletionRequest,
         _model_id: Option<&str>,
     ) -> Response {
@@ -1060,10 +1113,10 @@ impl RouterTrait for VllmPDRouter {
             // Convert to generic request and use vLLM processing
             let request_json = match serde_json::to_value(body) {
                 Ok(json) => {
-                    info!(
-                        "Serialized chat request: {}",
-                        serde_json::to_string_pretty(&json).unwrap_or_default()
-                    );
+                    // info!(
+                    //     "Serialized chat request: {}",
+                    //     serde_json::to_string_pretty(&json).unwrap_or_default()
+                    // );
                     json
                 }
                 Err(e) => {
@@ -1076,7 +1129,7 @@ impl RouterTrait for VllmPDRouter {
             };
 
             // Process vLLM two-stage request with service discovery
-            self.process_vllm_request(request_json, "/v1/chat/completions")
+            self.process_vllm_request(request_json, "/v1/chat/completions", headers)
                 .await
         } else {
             // Direct URL mode - implement routing logic here (not delegating to PDRouter)
@@ -1085,10 +1138,10 @@ impl RouterTrait for VllmPDRouter {
             // Convert request to JSON
             let request_json = match serde_json::to_value(body) {
                 Ok(json) => {
-                    info!(
-                        "Serialized chat request: {}",
-                        serde_json::to_string_pretty(&json).unwrap_or_default()
-                    );
+                    // info!(
+                    //     "Serialized chat request: {}",
+                    //     serde_json::to_string_pretty(&json).unwrap_or_default()
+                    // );
                     json
                 }
                 Err(e) => {
@@ -1153,22 +1206,29 @@ impl RouterTrait for VllmPDRouter {
 
             let prefill_worker = &prefill_workers[prefill_idx];
             let decode_worker = &decode_workers[decode_idx];
+            // Increment load here rather than in process_vllm_two_stage_request since we don't have access to
+            // the worker references there -- only clones.
+            prefill_worker.increment_load();
+            decode_worker.increment_load();
 
             info!(
-                "Selected prefill={} [policy:{}], decode={} [policy:{}]",
+                "Chat: Selected prefill={} [policy:{}], load={}, decode={} [policy:{}], load={}",
                 prefill_worker.url(),
                 prefill_policy.name(),
+                prefill_worker.load(),
                 decode_worker.url(),
-                decode_policy.name()
+                decode_policy.name(),
+                decode_worker.load()
             );
 
             // Execute dual dispatch with vLLM two-stage processing
-            match self
+            let resp = match self
                 .process_vllm_two_stage_request(
                     request_json,
                     prefill_worker.clone(),
                     decode_worker.clone(),
                     "/v1/chat/completions",
+                    headers,
                 )
                 .await
             {
@@ -1184,13 +1244,16 @@ impl RouterTrait for VllmPDRouter {
                     )
                         .into_response()
                 }
-            }
+            };
+            prefill_worker.decrement_load();
+            decode_worker.decrement_load();
+            resp
         }
     }
 
     async fn route_completion(
         &self,
-        _headers: Option<&HeaderMap>,
+        headers: Option<&HeaderMap>,
         body: &crate::protocols::spec::CompletionRequest,
         _model_id: Option<&str>,
     ) -> Response {
@@ -1206,10 +1269,10 @@ impl RouterTrait for VllmPDRouter {
             // Convert to generic request and use vLLM processing
             let request_json = match serde_json::to_value(body) {
                 Ok(json) => {
-                    info!(
-                        "Serialized completion request: {}",
-                        serde_json::to_string_pretty(&json).unwrap_or_default()
-                    );
+                    // info!(
+                    //     "Serialized completion request: {}",
+                    //     serde_json::to_string_pretty(&json).unwrap_or_default()
+                    // );
                     json
                 }
                 Err(e) => {
@@ -1222,7 +1285,7 @@ impl RouterTrait for VllmPDRouter {
             };
 
             // Process vLLM two-stage request with service discovery
-            self.process_vllm_request(request_json, "/v1/completions")
+            self.process_vllm_request(request_json, "/v1/completions", headers)
                 .await
         } else {
             // Direct URL mode - implement routing logic here (not delegating to PDRouter)
@@ -1231,10 +1294,10 @@ impl RouterTrait for VllmPDRouter {
             // Convert request to JSON
             let request_json = match serde_json::to_value(body) {
                 Ok(json) => {
-                    info!(
-                        "Serialized completion request: {}",
-                        serde_json::to_string_pretty(&json).unwrap_or_default()
-                    );
+                    // info!(
+                    //     "Serialized completion request: {}",
+                    //     serde_json::to_string_pretty(&json).unwrap_or_default()
+                    // );
                     json
                 }
                 Err(e) => {
@@ -1299,22 +1362,27 @@ impl RouterTrait for VllmPDRouter {
 
             let prefill_worker = &prefill_workers[prefill_idx];
             let decode_worker = &decode_workers[decode_idx];
+            prefill_worker.increment_load();
+            decode_worker.increment_load();
 
             info!(
-                "Selected prefill={} [policy:{}], decode={} [policy:{}]",
+                "Completion: Selected prefill={} [policy:{}], load={}, decode={} [policy:{}], load={}",
                 prefill_worker.url(),
                 prefill_policy.name(),
+                prefill_worker.load(),
                 decode_worker.url(),
-                decode_policy.name()
+                decode_policy.name(),
+                decode_worker.load()
             );
 
             // Execute dual dispatch with vLLM two-stage processing
-            match self
+            let resp = match self
                 .process_vllm_two_stage_request(
                     request_json,
                     prefill_worker.clone(),
                     decode_worker.clone(),
                     "/v1/completions",
+                    headers,
                 )
                 .await
             {
@@ -1330,7 +1398,10 @@ impl RouterTrait for VllmPDRouter {
                     )
                         .into_response()
                 }
-            }
+            };
+            prefill_worker.decrement_load();
+            decode_worker.decrement_load();
+            resp
         }
     }
 

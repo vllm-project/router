@@ -122,6 +122,11 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
 
     /// Get as Any for downcasting
     fn as_any(&self) -> &dyn std::any::Any;
+
+    /// Initialize the policy with a set of workers
+    fn init_workers(&self, _workers: &[Arc<dyn Worker>]) {
+        // Default: no-op for policies that don't need initialization
+    }
 }
 
 /// Configuration for cache-aware policy
