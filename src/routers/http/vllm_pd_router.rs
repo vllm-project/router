@@ -195,10 +195,10 @@ impl VllmPDRouter {
     /// Process vLLM request using pure service discovery
     async fn process_vllm_request(&self, request_json: Value, path: &str, headers: Option<&HeaderMap>) -> Response {
         debug!("Processing vLLM request for path: {}", path);
-        // debug!(
-        //     "Request JSON: {}",
-        //     serde_json::to_string_pretty(&request_json).unwrap_or_default()
-        // );
+        debug!(
+            "Request JSON: {}",
+            serde_json::to_string_pretty(&request_json).unwrap_or_default()
+        );
 
         // Get available instances from service discovery
         let prefill_instances = self.service_registry.get_prefill_instances();
@@ -670,10 +670,10 @@ impl VllmPDRouter {
                 request_id
             );
         }
-        // debug!(
-        //     "📤 Prefill request payload: {}",
-        //     serde_json::to_string_pretty(&prefill_request).unwrap_or_default()
-        // );
+        debug!(
+            "📤 Prefill request payload: {}",
+            serde_json::to_string_pretty(&prefill_request).unwrap_or_default()
+        );
 
         // Start profiling on prefill server
         self.start_profiling(&prefill_base_url).await;
@@ -824,10 +824,10 @@ impl VllmPDRouter {
                 request_id
             );
         }
-        // debug!(
-        //     "📤 Decode request payload: {}",
-        //     serde_json::to_string_pretty(&decode_request).unwrap_or_default()
-        // );
+        debug!(
+            "📤 Decode request payload: {}",
+            serde_json::to_string_pretty(&decode_request).unwrap_or_default()
+        );
 
         // Start profiling on decode server
         self.start_profiling(&decode_base_url).await;
@@ -1141,10 +1141,10 @@ impl RouterTrait for VllmPDRouter {
             // Convert to generic request and use vLLM processing
             let request_json = match serde_json::to_value(body) {
                 Ok(json) => {
-                    // info!(
-                    //     "Serialized chat request: {}",
-                    //     serde_json::to_string_pretty(&json).unwrap_or_default()
-                    // );
+                    debug!(
+                        "Serialized chat request: {}",
+                        serde_json::to_string_pretty(&json).unwrap_or_default()
+                    );
                     json
                 }
                 Err(e) => {
@@ -1166,10 +1166,10 @@ impl RouterTrait for VllmPDRouter {
             // Convert request to JSON
             let request_json = match serde_json::to_value(body) {
                 Ok(json) => {
-                    // info!(
-                    //     "Serialized chat request: {}",
-                    //     serde_json::to_string_pretty(&json).unwrap_or_default()
-                    // );
+                    debug!(
+                        "Serialized chat request: {}",
+                        serde_json::to_string_pretty(&json).unwrap_or_default()
+                    );
                     json
                 }
                 Err(e) => {
@@ -1291,10 +1291,10 @@ impl RouterTrait for VllmPDRouter {
             // Convert to generic request and use vLLM processing
             let request_json = match serde_json::to_value(body) {
                 Ok(json) => {
-                    // info!(
-                    //     "Serialized completion request: {}",
-                    //     serde_json::to_string_pretty(&json).unwrap_or_default()
-                    // );
+                    debug!(
+                        "Serialized completion request: {}",
+                        serde_json::to_string_pretty(&json).unwrap_or_default()
+                    );
                     json
                 }
                 Err(e) => {
@@ -1316,10 +1316,10 @@ impl RouterTrait for VllmPDRouter {
             // Convert request to JSON
             let request_json = match serde_json::to_value(body) {
                 Ok(json) => {
-                    // info!(
-                    //     "Serialized completion request: {}",
-                    //     serde_json::to_string_pretty(&json).unwrap_or_default()
-                    // );
+                    debug!(
+                        "Serialized completion request: {}",
+                        serde_json::to_string_pretty(&json).unwrap_or_default()
+                    );
                     json
                 }
                 Err(e) => {
