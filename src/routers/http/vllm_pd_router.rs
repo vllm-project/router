@@ -193,7 +193,12 @@ impl VllmPDRouter {
     }
 
     /// Process vLLM request using pure service discovery
-    async fn process_vllm_request(&self, request_json: Value, path: &str, headers: Option<&HeaderMap>) -> Response {
+    async fn process_vllm_request(
+        &self,
+        request_json: Value,
+        path: &str,
+        headers: Option<&HeaderMap>,
+    ) -> Response {
         debug!("Processing vLLM request for path: {}", path);
         debug!(
             "Request JSON: {}",
@@ -379,7 +384,10 @@ impl VllmPDRouter {
         // Propagate trace headers
         if let Some(h) = headers {
             for (k, v) in h.iter() {
-                if k.as_str() == "traceparent" || k.as_str() == "tracestate" || k.as_str() == "baggage" {
+                if k.as_str() == "traceparent"
+                    || k.as_str() == "tracestate"
+                    || k.as_str() == "baggage"
+                {
                     prefill_request_builder = prefill_request_builder.header(k, v);
                 }
             }
@@ -478,7 +486,10 @@ impl VllmPDRouter {
         // Propagate trace headers
         if let Some(h) = headers {
             for (k, v) in h.iter() {
-                if k.as_str() == "traceparent" || k.as_str() == "tracestate" || k.as_str() == "baggage" {
+                if k.as_str() == "traceparent"
+                    || k.as_str() == "tracestate"
+                    || k.as_str() == "baggage"
+                {
                     decode_request_builder = decode_request_builder.header(k, v);
                 }
             }
@@ -695,7 +706,10 @@ impl VllmPDRouter {
         // Propagate trace headers
         if let Some(h) = headers {
             for (k, v) in h.iter() {
-                if k.as_str() == "traceparent" || k.as_str() == "tracestate" || k.as_str() == "baggage" {
+                if k.as_str() == "traceparent"
+                    || k.as_str() == "tracestate"
+                    || k.as_str() == "baggage"
+                {
                     prefill_request_builder = prefill_request_builder.header(k, v);
                 }
             }
@@ -707,11 +721,7 @@ impl VllmPDRouter {
                 prefill_request_builder.header("X-data-parallel-rank", rank.to_string());
         }
 
-        let prefill_response = match prefill_request_builder
-            .json(&prefill_request)
-            .send()
-            .await
-        {
+        let prefill_response = match prefill_request_builder.json(&prefill_request).send().await {
             Ok(resp) => resp,
             Err(e) => {
                 prefill_worker.decrement_load();
@@ -849,7 +859,10 @@ impl VllmPDRouter {
         // Propagate trace headers
         if let Some(h) = headers {
             for (k, v) in h.iter() {
-                if k.as_str() == "traceparent" || k.as_str() == "tracestate" || k.as_str() == "baggage" {
+                if k.as_str() == "traceparent"
+                    || k.as_str() == "tracestate"
+                    || k.as_str() == "baggage"
+                {
                     decode_request_builder = decode_request_builder.header(k, v);
                 }
             }
@@ -861,11 +874,7 @@ impl VllmPDRouter {
                 decode_request_builder.header("X-data-parallel-rank", rank.to_string());
         }
 
-        let decode_response = match decode_request_builder
-            .json(&decode_request)
-            .send()
-            .await
-        {
+        let decode_response = match decode_request_builder.json(&decode_request).send().await {
             Ok(resp) => resp,
             Err(e) => {
                 decode_worker.decrement_load();

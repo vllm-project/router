@@ -253,7 +253,10 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         let is_imbalanced = max_load.saturating_sub(min_load) > self.config.balance_abs_threshold
             && (max_load as f32) > (min_load as f32 * self.config.balance_rel_threshold);
 
-        info!("Load status for model: max_load={}, min_load={}, is_imbalanced={}", max_load, min_load, is_imbalanced);
+        info!(
+            "Load status for model: max_load={}, min_load={}, is_imbalanced={}",
+            max_load, min_load, is_imbalanced
+        );
 
         if is_imbalanced {
             return self.select_worker_min_load(
@@ -419,7 +422,11 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         // Group workers by model
         info!(
             "Initializing workers for cache-aware policy: {}",
-            workers.iter().map(|w| w.url()).collect::<Vec<_>>().join(", ")
+            workers
+                .iter()
+                .map(|w| w.url())
+                .collect::<Vec<_>>()
+                .join(", ")
         );
         let mut model_workers: HashMap<String, Vec<&Arc<dyn Worker>>> = HashMap::new();
         for worker in workers {
