@@ -1028,13 +1028,20 @@ impl VllmPDRouter {
 
             info!("VllmPDRouter created successfully with direct URLs");
 
-            // Create and initialize a policy registry.
             let prefill_workers = pd_router.worker_registry.get_prefill_workers();
             let decode_workers = pd_router.worker_registry.get_decode_workers();
+            let prefill_policy = ctx.policy_registry.get_prefill_policy();
+            let decode_policy = ctx.policy_registry.get_decode_policy();
 
-            info!("Cache Aware Policy Initializing prefill and decode policies with workers.");
-            ctx.policy_registry.get_prefill_policy().init_workers(&prefill_workers);
-            ctx.policy_registry.get_decode_policy().init_workers(&decode_workers);
+            if prefill_policy.requires_initialization() {
+                info!("Initializing prefill policy with workers.");
+                prefill_policy.init_workers(&prefill_workers);
+            }
+            if decode_policy.requires_initialization() {
+                info!("Initializing decode policy with workers.");
+                decode_policy.init_workers(&decode_workers);
+            }
+            info!("Initializing prefill and decode policies with workers.");
 
             Ok(Self {
                 pd_router,
