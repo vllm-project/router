@@ -586,6 +586,10 @@ impl VllmPDRouter {
     }
 
     /// Two-stage request processing for vLLM disaggregated mode
+    ///
+    /// This function handles fine-grained load tracking: the prefill worker's load is only
+    /// incremented during the prefill phase, and the decode worker's load is only incremented
+    /// during the decode phase. This accurately reflects the sequential nature of PD disaggregation.
     async fn process_vllm_two_stage_request(
         &self,
         original_request: Value,
@@ -601,6 +605,9 @@ impl VllmPDRouter {
             decode_worker.url(),
             path
         );
+
+        // Increment prefill load at the start of the prefill phase
+        prefill_worker.increment_load();
 
         let prefill_zmq_addr = self.get_zmq_address(prefill_worker.url(), ServiceType::Prefill);
         let decode_zmq_addr = self.get_zmq_address(decode_worker.url(), ServiceType::Decode);
@@ -700,13 +707,19 @@ impl VllmPDRouter {
                 prefill_request_builder.header("X-data-parallel-rank", rank.to_string());
         }
 
-        let prefill_response = prefill_request_builder
+        let prefill_response = match prefill_request_builder
             .json(&prefill_request)
             .send()
             .await
-            .map_err(|e| PDRouterError::NetworkError {
-                message: format!("Prefill request failed to {}: {}", prefill_url, e),
-            })?;
+        {
+            Ok(resp) => resp,
+            Err(e) => {
+                prefill_worker.decrement_load();
+                return Err(PDRouterError::NetworkError {
+                    message: format!("Prefill request failed to {}: {}", prefill_url, e),
+                });
+            }
+        };
 
         debug!("📥 Prefill response status: {}", prefill_response.status());
         debug!(
@@ -715,16 +728,18 @@ impl VllmPDRouter {
         );
 
         // Extract prefill response body to get kv_transfer_params
-        let prefill_bytes =
-            prefill_response
-                .bytes()
-                .await
-                .map_err(|e| PDRouterError::NetworkError {
+        let prefill_bytes = match prefill_response.bytes().await {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                prefill_worker.decrement_load();
+                return Err(PDRouterError::NetworkError {
                     message: format!(
                         "Failed to read prefill response from {}: {}",
                         prefill_url, e
                     ),
-                })?;
+                });
+            }
+        };
 
         debug!(
             "📥 Prefill response body size: {} bytes",
@@ -738,10 +753,15 @@ impl VllmPDRouter {
         }
 
         // Parse prefill response to extract kv_transfer_params
-        let prefill_response_json: Value =
-            serde_json::from_slice(&prefill_bytes).map_err(|e| PDRouterError::NetworkError {
-                message: format!("Failed to parse prefill response as JSON: {}", e),
-            })?;
+        let prefill_response_json: Value = match serde_json::from_slice(&prefill_bytes) {
+            Ok(json) => json,
+            Err(e) => {
+                prefill_worker.decrement_load();
+                return Err(PDRouterError::NetworkError {
+                    message: format!("Failed to parse prefill response as JSON: {}", e),
+                });
+            }
+        };
 
         // Extract kv_transfer_params from prefill response if present
         let kv_transfer_params = prefill_response_json.get("kv_transfer_params").cloned();
@@ -758,6 +778,10 @@ impl VllmPDRouter {
         // Stop profiling on prefill server after its work is done
         self.stop_profiling(&prefill_base_url).await;
 
+        // Prefill phase complete: decrement prefill load, increment decode load
+        prefill_worker.decrement_load();
+        decode_worker.increment_load();
+
         debug!("✅ vLLM Stage 1 completed, starting Stage 2 - Decode");
 
         // Stage 2: Prepare decode request with kv_transfer_params from prefill response at top level
@@ -772,6 +796,7 @@ impl VllmPDRouter {
             match dp_utils::extract_dp_rank(decode_worker.url()) {
                 Ok((base, rank)) => (base.to_string(), Some(rank)),
                 Err(e) => {
+                    decode_worker.decrement_load();
                     return Err(PDRouterError::NetworkError {
                         message: format!(
                             "Failed to extract dp_rank from decode worker URL {}: {}",
@@ -836,16 +861,25 @@ impl VllmPDRouter {
                 decode_request_builder.header("X-data-parallel-rank", rank.to_string());
         }
 
-        let decode_response = decode_request_builder
+        let decode_response = match decode_request_builder
             .json(&decode_request)
             .send()
             .await
-            .map_err(|e| PDRouterError::NetworkError {
-                message: format!("Decode request failed to {}: {}", decode_url, e),
-            })?;
+        {
+            Ok(resp) => resp,
+            Err(e) => {
+                decode_worker.decrement_load();
+                return Err(PDRouterError::NetworkError {
+                    message: format!("Decode request failed to {}: {}", decode_url, e),
+                });
+            }
+        };
 
         // Stop profiling on decode server after response received
         self.stop_profiling(&decode_base_url).await;
+
+        // Decode phase complete: decrement decode load
+        decode_worker.decrement_load();
 
         let status = decode_response.status();
         let headers = decode_response.headers().clone();
@@ -1200,19 +1234,15 @@ impl RouterTrait for VllmPDRouter {
 
             let prefill_worker = &prefill_workers[prefill_idx];
             let decode_worker = &decode_workers[decode_idx];
-            // Increment load here rather than in process_vllm_two_stage_request since we don't have access to
-            // the worker references there -- only clones.
-            prefill_worker.increment_load();
-            decode_worker.increment_load();
+            // Load tracking is handled inside process_vllm_two_stage_request for fine-grained
+            // tracking: prefill load only during prefill phase, decode load only during decode phase.
 
             info!(
-                "Chat: Selected prefill={} [policy:{}], load={}, decode={} [policy:{}], load={}",
+                "Chat: Selected prefill={} [policy:{}], decode={} [policy:{}]",
                 prefill_worker.url(),
                 prefill_policy.name(),
-                prefill_worker.load(),
                 decode_worker.url(),
-                decode_policy.name(),
-                decode_worker.load()
+                decode_policy.name()
             );
 
             // Execute dual dispatch with vLLM two-stage processing
@@ -1239,8 +1269,6 @@ impl RouterTrait for VllmPDRouter {
                         .into_response()
                 }
             };
-            prefill_worker.decrement_load();
-            decode_worker.decrement_load();
             resp
         }
     }
@@ -1356,17 +1384,15 @@ impl RouterTrait for VllmPDRouter {
 
             let prefill_worker = &prefill_workers[prefill_idx];
             let decode_worker = &decode_workers[decode_idx];
-            prefill_worker.increment_load();
-            decode_worker.increment_load();
+            // Load tracking is handled inside process_vllm_two_stage_request for fine-grained
+            // tracking: prefill load only during prefill phase, decode load only during decode phase.
 
             info!(
-                "Completion: Selected prefill={} [policy:{}], load={}, decode={} [policy:{}], load={}",
+                "Completion: Selected prefill={} [policy:{}], decode={} [policy:{}]",
                 prefill_worker.url(),
                 prefill_policy.name(),
-                prefill_worker.load(),
                 decode_worker.url(),
-                decode_policy.name(),
-                decode_worker.load()
+                decode_policy.name()
             );
 
             // Execute dual dispatch with vLLM two-stage processing
@@ -1393,8 +1419,6 @@ impl RouterTrait for VllmPDRouter {
                         .into_response()
                 }
             };
-            prefill_worker.decrement_load();
-            decode_worker.decrement_load();
             resp
         }
     }
