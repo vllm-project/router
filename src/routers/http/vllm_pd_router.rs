@@ -275,10 +275,8 @@ impl VllmPDRouter {
         match self
             .process_vllm_two_stage_request_discovered(
                 request_json,
-                prefill_http,
-                prefill_zmq,
-                decode_http,
-                decode_zmq,
+                &prefill_instances[prefill_idx],
+                &decode_instances[decode_idx],
                 path,
                 headers,
             )
@@ -303,13 +301,14 @@ impl VllmPDRouter {
     async fn process_vllm_two_stage_request_discovered(
         &self,
         request_json: Value,
-        prefill_http: &str,
-        prefill_zmq: &str,
-        decode_http: &str,
-        decode_zmq: &str,
+        prefill_instance: &(String, String),
+        decode_instance: &(String, String),
         path: &str,
         headers: Option<&HeaderMap>,
     ) -> Result<Response, String> {
+        let (prefill_http, prefill_zmq) = prefill_instance;
+        let (decode_http, decode_zmq) = decode_instance;
+
         debug!("ENTERED process_vllm_two_stage_request_discovered method");
         debug!(
             "Prefill: HTTP={}, ZMQ={}, Decode: HTTP={}, ZMQ={}, Path: {}",
