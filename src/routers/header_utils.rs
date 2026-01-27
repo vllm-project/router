@@ -51,3 +51,46 @@ fn should_forward_header(name: &str) -> bool {
         "host" // Should not forward the backend's host header
     )
 }
+
+/// Header names for W3C Trace Context (OpenTelemetry) propagation
+pub const TRACE_HEADER_NAMES: &[&str] = &["traceparent", "tracestate", "baggage"];
+
+/// Propagate OpenTelemetry trace headers to a reqwest RequestBuilder
+///
+/// This enables distributed tracing across service boundaries by forwarding
+/// W3C Trace Context headers from incoming requests to outgoing backend requests.
+pub fn propagate_trace_headers(
+    request: reqwest::RequestBuilder,
+    headers: Option<&HeaderMap>,
+) -> reqwest::RequestBuilder {
+    propagate_headers(request, headers, TRACE_HEADER_NAMES)
+}
+
+/// Propagate specific headers from incoming request to outgoing reqwest RequestBuilder
+///
+/// This is a general-purpose helper for selectively forwarding headers by name.
+/// Only headers whose names match the provided list (case-insensitive) are propagated.
+///
+/// # Arguments
+/// * `request` - The reqwest RequestBuilder to add headers to
+/// * `headers` - Optional incoming headers to check
+/// * `header_names` - List of header names to propagate (matched case-insensitively)
+///
+/// # Returns
+/// The RequestBuilder with matching headers added
+pub fn propagate_headers(
+    mut request: reqwest::RequestBuilder,
+    headers: Option<&HeaderMap>,
+    header_names: &[&str],
+) -> reqwest::RequestBuilder {
+    if let Some(h) = headers {
+        for (k, v) in h.iter() {
+            if header_names.iter().any(|&name| k.as_str().eq_ignore_ascii_case(name)) {
+                request = request.header(k, v);
+            }
+        }
+    }
+    request
+}
+
+

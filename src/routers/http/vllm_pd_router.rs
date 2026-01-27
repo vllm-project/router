@@ -1,5 +1,6 @@
 // vLLM PD (Prefill-Decode) Router Implementation
 // This module extends PDRouter to handle vLLM-specific two-stage processing
+use super::super::header_utils;
 use super::dp_utils;
 use super::logprobs_merge;
 use super::pd_router::PDRouter;
@@ -297,6 +298,8 @@ impl VllmPDRouter {
         }
     }
 
+
+
     /// Two-stage request processing for vLLM disaggregated mode using discovered endpoints
     async fn process_vllm_two_stage_request_discovered(
         &self,
@@ -380,19 +383,8 @@ impl VllmPDRouter {
             .header("Content-Type", "application/json")
             .header("X-Request-Id", &request_id); // P2P coordination metadata in header
 
-        // Propagate trace headers
-        if let Some(h) = headers {
-            for (k, v) in h.iter() {
-                if k.as_str() == "traceparent"
-                    || k.as_str() == "tracestate"
-                    || k.as_str() == "baggage"
-                {
-                    prefill_request_builder = prefill_request_builder.header(k, v);
-                }
-            }
-        }
-
-        // Add X-data-parallel-rank header using shared utility
+        // Propagate trace headers and add X-data-parallel-rank header using shared utilities
+        prefill_request_builder = header_utils::propagate_trace_headers(prefill_request_builder, headers);
         prefill_request_builder =
             dp_utils::add_dp_rank_header(prefill_request_builder, prefill_dp_rank);
         if let Some(rank) = prefill_dp_rank {
@@ -482,19 +474,8 @@ impl VllmPDRouter {
             .header("Content-Type", "application/json")
             .header("X-Request-Id", &request_id); // Same P2P coordination metadata in header
 
-        // Propagate trace headers
-        if let Some(h) = headers {
-            for (k, v) in h.iter() {
-                if k.as_str() == "traceparent"
-                    || k.as_str() == "tracestate"
-                    || k.as_str() == "baggage"
-                {
-                    decode_request_builder = decode_request_builder.header(k, v);
-                }
-            }
-        }
-
-        // Add X-data-parallel-rank header using shared utility
+        // Propagate trace headers and add X-data-parallel-rank header using shared utilities
+        decode_request_builder = header_utils::propagate_trace_headers(decode_request_builder, headers);
         decode_request_builder =
             dp_utils::add_dp_rank_header(decode_request_builder, decode_dp_rank);
         if let Some(rank) = decode_dp_rank {
@@ -703,16 +684,7 @@ impl VllmPDRouter {
             .header("X-Request-Id", &request_id);
 
         // Propagate trace headers
-        if let Some(h) = headers {
-            for (k, v) in h.iter() {
-                if k.as_str() == "traceparent"
-                    || k.as_str() == "tracestate"
-                    || k.as_str() == "baggage"
-                {
-                    prefill_request_builder = prefill_request_builder.header(k, v);
-                }
-            }
-        }
+        prefill_request_builder = header_utils::propagate_trace_headers(prefill_request_builder, headers);
 
         // Add X-data-parallel-rank header if intra_node_data_parallel_size > 1
         if let Some(rank) = prefill_dp_rank {
@@ -856,16 +828,7 @@ impl VllmPDRouter {
             .header("X-Request-Id", &request_id);
 
         // Propagate trace headers
-        if let Some(h) = headers {
-            for (k, v) in h.iter() {
-                if k.as_str() == "traceparent"
-                    || k.as_str() == "tracestate"
-                    || k.as_str() == "baggage"
-                {
-                    decode_request_builder = decode_request_builder.header(k, v);
-                }
-            }
-        }
+        decode_request_builder = header_utils::propagate_trace_headers(decode_request_builder, headers);
 
         // Add X-data-parallel-rank header if intra_node_data_parallel_size > 1
         if let Some(rank) = decode_dp_rank {

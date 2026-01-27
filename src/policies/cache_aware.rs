@@ -253,7 +253,7 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         let is_imbalanced = max_load.saturating_sub(min_load) > self.config.balance_abs_threshold
             && (max_load as f32) > (min_load as f32 * self.config.balance_rel_threshold);
 
-        info!(
+        debug!(
             "Load status for model: max_load={}, min_load={}, is_imbalanced={}",
             max_load, min_load, is_imbalanced
         );
@@ -281,7 +281,7 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
 
         let Some(tree) = tree else {
             // No tree for this model, log warning and use random selection
-            info!(
+            debug!(
                 "Warning: No tree found for model '{}', using random worker selection",
                 model_id
             );
@@ -296,7 +296,7 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
 
             return Some(selected_idx);
         };
-        info!("Using cache-aware routing for model '{}'", model_id);
+        debug!("Using cache-aware routing for model '{}'", model_id);
         // Now we work with the tree without holding the HashMap lock
         // Use prefix_match_with_counts to avoid redundant chars().count() calls
         let result = tree.prefix_match_with_counts(text);
@@ -306,7 +306,7 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
             result.matched_char_count as f32 / result.input_char_count as f32
         };
 
-        info!(
+        debug!(
             "Cache match for model '{}': matched_chars={}, input_chars={}, match_rate={:.2}",
             model_id, result.matched_char_count, result.input_char_count, match_rate
         );
