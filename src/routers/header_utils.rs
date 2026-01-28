@@ -85,12 +85,13 @@ pub fn propagate_headers(
 ) -> reqwest::RequestBuilder {
     if let Some(h) = headers {
         for (k, v) in h.iter() {
-            if header_names.iter().any(|&name| k.as_str().eq_ignore_ascii_case(name)) {
+            if header_names
+                .iter()
+                .any(|&name| k.as_str().eq_ignore_ascii_case(name))
+            {
                 request = request.header(k, v);
             }
         }
     }
     request
 }
-
-

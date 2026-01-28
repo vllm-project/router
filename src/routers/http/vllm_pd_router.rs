@@ -298,8 +298,6 @@ impl VllmPDRouter {
         }
     }
 
-
-
     /// Two-stage request processing for vLLM disaggregated mode using discovered endpoints
     async fn process_vllm_two_stage_request_discovered(
         &self,
@@ -384,7 +382,8 @@ impl VllmPDRouter {
             .header("X-Request-Id", &request_id); // P2P coordination metadata in header
 
         // Propagate trace headers and add X-data-parallel-rank header using shared utilities
-        prefill_request_builder = header_utils::propagate_trace_headers(prefill_request_builder, headers);
+        prefill_request_builder =
+            header_utils::propagate_trace_headers(prefill_request_builder, headers);
         prefill_request_builder =
             dp_utils::add_dp_rank_header(prefill_request_builder, prefill_dp_rank);
         if let Some(rank) = prefill_dp_rank {
@@ -475,7 +474,8 @@ impl VllmPDRouter {
             .header("X-Request-Id", &request_id); // Same P2P coordination metadata in header
 
         // Propagate trace headers and add X-data-parallel-rank header using shared utilities
-        decode_request_builder = header_utils::propagate_trace_headers(decode_request_builder, headers);
+        decode_request_builder =
+            header_utils::propagate_trace_headers(decode_request_builder, headers);
         decode_request_builder =
             dp_utils::add_dp_rank_header(decode_request_builder, decode_dp_rank);
         if let Some(rank) = decode_dp_rank {
@@ -684,7 +684,8 @@ impl VllmPDRouter {
             .header("X-Request-Id", &request_id);
 
         // Propagate trace headers
-        prefill_request_builder = header_utils::propagate_trace_headers(prefill_request_builder, headers);
+        prefill_request_builder =
+            header_utils::propagate_trace_headers(prefill_request_builder, headers);
 
         // Add X-data-parallel-rank header if intra_node_data_parallel_size > 1
         if let Some(rank) = prefill_dp_rank {
@@ -828,7 +829,8 @@ impl VllmPDRouter {
             .header("X-Request-Id", &request_id);
 
         // Propagate trace headers
-        decode_request_builder = header_utils::propagate_trace_headers(decode_request_builder, headers);
+        decode_request_builder =
+            header_utils::propagate_trace_headers(decode_request_builder, headers);
 
         // Add X-data-parallel-rank header if intra_node_data_parallel_size > 1
         if let Some(rank) = decode_dp_rank {
