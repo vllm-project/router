@@ -259,7 +259,7 @@ steps:
               uv pip install requests pytest openai
 
               # Install LM Evaluation Harness with API extras for accuracy testing
-              uv pip install 'lm-eval[api]>=0.4.0'
+              uv pip install 'lm-eval[api]>=0.4.0' hf_transfer
 
               # Install Rust for building the router
               curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
