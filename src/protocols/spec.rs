@@ -55,7 +55,11 @@ use std::collections::HashMap;
 
 // ============= Message Types =============
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+// Note: We implement Deserialize manually below to dispatch based on the "role" field.
+// This fixes a bug where serde's untagged enum matching would incorrectly match Assistant
+// messages as System messages (because System only requires role + content, serde tries
+// it first and silently ignores reasoning_content and other Assistant-specific fields).
+#[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
 pub enum ChatMessage {
     System {
@@ -94,6 +98,124 @@ pub enum ChatMessage {
         content: String,
         name: String,
     },
+}
+
+impl<'de> Deserialize<'de> for ChatMessage {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Error;
+
+        let value = Value::deserialize(deserializer)?;
+        let role = value
+            .get("role")
+            .and_then(|r| r.as_str())
+            .ok_or_else(|| D::Error::custom("missing role field"))?;
+
+        match role {
+            "assistant" => Ok(ChatMessage::Assistant {
+                role: role.to_string(),
+                content: value.get("content").and_then(|c| {
+                    if c.is_null() {
+                        None
+                    } else {
+                        c.as_str().map(String::from)
+                    }
+                }),
+                name: value.get("name").and_then(|n| {
+                    if n.is_null() {
+                        None
+                    } else {
+                        n.as_str().map(String::from)
+                    }
+                }),
+                tool_calls: value.get("tool_calls").and_then(|tc| {
+                    if tc.is_null() {
+                        None
+                    } else {
+                        serde_json::from_value(tc.clone()).ok()
+                    }
+                }),
+                function_call: value.get("function_call").and_then(|fc| {
+                    if fc.is_null() {
+                        None
+                    } else {
+                        serde_json::from_value(fc.clone()).ok()
+                    }
+                }),
+                reasoning_content: value.get("reasoning_content").and_then(|r| {
+                    if r.is_null() {
+                        None
+                    } else {
+                        r.as_str().map(String::from)
+                    }
+                }),
+            }),
+            "system" => Ok(ChatMessage::System {
+                role: role.to_string(),
+                content: value
+                    .get("content")
+                    .and_then(|c| c.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                name: value.get("name").and_then(|n| {
+                    if n.is_null() {
+                        None
+                    } else {
+                        n.as_str().map(String::from)
+                    }
+                }),
+            }),
+            "user" => {
+                let content = value
+                    .get("content")
+                    .map(|c| {
+                        serde_json::from_value(c.clone())
+                            .unwrap_or(UserMessageContent::Text(String::new()))
+                    })
+                    .unwrap_or(UserMessageContent::Text(String::new()));
+                Ok(ChatMessage::User {
+                    role: role.to_string(),
+                    content,
+                    name: value.get("name").and_then(|n| {
+                        if n.is_null() {
+                            None
+                        } else {
+                            n.as_str().map(String::from)
+                        }
+                    }),
+                })
+            }
+            "tool" => Ok(ChatMessage::Tool {
+                role: role.to_string(),
+                content: value
+                    .get("content")
+                    .and_then(|c| c.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                tool_call_id: value
+                    .get("tool_call_id")
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+            }),
+            "function" => Ok(ChatMessage::Function {
+                role: role.to_string(),
+                content: value
+                    .get("content")
+                    .and_then(|c| c.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                name: value
+                    .get("name")
+                    .and_then(|n| n.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+            }),
+            _ => Err(D::Error::custom(format!("unknown role: {}", role))),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
@@ -3209,5 +3331,196 @@ mod tests {
         let request: ChatCompletionRequest = serde_json::from_str(json).unwrap();
 
         assert!(request.structured_outputs.is_none());
+    }
+
+    // ==================================================================
+    // =            CHAT MESSAGE DESERIALIZATION TESTS                   =
+    // ==================================================================
+
+    #[test]
+    fn test_chat_message_assistant_with_reasoning_content() {
+        let json = r#"{
+            "role": "assistant",
+            "content": "Hello there!",
+            "reasoning_content": "Let me think about how to greet the user..."
+        }"#;
+
+        let message: ChatMessage = serde_json::from_str(json).unwrap();
+
+        match message {
+            ChatMessage::Assistant {
+                content,
+                reasoning_content,
+                ..
+            } => {
+                assert_eq!(content.as_ref().unwrap(), "Hello there!");
+                assert_eq!(
+                    reasoning_content.as_ref().unwrap(),
+                    "Let me think about how to greet the user..."
+                );
+            }
+            other => panic!(
+                "Expected Assistant message but got {:?}",
+                std::mem::discriminant(&other)
+            ),
+        }
+    }
+
+    #[test]
+    fn test_chat_message_assistant_with_null_content_and_reasoning() {
+        let json = r#"{
+            "role": "assistant",
+            "content": null,
+            "reasoning_content": "Deep thinking in progress..."
+        }"#;
+
+        let message: ChatMessage = serde_json::from_str(json).unwrap();
+
+        match message {
+            ChatMessage::Assistant {
+                content,
+                reasoning_content,
+                ..
+            } => {
+                assert!(content.is_none());
+                assert_eq!(
+                    reasoning_content.as_ref().unwrap(),
+                    "Deep thinking in progress..."
+                );
+            }
+            _ => panic!("Expected Assistant message"),
+        }
+    }
+
+    #[test]
+    fn test_chat_message_assistant_with_tool_calls() {
+        let json = r#"{
+            "role": "assistant",
+            "content": null,
+            "tool_calls": [{
+                "id": "call_abc123",
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "arguments": "{\"location\": \"Boston\"}"
+                }
+            }]
+        }"#;
+
+        let message: ChatMessage = serde_json::from_str(json).unwrap();
+
+        match message {
+            ChatMessage::Assistant { tool_calls, .. } => {
+                let calls = tool_calls.unwrap();
+                assert_eq!(calls.len(), 1);
+                assert_eq!(calls[0].id, "call_abc123");
+                assert_eq!(calls[0].function.name, "get_weather");
+            }
+            _ => panic!("Expected Assistant message"),
+        }
+    }
+
+    #[test]
+    fn test_chat_message_system() {
+        let json = r#"{
+            "role": "system",
+            "content": "You are a helpful assistant."
+        }"#;
+
+        let message: ChatMessage = serde_json::from_str(json).unwrap();
+
+        match message {
+            ChatMessage::System { content, .. } => {
+                assert_eq!(content, "You are a helpful assistant.");
+            }
+            _ => panic!("Expected System message"),
+        }
+    }
+
+    #[test]
+    fn test_chat_message_user_text() {
+        let json = r#"{
+            "role": "user",
+            "content": "Hello!"
+        }"#;
+
+        let message: ChatMessage = serde_json::from_str(json).unwrap();
+
+        match message {
+            ChatMessage::User { content, .. } => match content {
+                UserMessageContent::Text(text) => assert_eq!(text, "Hello!"),
+                _ => panic!("Expected Text content"),
+            },
+            _ => panic!("Expected User message"),
+        }
+    }
+
+    #[test]
+    fn test_chat_message_tool() {
+        let json = r#"{
+            "role": "tool",
+            "content": "Tool result here",
+            "tool_call_id": "call_123"
+        }"#;
+
+        let message: ChatMessage = serde_json::from_str(json).unwrap();
+
+        match message {
+            ChatMessage::Tool {
+                content,
+                tool_call_id,
+                ..
+            } => {
+                assert_eq!(content, "Tool result here");
+                assert_eq!(tool_call_id, "call_123");
+            }
+            _ => panic!("Expected Tool message"),
+        }
+    }
+
+    #[test]
+    fn test_chat_message_function() {
+        let json = r#"{
+            "role": "function",
+            "content": "Function result",
+            "name": "my_function"
+        }"#;
+
+        let message: ChatMessage = serde_json::from_str(json).unwrap();
+
+        match message {
+            ChatMessage::Function { content, name, .. } => {
+                assert_eq!(content, "Function result");
+                assert_eq!(name, "my_function");
+            }
+            _ => panic!("Expected Function message"),
+        }
+    }
+
+    #[test]
+    fn test_chat_message_roundtrip_serialization() {
+        let original = ChatMessage::Assistant {
+            role: "assistant".to_string(),
+            content: Some("Hello!".to_string()),
+            name: None,
+            tool_calls: None,
+            function_call: None,
+            reasoning_content: Some("Thinking...".to_string()),
+        };
+
+        let serialized = serde_json::to_string(&original).unwrap();
+        let deserialized: ChatMessage = serde_json::from_str(&serialized).unwrap();
+
+        match deserialized {
+            ChatMessage::Assistant {
+                content,
+                reasoning_content,
+                ..
+            } => {
+                assert_eq!(content.as_ref().unwrap(), "Hello!");
+                assert_eq!(reasoning_content.as_ref().unwrap(), "Thinking...");
+            }
+            _ => panic!("Expected Assistant message"),
+        }
     }
 }
