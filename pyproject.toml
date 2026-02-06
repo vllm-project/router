@@ -43,3 +43,7 @@ find = { where = ["py_src"] }
 # workaround for https://github.com/pypa/twine/issues/1216
 [tool.setuptools]
 license-files = []
+
+[tool.distutils.bdist_wheel]
+py_limited_api = "cp38"
+
