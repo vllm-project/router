@@ -1,6 +1,6 @@
 [package]
 name = "vllm_router_rs"
-version = "0.1.9"
+version = "0.1.10"
 edition = "2021"
 
 [features]
