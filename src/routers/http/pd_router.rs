@@ -8,7 +8,7 @@ use crate::core::{
     WorkerFactory, WorkerLoadGuard, WorkerRegistry, WorkerType,
 };
 use crate::metrics::RouterMetrics;
-use crate::policies::{LoadBalancingPolicy, PolicyRegistry};
+use crate::policies::{LoadBalancingPolicy, PolicyRegistry, RequestHeaders};
 use crate::protocols::spec::{
     ChatCompletionRequest, ChatMessage, CompletionRequest, GenerateRequest, RerankRequest,
     ResponsesRequest, StringOrArray, UserMessageContent,
@@ -60,6 +60,20 @@ struct PDRequestContext<'a> {
     return_logprob: bool,
     request_text: Option<String>,
     model_id: Option<&'a str>,
+}
+
+/// Convert axum HeaderMap to policy RequestHeaders (HashMap<String, String>)
+fn headers_to_request_headers(headers: Option<&HeaderMap>) -> Option<RequestHeaders> {
+    headers.map(|h| {
+        h.iter()
+            .filter_map(|(name, value)| {
+                value
+                    .to_str()
+                    .ok()
+                    .map(|v| (name.as_str().to_lowercase(), v.to_string()))
+            })
+            .collect()
+    })
 }
 
 impl PDRouter {
@@ -838,7 +852,11 @@ impl PDRouter {
                     async move {
                         // Select workers fresh for each attempt
                         let (prefill, decode) = match self
-                            .select_pd_pair(context.request_text.as_deref(), context.model_id)
+                            .select_pd_pair(
+                                context.request_text.as_deref(),
+                                context.model_id,
+                                headers,
+                            )
                             .await
                         {
                             Ok(pair) => pair,
@@ -1245,6 +1263,7 @@ impl PDRouter {
         &self,
         request_text: Option<&str>,
         model_id: Option<&str>,
+        headers: Option<&HeaderMap>,
     ) -> Result<(Arc<dyn Worker>, Arc<dyn Worker>), String> {
         // Get workers from registry - filter by model if provided
         let prefill_workers = if let Some(model) = model_id {
@@ -1269,6 +1288,9 @@ impl PDRouter {
             self.worker_registry.get_decode_workers()
         };
 
+        // Convert headers for policies that need them (e.g., consistent_hash)
+        let request_headers = headers_to_request_headers(headers);
+
         // Select workers using helper function
         // Use separate policies for prefill and decode to avoid counter conflicts
         let prefill_policy = self.policy_registry.get_prefill_policy();
@@ -1278,6 +1300,7 @@ impl PDRouter {
             &prefill_workers,
             &*prefill_policy,
             request_text,
+            request_headers.as_ref(),
             "prefill",
         )?;
 
@@ -1285,6 +1308,7 @@ impl PDRouter {
             &decode_workers,
             &*decode_policy,
             request_text,
+            request_headers.as_ref(),
             "decode",
         )?;
 
@@ -1296,6 +1320,7 @@ impl PDRouter {
         workers: &[Arc<dyn Worker>],
         policy: &dyn LoadBalancingPolicy,
         request_text: Option<&str>,
+        headers: Option<&RequestHeaders>,
         worker_type: &str,
     ) -> Result<Arc<dyn Worker>, String> {
         // Check if we have any workers
@@ -1320,9 +1345,9 @@ impl PDRouter {
             ));
         }
 
-        // Let policy select from available workers (no conversion needed now!)
+        // Let policy select from available workers with headers for session affinity
         let selected_idx = policy
-            .select_worker(&available_workers, request_text)
+            .select_worker_with_headers(&available_workers, request_text, headers)
             .ok_or_else(|| {
                 format!(
                     "Policy {} failed to select a {} worker",
@@ -1830,7 +1855,7 @@ impl RouterTrait for PDRouter {
         // Note: This endpoint actually causes the model to generate tokens, so we only test one pair
 
         // Select a random worker pair using the policy
-        let (prefill, decode) = match self.select_pd_pair(None, None).await {
+        let (prefill, decode) = match self.select_pd_pair(None, None, None).await {
             Ok(pair) => pair,
             Err(e) => {
                 return (
@@ -2538,7 +2563,7 @@ mod tests {
         router.worker_registry.register(Arc::from(healthy_worker));
         router.worker_registry.register(Arc::from(decode_worker));
 
-        let result = router.select_pd_pair(None, None).await;
+        let result = router.select_pd_pair(None, None, None).await;
 
         assert!(result.is_ok());
         let (prefill, _decode) = result.unwrap();
@@ -2552,7 +2577,7 @@ mod tests {
     async fn test_empty_worker_lists() {
         let router = create_test_pd_router();
 
-        let result = router.select_pd_pair(None, None).await;
+        let result = router.select_pd_pair(None, None, None).await;
 
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("No prefill workers available"));

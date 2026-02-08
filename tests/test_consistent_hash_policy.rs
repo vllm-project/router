@@ -715,4 +715,150 @@ mod consistent_hash_policy_tests {
             "ConsistentHashPolicy should report that it needs headers"
         );
     }
+
+    // =============================
+    // PD mode + HTTP Header routing tests
+    // =============================
+
+    #[test]
+    fn test_select_worker_pair_with_headers_pd_mode() {
+        let policy = ConsistentHashPolicy::new();
+        let prefill_workers = create_test_workers();
+        let decode_workers = create_test_workers();
+
+        let session_id = "pd-header-session-456";
+        let headers = create_headers(&[("x-session-id", session_id)]);
+
+        // Test PD mode worker pair selection with HTTP headers
+        if let Some((prefill_idx, decode_idx)) = policy.select_worker_pair_with_headers(
+            &prefill_workers,
+            &decode_workers,
+            Some(r#"{"prompt": "pd header test"}"#),
+            Some(&headers),
+        ) {
+            assert!(
+                prefill_idx < prefill_workers.len(),
+                "Prefill worker index should be valid"
+            );
+            assert!(
+                decode_idx < decode_workers.len(),
+                "Decode worker index should be valid"
+            );
+
+            // For the same session header, should get consistent results
+            if let Some((prefill_idx2, decode_idx2)) = policy.select_worker_pair_with_headers(
+                &prefill_workers,
+                &decode_workers,
+                Some(r#"{"prompt": "different prompt, same header"}"#),
+                Some(&headers),
+            ) {
+                assert_eq!(
+                    prefill_idx, prefill_idx2,
+                    "Prefill worker should be consistent for same X-Session-ID header"
+                );
+                assert_eq!(
+                    decode_idx, decode_idx2,
+                    "Decode worker should be consistent for same X-Session-ID header"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_pd_mode_header_takes_priority_over_body() {
+        let policy = ConsistentHashPolicy::new();
+        let prefill_workers = create_test_workers();
+        let decode_workers = create_test_workers();
+
+        let header_session = "header-wins-in-pd";
+        let body_session = "body-loses-in-pd";
+
+        let headers = create_headers(&[("x-session-id", header_session)]);
+        let body = format!(
+            r#"{{"session_params": {{"session_id": "{}"}}, "prompt": "test"}}"#,
+            body_session
+        );
+
+        // PD pair with header
+        let with_header = policy
+            .select_worker_pair_with_headers(
+                &prefill_workers,
+                &decode_workers,
+                Some(&body),
+                Some(&headers),
+            )
+            .expect("Should select pair with header");
+
+        // PD pair with header-only (no body session)
+        let header_only = policy
+            .select_worker_pair_with_headers(
+                &prefill_workers,
+                &decode_workers,
+                Some(r#"{"prompt": "no session in body"}"#),
+                Some(&headers),
+            )
+            .expect("Should select pair with header only");
+
+        // Header should take priority - both should route to same workers
+        assert_eq!(
+            with_header.0, header_only.0,
+            "Prefill: HTTP header should take priority over body session_params in PD mode"
+        );
+        assert_eq!(
+            with_header.1, header_only.1,
+            "Decode: HTTP header should take priority over body session_params in PD mode"
+        );
+    }
+
+    #[test]
+    fn test_pd_mode_without_headers_falls_back_to_body() {
+        let policy = ConsistentHashPolicy::new();
+        let prefill_workers = create_test_workers();
+        let decode_workers = create_test_workers();
+
+        let session_id = "body-session-in-pd";
+        let body = format!(
+            r#"{{"session_params": {{"session_id": "{}"}}, "prompt": "test"}}"#,
+            session_id
+        );
+
+        // PD pair without headers (None)
+        let without_headers = policy
+            .select_worker_pair_with_headers(&prefill_workers, &decode_workers, Some(&body), None)
+            .expect("Should select pair without headers");
+
+        // PD pair with empty headers
+        let empty_headers: RequestHeaders = HashMap::new();
+        let with_empty_headers = policy
+            .select_worker_pair_with_headers(
+                &prefill_workers,
+                &decode_workers,
+                Some(&body),
+                Some(&empty_headers),
+            )
+            .expect("Should select pair with empty headers");
+
+        // PD pair using old API (no headers)
+        let old_api = policy
+            .select_worker_pair(&prefill_workers, &decode_workers, Some(&body))
+            .expect("Should select pair with old API");
+
+        // All three should route to the same workers via body fallback
+        assert_eq!(
+            without_headers.0, with_empty_headers.0,
+            "Prefill: None headers and empty headers should route the same"
+        );
+        assert_eq!(
+            without_headers.1, with_empty_headers.1,
+            "Decode: None headers and empty headers should route the same"
+        );
+        assert_eq!(
+            without_headers.0, old_api.0,
+            "Prefill: Should be consistent with old API"
+        );
+        assert_eq!(
+            without_headers.1, old_api.1,
+            "Decode: Should be consistent with old API"
+        );
+    }
 }

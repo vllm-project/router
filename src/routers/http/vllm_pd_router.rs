@@ -7,7 +7,7 @@ use super::pd_router::PDRouter;
 use super::pd_types::PDRouterError;
 use super::vllm_service_discovery::{ServiceRegistry, ServiceType};
 use crate::core::{BasicWorker, Worker, WorkerType};
-use crate::policies::PolicyRegistry;
+use crate::policies::{PolicyRegistry, RequestHeaders};
 use crate::routers::{RouterTrait, WorkerManagement};
 use async_trait::async_trait;
 use axum::{
@@ -44,6 +44,20 @@ pub struct VllmPDRouter {
     profiling_tasks: Arc<Mutex<HashMap<String, tokio::task::AbortHandle>>>,
     /// Intra-node data parallel size for DP-aware routing (automatically enabled when > 1)
     intra_node_data_parallel_size: usize,
+}
+
+/// Convert axum HeaderMap to policy RequestHeaders (HashMap<String, String>)
+fn headers_to_request_headers(headers: Option<&HeaderMap>) -> Option<RequestHeaders> {
+    headers.map(|h| {
+        h.iter()
+            .filter_map(|(name, value)| {
+                value
+                    .to_str()
+                    .ok()
+                    .map(|v| (name.as_str().to_lowercase(), v.to_string()))
+            })
+            .collect()
+    })
 }
 
 impl VllmPDRouter {
@@ -181,6 +195,7 @@ impl VllmPDRouter {
         instances: &[(String, String)],
         is_prefill: bool,
         request_text: Option<&str>,
+        headers: Option<&RequestHeaders>,
     ) -> Option<usize> {
         if instances.is_empty() {
             return None;
@@ -196,8 +211,8 @@ impl VllmPDRouter {
             self.policy_registry.get_decode_policy()
         };
 
-        // Use policy to select worker
-        policy.select_worker(&workers, request_text)
+        // Use policy to select worker with headers for session affinity
+        policy.select_worker_with_headers(&workers, request_text, headers)
     }
 
     /// Process vLLM request using pure service discovery
@@ -239,20 +254,31 @@ impl VllmPDRouter {
         let request_text = serde_json::to_string(&request_json).ok();
         let request_str = request_text.as_deref();
 
-        let prefill_idx =
-            match self.select_worker_with_policy(&prefill_instances, true, request_str) {
-                Some(idx) => idx,
-                None => {
-                    return (
-                        axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                        "Prefill policy failed to select a worker".to_string(),
-                    )
-                        .into_response();
-                }
-            };
+        // Convert headers for policies that need them (e.g., consistent_hash)
+        let request_headers = headers_to_request_headers(headers);
 
-        let decode_idx = match self.select_worker_with_policy(&decode_instances, false, request_str)
-        {
+        let prefill_idx = match self.select_worker_with_policy(
+            &prefill_instances,
+            true,
+            request_str,
+            request_headers.as_ref(),
+        ) {
+            Some(idx) => idx,
+            None => {
+                return (
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                    "Prefill policy failed to select a worker".to_string(),
+                )
+                    .into_response();
+            }
+        };
+
+        let decode_idx = match self.select_worker_with_policy(
+            &decode_instances,
+            false,
+            request_str,
+            request_headers.as_ref(),
+        ) {
             Some(idx) => idx,
             None => {
                 return (
@@ -1194,10 +1220,17 @@ impl RouterTrait for VllmPDRouter {
             let request_text = serde_json::to_string(&request_json).ok();
             let request_str = request_text.as_deref();
 
+            // Convert headers for policies that need them (e.g., consistent_hash)
+            let request_headers = headers_to_request_headers(headers);
+
             let prefill_policy = self.policy_registry.get_prefill_policy();
             let decode_policy = self.policy_registry.get_decode_policy();
 
-            let prefill_idx = match prefill_policy.select_worker(&prefill_workers, request_str) {
+            let prefill_idx = match prefill_policy.select_worker_with_headers(
+                &prefill_workers,
+                request_str,
+                request_headers.as_ref(),
+            ) {
                 Some(idx) => idx,
                 None => {
                     return (
@@ -1208,7 +1241,11 @@ impl RouterTrait for VllmPDRouter {
                 }
             };
 
-            let decode_idx = match decode_policy.select_worker(&decode_workers, request_str) {
+            let decode_idx = match decode_policy.select_worker_with_headers(
+                &decode_workers,
+                request_str,
+                request_headers.as_ref(),
+            ) {
                 Some(idx) => idx,
                 None => {
                     return (
@@ -1344,10 +1381,17 @@ impl RouterTrait for VllmPDRouter {
             let request_text = serde_json::to_string(&request_json).ok();
             let request_str = request_text.as_deref();
 
+            // Convert headers for policies that need them (e.g., consistent_hash)
+            let request_headers = headers_to_request_headers(headers);
+
             let prefill_policy = self.policy_registry.get_prefill_policy();
             let decode_policy = self.policy_registry.get_decode_policy();
 
-            let prefill_idx = match prefill_policy.select_worker(&prefill_workers, request_str) {
+            let prefill_idx = match prefill_policy.select_worker_with_headers(
+                &prefill_workers,
+                request_str,
+                request_headers.as_ref(),
+            ) {
                 Some(idx) => idx,
                 None => {
                     return (
@@ -1358,7 +1402,11 @@ impl RouterTrait for VllmPDRouter {
                 }
             };
 
-            let decode_idx = match decode_policy.select_worker(&decode_workers, request_str) {
+            let decode_idx = match decode_policy.select_worker_with_headers(
+                &decode_workers,
+                request_str,
+                request_headers.as_ref(),
+            ) {
                 Some(idx) => idx,
                 None => {
                     return (
@@ -1515,10 +1563,17 @@ impl RouterTrait for VllmPDRouter {
             let request_text = serde_json::to_string(&request_json).ok();
             let request_str = request_text.as_deref();
 
+            // Convert headers for policies that need them (e.g., consistent_hash)
+            let request_headers = headers_to_request_headers(headers);
+
             let prefill_policy = self.policy_registry.get_prefill_policy();
             let decode_policy = self.policy_registry.get_decode_policy();
 
-            let prefill_idx = match prefill_policy.select_worker(&prefill_workers, request_str) {
+            let prefill_idx = match prefill_policy.select_worker_with_headers(
+                &prefill_workers,
+                request_str,
+                request_headers.as_ref(),
+            ) {
                 Some(idx) => idx,
                 None => {
                     return (
@@ -1529,7 +1584,11 @@ impl RouterTrait for VllmPDRouter {
                 }
             };
 
-            let decode_idx = match decode_policy.select_worker(&decode_workers, request_str) {
+            let decode_idx = match decode_policy.select_worker_with_headers(
+                &decode_workers,
+                request_str,
+                request_headers.as_ref(),
+            ) {
                 Some(idx) => idx,
                 None => {
                     return (
