@@ -437,21 +437,37 @@ impl CliArgs {
             // Use decode URLs from CLI arguments (already parsed by clap)
             let decode_urls = &self.decode;
 
-            // Support both pure service discovery mode and hybrid mode with static URLs
+            // Support multiple discovery/configuration modes:
+            // 1. Static URLs (--prefill/--decode)
+            // 2. vLLM ZMQ discovery (--vllm-discovery-address)
+            // 3. K8s service discovery (--service-discovery with --prefill-selector/--decode-selector)
             let use_static_urls = !prefill_urls.is_empty() || !decode_urls.is_empty();
-            let use_discovery = self.vllm_discovery_address.is_some();
+            let use_vllm_discovery = self.vllm_discovery_address.is_some();
+            let use_k8s_discovery = self.service_discovery
+                && (!self.prefill_selector.is_empty() || !self.decode_selector.is_empty());
 
-            if !use_static_urls && !use_discovery {
+            if !use_static_urls && !use_vllm_discovery && !use_k8s_discovery {
                 return Err(ConfigError::ValidationFailed {
-                    reason: "vLLM PD disaggregation mode requires either --vllm-discovery-address or --prefill/--decode URLs".to_string(),
+                    reason: "vLLM PD disaggregation mode requires one of: --vllm-discovery-address, --prefill/--decode URLs, or --service-discovery with --prefill-selector/--decode-selector".to_string(),
                 });
             }
 
             // Use decode URLs directly from CLI
             let final_decode_urls = decode_urls.clone();
 
-            if use_static_urls && use_discovery {
-                eprintln!("ℹ️  INFO: Using hybrid mode - static URLs as fallback, service discovery for dynamic workers.");
+            // Log the discovery/configuration mode being used
+            if use_k8s_discovery {
+                eprintln!("ℹ️  INFO: Using K8s service discovery mode for vLLM PD disaggregation.");
+                eprintln!("   Prefill selector: {:?}", self.prefill_selector);
+                eprintln!("   Decode selector: {:?}", self.decode_selector);
+                if use_static_urls {
+                    eprintln!(
+                        "   Static fallback URLs - Prefill: {:?}, Decode: {:?}",
+                        prefill_urls, final_decode_urls
+                    );
+                }
+            } else if use_static_urls && use_vllm_discovery {
+                eprintln!("ℹ️  INFO: Using hybrid mode - static URLs as fallback, vLLM ZMQ discovery for dynamic workers.");
                 eprintln!("   Prefill URLs: {:?}", prefill_urls);
                 eprintln!("   Decode URLs: {:?}", final_decode_urls);
                 eprintln!("   Discovery address: {:?}", self.vllm_discovery_address);
@@ -460,7 +476,7 @@ impl CliArgs {
                 eprintln!("   Prefill URLs: {:?}", prefill_urls);
                 eprintln!("   Decode URLs: {:?}", final_decode_urls);
             } else {
-                eprintln!("ℹ️  INFO: Using pure service discovery mode.");
+                eprintln!("ℹ️  INFO: Using vLLM ZMQ service discovery mode.");
                 eprintln!("   Discovery address: {:?}", self.vllm_discovery_address);
             }
 
