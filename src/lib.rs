@@ -477,7 +477,8 @@ impl Router {
                 check_interval: std::time::Duration::from_secs(60),
                 port: self.service_discovery_port,
                 namespace: self.service_discovery_namespace.clone(),
-                pd_mode: self.pd_disaggregation,
+                // Enable PD mode for both --pd-disaggregation and --vllm-pd-disaggregation
+                pd_mode: self.pd_disaggregation || self.vllm_pd_disaggregation,
                 prefill_selector: self.prefill_selector.clone(),
                 decode_selector: self.decode_selector.clone(),
                 bootstrap_port_annotation: self.bootstrap_port_annotation.clone(),

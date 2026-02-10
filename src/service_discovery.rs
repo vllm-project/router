@@ -382,10 +382,11 @@ async fn handle_pod_event(
 
             // Handle PD mode with specific pod types
             let result = if pd_mode && pod_info.pod_type.is_some() {
-                // Need to import PDRouter type
+                // Import both PD router types
                 use crate::routers::http::pd_router::PDRouter;
+                use crate::routers::http::vllm_pd_router::VllmPDRouter;
 
-                // Try to downcast to PDRouter
+                // Try to downcast to PDRouter first, then VllmPDRouter
                 if let Some(pd_router) = router.as_any().downcast_ref::<PDRouter>() {
                     match &pod_info.pod_type {
                         Some(PodType::Prefill) => pd_router
@@ -401,8 +402,25 @@ async fn handle_pod_event(
                             router.add_worker(&worker_url).await
                         }
                     }
+                } else if let Some(vllm_pd_router) = router.as_any().downcast_ref::<VllmPDRouter>()
+                {
+                    // Support --vllm-pd-disaggregation mode with K8s service discovery
+                    match &pod_info.pod_type {
+                        Some(PodType::Prefill) => vllm_pd_router
+                            .add_prefill_server(worker_url.clone(), pod_info.bootstrap_port)
+                            .await
+                            .map_err(|e| e.to_string()),
+                        Some(PodType::Decode) => vllm_pd_router
+                            .add_decode_server(worker_url.clone())
+                            .await
+                            .map_err(|e| e.to_string()),
+                        Some(PodType::Regular) | None => {
+                            // Fall back to regular add_worker for regular pods
+                            router.add_worker(&worker_url).await
+                        }
+                    }
                 } else {
-                    Err("PD mode enabled but router is not a PDRouter".to_string())
+                    Err("PD mode enabled but router is not a PDRouter or VllmPDRouter".to_string())
                 }
             } else {
                 // Regular mode or no pod type specified
@@ -453,9 +471,11 @@ async fn handle_pod_deletion(
 
         // Handle PD mode removal
         if pd_mode && pod_info.pod_type.is_some() {
+            // Import both PD router types
             use crate::routers::http::pd_router::PDRouter;
+            use crate::routers::http::vllm_pd_router::VllmPDRouter;
 
-            // Try to downcast to PDRouter for PD-specific removal
+            // Try to downcast to PDRouter first, then VllmPDRouter
             if let Some(pd_router) = router.as_any().downcast_ref::<PDRouter>() {
                 match &pod_info.pod_type {
                     Some(PodType::Prefill) => {
@@ -473,8 +493,26 @@ async fn handle_pod_deletion(
                         router.remove_worker(&worker_url);
                     }
                 }
+            } else if let Some(vllm_pd_router) = router.as_any().downcast_ref::<VllmPDRouter>() {
+                // Support --vllm-pd-disaggregation mode with K8s service discovery
+                match &pod_info.pod_type {
+                    Some(PodType::Prefill) => {
+                        if let Err(e) = vllm_pd_router.remove_prefill_server(&worker_url).await {
+                            error!("Failed to remove vllm prefill server {}: {}", worker_url, e);
+                        }
+                    }
+                    Some(PodType::Decode) => {
+                        if let Err(e) = vllm_pd_router.remove_decode_server(&worker_url).await {
+                            error!("Failed to remove vllm decode server {}: {}", worker_url, e);
+                        }
+                    }
+                    Some(PodType::Regular) | None => {
+                        // Fall back to regular remove_worker
+                        router.remove_worker(&worker_url);
+                    }
+                }
             } else {
-                // PD mode but not a PDRouter, use generic removal
+                // PD mode but not a PDRouter or VllmPDRouter, use generic removal
                 router.remove_worker(&worker_url);
             }
         } else {

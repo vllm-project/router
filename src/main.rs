@@ -628,7 +628,8 @@ impl CliArgs {
                 check_interval: std::time::Duration::from_secs(60),
                 port: self.service_discovery_port,
                 namespace: self.service_discovery_namespace.clone(),
-                pd_mode: self.pd_disaggregation,
+                // Enable PD mode for both --pd-disaggregation and --vllm-pd-disaggregation
+                pd_mode: self.pd_disaggregation || self.vllm_pd_disaggregation,
                 prefill_selector: Self::parse_selector(&self.prefill_selector),
                 decode_selector: Self::parse_selector(&self.decode_selector),
                 bootstrap_port_annotation: "vllm.ai/bootstrap-port".to_string(),
