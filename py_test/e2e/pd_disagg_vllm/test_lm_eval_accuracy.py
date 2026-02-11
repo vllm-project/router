@@ -15,7 +15,6 @@ import sys
 import lm_eval
 import openai
 
-
 # Test configuration
 TASK = "gsm8k"
 FILTER = "exact_match,strict-match"
