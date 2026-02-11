@@ -412,6 +412,7 @@ class TestPolicyFromStr:
         assert policy_from_str("round_robin") == PolicyType.RoundRobin
         assert policy_from_str("cache_aware") == PolicyType.CacheAware
         assert policy_from_str("power_of_two") == PolicyType.PowerOfTwo
+        assert policy_from_str("consistent_hash") == PolicyType.ConsistentHash
 
     def test_invalid_policy(self):
         """Test conversion of invalid policy string."""
