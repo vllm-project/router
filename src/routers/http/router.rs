@@ -282,35 +282,35 @@ impl Router {
             // Wait for all health checks to complete
             let results = futures::future::join_all(health_checks).await;
 
-            let mut all_healthy = true;
             let mut unhealthy_hosts = Vec::new();
+            let mut healthy_host_count = 0;
 
             for result in results {
                 match result {
                     Ok(None) => {
+                        healthy_host_count += 1;
                         // Host is healthy
                     }
                     Ok(Some((url, reason))) => {
-                        all_healthy = false;
                         unhealthy_hosts.push((url, reason));
                     }
                     Err(e) => {
-                        all_healthy = false;
                         unhealthy_hosts.push(("unknown".to_string(), format!("task error: {}", e)));
                     }
                 }
             }
 
-            if all_healthy {
+            if healthy_host_count > 0 {
                 info!(
-                    "All {} unique hosts are healthy (representing {} workers)",
+                    "{} out of {} unique hosts are healthy (representing {} workers)",
+                    healthy_host_count,
                     unique_hosts_vec.len(),
                     worker_urls.len()
                 );
                 return Ok(());
             } else {
                 debug!(
-                    "Waiting for {} unique hosts to become healthy ({} unhealthy: {:?})",
+                   "Waiting for at least 1 of {} unique hosts to become healthy ({} unhealthy: {:?})",
                     unique_hosts_vec.len(),
                     unhealthy_hosts.len(),
                     unhealthy_hosts
@@ -1948,5 +1948,54 @@ mod tests {
             method1, method2,
             "Both header conversion methods should produce identical results"
         );
+    }
+
+    /// Helper: start a minimal mock server that responds 200 on /health.
+    async fn start_healthy_mock_server() -> (String, tokio::task::JoinHandle<()>) {
+        use axum::{routing::get, Router as AxumRouter};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = AxumRouter::new().route("/health", get(|| async { "ok" }));
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        (format!("http://{}", addr), handle)
+    }
+
+    #[tokio::test]
+    async fn test_wait_for_healthy_workers_all_healthy() {
+        let (url, _handle) = start_healthy_mock_server().await;
+        let result = Router::wait_for_healthy_workers(&[url], 5, 1).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_wait_for_healthy_workers_partial_health() {
+        // One healthy server + one unreachable URL.
+        // The new behaviour succeeds when at least one host is healthy.
+        let (healthy_url, _handle) = start_healthy_mock_server().await;
+        let unreachable_url = "http://127.0.0.1:1".to_string(); // port 1 is unreachable
+
+        let result = Router::wait_for_healthy_workers(
+            &[healthy_url, unreachable_url],
+            5,
+            1,
+        )
+        .await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_wait_for_healthy_workers_dp_aware_dedup() {
+        // DP-aware URLs like http://host:port@0, @1, @2 should be deduplicated
+        // to a single /health check on http://host:port.
+        let (base_url, _handle) = start_healthy_mock_server().await;
+        let dp_urls: Vec<String> = (0..4).map(|rank| format!("{}@{}", base_url, rank)).collect();
+
+        let result = Router::wait_for_healthy_workers(&dp_urls, 5, 1).await;
+        assert!(result.is_ok());
     }
 }

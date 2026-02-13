@@ -497,8 +497,12 @@ impl PDRouter {
                 (prefill_urls, decode_urls)
             };
 
+
+        let mut prefill_workers_urls = vec![];
+        let mut decode_workers_urls = vec![];
         // Register prefill workers in the registry
         for (url, port) in expanded_prefill_urls {
+            prefill_workers_urls.push(url.clone());
             let worker = BasicWorker::new(
                 url,
                 WorkerType::Prefill {
@@ -518,6 +522,7 @@ impl PDRouter {
 
         // Register decode workers in the registry
         for url in expanded_decode_urls {
+            decode_workers_urls.push(url.clone());
             let worker = BasicWorker::new(url, WorkerType::Decode)
                 .with_circuit_breaker_config(core_cb_config.clone())
                 .with_health_config(HealthConfig {
@@ -536,9 +541,19 @@ impl PDRouter {
             .iter()
             .map(|worker| worker.url().to_string())
             .collect();
-        if !all_urls.is_empty() {
+        // At least one prefill and one decode are up
+        if !prefill_workers_urls.is_empty() {
             crate::routers::http::router::Router::wait_for_healthy_workers(
-                &all_urls,
+                &prefill_workers_urls,
+                ctx.router_config.worker_startup_timeout_secs,
+                ctx.router_config.worker_startup_check_interval_secs,
+            )
+            .await?;
+        }
+
+        if !decode_workers_urls.is_empty() {
+            crate::routers::http::router::Router::wait_for_healthy_workers(
+                &decode_workers_urls,
                 ctx.router_config.worker_startup_timeout_secs,
                 ctx.router_config.worker_startup_check_interval_secs,
             )
