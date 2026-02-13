@@ -497,7 +497,6 @@ impl PDRouter {
                 (prefill_urls, decode_urls)
             };
 
-
         let mut prefill_workers_urls = vec![];
         let mut decode_workers_urls = vec![];
         // Register prefill workers in the registry

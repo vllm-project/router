@@ -1979,12 +1979,7 @@ mod tests {
         let (healthy_url, _handle) = start_healthy_mock_server().await;
         let unreachable_url = "http://127.0.0.1:1".to_string(); // port 1 is unreachable
 
-        let result = Router::wait_for_healthy_workers(
-            &[healthy_url, unreachable_url],
-            5,
-            1,
-        )
-        .await;
+        let result = Router::wait_for_healthy_workers(&[healthy_url, unreachable_url], 5, 1).await;
         assert!(result.is_ok());
     }
 
@@ -1993,7 +1988,9 @@ mod tests {
         // DP-aware URLs like http://host:port@0, @1, @2 should be deduplicated
         // to a single /health check on http://host:port.
         let (base_url, _handle) = start_healthy_mock_server().await;
-        let dp_urls: Vec<String> = (0..4).map(|rank| format!("{}@{}", base_url, rank)).collect();
+        let dp_urls: Vec<String> = (0..4)
+            .map(|rank| format!("{}@{}", base_url, rank))
+            .collect();
 
         let result = Router::wait_for_healthy_workers(&dp_urls, 5, 1).await;
         assert!(result.is_ok());
