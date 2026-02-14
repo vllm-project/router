@@ -1983,6 +1983,46 @@ mod tests {
         assert!(result.is_ok());
     }
 
+    /// Helper: start a mock server that returns 503 on /health for a given
+    /// duration, then switches to 200. Simulates a worker with a slow startup.
+    async fn start_delayed_healthy_mock_server(
+        delay: std::time::Duration,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        use axum::{extract::State, http::StatusCode, routing::get, Router as AxumRouter};
+        use std::sync::Arc;
+        use tokio::net::TcpListener;
+
+        let start = std::time::Instant::now();
+        let ready_after = Arc::new(delay);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let app = AxumRouter::new()
+            .route(
+                "/health",
+                get(
+                    move |State((start, ready_after)): State<(
+                        std::time::Instant,
+                        Arc<std::time::Duration>,
+                    )>| async move {
+                        if start.elapsed() >= *ready_after {
+                            StatusCode::OK
+                        } else {
+                            StatusCode::SERVICE_UNAVAILABLE
+                        }
+                    },
+                ),
+            )
+            .with_state((start, ready_after));
+
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        (format!("http://{}", addr), handle)
+    }
+
     #[tokio::test]
     async fn test_wait_for_healthy_workers_dp_aware_dedup() {
         // DP-aware URLs like http://host:port@0, @1, @2 should be deduplicated
@@ -1994,5 +2034,94 @@ mod tests {
 
         let result = Router::wait_for_healthy_workers(&dp_urls, 5, 1).await;
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_delayed_worker_becomes_routable_via_health_checker() {
+        use crate::core::{BasicWorker, HealthConfig, WorkerRegistry, WorkerType};
+        use std::sync::Arc;
+
+        // Two workers: one immediately healthy, one delayed (503 for 2s, then 200).
+        let (healthy_url, _h1) = start_healthy_mock_server().await;
+        let (delayed_url, _h2) =
+            start_delayed_healthy_mock_server(std::time::Duration::from_secs(2)).await;
+
+        // Verify the delayed worker is genuinely unhealthy right now.
+        let client = reqwest::Client::new();
+        let resp = client
+            .get(format!("{}/health", &delayed_url))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 503);
+
+        // ── Step 1: wait_for_healthy_workers (mirrors PDRouter::new startup) ──
+        // This succeeds because the healthy worker responds immediately,
+        // even though the delayed worker is still returning 503.
+        let result =
+            Router::wait_for_healthy_workers(&[healthy_url.clone(), delayed_url.clone()], 10, 1)
+                .await;
+        assert!(
+            result.is_ok(),
+            "Startup should succeed with at least one healthy worker"
+        );
+
+        // ── Step 2: register workers in the registry (mirrors PDRouter::new) ──
+        let registry = Arc::new(WorkerRegistry::new());
+
+        let healthy_worker = Arc::new(
+            BasicWorker::new(healthy_url, WorkerType::Decode).with_health_config(HealthConfig {
+                timeout_secs: 2,
+                check_interval_secs: 1,
+                endpoint: "/health".to_string(),
+                failure_threshold: 3,
+                success_threshold: 1,
+            }),
+        );
+        registry.register(healthy_worker);
+
+        let delayed_worker = Arc::new(
+            BasicWorker::new(delayed_url, WorkerType::Decode).with_health_config(HealthConfig {
+                timeout_secs: 2,
+                check_interval_secs: 1,
+                endpoint: "/health".to_string(),
+                failure_threshold: 3,
+                success_threshold: 1,
+            }),
+        );
+        delayed_worker.set_healthy(false); // starts unhealthy
+        registry.register(delayed_worker.clone());
+
+        // Only the immediately-healthy worker should be available for routing.
+        let healthy = registry.get_workers_filtered(None, None, None, true);
+        assert_eq!(
+            healthy.len(),
+            1,
+            "Only 1 worker should be healthy initially, got {}",
+            healthy.len()
+        );
+
+        // ── Step 3: start background health checker (mirrors PDRouter::new) ──
+        let health_checker = registry.start_health_checker(1);
+
+        // ── Step 4: wait for delayed worker to recover ──
+        // The mock server switches to 200 at t≈2s. With a 1s check interval
+        // and success_threshold=1, the worker should be healthy by t≈3-4s.
+        tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+
+        // Both workers should now be available for routing.
+        let healthy = registry.get_workers_filtered(None, None, None, true);
+        assert_eq!(
+            healthy.len(),
+            2,
+            "Both workers should be healthy after recovery, got {}",
+            healthy.len()
+        );
+        assert!(
+            delayed_worker.is_healthy(),
+            "Delayed worker should have transitioned to healthy via health checker"
+        );
+
+        health_checker.shutdown().await;
     }
 }
