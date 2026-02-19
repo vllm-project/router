@@ -4,7 +4,7 @@ use super::super::header_utils;
 use super::dp_utils;
 use super::logprobs_merge;
 use super::pd_router::PDRouter;
-use super::pd_types::PDRouterError;
+use super::pd_types::{error_chain, PDRouterError};
 use super::vllm_service_discovery::{ServiceRegistry, ServiceType};
 use crate::core::{BasicWorker, Worker, WorkerType};
 use crate::policies::PolicyRegistry;
@@ -20,7 +20,7 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 /// vLLM PD Router that extends PDRouter with vLLM-specific request handling
@@ -318,7 +318,7 @@ impl VllmPDRouter {
                 response
             }
             Err(e) => {
-                debug!("Two-stage processing failed: {}", e);
+                error!("Two-stage processing failed: {}", e);
                 (
                     axum::http::StatusCode::INTERNAL_SERVER_ERROR,
                     format!("Request processing failed: {}", e),
@@ -416,7 +416,10 @@ impl VllmPDRouter {
             .body(prefill_request_str)
             .send()
             .await
-            .map_err(|e| format!("Prefill request failed: {}", e))?;
+            .map_err(|e| {
+                let full_error = error_chain(&e);
+                format!("Prefill request failed to {}: {}", prefill_http, full_error)
+            })?;
 
         let prefill_status = prefill_response.status();
         debug!("Prefill server responded with status: {}", prefill_status);
@@ -433,7 +436,10 @@ impl VllmPDRouter {
         let prefill_response_text = prefill_response
             .text()
             .await
-            .map_err(|e| format!("Failed to read prefill response: {}", e))?;
+            .map_err(|e| {
+                let full_error = error_chain(&e);
+                format!("Failed to read prefill response from {}: {}", prefill_http, full_error)
+            })?;
 
         debug!("Prefill response body: {}", prefill_response_text);
 
@@ -508,7 +514,10 @@ impl VllmPDRouter {
             .body(decode_request_str)
             .send()
             .await
-            .map_err(|e| format!("Decode request failed: {}", e))?;
+            .map_err(|e| {
+                let full_error = error_chain(&e);
+                format!("Decode request failed to {}: {}", decode_http, full_error)
+            })?;
 
         debug!(
             "Decode server responded with status: {}",
@@ -716,8 +725,9 @@ impl VllmPDRouter {
             Ok(resp) => resp,
             Err(e) => {
                 prefill_worker.decrement_load();
+                let full_error = error_chain(&e);
                 return Err(PDRouterError::NetworkError {
-                    message: format!("Prefill request failed to {}: {}", prefill_url, e),
+                    message: format!("Prefill request failed to {}: {}", prefill_url, full_error),
                 });
             }
         };
@@ -733,10 +743,11 @@ impl VllmPDRouter {
             Ok(bytes) => bytes,
             Err(e) => {
                 prefill_worker.decrement_load();
+                let full_error = error_chain(&e);
                 return Err(PDRouterError::NetworkError {
                     message: format!(
                         "Failed to read prefill response from {}: {}",
-                        prefill_url, e
+                        prefill_url, full_error
                     ),
                 });
             }
@@ -861,8 +872,9 @@ impl VllmPDRouter {
             Ok(resp) => resp,
             Err(e) => {
                 decode_worker.decrement_load();
+                let full_error = error_chain(&e);
                 return Err(PDRouterError::NetworkError {
-                    message: format!("Decode request failed to {}: {}", decode_url, e),
+                    message: format!("Decode request failed to {}: {}", decode_url, full_error),
                 });
             }
         };
@@ -1278,7 +1290,7 @@ impl RouterTrait for VllmPDRouter {
                     response
                 }
                 Err(e) => {
-                    info!("Two-stage processing failed: {}", e);
+                    error!("Two-stage processing failed: {}", e);
                     (
                         axum::http::StatusCode::INTERNAL_SERVER_ERROR,
                         format!("Request processing failed: {}", e),
@@ -1446,7 +1458,7 @@ impl RouterTrait for VllmPDRouter {
                     response
                 }
                 Err(e) => {
-                    info!("Two-stage processing failed: {}", e);
+                    error!("Two-stage processing failed: {}", e);
                     (
                         axum::http::StatusCode::INTERNAL_SERVER_ERROR,
                         format!("Request processing failed: {}", e),
@@ -1637,11 +1649,19 @@ impl RouterTrait for VllmPDRouter {
                 .await
             {
                 Ok(response) => response,
-                Err(e) => (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Transparent proxy request failed: {}", e),
-                )
-                    .into_response(),
+                Err(e) => {
+                    error!(
+                        "Transparent proxy request failed: prefill={}, decode={}, error={}",
+                        prefill_worker.url(),
+                        decode_worker.url(),
+                        e
+                    );
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Transparent proxy request failed: {}", e),
+                    )
+                        .into_response()
+                }
             }
         }
     }
