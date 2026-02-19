@@ -140,6 +140,7 @@ impl VllmPDRouter {
     /// Modify request for prefill stage (set max_tokens=1)
     /// - For inference/v1/generate: patch sampling_params.max_tokens and sampling_params.min_tokens
     /// - For other endpoints (fallback): patch top-level max_tokens, max_completion_tokens, min_tokens
+    ///
     /// stream=false and stream_options removal are always applied at top level.
     fn prepare_prefill_request(mut request: Value, path: &str) -> Value {
         if path.contains("inference/v1/generate") {
@@ -148,8 +149,7 @@ impl VllmPDRouter {
                 sampling_params["max_tokens"] = json!(1);
                 // Also adjust min_tokens to ensure min_tokens <= max_tokens
                 // This is required because vLLM validates that min_tokens <= max_tokens
-                if let Some(min_tokens) =
-                    sampling_params.get("min_tokens").and_then(|v| v.as_u64())
+                if let Some(min_tokens) = sampling_params.get("min_tokens").and_then(|v| v.as_u64())
                 {
                     if min_tokens > 1 {
                         sampling_params["min_tokens"] = json!(1);
@@ -1745,8 +1745,7 @@ mod tests {
                 "temperature": 0.7
             }
         });
-        let result =
-            VllmPDRouter::prepare_prefill_request(request, "/inference/v1/generate");
+        let result = VllmPDRouter::prepare_prefill_request(request, "/inference/v1/generate");
         // sampling_params.max_tokens should be capped
         assert_eq!(result["sampling_params"]["max_tokens"], 1);
         // temperature should be preserved
@@ -1764,8 +1763,7 @@ mod tests {
                 "min_tokens": 50
             }
         });
-        let result =
-            VllmPDRouter::prepare_prefill_request(request, "/inference/v1/generate");
+        let result = VllmPDRouter::prepare_prefill_request(request, "/inference/v1/generate");
         assert_eq!(result["sampling_params"]["max_tokens"], 1);
         assert_eq!(result["sampling_params"]["min_tokens"], 1);
     }
@@ -1776,8 +1774,7 @@ mod tests {
         let request = json!({
             "token_ids": [123, 456],
         });
-        let result =
-            VllmPDRouter::prepare_prefill_request(request, "/inference/v1/generate");
+        let result = VllmPDRouter::prepare_prefill_request(request, "/inference/v1/generate");
         // stream should still be forced to false
         assert_eq!(result["stream"], false);
         // top-level max_tokens should NOT be set (generate path)
@@ -1795,8 +1792,7 @@ mod tests {
             "stream": true,
             "stream_options": {"include_usage": true}
         });
-        let result =
-            VllmPDRouter::prepare_prefill_request(request, "/inference/v1/generate");
+        let result = VllmPDRouter::prepare_prefill_request(request, "/inference/v1/generate");
         assert_eq!(result["stream"], false);
         assert!(result.get("stream_options").is_none());
     }
