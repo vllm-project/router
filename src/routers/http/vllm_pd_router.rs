@@ -1659,3 +1659,142 @@ impl WorkerManagement for VllmPDRouter {
         self.pd_router.get_worker_urls()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    // --- OpenAI-style endpoint tests (chat/completions, completions) ---
+
+    #[test]
+    fn test_prefill_chat_completion_sets_max_tokens_1() {
+        let request = json!({
+            "model": "test",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 512,
+            "stream": true
+        });
+        let result = VllmPDRouter::prepare_prefill_request(request, "/v1/chat/completions");
+        assert_eq!(result["max_tokens"], 1);
+        assert_eq!(result["stream"], false);
+    }
+
+    #[test]
+    fn test_prefill_chat_completion_sets_max_completion_tokens_1() {
+        let request = json!({
+            "model": "test",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 512,
+            "max_completion_tokens": 256
+        });
+        let result = VllmPDRouter::prepare_prefill_request(request, "/v1/chat/completions");
+        assert_eq!(result["max_tokens"], 1);
+        assert_eq!(result["max_completion_tokens"], 1);
+    }
+
+    #[test]
+    fn test_prefill_chat_completion_clamps_min_tokens() {
+        let request = json!({
+            "model": "test",
+            "max_tokens": 512,
+            "min_tokens": 100
+        });
+        let result = VllmPDRouter::prepare_prefill_request(request, "/v1/completions");
+        assert_eq!(result["max_tokens"], 1);
+        assert_eq!(result["min_tokens"], 1);
+    }
+
+    #[test]
+    fn test_prefill_chat_completion_leaves_small_min_tokens() {
+        let request = json!({
+            "model": "test",
+            "max_tokens": 512,
+            "min_tokens": 0
+        });
+        let result = VllmPDRouter::prepare_prefill_request(request, "/v1/completions");
+        assert_eq!(result["max_tokens"], 1);
+        // min_tokens <= 1, so it should be left as-is
+        assert_eq!(result["min_tokens"], 0);
+    }
+
+    #[test]
+    fn test_prefill_chat_completion_removes_stream_options() {
+        let request = json!({
+            "model": "test",
+            "max_tokens": 512,
+            "stream": true,
+            "stream_options": {"include_usage": true}
+        });
+        let result = VllmPDRouter::prepare_prefill_request(request, "/v1/chat/completions");
+        assert_eq!(result["stream"], false);
+        assert!(result.get("stream_options").is_none());
+    }
+
+    // --- Generate API endpoint tests (inference/v1/generate) ---
+
+    #[test]
+    fn test_prefill_generate_patches_sampling_params() {
+        let request = json!({
+            "token_ids": [123, 456],
+            "sampling_params": {
+                "max_tokens": 512,
+                "temperature": 0.7
+            }
+        });
+        let result =
+            VllmPDRouter::prepare_prefill_request(request, "/inference/v1/generate");
+        // sampling_params.max_tokens should be capped
+        assert_eq!(result["sampling_params"]["max_tokens"], 1);
+        // temperature should be preserved
+        assert_eq!(result["sampling_params"]["temperature"], 0.7);
+        // top-level max_tokens should NOT be set
+        assert!(result.get("max_tokens").is_none());
+    }
+
+    #[test]
+    fn test_prefill_generate_clamps_sampling_params_min_tokens() {
+        let request = json!({
+            "token_ids": [123, 456],
+            "sampling_params": {
+                "max_tokens": 512,
+                "min_tokens": 50
+            }
+        });
+        let result =
+            VllmPDRouter::prepare_prefill_request(request, "/inference/v1/generate");
+        assert_eq!(result["sampling_params"]["max_tokens"], 1);
+        assert_eq!(result["sampling_params"]["min_tokens"], 1);
+    }
+
+    #[test]
+    fn test_prefill_generate_without_sampling_params() {
+        // If sampling_params is missing, should not panic
+        let request = json!({
+            "token_ids": [123, 456],
+        });
+        let result =
+            VllmPDRouter::prepare_prefill_request(request, "/inference/v1/generate");
+        // stream should still be forced to false
+        assert_eq!(result["stream"], false);
+        // top-level max_tokens should NOT be set (generate path)
+        assert!(result.get("max_tokens").is_none());
+        // create sampling_params and set min max
+        assert_eq!(result["sampling_params"]["max_tokens"], 1);
+        assert_eq!(result["sampling_params"]["min_tokens"], 1);
+    }
+
+    #[test]
+    fn test_prefill_generate_forces_stream_false() {
+        let request = json!({
+            "token_ids": [123, 456],
+            "sampling_params": {"max_tokens": 512},
+            "stream": true,
+            "stream_options": {"include_usage": true}
+        });
+        let result =
+            VllmPDRouter::prepare_prefill_request(request, "/inference/v1/generate");
+        assert_eq!(result["stream"], false);
+        assert!(result.get("stream_options").is_none());
+    }
+}
