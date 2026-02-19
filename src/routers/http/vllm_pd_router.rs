@@ -155,6 +155,9 @@ impl VllmPDRouter {
                         sampling_params["min_tokens"] = json!(1);
                     }
                 }
+            } else {
+                // Create sampling_params with prefill defaults when missing
+                request["sampling_params"] = json!({"max_tokens": 1, "min_tokens": 1});
             }
         } else {
             // Fallback: OpenAI-style endpoints (chat/completions)
