@@ -138,16 +138,36 @@ impl VllmPDRouter {
     }
 
     /// Modify request for prefill stage (set max_tokens=1)
-    fn prepare_prefill_request(mut request: Value) -> Value {
-        request["max_tokens"] = json!(1);
-        if request.get("max_completion_tokens").is_some() {
-            request["max_completion_tokens"] = json!(1);
-        }
-        // Also adjust min_tokens to ensure min_tokens <= max_tokens
-        // This is required because vLLM validates that min_tokens <= max_tokens
-        if let Some(min_tokens) = request.get("min_tokens").and_then(|v| v.as_u64()) {
-            if min_tokens > 1 {
-                request["min_tokens"] = json!(1);
+    /// - For inference/v1/generate: patch sampling_params.max_tokens and sampling_params.min_tokens
+    /// - For other endpoints (fallback): patch top-level max_tokens, max_completion_tokens, min_tokens
+    /// stream=false and stream_options removal are always applied at top level.
+    fn prepare_prefill_request(mut request: Value, path: &str) -> Value {
+        if path.contains("inference/v1/generate") {
+            // Generate API: max_tokens and min_tokens are in sampling_params
+            if let Some(sampling_params) = request.get_mut("sampling_params") {
+                sampling_params["max_tokens"] = json!(1);
+                // Also adjust min_tokens to ensure min_tokens <= max_tokens
+                // This is required because vLLM validates that min_tokens <= max_tokens
+                if let Some(min_tokens) =
+                    sampling_params.get("min_tokens").and_then(|v| v.as_u64())
+                {
+                    if min_tokens > 1 {
+                        sampling_params["min_tokens"] = json!(1);
+                    }
+                }
+            }
+        } else {
+            // Fallback: OpenAI-style endpoints (chat/completions)
+            request["max_tokens"] = json!(1);
+            if request.get("max_completion_tokens").is_some() {
+                request["max_completion_tokens"] = json!(1);
+            }
+            // Also adjust min_tokens to ensure min_tokens <= max_tokens
+            // This is required because vLLM validates that min_tokens <= max_tokens
+            if let Some(min_tokens) = request.get("min_tokens").and_then(|v| v.as_u64()) {
+                if min_tokens > 1 {
+                    request["min_tokens"] = json!(1);
+                }
             }
         }
         // Force non-streaming for prefill to get JSON response with kv_transfer_params
@@ -333,18 +353,7 @@ impl VllmPDRouter {
         // The P2P metadata will be sent in X-Request-Id header instead
 
         // Prepare prefill request (max_tokens=1 to force prefill-only mode)
-        let mut prefill_request = request_json.clone();
-        prefill_request["max_tokens"] = serde_json::Value::Number(serde_json::Number::from(1));
-        if prefill_request.get("max_completion_tokens").is_some() {
-            prefill_request["max_completion_tokens"] =
-                serde_json::Value::Number(serde_json::Number::from(1));
-        }
-        // Force non-streaming for prefill to get JSON response with kv_transfer_params
-        prefill_request["stream"] = serde_json::Value::Bool(false);
-        // Remove stream_options since we're setting stream=false
-        prefill_request
-            .as_object_mut()
-            .and_then(|obj| obj.remove("stream_options"));
+        let mut prefill_request = Self::prepare_prefill_request(request_json.clone(), path);
 
         // Add kv_transfer_params for NixlConnector support at top level
         // This enables the prefill instance to prepare for remote decode
@@ -621,7 +630,7 @@ impl VllmPDRouter {
         );
 
         // Stage 1: Prepare prefill request with max_tokens=1 and kv_transfer_params
-        let mut prefill_request = Self::prepare_prefill_request(original_request.clone());
+        let mut prefill_request = Self::prepare_prefill_request(original_request.clone(), path);
 
         // Add kv_transfer_params for NixlConnector support at top level
         // This enables the prefill instance to prepare for remote decode
