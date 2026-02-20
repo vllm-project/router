@@ -433,13 +433,13 @@ impl VllmPDRouter {
         }
 
         // Extract kv_transfer_params from prefill response
-        let prefill_response_text = prefill_response
-            .text()
-            .await
-            .map_err(|e| {
-                let full_error = error_chain(&e);
-                format!("Failed to read prefill response from {}: {}", prefill_http, full_error)
-            })?;
+        let prefill_response_text = prefill_response.text().await.map_err(|e| {
+            let full_error = error_chain(&e);
+            format!(
+                "Failed to read prefill response from {}: {}",
+                prefill_http, full_error
+            )
+        })?;
 
         debug!("Prefill response body: {}", prefill_response_text);
 
