@@ -167,9 +167,14 @@ impl PodInfo {
         self.is_ready && self.status == "Running"
     }
 
-    /// Generates a worker URL for this pod
+    /// Generates a worker URL for this pod.
+    /// IPv6 addresses are wrapped in brackets per RFC 2732 (e.g. `http://[::1]:8000`).
     pub fn worker_url(&self, port: u16) -> String {
-        format!("http://{}:{}", self.ip, port)
+        if self.ip.contains(':') {
+            format!("http://[{}]:{}", self.ip, port)
+        } else {
+            format!("http://{}:{}", self.ip, port)
+        }
     }
 }
 
@@ -901,7 +906,7 @@ mod tests {
     }
 
     #[test]
-    fn test_pod_info_worker_url() {
+    fn test_pod_info_worker_url_ipv4() {
         let pod_info = PodInfo {
             name: "p1".into(),
             ip: "1.2.3.4".into(),
@@ -911,6 +916,22 @@ mod tests {
             bootstrap_port: None,
         };
         assert_eq!(pod_info.worker_url(8080), "http://1.2.3.4:8080");
+    }
+
+    #[test]
+    fn test_pod_info_worker_url_ipv6() {
+        let pod_info = PodInfo {
+            name: "p1".into(),
+            ip: "2803:6086:5cd3:6062:c68d:e7c7:480:10".into(),
+            status: "Running".into(),
+            is_ready: true,
+            pod_type: None,
+            bootstrap_port: None,
+        };
+        assert_eq!(
+            pod_info.worker_url(8000),
+            "http://[2803:6086:5cd3:6062:c68d:e7c7:480:10]:8000"
+        );
     }
 
     #[test]
