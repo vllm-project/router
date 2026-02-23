@@ -902,7 +902,7 @@ mod tests {
     }
 
     #[test]
-    fn test_pod_info_worker_url() {
+    fn test_pod_info_worker_url_ipv4() {
         let pod_info = PodInfo {
             name: "p1".into(),
             ip: "1.2.3.4".parse().unwrap(),
