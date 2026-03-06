@@ -90,7 +90,7 @@ pub enum ChatMessage {
     },
     Tool {
         role: String, // "tool"
-        content: String,
+        content: Value,
         tool_call_id: String,
     },
     Function {
@@ -191,9 +191,8 @@ impl<'de> Deserialize<'de> for ChatMessage {
                 role: role.to_string(),
                 content: value
                     .get("content")
-                    .and_then(|c| c.as_str())
-                    .unwrap_or("")
-                    .to_string(),
+                    .cloned()
+                    .unwrap_or_else(|| Value::String(String::new())),
                 tool_call_id: value
                     .get("tool_call_id")
                     .and_then(|t| t.as_str())
@@ -3615,8 +3614,34 @@ mod tests {
                 tool_call_id,
                 ..
             } => {
-                assert_eq!(content, "Tool result here");
+                assert_eq!(content, Value::String("Tool result here".to_string()));
                 assert_eq!(tool_call_id, "call_123");
+            }
+            _ => panic!("Expected Tool message"),
+        }
+    }
+
+    #[test]
+    fn test_chat_message_tool_preserves_array_content() {
+        let json = r#"{
+            "role": "tool",
+            "content": [{"type": "text", "text": "1 files found: ['wi_example.docx']"}],
+            "tool_call_id": "call_456"
+        }"#;
+
+        let message: ChatMessage = serde_json::from_str(json).unwrap();
+
+        match message {
+            ChatMessage::Tool {
+                content,
+                tool_call_id,
+                ..
+            } => {
+                let expected = serde_json::json!([
+                    {"type": "text", "text": "1 files found: ['wi_example.docx']"}
+                ]);
+                assert_eq!(content, expected);
+                assert_eq!(tool_call_id, "call_456");
             }
             _ => panic!("Expected Tool message"),
         }
