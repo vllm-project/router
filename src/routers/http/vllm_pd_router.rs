@@ -696,11 +696,12 @@ impl VllmPDRouter {
 
         debug!("Added kv_transfer_params to prefill request for NixlConnector support");
 
-        // Use endpoint_url() to get the base URL without @rank suffix,
-        // avoiding IPv6+DP URL corruption (same fix as Router and PDRouter)
-        let prefill_base_url = prefill_worker.base_url().to_string();
-        let prefill_dp_rank = prefill_worker.dp_rank();
-        let prefill_url = prefill_worker.endpoint_url(path);
+        // Use parse_worker_url to safely strip @rank suffix before sending to reqwest.
+        // BasicWorker stores the full URL including @rank, and its default trait
+        // base_url()/endpoint_url() do not strip it, causing reqwest to misparse
+        // "http://host:port@rank" as HTTP userinfo (user:pass@host).
+        let (prefill_base_url, prefill_dp_rank) = dp_utils::parse_worker_url(prefill_worker.url());
+        let prefill_url = format!("{}{}", prefill_base_url, path);
 
         debug!(
             "🚀 vLLM Stage 1 - Prefill: {} with request_id: {}",
@@ -836,11 +837,10 @@ impl VllmPDRouter {
             debug!("Added kv_transfer_params to decode request");
         }
 
-        // Use endpoint_url() to get the base URL without @rank suffix,
-        // avoiding IPv6+DP URL corruption (same fix as Router and PDRouter)
-        let decode_base_url = decode_worker.base_url().to_string();
-        let decode_dp_rank = decode_worker.dp_rank();
-        let decode_url = decode_worker.endpoint_url(path);
+        // Use parse_worker_url to safely strip @rank suffix before sending to reqwest.
+        // Same fix as prefill path above - see comment there for details.
+        let (decode_base_url, decode_dp_rank) = dp_utils::parse_worker_url(decode_worker.url());
+        let decode_url = format!("{}{}", decode_base_url, path);
 
         debug!(
             "🚀 vLLM Stage 2 - Decode: {} with request_id: {}",

@@ -254,4 +254,123 @@ mod tests {
             assert_eq!(rank, i);
         }
     }
+    // ============================================================
+    // Verify parse_worker_url handles ALL URL formats correctly
+    // These tests cover both the #98 regression (hostname:port)
+    // and the original #92 concern (IPv6)
+    // ============================================================
+
+    #[test]
+    fn test_parse_worker_url_hostname_port_dp() {
+        let (base, rank) = parse_worker_url("http://node1:8087@3");
+        assert_eq!(base, "http://node1:8087");
+        assert_eq!(rank, Some(3));
+        // Verify the URL we'd send to reqwest is clean
+        let request_url = format!("{}/v1/completions", base);
+        assert!(
+            !request_url.contains('@'),
+            "request URL must not contain @rank"
+        );
+        assert_eq!(request_url, "http://node1:8087/v1/completions");
+    }
+
+    #[test]
+    fn test_parse_worker_url_hostname_port_no_dp() {
+        let (base, rank) = parse_worker_url("http://node1:8087");
+        assert_eq!(base, "http://node1:8087");
+        assert_eq!(rank, None);
+    }
+
+    // ============================================================
+    // Critical: prove that reqwest would parse @rank as userinfo
+    // This is the actual bug that #98 introduced
+    // ============================================================
+
+    #[test]
+    fn test_reqwest_userinfo_proof() {
+        // Demonstrate WHY @rank must be stripped before reqwest:
+        // reqwest/url parses "http://host:port@rank" as userinfo
+
+        // BAD: raw URL with @rank — reqwest sees wrong host
+        let bad_url = url::Url::parse("http://node1:8087@3/v1/completions").unwrap();
+        assert_eq!(
+            bad_url.host_str(),
+            Some("0.0.0.3"),
+            "proves @rank corrupts host"
+        );
+        assert_eq!(bad_url.username(), "node1", "host becomes username");
+
+        // GOOD: stripped URL — reqwest sees correct host
+        let (base, rank) = parse_worker_url("http://node1:8087@3");
+        let good_url_str = format!("{}/v1/completions", base);
+        let good_url = url::Url::parse(&good_url_str).unwrap();
+        assert_eq!(
+            good_url.host_str(),
+            Some("node1"),
+            "host is correct after stripping"
+        );
+        assert_eq!(good_url.port(), Some(8087));
+        assert_eq!(rank, Some(3));
+    }
+
+    #[test]
+    fn test_reqwest_userinfo_proof_ipv6() {
+        // Same proof for IPv6 — verify our fix works for both formats
+        let (base, rank) =
+            parse_worker_url("https://[2a03:83e4:5006:0090:5f5a:f8c5:0400:0000]:20009@2");
+        let url_str = format!("{}/v1/completions", base);
+        let parsed = url::Url::parse(&url_str).unwrap();
+        assert_eq!(
+            parsed.host_str(),
+            Some("[2a03:83e4:5006:90:5f5a:f8c5:400:0]")
+        );
+        assert_eq!(parsed.port(), Some(20009));
+        assert_eq!(rank, Some(2));
+        assert!(parsed.username().is_empty(), "no userinfo pollution");
+    }
+
+    // ============================================================
+    // End-to-end: expand → parse → build URL round-trip
+    // ============================================================
+
+    #[tokio::test]
+    async fn test_dp_expand_roundtrip_hostname() {
+        let urls = vec!["http://node1:8087".to_string()];
+        let expanded = get_dp_aware_workers(&urls, &None, 4).await.unwrap();
+
+        for (i, worker_url) in expanded.iter().enumerate() {
+            // Simulate what our fixed vllm_pd_router does:
+            let (base, rank) = parse_worker_url(worker_url);
+            let request_url = format!("{}/v1/completions", base);
+
+            // Verify rank is correct
+            assert_eq!(rank, Some(i));
+
+            // Verify URL is clean for reqwest
+            assert!(!request_url.contains('@'));
+            let parsed = url::Url::parse(&request_url).unwrap();
+            assert_eq!(parsed.host_str(), Some("node1"));
+            assert_eq!(parsed.port(), Some(8087));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_dp_expand_roundtrip_ipv6() {
+        let urls = vec!["https://[2a03:83e4:5006:0090:5f5a:f8c5:0400:0000]:20009".to_string()];
+        let expanded = get_dp_aware_workers(&urls, &None, 4).await.unwrap();
+
+        for (i, worker_url) in expanded.iter().enumerate() {
+            let (base, rank) = parse_worker_url(worker_url);
+            let request_url = format!("{}/v1/completions", base);
+
+            assert_eq!(rank, Some(i));
+            assert!(!request_url.contains('@'));
+            let parsed = url::Url::parse(&request_url).unwrap();
+            assert_eq!(
+                parsed.host_str(),
+                Some("[2a03:83e4:5006:90:5f5a:f8c5:400:0]")
+            );
+            assert_eq!(parsed.port(), Some(20009));
+        }
+    }
 }
