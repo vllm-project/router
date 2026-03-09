@@ -3,13 +3,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rerun-if-changed=src/proto/vllm_scheduler.proto");
 
     // Configure protobuf compilation with custom settings
-    let config = prost_build::Config::new();
+    let config = tonic_prost_build::Config::new();
 
     // Skip serde for types that use prost_types::Struct
     // These cause conflicts and we don't need serde for all generated types
 
     // Configure tonic-build for gRPC code generation
-    tonic_build::configure()
+    tonic_prost_build::configure()
         // Generate both client and server code
         .build_server(true)
         .build_client(true)
@@ -23,7 +23,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "#[allow(unused, clippy::mixed_attributes_style)]",
         )
         // Compile the proto file with the custom config
-        .compile_protos_with_config(config, &["src/proto/vllm_scheduler.proto"], &["src/proto"])?;
+        .compile_with_config(config, &["src/proto/vllm_scheduler.proto"], &["src/proto"])?;
 
     println!("cargo:warning=Protobuf compilation completed successfully");
 
