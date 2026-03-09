@@ -3492,9 +3492,7 @@ mod tests {
 
         match message {
             ChatMessage::Assistant {
-                content,
-                reasoning,
-                ..
+                content, reasoning, ..
             } => {
                 assert_eq!(content.as_ref().unwrap(), "Hello there!");
                 assert_eq!(
@@ -3521,15 +3519,10 @@ mod tests {
 
         match message {
             ChatMessage::Assistant {
-                content,
-                reasoning,
-                ..
+                content, reasoning, ..
             } => {
                 assert!(content.is_none());
-                assert_eq!(
-                    reasoning.as_ref().unwrap(),
-                    "Deep thinking in progress..."
-                );
+                assert_eq!(reasoning.as_ref().unwrap(), "Deep thinking in progress...");
             }
             _ => panic!("Expected Assistant message"),
         }
@@ -3682,9 +3675,7 @@ mod tests {
 
         match deserialized {
             ChatMessage::Assistant {
-                content,
-                reasoning,
-                ..
+                content, reasoning, ..
             } => {
                 assert_eq!(content.as_ref().unwrap(), "Hello!");
                 assert_eq!(reasoning.as_ref().unwrap(), "Thinking...");
