@@ -231,7 +231,7 @@ fn create_large_chat_completion_request() -> ChatCompletionRequest {
             name: None,
             tool_calls: None,
             function_call: None,
-            reasoning_content: None,
+            reasoning: None,
         });
     }
 

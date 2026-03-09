@@ -58,7 +58,7 @@ use std::collections::HashMap;
 // Note: We implement Deserialize manually below to dispatch based on the "role" field.
 // This fixes a bug where serde's untagged enum matching would incorrectly match Assistant
 // messages as System messages (because System only requires role + content, serde tries
-// it first and silently ignores reasoning_content and other Assistant-specific fields).
+// it first and silently ignores reasoning and other Assistant-specific fields).
 #[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
 pub enum ChatMessage {
@@ -84,9 +84,9 @@ pub enum ChatMessage {
         tool_calls: Option<Vec<ToolCall>>,
         #[serde(skip_serializing_if = "Option::is_none")]
         function_call: Option<FunctionCallResponse>,
-        /// Reasoning content for O1-style models (VLLM extension)
+        /// Reasoning content for reasoning models
         #[serde(skip_serializing_if = "Option::is_none")]
-        reasoning_content: Option<String>,
+        reasoning: Option<String>,
     },
     Tool {
         role: String, // "tool"
@@ -144,7 +144,7 @@ impl<'de> Deserialize<'de> for ChatMessage {
                         serde_json::from_value(fc.clone()).ok()
                     }
                 }),
-                reasoning_content: value.get("reasoning_content").and_then(|r| {
+                reasoning: value.get("reasoning").and_then(|r| {
                     if r.is_null() {
                         None
                     } else {
@@ -316,9 +316,9 @@ pub struct ChatMessageDelta {
     pub tool_calls: Option<Vec<ToolCallDelta>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub function_call: Option<FunctionCallDelta>,
-    /// Reasoning content delta for O1-style models (VLLM extension)
+    /// Reasoning content delta for reasoning models
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub reasoning_content: Option<String>,
+    pub reasoning: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -3481,11 +3481,11 @@ mod tests {
     // ==================================================================
 
     #[test]
-    fn test_chat_message_assistant_with_reasoning_content() {
+    fn test_chat_message_assistant_with_reasoning() {
         let json = r#"{
             "role": "assistant",
             "content": "Hello there!",
-            "reasoning_content": "Let me think about how to greet the user..."
+            "reasoning": "Let me think about how to greet the user..."
         }"#;
 
         let message: ChatMessage = serde_json::from_str(json).unwrap();
@@ -3493,12 +3493,12 @@ mod tests {
         match message {
             ChatMessage::Assistant {
                 content,
-                reasoning_content,
+                reasoning,
                 ..
             } => {
                 assert_eq!(content.as_ref().unwrap(), "Hello there!");
                 assert_eq!(
-                    reasoning_content.as_ref().unwrap(),
+                    reasoning.as_ref().unwrap(),
                     "Let me think about how to greet the user..."
                 );
             }
@@ -3514,7 +3514,7 @@ mod tests {
         let json = r#"{
             "role": "assistant",
             "content": null,
-            "reasoning_content": "Deep thinking in progress..."
+            "reasoning": "Deep thinking in progress..."
         }"#;
 
         let message: ChatMessage = serde_json::from_str(json).unwrap();
@@ -3522,12 +3522,12 @@ mod tests {
         match message {
             ChatMessage::Assistant {
                 content,
-                reasoning_content,
+                reasoning,
                 ..
             } => {
                 assert!(content.is_none());
                 assert_eq!(
-                    reasoning_content.as_ref().unwrap(),
+                    reasoning.as_ref().unwrap(),
                     "Deep thinking in progress..."
                 );
             }
@@ -3674,7 +3674,7 @@ mod tests {
             name: None,
             tool_calls: None,
             function_call: None,
-            reasoning_content: Some("Thinking...".to_string()),
+            reasoning: Some("Thinking...".to_string()),
         };
 
         let serialized = serde_json::to_string(&original).unwrap();
@@ -3683,11 +3683,11 @@ mod tests {
         match deserialized {
             ChatMessage::Assistant {
                 content,
-                reasoning_content,
+                reasoning,
                 ..
             } => {
                 assert_eq!(content.as_ref().unwrap(), "Hello!");
-                assert_eq!(reasoning_content.as_ref().unwrap(), "Thinking...");
+                assert_eq!(reasoning.as_ref().unwrap(), "Thinking...");
             }
             _ => panic!("Expected Assistant message"),
         }
