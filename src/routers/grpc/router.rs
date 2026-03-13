@@ -197,7 +197,7 @@ impl RouterTrait for GrpcRouter {
     async fn route_chat(
         &self,
         _headers: Option<&HeaderMap>,
-        _body: &crate::protocols::spec::ChatCompletionRequest,
+        _body: &serde_json::Value,
         _model_id: Option<&str>,
     ) -> Response {
         (StatusCode::NOT_IMPLEMENTED).into_response()

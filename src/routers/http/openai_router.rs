@@ -2,9 +2,7 @@
 
 use crate::config::CircuitBreakerConfig;
 use crate::core::{CircuitBreaker, CircuitBreakerConfig as CoreCircuitBreakerConfig};
-use crate::protocols::spec::{
-    ChatCompletionRequest, CompletionRequest, GenerateRequest, RerankRequest,
-};
+use crate::protocols::spec::{CompletionRequest, GenerateRequest, RerankRequest};
 use async_trait::async_trait;
 use axum::{
     body::Body,
@@ -199,24 +197,20 @@ impl super::super::RouterTrait for OpenAIRouter {
     async fn route_chat(
         &self,
         headers: Option<&HeaderMap>,
-        body: &ChatCompletionRequest,
+        body: &serde_json::Value,
         _model_id: Option<&str>,
     ) -> Response {
         if !self.circuit_breaker.can_execute() {
             return (StatusCode::SERVICE_UNAVAILABLE, "Circuit breaker open").into_response();
         }
 
-        // Serialize request body, removing VLLM-only fields
-        let mut payload = match serde_json::to_value(body) {
-            Ok(v) => v,
-            Err(e) => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    format!("Failed to serialize request: {}", e),
-                )
-                    .into_response();
-            }
-        };
+        let is_stream = body
+            .get("stream")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        // Clone and remove VLLM-only fields before sending to OpenAI backend
+        let mut payload = body.clone();
         if let Some(obj) = payload.as_object_mut() {
             for key in [
                 "top_k",
@@ -252,7 +246,7 @@ impl super::super::RouterTrait for OpenAIRouter {
         }
 
         // Accept SSE when stream=true
-        if body.stream {
+        if is_stream {
             req = req.header("Accept", "text/event-stream");
         }
 
@@ -271,7 +265,7 @@ impl super::super::RouterTrait for OpenAIRouter {
         let status = StatusCode::from_u16(resp.status().as_u16())
             .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
 
-        if !body.stream {
+        if !is_stream {
             // Capture Content-Type before consuming response body
             let content_type = resp.headers().get(CONTENT_TYPE).cloned();
             match resp.bytes().await {

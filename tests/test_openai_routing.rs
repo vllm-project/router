@@ -12,10 +12,7 @@ use std::sync::Arc;
 use tower::ServiceExt;
 use vllm_router_rs::{
     config::{RouterConfig, RoutingMode},
-    protocols::spec::{
-        ChatCompletionRequest, ChatMessage, CompletionRequest, GenerateRequest, PromptInput,
-        UserMessageContent,
-    },
+    protocols::spec::{CompletionRequest, GenerateRequest, PromptInput},
     routers::{openai_router::OpenAIRouter, RouterTrait},
 };
 
@@ -23,15 +20,14 @@ mod common;
 use common::mock_openai_server::MockOpenAIServer;
 
 /// Helper function to create a minimal chat completion request for testing
-fn create_minimal_chat_request() -> ChatCompletionRequest {
-    let val = json!({
+fn create_minimal_chat_request() -> serde_json::Value {
+    json!({
         "model": "gpt-3.5-turbo",
         "messages": [
             {"role": "user", "content": "Hello"}
         ],
         "max_tokens": 100
-    });
-    serde_json::from_value(val).unwrap()
+    })
 }
 
 /// Helper function to create a minimal completion request for testing
@@ -221,14 +217,15 @@ async fn test_openai_router_chat_completion_with_mock() {
     // Create router pointing to mock server
     let router = OpenAIRouter::new(base_url, None).await.unwrap();
 
-    // Create a minimal chat completion request
-    let mut chat_request = create_minimal_chat_request();
-    chat_request.messages = vec![ChatMessage::User {
-        role: "user".to_string(),
-        content: UserMessageContent::Text("Hello, how are you?".to_string()),
-        name: None,
-    }];
-    chat_request.temperature = Some(0.7);
+    // Create a chat completion request as JSON Value
+    let chat_request = json!({
+        "model": "gpt-3.5-turbo",
+        "messages": [
+            {"role": "user", "content": "Hello, how are you?"}
+        ],
+        "max_tokens": 100,
+        "temperature": 0.7
+    });
 
     // Route the request
     let response = router.route_chat(None, &chat_request, None).await;
@@ -267,10 +264,9 @@ async fn test_openai_e2e_with_server() {
                 async move {
                     let (parts, body) = req.into_parts();
                     let body_bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
-                    let body_str = String::from_utf8(body_bytes.to_vec()).unwrap();
 
-                    let chat_request: ChatCompletionRequest =
-                        serde_json::from_str(&body_str).unwrap();
+                    let chat_request: serde_json::Value =
+                        serde_json::from_slice(&body_bytes).unwrap();
 
                     router
                         .route_chat(Some(&parts.headers), &chat_request, None)
@@ -322,7 +318,7 @@ async fn test_openai_router_chat_streaming_with_mock() {
     let router = OpenAIRouter::new(base_url, None).await.unwrap();
 
     // Build a streaming chat request
-    let val = json!({
+    let chat_request = json!({
         "model": "gpt-3.5-turbo",
         "messages": [
             {"role": "user", "content": "Hello"}
@@ -330,7 +326,6 @@ async fn test_openai_router_chat_streaming_with_mock() {
         "max_tokens": 10,
         "stream": true
     });
-    let chat_request: ChatCompletionRequest = serde_json::from_value(val).unwrap();
 
     let response = router.route_chat(None, &chat_request, None).await;
     assert_eq!(response.status(), StatusCode::OK);
@@ -433,7 +428,7 @@ async fn test_openai_router_chat_with_reasoning_fields() {
     let router = OpenAIRouter::new(base_url, None).await.unwrap();
 
     // Create a chat request with all three new reasoning fields
-    let val = json!({
+    let chat_request = json!({
         "model": "gpt-3.5-turbo",
         "messages": [
             {"role": "user", "content": "What is 2+2?"}
@@ -443,15 +438,11 @@ async fn test_openai_router_chat_with_reasoning_fields() {
         "reasoning_effort": "low",
         "include_reasoning": false
     });
-    let chat_request: ChatCompletionRequest = serde_json::from_value(val).unwrap();
 
-    // Verify the fields are correctly deserialized
-    assert_eq!(chat_request.echo, Some(true));
-    assert!(!chat_request.include_reasoning);
-    assert!(matches!(
-        chat_request.reasoning_effort,
-        Some(vllm_router_rs::protocols::spec::ReasoningEffort::Low)
-    ));
+    // Verify the fields exist in the JSON
+    assert_eq!(chat_request["echo"], true);
+    assert_eq!(chat_request["include_reasoning"], false);
+    assert_eq!(chat_request["reasoning_effort"], "low");
 
     // Route the request to mock server
     let response = router.route_chat(None, &chat_request, None).await;

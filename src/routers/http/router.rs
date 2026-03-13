@@ -6,8 +6,8 @@ use crate::core::{
 use crate::metrics::RouterMetrics;
 use crate::policies::{LoadBalancingPolicy, PolicyRegistry};
 use crate::protocols::spec::{
-    ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest, GenerationRequest,
-    RerankRequest, RerankResponse, RerankResult, ResponsesRequest,
+    CompletionRequest, EmbeddingRequest, GenerateRequest, GenerationRequest, RerankRequest,
+    RerankResponse, RerankResult, ResponsesRequest,
 };
 use crate::routers::header_utils;
 use crate::routers::http::dp_utils;
@@ -586,6 +586,114 @@ impl Router {
 
                 // For retryable failures, we need to decrement load since send_typed_request
                 // won't have done it (it only decrements on success or non-retryable failures)
+                if is_retryable_status(response.status()) && load_incremented {
+                    if let Some(cleanup_worker) = worker_for_cleanup {
+                        cleanup_worker.decrement_load();
+                        RouterMetrics::set_running_requests(
+                            cleanup_worker.url(),
+                            cleanup_worker.load(),
+                        );
+                    }
+                }
+
+                response
+            },
+            // should_retry predicate
+            |res, _attempt| is_retryable_status(res.status()),
+            // on_backoff hook
+            |delay, attempt| {
+                RouterMetrics::record_retry(route);
+                RouterMetrics::record_retry_backoff_duration(delay, attempt);
+            },
+            // on_exhausted hook
+            || RouterMetrics::record_retries_exhausted(route),
+        )
+        .await;
+
+        if response.status().is_success() {
+            let duration = start.elapsed();
+            RouterMetrics::record_request(route);
+            RouterMetrics::record_generate_duration(duration);
+        } else if !is_retryable_status(response.status()) {
+            RouterMetrics::record_request_error(route, "non_retryable_error");
+        }
+
+        response
+    }
+
+    /// Route a request using a raw JSON Value instead of a typed struct.
+    /// This preserves all unknown fields through the proxy (no struct round-trip).
+    /// Provides the same features as route_typed_request: retry, circuit breaker,
+    /// load tracking, metrics, and streaming SSE handling.
+    pub async fn route_value_request(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &serde_json::Value,
+        route: &str,
+        model_id: Option<&str>,
+    ) -> Response {
+        let start = Instant::now();
+        let is_stream = body
+            .get("stream")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let text = body
+            .get("session_params")
+            .and_then(|sp| sp.get("session_id"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        let response = RetryExecutor::execute_response_with_retry(
+            &self.retry_config,
+            // operation per attempt
+            |_: u32| async {
+                let worker = match self.select_worker_for_model(model_id, Some(&text), headers) {
+                    Some(w) => w,
+                    None => {
+                        RouterMetrics::record_request_error(route, "no_available_workers");
+                        return (
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "No available workers (all circuits open or unhealthy)",
+                        )
+                            .into_response();
+                    }
+                };
+
+                // Optional load tracking for cache-aware policy
+                let policy = match model_id {
+                    Some(model) => self.policy_registry.get_policy_or_default(model),
+                    None => self.policy_registry.get_default_policy(),
+                };
+
+                let load_incremented = if policy.name() == "cache_aware" {
+                    worker.increment_load();
+                    RouterMetrics::set_running_requests(worker.url(), worker.load());
+                    true
+                } else {
+                    false
+                };
+
+                let worker_for_cleanup = if load_incremented {
+                    Some(worker.clone())
+                } else {
+                    None
+                };
+
+                let response = self
+                    .send_typed_request(
+                        headers,
+                        body,
+                        route,
+                        worker.url(),
+                        is_stream,
+                        load_incremented,
+                    )
+                    .await;
+
+                let status = response.status();
+                worker.record_outcome(status.is_success() || status.is_client_error());
+
                 if is_retryable_status(response.status()) && load_incremented {
                     if let Some(cleanup_worker) = worker_for_cleanup {
                         cleanup_worker.decrement_load();
@@ -1399,10 +1507,10 @@ impl RouterTrait for Router {
     async fn route_chat(
         &self,
         headers: Option<&HeaderMap>,
-        body: &ChatCompletionRequest,
+        body: &serde_json::Value,
         model_id: Option<&str>,
     ) -> Response {
-        self.route_typed_request(headers, body, "/v1/chat/completions", model_id)
+        self.route_value_request(headers, body, "/v1/chat/completions", model_id)
             .await
     }
 
