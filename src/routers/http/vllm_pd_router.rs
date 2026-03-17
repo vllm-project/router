@@ -1172,7 +1172,7 @@ impl RouterTrait for VllmPDRouter {
     async fn route_chat(
         &self,
         headers: Option<&HeaderMap>,
-        body: &crate::protocols::spec::ChatCompletionRequest,
+        body: &serde_json::Value,
         _model_id: Option<&str>,
     ) -> Response {
         info!(
@@ -1184,23 +1184,11 @@ impl RouterTrait for VllmPDRouter {
             // Discovery mode - use vLLM-specific two-stage processing
             info!("Using service discovery mode, processing vLLM two-stage request");
 
-            // Convert to generic request and use vLLM processing
-            let request_json = match serde_json::to_value(body) {
-                Ok(json) => {
-                    debug!(
-                        "Serialized chat request: {}",
-                        serde_json::to_string_pretty(&json).unwrap_or_default()
-                    );
-                    json
-                }
-                Err(e) => {
-                    return (
-                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("Serialization error: {}", e),
-                    )
-                        .into_response()
-                }
-            };
+            let request_json = body.clone();
+            debug!(
+                "Chat request: {}",
+                serde_json::to_string_pretty(&request_json).unwrap_or_default()
+            );
 
             // Process vLLM two-stage request with service discovery
             self.process_vllm_request(request_json, "/v1/chat/completions", headers)
@@ -1209,23 +1197,11 @@ impl RouterTrait for VllmPDRouter {
             // Direct URL mode - implement routing logic here (not delegating to PDRouter)
             info!("Using direct URL mode with VllmPDRouter's own routing logic");
 
-            // Convert request to JSON
-            let request_json = match serde_json::to_value(body) {
-                Ok(json) => {
-                    debug!(
-                        "Serialized chat request: {}",
-                        serde_json::to_string_pretty(&json).unwrap_or_default()
-                    );
-                    json
-                }
-                Err(e) => {
-                    return (
-                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("Serialization error: {}", e),
-                    )
-                        .into_response()
-                }
-            };
+            let request_json = body.clone();
+            debug!(
+                "Chat request: {}",
+                serde_json::to_string_pretty(&request_json).unwrap_or_default()
+            );
 
             // Get prefill and decode workers from worker_registry
             let prefill_workers = self.pd_router.worker_registry.get_prefill_workers();

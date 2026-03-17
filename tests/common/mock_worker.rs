@@ -148,8 +148,12 @@ impl Drop for MockWorker {
 
 // Handler implementations
 
-/// Check if request should fail based on configured fail_rate
+/// Check if request should fail based on configured fail_rate or deterministic failure schedule
 async fn should_fail(config: &MockWorkerConfig) -> bool {
+    // Check deterministic failure schedule first (set via set_deterministic_failures)
+    if let Some(should) = check_deterministic_failure(config.port) {
+        return should;
+    }
     rand::random::<f32>() < config.fail_rate
 }
 
@@ -404,8 +408,13 @@ async fn chat_completions_handler(
 ) -> Response {
     let config = config.read().await;
 
-    // Capture request for test inspection
-    capture_request(config.port, "/v1/chat/completions", &headers);
+    // Capture request with body for test inspection
+    capture_request_with_body(
+        config.port,
+        "/v1/chat/completions",
+        &headers,
+        Some(payload.clone()),
+    );
 
     if should_fail(&config).await {
         return (
@@ -886,11 +895,12 @@ impl Default for MockWorkerConfig {
 
 // --- Request header capture for verifying router behavior (e.g., X-data-parallel-rank) ---
 
-/// A captured request with headers and path
+/// A captured request with headers, path, and optionally the request body
 #[derive(Debug, Clone)]
 pub struct CapturedRequest {
     pub path: String,
     pub headers: HashMap<String, String>,
+    pub body: Option<serde_json::Value>,
 }
 
 static REQ_CAPTURE_STORE: OnceLock<Mutex<HashMap<u16, Vec<CapturedRequest>>>> = OnceLock::new();
@@ -899,8 +909,18 @@ fn get_capture_store() -> &'static Mutex<HashMap<u16, Vec<CapturedRequest>>> {
     REQ_CAPTURE_STORE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Record a request for a given worker port
+/// Record a request for a given worker port (without body)
 pub fn capture_request(port: u16, path: &str, headers: &axum::http::HeaderMap) {
+    capture_request_with_body(port, path, headers, None);
+}
+
+/// Record a request for a given worker port (with optional body)
+pub fn capture_request_with_body(
+    port: u16,
+    path: &str,
+    headers: &axum::http::HeaderMap,
+    body: Option<serde_json::Value>,
+) {
     let captured = CapturedRequest {
         path: path.to_string(),
         headers: headers
@@ -912,6 +932,7 @@ pub fn capture_request(port: u16, path: &str, headers: &axum::http::HeaderMap) {
                     .map(|v| (name.as_str().to_string(), v.to_string()))
             })
             .collect(),
+        body,
     };
     let mut store = get_capture_store().lock().unwrap();
     store.entry(port).or_default().push(captured);
@@ -927,4 +948,49 @@ pub fn get_captured_requests(port: u16) -> Vec<CapturedRequest> {
 pub fn clear_captured_requests(port: u16) {
     let mut store = get_capture_store().lock().unwrap();
     store.remove(&port);
+}
+
+// --- Deterministic failure scheduling ---
+
+struct DeterministicFailureState {
+    fail_on_requests: Vec<usize>,
+    counter: usize,
+}
+
+static DETERMINISTIC_FAILURE_STORE: OnceLock<Mutex<HashMap<u16, DeterministicFailureState>>> =
+    OnceLock::new();
+
+fn get_failure_store() -> &'static Mutex<HashMap<u16, DeterministicFailureState>> {
+    DETERMINISTIC_FAILURE_STORE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Set deterministic failure schedule for a worker port.
+/// `fail_on_requests` is a list of 1-indexed request numbers that should fail.
+pub fn set_deterministic_failures(port: u16, fail_on_requests: Vec<usize>) {
+    let mut store = get_failure_store().lock().unwrap();
+    store.insert(
+        port,
+        DeterministicFailureState {
+            fail_on_requests,
+            counter: 0,
+        },
+    );
+}
+
+/// Clear deterministic failure schedule for a worker port.
+pub fn clear_deterministic_failures(port: u16) {
+    let mut store = get_failure_store().lock().unwrap();
+    store.remove(&port);
+}
+
+/// Check if the current request should fail deterministically.
+/// Returns None if no schedule is set for this port.
+fn check_deterministic_failure(port: u16) -> Option<bool> {
+    let mut store = get_failure_store().lock().unwrap();
+    if let Some(state) = store.get_mut(&port) {
+        state.counter += 1;
+        Some(state.fail_on_requests.contains(&state.counter))
+    } else {
+        None
+    }
 }

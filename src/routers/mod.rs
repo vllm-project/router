@@ -10,8 +10,7 @@ use axum::{
 use std::fmt::Debug;
 
 use crate::protocols::spec::{
-    ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest, RerankRequest,
-    ResponsesRequest,
+    CompletionRequest, EmbeddingRequest, GenerateRequest, RerankRequest, ResponsesRequest,
 };
 
 pub mod factory;
@@ -72,11 +71,11 @@ pub trait RouterTrait: Send + Sync + Debug + WorkerManagement {
         model_id: Option<&str>,
     ) -> Response;
 
-    /// Route a chat completion request
+    /// Route a chat completion request (accepts raw JSON for transparent pass-through)
     async fn route_chat(
         &self,
         headers: Option<&HeaderMap>,
-        body: &ChatCompletionRequest,
+        body: &serde_json::Value,
         model_id: Option<&str>,
     ) -> Response;
 

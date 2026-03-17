@@ -8,8 +8,7 @@ use crate::{
     policies::PolicyRegistry,
     protocols::{
         spec::{
-            ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest,
-            RerankRequest, V1RerankReqInput,
+            CompletionRequest, EmbeddingRequest, GenerateRequest, RerankRequest, V1RerankReqInput,
         },
         worker_spec::{WorkerApiResponse, WorkerConfigRequest, WorkerErrorResponse},
     },
@@ -255,13 +254,17 @@ async fn generate(
 async fn v1_chat_completions(
     State(state): State<Arc<AppState>>,
     headers: http::HeaderMap,
-    Json(body): Json<ChatCompletionRequest>,
+    Json(body): Json<serde_json::Value>,
 ) -> Response {
     if let Err(response) = authorize_request(&state, &headers).await {
         return response;
     }
 
-    state.router.route_chat(Some(&headers), &body, None).await
+    let model_id = body.get("model").and_then(|v| v.as_str());
+    state
+        .router
+        .route_chat(Some(&headers), &body, model_id)
+        .await
 }
 
 async fn v1_completions(

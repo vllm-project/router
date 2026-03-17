@@ -11,8 +11,7 @@ use crate::core::{
 use crate::metrics::RouterMetrics;
 use crate::policies::{LoadBalancingPolicy, PolicyRegistry};
 use crate::protocols::spec::{
-    ChatCompletionRequest, ChatMessage, CompletionRequest, GenerateRequest, RerankRequest,
-    ResponsesRequest, StringOrArray, UserMessageContent,
+    CompletionRequest, GenerateRequest, RerankRequest, ResponsesRequest, StringOrArray,
 };
 use crate::routers::header_utils;
 use crate::routers::{RouterTrait, WorkerManagement};
@@ -745,17 +744,6 @@ impl PDRouter {
             if text.contains("[") && text.contains("]") {
                 // This is a simplified check - in reality we'd need to parse JSON
                 return None; // For now, fall back to non-batch
-            }
-        }
-        None
-    }
-
-    // Helper to determine batch size from a ChatCompletionRequest
-    fn get_chat_batch_size(req: &ChatCompletionRequest) -> Option<usize> {
-        // Check 'n' parameter for multiple responses
-        if let Some(n) = req.n {
-            if n > 1 {
-                return Some(n as usize);
             }
         }
         None
@@ -2013,29 +2001,46 @@ impl RouterTrait for PDRouter {
     async fn route_chat(
         &self,
         headers: Option<&HeaderMap>,
-        body: &ChatCompletionRequest,
+        body: &serde_json::Value,
         model_id: Option<&str>,
     ) -> Response {
-        // Extract parameters
-        let is_stream = body.stream;
-        let return_logprob = body.logprobs;
+        // Extract parameters from JSON
+        let is_stream = body
+            .get("stream")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let return_logprob = body
+            .get("logprobs")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
 
-        // Extract text for cache-aware routing
+        // Extract text for cache-aware routing from first message
         let request_text = if self.policies_need_request_text() {
-            body.messages.first().and_then(|msg| match msg {
-                ChatMessage::User { content, .. } => match content {
-                    UserMessageContent::Text(text) => Some(text.clone()),
-                    UserMessageContent::Parts(_) => None,
-                },
-                ChatMessage::System { content, .. } => Some(content.clone()),
-                _ => None,
-            })
+            body.get("messages")
+                .and_then(|msgs| msgs.as_array())
+                .and_then(|msgs| msgs.first())
+                .and_then(|msg| {
+                    let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
+                    match role {
+                        "user" | "system" => msg
+                            .get("content")
+                            .and_then(|c| c.as_str())
+                            .map(|s| s.to_string()),
+                        _ => None,
+                    }
+                })
         } else {
             None
         };
 
-        // Calculate batch size
-        let batch_size = Self::get_chat_batch_size(body);
+        // Calculate batch size from 'n' parameter
+        let batch_size = body.get("n").and_then(|v| v.as_u64()).and_then(|n| {
+            if n > 1 {
+                Some(n as usize)
+            } else {
+                None
+            }
+        });
 
         // Create context
         let context = PDRequestContext {

@@ -7,8 +7,7 @@
 use crate::config::RouterConfig;
 use crate::core::{CircuitBreakerConfig, Worker, WorkerFactory, WorkerRegistry, WorkerType};
 use crate::protocols::spec::{
-    ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest, RerankRequest,
-    ResponsesRequest,
+    CompletionRequest, EmbeddingRequest, GenerateRequest, RerankRequest, ResponsesRequest,
 };
 use crate::protocols::worker_spec::{
     ServerInfo, WorkerApiResponse, WorkerConfigRequest, WorkerErrorResponse, WorkerInfo,
@@ -589,14 +588,14 @@ impl RouterTrait for RouterManager {
     async fn route_chat(
         &self,
         headers: Option<&HeaderMap>,
-        body: &ChatCompletionRequest,
+        body: &serde_json::Value,
         _model_id: Option<&str>,
     ) -> Response {
         // Select router based on headers and model.
         // When model is None, select_router_for_request considers all registered
         // routers (including PD routers), so a single-model deployment will still
         // route correctly even without the model field.
-        let model_id = body.model.as_deref();
+        let model_id = body.get("model").and_then(|v| v.as_str());
         let router = self.select_router_for_request(headers, model_id);
 
         if let Some(router) = router {
