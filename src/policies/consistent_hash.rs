@@ -317,8 +317,8 @@ impl ConsistentHashPolicy {
         "x-session-id",
         "x-user-id",
         "x-tenant-id",
+        "x-correlation-id", // per-session — check before per-request
         "x-request-id",
-        "x-correlation-id",
         "x-trace-id",
     ];
 

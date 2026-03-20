@@ -715,4 +715,113 @@ mod consistent_hash_policy_tests {
             "ConsistentHashPolicy should report that it needs headers"
         );
     }
+
+    #[test]
+    fn test_correlation_id_priority_over_request_id() {
+        let policy = ConsistentHashPolicy::new();
+        let workers = create_test_workers();
+
+        let correlation_id = "session-correlation-abc";
+        let request_id = "unique-request-xyz";
+
+        // Test with x-correlation-id only
+        let correlation_headers = create_headers(&[("x-correlation-id", correlation_id)]);
+        let correlation_worker = policy
+            .select_worker_with_headers(
+                &workers,
+                Some(r#"{"prompt": "test"}"#),
+                Some(&correlation_headers),
+            )
+            .expect("Should select worker with x-correlation-id");
+
+        // Test with both headers - x-correlation-id should win
+        let both_headers = create_headers(&[
+            ("x-correlation-id", correlation_id),
+            ("x-request-id", request_id),
+        ]);
+        let both_worker = policy
+            .select_worker_with_headers(
+                &workers,
+                Some(r#"{"prompt": "test"}"#),
+                Some(&both_headers),
+            )
+            .expect("Should select worker with both headers");
+
+        assert_eq!(
+            correlation_worker, both_worker,
+            "x-correlation-id should take priority over x-request-id"
+        );
+    }
+
+    #[test]
+    fn test_correlation_id_consistent_across_turns() {
+        let policy = ConsistentHashPolicy::new();
+        let workers = create_test_workers();
+
+        let correlation_id = "multi-turn-session-123";
+
+        // Simulate multiple turns with same correlation ID but different request IDs
+        let mut selected_workers = Vec::new();
+        for i in 0..10 {
+            let headers = create_headers(&[
+                ("x-correlation-id", correlation_id),
+                ("x-request-id", &format!("request-turn-{}", i)),
+            ]);
+            let worker = policy
+                .select_worker_with_headers(
+                    &workers,
+                    Some(r#"{"prompt": "test"}"#),
+                    Some(&headers),
+                )
+                .expect("Should select worker");
+            selected_workers.push(worker);
+        }
+
+        // All turns should route to the same worker
+        let first_worker = &selected_workers[0];
+        for (i, worker) in selected_workers.iter().enumerate() {
+            assert_eq!(
+                first_worker, worker,
+                "Turn {} should route to same worker as turn 0 when x-correlation-id is shared",
+                i
+            );
+        }
+    }
+
+    #[test]
+    fn test_tenant_id_priority_over_correlation_id() {
+        let policy = ConsistentHashPolicy::new();
+        let workers = create_test_workers();
+
+        let tenant_id = "tenant-abc";
+        let correlation_id = "correlation-xyz";
+
+        // Test with x-tenant-id only
+        let tenant_headers = create_headers(&[("x-tenant-id", tenant_id)]);
+        let tenant_worker = policy
+            .select_worker_with_headers(
+                &workers,
+                Some(r#"{"prompt": "test"}"#),
+                Some(&tenant_headers),
+            )
+            .expect("Should select worker with x-tenant-id");
+
+        // Test with both headers - x-tenant-id should win
+        let both_headers = create_headers(&[
+            ("x-tenant-id", tenant_id),
+            ("x-correlation-id", correlation_id),
+        ]);
+        let both_worker = policy
+            .select_worker_with_headers(
+                &workers,
+                Some(r#"{"prompt": "test"}"#),
+                Some(&both_headers),
+            )
+            .expect("Should select worker with both headers");
+
+        assert_eq!(
+            tenant_worker, both_worker,
+            "x-tenant-id should take priority over x-correlation-id"
+        );
+    }
 }
