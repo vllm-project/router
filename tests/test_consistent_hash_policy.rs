@@ -768,11 +768,7 @@ mod consistent_hash_policy_tests {
                 ("x-request-id", &format!("request-turn-{}", i)),
             ]);
             let worker = policy
-                .select_worker_with_headers(
-                    &workers,
-                    Some(r#"{"prompt": "test"}"#),
-                    Some(&headers),
-                )
+                .select_worker_with_headers(&workers, Some(r#"{"prompt": "test"}"#), Some(&headers))
                 .expect("Should select worker");
             selected_workers.push(worker);
         }
