@@ -17,7 +17,7 @@ use crate::core::Worker;
 use crate::metrics::RouterMetrics;
 
 /// Number of virtual nodes per physical worker (for better load distribution)
-const VIRTUAL_NODES_PER_WORKER: u32 = 160;
+pub const VIRTUAL_NODES_PER_WORKER: u32 = 160;
 
 /// Consistent hashing policy
 ///
@@ -229,7 +229,7 @@ impl ConsistentHashPolicy {
     }
 
     /// Facebook-style hash function using furc_hash for consistent hashing
-    fn fbi_hash(key: &str) -> u64 {
+    pub fn fbi_hash(key: &str) -> u64 {
         // Use furc_hash with a large modulus to get good distribution
         // Then expand to u64 for our hash ring
         const LARGE_MODULUS: u32 = (1u32 << 23) - 1; // Max furc_hash modulus
