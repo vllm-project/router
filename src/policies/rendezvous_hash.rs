@@ -8,10 +8,10 @@
 
 use std::sync::Arc;
 
-use tracing::debug;
 use tracing::info;
 
 use super::get_healthy_worker_indices;
+use super::hash_key;
 use super::LoadBalancingPolicy;
 use super::RequestHeaders;
 use crate::core::Worker;
@@ -30,103 +30,6 @@ pub struct RendezvousHashPolicy;
 impl RendezvousHashPolicy {
     pub fn new() -> Self {
         Self
-    }
-
-    /// HTTP header names to check for session ID (same priority as consistent_hash)
-    const SESSION_HEADER_NAMES: &'static [&'static str] = &[
-        "x-session-id",
-        "x-user-id",
-        "x-tenant-id",
-        "x-correlation-id",
-        "x-request-id",
-        "x-trace-id",
-    ];
-
-    /// Extract hash key from HTTP headers
-    fn extract_hash_key_from_headers(&self, headers: &RequestHeaders) -> Option<String> {
-        for header_name in Self::SESSION_HEADER_NAMES {
-            if let Some(value) = headers.get(*header_name) {
-                if !value.is_empty() {
-                    debug!(
-                        "Rendezvous hash: found session key in header '{}': {}",
-                        header_name, value
-                    );
-                    return Some(format!("header:{}:{}", header_name, value));
-                }
-            }
-        }
-        None
-    }
-
-    /// Extract hash key from request body fields
-    fn extract_hash_key_from_body(&self, request_text: Option<&str>) -> Option<String> {
-        let text = request_text.unwrap_or("");
-        if text.is_empty() {
-            return None;
-        }
-
-        // Try JSON field extraction in priority order
-        for (field, prefix) in &[
-            ("session_id", "session"),
-            ("user", "user"),
-            ("user_id", "user"),
-        ] {
-            if let Some(value) = extract_json_field_value(text, field) {
-                return Some(format!("{}:{}", prefix, value));
-            }
-        }
-
-        None
-    }
-
-    /// Extract hash key with priority: headers > body > fallback
-    fn extract_hash_key(
-        &self,
-        request_text: Option<&str>,
-        headers: Option<&RequestHeaders>,
-    ) -> String {
-        if let Some(hdrs) = headers {
-            if let Some(key) = self.extract_hash_key_from_headers(hdrs) {
-                return key;
-            }
-        }
-
-        if let Some(key) = self.extract_hash_key_from_body(request_text) {
-            return key;
-        }
-
-        let text = request_text.unwrap_or("");
-        if text.len() > 100 {
-            format!(
-                "request_hash:{:016x}",
-                ConsistentHashPolicy::fbi_hash(text)
-            )
-        } else {
-            format!("request:{}", text)
-        }
-    }
-}
-
-/// Extract a quoted string value for a JSON field name from text
-fn extract_json_field_value(text: &str, field_name: &str) -> Option<String> {
-    let pattern = format!("\"{}\"", field_name);
-    let field_pos = text.find(&pattern)?;
-    let after_field = &text[field_pos + pattern.len()..];
-
-    // Skip whitespace, find colon
-    let after_colon = after_field.trim_start();
-    if !after_colon.starts_with(':') {
-        return None;
-    }
-    let after_colon = after_colon[1..].trim_start();
-
-    // Extract quoted value
-    if after_colon.starts_with('"') {
-        let value_start = &after_colon[1..];
-        let end_quote = value_start.find('"')?;
-        Some(value_start[..end_quote].to_string())
-    } else {
-        None
     }
 }
 
@@ -149,7 +52,7 @@ impl LoadBalancingPolicy for RendezvousHashPolicy {
             return None;
         }
 
-        let hash_key = self.extract_hash_key(request_text, headers);
+        let hash_key = hash_key::extract_hash_key(request_text, headers);
 
         // Score each healthy worker and pick the highest
         let selected_idx = healthy_indices
@@ -287,7 +190,6 @@ mod tests {
             let idx_3 = policy.select_worker(&workers_3, Some(&request)).unwrap();
             let idx_2 = policy.select_worker(&workers_2, Some(&request)).unwrap();
 
-            // If was on worker1 or worker2, should stay on same worker
             let url_3 = workers_3[idx_3].url();
             let url_2 = workers_2[idx_2].url();
             if url_3 != "http://worker3:8000" && url_3 == url_2 {
@@ -295,9 +197,6 @@ mod tests {
             }
         }
 
-        // Sessions not on worker3 should mostly stay on the same worker
-        // With rendezvous hashing, sessions on worker1/worker2 should NOT move
-        // when worker3 is removed
         let sessions_not_on_worker3 = (0..total)
             .filter(|i| {
                 let request = format!(r#"{{"session_id": "session_{}"}}"#, i);
@@ -326,21 +225,5 @@ mod tests {
         let idx2 = policy.select_worker_with_headers(&workers, None, Some(&headers));
         assert_eq!(idx1, idx2);
         assert!(idx1.is_some());
-    }
-
-    #[test]
-    fn test_extract_json_field_value() {
-        assert_eq!(
-            extract_json_field_value(r#"{"session_id": "abc123"}"#, "session_id"),
-            Some("abc123".to_string())
-        );
-        assert_eq!(
-            extract_json_field_value(r#"{"user": "bob", "prompt": "hi"}"#, "user"),
-            Some("bob".to_string())
-        );
-        assert_eq!(
-            extract_json_field_value(r#"{"other": "val"}"#, "session_id"),
-            None
-        );
     }
 }

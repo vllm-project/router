@@ -11,6 +11,7 @@ use std::sync::Arc;
 mod cache_aware;
 mod consistent_hash;
 mod factory;
+mod hash_key;
 mod power_of_two;
 mod random;
 mod registry;

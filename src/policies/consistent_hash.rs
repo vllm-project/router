@@ -11,6 +11,7 @@ use tracing::debug;
 use tracing::info;
 
 use super::get_healthy_worker_indices;
+use super::hash_key;
 use super::LoadBalancingPolicy;
 use super::RequestHeaders;
 use crate::core::Worker;
@@ -312,241 +313,6 @@ impl ConsistentHashPolicy {
         selected_worker
     }
 
-    /// HTTP header names to check for session ID (case-insensitive, checked in order)
-    const SESSION_HEADER_NAMES: &'static [&'static str] = &[
-        "x-session-id",
-        "x-user-id",
-        "x-tenant-id",
-        "x-correlation-id", // per-session — check before per-request
-        "x-request-id",
-        "x-trace-id",
-    ];
-
-    /// Extract hash key from HTTP headers
-    /// Returns Some(key) if a session/user identifier is found in headers
-    fn extract_hash_key_from_headers(&self, headers: &RequestHeaders) -> Option<String> {
-        for header_name in Self::SESSION_HEADER_NAMES {
-            if let Some(value) = headers.get(*header_name) {
-                if !value.is_empty() {
-                    info!(
-                        "CONSISTENT_HASH_DEBUG: Found session key in header '{}': {}",
-                        header_name, value
-                    );
-                    return Some(format!("header:{}:{}", header_name, value));
-                }
-            }
-        }
-        None
-    }
-
-    /// Extract hash key from request text
-    /// Priority: session_params.session_id > user field > legacy session_id > legacy user_id > request content
-    fn extract_hash_key_from_body(&self, request_text: Option<&str>) -> Option<String> {
-        let text = request_text.unwrap_or("");
-        if text.is_empty() {
-            return None;
-        }
-
-        // 1. Try to extract session_params.session_id first (highest priority in body)
-        if let Some(session_id) =
-            self.extract_nested_field_value(text, "session_params", "session_id")
-        {
-            info!(
-                "CONSISTENT_HASH_DEBUG: Found session_params.session_id: {}",
-                session_id
-            );
-            return Some(format!("session:{}", session_id));
-        }
-
-        // 2. Try to extract direct user field (from OpenAI ChatCompletion/Completion requests)
-        if let Some(user) = self.extract_field_value(text, "user") {
-            info!("CONSISTENT_HASH_DEBUG: Found user field: {}", user);
-            return Some(format!("user:{}", user));
-        }
-
-        // 3. Fallback: try legacy session_id field (for backward compatibility)
-        if let Some(session_id) = self.extract_field_value(text, "session_id") {
-            return Some(format!("session:{}", session_id));
-        }
-
-        // 4. Fallback: try legacy user_id field (for backward compatibility)
-        if let Some(user_id) = self.extract_field_value(text, "user_id") {
-            return Some(format!("user:{}", user_id));
-        }
-
-        None
-    }
-
-    /// Extract hash key with priority: HTTP headers > body fields > request content hash
-    ///
-    /// Priority order:
-    /// 1. HTTP Headers: x-session-id, x-user-id, x-tenant-id, x-request-id, x-correlation-id, x-trace-id
-    /// 2. Body: session_params.session_id
-    /// 3. Body: user field (OpenAI format)
-    /// 4. Body: session_id (legacy)
-    /// 5. Body: user_id (legacy)
-    /// 6. Fallback: hash of request body
-    fn extract_hash_key(
-        &self,
-        request_text: Option<&str>,
-        headers: Option<&RequestHeaders>,
-    ) -> String {
-        // 1. First priority: HTTP headers (infrastructure level, no body parsing needed)
-        if let Some(hdrs) = headers {
-            if let Some(key) = self.extract_hash_key_from_headers(hdrs) {
-                return key;
-            }
-        }
-
-        // 2. Second priority: Body fields
-        if let Some(key) = self.extract_hash_key_from_body(request_text) {
-            return key;
-        }
-
-        // 3. Final fallback: hash of request body
-        let text = request_text.unwrap_or("");
-        if text.len() > 100 {
-            format!("request_hash:{:016x}", Self::fbi_hash(text))
-        } else {
-            format!("request:{}", text)
-        }
-    }
-
-    /// Extract nested field value like session_params.session_id from JSON text
-    fn extract_nested_field_value(
-        &self,
-        text: &str,
-        parent_field: &str,
-        child_field: &str,
-    ) -> Option<String> {
-        // Look for "session_params": { ... "session_id": "value" ... }
-        if let Some(parent_start) = self.find_field_start(text, parent_field) {
-            // Find the opening brace for the parent object
-            if let Some(obj_start) = text[parent_start..].find('{') {
-                let obj_start_pos = parent_start + obj_start;
-
-                // Find the matching closing brace
-                if let Some(obj_content) = self.extract_json_object(&text[obj_start_pos..]) {
-                    return self.extract_field_value(&obj_content, child_field);
-                }
-            }
-        }
-        None
-    }
-
-    /// Find the start position of a field in JSON text
-    fn find_field_start(&self, text: &str, field_name: &str) -> Option<usize> {
-        let patterns = [format!("\"{}\"", field_name), format!("'{}'", field_name)];
-
-        for pattern in &patterns {
-            if let Some(field_pos) = text.find(pattern) {
-                // Look for colon after the field name
-                let after_field = &text[field_pos + pattern.len()..];
-
-                // Skip whitespace and look for colon
-                for (i, ch) in after_field.char_indices() {
-                    if ch == ':' {
-                        return Some(field_pos + pattern.len() + i + 1);
-                    } else if !ch.is_whitespace() {
-                        // Found non-whitespace before colon, this match is invalid
-                        break;
-                    }
-                }
-            }
-        }
-        None
-    }
-
-    /// Extract JSON object content (simple brace matching)
-    fn extract_json_object(&self, text: &str) -> Option<String> {
-        if !text.starts_with('{') {
-            return None;
-        }
-
-        let mut brace_count = 0;
-        let mut end_pos = 0;
-
-        for (i, ch) in text.char_indices() {
-            match ch {
-                '{' => brace_count += 1,
-                '}' => {
-                    brace_count -= 1;
-                    if brace_count == 0 {
-                        end_pos = i + 1;
-                        break;
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        if brace_count == 0 && end_pos > 0 {
-            Some(text[0..end_pos].to_string())
-        } else {
-            None
-        }
-    }
-
-    /// Extract field value from JSON-like text (simple parser)
-    fn extract_field_value(&self, text: &str, field_name: &str) -> Option<String> {
-        // Look for patterns like "session_id": "value" or "session_id":"value"
-        // We'll use a more flexible approach that handles whitespace better
-        let patterns = [
-            format!("\"{}\"", field_name),
-            format!("'{}'", field_name),
-            field_name.to_string(),
-        ];
-
-        for pattern in &patterns {
-            if let Some(field_pos) = text.find(pattern) {
-                // Look for colon after the field name
-                let after_field = &text[field_pos + pattern.len()..];
-
-                // Skip whitespace and look for colon
-                let mut colon_pos = None;
-                for (i, ch) in after_field.char_indices() {
-                    if ch == ':' {
-                        colon_pos = Some(i);
-                        break;
-                    } else if !ch.is_whitespace() {
-                        // Found non-whitespace before colon, this match is invalid
-                        break;
-                    }
-                }
-
-                if let Some(colon_idx) = colon_pos {
-                    let after_colon = &after_field[colon_idx + 1..];
-                    let trimmed = after_colon.trim_start();
-
-                    // Extract quoted string
-                    if trimmed.starts_with('"') {
-                        if let Some(stripped) = trimmed.strip_prefix('"') {
-                            if let Some(end_quote) = stripped.find('"') {
-                                return Some(stripped[..end_quote].to_string());
-                            }
-                        }
-                    } else if trimmed.starts_with('\'') {
-                        if let Some(stripped) = trimmed.strip_prefix('\'') {
-                            if let Some(end_quote) = stripped.find('\'') {
-                                return Some(stripped[..end_quote].to_string());
-                            }
-                        }
-                    } else {
-                        // Unquoted value - extract until delimiter
-                        let end_pos = trimmed
-                            .find(&[',', ' ', '}', ']', '\n', '\r', '\t'][..])
-                            .unwrap_or(trimmed.len());
-                        if end_pos > 0 {
-                            return Some(trimmed[..end_pos].to_string());
-                        }
-                    }
-                }
-            }
-        }
-
-        None
-    }
-
     /// Handle DP-aware routing by extracting DP rank from worker URL
     fn extract_dp_info(&self, worker_url: &str) -> (String, Option<usize>) {
         if worker_url.contains('@') {
@@ -577,8 +343,8 @@ impl LoadBalancingPolicy for ConsistentHashPolicy {
         // Update hash ring if needed
         self.update_hash_ring(workers);
 
-        // Extract hash key with new priority: headers > body > fallback
-        let hash_key = self.extract_hash_key(request_text, headers);
+        // Extract hash key with priority: headers > body > fallback
+        let hash_key = hash_key::extract_hash_key(request_text, headers);
 
         // DEBUG: Log the request text and extracted hash key
         if let Some(text) = request_text {
@@ -755,25 +521,6 @@ mod tests {
         let hash1 = ConsistentHashPolicy::fbi_hash(key);
         let hash2 = ConsistentHashPolicy::fbi_hash(key);
         assert_eq!(hash1, hash2, "Hash function should be deterministic");
-    }
-
-    #[test]
-    fn test_extract_session_id() {
-        let policy = ConsistentHashPolicy::new();
-
-        // Test JSON-style extraction
-        let request1 = r#"{"session_id": "abc123", "prompt": "hello"}"#;
-        assert_eq!(
-            policy.extract_field_value(request1, "session_id"),
-            Some("abc123".to_string())
-        );
-
-        // Test different quote styles
-        let request2 = r#"{'session_id': 'def456', 'prompt': 'world'}"#;
-        assert_eq!(
-            policy.extract_field_value(request2, "session_id"),
-            Some("def456".to_string())
-        );
     }
 
     #[test]
