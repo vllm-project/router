@@ -14,6 +14,7 @@ mod factory;
 mod power_of_two;
 mod random;
 mod registry;
+mod rendezvous_hash;
 mod round_robin;
 
 pub use cache_aware::CacheAwarePolicy;
@@ -23,6 +24,7 @@ pub use factory::PolicyFactory;
 pub use power_of_two::PowerOfTwoPolicy;
 pub use random::RandomPolicy;
 pub use registry::PolicyRegistry;
+pub use rendezvous_hash::RendezvousHashPolicy;
 pub use round_robin::RoundRobinPolicy;
 
 /// HTTP headers passed to policies for routing decisions

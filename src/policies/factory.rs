@@ -2,7 +2,7 @@
 
 use super::{
     CacheAwareConfig, CacheAwarePolicy, ConsistentHashPolicy, LoadBalancingPolicy,
-    PowerOfTwoPolicy, RandomPolicy, RoundRobinPolicy,
+    PowerOfTwoPolicy, RandomPolicy, RendezvousHashPolicy, RoundRobinPolicy,
 };
 use crate::config::PolicyConfig;
 use std::sync::Arc;
@@ -38,6 +38,7 @@ impl PolicyFactory {
                 // The consistent hash policy uses a hardcoded value for now
                 Arc::new(ConsistentHashPolicy::new())
             }
+            PolicyConfig::RendezvousHash => Arc::new(RendezvousHashPolicy::new()),
         }
     }
 
@@ -49,6 +50,7 @@ impl PolicyFactory {
             "power_of_two" | "poweroftwo" => Some(Arc::new(PowerOfTwoPolicy::new())),
             "cache_aware" | "cacheaware" => Some(Arc::new(CacheAwarePolicy::new())),
             "consistent_hash" | "consistenthash" => Some(Arc::new(ConsistentHashPolicy::new())),
+            "rendezvous_hash" | "rendezvoushash" => Some(Arc::new(RendezvousHashPolicy::new())),
             _ => None,
         }
     }
@@ -88,6 +90,10 @@ mod tests {
         let policy =
             PolicyFactory::create_from_config(&PolicyConfig::ConsistentHash { virtual_nodes: 160 });
         assert_eq!(policy.name(), "consistent_hash");
+
+        // Test RendezvousHash
+        let policy = PolicyFactory::create_from_config(&PolicyConfig::RendezvousHash);
+        assert_eq!(policy.name(), "rendezvous_hash");
     }
 
     #[test]
@@ -102,6 +108,8 @@ mod tests {
         assert!(PolicyFactory::create_by_name("CacheAware").is_some());
         assert!(PolicyFactory::create_by_name("consistent_hash").is_some());
         assert!(PolicyFactory::create_by_name("ConsistentHash").is_some());
+        assert!(PolicyFactory::create_by_name("rendezvous_hash").is_some());
+        assert!(PolicyFactory::create_by_name("RendezvousHash").is_some());
         assert!(PolicyFactory::create_by_name("unknown").is_none());
     }
 }

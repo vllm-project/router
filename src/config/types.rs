@@ -254,6 +254,9 @@ pub enum PolicyConfig {
         /// Number of virtual nodes per worker for better distribution
         virtual_nodes: u32,
     },
+
+    #[serde(rename = "rendezvous_hash")]
+    RendezvousHash,
 }
 
 impl PolicyConfig {
@@ -264,6 +267,7 @@ impl PolicyConfig {
             PolicyConfig::CacheAware { .. } => "cache_aware",
             PolicyConfig::PowerOfTwo { .. } => "power_of_two",
             PolicyConfig::ConsistentHash { .. } => "consistent_hash",
+            PolicyConfig::RendezvousHash => "rendezvous_hash",
         }
     }
 }

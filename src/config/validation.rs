@@ -239,6 +239,9 @@ impl ConfigValidator {
                     });
                 }
             }
+            PolicyConfig::RendezvousHash => {
+                // No specific validation needed
+            }
         }
         Ok(())
     }

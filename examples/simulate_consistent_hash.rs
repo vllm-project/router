@@ -7,14 +7,23 @@
 //!   cargo run --example simulate_consistent_hash
 //!   cargo run --example simulate_consistent_hash -- --num-sessions 500000 --dp-size 4
 //!   cargo run --example simulate_consistent_hash -- --trials 100
+//!   cargo run --example simulate_consistent_hash -- --mode rendezvous --trials 100
 
 use std::collections::{BTreeMap, HashMap};
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use uuid::Uuid;
 
 use vllm_router_rs::policies::ConsistentHashPolicy;
 use vllm_router_rs::policies::VIRTUAL_NODES_PER_WORKER;
+
+#[derive(Clone, ValueEnum)]
+enum Mode {
+    /// Ring-based consistent hashing (current router implementation)
+    Ring,
+    /// Rendezvous hashing (Highest Random Weight)
+    Rendezvous,
+}
 
 #[derive(Parser)]
 #[command(name = "simulate_consistent_hash")]
@@ -32,7 +41,7 @@ struct Args {
     #[arg(long, default_value_t = 4)]
     dp_size: usize,
 
-    /// Virtual nodes per logical worker on the hash ring
+    /// Virtual nodes per logical worker on the hash ring (only used in ring mode)
     #[arg(long, default_value_t = VIRTUAL_NODES_PER_WORKER)]
     virtual_nodes: u32,
 
@@ -40,9 +49,13 @@ struct Args {
     #[arg(long, default_value = "x-session-id")]
     header_name: String,
 
-    /// Number of independent trials to run (each with a different seed)
+    /// Number of independent trials to run
     #[arg(long, default_value_t = 1)]
     trials: usize,
+
+    /// Hashing mode: ring (consistent hash ring) or rendezvous (HRW)
+    #[arg(long, value_enum, default_value_t = Mode::Ring)]
+    mode: Mode,
 }
 
 /// Stats collected from a single trial
@@ -68,17 +81,19 @@ fn run_single_trial(args: &Args, verbose: bool) -> TrialStats {
         }
     }
 
-    // Build hash ring
+    // Build hash ring (only used in ring mode)
     let mut ring: BTreeMap<u64, String> = BTreeMap::new();
-    for url in &worker_urls {
-        for i in 0..args.virtual_nodes {
-            let virtual_key = format!("{}:{}", url, i);
-            let hash_value = ConsistentHashPolicy::fbi_hash(&virtual_key);
-            ring.insert(hash_value, url.clone());
+    if matches!(args.mode, Mode::Ring) {
+        for url in &worker_urls {
+            for i in 0..args.virtual_nodes {
+                let virtual_key = format!("{}:{}", url, i);
+                let hash_value = ConsistentHashPolicy::fbi_hash(&virtual_key);
+                ring.insert(hash_value, url.clone());
+            }
         }
     }
 
-    if verbose {
+    if verbose && matches!(args.mode, Mode::Ring) {
         analyze_ring_distribution(&ring, &worker_urls, args.num_workers, args.dp_size);
     }
 
@@ -96,14 +111,28 @@ fn run_single_trial(args: &Args, verbose: bool) -> TrialStats {
 
     for session_id in &session_ids {
         let hash_key = format!("header:{}:{}", args.header_name, session_id);
-        let hash_value = ConsistentHashPolicy::fbi_hash(&hash_key);
 
-        let selected = ring
-            .range(hash_value..)
-            .next()
-            .or_else(|| ring.iter().next())
-            .map(|(_, url)| url.clone())
-            .unwrap();
+        let selected = match args.mode {
+            Mode::Ring => {
+                let hash_value = ConsistentHashPolicy::fbi_hash(&hash_key);
+                ring.range(hash_value..)
+                    .next()
+                    .or_else(|| ring.iter().next())
+                    .map(|(_, url)| url.clone())
+                    .unwrap()
+            }
+            Mode::Rendezvous => {
+                // Rendezvous hashing: score each worker, pick highest
+                worker_urls
+                    .iter()
+                    .max_by_key(|url| {
+                        let score_key = format!("{}:{}", hash_key, url);
+                        ConsistentHashPolicy::fbi_hash(&score_key)
+                    })
+                    .unwrap()
+                    .clone()
+            }
+        };
 
         *per_url_count.get_mut(&selected).unwrap() += 1;
     }
@@ -193,15 +222,22 @@ fn main() {
     let args = Args::parse();
 
     let total_logical = args.num_workers * args.dp_size;
+    let mode_name = match args.mode {
+        Mode::Ring => "ring",
+        Mode::Rendezvous => "rendezvous",
+    };
     println!("=== Consistent Hash Balance Simulation ===");
+    println!("Mode: {}", mode_name);
     println!("Physical decode workers: {}", args.num_workers);
     println!("DP size (GPUs per worker): {}", args.dp_size);
     println!("Logical worker URLs: {}", total_logical);
-    println!("Virtual nodes per logical worker: {}", args.virtual_nodes);
-    println!(
-        "Total virtual nodes on ring: {}",
-        total_logical as u32 * args.virtual_nodes
-    );
+    if matches!(args.mode, Mode::Ring) {
+        println!("Virtual nodes per logical worker: {}", args.virtual_nodes);
+        println!(
+            "Total virtual nodes on ring: {}",
+            total_logical as u32 * args.virtual_nodes
+        );
+    }
     println!("Sessions to simulate: {}", args.num_sessions);
     println!("Trials: {}", args.trials);
     println!();
@@ -257,6 +293,7 @@ fn percentile(sorted: &[f64], pct: f64) -> f64 {
     sorted[idx.min(sorted.len() - 1)]
 }
 
+/// Compute arc ownership per URL on the ring, returning both totals and per-vnode arcs
 /// Analyze how virtual nodes are distributed on the hash ring
 fn analyze_ring_distribution(
     ring: &BTreeMap<u64, String>,
