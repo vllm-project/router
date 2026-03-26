@@ -197,7 +197,10 @@ fn run_single_trial(args: &Args, verbose: bool) -> TrialStats {
         println!("Expected per worker:  {:.1}", mean);
         println!("Min:                  {}", min_count);
         println!("Max:                  {}", max_count);
-        println!("Imbalance ratio:      {:.4} (max/expected)", worker_imbalance);
+        println!(
+            "Imbalance ratio:      {:.4} (max/expected)",
+            worker_imbalance
+        );
         println!("Std deviation:        {:.2}", std_dev);
         println!("Coeff of variation:   {:.4} (lower is better)", worker_cv);
 
@@ -366,10 +369,7 @@ fn analyze_ring_distribution(
             arc_per_worker[w] * 100.0
         );
     }
-    let arc_min = arc_per_worker
-        .iter()
-        .cloned()
-        .fold(f64::INFINITY, f64::min);
+    let arc_min = arc_per_worker.iter().cloned().fold(f64::INFINITY, f64::min);
     let arc_max = arc_per_worker
         .iter()
         .cloned()
