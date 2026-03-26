@@ -139,10 +139,10 @@ fn run_single_trial(args: &Args, verbose: bool) -> TrialStats {
 
     // Aggregate per physical worker
     let mut per_worker_count: Vec<usize> = vec![0; args.num_workers];
-    for w in 0..args.num_workers {
+    for (w, count) in per_worker_count.iter_mut().enumerate() {
         for rank in 0..args.dp_size {
             let url = format!("http://decode-worker{}:8000@{}", w, rank);
-            per_worker_count[w] += per_url_count[&url];
+            *count += per_url_count[&url];
         }
     }
 
@@ -187,9 +187,8 @@ fn run_single_trial(args: &Args, verbose: bool) -> TrialStats {
         println!("\n=== Per-Physical-Worker Distribution ===");
         println!("{:<30} {:>8} {:>8}", "Worker", "Count", "%");
         println!("{}", "-".repeat(50));
-        for w in 0..args.num_workers {
-            let count = per_worker_count[w];
-            let pct = 100.0 * count as f64 / args.num_sessions as f64;
+        for (w, count) in per_worker_count.iter().enumerate() {
+            let pct = 100.0 * *count as f64 / args.num_sessions as f64;
             println!("decode-worker{:<17} {:>8} {:>7.2}%", w, count, pct);
         }
 
@@ -315,10 +314,10 @@ fn analyze_ring_distribution(
     }
 
     let mut vnodes_per_worker: Vec<usize> = vec![0; num_workers];
-    for w in 0..num_workers {
+    for (w, count) in vnodes_per_worker.iter_mut().enumerate() {
         for rank in 0..dp_size {
             let url = format!("http://decode-worker{}:8000@{}", w, rank);
-            vnodes_per_worker[w] += vnodes_per_url[&url];
+            *count += vnodes_per_url[&url];
         }
     }
 
@@ -329,11 +328,11 @@ fn analyze_ring_distribution(
         worker_urls.len() as u32 * VIRTUAL_NODES_PER_WORKER
     );
 
-    for w in 0..num_workers {
-        let pct = 100.0 * vnodes_per_worker[w] as f64 / total_vnodes as f64;
+    for (w, &vnode_count) in vnodes_per_worker.iter().enumerate() {
+        let pct = 100.0 * vnode_count as f64 / total_vnodes as f64;
         println!(
             "  decode-worker{}: {} vnodes ({:.1}%)",
-            w, vnodes_per_worker[w], pct
+            w, vnode_count, pct
         );
     }
 
@@ -351,22 +350,22 @@ fn analyze_ring_distribution(
         };
         let arc_frac = arc as f64 / u64::MAX as f64;
         let url = &owners[i];
-        for w in 0..num_workers {
+        for (w, arc) in arc_per_worker.iter_mut().enumerate() {
             let prefix = format!("http://decode-worker{}:8000@", w);
             if url.starts_with(&prefix) {
-                arc_per_worker[w] += arc_frac;
+                *arc += arc_frac;
                 break;
             }
         }
     }
 
     println!("\nHash ring arc ownership (fraction of keyspace):");
-    for w in 0..num_workers {
+    for (w, &arc) in arc_per_worker.iter().enumerate() {
         println!(
             "  decode-worker{}: {:.4} ({:.2}%)",
             w,
-            arc_per_worker[w],
-            arc_per_worker[w] * 100.0
+            arc,
+            arc * 100.0
         );
     }
     let arc_min = arc_per_worker.iter().cloned().fold(f64::INFINITY, f64::min);
