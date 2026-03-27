@@ -2,7 +2,10 @@
 
 use super::{
     http::{
-        openai_router::OpenAIRouter, pd_router::PDRouter, router::Router,
+        moriio_pd_router::MoriIOPDRouter,
+        openai_router::OpenAIRouter,
+        pd_router::PDRouter,
+        router::Router,
         vllm_pd_router::VllmPDRouter,
     },
     RouterTrait,
@@ -49,6 +52,9 @@ impl RouterFactory {
                         decode_policy: _,
                         discovery_address: _,
                     } => Err("vLLM PD mode requires HTTP connection_mode".to_string()),
+                    RoutingMode::MoriIOPrefillDecode { .. } => {
+                        Err("MoRIIO PD mode requires HTTP connection_mode".to_string())
+                    }
                     RoutingMode::OpenAI { .. } => {
                         Err("OpenAI mode requires HTTP connection_mode".to_string())
                     }
@@ -91,6 +97,28 @@ impl RouterFactory {
                         tracing::info!("Creating VllmPDRouter with prefill_urls: {:?}, decode_urls: {:?}, discovery: {:?}",
                                       prefill_urls, decode_urls, discovery_address);
                         Self::create_vllm_pd_router(
+                            prefill_urls,
+                            decode_urls,
+                            discovery_address.clone(),
+                            prefill_policy.as_ref(),
+                            decode_policy.as_ref(),
+                            &ctx.router_config.policy,
+                            ctx,
+                        )
+                        .await
+                    }
+                    RoutingMode::MoriIOPrefillDecode {
+                        prefill_urls,
+                        decode_urls,
+                        prefill_policy,
+                        decode_policy,
+                        discovery_address,
+                    } => {
+                        tracing::info!(
+                            "Creating MoriIOPDRouter with discovery: {:?}",
+                            discovery_address
+                        );
+                        Self::create_moriio_pd_router(
                             prefill_urls,
                             decode_urls,
                             discovery_address.clone(),
@@ -189,6 +217,33 @@ impl RouterFactory {
         .await?;
         tracing::info!("VllmPDRouter instance created successfully");
 
+        Ok(Box::new(router))
+    }
+
+    /// Create a MoRIIO PD router with service discovery
+    pub async fn create_moriio_pd_router(
+        _prefill_urls: &[(String, Option<u16>)],
+        _decode_urls: &[String],
+        discovery_address: Option<String>,
+        prefill_policy_config: Option<&PolicyConfig>,
+        decode_policy_config: Option<&PolicyConfig>,
+        main_policy_config: &PolicyConfig,
+        ctx: &Arc<AppContext>,
+    ) -> Result<Box<dyn RouterTrait>, String> {
+        let prefill_policy =
+            PolicyFactory::create_from_config(prefill_policy_config.unwrap_or(main_policy_config));
+        let decode_policy =
+            PolicyFactory::create_from_config(decode_policy_config.unwrap_or(main_policy_config));
+        ctx.policy_registry.set_prefill_policy(prefill_policy);
+        ctx.policy_registry.set_decode_policy(decode_policy);
+
+        let discovery_addr = discovery_address.ok_or_else(|| {
+            "MoRIIO PD mode requires a discovery_address (static URL mode not yet supported)"
+                .to_string()
+        })?;
+
+        let router = MoriIOPDRouter::new_discovery(&discovery_addr, ctx).await?;
+        tracing::info!("MoriIOPDRouter instance created successfully");
         Ok(Box::new(router))
     }
 

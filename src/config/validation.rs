@@ -13,6 +13,9 @@ impl ConfigValidator {
                 RoutingMode::VllmPrefillDecode {
                     discovery_address: Some(_),
                     ..
+                } | RoutingMode::MoriIOPrefillDecode {
+                    discovery_address: Some(_),
+                    ..
                 }
             );
 
@@ -146,6 +149,46 @@ impl ConfigValidator {
                             });
                         }
                     }
+                }
+
+                // Validate optional prefill and decode policies
+                if let Some(p_policy) = prefill_policy {
+                    Self::validate_policy(p_policy)?;
+                }
+                if let Some(d_policy) = decode_policy {
+                    Self::validate_policy(d_policy)?;
+                }
+            }
+            RoutingMode::MoriIOPrefillDecode {
+                prefill_urls,
+                decode_urls,
+                prefill_policy,
+                decode_policy,
+                discovery_address,
+            } => {
+                // Require either discovery_address or both URL lists
+                let has_moriio_discovery = discovery_address.is_some();
+                if !has_moriio_discovery {
+                    if prefill_urls.is_empty() {
+                        return Err(ConfigError::ValidationFailed {
+                            reason: "MoRIIO PD mode requires either discovery_address or at least one prefill_urls entry".to_string(),
+                        });
+                    }
+                    if decode_urls.is_empty() {
+                        return Err(ConfigError::ValidationFailed {
+                            reason: "MoRIIO PD mode requires either discovery_address or at least one decode_urls entry".to_string(),
+                        });
+                    }
+                }
+
+                // Validate static URLs if provided
+                if !prefill_urls.is_empty() {
+                    let prefill_url_strings: Vec<String> =
+                        prefill_urls.iter().map(|(url, _)| url.clone()).collect();
+                    Self::validate_urls(&prefill_url_strings)?;
+                }
+                if !decode_urls.is_empty() {
+                    Self::validate_urls(decode_urls)?;
                 }
 
                 // Validate optional prefill and decode policies
@@ -333,6 +376,10 @@ impl ConfigValidator {
                         reason: "vLLM PD mode with service discovery requires at least one non-empty selector (prefill or decode)".to_string(),
                     });
                 }
+            }
+            RoutingMode::MoriIOPrefillDecode { .. } => {
+                // MoRIIO uses its own ZMQ discovery (discovery_address in mode config),
+                // not the Kubernetes discovery. Allow with or without k8s selectors.
             }
             RoutingMode::OpenAI { .. } => {
                 // OpenAI mode doesn't use service discovery

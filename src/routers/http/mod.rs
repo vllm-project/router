@@ -2,6 +2,8 @@
 
 pub mod dp_utils;
 pub mod logprobs_merge;
+pub mod moriio_pd_router;
+pub mod moriio_service_discovery;
 pub mod openai_router;
 pub mod pd_router;
 pub mod pd_types;
