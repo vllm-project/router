@@ -108,6 +108,7 @@ impl ConfigValidator {
                 prefill_policy,
                 decode_policy,
                 discovery_address: _,
+                kv_events: _,
             } => {
                 // Only require URLs if service discovery is disabled
                 if !has_service_discovery {
@@ -235,6 +236,27 @@ impl ConfigValidator {
                     return Err(ConfigError::InvalidValue {
                         field: "virtual_nodes".to_string(),
                         value: virtual_nodes.to_string(),
+                        reason: "Must be > 0".to_string(),
+                    });
+                }
+            }
+            PolicyConfig::PreciseCacheAware {
+                block_size,
+                hash_seed: _,
+                enable_speculative: _,
+                speculative_ttl_ms,
+            } => {
+                if *block_size == 0 {
+                    return Err(ConfigError::InvalidValue {
+                        field: "block_size".to_string(),
+                        value: block_size.to_string(),
+                        reason: "Must be > 0".to_string(),
+                    });
+                }
+                if *speculative_ttl_ms == 0 {
+                    return Err(ConfigError::InvalidValue {
+                        field: "speculative_ttl_ms".to_string(),
+                        value: speculative_ttl_ms.to_string(),
                         reason: "Must be > 0".to_string(),
                     });
                 }

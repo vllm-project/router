@@ -123,7 +123,7 @@ struct CliArgs {
     worker_urls: Vec<String>,
 
     /// Load balancing policy to use
-    #[arg(long, default_value = "cache_aware", value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "consistent_hash"])]
+    #[arg(long, default_value = "cache_aware", value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "consistent_hash", "precise_cache_aware"])]
     policy: String,
 
     /// Enable PD (Prefill-Decode) disaggregated mode
@@ -144,11 +144,11 @@ struct CliArgs {
     decode: Vec<String>,
 
     /// Specific policy for prefill nodes in PD mode
-    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "consistent_hash"])]
+    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "consistent_hash", "precise_cache_aware"])]
     prefill_policy: Option<String>,
 
     /// Specific policy for decode nodes in PD mode
-    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "consistent_hash"])]
+    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "consistent_hash", "precise_cache_aware"])]
     decode_policy: Option<String>,
 
     /// Timeout in seconds for worker startup
@@ -363,6 +363,50 @@ struct CliArgs {
     /// Enable profiling calls to vLLM workers
     #[arg(long, default_value_t = false)]
     profile: bool,
+
+    // --- KV Events configuration (for precise_cache_aware policy) ---
+
+    /// Enable real-time KV cache event ingestion from vLLM workers via ZMQ.
+    /// Required when using --policy precise_cache_aware or --prefill-policy / --decode-policy precise_cache_aware.
+    #[arg(long, default_value_t = false, help_heading = "KV Events")]
+    kv_events_enabled: bool,
+
+    /// ZMQ topic prefix filter for KV events (must match vLLM --kv-events-config topic prefix)
+    #[arg(long, default_value = "kv@", help_heading = "KV Events")]
+    kv_events_topic_filter: String,
+
+    /// Default ZMQ port for KV event publishers on vLLM workers.
+    /// Used to derive ZMQ endpoints from worker HTTP addresses.
+    #[arg(long, default_value_t = 5556, help_heading = "KV Events")]
+    kv_events_port: u16,
+
+    /// Maximum entries in the KV block index (advisory, for pre-allocation)
+    #[arg(long, default_value_t = 100_000_000, help_heading = "KV Events")]
+    kv_index_max_entries: usize,
+
+    /// Uncached-token threshold for P/D disaggregation bypass.
+    /// When the best decode worker's uncached tokens are below this value,
+    /// the router skips prefill disaggregation and sends the request directly.
+    #[arg(long, default_value_t = 256, help_heading = "KV Events")]
+    pd_uncached_token_threshold: usize,
+
+    // --- Precise cache-aware policy parameters ---
+
+    /// KV block size in tokens (must match vLLM --block-size)
+    #[arg(long, default_value_t = 16, help_heading = "KV Events")]
+    kv_block_size: usize,
+
+    /// Hash seed for block key computation (must match vLLM PYTHONHASHSEED)
+    #[arg(long, default_value_t = 0, help_heading = "KV Events")]
+    kv_hash_seed: u64,
+
+    /// Enable speculative index insertion after routing decisions
+    #[arg(long, default_value_t = true, help_heading = "KV Events")]
+    kv_speculative_indexing: bool,
+
+    /// TTL in milliseconds for speculative index entries
+    #[arg(long, default_value_t = 2000, help_heading = "KV Events")]
+    kv_speculative_ttl_ms: u64,
 }
 
 impl CliArgs {
@@ -408,6 +452,12 @@ impl CliArgs {
             },
             "consistent_hash" => PolicyConfig::ConsistentHash {
                 virtual_nodes: 160, // Default value
+            },
+            "precise_cache_aware" => PolicyConfig::PreciseCacheAware {
+                block_size: self.kv_block_size,
+                hash_seed: self.kv_hash_seed,
+                enable_speculative: self.kv_speculative_indexing,
+                speculative_ttl_ms: self.kv_speculative_ttl_ms,
             },
             _ => PolicyConfig::RoundRobin, // Fallback
         }
@@ -506,6 +556,17 @@ impl CliArgs {
                 prefill_policy: self.prefill_policy.as_ref().map(|p| self.parse_policy(p)),
                 decode_policy: self.decode_policy.as_ref().map(|p| self.parse_policy(p)),
                 discovery_address: self.vllm_discovery_address.clone(),
+                kv_events: if self.kv_events_enabled {
+                    Some(vllm_router_rs::config::KVEventsConfig {
+                        enabled: true,
+                        topic_filter: self.kv_events_topic_filter.clone(),
+                        default_port: self.kv_events_port,
+                        index_max_entries: self.kv_index_max_entries,
+                        pd_uncached_token_threshold: self.pd_uncached_token_threshold,
+                    })
+                } else {
+                    None
+                },
             }
         } else {
             // Regular mode

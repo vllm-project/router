@@ -48,6 +48,7 @@ impl RouterFactory {
                         prefill_policy: _,
                         decode_policy: _,
                         discovery_address: _,
+                        kv_events: _,
                     } => Err("vLLM PD mode requires HTTP connection_mode".to_string()),
                     RoutingMode::OpenAI { .. } => {
                         Err("OpenAI mode requires HTTP connection_mode".to_string())
@@ -87,6 +88,7 @@ impl RouterFactory {
                         prefill_policy,
                         decode_policy,
                         discovery_address,
+                        kv_events: _,
                     } => {
                         tracing::info!("Creating VllmPDRouter with prefill_urls: {:?}, decode_urls: {:?}, discovery: {:?}",
                                       prefill_urls, decode_urls, discovery_address);

@@ -145,6 +145,12 @@ impl Router {
                 PolicyType::ConsistentHash => ConfigPolicyConfig::ConsistentHash {
                     virtual_nodes: 160, // Default value
                 },
+                PolicyType::PreciseCacheAware => ConfigPolicyConfig::PreciseCacheAware {
+                    block_size: 16,            // Default value
+                    hash_seed: 0,              // Default value
+                    enable_speculative: true,   // Default value
+                    speculative_ttl_ms: 2000,  // Default value
+                },
             }
         };
 
@@ -161,6 +167,7 @@ impl Router {
                 prefill_policy: self.prefill_policy.as_ref().map(convert_policy),
                 decode_policy: self.decode_policy.as_ref().map(convert_policy),
                 discovery_address: None,
+                kv_events: None,
             }
         } else if self.pd_disaggregation {
             RoutingMode::PrefillDecode {
