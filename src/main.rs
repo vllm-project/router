@@ -104,9 +104,14 @@ Examples:
     --vllm-discovery-address 0.0.0.0:30001 \
     --policy consistent_hash
 
-  # Note: In vLLM mode, prefill/decode workers automatically register their
-  # HTTP and ZMQ addresses via service discovery. No static --prefill or
-  # --decode parameters are needed.
+  # MoRIIO (AMD) PD mode with ZMQ service discovery
+  vllm-router --moriio-pd-disaggregation \
+    --moriio-discovery-address 0.0.0.0:30001 \
+    --policy consistent_hash
+
+  # Note: In vLLM and MoRIIO modes, prefill/decode workers automatically
+  # register their HTTP and ZMQ addresses via service discovery. No static
+  # --prefill or --decode parameters are needed.
 
 "#)]
 struct CliArgs {
@@ -138,6 +143,15 @@ struct CliArgs {
     /// Required for --vllm-pd-disaggregation mode. Workers register their HTTP and ZMQ addresses here.
     #[arg(long)]
     vllm_discovery_address: Option<String>,
+
+    /// Enable MoRIIO PD (Prefill-Decode) disaggregated mode for AMD MoRIIO connector
+    #[arg(long, default_value_t = false)]
+    moriio_pd_disaggregation: bool,
+
+    /// ZMQ service discovery address for MoRIIO worker registration (e.g., "0.0.0.0:30001")
+    /// Required for --moriio-pd-disaggregation mode. Workers register their HTTP and ZMQ addresses here.
+    #[arg(long)]
+    moriio_discovery_address: Option<String>,
 
     /// Decode server URL (can be specified multiple times)
     #[arg(long, action = ArgAction::Append)]
@@ -419,10 +433,17 @@ impl CliArgs {
         prefill_urls: Vec<(String, Option<u16>)>,
     ) -> ConfigResult<RouterConfig> {
         // Validate mutually exclusive modes
-        if self.pd_disaggregation && self.vllm_pd_disaggregation {
+        let pd_mode_count = [
+            self.pd_disaggregation,
+            self.vllm_pd_disaggregation,
+            self.moriio_pd_disaggregation,
+        ]
+        .iter()
+        .filter(|&&b| b)
+        .count();
+        if pd_mode_count > 1 {
             return Err(ConfigError::ValidationFailed {
-                reason: "Cannot enable both --pd-disaggregation and --vllm-pd-disaggregation"
-                    .to_string(),
+                reason: "Only one of --pd-disaggregation, --vllm-pd-disaggregation, or --moriio-pd-disaggregation may be set at a time".to_string(),
             });
         }
 
@@ -506,6 +527,19 @@ impl CliArgs {
                 prefill_policy: self.prefill_policy.as_ref().map(|p| self.parse_policy(p)),
                 decode_policy: self.decode_policy.as_ref().map(|p| self.parse_policy(p)),
                 discovery_address: self.vllm_discovery_address.clone(),
+            }
+        } else if self.moriio_pd_disaggregation {
+            let discovery_address = self.moriio_discovery_address.clone().ok_or_else(|| {
+                ConfigError::ValidationFailed {
+                    reason: "--moriio-pd-disaggregation requires --moriio-discovery-address"
+                        .to_string(),
+                }
+            })?;
+            eprintln!("INFO: MoRIIO PD disaggregation mode. Discovery address: {}", discovery_address);
+            RoutingMode::MoriIOPrefillDecode {
+                prefill_policy: self.prefill_policy.as_ref().map(|p| self.parse_policy(p)),
+                decode_policy: self.decode_policy.as_ref().map(|p| self.parse_policy(p)),
+                discovery_address,
             }
         } else {
             // Regular mode
@@ -759,6 +793,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "DEBUG: vllm_pd_disaggregation: {}",
         cli_args.vllm_pd_disaggregation
     );
+    println!(
+        "DEBUG: moriio_pd_disaggregation: {}",
+        cli_args.moriio_pd_disaggregation
+    );
 
     // Print startup info
     println!("VLLM Router starting...");
@@ -769,6 +807,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "OpenAI Backend".to_string()
     } else if cli_args.vllm_pd_disaggregation {
         "vLLM PD Disaggregated".to_string()
+    } else if cli_args.moriio_pd_disaggregation {
+        "MoRIIO PD Disaggregated".to_string()
     } else if cli_args.pd_disaggregation {
         "PD Disaggregated".to_string()
     } else {
