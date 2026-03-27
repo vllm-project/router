@@ -1,4 +1,4 @@
-//! Precise cache-aware routing policy backed by real-time KV events.
+//! KV-aware routing policy backed by real-time KV events from vLLM.
 //!
 //! Unlike the approximate [`CacheAwarePolicy`](super::CacheAwarePolicy) that
 //! infers cache state from request routing history, this policy queries the
@@ -28,9 +28,9 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, warn};
 
-/// Configuration for the precise cache-aware policy.
+/// Configuration for the KV-aware policy.
 #[derive(Debug, Clone)]
-pub struct PreciseCacheAwareConfig {
+pub struct KvAwareConfig {
     /// Block size in tokens (must match vLLM `--block-size`).
     pub block_size: usize,
     /// Hash seed (must match vLLM `PYTHONHASHSEED`).
@@ -41,7 +41,7 @@ pub struct PreciseCacheAwareConfig {
     pub speculative_ttl: Duration,
 }
 
-impl Default for PreciseCacheAwareConfig {
+impl Default for KvAwareConfig {
     fn default() -> Self {
         Self {
             block_size: 16,
@@ -53,16 +53,16 @@ impl Default for PreciseCacheAwareConfig {
 }
 
 /// Routing policy that uses real KV cache state from vLLM event streams.
-pub struct PreciseCacheAwarePolicy {
-    config: PreciseCacheAwareConfig,
+pub struct KvAwarePolicy {
+    config: KvAwareConfig,
     block_index: Arc<KVBlockIndex>,
     key_generator: BlockKeyGenerator,
     tokenizer: Arc<dyn Encoder>,
 }
 
-impl std::fmt::Debug for PreciseCacheAwarePolicy {
+impl std::fmt::Debug for KvAwarePolicy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PreciseCacheAwarePolicy")
+        f.debug_struct("KvAwarePolicy")
             .field("config", &self.config)
             .field("block_index", &self.block_index)
             .field("key_generator", &self.key_generator)
@@ -70,7 +70,7 @@ impl std::fmt::Debug for PreciseCacheAwarePolicy {
     }
 }
 
-impl PreciseCacheAwarePolicy {
+impl KvAwarePolicy {
     /// Create a new policy.
     ///
     /// # Arguments
@@ -78,7 +78,7 @@ impl PreciseCacheAwarePolicy {
     /// * `block_index` – Shared reference to the global KV block index.
     /// * `tokenizer` – Tokenizer for converting request text to token IDs.
     pub fn new(
-        config: PreciseCacheAwareConfig,
+        config: KvAwareConfig,
         block_index: Arc<KVBlockIndex>,
         tokenizer: Arc<dyn Encoder>,
     ) -> Self {
@@ -99,7 +99,7 @@ impl PreciseCacheAwarePolicy {
                 self.key_generator.generate_block_keys(&token_ids)
             }
             Err(e) => {
-                warn!("PreciseCacheAwarePolicy: tokenization failed: {}", e);
+                warn!("KvAwarePolicy: tokenization failed: {}", e);
                 Vec::new()
             }
         }
@@ -134,7 +134,7 @@ impl PreciseCacheAwarePolicy {
             .unwrap_or(0);
 
         debug!(
-            "PreciseCacheAware: best worker {} with prefix score {}/{} ({:.1}%)",
+            "KvAware: best worker {} with prefix score {}/{} ({:.1}%)",
             workers[best_idx].url(),
             best_score,
             block_keys.len(),
@@ -147,7 +147,7 @@ impl PreciseCacheAwarePolicy {
 
         // If no worker has any cached blocks, fall back to least-load.
         let selected = if best_score == 0 {
-            debug!("PreciseCacheAware: no cache hits, falling back to least-load");
+            debug!("KvAware: no cache hits, falling back to least-load");
             healthy_indices
                 .iter()
                 .min_by_key(|&&idx| workers[idx].load())
@@ -165,7 +165,7 @@ impl PreciseCacheAwarePolicy {
                 self.config.speculative_ttl,
             );
             debug!(
-                "PreciseCacheAware: speculative insert of {} blocks for {}",
+                "KvAware: speculative insert of {} blocks for {}",
                 uncached_keys.len(),
                 workers[selected].url()
             );
@@ -175,7 +175,7 @@ impl PreciseCacheAwarePolicy {
     }
 }
 
-impl LoadBalancingPolicy for PreciseCacheAwarePolicy {
+impl LoadBalancingPolicy for KvAwarePolicy {
     fn select_worker_with_headers(
         &self,
         workers: &[Arc<dyn Worker>],
@@ -215,7 +215,7 @@ impl LoadBalancingPolicy for PreciseCacheAwarePolicy {
     }
 
     fn name(&self) -> &'static str {
-        "precise_cache_aware"
+        "kv_aware"
     }
 
     fn needs_request_text(&self) -> bool {

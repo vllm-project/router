@@ -202,12 +202,12 @@ impl PolicyRegistry {
             }
             PolicyConfig::PowerOfTwo { .. } => Arc::new(PowerOfTwoPolicy::new()),
             PolicyConfig::ConsistentHash { .. } => Arc::new(ConsistentHashPolicy::new()),
-            PolicyConfig::PreciseCacheAware { .. } => {
-                // PreciseCacheAwarePolicy requires KVBlockIndex + tokenizer;
+            PolicyConfig::KvAware { .. } => {
+                // KvAwarePolicy requires KVBlockIndex + tokenizer;
                 // it is wired up during router construction.  Return a
                 // placeholder here so that registry creation does not fail.
                 tracing::warn!(
-                    "PolicyRegistry: PreciseCacheAware requires KV event infrastructure; \
+                    "PolicyRegistry: KvAware requires KV event infrastructure; \
                      returning placeholder RandomPolicy."
                 );
                 Arc::new(RandomPolicy::new())

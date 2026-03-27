@@ -157,7 +157,7 @@ pub enum RoutingMode {
         /// ZMQ service discovery address (e.g., "0.0.0.0:30001")
         #[serde(skip_serializing_if = "Option::is_none")]
         discovery_address: Option<String>,
-        /// KV events configuration for precise cache-aware routing
+        /// KV events configuration for KV-aware routing
         #[serde(skip_serializing_if = "Option::is_none")]
         kv_events: Option<KVEventsConfig>,
     },
@@ -258,10 +258,10 @@ pub enum PolicyConfig {
         virtual_nodes: u32,
     },
 
-    /// Precise cache-aware routing backed by real-time KV events from vLLM.
+    /// KV-aware routing backed by real-time KV events from vLLM.
     /// Requires `kv_events` to be enabled in the routing mode configuration.
-    #[serde(rename = "precise_cache_aware")]
-    PreciseCacheAware {
+    #[serde(rename = "kv_aware")]
+    KvAware {
         /// Tokens per KV block (must match vLLM `--block-size`, default 16)
         #[serde(default = "default_kv_block_size")]
         block_size: usize,
@@ -297,7 +297,7 @@ impl PolicyConfig {
             PolicyConfig::CacheAware { .. } => "cache_aware",
             PolicyConfig::PowerOfTwo { .. } => "power_of_two",
             PolicyConfig::ConsistentHash { .. } => "consistent_hash",
-            PolicyConfig::PreciseCacheAware { .. } => "precise_cache_aware",
+            PolicyConfig::KvAware { .. } => "kv_aware",
         }
     }
 }
@@ -306,7 +306,7 @@ impl PolicyConfig {
 ///
 /// Presence of `Some(KVEventsConfig)` in the routing mode means KV event
 /// ingestion is enabled.  This is automatically set when any policy
-/// (main, prefill, or decode) is `precise_cache_aware`.
+/// (main, prefill, or decode) is `kv_aware`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KVEventsConfig {
     /// ZMQ topic prefix filter (default: "kv@").

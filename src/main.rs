@@ -123,7 +123,7 @@ struct CliArgs {
     worker_urls: Vec<String>,
 
     /// Load balancing policy to use
-    #[arg(long, default_value = "cache_aware", value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "consistent_hash", "precise_cache_aware"])]
+    #[arg(long, default_value = "cache_aware", value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "consistent_hash", "kv_aware"])]
     policy: String,
 
     /// Enable PD (Prefill-Decode) disaggregated mode
@@ -144,11 +144,11 @@ struct CliArgs {
     decode: Vec<String>,
 
     /// Specific policy for prefill nodes in PD mode
-    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "consistent_hash", "precise_cache_aware"])]
+    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "consistent_hash", "kv_aware"])]
     prefill_policy: Option<String>,
 
     /// Specific policy for decode nodes in PD mode
-    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "consistent_hash", "precise_cache_aware"])]
+    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "consistent_hash", "kv_aware"])]
     decode_policy: Option<String>,
 
     /// Timeout in seconds for worker startup
@@ -364,7 +364,7 @@ struct CliArgs {
     #[arg(long, default_value_t = false)]
     profile: bool,
 
-    // --- KV Events configuration (for precise_cache_aware policy) ---
+    // --- KV Events configuration (for kv_aware policy) ---
 
     /// ZMQ topic prefix filter for KV events (must match vLLM --kv-events-config topic prefix)
     #[arg(long, default_value = "kv@", help_heading = "KV Events")]
@@ -385,7 +385,7 @@ struct CliArgs {
     #[arg(long, default_value_t = 256, help_heading = "KV Events")]
     pd_uncached_token_threshold: usize,
 
-    // --- Precise cache-aware policy parameters ---
+    // --- KV-aware policy parameters ---
 
     /// KV block size in tokens (must match vLLM --block-size)
     #[arg(long, default_value_t = 16, help_heading = "KV Events")]
@@ -448,7 +448,7 @@ impl CliArgs {
             "consistent_hash" => PolicyConfig::ConsistentHash {
                 virtual_nodes: 160, // Default value
             },
-            "precise_cache_aware" => PolicyConfig::PreciseCacheAware {
+            "kv_aware" => PolicyConfig::KvAware {
                 block_size: self.kv_block_size,
                 hash_seed: self.kv_hash_seed,
                 enable_speculative: self.kv_speculative_indexing,
@@ -552,10 +552,10 @@ impl CliArgs {
                 decode_policy: self.decode_policy.as_ref().map(|p| self.parse_policy(p)),
                 discovery_address: self.vllm_discovery_address.clone(),
                 kv_events: {
-                    // Automatically enable KV events when any policy is precise_cache_aware
-                    let needs_kv_events = self.policy == "precise_cache_aware"
-                        || self.prefill_policy.as_deref() == Some("precise_cache_aware")
-                        || self.decode_policy.as_deref() == Some("precise_cache_aware");
+                    // Automatically enable KV events when any policy is kv_aware
+                    let needs_kv_events = self.policy == "kv_aware"
+                        || self.prefill_policy.as_deref() == Some("kv_aware")
+                        || self.decode_policy.as_deref() == Some("kv_aware");
                     if needs_kv_events {
                         Some(vllm_router_rs::config::KVEventsConfig {
                             topic_filter: self.kv_events_topic_filter.clone(),

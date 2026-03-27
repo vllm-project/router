@@ -240,7 +240,7 @@ impl ConfigValidator {
                     });
                 }
             }
-            PolicyConfig::PreciseCacheAware {
+            PolicyConfig::KvAware {
                 block_size,
                 hash_seed: _,
                 enable_speculative: _,

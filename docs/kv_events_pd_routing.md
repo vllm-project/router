@@ -3,7 +3,7 @@
 ## Summary
 
 This feature introduces real-time KV cache event ingestion from vLLM workers,
-enabling **precise cache-aware routing** for Prefill/Decode disaggregated
+enabling **KV-aware routing** for Prefill/Decode disaggregated
 inference.  Instead of approximating cache state from routing history
 (the existing `cache_aware` policy), the router subscribes to actual
 `BlockStored` / `BlockRemoved` / `AllBlocksCleared` events published by
@@ -21,10 +21,10 @@ vLLM over ZMQ, maintains a global KV block index, and uses it to:
 ## Quick Start
 
 ```bash
-# vLLM PD mode with precise cache-aware routing (KV events enabled automatically)
+# vLLM PD mode with KV-aware routing (KV events enabled automatically)
 vllm-router --vllm-pd-disaggregation \
   --vllm-discovery-address 0.0.0.0:30001 \
-  --policy precise_cache_aware \
+  --policy kv_aware \
   --kv-block-size 16 \
   --kv-hash-seed 12345 \
   --model-path Qwen/Qwen3-32B
@@ -32,8 +32,8 @@ vllm-router --vllm-pd-disaggregation \
 # With separate policies for prefill and decode
 vllm-router --vllm-pd-disaggregation \
   --vllm-discovery-address 0.0.0.0:30001 \
-  --prefill-policy precise_cache_aware \
-  --decode-policy precise_cache_aware \
+  --prefill-policy kv_aware \
+  --decode-policy kv_aware \
   --kv-block-size 16 \
   --kv-hash-seed 12345 \
   --pd-uncached-token-threshold 256 \
@@ -45,21 +45,21 @@ vllm-router --vllm-pd-disaggregation \
   --prefill http://10.0.0.2:8000 9002 \
   --decode http://10.0.0.3:8000 \
   --decode http://10.0.0.4:8000 \
-  --policy precise_cache_aware \
+  --policy kv_aware \
   --kv-block-size 16 \
   --kv-hash-seed 12345
 ```
 
 > **Note**: There is no `--kv-events-enabled` flag.  KV event ingestion is
 > **automatically enabled** whenever `--policy`, `--prefill-policy`, or
-> `--decode-policy` is set to `precise_cache_aware`.
+> `--decode-policy` is set to `kv_aware`.
 
 ## CLI Parameters
 
 ### KV Events Configuration
 
 KV event ingestion is **automatically enabled** when any policy is set to
-`precise_cache_aware`.  The following flags tune the event subsystem:
+`kv_aware`.  The following flags tune the event subsystem:
 
 | Flag | Default | Description |
 |------|---------|-------------|
@@ -104,7 +104,7 @@ vLLM Decode  Pod₂  ─┘                         │  ┌──────�
                                                │          │           │
                                                │  ┌───────▼────────┐  │
                                                │  │ PrefixScorer   │  │
-                                               │  │ + PreciseCache │  │
+                                               │  │ + KvAware │  │
                                                │  │   AwarePolicy  │  │
                                                │  └───────┬────────┘  │
                                                │          │           │
@@ -131,7 +131,7 @@ the two-stage prefill/decode flow:
 
 ## Comparison with Existing `cache_aware` Policy
 
-| Aspect | `cache_aware` (existing) | `precise_cache_aware` (this PR) |
+| Aspect | `cache_aware` (existing) | `kv_aware` (this PR) |
 |--------|-------------------------|--------------------------------|
 | Data source | Router's own routing history (approximate radix tree) | Real KV events from vLLM engines |
 | Accuracy | Approximate (may drift) | Near-exact (sub-second lag) |
@@ -167,7 +167,7 @@ export PYTHONHASHSEED=12345
   Yes                 No
    │                  │
    ▼                  ▼
- precise_cache_aware  ┌─────────────────────┐
+ kv_aware  ┌─────────────────────┐
                       │ Need session        │
                       │ affinity?           │
                       └────────┬────────────┘

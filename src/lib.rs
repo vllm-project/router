@@ -30,7 +30,7 @@ pub enum PolicyType {
     CacheAware,
     PowerOfTwo,
     ConsistentHash,
-    PreciseCacheAware,
+    KvAware,
 }
 
 #[pyclass]
@@ -145,7 +145,7 @@ impl Router {
                 PolicyType::ConsistentHash => ConfigPolicyConfig::ConsistentHash {
                     virtual_nodes: 160, // Default value
                 },
-                PolicyType::PreciseCacheAware => ConfigPolicyConfig::PreciseCacheAware {
+                PolicyType::KvAware => ConfigPolicyConfig::KvAware {
                     block_size: 16,            // Default value
                     hash_seed: 0,              // Default value
                     enable_speculative: true,   // Default value
