@@ -428,15 +428,10 @@ impl MoriIOPDRouter {
 
         // --- Stage 2: Decode ---
         let mut decode_req = request_json.clone();
-        // Decrement token limits by 1 to account for the prefill token
+        // Decrement max_tokens by 1 to account for the prefill token
         if let Some(mt) = decode_req.get("max_tokens").and_then(|v| v.as_u64()) {
             if mt > 0 {
                 decode_req["max_tokens"] = json!(mt - 1);
-            }
-        }
-        if let Some(mt) = decode_req.get("max_completion_tokens").and_then(|v| v.as_u64()) {
-            if mt > 0 {
-                decode_req["max_completion_tokens"] = json!(mt - 1);
             }
         }
         decode_req["kv_transfer_params"] = Self::build_decode_kv_params(
@@ -543,15 +538,10 @@ impl MoriIOPDRouter {
 
         // Build decode request immediately — block IDs stay null; decode waits for ZMQ notification
         let mut decode_req = request_json.clone();
-        // Decrement token limits by 1 to account for the prefill token
+        // Decrement max_tokens by 1 to account for the prefill token
         if let Some(mt) = decode_req.get("max_tokens").and_then(|v| v.as_u64()) {
             if mt > 0 {
                 decode_req["max_tokens"] = json!(mt - 1);
-            }
-        }
-        if let Some(mt) = decode_req.get("max_completion_tokens").and_then(|v| v.as_u64()) {
-            if mt > 0 {
-                decode_req["max_completion_tokens"] = json!(mt - 1);
             }
         }
         decode_req["kv_transfer_params"] =
