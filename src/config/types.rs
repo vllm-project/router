@@ -160,12 +160,6 @@ pub enum RoutingMode {
     },
     #[serde(rename = "moriio_prefill_decode")]
     MoriIOPrefillDecode {
-        /// Prefill worker URLs (unused when discovery_address is set)
-        #[serde(default)]
-        prefill_urls: Vec<(String, Option<u16>)>,
-        /// Decode worker URLs (unused when discovery_address is set)
-        #[serde(default)]
-        decode_urls: Vec<String>,
         /// Optional separate policy for prefill workers
         #[serde(skip_serializing_if = "Option::is_none")]
         prefill_policy: Option<PolicyConfig>,
@@ -173,8 +167,7 @@ pub enum RoutingMode {
         #[serde(skip_serializing_if = "Option::is_none")]
         decode_policy: Option<PolicyConfig>,
         /// ZMQ service discovery address (e.g., "0.0.0.0:30001")
-        #[serde(skip_serializing_if = "Option::is_none")]
-        discovery_address: Option<String>,
+        discovery_address: String,
     },
 }
 
@@ -209,11 +202,7 @@ impl RoutingMode {
                 decode_urls,
                 ..
             } => prefill_urls.len() + decode_urls.len(),
-            RoutingMode::MoriIOPrefillDecode {
-                prefill_urls,
-                decode_urls,
-                ..
-            } => prefill_urls.len() + decode_urls.len(),
+            RoutingMode::MoriIOPrefillDecode { .. } => 0,
             // OpenAI mode represents a single upstream
             RoutingMode::OpenAI { .. } => 1,
         }

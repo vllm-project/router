@@ -68,7 +68,6 @@ pub struct MoriIOInstance {
     pub notify_port: u16,
     pub dp_size: u32,
     pub tp_size: u32,
-    pub transfer_mode: TransferMode,
     /// Unix timestamp after which this entry is considered stale
     pub expires_at: u64,
 }
@@ -127,6 +126,7 @@ impl MoriIOServiceRegistry {
             info!("MoRIIO ZMQ service discovery bound to tcp://{}", bind_addr);
             socket.set_rcvtimeo(1000).unwrap();
 
+            let mut cleanup_counter: u32 = 0;
             loop {
                 if shutdown_rx.try_recv().is_ok() {
                     info!("MoRIIO service discovery shutting down");
@@ -134,18 +134,17 @@ impl MoriIOServiceRegistry {
                 }
 
                 match socket.recv_multipart(zmq::DONTWAIT) {
-                    Ok(parts) if parts.len() >= 2 => {
-                        let message_data = &parts[1];
+                    Ok(parts) if parts.len() >= 3 => {
+                        let message_data = &parts[2];
                         Self::handle_registration(
                             message_data,
                             &prefill_instances,
                             &decode_instances,
                             &global_transfer_mode,
-                        )
-                        .await;
+                        );
                     }
                     Ok(_) => {
-                        warn!("MoRIIO ZMQ received malformed multipart message (< 2 parts)");
+                        warn!("MoRIIO ZMQ received malformed multipart message (< 3 parts)");
                     }
                     Err(zmq::Error::EAGAIN) => {
                         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
@@ -156,14 +155,18 @@ impl MoriIOServiceRegistry {
                     }
                 }
 
-                Self::cleanup_expired(&prefill_instances, &decode_instances).await;
+                cleanup_counter += 1;
+                if cleanup_counter >= 500 {
+                    cleanup_counter = 0;
+                    Self::cleanup_expired(&prefill_instances, &decode_instances, &global_transfer_mode).await;
+                }
             }
         });
 
         Ok(())
     }
 
-    async fn handle_registration(
+    fn handle_registration(
         message_data: &[u8],
         prefill_instances: &Arc<Mutex<HashMap<String, MoriIOInstance>>>,
         decode_instances: &Arc<Mutex<HashMap<String, MoriIOInstance>>>,
@@ -215,7 +218,6 @@ impl MoriIOServiceRegistry {
             notify_port: reg.notify_port,
             dp_size: reg.dp_size,
             tp_size: reg.tp_size,
-            transfer_mode: mode,
             expires_at: now + DEFAULT_PING_SECONDS,
         };
 
@@ -265,12 +267,14 @@ impl MoriIOServiceRegistry {
     async fn cleanup_expired(
         prefill_instances: &Arc<Mutex<HashMap<String, MoriIOInstance>>>,
         decode_instances: &Arc<Mutex<HashMap<String, MoriIOInstance>>>,
+        global_mode: &Arc<Mutex<Option<TransferMode>>>,
     ) {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs();
 
+        let prefill_empty;
         {
             let mut map = prefill_instances.lock().unwrap();
             let expired: Vec<_> = map
@@ -282,8 +286,10 @@ impl MoriIOServiceRegistry {
                 info!("Remove MoRIIO Prefill [addr={}, expired]", key);
                 map.remove(&key);
             }
+            prefill_empty = map.is_empty();
         }
 
+        let decode_empty;
         {
             let mut map = decode_instances.lock().unwrap();
             let expired: Vec<_> = map
@@ -295,6 +301,12 @@ impl MoriIOServiceRegistry {
                 info!("Remove MoRIIO Decode [addr={}, expired]", key);
                 map.remove(&key);
             }
+            decode_empty = map.is_empty();
+        }
+
+        if prefill_empty && decode_empty {
+            *global_mode.lock().unwrap() = None;
+            info!("All MoRIIO instances expired; transfer_mode reset");
         }
     }
 
@@ -360,8 +372,8 @@ mod tests {
         assert_eq!(TransferMode::Write.to_string(), "WRITE");
     }
 
-    #[tokio::test]
-    async fn test_handle_registration_mode_mismatch() {
+    #[test]
+    fn test_handle_registration_mode_mismatch() {
         let prefill = Arc::new(Mutex::new(HashMap::new()));
         let decode = Arc::new(Mutex::new(HashMap::new()));
         let global = Arc::new(Mutex::new(Some(TransferMode::Read)));
@@ -379,7 +391,7 @@ mod tests {
         };
         let data = rmp_serde::to_vec_named(&reg).unwrap();
 
-        MoriIOServiceRegistry::handle_registration(&data, &prefill, &decode, &global).await;
+        MoriIOServiceRegistry::handle_registration(&data, &prefill, &decode, &global);
 
         // Should have been rejected — no prefill instance added
         assert!(prefill.lock().unwrap().is_empty());
@@ -387,8 +399,8 @@ mod tests {
         assert_eq!(*global.lock().unwrap(), Some(TransferMode::Read));
     }
 
-    #[tokio::test]
-    async fn test_handle_registration_sets_global_mode() {
+    #[test]
+    fn test_handle_registration_sets_global_mode() {
         let prefill = Arc::new(Mutex::new(HashMap::new()));
         let decode = Arc::new(Mutex::new(HashMap::new()));
         let global = Arc::new(Mutex::new(None));
@@ -405,7 +417,7 @@ mod tests {
         };
         let data = rmp_serde::to_vec_named(&reg).unwrap();
 
-        MoriIOServiceRegistry::handle_registration(&data, &prefill, &decode, &global).await;
+        MoriIOServiceRegistry::handle_registration(&data, &prefill, &decode, &global);
 
         assert_eq!(*global.lock().unwrap(), Some(TransferMode::Read));
         assert_eq!(prefill.lock().unwrap().len(), 1);

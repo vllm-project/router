@@ -571,15 +571,8 @@ impl CliArgs {
                 }
                 all_urls.extend(decode_urls.clone());
             }
-            RoutingMode::MoriIOPrefillDecode {
-                prefill_urls,
-                decode_urls,
-                ..
-            } => {
-                for (url, _) in prefill_urls {
-                    all_urls.push(url.clone());
-                }
-                all_urls.extend(decode_urls.clone());
+            RoutingMode::MoriIOPrefillDecode { .. } => {
+                // MoRIIO uses ZMQ service discovery; no static URLs to collect
             }
             RoutingMode::OpenAI { .. } => {
                 // For connection-mode detection, skip URLs; OpenAI forces HTTP below.

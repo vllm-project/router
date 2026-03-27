@@ -82,18 +82,12 @@ fn select_worker(
 /// MoRIIO PD Router — routes requests through the MoRIIO connector in READ or WRITE mode
 #[derive(Debug)]
 pub struct MoriIOPDRouter {
-    /// Service registry (used in discovery mode)
+    /// Service registry for ZMQ-based instance discovery
     service_registry: Arc<MoriIOServiceRegistry>,
     /// HTTP client for forwarding requests
     http_client: reqwest::Client,
     /// Policy registry for load balancing
     policy_registry: Arc<PolicyRegistry>,
-    /// Whether to use service discovery (true) or static instances (false)
-    use_discovery: bool,
-    /// Static prefill instances (used when use_discovery=false)
-    static_prefill: Vec<MoriIOInstance>,
-    /// Static decode instances (used when use_discovery=false)
-    static_decode: Vec<MoriIOInstance>,
 }
 
 impl MoriIOPDRouter {
@@ -117,9 +111,6 @@ impl MoriIOPDRouter {
             service_registry: Arc::new(registry),
             http_client: reqwest::Client::new(),
             policy_registry: ctx.policy_registry.clone(),
-            use_discovery: true,
-            static_prefill: vec![],
-            static_decode: vec![],
         })
     }
 
@@ -215,17 +206,9 @@ impl MoriIOPDRouter {
         path: &str,
         headers: Option<&HeaderMap>,
     ) -> Response {
-        // Fetch live instances
-        let prefill_instances = if self.use_discovery {
-            self.service_registry.get_prefill_instances()
-        } else {
-            self.static_prefill.clone()
-        };
-        let decode_instances = if self.use_discovery {
-            self.service_registry.get_decode_instances()
-        } else {
-            self.static_decode.clone()
-        };
+        // Fetch live instances from service registry
+        let prefill_instances = self.service_registry.get_prefill_instances();
+        let decode_instances = self.service_registry.get_decode_instances();
 
         if prefill_instances.is_empty() || decode_instances.is_empty() {
             RouterMetrics::record_pd_error("server_selection");
@@ -240,20 +223,16 @@ impl MoriIOPDRouter {
                 .into_response();
         }
 
-        // Detect transfer mode (use first available instance's mode)
-        let transfer_mode = if self.use_discovery {
-            match self.service_registry.transfer_mode() {
-                Some(m) => m,
-                None => {
-                    return (
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "MoRIIO transfer_mode not yet determined (no instance registered)",
-                    )
-                        .into_response();
-                }
+        // Detect transfer mode from service registry
+        let transfer_mode = match self.service_registry.transfer_mode() {
+            Some(m) => m,
+            None => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "MoRIIO transfer_mode not yet determined (no instance registered)",
+                )
+                    .into_response();
             }
-        } else {
-            prefill_instances[0].transfer_mode
         };
 
         let request_text = serde_json::to_string(&request_json).ok();
@@ -449,10 +428,15 @@ impl MoriIOPDRouter {
 
         // --- Stage 2: Decode ---
         let mut decode_req = request_json.clone();
-        // Decrement max_tokens by 1 to account for the prefill token
+        // Decrement token limits by 1 to account for the prefill token
         if let Some(mt) = decode_req.get("max_tokens").and_then(|v| v.as_u64()) {
             if mt > 0 {
                 decode_req["max_tokens"] = json!(mt - 1);
+            }
+        }
+        if let Some(mt) = decode_req.get("max_completion_tokens").and_then(|v| v.as_u64()) {
+            if mt > 0 {
+                decode_req["max_completion_tokens"] = json!(mt - 1);
             }
         }
         decode_req["kv_transfer_params"] = Self::build_decode_kv_params(
@@ -559,9 +543,15 @@ impl MoriIOPDRouter {
 
         // Build decode request immediately — block IDs stay null; decode waits for ZMQ notification
         let mut decode_req = request_json.clone();
+        // Decrement token limits by 1 to account for the prefill token
         if let Some(mt) = decode_req.get("max_tokens").and_then(|v| v.as_u64()) {
             if mt > 0 {
                 decode_req["max_tokens"] = json!(mt - 1);
+            }
+        }
+        if let Some(mt) = decode_req.get("max_completion_tokens").and_then(|v| v.as_u64()) {
+            if mt > 0 {
+                decode_req["max_completion_tokens"] = json!(mt - 1);
             }
         }
         decode_req["kv_transfer_params"] =
@@ -812,14 +802,11 @@ impl RouterTrait for MoriIOPDRouter {
 
     async fn get_worker_loads(&self) -> Response {
         let (prefill_count, decode_count) = self.service_registry.get_instance_counts();
-        (
-            StatusCode::OK,
-            format!(
-                "{{\"prefill_instances\":{},\"decode_instances\":{}}}",
-                prefill_count, decode_count
-            ),
-        )
-            .into_response()
+        let body = serde_json::json!({
+            "prefill_instances": prefill_count,
+            "decode_instances": decode_count,
+        });
+        (StatusCode::OK, body.to_string()).into_response()
     }
 
     fn router_type(&self) -> &'static str {
@@ -827,19 +814,11 @@ impl RouterTrait for MoriIOPDRouter {
     }
 
     fn readiness(&self) -> Response {
-        if self.use_discovery {
-            let (p, d) = self.service_registry.get_instance_counts();
-            if p == 0 || d == 0 {
-                return (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "Waiting for MoRIIO workers to register",
-                )
-                    .into_response();
-            }
-        } else if self.static_prefill.is_empty() || self.static_decode.is_empty() {
+        let (p, d) = self.service_registry.get_instance_counts();
+        if p == 0 || d == 0 {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
-                "No MoRIIO static workers configured",
+                "Waiting for MoRIIO workers to register",
             )
                 .into_response();
         }
@@ -933,21 +912,20 @@ mod tests {
         assert_eq!(result["min_tokens"], 1);
     }
 
-    fn make_instance(addr: &str, mode: TransferMode) -> MoriIOInstance {
+    fn make_instance(addr: &str) -> MoriIOInstance {
         MoriIOInstance {
             request_address: addr.to_string(),
             handshake_port: 8001,
             notify_port: 8002,
             dp_size: 1,
             tp_size: 1,
-            transfer_mode: mode,
             expires_at: u64::MAX,
         }
     }
 
     #[test]
     fn test_build_prefill_kv_params() {
-        let decode = make_instance("http://10.0.0.2:9000/v1/completions", TransferMode::Read);
+        let decode = make_instance("http://10.0.0.2:9000/v1/completions");
         let params = MoriIOPDRouter::build_prefill_kv_params("tx-abc", &decode);
         assert_eq!(params["transfer_id"], "tx-abc");
         assert_eq!(params["do_remote_decode"], true);
@@ -962,7 +940,7 @@ mod tests {
 
     #[test]
     fn test_build_decode_kv_params_read_mode_with_engine_id() {
-        let prefill = make_instance("http://10.0.0.1:8000/v1/completions", TransferMode::Read);
+        let prefill = make_instance("http://10.0.0.1:8000/v1/completions");
         let engine_id = json!("engine-xyz");
         let block_ids = json!([1, 2, 3]);
         let params = MoriIOPDRouter::build_decode_kv_params(
@@ -986,7 +964,7 @@ mod tests {
     #[test]
     fn test_build_decode_kv_params_dp_rank_included_when_dp_gt_1() {
         let mut prefill =
-            make_instance("http://10.0.0.1:8000/v1/completions", TransferMode::Read);
+            make_instance("http://10.0.0.1:8000/v1/completions");
         prefill.dp_size = 4;
         let params =
             MoriIOPDRouter::build_decode_kv_params("tx-abc", &prefill, 2, None, None);
@@ -997,7 +975,7 @@ mod tests {
 
     #[test]
     fn test_build_decode_kv_params_write_mode_null_blocks() {
-        let prefill = make_instance("http://10.0.0.1:8000/v1/completions", TransferMode::Write);
+        let prefill = make_instance("http://10.0.0.1:8000/v1/completions");
         let params =
             MoriIOPDRouter::build_decode_kv_params("tx-write", &prefill, 0, None, None);
         assert_eq!(params["remote_engine_id"], Value::Null);
