@@ -366,11 +366,6 @@ struct CliArgs {
 
     // --- KV Events configuration (for precise_cache_aware policy) ---
 
-    /// Enable real-time KV cache event ingestion from vLLM workers via ZMQ.
-    /// Required when using --policy precise_cache_aware or --prefill-policy / --decode-policy precise_cache_aware.
-    #[arg(long, default_value_t = false, help_heading = "KV Events")]
-    kv_events_enabled: bool,
-
     /// ZMQ topic prefix filter for KV events (must match vLLM --kv-events-config topic prefix)
     #[arg(long, default_value = "kv@", help_heading = "KV Events")]
     kv_events_topic_filter: String,
@@ -556,16 +551,21 @@ impl CliArgs {
                 prefill_policy: self.prefill_policy.as_ref().map(|p| self.parse_policy(p)),
                 decode_policy: self.decode_policy.as_ref().map(|p| self.parse_policy(p)),
                 discovery_address: self.vllm_discovery_address.clone(),
-                kv_events: if self.kv_events_enabled {
-                    Some(vllm_router_rs::config::KVEventsConfig {
-                        enabled: true,
-                        topic_filter: self.kv_events_topic_filter.clone(),
-                        default_port: self.kv_events_port,
-                        index_max_entries: self.kv_index_max_entries,
-                        pd_uncached_token_threshold: self.pd_uncached_token_threshold,
-                    })
-                } else {
-                    None
+                kv_events: {
+                    // Automatically enable KV events when any policy is precise_cache_aware
+                    let needs_kv_events = self.policy == "precise_cache_aware"
+                        || self.prefill_policy.as_deref() == Some("precise_cache_aware")
+                        || self.decode_policy.as_deref() == Some("precise_cache_aware");
+                    if needs_kv_events {
+                        Some(vllm_router_rs::config::KVEventsConfig {
+                            topic_filter: self.kv_events_topic_filter.clone(),
+                            default_port: self.kv_events_port,
+                            index_max_entries: self.kv_index_max_entries,
+                            pd_uncached_token_threshold: self.pd_uncached_token_threshold,
+                        })
+                    } else {
+                        None
+                    }
                 },
             }
         } else {

@@ -21,11 +21,10 @@ vLLM over ZMQ, maintains a global KV block index, and uses it to:
 ## Quick Start
 
 ```bash
-# vLLM PD mode with precise cache-aware routing and KV events
+# vLLM PD mode with precise cache-aware routing (KV events enabled automatically)
 vllm-router --vllm-pd-disaggregation \
   --vllm-discovery-address 0.0.0.0:30001 \
   --policy precise_cache_aware \
-  --kv-events-enabled \
   --kv-block-size 16 \
   --kv-hash-seed 12345 \
   --model-path Qwen/Qwen3-32B
@@ -35,7 +34,6 @@ vllm-router --vllm-pd-disaggregation \
   --vllm-discovery-address 0.0.0.0:30001 \
   --prefill-policy precise_cache_aware \
   --decode-policy precise_cache_aware \
-  --kv-events-enabled \
   --kv-block-size 16 \
   --kv-hash-seed 12345 \
   --pd-uncached-token-threshold 256 \
@@ -48,18 +46,23 @@ vllm-router --vllm-pd-disaggregation \
   --decode http://10.0.0.3:8000 \
   --decode http://10.0.0.4:8000 \
   --policy precise_cache_aware \
-  --kv-events-enabled \
   --kv-block-size 16 \
   --kv-hash-seed 12345
 ```
+
+> **Note**: There is no `--kv-events-enabled` flag.  KV event ingestion is
+> **automatically enabled** whenever `--policy`, `--prefill-policy`, or
+> `--decode-policy` is set to `precise_cache_aware`.
 
 ## CLI Parameters
 
 ### KV Events Configuration
 
+KV event ingestion is **automatically enabled** when any policy is set to
+`precise_cache_aware`.  The following flags tune the event subsystem:
+
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--kv-events-enabled` | `false` | Enable real-time KV cache event ingestion from vLLM workers via ZMQ |
 | `--kv-events-topic-filter` | `kv@` | ZMQ topic prefix filter (must match vLLM `--kv-events-config` topic prefix) |
 | `--kv-events-port` | `5556` | Default ZMQ port for KV event publishers on vLLM workers |
 | `--kv-index-max-entries` | `100000000` | Maximum entries in the KV block index (advisory) |

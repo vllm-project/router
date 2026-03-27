@@ -304,13 +304,11 @@ impl PolicyConfig {
 
 /// Configuration for subscribing to vLLM KV cache events via ZMQ.
 ///
-/// When enabled, the router maintains a real-time index of which KV blocks
-/// reside on which workers, enabling precise cache-aware routing.
+/// Presence of `Some(KVEventsConfig)` in the routing mode means KV event
+/// ingestion is enabled.  This is automatically set when any policy
+/// (main, prefill, or decode) is `precise_cache_aware`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KVEventsConfig {
-    /// Enable KV event ingestion (default: false).
-    #[serde(default)]
-    pub enabled: bool,
     /// ZMQ topic prefix filter (default: "kv@").
     #[serde(default = "default_kv_topic_filter")]
     pub topic_filter: String,
@@ -348,7 +346,6 @@ fn default_pd_uncached_token_threshold() -> usize {
 impl Default for KVEventsConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
             topic_filter: default_kv_topic_filter(),
             default_port: default_kv_events_port(),
             index_max_entries: default_kv_index_max_entries(),
