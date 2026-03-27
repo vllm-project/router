@@ -7,6 +7,8 @@ pub mod core;
 pub mod data_connector;
 #[cfg(feature = "grpc-client")]
 pub mod grpc;
+pub mod kv_events;
+pub mod kv_index;
 pub mod metrics;
 pub mod middleware;
 pub mod otel_http;
@@ -28,6 +30,7 @@ pub enum PolicyType {
     CacheAware,
     PowerOfTwo,
     ConsistentHash,
+    PreciseCacheAware,
 }
 
 #[pyclass]

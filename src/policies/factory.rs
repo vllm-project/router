@@ -11,7 +11,14 @@ use std::sync::Arc;
 pub struct PolicyFactory;
 
 impl PolicyFactory {
-    /// Create a policy from configuration
+    /// Create a policy from configuration.
+    ///
+    /// Note: [`PolicyConfig::PreciseCacheAware`] requires external resources
+    /// (KV block index, tokenizer) that are not available through the config
+    /// alone.  Use [`create_precise_cache_aware`] for that variant.
+    /// This method returns a default `RandomPolicy` as a placeholder if
+    /// `PreciseCacheAware` is requested here; the actual wiring is done
+    /// in the router initialization code.
     pub fn create_from_config(config: &PolicyConfig) -> Arc<dyn LoadBalancingPolicy> {
         match config {
             PolicyConfig::Random => Arc::new(RandomPolicy::new()),
@@ -38,6 +45,17 @@ impl PolicyFactory {
                 // The consistent hash policy uses a hardcoded value for now
                 Arc::new(ConsistentHashPolicy::new())
             }
+            PolicyConfig::PreciseCacheAware { .. } => {
+                // PreciseCacheAwarePolicy needs KVBlockIndex + tokenizer;
+                // it is wired up during router construction.  Return a
+                // placeholder here so that config parsing does not fail.
+                tracing::warn!(
+                    "PolicyFactory: PreciseCacheAware requires KV event infrastructure; \
+                     returning placeholder RandomPolicy.  The router init code should \
+                     replace this with the real policy."
+                );
+                Arc::new(RandomPolicy::new())
+            }
         }
     }
 
@@ -49,6 +67,8 @@ impl PolicyFactory {
             "power_of_two" | "poweroftwo" => Some(Arc::new(PowerOfTwoPolicy::new())),
             "cache_aware" | "cacheaware" => Some(Arc::new(CacheAwarePolicy::new())),
             "consistent_hash" | "consistenthash" => Some(Arc::new(ConsistentHashPolicy::new())),
+            // "precise_cache_aware" is not available via name lookup because
+            // it requires external dependencies (index, tokenizer).
             _ => None,
         }
     }

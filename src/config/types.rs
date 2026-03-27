@@ -157,6 +157,9 @@ pub enum RoutingMode {
         /// ZMQ service discovery address (e.g., "0.0.0.0:30001")
         #[serde(skip_serializing_if = "Option::is_none")]
         discovery_address: Option<String>,
+        /// KV events configuration for precise cache-aware routing
+        #[serde(skip_serializing_if = "Option::is_none")]
+        kv_events: Option<KVEventsConfig>,
     },
 }
 
@@ -254,6 +257,36 @@ pub enum PolicyConfig {
         /// Number of virtual nodes per worker for better distribution
         virtual_nodes: u32,
     },
+
+    /// Precise cache-aware routing backed by real-time KV events from vLLM.
+    /// Requires `kv_events` to be enabled in the routing mode configuration.
+    #[serde(rename = "precise_cache_aware")]
+    PreciseCacheAware {
+        /// Tokens per KV block (must match vLLM `--block-size`, default 16)
+        #[serde(default = "default_kv_block_size")]
+        block_size: usize,
+        /// Hash seed (must match vLLM `PYTHONHASHSEED`, default 0)
+        #[serde(default)]
+        hash_seed: u64,
+        /// Enable speculative index insertion after routing decisions
+        #[serde(default = "default_true")]
+        enable_speculative: bool,
+        /// TTL in milliseconds for speculative index entries (default 2000)
+        #[serde(default = "default_speculative_ttl_ms")]
+        speculative_ttl_ms: u64,
+    },
+}
+
+fn default_kv_block_size() -> usize {
+    16
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_speculative_ttl_ms() -> u64 {
+    2000
 }
 
 impl PolicyConfig {
@@ -264,6 +297,62 @@ impl PolicyConfig {
             PolicyConfig::CacheAware { .. } => "cache_aware",
             PolicyConfig::PowerOfTwo { .. } => "power_of_two",
             PolicyConfig::ConsistentHash { .. } => "consistent_hash",
+            PolicyConfig::PreciseCacheAware { .. } => "precise_cache_aware",
+        }
+    }
+}
+
+/// Configuration for subscribing to vLLM KV cache events via ZMQ.
+///
+/// When enabled, the router maintains a real-time index of which KV blocks
+/// reside on which workers, enabling precise cache-aware routing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KVEventsConfig {
+    /// Enable KV event ingestion (default: false).
+    #[serde(default)]
+    pub enabled: bool,
+    /// ZMQ topic prefix filter (default: "kv@").
+    #[serde(default = "default_kv_topic_filter")]
+    pub topic_filter: String,
+    /// Default ZMQ port for KV event publishers on each vLLM worker.
+    /// Used when deriving ZMQ endpoints from HTTP addresses.
+    #[serde(default = "default_kv_events_port")]
+    pub default_port: u16,
+    /// Maximum entries in the KV block index (advisory, for pre-allocation).
+    #[serde(default = "default_kv_index_max_entries")]
+    pub index_max_entries: usize,
+    /// Uncached-token threshold for P/D disaggregation bypass.
+    /// When the best decode worker's uncached tokens are below this
+    /// threshold, the router skips prefill disaggregation and sends the
+    /// request directly to the decode worker.
+    #[serde(default = "default_pd_uncached_token_threshold")]
+    pub pd_uncached_token_threshold: usize,
+}
+
+fn default_kv_topic_filter() -> String {
+    "kv@".to_string()
+}
+
+fn default_kv_events_port() -> u16 {
+    5556
+}
+
+fn default_kv_index_max_entries() -> usize {
+    100_000_000
+}
+
+fn default_pd_uncached_token_threshold() -> usize {
+    256
+}
+
+impl Default for KVEventsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            topic_filter: default_kv_topic_filter(),
+            default_port: default_kv_events_port(),
+            index_max_entries: default_kv_index_max_entries(),
+            pd_uncached_token_threshold: default_pd_uncached_token_threshold(),
         }
     }
 }

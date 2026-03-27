@@ -90,6 +90,7 @@ strum = { version = "0.26", features = ["derive"] }
 once_cell = "1.21.3"
 zmq = "0.10.0"
 rmp-serde = "1.3"
+rmpv = "1.3"
 
 [build-dependencies]
 tonic-prost-build = "0.14"
