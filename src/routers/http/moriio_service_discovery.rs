@@ -134,8 +134,8 @@ impl MoriIOServiceRegistry {
                 }
 
                 match socket.recv_multipart(zmq::DONTWAIT) {
-                    Ok(parts) if parts.len() >= 3 => {
-                        let message_data = &parts[2];
+                    Ok(parts) if parts.len() >= 2 => {
+                        let message_data = &parts[1];
                         Self::handle_registration(
                             message_data,
                             &prefill_instances,
@@ -144,7 +144,7 @@ impl MoriIOServiceRegistry {
                         );
                     }
                     Ok(_) => {
-                        warn!("MoRIIO ZMQ received malformed multipart message (< 3 parts)");
+                        warn!("MoRIIO ZMQ received malformed multipart message (< 2 parts)");
                     }
                     Err(zmq::Error::EAGAIN) => {
                         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
