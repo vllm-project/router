@@ -116,7 +116,6 @@ impl<'a> PrefixScorer<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
 
     fn make_index() -> KVBlockIndex {
         KVBlockIndex::new(10000)
@@ -194,7 +193,7 @@ mod tests {
         let result = scorer.score(&[1, 2, 3]);
 
         // W1 doesn't hold any of the queried blocks.
-        assert!(result.scores.is_empty() || result.scores.get("http://w1:8000").is_none());
+        assert!(result.scores.is_empty() || !result.scores.contains_key("http://w1:8000"));
     }
 
     #[test]

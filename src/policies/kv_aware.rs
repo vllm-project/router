@@ -23,7 +23,7 @@ use super::{get_healthy_worker_indices, LoadBalancingPolicy, RequestHeaders};
 use crate::core::Worker;
 use crate::kv_index::{BlockKeyGenerator, KVBlockIndex, PrefixScorer};
 use crate::metrics::RouterMetrics;
-use crate::tokenizer::traits::{Encoder, Encoding};
+use crate::tokenizer::traits::Encoder;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, warn};
