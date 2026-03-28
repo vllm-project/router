@@ -365,7 +365,6 @@ struct CliArgs {
     profile: bool,
 
     // --- KV Events configuration (for kv_aware policy) ---
-
     /// ZMQ topic prefix filter for KV events (must match vLLM --kv-events-config topic prefix)
     #[arg(long, default_value = "kv@", help_heading = "KV Events")]
     kv_events_topic_filter: String,
@@ -386,7 +385,6 @@ struct CliArgs {
     pd_uncached_token_threshold: usize,
 
     // --- KV-aware policy parameters ---
-
     /// KV block size in tokens (must match vLLM --block-size)
     #[arg(long, default_value_t = 16, help_heading = "KV Events")]
     kv_block_size: usize,

@@ -194,7 +194,7 @@ mod tests {
         let result = scorer.score(&[1, 2, 3]);
 
         // W1 doesn't hold any of the queried blocks.
-        assert!(result.scores.is_empty() || result.scores.get("http://w1:8000") == None);
+        assert!(result.scores.is_empty() || result.scores.get("http://w1:8000").is_none());
     }
 
     #[test]

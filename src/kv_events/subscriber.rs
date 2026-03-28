@@ -60,7 +60,13 @@ pub fn spawn_subscriber(
     let join_handle = std::thread::Builder::new()
         .name(format!("kv-sub-{}", worker_id))
         .spawn(move || {
-            subscriber_loop(&wid, &zmq_endpoint, &topic_filter, &event_tx, &running_clone);
+            subscriber_loop(
+                &wid,
+                &zmq_endpoint,
+                &topic_filter,
+                &event_tx,
+                &running_clone,
+            );
         })
         .expect("failed to spawn KV event subscriber thread");
 
@@ -93,10 +99,7 @@ fn subscriber_loop(
 
     // Set a receive timeout so we can periodically check the `running` flag.
     if let Err(e) = socket.set_rcvtimeo(1000) {
-        warn!(
-            "KV subscriber {}: failed to set rcvtimeo: {}",
-            worker_id, e
-        );
+        warn!("KV subscriber {}: failed to set rcvtimeo: {}", worker_id, e);
     }
 
     if let Err(e) = socket.set_subscribe(topic_filter.as_bytes()) {
@@ -137,10 +140,7 @@ fn subscriber_loop(
                 match decoder::decode_event_batch(payload, worker_id) {
                     Ok(batch) => {
                         if event_tx.send(batch).is_err() {
-                            info!(
-                                "KV subscriber {}: channel closed, stopping",
-                                worker_id
-                            );
+                            info!("KV subscriber {}: channel closed, stopping", worker_id);
                             break;
                         }
                     }

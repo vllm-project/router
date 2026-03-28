@@ -118,13 +118,7 @@ impl KvAwarePolicy {
         // Find the healthy worker with the highest prefix score.
         let best_idx = healthy_indices
             .iter()
-            .max_by_key(|&&idx| {
-                result
-                    .scores
-                    .get(workers[idx].url())
-                    .copied()
-                    .unwrap_or(0)
-            })
+            .max_by_key(|&&idx| result.scores.get(workers[idx].url()).copied().unwrap_or(0))
             .copied()?;
 
         let best_score = result

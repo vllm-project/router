@@ -77,7 +77,7 @@ impl KVBlockIndex {
     /// Called when a `BlockStored` event is received.  Duplicate entries
     /// for the same (hash, worker) pair are deduplicated.
     pub fn on_block_stored(&self, block_hash: u64, worker_url: &str) {
-        let mut entry = self.index.entry(block_hash).or_insert_with(Vec::new);
+        let mut entry = self.index.entry(block_hash).or_default();
         let locations = entry.value_mut();
 
         // Deduplicate: if the worker is already recorded, refresh timestamp
@@ -135,14 +135,9 @@ impl KVBlockIndex {
     /// The entries carry a TTL and are replaced by real events when they
     /// arrive.  This prevents duplicate work when multiple requests with
     /// the same prefix arrive in quick succession.
-    pub fn speculative_insert(
-        &self,
-        block_hashes: &[u64],
-        worker_url: &str,
-        ttl: Duration,
-    ) {
+    pub fn speculative_insert(&self, block_hashes: &[u64], worker_url: &str, ttl: Duration) {
         for &hash in block_hashes {
-            let mut entry = self.index.entry(hash).or_insert_with(Vec::new);
+            let mut entry = self.index.entry(hash).or_default();
             let locations = entry.value_mut();
 
             // Skip if the worker already has a real (non-speculative) entry.
@@ -154,9 +149,7 @@ impl KVBlockIndex {
             }
 
             // Remove stale speculative entry for this worker if present.
-            locations.retain(|loc| {
-                !(loc.worker_url == worker_url && loc.is_speculative)
-            });
+            locations.retain(|loc| !(loc.worker_url == worker_url && loc.is_speculative));
 
             locations.push(BlockLocation {
                 worker_url: worker_url.to_string(),

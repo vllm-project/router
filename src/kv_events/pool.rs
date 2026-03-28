@@ -156,9 +156,6 @@ mod tests {
             derive_zmq_endpoint("http://10.0.0.5:8000", 5556),
             "tcp://10.0.0.5:5556"
         );
-        assert_eq!(
-            derive_zmq_endpoint("my-host", 5556),
-            "tcp://my-host:5556"
-        );
+        assert_eq!(derive_zmq_endpoint("my-host", 5556), "tcp://my-host:5556");
     }
 }

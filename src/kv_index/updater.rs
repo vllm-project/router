@@ -1,8 +1,8 @@
 //! Background task that consumes [`KVEventBatch`] messages from the event
 //! pool channel and applies them to the [`KVBlockIndex`].
 
-use crate::kv_events::KVEventBatch;
 use crate::kv_events::decoder::KVEvent;
+use crate::kv_events::KVEventBatch;
 use crate::kv_index::KVBlockIndex;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -75,7 +75,7 @@ pub async fn run_kv_index_updater(
         }
 
         // Periodic progress log every 10000 batches.
-        if total_batches % 10_000 == 0 {
+        if total_batches.is_multiple_of(10_000) {
             info!(
                 "KV index updater progress: {} batches, {} events, {} index entries",
                 total_batches,

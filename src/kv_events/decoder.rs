@@ -58,9 +58,8 @@ pub struct KVEventBatch {
 /// Each event is a tagged array where the first element is the type
 /// discriminator assigned by `msgspec` (`tag=True`).
 pub fn decode_event_batch(payload: &[u8], worker_id: &str) -> Result<KVEventBatch, String> {
-    let value: rmpv::Value =
-        rmpv::decode::read_value(&mut std::io::Cursor::new(payload))
-            .map_err(|e| format!("msgpack decode error: {}", e))?;
+    let value: rmpv::Value = rmpv::decode::read_value(&mut std::io::Cursor::new(payload))
+        .map_err(|e| format!("msgpack decode error: {}", e))?;
 
     let arr = value
         .as_array()
@@ -88,10 +87,7 @@ pub fn decode_event_batch(payload: &[u8], worker_id: &str) -> Result<KVEventBatc
         match decode_single_event(raw) {
             Ok(ev) => events.push(ev),
             Err(e) => {
-                warn!(
-                    "Skipping malformed KV event from {}: {}",
-                    worker_id, e
-                );
+                warn!("Skipping malformed KV event from {}: {}", worker_id, e);
             }
         }
     }
@@ -268,10 +264,8 @@ mod tests {
             ]),
             rmpv::Value::Nil,
         ]);
-        let batch_val = rmpv::Value::Array(vec![
-            rmpv::Value::F64(1.0),
-            rmpv::Value::Array(vec![event]),
-        ]);
+        let batch_val =
+            rmpv::Value::Array(vec![rmpv::Value::F64(1.0), rmpv::Value::Array(vec![event])]);
         let mut buf = Vec::new();
         rmpv::encode::write_value(&mut buf, &batch_val).unwrap();
 

@@ -146,10 +146,10 @@ impl Router {
                     virtual_nodes: 160, // Default value
                 },
                 PolicyType::KvAware => ConfigPolicyConfig::KvAware {
-                    block_size: 16,            // Default value
-                    hash_seed: 0,              // Default value
-                    enable_speculative: true,   // Default value
-                    speculative_ttl_ms: 2000,  // Default value
+                    block_size: 16,           // Default value
+                    hash_seed: 0,             // Default value
+                    enable_speculative: true, // Default value
+                    speculative_ttl_ms: 2000, // Default value
                 },
             }
         };
