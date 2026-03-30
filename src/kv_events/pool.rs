@@ -38,6 +38,15 @@ pub struct KVEventPool {
     subscribers: HashMap<String, SubscriberHandle>,
 }
 
+impl std::fmt::Debug for KVEventPool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KVEventPool")
+            .field("config", &self.config)
+            .field("worker_count", &self.subscribers.len())
+            .finish()
+    }
+}
+
 impl KVEventPool {
     /// Create a new pool and return the receiver end of the event channel.
     pub fn new(config: KVEventPoolConfig) -> (Self, mpsc::UnboundedReceiver<KVEventBatch>) {
