@@ -252,11 +252,12 @@ impl RouterFactory {
                         enable_speculative,
                         speculative_ttl_ms,
                     } => {
-                        let (ref block_index, _, ref tok, _) = kv_infra.as_ref().ok_or_else(|| {
-                            "KvAware policy requires KV event infrastructure (--model-path or \
-                             --tokenizer-path must be set and kv_events config must be present)"
-                                .to_string()
-                        })?;
+                        let (ref block_index, _, ref tok, _) =
+                            kv_infra.as_ref().ok_or_else(|| {
+                                "KvAware policy requires KV event infrastructure (--model-path or \
+                                 --tokenizer-path must be set and kv_events config must be present)"
+                                    .to_string()
+                            })?;
                         let kv_config = KvAwareConfig {
                             block_size: *block_size,
                             hash_seed: *hash_seed,
