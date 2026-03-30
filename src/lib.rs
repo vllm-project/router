@@ -161,20 +161,50 @@ impl Router {
                 worker_urls: vec![],
             }
         } else if self.vllm_pd_disaggregation {
+            // Automatically enable KV events when any policy is kv_aware
+            let any_kv_aware = matches!(self.policy, PolicyType::KvAware)
+                || matches!(self.prefill_policy, Some(PolicyType::KvAware))
+                || matches!(self.decode_policy, Some(PolicyType::KvAware));
+
             RoutingMode::VllmPrefillDecode {
                 prefill_urls: self.prefill_urls.clone().unwrap_or_default(),
                 decode_urls: self.decode_urls.clone().unwrap_or_default(),
                 prefill_policy: self.prefill_policy.as_ref().map(convert_policy),
                 decode_policy: self.decode_policy.as_ref().map(convert_policy),
                 discovery_address: None,
-                kv_events: None,
+                kv_events: if any_kv_aware {
+                    Some(config::KVEventsConfig::default())
+                } else {
+                    None
+                },
             }
         } else if self.pd_disaggregation {
-            RoutingMode::PrefillDecode {
-                prefill_urls: self.prefill_urls.clone().unwrap_or_default(),
-                decode_urls: self.decode_urls.clone().unwrap_or_default(),
-                prefill_policy: self.prefill_policy.as_ref().map(convert_policy),
-                decode_policy: self.decode_policy.as_ref().map(convert_policy),
+            // Check if any policy is KvAware; if so, auto-upgrade to
+            // VllmPrefillDecode which supports KV event infrastructure.
+            let any_kv_aware = matches!(self.policy, PolicyType::KvAware)
+                || matches!(self.prefill_policy, Some(PolicyType::KvAware))
+                || matches!(self.decode_policy, Some(PolicyType::KvAware));
+
+            if any_kv_aware {
+                tracing::info!(
+                    "kv_aware policy detected with --pd-disaggregation; \
+                     auto-upgrading to VllmPrefillDecode mode for KV event support"
+                );
+                RoutingMode::VllmPrefillDecode {
+                    prefill_urls: self.prefill_urls.clone().unwrap_or_default(),
+                    decode_urls: self.decode_urls.clone().unwrap_or_default(),
+                    prefill_policy: self.prefill_policy.as_ref().map(convert_policy),
+                    decode_policy: self.decode_policy.as_ref().map(convert_policy),
+                    discovery_address: None,
+                    kv_events: Some(config::KVEventsConfig::default()),
+                }
+            } else {
+                RoutingMode::PrefillDecode {
+                    prefill_urls: self.prefill_urls.clone().unwrap_or_default(),
+                    decode_urls: self.decode_urls.clone().unwrap_or_default(),
+                    prefill_policy: self.prefill_policy.as_ref().map(convert_policy),
+                    decode_policy: self.decode_policy.as_ref().map(convert_policy),
+                }
             }
         } else {
             RoutingMode::Regular {

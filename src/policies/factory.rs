@@ -44,12 +44,12 @@ impl PolicyFactory {
                 Arc::new(ConsistentHashPolicy::new())
             }
             PolicyConfig::KvAware { .. } => {
-                // KvAwarePolicy requires KVBlockIndex + tokenizer which are
-                // bootstrapped during router construction in factory.rs.
-                // This code path should never be reached for KvAware.
-                unreachable!(
-                    "KvAware policy must be constructed via router factory, \
-                     not through PolicyFactory::create_from_config()"
+                // KvAwarePolicy requires KVBlockIndex + tokenizer which are only
+                // available in the VllmPrefillDecode router path.  If we reach
+                // here it means kv_aware was requested in a non-PD context.
+                panic!(
+                    "kv_aware policy requires --pd-disaggregation or \
+                     --vllm-pd-disaggregation mode"
                 )
             }
         }
