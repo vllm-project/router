@@ -15,10 +15,8 @@ impl PolicyFactory {
     ///
     /// Note: [`PolicyConfig::KvAware`] requires external resources
     /// (KV block index, tokenizer) that are not available through the config
-    /// alone.  Use [`create_kv_aware`] for that variant.
-    /// This method returns a default `RandomPolicy` as a placeholder if
-    /// `KvAware` is requested here; the actual wiring is done
-    /// in the router initialization code.
+    /// alone.  It is constructed directly in the router factory code.
+    /// This method will panic if `KvAware` is requested.
     pub fn create_from_config(config: &PolicyConfig) -> Arc<dyn LoadBalancingPolicy> {
         match config {
             PolicyConfig::Random => Arc::new(RandomPolicy::new()),
@@ -46,15 +44,13 @@ impl PolicyFactory {
                 Arc::new(ConsistentHashPolicy::new())
             }
             PolicyConfig::KvAware { .. } => {
-                // KvAwarePolicy needs KVBlockIndex + tokenizer;
-                // it is wired up during router construction.  Return a
-                // placeholder here so that config parsing does not fail.
-                tracing::warn!(
-                    "PolicyFactory: KvAware requires KV event infrastructure; \
-                     returning placeholder RandomPolicy.  The router init code should \
-                     replace this with the real policy."
-                );
-                Arc::new(RandomPolicy::new())
+                // KvAwarePolicy requires KVBlockIndex + tokenizer which are
+                // bootstrapped during router construction in factory.rs.
+                // This code path should never be reached for KvAware.
+                unreachable!(
+                    "KvAware policy must be constructed via router factory, \
+                     not through PolicyFactory::create_from_config()"
+                )
             }
         }
     }

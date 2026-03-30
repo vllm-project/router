@@ -203,14 +203,13 @@ impl PolicyRegistry {
             PolicyConfig::PowerOfTwo { .. } => Arc::new(PowerOfTwoPolicy::new()),
             PolicyConfig::ConsistentHash { .. } => Arc::new(ConsistentHashPolicy::new()),
             PolicyConfig::KvAware { .. } => {
-                // KvAwarePolicy requires KVBlockIndex + tokenizer;
-                // it is wired up during router construction.  Return a
-                // placeholder here so that registry creation does not fail.
-                tracing::warn!(
-                    "PolicyRegistry: KvAware requires KV event infrastructure; \
-                     returning placeholder RandomPolicy."
-                );
-                Arc::new(RandomPolicy::new())
+                // KvAwarePolicy requires KVBlockIndex + tokenizer which are
+                // bootstrapped during router construction in factory.rs.
+                // This code path should never be reached for KvAware.
+                unreachable!(
+                    "KvAware policy must be constructed via router factory, \
+                     not through PolicyRegistry"
+                )
             }
         }
     }
