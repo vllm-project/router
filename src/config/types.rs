@@ -332,7 +332,7 @@ fn default_kv_topic_filter() -> String {
 }
 
 fn default_kv_events_port() -> u16 {
-    5556
+    5557
 }
 
 fn default_kv_index_max_entries() -> usize {

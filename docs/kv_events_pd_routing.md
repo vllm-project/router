@@ -64,7 +64,7 @@ KV event ingestion is **automatically enabled** when any policy is set to
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--kv-events-topic-filter` | `kv@` | ZMQ topic prefix filter (must match vLLM `--kv-events-config` topic prefix) |
-| `--kv-events-port` | `5556` | Default ZMQ port for KV event publishers on vLLM workers |
+| `--kv-events-port` | `5557` | Default ZMQ port for KV event publishers on vLLM workers |
 | `--kv-index-max-entries` | `100000000` | Maximum entries in the KV block index (advisory) |
 | `--pd-uncached-token-threshold` | `256` | When the best decode worker's uncached tokens are below this value, skip prefill disaggregation |
 
@@ -84,7 +84,7 @@ KV event ingestion is **automatically enabled** when any policy is set to
 | `--kv-block-size` | `--block-size` | `16` |
 | `--kv-hash-seed` | `PYTHONHASHSEED` env var | `12345` |
 | `--kv-events-topic-filter` | `--kv-events-config` topic prefix | `kv@` |
-| `--kv-events-port` | `--kv-events-config` endpoint port | `5556` |
+| `--kv-events-port` | `--kv-events-config` endpoint port | `5557` |
 
 ## Architecture
 
@@ -148,7 +148,7 @@ Each vLLM worker must enable KV cache events:
 # Example vLLM launch with KV events enabled
 vllm serve Qwen/Qwen3-32B \
   --block-size 16 \
-  --kv-events-config '{"enable_kv_cache_events":true,"publisher":"zmq","endpoint":"tcp://*:5556","topic":"kv@${POD_IP}@Qwen/Qwen3-32B"}'
+  --kv-events-config '{"enable_kv_cache_events":true,"publisher":"zmq","endpoint":"tcp://*:5557","topic":"kv@${POD_IP}@Qwen/Qwen3-32B"}'
 
 # Ensure PYTHONHASHSEED matches --kv-hash-seed on the router
 export PYTHONHASHSEED=12345

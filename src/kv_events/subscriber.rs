@@ -44,7 +44,7 @@ impl Drop for SubscriberHandle {
 ///
 /// # Arguments
 /// * `worker_id`    – Logical name for this worker (used in decoded batches).
-/// * `zmq_endpoint` – Full ZMQ address, e.g. `tcp://10.0.0.5:5556`.
+/// * `zmq_endpoint` – Full ZMQ address, e.g. `tcp://10.0.0.5:5557`.
 /// * `topic_filter` – Topic prefix for SUB filtering (e.g. `"kv@"`).
 /// * `event_tx`     – Channel sender for decoded event batches.
 pub fn spawn_subscriber(

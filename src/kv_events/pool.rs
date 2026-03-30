@@ -25,7 +25,7 @@ impl Default for KVEventPoolConfig {
     fn default() -> Self {
         Self {
             topic_filter: "kv@".to_string(),
-            default_kv_events_port: 5556,
+            default_kv_events_port: 5557,
         }
     }
 }
@@ -126,7 +126,7 @@ impl Drop for KVEventPool {
 
 /// Derive a ZMQ TCP endpoint from an HTTP address string.
 ///
-/// Example: `"10.0.0.5:8000"` with port 5556 -> `"tcp://10.0.0.5:5556"`
+/// Example: `"10.0.0.5:8000"` with port 5557 -> `"tcp://10.0.0.5:5557"`
 fn derive_zmq_endpoint(http_address: &str, kv_events_port: u16) -> String {
     // Strip scheme if present.
     let addr = http_address
@@ -149,13 +149,13 @@ mod tests {
     #[test]
     fn test_derive_zmq_endpoint() {
         assert_eq!(
-            derive_zmq_endpoint("10.0.0.5:8000", 5556),
-            "tcp://10.0.0.5:5556"
+            derive_zmq_endpoint("10.0.0.5:8000", 5557),
+            "tcp://10.0.0.5:5557"
         );
         assert_eq!(
-            derive_zmq_endpoint("http://10.0.0.5:8000", 5556),
-            "tcp://10.0.0.5:5556"
+            derive_zmq_endpoint("http://10.0.0.5:8000", 5557),
+            "tcp://10.0.0.5:5557"
         );
-        assert_eq!(derive_zmq_endpoint("my-host", 5556), "tcp://my-host:5556");
+        assert_eq!(derive_zmq_endpoint("my-host", 5557), "tcp://my-host:5557");
     }
 }

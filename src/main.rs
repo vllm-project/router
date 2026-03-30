@@ -371,7 +371,7 @@ struct CliArgs {
 
     /// Default ZMQ port for KV event publishers on vLLM workers.
     /// Used to derive ZMQ endpoints from worker HTTP addresses.
-    #[arg(long, default_value_t = 5556, help_heading = "KV Events")]
+    #[arg(long, default_value_t = 5557, help_heading = "KV Events")]
     kv_events_port: u16,
 
     /// Maximum entries in the KV block index (advisory, for pre-allocation)
