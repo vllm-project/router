@@ -241,15 +241,22 @@ impl RouterFactory {
         };
 
         // ── Policy construction ────────────────────────────────────────────
-        let make_real_policy = |cfg: &PolicyConfig| -> Arc<dyn LoadBalancingPolicy> {
-            match cfg {
-                PolicyConfig::KvAware {
-                    block_size,
-                    hash_seed,
-                    enable_speculative,
-                    speculative_ttl_ms,
-                } => {
-                    if let Some((ref block_index, _, ref tok, _)) = kv_infra {
+        // For KvAware, we must use the bootstrapped KV infrastructure (index +
+        // tokenizer).  For all other policies, delegate to PolicyFactory.
+        let make_real_policy =
+            |cfg: &PolicyConfig| -> Result<Arc<dyn LoadBalancingPolicy>, String> {
+                match cfg {
+                    PolicyConfig::KvAware {
+                        block_size,
+                        hash_seed,
+                        enable_speculative,
+                        speculative_ttl_ms,
+                    } => {
+                        let (ref block_index, _, ref tok, _) = kv_infra.as_ref().ok_or_else(|| {
+                            "KvAware policy requires KV event infrastructure (--model-path or \
+                             --tokenizer-path must be set and kv_events config must be present)"
+                                .to_string()
+                        })?;
                         let kv_config = KvAwareConfig {
                             block_size: *block_size,
                             hash_seed: *hash_seed,
@@ -257,34 +264,27 @@ impl RouterFactory {
                             speculative_ttl: Duration::from_millis(*speculative_ttl_ms),
                         };
                         tracing::info!(
-                            "Creating real KvAwarePolicy \
+                            "Creating KvAwarePolicy \
                              (block_size={}, hash_seed={}, speculative={})",
                             block_size,
                             hash_seed,
                             enable_speculative,
                         );
-                        Arc::new(KvAwarePolicy::new(
+                        Ok(Arc::new(KvAwarePolicy::new(
                             kv_config,
                             Arc::clone(block_index),
                             Arc::clone(tok),
-                        ))
-                    } else {
-                        tracing::error!(
-                            "KvAware policy requested but KV events config is missing! \
-                             Falling back to RandomPolicy placeholder."
-                        );
-                        PolicyFactory::create_from_config(cfg)
+                        )))
                     }
+                    _ => Ok(PolicyFactory::create_from_config(cfg)),
                 }
-                _ => PolicyFactory::create_from_config(cfg),
-            }
-        };
+            };
 
         let effective_prefill = prefill_policy_config.unwrap_or(main_policy_config);
         let effective_decode = decode_policy_config.unwrap_or(main_policy_config);
 
-        let prefill_policy = make_real_policy(effective_prefill);
-        let decode_policy = make_real_policy(effective_decode);
+        let prefill_policy = make_real_policy(effective_prefill)?;
+        let decode_policy = make_real_policy(effective_decode)?;
 
         // Install policies into the shared registry.
         ctx.policy_registry.set_prefill_policy(prefill_policy);
