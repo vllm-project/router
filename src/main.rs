@@ -490,11 +490,49 @@ impl CliArgs {
                 });
             }
 
-            RoutingMode::PrefillDecode {
-                prefill_urls,
-                decode_urls,
-                prefill_policy: self.prefill_policy.as_ref().map(|p| self.parse_policy(p)),
-                decode_policy: self.decode_policy.as_ref().map(|p| self.parse_policy(p)),
+            // Check if any policy is kv_aware; if so, auto-upgrade to
+            // VllmPrefillDecode which supports KV event infrastructure.
+            let needs_kv_events = self.policy == "kv_aware"
+                || self.prefill_policy.as_deref() == Some("kv_aware")
+                || self.decode_policy.as_deref() == Some("kv_aware");
+
+            if needs_kv_events {
+                eprintln!(
+                    "ℹ️  INFO: kv_aware policy detected with --pd-disaggregation; \
+                     auto-upgrading to VllmPrefillDecode mode for KV event support"
+                );
+                RoutingMode::VllmPrefillDecode {
+                    prefill_urls,
+                    decode_urls,
+                    prefill_policy: self
+                        .prefill_policy
+                        .as_ref()
+                        .map(|p| self.parse_policy(p)),
+                    decode_policy: self
+                        .decode_policy
+                        .as_ref()
+                        .map(|p| self.parse_policy(p)),
+                    discovery_address: self.vllm_discovery_address.clone(),
+                    kv_events: Some(vllm_router_rs::config::KVEventsConfig {
+                        topic_filter: self.kv_events_topic_filter.clone(),
+                        default_port: self.kv_events_port,
+                        index_max_entries: self.kv_index_max_entries,
+                        pd_uncached_token_threshold: self.pd_uncached_token_threshold,
+                    }),
+                }
+            } else {
+                RoutingMode::PrefillDecode {
+                    prefill_urls,
+                    decode_urls,
+                    prefill_policy: self
+                        .prefill_policy
+                        .as_ref()
+                        .map(|p| self.parse_policy(p)),
+                    decode_policy: self
+                        .decode_policy
+                        .as_ref()
+                        .map(|p| self.parse_policy(p)),
+                }
             }
         } else if self.vllm_pd_disaggregation {
             // Use decode URLs from CLI arguments (already parsed by clap)
