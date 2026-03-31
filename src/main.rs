@@ -504,14 +504,8 @@ impl CliArgs {
                 RoutingMode::VllmPrefillDecode {
                     prefill_urls,
                     decode_urls,
-                    prefill_policy: self
-                        .prefill_policy
-                        .as_ref()
-                        .map(|p| self.parse_policy(p)),
-                    decode_policy: self
-                        .decode_policy
-                        .as_ref()
-                        .map(|p| self.parse_policy(p)),
+                    prefill_policy: self.prefill_policy.as_ref().map(|p| self.parse_policy(p)),
+                    decode_policy: self.decode_policy.as_ref().map(|p| self.parse_policy(p)),
                     discovery_address: self.vllm_discovery_address.clone(),
                     kv_events: Some(vllm_router_rs::config::KVEventsConfig {
                         topic_filter: self.kv_events_topic_filter.clone(),
@@ -524,14 +518,8 @@ impl CliArgs {
                 RoutingMode::PrefillDecode {
                     prefill_urls,
                     decode_urls,
-                    prefill_policy: self
-                        .prefill_policy
-                        .as_ref()
-                        .map(|p| self.parse_policy(p)),
-                    decode_policy: self
-                        .decode_policy
-                        .as_ref()
-                        .map(|p| self.parse_policy(p)),
+                    prefill_policy: self.prefill_policy.as_ref().map(|p| self.parse_policy(p)),
+                    decode_policy: self.decode_policy.as_ref().map(|p| self.parse_policy(p)),
                 }
             }
         } else if self.vllm_pd_disaggregation {
