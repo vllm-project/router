@@ -204,11 +204,15 @@ impl PolicyRegistry {
             PolicyConfig::ConsistentHash { .. } => Arc::new(ConsistentHashPolicy::new()),
             PolicyConfig::KvAware { .. } => {
                 // KvAwarePolicy requires KVBlockIndex + tokenizer which are only
-                // available in the VllmPrefillDecode router path.
-                panic!(
-                    "kv_aware policy requires --pd-disaggregation or \
-                     --vllm-pd-disaggregation mode"
-                )
+                // available in the VllmPrefillDecode router path.  When the
+                // registry is constructed before the PD router is set up, use a
+                // round-robin placeholder.  The real KvAwarePolicy will be
+                // installed later via set_prefill_policy / set_decode_policy.
+                tracing::debug!(
+                    "KvAware requested in PolicyRegistry::create_policy_from_config; \
+                     using RoundRobin placeholder (real policy set by PD router)"
+                );
+                Arc::new(RoundRobinPolicy::new())
             }
         }
     }

@@ -45,12 +45,13 @@ impl PolicyFactory {
             }
             PolicyConfig::KvAware { .. } => {
                 // KvAwarePolicy requires KVBlockIndex + tokenizer which are only
-                // available in the VllmPrefillDecode router path.  If we reach
-                // here it means kv_aware was requested in a non-PD context.
-                panic!(
-                    "kv_aware policy requires --pd-disaggregation or \
-                     --vllm-pd-disaggregation mode"
-                )
+                // available in the VllmPrefillDecode router path.  Use a
+                // round-robin placeholder; the real policy is installed later.
+                tracing::debug!(
+                    "KvAware requested in PolicyFactory::create_from_config; \
+                     using RoundRobin placeholder (real policy set by PD router)"
+                );
+                Arc::new(RoundRobinPolicy::new())
             }
         }
     }
