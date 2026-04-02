@@ -321,14 +321,16 @@ impl ConfigValidator {
                 }
             }
             RoutingMode::PrefillDecode { .. } => {
-                if discovery.prefill_selector.is_empty() && discovery.decode_selector.is_empty() {
+                let has_valid_prefill = discovery.prefill_selectors.values().any(|s| !s.is_empty());
+                if !has_valid_prefill && discovery.decode_selector.is_empty() {
                     return Err(ConfigError::ValidationFailed {
                         reason: "PD mode with service discovery requires at least one non-empty selector (prefill or decode)".to_string(),
                     });
                 }
             }
             RoutingMode::VllmPrefillDecode { .. } => {
-                if discovery.prefill_selector.is_empty() && discovery.decode_selector.is_empty() {
+                let has_valid_prefill = discovery.prefill_selectors.values().any(|s| !s.is_empty());
+                if !has_valid_prefill && discovery.decode_selector.is_empty() {
                     return Err(ConfigError::ValidationFailed {
                         reason: "vLLM PD mode with service discovery requires at least one non-empty selector (prefill or decode)".to_string(),
                     });

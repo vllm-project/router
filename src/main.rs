@@ -1,5 +1,5 @@
 use clap::{ArgAction, Parser, ValueEnum};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use vllm_router_rs::config::{
     CircuitBreakerConfig, ConfigError, ConfigResult, ConnectionMode, DiscoveryConfig,
     HealthCheckConfig, HistoryBackend, MetricsConfig, PolicyConfig, RetryConfig, RouterConfig,
@@ -42,6 +42,80 @@ fn parse_prefill_args() -> Vec<(String, Option<u16>)> {
     }
 
     prefill_entries
+}
+
+/// Parse prefill selectors with optional pool name prefix.
+///
+/// Supports:
+/// - `--prefill-selector app=my-prefill` → pool "default" (backward compat)
+/// - `--prefill-selector text:app=text-prefill` → pool "text"
+/// - `--prefill-selector perception:app=mm-prefill` → pool "perception"
+///
+/// Parsing: split on first `:` — if the left side contains no `=`, it's a pool name;
+/// otherwise treat whole string as `key=value` for pool "default".
+fn parse_prefill_selectors(selector_list: &[String]) -> BTreeMap<String, HashMap<String, String>> {
+    let mut pools: BTreeMap<String, HashMap<String, String>> = BTreeMap::new();
+
+    for item in selector_list {
+        let item = item.trim();
+        if item.is_empty() {
+            continue;
+        }
+
+        // Split on first ':'
+        let (pool_name, kv_str) = if let Some(colon_pos) = item.find(':') {
+            let left = item[..colon_pos].trim();
+            if left.contains('=') {
+                ("default", item)
+            } else {
+                (left, item[colon_pos + 1..].trim())
+            }
+        } else {
+            ("default", item)
+        };
+
+        // Validate pool name is not empty
+        let pool_name = if pool_name.is_empty() {
+            eprintln!(
+                "WARNING: Empty pool name in --prefill-selector '{}', using 'default'",
+                item
+            );
+            "default"
+        } else {
+            pool_name
+        };
+
+        // Parse key=value pairs from kv_str
+        let map = pools.entry(pool_name.to_string()).or_default();
+        for kv in kv_str.split(',') {
+            let kv = kv.trim();
+            if kv.is_empty() {
+                continue;
+            }
+            if let Some(eq_pos) = kv.find('=') {
+                let key = kv[..eq_pos].trim().to_string();
+                let value = kv[eq_pos + 1..].trim().to_string();
+                if !key.is_empty() {
+                    map.insert(key, value);
+                }
+            }
+        }
+    }
+
+    // Remove pools with empty selectors (e.g., from "--prefill-selector text:")
+    pools.retain(|name, sel| {
+        if sel.is_empty() {
+            eprintln!(
+                "WARNING: Prefill pool '{}' has no label selectors and will never match any pods. Ignoring.",
+                name
+            );
+            false
+        } else {
+            true
+        }
+    });
+
+    pools
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
@@ -531,7 +605,7 @@ impl CliArgs {
                 port: self.service_discovery_port,
                 check_interval_secs: 60,
                 selector: Self::parse_selector(&self.selector),
-                prefill_selector: Self::parse_selector(&self.prefill_selector),
+                prefill_selectors: parse_prefill_selectors(&self.prefill_selector),
                 decode_selector: Self::parse_selector(&self.decode_selector),
                 bootstrap_port_annotation: "vllm.ai/bootstrap-port".to_string(),
             })
@@ -666,7 +740,7 @@ impl CliArgs {
                 namespace: self.service_discovery_namespace.clone(),
                 // Enable PD mode for both --pd-disaggregation and --vllm-pd-disaggregation
                 pd_mode: self.pd_disaggregation || self.vllm_pd_disaggregation,
-                prefill_selector: Self::parse_selector(&self.prefill_selector),
+                prefill_selectors: parse_prefill_selectors(&self.prefill_selector),
                 decode_selector: Self::parse_selector(&self.decode_selector),
                 bootstrap_port_annotation: "vllm.ai/bootstrap-port".to_string(),
             })
@@ -834,4 +908,113 @@ Provide --worker-urls or PD flags as usual.",
     })?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_prefill_selectors_unnamed() {
+        let selectors = vec!["app=my-prefill".to_string()];
+        let result = parse_prefill_selectors(&selectors);
+        assert_eq!(result.len(), 1);
+        assert_eq!(
+            result.get("default").unwrap().get("app").unwrap(),
+            "my-prefill"
+        );
+    }
+
+    #[test]
+    fn test_parse_prefill_selectors_named() {
+        let selectors = vec![
+            "text:app=text-prefill".to_string(),
+            "perception:app=mm-prefill".to_string(),
+        ];
+        let result = parse_prefill_selectors(&selectors);
+        assert_eq!(result.len(), 2);
+        assert_eq!(
+            result.get("text").unwrap().get("app").unwrap(),
+            "text-prefill"
+        );
+        assert_eq!(
+            result.get("perception").unwrap().get("app").unwrap(),
+            "mm-prefill"
+        );
+    }
+
+    #[test]
+    fn test_parse_prefill_selectors_mixed() {
+        let selectors = vec![
+            "app=default-prefill".to_string(),
+            "text:app=text-prefill".to_string(),
+        ];
+        let result = parse_prefill_selectors(&selectors);
+        assert_eq!(result.len(), 2);
+        assert_eq!(
+            result.get("default").unwrap().get("app").unwrap(),
+            "default-prefill"
+        );
+        assert_eq!(
+            result.get("text").unwrap().get("app").unwrap(),
+            "text-prefill"
+        );
+    }
+
+    #[test]
+    fn test_parse_prefill_selectors_multi_label() {
+        let selectors = vec!["text:app=prefill,component=text".to_string()];
+        let result = parse_prefill_selectors(&selectors);
+        let text_pool = result.get("text").unwrap();
+        assert_eq!(text_pool.get("app").unwrap(), "prefill");
+        assert_eq!(text_pool.get("component").unwrap(), "text");
+    }
+
+    #[test]
+    fn test_parse_prefill_selectors_empty() {
+        let selectors: Vec<String> = vec![];
+        let result = parse_prefill_selectors(&selectors);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_parse_prefill_selectors_empty_pool_name() {
+        let selectors = vec![":app=my-prefill".to_string()];
+        let result = parse_prefill_selectors(&selectors);
+        // Empty pool name should default to "default"
+        assert!(result.contains_key("default"));
+        assert_eq!(
+            result.get("default").unwrap().get("app").unwrap(),
+            "my-prefill"
+        );
+    }
+
+    #[test]
+    fn test_parse_prefill_selectors_empty_value() {
+        let selectors = vec!["text:".to_string()];
+        let result = parse_prefill_selectors(&selectors);
+        // Empty selector map is filtered out
+        assert!(!result.contains_key("text"));
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_parse_prefill_selectors_duplicate_keys() {
+        let selectors = vec!["text:app=val1,app=val2".to_string()];
+        let result = parse_prefill_selectors(&selectors);
+        // Last value wins for duplicate keys
+        assert_eq!(result.get("text").unwrap().get("app").unwrap(), "val2");
+    }
+
+    #[test]
+    fn test_parse_prefill_selectors_whitespace() {
+        let selectors = vec!["  text : app = prefill , role = worker  ".to_string()];
+        let result = parse_prefill_selectors(&selectors);
+        assert_eq!(result.len(), 1);
+        let text_pool = result
+            .get("text")
+            .expect("pool name should be trimmed to 'text'");
+        assert_eq!(text_pool.get("app").unwrap(), "prefill");
+        assert_eq!(text_pool.get("role").unwrap(), "worker");
+    }
 }

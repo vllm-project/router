@@ -219,6 +219,52 @@ impl WorkerRegistry {
             .collect()
     }
 
+    /// Get prefill workers filtered by pool name.
+    /// Falls back to the "default" pool if the requested pool has no workers,
+    /// ensuring backward compatibility with single-pool configs that use unnamed
+    /// `--prefill-selector` (which creates pool "default").
+    pub fn get_prefill_workers_by_pool(&self, pool_name: &str) -> Vec<Arc<dyn Worker>> {
+        let workers = self.get_prefill_workers_for_pool(pool_name);
+        if workers.is_empty() && pool_name != "default" {
+            let default_workers = self.get_prefill_workers_for_pool("default");
+            if !default_workers.is_empty() {
+                tracing::info!(
+                    "No prefill workers in pool '{}', falling back to 'default' pool ({} workers)",
+                    pool_name,
+                    default_workers.len()
+                );
+                return default_workers;
+            }
+        }
+        workers
+    }
+
+    /// Get prefill workers for a specific pool without fallback.
+    fn get_prefill_workers_for_pool(&self, pool_name: &str) -> Vec<Arc<dyn Worker>> {
+        self.workers
+            .iter()
+            .filter_map(|entry| {
+                let worker = entry.value();
+                match worker.worker_type() {
+                    WorkerType::Prefill { .. } => {
+                        let worker_pool = worker
+                            .metadata()
+                            .labels
+                            .get("prefill_pool")
+                            .map(|s| s.as_str())
+                            .unwrap_or("default");
+                        if worker_pool == pool_name {
+                            Some(worker.clone())
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                }
+            })
+            .collect()
+    }
+
     /// Get all decode workers
     pub fn get_decode_workers(&self) -> Vec<Arc<dyn Worker>> {
         self.get_by_type(&WorkerType::Decode)
@@ -522,5 +568,256 @@ mod tests {
         let llama_workers_after = registry.get_by_model_fast("llama-3");
         assert_eq!(llama_workers_after.len(), 1);
         assert_eq!(llama_workers_after[0].url(), "http://worker2:8080");
+    }
+
+    // ===== get_prefill_workers_by_pool tests =====
+
+    #[test]
+    fn test_get_prefill_workers_by_pool_filters_correctly() {
+        let registry = WorkerRegistry::new();
+
+        // Create prefill workers in different pools
+        let text_worker = crate::core::BasicWorker::new(
+            "http://text-prefill:8080".to_string(),
+            crate::core::WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+        )
+        .with_label("prefill_pool".to_string(), "text".to_string());
+
+        let perception_worker = crate::core::BasicWorker::new(
+            "http://perception-prefill:8080".to_string(),
+            crate::core::WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+        )
+        .with_label("prefill_pool".to_string(), "perception".to_string());
+
+        let decode_worker = crate::core::BasicWorker::new(
+            "http://decode:8080".to_string(),
+            crate::core::WorkerType::Decode,
+        );
+
+        registry.register(Arc::new(text_worker));
+        registry.register(Arc::new(perception_worker));
+        registry.register(Arc::new(decode_worker));
+
+        // Filter by "text" pool
+        let text_workers = registry.get_prefill_workers_by_pool("text");
+        assert_eq!(text_workers.len(), 1);
+        assert_eq!(text_workers[0].url(), "http://text-prefill:8080");
+
+        // Filter by "perception" pool
+        let perception_workers = registry.get_prefill_workers_by_pool("perception");
+        assert_eq!(perception_workers.len(), 1);
+        assert_eq!(
+            perception_workers[0].url(),
+            "http://perception-prefill:8080"
+        );
+
+        // Decode workers should not appear in any pool
+        let empty = registry.get_prefill_workers_by_pool("decode");
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn test_get_prefill_workers_by_pool_default_pool() {
+        let registry = WorkerRegistry::new();
+
+        // Worker without prefill_pool label defaults to "default"
+        let worker_no_label = crate::core::BasicWorker::new(
+            "http://prefill-no-label:8080".to_string(),
+            crate::core::WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+        );
+
+        let worker_explicit_default = crate::core::BasicWorker::new(
+            "http://prefill-default:8080".to_string(),
+            crate::core::WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+        )
+        .with_label("prefill_pool".to_string(), "default".to_string());
+
+        let worker_text = crate::core::BasicWorker::new(
+            "http://prefill-text:8080".to_string(),
+            crate::core::WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+        )
+        .with_label("prefill_pool".to_string(), "text".to_string());
+
+        registry.register(Arc::new(worker_no_label));
+        registry.register(Arc::new(worker_explicit_default));
+        registry.register(Arc::new(worker_text));
+
+        // "default" pool should include both the no-label and explicit-default workers
+        let default_workers = registry.get_prefill_workers_by_pool("default");
+        assert_eq!(default_workers.len(), 2);
+        let urls: Vec<String> = default_workers
+            .iter()
+            .map(|w| w.url().to_string())
+            .collect();
+        assert!(urls.contains(&"http://prefill-no-label:8080".to_string()));
+        assert!(urls.contains(&"http://prefill-default:8080".to_string()));
+
+        // "text" pool should only have the text worker
+        let text_workers = registry.get_prefill_workers_by_pool("text");
+        assert_eq!(text_workers.len(), 1);
+        assert_eq!(text_workers[0].url(), "http://prefill-text:8080");
+    }
+
+    #[test]
+    fn test_get_prefill_workers_by_pool_empty_pool() {
+        let registry = WorkerRegistry::new();
+
+        let worker = crate::core::BasicWorker::new(
+            "http://prefill:8080".to_string(),
+            crate::core::WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+        )
+        .with_label("prefill_pool".to_string(), "text".to_string());
+
+        registry.register(Arc::new(worker));
+
+        // Non-existent pool with no "default" pool returns empty
+        let workers = registry.get_prefill_workers_by_pool("nonexistent");
+        assert!(workers.is_empty());
+    }
+
+    #[test]
+    fn test_get_prefill_workers_by_pool_fallback_to_default() {
+        let registry = WorkerRegistry::new();
+
+        // Register a worker in the "default" pool (simulates legacy --prefill-selector app=my-prefill)
+        let default_worker = crate::core::BasicWorker::new(
+            "http://default-prefill:8080".to_string(),
+            crate::core::WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+        );
+        // No prefill_pool label → defaults to "default"
+
+        registry.register(Arc::new(default_worker));
+
+        // Requesting "text" pool (from detect_prefill_pool) should fall back to "default"
+        let workers = registry.get_prefill_workers_by_pool("text");
+        assert_eq!(workers.len(), 1);
+        assert_eq!(workers[0].url(), "http://default-prefill:8080");
+
+        // Requesting "default" directly also works
+        let workers = registry.get_prefill_workers_by_pool("default");
+        assert_eq!(workers.len(), 1);
+    }
+
+    #[test]
+    fn test_get_prefill_workers_by_pool_no_fallback_when_pool_exists() {
+        let registry = WorkerRegistry::new();
+
+        // Register workers in both "text" and "default" pools
+        let text_worker = crate::core::BasicWorker::new(
+            "http://text-prefill:8080".to_string(),
+            crate::core::WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+        )
+        .with_label("prefill_pool".to_string(), "text".to_string());
+
+        let default_worker = crate::core::BasicWorker::new(
+            "http://default-prefill:8080".to_string(),
+            crate::core::WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+        );
+
+        registry.register(Arc::new(text_worker));
+        registry.register(Arc::new(default_worker));
+
+        // Requesting "text" should NOT fall back — it has its own workers
+        let workers = registry.get_prefill_workers_by_pool("text");
+        assert_eq!(workers.len(), 1);
+        assert_eq!(workers[0].url(), "http://text-prefill:8080");
+    }
+
+    #[test]
+    fn test_get_prefill_workers_by_pool_ignores_decode_workers() {
+        let registry = WorkerRegistry::new();
+
+        // Even if a decode worker has a prefill_pool label, it should not be returned
+        let decode_worker = crate::core::BasicWorker::new(
+            "http://decode:8080".to_string(),
+            crate::core::WorkerType::Decode,
+        )
+        .with_label("prefill_pool".to_string(), "text".to_string());
+
+        let regular_worker = crate::core::BasicWorker::new(
+            "http://regular:8080".to_string(),
+            crate::core::WorkerType::Regular,
+        )
+        .with_label("prefill_pool".to_string(), "text".to_string());
+
+        registry.register(Arc::new(decode_worker));
+        registry.register(Arc::new(regular_worker));
+
+        let text_workers = registry.get_prefill_workers_by_pool("text");
+        assert!(text_workers.is_empty());
+    }
+
+    #[test]
+    fn test_get_prefill_workers_by_pool_multiple_in_same_pool() {
+        let registry = WorkerRegistry::new();
+
+        for i in 0..3 {
+            let worker = crate::core::BasicWorker::new(
+                format!("http://text-prefill-{}:8080", i),
+                crate::core::WorkerType::Prefill {
+                    bootstrap_port: None,
+                },
+            )
+            .with_label("prefill_pool".to_string(), "text".to_string());
+            registry.register(Arc::new(worker));
+        }
+
+        let text_workers = registry.get_prefill_workers_by_pool("text");
+        assert_eq!(text_workers.len(), 3);
+    }
+
+    #[test]
+    fn test_get_prefill_workers_unchanged() {
+        // Verify get_prefill_workers() still returns ALL prefill workers regardless of pool
+        let registry = WorkerRegistry::new();
+
+        let text_worker = crate::core::BasicWorker::new(
+            "http://text-prefill:8080".to_string(),
+            crate::core::WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+        )
+        .with_label("prefill_pool".to_string(), "text".to_string());
+
+        let perception_worker = crate::core::BasicWorker::new(
+            "http://perception-prefill:8080".to_string(),
+            crate::core::WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+        )
+        .with_label("prefill_pool".to_string(), "perception".to_string());
+
+        let no_label_worker = crate::core::BasicWorker::new(
+            "http://unlabeled-prefill:8080".to_string(),
+            crate::core::WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+        );
+
+        registry.register(Arc::new(text_worker));
+        registry.register(Arc::new(perception_worker));
+        registry.register(Arc::new(no_label_worker));
+
+        // get_prefill_workers() should return all 3
+        let all_prefill = registry.get_prefill_workers();
+        assert_eq!(all_prefill.len(), 3);
     }
 }

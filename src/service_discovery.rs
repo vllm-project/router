@@ -8,7 +8,7 @@ use kube::{
     runtime::WatchStreamExt,
     Client,
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 
 use rustls;
@@ -28,7 +28,13 @@ pub struct ServiceDiscoveryConfig {
     pub namespace: Option<String>,
     // PD mode specific configuration
     pub pd_mode: bool,
-    pub prefill_selector: HashMap<String, String>,
+    /// Prefill pool selectors, keyed by pool name.
+    /// When a pod matches multiple pool selectors, the most specific selector
+    /// (most label key-value pairs) wins. If two selectors have the same
+    /// specificity, BTreeMap alphabetical order breaks the tie.
+    /// For best results, ensure selectors are mutually exclusive so that each
+    /// pod matches at most one pool.
+    pub prefill_selectors: BTreeMap<String, HashMap<String, String>>,
     pub decode_selector: HashMap<String, String>,
     // Bootstrap port annotation specific to mooncake implementation
     pub bootstrap_port_annotation: String,
@@ -43,7 +49,7 @@ impl Default for ServiceDiscoveryConfig {
             port: 8000,      // Standard port for modern services
             namespace: None, // None means watch all namespaces
             pd_mode: false,
-            prefill_selector: HashMap::new(),
+            prefill_selectors: BTreeMap::new(),
             decode_selector: HashMap::new(),
             bootstrap_port_annotation: "vllm.ai/bootstrap-port".to_string(),
         }
@@ -53,7 +59,7 @@ impl Default for ServiceDiscoveryConfig {
 /// Pod type for PD mode service discovery
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum PodType {
-    Prefill,
+    Prefill { pool: String },
     Decode,
     Regular,
 }
@@ -86,12 +92,15 @@ impl PodInfo {
     pub fn should_include(pod: &Pod, config: &ServiceDiscoveryConfig) -> bool {
         if config.pd_mode {
             // In PD mode, at least one selector must be non-empty
-            if config.prefill_selector.is_empty() && config.decode_selector.is_empty() {
-                warn!("PD mode enabled but both prefill_selector and decode_selector are empty");
+            if config.prefill_selectors.is_empty() && config.decode_selector.is_empty() {
+                warn!("PD mode enabled but both prefill_selectors and decode_selector are empty");
                 return false;
             }
-            // In PD mode, pod must match either prefill or decode selector
-            Self::matches_selector(pod, &config.prefill_selector)
+            // In PD mode, pod must match any prefill pool selector or decode selector
+            config
+                .prefill_selectors
+                .values()
+                .any(|sel| Self::matches_selector(pod, sel))
                 || Self::matches_selector(pod, &config.decode_selector)
         } else {
             // In regular mode, pod must match the general selector
@@ -122,9 +131,19 @@ impl PodInfo {
         // Determine pod type based on labels if config is provided and in PD mode
         let pod_type = if let Some(config) = config {
             if config.pd_mode {
-                // Use simplified helper methods for cleaner logic
-                if Self::matches_selector(pod, &config.prefill_selector) {
-                    Some(PodType::Prefill)
+                // Check each prefill pool selector to find which pool this pod belongs to.
+                // When multiple selectors match, pick the most specific one (most labels).
+                // This ensures a selector with app=vllm,pool=perception beats app=vllm alone,
+                // regardless of pool name ordering.
+                let prefill_pool = config
+                    .prefill_selectors
+                    .iter()
+                    .filter(|(_, sel)| Self::matches_selector(pod, sel))
+                    .max_by_key(|(_, sel)| sel.len())
+                    .map(|(pool_name, _)| pool_name.clone());
+
+                if let Some(pool) = prefill_pool {
+                    Some(PodType::Prefill { pool })
                 } else if Self::matches_selector(pod, &config.decode_selector) {
                     Some(PodType::Decode)
                 } else {
@@ -139,7 +158,7 @@ impl PodInfo {
         };
 
         // Extract bootstrap port from annotations for prefill pods
-        let bootstrap_port = if matches!(pod_type, Some(PodType::Prefill)) {
+        let bootstrap_port = if matches!(pod_type, Some(PodType::Prefill { .. })) {
             if let Some(config) = config {
                 pod.metadata
                     .annotations
@@ -196,12 +215,18 @@ pub async fn start_service_discovery(
 
     // Log the appropriate selectors based on mode
     if config.pd_mode {
-        let prefill_selector = config
-            .prefill_selector
+        let prefill_selectors_str: Vec<String> = config
+            .prefill_selectors
             .iter()
-            .map(|(k, v)| format!("{}={}", k, v))
-            .collect::<Vec<_>>()
-            .join(",");
+            .map(|(pool, sel)| {
+                let labels = sel
+                    .iter()
+                    .map(|(k, v)| format!("{}={}", k, v))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                format!("{}:{}", pool, labels)
+            })
+            .collect();
 
         let decode_selector = config
             .decode_selector
@@ -211,8 +236,9 @@ pub async fn start_service_discovery(
             .join(",");
 
         info!(
-            "Starting K8s service discovery | PD mode | prefill: '{}' | decode: '{}'",
-            prefill_selector, decode_selector
+            "Starting K8s service discovery | PD mode | prefill pools: [{}] | decode: '{}'",
+            prefill_selectors_str.join(", "),
+            decode_selector
         );
     } else {
         let label_selector = config
@@ -390,8 +416,12 @@ async fn handle_pod_event(
                 // Try to downcast to PDRouter first, then VllmPDRouter
                 if let Some(pd_router) = router.as_any().downcast_ref::<PDRouter>() {
                     match &pod_info.pod_type {
-                        Some(PodType::Prefill) => pd_router
-                            .add_prefill_server(worker_url.clone(), pod_info.bootstrap_port)
+                        Some(PodType::Prefill { ref pool }) => pd_router
+                            .add_prefill_server_with_pool(
+                                pool,
+                                worker_url.clone(),
+                                pod_info.bootstrap_port,
+                            )
                             .await
                             .map_err(|e| e.to_string()),
                         Some(PodType::Decode) => pd_router
@@ -407,8 +437,12 @@ async fn handle_pod_event(
                 {
                     // Support --vllm-pd-disaggregation mode with K8s service discovery
                     match &pod_info.pod_type {
-                        Some(PodType::Prefill) => vllm_pd_router
-                            .add_prefill_server(worker_url.clone(), pod_info.bootstrap_port)
+                        Some(PodType::Prefill { ref pool }) => vllm_pd_router
+                            .add_prefill_server_with_pool(
+                                pool,
+                                worker_url.clone(),
+                                pod_info.bootstrap_port,
+                            )
                             .await
                             .map_err(|e| e.to_string()),
                         Some(PodType::Decode) => vllm_pd_router
@@ -479,7 +513,7 @@ async fn handle_pod_deletion(
             // Try to downcast to PDRouter first, then VllmPDRouter
             if let Some(pd_router) = router.as_any().downcast_ref::<PDRouter>() {
                 match &pod_info.pod_type {
-                    Some(PodType::Prefill) => {
+                    Some(PodType::Prefill { .. }) => {
                         if let Err(e) = pd_router.remove_prefill_server(&worker_url).await {
                             error!("Failed to remove prefill server {}: {}", worker_url, e);
                         }
@@ -497,7 +531,7 @@ async fn handle_pod_deletion(
             } else if let Some(vllm_pd_router) = router.as_any().downcast_ref::<VllmPDRouter>() {
                 // Support --vllm-pd-disaggregation mode with K8s service discovery
                 match &pod_info.pod_type {
-                    Some(PodType::Prefill) => {
+                    Some(PodType::Prefill { .. }) => {
                         if let Err(e) = vllm_pd_router.remove_prefill_server(&worker_url).await {
                             error!("Failed to remove vllm prefill server {}: {}", worker_url, e);
                         }
@@ -655,6 +689,9 @@ mod tests {
         prefill_selector.insert("app".to_string(), "vllm".to_string());
         prefill_selector.insert("component".to_string(), "prefill".to_string());
 
+        let mut prefill_selectors = BTreeMap::new();
+        prefill_selectors.insert("default".to_string(), prefill_selector);
+
         let mut decode_selector = HashMap::new();
         decode_selector.insert("app".to_string(), "vllm".to_string());
         decode_selector.insert("component".to_string(), "decode".to_string());
@@ -666,7 +703,7 @@ mod tests {
             port: 8080,
             namespace: None,
             pd_mode: true,
-            prefill_selector,
+            prefill_selectors,
             decode_selector,
             bootstrap_port_annotation: "vllm.ai/bootstrap-port".to_string(),
         }
@@ -708,7 +745,7 @@ mod tests {
         assert_eq!(config.port, 8000);
         assert!(config.namespace.is_none());
         assert!(!config.pd_mode);
-        assert!(config.prefill_selector.is_empty());
+        assert!(config.prefill_selectors.is_empty());
         assert!(config.decode_selector.is_empty());
         assert_eq!(config.bootstrap_port_annotation, "vllm.ai/bootstrap-port");
     }
@@ -716,11 +753,13 @@ mod tests {
     #[test]
     fn test_pod_type_enum() {
         // Test that PodType enum has expected variants
-        let prefill = PodType::Prefill;
+        let prefill = PodType::Prefill {
+            pool: "default".to_string(),
+        };
         let decode = PodType::Decode;
         let regular = PodType::Regular;
 
-        assert_eq!(format!("{:?}", prefill), "Prefill");
+        assert!(format!("{:?}", prefill).contains("Prefill"));
         assert_eq!(format!("{:?}", decode), "Decode");
         assert_eq!(format!("{:?}", regular), "Regular");
     }
@@ -753,7 +792,12 @@ mod tests {
         assert_eq!(pod_info.ip, "10.0.0.1".parse::<IpAddr>().unwrap());
         assert_eq!(pod_info.status, "Running");
         assert!(pod_info.is_ready);
-        assert_eq!(pod_info.pod_type, Some(PodType::Prefill));
+        assert_eq!(
+            pod_info.pod_type,
+            Some(PodType::Prefill {
+                pool: "default".to_string()
+            })
+        );
         assert_eq!(pod_info.bootstrap_port, Some(8081));
     }
 
@@ -812,7 +856,12 @@ mod tests {
         let config = create_pd_config();
 
         let pod_info = PodInfo::from_pod(&pod, Some(&config)).unwrap();
-        assert_eq!(pod_info.pod_type, Some(PodType::Prefill));
+        assert_eq!(
+            pod_info.pod_type,
+            Some(PodType::Prefill {
+                pool: "default".to_string()
+            })
+        );
         assert!(pod_info.bootstrap_port.is_none()); // Should be None for invalid port
     }
 
@@ -937,7 +986,9 @@ mod tests {
             ip: "1.2.3.4".parse().unwrap(),
             status: "Running".into(),
             is_ready: true,
-            pod_type: Some(PodType::Prefill),
+            pod_type: Some(PodType::Prefill {
+                pool: "default".to_string(),
+            }),
             bootstrap_port: Some(8081),
         };
 
@@ -946,7 +997,9 @@ mod tests {
             ip: "1.2.3.4".parse().unwrap(),
             status: "Running".into(),
             is_ready: true,
-            pod_type: Some(PodType::Prefill),
+            pod_type: Some(PodType::Prefill {
+                pool: "default".to_string(),
+            }),
             bootstrap_port: Some(8081),
         };
 
@@ -1028,7 +1081,9 @@ mod tests {
             ip: "1.2.3.4".parse().unwrap(),
             status: "Running".into(),
             is_ready: true,
-            pod_type: Some(PodType::Prefill),
+            pod_type: Some(PodType::Prefill {
+                pool: "default".to_string(),
+            }),
             bootstrap_port: Some(8081),
         };
         let port = 8080u16;
@@ -1084,7 +1139,9 @@ mod tests {
             ip: "1.2.3.4".parse().unwrap(),
             status: "Running".into(),
             is_ready: true,
-            pod_type: Some(PodType::Prefill),
+            pod_type: Some(PodType::Prefill {
+                pool: "default".to_string(),
+            }),
             bootstrap_port: Some(8081),
         };
 
@@ -1175,7 +1232,9 @@ mod tests {
             ip: "1.2.3.4".parse().unwrap(),
             status: "Running".into(),
             is_ready: true,
-            pod_type: Some(PodType::Prefill),
+            pod_type: Some(PodType::Prefill {
+                pool: "default".to_string(),
+            }),
             bootstrap_port: Some(8081),
         };
         let port = 8080u16;
@@ -1192,6 +1251,276 @@ mod tests {
 
         // Pod should not be tracked since router.add_pd_worker will fail for regular router
         assert!(!tracked_pods.lock().unwrap().contains(&pod_info));
+    }
+
+    // Helper to create a multi-pool PD config with "text" and "perception" prefill pools
+    fn create_multi_pool_pd_config() -> ServiceDiscoveryConfig {
+        let mut text_selector = HashMap::new();
+        text_selector.insert("app".to_string(), "vllm".to_string());
+        text_selector.insert("pool".to_string(), "text-prefill".to_string());
+
+        let mut perception_selector = HashMap::new();
+        perception_selector.insert("app".to_string(), "vllm".to_string());
+        perception_selector.insert("pool".to_string(), "perception-prefill".to_string());
+
+        let mut prefill_selectors = BTreeMap::new();
+        prefill_selectors.insert("text".to_string(), text_selector);
+        prefill_selectors.insert("perception".to_string(), perception_selector);
+
+        let mut decode_selector = HashMap::new();
+        decode_selector.insert("app".to_string(), "vllm".to_string());
+        decode_selector.insert("pool".to_string(), "decode".to_string());
+
+        ServiceDiscoveryConfig {
+            enabled: true,
+            selector: HashMap::new(),
+            check_interval: Duration::from_secs(60),
+            port: 8080,
+            namespace: None,
+            pd_mode: true,
+            prefill_selectors,
+            decode_selector,
+            bootstrap_port_annotation: "vllm.ai/bootstrap-port".to_string(),
+        }
+    }
+
+    // Helper to create a pod with arbitrary labels
+    fn create_labeled_pod(
+        name: &str,
+        ip: &str,
+        labels: Vec<(&str, &str)>,
+        bootstrap_port: Option<u16>,
+    ) -> Pod {
+        let mut label_map = std::collections::BTreeMap::new();
+        for (k, v) in labels {
+            label_map.insert(k.to_string(), v.to_string());
+        }
+
+        let mut annotations = std::collections::BTreeMap::new();
+        if let Some(port) = bootstrap_port {
+            annotations.insert("vllm.ai/bootstrap-port".to_string(), port.to_string());
+        }
+
+        Pod {
+            metadata: ObjectMeta {
+                name: Some(name.to_string()),
+                labels: Some(label_map),
+                annotations: Some(annotations),
+                ..Default::default()
+            },
+            spec: Some(PodSpec::default()),
+            status: Some(PodStatus {
+                pod_ip: Some(ip.to_string()),
+                phase: Some("Running".to_string()),
+                conditions: Some(vec![PodCondition {
+                    type_: "Ready".to_string(),
+                    status: "True".to_string(),
+                    last_probe_time: None,
+                    last_transition_time: None,
+                    message: None,
+                    reason: None,
+                    observed_generation: None,
+                }]),
+                ..Default::default()
+            }),
+        }
+    }
+
+    #[test]
+    fn test_from_pod_multi_pool_text_prefill() {
+        let config = create_multi_pool_pd_config();
+        let pod = create_labeled_pod(
+            "text-prefill-0",
+            "10.0.1.1",
+            vec![("app", "vllm"), ("pool", "text-prefill")],
+            Some(9001),
+        );
+
+        let pod_info = PodInfo::from_pod(&pod, Some(&config)).unwrap();
+        assert_eq!(pod_info.name, "text-prefill-0");
+        assert_eq!(
+            pod_info.pod_type,
+            Some(PodType::Prefill {
+                pool: "text".to_string()
+            })
+        );
+        assert_eq!(pod_info.bootstrap_port, Some(9001));
+    }
+
+    #[test]
+    fn test_from_pod_multi_pool_perception_prefill() {
+        let config = create_multi_pool_pd_config();
+        let pod = create_labeled_pod(
+            "perception-prefill-0",
+            "10.0.2.1",
+            vec![("app", "vllm"), ("pool", "perception-prefill")],
+            Some(9002),
+        );
+
+        let pod_info = PodInfo::from_pod(&pod, Some(&config)).unwrap();
+        assert_eq!(pod_info.name, "perception-prefill-0");
+        assert_eq!(
+            pod_info.pod_type,
+            Some(PodType::Prefill {
+                pool: "perception".to_string()
+            })
+        );
+        assert_eq!(pod_info.bootstrap_port, Some(9002));
+    }
+
+    #[test]
+    fn test_from_pod_multi_pool_decode() {
+        let config = create_multi_pool_pd_config();
+        let pod = create_labeled_pod(
+            "decode-0",
+            "10.0.3.1",
+            vec![("app", "vllm"), ("pool", "decode")],
+            None,
+        );
+
+        let pod_info = PodInfo::from_pod(&pod, Some(&config)).unwrap();
+        assert_eq!(pod_info.name, "decode-0");
+        assert_eq!(pod_info.pod_type, Some(PodType::Decode));
+        assert!(pod_info.bootstrap_port.is_none());
+    }
+
+    #[test]
+    fn test_from_pod_multi_pool_unmatched_falls_to_regular() {
+        let config = create_multi_pool_pd_config();
+        let pod = create_labeled_pod(
+            "other-0",
+            "10.0.4.1",
+            vec![("app", "vllm"), ("pool", "unknown-pool")],
+            None,
+        );
+
+        let pod_info = PodInfo::from_pod(&pod, Some(&config)).unwrap();
+        assert_eq!(pod_info.pod_type, Some(PodType::Regular));
+        assert!(pod_info.bootstrap_port.is_none());
+    }
+
+    #[test]
+    fn test_should_include_multi_pool_text_prefill() {
+        let config = create_multi_pool_pd_config();
+        let pod = create_labeled_pod(
+            "text-prefill-0",
+            "10.0.1.1",
+            vec![("app", "vllm"), ("pool", "text-prefill")],
+            Some(9001),
+        );
+        assert!(PodInfo::should_include(&pod, &config));
+    }
+
+    #[test]
+    fn test_should_include_multi_pool_perception_prefill() {
+        let config = create_multi_pool_pd_config();
+        let pod = create_labeled_pod(
+            "perception-prefill-0",
+            "10.0.2.1",
+            vec![("app", "vllm"), ("pool", "perception-prefill")],
+            Some(9002),
+        );
+        assert!(PodInfo::should_include(&pod, &config));
+    }
+
+    #[test]
+    fn test_should_include_multi_pool_decode() {
+        let config = create_multi_pool_pd_config();
+        let pod = create_labeled_pod(
+            "decode-0",
+            "10.0.3.1",
+            vec![("app", "vllm"), ("pool", "decode")],
+            None,
+        );
+        assert!(PodInfo::should_include(&pod, &config));
+    }
+
+    #[test]
+    fn test_should_include_multi_pool_rejects_unmatched() {
+        let config = create_multi_pool_pd_config();
+        let pod = create_labeled_pod(
+            "other-0",
+            "10.0.4.1",
+            vec![("app", "other-app"), ("pool", "text-prefill")],
+            None,
+        );
+        assert!(!PodInfo::should_include(&pod, &config));
+    }
+
+    #[test]
+    fn test_pod_type_equality_different_pools() {
+        let text_pool = PodType::Prefill {
+            pool: "text".to_string(),
+        };
+        let perception_pool = PodType::Prefill {
+            pool: "perception".to_string(),
+        };
+        let default_pool = PodType::Prefill {
+            pool: "default".to_string(),
+        };
+
+        assert_ne!(text_pool, perception_pool);
+        assert_ne!(text_pool, default_pool);
+        assert_ne!(perception_pool, default_pool);
+
+        let text_pool2 = PodType::Prefill {
+            pool: "text".to_string(),
+        };
+        assert_eq!(text_pool, text_pool2);
+    }
+
+    #[test]
+    fn test_overlapping_selectors_most_specific_wins() {
+        // Both pools match on app=vllm, but "perception" also requires pool=perception.
+        // A pod with app=vllm,pool=perception matches both selectors.
+        // The most specific selector (most labels) wins, so "perception" (2 labels)
+        // beats "text" (1 label) regardless of pool name ordering.
+        let mut broad_selector = HashMap::new();
+        broad_selector.insert("app".to_string(), "vllm".to_string());
+
+        let mut specific_selector = HashMap::new();
+        specific_selector.insert("app".to_string(), "vllm".to_string());
+        specific_selector.insert("pool".to_string(), "perception".to_string());
+
+        let mut prefill_selectors = BTreeMap::new();
+        // "text" pool has a broad selector (just app=vllm)
+        prefill_selectors.insert("text".to_string(), broad_selector);
+        // "perception" pool has a more specific selector (app=vllm,pool=perception)
+        prefill_selectors.insert("perception".to_string(), specific_selector);
+
+        let config = ServiceDiscoveryConfig {
+            enabled: true,
+            selector: HashMap::new(),
+            check_interval: Duration::from_secs(60),
+            port: 8080,
+            namespace: None,
+            pd_mode: true,
+            prefill_selectors,
+            decode_selector: HashMap::new(),
+            bootstrap_port_annotation: "vllm.ai/bootstrap-port".to_string(),
+        };
+
+        // Pod matches both selectors
+        let pod = create_labeled_pod(
+            "overlap-pod",
+            "10.0.1.1",
+            vec![("app", "vllm"), ("pool", "perception")],
+            None,
+        );
+
+        // Run multiple times to verify determinism
+        for _ in 0..10 {
+            let pod_info = PodInfo::from_pod(&pod, Some(&config)).unwrap();
+            // "perception" selector has 2 labels vs "text" with 1 label,
+            // so most-specific-wins picks "perception"
+            assert_eq!(
+                pod_info.pod_type,
+                Some(PodType::Prefill {
+                    pool: "perception".to_string()
+                }),
+                "Most specific selector (most labels) should win with overlapping selectors"
+            );
+        }
     }
 
     #[tokio::test]

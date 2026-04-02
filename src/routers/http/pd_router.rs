@@ -263,6 +263,17 @@ impl PDRouter {
         url: String,
         bootstrap_port: Option<u16>,
     ) -> Result<String, PDRouterError> {
+        self.add_prefill_server_with_pool("default", url, bootstrap_port)
+            .await
+    }
+
+    /// Add a prefill server with a pool label for multi-pool routing
+    pub async fn add_prefill_server_with_pool(
+        &self,
+        pool: &str,
+        url: String,
+        bootstrap_port: Option<u16>,
+    ) -> Result<String, PDRouterError> {
         // Wait for the new server to be healthy
         self.wait_for_server_health(&url).await?;
 
@@ -271,15 +282,12 @@ impl PDRouter {
             return Err(PDRouterError::WorkerAlreadyExists { url: url.clone() });
         }
 
-        // Create Worker for the new prefill server with circuit breaker configuration
-        // TODO: In IGW mode, fetch model_id from worker's /get_model_info endpoint
-        let worker = WorkerFactory::create_prefill_with_config(
-            url.clone(),
-            bootstrap_port,
-            self.circuit_breaker_config.clone(),
-        );
+        // Create Worker for the new prefill server with circuit breaker and pool label
+        let worker = BasicWorker::new(url.clone(), WorkerType::Prefill { bootstrap_port })
+            .with_circuit_breaker_config(self.circuit_breaker_config.clone())
+            .with_label("prefill_pool".to_string(), pool.to_string());
 
-        let worker_arc: Arc<dyn Worker> = Arc::from(worker);
+        let worker_arc: Arc<dyn Worker> = Arc::new(worker);
 
         // Register the worker in the registry
         self.worker_registry.register(worker_arc.clone());
@@ -299,8 +307,11 @@ impl PDRouter {
             }
         }
 
-        info!("Added prefill server: {}", url);
-        Ok(format!("Successfully added prefill server: {}", url))
+        info!("Added prefill server: {} (pool: {})", url, pool);
+        Ok(format!(
+            "Successfully added prefill server: {} (pool: {})",
+            url, pool
+        ))
     }
 
     pub async fn add_decode_server(&self, url: String) -> Result<String, PDRouterError> {

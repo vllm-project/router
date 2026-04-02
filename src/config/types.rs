@@ -1,7 +1,7 @@
 use super::ConfigResult;
 use crate::config::validation::ConfigValidator;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 /// Main router configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -281,8 +281,11 @@ pub struct DiscoveryConfig {
     pub check_interval_secs: u64,
     /// Regular mode selector
     pub selector: HashMap<String, String>,
-    /// PD mode prefill selector
-    pub prefill_selector: HashMap<String, String>,
+    /// PD mode prefill selectors (pool_name -> label selector)
+    /// Supports multiple prefill pools for modality-based routing.
+    /// Uses BTreeMap for deterministic iteration order (sorted by pool name),
+    /// ensuring consistent pool assignment when selectors overlap.
+    pub prefill_selectors: BTreeMap<String, HashMap<String, String>>,
     /// PD mode decode selector
     pub decode_selector: HashMap<String, String>,
     /// Bootstrap port annotation key
@@ -297,7 +300,7 @@ impl Default for DiscoveryConfig {
             port: 8000,
             check_interval_secs: 120,
             selector: HashMap::new(),
-            prefill_selector: HashMap::new(),
+            prefill_selectors: BTreeMap::new(),
             decode_selector: HashMap::new(),
             bootstrap_port_annotation: "vllm.ai/bootstrap-port".to_string(),
         }
@@ -806,7 +809,7 @@ mod tests {
         assert_eq!(config.port, 8000);
         assert_eq!(config.check_interval_secs, 120);
         assert!(config.selector.is_empty());
-        assert!(config.prefill_selector.is_empty());
+        assert!(config.prefill_selectors.is_empty());
         assert!(config.decode_selector.is_empty());
         assert_eq!(config.bootstrap_port_annotation, "vllm.ai/bootstrap-port");
     }
@@ -817,13 +820,16 @@ mod tests {
         selector.insert("app".to_string(), "vllm".to_string());
         selector.insert("role".to_string(), "worker".to_string());
 
+        let mut prefill_selectors = BTreeMap::new();
+        prefill_selectors.insert("default".to_string(), selector.clone());
+
         let config = DiscoveryConfig {
             enabled: true,
             namespace: Some("default".to_string()),
             port: 9000,
             check_interval_secs: 30,
             selector: selector.clone(),
-            prefill_selector: selector.clone(),
+            prefill_selectors,
             decode_selector: selector.clone(),
             bootstrap_port_annotation: "custom.io/port".to_string(),
         };
@@ -1160,7 +1166,11 @@ mod tests {
                 port: 8443,
                 check_interval_secs: 120,
                 selector: selectors.clone(),
-                prefill_selector: selectors.clone(),
+                prefill_selectors: {
+                    let mut m = BTreeMap::new();
+                    m.insert("default".to_string(), selectors.clone());
+                    m
+                },
                 decode_selector: selectors,
                 bootstrap_port_annotation: "mycompany.io/bootstrap".to_string(),
             }),

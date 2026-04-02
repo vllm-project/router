@@ -367,6 +367,11 @@ impl BasicWorker {
         self
     }
 
+    pub fn with_label(mut self, key: String, value: String) -> Self {
+        self.metadata.labels.insert(key, value);
+        self
+    }
+
     pub fn with_health_config(mut self, config: HealthConfig) -> Self {
         self.metadata.health_config = config;
         self
@@ -1975,6 +1980,73 @@ mod tests {
         assert_eq!(
             dp_worker.circuit_breaker().state(),
             crate::core::CircuitState::Open
+        );
+    }
+
+    // ===== with_label tests =====
+
+    #[test]
+    fn test_with_label_adds_single_label() {
+        let worker = BasicWorker::new("http://worker:8080".to_string(), WorkerType::Regular)
+            .with_label("pool".to_string(), "text".to_string());
+
+        assert_eq!(
+            worker.metadata().labels.get("pool"),
+            Some(&"text".to_string())
+        );
+    }
+
+    #[test]
+    fn test_with_label_adds_multiple_labels() {
+        let worker = BasicWorker::new(
+            "http://worker:8080".to_string(),
+            WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+        )
+        .with_label("prefill_pool".to_string(), "perception".to_string())
+        .with_label("region".to_string(), "us-east".to_string());
+
+        assert_eq!(
+            worker.metadata().labels.get("prefill_pool"),
+            Some(&"perception".to_string())
+        );
+        assert_eq!(
+            worker.metadata().labels.get("region"),
+            Some(&"us-east".to_string())
+        );
+        assert_eq!(worker.metadata().labels.len(), 2);
+    }
+
+    #[test]
+    fn test_with_label_overwrites_existing() {
+        let worker = BasicWorker::new("http://worker:8080".to_string(), WorkerType::Regular)
+            .with_label("pool".to_string(), "text".to_string())
+            .with_label("pool".to_string(), "perception".to_string());
+
+        assert_eq!(
+            worker.metadata().labels.get("pool"),
+            Some(&"perception".to_string())
+        );
+        assert_eq!(worker.metadata().labels.len(), 1);
+    }
+
+    #[test]
+    fn test_with_label_combined_with_with_labels() {
+        let mut labels = std::collections::HashMap::new();
+        labels.insert("env".to_string(), "prod".to_string());
+
+        let worker = BasicWorker::new("http://worker:8080".to_string(), WorkerType::Regular)
+            .with_labels(labels)
+            .with_label("prefill_pool".to_string(), "text".to_string());
+
+        assert_eq!(
+            worker.metadata().labels.get("env"),
+            Some(&"prod".to_string())
+        );
+        assert_eq!(
+            worker.metadata().labels.get("prefill_pool"),
+            Some(&"text".to_string())
         );
     }
 

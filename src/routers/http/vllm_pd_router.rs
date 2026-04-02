@@ -229,26 +229,29 @@ impl VllmPDRouter {
         policy.select_worker(&workers, request_text)
     }
 
-    /// Process vLLM request using pure service discovery
-    async fn process_vllm_request(
+    /// Process vLLM request using pool-aware service discovery
+    async fn process_vllm_request_with_pool(
         &self,
         request_json: Value,
         path: &str,
         headers: Option<&HeaderMap>,
+        pool_name: &str,
     ) -> Response {
-        debug!("Processing vLLM request for path: {}", path);
         debug!(
-            "Request JSON: {}",
-            serde_json::to_string_pretty(&request_json).unwrap_or_default()
+            "Processing vLLM request for path: {} (pool: {})",
+            path, pool_name
         );
 
-        // Get available instances from service discovery
-        let prefill_instances = self.service_registry.get_prefill_instances();
+        // Get pool-filtered prefill instances and all decode instances
+        let prefill_instances = self
+            .service_registry
+            .get_prefill_instances_by_pool(pool_name);
         let decode_instances = self.service_registry.get_decode_instances();
 
         debug!(
-            "Found {} prefill instances, {} decode instances from service discovery",
+            "Found {} prefill instances (pool: {}), {} decode instances from service discovery",
             prefill_instances.len(),
+            pool_name,
             decode_instances.len()
         );
 
@@ -257,32 +260,59 @@ impl VllmPDRouter {
             return (
                 axum::http::StatusCode::SERVICE_UNAVAILABLE,
                 format!(
-                    "No workers available via service discovery: {} prefill, {} decode",
+                    "No workers available via service discovery: {} prefill (pool: {}), {} decode",
                     prefill_instances.len(),
+                    pool_name,
                     decode_instances.len()
                 ),
             )
                 .into_response();
         }
 
+        // Delegate to the non-pool-aware method for the rest of the logic
+        // (the instances are already filtered)
+        self.process_vllm_request_with_instances(
+            request_json,
+            path,
+            headers,
+            &prefill_instances,
+            &decode_instances,
+        )
+        .await
+    }
+
+    /// Shared helper: process a vLLM request given pre-filtered prefill/decode instances
+    async fn process_vllm_request_with_instances(
+        &self,
+        request_json: Value,
+        path: &str,
+        headers: Option<&HeaderMap>,
+        prefill_instances: &[(String, String)],
+        decode_instances: &[(String, String)],
+    ) -> Response {
+        debug!(
+            "Request JSON: {}",
+            serde_json::to_string_pretty(&request_json).unwrap_or_default()
+        );
+
         // Use policy-based load balancing to select prefill and decode workers
         let request_text = serde_json::to_string(&request_json).ok();
         let request_str = request_text.as_deref();
 
-        let prefill_idx =
-            match self.select_worker_with_policy(&prefill_instances, true, request_str) {
-                Some(idx) => idx,
-                None => {
-                    RouterMetrics::record_pd_error("server_selection");
-                    return (
-                        axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                        "Prefill policy failed to select a worker".to_string(),
-                    )
-                        .into_response();
-                }
-            };
+        let prefill_idx = match self.select_worker_with_policy(prefill_instances, true, request_str)
+        {
+            Some(idx) => idx,
+            None => {
+                RouterMetrics::record_pd_error("server_selection");
+                return (
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                    "Prefill policy failed to select a worker".to_string(),
+                )
+                    .into_response();
+            }
+        };
 
-        let decode_idx = match self.select_worker_with_policy(&decode_instances, false, request_str)
+        let decode_idx = match self.select_worker_with_policy(decode_instances, false, request_str)
         {
             Some(idx) => idx,
             None => {
@@ -324,6 +354,135 @@ impl VllmPDRouter {
         {
             Ok(response) => {
                 debug!("Two-stage processing completed successfully");
+                response
+            }
+            Err(e) => {
+                error!("Two-stage processing failed: {}", e);
+                (
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Request processing failed: {}", e),
+                )
+                    .into_response()
+            }
+        }
+    }
+
+    /// Direct URL mode: select prefill/decode workers by pool, then execute two-stage dispatch.
+    /// Shared by route_chat, route_completion, and route_transparent.
+    async fn route_direct_url(
+        &self,
+        request_json: Value,
+        path: &str,
+        headers: Option<&HeaderMap>,
+        pool_name: &str,
+    ) -> Response {
+        let all_prefill = self
+            .pd_router
+            .worker_registry
+            .get_prefill_workers_by_pool(pool_name);
+        let prefill_workers: Vec<Arc<dyn Worker>> = all_prefill
+            .into_iter()
+            .filter(|w| w.is_available())
+            .collect();
+        let all_decode = self.pd_router.worker_registry.get_decode_workers();
+        let decode_workers: Vec<Arc<dyn Worker>> = all_decode
+            .into_iter()
+            .filter(|w| w.is_available())
+            .collect();
+
+        info!(
+            "Found {} prefill workers (pool: {}), {} decode workers from worker_registry",
+            prefill_workers.len(),
+            pool_name,
+            decode_workers.len()
+        );
+
+        if prefill_workers.is_empty() || decode_workers.is_empty() {
+            RouterMetrics::record_pd_error("server_selection");
+            return (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                format!(
+                    "No workers available: {} prefill (pool: {}), {} decode. Check that prefill pods with matching labels are running and that --prefill-selector pool names match request modalities.",
+                    prefill_workers.len(),
+                    pool_name,
+                    decode_workers.len()
+                ),
+            )
+                .into_response();
+        }
+
+        let request_text = serde_json::to_string(&request_json).ok();
+        let request_str = request_text.as_deref();
+        let request_headers: Option<HashMap<String, String>> = headers.map(|h| {
+            h.iter()
+                .filter_map(|(name, value)| {
+                    value
+                        .to_str()
+                        .ok()
+                        .map(|v| (name.as_str().to_lowercase(), v.to_string()))
+                })
+                .collect()
+        });
+
+        let prefill_policy = self.policy_registry.get_prefill_policy();
+        let decode_policy = self.policy_registry.get_decode_policy();
+
+        let prefill_idx = match prefill_policy.select_worker_with_headers(
+            &prefill_workers,
+            request_str,
+            request_headers.as_ref(),
+        ) {
+            Some(idx) => idx,
+            None => {
+                RouterMetrics::record_pd_error("server_selection");
+                return (
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                    "Prefill policy failed to select a worker".to_string(),
+                )
+                    .into_response();
+            }
+        };
+
+        let decode_idx = match decode_policy.select_worker_with_headers(
+            &decode_workers,
+            request_str,
+            request_headers.as_ref(),
+        ) {
+            Some(idx) => idx,
+            None => {
+                RouterMetrics::record_pd_error("server_selection");
+                return (
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                    "Decode policy failed to select a worker".to_string(),
+                )
+                    .into_response();
+            }
+        };
+
+        let prefill_worker = &prefill_workers[prefill_idx];
+        let decode_worker = &decode_workers[decode_idx];
+
+        info!(
+            "Selected prefill={} [policy:{}], decode={} [policy:{}] for {}",
+            prefill_worker.url(),
+            prefill_policy.name(),
+            decode_worker.url(),
+            decode_policy.name(),
+            path
+        );
+
+        match self
+            .process_vllm_two_stage_request(
+                request_json,
+                prefill_worker.clone(),
+                decode_worker.clone(),
+                path,
+                headers,
+            )
+            .await
+        {
+            Ok(response) => {
+                info!("Two-stage processing completed successfully");
                 response
             }
             Err(e) => {
@@ -1140,6 +1299,19 @@ impl VllmPDRouter {
         self.pd_router.add_prefill_server(url, bootstrap_port).await
     }
 
+    /// Add a prefill server with a pool label for multi-pool routing
+    /// Delegates to the underlying PDRouter
+    pub async fn add_prefill_server_with_pool(
+        &self,
+        pool: &str,
+        url: String,
+        bootstrap_port: Option<u16>,
+    ) -> Result<String, PDRouterError> {
+        self.pd_router
+            .add_prefill_server_with_pool(pool, url, bootstrap_port)
+            .await
+    }
+
     /// Add a decode server to the router
     /// Delegates to the underlying PDRouter
     pub async fn add_decode_server(&self, url: String) -> Result<String, PDRouterError> {
@@ -1209,9 +1381,12 @@ impl RouterTrait for VllmPDRouter {
         body: &crate::protocols::spec::ChatCompletionRequest,
         _model_id: Option<&str>,
     ) -> Response {
+        // Detect prefill pool based on request modality
+        let pool_name = crate::protocols::spec::detect_prefill_pool(body);
+        RouterMetrics::record_prefill_pool_routed(pool_name);
         info!(
-            "vLLM route_chat called, use_discovery={}",
-            self.use_discovery
+            "vLLM route_chat called, use_discovery={}, prefill_pool={}",
+            self.use_discovery, pool_name
         );
 
         if self.use_discovery {
@@ -1236,22 +1411,18 @@ impl RouterTrait for VllmPDRouter {
                 }
             };
 
-            // Process vLLM two-stage request with service discovery
-            self.process_vllm_request(request_json, "/v1/chat/completions", headers)
-                .await
+            // Process vLLM two-stage request with service discovery (pool-aware)
+            self.process_vllm_request_with_pool(
+                request_json,
+                "/v1/chat/completions",
+                headers,
+                pool_name,
+            )
+            .await
         } else {
-            // Direct URL mode - implement routing logic here (not delegating to PDRouter)
-            info!("Using direct URL mode with VllmPDRouter's own routing logic");
-
-            // Convert request to JSON
+            // Direct URL mode
             let request_json = match serde_json::to_value(body) {
-                Ok(json) => {
-                    debug!(
-                        "Serialized chat request: {}",
-                        serde_json::to_string_pretty(&json).unwrap_or_default()
-                    );
-                    json
-                }
+                Ok(json) => json,
                 Err(e) => {
                     return (
                         axum::http::StatusCode::INTERNAL_SERVER_ERROR,
@@ -1260,117 +1431,8 @@ impl RouterTrait for VllmPDRouter {
                         .into_response()
                 }
             };
-
-            // Get prefill and decode workers from worker_registry
-            let prefill_workers = self.pd_router.worker_registry.get_prefill_workers();
-            let decode_workers = self.pd_router.worker_registry.get_decode_workers();
-
-            info!(
-                "Found {} prefill workers, {} decode workers from worker_registry",
-                prefill_workers.len(),
-                decode_workers.len()
-            );
-
-            if prefill_workers.is_empty() || decode_workers.is_empty() {
-                RouterMetrics::record_pd_error("server_selection");
-                return (
-                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                    format!(
-                        "No workers available: {} prefill, {} decode",
-                        prefill_workers.len(),
-                        decode_workers.len()
-                    ),
-                )
-                    .into_response();
-            }
-
-            // Select workers using policy with headers for consistent hash
-            let request_text = serde_json::to_string(&request_json).ok();
-            let request_str = request_text.as_deref();
-            let request_headers: Option<HashMap<String, String>> = headers.map(|h| {
-                h.iter()
-                    .filter_map(|(name, value)| {
-                        value
-                            .to_str()
-                            .ok()
-                            .map(|v| (name.as_str().to_lowercase(), v.to_string()))
-                    })
-                    .collect()
-            });
-
-            let prefill_policy = self.policy_registry.get_prefill_policy();
-            let decode_policy = self.policy_registry.get_decode_policy();
-
-            let prefill_idx = match prefill_policy.select_worker_with_headers(
-                &prefill_workers,
-                request_str,
-                request_headers.as_ref(),
-            ) {
-                Some(idx) => idx,
-                None => {
-                    RouterMetrics::record_pd_error("server_selection");
-                    return (
-                        axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                        "Prefill policy failed to select a worker".to_string(),
-                    )
-                        .into_response();
-                }
-            };
-
-            let decode_idx = match decode_policy.select_worker_with_headers(
-                &decode_workers,
-                request_str,
-                request_headers.as_ref(),
-            ) {
-                Some(idx) => idx,
-                None => {
-                    RouterMetrics::record_pd_error("server_selection");
-                    return (
-                        axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                        "Decode policy failed to select a worker".to_string(),
-                    )
-                        .into_response();
-                }
-            };
-
-            let prefill_worker = &prefill_workers[prefill_idx];
-            let decode_worker = &decode_workers[decode_idx];
-            // Load tracking is handled inside process_vllm_two_stage_request for fine-grained
-            // tracking: prefill load only during prefill phase, decode load only during decode phase.
-
-            info!(
-                "Chat: Selected prefill={} [policy:{}], decode={} [policy:{}]",
-                prefill_worker.url(),
-                prefill_policy.name(),
-                decode_worker.url(),
-                decode_policy.name()
-            );
-
-            // Execute dual dispatch with vLLM two-stage processing
-            let resp = match self
-                .process_vllm_two_stage_request(
-                    request_json,
-                    prefill_worker.clone(),
-                    decode_worker.clone(),
-                    "/v1/chat/completions",
-                    headers,
-                )
+            self.route_direct_url(request_json, "/v1/chat/completions", headers, pool_name)
                 .await
-            {
-                Ok(response) => {
-                    info!("Two-stage processing completed successfully");
-                    response
-                }
-                Err(e) => {
-                    error!("Two-stage processing failed: {}", e);
-                    (
-                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("Request processing failed: {}", e),
-                    )
-                        .into_response()
-                }
-            };
-            resp
         }
     }
 
@@ -1380,9 +1442,14 @@ impl RouterTrait for VllmPDRouter {
         body: &crate::protocols::spec::CompletionRequest,
         _model_id: Option<&str>,
     ) -> Response {
+        // Completion requests always route to the "text" pool.
+        // The /v1/completions API uses a plain text `prompt` field, not structured
+        // `messages` with content parts, so modality detection is not applicable.
+        let pool_name = "text";
+        RouterMetrics::record_prefill_pool_routed(pool_name);
         info!(
-            "vLLM route_completion called, use_discovery={}",
-            self.use_discovery
+            "vLLM route_completion called, use_discovery={}, prefill_pool={}",
+            self.use_discovery, pool_name
         );
 
         if self.use_discovery {
@@ -1407,22 +1474,13 @@ impl RouterTrait for VllmPDRouter {
                 }
             };
 
-            // Process vLLM two-stage request with service discovery
-            self.process_vllm_request(request_json, "/v1/completions", headers)
+            // Process vLLM two-stage request with service discovery (pool-aware)
+            self.process_vllm_request_with_pool(request_json, "/v1/completions", headers, pool_name)
                 .await
         } else {
-            // Direct URL mode - implement routing logic here (not delegating to PDRouter)
-            info!("Using direct URL mode with VllmPDRouter's own routing logic");
-
-            // Convert request to JSON
+            // Direct URL mode
             let request_json = match serde_json::to_value(body) {
-                Ok(json) => {
-                    debug!(
-                        "Serialized completion request: {}",
-                        serde_json::to_string_pretty(&json).unwrap_or_default()
-                    );
-                    json
-                }
+                Ok(json) => json,
                 Err(e) => {
                     return (
                         axum::http::StatusCode::INTERNAL_SERVER_ERROR,
@@ -1431,117 +1489,8 @@ impl RouterTrait for VllmPDRouter {
                         .into_response()
                 }
             };
-
-            // Get prefill and decode workers from worker_registry
-            let prefill_workers = self.pd_router.worker_registry.get_prefill_workers();
-            let decode_workers = self.pd_router.worker_registry.get_decode_workers();
-
-            info!(
-                "Found {} prefill workers, {} decode workers from worker_registry",
-                prefill_workers.len(),
-                decode_workers.len()
-            );
-
-            if prefill_workers.is_empty() || decode_workers.is_empty() {
-                RouterMetrics::record_pd_error("server_selection");
-                return (
-                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                    format!(
-                        "No workers available: {} prefill, {} decode",
-                        prefill_workers.len(),
-                        decode_workers.len()
-                    ),
-                )
-                    .into_response();
-            }
-
-            // Select workers using policy with headers for consistent hash
-            let request_text = serde_json::to_string(&request_json).ok();
-            let request_str = request_text.as_deref();
-            let request_headers: Option<HashMap<String, String>> = headers.map(|h| {
-                h.iter()
-                    .filter_map(|(name, value)| {
-                        value
-                            .to_str()
-                            .ok()
-                            .map(|v| (name.as_str().to_lowercase(), v.to_string()))
-                    })
-                    .collect()
-            });
-
-            let prefill_policy = self.policy_registry.get_prefill_policy();
-            let decode_policy = self.policy_registry.get_decode_policy();
-
-            let prefill_idx = match prefill_policy.select_worker_with_headers(
-                &prefill_workers,
-                request_str,
-                request_headers.as_ref(),
-            ) {
-                Some(idx) => idx,
-                None => {
-                    RouterMetrics::record_pd_error("server_selection");
-                    return (
-                        axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                        "Prefill policy failed to select a worker".to_string(),
-                    )
-                        .into_response();
-                }
-            };
-
-            let decode_idx = match decode_policy.select_worker_with_headers(
-                &decode_workers,
-                request_str,
-                request_headers.as_ref(),
-            ) {
-                Some(idx) => idx,
-                None => {
-                    RouterMetrics::record_pd_error("server_selection");
-                    return (
-                        axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                        "Decode policy failed to select a worker".to_string(),
-                    )
-                        .into_response();
-                }
-            };
-
-            let prefill_worker = &prefill_workers[prefill_idx];
-            let decode_worker = &decode_workers[decode_idx];
-            // Load tracking is handled inside process_vllm_two_stage_request for fine-grained
-            // tracking: prefill load only during prefill phase, decode load only during decode phase.
-
-            info!(
-                "Completion: Selected prefill={} [policy:{}], decode={} [policy:{}]",
-                prefill_worker.url(),
-                prefill_policy.name(),
-                decode_worker.url(),
-                decode_policy.name()
-            );
-
-            // Execute dual dispatch with vLLM two-stage processing
-            let resp = match self
-                .process_vllm_two_stage_request(
-                    request_json,
-                    prefill_worker.clone(),
-                    decode_worker.clone(),
-                    "/v1/completions",
-                    headers,
-                )
+            self.route_direct_url(request_json, "/v1/completions", headers, pool_name)
                 .await
-            {
-                Ok(response) => {
-                    info!("Two-stage processing completed successfully");
-                    response
-                }
-                Err(e) => {
-                    error!("Two-stage processing failed: {}", e);
-                    (
-                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("Request processing failed: {}", e),
-                    )
-                        .into_response()
-                }
-            };
-            resp
         }
     }
 
@@ -1635,121 +1584,18 @@ impl RouterTrait for VllmPDRouter {
         // Body is already a serde_json::Value, use it directly
         let request_json = body;
 
+        // Detect prefill pool from request body for transparent proxy
+        let pool_name = crate::protocols::spec::detect_prefill_pool_from_json(&request_json);
+        RouterMetrics::record_prefill_pool_routed(pool_name);
+
         if self.use_discovery {
-            // Discovery mode - use vLLM-specific two-stage processing
-            self.process_vllm_request(request_json, path, headers).await
-        } else {
-            // Direct URL mode - use worker registry, filtered by availability
-            let all_prefill = self.pd_router.worker_registry.get_prefill_workers();
-            let prefill_workers: Vec<Arc<dyn Worker>> = all_prefill
-                .iter()
-                .filter(|w| w.is_available())
-                .cloned()
-                .collect();
-            let all_decode = self.pd_router.worker_registry.get_decode_workers();
-            let decode_workers: Vec<Arc<dyn Worker>> = all_decode
-                .iter()
-                .filter(|w| w.is_available())
-                .cloned()
-                .collect();
-
-            if prefill_workers.is_empty() || decode_workers.is_empty() {
-                RouterMetrics::record_pd_error("server_selection");
-                return (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    format!(
-                        "No available workers: {} prefill, {} decode",
-                        prefill_workers.len(),
-                        decode_workers.len()
-                    ),
-                )
-                    .into_response();
-            }
-
-            // Select workers using policy with headers for consistent hash
-            let request_text = serde_json::to_string(&request_json).ok();
-            let request_str = request_text.as_deref();
-            let request_headers: Option<HashMap<String, String>> = headers.map(|h| {
-                h.iter()
-                    .filter_map(|(name, value)| {
-                        value
-                            .to_str()
-                            .ok()
-                            .map(|v| (name.as_str().to_lowercase(), v.to_string()))
-                    })
-                    .collect()
-            });
-
-            let prefill_policy = self.policy_registry.get_prefill_policy();
-            let decode_policy = self.policy_registry.get_decode_policy();
-
-            let prefill_idx = match prefill_policy.select_worker_with_headers(
-                &prefill_workers,
-                request_str,
-                request_headers.as_ref(),
-            ) {
-                Some(idx) => idx,
-                None => {
-                    RouterMetrics::record_pd_error("server_selection");
-                    return (
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "Prefill policy failed to select a worker".to_string(),
-                    )
-                        .into_response();
-                }
-            };
-
-            let decode_idx = match decode_policy.select_worker_with_headers(
-                &decode_workers,
-                request_str,
-                request_headers.as_ref(),
-            ) {
-                Some(idx) => idx,
-                None => {
-                    RouterMetrics::record_pd_error("server_selection");
-                    return (
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "Decode policy failed to select a worker".to_string(),
-                    )
-                        .into_response();
-                }
-            };
-
-            let prefill_worker = &prefill_workers[prefill_idx];
-            let decode_worker = &decode_workers[decode_idx];
-
-            debug!(
-                "Transparent proxy: prefill={}, decode={}",
-                prefill_worker.url(),
-                decode_worker.url()
-            );
-
-            // Execute two-stage processing
-            match self
-                .process_vllm_two_stage_request(
-                    request_json,
-                    prefill_worker.clone(),
-                    decode_worker.clone(),
-                    path,
-                    headers,
-                )
+            // Discovery mode - use vLLM-specific two-stage processing (pool-aware)
+            self.process_vllm_request_with_pool(request_json, path, headers, pool_name)
                 .await
-            {
-                Ok(response) => response,
-                Err(e) => {
-                    error!(
-                        "Transparent proxy request failed: prefill={}, decode={}, error={}",
-                        prefill_worker.url(),
-                        decode_worker.url(),
-                        e
-                    );
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("Transparent proxy request failed: {}", e),
-                    )
-                        .into_response()
-                }
-            }
+        } else {
+            // Direct URL mode
+            self.route_direct_url(request_json, path, headers, pool_name)
+                .await
         }
     }
 }

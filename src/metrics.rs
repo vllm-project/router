@@ -238,6 +238,12 @@ pub fn init_metrics() {
         "Time per streaming decode step"
     );
 
+    // Multi-prefill-pool metrics
+    describe_counter!(
+        "vllm_router_prefill_pool_routed_total",
+        "Total requests routed to each prefill pool"
+    );
+
     // Factory metrics
     describe_counter!(
         "vllm_tokenizer_factory_loads_total",
@@ -404,6 +410,14 @@ impl RouterMetrics {
     pub fn record_pd_prefill_request(worker: &str) {
         counter!("vllm_router_pd_prefill_requests_total",
             "worker" => worker.to_string()
+        )
+        .increment(1);
+    }
+
+    /// Record a prefill pool routing event (which pool was selected for a request)
+    pub fn record_prefill_pool_routed(pool: &str) {
+        counter!("vllm_router_prefill_pool_routed_total",
+            "pool" => pool.to_string()
         )
         .increment(1);
     }

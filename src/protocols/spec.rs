@@ -2363,10 +2363,54 @@ pub enum LoRAPath {
     Batch(Vec<Option<String>>),
 }
 
+// ============= Prefill Pool Detection =============
+
+/// Detect which prefill pool should handle a chat completion request based on modality.
+/// Returns "perception" if any user message contains a non-text content part
+/// (e.g., image_url, audio_url, video), otherwise returns "text".
+pub fn detect_prefill_pool(request: &ChatCompletionRequest) -> &'static str {
+    let has_non_text = request.messages.iter().any(|msg| {
+        matches!(msg, ChatMessage::User { content: UserMessageContent::Parts(parts), .. }
+            if parts.iter().any(|p| !matches!(p, ContentPart::Text { .. })))
+    });
+    if has_non_text {
+        "perception"
+    } else {
+        "text"
+    }
+}
+
+/// Detect which prefill pool should handle a request from a raw JSON value.
+/// Same logic as detect_prefill_pool but operates on serde_json::Value.
+/// Returns "perception" if any user message contains a non-text content part
+/// (e.g., image_url, audio_url, video), otherwise returns "text".
+/// Note: Any content part with a "type" field that is not "text" (including
+/// unknown or misspelled types) is treated as non-text and routed to "perception".
+/// This errs on the side of multimodal processing for unrecognized types.
+pub fn detect_prefill_pool_from_json(json: &serde_json::Value) -> &'static str {
+    let has_non_text = json
+        .get("messages")
+        .and_then(|m| m.as_array())
+        .into_iter()
+        .flatten()
+        .filter(|msg| msg.get("role").and_then(|r| r.as_str()) == Some("user"))
+        .filter_map(|msg| msg.get("content").and_then(|c| c.as_array()))
+        .flatten()
+        .any(|part| {
+            let part_type = part.get("type").and_then(|t| t.as_str());
+            part_type.is_some() && part_type != Some("text")
+        });
+    if has_non_text {
+        "perception"
+    } else {
+        "text"
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json;
+    use serde_json::{self, json};
 
     // ==================================================================
     // =            RERANK REQUEST TESTS                                =
@@ -3682,5 +3726,110 @@ mod tests {
             }
             _ => panic!("Expected Assistant message"),
         }
+    }
+
+    // ============= Prefill Pool Detection Tests =============
+
+    #[test]
+    fn test_detect_prefill_pool_text_only() {
+        let request = serde_json::from_value::<ChatCompletionRequest>(json!({
+            "messages": [
+                {"role": "user", "content": "Hello, how are you?"}
+            ]
+        }))
+        .unwrap();
+        assert_eq!(detect_prefill_pool(&request), "text");
+    }
+
+    #[test]
+    fn test_detect_prefill_pool_with_image() {
+        let request = serde_json::from_value::<ChatCompletionRequest>(json!({
+            "messages": [
+                {"role": "user", "content": [
+                    {"type": "text", "text": "What's in this image?"},
+                    {"type": "image_url", "image_url": {"url": "https://example.com/image.png"}}
+                ]}
+            ]
+        }))
+        .unwrap();
+        assert_eq!(detect_prefill_pool(&request), "perception");
+    }
+
+    #[test]
+    fn test_detect_prefill_pool_mixed_messages() {
+        let request = serde_json::from_value::<ChatCompletionRequest>(json!({
+            "messages": [
+                {"role": "system", "content": "You are a helpful assistant."},
+                {"role": "user", "content": "Hello!"},
+                {"role": "assistant", "content": "Hi there!"},
+                {"role": "user", "content": [
+                    {"type": "text", "text": "Describe this"},
+                    {"type": "image_url", "image_url": {"url": "https://example.com/img.jpg"}}
+                ]}
+            ]
+        }))
+        .unwrap();
+        assert_eq!(detect_prefill_pool(&request), "perception");
+    }
+
+    #[test]
+    fn test_detect_prefill_pool_text_parts_only() {
+        let request = serde_json::from_value::<ChatCompletionRequest>(json!({
+            "messages": [
+                {"role": "user", "content": [
+                    {"type": "text", "text": "Part 1"},
+                    {"type": "text", "text": "Part 2"}
+                ]}
+            ]
+        }))
+        .unwrap();
+        assert_eq!(detect_prefill_pool(&request), "text");
+    }
+
+    #[test]
+    fn test_detect_prefill_pool_from_json_text() {
+        let json = json!({
+            "messages": [
+                {"role": "user", "content": "Simple text"}
+            ]
+        });
+        assert_eq!(detect_prefill_pool_from_json(&json), "text");
+    }
+
+    #[test]
+    fn test_detect_prefill_pool_from_json_image() {
+        let json = json!({
+            "messages": [
+                {"role": "user", "content": [
+                    {"type": "text", "text": "What's this?"},
+                    {"type": "image_url", "image_url": {"url": "https://example.com/img.png"}}
+                ]}
+            ]
+        });
+        assert_eq!(detect_prefill_pool_from_json(&json), "perception");
+    }
+
+    #[test]
+    fn test_detect_prefill_pool_from_json_no_messages() {
+        let json = json!({"prompt": "Hello"});
+        assert_eq!(detect_prefill_pool_from_json(&json), "text");
+    }
+
+    #[test]
+    fn test_detect_prefill_pool_from_json_audio() {
+        let json = json!({"messages": [{"role": "user", "content": [{"type": "audio_url", "audio_url": {"url": "http://example.com/audio.mp3"}}]}]});
+        assert_eq!(detect_prefill_pool_from_json(&json), "perception");
+    }
+
+    #[test]
+    fn test_detect_prefill_pool_from_json_video() {
+        let json = json!({"messages": [{"role": "user", "content": [{"type": "video", "video": {"url": "http://example.com/video.mp4"}}]}]});
+        assert_eq!(detect_prefill_pool_from_json(&json), "perception");
+    }
+
+    #[test]
+    fn test_detect_prefill_pool_from_json_unknown_type() {
+        let json = json!({"messages": [{"role": "user", "content": [{"type": "custom_modality", "data": "something"}]}]});
+        assert_eq!(detect_prefill_pool_from_json(&json), "perception");
     }
 }

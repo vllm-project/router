@@ -1,7 +1,7 @@
 use pyo3::prelude::*;
 pub mod config;
 pub mod logging;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 pub mod core;
 pub mod data_connector;
@@ -118,6 +118,16 @@ impl Router {
         config::ConnectionMode::Http
     }
 
+    /// Convert a single prefill selector to a BTreeMap with pool "default".
+    /// Returns empty map if the selector is empty.
+    fn prefill_selector_as_pools(&self) -> BTreeMap<String, HashMap<String, String>> {
+        if self.prefill_selector.is_empty() {
+            BTreeMap::new()
+        } else {
+            BTreeMap::from([("default".to_string(), self.prefill_selector.clone())])
+        }
+    }
+
     /// Convert PyO3 Router to RouterConfig
     pub fn to_router_config(&self) -> config::ConfigResult<config::RouterConfig> {
         use config::{
@@ -183,7 +193,7 @@ impl Router {
                 port: self.service_discovery_port,
                 check_interval_secs: 60,
                 selector: self.selector.clone(),
-                prefill_selector: self.prefill_selector.clone(),
+                prefill_selectors: self.prefill_selector_as_pools(),
                 decode_selector: self.decode_selector.clone(),
                 bootstrap_port_annotation: self.bootstrap_port_annotation.clone(),
             })
@@ -495,7 +505,7 @@ impl Router {
                 namespace: self.service_discovery_namespace.clone(),
                 // Enable PD mode for both --pd-disaggregation and --vllm-pd-disaggregation
                 pd_mode: self.pd_disaggregation || self.vllm_pd_disaggregation,
-                prefill_selector: self.prefill_selector.clone(),
+                prefill_selectors: self.prefill_selector_as_pools(),
                 decode_selector: self.decode_selector.clone(),
                 bootstrap_port_annotation: self.bootstrap_port_annotation.clone(),
             })
