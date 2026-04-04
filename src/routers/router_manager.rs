@@ -533,7 +533,7 @@ impl RouterTrait for RouterManager {
 
     /// Get available models - query from worker registry
     // NOTE: serde_json::json!() sorts keys alphabetically,
-    // resulting in a different field order from the OpenAI API Spec. 
+    // resulting in a different field order from the OpenAI API Spec.
     // TODO: Preserve declaration order.
     async fn get_models(&self, _req: Request<Body>) -> Response {
         let models = self.worker_registry.get_models();
