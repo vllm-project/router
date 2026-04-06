@@ -1519,6 +1519,54 @@ impl RouterTrait for Router {
         }
     }
 
+    async fn reset_prefix_cache(&self) -> Response {
+        // Get all worker URLs
+        let worker_urls = self.get_worker_urls();
+
+        // Send requests to all workers concurrently
+        let mut tasks = Vec::new();
+        for worker_url in &worker_urls {
+            let worker_url = if self.intra_node_data_parallel_size > 1 {
+                let (worker_url_prefix, _dp_rank) = match dp_utils::extract_dp_rank(worker_url) {
+                    Ok(tup) => tup,
+                    Err(e) => {
+                        error!("Failed to extract dp_rank: {}", e);
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("Failed to extract dp_rank: {}", e),
+                        )
+                            .into_response();
+                    }
+                };
+                worker_url_prefix
+            } else {
+                worker_url
+            };
+            let request_builder = self
+                .client
+                .post(format!("{}/reset_prefix_cache", worker_url));
+            tasks.push(request_builder.send());
+        }
+
+        let results = futures_util::future::join_all(tasks).await;
+
+        let all_success = results.iter().all(|r| {
+            r.as_ref()
+                .map(|res| res.status().is_success())
+                .unwrap_or(false)
+        });
+
+        if all_success {
+            (StatusCode::OK, "Prefix cache reset on all servers").into_response()
+        } else {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Prefix cache reset failed on one or more servers",
+            )
+                .into_response()
+        }
+    }
+
     async fn get_worker_loads(&self) -> Response {
         let urls = self.get_worker_urls();
         let mut loads = Vec::new();

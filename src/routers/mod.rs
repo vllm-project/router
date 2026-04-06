@@ -142,6 +142,9 @@ pub trait RouterTrait: Send + Sync + Debug + WorkerManagement {
     /// Flush cache on all workers
     async fn flush_cache(&self) -> Response;
 
+    /// Reset prefix cache on all workers
+    async fn reset_prefix_cache(&self) -> Response;
+
     /// Get worker loads (for monitoring)
     async fn get_worker_loads(&self) -> Response;
 

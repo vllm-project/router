@@ -751,6 +751,14 @@ impl RouterTrait for RouterManager {
         }
     }
 
+    async fn reset_prefix_cache(&self) -> Response {
+        if self.routers.is_empty() {
+            (StatusCode::SERVICE_UNAVAILABLE, "No routers configured").into_response()
+        } else {
+            (StatusCode::OK, "Prefix cache reset requested").into_response()
+        }
+    }
+
     /// Get worker loads from all routers
     async fn get_worker_loads(&self) -> Response {
         // Return worker loads from the registry

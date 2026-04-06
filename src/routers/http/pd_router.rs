@@ -2175,6 +2175,45 @@ impl RouterTrait for PDRouter {
         }
     }
 
+    async fn reset_prefix_cache(&self) -> Response {
+        // Process both prefill and decode workers
+        let (prefill_results, prefill_errors) = self
+            .process_workers(
+                WorkerType::Prefill {
+                    bootstrap_port: None,
+                },
+                "Prefill",
+                "reset_prefix_cache",
+            )
+            .await;
+        let (decode_results, decode_errors) = self
+            .process_workers(WorkerType::Decode, "Decode", "reset_prefix_cache")
+            .await;
+
+        // Combine results and errors
+        let mut results = prefill_results;
+        results.extend(decode_results);
+        let mut errors = prefill_errors;
+        errors.extend(decode_errors);
+
+        if errors.is_empty() {
+            (
+                StatusCode::OK,
+                format!("Prefix cache reset successfully: {:?}", results),
+            )
+                .into_response()
+        } else {
+            (
+                StatusCode::PARTIAL_CONTENT,
+                format!(
+                    "Partial success. Results: {:?}, Errors: {:?}",
+                    results, errors
+                ),
+            )
+                .into_response()
+        }
+    }
+
     async fn get_worker_loads(&self) -> Response {
         let mut loads = HashMap::new();
         let mut errors = Vec::new();

@@ -375,6 +375,14 @@ impl super::super::RouterTrait for OpenAIRouter {
             .into_response()
     }
 
+    async fn reset_prefix_cache(&self) -> Response {
+        (
+            StatusCode::NOT_IMPLEMENTED,
+            "reset_prefix_cache not supported for OpenAI router",
+        )
+            .into_response()
+    }
+
     async fn get_worker_loads(&self) -> Response {
         (
             StatusCode::NOT_IMPLEMENTED,

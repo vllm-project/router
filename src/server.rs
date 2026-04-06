@@ -521,6 +521,17 @@ async fn flush_cache(State(state): State<Arc<AppState>>, headers: http::HeaderMa
     state.router.flush_cache().await
 }
 
+async fn reset_prefix_cache(
+    State(state): State<Arc<AppState>>,
+    headers: http::HeaderMap,
+) -> Response {
+    if let Err(response) = authorize_request(&state, &headers).await {
+        return response;
+    }
+
+    state.router.reset_prefix_cache().await
+}
+
 async fn get_loads(State(state): State<Arc<AppState>>, headers: http::HeaderMap) -> Response {
     if let Err(response) = authorize_request(&state, &headers).await {
         return response;
@@ -744,6 +755,7 @@ pub fn build_app(
         .route("/remove_worker", post(remove_worker))
         .route("/list_workers", get(list_workers))
         .route("/flush_cache", post(flush_cache))
+        .route("/reset_prefix_cache", post(reset_prefix_cache))
         .route("/get_loads", get(get_loads));
 
     // Worker management routes
