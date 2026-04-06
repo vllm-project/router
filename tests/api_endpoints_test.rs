@@ -2296,4 +2296,93 @@ mod rerank_tests {
 
         ctx.shutdown().await;
     }
+
+    #[tokio::test]
+    async fn test_reset_prefix_cache() {
+        let ctx = TestContext::new(vec![MockWorkerConfig {
+            port: 18701,
+            worker_type: WorkerType::Regular,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 0.0,
+        }])
+        .await;
+
+        let app = ctx.create_app().await;
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/reset_prefix_cache")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        if !body_bytes.is_empty() {
+            if let Ok(body) = serde_json::from_slice::<serde_json::Value>(&body_bytes) {
+                assert!(body.is_object());
+            }
+        }
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_reset_prefix_cache_no_workers() {
+        let ctx = TestContext::new(vec![]).await;
+
+        let app = ctx.create_app().await;
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/reset_prefix_cache")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        // Should either succeed (no-op) or return service unavailable
+        assert!(
+            resp.status() == StatusCode::OK || resp.status() == StatusCode::SERVICE_UNAVAILABLE
+        );
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_reset_prefix_cache_multiple_workers() {
+        let ctx = TestContext::new(vec![
+            MockWorkerConfig {
+                port: 18702,
+                worker_type: WorkerType::Regular,
+                health_status: HealthStatus::Healthy,
+                response_delay_ms: 0,
+                fail_rate: 0.0,
+            },
+            MockWorkerConfig {
+                port: 18703,
+                worker_type: WorkerType::Regular,
+                health_status: HealthStatus::Healthy,
+                response_delay_ms: 0,
+                fail_rate: 0.0,
+            },
+        ])
+        .await;
+
+        let app = ctx.create_app().await;
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/reset_prefix_cache")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        ctx.shutdown().await;
+    }
 }
