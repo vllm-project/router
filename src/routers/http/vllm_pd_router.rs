@@ -1990,7 +1990,10 @@ mod tests {
 
         assert!(kv_transfer_params.is_some());
         assert!(prompt_token_ids.is_some());
-        assert_eq!(prompt_token_ids.as_ref().unwrap().as_array().unwrap().len(), 5);
+        assert_eq!(
+            prompt_token_ids.as_ref().unwrap().as_array().unwrap().len(),
+            5
+        );
 
         // Build decode request as the router does
         let original_request = json!({
