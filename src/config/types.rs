@@ -81,6 +81,12 @@ pub struct RouterConfig {
     /// Profiling timeout in seconds (for vLLM profiling endpoints)
     #[serde(default = "default_profile_timeout_secs")]
     pub profile_timeout_secs: u64,
+    /// Seconds to wait for a healthy worker when none are available (0 = immediate 503).
+    /// During rolling updates, new pods may take minutes to load models. This setting
+    /// makes the router hold requests until a worker becomes available rather than
+    /// immediately returning 503.
+    #[serde(default)]
+    pub engine_wait_timeout_secs: u64,
 }
 
 fn default_profile_timeout_secs() -> u64 {
@@ -487,6 +493,7 @@ impl Default for RouterConfig {
             history_backend: default_history_backend(),
             enable_profiling: false,
             profile_timeout_secs: default_profile_timeout_secs(),
+            engine_wait_timeout_secs: 0,
         }
     }
 }
@@ -1058,6 +1065,7 @@ mod tests {
             history_backend: default_history_backend(),
             enable_profiling: false,
             profile_timeout_secs: default_profile_timeout_secs(),
+            engine_wait_timeout_secs: 0,
         };
 
         assert!(config.mode.is_pd_mode());
@@ -1125,6 +1133,7 @@ mod tests {
             history_backend: default_history_backend(),
             enable_profiling: false,
             profile_timeout_secs: default_profile_timeout_secs(),
+            engine_wait_timeout_secs: 0,
         };
 
         assert!(!config.mode.is_pd_mode());
@@ -1188,6 +1197,7 @@ mod tests {
             history_backend: default_history_backend(),
             enable_profiling: false,
             profile_timeout_secs: default_profile_timeout_secs(),
+            engine_wait_timeout_secs: 0,
         };
 
         assert!(config.has_service_discovery());

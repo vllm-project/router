@@ -251,6 +251,7 @@ impl Router {
             history_backend: config::HistoryBackend::Memory,
             enable_profiling: false, // Profiling disabled in Python binding by default
             profile_timeout_secs: 10, // Default profiling timeout
+            engine_wait_timeout_secs: 0, // Disabled by default in Python binding
         })
     }
 }

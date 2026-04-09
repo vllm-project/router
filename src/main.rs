@@ -363,6 +363,12 @@ struct CliArgs {
     /// Enable profiling calls to vLLM workers
     #[arg(long, default_value_t = false)]
     profile: bool,
+
+    /// Seconds to wait for a healthy worker when none are available (0 = immediate 503).
+    /// Useful during rolling updates when new pods take minutes to load models.
+    /// The router holds requests until a worker becomes available or the timeout expires.
+    #[arg(long, default_value_t = 0)]
+    engine_wait_timeout_secs: u64,
 }
 
 impl CliArgs {
@@ -651,6 +657,7 @@ impl CliArgs {
             },
             enable_profiling: self.profile,
             profile_timeout_secs: 10, // Default profiling timeout
+            engine_wait_timeout_secs: self.engine_wait_timeout_secs,
         })
     }
 

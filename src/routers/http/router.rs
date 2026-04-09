@@ -43,6 +43,7 @@ pub struct Router {
     api_key: Option<String>,
     retry_config: RetryConfig,
     circuit_breaker_config: CircuitBreakerConfig,
+    engine_wait_timeout: Duration,
     _worker_loads: Arc<tokio::sync::watch::Receiver<HashMap<String, isize>>>,
     _load_monitor_handle: Option<Arc<tokio::task::JoinHandle<()>>>,
 }
@@ -179,6 +180,9 @@ impl Router {
             api_key: ctx.router_config.api_key.clone(),
             retry_config: ctx.router_config.effective_retry_config(),
             circuit_breaker_config: core_cb_config,
+            engine_wait_timeout: Duration::from_secs(
+                ctx.router_config.engine_wait_timeout_secs,
+            ),
             _worker_loads: worker_loads,
             _load_monitor_handle: load_monitor_handle,
         })
@@ -554,6 +558,31 @@ impl Router {
             |_: u32| async {
                 let worker = match self.select_worker_for_model(model_id, Some(&text), headers) {
                     Some(w) => w,
+                    None if !self.engine_wait_timeout.is_zero() => {
+                        // Wait for a healthy worker to become available instead of
+                        // immediately returning 503. This is useful during rolling
+                        // updates when new pods take minutes to load models.
+                        let wait_start = Instant::now();
+                        loop {
+                            if wait_start.elapsed() >= self.engine_wait_timeout {
+                                RouterMetrics::record_request_error(
+                                    route,
+                                    "no_available_workers",
+                                );
+                                return (
+                                    StatusCode::SERVICE_UNAVAILABLE,
+                                    "No available workers after waiting for engine readiness",
+                                )
+                                    .into_response();
+                            }
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                            if let Some(w) =
+                                self.select_worker_for_model(model_id, Some(&text), headers)
+                            {
+                                break w;
+                            }
+                        }
+                    }
                     None => {
                         RouterMetrics::record_request_error(route, "no_available_workers");
                         return (
@@ -1792,6 +1821,7 @@ mod tests {
             client: Client::new(),
             retry_config: RetryConfig::default(),
             circuit_breaker_config: CircuitBreakerConfig::default(),
+            engine_wait_timeout: Duration::ZERO,
             _worker_loads: Arc::new(rx),
             _load_monitor_handle: None,
         }
@@ -1864,6 +1894,7 @@ mod tests {
             client: Client::new(),
             retry_config: RetryConfig::default(),
             circuit_breaker_config: CircuitBreakerConfig::default(),
+            engine_wait_timeout: Duration::ZERO,
             _worker_loads: Arc::new(rx),
             _load_monitor_handle: None,
         }
