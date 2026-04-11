@@ -636,6 +636,250 @@ mod dp_e2e_tests {
         decode_worker.stop().await;
     }
 
+    // -----------------------------------------------------------------
+    // PD Router + DP > 1: add_prefill_server / add_decode_server runtime path
+    // -----------------------------------------------------------------
+    // These tests verify the fix for D100422851: when dp_size > 1,
+    // add_prefill_server/add_decode_server must create DPAwareWorker
+    // (not BasicWorker) to prevent IPv6+DP URL corruption.
+
+    #[tokio::test]
+    async fn test_pd_router_add_prefill_server_dp2_creates_dp_aware_worker() {
+        // Start initial PD workers for router creation
+        let mut initial_prefill = MockWorker::new(MockWorkerConfig {
+            port: 0,
+            worker_type: WorkerType::Prefill,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 0.0,
+        });
+        let mut initial_decode = MockWorker::new(MockWorkerConfig {
+            port: 0,
+            worker_type: WorkerType::Decode,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 0.0,
+        });
+        let prefill_url = initial_prefill.start().await.unwrap();
+        let decode_url = initial_decode.start().await.unwrap();
+
+        // Start a NEW prefill worker to add at runtime
+        let mut new_prefill = MockWorker::new(MockWorkerConfig {
+            port: 0,
+            worker_type: WorkerType::Prefill,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 0.0,
+        });
+        let new_prefill_url = new_prefill.start().await.unwrap();
+
+        // Create PDRouter with dp_size=2
+        let config = make_pd_config(
+            vec![(prefill_url.clone(), None)],
+            vec![decode_url.clone()],
+            2,
+        );
+        let app_context = common::create_test_context(config.clone());
+        let router = RouterFactory::create_router(&app_context).await.unwrap();
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+        // Initial workers: 1 prefill × 2 + 1 decode × 2 = 4
+        assert_eq!(app_context.worker_registry.get_all().len(), 4);
+
+        // Downcast to PDRouter and add a new prefill server at runtime
+        use vllm_router_rs::routers::http::pd_router::PDRouter;
+        let pd_router = router.as_any().downcast_ref::<PDRouter>().unwrap();
+        assert_eq!(pd_router.dp_size, 2, "PDRouter should have dp_size=2");
+
+        // Add new prefill server (plain URL, no @rank — mimics service discovery)
+        let result = pd_router
+            .add_prefill_server(new_prefill_url.clone(), None)
+            .await;
+        assert!(
+            result.is_ok(),
+            "add_prefill_server should succeed: {:?}",
+            result.err()
+        );
+
+        // The new worker should be registered as DPAwareWorker
+        // With dp_size=2 and no @rank in URL, parse_worker_url returns rank=None,
+        // so DPAwareWorker gets rank 0 → url = "new_prefill_url@0"
+        let new_worker_url = format!("{}@0", new_prefill_url);
+        let worker = app_context.worker_registry.get_by_url(&new_worker_url);
+        assert!(
+            worker.is_some(),
+            "DPAwareWorker should be registered with @0 suffix. Registry URLs: {:?}",
+            app_context
+                .worker_registry
+                .get_all()
+                .iter()
+                .map(|w| w.url().to_string())
+                .collect::<Vec<_>>()
+        );
+
+        let w = worker.unwrap();
+        assert!(
+            w.is_dp_aware(),
+            "Runtime-added worker should be DP-aware when dp_size > 1"
+        );
+        assert_eq!(w.dp_rank(), Some(0));
+        assert_eq!(w.dp_size(), Some(2));
+
+        // Critical: endpoint_url must NOT contain @rank
+        let endpoint = w.endpoint_url("/v1/completions");
+        assert!(
+            !endpoint.contains('@'),
+            "Runtime-added worker endpoint_url must not contain @rank (got: {})",
+            endpoint
+        );
+
+        initial_prefill.stop().await;
+        initial_decode.stop().await;
+        new_prefill.stop().await;
+    }
+
+    #[tokio::test]
+    async fn test_pd_router_add_decode_server_dp2_creates_dp_aware_worker() {
+        let mut initial_prefill = MockWorker::new(MockWorkerConfig {
+            port: 0,
+            worker_type: WorkerType::Prefill,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 0.0,
+        });
+        let mut initial_decode = MockWorker::new(MockWorkerConfig {
+            port: 0,
+            worker_type: WorkerType::Decode,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 0.0,
+        });
+        let prefill_url = initial_prefill.start().await.unwrap();
+        let decode_url = initial_decode.start().await.unwrap();
+
+        // New decode worker to add at runtime
+        let mut new_decode = MockWorker::new(MockWorkerConfig {
+            port: 0,
+            worker_type: WorkerType::Decode,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 0.0,
+        });
+        let new_decode_url = new_decode.start().await.unwrap();
+
+        let config = make_pd_config(
+            vec![(prefill_url.clone(), None)],
+            vec![decode_url.clone()],
+            2,
+        );
+        let app_context = common::create_test_context(config.clone());
+        let router = RouterFactory::create_router(&app_context).await.unwrap();
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+        use vllm_router_rs::routers::http::pd_router::PDRouter;
+        let pd_router = router.as_any().downcast_ref::<PDRouter>().unwrap();
+
+        // Add new decode server at runtime
+        let result = pd_router.add_decode_server(new_decode_url.clone()).await;
+        assert!(
+            result.is_ok(),
+            "add_decode_server should succeed: {:?}",
+            result.err()
+        );
+
+        // Verify the new worker is DPAwareWorker
+        let new_worker_url = format!("{}@0", new_decode_url);
+        let worker = app_context.worker_registry.get_by_url(&new_worker_url);
+        assert!(
+            worker.is_some(),
+            "DPAwareWorker should be registered with @0 suffix"
+        );
+
+        let w = worker.unwrap();
+        assert!(w.is_dp_aware());
+        assert_eq!(w.dp_rank(), Some(0));
+
+        let endpoint = w.endpoint_url("/v1/completions");
+        assert!(
+            !endpoint.contains('@'),
+            "Decode worker endpoint_url must not contain @rank (got: {})",
+            endpoint
+        );
+
+        initial_prefill.stop().await;
+        initial_decode.stop().await;
+        new_decode.stop().await;
+    }
+
+    #[tokio::test]
+    async fn test_pd_router_add_prefill_server_dp1_creates_basic_worker() {
+        // With dp_size=1, add_prefill_server should create BasicWorker
+        let mut initial_prefill = MockWorker::new(MockWorkerConfig {
+            port: 0,
+            worker_type: WorkerType::Prefill,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 0.0,
+        });
+        let mut initial_decode = MockWorker::new(MockWorkerConfig {
+            port: 0,
+            worker_type: WorkerType::Decode,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 0.0,
+        });
+        let prefill_url = initial_prefill.start().await.unwrap();
+        let decode_url = initial_decode.start().await.unwrap();
+
+        let mut new_prefill = MockWorker::new(MockWorkerConfig {
+            port: 0,
+            worker_type: WorkerType::Prefill,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 0.0,
+        });
+        let new_prefill_url = new_prefill.start().await.unwrap();
+
+        let config = make_pd_config(
+            vec![(prefill_url.clone(), None)],
+            vec![decode_url.clone()],
+            1, // dp_size=1
+        );
+        let app_context = common::create_test_context(config.clone());
+        let router = RouterFactory::create_router(&app_context).await.unwrap();
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+        use vllm_router_rs::routers::http::pd_router::PDRouter;
+        let pd_router = router.as_any().downcast_ref::<PDRouter>().unwrap();
+        assert_eq!(pd_router.dp_size, 1);
+
+        let result = pd_router
+            .add_prefill_server(new_prefill_url.clone(), None)
+            .await;
+        assert!(result.is_ok());
+
+        // With dp_size=1, worker is registered with the original URL (no @rank)
+        let worker = app_context.worker_registry.get_by_url(&new_prefill_url);
+        assert!(
+            worker.is_some(),
+            "BasicWorker should be registered with original URL"
+        );
+
+        let w = worker.unwrap();
+        assert!(
+            !w.is_dp_aware(),
+            "Worker should NOT be DP-aware when dp_size=1"
+        );
+        assert!(!w.url().contains('@'));
+
+        initial_prefill.stop().await;
+        initial_decode.stop().await;
+        new_prefill.stop().await;
+    }
+
     #[tokio::test]
     async fn test_pd_router_dp1_creates_basic_workers() {
         let mut prefill_worker = MockWorker::new(MockWorkerConfig {

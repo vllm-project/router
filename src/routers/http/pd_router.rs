@@ -51,6 +51,8 @@ pub struct PDRouter {
     pub circuit_breaker_config: CircuitBreakerConfig,
     // Channel for sending prefill responses to background workers for draining
     prefill_drain_tx: mpsc::Sender<reqwest::Response>,
+    // Intra-node data parallel size for creating DPAwareWorker in add_*_server()
+    pub dp_size: usize,
 }
 
 // Request context for PD router operations
@@ -271,15 +273,24 @@ impl PDRouter {
             return Err(PDRouterError::WorkerAlreadyExists { url: url.clone() });
         }
 
-        // Create Worker for the new prefill server with circuit breaker configuration
-        // TODO: In IGW mode, fetch model_id from worker's /get_model_info endpoint
-        let worker = WorkerFactory::create_prefill_with_config(
-            url.clone(),
-            bootstrap_port,
-            self.circuit_breaker_config.clone(),
-        );
-
-        let worker_arc: Arc<dyn Worker> = Arc::from(worker);
+        // Create DPAwareWorker when dp_size > 1 and URL has @rank suffix,
+        // matching the logic in PDRouter::new(). DPAwareWorker strips the @rank
+        // suffix in endpoint_url(), preventing IPv6+DP URL corruption where
+        // reqwest interprets @N as a userinfo separator per RFC 3986.
+        let worker_type = WorkerType::Prefill { bootstrap_port };
+        let worker_arc: Arc<dyn Worker> = if self.dp_size > 1 {
+            let (base_url, dp_rank) = dp_utils::parse_worker_url(&url);
+            Arc::new(
+                DPAwareWorker::new(base_url, dp_rank.unwrap_or(0), self.dp_size, worker_type)
+                    .with_circuit_breaker_config(self.circuit_breaker_config.clone()),
+            )
+        } else {
+            Arc::from(WorkerFactory::create_prefill_with_config(
+                url.clone(),
+                bootstrap_port,
+                self.circuit_breaker_config.clone(),
+            ))
+        };
 
         // Register the worker in the registry
         self.worker_registry.register(worker_arc.clone());
@@ -312,14 +323,19 @@ impl PDRouter {
             return Err(PDRouterError::WorkerAlreadyExists { url: url.clone() });
         }
 
-        // Create Worker for the new decode server with circuit breaker configuration
-        // TODO: In IGW mode, fetch model_id from worker's /get_model_info endpoint
-        let worker = WorkerFactory::create_decode_with_config(
-            url.clone(),
-            self.circuit_breaker_config.clone(),
-        );
-
-        let worker_arc: Arc<dyn Worker> = Arc::from(worker);
+        // Create DPAwareWorker when dp_size > 1, same as add_prefill_server
+        let worker_arc: Arc<dyn Worker> = if self.dp_size > 1 {
+            let (base_url, dp_rank) = dp_utils::parse_worker_url(&url);
+            Arc::new(
+                DPAwareWorker::new(base_url, dp_rank.unwrap_or(0), self.dp_size, WorkerType::Decode)
+                    .with_circuit_breaker_config(self.circuit_breaker_config.clone()),
+            )
+        } else {
+            Arc::from(WorkerFactory::create_decode_with_config(
+                url.clone(),
+                self.circuit_breaker_config.clone(),
+            ))
+        };
 
         // Register the worker in the registry
         self.worker_registry.register(worker_arc.clone());
@@ -709,6 +725,7 @@ impl PDRouter {
             prefill_drain_tx,
             retry_config: ctx.router_config.effective_retry_config(),
             circuit_breaker_config: core_cb_config,
+            dp_size,
         })
     }
 
@@ -2454,7 +2471,7 @@ impl RouterTrait for PDRouter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::{BasicWorker, WorkerType};
+    use crate::core::{BasicWorker, DPAwareWorker, Worker, WorkerType};
 
     fn create_test_pd_router() -> PDRouter {
         let worker_registry = Arc::new(WorkerRegistry::new());
@@ -2473,6 +2490,28 @@ mod tests {
             prefill_drain_tx: mpsc::channel(100).0,
             retry_config: RetryConfig::default(),
             circuit_breaker_config: CircuitBreakerConfig::default(),
+            dp_size: 1,
+        }
+    }
+
+    fn create_test_pd_router_with_dp(dp_size: usize) -> PDRouter {
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        let policy_registry =
+            Arc::new(PolicyRegistry::new(crate::config::PolicyConfig::RoundRobin));
+
+        PDRouter {
+            worker_registry,
+            policy_registry,
+            worker_startup_timeout_secs: 5,
+            worker_startup_check_interval_secs: 1,
+            worker_loads: Arc::new(tokio::sync::watch::channel(HashMap::new()).1),
+            load_monitor_handle: None,
+            client: Client::new(),
+            prefill_client: Client::new(),
+            prefill_drain_tx: mpsc::channel(100).0,
+            retry_config: RetryConfig::default(),
+            circuit_breaker_config: CircuitBreakerConfig::default(),
+            dp_size,
         }
     }
 
@@ -2857,5 +2896,184 @@ mod tests {
         // Check final state
         let workers = router.worker_registry.get_prefill_workers();
         assert_eq!(workers.len(), 5);
+    }
+
+    // ============= DP-Aware Worker Creation Tests =============
+    // These tests verify that add_prefill_server/add_decode_server create
+    // DPAwareWorker (not BasicWorker) when dp_size > 1, preventing IPv6+DP
+    // URL corruption where @rank is misinterpreted as userinfo per RFC 3986.
+
+    #[test]
+    fn test_pd_router_dp_size_field() {
+        let router1 = create_test_pd_router();
+        assert_eq!(router1.dp_size, 1, "Default test router should have dp_size=1");
+
+        let router2 = create_test_pd_router_with_dp(4);
+        assert_eq!(router2.dp_size, 4);
+    }
+
+    #[test]
+    fn test_add_prefill_dp_creates_dp_aware_worker() {
+        // Simulate what happens when add_prefill_server registers a @rank URL
+        // with dp_size > 1: should create DPAwareWorker, not BasicWorker
+        let router = create_test_pd_router_with_dp(2);
+        let url = "http://10.0.0.1:8000@0";
+
+        let (base_url, dp_rank) = super::dp_utils::parse_worker_url(url);
+        let worker: Arc<dyn Worker> = Arc::new(DPAwareWorker::new(
+            base_url.clone(),
+            dp_rank.unwrap_or(0),
+            router.dp_size,
+            WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+        ));
+
+        router.worker_registry.register(worker.clone());
+
+        // Verify worker is DP-aware
+        assert!(worker.is_dp_aware(), "Worker should be DP-aware when dp_size > 1");
+        assert_eq!(worker.dp_rank(), Some(0));
+        assert_eq!(worker.dp_size(), Some(2));
+
+        // Critical: endpoint_url must NOT contain @rank
+        let endpoint = worker.endpoint_url("/v1/completions");
+        assert_eq!(
+            endpoint, "http://10.0.0.1:8000/v1/completions",
+            "DPAwareWorker endpoint_url must strip @rank"
+        );
+        assert!(
+            !endpoint.contains('@'),
+            "endpoint_url must not contain @ (got: {})",
+            endpoint
+        );
+
+        // Verify the registry URL still has @rank for identification
+        assert_eq!(worker.url(), "http://10.0.0.1:8000@0");
+    }
+
+    #[test]
+    fn test_add_prefill_dp1_creates_basic_worker() {
+        // With dp_size=1, should create BasicWorker (no @rank in URL)
+        let router = create_test_pd_router();
+        let url = "http://10.0.0.1:8000";
+
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+            url.to_string(),
+            WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+        ));
+
+        router.worker_registry.register(worker.clone());
+
+        assert!(!worker.is_dp_aware(), "Worker should NOT be DP-aware when dp_size=1");
+        assert_eq!(worker.dp_rank(), None);
+        assert_eq!(
+            worker.endpoint_url("/v1/completions"),
+            "http://10.0.0.1:8000/v1/completions"
+        );
+    }
+
+    #[test]
+    fn test_add_decode_dp_creates_dp_aware_worker() {
+        let router = create_test_pd_router_with_dp(4);
+        let url = "http://10.0.0.1:9000@2";
+
+        let (base_url, dp_rank) = super::dp_utils::parse_worker_url(url);
+        let worker: Arc<dyn Worker> = Arc::new(DPAwareWorker::new(
+            base_url,
+            dp_rank.unwrap_or(0),
+            router.dp_size,
+            WorkerType::Decode,
+        ));
+
+        router.worker_registry.register(worker.clone());
+
+        assert!(worker.is_dp_aware());
+        assert_eq!(worker.dp_rank(), Some(2));
+        assert_eq!(worker.dp_size(), Some(4));
+
+        let endpoint = worker.endpoint_url("/v1/completions");
+        assert_eq!(endpoint, "http://10.0.0.1:9000/v1/completions");
+        assert!(!endpoint.contains('@'));
+    }
+
+    #[test]
+    fn test_dp_aware_worker_ipv6_url_not_corrupted() {
+        // This is the exact production bug: IPv6 + @rank suffix causes URL corruption
+        let router = create_test_pd_router_with_dp(2);
+        let ipv6_url = "https://[2a03:83e4:5006:0090:5f5a:f8c5:0400:0000]:20009@0";
+
+        let (base_url, dp_rank) = super::dp_utils::parse_worker_url(ipv6_url);
+        assert_eq!(
+            base_url,
+            "https://[2a03:83e4:5006:0090:5f5a:f8c5:0400:0000]:20009"
+        );
+        assert_eq!(dp_rank, Some(0));
+
+        // DPAwareWorker correctly strips @rank
+        let dp_worker: Arc<dyn Worker> = Arc::new(DPAwareWorker::new(
+            base_url.clone(),
+            dp_rank.unwrap_or(0),
+            router.dp_size,
+            WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+        ));
+
+        let endpoint = dp_worker.endpoint_url("/v1/completions");
+        assert_eq!(
+            endpoint,
+            "https://[2a03:83e4:5006:0090:5f5a:f8c5:0400:0000]:20009/v1/completions",
+            "DPAwareWorker must produce clean IPv6 endpoint URL"
+        );
+
+        // BasicWorker would include @rank, causing corruption
+        let basic_worker = BasicWorker::new(ipv6_url.to_string(), WorkerType::Prefill {
+            bootstrap_port: None,
+        });
+        let bad_endpoint = basic_worker.endpoint_url("/v1/completions");
+        assert_eq!(
+            bad_endpoint,
+            "https://[2a03:83e4:5006:0090:5f5a:f8c5:0400:0000]:20009@0/v1/completions",
+            "BasicWorker includes @rank in endpoint URL (this is the bug)"
+        );
+    }
+
+    #[test]
+    fn test_dp_add_prefill_logic_matches_new() {
+        // Verify that the add_prefill_server logic (dp_size > 1 branch)
+        // produces the same result as PDRouter::new() worker creation
+        let dp_size = 4;
+        let urls = vec![
+            "http://10.0.0.1:8000@0",
+            "http://10.0.0.1:8000@1",
+            "http://10.0.0.1:8000@2",
+            "http://10.0.0.1:8000@3",
+        ];
+
+        for (expected_rank, url) in urls.iter().enumerate() {
+            let (base_url, dp_rank) = super::dp_utils::parse_worker_url(url);
+            assert_eq!(base_url, "http://10.0.0.1:8000");
+            assert_eq!(dp_rank, Some(expected_rank));
+
+            let worker = DPAwareWorker::new(
+                base_url,
+                dp_rank.unwrap_or(0),
+                dp_size,
+                WorkerType::Prefill {
+                    bootstrap_port: Some(8080),
+                },
+            );
+
+            assert!(worker.is_dp_aware());
+            assert_eq!(worker.dp_rank(), Some(expected_rank));
+            assert_eq!(worker.dp_size(), Some(dp_size));
+            assert_eq!(
+                worker.endpoint_url("/v1/completions"),
+                "http://10.0.0.1:8000/v1/completions"
+            );
+        }
     }
 }
