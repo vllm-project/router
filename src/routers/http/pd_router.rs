@@ -327,8 +327,13 @@ impl PDRouter {
         let worker_arc: Arc<dyn Worker> = if self.dp_size > 1 {
             let (base_url, dp_rank) = dp_utils::parse_worker_url(&url);
             Arc::new(
-                DPAwareWorker::new(base_url, dp_rank.unwrap_or(0), self.dp_size, WorkerType::Decode)
-                    .with_circuit_breaker_config(self.circuit_breaker_config.clone()),
+                DPAwareWorker::new(
+                    base_url,
+                    dp_rank.unwrap_or(0),
+                    self.dp_size,
+                    WorkerType::Decode,
+                )
+                .with_circuit_breaker_config(self.circuit_breaker_config.clone()),
             )
         } else {
             Arc::from(WorkerFactory::create_decode_with_config(
@@ -2906,7 +2911,10 @@ mod tests {
     #[test]
     fn test_pd_router_dp_size_field() {
         let router1 = create_test_pd_router();
-        assert_eq!(router1.dp_size, 1, "Default test router should have dp_size=1");
+        assert_eq!(
+            router1.dp_size, 1,
+            "Default test router should have dp_size=1"
+        );
 
         let router2 = create_test_pd_router_with_dp(4);
         assert_eq!(router2.dp_size, 4);
@@ -2932,7 +2940,10 @@ mod tests {
         router.worker_registry.register(worker.clone());
 
         // Verify worker is DP-aware
-        assert!(worker.is_dp_aware(), "Worker should be DP-aware when dp_size > 1");
+        assert!(
+            worker.is_dp_aware(),
+            "Worker should be DP-aware when dp_size > 1"
+        );
         assert_eq!(worker.dp_rank(), Some(0));
         assert_eq!(worker.dp_size(), Some(2));
 
@@ -2967,7 +2978,10 @@ mod tests {
 
         router.worker_registry.register(worker.clone());
 
-        assert!(!worker.is_dp_aware(), "Worker should NOT be DP-aware when dp_size=1");
+        assert!(
+            !worker.is_dp_aware(),
+            "Worker should NOT be DP-aware when dp_size=1"
+        );
         assert_eq!(worker.dp_rank(), None);
         assert_eq!(
             worker.endpoint_url("/v1/completions"),
@@ -3024,15 +3038,17 @@ mod tests {
 
         let endpoint = dp_worker.endpoint_url("/v1/completions");
         assert_eq!(
-            endpoint,
-            "https://[2a03:83e4:5006:0090:5f5a:f8c5:0400:0000]:20009/v1/completions",
+            endpoint, "https://[2a03:83e4:5006:0090:5f5a:f8c5:0400:0000]:20009/v1/completions",
             "DPAwareWorker must produce clean IPv6 endpoint URL"
         );
 
         // BasicWorker would include @rank, causing corruption
-        let basic_worker = BasicWorker::new(ipv6_url.to_string(), WorkerType::Prefill {
-            bootstrap_port: None,
-        });
+        let basic_worker = BasicWorker::new(
+            ipv6_url.to_string(),
+            WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+        );
         let bad_endpoint = basic_worker.endpoint_url("/v1/completions");
         assert_eq!(
             bad_endpoint,
@@ -3046,7 +3062,7 @@ mod tests {
         // Verify that the add_prefill_server logic (dp_size > 1 branch)
         // produces the same result as PDRouter::new() worker creation
         let dp_size = 4;
-        let urls = vec![
+        let urls = [
             "http://10.0.0.1:8000@0",
             "http://10.0.0.1:8000@1",
             "http://10.0.0.1:8000@2",
