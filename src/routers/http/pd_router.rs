@@ -273,10 +273,11 @@ impl PDRouter {
             return Err(PDRouterError::WorkerAlreadyExists { url: url.clone() });
         }
 
+        // TODO: In IGW mode, fetch model_id from worker's /get_model_info endpoint
         // Create DPAwareWorker when dp_size > 1 and URL has @rank suffix,
         // matching the logic in PDRouter::new(). DPAwareWorker strips the @rank
         // suffix in endpoint_url(), preventing IPv6+DP URL corruption where
-        // reqwest interprets @N as a userinfo separator per RFC 3986.
+        // HTTP clients interpret @N as a userinfo separator per RFC 3986.
         let worker_type = WorkerType::Prefill { bootstrap_port };
         let worker_arc: Arc<dyn Worker> = if self.dp_size > 1 {
             let (base_url, dp_rank) = dp_utils::parse_worker_url(&url);
@@ -323,6 +324,7 @@ impl PDRouter {
             return Err(PDRouterError::WorkerAlreadyExists { url: url.clone() });
         }
 
+        // TODO: In IGW mode, fetch model_id from worker's /get_model_info endpoint
         // Create DPAwareWorker when dp_size > 1, same as add_prefill_server
         let worker_arc: Arc<dyn Worker> = if self.dp_size > 1 {
             let (base_url, dp_rank) = dp_utils::parse_worker_url(&url);
