@@ -42,7 +42,7 @@ impl ConfigValidator {
     /// Validate routing mode configuration
     fn validate_mode(mode: &RoutingMode, has_service_discovery: bool) -> ConfigResult<()> {
         match mode {
-            RoutingMode::Regular { worker_urls } => {
+            RoutingMode::Regular { worker_urls, .. } => {
                 // Validate URLs if any are provided
                 if !worker_urls.is_empty() {
                     Self::validate_urls(worker_urls)?;
@@ -588,6 +588,7 @@ mod tests {
         let config = RouterConfig::new(
             RoutingMode::Regular {
                 worker_urls: vec!["http://worker:8000".to_string()],
+                kv_events: None,
             },
             PolicyConfig::Random,
         );
@@ -600,6 +601,7 @@ mod tests {
         let config = RouterConfig::new(
             RoutingMode::Regular {
                 worker_urls: vec![],
+                kv_events: None,
             },
             PolicyConfig::Random,
         );
@@ -613,6 +615,7 @@ mod tests {
         let mut config = RouterConfig::new(
             RoutingMode::Regular {
                 worker_urls: vec![],
+                kv_events: None,
             },
             PolicyConfig::Random,
         );
@@ -635,6 +638,7 @@ mod tests {
         let config = RouterConfig::new(
             RoutingMode::Regular {
                 worker_urls: vec!["invalid-url".to_string()],
+                kv_events: None,
             },
             PolicyConfig::Random,
         );
@@ -650,6 +654,7 @@ mod tests {
                     "http://worker1:8000".to_string(),
                     "http://worker2:8000".to_string(),
                 ],
+                kv_events: None,
             },
             PolicyConfig::CacheAware {
                 cache_threshold: 1.5, // Invalid: > 1.0
@@ -669,6 +674,7 @@ mod tests {
         let config = RouterConfig::new(
             RoutingMode::Regular {
                 worker_urls: vec!["http://worker1:8000".to_string()],
+                kv_events: None,
             },
             PolicyConfig::CacheAware {
                 cache_threshold: 0.5,
@@ -746,6 +752,7 @@ mod tests {
                     "http://worker1:8000".to_string(),
                     "http://worker2:8000".to_string(),
                 ],
+                kv_events: None,
             },
             PolicyConfig::PowerOfTwo {
                 load_check_interval_secs: 60,
@@ -818,6 +825,7 @@ mod tests {
         let mut config = RouterConfig::new(
             RoutingMode::Regular {
                 worker_urls: vec!["grpc://worker:50051".to_string()],
+                kv_events: None,
             },
             PolicyConfig::Random,
         );
@@ -840,6 +848,7 @@ mod tests {
         let mut config = RouterConfig::new(
             RoutingMode::Regular {
                 worker_urls: vec!["grpc://worker:50051".to_string()],
+                kv_events: None,
             },
             PolicyConfig::Random,
         );
@@ -857,6 +866,7 @@ mod tests {
         let mut config = RouterConfig::new(
             RoutingMode::Regular {
                 worker_urls: vec!["grpc://worker:50051".to_string()],
+                kv_events: None,
             },
             PolicyConfig::Random,
         );

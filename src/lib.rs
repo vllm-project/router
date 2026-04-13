@@ -159,6 +159,7 @@ impl Router {
             // IGW mode - routing mode is not used in IGW, but we need to provide a placeholder
             RoutingMode::Regular {
                 worker_urls: vec![],
+                kv_events: None,
             }
         } else if self.vllm_pd_disaggregation {
             // Automatically enable KV events when any policy is kv_aware
@@ -209,6 +210,11 @@ impl Router {
         } else {
             RoutingMode::Regular {
                 worker_urls: self.worker_urls.clone(),
+                kv_events: if matches!(self.policy, PolicyType::KvAware) {
+                    Some(config::KVEventsConfig::default())
+                } else {
+                    None
+                },
             }
         };
 

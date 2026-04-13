@@ -474,6 +474,7 @@ impl CliArgs {
             // IGW mode - routing mode is not used in IGW, but we need to provide a placeholder
             RoutingMode::Regular {
                 worker_urls: vec![],
+                kv_events: None,
             }
         } else if matches!(self.backend, Backend::Openai) {
             // OpenAI backend mode - use worker_urls as base(s)
@@ -602,6 +603,16 @@ impl CliArgs {
             }
             RoutingMode::Regular {
                 worker_urls: self.worker_urls.clone(),
+                kv_events: if self.policy == "kv_aware" {
+                    Some(vllm_router_rs::config::KVEventsConfig {
+                        topic_filter: self.kv_events_topic_filter.clone(),
+                        default_port: self.kv_events_port,
+                        index_max_entries: self.kv_index_max_entries,
+                        pd_uncached_token_threshold: self.pd_uncached_token_threshold,
+                    })
+                } else {
+                    None
+                },
             }
         };
 
@@ -633,7 +644,7 @@ impl CliArgs {
         // Determine connection mode from all worker URLs
         let mut all_urls = Vec::new();
         match &mode {
-            RoutingMode::Regular { worker_urls } => {
+            RoutingMode::Regular { worker_urls, .. } => {
                 all_urls.extend(worker_urls.clone());
             }
             RoutingMode::PrefillDecode {

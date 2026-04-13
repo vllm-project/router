@@ -123,6 +123,9 @@ pub enum RoutingMode {
     Regular {
         /// List of worker URLs
         worker_urls: Vec<String>,
+        /// KV events configuration for KV-aware routing (optional)
+        #[serde(skip_serializing_if = "Option::is_none")]
+        kv_events: Option<KVEventsConfig>,
     },
     #[serde(rename = "prefill_decode")]
     PrefillDecode {
@@ -177,7 +180,7 @@ impl RoutingMode {
 
     pub fn worker_count(&self) -> usize {
         match self {
-            RoutingMode::Regular { worker_urls } => worker_urls.len(),
+            RoutingMode::Regular { worker_urls, .. } => worker_urls.len(),
             RoutingMode::PrefillDecode {
                 prefill_urls,
                 decode_urls,
@@ -540,6 +543,7 @@ impl Default for RouterConfig {
         Self {
             mode: RoutingMode::Regular {
                 worker_urls: vec![],
+                kv_events: None,
             },
             policy: PolicyConfig::Random,
             host: "127.0.0.1".to_string(),
@@ -647,7 +651,7 @@ mod tests {
         let config = RouterConfig::default();
 
         assert!(
-            matches!(config.mode, RoutingMode::Regular { worker_urls } if worker_urls.is_empty())
+            matches!(config.mode, RoutingMode::Regular { worker_urls, .. } if worker_urls.is_empty())
         );
         assert!(matches!(config.policy, PolicyConfig::Random));
         assert_eq!(config.host, "127.0.0.1");
@@ -666,13 +670,14 @@ mod tests {
     fn test_router_config_new() {
         let mode = RoutingMode::Regular {
             worker_urls: vec!["http://worker1".to_string(), "http://worker2".to_string()],
+            kv_events: None,
         };
         let policy = PolicyConfig::RoundRobin;
 
         let config = RouterConfig::new(mode, policy);
 
         match config.mode {
-            RoutingMode::Regular { worker_urls } => {
+            RoutingMode::Regular { worker_urls, .. } => {
                 assert_eq!(worker_urls.len(), 2);
                 assert_eq!(worker_urls[0], "http://worker1");
                 assert_eq!(worker_urls[1], "http://worker2");
@@ -691,6 +696,7 @@ mod tests {
         let config = RouterConfig {
             mode: RoutingMode::Regular {
                 worker_urls: vec!["http://worker1".to_string()],
+                kv_events: None,
             },
             policy: PolicyConfig::Random,
             host: "0.0.0.0".to_string(),
@@ -719,6 +725,7 @@ mod tests {
     fn test_routing_mode_is_pd_mode() {
         let regular = RoutingMode::Regular {
             worker_urls: vec!["http://worker1".to_string()],
+            kv_events: None,
         };
         assert!(!regular.is_pd_mode());
 
@@ -739,6 +746,7 @@ mod tests {
                 "http://worker2".to_string(),
                 "http://worker3".to_string(),
             ],
+            kv_events: None,
         };
         assert_eq!(regular.worker_count(), 3);
 
@@ -759,6 +767,7 @@ mod tests {
 
         let empty_regular = RoutingMode::Regular {
             worker_urls: vec![],
+            kv_events: None,
         };
         assert_eq!(empty_regular.worker_count(), 0);
     }
@@ -768,6 +777,7 @@ mod tests {
         // Test Regular mode
         let regular = RoutingMode::Regular {
             worker_urls: vec!["http://worker1".to_string()],
+            kv_events: None,
         };
         let json = serde_json::to_string(&regular).unwrap();
         assert!(json.contains("\"type\":\"regular\""));
@@ -966,6 +976,7 @@ mod tests {
         let config = RouterConfig {
             mode: RoutingMode::Regular {
                 worker_urls: vec![],
+                kv_events: None,
             },
             ..Default::default()
         };
@@ -1027,6 +1038,7 @@ mod tests {
 
         let mode = RoutingMode::Regular {
             worker_urls: large_urls.clone(),
+            kv_events: None,
         };
 
         assert_eq!(mode.worker_count(), 1000);
@@ -1041,7 +1053,7 @@ mod tests {
         let deserialized: RouterConfig = serde_json::from_str(&json).unwrap();
 
         match deserialized.mode {
-            RoutingMode::Regular { worker_urls } => {
+            RoutingMode::Regular { worker_urls, .. } => {
                 assert_eq!(worker_urls.len(), 1000);
             }
             _ => panic!("Expected Regular mode"),
@@ -1053,6 +1065,7 @@ mod tests {
         let config = RouterConfig {
             mode: RoutingMode::Regular {
                 worker_urls: vec!["http://работник1".to_string(), "http://工作者2".to_string()],
+                kv_events: None,
             },
             log_dir: Some("/日志/目录".to_string()),
             ..Default::default()
@@ -1062,7 +1075,7 @@ mod tests {
         let deserialized: RouterConfig = serde_json::from_str(&json).unwrap();
 
         match deserialized.mode {
-            RoutingMode::Regular { worker_urls } => {
+            RoutingMode::Regular { worker_urls, .. } => {
                 assert_eq!(worker_urls[0], "http://работник1");
                 assert_eq!(worker_urls[1], "http://工作者2");
             }
@@ -1165,6 +1178,7 @@ mod tests {
                     "http://worker2:8000".to_string(),
                     "http://worker3:8000".to_string(),
                 ],
+                kv_events: None,
             },
             policy: PolicyConfig::CacheAware {
                 cache_threshold: 0.9,
@@ -1229,6 +1243,7 @@ mod tests {
         let config = RouterConfig {
             mode: RoutingMode::Regular {
                 worker_urls: vec!["http://worker1".to_string()],
+                kv_events: None,
             },
             policy: PolicyConfig::RoundRobin,
             host: "::1".to_string(), // IPv6
@@ -1427,6 +1442,7 @@ mod tests {
         // For regular mode, the helper methods should just return the main policy
         let regular = RoutingMode::Regular {
             worker_urls: vec!["http://worker1".to_string()],
+            kv_events: None,
         };
 
         let main_policy = PolicyConfig::RoundRobin;

@@ -30,7 +30,7 @@ impl RouterFactory {
             ConnectionMode::Grpc => {
                 // Route to gRPC implementation based on routing mode
                 match &ctx.router_config.mode {
-                    RoutingMode::Regular { worker_urls } => {
+                    RoutingMode::Regular { worker_urls, .. } => {
                         Self::create_grpc_router(worker_urls, &ctx.router_config.policy, ctx).await
                     }
                     RoutingMode::PrefillDecode {
@@ -65,8 +65,8 @@ impl RouterFactory {
             ConnectionMode::Http => {
                 // Route to HTTP implementation based on routing mode
                 match &ctx.router_config.mode {
-                    RoutingMode::Regular { worker_urls } => {
-                        Self::create_regular_router(worker_urls, ctx).await
+                    RoutingMode::Regular { worker_urls, kv_events, .. } => {
+                        Self::create_regular_router(worker_urls, kv_events.as_ref(), ctx).await
                     }
                     RoutingMode::PrefillDecode {
                         prefill_urls,
@@ -128,11 +128,94 @@ impl RouterFactory {
     /// Create a regular router
     pub async fn create_regular_router(
         worker_urls: &[String],
+        kv_events_config: Option<&KVEventsConfig>,
         ctx: &Arc<AppContext>,
     ) -> Result<Box<dyn RouterTrait>, String> {
+        // Bootstrap KV event infrastructure when kv_aware policy is used
+        if let Some(kv_cfg) = kv_events_config {
+            if matches!(ctx.router_config.policy, PolicyConfig::KvAware { .. }) {
+                tracing::info!(
+                    "Bootstrapping KV event infrastructure for regular mode \
+                     (topic={}, port={}, max_entries={})",
+                    kv_cfg.topic_filter,
+                    kv_cfg.default_port,
+                    kv_cfg.index_max_entries,
+                );
+
+                // 1. Global KV block index
+                let block_index = Arc::new(KVBlockIndex::new(kv_cfg.index_max_entries));
+
+                // 2. Event pool: manages per-worker ZMQ SUB connections
+                let pool_config = KVEventPoolConfig {
+                    topic_filter: kv_cfg.topic_filter.clone(),
+                    default_kv_events_port: kv_cfg.default_port,
+                };
+                let (mut event_pool, event_rx) = KVEventPool::new(pool_config);
+
+                // Subscribe to all statically configured workers
+                for url in worker_urls {
+                    event_pool.subscribe_worker_by_http(url.clone(), url);
+                }
+                tracing::info!(
+                    "KV event pool: subscribed to {} initial workers",
+                    event_pool.worker_count(),
+                );
+
+                // 3. Background updater: consumes events and mutates the index
+                let index_for_updater = Arc::clone(&block_index);
+                tokio::spawn(async move {
+                    run_kv_index_updater(event_rx, index_for_updater).await;
+                });
+
+                // 4. Tokenizer
+                let model_path = ctx
+                    .router_config
+                    .model_path
+                    .as_ref()
+                    .or(ctx.router_config.tokenizer_path.as_ref())
+                    .ok_or_else(|| {
+                        "kv_aware policy requires --model-path or --tokenizer-path".to_string()
+                    })?;
+
+                tracing::info!("Loading tokenizer from: {}", model_path);
+                let tokenizer: Arc<dyn Encoder> = create_tokenizer_async(model_path)
+                    .await
+                    .map_err(|e| format!("Failed to load tokenizer for kv_aware: {}", e))?
+                    as Arc<dyn Encoder>;
+
+                // 5. Create real KvAwarePolicy and install into registry
+                if let PolicyConfig::KvAware {
+                    block_size,
+                    hash_seed,
+                    enable_speculative,
+                    speculative_ttl_ms,
+                } = &ctx.router_config.policy
+                {
+                    let kv_config = KvAwareConfig {
+                        block_size: *block_size,
+                        hash_seed: *hash_seed,
+                        enable_speculative: *enable_speculative,
+                        speculative_ttl: Duration::from_millis(*speculative_ttl_ms),
+                    };
+                    tracing::info!(
+                        "Creating KvAwarePolicy for regular mode \
+                         (block_size={}, hash_seed={}, speculative={})",
+                        block_size,
+                        hash_seed,
+                        enable_speculative,
+                    );
+                    let policy = Arc::new(KvAwarePolicy::new(
+                        kv_config,
+                        Arc::clone(&block_index),
+                        Arc::clone(&tokenizer),
+                    ));
+                    ctx.policy_registry.set_default_policy(policy);
+                }
+            }
+        }
+
         // Create regular router with context
         let router = Router::new(worker_urls.to_vec(), ctx).await?;
-
         Ok(Box::new(router))
     }
 

@@ -1,11 +1,11 @@
-# KV Events-Aware P/D Disaggregated Routing
+# KV Events-Aware Routing
 
 ## Summary
 
 This feature introduces real-time KV cache event ingestion from vLLM workers,
-enabling **KV-aware routing** for Prefill/Decode disaggregated
-inference.  Instead of approximating cache state from routing history
-(the existing `cache_aware` policy), the router subscribes to actual
+enabling **KV-aware routing** for both regular and Prefill/Decode (P/D)
+disaggregated inference.  Instead of approximating cache state from routing
+history (the existing `cache_aware` policy), the router subscribes to actual
 `BlockStored` / `BlockRemoved` / `AllBlocksCleared` events published by
 vLLM over ZMQ, maintains a global KV block index, and uses it to:
 
@@ -19,6 +19,26 @@ vLLM over ZMQ, maintains a global KV block index, and uses it to:
    with overlapping prefixes arrive in quick succession.
 
 ## Quick Start
+
+### Regular Mode (Non-PD)
+
+Use `kv_aware` in regular mode to route requests to the worker with the
+highest prefix cache hit, without P/D disaggregation:
+
+```bash
+# Regular mode with KV-aware routing
+vllm-router \
+  --worker-urls http://worker1:8000 http://worker2:8000 http://worker3:8000 \
+  --policy kv_aware \
+  --kv-block-size 16 \
+  --kv-hash-seed 12345 \
+  --model-path Qwen/Qwen3-32B
+```
+
+> KV event ingestion is **automatically enabled** when `--policy` is set to
+> `kv_aware`.  No separate `--kv-events-enabled` flag is needed.
+
+### P/D Disaggregated Mode
 
 ```bash
 # vLLM PD mode with KV-aware routing (KV events enabled automatically)
