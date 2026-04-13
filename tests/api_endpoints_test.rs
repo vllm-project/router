@@ -28,6 +28,7 @@ impl TestContext {
         // Create default router config
         let config = RouterConfig {
             mode: RoutingMode::Regular {
+                kv_events: None,
                 worker_urls: vec![],
             },
             policy: PolicyConfig::Random,
@@ -89,6 +90,7 @@ impl TestContext {
         // Update config with worker URLs if not already set
         if let RoutingMode::Regular {
             worker_urls: ref mut urls,
+            ..
         } = config.mode
         {
             if urls.is_empty() {
@@ -1366,6 +1368,7 @@ mod error_tests {
         // Create context with small payload limit
         let config = RouterConfig {
             mode: RoutingMode::Regular {
+                kv_events: None,
                 worker_urls: vec![],
             },
             policy: PolicyConfig::Random,
@@ -1894,6 +1897,7 @@ mod request_id_tests {
         // Create config with custom request ID headers
         let config = RouterConfig {
             mode: RoutingMode::Regular {
+                kv_events: None,
                 worker_urls: vec![],
             },
             policy: PolicyConfig::Random,

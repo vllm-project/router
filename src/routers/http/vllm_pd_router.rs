@@ -5,7 +5,9 @@ use super::logprobs_merge;
 use super::pd_router::PDRouter;
 use super::pd_types::{error_chain, PDRouterError};
 use super::vllm_service_discovery::{ServiceRegistry, ServiceType};
+use crate::config::KVEventsConfig;
 use crate::core::{BasicWorker, Worker, WorkerType};
+use crate::kv_events::KVEventPool;
 use crate::metrics::RouterMetrics;
 use crate::otel_http::{self, ClientRequestOptions};
 use crate::policies::PolicyRegistry;
@@ -46,6 +48,12 @@ pub struct VllmPDRouter {
     profiling_tasks: Arc<Mutex<HashMap<String, tokio::task::AbortHandle>>>,
     /// Intra-node data parallel size for DP-aware routing (automatically enabled when > 1)
     intra_node_data_parallel_size: usize,
+    /// KV event pool for managing ZMQ subscriptions to vLLM workers (when kv_aware policy is used).
+    /// Protected by Mutex to allow dynamic subscribe/unsubscribe from service discovery callbacks.
+    kv_event_pool: Option<Arc<Mutex<KVEventPool>>>,
+    /// KV events configuration (retained for logging/diagnostics).
+    #[allow(dead_code)]
+    kv_events_config: Option<KVEventsConfig>,
 }
 
 impl VllmPDRouter {
@@ -1047,12 +1055,22 @@ impl VllmPDRouter {
     /// Supports two modes:
     /// 1. Discovery mode: discovery_address is Some, prefill_urls and decode_urls are empty
     /// 2. Direct URL mode: discovery_address is None, prefill_urls and decode_urls are provided
+    ///
+    /// When `kv_event_pool` is `Some`, the router manages dynamic ZMQ subscriptions:
+    /// new workers discovered via service discovery are automatically subscribed.
     pub async fn new(
         prefill_urls: Vec<(String, Option<u16>)>,
         decode_urls: Vec<String>,
         discovery_address: Option<String>,
+        kv_event_pool: Option<(KVEventPool, KVEventsConfig)>,
         ctx: &Arc<crate::server::AppContext>,
     ) -> Result<Self, String> {
+        // Wrap the event pool in Arc<Mutex<>> for shared mutable access.
+        let (kv_pool, kv_cfg) = match kv_event_pool {
+            Some((pool, cfg)) => (Some(Arc::new(Mutex::new(pool))), Some(cfg)),
+            None => (None, None),
+        };
+
         if let Some(ref addr) = discovery_address {
             // Discovery mode
             info!(
@@ -1084,6 +1102,8 @@ impl VllmPDRouter {
                 profile_timeout_secs: ctx.router_config.profile_timeout_secs,
                 profiling_tasks: Arc::new(Mutex::new(HashMap::new())),
                 intra_node_data_parallel_size: ctx.router_config.intra_node_data_parallel_size,
+                kv_event_pool: kv_pool.clone(),
+                kv_events_config: kv_cfg.clone(),
             })
         } else {
             // Direct URL mode (same as PDRouter)
@@ -1126,36 +1146,87 @@ impl VllmPDRouter {
                 profile_timeout_secs: ctx.router_config.profile_timeout_secs,
                 profiling_tasks: Arc::new(Mutex::new(HashMap::new())),
                 intra_node_data_parallel_size: ctx.router_config.intra_node_data_parallel_size,
+                kv_event_pool: kv_pool,
+                kv_events_config: kv_cfg,
             })
         }
     }
 
-    /// Add a prefill server to the router
-    /// Delegates to the underlying PDRouter
+    /// Subscribe a dynamically discovered worker to KV events (if the pool is active).
+    pub async fn subscribe_kv_events(&self, worker_id: &str, http_address: &str) {
+        if let Some(ref pool) = self.kv_event_pool {
+            let mut pool = pool.lock().await;
+            if !pool.has_worker(worker_id) {
+                pool.subscribe_worker_by_http(worker_id.to_string(), http_address);
+                info!(
+                    "KV events: subscribed to new worker {} (total: {})",
+                    worker_id,
+                    pool.worker_count(),
+                );
+            }
+        }
+    }
+
+    /// Unsubscribe a removed worker from KV events (if the pool is active).
+    pub async fn unsubscribe_kv_events(&self, worker_id: &str) {
+        if let Some(ref pool) = self.kv_event_pool {
+            let mut pool = pool.lock().await;
+            if pool.has_worker(worker_id) {
+                pool.unsubscribe_worker(worker_id);
+                info!(
+                    "KV events: unsubscribed worker {} (remaining: {})",
+                    worker_id,
+                    pool.worker_count(),
+                );
+            }
+        }
+    }
+
+    /// Add a prefill server to the router.
+    /// Delegates to the underlying PDRouter and subscribes to KV events.
     pub async fn add_prefill_server(
         &self,
         url: String,
         bootstrap_port: Option<u16>,
     ) -> Result<String, PDRouterError> {
-        self.pd_router.add_prefill_server(url, bootstrap_port).await
+        let result = self
+            .pd_router
+            .add_prefill_server(url.clone(), bootstrap_port)
+            .await;
+        if result.is_ok() {
+            self.subscribe_kv_events(&url, &url).await;
+        }
+        result
     }
 
-    /// Add a decode server to the router
-    /// Delegates to the underlying PDRouter
+    /// Add a decode server to the router.
+    /// Delegates to the underlying PDRouter and subscribes to KV events.
     pub async fn add_decode_server(&self, url: String) -> Result<String, PDRouterError> {
-        self.pd_router.add_decode_server(url).await
+        let result = self.pd_router.add_decode_server(url.clone()).await;
+        if result.is_ok() {
+            self.subscribe_kv_events(&url, &url).await;
+        }
+        result
     }
 
-    /// Remove a prefill server from the router
-    /// Delegates to the underlying PDRouter
+    /// Remove a prefill server from the router.
+    /// Delegates to the underlying PDRouter and unsubscribes from KV events.
     pub async fn remove_prefill_server(&self, url: &str) -> Result<String, PDRouterError> {
-        self.pd_router.remove_prefill_server(url).await
+        let result = self.pd_router.remove_prefill_server(url).await;
+        if result.is_ok() {
+            self.unsubscribe_kv_events(url).await;
+        }
+        result
     }
 
-    /// Remove a decode server from the router
-    /// Delegates to the underlying PDRouter
+    /// Remove a decode server from the router.
+    /// Delegates to the underlying PDRouter and unsubscribes from KV events.
     pub async fn remove_decode_server(&self, url: &str) -> Result<String, PDRouterError> {
-        self.pd_router.remove_decode_server(url).await
+        let result = self.pd_router.remove_decode_server(url).await;
+        if result.is_ok() {
+            self.unsubscribe_kv_events(url).await;
+        }
+        result
     }
 
     /// Get a reference to the underlying PDRouter's worker registry

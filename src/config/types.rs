@@ -123,6 +123,9 @@ pub enum RoutingMode {
     Regular {
         /// List of worker URLs
         worker_urls: Vec<String>,
+        /// KV events configuration for KV-aware routing (optional)
+        #[serde(skip_serializing_if = "Option::is_none")]
+        kv_events: Option<KVEventsConfig>,
     },
     #[serde(rename = "prefill_decode")]
     PrefillDecode {
@@ -157,6 +160,9 @@ pub enum RoutingMode {
         /// ZMQ service discovery address (e.g., "0.0.0.0:30001")
         #[serde(skip_serializing_if = "Option::is_none")]
         discovery_address: Option<String>,
+        /// KV events configuration for KV-aware routing
+        #[serde(skip_serializing_if = "Option::is_none")]
+        kv_events: Option<KVEventsConfig>,
     },
 }
 
@@ -174,7 +180,7 @@ impl RoutingMode {
 
     pub fn worker_count(&self) -> usize {
         match self {
-            RoutingMode::Regular { worker_urls } => worker_urls.len(),
+            RoutingMode::Regular { worker_urls, .. } => worker_urls.len(),
             RoutingMode::PrefillDecode {
                 prefill_urls,
                 decode_urls,
@@ -254,6 +260,36 @@ pub enum PolicyConfig {
         /// Number of virtual nodes per worker for better distribution
         virtual_nodes: u32,
     },
+
+    /// KV-aware routing backed by real-time KV events from vLLM.
+    /// Requires `kv_events` to be enabled in the routing mode configuration.
+    #[serde(rename = "kv_aware")]
+    KvAware {
+        /// Tokens per KV block (must match vLLM `--block-size`, default 16)
+        #[serde(default = "default_kv_block_size")]
+        block_size: usize,
+        /// Hash seed (must match vLLM `PYTHONHASHSEED`, default 0)
+        #[serde(default)]
+        hash_seed: u64,
+        /// Enable speculative index insertion after routing decisions
+        #[serde(default = "default_true")]
+        enable_speculative: bool,
+        /// TTL in milliseconds for speculative index entries (default 2000)
+        #[serde(default = "default_speculative_ttl_ms")]
+        speculative_ttl_ms: u64,
+    },
+}
+
+fn default_kv_block_size() -> usize {
+    16
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_speculative_ttl_ms() -> u64 {
+    2000
 }
 
 impl PolicyConfig {
@@ -264,6 +300,59 @@ impl PolicyConfig {
             PolicyConfig::CacheAware { .. } => "cache_aware",
             PolicyConfig::PowerOfTwo { .. } => "power_of_two",
             PolicyConfig::ConsistentHash { .. } => "consistent_hash",
+            PolicyConfig::KvAware { .. } => "kv_aware",
+        }
+    }
+}
+
+/// Configuration for subscribing to vLLM KV cache events via ZMQ.
+///
+/// Presence of `Some(KVEventsConfig)` in the routing mode means KV event
+/// ingestion is enabled.  This is automatically set when any policy
+/// (main, prefill, or decode) is `kv_aware`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KVEventsConfig {
+    /// ZMQ topic prefix filter (default: "kv@").
+    #[serde(default = "default_kv_topic_filter")]
+    pub topic_filter: String,
+    /// Default ZMQ port for KV event publishers on each vLLM worker.
+    /// Used when deriving ZMQ endpoints from HTTP addresses.
+    #[serde(default = "default_kv_events_port")]
+    pub default_port: u16,
+    /// Maximum entries in the KV block index (advisory, for pre-allocation).
+    #[serde(default = "default_kv_index_max_entries")]
+    pub index_max_entries: usize,
+    /// Uncached-token threshold for P/D disaggregation bypass.
+    /// When the best decode worker's uncached tokens are below this
+    /// threshold, the router skips prefill disaggregation and sends the
+    /// request directly to the decode worker.
+    #[serde(default = "default_pd_uncached_token_threshold")]
+    pub pd_uncached_token_threshold: usize,
+}
+
+fn default_kv_topic_filter() -> String {
+    "kv@".to_string()
+}
+
+fn default_kv_events_port() -> u16 {
+    5557
+}
+
+fn default_kv_index_max_entries() -> usize {
+    100_000_000
+}
+
+fn default_pd_uncached_token_threshold() -> usize {
+    256
+}
+
+impl Default for KVEventsConfig {
+    fn default() -> Self {
+        Self {
+            topic_filter: default_kv_topic_filter(),
+            default_port: default_kv_events_port(),
+            index_max_entries: default_kv_index_max_entries(),
+            pd_uncached_token_threshold: default_pd_uncached_token_threshold(),
         }
     }
 }
@@ -454,6 +543,7 @@ impl Default for RouterConfig {
         Self {
             mode: RoutingMode::Regular {
                 worker_urls: vec![],
+                kv_events: None,
             },
             policy: PolicyConfig::Random,
             host: "127.0.0.1".to_string(),
@@ -561,7 +651,7 @@ mod tests {
         let config = RouterConfig::default();
 
         assert!(
-            matches!(config.mode, RoutingMode::Regular { worker_urls } if worker_urls.is_empty())
+            matches!(config.mode, RoutingMode::Regular { worker_urls, .. } if worker_urls.is_empty())
         );
         assert!(matches!(config.policy, PolicyConfig::Random));
         assert_eq!(config.host, "127.0.0.1");
@@ -580,13 +670,14 @@ mod tests {
     fn test_router_config_new() {
         let mode = RoutingMode::Regular {
             worker_urls: vec!["http://worker1".to_string(), "http://worker2".to_string()],
+            kv_events: None,
         };
         let policy = PolicyConfig::RoundRobin;
 
         let config = RouterConfig::new(mode, policy);
 
         match config.mode {
-            RoutingMode::Regular { worker_urls } => {
+            RoutingMode::Regular { worker_urls, .. } => {
                 assert_eq!(worker_urls.len(), 2);
                 assert_eq!(worker_urls[0], "http://worker1");
                 assert_eq!(worker_urls[1], "http://worker2");
@@ -605,6 +696,7 @@ mod tests {
         let config = RouterConfig {
             mode: RoutingMode::Regular {
                 worker_urls: vec!["http://worker1".to_string()],
+                kv_events: None,
             },
             policy: PolicyConfig::Random,
             host: "0.0.0.0".to_string(),
@@ -633,6 +725,7 @@ mod tests {
     fn test_routing_mode_is_pd_mode() {
         let regular = RoutingMode::Regular {
             worker_urls: vec!["http://worker1".to_string()],
+            kv_events: None,
         };
         assert!(!regular.is_pd_mode());
 
@@ -653,6 +746,7 @@ mod tests {
                 "http://worker2".to_string(),
                 "http://worker3".to_string(),
             ],
+            kv_events: None,
         };
         assert_eq!(regular.worker_count(), 3);
 
@@ -673,6 +767,7 @@ mod tests {
 
         let empty_regular = RoutingMode::Regular {
             worker_urls: vec![],
+            kv_events: None,
         };
         assert_eq!(empty_regular.worker_count(), 0);
     }
@@ -682,6 +777,7 @@ mod tests {
         // Test Regular mode
         let regular = RoutingMode::Regular {
             worker_urls: vec!["http://worker1".to_string()],
+            kv_events: None,
         };
         let json = serde_json::to_string(&regular).unwrap();
         assert!(json.contains("\"type\":\"regular\""));
@@ -880,6 +976,7 @@ mod tests {
         let config = RouterConfig {
             mode: RoutingMode::Regular {
                 worker_urls: vec![],
+                kv_events: None,
             },
             ..Default::default()
         };
@@ -941,6 +1038,7 @@ mod tests {
 
         let mode = RoutingMode::Regular {
             worker_urls: large_urls.clone(),
+            kv_events: None,
         };
 
         assert_eq!(mode.worker_count(), 1000);
@@ -955,7 +1053,7 @@ mod tests {
         let deserialized: RouterConfig = serde_json::from_str(&json).unwrap();
 
         match deserialized.mode {
-            RoutingMode::Regular { worker_urls } => {
+            RoutingMode::Regular { worker_urls, .. } => {
                 assert_eq!(worker_urls.len(), 1000);
             }
             _ => panic!("Expected Regular mode"),
@@ -967,6 +1065,7 @@ mod tests {
         let config = RouterConfig {
             mode: RoutingMode::Regular {
                 worker_urls: vec!["http://работник1".to_string(), "http://工作者2".to_string()],
+                kv_events: None,
             },
             log_dir: Some("/日志/目录".to_string()),
             ..Default::default()
@@ -976,7 +1075,7 @@ mod tests {
         let deserialized: RouterConfig = serde_json::from_str(&json).unwrap();
 
         match deserialized.mode {
-            RoutingMode::Regular { worker_urls } => {
+            RoutingMode::Regular { worker_urls, .. } => {
                 assert_eq!(worker_urls[0], "http://работник1");
                 assert_eq!(worker_urls[1], "http://工作者2");
             }
@@ -1079,6 +1178,7 @@ mod tests {
                     "http://worker2:8000".to_string(),
                     "http://worker3:8000".to_string(),
                 ],
+                kv_events: None,
             },
             policy: PolicyConfig::CacheAware {
                 cache_threshold: 0.9,
@@ -1143,6 +1243,7 @@ mod tests {
         let config = RouterConfig {
             mode: RoutingMode::Regular {
                 worker_urls: vec!["http://worker1".to_string()],
+                kv_events: None,
             },
             policy: PolicyConfig::RoundRobin,
             host: "::1".to_string(), // IPv6
@@ -1341,6 +1442,7 @@ mod tests {
         // For regular mode, the helper methods should just return the main policy
         let regular = RoutingMode::Regular {
             worker_urls: vec!["http://worker1".to_string()],
+            kv_events: None,
         };
 
         let main_policy = PolicyConfig::RoundRobin;

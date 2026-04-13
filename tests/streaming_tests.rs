@@ -18,6 +18,7 @@ impl TestContext {
     async fn new(worker_configs: Vec<MockWorkerConfig>) -> Self {
         let mut config = RouterConfig {
             mode: RoutingMode::Regular {
+                kv_events: None,
                 worker_urls: vec![],
             },
             port: 3004,
@@ -40,7 +41,10 @@ impl TestContext {
             tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
         }
 
-        config.mode = RoutingMode::Regular { worker_urls };
+        config.mode = RoutingMode::Regular {
+            worker_urls,
+            kv_events: None,
+        };
 
         let app_context = common::create_test_context(config);
         let router = RouterFactory::create_router(&app_context).await.unwrap();

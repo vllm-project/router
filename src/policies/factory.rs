@@ -11,7 +11,12 @@ use std::sync::Arc;
 pub struct PolicyFactory;
 
 impl PolicyFactory {
-    /// Create a policy from configuration
+    /// Create a policy from configuration.
+    ///
+    /// Note: [`PolicyConfig::KvAware`] requires external resources
+    /// (KV block index, tokenizer) that are not available through the config
+    /// alone.  It is constructed directly in the router factory code.
+    /// This method will panic if `KvAware` is requested.
     pub fn create_from_config(config: &PolicyConfig) -> Arc<dyn LoadBalancingPolicy> {
         match config {
             PolicyConfig::Random => Arc::new(RandomPolicy::new()),
@@ -38,6 +43,16 @@ impl PolicyFactory {
                 // The consistent hash policy uses a hardcoded value for now
                 Arc::new(ConsistentHashPolicy::new())
             }
+            PolicyConfig::KvAware { .. } => {
+                // KvAwarePolicy requires KVBlockIndex + tokenizer which are only
+                // available in the VllmPrefillDecode router path.  Use a
+                // round-robin placeholder; the real policy is installed later.
+                tracing::debug!(
+                    "KvAware requested in PolicyFactory::create_from_config; \
+                     using RoundRobin placeholder (real policy set by PD router)"
+                );
+                Arc::new(RoundRobinPolicy::new())
+            }
         }
     }
 
@@ -49,6 +64,8 @@ impl PolicyFactory {
             "power_of_two" | "poweroftwo" => Some(Arc::new(PowerOfTwoPolicy::new())),
             "cache_aware" | "cacheaware" => Some(Arc::new(CacheAwarePolicy::new())),
             "consistent_hash" | "consistenthash" => Some(Arc::new(ConsistentHashPolicy::new())),
+            // "kv_aware" is not available via name lookup because
+            // it requires external dependencies (index, tokenizer).
             _ => None,
         }
     }

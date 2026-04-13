@@ -22,8 +22,8 @@ pub struct PolicyRegistry {
     /// Model ID -> Worker count for cleanup tracking
     model_worker_counts: Arc<RwLock<HashMap<String, usize>>>,
 
-    /// Default policy instance (cached)
-    default_policy: Arc<dyn LoadBalancingPolicy>,
+    /// Default policy instance (cached, replaceable for late-binding policies like KvAware)
+    default_policy: Arc<RwLock<Arc<dyn LoadBalancingPolicy>>>,
 
     /// Prefill policy for PD mode
     prefill_policy: Arc<RwLock<Option<Arc<dyn LoadBalancingPolicy>>>>,
@@ -40,7 +40,7 @@ impl PolicyRegistry {
         Self {
             model_policies: Arc::new(RwLock::new(HashMap::new())),
             model_worker_counts: Arc::new(RwLock::new(HashMap::new())),
-            default_policy,
+            default_policy: Arc::new(RwLock::new(default_policy)),
             prefill_policy: Arc::new(RwLock::new(None)),
             decode_policy: Arc::new(RwLock::new(None)),
         }
@@ -139,7 +139,12 @@ impl PolicyRegistry {
 
     /// Get the default policy
     pub fn get_default_policy(&self) -> Arc<dyn LoadBalancingPolicy> {
-        Arc::clone(&self.default_policy)
+        Arc::clone(&self.default_policy.read().unwrap())
+    }
+
+    /// Replace the default policy (used for late-binding policies like KvAware)
+    pub fn set_default_policy(&self, policy: Arc<dyn LoadBalancingPolicy>) {
+        *self.default_policy.write().unwrap() = policy;
     }
 
     /// Get policy for a model, or default if not found
@@ -162,7 +167,7 @@ impl PolicyRegistry {
 
         // 2. Use default policy
         debug!("Using default policy for model {}", model_id);
-        Arc::clone(&self.default_policy)
+        self.get_default_policy()
     }
 
     /// Create a policy from a type string
@@ -174,7 +179,7 @@ impl PolicyRegistry {
             "power_of_two" => Arc::new(PowerOfTwoPolicy::new()),
             _ => {
                 warn!("Unknown policy type '{}', using default", policy_type);
-                Arc::clone(&self.default_policy)
+                self.get_default_policy()
             }
         }
     }
@@ -202,6 +207,18 @@ impl PolicyRegistry {
             }
             PolicyConfig::PowerOfTwo { .. } => Arc::new(PowerOfTwoPolicy::new()),
             PolicyConfig::ConsistentHash { .. } => Arc::new(ConsistentHashPolicy::new()),
+            PolicyConfig::KvAware { .. } => {
+                // KvAwarePolicy requires KVBlockIndex + tokenizer which are only
+                // available in the VllmPrefillDecode router path.  When the
+                // registry is constructed before the PD router is set up, use a
+                // round-robin placeholder.  The real KvAwarePolicy will be
+                // installed later via set_prefill_policy / set_decode_policy.
+                tracing::debug!(
+                    "KvAware requested in PolicyRegistry::create_policy_from_config; \
+                     using RoundRobin placeholder (real policy set by PD router)"
+                );
+                Arc::new(RoundRobinPolicy::new())
+            }
         }
     }
 
@@ -263,7 +280,10 @@ impl std::fmt::Debug for PolicyRegistry {
         f.debug_struct("PolicyRegistry")
             .field("model_policies", &self.model_policies)
             .field("model_worker_counts", &self.model_worker_counts)
-            .field("default_policy", &self.default_policy.name())
+            .field(
+                "default_policy",
+                &self.default_policy.read().unwrap().name(),
+            )
             .finish()
     }
 }
