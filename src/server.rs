@@ -901,13 +901,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
             ));
 
             // 1. HTTP Regular Router
-            match RouterFactory::create_regular_router(
-                &[],
-                None,
-                &app_context,
-            )
-            .await
-            {
+            match RouterFactory::create_regular_router(&[], None, &app_context).await {
                 Ok(http_regular) => {
                     info!("Created HTTP Regular router");
                     router_manager.register_router(
