@@ -65,9 +65,11 @@ impl RouterFactory {
             ConnectionMode::Http => {
                 // Route to HTTP implementation based on routing mode
                 match &ctx.router_config.mode {
-                    RoutingMode::Regular { worker_urls, kv_events, .. } => {
-                        Self::create_regular_router(worker_urls, kv_events.as_ref(), ctx).await
-                    }
+                    RoutingMode::Regular {
+                        worker_urls,
+                        kv_events,
+                        ..
+                    } => Self::create_regular_router(worker_urls, kv_events.as_ref(), ctx).await,
                     RoutingMode::PrefillDecode {
                         prefill_urls,
                         decode_urls,

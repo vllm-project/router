@@ -280,7 +280,10 @@ impl std::fmt::Debug for PolicyRegistry {
         f.debug_struct("PolicyRegistry")
             .field("model_policies", &self.model_policies)
             .field("model_worker_counts", &self.model_worker_counts)
-            .field("default_policy", &self.default_policy.read().unwrap().name())
+            .field(
+                "default_policy",
+                &self.default_policy.read().unwrap().name(),
+            )
             .finish()
     }
 }
