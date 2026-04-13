@@ -330,10 +330,7 @@ fn analyze_ring_distribution(
 
     for (w, &vnode_count) in vnodes_per_worker.iter().enumerate() {
         let pct = 100.0 * vnode_count as f64 / total_vnodes as f64;
-        println!(
-            "  decode-worker{}: {} vnodes ({:.1}%)",
-            w, vnode_count, pct
-        );
+        println!("  decode-worker{}: {} vnodes ({:.1}%)", w, vnode_count, pct);
     }
 
     let hashes: Vec<u64> = ring.keys().copied().collect();
@@ -361,12 +358,7 @@ fn analyze_ring_distribution(
 
     println!("\nHash ring arc ownership (fraction of keyspace):");
     for (w, &arc) in arc_per_worker.iter().enumerate() {
-        println!(
-            "  decode-worker{}: {:.4} ({:.2}%)",
-            w,
-            arc,
-            arc * 100.0
-        );
+        println!("  decode-worker{}: {:.4} ({:.2}%)", w, arc, arc * 100.0);
     }
     let arc_min = arc_per_worker.iter().cloned().fold(f64::INFINITY, f64::min);
     let arc_max = arc_per_worker
