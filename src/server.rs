@@ -902,8 +902,8 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
 
             // 1. HTTP Regular Router
             match RouterFactory::create_regular_router(
-                &[], // Empty worker list - workers added later
-                None, // No KV events config for IGW mode
+                &[],
+                None,
                 &app_context,
             )
             .await

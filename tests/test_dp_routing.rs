@@ -247,7 +247,10 @@ mod dp_e2e_tests {
     /// Helper to create a RouterConfig with DP settings for Regular mode
     fn make_regular_config(worker_urls: Vec<String>, dp_size: usize) -> RouterConfig {
         RouterConfig {
-            mode: RoutingMode::Regular { worker_urls, kv_events: None },
+            mode: RoutingMode::Regular {
+                worker_urls,
+                kv_events: None,
+            },
             policy: PolicyConfig::RoundRobin,
             host: "127.0.0.1".to_string(),
             port: 0,
