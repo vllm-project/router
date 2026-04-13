@@ -24,6 +24,7 @@ use vllm_router_rs::{
 fn test_router_config(worker_url: &str) -> RouterConfig {
     RouterConfig {
         mode: RoutingMode::Regular {
+            kv_events: None,
             worker_urls: vec![worker_url.to_string()],
         },
         policy: PolicyConfig::RoundRobin,
@@ -119,7 +120,7 @@ async fn app_routes_requests_without_trace_layer_when_otel_disabled() {
 
     let config = test_router_config(&worker_url);
     let ctx = create_test_context(config.clone());
-    let router = RouterFactory::create_regular_router(std::slice::from_ref(&worker_url), &ctx)
+    let router = RouterFactory::create_regular_router(std::slice::from_ref(&worker_url), None, &ctx)
         .await
         .expect("Failed to create router");
     let app = create_test_app_with_tracing(Arc::from(router), Client::new(), &config, false);

@@ -51,6 +51,7 @@ fn setup_otel_harness() -> (
 fn test_router_config(worker_url: &str) -> RouterConfig {
     RouterConfig {
         mode: RoutingMode::Regular {
+            kv_events: None,
             worker_urls: vec![worker_url.to_string()],
         },
         policy: PolicyConfig::RoundRobin,
@@ -79,7 +80,7 @@ async fn test_otel_integration() {
     {
         let (exporter, provider, _guard) = setup_otel_harness();
 
-        let router = RouterFactory::create_regular_router(std::slice::from_ref(&worker_url), &ctx)
+        let router = RouterFactory::create_regular_router(std::slice::from_ref(&worker_url), None, &ctx)
             .await
             .unwrap();
         let app = create_test_app(
@@ -161,7 +162,7 @@ async fn test_otel_integration() {
 
         mock_worker::clear_captured_requests(port);
 
-        let router = RouterFactory::create_regular_router(std::slice::from_ref(&worker_url), &ctx)
+        let router = RouterFactory::create_regular_router(std::slice::from_ref(&worker_url), None, &ctx)
             .await
             .unwrap();
         let app = create_test_app(
