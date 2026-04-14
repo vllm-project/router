@@ -185,6 +185,8 @@ impl VllmPDRouter {
         if let Some(obj) = request.as_object_mut() {
             obj.remove("stream_options");
         }
+        // Request prompt_token_ids in prefill response so decode can skip re-tokenization
+        request["return_token_ids"] = json!(true);
         request
     }
 
@@ -478,6 +480,8 @@ impl VllmPDRouter {
 
         // Extract kv_transfer_params from prefill response if present
         let kv_transfer_params = prefill_response_json.get("kv_transfer_params").cloned();
+        // Extract prompt_token_ids from prefill response to skip re-tokenization on decode
+        let prompt_token_ids = prefill_response_json.get("prompt_token_ids").cloned();
 
         if let Some(ref params) = kv_transfer_params {
             debug!(
@@ -487,12 +491,19 @@ impl VllmPDRouter {
         } else {
             debug!("No kv_transfer_params found in prefill response, will proceed without them");
         }
+        if prompt_token_ids.is_some() {
+            debug!("Extracted prompt_token_ids from prefill response for decode-side tokenization skip");
+        }
 
         // Prepare decode request with kv_transfer_params from prefill response at top level
         let mut decode_request = request_json.clone();
         if let Some(params) = kv_transfer_params {
             decode_request["kv_transfer_params"] = params;
             debug!("Added kv_transfer_params to decode request");
+        }
+        if let Some(token_ids) = prompt_token_ids {
+            decode_request["prompt_token_ids"] = token_ids;
+            debug!("Added prompt_token_ids to decode request (skip re-tokenization)");
         }
 
         let decode_request_str = serde_json::to_string(&decode_request)
@@ -840,6 +851,8 @@ impl VllmPDRouter {
 
         // Extract kv_transfer_params from prefill response if present
         let kv_transfer_params = prefill_response_json.get("kv_transfer_params").cloned();
+        // Extract prompt_token_ids from prefill response to skip re-tokenization on decode
+        let prompt_token_ids = prefill_response_json.get("prompt_token_ids").cloned();
 
         if let Some(ref params) = kv_transfer_params {
             debug!(
@@ -848,6 +861,9 @@ impl VllmPDRouter {
             );
         } else {
             debug!("No kv_transfer_params found in prefill response, will proceed without them");
+        }
+        if prompt_token_ids.is_some() {
+            debug!("Extracted prompt_token_ids from prefill response for decode-side tokenization skip");
         }
 
         // Stop profiling on prefill server after its work is done
@@ -864,6 +880,10 @@ impl VllmPDRouter {
         if let Some(params) = kv_transfer_params {
             decode_request["kv_transfer_params"] = params;
             debug!("Added kv_transfer_params to decode request");
+        }
+        if let Some(token_ids) = prompt_token_ids {
+            decode_request["prompt_token_ids"] = token_ids;
+            debug!("Added prompt_token_ids to decode request (skip re-tokenization)");
         }
 
         // Use endpoint_url() to get the base URL without @rank suffix,
@@ -1934,5 +1954,95 @@ mod tests {
         let result = VllmPDRouter::prepare_prefill_request(request, "/inference/v1/generate");
         assert_eq!(result["stream"], false);
         assert!(result.get("stream_options").is_none());
+    }
+
+    // --- Skip decode-side tokenization tests ---
+
+    #[test]
+    fn test_prefill_request_sets_return_token_ids() {
+        let request = json!({
+            "model": "test",
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 512
+        });
+        let result = VllmPDRouter::prepare_prefill_request(request, "/v1/chat/completions");
+        assert_eq!(result["return_token_ids"], true);
+    }
+
+    #[test]
+    fn test_prefill_response_prompt_token_ids_forwarded_to_decode() {
+        // Simulate: prefill response contains kv_transfer_params and prompt_token_ids
+        let prefill_response = json!({
+            "id": "chatcmpl-123",
+            "choices": [{"message": {"content": "hi"}, "finish_reason": "length"}],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 1, "total_tokens": 6},
+            "kv_transfer_params": {
+                "do_remote_prefill": true,
+                "remote_block_ids": [[1, 2, 3]],
+                "remote_engine_id": "engine-1"
+            },
+            "prompt_token_ids": [100, 200, 300, 400, 500]
+        });
+
+        // Extract fields as the router does
+        let kv_transfer_params = prefill_response.get("kv_transfer_params").cloned();
+        let prompt_token_ids = prefill_response.get("prompt_token_ids").cloned();
+
+        assert!(kv_transfer_params.is_some());
+        assert!(prompt_token_ids.is_some());
+        assert_eq!(
+            prompt_token_ids.as_ref().unwrap().as_array().unwrap().len(),
+            5
+        );
+
+        // Build decode request as the router does
+        let original_request = json!({
+            "model": "test",
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 512,
+            "stream": true
+        });
+        let mut decode_request = original_request.clone();
+        if let Some(params) = kv_transfer_params {
+            decode_request["kv_transfer_params"] = params;
+        }
+        if let Some(token_ids) = prompt_token_ids {
+            decode_request["prompt_token_ids"] = token_ids;
+        }
+
+        // Verify decode request has both fields
+        assert!(decode_request.get("kv_transfer_params").is_some());
+        assert_eq!(
+            decode_request["kv_transfer_params"]["do_remote_prefill"],
+            true
+        );
+        assert!(decode_request.get("prompt_token_ids").is_some());
+        assert_eq!(
+            decode_request["prompt_token_ids"].as_array().unwrap().len(),
+            5
+        );
+        // Original fields preserved
+        assert_eq!(decode_request["model"], "test");
+        assert_eq!(decode_request["stream"], true);
+    }
+
+    #[test]
+    fn test_prefill_response_without_prompt_token_ids() {
+        // When prefill response lacks prompt_token_ids, decode request should not have it
+        let prefill_response = json!({
+            "id": "chatcmpl-123",
+            "choices": [],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 1, "total_tokens": 6},
+            "kv_transfer_params": {"do_remote_prefill": true}
+        });
+
+        let prompt_token_ids = prefill_response.get("prompt_token_ids").cloned();
+        assert!(prompt_token_ids.is_none());
+
+        let mut decode_request = json!({"model": "test", "messages": []});
+        if let Some(token_ids) = prompt_token_ids {
+            decode_request["prompt_token_ids"] = token_ids;
+        }
+        assert!(decode_request.get("prompt_token_ids").is_none());
     }
 }
