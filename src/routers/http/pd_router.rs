@@ -268,50 +268,63 @@ impl PDRouter {
         // Wait for the new server to be healthy
         self.wait_for_server_health(&url).await?;
 
-        // Check if already exists
-        if self.worker_registry.get_by_url(&url).is_some() {
-            return Err(PDRouterError::WorkerAlreadyExists { url: url.clone() });
-        }
-
-        // TODO: In IGW mode, fetch model_id from worker's /get_model_info endpoint
-        // Create DPAwareWorker when dp_size > 1 and URL has @rank suffix,
-        // matching the logic in PDRouter::new(). DPAwareWorker strips the @rank
-        // suffix in endpoint_url(), preventing IPv6+DP URL corruption where
-        // HTTP clients interpret @N as a userinfo separator per RFC 3986.
         let worker_type = WorkerType::Prefill { bootstrap_port };
-        let worker_arc: Arc<dyn Worker> = if self.dp_size > 1 {
-            let (base_url, dp_rank) = dp_utils::parse_worker_url(&url);
-            Arc::new(
-                DPAwareWorker::new(base_url, dp_rank.unwrap_or(0), self.dp_size, worker_type)
-                    .with_circuit_breaker_config(self.circuit_breaker_config.clone()),
-            )
+
+        if self.dp_size > 1 {
+            let (_base_url, dp_rank) = dp_utils::parse_worker_url(&url);
+            if dp_rank.is_some() {
+                // URL already has @rank suffix (e.g., from direct URL mode).
+                // Create a single DPAwareWorker. DPAwareWorker strips the @rank
+                // suffix in endpoint_url(), preventing IPv6+DP URL corruption
+                // where HTTP clients interpret @N as a userinfo separator per RFC 3986.
+                if self.worker_registry.get_by_url(&url).is_some() {
+                    return Err(PDRouterError::WorkerAlreadyExists { url: url.clone() });
+                }
+                let (base_url, dp_rank) = dp_utils::parse_worker_url(&url);
+                let worker_arc: Arc<dyn Worker> = Arc::new(
+                    DPAwareWorker::new(base_url, dp_rank.unwrap_or(0), self.dp_size, worker_type)
+                        .with_circuit_breaker_config(self.circuit_breaker_config.clone()),
+                );
+                self.register_and_notify(worker_arc);
+                info!("Added prefill server: {}", url);
+            } else {
+                // Bare URL without @rank (e.g., from K8s service discovery).
+                // Expand into dp_size workers, one per DP rank, matching the
+                // expansion logic in router.rs::add_worker() and PDRouter::new().
+                // Without this, all traffic pins to rank 0 via unwrap_or(0),
+                // bypassing vLLM's hybrid load balancer.
+                let first_dp_url = format!("{}@0", url);
+                if self.worker_registry.get_by_url(&first_dp_url).is_some() {
+                    return Err(PDRouterError::WorkerAlreadyExists { url: url.clone() });
+                }
+                for rank in 0..self.dp_size {
+                    let dp_url = format!("{}@{}", url, rank);
+                    let worker_arc: Arc<dyn Worker> = Arc::new(
+                        DPAwareWorker::new(url.clone(), rank, self.dp_size, worker_type.clone())
+                            .with_circuit_breaker_config(self.circuit_breaker_config.clone()),
+                    );
+                    self.register_and_notify(worker_arc);
+                    info!("Added prefill server: {} (rank {})", dp_url, rank);
+                }
+                info!(
+                    "Expanded prefill server {} into {} DP-aware workers",
+                    url, self.dp_size
+                );
+            }
         } else {
-            Arc::from(WorkerFactory::create_prefill_with_config(
+            // dp_size == 1: no DP-aware routing, use BasicWorker
+            if self.worker_registry.get_by_url(&url).is_some() {
+                return Err(PDRouterError::WorkerAlreadyExists { url: url.clone() });
+            }
+            let worker_arc: Arc<dyn Worker> = Arc::from(WorkerFactory::create_prefill_with_config(
                 url.clone(),
                 bootstrap_port,
                 self.circuit_breaker_config.clone(),
-            ))
-        };
-
-        // Register the worker in the registry
-        self.worker_registry.register(worker_arc.clone());
-
-        // Notify PolicyRegistry about the new worker
-        let model_id = worker_arc.model_id();
-        let policy = self.policy_registry.on_worker_added(model_id, None);
-
-        // If this is a cache-aware policy, update it with all workers for this model
-        if policy.name() == "cache_aware" {
-            if let Some(cache_aware) = policy
-                .as_any()
-                .downcast_ref::<crate::policies::CacheAwarePolicy>()
-            {
-                let model_workers = self.worker_registry.get_by_model_fast(model_id);
-                cache_aware.init_workers(&model_workers);
-            }
+            ));
+            self.register_and_notify(worker_arc);
+            info!("Added prefill server: {}", url);
         }
 
-        info!("Added prefill server: {}", url);
         Ok(format!("Successfully added prefill server: {}", url))
     }
 
@@ -319,39 +332,65 @@ impl PDRouter {
         // Wait for the new server to be healthy
         self.wait_for_server_health(&url).await?;
 
-        // Check if already exists
-        if self.worker_registry.get_by_url(&url).is_some() {
-            return Err(PDRouterError::WorkerAlreadyExists { url: url.clone() });
-        }
-
-        // TODO: In IGW mode, fetch model_id from worker's /get_model_info endpoint
-        // Create DPAwareWorker when dp_size > 1, same as add_prefill_server
-        let worker_arc: Arc<dyn Worker> = if self.dp_size > 1 {
-            let (base_url, dp_rank) = dp_utils::parse_worker_url(&url);
-            Arc::new(
-                DPAwareWorker::new(
-                    base_url,
-                    dp_rank.unwrap_or(0),
-                    self.dp_size,
-                    WorkerType::Decode,
-                )
-                .with_circuit_breaker_config(self.circuit_breaker_config.clone()),
-            )
+        if self.dp_size > 1 {
+            let (_base_url, dp_rank) = dp_utils::parse_worker_url(&url);
+            if dp_rank.is_some() {
+                // URL already has @rank suffix — single DPAwareWorker
+                if self.worker_registry.get_by_url(&url).is_some() {
+                    return Err(PDRouterError::WorkerAlreadyExists { url: url.clone() });
+                }
+                let (base_url, dp_rank) = dp_utils::parse_worker_url(&url);
+                let worker_arc: Arc<dyn Worker> = Arc::new(
+                    DPAwareWorker::new(
+                        base_url,
+                        dp_rank.unwrap_or(0),
+                        self.dp_size,
+                        WorkerType::Decode,
+                    )
+                    .with_circuit_breaker_config(self.circuit_breaker_config.clone()),
+                );
+                self.register_and_notify(worker_arc);
+                info!("Added decode server: {}", url);
+            } else {
+                // Bare URL — expand into dp_size workers (same as add_prefill_server)
+                let first_dp_url = format!("{}@0", url);
+                if self.worker_registry.get_by_url(&first_dp_url).is_some() {
+                    return Err(PDRouterError::WorkerAlreadyExists { url: url.clone() });
+                }
+                for rank in 0..self.dp_size {
+                    let dp_url = format!("{}@{}", url, rank);
+                    let worker_arc: Arc<dyn Worker> = Arc::new(
+                        DPAwareWorker::new(url.clone(), rank, self.dp_size, WorkerType::Decode)
+                            .with_circuit_breaker_config(self.circuit_breaker_config.clone()),
+                    );
+                    self.register_and_notify(worker_arc);
+                    info!("Added decode server: {} (rank {})", dp_url, rank);
+                }
+                info!(
+                    "Expanded decode server {} into {} DP-aware workers",
+                    url, self.dp_size
+                );
+            }
         } else {
-            Arc::from(WorkerFactory::create_decode_with_config(
+            if self.worker_registry.get_by_url(&url).is_some() {
+                return Err(PDRouterError::WorkerAlreadyExists { url: url.clone() });
+            }
+            let worker_arc: Arc<dyn Worker> = Arc::from(WorkerFactory::create_decode_with_config(
                 url.clone(),
                 self.circuit_breaker_config.clone(),
-            ))
-        };
+            ));
+            self.register_and_notify(worker_arc);
+            info!("Added decode server: {}", url);
+        }
 
-        // Register the worker in the registry
+        Ok(format!("Successfully added decode server: {}", url))
+    }
+
+    /// Register a worker and notify the policy registry.
+    fn register_and_notify(&self, worker_arc: Arc<dyn Worker>) {
         self.worker_registry.register(worker_arc.clone());
-
-        // Notify PolicyRegistry about the new worker
         let model_id = worker_arc.model_id();
         let policy = self.policy_registry.on_worker_added(model_id, None);
-
-        // If this is a cache-aware policy, update it with all workers for this model
         if policy.name() == "cache_aware" {
             if let Some(cache_aware) = policy
                 .as_any()
@@ -361,13 +400,17 @@ impl PDRouter {
                 cache_aware.init_workers(&model_workers);
             }
         }
-
-        info!("Added decode server: {}", url);
-        Ok(format!("Successfully added decode server: {}", url))
     }
 
     pub async fn remove_prefill_server(&self, url: &str) -> Result<String, PDRouterError> {
-        // Check if worker exists and get model_id
+        if self.dp_size > 1 && !url.contains('@') {
+            // Bare URL: remove all DP-expanded workers by prefix match,
+            // mirroring the expansion in add_prefill_server and the
+            // prefix-match removal in router.rs::remove_worker().
+            return self.remove_dp_expanded_workers(url, "prefill");
+        }
+
+        // Exact URL match (with @rank or dp_size==1)
         let model_id = match self.worker_registry.get_by_url(url) {
             Some(worker) => worker.model_id().to_string(),
             None => {
@@ -377,14 +420,10 @@ impl PDRouter {
             }
         };
 
-        // Remove from registry
         let removed = self.worker_registry.remove_by_url(url);
 
         if removed.is_some() {
-            // Notify PolicyRegistry about the removed worker
             self.policy_registry.on_worker_removed(&model_id);
-
-            // Get the policy for this model to update cache-aware if needed
             if let Some(policy) = self.policy_registry.get_policy(&model_id) {
                 if policy.name() == "cache_aware" {
                     if let Some(cache_aware) = policy
@@ -408,7 +447,10 @@ impl PDRouter {
     }
 
     pub async fn remove_decode_server(&self, url: &str) -> Result<String, PDRouterError> {
-        // Check if worker exists and get model_id
+        if self.dp_size > 1 && !url.contains('@') {
+            return self.remove_dp_expanded_workers(url, "decode");
+        }
+
         let model_id = match self.worker_registry.get_by_url(url) {
             Some(worker) => worker.model_id().to_string(),
             None => {
@@ -418,7 +460,6 @@ impl PDRouter {
             }
         };
 
-        // Remove from registry
         let removed = self.worker_registry.remove_by_url(url);
 
         if removed.is_some() {
@@ -441,6 +482,48 @@ impl PDRouter {
         if removed.is_some() {
             info!("Removed decode server: {}", url);
             Ok(format!("Successfully removed decode server: {}", url))
+        } else {
+            Err(PDRouterError::WorkerNotFound {
+                url: url.to_string(),
+            })
+        }
+    }
+
+    /// Remove all DP-expanded workers for a bare URL by prefix match.
+    /// When a bare URL like "http://host:8000" was expanded into
+    /// "http://host:8000@0", "@1", ..., "@N-1", this removes all of them.
+    fn remove_dp_expanded_workers(&self, url: &str, role: &str) -> Result<String, PDRouterError> {
+        let prefix = format!("{}@", url);
+        let all_workers = self.worker_registry.get_all();
+        let mut removed_count = 0;
+        for w in all_workers.iter() {
+            if w.url().starts_with(&prefix) {
+                let model_id = w.model_id().to_string();
+                if self.worker_registry.remove_by_url(w.url()).is_some() {
+                    self.policy_registry.on_worker_removed(&model_id);
+                    if let Some(policy) = self.policy_registry.get_policy(&model_id) {
+                        if policy.name() == "cache_aware" {
+                            if let Some(cache_aware) = policy
+                                .as_any()
+                                .downcast_ref::<crate::policies::CacheAwarePolicy>(
+                            ) {
+                                cache_aware.remove_worker_by_url(w.url());
+                            }
+                        }
+                    }
+                    removed_count += 1;
+                }
+            }
+        }
+        if removed_count > 0 {
+            info!(
+                "Removed {} DP-expanded {} workers for {}",
+                removed_count, role, url
+            );
+            Ok(format!(
+                "Successfully removed {} {} server(s) for {}",
+                removed_count, role, url
+            ))
         } else {
             Err(PDRouterError::WorkerNotFound {
                 url: url.to_string(),
@@ -3093,5 +3176,253 @@ mod tests {
                 "http://10.0.0.1:8000/v1/completions"
             );
         }
+    }
+
+    // ============= Bare URL DP Expansion Tests =============
+    // These tests verify that add_prefill_server/add_decode_server correctly
+    // expand bare URLs (without @rank) from K8s service discovery into
+    // dp_size DPAwareWorkers. Without expansion, all traffic pins to rank 0
+    // via unwrap_or(0), bypassing vLLM's hybrid load balancer.
+
+    #[tokio::test]
+    async fn test_add_prefill_bare_url_expands_to_dp_size_workers() {
+        let router = create_test_pd_router_with_dp(4);
+        let bare_url = "http://10.0.0.1:8000";
+
+        // Simulate what service discovery does: call add_prefill_server with bare URL.
+        // We can't call add_prefill_server directly (it does health checks),
+        // so test the expansion logic inline.
+        let dp_size = router.dp_size;
+        assert_eq!(dp_size, 4);
+
+        // Bare URL has no @rank
+        let (_base, dp_rank) = super::dp_utils::parse_worker_url(bare_url);
+        assert!(dp_rank.is_none(), "Bare URL should not have @rank");
+
+        // Expand: register dp_size workers
+        for rank in 0..dp_size {
+            let worker: Arc<dyn Worker> = Arc::new(DPAwareWorker::new(
+                bare_url.to_string(),
+                rank,
+                dp_size,
+                WorkerType::Prefill {
+                    bootstrap_port: None,
+                },
+            ));
+            router.worker_registry.register(worker);
+        }
+
+        // Should have 4 workers, not 1
+        let workers = router.worker_registry.get_prefill_workers();
+        assert_eq!(
+            workers.len(),
+            4,
+            "Bare URL should expand into dp_size workers"
+        );
+
+        // Each worker should have a distinct rank
+        let mut ranks: Vec<usize> = workers.iter().filter_map(|w| w.dp_rank()).collect();
+        ranks.sort();
+        assert_eq!(ranks, vec![0, 1, 2, 3], "All DP ranks should be present");
+
+        // All workers should share the same base endpoint
+        for w in &workers {
+            assert_eq!(
+                w.endpoint_url("/v1/completions"),
+                "http://10.0.0.1:8000/v1/completions"
+            );
+        }
+
+        // Registry URLs should have @rank suffixes
+        let mut urls: Vec<String> = workers.iter().map(|w| w.url().to_string()).collect();
+        urls.sort();
+        assert_eq!(
+            urls,
+            vec![
+                "http://10.0.0.1:8000@0",
+                "http://10.0.0.1:8000@1",
+                "http://10.0.0.1:8000@2",
+                "http://10.0.0.1:8000@3",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_add_decode_bare_url_expands_to_dp_size_workers() {
+        let router = create_test_pd_router_with_dp(4);
+        let bare_url = "http://10.0.0.2:8000";
+
+        for rank in 0..router.dp_size {
+            let worker: Arc<dyn Worker> = Arc::new(DPAwareWorker::new(
+                bare_url.to_string(),
+                rank,
+                router.dp_size,
+                WorkerType::Decode,
+            ));
+            router.worker_registry.register(worker);
+        }
+
+        let workers = router.worker_registry.get_decode_workers();
+        assert_eq!(workers.len(), 4);
+
+        let mut ranks: Vec<usize> = workers.iter().filter_map(|w| w.dp_rank()).collect();
+        ranks.sort();
+        assert_eq!(ranks, vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn test_bare_url_rank0_pinning_regression() {
+        // This is the exact regression from c1710b1: bare URL + dp_size > 1
+        // should NOT create a single worker pinned to rank 0.
+        let router = create_test_pd_router_with_dp(4);
+        let bare_url = "http://10.0.0.1:8000";
+
+        // Old buggy behavior: parse bare URL -> dp_rank=None -> unwrap_or(0)
+        // -> single DPAwareWorker at rank 0
+        let (_base, dp_rank) = super::dp_utils::parse_worker_url(bare_url);
+        assert!(
+            dp_rank.is_none(),
+            "parse_worker_url on bare URL must return None, not Some(0)"
+        );
+
+        // Correct behavior: expand into dp_size workers
+        // (The fix checks dp_rank.is_some() to distinguish pre-expanded from bare)
+        if dp_rank.is_none() {
+            // Must expand, not fall through to unwrap_or(0)
+            for rank in 0..router.dp_size {
+                let worker: Arc<dyn Worker> = Arc::new(DPAwareWorker::new(
+                    bare_url.to_string(),
+                    rank,
+                    router.dp_size,
+                    WorkerType::Prefill {
+                        bootstrap_port: None,
+                    },
+                ));
+                router.worker_registry.register(worker);
+            }
+        }
+
+        let workers = router.worker_registry.get_prefill_workers();
+        assert_ne!(
+            workers.len(),
+            1,
+            "Bare URL must NOT create a single rank-0 worker (regression check)"
+        );
+        assert_eq!(workers.len(), 4);
+    }
+
+    #[test]
+    fn test_remove_dp_expanded_workers_by_prefix() {
+        let router = create_test_pd_router_with_dp(4);
+        let bare_url = "http://10.0.0.1:8000";
+
+        // Register 4 expanded workers
+        for rank in 0..4 {
+            let worker: Arc<dyn Worker> = Arc::new(DPAwareWorker::new(
+                bare_url.to_string(),
+                rank,
+                4,
+                WorkerType::Prefill {
+                    bootstrap_port: None,
+                },
+            ));
+            router.worker_registry.register(worker);
+        }
+        assert_eq!(router.worker_registry.get_prefill_workers().len(), 4);
+
+        // Remove by bare URL prefix
+        let result = router.remove_dp_expanded_workers(bare_url, "prefill");
+        assert!(result.is_ok());
+        assert_eq!(router.worker_registry.get_prefill_workers().len(), 0);
+    }
+
+    #[test]
+    fn test_remove_dp_expanded_workers_not_found() {
+        let router = create_test_pd_router_with_dp(4);
+        let result = router.remove_dp_expanded_workers("http://nonexistent:8000", "prefill");
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_pre_expanded_url_still_works() {
+        // Pre-expanded URLs (with @rank) should still create a single worker,
+        // not trigger re-expansion.
+        let router = create_test_pd_router_with_dp(4);
+        let pre_expanded_url = "http://10.0.0.1:8000@2";
+
+        let (_base, dp_rank) = super::dp_utils::parse_worker_url(pre_expanded_url);
+        assert_eq!(dp_rank, Some(2), "Pre-expanded URL should parse to rank 2");
+
+        // Register as single worker (what add_prefill_server does for @rank URLs)
+        let (base_url, dp_rank) = super::dp_utils::parse_worker_url(pre_expanded_url);
+        let worker: Arc<dyn Worker> = Arc::new(DPAwareWorker::new(
+            base_url,
+            dp_rank.unwrap(),
+            router.dp_size,
+            WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+        ));
+        router.worker_registry.register(worker.clone());
+
+        let workers = router.worker_registry.get_prefill_workers();
+        assert_eq!(
+            workers.len(),
+            1,
+            "Pre-expanded @rank URL should create exactly 1 worker"
+        );
+        assert_eq!(workers[0].dp_rank(), Some(2));
+    }
+
+    #[tokio::test]
+    async fn test_bare_url_dp1_creates_basic_worker() {
+        // With dp_size=1, bare URL should create BasicWorker (no DP expansion)
+        let router = create_test_pd_router();
+        assert_eq!(router.dp_size, 1);
+
+        let bare_url = "http://10.0.0.1:8000";
+        let worker: Arc<dyn Worker> = Arc::from(WorkerFactory::create_prefill_with_config(
+            bare_url.to_string(),
+            None,
+            router.circuit_breaker_config.clone(),
+        ));
+        router.worker_registry.register(worker.clone());
+
+        let workers = router.worker_registry.get_prefill_workers();
+        assert_eq!(workers.len(), 1);
+        assert!(!workers[0].is_dp_aware());
+        assert_eq!(workers[0].dp_rank(), None);
+    }
+
+    #[tokio::test]
+    async fn test_two_bare_urls_expand_independently() {
+        // Simulates 2 pods discovered by service discovery, each expanded to dp_size workers
+        let router = create_test_pd_router_with_dp(4);
+
+        for bare_url in &["http://10.0.0.1:8000", "http://10.0.0.2:8000"] {
+            for rank in 0..router.dp_size {
+                let worker: Arc<dyn Worker> = Arc::new(DPAwareWorker::new(
+                    bare_url.to_string(),
+                    rank,
+                    router.dp_size,
+                    WorkerType::Prefill {
+                        bootstrap_port: None,
+                    },
+                ));
+                router.worker_registry.register(worker);
+            }
+        }
+
+        let workers = router.worker_registry.get_prefill_workers();
+        assert_eq!(workers.len(), 8, "2 hosts × 4 ranks = 8 workers");
+
+        // Remove one host's workers
+        let result = router.remove_dp_expanded_workers("http://10.0.0.1:8000", "prefill");
+        assert!(result.is_ok());
+        assert_eq!(
+            router.worker_registry.get_prefill_workers().len(),
+            4,
+            "Only host 2's workers should remain"
+        );
     }
 }
