@@ -14,7 +14,7 @@ The VLLM Router tokenizer layer provides a unified interface for text tokenizati
 - **Stop Sequences**: Complex pattern matching for stop tokens and sequences with "jail" buffering
 - **Sequence Management**: Stateful token sequence tracking with incremental text generation
 - **Chat Templates**: Jinja2-based conversation formatting with HuggingFace compatibility
-- **Metrics Integration**: Comprehensive performance and error tracking across all operations
+- **Router-Level Observability**: Production Prometheus coverage lives above the tokenizer layer today
 
 **Data Flow:**
 1. Request → Factory (type detection/HF download) → Concrete Tokenizer Creation
@@ -27,7 +27,7 @@ The VLLM Router tokenizer layer provides a unified interface for text tokenizati
 
 - **Extended Backend Support**: HuggingFace, Tiktoken (GPT models), and Mock for testing
 - **HuggingFace Hub Integration**: Automatic tokenizer downloads with caching
-- **Comprehensive Metrics**: Full TokenizerMetrics integration for observability
+- **No Dedicated Tokenizer Metrics**: Production Prometheus exporters do not emit tokenizer-only series today
 - **Unified Dependencies**: All tokenizer backends included by default (no feature gates)
 - **Stop Sequence Detection**: Sophisticated partial matching with jail buffer
 - **Chat Template Support**: Full Jinja2 rendering with HuggingFace compatibility
@@ -73,14 +73,6 @@ graph TB
         SQ --> ITXT[Incremental Text]
         SD --> SO[Stop Output]
     end
-
-    subgraph Metrics
-        M[TokenizerMetrics]
-        E -.-> M
-        D -.-> M
-        DS -.-> M
-        SD -.-> M
-    end
 ```
 
 ### Sequence Flow Diagram
@@ -92,7 +84,6 @@ sequenceDiagram
     participant T as Tokenizer
     participant DS as DecodeStream
     participant SD as StopDecoder
-    participant M as Metrics
 
     C->>F: create_tokenizer(path_or_model_id)
     F->>F: detect_type()
@@ -102,13 +93,10 @@ sequenceDiagram
         F->>F: download_tokenizer_from_hf()
         F->>T: new from downloaded files
     end
-    F->>M: record_factory_load()
     F-->>C: Arc<dyn Tokenizer>
 
     C->>T: encode(text)
-    T->>M: record_encode_request()
     T->>T: tokenize
-    T->>M: record_tokens_per_encode()
     T-->>C: Encoding
 
     C->>DS: new(tokenizer, tokens)
@@ -117,10 +105,8 @@ sequenceDiagram
         DS->>T: decode(partial)
         DS->>DS: check UTF-8 boundary
         alt complete char
-            DS->>M: record_stream_token()
             DS-->>C: Some(text)
         else incomplete
-            DS->>M: record_incomplete_utf8()
             DS-->>C: None
         end
     end
@@ -128,10 +114,8 @@ sequenceDiagram
     C->>SD: process_token(id)
     SD->>SD: check stop conditions
     alt stop token
-        SD->>M: record_stop_detected()
         SD-->>C: Stopped
     else partial match
-        SD->>M: record_partial_match()
         SD-->>C: Held
     else no match
         SD->>T: decode incremental
@@ -945,19 +929,10 @@ The `Encoding` enum must:
 
 ### Metrics
 
-**Metric Names (via TokenizerMetrics):**
-- `vllm_tokenizer_encode_duration_seconds`
-- `vllm_tokenizer_decode_duration_seconds`
-- `vllm_tokenizer_tokens_per_encode`
-- `vllm_tokenizer_chars_per_encode`
-- `vllm_tokenizer_factory_load_duration_seconds`
-- `vllm_tokenizer_stop_sequence_detected`
-- `vllm_tokenizer_stream_incomplete_utf8_total`
+The tokenizer layer does not currently export dedicated Prometheus metrics in production.
+Observability today comes from the router-level request, policy, and discovery metrics.
 
-**Labels:**
-- `tokenizer_type`: huggingface, tiktoken, mock
-- `operation`: encode, decode, factory_load
-- `error_type`: Various error conditions
+If tokenizer-specific metrics are added later, document the concrete emitters and test coverage here.
 
 ### Failure Modes
 

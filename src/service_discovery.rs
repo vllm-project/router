@@ -1,3 +1,4 @@
+use crate::metrics::RouterMetrics;
 use crate::routers::RouterTrait;
 
 use futures::{StreamExt, TryStreamExt};
@@ -430,6 +431,7 @@ async fn handle_pod_event(
 
             match result {
                 Ok(_) => {
+                    RouterMetrics::record_discovery_update(1, 0);
                     debug!("Worker added: {}", worker_url);
                 }
                 Err(e) => {
@@ -520,6 +522,8 @@ async fn handle_pod_deletion(
             // Regular mode removal
             router.remove_worker(&worker_url);
         }
+
+        RouterMetrics::record_discovery_update(0, 1);
     } else {
         // This case might occur if a pod is deleted before it was ever marked healthy and added.
         // Or if the event is duplicated. No action needed on the router if it wasn't tracked (and thus not added).

@@ -893,12 +893,18 @@ impl Tree {
         self.tenant_char_count.remove(tenant_id.as_ref());
     }
 
-    #[allow(dead_code)]
     pub fn get_tenant_char_count(&self) -> HashMap<String, usize> {
         self.tenant_char_count
             .iter()
             .map(|entry| (entry.key().to_string(), *entry.value()))
             .collect()
+    }
+
+    pub fn tenant_size(&self, tenant: &str) -> usize {
+        self.tenant_char_count
+            .get(tenant)
+            .map(|entry| *entry.value())
+            .unwrap_or(0)
     }
 
     #[allow(dead_code)]

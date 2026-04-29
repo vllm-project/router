@@ -1,6 +1,6 @@
 use axum::{
-    extract::Request, extract::State, http::HeaderValue, http::StatusCode, middleware::Next,
-    response::IntoResponse, response::Response,
+    extract::MatchedPath, extract::Request, extract::State, http::HeaderValue, http::StatusCode,
+    middleware::Next, response::IntoResponse, response::Response,
 };
 use rand::Rng;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -214,6 +214,24 @@ impl<B> OnRequest<B> for RequestLogger {
             "started processing request"
         );
     }
+}
+
+fn request_route_label<B>(request: &Request<B>) -> &str {
+    request
+        .extensions()
+        .get::<MatchedPath>()
+        .map(|route| route.as_str())
+        .unwrap_or("unmatched")
+}
+
+pub async fn http_metrics_middleware(request: Request<axum::body::Body>, next: Next) -> Response {
+    let start = Instant::now();
+    let method = request.method().to_string();
+    let route = request_route_label(&request).to_string();
+
+    let response = next.run(request).await;
+    RouterMetrics::observe_http_request(&route, &method, response.status(), start.elapsed());
+    response
 }
 
 /// Custom on_response handler
@@ -583,5 +601,76 @@ pub async fn concurrency_limit_middleware(
             warn!("No tokens available and queuing is disabled, returning 429");
             StatusCode::TOO_MANY_REQUESTS.into_response()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{body::Body, http::Request as HttpRequest, routing::get, Router};
+    use metrics::set_default_local_recorder;
+    use metrics_exporter_prometheus::{Matcher, PrometheusBuilder};
+    use tower::ServiceExt;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_http_metrics_middleware_uses_matched_route_and_status_labels() {
+        let recorder = PrometheusBuilder::new()
+            .set_buckets_for_metric(
+                Matcher::Suffix(String::from("duration_seconds")),
+                &[
+                    0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 15.0,
+                    30.0, 45.0, 60.0, 90.0, 120.0, 180.0, 240.0,
+                ],
+            )
+            .expect("failed to set buckets")
+            .build_recorder();
+        let handle = recorder.handle();
+        let _guard = set_default_local_recorder(&recorder);
+
+        let app = Router::new()
+            .route(
+                "/widgets/{widget_id}",
+                get(|| async { StatusCode::ACCEPTED }),
+            )
+            .layer(axum::middleware::from_fn(http_metrics_middleware));
+
+        let response = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method("GET")
+                    .uri("/widgets/123")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+        let rendered = handle.render();
+        let request_line = rendered
+            .lines()
+            .find(|line| line.starts_with("vllm_router_http_requests_total{"))
+            .expect("missing request counter output");
+        assert!(
+            request_line.contains("route=\"/widgets/{widget_id}\"")
+                && request_line.contains("method=\"GET\"")
+                && request_line.contains("status_code=\"202\"")
+                && request_line.contains("status_class=\"2xx\"")
+                && request_line.ends_with(" 1"),
+            "unexpected request metric line: {request_line}"
+        );
+
+        let duration_line = rendered
+            .lines()
+            .find(|line| line.starts_with("vllm_router_http_request_duration_seconds_count{"))
+            .expect("missing request duration output");
+        assert!(
+            duration_line.contains("route=\"/widgets/{widget_id}\"")
+                && duration_line.contains("method=\"GET\"")
+                && duration_line.contains("status_class=\"2xx\"")
+                && duration_line.ends_with(" 1"),
+            "unexpected request duration metric line: {duration_line}"
+        );
     }
 }

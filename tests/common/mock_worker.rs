@@ -42,26 +42,91 @@ pub enum HealthStatus {
     Degraded,
 }
 
+/// Supported deterministic response modes for router integration tests.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum MockHttpResponseMode {
+    #[default]
+    Default,
+    Ok,
+    TooManyRequests,
+    ServiceUnavailable,
+}
+
+impl MockHttpResponseMode {
+    fn forced_http_status(self) -> Option<StatusCode> {
+        match self {
+            Self::Default => None,
+            Self::Ok => Some(StatusCode::OK),
+            Self::TooManyRequests => Some(StatusCode::TOO_MANY_REQUESTS),
+            Self::ServiceUnavailable => Some(StatusCode::SERVICE_UNAVAILABLE),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct MockWorkerState {
+    config: Arc<RwLock<MockWorkerConfig>>,
+    forced_http_status: Arc<RwLock<Option<StatusCode>>>,
+}
+
 /// Mock worker server for testing
 pub struct MockWorker {
     config: Arc<RwLock<MockWorkerConfig>>,
+    forced_http_status: Arc<RwLock<Option<StatusCode>>>,
     shutdown_handle: Option<tokio::task::JoinHandle<()>>,
     shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
 impl MockWorker {
     pub fn new(config: MockWorkerConfig) -> Self {
+        Self::new_with_forced_http_status(config, None)
+    }
+
+    pub fn with_http_response_mode(
+        config: MockWorkerConfig,
+        response_mode: MockHttpResponseMode,
+    ) -> Self {
+        Self::new_with_forced_http_status(config, response_mode.forced_http_status())
+    }
+
+    pub fn with_forced_http_status(config: MockWorkerConfig, status: StatusCode) -> Self {
+        Self::new_with_forced_http_status(config, Some(status))
+    }
+
+    fn new_with_forced_http_status(
+        config: MockWorkerConfig,
+        forced_http_status: Option<StatusCode>,
+    ) -> Self {
         Self {
             config: Arc::new(RwLock::new(config)),
+            forced_http_status: Arc::new(RwLock::new(forced_http_status)),
             shutdown_handle: None,
             shutdown_tx: None,
         }
+    }
+
+    pub async fn set_forced_http_status(&self, status: Option<StatusCode>) {
+        *self.forced_http_status.write().await = status;
+    }
+
+    pub async fn set_http_response_mode(&self, response_mode: MockHttpResponseMode) {
+        self.set_forced_http_status(response_mode.forced_http_status())
+            .await;
+    }
+
+    pub async fn clear_http_response_mode(&self) {
+        self.set_http_response_mode(MockHttpResponseMode::Default)
+            .await;
     }
 
     /// Start the mock worker server
     pub async fn start(&mut self) -> Result<String, Box<dyn std::error::Error>> {
         let config = self.config.clone();
         let port = config.read().await.port;
+        let state = MockWorkerState {
+            config: self.config.clone(),
+            forced_http_status: self.forced_http_status.clone(),
+        };
 
         // If port is 0, find an available port
         let port = if port == 0 {
@@ -91,7 +156,7 @@ impl MockWorker {
             )
             .route("/flush_cache", post(flush_cache_handler))
             .route("/v1/models", get(v1_models_handler))
-            .with_state(config);
+            .with_state(state);
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
         self.shutdown_tx = Some(shutdown_tx);
@@ -148,13 +213,41 @@ impl Drop for MockWorker {
 
 // Handler implementations
 
-/// Check if request should fail based on configured fail_rate
-async fn should_fail(config: &MockWorkerConfig) -> bool {
-    rand::random::<f32>() < config.fail_rate
+async fn forced_http_status(state: &MockWorkerState) -> Option<StatusCode> {
+    *state.forced_http_status.read().await
 }
 
-async fn health_handler(State(config): State<Arc<RwLock<MockWorkerConfig>>>) -> Response {
-    let config = config.read().await;
+/// Keep legacy randomized failures unless a deterministic forced status is configured.
+fn should_fail(config: &MockWorkerConfig, forced_http_status: Option<StatusCode>) -> bool {
+    forced_http_status.is_none() && rand::random::<f32>() < config.fail_rate
+}
+
+fn forced_json_error_response(status: StatusCode) -> Response {
+    (
+        status,
+        Json(json!({
+            "error": format!("Forced {} response for testing", status.as_u16())
+        })),
+    )
+        .into_response()
+}
+
+fn forced_openai_error_response(status: StatusCode) -> Response {
+    (
+        status,
+        Json(json!({
+            "error": {
+                "message": format!("Forced {} response for testing", status.as_u16()),
+                "type": status.canonical_reason().unwrap_or("error").to_ascii_lowercase(),
+                "code": status.as_u16().to_string(),
+            }
+        })),
+    )
+        .into_response()
+}
+
+async fn health_handler(State(state): State<MockWorkerState>) -> Response {
+    let config = state.config.read().await;
 
     match config.health_status {
         HealthStatus::Healthy => Json(json!({
@@ -179,10 +272,10 @@ async fn health_handler(State(config): State<Arc<RwLock<MockWorkerConfig>>>) -> 
     }
 }
 
-async fn health_generate_handler(State(config): State<Arc<RwLock<MockWorkerConfig>>>) -> Response {
-    let config = config.read().await;
+async fn health_generate_handler(State(state): State<MockWorkerState>) -> Response {
+    let config = state.config.read().await;
 
-    if should_fail(&config).await {
+    if should_fail(&config, None) {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({
@@ -210,10 +303,10 @@ async fn health_generate_handler(State(config): State<Arc<RwLock<MockWorkerConfi
     }
 }
 
-async fn server_info_handler(State(config): State<Arc<RwLock<MockWorkerConfig>>>) -> Response {
-    let config = config.read().await;
+async fn server_info_handler(State(state): State<MockWorkerState>) -> Response {
+    let config = state.config.read().await;
 
-    if should_fail(&config).await {
+    if should_fail(&config, None) {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({
@@ -262,10 +355,10 @@ async fn server_info_handler(State(config): State<Arc<RwLock<MockWorkerConfig>>>
     .into_response()
 }
 
-async fn model_info_handler(State(config): State<Arc<RwLock<MockWorkerConfig>>>) -> Response {
-    let config = config.read().await;
+async fn model_info_handler(State(state): State<MockWorkerState>) -> Response {
+    let config = state.config.read().await;
 
-    if should_fail(&config).await {
+    if should_fail(&config, None) {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({
@@ -290,16 +383,21 @@ async fn model_info_handler(State(config): State<Arc<RwLock<MockWorkerConfig>>>)
 }
 
 async fn generate_handler(
-    State(config): State<Arc<RwLock<MockWorkerConfig>>>,
+    State(state): State<MockWorkerState>,
     headers: axum::http::HeaderMap,
     Json(payload): Json<serde_json::Value>,
 ) -> Response {
-    let config = config.read().await;
+    let forced_http_status = forced_http_status(&state).await;
+    let config = state.config.read().await;
 
     // Capture request for test inspection
     capture_request(config.port, "/generate", &headers);
 
-    if should_fail(&config).await {
+    if let Some(status) = forced_http_status.filter(|status| *status != StatusCode::OK) {
+        return forced_json_error_response(status);
+    }
+
+    if should_fail(&config, forced_http_status) {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({
@@ -398,16 +496,21 @@ async fn generate_handler(
 }
 
 async fn chat_completions_handler(
-    State(config): State<Arc<RwLock<MockWorkerConfig>>>,
+    State(state): State<MockWorkerState>,
     headers: axum::http::HeaderMap,
     Json(payload): Json<serde_json::Value>,
 ) -> Response {
-    let config = config.read().await;
+    let forced_http_status = forced_http_status(&state).await;
+    let config = state.config.read().await;
 
     // Capture request for test inspection
     capture_request(config.port, "/v1/chat/completions", &headers);
 
-    if should_fail(&config).await {
+    if let Some(status) = forced_http_status.filter(|status| *status != StatusCode::OK) {
+        return forced_openai_error_response(status);
+    }
+
+    if should_fail(&config, forced_http_status) {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({
@@ -485,16 +588,21 @@ async fn chat_completions_handler(
 }
 
 async fn completions_handler(
-    State(config): State<Arc<RwLock<MockWorkerConfig>>>,
+    State(state): State<MockWorkerState>,
     headers: axum::http::HeaderMap,
     Json(payload): Json<serde_json::Value>,
 ) -> Response {
-    let config = config.read().await;
+    let forced_http_status = forced_http_status(&state).await;
+    let config = state.config.read().await;
 
     // Capture request for test inspection
     capture_request(config.port, "/v1/completions", &headers);
 
-    if should_fail(&config).await {
+    if let Some(status) = forced_http_status.filter(|status| *status != StatusCode::OK) {
+        return forced_openai_error_response(status);
+    }
+
+    if should_fail(&config, forced_http_status) {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({
@@ -569,12 +677,17 @@ async fn completions_handler(
 }
 
 async fn responses_handler(
-    State(config): State<Arc<RwLock<MockWorkerConfig>>>,
+    State(state): State<MockWorkerState>,
     Json(payload): Json<serde_json::Value>,
 ) -> Response {
-    let config = config.read().await;
+    let forced_http_status = forced_http_status(&state).await;
+    let config = state.config.read().await;
 
-    if should_fail(&config).await {
+    if let Some(status) = forced_http_status.filter(|status| *status != StatusCode::OK) {
+        return forced_openai_error_response(status);
+    }
+
+    if should_fail(&config, forced_http_status) {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({
@@ -680,10 +793,15 @@ async fn responses_handler(
     }
 }
 
-async fn flush_cache_handler(State(config): State<Arc<RwLock<MockWorkerConfig>>>) -> Response {
-    let config = config.read().await;
+async fn flush_cache_handler(State(state): State<MockWorkerState>) -> Response {
+    let forced_http_status = forced_http_status(&state).await;
+    let config = state.config.read().await;
 
-    if should_fail(&config).await {
+    if let Some(status) = forced_http_status.filter(|status| *status != StatusCode::OK) {
+        return forced_json_error_response(status);
+    }
+
+    if should_fail(&config, forced_http_status) {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({
@@ -699,10 +817,15 @@ async fn flush_cache_handler(State(config): State<Arc<RwLock<MockWorkerConfig>>>
     .into_response()
 }
 
-async fn v1_models_handler(State(config): State<Arc<RwLock<MockWorkerConfig>>>) -> Response {
-    let config = config.read().await;
+async fn v1_models_handler(State(state): State<MockWorkerState>) -> Response {
+    let forced_http_status = forced_http_status(&state).await;
+    let config = state.config.read().await;
 
-    if should_fail(&config).await {
+    if let Some(status) = forced_http_status.filter(|status| *status != StatusCode::OK) {
+        return forced_openai_error_response(status);
+    }
+
+    if should_fail(&config, forced_http_status) {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({
@@ -734,11 +857,15 @@ async fn v1_models_handler(State(config): State<Arc<RwLock<MockWorkerConfig>>>) 
 }
 
 async fn responses_get_handler(
-    State(config): State<Arc<RwLock<MockWorkerConfig>>>,
+    State(state): State<MockWorkerState>,
     Path(response_id): Path<String>,
 ) -> Response {
-    let config = config.read().await;
-    if should_fail(&config).await {
+    let forced_http_status = forced_http_status(&state).await;
+    let config = state.config.read().await;
+    if let Some(status) = forced_http_status.filter(|status| *status != StatusCode::OK) {
+        return forced_json_error_response(status);
+    }
+    if should_fail(&config, forced_http_status) {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "error": "Random failure for testing" })),
@@ -771,11 +898,15 @@ async fn responses_get_handler(
 }
 
 async fn responses_cancel_handler(
-    State(config): State<Arc<RwLock<MockWorkerConfig>>>,
+    State(state): State<MockWorkerState>,
     Path(response_id): Path<String>,
 ) -> Response {
-    let config = config.read().await;
-    if should_fail(&config).await {
+    let forced_http_status = forced_http_status(&state).await;
+    let config = state.config.read().await;
+    if let Some(status) = forced_http_status.filter(|status| *status != StatusCode::OK) {
+        return forced_json_error_response(status);
+    }
+    if should_fail(&config, forced_http_status) {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "error": "Random failure for testing" })),
@@ -823,18 +954,23 @@ fn response_exists_for_port(port: u16, response_id: &str) -> bool {
 
 // Minimal rerank handler returning mock results; router shapes final response
 async fn rerank_handler(
-    State(config): State<Arc<RwLock<MockWorkerConfig>>>,
+    State(state): State<MockWorkerState>,
     Json(payload): Json<serde_json::Value>,
 ) -> impl IntoResponse {
-    let config = config.read().await;
+    let forced_http_status = forced_http_status(&state).await;
+    let config = state.config.read().await;
 
     // Simulate response delay
     if config.response_delay_ms > 0 {
         tokio::time::sleep(tokio::time::Duration::from_millis(config.response_delay_ms)).await;
     }
 
+    if let Some(status) = forced_http_status.filter(|status| *status != StatusCode::OK) {
+        return forced_json_error_response(status);
+    }
+
     // Simulate failure rate
-    if rand::random::<f32>() < config.fail_rate {
+    if should_fail(&config, forced_http_status) {
         return (StatusCode::INTERNAL_SERVER_ERROR, "Simulated failure").into_response();
     }
 
@@ -927,4 +1063,78 @@ pub fn get_captured_requests(port: u16) -> Vec<CapturedRequest> {
 pub fn clear_captured_requests(port: u16) {
     let mut store = get_capture_store().lock().unwrap();
     store.remove(&port);
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    async fn post_chat_completion(url: &str) -> reqwest::Response {
+        reqwest::Client::new()
+            .post(format!("{}/v1/chat/completions", url))
+            .json(&json!({
+                "model": "mock-model",
+                "messages": [{
+                    "role": "user",
+                    "content": "hello"
+                }]
+            }))
+            .send()
+            .await
+            .expect("mock worker request should succeed")
+    }
+
+    #[tokio::test]
+    async fn forced_http_status_returns_deterministic_retryable_errors() {
+        for (response_mode, status) in [
+            (
+                super::MockHttpResponseMode::TooManyRequests,
+                axum::http::StatusCode::TOO_MANY_REQUESTS,
+            ),
+            (
+                super::MockHttpResponseMode::ServiceUnavailable,
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            ),
+        ] {
+            let mut worker = super::MockWorker::with_http_response_mode(
+                super::MockWorkerConfig::default(),
+                response_mode,
+            );
+            let url = worker.start().await.expect("mock worker should start");
+
+            let response = post_chat_completion(&url).await;
+            assert_eq!(response.status(), status);
+
+            let body: serde_json::Value = response
+                .json()
+                .await
+                .expect("forced error body should be valid json");
+            assert_eq!(body["error"]["code"], status.as_u16().to_string());
+
+            worker.stop().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn forced_http_status_ok_disables_random_failures() {
+        let mut worker = super::MockWorker::with_http_response_mode(
+            super::MockWorkerConfig {
+                fail_rate: 1.0,
+                ..Default::default()
+            },
+            super::MockHttpResponseMode::Ok,
+        );
+        let url = worker.start().await.expect("mock worker should start");
+
+        let response = post_chat_completion(&url).await;
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+
+        let body: serde_json::Value = response
+            .json()
+            .await
+            .expect("forced success body should be valid json");
+        assert_eq!(body["object"], "chat.completion");
+
+        worker.stop().await;
+    }
 }

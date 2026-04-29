@@ -84,6 +84,24 @@ pub struct CacheAwarePolicy {
     eviction_handle: Option<thread::JoinHandle<()>>,
 }
 
+fn update_tree_size_metric(tree: &Tree, worker_url: &str) {
+    RouterMetrics::set_tree_size(worker_url, tree.tenant_size(worker_url));
+}
+
+fn sync_tree_size_metrics(tree: &Tree, previous_sizes: &HashMap<String, usize>) {
+    let current_sizes = tree.get_tenant_char_count();
+
+    for (worker, size) in &current_sizes {
+        RouterMetrics::set_tree_size(worker, *size);
+    }
+
+    for worker in previous_sizes.keys() {
+        if !current_sizes.contains_key(worker) {
+            RouterMetrics::set_tree_size(worker, 0);
+        }
+    }
+}
+
 impl CacheAwarePolicy {
     pub fn new() -> Self {
         Self::with_config(CacheAwareConfig::default())
@@ -105,7 +123,9 @@ impl CacheAwarePolicy {
                 for entry in trees_clone.iter() {
                     let model_id = entry.key();
                     let tree = entry.value();
+                    let previous_sizes = tree.get_tenant_char_count();
                     tree.evict_tenant_by_size(max_tree_size);
+                    sync_tree_size_metrics(tree, &previous_sizes);
                     debug!(
                         "Cache eviction completed for model {}, max_size: {}",
                         model_id, max_tree_size
@@ -131,6 +151,7 @@ impl CacheAwarePolicy {
             .entry(tree_key.to_string())
             .or_insert_with(|| Arc::new(Tree::new()));
         tree.insert("", worker.url());
+        update_tree_size_metric(&tree, worker.url());
     }
 
     /// Add a worker by URL and model (for backward compatibility)
@@ -140,6 +161,7 @@ impl CacheAwarePolicy {
             .entry(model_id.to_string())
             .or_insert_with(|| Arc::new(Tree::new()));
         tree.insert("", url);
+        update_tree_size_metric(&tree, url);
     }
 
     /// Remove a worker from the tree
@@ -147,6 +169,7 @@ impl CacheAwarePolicy {
         let tree_key = normalize_model_key(worker.model_id());
         if let Some(tree) = self.trees.get(tree_key) {
             tree.remove_tenant(worker.url());
+            RouterMetrics::set_tree_size(worker.url(), 0);
         }
     }
 
@@ -156,6 +179,7 @@ impl CacheAwarePolicy {
         for tree_ref in self.trees.iter() {
             tree_ref.value().remove_tenant(url);
         }
+        RouterMetrics::set_tree_size(url, 0);
     }
 
     /// Run cache eviction to prevent unbounded growth
@@ -163,7 +187,9 @@ impl CacheAwarePolicy {
         for tree_ref in self.trees.iter() {
             let model_id = tree_ref.key();
             let tree = tree_ref.value();
+            let previous_sizes = tree.get_tenant_char_count();
             tree.evict_tenant_by_size(max_size);
+            sync_tree_size_metrics(tree, &previous_sizes);
             debug!(
                 "Cache eviction for model {}, max_size: {}",
                 model_id, max_size
@@ -208,6 +234,7 @@ impl CacheAwarePolicy {
             if let Some(tree) = tree {
                 let worker_url = workers[min_load_idx].url();
                 tree.insert(text, worker_url);
+                update_tree_size_metric(&tree, worker_url);
             } else {
                 debug!(
                     "Warning: No tree found for model '{}', skipping cache update",
@@ -310,8 +337,9 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
             "Cache match for model '{}': matched_chars={}, input_chars={}, match_rate={:.2}",
             model_id, result.matched_char_count, result.input_char_count, match_rate
         );
+        let is_cache_hit = match_rate > self.config.cache_threshold;
         // Select worker without String allocation
-        let selected_idx = if match_rate > self.config.cache_threshold {
+        let selected_idx = if is_cache_hit {
             // Cache hit path: find worker by URL (compare &str directly, no allocation)
             let tenant_url: &str = &result.tenant;
             workers
@@ -329,6 +357,13 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         if let Some(idx) = selected_idx {
             // Update the tree with this request (use worker URL directly, no allocation)
             tree.insert(text, workers[idx].url());
+            update_tree_size_metric(&tree, workers[idx].url());
+
+            if is_cache_hit {
+                RouterMetrics::record_cache_hit();
+            } else {
+                RouterMetrics::record_cache_miss();
+            }
 
             // Increment processed counter
             workers[idx].increment_processed();
@@ -339,9 +374,11 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         }
 
         // Selected worker no longer exists or unhealthy, remove stale tenant from tree
-        if match_rate > self.config.cache_threshold {
+        if is_cache_hit {
             let tenant_url: &str = &result.tenant;
             tree.remove_tenant(tenant_url);
+            RouterMetrics::set_tree_size(tenant_url, 0);
+            RouterMetrics::record_cache_miss();
             debug!("Removed stale worker {} from cache tree", tenant_url);
         }
 
@@ -478,6 +515,8 @@ impl Drop for CacheAwarePolicy {
 mod tests {
     use super::*;
     use crate::core::{BasicWorker, WorkerType};
+    use metrics::with_local_recorder;
+    use metrics_exporter_prometheus::PrometheusBuilder;
 
     #[test]
     fn test_cache_aware_with_balanced_load() {
@@ -573,5 +612,76 @@ mod tests {
         // All requests should now go to worker2
         let idx = policy.select_worker(&workers, Some("test1")).unwrap();
         assert_eq!(idx, 1);
+    }
+
+    #[test]
+    fn test_cache_aware_emits_hit_miss_and_tree_size_metrics() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+            eviction_interval_secs: 0,
+            ..Default::default()
+        });
+        let workers: Vec<Arc<dyn Worker>> = vec![
+            Arc::new(BasicWorker::new(
+                "http://w1:8000".to_string(),
+                WorkerType::Regular,
+            )),
+            Arc::new(BasicWorker::new(
+                "http://w2:8000".to_string(),
+                WorkerType::Regular,
+            )),
+        ];
+
+        policy.init_workers(&workers);
+
+        let selected_worker = with_local_recorder(&recorder, || {
+            let idx = policy.select_worker(&workers, Some("hello")).unwrap();
+            let selected_worker = workers[idx].url().to_string();
+            let repeat_idx = policy.select_worker(&workers, Some("hello")).unwrap();
+            assert_eq!(repeat_idx, idx);
+            selected_worker
+        });
+
+        let rendered = handle.render();
+
+        assert!(rendered.contains("vllm_router_cache_hits_total 1"));
+        assert!(rendered.contains("vllm_router_cache_misses_total 1"));
+        assert!(rendered.lines().any(|line| {
+            line.starts_with("vllm_router_tree_size{")
+                && line.contains(&format!("worker=\"{}\"", selected_worker))
+                && line.ends_with(" 5")
+        }));
+    }
+
+    #[test]
+    fn test_cache_aware_removal_clears_tree_size_metric() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let config = CacheAwareConfig {
+            eviction_interval_secs: 0,
+            ..Default::default()
+        };
+        let policy = CacheAwarePolicy::with_config(config);
+        let workers: Vec<Arc<dyn Worker>> = vec![Arc::new(BasicWorker::new(
+            "http://w1:8000".to_string(),
+            WorkerType::Regular,
+        ))];
+
+        policy.init_workers(&workers);
+
+        with_local_recorder(&recorder, || {
+            let worker_url = workers[0].url().to_string();
+            policy.select_worker(&workers, Some("hello")).unwrap();
+            policy.remove_worker_by_url(&worker_url);
+        });
+
+        let rendered = handle.render();
+
+        assert!(rendered.lines().any(|line| {
+            line.starts_with("vllm_router_tree_size{")
+                && line.contains("worker=\"http://w1:8000\"")
+                && line.ends_with(" 0")
+        }));
     }
 }

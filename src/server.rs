@@ -784,6 +784,9 @@ pub fn build_app_with_request_tracing(
         .layer(DefaultBodyLimit::max(max_payload_size))
         .layer(tower_http::limit::RequestBodyLimitLayer::new(
             max_payload_size,
+        ))
+        .layer(axum::middleware::from_fn(
+            middleware::http_metrics_middleware,
         ));
 
     let base_app = if enable_request_tracing {

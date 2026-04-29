@@ -1,6 +1,8 @@
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Only regenerate if the proto file changes
     println!("cargo:rerun-if-changed=src/proto/vllm_scheduler.proto");
+    println!("cargo:rerun-if-changed=src/proto/google/protobuf/timestamp.proto");
+    println!("cargo:rerun-if-changed=src/proto/google/protobuf/struct.proto");
 
     // Configure protobuf compilation with custom settings
     let config = tonic_prost_build::Config::new();
@@ -8,7 +10,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Skip serde for types that use prost_types::Struct
     // These cause conflicts and we don't need serde for all generated types
 
-    // Configure tonic-build for gRPC code generation
+    // Vendored well-known protos keep clean builds and clippy runs working
+    // even when the system protoc installation does not ship them.
     tonic_prost_build::configure()
         // Generate both client and server code
         .build_server(true)

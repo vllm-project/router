@@ -21,7 +21,7 @@ use axum::{
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
@@ -377,6 +377,46 @@ impl VllmPDRouter {
         policy.select_worker(&workers, request_text)
     }
 
+    fn server_selection_error_response(route: &str, message: impl Into<String>) -> Response {
+        RouterMetrics::record_pd_error(
+            route,
+            "POST",
+            StatusCode::SERVICE_UNAVAILABLE,
+            "server_selection",
+        );
+        (StatusCode::SERVICE_UNAVAILABLE, message.into()).into_response()
+    }
+
+    fn finish_pd_request(
+        route: &str,
+        method: &str,
+        start_time: Instant,
+        response: Response,
+    ) -> Response {
+        let duration = start_time.elapsed();
+        RouterMetrics::observe_http_response(route, method, response.status(), duration);
+        RouterMetrics::observe_pd_request(route, method, response.status(), duration);
+        response
+    }
+
+    fn observe_backend_response(
+        route: &str,
+        worker: &str,
+        request_phase: &str,
+        method: &str,
+        status: StatusCode,
+        duration: Duration,
+    ) {
+        RouterMetrics::observe_backend_http_response(
+            route,
+            worker,
+            request_phase,
+            method,
+            status,
+            duration,
+        );
+    }
+
     /// Process vLLM request using pure service discovery
     async fn process_vllm_request(
         &self,
@@ -401,16 +441,14 @@ impl VllmPDRouter {
         );
 
         if prefill_instances.is_empty() || decode_instances.is_empty() {
-            RouterMetrics::record_pd_error("server_selection");
-            return (
-                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            return Self::server_selection_error_response(
+                path,
                 format!(
                     "No workers available via service discovery: {} prefill, {} decode",
                     prefill_instances.len(),
                     decode_instances.len()
                 ),
-            )
-                .into_response();
+            );
         }
 
         // Use policy-based load balancing to select prefill and decode workers
@@ -421,12 +459,10 @@ impl VllmPDRouter {
             match self.select_worker_with_policy(&prefill_instances, true, request_str) {
                 Some(idx) => idx,
                 None => {
-                    RouterMetrics::record_pd_error("server_selection");
-                    return (
-                        axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                        "Prefill policy failed to select a worker".to_string(),
-                    )
-                        .into_response();
+                    return Self::server_selection_error_response(
+                        path,
+                        "Prefill policy failed to select a worker",
+                    );
                 }
             };
 
@@ -434,12 +470,10 @@ impl VllmPDRouter {
         {
             Some(idx) => idx,
             None => {
-                RouterMetrics::record_pd_error("server_selection");
-                return (
-                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                    "Decode policy failed to select a worker".to_string(),
-                )
-                    .into_response();
+                return Self::server_selection_error_response(
+                    path,
+                    "Decode policy failed to select a worker",
+                );
             }
         };
 
@@ -498,7 +532,6 @@ impl VllmPDRouter {
         let (decode_http, decode_zmq) = decode_instance;
 
         debug!("ENTERED process_vllm_two_stage_request_discovered method");
-        let start_time = Instant::now();
         debug!(
             "Prefill: HTTP={}, ZMQ={}, Decode: HTTP={}, ZMQ={}, Path: {}",
             prefill_http, prefill_zmq, decode_http, decode_zmq, path
@@ -573,6 +606,7 @@ impl VllmPDRouter {
         }
 
         let prefill_request_url = format!("http://{}{}", prefill_base_http, path);
+        let prefill_request_start = Instant::now();
         let prefill_response = match otel_http::send_client_request(
             prefill_request_builder.body(prefill_request_str),
             headers,
@@ -588,10 +622,7 @@ impl VllmPDRouter {
             Ok(resp) => resp,
             Err(e) => {
                 let full_error = error_chain(&e);
-                let duration = start_time.elapsed();
-                RouterMetrics::record_pd_prefill_error(prefill_http);
-                RouterMetrics::record_pd_request(path);
-                RouterMetrics::record_pd_request_duration(path, duration);
+                RouterMetrics::record_pd_prefill_error(prefill_http, "transport", None);
                 return Err(format!(
                     "Prefill request failed to {}: {}",
                     prefill_http, full_error
@@ -601,12 +632,22 @@ impl VllmPDRouter {
 
         let prefill_status = prefill_response.status();
         debug!("Prefill server responded with status: {}", prefill_status);
+        Self::observe_backend_response(
+            path,
+            prefill_http,
+            "prefill",
+            "POST",
+            prefill_status,
+            prefill_request_start.elapsed(),
+        );
+        RouterMetrics::record_pd_prefill_request(prefill_http, prefill_status);
 
         if !prefill_status.is_success() {
-            let duration = start_time.elapsed();
-            RouterMetrics::record_pd_prefill_error(prefill_http);
-            RouterMetrics::record_pd_request(path);
-            RouterMetrics::record_pd_request_duration(path, duration);
+            RouterMetrics::record_pd_prefill_error(
+                prefill_http,
+                "http_response",
+                Some(prefill_status),
+            );
             let error_body = prefill_response.text().await.unwrap_or_default();
             return Err(format!(
                 "Prefill server error {}: {}",
@@ -615,18 +656,29 @@ impl VllmPDRouter {
         }
 
         // Extract kv_transfer_params from prefill response
-        let prefill_response_text = prefill_response.text().await.map_err(|e| {
-            let full_error = error_chain(&e);
-            format!(
-                "Failed to read prefill response from {}: {}",
-                prefill_http, full_error
-            )
-        })?;
+        let prefill_response_text = match prefill_response.text().await {
+            Ok(text) => text,
+            Err(e) => {
+                let full_error = error_chain(&e);
+                RouterMetrics::record_pd_prefill_error(
+                    prefill_http,
+                    "body_read",
+                    Some(prefill_status),
+                );
+                return Err(format!(
+                    "Failed to read prefill response from {}: {}",
+                    prefill_http, full_error
+                ));
+            }
+        };
 
         debug!("Prefill response body: {}", prefill_response_text);
 
-        let prefill_response_json: Value = serde_json::from_str(&prefill_response_text)
-            .map_err(|e| format!("Failed to parse prefill response as JSON: {}", e))?;
+        let prefill_response_json: Value =
+            serde_json::from_str(&prefill_response_text).map_err(|e| {
+                RouterMetrics::record_pd_prefill_error(prefill_http, "parse", Some(prefill_status));
+                format!("Failed to parse prefill response as JSON: {}", e)
+            })?;
 
         // Extract kv_transfer_params from prefill response if present
         let kv_transfer_params = prefill_response_json.get("kv_transfer_params").cloned();
@@ -725,6 +777,7 @@ impl VllmPDRouter {
         }
 
         let decode_request_url = format!("http://{}{}", decode_base_http, path);
+        let decode_request_start = Instant::now();
         let decode_response = match otel_http::send_client_request(
             decode_request_builder.body(decode_request_str),
             headers,
@@ -740,11 +793,7 @@ impl VllmPDRouter {
             Ok(resp) => resp,
             Err(e) => {
                 let full_error = error_chain(&e);
-                let duration = start_time.elapsed();
-                RouterMetrics::record_pd_decode_error(decode_http);
-                RouterMetrics::record_pd_request(path);
-                RouterMetrics::record_pd_request_duration(path, duration);
-                RouterMetrics::record_pd_prefill_request(prefill_http);
+                RouterMetrics::record_pd_decode_error(decode_http, "transport", None);
                 return Err(format!(
                     "Decode request failed to {}: {}",
                     decode_http, full_error
@@ -756,20 +805,27 @@ impl VllmPDRouter {
             "Decode server responded with status: {}",
             decode_response.status()
         );
+        let decode_status = decode_response.status();
+        Self::observe_backend_response(
+            path,
+            decode_http,
+            "decode",
+            "POST",
+            decode_status,
+            decode_request_start.elapsed(),
+        );
+        RouterMetrics::record_pd_decode_request(decode_http, decode_status);
 
         // Stop profiling on decode server after response received
         self.stop_profiling(&format!("http://{}", decode_base_http))
             .await;
 
-        // Record PD metrics
-        let duration = start_time.elapsed();
-        RouterMetrics::record_pd_request(path);
-        RouterMetrics::record_pd_request_duration(path, duration);
-        RouterMetrics::record_pd_prefill_request(prefill_http);
-        RouterMetrics::record_pd_decode_request(decode_http);
-
-        if !decode_response.status().is_success() {
-            RouterMetrics::record_pd_decode_error(decode_http);
+        if !decode_status.is_success() {
+            RouterMetrics::record_pd_decode_error(
+                decode_http,
+                "http_response",
+                Some(decode_status),
+            );
         }
 
         // Check if logprobs merging is needed
@@ -862,7 +918,6 @@ impl VllmPDRouter {
         headers: Option<&HeaderMap>,
     ) -> Result<Response, PDRouterError> {
         debug!("ENTERED process_vllm_two_stage_request method");
-        let start_time = Instant::now();
         debug!(
             "Prefill worker: {}, Decode worker: {}, Path: {}",
             prefill_worker.url(),
@@ -951,6 +1006,7 @@ impl VllmPDRouter {
         prefill_request_builder =
             dp_utils::add_dp_rank_header(prefill_request_builder, prefill_dp_rank);
 
+        let prefill_request_start = Instant::now();
         let prefill_response = match otel_http::send_client_request(
             prefill_request_builder.json(&prefill_request),
             headers,
@@ -967,17 +1023,24 @@ impl VllmPDRouter {
             Err(e) => {
                 prefill_worker.decrement_load();
                 let full_error = error_chain(&e);
-                let duration = start_time.elapsed();
-                RouterMetrics::record_pd_prefill_error(&prefill_base_url);
-                RouterMetrics::record_pd_request(path);
-                RouterMetrics::record_pd_request_duration(path, duration);
+                RouterMetrics::record_pd_prefill_error(&prefill_base_url, "transport", None);
                 return Err(PDRouterError::NetworkError {
                     message: format!("Prefill request failed to {}: {}", prefill_url, full_error),
                 });
             }
         };
 
-        debug!("📥 Prefill response status: {}", prefill_response.status());
+        let prefill_status = prefill_response.status();
+        Self::observe_backend_response(
+            path,
+            &prefill_base_url,
+            "prefill",
+            "POST",
+            prefill_status,
+            prefill_request_start.elapsed(),
+        );
+        RouterMetrics::record_pd_prefill_request(&prefill_base_url, prefill_status);
+        debug!("📥 Prefill response status: {}", prefill_status);
         debug!(
             "📥 Prefill response headers: {:?}",
             prefill_response.headers()
@@ -989,10 +1052,11 @@ impl VllmPDRouter {
             Err(e) => {
                 prefill_worker.decrement_load();
                 let full_error = error_chain(&e);
-                let duration = start_time.elapsed();
-                RouterMetrics::record_pd_prefill_error(&prefill_base_url);
-                RouterMetrics::record_pd_request(path);
-                RouterMetrics::record_pd_request_duration(path, duration);
+                RouterMetrics::record_pd_prefill_error(
+                    &prefill_base_url,
+                    "body_read",
+                    Some(prefill_status),
+                );
                 return Err(PDRouterError::NetworkError {
                     message: format!(
                         "Failed to read prefill response from {}: {}",
@@ -1001,6 +1065,22 @@ impl VllmPDRouter {
                 });
             }
         };
+
+        if !prefill_status.is_success() {
+            prefill_worker.decrement_load();
+            RouterMetrics::record_pd_prefill_error(
+                &prefill_base_url,
+                "http_response",
+                Some(prefill_status),
+            );
+            return Err(PDRouterError::NetworkError {
+                message: format!(
+                    "Prefill server error {}: {}",
+                    prefill_status,
+                    String::from_utf8_lossy(&prefill_bytes)
+                ),
+            });
+        }
 
         debug!(
             "📥 Prefill response body size: {} bytes",
@@ -1018,10 +1098,11 @@ impl VllmPDRouter {
             Ok(json) => json,
             Err(e) => {
                 prefill_worker.decrement_load();
-                let duration = start_time.elapsed();
-                RouterMetrics::record_pd_prefill_error(&prefill_base_url);
-                RouterMetrics::record_pd_request(path);
-                RouterMetrics::record_pd_request_duration(path, duration);
+                RouterMetrics::record_pd_prefill_error(
+                    &prefill_base_url,
+                    "parse",
+                    Some(prefill_status),
+                );
                 return Err(PDRouterError::NetworkError {
                     message: format!("Failed to parse prefill response as JSON: {}", e),
                 });
@@ -1133,6 +1214,7 @@ impl VllmPDRouter {
         decode_request_builder =
             dp_utils::add_dp_rank_header(decode_request_builder, decode_dp_rank);
 
+        let decode_request_start = Instant::now();
         let decode_response = match otel_http::send_client_request(
             decode_request_builder.json(&decode_request),
             headers,
@@ -1149,11 +1231,7 @@ impl VllmPDRouter {
             Err(e) => {
                 decode_worker.decrement_load();
                 let full_error = error_chain(&e);
-                let duration = start_time.elapsed();
-                RouterMetrics::record_pd_decode_error(&decode_base_url);
-                RouterMetrics::record_pd_request(path);
-                RouterMetrics::record_pd_request_duration(path, duration);
-                RouterMetrics::record_pd_prefill_request(&prefill_base_url);
+                RouterMetrics::record_pd_decode_error(&decode_base_url, "transport", None);
                 return Err(PDRouterError::NetworkError {
                     message: format!("Decode request failed to {}: {}", decode_url, full_error),
                 });
@@ -1167,20 +1245,22 @@ impl VllmPDRouter {
         decode_worker.decrement_load();
 
         let status = decode_response.status();
+        Self::observe_backend_response(
+            path,
+            &decode_base_url,
+            "decode",
+            "POST",
+            status,
+            decode_request_start.elapsed(),
+        );
+        RouterMetrics::record_pd_decode_request(&decode_base_url, status);
         let headers = decode_response.headers().clone();
 
         info!("📥 Decode response status: {}", status);
         info!("📥 Decode response headers: {:?}", headers);
 
-        // Record PD metrics
-        let duration = start_time.elapsed();
-        RouterMetrics::record_pd_request(path);
-        RouterMetrics::record_pd_request_duration(path, duration);
-        RouterMetrics::record_pd_prefill_request(&prefill_base_url);
-        RouterMetrics::record_pd_decode_request(&decode_base_url);
-
         if !status.is_success() {
-            RouterMetrics::record_pd_decode_error(&decode_base_url);
+            RouterMetrics::record_pd_decode_error(&decode_base_url, "http_response", Some(status));
         }
 
         // Check if logprobs merging is needed
@@ -1486,6 +1566,7 @@ impl RouterTrait for VllmPDRouter {
         body: &crate::protocols::spec::ChatCompletionRequest,
         _model_id: Option<&str>,
     ) -> Response {
+        let start_time = Instant::now();
         info!(
             "vLLM route_chat called, use_discovery={}",
             self.use_discovery
@@ -1505,17 +1586,27 @@ impl RouterTrait for VllmPDRouter {
                     json
                 }
                 Err(e) => {
-                    return (
-                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("Serialization error: {}", e),
+                    return Self::finish_pd_request(
+                        "/v1/chat/completions",
+                        "POST",
+                        start_time,
+                        (
+                            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("Serialization error: {}", e),
+                        )
+                            .into_response(),
                     )
-                        .into_response()
                 }
             };
 
             // Process vLLM two-stage request with service discovery
-            self.process_vllm_request(request_json, "/v1/chat/completions", headers)
-                .await
+            return Self::finish_pd_request(
+                "/v1/chat/completions",
+                "POST",
+                start_time,
+                self.process_vllm_request(request_json, "/v1/chat/completions", headers)
+                    .await,
+            );
         } else {
             // Direct URL mode - implement routing logic here (not delegating to PDRouter)
             info!("Using direct URL mode with VllmPDRouter's own routing logic");
@@ -1530,11 +1621,16 @@ impl RouterTrait for VllmPDRouter {
                     json
                 }
                 Err(e) => {
-                    return (
-                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("Serialization error: {}", e),
+                    return Self::finish_pd_request(
+                        "/v1/chat/completions",
+                        "POST",
+                        start_time,
+                        (
+                            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("Serialization error: {}", e),
+                        )
+                            .into_response(),
                     )
-                        .into_response()
                 }
             };
 
@@ -1549,16 +1645,19 @@ impl RouterTrait for VllmPDRouter {
             );
 
             if prefill_workers.is_empty() || decode_workers.is_empty() {
-                RouterMetrics::record_pd_error("server_selection");
-                return (
-                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                    format!(
-                        "No workers available: {} prefill, {} decode",
-                        prefill_workers.len(),
-                        decode_workers.len()
+                return Self::finish_pd_request(
+                    "/v1/chat/completions",
+                    "POST",
+                    start_time,
+                    Self::server_selection_error_response(
+                        "/v1/chat/completions",
+                        format!(
+                            "No workers available: {} prefill, {} decode",
+                            prefill_workers.len(),
+                            decode_workers.len()
+                        ),
                     ),
-                )
-                    .into_response();
+                );
             }
 
             // Select workers using policy with headers for consistent hash
@@ -1585,12 +1684,15 @@ impl RouterTrait for VllmPDRouter {
             ) {
                 Some(idx) => idx,
                 None => {
-                    RouterMetrics::record_pd_error("server_selection");
-                    return (
-                        axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                        "Prefill policy failed to select a worker".to_string(),
-                    )
-                        .into_response();
+                    return Self::finish_pd_request(
+                        "/v1/chat/completions",
+                        "POST",
+                        start_time,
+                        Self::server_selection_error_response(
+                            "/v1/chat/completions",
+                            "Prefill policy failed to select a worker",
+                        ),
+                    );
                 }
             };
 
@@ -1601,12 +1703,15 @@ impl RouterTrait for VllmPDRouter {
             ) {
                 Some(idx) => idx,
                 None => {
-                    RouterMetrics::record_pd_error("server_selection");
-                    return (
-                        axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                        "Decode policy failed to select a worker".to_string(),
-                    )
-                        .into_response();
+                    return Self::finish_pd_request(
+                        "/v1/chat/completions",
+                        "POST",
+                        start_time,
+                        Self::server_selection_error_response(
+                            "/v1/chat/completions",
+                            "Decode policy failed to select a worker",
+                        ),
+                    );
                 }
             };
 
@@ -1647,7 +1752,7 @@ impl RouterTrait for VllmPDRouter {
                         .into_response()
                 }
             };
-            resp
+            Self::finish_pd_request("/v1/chat/completions", "POST", start_time, resp)
         }
     }
 
@@ -1657,6 +1762,7 @@ impl RouterTrait for VllmPDRouter {
         body: &crate::protocols::spec::CompletionRequest,
         _model_id: Option<&str>,
     ) -> Response {
+        let start_time = Instant::now();
         info!(
             "vLLM route_completion called, use_discovery={}",
             self.use_discovery
@@ -1676,17 +1782,27 @@ impl RouterTrait for VllmPDRouter {
                     json
                 }
                 Err(e) => {
-                    return (
-                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("Serialization error: {}", e),
+                    return Self::finish_pd_request(
+                        "/v1/completions",
+                        "POST",
+                        start_time,
+                        (
+                            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("Serialization error: {}", e),
+                        )
+                            .into_response(),
                     )
-                        .into_response()
                 }
             };
 
             // Process vLLM two-stage request with service discovery
-            self.process_vllm_request(request_json, "/v1/completions", headers)
-                .await
+            return Self::finish_pd_request(
+                "/v1/completions",
+                "POST",
+                start_time,
+                self.process_vllm_request(request_json, "/v1/completions", headers)
+                    .await,
+            );
         } else {
             // Direct URL mode - implement routing logic here (not delegating to PDRouter)
             info!("Using direct URL mode with VllmPDRouter's own routing logic");
@@ -1701,11 +1817,16 @@ impl RouterTrait for VllmPDRouter {
                     json
                 }
                 Err(e) => {
-                    return (
-                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("Serialization error: {}", e),
+                    return Self::finish_pd_request(
+                        "/v1/completions",
+                        "POST",
+                        start_time,
+                        (
+                            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("Serialization error: {}", e),
+                        )
+                            .into_response(),
                     )
-                        .into_response()
                 }
             };
 
@@ -1720,16 +1841,19 @@ impl RouterTrait for VllmPDRouter {
             );
 
             if prefill_workers.is_empty() || decode_workers.is_empty() {
-                RouterMetrics::record_pd_error("server_selection");
-                return (
-                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                    format!(
-                        "No workers available: {} prefill, {} decode",
-                        prefill_workers.len(),
-                        decode_workers.len()
+                return Self::finish_pd_request(
+                    "/v1/completions",
+                    "POST",
+                    start_time,
+                    Self::server_selection_error_response(
+                        "/v1/completions",
+                        format!(
+                            "No workers available: {} prefill, {} decode",
+                            prefill_workers.len(),
+                            decode_workers.len()
+                        ),
                     ),
-                )
-                    .into_response();
+                );
             }
 
             // Select workers using policy with headers for consistent hash
@@ -1756,12 +1880,15 @@ impl RouterTrait for VllmPDRouter {
             ) {
                 Some(idx) => idx,
                 None => {
-                    RouterMetrics::record_pd_error("server_selection");
-                    return (
-                        axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                        "Prefill policy failed to select a worker".to_string(),
-                    )
-                        .into_response();
+                    return Self::finish_pd_request(
+                        "/v1/completions",
+                        "POST",
+                        start_time,
+                        Self::server_selection_error_response(
+                            "/v1/completions",
+                            "Prefill policy failed to select a worker",
+                        ),
+                    );
                 }
             };
 
@@ -1772,12 +1899,15 @@ impl RouterTrait for VllmPDRouter {
             ) {
                 Some(idx) => idx,
                 None => {
-                    RouterMetrics::record_pd_error("server_selection");
-                    return (
-                        axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                        "Decode policy failed to select a worker".to_string(),
-                    )
-                        .into_response();
+                    return Self::finish_pd_request(
+                        "/v1/completions",
+                        "POST",
+                        start_time,
+                        Self::server_selection_error_response(
+                            "/v1/completions",
+                            "Decode policy failed to select a worker",
+                        ),
+                    );
                 }
             };
 
@@ -1818,7 +1948,7 @@ impl RouterTrait for VllmPDRouter {
                         .into_response()
                 }
             };
-            resp
+            Self::finish_pd_request("/v1/completions", "POST", start_time, resp)
         }
     }
 
@@ -1895,13 +2025,19 @@ impl RouterTrait for VllmPDRouter {
         method: &Method,
         body: serde_json::Value,
     ) -> Response {
+        let start_time = Instant::now();
         // Only handle POST requests for inference
         if *method != Method::POST {
-            return (
-                StatusCode::METHOD_NOT_ALLOWED,
-                "Only POST requests are supported for transparent proxy",
-            )
-                .into_response();
+            return Self::finish_pd_request(
+                path,
+                method.as_str(),
+                start_time,
+                (
+                    StatusCode::METHOD_NOT_ALLOWED,
+                    "Only POST requests are supported for transparent proxy",
+                )
+                    .into_response(),
+            );
         }
 
         debug!(
@@ -1914,7 +2050,12 @@ impl RouterTrait for VllmPDRouter {
 
         if self.use_discovery {
             // Discovery mode - use vLLM-specific two-stage processing
-            self.process_vllm_request(request_json, path, headers).await
+            Self::finish_pd_request(
+                path,
+                method.as_str(),
+                start_time,
+                self.process_vllm_request(request_json, path, headers).await,
+            )
         } else {
             // Direct URL mode - use worker registry, filtered by availability
             let all_prefill = self.pd_router.worker_registry.get_prefill_workers();
@@ -1931,16 +2072,19 @@ impl RouterTrait for VllmPDRouter {
                 .collect();
 
             if prefill_workers.is_empty() || decode_workers.is_empty() {
-                RouterMetrics::record_pd_error("server_selection");
-                return (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    format!(
-                        "No available workers: {} prefill, {} decode",
-                        prefill_workers.len(),
-                        decode_workers.len()
+                return Self::finish_pd_request(
+                    path,
+                    method.as_str(),
+                    start_time,
+                    Self::server_selection_error_response(
+                        path,
+                        format!(
+                            "No available workers: {} prefill, {} decode",
+                            prefill_workers.len(),
+                            decode_workers.len()
+                        ),
                     ),
-                )
-                    .into_response();
+                );
             }
 
             // Select workers using policy with headers for consistent hash
@@ -1967,12 +2111,15 @@ impl RouterTrait for VllmPDRouter {
             ) {
                 Some(idx) => idx,
                 None => {
-                    RouterMetrics::record_pd_error("server_selection");
-                    return (
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "Prefill policy failed to select a worker".to_string(),
-                    )
-                        .into_response();
+                    return Self::finish_pd_request(
+                        path,
+                        method.as_str(),
+                        start_time,
+                        Self::server_selection_error_response(
+                            path,
+                            "Prefill policy failed to select a worker",
+                        ),
+                    );
                 }
             };
 
@@ -1983,12 +2130,15 @@ impl RouterTrait for VllmPDRouter {
             ) {
                 Some(idx) => idx,
                 None => {
-                    RouterMetrics::record_pd_error("server_selection");
-                    return (
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "Decode policy failed to select a worker".to_string(),
-                    )
-                        .into_response();
+                    return Self::finish_pd_request(
+                        path,
+                        method.as_str(),
+                        start_time,
+                        Self::server_selection_error_response(
+                            path,
+                            "Decode policy failed to select a worker",
+                        ),
+                    );
                 }
             };
 
@@ -2012,7 +2162,9 @@ impl RouterTrait for VllmPDRouter {
                 )
                 .await
             {
-                Ok(response) => response,
+                Ok(response) => {
+                    Self::finish_pd_request(path, method.as_str(), start_time, response)
+                }
                 Err(e) => {
                     error!(
                         "Transparent proxy request failed: prefill={}, decode={}, error={}",
@@ -2020,11 +2172,16 @@ impl RouterTrait for VllmPDRouter {
                         decode_worker.url(),
                         e
                     );
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("Transparent proxy request failed: {}", e),
+                    Self::finish_pd_request(
+                        path,
+                        method.as_str(),
+                        start_time,
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("Transparent proxy request failed: {}", e),
+                        )
+                            .into_response(),
                     )
-                        .into_response()
                 }
             }
         }
@@ -2050,7 +2207,106 @@ impl WorkerManagement for VllmPDRouter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::response::IntoResponse;
+    use metrics::with_local_recorder;
+    use metrics_exporter_prometheus::PrometheusBuilder;
     use serde_json::json;
+    use std::time::Duration;
+
+    fn build_test_recorder() -> metrics_exporter_prometheus::PrometheusRecorder {
+        PrometheusBuilder::new().build_recorder()
+    }
+
+    #[test]
+    fn test_finish_pd_request_emits_final_http_response_metrics_once() {
+        let recorder = build_test_recorder();
+        let handle = recorder.handle();
+
+        with_local_recorder(&recorder, || {
+            let response = VllmPDRouter::finish_pd_request(
+                "/v1/chat/completions",
+                "POST",
+                Instant::now(),
+                (StatusCode::TOO_MANY_REQUESTS, "rate limited").into_response(),
+            );
+            assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        });
+
+        let rendered = handle.render();
+
+        assert!(rendered.lines().any(|line| {
+            line.starts_with("vllm_router_http_responses_total{")
+                && line.contains("route=\"/v1/chat/completions\"")
+                && line.contains("http_request_method=\"POST\"")
+                && line.contains("http_response_status_code=\"429\"")
+                && line.contains("http_response_status_class=\"4xx\"")
+                && line.ends_with(" 1")
+        }));
+        assert!(rendered.lines().any(|line| {
+            line.starts_with("vllm_router_http_response_duration_seconds_count{")
+                && line.contains("route=\"/v1/chat/completions\"")
+                && line.contains("http_request_method=\"POST\"")
+                && line.contains("http_response_status_code=\"429\"")
+                && line.contains("http_response_status_class=\"4xx\"")
+                && line.ends_with(" 1")
+        }));
+    }
+
+    #[test]
+    fn test_observe_backend_response_emits_phase_and_status_labels() {
+        let recorder = build_test_recorder();
+        let handle = recorder.handle();
+
+        with_local_recorder(&recorder, || {
+            VllmPDRouter::observe_backend_response(
+                "/v1/chat/completions",
+                "http://prefill1",
+                "prefill",
+                "POST",
+                StatusCode::SERVICE_UNAVAILABLE,
+                Duration::from_millis(5),
+            );
+            VllmPDRouter::observe_backend_response(
+                "/v1/chat/completions",
+                "http://decode1",
+                "decode",
+                "POST",
+                StatusCode::TOO_MANY_REQUESTS,
+                Duration::from_millis(10),
+            );
+        });
+
+        let rendered = handle.render();
+
+        assert!(rendered.lines().any(|line| {
+            line.starts_with("vllm_router_backend_http_responses_total{")
+                && line.contains("route=\"/v1/chat/completions\"")
+                && line.contains("worker=\"http://prefill1\"")
+                && line.contains("vllm_request_phase=\"prefill\"")
+                && line.contains("http_request_method=\"POST\"")
+                && line.contains("http_response_status_code=\"503\"")
+                && line.contains("http_response_status_class=\"5xx\"")
+                && line.ends_with(" 1")
+        }));
+        assert!(rendered.lines().any(|line| {
+            line.starts_with("vllm_router_backend_http_responses_total{")
+                && line.contains("route=\"/v1/chat/completions\"")
+                && line.contains("worker=\"http://decode1\"")
+                && line.contains("vllm_request_phase=\"decode\"")
+                && line.contains("http_request_method=\"POST\"")
+                && line.contains("http_response_status_code=\"429\"")
+                && line.contains("http_response_status_class=\"4xx\"")
+                && line.ends_with(" 1")
+        }));
+        assert!(rendered.lines().any(|line| {
+            line.starts_with("vllm_router_backend_http_response_duration_seconds_count{")
+                && line.contains("worker=\"http://prefill1\"")
+                && line.contains("vllm_request_phase=\"prefill\"")
+                && line.contains("http_response_status_code=\"503\"")
+                && line.contains("http_response_status_class=\"5xx\"")
+                && line.ends_with(" 1")
+        }));
+    }
 
     // --- OpenAI-style endpoint tests (chat/completions, completions) ---
 

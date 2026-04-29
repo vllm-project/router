@@ -423,13 +423,14 @@ impl Router {
 
     // Helper method to proxy GET requests to the first available worker
     async fn proxy_get_request(&self, req: Request<Body>, endpoint: &str) -> Response {
+        let start_time = Instant::now();
         let incoming_headers = req.headers();
         let headers = header_utils::copy_request_headers(&req);
+        let route_name = format!("/{}", endpoint);
 
-        match self.select_first_worker() {
+        let response = match self.select_first_worker() {
             Ok(worker_url) => {
                 let url = format!("{}/{}", worker_url, endpoint);
-                let route_name = format!("/{}", endpoint);
                 let mut request_builder = self.client.get(&url);
                 for (name, value) in headers {
                     let name_lc = name.to_lowercase();
@@ -441,6 +442,7 @@ impl Router {
                     }
                 }
 
+                let request_start = Instant::now();
                 match otel_http::send_client_request(
                     request_builder,
                     Some(incoming_headers),
@@ -456,6 +458,13 @@ impl Router {
                     Ok(res) => {
                         let status = StatusCode::from_u16(res.status().as_u16())
                             .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                        Self::observe_backend_response(
+                            &route_name,
+                            &worker_url,
+                            "GET",
+                            status,
+                            request_start.elapsed(),
+                        );
 
                         // Preserve headers from backend
                         let response_headers =
@@ -483,7 +492,9 @@ impl Router {
                 }
             }
             Err(e) => (StatusCode::SERVICE_UNAVAILABLE, e).into_response(),
-        }
+        };
+
+        Self::finish_regular_request(&route_name, "GET", start_time, response)
     }
 
     /// Convert axum HeaderMap to policy RequestHeaders (HashMap<String, String>)
@@ -547,74 +558,89 @@ impl Router {
         let start = Instant::now();
         let is_stream = typed_req.is_stream();
         let text = typed_req.extract_text_for_routing();
+        let last_error_type = Arc::new(std::sync::Mutex::new(None::<&'static str>));
 
         let response = RetryExecutor::execute_response_with_retry(
             &self.retry_config,
             // operation per attempt
-            |_: u32| async {
-                let worker = match self.select_worker_for_model(model_id, Some(&text), headers) {
-                    Some(w) => w,
-                    None => {
-                        RouterMetrics::record_request_error(route, "no_available_workers");
-                        return (
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            "No available workers (all circuits open or unhealthy)",
-                        )
-                            .into_response();
-                    }
-                };
+            {
+                let last_error_type = Arc::clone(&last_error_type);
+                move |_: u32| {
+                    let last_error_type = Arc::clone(&last_error_type);
+                    let text = text.clone();
+                    async move {
+                        let worker =
+                            match self.select_worker_for_model(model_id, Some(&text), headers) {
+                                Some(w) => w,
+                                None => {
+                                    *last_error_type
+                                        .lock()
+                                        .expect("request error mutex poisoned") =
+                                        Some("no_available_workers");
+                                    return (
+                                        StatusCode::SERVICE_UNAVAILABLE,
+                                        "No available workers (all circuits open or unhealthy)",
+                                    )
+                                        .into_response();
+                                }
+                            };
+                        *last_error_type
+                            .lock()
+                            .expect("request error mutex poisoned") = None;
 
-                // Optional load tracking for cache-aware policy
-                // Get the policy for this model to check if it's cache-aware
-                let policy = match model_id {
-                    Some(model) => self.policy_registry.get_policy_or_default(model),
-                    None => self.policy_registry.get_default_policy(),
-                };
+                        // Optional load tracking for cache-aware policy
+                        // Get the policy for this model to check if it's cache-aware
+                        let policy = match model_id {
+                            Some(model) => self.policy_registry.get_policy_or_default(model),
+                            None => self.policy_registry.get_default_policy(),
+                        };
 
-                let load_incremented = if policy.name() == "cache_aware" {
-                    worker.increment_load();
-                    RouterMetrics::set_running_requests(worker.url(), worker.load());
-                    true
-                } else {
-                    false
-                };
+                        let load_incremented = if policy.name() == "cache_aware" {
+                            worker.increment_load();
+                            RouterMetrics::set_running_requests(worker.url(), worker.load());
+                            true
+                        } else {
+                            false
+                        };
 
-                // Keep a clone for potential cleanup on retry
-                let worker_for_cleanup = if load_incremented {
-                    Some(worker.clone())
-                } else {
-                    None
-                };
+                        // Keep a clone for potential cleanup on retry
+                        let worker_for_cleanup = if load_incremented {
+                            Some(worker.clone())
+                        } else {
+                            None
+                        };
 
-                let response = self
-                    .send_typed_request(
-                        headers,
-                        typed_req,
-                        route,
-                        worker.url(),
-                        is_stream,
-                        load_incremented,
-                    )
-                    .await;
+                        let response = self
+                            .send_typed_request(
+                                headers,
+                                typed_req,
+                                route,
+                                worker.url(),
+                                is_stream,
+                                load_incremented,
+                            )
+                            .await;
 
-                // Client errors (4xx) are not worker failures - only server errors (5xx)
-                // should count against the circuit breaker. This matches pd_router.rs behavior.
-                let status = response.status();
-                worker.record_outcome(status.is_success() || status.is_client_error());
+                        // Client errors (4xx) are not worker failures - only server errors (5xx)
+                        // should count against the circuit breaker. This matches pd_router.rs behavior.
+                        let status = response.status();
+                        worker.record_outcome(status.is_success() || status.is_client_error());
 
-                // For retryable failures, we need to decrement load since send_typed_request
-                // won't have done it (it only decrements on success or non-retryable failures)
-                if is_retryable_status(response.status()) && load_incremented {
-                    if let Some(cleanup_worker) = worker_for_cleanup {
-                        cleanup_worker.decrement_load();
-                        RouterMetrics::set_running_requests(
-                            cleanup_worker.url(),
-                            cleanup_worker.load(),
-                        );
+                        // For retryable failures, we need to decrement load since send_typed_request
+                        // won't have done it (it only decrements on success or non-retryable failures)
+                        if is_retryable_status(response.status()) && load_incremented {
+                            if let Some(cleanup_worker) = worker_for_cleanup {
+                                cleanup_worker.decrement_load();
+                                RouterMetrics::set_running_requests(
+                                    cleanup_worker.url(),
+                                    cleanup_worker.load(),
+                                );
+                            }
+                        }
+
+                        response
                     }
                 }
-
-                response
             },
             // should_retry predicate
             |res, _attempt| is_retryable_status(res.status()),
@@ -628,15 +654,52 @@ impl Router {
         )
         .await;
 
-        if response.status().is_success() {
-            let duration = start.elapsed();
-            RouterMetrics::record_request(route);
-            RouterMetrics::record_generate_duration(duration);
-        } else if !is_retryable_status(response.status()) {
-            RouterMetrics::record_request_error(route, "non_retryable_error");
+        let status = response.status();
+        if status.is_success() {
+            RouterMetrics::record_generate_duration(start.elapsed());
+        } else if let Some(error_type) = last_error_type
+            .lock()
+            .expect("request error mutex poisoned")
+            .take()
+        {
+            RouterMetrics::record_request_error(route, "POST", status, error_type);
+        } else if !is_retryable_status(status) {
+            RouterMetrics::record_request_error(route, "POST", status, "non_retryable_error");
         }
 
         response
+    }
+
+    fn finish_regular_request(
+        route: &str,
+        method: &str,
+        start_time: Instant,
+        response: Response,
+    ) -> Response {
+        RouterMetrics::observe_http_response(
+            route,
+            method,
+            response.status(),
+            start_time.elapsed(),
+        );
+        response
+    }
+
+    fn observe_backend_response(
+        route: &str,
+        worker: &str,
+        method: &str,
+        status: StatusCode,
+        duration: Duration,
+    ) {
+        RouterMetrics::observe_backend_http_response(
+            route,
+            worker,
+            "inference",
+            method,
+            status,
+            duration,
+        );
     }
 
     // Helper: return base worker URL (strips DP suffix when enabled)
@@ -654,6 +717,7 @@ impl Router {
         &self,
         headers: Option<&HeaderMap>,
         endpoint: &str,
+        route: &str,
         method: Method,
     ) -> Response {
         // TODO: currently the vllm worker is using in-memory state management, so this implementation has to fan out to all workers.
@@ -668,7 +732,6 @@ impl Router {
             let base = self.worker_base_url(&worker_url);
 
             let url = format!("{}/{}", base, endpoint);
-            let route_name = format!("/{}", endpoint);
             let method_name = method.as_str().to_string();
             let mut request_builder = match method.clone() {
                 Method::GET => self.client.get(&url),
@@ -694,13 +757,14 @@ impl Router {
                 }
             }
 
+            let request_start = Instant::now();
             match otel_http::send_client_request(
                 request_builder,
                 headers,
                 ClientRequestOptions {
                     method: &method_name,
                     url: &url,
-                    route: Some(&route_name),
+                    route: Some(route),
                     request_phase: None,
                 },
             )
@@ -709,6 +773,13 @@ impl Router {
                 Ok(res) => {
                     let status = StatusCode::from_u16(res.status().as_u16())
                         .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                    Self::observe_backend_response(
+                        route,
+                        &worker_url,
+                        &method_name,
+                        status,
+                        request_start.elapsed(),
+                    );
                     let response_headers = header_utils::preserve_response_headers(res.headers());
                     match res.bytes().await {
                         Ok(body) => {
@@ -748,8 +819,13 @@ impl Router {
     }
 
     // Route a GET request with provided headers to a specific endpoint
-    async fn route_get_request(&self, headers: Option<&HeaderMap>, endpoint: &str) -> Response {
-        self.route_simple_request(headers, endpoint, Method::GET)
+    async fn route_get_request(
+        &self,
+        headers: Option<&HeaderMap>,
+        endpoint: &str,
+        route: &str,
+    ) -> Response {
+        self.route_simple_request(headers, endpoint, route, Method::GET)
             .await
     }
 
@@ -758,8 +834,9 @@ impl Router {
         &self,
         headers: Option<&HeaderMap>,
         endpoint: &str,
+        route: &str,
     ) -> Response {
-        self.route_simple_request(headers, endpoint, Method::POST)
+        self.route_simple_request(headers, endpoint, route, Method::POST)
             .await
     }
 
@@ -837,6 +914,7 @@ impl Router {
             request_builder = request_builder.header("X-data-parallel-rank", dp_rank.to_string());
         }
 
+        let request_start = Instant::now();
         let res = match otel_http::send_client_request(
             request_builder,
             headers,
@@ -874,6 +952,7 @@ impl Router {
 
         let status = StatusCode::from_u16(res.status().as_u16())
             .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        Self::observe_backend_response(route, worker_url, "POST", status, request_start.elapsed());
 
         if !is_stream {
             // For non-streaming requests, preserve headers
@@ -1444,8 +1523,11 @@ impl RouterTrait for Router {
         body: &GenerateRequest,
         model_id: Option<&str>,
     ) -> Response {
-        self.route_typed_request(headers, body, "/generate", model_id)
-            .await
+        let start_time = Instant::now();
+        let response = self
+            .route_typed_request(headers, body, "/generate", model_id)
+            .await;
+        Self::finish_regular_request("/generate", "POST", start_time, response)
     }
 
     async fn route_chat(
@@ -1454,8 +1536,11 @@ impl RouterTrait for Router {
         body: &ChatCompletionRequest,
         model_id: Option<&str>,
     ) -> Response {
-        self.route_typed_request(headers, body, "/v1/chat/completions", model_id)
-            .await
+        let start_time = Instant::now();
+        let response = self
+            .route_typed_request(headers, body, "/v1/chat/completions", model_id)
+            .await;
+        Self::finish_regular_request("/v1/chat/completions", "POST", start_time, response)
     }
 
     async fn route_completion(
@@ -1464,8 +1549,11 @@ impl RouterTrait for Router {
         body: &CompletionRequest,
         model_id: Option<&str>,
     ) -> Response {
-        self.route_typed_request(headers, body, "/v1/completions", model_id)
-            .await
+        let start_time = Instant::now();
+        let response = self
+            .route_typed_request(headers, body, "/v1/completions", model_id)
+            .await;
+        Self::finish_regular_request("/v1/completions", "POST", start_time, response)
     }
 
     async fn route_responses(
@@ -1474,18 +1562,29 @@ impl RouterTrait for Router {
         body: &ResponsesRequest,
         model_id: Option<&str>,
     ) -> Response {
-        self.route_typed_request(headers, body, "/v1/responses", model_id)
-            .await
+        let start_time = Instant::now();
+        let response = self
+            .route_typed_request(headers, body, "/v1/responses", model_id)
+            .await;
+        Self::finish_regular_request("/v1/responses", "POST", start_time, response)
     }
 
     async fn get_response(&self, headers: Option<&HeaderMap>, response_id: &str) -> Response {
+        let start_time = Instant::now();
         let endpoint = format!("v1/responses/{}", response_id);
-        self.route_get_request(headers, &endpoint).await
+        let route = "/v1/responses/{response_id}";
+        let response = self.route_get_request(headers, &endpoint, route).await;
+        Self::finish_regular_request(route, "GET", start_time, response)
     }
 
     async fn cancel_response(&self, headers: Option<&HeaderMap>, response_id: &str) -> Response {
+        let start_time = Instant::now();
         let endpoint = format!("v1/responses/{}/cancel", response_id);
-        self.route_post_empty_request(headers, &endpoint).await
+        let route = "/v1/responses/{response_id}/cancel";
+        let response = self
+            .route_post_empty_request(headers, &endpoint, route)
+            .await;
+        Self::finish_regular_request(route, "POST", start_time, response)
     }
 
     async fn route_embeddings(
@@ -1505,11 +1604,10 @@ impl RouterTrait for Router {
             RouterMetrics::record_embeddings_request();
             RouterMetrics::record_embeddings_duration(start.elapsed());
         } else {
-            let error_type = format!("http_{}", res.status().as_u16());
-            RouterMetrics::record_embeddings_error(&error_type);
+            RouterMetrics::record_embeddings_error(res.status());
         }
 
-        res
+        Self::finish_regular_request("/v1/embeddings", "POST", start, res)
     }
 
     async fn route_rerank(
@@ -1518,27 +1616,30 @@ impl RouterTrait for Router {
         body: &RerankRequest,
         model_id: Option<&str>,
     ) -> Response {
-        if let Err(e) = body.validate() {
-            return (StatusCode::BAD_REQUEST, e).into_response();
-        }
-        let response = self
-            .route_typed_request(headers, body, "/v1/rerank", model_id)
-            .await;
-        if response.status().is_success() {
-            match Self::build_rerank_response(body, response).await {
-                Ok(rerank_response) => rerank_response,
-                Err(e) => {
-                    error!("Failed to build rerank response: {}", e);
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "Failed to build rerank response".to_string(),
-                    )
-                        .into_response();
-                }
-            }
+        let start_time = Instant::now();
+        let response = if let Err(e) = body.validate() {
+            (StatusCode::BAD_REQUEST, e).into_response()
         } else {
-            response
-        }
+            let response = self
+                .route_typed_request(headers, body, "/v1/rerank", model_id)
+                .await;
+            if response.status().is_success() {
+                match Self::build_rerank_response(body, response).await {
+                    Ok(rerank_response) => rerank_response,
+                    Err(e) => {
+                        error!("Failed to build rerank response: {}", e);
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "Failed to build rerank response".to_string(),
+                        )
+                            .into_response()
+                    }
+                }
+            } else {
+                response
+            }
+        };
+        Self::finish_regular_request("/v1/rerank", "POST", start_time, response)
     }
 
     async fn flush_cache(&self) -> Response {
@@ -1648,125 +1749,244 @@ impl RouterTrait for Router {
         method: &Method,
         body: serde_json::Value,
     ) -> Response {
+        let start_time = Instant::now();
         debug!("Transparent proxy: routing {} {} to backend", method, path);
 
-        // Select a worker (filter by availability like select_worker_for_model)
-        let all_workers = self.worker_registry.get_all();
-        let workers: Vec<Arc<dyn Worker>> = all_workers
-            .iter()
-            .filter(|w| w.is_available())
-            .cloned()
-            .collect();
-        if workers.is_empty() {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "No available workers".to_string(),
-            )
-                .into_response();
-        }
-
-        let policy = self.policy_registry.get_default_policy();
-        let request_text = serde_json::to_string(&body).ok();
-        let request_headers = Self::headers_to_request_headers(headers);
-        let worker_idx = match policy.select_worker_with_headers(
-            &workers,
-            request_text.as_deref(),
-            request_headers.as_ref(),
-        ) {
-            Some(idx) => idx,
-            None => {
-                return (
+        let response = {
+            // Select a worker (filter by availability like select_worker_for_model)
+            let all_workers = self.worker_registry.get_all();
+            let workers: Vec<Arc<dyn Worker>> = all_workers
+                .iter()
+                .filter(|w| w.is_available())
+                .cloned()
+                .collect();
+            if workers.is_empty() {
+                (
                     StatusCode::SERVICE_UNAVAILABLE,
-                    "Failed to select a worker".to_string(),
+                    "No available workers".to_string(),
                 )
-                    .into_response();
-            }
-        };
-
-        let worker: &dyn Worker = workers[worker_idx].as_ref();
-        let url = worker.endpoint_url(path);
-
-        debug!("Transparent proxy: forwarding to {}", url);
-
-        // Build the request
-        let mut request_builder = match *method {
-            Method::GET => self.client.get(&url),
-            Method::POST => self.client.post(&url),
-            Method::PUT => self.client.put(&url),
-            Method::DELETE => self.client.delete(&url),
-            Method::PATCH => self.client.patch(&url),
-            Method::HEAD => self.client.head(&url),
-            _ => {
-                return (
-                    StatusCode::METHOD_NOT_ALLOWED,
-                    format!("Method {} not supported", method),
-                )
-                    .into_response();
-            }
-        };
-
-        // Add X-data-parallel-rank header for DP-aware routing
-        request_builder = dp_utils::add_dp_rank_header(request_builder, worker.dp_rank());
-
-        // Add JSON body if not null/empty
-        if !body.is_null() {
-            request_builder = request_builder.json(&body);
-        }
-
-        // Add authorization if configured
-        if let Some(ref key) = self.api_key {
-            request_builder = request_builder.header("Authorization", format!("Bearer {}", key));
-        }
-
-        // Send request
-        match otel_http::send_client_request(
-            request_builder,
-            headers,
-            ClientRequestOptions {
-                method: method.as_str(),
-                url: &url,
-                route: Some(path),
-                request_phase: Some("inference"),
-            },
-        )
-        .await
-        {
-            Ok(response) => {
-                let status = response.status();
-                let headers = response.headers().clone();
-
-                // Stream the response body
-                let body = Body::from_stream(response.bytes_stream());
-                let mut response_builder = Response::builder().status(status.as_u16());
-
-                for (name, value) in headers.iter() {
-                    if name != "transfer-encoding" && name != "content-length" {
-                        response_builder = response_builder.header(name, value);
+                    .into_response()
+            } else {
+                let policy = self.policy_registry.get_default_policy();
+                let request_text = serde_json::to_string(&body).ok();
+                let request_headers = Self::headers_to_request_headers(headers);
+                let worker_idx = match policy.select_worker_with_headers(
+                    &workers,
+                    request_text.as_deref(),
+                    request_headers.as_ref(),
+                ) {
+                    Some(idx) => idx,
+                    None => {
+                        return Self::finish_regular_request(
+                            path,
+                            method.as_str(),
+                            start_time,
+                            (
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                "Failed to select a worker".to_string(),
+                            )
+                                .into_response(),
+                        );
                     }
+                };
+
+                let worker: &dyn Worker = workers[worker_idx].as_ref();
+                let url = worker.endpoint_url(path);
+
+                debug!("Transparent proxy: forwarding to {}", url);
+
+                // Build the request
+                let mut request_builder = match *method {
+                    Method::GET => self.client.get(&url),
+                    Method::POST => self.client.post(&url),
+                    Method::PUT => self.client.put(&url),
+                    Method::DELETE => self.client.delete(&url),
+                    Method::PATCH => self.client.patch(&url),
+                    Method::HEAD => self.client.head(&url),
+                    _ => {
+                        return Self::finish_regular_request(
+                            path,
+                            method.as_str(),
+                            start_time,
+                            (
+                                StatusCode::METHOD_NOT_ALLOWED,
+                                format!("Method {} not supported", method),
+                            )
+                                .into_response(),
+                        );
+                    }
+                };
+
+                // Add X-data-parallel-rank header for DP-aware routing
+                request_builder = dp_utils::add_dp_rank_header(request_builder, worker.dp_rank());
+
+                // Add JSON body if not null/empty
+                if !body.is_null() {
+                    request_builder = request_builder.json(&body);
                 }
 
-                match response_builder.body(body) {
-                    Ok(response) => response,
+                // Add authorization if configured
+                if let Some(ref key) = self.api_key {
+                    request_builder =
+                        request_builder.header("Authorization", format!("Bearer {}", key));
+                }
+
+                // Send request
+                let request_start = Instant::now();
+                match otel_http::send_client_request(
+                    request_builder,
+                    headers,
+                    ClientRequestOptions {
+                        method: method.as_str(),
+                        url: &url,
+                        route: Some(path),
+                        request_phase: Some("inference"),
+                    },
+                )
+                .await
+                {
+                    Ok(backend_response) => {
+                        let status = StatusCode::from_u16(backend_response.status().as_u16())
+                            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                        Self::observe_backend_response(
+                            path,
+                            worker.url(),
+                            method.as_str(),
+                            status,
+                            request_start.elapsed(),
+                        );
+                        let headers = backend_response.headers().clone();
+
+                        // Stream the response body
+                        let body = Body::from_stream(backend_response.bytes_stream());
+                        let mut response_builder = Response::builder().status(status.as_u16());
+
+                        for (name, value) in headers.iter() {
+                            if name != "transfer-encoding" && name != "content-length" {
+                                response_builder = response_builder.header(name, value);
+                            }
+                        }
+
+                        match response_builder.body(body) {
+                            Ok(response) => response,
+                            Err(e) => (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                format!("Failed to build response: {}", e),
+                            )
+                                .into_response(),
+                        }
+                    }
                     Err(e) => (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("Failed to build response: {}", e),
+                        StatusCode::BAD_GATEWAY,
+                        format!("Backend request failed: {}", e),
                     )
                         .into_response(),
                 }
             }
-            Err(e) => (
-                StatusCode::BAD_GATEWAY,
-                format!("Backend request failed: {}", e),
-            )
-                .into_response(),
-        }
+        };
+
+        Self::finish_regular_request(path, method.as_str(), start_time, response)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{extract::State, routing::any, Json, Router as AxumRouter};
+    use metrics::set_default_local_recorder;
+    use metrics_exporter_prometheus::PrometheusBuilder;
+    use serde_json::json;
     use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::net::TcpListener;
+
+    #[derive(Clone)]
+    struct ResponseSequenceState {
+        statuses: Arc<Vec<StatusCode>>,
+        attempts: Arc<AtomicUsize>,
+    }
+
+    fn build_test_recorder() -> metrics_exporter_prometheus::PrometheusRecorder {
+        PrometheusBuilder::new().build_recorder()
+    }
+
+    fn assert_metric_line(rendered: &str, prefix: &str, fragments: &[&str], suffix: &str) {
+        assert!(
+            rendered.lines().any(|line| {
+                line.starts_with(prefix)
+                    && fragments.iter().all(|fragment| line.contains(fragment))
+                    && line.ends_with(suffix)
+            }),
+            "missing metric line: prefix={prefix}, fragments={fragments:?}, suffix={suffix}\n{rendered}"
+        );
+    }
+
+    async fn response_sequence_handler(State(state): State<ResponseSequenceState>) -> Response {
+        let attempt = state.attempts.fetch_add(1, Ordering::SeqCst);
+        let status = state
+            .statuses
+            .get(attempt)
+            .copied()
+            .or_else(|| state.statuses.last().copied())
+            .unwrap_or(StatusCode::OK);
+        (
+            status,
+            Json(json!({
+                "attempt": attempt + 1,
+                "status": status.as_u16(),
+            })),
+        )
+            .into_response()
+    }
+
+    async fn start_status_sequence_server(
+        route: &str,
+        statuses: Vec<StatusCode>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let state = ResponseSequenceState {
+            statuses: Arc::new(statuses),
+            attempts: Arc::new(AtomicUsize::new(0)),
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = AxumRouter::new()
+            .route(route, any(response_sequence_handler))
+            .with_state(state);
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        (format!("http://{}", addr), handle)
+    }
+
+    fn create_router_with_worker_urls(worker_urls: &[String], retry_config: RetryConfig) -> Router {
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        let policy_registry = Arc::new(PolicyRegistry::new(
+            crate::config::types::PolicyConfig::RoundRobin,
+        ));
+
+        for worker_url in worker_urls {
+            worker_registry.register(Arc::new(BasicWorker::new(
+                worker_url.clone(),
+                WorkerType::Regular,
+            )));
+        }
+
+        let (_, rx) = tokio::sync::watch::channel(HashMap::new());
+        Router {
+            worker_registry,
+            policy_registry,
+            worker_startup_timeout_secs: 5,
+            worker_startup_check_interval_secs: 1,
+            intra_node_data_parallel_size: 1,
+            api_key: None,
+            client: Client::new(),
+            retry_config,
+            circuit_breaker_config: CircuitBreakerConfig::default(),
+            _worker_loads: Arc::new(rx),
+            _load_monitor_handle: None,
+        }
+    }
 
     fn create_test_regular_router() -> Router {
         // Create registries
@@ -2205,5 +2425,331 @@ mod tests {
         );
 
         health_checker.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_proxy_get_request_records_status_metrics_for_client_and_backend() {
+        let (worker_url, server_handle) =
+            start_status_sequence_server("/v1/models", vec![StatusCode::OK]).await;
+        let router = create_router_with_worker_urls(
+            std::slice::from_ref(&worker_url),
+            RetryConfig::default(),
+        );
+
+        let recorder = build_test_recorder();
+        let handle = recorder.handle();
+        let _recorder_guard = set_default_local_recorder(&recorder);
+
+        let request = Request::builder()
+            .uri("/v1/models")
+            .body(Body::empty())
+            .unwrap();
+        let response = router.get_models(request).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+
+        let rendered = handle.render();
+        let route = "route=\"/v1/models\"";
+        let method = "http_request_method=\"GET\"";
+        let worker = format!("worker=\"{worker_url}\"");
+
+        assert_metric_line(
+            &rendered,
+            "vllm_router_backend_http_responses_total{",
+            &[
+                route,
+                worker.as_str(),
+                "vllm_request_phase=\"inference\"",
+                method,
+                "http_response_status_code=\"200\"",
+                "http_response_status_class=\"2xx\"",
+            ],
+            " 1",
+        );
+        assert_metric_line(
+            &rendered,
+            "vllm_router_backend_http_response_duration_seconds_count{",
+            &[
+                route,
+                worker.as_str(),
+                "vllm_request_phase=\"inference\"",
+                method,
+                "http_response_status_code=\"200\"",
+                "http_response_status_class=\"2xx\"",
+            ],
+            " 1",
+        );
+        assert_metric_line(
+            &rendered,
+            "vllm_router_http_responses_total{",
+            &[
+                route,
+                method,
+                "http_response_status_code=\"200\"",
+                "http_response_status_class=\"2xx\"",
+            ],
+            " 1",
+        );
+        assert_metric_line(
+            &rendered,
+            "vllm_router_http_response_duration_seconds_count{",
+            &[
+                route,
+                method,
+                "http_response_status_code=\"200\"",
+                "http_response_status_class=\"2xx\"",
+            ],
+            " 1",
+        );
+
+        server_handle.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_route_generate_records_retryable_backend_and_final_status_metrics() {
+        let (worker_url, server_handle) = start_status_sequence_server(
+            "/generate",
+            vec![StatusCode::SERVICE_UNAVAILABLE, StatusCode::OK],
+        )
+        .await;
+        let retry_config = RetryConfig {
+            max_retries: 2,
+            initial_backoff_ms: 1,
+            max_backoff_ms: 1,
+            backoff_multiplier: 1.0,
+            jitter_factor: 0.0,
+        };
+        let router =
+            create_router_with_worker_urls(std::slice::from_ref(&worker_url), retry_config);
+
+        let recorder = build_test_recorder();
+        let handle = recorder.handle();
+        let _recorder_guard = set_default_local_recorder(&recorder);
+
+        let response = router
+            .route_generate(
+                None,
+                &GenerateRequest {
+                    text: Some("retry me".to_string()),
+                    prompt: None,
+                    input_ids: None,
+                    stream: false,
+                    parameters: None,
+                    sampling_params: None,
+                    return_logprob: false,
+                    lora_path: None,
+                    session_params: None,
+                    return_hidden_states: false,
+                    rid: None,
+                },
+                None,
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+
+        let rendered = handle.render();
+        let route = "route=\"/generate\"";
+        let method = "http_request_method=\"POST\"";
+        let worker = format!("worker=\"{worker_url}\"");
+
+        assert_metric_line(
+            &rendered,
+            "vllm_router_backend_http_responses_total{",
+            &[
+                route,
+                worker.as_str(),
+                "vllm_request_phase=\"inference\"",
+                method,
+                "http_response_status_code=\"503\"",
+                "http_response_status_class=\"5xx\"",
+            ],
+            " 1",
+        );
+        assert_metric_line(
+            &rendered,
+            "vllm_router_backend_http_responses_total{",
+            &[
+                route,
+                worker.as_str(),
+                "vllm_request_phase=\"inference\"",
+                method,
+                "http_response_status_code=\"200\"",
+                "http_response_status_class=\"2xx\"",
+            ],
+            " 1",
+        );
+        assert_metric_line(
+            &rendered,
+            "vllm_router_backend_http_response_duration_seconds_count{",
+            &[
+                route,
+                worker.as_str(),
+                "vllm_request_phase=\"inference\"",
+                method,
+                "http_response_status_code=\"503\"",
+                "http_response_status_class=\"5xx\"",
+            ],
+            " 1",
+        );
+        assert_metric_line(
+            &rendered,
+            "vllm_router_http_responses_total{",
+            &[
+                route,
+                method,
+                "http_response_status_code=\"200\"",
+                "http_response_status_class=\"2xx\"",
+            ],
+            " 1",
+        );
+        assert_metric_line(
+            &rendered,
+            "vllm_router_http_response_duration_seconds_count{",
+            &[
+                route,
+                method,
+                "http_response_status_code=\"200\"",
+                "http_response_status_class=\"2xx\"",
+            ],
+            " 1",
+        );
+        assert!(
+            !rendered.lines().any(|line| {
+                line.starts_with("vllm_router_http_responses_total{")
+                    && line.contains(route)
+                    && line.contains("http_response_status_code=\"503\"")
+            }),
+            "final response metrics should reflect only the client-visible response\n{rendered}"
+        );
+
+        server_handle.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_get_response_uses_normalized_route_label_for_status_metrics() {
+        let (worker_url, server_handle) =
+            start_status_sequence_server("/v1/responses/{response_id}", vec![StatusCode::OK]).await;
+        let router = create_router_with_worker_urls(
+            std::slice::from_ref(&worker_url),
+            RetryConfig::default(),
+        );
+
+        let recorder = build_test_recorder();
+        let handle = recorder.handle();
+        let _recorder_guard = set_default_local_recorder(&recorder);
+
+        let response = router.get_response(None, "resp_123").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+
+        let rendered = handle.render();
+        let normalized_route = "route=\"/v1/responses/{response_id}\"";
+        let raw_route = "route=\"/v1/responses/resp_123\"";
+        let method = "http_request_method=\"GET\"";
+        let worker = format!("worker=\"{worker_url}\"");
+
+        assert_metric_line(
+            &rendered,
+            "vllm_router_backend_http_responses_total{",
+            &[
+                normalized_route,
+                worker.as_str(),
+                "vllm_request_phase=\"inference\"",
+                method,
+                "http_response_status_code=\"200\"",
+                "http_response_status_class=\"2xx\"",
+            ],
+            " 1",
+        );
+        assert_metric_line(
+            &rendered,
+            "vllm_router_http_responses_total{",
+            &[
+                normalized_route,
+                method,
+                "http_response_status_code=\"200\"",
+                "http_response_status_class=\"2xx\"",
+            ],
+            " 1",
+        );
+        assert!(
+            !rendered.contains(raw_route),
+            "raw response IDs should not appear in status metric labels\n{rendered}"
+        );
+
+        server_handle.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_route_transparent_records_status_metrics_for_client_and_backend() {
+        let (worker_url, server_handle) =
+            start_status_sequence_server("/v1/responses", vec![StatusCode::TOO_MANY_REQUESTS])
+                .await;
+        let router = create_router_with_worker_urls(
+            std::slice::from_ref(&worker_url),
+            RetryConfig::default(),
+        );
+
+        let recorder = build_test_recorder();
+        let handle = recorder.handle();
+        let _recorder_guard = set_default_local_recorder(&recorder);
+
+        let response = router
+            .route_transparent(
+                None,
+                "/v1/responses",
+                &Method::POST,
+                json!({
+                    "model": "mock-model",
+                    "input": "transparent route",
+                }),
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        let _ = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+
+        let rendered = handle.render();
+        let route = "route=\"/v1/responses\"";
+        let method = "http_request_method=\"POST\"";
+        let worker = format!("worker=\"{worker_url}\"");
+
+        assert_metric_line(
+            &rendered,
+            "vllm_router_backend_http_responses_total{",
+            &[
+                route,
+                worker.as_str(),
+                "vllm_request_phase=\"inference\"",
+                method,
+                "http_response_status_code=\"429\"",
+                "http_response_status_class=\"4xx\"",
+            ],
+            " 1",
+        );
+        assert_metric_line(
+            &rendered,
+            "vllm_router_http_responses_total{",
+            &[
+                route,
+                method,
+                "http_response_status_code=\"429\"",
+                "http_response_status_class=\"4xx\"",
+            ],
+            " 1",
+        );
+        assert_metric_line(
+            &rendered,
+            "vllm_router_http_response_duration_seconds_count{",
+            &[
+                route,
+                method,
+                "http_response_status_code=\"429\"",
+                "http_response_status_class=\"4xx\"",
+            ],
+            " 1",
+        );
+
+        server_handle.abort();
     }
 }
