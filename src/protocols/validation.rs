@@ -924,6 +924,7 @@ mod tests {
                 chat_template_kwargs: None,
                 return_hidden_states: false,
                 structured_outputs: None,
+                other: Default::default(),
             }
         }
 

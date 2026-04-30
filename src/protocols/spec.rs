@@ -524,6 +524,10 @@ pub struct ChatCompletionRequest {
     /// Structured outputs parameters
     #[serde(skip_serializing_if = "Option::is_none")]
     pub structured_outputs: Option<StructuredOutputsParams>,
+
+    /// Additional fields passed through transparently to the backend
+    #[serde(flatten)]
+    pub other: serde_json::Map<String, serde_json::Value>,
 }
 
 impl GenerationRequest for ChatCompletionRequest {

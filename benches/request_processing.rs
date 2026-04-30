@@ -75,6 +75,7 @@ fn default_chat_completion_request() -> ChatCompletionRequest {
         reasoning_effort: None,
         include_reasoning: true,
         structured_outputs: None,
+        other: serde_json::Map::new(),
     }
 }
 
