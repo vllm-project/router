@@ -40,9 +40,10 @@ ROUTER_PORT=${ROUTER_PORT:-8300}
 # =============================================================================
 
 if [[ "$KV_CONNECTOR" == "moriio" ]]; then
-  # MoRI-IO: block-size 1 required; no intra-node DP in base config
-  PREFILL_BLOCK_SIZE=${PREFILL_BLOCK_SIZE:-1}
-  DECODE_BLOCK_SIZE=${DECODE_BLOCK_SIZE:-1}
+  # MoRI-IO: block-size 1 is needed for some models (e.g. DeepSeek) but not supported
+  # by all ROCm attention backends — override with PREFILL_BLOCK_SIZE/DECODE_BLOCK_SIZE if needed.
+  PREFILL_BLOCK_SIZE=${PREFILL_BLOCK_SIZE:-16}
+  DECODE_BLOCK_SIZE=${DECODE_BLOCK_SIZE:-16}
   INTRA_NODE_DP_SIZE=${INTRA_NODE_DP_SIZE:-1}
   GPU_DEVICE_VAR="HIP_VISIBLE_DEVICES"
 
