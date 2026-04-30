@@ -291,6 +291,69 @@ steps:
     artifact_paths:
       - "/tmp/router.log"
 
+  - label: ":amd: P/D Disaggregation Test - MoRI-IO (AMD GPUs)"
+    key: "pd-disagg-moriio-test"
+    timeout_in_minutes: 60
+    retry:
+      automatic:
+        - exit_status: "*"
+          limit: 2
+      manual:
+        allowed: true
+        reason: "GPU tests can be flaky - retry if needed"
+    plugins:
+      - docker#v5.11.0:
+          image: "vllm/vllm-openai-rocm:0.19.2"
+          workdir: /workdir
+          volumes:
+            - ".:/workdir"
+            - "/root/.cache/huggingface:/root/.cache/huggingface"
+            - "/dev/kfd:/dev/kfd"
+            - "/dev/dri:/dev/dri"
+          shm-size: "256g"
+          privileged: true
+          environment:
+            - "VLLM_USE_V1=1"
+            - "VLLM_MORIIO_CONNECTOR_READ_MODE=0"
+            - "MORI_IO_ENABLE_NOTIFICATION=0"
+            - "VLLM_ENGINE_READY_TIMEOUT_S=3600"
+            - "VLLM_LOGGING_LEVEL=INFO"
+          propagate-environment: true
+          command:
+            - bash
+            - -c
+            - |
+              set -euo pipefail
+
+              # Install system dependencies for building the router
+              apt-get update && apt-get install -y \
+                curl \
+                pkg-config \
+                libssl-dev \
+                protobuf-compiler
+
+              # Install Rust
+              curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+              source /root/.cargo/env
+
+              # Build the router
+              cargo build --release
+              export PATH="/workdir/target/release:$$PATH"
+
+              # Install test dependencies
+              pip install requests pytest openai
+
+              # Run MoRI-IO P/D disaggregation test
+              cd py_test/e2e/pd_disagg_vllm
+              bash ./run_moriio_test.sh
+    agents:
+      queue: "gpu_4_queue_amd"
+    depends_on: "build"
+    artifact_paths:
+      - "/tmp/router.log"
+      - "/tmp/prefill_*.log"
+      - "/tmp/decode_*.log"
+
   # ============================================================================
   # Docker Build - Parallel with tests
   # ============================================================================
