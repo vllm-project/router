@@ -218,13 +218,13 @@ for i in $(seq 0 $((NUM_PREFILL_INSTANCES - 1))); do
     HANDSHAKE_PORT=$((PREFILL_HANDSHAKE_BASE_PORT + i))
     NOTIFY_PORT=$((PREFILL_NOTIFY_BASE_PORT + i))
     INSTANCE_KV_CONFIG=$(build_prefill_kv_config $PORT $HANDSHAKE_PORT $NOTIFY_PORT)
-    CONNECTOR_EXTRA_ARGS=""
+    CONNECTOR_EXTRA_ARGS=()
     CONNECTOR_ENV="${GPU_DEVICE_VAR}=${GPU_IDS} VLLM_MORIIO_CONNECTOR_READ_MODE=1 MORI_IO_ENABLE_NOTIFICATION=0 VLLM_ENGINE_READY_TIMEOUT_S=3600"
   else
     NIXL_PORT=$((PREFILL_NIXL_BASE_PORT + i))
     NIXL_HTTP_PORT=$((PREFILL_NIXL_HTTP_BASE_PORT + i))
     INSTANCE_KV_CONFIG=$(build_prefill_kv_config $PORT $NIXL_HTTP_PORT)
-    CONNECTOR_EXTRA_ARGS="--data-parallel-size ${INTRA_NODE_DP_SIZE} --enable-prefix-caching --disable-hybrid-kv-cache-manager --disable-log-stats"
+    CONNECTOR_EXTRA_ARGS=(--data-parallel-size ${INTRA_NODE_DP_SIZE} --enable-prefix-caching --disable-hybrid-kv-cache-manager --disable-log-stats)
     CONNECTOR_ENV="${GPU_DEVICE_VAR}=${GPU_IDS} VLLM_NIXL_SIDE_CHANNEL_HOST=0.0.0.0 VLLM_NIXL_SIDE_CHANNEL_PORT=${NIXL_PORT} UCX_TLS=all UCX_NET_DEVICES=all FLASHINFER_DISABLE_VERSION_CHECK=1"
   fi
 
@@ -241,7 +241,7 @@ for i in $(seq 0 $((NUM_PREFILL_INSTANCES - 1))); do
     --tensor-parallel-size $PREFILLER_TP_SIZE \
     --enforce-eager \
     --trust-remote-code \
-    $CONNECTOR_EXTRA_ARGS \
+    "${CONNECTOR_EXTRA_ARGS[@]}" \
     --kv-transfer-config "$INSTANCE_KV_CONFIG" \
     > /tmp/prefill_${i}.log 2>&1 &
 
@@ -271,13 +271,13 @@ for i in $(seq 0 $((NUM_DECODE_INSTANCES - 1))); do
     HANDSHAKE_PORT=$((DECODE_HANDSHAKE_BASE_PORT + i))
     NOTIFY_PORT=$((DECODE_NOTIFY_BASE_PORT + i))
     INSTANCE_KV_CONFIG=$(build_decode_kv_config $PORT $HANDSHAKE_PORT $NOTIFY_PORT)
-    CONNECTOR_EXTRA_ARGS="--all2all-backend mori --compilation-config '{\"cudagraph_mode\": \"PIECEWISE\"}'"
+    CONNECTOR_EXTRA_ARGS=(--all2all-backend mori --compilation-config '{"cudagraph_mode":"PIECEWISE"}')
     CONNECTOR_ENV="${GPU_DEVICE_VAR}=${GPU_IDS} VLLM_MORIIO_CONNECTOR_READ_MODE=1 MORI_IO_ENABLE_NOTIFICATION=0 VLLM_ENGINE_READY_TIMEOUT_S=3600"
   else
     NIXL_PORT=$((DECODE_NIXL_BASE_PORT + i))
     NIXL_HTTP_PORT=$((DECODE_NIXL_HTTP_BASE_PORT + i))
     INSTANCE_KV_CONFIG=$(build_decode_kv_config $PORT $NIXL_HTTP_PORT)
-    CONNECTOR_EXTRA_ARGS="--data-parallel-size ${INTRA_NODE_DP_SIZE} --disable-hybrid-kv-cache-manager --disable-log-stats"
+    CONNECTOR_EXTRA_ARGS=(--data-parallel-size ${INTRA_NODE_DP_SIZE} --disable-hybrid-kv-cache-manager --disable-log-stats)
     CONNECTOR_ENV="${GPU_DEVICE_VAR}=${GPU_IDS} VLLM_NIXL_SIDE_CHANNEL_HOST=0.0.0.0 VLLM_NIXL_SIDE_CHANNEL_PORT=${NIXL_PORT} UCX_TLS=all UCX_NET_DEVICES=all FLASHINFER_DISABLE_VERSION_CHECK=1"
   fi
 
@@ -294,7 +294,7 @@ for i in $(seq 0 $((NUM_DECODE_INSTANCES - 1))); do
     --tensor-parallel-size $DECODER_TP_SIZE \
     --enforce-eager \
     --trust-remote-code \
-    $CONNECTOR_EXTRA_ARGS \
+    "${CONNECTOR_EXTRA_ARGS[@]}" \
     --kv-transfer-config "$INSTANCE_KV_CONFIG" \
     > /tmp/decode_${i}.log 2>&1 &
 
