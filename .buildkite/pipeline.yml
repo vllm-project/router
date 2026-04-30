@@ -303,7 +303,7 @@ steps:
         reason: "GPU tests can be flaky - retry if needed"
     plugins:
       - docker#v5.11.0:
-          image: "vllm/vllm-openai-rocm:0.19.2"
+          image: "vllm/vllm-openai-rocm:v0.20.0"
           workdir: /workdir
           volumes:
             - ".:/workdir"
