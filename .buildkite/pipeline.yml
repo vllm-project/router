@@ -284,7 +284,7 @@ steps:
 
               # Run P/D disaggregation test
               cd py_test/e2e/pd_disagg_vllm
-              bash ./run_accuracy_test.sh
+              KV_CONNECTOR=nixl bash ./run_accuracy_test.sh
     agents:
       queue: "gpu_4_queue"
     depends_on: "build"
@@ -345,7 +345,7 @@ steps:
 
               # Run MoRI-IO P/D disaggregation test
               cd py_test/e2e/pd_disagg_vllm
-              bash ./run_moriio_test.sh
+              KV_CONNECTOR=moriio bash ./run_accuracy_test.sh
     agents:
       queue: "gpu_4_queue_amd"
     depends_on: "build"
