@@ -190,6 +190,33 @@ wait_for_router() {
   done
 }
 
+# For ZMQ discovery mode (MoRI-IO): the health endpoint doesn't return "ok" until
+# after the first periodic worker health check fires (up to 60s after startup).
+# We only need to confirm the HTTP server is bound before proceeding.
+wait_for_router_up() {
+  local port=$1
+  local max_timeout=${2:-30}
+  echo "Waiting for router HTTP server on port ${port} (max: ${max_timeout}s)..."
+
+  local start_time=$(date +%s)
+  while true; do
+    local http_code
+    http_code=$(curl -s -o /dev/null -w "%{http_code}" "http://localhost:${port}/health" 2>/dev/null || echo "000")
+    if [[ "$http_code" != "000" ]]; then
+      echo "Router on port ${port} is accepting connections (HTTP ${http_code})"
+      return 0
+    fi
+
+    local elapsed=$(($(date +%s) - start_time))
+    if [[ $elapsed -ge $max_timeout ]]; then
+      echo "ERROR: Router on port ${port} not accessible within ${max_timeout}s"
+      return 1
+    fi
+
+    sleep 1
+  done
+}
+
 # =============================================================================
 # Clean up existing instances
 # =============================================================================
@@ -393,12 +420,12 @@ fi
 
 ROUTER_PID=$!
 
-wait_for_router "$ROUTER_PORT"
-
-# For MoRI-IO, give ZMQ registrations time to propagate after the router is up
 if [[ "$KV_CONNECTOR" == "moriio" ]]; then
-  echo "Waiting for ZMQ registrations to propagate..."
-  sleep 10
+  # With ZMQ discovery the health endpoint won't return "ok" until after the first
+  # periodic worker health check (60s interval). Just confirm the HTTP server is up.
+  wait_for_router_up "$ROUTER_PORT"
+else
+  wait_for_router "$ROUTER_PORT"
 fi
 
 # =============================================================================
