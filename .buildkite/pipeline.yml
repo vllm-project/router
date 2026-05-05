@@ -291,7 +291,7 @@ steps:
     artifact_paths:
       - "/tmp/router.log"
 
-  - label: ":amd: P/D Disaggregation Test - MoRI-IO (AMD GPUs)"
+  - label: "(AMD) P/D Disaggregation Test - MoRI-IO (4 GPUs)"
     key: "pd-disagg-moriio-test"
     timeout_in_minutes: 60
     retry:
