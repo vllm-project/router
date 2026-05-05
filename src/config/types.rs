@@ -121,6 +121,10 @@ pub enum KvConnector {
     #[serde(rename = "moriio")]
     #[value(name = "moriio")]
     MoriIO,
+    /// P2P NCCL KV transfer (PUT, PUT_ASYNC, GET modes)
+    #[serde(rename = "p2pnccl")]
+    #[value(name = "p2pnccl")]
+    P2pNccl,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
