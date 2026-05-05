@@ -175,7 +175,7 @@ wait_for_router() {
 
   local start_time=$(date +%s)
   while true; do
-    if curl -s "http://localhost:${port}/health" | grep -q "ok"; then
+    if curl -s "http://localhost:${port}/health" | grep -qE "ok|healthy"; then
       echo "Router on port ${port} is ready!"
       return 0
     fi
