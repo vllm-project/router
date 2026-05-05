@@ -918,19 +918,15 @@ impl PdRouterBase {
 
 impl PdRouterBase {
     pub async fn health(&self, _req: Request<Body>) -> Response {
-        let prefill_workers = self.worker_registry.get_prefill_workers();
-        let decode_workers = self.worker_registry.get_decode_workers();
-
-        // In discovery mode workers register asynchronously; an empty registry means
-        // the router is not yet ready, not that all workers are healthy.
-        if prefill_workers.is_empty() || decode_workers.is_empty() {
-            return (StatusCode::SERVICE_UNAVAILABLE, "No workers registered yet").into_response();
-        }
-
+        // This is a server readiness check - checking if we have healthy workers
+        // Workers handle their own health checks in the background
+        let mut all_healthy = true;
         let mut unhealthy_servers = Vec::new();
 
-        for worker in prefill_workers.iter().chain(decode_workers.iter()) {
+        // Check all workers
+        for worker in self.worker_registry.get_all() {
             if !worker.is_healthy() {
+                all_healthy = false;
                 let worker_type = match worker.worker_type() {
                     WorkerType::Prefill { .. } => "Prefill",
                     WorkerType::Decode => "Decode",
@@ -940,7 +936,7 @@ impl PdRouterBase {
             }
         }
 
-        if unhealthy_servers.is_empty() {
+        if all_healthy {
             (StatusCode::OK, "All servers healthy").into_response()
         } else {
             (

@@ -1501,7 +1501,24 @@ impl RouterTrait for VllmPDRouter {
     }
 
     async fn health(&self, req: Request<Body>) -> Response {
-        self.pd_router.health(req).await
+        if self.use_discovery {
+            let prefill = self.service_registry.get_prefill_instances();
+            let decode = self.service_registry.get_decode_instances();
+            if prefill.is_empty() || decode.is_empty() {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!(
+                        "No workers registered yet via discovery: {} prefill, {} decode",
+                        prefill.len(),
+                        decode.len()
+                    ),
+                )
+                    .into_response();
+            }
+            (StatusCode::OK, "All servers healthy").into_response()
+        } else {
+            self.pd_router.health(req).await
+        }
     }
 
     async fn health_generate(&self, req: Request<Body>) -> Response {
