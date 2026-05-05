@@ -924,11 +924,7 @@ impl PdRouterBase {
         // In discovery mode workers register asynchronously; an empty registry means
         // the router is not yet ready, not that all workers are healthy.
         if prefill_workers.is_empty() || decode_workers.is_empty() {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "No workers registered yet",
-            )
-                .into_response();
+            return (StatusCode::SERVICE_UNAVAILABLE, "No workers registered yet").into_response();
         }
 
         let mut unhealthy_servers = Vec::new();
