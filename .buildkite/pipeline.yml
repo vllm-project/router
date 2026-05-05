@@ -343,6 +343,9 @@ steps:
               # Install test dependencies
               pip install requests pytest openai
 
+              # Install LM Evaluation Harness with API extras for accuracy testing
+              pip install 'lm-eval[api]>=0.4.0' hf_transfer
+
               # Run MoRI-IO P/D disaggregation test
               cd py_test/e2e/pd_disagg_vllm
               KV_CONNECTOR=moriio bash ./run_accuracy_test.sh
