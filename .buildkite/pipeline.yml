@@ -314,10 +314,10 @@ steps:
           privileged: true
           environment:
             - "VLLM_USE_V1=1"
-            - "VLLM_MORIIO_CONNECTOR_READ_MODE=0"
+            - "VLLM_LOGGING_LEVEL=INFO"
+            - "VLLM_MORIIO_CONNECTOR_READ_MODE=1"
             - "MORI_IO_ENABLE_NOTIFICATION=0"
             - "VLLM_ENGINE_READY_TIMEOUT_S=3600"
-            - "VLLM_LOGGING_LEVEL=INFO"
           propagate-environment: true
           command:
             - bash
