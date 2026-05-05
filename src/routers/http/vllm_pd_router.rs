@@ -192,6 +192,8 @@ impl VllmPDRouter {
                 Uuid::new_v4().simple()
             )),
             KvConnector::Nixl => None,
+            // P2pNccl embeds P/D addresses in the request_id; no transfer_id needed.
+            KvConnector::P2pNccl => None,
         }
     }
 
@@ -246,6 +248,8 @@ impl VllmPDRouter {
                 "remote_host": serde_json::Value::Null,
                 "remote_port": serde_json::Value::Null
             })),
+            // P2pNccl resolves P/D addresses from the request_id itself; no params needed.
+            KvConnector::P2pNccl => Ok(json!({})),
         }
     }
 
@@ -304,6 +308,8 @@ impl VllmPDRouter {
                 }
             }
             KvConnector::Nixl => Some(prefill_response_json?.get("kv_transfer_params")?.clone()),
+            // P2pNccl resolves P/D addresses from the request_id; decode needs no injected params.
+            KvConnector::P2pNccl => None,
         }
     }
 
@@ -787,9 +793,10 @@ impl VllmPDRouter {
         let (decode_base_http, decode_dp_rank) =
             extract_base_http_and_dp_rank(decode_http, self.intra_node_data_parallel_size);
 
-        // Concurrent dispatch: e.g. MoRI-IO WRITE mode
-        let is_concurrent_dispatch = matches!(self.kv_connector, KvConnector::MoriIO)
-            && matches!(self.moriio_transfer_mode(), Some(MoriIOTransferMode::Write));
+        // Concurrent dispatch: e.g. MoRI-IO WRITE mode, P2pNccl
+        let is_concurrent_dispatch = matches!(self.kv_connector, KvConnector::P2pNccl)
+            || (matches!(self.kv_connector, KvConnector::MoriIO)
+                && matches!(self.moriio_transfer_mode(), Some(MoriIOTransferMode::Write)));
 
         let needs_logprobs = request_json.get("logprobs").is_some()
             || request_json
