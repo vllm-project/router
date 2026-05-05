@@ -350,7 +350,7 @@ steps:
               cd py_test/e2e/pd_disagg_vllm
               KV_CONNECTOR=moriio bash ./run_accuracy_test.sh
     agents:
-      queue: "gpu_4_queue_amd"
+      queue: "amd_mi300_4"
     depends_on: "build"
     artifact_paths:
       - "/tmp/router.log"
