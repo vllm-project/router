@@ -115,7 +115,7 @@ impl ConfigValidator {
                 // Validate URL format
                 if let Err(e) = url::Url::parse(&worker_urls[0]) {
                     return Err(ConfigError::ValidationFailed {
-                        reason: format!("Invalid OpenAI worker URL '{}': {}", &worker_urls[0], e),
+                        reason: format!("Invalid OpenAI worker URL '{}': {}", worker_urls[0], e),
                     });
                 }
             }

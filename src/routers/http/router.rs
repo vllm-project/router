@@ -2130,7 +2130,7 @@ mod tests {
         // Verify the delayed worker is genuinely unhealthy right now.
         let client = reqwest::Client::new();
         let resp = client
-            .get(format!("{}/health", &delayed_url))
+            .get(format!("{}/health", delayed_url))
             .send()
             .await
             .unwrap();
