@@ -2,6 +2,7 @@
 # This pipeline runs automated checks, builds, and tests for the vLLM Router project
 
 env:
+  RUST_IMAGE: "rust:1.95.0-bullseye"
   # Disable incremental compilation for consistent CI builds
   CARGO_INCREMENTAL: "0"
   # Enable full Rust backtraces for debugging
@@ -17,7 +18,7 @@ steps:
       - label: ":rust: Rust Format Check"
         plugins:
           - docker#v5.11.0:
-              image: "rustlang/rust:nightly-bullseye"
+              image: "$RUST_IMAGE"
               workdir: /workdir
               volumes:
                 - ".:/workdir"
@@ -36,7 +37,7 @@ steps:
       - label: ":rust: Clippy"
         plugins:
           - docker#v5.11.0:
-              image: "rustlang/rust:nightly-bullseye"
+              image: "$RUST_IMAGE"
               workdir: /workdir
               volumes:
                 - ".:/workdir"
@@ -74,7 +75,7 @@ steps:
       - label: ":rust: Build Rust (Release)"
         plugins:
           - docker#v5.11.0:
-              image: "rustlang/rust:nightly-bullseye"
+              image: "$RUST_IMAGE"
               workdir: /workdir
               volumes:
                 - ".:/workdir"
@@ -95,7 +96,7 @@ steps:
       - label: ":python: Build Python Wheel"
         plugins:
           - docker#v5.11.0:
-              image: "rustlang/rust:nightly-bullseye"
+              image: "$RUST_IMAGE"
               workdir: /workdir
               volumes:
                 - ".:/workdir"
@@ -128,7 +129,7 @@ steps:
       - label: ":rust: Rust Unit Tests"
         plugins:
           - docker#v5.11.0:
-              image: "rustlang/rust:nightly-bullseye"
+              image: "$RUST_IMAGE"
               workdir: /workdir
               volumes:
                 - ".:/workdir"
@@ -147,7 +148,7 @@ steps:
       - label: ":rust: Rust Integration Tests"
         plugins:
           - docker#v5.11.0:
-              image: "rustlang/rust:nightly-bullseye"
+              image: "$RUST_IMAGE"
               workdir: /workdir
               volumes:
                 - ".:/workdir"
@@ -166,7 +167,7 @@ steps:
       - label: ":python: Python Tests"
         plugins:
           - docker#v5.11.0:
-              image: "rustlang/rust:nightly-bullseye"
+              image: "$RUST_IMAGE"
               workdir: /workdir
               volumes:
                 - ".:/workdir"

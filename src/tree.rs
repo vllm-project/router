@@ -1544,7 +1544,7 @@ mod tests {
         let final_sizes = tree.get_used_size_per_tenant();
         println!("Final sizes after test completion: {:?}", final_sizes);
 
-        for (_, &size) in final_sizes.iter() {
+        for &size in final_sizes.values() {
             assert!(
                 size <= max_size,
                 "Tenant exceeds size limit. Final size: {}, Limit: {}",
