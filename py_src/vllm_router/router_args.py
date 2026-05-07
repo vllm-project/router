@@ -49,6 +49,8 @@ class RouterArgs:
     prefill_selector: Dict[str, str] = dataclasses.field(default_factory=dict)
     decode_selector: Dict[str, str] = dataclasses.field(default_factory=dict)
     bootstrap_port_annotation: str = "vllm.ai/bootstrap-port"
+    # ZMQ service discovery address for vLLM PD mode
+    vllm_discovery_address: Optional[str] = None
     # KV connector for PD disaggregation (nixl pull-based or mooncake push-based)
     kv_connector: str = "nixl"
     # Prometheus configuration
@@ -310,13 +312,21 @@ class RouterArgs:
             help="Label selector for decode server pods in PD mode (format: key1=value1 key2=value2)",
         )
         parser.add_argument(
+            f"--{prefix}vllm-discovery-address",
+            type=str,
+            default=None,
+            help="ZMQ service discovery address for vLLM PD mode (e.g., '0.0.0.0:30001'). "
+            "Workers register their HTTP and ZMQ addresses here.",
+        )
+        parser.add_argument(
             f"--{prefix}kv-connector",
             type=str,
             default=RouterArgs.kv_connector,
-            choices=["nixl", "mooncake"],
+            choices=["nixl", "mooncake", "moriio"],
             help="KV connector type for PD disaggregation. 'nixl' (default) uses NIXL's "
             "pull-based KV transfer; 'mooncake' uses Mooncake's push-based protocol "
-            "(queries each prefill node's bootstrap server for engine_id per DP rank).",
+            "(queries each prefill node's bootstrap server for engine_id per DP rank); "
+            "'moriio' uses the MoRI-IO connector (either READ or WRITE modes).",
         )
         # Prometheus configuration
         parser.add_argument(
@@ -511,7 +521,7 @@ class RouterArgs:
         # Validate configuration based on mode
         if self.vllm_pd_disaggregation:
             # Validate PD configuration - skip URL requirements if using service discovery
-            if not self.service_discovery:
+            if not self.service_discovery and not self.vllm_discovery_address:
                 if not self.prefill_urls:
                     raise ValueError("PD disaggregation mode requires --prefill")
                 if not self.decode_urls:

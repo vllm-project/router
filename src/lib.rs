@@ -61,6 +61,7 @@ struct Router {
     request_timeout_secs: u64,
     request_id_headers: Option<Vec<String>>,
     vllm_pd_disaggregation: bool,
+    vllm_discovery_address: Option<String>,
     prefill_urls: Option<Vec<(String, Option<u16>)>>,
     decode_urls: Option<Vec<String>>,
     prefill_policy: Option<PolicyType>,
@@ -138,7 +139,7 @@ impl Router {
                 decode_urls: self.decode_urls.clone().unwrap_or_default(),
                 prefill_policy: self.prefill_policy.as_ref().map(convert_policy),
                 decode_policy: self.decode_policy.as_ref().map(convert_policy),
-                discovery_address: None,
+                discovery_address: self.vllm_discovery_address.clone(),
             }
         } else {
             RoutingMode::Regular {
@@ -226,10 +227,11 @@ impl Router {
             kv_connector: match self.kv_connector.to_ascii_lowercase().as_str() {
                 "nixl" => config::KvConnector::Nixl,
                 "mooncake" => config::KvConnector::Mooncake,
+                "moriio" => config::KvConnector::MoriIO,
                 other => {
                     return Err(config::ConfigError::ValidationFailed {
                         reason: format!(
-                            "Invalid kv_connector '{}': expected 'nixl' or 'mooncake'",
+                            "Invalid kv_connector '{}': expected 'nixl', 'mooncake', or 'moriio'",
                             other
                         ),
                     });
@@ -272,6 +274,7 @@ impl Router {
         request_timeout_secs = 1800,  // Add configurable request timeout
         request_id_headers = None,  // Custom request ID headers
         vllm_pd_disaggregation = false,  // New flag for PD mode
+        vllm_discovery_address = None,
         prefill_urls = None,
         decode_urls = None,
         prefill_policy = None,
@@ -339,6 +342,7 @@ impl Router {
         request_timeout_secs: u64,
         request_id_headers: Option<Vec<String>>,
         vllm_pd_disaggregation: bool,
+        vllm_discovery_address: Option<String>,
         prefill_urls: Option<Vec<(String, Option<u16>)>>,
         decode_urls: Option<Vec<String>>,
         prefill_policy: Option<PolicyType>,
@@ -399,6 +403,7 @@ impl Router {
             request_timeout_secs,
             request_id_headers,
             vllm_pd_disaggregation,
+            vllm_discovery_address,
             prefill_urls,
             decode_urls,
             prefill_policy,

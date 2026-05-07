@@ -1,9 +1,11 @@
 // vLLM Service Discovery Implementation
-// This module implements service discovery for vLLM P2P NCCL coordination
+// This module implements service discovery for vLLM P2P NCCL and MoRI-IO
+// connector coordination
 
+use crate::config::KvConnector;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
@@ -36,6 +38,31 @@ pub struct ServiceRegistration {
     pub zmq_address: String,
 }
 
+/// MoRI-IO transfer mode, determined from the first instance registration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MoriIOTransferMode {
+    Read,
+    Write,
+}
+
+/// MoRI-IO-specific service registration data.
+#[derive(Debug, Clone, Deserialize)]
+pub struct MoriIOServiceRegistration {
+    #[serde(flatten)]
+    pub base: ServiceRegistration,
+    pub transfer_mode: String, // "READ" or "WRITE"
+}
+
+impl MoriIOServiceRegistration {
+    pub fn parsed_transfer_mode(&self) -> Option<MoriIOTransferMode> {
+        match self.transfer_mode.as_str() {
+            "READ" => Some(MoriIOTransferMode::Read),
+            "WRITE" => Some(MoriIOTransferMode::Write),
+            _ => None,
+        }
+    }
+}
+
 /// Service instance with expiration timestamp
 #[derive(Debug, Clone)]
 pub struct ServiceInstance {
@@ -49,6 +76,62 @@ pub struct ServiceRegistry {
     prefill_instances: Arc<Mutex<HashMap<String, ServiceInstance>>>,
     decode_instances: Arc<Mutex<HashMap<String, ServiceInstance>>>,
     shutdown_tx: Option<broadcast::Sender<()>>,
+    /// Set on first MoRI-IO registration; subsequent mismatches are rejected.
+    pub moriio_transfer_mode: Arc<OnceLock<MoriIOTransferMode>>,
+}
+
+/// Deserialize a registration message according to the active KV connector.
+/// Returns the parsed `ServiceRegistration` and, for MoRI-IO, the validated transfer mode.
+/// Returns `None` if the message should be dropped (parse error, unknown mode, or
+/// transfer-mode mismatch). The caller is responsible for committing the transfer mode
+/// to the `OnceLock` only after the service type has been validated.
+fn parse_registration(
+    message_data: &[u8],
+    remote_address: &[u8],
+    kv_connector: KvConnector,
+    stored_transfer_mode: Option<MoriIOTransferMode>,
+) -> Option<(ServiceRegistration, Option<MoriIOTransferMode>)> {
+    if matches!(kv_connector, KvConnector::MoriIO) {
+        let reg: MoriIOServiceRegistration = match rmp_serde::from_slice(message_data) {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("Failed to parse MoRI-IO service registration: {}", e);
+                return None;
+            }
+        };
+        let mode = match reg.parsed_transfer_mode() {
+            Some(m) => m,
+            None => {
+                warn!(
+                    "Unknown MoRI-IO transfer_mode '{}' from {}; skipping",
+                    reg.transfer_mode,
+                    String::from_utf8_lossy(remote_address)
+                );
+                return None;
+            }
+        };
+        // Check for mismatch against already-committed mode without committing yet.
+        if let Some(stored) = stored_transfer_mode {
+            if stored != mode {
+                warn!(
+                    "MoRI-IO transfer_mode mismatch: expected {:?}, got {:?} from {}; skipping",
+                    stored,
+                    mode,
+                    String::from_utf8_lossy(remote_address)
+                );
+                return None;
+            }
+        }
+        Some((reg.base, Some(mode)))
+    } else {
+        match rmp_serde::from_slice(message_data) {
+            Ok(data) => Some((data, None)),
+            Err(e) => {
+                warn!("Failed to parse service registration: {}", e);
+                None
+            }
+        }
+    }
 }
 
 impl Default for ServiceRegistry {
@@ -64,11 +147,16 @@ impl ServiceRegistry {
             prefill_instances: Arc::new(Mutex::new(HashMap::new())),
             decode_instances: Arc::new(Mutex::new(HashMap::new())),
             shutdown_tx: None,
+            moriio_transfer_mode: Arc::new(OnceLock::new()),
         }
     }
 
     /// Start the ZMQ service discovery listener
-    pub async fn start_listener(&mut self, bind_address: &str) -> Result<(), String> {
+    pub async fn start_listener(
+        &mut self,
+        bind_address: &str,
+        kv_connector: KvConnector,
+    ) -> Result<(), String> {
         info!(
             "Starting vLLM service discovery listener on {}",
             bind_address
@@ -79,6 +167,7 @@ impl ServiceRegistry {
 
         let prefill_instances = Arc::clone(&self.prefill_instances);
         let decode_instances = Arc::clone(&self.decode_instances);
+        let moriio_transfer_mode = Arc::clone(&self.moriio_transfer_mode);
         let bind_addr = bind_address.to_string();
 
         tokio::spawn(async move {
@@ -115,6 +204,8 @@ impl ServiceRegistry {
                                 &remote_address,
                                 &prefill_instances,
                                 &decode_instances,
+                                kv_connector,
+                                &moriio_transfer_mode,
                             )
                             .await;
                         }
@@ -143,14 +234,17 @@ impl ServiceRegistry {
         remote_address: &[u8],
         prefill_instances: &Arc<Mutex<HashMap<String, ServiceInstance>>>,
         decode_instances: &Arc<Mutex<HashMap<String, ServiceInstance>>>,
+        kv_connector: KvConnector,
+        moriio_transfer_mode: &Arc<OnceLock<MoriIOTransferMode>>,
     ) {
-        // Parse MessagePack data
-        let data: ServiceRegistration = match rmp_serde::from_slice(message_data) {
-            Ok(data) => data,
-            Err(e) => {
-                warn!("Failed to parse service registration: {}", e);
-                return;
-            }
+        let (data, parsed_mode) = match parse_registration(
+            message_data,
+            remote_address,
+            kv_connector,
+            moriio_transfer_mode.get().copied(),
+        ) {
+            Some(parsed) => parsed,
+            None => return,
         };
 
         let current_time = SystemTime::now()
@@ -164,6 +258,18 @@ impl ServiceRegistry {
         };
 
         let remote_addr_str = String::from_utf8_lossy(remote_address);
+
+        match data.service_type.as_str() {
+            "P" | "D" => {
+                // Commit transfer mode only after service type is confirmed valid.
+                if let Some(mode) = parsed_mode {
+                    if moriio_transfer_mode.set(mode).is_ok() {
+                        info!("MoRI-IO transfer mode set to {:?}", mode);
+                    }
+                }
+            }
+            _ => {}
+        }
 
         match data.service_type.as_str() {
             "P" => {
@@ -308,7 +414,7 @@ impl ServiceRegistry {
             .map(|instance| instance.zmq_address.clone())
     }
 
-    /// Get all available prefill instances
+    /// Get all available prefill instances as `(http_address, zmq_address)`.
     pub fn get_prefill_instances(&self) -> Vec<(String, String)> {
         let guard = self.prefill_instances.lock().unwrap();
         guard
@@ -317,7 +423,7 @@ impl ServiceRegistry {
             .collect()
     }
 
-    /// Get all available decode instances
+    /// Get all available decode instances as `(http_address, zmq_address)`.
     pub fn get_decode_instances(&self) -> Vec<(String, String)> {
         let guard = self.decode_instances.lock().unwrap();
         guard
@@ -344,5 +450,66 @@ impl ServiceRegistry {
 impl Drop for ServiceRegistry {
     fn drop(&mut self) {
         self.shutdown();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_moriio_msgpack(service_type: &str, transfer_mode: &str) -> Vec<u8> {
+        // rmp_serde::to_vec_named produces msgpack — suitable for our deserializer.
+        rmp_serde::to_vec_named(&serde_json::json!({
+            "type": service_type,
+            "http_address": "1.2.3.4:8000",
+            "zmq_address": "host:1.2.3.4,handshake:6301,notify:61005",
+            "transfer_mode": transfer_mode,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn test_moriio_service_registration_deserializes_read() {
+        let bytes = make_moriio_msgpack("P", "READ");
+        let reg: MoriIOServiceRegistration = rmp_serde::from_slice(&bytes).unwrap();
+        assert_eq!(reg.base.service_type, "P");
+        assert_eq!(reg.base.http_address, "1.2.3.4:8000");
+        assert_eq!(reg.parsed_transfer_mode(), Some(MoriIOTransferMode::Read));
+    }
+
+    #[test]
+    fn test_moriio_service_registration_deserializes_write() {
+        let bytes = make_moriio_msgpack("D", "WRITE");
+        let reg: MoriIOServiceRegistration = rmp_serde::from_slice(&bytes).unwrap();
+        assert_eq!(reg.base.service_type, "D");
+        assert_eq!(reg.parsed_transfer_mode(), Some(MoriIOTransferMode::Write));
+    }
+
+    #[test]
+    fn test_moriio_transfer_mode_mismatch_rejected() {
+        let bytes = make_moriio_msgpack("P", "WRITE");
+        // Stored mode is READ; incoming is WRITE — should be rejected.
+        let result = parse_registration(
+            &bytes,
+            b"peer",
+            KvConnector::MoriIO,
+            Some(MoriIOTransferMode::Read),
+        );
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_moriio_transfer_mode_consistent_registration_accepted() {
+        let bytes = make_moriio_msgpack("P", "WRITE");
+        // Stored mode matches incoming mode — should be accepted.
+        let result = parse_registration(
+            &bytes,
+            b"peer",
+            KvConnector::MoriIO,
+            Some(MoriIOTransferMode::Write),
+        );
+        assert!(result.is_some());
+        let (_, mode) = result.unwrap();
+        assert_eq!(mode, Some(MoriIOTransferMode::Write));
     }
 }

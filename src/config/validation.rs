@@ -394,8 +394,18 @@ impl ConfigValidator {
         // All policies are now supported for both router types thanks to the unified trait design
         // No mode/policy restrictions needed anymore
 
-        // Check if service discovery is enabled for worker count validation
-        let has_service_discovery = config.discovery.as_ref().is_some_and(|d| d.enabled);
+        // Check if service discovery is enabled for worker count validation.
+        // This covers both K8s service discovery (config.discovery) and vLLM ZMQ
+        // service discovery (VllmPrefillDecode { discovery_address: Some(_) }).
+        let has_vllm_discovery = matches!(
+            &config.mode,
+            RoutingMode::VllmPrefillDecode {
+                discovery_address: Some(_),
+                ..
+            }
+        );
+        let has_service_discovery =
+            config.discovery.as_ref().is_some_and(|d| d.enabled) || has_vllm_discovery;
 
         // Only validate worker counts if service discovery is disabled
         if !has_service_discovery {
@@ -442,6 +452,17 @@ impl ConfigValidator {
 
         // DP-aware routing is now automatically enabled when data_parallel_size > 1
         // and is compatible with service discovery
+
+        // MoRI-IO requires service discovery: ZMQ addresses are obtained via instance
+        // registration and are not available in direct URL mode.
+        if config.kv_connector == KvConnector::MoriIO && !has_vllm_discovery {
+            return Err(ConfigError::IncompatibleConfig {
+                reason: "MoRI-IO KV connector requires service discovery to be enabled \
+                         (ZMQ addresses are obtained via instance registration). Please \
+                        run with `--vllm-discovery-address ${address}`"
+                    .to_string(),
+            });
+        }
 
         Ok(())
     }
@@ -726,5 +747,43 @@ mod tests {
         if let Err(e) = result {
             assert!(e.to_string().contains("prefill requires at least 2"));
         }
+    }
+
+    #[test]
+    fn test_moriio_requires_service_discovery() {
+        let mut config = RouterConfig::new(
+            RoutingMode::Regular {
+                worker_urls: vec!["http://worker:8000".to_string()],
+            },
+            PolicyConfig::Random,
+        );
+        config.kv_connector = KvConnector::MoriIO;
+        config.discovery = None;
+
+        let result = ConfigValidator::validate(&config);
+        assert!(result.is_err());
+        if let Err(e) = result {
+            assert!(e
+                .to_string()
+                .contains("MoRI-IO KV connector requires service discovery"));
+        }
+    }
+
+    #[test]
+    fn test_moriio_with_service_discovery_is_valid() {
+        let mut config = RouterConfig::new(
+            RoutingMode::VllmPrefillDecode {
+                prefill_urls: vec![],
+                decode_urls: vec![],
+                prefill_policy: None,
+                decode_policy: None,
+                discovery_address: Some("0.0.0.0:36367".to_string()),
+            },
+            PolicyConfig::Random,
+        );
+        config.kv_connector = KvConnector::MoriIO;
+
+        let result = ConfigValidator::validate(&config);
+        assert!(result.is_ok());
     }
 }
