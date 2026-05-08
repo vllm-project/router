@@ -295,10 +295,8 @@ steps:
   - label: "(AMD) P/D Disaggregation Test - MoRI-IO (4 GPUs)"
     key: "pd-disagg-moriio-test"
     env:
-      # AMD agents lack SSH keys for this repo; rewrite SSH to HTTPS for checkout
-      GIT_CONFIG_COUNT: "1"
-      GIT_CONFIG_KEY_0: "url.https://github.com/.insteadOf"
-      GIT_CONFIG_VALUE_0: "git@github.com:"
+      # AMD agents lack SSH keys for this repo; clone over HTTPS instead
+      BUILDKITE_REPO: "https://github.com/vllm-project/router.git"
     timeout_in_minutes: 60
     retry:
       automatic:
