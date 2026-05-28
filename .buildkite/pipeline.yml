@@ -292,9 +292,14 @@ steps:
     artifact_paths:
       - "/tmp/router.log"
 
-  - label: "(AMD) P/D Disaggregation Test - MoRI-IO (4 GPUs)"
+  - label: "(AMD) P/D Disaggregation Test - MoRI-IO read_mode={{matrix.read_mode}} (4 GPUs)"
     key: "pd-disagg-moriio-test"
     timeout_in_minutes: 60
+    matrix:
+      setup:
+        read_mode:
+          - "true"
+          - "false"
     retry:
       automatic:
         - exit_status: "*"
@@ -319,6 +324,7 @@ steps:
             - "VLLM_LOGGING_LEVEL=INFO"
             - "MORI_IO_ENABLE_NOTIFICATION=0"
             - "VLLM_ENGINE_READY_TIMEOUT_S=3600"
+            - "MORIIO_READ_MODE={{matrix.read_mode}}"
           propagate-environment: true
           command:
             - bash

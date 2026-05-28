@@ -54,6 +54,14 @@ if [[ "$KV_CONNECTOR" == "moriio" ]]; then
   DECODE_HANDSHAKE_BASE_PORT=${DECODE_HANDSHAKE_BASE_PORT:-6401}
   PREFILL_NOTIFY_BASE_PORT=${PREFILL_NOTIFY_BASE_PORT:-61005}
   DECODE_NOTIFY_BASE_PORT=${DECODE_NOTIFY_BASE_PORT:-61105}
+
+  # read_mode=true: decode pulls KV from prefill via RDMA read.
+  # read_mode=false (write mode): prefill pushes KV into decode layer-by-layer.
+  MORIIO_READ_MODE=${MORIIO_READ_MODE:-"true"}
+  if [[ "$MORIIO_READ_MODE" != "true" && "$MORIIO_READ_MODE" != "false" ]]; then
+    echo "ERROR: MORIIO_READ_MODE must be 'true' or 'false', got '${MORIIO_READ_MODE}'"
+    exit 1
+  fi
 else
   # NIXL: larger block sizes; intra-node DP exercises DP-aware routing
   PREFILL_BLOCK_SIZE=${PREFILL_BLOCK_SIZE:-128}
@@ -99,7 +107,7 @@ build_prefill_kv_config() {
   if [[ "$KV_CONNECTOR" == "moriio" ]]; then
     local handshake_port=$2
     local notify_port=$3
-    echo "{\"kv_connector\":\"MoRIIOConnector\",\"kv_role\":\"kv_producer\",\"kv_connector_extra_config\":{\"proxy_ip\":\"${PROXY_IP}\",\"proxy_ping_port\":\"${PROXY_PING_PORT}\",\"http_port\":\"${port}\",\"handshake_port\":\"${handshake_port}\",\"notify_port\":\"${notify_port}\",\"read_mode\":\"true\",\"backend\":\"xgmi\"}}"
+    echo "{\"kv_connector\":\"MoRIIOConnector\",\"kv_role\":\"kv_producer\",\"kv_connector_extra_config\":{\"proxy_ip\":\"${PROXY_IP}\",\"proxy_ping_port\":\"${PROXY_PING_PORT}\",\"http_port\":\"${port}\",\"handshake_port\":\"${handshake_port}\",\"notify_port\":\"${notify_port}\",\"read_mode\":\"${MORIIO_READ_MODE}\",\"backend\":\"xgmi\"}}"
   else
     local nixl_http_port=$2
     if [[ "$KV_BUFFER_DEVICE" == "cuda" ]]; then
@@ -115,7 +123,7 @@ build_decode_kv_config() {
   if [[ "$KV_CONNECTOR" == "moriio" ]]; then
     local handshake_port=$2
     local notify_port=$3
-    echo "{\"kv_connector\":\"MoRIIOConnector\",\"kv_role\":\"kv_consumer\",\"kv_connector_extra_config\":{\"proxy_ip\":\"${PROXY_IP}\",\"proxy_ping_port\":\"${PROXY_PING_PORT}\",\"http_port\":\"${port}\",\"handshake_port\":\"${handshake_port}\",\"notify_port\":\"${notify_port}\",\"read_mode\":\"true\",\"backend\":\"xgmi\"}}"
+    echo "{\"kv_connector\":\"MoRIIOConnector\",\"kv_role\":\"kv_consumer\",\"kv_connector_extra_config\":{\"proxy_ip\":\"${PROXY_IP}\",\"proxy_ping_port\":\"${PROXY_PING_PORT}\",\"http_port\":\"${port}\",\"handshake_port\":\"${handshake_port}\",\"notify_port\":\"${notify_port}\",\"read_mode\":\"${MORIIO_READ_MODE}\",\"backend\":\"xgmi\"}}"
   else
     local nixl_http_port=$2
     if [[ "$KV_BUFFER_DEVICE" == "cuda" ]]; then
