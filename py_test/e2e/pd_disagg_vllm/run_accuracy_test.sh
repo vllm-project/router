@@ -272,7 +272,7 @@ for i in $(seq 0 $((NUM_DECODE_INSTANCES - 1))); do
     HANDSHAKE_PORT=$((DECODE_HANDSHAKE_BASE_PORT + i))
     NOTIFY_PORT=$((DECODE_NOTIFY_BASE_PORT + i))
     INSTANCE_KV_CONFIG=$(build_decode_kv_config $PORT $HANDSHAKE_PORT $NOTIFY_PORT)
-    CONNECTOR_EXTRA_ARGS=(--all2all-backend mori --compilation-config '{"cudagraph_mode":"PIECEWISE"}')
+    CONNECTOR_EXTRA_ARGS=(--all2all-backend mori_low_latency --compilation-config '{"cudagraph_mode":"PIECEWISE"}')
     CONNECTOR_ENV="${GPU_DEVICE_VAR}=${GPU_IDS} MORI_IO_ENABLE_NOTIFICATION=0 VLLM_ENGINE_READY_TIMEOUT_S=3600"
   else
     NIXL_PORT=$((DECODE_NIXL_BASE_PORT + i))
