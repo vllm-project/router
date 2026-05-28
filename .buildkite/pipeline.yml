@@ -304,7 +304,7 @@ steps:
         reason: "GPU tests can be flaky - retry if needed"
     plugins:
       - docker#v5.11.0:
-          image: "vllm/vllm-openai-rocm:v0.20.0"
+          image: "vllm/vllm-openai-rocm:nightly"
           workdir: /workdir
           volumes:
             - ".:/workdir"
@@ -316,7 +316,6 @@ steps:
           environment:
             - "VLLM_USE_V1=1"
             - "VLLM_LOGGING_LEVEL=INFO"
-            - "VLLM_MORIIO_CONNECTOR_READ_MODE=1"
             - "MORI_IO_ENABLE_NOTIFICATION=0"
             - "VLLM_ENGINE_READY_TIMEOUT_S=3600"
           propagate-environment: true

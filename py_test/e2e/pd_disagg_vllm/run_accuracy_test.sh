@@ -99,7 +99,7 @@ build_prefill_kv_config() {
   if [[ "$KV_CONNECTOR" == "moriio" ]]; then
     local handshake_port=$2
     local notify_port=$3
-    echo "{\"kv_connector\":\"MoRIIOConnector\",\"kv_role\":\"kv_producer\",\"kv_connector_extra_config\":{\"proxy_ip\":\"${PROXY_IP}\",\"proxy_ping_port\":\"${PROXY_PING_PORT}\",\"http_port\":\"${port}\",\"handshake_port\":\"${handshake_port}\",\"notify_port\":\"${notify_port}\"}}"
+    echo "{\"kv_connector\":\"MoRIIOConnector\",\"kv_role\":\"kv_producer\",\"kv_connector_extra_config\":{\"proxy_ip\":\"${PROXY_IP}\",\"proxy_ping_port\":\"${PROXY_PING_PORT}\",\"http_port\":\"${port}\",\"handshake_port\":\"${handshake_port}\",\"notify_port\":\"${notify_port}\",\"read_mode\":\"true\",\"backend\":\"xgmi\"}}"
   else
     local nixl_http_port=$2
     if [[ "$KV_BUFFER_DEVICE" == "cuda" ]]; then
@@ -115,7 +115,7 @@ build_decode_kv_config() {
   if [[ "$KV_CONNECTOR" == "moriio" ]]; then
     local handshake_port=$2
     local notify_port=$3
-    echo "{\"kv_connector\":\"MoRIIOConnector\",\"kv_role\":\"kv_consumer\",\"kv_connector_extra_config\":{\"proxy_ip\":\"${PROXY_IP}\",\"proxy_ping_port\":\"${PROXY_PING_PORT}\",\"http_port\":\"${port}\",\"handshake_port\":\"${handshake_port}\",\"notify_port\":\"${notify_port}\"}}"
+    echo "{\"kv_connector\":\"MoRIIOConnector\",\"kv_role\":\"kv_consumer\",\"kv_connector_extra_config\":{\"proxy_ip\":\"${PROXY_IP}\",\"proxy_ping_port\":\"${PROXY_PING_PORT}\",\"http_port\":\"${port}\",\"handshake_port\":\"${handshake_port}\",\"notify_port\":\"${notify_port}\",\"read_mode\":\"true\",\"backend\":\"xgmi\"}}"
   else
     local nixl_http_port=$2
     if [[ "$KV_BUFFER_DEVICE" == "cuda" ]]; then
@@ -220,7 +220,7 @@ for i in $(seq 0 $((NUM_PREFILL_INSTANCES - 1))); do
     NOTIFY_PORT=$((PREFILL_NOTIFY_BASE_PORT + i))
     INSTANCE_KV_CONFIG=$(build_prefill_kv_config $PORT $HANDSHAKE_PORT $NOTIFY_PORT)
     CONNECTOR_EXTRA_ARGS=()
-    CONNECTOR_ENV="${GPU_DEVICE_VAR}=${GPU_IDS} VLLM_MORIIO_CONNECTOR_READ_MODE=1 MORI_IO_ENABLE_NOTIFICATION=0 VLLM_ENGINE_READY_TIMEOUT_S=3600"
+    CONNECTOR_ENV="${GPU_DEVICE_VAR}=${GPU_IDS} MORI_IO_ENABLE_NOTIFICATION=0 VLLM_ENGINE_READY_TIMEOUT_S=3600"
   else
     NIXL_PORT=$((PREFILL_NIXL_BASE_PORT + i))
     NIXL_HTTP_PORT=$((PREFILL_NIXL_HTTP_BASE_PORT + i))
@@ -273,7 +273,7 @@ for i in $(seq 0 $((NUM_DECODE_INSTANCES - 1))); do
     NOTIFY_PORT=$((DECODE_NOTIFY_BASE_PORT + i))
     INSTANCE_KV_CONFIG=$(build_decode_kv_config $PORT $HANDSHAKE_PORT $NOTIFY_PORT)
     CONNECTOR_EXTRA_ARGS=(--all2all-backend mori --compilation-config '{"cudagraph_mode":"PIECEWISE"}')
-    CONNECTOR_ENV="${GPU_DEVICE_VAR}=${GPU_IDS} VLLM_MORIIO_CONNECTOR_READ_MODE=1 MORI_IO_ENABLE_NOTIFICATION=0 VLLM_ENGINE_READY_TIMEOUT_S=3600"
+    CONNECTOR_ENV="${GPU_DEVICE_VAR}=${GPU_IDS} MORI_IO_ENABLE_NOTIFICATION=0 VLLM_ENGINE_READY_TIMEOUT_S=3600"
   else
     NIXL_PORT=$((DECODE_NIXL_BASE_PORT + i))
     NIXL_HTTP_PORT=$((DECODE_NIXL_HTTP_BASE_PORT + i))
