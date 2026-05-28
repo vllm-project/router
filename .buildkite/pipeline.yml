@@ -314,6 +314,7 @@ steps:
           shm-size: "256g"
           privileged: true
           environment:
+            - "HF_TOKEN"
             - "VLLM_USE_V1=1"
             - "VLLM_LOGGING_LEVEL=INFO"
             - "MORI_IO_ENABLE_NOTIFICATION=0"
@@ -324,6 +325,14 @@ steps:
             - -c
             - |
               set -euo pipefail
+
+              # Verify HF_TOKEN is set (required for gated models like Llama)
+              if [ -z "$${HF_TOKEN:-}" ]; then
+                echo "ERROR: HF_TOKEN is not set. This is required for gated models."
+                echo "Please configure HF_TOKEN as a Buildkite Secret in Organization Settings."
+                exit 1
+              fi
+              echo "HF_TOKEN is configured."
 
               # Install system dependencies for building the router
               apt-get update && apt-get install -y \
