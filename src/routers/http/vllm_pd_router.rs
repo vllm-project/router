@@ -1559,35 +1559,14 @@ impl VllmPDRouter {
                 }
             }
 
-            if is_streaming {
-                let stream =
-                    LoadTrackedDecodeStream::new(decode_response.bytes_stream(), decode_worker);
-                let body = Body::from_stream(stream);
-                response_builder
-                    .body(body)
-                    .map_err(|e| PDRouterError::NetworkError {
-                        message: format!("Failed to build response from {}: {}", decode_url, e),
-                    })
-            } else {
-                let body = match decode_response.bytes().await {
-                    Ok(body) => body,
-                    Err(e) => {
-                        decode_worker.decrement_load();
-                        return Err(PDRouterError::NetworkError {
-                            message: format!(
-                                "Failed to read decode response from {}: {}",
-                                decode_url, e
-                            ),
-                        });
-                    }
-                };
-                decode_worker.decrement_load();
-                response_builder
-                    .body(Body::from(body))
-                    .map_err(|e| PDRouterError::NetworkError {
-                        message: format!("Failed to build response from {}: {}", decode_url, e),
-                    })
-            }
+            let stream =
+                LoadTrackedDecodeStream::new(decode_response.bytes_stream(), decode_worker);
+            let body = Body::from_stream(stream);
+            response_builder
+                .body(body)
+                .map_err(|e| PDRouterError::NetworkError {
+                    message: format!("Failed to build response from {}: {}", decode_url, e),
+                })
         }
     }
 
