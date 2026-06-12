@@ -80,6 +80,7 @@ strum = { version = "0.26", features = ["derive"] }
 once_cell = "1.21.3"
 zmq = "0.10.0"
 rmp-serde = "1.3"
+base64 = "0.22"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
