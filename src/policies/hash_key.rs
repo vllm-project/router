@@ -51,6 +51,57 @@ pub(crate) fn extract_hash_key(
     }
 }
 
+/// Extract a raw session identifier (the *value* only, without any prefix) from
+/// HTTP headers or request body.
+///
+/// Unlike [`extract_hash_key`], this does NOT fall back to hashing the request
+/// body when no explicit session/user identifier is present; it returns `None`
+/// instead. This is used by load-balancing policies (e.g.
+/// `sticky_least_loaded`) that need a stable, externally-addressable
+/// session id so that a matching `finish_session(session_id)` call can later
+/// release the session.
+///
+/// Lookup order mirrors [`extract_hash_key`]:
+/// 1. HTTP headers: x-session-id, x-user-id, x-tenant-id, x-correlation-id, x-request-id, x-trace-id
+/// 2. Body: session_params.session_id (nested)
+/// 3. Body: user (OpenAI format)
+/// 4. Body: session_id (legacy)
+/// 5. Body: user_id (legacy)
+pub(crate) fn extract_session_id(
+    request_text: Option<&str>,
+    headers: Option<&RequestHeaders>,
+) -> Option<String> {
+    if let Some(hdrs) = headers {
+        for header_name in SESSION_HEADER_NAMES {
+            if let Some(value) = hdrs.get(*header_name) {
+                if !value.is_empty() {
+                    return Some(value.clone());
+                }
+            }
+        }
+    }
+
+    let text = request_text.unwrap_or("");
+    if text.is_empty() {
+        return None;
+    }
+
+    if let Some(session_id) = extract_nested_field_value(text, "session_params", "session_id") {
+        return Some(session_id);
+    }
+    if let Some(user) = extract_field_value(text, "user") {
+        return Some(user);
+    }
+    if let Some(session_id) = extract_field_value(text, "session_id") {
+        return Some(session_id);
+    }
+    if let Some(user_id) = extract_field_value(text, "user_id") {
+        return Some(user_id);
+    }
+
+    None
+}
+
 /// Extract hash key from HTTP headers
 pub(crate) fn extract_hash_key_from_headers(headers: &RequestHeaders) -> Option<String> {
     for header_name in SESSION_HEADER_NAMES {
@@ -475,5 +526,46 @@ mod tests {
     fn test_find_field_start_missing() {
         let text = r#"{"other": "value"}"#;
         assert_eq!(find_field_start(text, "field"), None);
+    }
+
+    // === extract_session_id tests ===
+
+    #[test]
+    fn test_extract_session_id_from_header() {
+        let mut headers = HashMap::new();
+        headers.insert("x-session-id".to_string(), "traj-42".to_string());
+        // Returns the raw value, without any "header:" prefix
+        assert_eq!(
+            extract_session_id(None, Some(&headers)),
+            Some("traj-42".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_session_id_header_priority_over_body() {
+        let mut headers = HashMap::new();
+        headers.insert("x-session-id".to_string(), "from-header".to_string());
+        let body = r#"{"session_id": "from-body"}"#;
+        assert_eq!(
+            extract_session_id(Some(body), Some(&headers)),
+            Some("from-header".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_session_id_from_body() {
+        let body = r#"{"session_id": "legacy123", "prompt": "hi"}"#;
+        assert_eq!(
+            extract_session_id(Some(body), None),
+            Some("legacy123".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_session_id_no_fallback() {
+        // No explicit session identifier -> None (unlike extract_hash_key)
+        let body = r#"{"prompt": "hello", "model": "llama"}"#;
+        assert_eq!(extract_session_id(Some(body), None), None);
+        assert_eq!(extract_session_id(None, None), None);
     }
 }

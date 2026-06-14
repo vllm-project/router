@@ -7,6 +7,7 @@
 use super::{
     CacheAwareConfig, CacheAwarePolicy, ConsistentHashPolicy, LoadBalancingPolicy,
     PowerOfTwoPolicy, RandomPolicy, RendezvousHashPolicy, RoundRobinPolicy,
+    StickyLeastLoadedPolicy,
 };
 use crate::config::types::PolicyConfig;
 use std::collections::HashMap;
@@ -172,6 +173,8 @@ impl PolicyRegistry {
             "random" => Arc::new(RandomPolicy::new()),
             "cache_aware" => Arc::new(CacheAwarePolicy::new()),
             "power_of_two" => Arc::new(PowerOfTwoPolicy::new()),
+            "consistent_hash" => Arc::new(ConsistentHashPolicy::new()),
+            "sticky_least_loaded" => Arc::new(StickyLeastLoadedPolicy::new()),
             "rendezvous_hash" => Arc::new(RendezvousHashPolicy::new()),
             _ => {
                 warn!("Unknown policy type '{}', using default", policy_type);
@@ -203,6 +206,7 @@ impl PolicyRegistry {
             }
             PolicyConfig::PowerOfTwo { .. } => Arc::new(PowerOfTwoPolicy::new()),
             PolicyConfig::ConsistentHash { .. } => Arc::new(ConsistentHashPolicy::new()),
+            PolicyConfig::StickyLeastLoaded => Arc::new(StickyLeastLoadedPolicy::new()),
             PolicyConfig::RendezvousHash => Arc::new(RendezvousHashPolicy::new()),
         }
     }
@@ -219,6 +223,31 @@ impl PolicyRegistry {
     /// Get worker counts per model
     pub fn get_worker_counts(&self) -> HashMap<String, usize> {
         self.model_worker_counts.read().unwrap().clone()
+    }
+
+    /// Mark a session as finished across all registered policies.
+    ///
+    /// Session-aware policies (e.g. `sticky_least_loaded`) will release
+    /// the replica capacity held by the session; all other policies ignore it.
+    /// This fans out to the default policy, every per-model policy, and the
+    /// prefill/decode policies (for PD mode), since we don't know which policy
+    /// instance is tracking the session.
+    pub fn finish_session(&self, session_id: &str) {
+        self.default_policy.finish_session(session_id);
+
+        {
+            let policies = self.model_policies.read().unwrap();
+            for policy in policies.values() {
+                policy.finish_session(session_id);
+            }
+        }
+
+        if let Some(policy) = self.prefill_policy.read().unwrap().as_ref() {
+            policy.finish_session(session_id);
+        }
+        if let Some(policy) = self.decode_policy.read().unwrap().as_ref() {
+            policy.finish_session(session_id);
+        }
     }
 
     /// Clear all policies (useful for testing)
