@@ -251,6 +251,21 @@ struct CliArgs {
     #[arg(long, default_value_t = 32768)]
     max_concurrent_requests: usize,
 
+    /// Queue size for pending requests when the max-concurrent limit is
+    /// reached (0 = no queue: shed immediately with HTTP 429)
+    #[arg(long, default_value_t = 100)]
+    queue_size: usize,
+
+    /// Maximum time in seconds a request may wait in the concurrency queue
+    /// before timing out
+    #[arg(long, default_value_t = 60)]
+    queue_timeout_secs: u64,
+
+    /// Token-bucket refill rate in tokens per second. Defaults to
+    /// --max-concurrent-requests when unset.
+    #[arg(long)]
+    rate_limit_tokens_per_second: Option<usize>,
+
     /// CORS allowed origins
     #[arg(long, num_args = 0..)]
     cors_allowed_origins: Vec<String>,
@@ -523,8 +538,8 @@ impl CliArgs {
                 Some(self.request_id_headers.clone())
             },
             max_concurrent_requests: self.max_concurrent_requests,
-            queue_size: 100,        // Default queue size
-            queue_timeout_secs: 60, // Default timeout
+            queue_size: self.queue_size,
+            queue_timeout_secs: self.queue_timeout_secs,
             cors_allowed_origins: self.cors_allowed_origins.clone(),
             retry: RetryConfig {
                 max_retries: self.retry_max_retries,
@@ -549,7 +564,7 @@ impl CliArgs {
                 endpoint: self.health_check_endpoint.clone(),
             },
             enable_igw: self.enable_igw,
-            rate_limit_tokens_per_second: None,
+            rate_limit_tokens_per_second: self.rate_limit_tokens_per_second,
             history_backend: match self.history_backend.as_str() {
                 "none" => HistoryBackend::None,
                 _ => HistoryBackend::Memory,
