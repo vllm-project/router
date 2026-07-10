@@ -442,9 +442,8 @@ impl VllmPDRouter {
     async fn get_nixl_info(&self, prefill_url: &str, dp_rank: Option<usize>) -> Option<Value> {
         let info = self.nixl_prefill_info.lock().await;
         if let Some(per_rank) = info.get(prefill_url) {
-            let rank = dp_rank.unwrap_or(0);
-            if let Some(identity) = per_rank.get(&rank) {
-                return Some(identity.clone());
+            if let Some(rank) = dp_rank {
+                return per_rank.get(&rank).cloned();
             }
             if let Some(identity) = per_rank.values().next() {
                 return Some(identity.clone());
