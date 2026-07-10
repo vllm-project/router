@@ -317,10 +317,7 @@ impl VllmPDRouter {
                         prefill_response_json,
                     )
                     .await?;
-                Some(Self::build_nixl_push_decode_params(
-                    &identity,
-                    request_id?,
-                ))
+                Some(Self::build_nixl_push_decode_params(&identity, request_id?))
             }
         }
     }
@@ -1158,8 +1155,12 @@ impl VllmPDRouter {
                 Ok(json) => json,
             };
             if let Some(prefill_json) = concurrent_prefill_response_json.as_ref() {
-                self.maybe_cache_nixl_push_identity(&prefill_url_key, prefill_dp_rank, prefill_json)
-                    .await;
+                self.maybe_cache_nixl_push_identity(
+                    &prefill_url_key,
+                    prefill_dp_rank,
+                    prefill_json,
+                )
+                .await;
             }
             let decode_response = match decode_result {
                 Ok(resp) => resp,
@@ -1658,9 +1659,7 @@ impl VllmPDRouter {
         let request_id = Self::generate_vllm_request_id(&prefill_zmq_addr, &decode_zmq_addr);
 
         let mut prefill_request = Self::prepare_prefill_request(original_request.clone(), path);
-        prefill_request["kv_transfer_params"] = self
-            .build_prefill_kv_transfer_params(None)
-            .ok()?;
+        prefill_request["kv_transfer_params"] = self.build_prefill_kv_transfer_params(None).ok()?;
 
         let mut decode_request = original_request.clone();
         decode_request["kv_transfer_params"] =
