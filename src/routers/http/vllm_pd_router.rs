@@ -291,7 +291,6 @@ impl VllmPDRouter {
                         "transfer_id": transfer_id.unwrap_or(""),
                         "remote_dp_size": self.intra_node_data_parallel_size,
                         "remote_tp_size": tp_size,
-                        "tp_size": tp_size,
                     });
                     if self.intra_node_data_parallel_size > 1 {
                         if let Some(rank) = prefill_dp_rank {
