@@ -279,6 +279,10 @@ impl VllmPDRouter {
             KvConnector::MoriIO => {
                 if matches!(self.moriio_transfer_mode(), Some(MoriIOTransferMode::Write)) {
                     // WRITE mode: build decode params directly; decode does not need the prefill response.
+                    let prefill_base = prefill_url.trim_start_matches("http://").trim_start_matches("https://");
+                    let (tp_size, _) = self
+                        .service_registry
+                        .get_tp_dp_size(prefill_base, ServiceType::Prefill);
                     let mut params = json!({
                         "do_remote_decode": false,
                         "do_remote_prefill": true,
@@ -286,9 +290,8 @@ impl VllmPDRouter {
                         "remote_block_ids": serde_json::Value::Null,
                         "transfer_id": transfer_id.unwrap_or(""),
                         "remote_dp_size": self.intra_node_data_parallel_size,
-                        // remote_tp_size is not yet consumed by the vLLM MoRI-IO connector;
-                        // hardcoded to 1 until https://github.com/vllm-project/vllm/issues/41211 is resolved.
-                        "remote_tp_size": 1,
+                        "remote_tp_size": tp_size,
+                        "tp_size": tp_size,
                     });
                     if self.intra_node_data_parallel_size > 1 {
                         if let Some(rank) = prefill_dp_rank {
