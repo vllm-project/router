@@ -199,7 +199,11 @@ impl VllmPDRouter {
     ///
     /// Returns an error for MoRI-IO when no transfer mode has been registered yet, so that
     /// requests are not silently dispatched in READ mode when no instances have registered.
-    fn build_prefill_kv_transfer_params(&self, transfer_id: Option<&str>) -> Result<Value, String> {
+    fn build_prefill_kv_transfer_params(
+        &self,
+        transfer_id: Option<&str>,
+        decode_base: Option<&str>,
+    ) -> Result<Value, String> {
         match self.kv_connector {
             KvConnector::Mooncake => Ok(json!({
                 "do_remote_decode": true,
@@ -215,15 +219,20 @@ impl VllmPDRouter {
                 if matches!(mode, MoriIOTransferMode::Write) {
                     // WRITE mode: prefill pushes KV blocks to decode.
                     // do_remote_decode=true tells the prefill connector to initiate the transfer.
+                    let remote_tp_size = decode_base
+                        .map(|base| {
+                            self.service_registry
+                                .get_tp_dp_size(base, ServiceType::Decode)
+                                .0
+                        })
+                        .unwrap_or(1);
                     Ok(json!({
                         "do_remote_decode": true,
                         "do_remote_prefill": false,
                         "remote_engine_id": serde_json::Value::Null,
                         "remote_block_ids": serde_json::Value::Null,
                         "remote_dp_size": self.intra_node_data_parallel_size,
-                        // remote_tp_size is not yet consumed by the vLLM MoRI-IO connector;
-                        // hardcoded to 1 until https://github.com/vllm-project/vllm/issues/41211 is resolved.
-                        "remote_tp_size": 1,
+                        "remote_tp_size": remote_tp_size,
                         "transfer_id": transfer_id.unwrap_or(""),
                     }))
                 } else {
@@ -775,19 +784,19 @@ impl VllmPDRouter {
         // Generate a connector-specific transfer_id (None for NIXL)
         let transfer_id = self.generate_transfer_id();
 
+        let (prefill_base_http, prefill_dp_rank) =
+            extract_base_http_and_dp_rank(prefill_http, self.intra_node_data_parallel_size);
+        let (decode_base_http, decode_dp_rank) =
+            extract_base_http_and_dp_rank(decode_http, self.intra_node_data_parallel_size);
+
         // Add kv_transfer_params for KV connector support at top level
         prefill_request["kv_transfer_params"] =
-            self.build_prefill_kv_transfer_params(transfer_id.as_deref())?;
+            self.build_prefill_kv_transfer_params(transfer_id.as_deref(), Some(&decode_base_http))?;
 
         debug!(
             "Added kv_transfer_params to prefill request for {:?} connector",
             self.kv_connector
         );
-
-        let (prefill_base_http, prefill_dp_rank) =
-            extract_base_http_and_dp_rank(prefill_http, self.intra_node_data_parallel_size);
-        let (decode_base_http, decode_dp_rank) =
-            extract_base_http_and_dp_rank(decode_http, self.intra_node_data_parallel_size);
 
         // Concurrent dispatch: e.g. MoRI-IO WRITE mode
         let is_concurrent_dispatch = matches!(self.kv_connector, KvConnector::MoriIO)
@@ -1158,8 +1167,9 @@ impl VllmPDRouter {
         let transfer_id = self.generate_transfer_id();
 
         // Add kv_transfer_params for KV connector support at top level
+        let decode_base_url = decode_worker.base_url().to_string();
         prefill_request["kv_transfer_params"] = self
-            .build_prefill_kv_transfer_params(transfer_id.as_deref())
+            .build_prefill_kv_transfer_params(transfer_id.as_deref(), Some(&decode_base_url))
             .map_err(|reason| PDRouterError::InvalidConfiguration { reason })?;
 
         debug!(
@@ -2541,7 +2551,7 @@ mod tests {
 
     // --- MoRI-IO WRITE mode parameter tests ---
 
-    fn moriio_write_prefill_params(transfer_id: Option<&str>, dp_size: usize) -> Value {
+    fn moriio_write_prefill_params(transfer_id: Option<&str>, dp_size: usize, tp_size: usize) -> Value {
         // Mirror the WRITE mode branch in build_prefill_kv_transfer_params.
         json!({
             "do_remote_decode": true,
@@ -2549,9 +2559,7 @@ mod tests {
             "remote_engine_id": serde_json::Value::Null,
             "remote_block_ids": serde_json::Value::Null,
             "remote_dp_size": dp_size,
-            // remote_tp_size is not yet consumed by the vLLM MoRI-IO connector;
-            // hardcoded to 1 until https://github.com/vllm-project/vllm/issues/41211 is resolved.
-            "remote_tp_size": 1,
+            "remote_tp_size": tp_size,
             "transfer_id": transfer_id.unwrap_or(""),
         })
     }
@@ -2583,12 +2591,12 @@ mod tests {
 
     #[test]
     fn test_moriio_write_prefill_params_has_do_remote_decode_true() {
-        let params = moriio_write_prefill_params(Some("tx-abc"), 1);
+        let params = moriio_write_prefill_params(Some("tx-abc"), 1, 8);
         assert_eq!(params["do_remote_decode"], true);
         assert_eq!(params["do_remote_prefill"], false);
         assert!(params["remote_engine_id"].is_null());
         assert!(params["remote_block_ids"].is_null());
-        assert_eq!(params["remote_tp_size"], 1);
+        assert_eq!(params["remote_tp_size"], 8);
         assert_eq!(params["remote_dp_size"], 1);
         assert_eq!(params["transfer_id"], "tx-abc");
     }
