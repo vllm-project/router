@@ -65,22 +65,6 @@ pub struct VllmPDRouter {
 /// Must match `MoRIIOConstants.TRANSFER_PREFIX` in the vLLM Python connector.
 const MORIIO_TRANSFER_PREFIX: &str = "tx";
 
-/// Strip the DP-rank suffix from a worker's HTTP address and return the base address
-/// plus the parsed rank. Returns `(original, None)` when DP is disabled.
-fn extract_base_http_and_dp_rank(
-    http: &str,
-    intra_node_data_parallel_size: usize,
-) -> (String, Option<usize>) {
-    if intra_node_data_parallel_size > 1 {
-        let url = format!("http://{}", http);
-        let (base, rank) = dp_utils::parse_worker_url(&url);
-        let base_http = base.replace("http://", "").replace("https://", "");
-        (base_http, rank)
-    } else {
-        (http.to_string(), None)
-    }
-}
-
 /// Build a prefill reqwest::RequestBuilder with the standard headers and dp-rank header.
 fn build_prefill_request_builder(
     http_client: &reqwest::Client,
@@ -894,10 +878,8 @@ impl VllmPDRouter {
             self.kv_connector
         );
 
-        let (prefill_base_http, prefill_dp_rank) =
-            extract_base_http_and_dp_rank(prefill_http, self.intra_node_data_parallel_size);
-        let (decode_base_http, decode_dp_rank) =
-            extract_base_http_and_dp_rank(decode_http, self.intra_node_data_parallel_size);
+        let (prefill_base_http, prefill_dp_rank) = dp_utils::parse_worker_url(prefill_http);
+        let (decode_base_http, decode_dp_rank) = dp_utils::parse_worker_url(decode_http);
         let prefill_url_key = format!("http://{}", prefill_base_http);
 
         let is_concurrent_dispatch = (matches!(self.kv_connector, KvConnector::MoriIO)
