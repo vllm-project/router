@@ -305,7 +305,12 @@ impl PdRouterBase {
             return Err(PDRouterError::WorkerAlreadyExists { url });
         }
 
-        info!("Added {} server {} as {} worker(s)", role, url, workers.len());
+        info!(
+            "Added {} server {} as {} worker(s)",
+            role,
+            url,
+            workers.len()
+        );
         for worker in workers {
             self.register_and_notify(worker);
         }
