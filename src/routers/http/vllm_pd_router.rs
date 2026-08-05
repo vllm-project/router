@@ -18,6 +18,7 @@ use axum::{
     http::{HeaderMap, Method, StatusCode},
     response::{IntoResponse, Response},
 };
+use dashmap::DashMap;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -58,6 +59,12 @@ pub struct VllmPDRouter {
     kv_connector: KvConnector,
     /// Mooncake bootstrap info: prefill base_url -> MooncakePrefillInfo
     mooncake_prefill_info: Arc<Mutex<HashMap<String, MooncakePrefillInfo>>>,
+    /// Persistent per-URL workers for policy selection. Selection previously
+    /// built throwaway `BasicWorker`s per request, so every policy saw
+    /// `load() == 0` and `processed_requests() == 0`: balance thresholds could
+    /// never trigger and tie-breaks collapsed onto the first worker. These
+    /// workers live for the router's lifetime and carry real counters.
+    policy_workers: DashMap<String, Arc<dyn Worker>>,
 }
 
 /// Transfer ID prefix used by MoRI-IO to correlate prefill and decode legs.
@@ -483,19 +490,29 @@ impl VllmPDRouter {
         request
     }
 
-    /// Convert service discovery instances to Worker objects for policy selection
-    fn instances_to_workers(instances: &[(String, String)]) -> Vec<Arc<dyn Worker>> {
-        instances
-            .iter()
-            .map(|(http_addr, _zmq_addr)| {
-                let full_url =
-                    if http_addr.starts_with("http://") || http_addr.starts_with("https://") {
-                        http_addr.clone()
-                    } else {
-                        format!("http://{}", http_addr)
-                    };
+    /// The persistent policy worker for an instance address, created on first
+    /// sight and reused for the router's lifetime so load/processed counters
+    /// accumulate across requests.
+    fn policy_worker(&self, http_addr: &str) -> Arc<dyn Worker> {
+        let full_url = if http_addr.starts_with("http://") || http_addr.starts_with("https://") {
+            http_addr.to_string()
+        } else {
+            format!("http://{}", http_addr)
+        };
+        self.policy_workers
+            .entry(full_url.clone())
+            .or_insert_with(|| {
                 Arc::new(BasicWorker::new(full_url, WorkerType::Regular)) as Arc<dyn Worker>
             })
+            .clone()
+    }
+
+    /// Convert service discovery instances to persistent Worker objects for
+    /// policy selection.
+    fn instances_to_workers(&self, instances: &[(String, String)]) -> Vec<Arc<dyn Worker>> {
+        instances
+            .iter()
+            .map(|(http_addr, _zmq_addr)| self.policy_worker(http_addr))
             .collect()
     }
 
@@ -511,7 +528,7 @@ impl VllmPDRouter {
         }
 
         // Convert instances to workers for policy selection
-        let workers = Self::instances_to_workers(instances);
+        let workers = self.instances_to_workers(instances);
 
         // Get the appropriate policy
         let policy = if is_prefill {
@@ -607,7 +624,17 @@ impl VllmPDRouter {
         );
 
         // Process two-stage vLLM request with discovered endpoints
-        match self
+        // Track in-flight load on the persistent policy workers so selection
+        // sees real imbalance. Decode residency is under-counted for
+        // streaming responses (the guard drops when the stream STARTS, not
+        // when it drains), so the load is a "committed to this worker" proxy
+        // — good enough for the balance thresholds, and the
+        // (load, processed, idx) tie-break covers the idle case.
+        let prefill_pw = self.policy_worker(&prefill_instances[prefill_idx].0);
+        let decode_pw = self.policy_worker(&decode_instances[decode_idx].0);
+        prefill_pw.increment_load();
+        decode_pw.increment_load();
+        let result = self
             .process_vllm_two_stage_request_discovered(
                 request_json,
                 &prefill_instances[prefill_idx],
@@ -615,8 +642,10 @@ impl VllmPDRouter {
                 path,
                 headers,
             )
-            .await
-        {
+            .await;
+        prefill_pw.decrement_load();
+        decode_pw.decrement_load();
+        match result {
             Ok(response) => {
                 debug!("Two-stage processing completed successfully");
                 response
@@ -1572,6 +1601,7 @@ impl VllmPDRouter {
                 intra_node_data_parallel_size: ctx.router_config.intra_node_data_parallel_size,
                 kv_connector,
                 mooncake_prefill_info: Arc::new(Mutex::new(HashMap::new())),
+                policy_workers: DashMap::new(),
             })
         } else {
             // Direct URL mode (same as PdRouterBase)
@@ -1660,6 +1690,7 @@ impl VllmPDRouter {
                 intra_node_data_parallel_size: ctx.router_config.intra_node_data_parallel_size,
                 kv_connector,
                 mooncake_prefill_info,
+                policy_workers: DashMap::new(),
             })
         }
     }
