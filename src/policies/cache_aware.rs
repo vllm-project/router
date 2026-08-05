@@ -193,10 +193,12 @@ impl CacheAwarePolicy {
         RouterMetrics::record_load_balancing_event();
         RouterMetrics::set_load_range(max_load, min_load);
 
-        // Use shortest queue when imbalanced
+        // Use shortest queue when imbalanced. Tie-break by processed count,
+        // then index: with equal loads a bare min_by_key is stable on the
+        // first worker and every tied request piles onto it.
         let min_load_idx = healthy_indices
             .iter()
-            .min_by_key(|&&idx| workers[idx].load())
+            .min_by_key(|&&idx| (workers[idx].load(), workers[idx].processed_requests(), idx))
             .copied()?;
 
         // Even in imbalanced mode, update the tree to maintain cache state
@@ -273,8 +275,20 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         let text = request_text.unwrap_or("");
 
         // Get the tree reference without locking the entire HashMap
-        // DashMap only locks the specific shard containing this key
-        let tree = self.trees.get(model_id).map(|entry| entry.value().clone());
+        // DashMap only locks the specific shard containing this key.
+        // Fall back to the sole tree when the model key mismatches: workers
+        // built from bare URLs report model_id "unknown" while init-time
+        // workers may carry the real model label (or vice versa), and a key
+        // miss here silently degrades the policy to random selection.
+        let tree = self
+            .trees
+            .get(model_id)
+            .map(|entry| entry.value().clone())
+            .or_else(|| {
+                (self.trees.len() == 1)
+                    .then(|| self.trees.iter().next().map(|e| e.value().clone()))
+                    .flatten()
+            });
 
         let keys: Vec<_> = self.trees.iter().map(|entry| entry.key().clone()).collect();
         debug!("Available tree keys: {:?}", keys);
@@ -319,10 +333,14 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
                 .position(|w| w.url() == tenant_url)
                 .filter(|&idx| workers[idx].is_healthy())
         } else {
-            // Low cache match: use worker with minimum load
+            // Low cache match: use worker with minimum load. Tie-break by
+            // processed count, then index — a bare load key is stable on the
+            // first worker whenever loads tie (e.g. an idle fleet), which
+            // funnels every new conversation to it and self-reinforces
+            // through the tree.
             healthy_indices
                 .iter()
-                .min_by_key(|&&idx| workers[idx].load())
+                .min_by_key(|&&idx| (workers[idx].load(), workers[idx].processed_requests(), idx))
                 .copied()
         };
 
