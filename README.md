@@ -77,6 +77,20 @@ vllm-router \
     --intra-node-data-parallel-size 8
 ```
 
+#### Additional Generate Paths
+
+Register extension endpoints that use the `/inference/v1/generate` request
+schema. Configured paths get typed routing, active-load accounting, retries,
+and circuit breaking. Built-in routes keep their existing handlers. Workers
+must expose same paths.
+
+```bash
+vllm-router \
+  --worker-urls http://worker1:8000 http://worker2:8000 \
+  --policy cache_aware \
+  --extra-generate-paths /custom/v1/generate
+```
+
 #### Prefill-Decode Disaggregation
 ```bash
 # When vLLM runs the NIXL connector, prefill/decode URLs are required.

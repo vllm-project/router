@@ -24,6 +24,7 @@ class TestRouterArgs:
         assert args.port == 30000
         assert args.policy == "cache_aware"
         assert args.worker_urls == []
+        assert args.extra_generate_paths == []
         assert args.vllm_pd_disaggregation is False
         assert args.prefill_urls == []
         assert args.decode_urls == []
@@ -439,6 +440,22 @@ class TestParseRouterArgs:
         assert router_args.port == 30001
         assert router_args.worker_urls == ["http://worker1:8000", "http://worker2:8000"]
         assert router_args.policy == "round_robin"
+
+    def test_parse_extra_generate_paths(self):
+        router_args = parse_router_args(
+            [
+                "--worker-urls",
+                "http://worker1:8000",
+                "--extra-generate-paths",
+                "/custom/v1/generate",
+                "/extension/generate",
+            ]
+        )
+
+        assert router_args.extra_generate_paths == [
+            "/custom/v1/generate",
+            "/extension/generate",
+        ]
 
     def test_parse_pd_args(self):
         """Test parsing PD disaggregated mode arguments."""

@@ -34,6 +34,7 @@ struct Router {
     host: String,
     port: u16,
     worker_urls: Vec<String>,
+    extra_generate_paths: Vec<String>,
     policy: PolicyType,
     worker_startup_timeout_secs: u64,
     worker_startup_check_interval: u64,
@@ -310,6 +311,7 @@ impl Router {
         otlp_traces_endpoint = None,
         // KV connector default (PD disaggregation)
         kv_connector = String::from("nixl"),
+        extra_generate_paths = vec![],
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -372,11 +374,13 @@ impl Router {
         enable_trace: bool,
         otlp_traces_endpoint: Option<String>,
         kv_connector: String,
+        extra_generate_paths: Vec<String>,
     ) -> PyResult<Self> {
         Ok(Router {
             host,
             port,
             worker_urls,
+            extra_generate_paths,
             policy,
             worker_startup_timeout_secs,
             worker_startup_check_interval,
@@ -483,26 +487,29 @@ impl Router {
 
         // Block on the async startup function
         runtime.block_on(async move {
-            server::startup(server::ServerConfig {
-                host: self.host.clone(),
-                port: self.port,
-                router_config,
-                max_payload_size: self.max_payload_size,
-                log_dir: self.log_dir.clone(),
-                log_level: self.log_level.clone(),
-                service_discovery_config,
-                prometheus_config,
-                request_timeout_secs: self.request_timeout_secs,
-                request_id_headers: self.request_id_headers.clone(),
-                trace_config: if self.enable_trace {
-                    Some(config::TraceConfig {
-                        otlp_traces_endpoint: self.otlp_traces_endpoint.clone(),
-                        ..Default::default()
-                    })
-                } else {
-                    None
+            server::startup_with_generate_paths(
+                server::ServerConfig {
+                    host: self.host.clone(),
+                    port: self.port,
+                    router_config,
+                    max_payload_size: self.max_payload_size,
+                    log_dir: self.log_dir.clone(),
+                    log_level: self.log_level.clone(),
+                    service_discovery_config,
+                    prometheus_config,
+                    request_timeout_secs: self.request_timeout_secs,
+                    request_id_headers: self.request_id_headers.clone(),
+                    trace_config: if self.enable_trace {
+                        Some(config::TraceConfig {
+                            otlp_traces_endpoint: self.otlp_traces_endpoint.clone(),
+                            ..Default::default()
+                        })
+                    } else {
+                        None
+                    },
                 },
-            })
+                self.extra_generate_paths.clone(),
+            )
             .await
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
         })

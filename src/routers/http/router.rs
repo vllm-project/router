@@ -1458,6 +1458,17 @@ impl RouterTrait for Router {
             .await
     }
 
+    async fn route_inference_generate_path(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &InferenceGenerateRequest,
+        path: &str,
+        model_id: Option<&str>,
+    ) -> Response {
+        self.route_typed_request(headers, body, path, model_id)
+            .await
+    }
+
     async fn route_chat(
         &self,
         headers: Option<&HeaderMap>,
