@@ -18,9 +18,13 @@ use axum::{
     http::{HeaderMap, Method, StatusCode},
     response::{IntoResponse, Response},
 };
+use bytes::Bytes;
+use futures_util::Stream;
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Instant;
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
@@ -63,6 +67,47 @@ pub struct VllmPDRouter {
 /// Transfer ID prefix used by MoRI-IO to correlate prefill and decode legs.
 /// Must match `MoRIIOConstants.TRANSFER_PREFIX` in the vLLM Python connector.
 const MORIIO_TRANSFER_PREFIX: &str = "tx";
+
+struct LoadTrackedDecodeStream {
+    inner: Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>,
+    worker: Option<Arc<dyn Worker>>,
+}
+
+impl LoadTrackedDecodeStream {
+    fn new(
+        stream: impl Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
+        worker: Arc<dyn Worker>,
+    ) -> Self {
+        Self {
+            inner: Box::pin(stream),
+            worker: Some(worker),
+        }
+    }
+
+    fn decrement_load_once(&mut self) {
+        if let Some(worker) = self.worker.take() {
+            worker.decrement_load();
+        }
+    }
+}
+
+impl Stream for LoadTrackedDecodeStream {
+    type Item = Result<Bytes, reqwest::Error>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let poll = self.inner.as_mut().poll_next(cx);
+        if matches!(poll, Poll::Ready(None)) {
+            self.decrement_load_once();
+        }
+        poll
+    }
+}
+
+impl Drop for LoadTrackedDecodeStream {
+    fn drop(&mut self) {
+        self.decrement_load_once();
+    }
+}
 
 /// Strip the DP-rank suffix from a worker's HTTP address and return the base address
 /// plus the parsed rank. Returns `(original, None)` when DP is disabled.
@@ -1417,11 +1462,8 @@ impl VllmPDRouter {
             }
         };
 
-        // Stop profiling on decode server after response received
+        // Stop profiling on decode server after response headers are received.
         self.stop_profiling(&decode_base_url).await;
-
-        // Decode phase complete: decrement decode load
-        decode_worker.decrement_load();
 
         let status = decode_response.status();
         let headers = decode_response.headers().clone();
@@ -1455,17 +1497,20 @@ impl VllmPDRouter {
         if needs_logprobs && !is_streaming {
             debug!("Logprobs requested and non-streaming - merging prefill and decode logprobs");
 
-            // Read decode response body
-            let decode_body =
-                decode_response
-                    .bytes()
-                    .await
-                    .map_err(|e| PDRouterError::NetworkError {
+            // Read the full decode response before releasing decode load.
+            let decode_body = match decode_response.bytes().await {
+                Ok(body) => body,
+                Err(e) => {
+                    decode_worker.decrement_load();
+                    return Err(PDRouterError::NetworkError {
                         message: format!(
                             "Failed to read decode response from {}: {}",
                             decode_url, e
                         ),
-                    })?;
+                    });
+                }
+            };
+            decode_worker.decrement_load();
 
             // Parse decode response as JSON
             let mut decode_json: Value =
@@ -1501,7 +1546,7 @@ impl VllmPDRouter {
                 }
             })
         } else {
-            // No logprobs merging needed - return decode response as-is (streaming or no logprobs)
+            // No logprobs merging needed.
             debug!(
                 "No logprobs merging needed (streaming={}, needs_logprobs={})",
                 is_streaming, needs_logprobs
@@ -1514,7 +1559,9 @@ impl VllmPDRouter {
                 }
             }
 
-            let body = Body::from_stream(decode_response.bytes_stream());
+            let stream =
+                LoadTrackedDecodeStream::new(decode_response.bytes_stream(), decode_worker);
+            let body = Body::from_stream(stream);
             response_builder
                 .body(body)
                 .map_err(|e| PDRouterError::NetworkError {
@@ -2354,6 +2401,8 @@ impl WorkerManagement for VllmPDRouter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
+    use futures_util::StreamExt;
     use serde_json::json;
 
     // --- OpenAI-style endpoint tests (chat/completions, completions) ---
@@ -2535,6 +2584,45 @@ mod tests {
         // Verify the KvConnector::Nixl variant exists and is the default.
         let connector = KvConnector::default();
         assert_eq!(connector, KvConnector::Nixl);
+    }
+
+    #[tokio::test]
+    async fn test_load_tracked_decode_stream_decrements_after_eof() {
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+            "http://decode".to_string(),
+            WorkerType::Decode,
+        ));
+        worker.increment_load();
+
+        let stream = futures_util::stream::iter(vec![
+            Ok::<Bytes, reqwest::Error>(Bytes::from_static(b"data: first\n\n")),
+            Ok::<Bytes, reqwest::Error>(Bytes::from_static(b"data: [DONE]\n\n")),
+        ]);
+        let mut stream = LoadTrackedDecodeStream::new(stream, worker.clone());
+
+        assert_eq!(worker.load(), 1);
+        assert!(stream.next().await.is_some());
+        assert_eq!(worker.load(), 1);
+        assert!(stream.next().await.is_some());
+        assert_eq!(worker.load(), 1);
+        assert!(stream.next().await.is_none());
+        assert_eq!(worker.load(), 0);
+    }
+
+    #[test]
+    fn test_load_tracked_decode_stream_decrements_on_drop() {
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+            "http://decode".to_string(),
+            WorkerType::Decode,
+        ));
+        worker.increment_load();
+
+        let stream = futures_util::stream::pending::<Result<Bytes, reqwest::Error>>();
+        let stream = LoadTrackedDecodeStream::new(stream, worker.clone());
+
+        assert_eq!(worker.load(), 1);
+        drop(stream);
+        assert_eq!(worker.load(), 0);
     }
 
     // --- MoRI-IO WRITE mode parameter tests ---
