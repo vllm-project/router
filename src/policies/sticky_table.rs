@@ -37,6 +37,13 @@ const MIGRATE_ABS_THRESHOLD: isize = 8;
 /// ...and this many times its load. Both must hold, so small absolute
 /// wobbles at low load and proportional wobbles at high load don't flap.
 const MIGRATE_REL_THRESHOLD: f64 = 2.0;
+/// ...and the request body is smaller than this. Body size is a proxy for
+/// context length, i.e. for what a migration costs: moving a session to a
+/// worker that has no prefix for it turns an incremental prefill into a
+/// full one. Trace replay showed unconditional migration doubling total
+/// prefill work and amplifying the very overload it tried to escape, so
+/// only sessions that are provably cheap to rebuild may move.
+const MIGRATE_MAX_BODY_BYTES: usize = 32 * 1024;
 
 struct SessionEntry {
     worker_url: String,
@@ -45,7 +52,36 @@ struct SessionEntry {
 
 struct Table {
     sessions: HashMap<String, SessionEntry>,
+    /// Sessions currently mapped to each worker URL. Placement tie-break:
+    /// under a uniform load snapshot (cold start, idle system) raw
+    /// least-loaded clusters every new session onto one momentarily-cool
+    /// worker; fewest-resident-sessions breaks those ties evenly.
+    resident: HashMap<String, usize>,
     last_eviction: Instant,
+}
+
+impl Table {
+    fn insert(&mut self, key: String, worker_url: String, now: Instant) {
+        *self.resident.entry(worker_url.clone()).or_insert(0) += 1;
+        if let Some(old) = self.sessions.insert(
+            key,
+            SessionEntry {
+                worker_url,
+                last_seen: now,
+            },
+        ) {
+            self.uncount(&old.worker_url);
+        }
+    }
+
+    fn uncount(&mut self, worker_url: &str) {
+        if let Some(n) = self.resident.get_mut(worker_url) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                self.resident.remove(worker_url);
+            }
+        }
+    }
 }
 
 /// Sticky-table policy: least-loaded placement, exact table stickiness.
@@ -61,6 +97,7 @@ impl StickyTablePolicy {
         Self {
             table: Mutex::new(Table {
                 sessions: HashMap::new(),
+                resident: HashMap::new(),
                 last_eviction: Instant::now(),
             }),
             cached_loads: Mutex::new(HashMap::new()),
@@ -107,14 +144,38 @@ impl StickyTablePolicy {
             .expect("candidates is non-empty")
     }
 
+    /// Placement target: least in-flight load, ties broken by fewest
+    /// resident sessions (see `Table::resident`).
+    fn placement(&self, workers: &[Arc<dyn Worker>], candidates: &[usize], table: &Table) -> usize {
+        *candidates
+            .iter()
+            .min_by_key(|&&idx| {
+                let w = workers[idx].as_ref();
+                (
+                    self.worker_load(w),
+                    table.resident.get(w.url()).copied().unwrap_or(0),
+                )
+            })
+            .expect("candidates is non-empty")
+    }
+
     fn evict_expired(&self, table: &mut Table, now: Instant) {
         if now.duration_since(table.last_eviction) < EVICTION_INTERVAL {
             return;
         }
         let before = table.sessions.len();
-        table
-            .sessions
-            .retain(|_, entry| now.duration_since(entry.last_seen) < SESSION_TTL);
+        let mut resident = std::mem::take(&mut table.resident);
+        table.sessions.retain(|_, entry| {
+            let live = now.duration_since(entry.last_seen) < SESSION_TTL;
+            if !live {
+                if let Some(n) = resident.get_mut(&entry.worker_url) {
+                    *n = n.saturating_sub(1);
+                }
+            }
+            live
+        });
+        resident.retain(|_, n| *n > 0);
+        table.resident = resident;
         table.last_eviction = now;
         let evicted = before - table.sessions.len();
         if evicted > 0 {
@@ -179,7 +240,9 @@ impl LoadBalancingPolicy for StickyTablePolicy {
                 let min_load = self.worker_load(workers[coolest].as_ref());
                 let overloaded = home_load - min_load >= MIGRATE_ABS_THRESHOLD
                     && home_load as f64 >= MIGRATE_REL_THRESHOLD * min_load.max(1) as f64;
-                if overloaded {
+                let cheap_to_move =
+                    request_text.is_some_and(|t| t.len() <= MIGRATE_MAX_BODY_BYTES);
+                if overloaded && cheap_to_move {
                     info!(
                         "Sticky table migrating session off {} (load {}) to {} (load {})",
                         workers[home].url(),
@@ -193,7 +256,7 @@ impl LoadBalancingPolicy for StickyTablePolicy {
                 }
             }
             None => {
-                let placed = self.least_loaded(workers, &healthy);
+                let placed = self.placement(workers, &healthy, &table);
                 info!(
                     "Sticky table placing new session on {} (load {}, {} sessions tracked)",
                     workers[placed].url(),
@@ -206,13 +269,7 @@ impl LoadBalancingPolicy for StickyTablePolicy {
 
         let entry_exists = table.sessions.contains_key(&key);
         if entry_exists || table.sessions.len() < MAX_SESSIONS {
-            table.sessions.insert(
-                key,
-                SessionEntry {
-                    worker_url: workers[idx].url().to_string(),
-                    last_seen: now,
-                },
-            );
+            table.insert(key, workers[idx].url().to_string(), now);
         } else {
             debug!("Sticky table full ({} sessions); routing without recording", MAX_SESSIONS);
         }
@@ -242,6 +299,7 @@ impl LoadBalancingPolicy for StickyTablePolicy {
     fn reset(&self) {
         if let Ok(mut table) = self.table.lock() {
             table.sessions.clear();
+            table.resident.clear();
         }
     }
 
@@ -335,27 +393,51 @@ mod tests {
     }
 
     #[test]
-    fn session_migrates_off_overloaded_home() {
+    fn cheap_session_migrates_off_overloaded_home() {
         let policy = StickyTablePolicy::new();
         let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
         let headers = session_headers("sess-d");
+        let small_body = r#"{"messages":[{"role":"user","content":"hi"}]}"#;
 
         let first = policy
-            .select_worker_with_headers(&workers, None, Some(&headers))
+            .select_worker_with_headers(&workers, Some(small_body), Some(&headers))
             .unwrap();
         for _ in 0..MIGRATE_ABS_THRESHOLD {
             workers[first].increment_load();
         }
         let second = policy
-            .select_worker_with_headers(&workers, None, Some(&headers))
+            .select_worker_with_headers(&workers, Some(small_body), Some(&headers))
             .unwrap();
         assert_ne!(second, first);
 
         // Migration rewrites the table: the session now sticks to the new home.
         let third = policy
-            .select_worker_with_headers(&workers, None, Some(&headers))
+            .select_worker_with_headers(&workers, Some(small_body), Some(&headers))
             .unwrap();
         assert_eq!(third, second);
+    }
+
+    #[test]
+    fn expensive_session_stays_home_despite_overload() {
+        let policy = StickyTablePolicy::new();
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+        let headers = session_headers("sess-d2");
+        let big_body = format!(
+            r#"{{"messages":[{{"role":"user","content":"{}"}}]}}"#,
+            "x".repeat(MIGRATE_MAX_BODY_BYTES)
+        );
+
+        let first = policy
+            .select_worker_with_headers(&workers, Some(&big_body), Some(&headers))
+            .unwrap();
+        for _ in 0..2 * MIGRATE_ABS_THRESHOLD as usize {
+            workers[first].increment_load();
+        }
+        // Re-prefilling a huge context costs more than queueing saves.
+        let second = policy
+            .select_worker_with_headers(&workers, Some(&big_body), Some(&headers))
+            .unwrap();
+        assert_eq!(second, first);
     }
 
     #[test]
