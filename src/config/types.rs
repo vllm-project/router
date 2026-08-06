@@ -246,6 +246,9 @@ pub enum PolicyConfig {
 
     #[serde(rename = "rendezvous_hash")]
     RendezvousHash,
+
+    #[serde(rename = "sticky_table")]
+    StickyTable,
 }
 
 impl PolicyConfig {
@@ -257,6 +260,7 @@ impl PolicyConfig {
             PolicyConfig::PowerOfTwo { .. } => "power_of_two",
             PolicyConfig::ConsistentHash { .. } => "consistent_hash",
             PolicyConfig::RendezvousHash => "rendezvous_hash",
+            PolicyConfig::StickyTable => "sticky_table",
         }
     }
 }
