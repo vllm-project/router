@@ -51,6 +51,14 @@ pub struct MoriIOServiceRegistration {
     #[serde(flatten)]
     pub base: ServiceRegistration,
     pub transfer_mode: String, // "READ" or "WRITE"
+    #[serde(default = "default_one")]
+    pub tp_size: usize,
+    #[serde(default = "default_one")]
+    pub dp_size: usize,
+}
+
+fn default_one() -> usize {
+    1
 }
 
 impl MoriIOServiceRegistration {
@@ -68,6 +76,8 @@ impl MoriIOServiceRegistration {
 pub struct ServiceInstance {
     pub zmq_address: String,
     pub expires_at: u64, // Unix timestamp
+    pub tp_size: usize,
+    pub dp_size: usize,
 }
 
 /// Service registry maintaining prefill and decode instances
@@ -90,7 +100,12 @@ fn parse_registration(
     remote_address: &[u8],
     kv_connector: KvConnector,
     stored_transfer_mode: Option<MoriIOTransferMode>,
-) -> Option<(ServiceRegistration, Option<MoriIOTransferMode>)> {
+) -> Option<(
+    ServiceRegistration,
+    Option<MoriIOTransferMode>,
+    usize,
+    usize,
+)> {
     if matches!(kv_connector, KvConnector::MoriIO) {
         let reg: MoriIOServiceRegistration = match rmp_serde::from_slice(message_data) {
             Ok(r) => r,
@@ -122,10 +137,10 @@ fn parse_registration(
                 return None;
             }
         }
-        Some((reg.base, Some(mode)))
+        Some((reg.base, Some(mode), reg.tp_size, reg.dp_size))
     } else {
         match rmp_serde::from_slice(message_data) {
-            Ok(data) => Some((data, None)),
+            Ok(data) => Some((data, None, 1, 1)),
             Err(e) => {
                 warn!("Failed to parse service registration: {}", e);
                 None
@@ -237,7 +252,7 @@ impl ServiceRegistry {
         kv_connector: KvConnector,
         moriio_transfer_mode: &Arc<OnceLock<MoriIOTransferMode>>,
     ) {
-        let (data, parsed_mode) = match parse_registration(
+        let (data, parsed_mode, tp_size, dp_size) = match parse_registration(
             message_data,
             remote_address,
             kv_connector,
@@ -255,6 +270,8 @@ impl ServiceRegistry {
         let instance = ServiceInstance {
             zmq_address: data.zmq_address.clone(),
             expires_at: current_time + DEFAULT_PING_SECONDS,
+            tp_size,
+            dp_size,
         };
 
         let remote_addr_str = String::from_utf8_lossy(remote_address);
@@ -379,6 +396,8 @@ impl ServiceRegistry {
         let instance = ServiceInstance {
             zmq_address: zmq_address.clone(),
             expires_at: current_time + DEFAULT_PING_SECONDS,
+            tp_size: 1,
+            dp_size: 1,
         };
 
         match service_type {
@@ -399,6 +418,19 @@ impl ServiceRegistry {
                 );
             }
         }
+    }
+
+    /// Get tp_size and dp_size for a given HTTP address (from registration payload).
+    pub fn get_tp_dp_size(&self, http_address: &str, service_type: ServiceType) -> (usize, usize) {
+        let instances = match service_type {
+            ServiceType::Prefill => &self.prefill_instances,
+            ServiceType::Decode => &self.decode_instances,
+        };
+        let guard = instances.lock().unwrap();
+        guard
+            .get(http_address)
+            .map(|i| (i.tp_size, i.dp_size))
+            .unwrap_or((1, 1))
     }
 
     /// Get ZMQ address for a given HTTP address
@@ -509,7 +541,7 @@ mod tests {
             Some(MoriIOTransferMode::Write),
         );
         assert!(result.is_some());
-        let (_, mode) = result.unwrap();
+        let (_, mode, _, _) = result.unwrap();
         assert_eq!(mode, Some(MoriIOTransferMode::Write));
     }
 }

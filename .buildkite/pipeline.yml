@@ -56,7 +56,7 @@ steps:
 
       - label: ":python: Python Format Check"
         command: |
-          pip install black ruff
+          pip install black ruff==0.16.0
           python -m black --check py_src/ py_test/
           python -m ruff check py_src/ py_test/
         agents:
