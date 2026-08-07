@@ -1686,11 +1686,7 @@ impl VllmPDRouter {
         let decode_base_url = decode_worker.base_url().to_string();
         let mut prefill_request = Self::prepare_prefill_request(original_request.clone(), path);
         prefill_request["kv_transfer_params"] = self
-            .build_prefill_kv_transfer_params(
-                None,
-                Some(&decode_base_url),
-                decode_worker.dp_rank(),
-            )
+            .build_prefill_kv_transfer_params(None, Some(&decode_base_url), decode_worker.dp_rank())
             .ok()?;
 
         let mut decode_request = original_request.clone();
