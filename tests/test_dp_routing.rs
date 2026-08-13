@@ -115,6 +115,89 @@ mod dp_routing_tests {
         }
     }
 
+    /// Serve a vLLM-shaped `/metrics` body advertising `ranks`, so DP rank
+    /// discovery has a real endpoint to read. Returns the base URL and a
+    /// shutdown handle.
+    async fn spawn_metrics_server(ranks: &[usize]) -> (String, tokio::sync::oneshot::Sender<()>) {
+        use axum::{routing::get, Router};
+
+        let mut body = String::from(
+            "# HELP vllm:num_requests_running Number of requests in model execution batches.\n\
+             # TYPE vllm:num_requests_running gauge\n",
+        );
+        for rank in ranks {
+            body.push_str(&format!(
+                "vllm:num_requests_running{{engine=\"{}\",model_name=\"m\"}} 0.0\n",
+                rank
+            ));
+        }
+
+        let app = Router::new().route("/metrics", get(move || std::future::ready(body.clone())));
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app)
+                .with_graceful_shutdown(async move {
+                    let _ = shutdown_rx.await;
+                })
+                .await;
+        });
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        (format!("http://127.0.0.1:{}", port), shutdown_tx)
+    }
+
+    /// A `--data-parallel-hybrid-lb` node that owns global ranks 4..7 must be
+    /// addressed as @4..@7. Addressing it as @0..@3 makes vLLM reject every
+    /// request with "engine-core error", which round-robin turns into a ~50%
+    /// error rate across a two-node deployment.
+    #[tokio::test]
+    async fn test_get_dp_aware_workers_discovers_global_ranks() {
+        let (url, shutdown) = spawn_metrics_server(&[4, 5, 6, 7]).await;
+
+        let expanded = dp_utils::get_dp_aware_workers(&[url.clone()], &None, 4)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            expanded,
+            vec![
+                format!("{}@4", url),
+                format!("{}@5", url),
+                format!("{}@6", url),
+                format!("{}@7", url),
+            ]
+        );
+
+        let _ = shutdown.send(());
+    }
+
+    /// Both nodes of a DP8 hybrid-LB deployment, expanded together: the ranks
+    /// must partition 0..7 rather than repeating 0..3 twice.
+    #[tokio::test]
+    async fn test_get_dp_aware_workers_two_nodes_partition_the_rank_space() {
+        let (node1, shutdown1) = spawn_metrics_server(&[0, 1, 2, 3]).await;
+        let (node2, shutdown2) = spawn_metrics_server(&[4, 5, 6, 7]).await;
+
+        let expanded = dp_utils::get_dp_aware_workers(&[node1.clone(), node2.clone()], &None, 4)
+            .await
+            .unwrap();
+
+        let ranks: Vec<usize> = expanded
+            .iter()
+            .map(|url| dp_utils::parse_worker_url(url).1.unwrap())
+            .collect();
+        assert_eq!(ranks, vec![0, 1, 2, 3, 4, 5, 6, 7]);
+
+        let _ = shutdown1.send(());
+        let _ = shutdown2.send(());
+    }
+
     #[tokio::test]
     async fn test_get_dp_aware_workers_expansion() {
         let urls = vec![
