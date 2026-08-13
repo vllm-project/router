@@ -28,7 +28,7 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 /// Mooncake prefill bootstrap info (engine_id per dp_rank)
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct MooncakePrefillInfo {
     bootstrap_addr: String,
     dp_engine_ids: HashMap<usize, String>,
@@ -105,6 +105,28 @@ fn build_prefill_request_builder(
 }
 
 impl VllmPDRouter {
+    /// Resolve the canonical prefill URL used as the Mooncake metadata key and
+    /// the bootstrap endpoint queried for that worker.
+    fn mooncake_prefill_target(
+        prefill_url: &str,
+        bootstrap_port: Option<u16>,
+    ) -> Result<(String, String), String> {
+        let parsed = url::Url::parse(prefill_url)
+            .map_err(|e| format!("Invalid prefill URL '{}': {}", prefill_url, e))?;
+        let host = parsed
+            .host()
+            .ok_or_else(|| format!("Prefill URL '{}' has no host", prefill_url))?
+            .to_string();
+        let base_url = format!(
+            "{}://{}:{}",
+            parsed.scheme(),
+            host,
+            parsed.port().unwrap_or(8000)
+        );
+        let bootstrap_addr = format!("http://{}:{}", host, bootstrap_port.unwrap_or(8998));
+        Ok((base_url, bootstrap_addr))
+    }
+
     /// Query the Mooncake bootstrap server on a prefill node to get engine_id per dp_rank.
     /// Retries with backoff since the prefill server may not be ready at router startup.
     async fn query_mooncake_bootstrap(
@@ -182,6 +204,41 @@ impl VllmPDRouter {
             "Mooncake bootstrap query to {} failed after {} attempts",
             url, max_retries
         ))
+    }
+
+    /// Query and cache Mooncake metadata before a prefill worker becomes routable.
+    async fn prepare_mooncake_prefill(
+        &self,
+        prefill_url: &str,
+        bootstrap_port: Option<u16>,
+    ) -> Result<(String, MooncakePrefillInfo), PDRouterError> {
+        let (base_url, bootstrap_addr) = Self::mooncake_prefill_target(prefill_url, bootstrap_port)
+            .map_err(|reason| PDRouterError::InvalidConfiguration { reason })?;
+        info!(
+            "Querying Mooncake bootstrap at {} for discovered prefill {}",
+            bootstrap_addr, base_url
+        );
+        let dp_engine_ids = Self::query_mooncake_bootstrap(&self.http_client, &bootstrap_addr)
+            .await
+            .map_err(|message| PDRouterError::NetworkError { message })?;
+        if dp_engine_ids.is_empty() {
+            return Err(PDRouterError::InvalidConfiguration {
+                reason: format!(
+                    "Mooncake bootstrap at {} returned no engine IDs for prefill {}",
+                    bootstrap_addr, base_url
+                ),
+            });
+        }
+
+        let prefill_info = MooncakePrefillInfo {
+            bootstrap_addr,
+            dp_engine_ids,
+        };
+        self.mooncake_prefill_info
+            .lock()
+            .await
+            .insert(base_url.clone(), prefill_info.clone());
+        Ok((base_url, prefill_info))
     }
 
     /// Returns the MoRI-IO transfer mode if it has been set by a registration, or `None`.
@@ -1657,17 +1714,8 @@ impl VllmPDRouter {
             if matches!(kv_connector, KvConnector::Mooncake) {
                 info!("Mooncake connector enabled, querying prefill bootstrap servers...");
                 for (url, bootstrap_port) in &prefill_urls {
-                    let parsed = url::Url::parse(url)
-                        .map_err(|e| format!("Invalid prefill URL '{}': {}", url, e))?;
-                    let host = parsed.host_str().unwrap_or("127.0.0.1");
-                    let port = bootstrap_port.unwrap_or(8998);
-                    let bootstrap_addr = format!("http://{}:{}", host, port);
-                    let base_url = format!(
-                        "{}://{}:{}",
-                        parsed.scheme(),
-                        host,
-                        parsed.port().unwrap_or(8000)
-                    );
+                    let (base_url, bootstrap_addr) =
+                        Self::mooncake_prefill_target(url, *bootstrap_port)?;
 
                     info!(
                         "Querying Mooncake bootstrap at {} for prefill {}",
@@ -1720,7 +1768,29 @@ impl VllmPDRouter {
         url: String,
         bootstrap_port: Option<u16>,
     ) -> Result<String, PDRouterError> {
-        self.pd_router.add_prefill_server(url, bootstrap_port).await
+        if !matches!(self.kv_connector, KvConnector::Mooncake) {
+            return self.pd_router.add_prefill_server(url, bootstrap_port).await;
+        }
+
+        // Populate Mooncake metadata before publishing the worker. Otherwise a request can
+        // select the worker and reach decode without the required kv_transfer_params.
+        let (base_url, inserted_info) = self.prepare_mooncake_prefill(&url, bootstrap_port).await?;
+        match self
+            .pd_router
+            .add_prefill_server(url.clone(), bootstrap_port)
+            .await
+        {
+            Ok(result) => Ok(result),
+            Err(error) => {
+                // Roll back only our own value. A concurrent registration may already have
+                // refreshed this URL with newer engine IDs.
+                let mut info = self.mooncake_prefill_info.lock().await;
+                if info.get(&base_url) == Some(&inserted_info) {
+                    info.remove(&base_url);
+                }
+                Err(error)
+            }
+        }
     }
 
     /// Add a decode server to the router
@@ -2418,7 +2488,47 @@ impl WorkerManagement for VllmPDRouter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::RouterConfig;
+    use crate::server::AppContext;
+    use axum::{routing::get, Json, Router as AxumRouter};
     use serde_json::json;
+    use tokio::net::TcpListener;
+
+    async fn test_mooncake_router() -> VllmPDRouter {
+        let config = RouterConfig {
+            kv_connector: KvConnector::Mooncake,
+            worker_startup_timeout_secs: 2,
+            worker_startup_check_interval_secs: 1,
+            ..RouterConfig::default()
+        };
+        let ctx = Arc::new(
+            AppContext::new(
+                config.clone(),
+                reqwest::Client::new(),
+                config.max_concurrent_requests,
+                config.rate_limit_tokens_per_second,
+                config.api_key_validation_urls.clone(),
+            )
+            .expect("test AppContext should be valid"),
+        );
+        let pd_router = PdRouterBase::new(vec![], vec![], &ctx)
+            .await
+            .expect("empty PD router should initialize");
+        VllmPDRouter {
+            pd_router,
+            service_registry: Arc::new(ServiceRegistry::new()),
+            http_client: reqwest::Client::new(),
+            policy_registry: ctx.policy_registry.clone(),
+            use_discovery: true,
+            enable_profiling: false,
+            profile_timeout_secs: 1,
+            profiling_tasks: Arc::new(Mutex::new(HashMap::new())),
+            intra_node_data_parallel_size: 1,
+            prefill_dp_round_robin: Arc::new(AtomicUsize::new(0)),
+            kv_connector: KvConnector::Mooncake,
+            mooncake_prefill_info: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
 
     #[test]
     fn test_discovery_health_requires_prefill_and_decode_workers() {
@@ -2427,6 +2537,87 @@ mod tests {
         assert!(!discovery_is_ready(0, 1));
         assert!(discovery_is_ready(1, 1));
         assert!(discovery_is_ready(2, 3));
+    }
+
+    #[test]
+    fn test_mooncake_prefill_target_uses_explicit_and_default_ports() {
+        assert_eq!(
+            VllmPDRouter::mooncake_prefill_target("http://10.0.0.8:8080", Some(9000)).unwrap(),
+            (
+                "http://10.0.0.8:8080".to_string(),
+                "http://10.0.0.8:9000".to_string()
+            )
+        );
+        assert_eq!(
+            VllmPDRouter::mooncake_prefill_target("http://prefill.example", None).unwrap(),
+            (
+                "http://prefill.example:8000".to_string(),
+                "http://prefill.example:8998".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn test_mooncake_prefill_target_formats_ipv6() {
+        assert_eq!(
+            VllmPDRouter::mooncake_prefill_target("http://[2001:db8::8]:8080", Some(9000)).unwrap(),
+            (
+                "http://[2001:db8::8]:8080".to_string(),
+                "http://[2001:db8::8]:9000".to_string()
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn test_discovered_mooncake_prefill_queries_bootstrap_before_registration() {
+        let app = AxumRouter::new()
+            .route("/health", get(|| async { "ok" }))
+            .route(
+                "/query",
+                get(|| async { Json(json!({"0": {"engine_id": "engine-0"}})) }),
+            );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let router = test_mooncake_router().await;
+        let prefill_url = format!("http://127.0.0.1:{}", port);
+        router
+            .add_prefill_server(prefill_url.clone(), Some(port))
+            .await
+            .expect("discovered Mooncake prefill should register");
+
+        assert!(router.worker_registry().get_by_url(&prefill_url).is_some());
+        assert_eq!(
+            router.get_mooncake_info(&prefill_url, Some(0)).await,
+            Some((format!("http://127.0.0.1:{}", port), "engine-0".to_string()))
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_discovered_mooncake_prefill_without_engine_ids_is_not_registered() {
+        let app = AxumRouter::new()
+            .route("/health", get(|| async { "ok" }))
+            .route("/query", get(|| async { Json(json!({})) }));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let router = test_mooncake_router().await;
+        let prefill_url = format!("http://127.0.0.1:{}", port);
+        let error = router
+            .add_prefill_server(prefill_url.clone(), Some(port))
+            .await
+            .expect_err("empty bootstrap response must fail closed");
+
+        assert!(matches!(error, PDRouterError::InvalidConfiguration { .. }));
+        assert!(router.worker_registry().get_by_url(&prefill_url).is_none());
+        assert!(router
+            .get_mooncake_info(&prefill_url, Some(0))
+            .await
+            .is_none());
+        server.abort();
     }
 
     // --- OpenAI-style endpoint tests (chat/completions, completions) ---
