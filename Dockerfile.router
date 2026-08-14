@@ -42,8 +42,11 @@ COPY py_src ./py_src
 COPY pyproject.toml ./
 COPY README.md ./
 
-# Install Python dependencies if using Python launcher
-RUN pip install setuptools-rust wheel build requests
+# Install Python dependencies if using Python launcher. 
+# Remove pip after installation to reduce image size and avoid CVE issues with 
+# bundled deps.
+RUN pip install setuptools-rust wheel build requests \
+    && pip uninstall -y pip
 
 # Expose default router port
 EXPOSE 8080
