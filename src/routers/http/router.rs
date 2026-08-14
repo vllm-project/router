@@ -882,7 +882,7 @@ impl Router {
             }
 
             response
-        } else if load_incremented {
+        } else if load_incremented && status.is_success() {
             // For streaming with load tracking, we need to manually decrement when done
             let registry = Arc::clone(&self.worker_registry);
             let worker_url = worker_url.to_string();
@@ -940,7 +940,14 @@ impl Router {
             *response.headers_mut() = response_headers;
             response
         } else {
-            // For requests without load tracking, just stream
+            // Non-success streaming (retried, body dropped) or no load tracking: decrement now.
+            if load_incremented {
+                if let Some(worker) = self.worker_registry.get_by_url(worker_url) {
+                    worker.decrement_load();
+                    RouterMetrics::set_running_requests(worker_url, worker.load());
+                }
+            }
+
             // Preserve headers for streaming response
             let mut response_headers = header_utils::preserve_response_headers(res.headers());
             // Ensure we set the correct content-type for SSE
@@ -2256,5 +2263,255 @@ mod tests {
             baseline,
             "worker load must return exactly to baseline (no double decrement)"
         );
+    }
+
+    fn build_load_test_router(worker_url: String, max_retries: u32) -> (Router, Arc<BasicWorker>) {
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        let worker = Arc::new(BasicWorker::new(worker_url, WorkerType::Regular));
+        worker_registry.register(worker.clone());
+
+        let policy_registry = Arc::new(PolicyRegistry::new(
+            crate::config::types::PolicyConfig::CacheAware {
+                cache_threshold: 0.5,
+                balance_abs_threshold: 32,
+                balance_rel_threshold: 1.5,
+                eviction_interval_secs: 60,
+                max_tree_size: 1000,
+            },
+        ));
+
+        let (_, rx) = tokio::sync::watch::channel(HashMap::new());
+        let router = Router {
+            worker_registry,
+            policy_registry,
+            worker_startup_timeout_secs: 5,
+            worker_startup_check_interval_secs: 1,
+            intra_node_data_parallel_size: 1,
+            api_key: None,
+            client: Client::new(),
+            retry_config: RetryConfig {
+                max_retries,
+                initial_backoff_ms: 1,
+                max_backoff_ms: 5,
+                backoff_multiplier: 2.0,
+                jitter_factor: 0.0,
+            },
+            circuit_breaker_config: CircuitBreakerConfig::default(),
+            _worker_loads: Arc::new(rx),
+            _load_monitor_handle: None,
+        };
+        (router, worker)
+    }
+
+    async fn spawn_backend(app: axum::Router) -> String {
+        use tokio::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        format!("http://{}", addr)
+    }
+
+    async fn settle_load(worker: &Arc<BasicWorker>, expected: usize) -> usize {
+        for _ in 0..200 {
+            if worker.load() == expected {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        worker.load()
+    }
+
+    #[tokio::test]
+    async fn test_load_returns_to_baseline_non_streaming_retries_exhausted() {
+        use axum::{http::StatusCode, routing::post, Router as AxumRouter};
+
+        let url = spawn_backend(AxumRouter::new().route(
+            "/generate",
+            post(|| async { StatusCode::SERVICE_UNAVAILABLE }),
+        ))
+        .await;
+        let (router, worker) = build_load_test_router(url, 3);
+
+        let baseline = 5;
+        for _ in 0..baseline {
+            worker.increment_load();
+        }
+
+        let req: GenerateRequest = serde_json::from_str(r#"{"text":"hi","stream":false}"#).unwrap();
+        let response = router
+            .route_typed_request(None, &req, "/generate", None)
+            .await;
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(worker.load(), baseline);
+    }
+
+    #[tokio::test]
+    async fn test_load_returns_to_baseline_non_streaming_success() {
+        use axum::{routing::post, Json, Router as AxumRouter};
+
+        let url = spawn_backend(AxumRouter::new().route(
+            "/generate",
+            post(|| async { Json(serde_json::json!({"text": "ok"})) }),
+        ))
+        .await;
+        let (router, worker) = build_load_test_router(url, 1);
+
+        let baseline = 5;
+        for _ in 0..baseline {
+            worker.increment_load();
+        }
+
+        let req: GenerateRequest = serde_json::from_str(r#"{"text":"hi","stream":false}"#).unwrap();
+        let response = router
+            .route_typed_request(None, &req, "/generate", None)
+            .await;
+
+        assert!(response.status().is_success());
+        assert_eq!(worker.load(), baseline);
+    }
+
+    #[tokio::test]
+    async fn test_load_returns_to_baseline_non_streaming_non_retryable() {
+        use axum::{http::StatusCode, routing::post, Router as AxumRouter};
+
+        let url = spawn_backend(
+            AxumRouter::new().route("/generate", post(|| async { StatusCode::BAD_REQUEST })),
+        )
+        .await;
+        let (router, worker) = build_load_test_router(url, 3);
+
+        let baseline = 5;
+        for _ in 0..baseline {
+            worker.increment_load();
+        }
+
+        let req: GenerateRequest = serde_json::from_str(r#"{"text":"hi","stream":false}"#).unwrap();
+        let response = router
+            .route_typed_request(None, &req, "/generate", None)
+            .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(worker.load(), baseline);
+    }
+
+    #[tokio::test]
+    async fn test_load_returns_to_baseline_streaming_success() {
+        use axum::{http::header::CONTENT_TYPE, routing::post, Router as AxumRouter};
+
+        let url = spawn_backend(AxumRouter::new().route(
+            "/generate",
+            post(|| async {
+                (
+                    [(CONTENT_TYPE, "text/event-stream")],
+                    "data: {\"text\":\"hi\"}\n\ndata: [DONE]\n\n",
+                )
+            }),
+        ))
+        .await;
+        let (router, worker) = build_load_test_router(url, 1);
+
+        let baseline = 5;
+        for _ in 0..baseline {
+            worker.increment_load();
+        }
+
+        let req: GenerateRequest = serde_json::from_str(r#"{"text":"hi","stream":true}"#).unwrap();
+        let response = router
+            .route_typed_request(None, &req, "/generate", None)
+            .await;
+        assert!(response.status().is_success());
+
+        let _ = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(settle_load(&worker, baseline).await, baseline);
+    }
+
+    #[tokio::test]
+    async fn test_load_returns_to_baseline_streaming_with_retries() {
+        use axum::{http::StatusCode, routing::post, Router as AxumRouter};
+
+        let url = spawn_backend(AxumRouter::new().route(
+            "/generate",
+            post(|| async { StatusCode::SERVICE_UNAVAILABLE }),
+        ))
+        .await;
+        let (router, worker) = build_load_test_router(url, 3);
+
+        let baseline = 5;
+        for _ in 0..baseline {
+            worker.increment_load();
+        }
+
+        let req: GenerateRequest = serde_json::from_str(r#"{"text":"hi","stream":true}"#).unwrap();
+        let response = router
+            .route_typed_request(None, &req, "/generate", None)
+            .await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let _ = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(settle_load(&worker, baseline).await, baseline);
+    }
+
+    #[tokio::test]
+    async fn test_load_returns_to_baseline_on_send_failure() {
+        let (router, worker) = build_load_test_router("http://127.0.0.1:1".to_string(), 1);
+
+        let baseline = 5;
+        for _ in 0..baseline {
+            worker.increment_load();
+        }
+
+        let req: GenerateRequest = serde_json::from_str(r#"{"text":"hi","stream":false}"#).unwrap();
+        let response = router
+            .route_typed_request(None, &req, "/generate", None)
+            .await;
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(worker.load(), baseline);
+    }
+
+    #[tokio::test]
+    async fn test_streaming_retryable_does_not_leak_load() {
+        use axum::{
+            http::StatusCode, response::Response as AxumResponse, routing::post,
+            Router as AxumRouter,
+        };
+
+        let url = spawn_backend(AxumRouter::new().route(
+            "/generate",
+            post(|| async {
+                let body = axum::body::Body::from_stream(futures::stream::pending::<
+                    Result<bytes::Bytes, std::io::Error>,
+                >());
+                let mut resp = AxumResponse::new(body);
+                *resp.status_mut() = StatusCode::SERVICE_UNAVAILABLE;
+                resp
+            }),
+        ))
+        .await;
+        let (router, worker) = build_load_test_router(url, 3);
+
+        let baseline = 5;
+        for _ in 0..baseline {
+            worker.increment_load();
+        }
+
+        let req: GenerateRequest = serde_json::from_str(r#"{"text":"hi","stream":true}"#).unwrap();
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            router.route_typed_request(None, &req, "/generate", None),
+        )
+        .await
+        .expect("route_typed_request should return promptly once headers arrive");
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(settle_load(&worker, baseline).await, baseline);
     }
 }
