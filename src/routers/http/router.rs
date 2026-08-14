@@ -47,6 +47,27 @@ pub struct Router {
     _load_monitor_handle: Option<Arc<tokio::task::JoinHandle<()>>>,
 }
 
+/// RAII guard that releases a worker's in-flight load on Drop, covering every
+/// return path (including early returns and the deferred streaming task).
+struct RequestLoadGuard {
+    worker: Arc<dyn Worker>,
+}
+
+impl RequestLoadGuard {
+    fn new(worker: Arc<dyn Worker>) -> Self {
+        worker.increment_load();
+        RouterMetrics::set_running_requests(worker.url(), worker.load());
+        Self { worker }
+    }
+}
+
+impl Drop for RequestLoadGuard {
+    fn drop(&mut self) {
+        self.worker.decrement_load();
+        RouterMetrics::set_running_requests(self.worker.url(), self.worker.load());
+    }
+}
+
 impl Router {
     /// Create a new router with injected policy and client
     #[allow(clippy::too_many_arguments)]
@@ -571,12 +592,10 @@ impl Router {
                     None => self.policy_registry.get_default_policy(),
                 };
 
-                let load_incremented = if policy.name() == "cache_aware" {
-                    worker.increment_load();
-                    RouterMetrics::set_running_requests(worker.url(), worker.load());
-                    true
+                let load_guard = if policy.name() == "cache_aware" {
+                    Some(RequestLoadGuard::new(worker.clone()))
                 } else {
-                    false
+                    None
                 };
 
                 let response = self
@@ -586,7 +605,7 @@ impl Router {
                         route,
                         worker.url(),
                         is_stream,
-                        load_incremented,
+                        load_guard,
                     )
                     .await;
 
@@ -752,7 +771,7 @@ impl Router {
         route: &str,
         worker_url: &str,
         is_stream: bool,
-        load_incremented: bool, // Whether load was incremented for this request
+        load_guard: Option<RequestLoadGuard>,
     ) -> Response {
         let (mut request_builder, extracted_dp_rank, request_url) =
             if self.intra_node_data_parallel_size > 1 {
@@ -837,14 +856,6 @@ impl Router {
                     worker_url, route, e
                 );
 
-                // Decrement load on error if it was incremented
-                if load_incremented {
-                    if let Some(worker) = self.worker_registry.get_by_url(worker_url) {
-                        worker.decrement_load();
-                        RouterMetrics::set_running_requests(worker_url, worker.load());
-                    }
-                }
-
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     format!("Request failed: {}", e),
@@ -873,47 +884,23 @@ impl Router {
                 }
             };
 
-            // Decrement load counter for non-streaming requests if it was incremented
-            if load_incremented {
-                if let Some(worker) = self.worker_registry.get_by_url(worker_url) {
-                    worker.decrement_load();
-                    RouterMetrics::set_running_requests(worker_url, worker.load());
-                }
-            }
-
+            // load_guard drops on return, decrementing once.
             response
-        } else if load_incremented && status.is_success() {
-            // For streaming with load tracking, we need to manually decrement when done
-            let registry = Arc::clone(&self.worker_registry);
-            let worker_url = worker_url.to_string();
-
-            // Preserve headers for streaming response
+        } else if status.is_success() {
+            // Successful SSE stream: move the guard into the forwarding task so the
+            // decrement is deferred until the stream ends.
             let mut response_headers = header_utils::preserve_response_headers(res.headers());
-            // Ensure we set the correct content-type for SSE
             response_headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
 
             let stream = res.bytes_stream();
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
 
-            // Spawn task to forward stream and detect completion
             tokio::spawn(async move {
+                let _load_guard = load_guard;
                 let mut stream = stream;
-                let mut decremented = false;
                 while let Some(chunk) = stream.next().await {
                     match chunk {
                         Ok(bytes) => {
-                            // Check for stream end marker
-                            if bytes
-                                .as_ref()
-                                .windows(12)
-                                .any(|window| window == b"data: [DONE]")
-                            {
-                                if let Some(worker) = registry.get_by_url(&worker_url) {
-                                    worker.decrement_load();
-                                    RouterMetrics::set_running_requests(&worker_url, worker.load());
-                                    decremented = true;
-                                }
-                            }
                             if tx.send(Ok(bytes)).is_err() {
                                 break;
                             }
@@ -922,12 +909,6 @@ impl Router {
                             let _ = tx.send(Err(format!("Stream error: {}", e)));
                             break;
                         }
-                    }
-                }
-                if !decremented {
-                    if let Some(worker) = registry.get_by_url(&worker_url) {
-                        worker.decrement_load();
-                        RouterMetrics::set_running_requests(&worker_url, worker.load());
                     }
                 }
             });
@@ -940,23 +921,13 @@ impl Router {
             *response.headers_mut() = response_headers;
             response
         } else {
-            // Non-success streaming (retried, body dropped) or no load tracking: decrement now.
-            if load_incremented {
-                if let Some(worker) = self.worker_registry.get_by_url(worker_url) {
-                    worker.decrement_load();
-                    RouterMetrics::set_running_requests(worker_url, worker.load());
-                }
-            }
-
-            // Preserve headers for streaming response
+            // Non-success streaming (retried, body dropped): guard drops on return.
             let mut response_headers = header_utils::preserve_response_headers(res.headers());
-            // Ensure we set the correct content-type for SSE
             response_headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
 
             let stream = res.bytes_stream();
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
 
-            // Spawn task to forward stream
             tokio::spawn(async move {
                 let mut stream = stream;
                 while let Some(chunk) = stream.next().await {
@@ -2513,5 +2484,59 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(settle_load(&worker, baseline).await, baseline);
+    }
+
+    #[tokio::test]
+    async fn test_load_returns_to_baseline_on_dp_parse_error() {
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        let worker = Arc::new(BasicWorker::new(
+            "http://127.0.0.1:59999".to_string(),
+            WorkerType::Regular,
+        ));
+        worker_registry.register(worker.clone());
+
+        let policy_registry = Arc::new(PolicyRegistry::new(
+            crate::config::types::PolicyConfig::CacheAware {
+                cache_threshold: 0.5,
+                balance_abs_threshold: 32,
+                balance_rel_threshold: 1.5,
+                eviction_interval_secs: 60,
+                max_tree_size: 1000,
+            },
+        ));
+
+        let (_, rx) = tokio::sync::watch::channel(HashMap::new());
+        let router = Router {
+            worker_registry,
+            policy_registry,
+            worker_startup_timeout_secs: 5,
+            worker_startup_check_interval_secs: 1,
+            intra_node_data_parallel_size: 2,
+            api_key: None,
+            client: Client::new(),
+            retry_config: RetryConfig {
+                max_retries: 3,
+                initial_backoff_ms: 1,
+                max_backoff_ms: 5,
+                backoff_multiplier: 2.0,
+                jitter_factor: 0.0,
+            },
+            circuit_breaker_config: CircuitBreakerConfig::default(),
+            _worker_loads: Arc::new(rx),
+            _load_monitor_handle: None,
+        };
+
+        let baseline = 5;
+        for _ in 0..baseline {
+            worker.increment_load();
+        }
+
+        let req: GenerateRequest = serde_json::from_str(r#"{"text":"hi","stream":false}"#).unwrap();
+        let response = router
+            .route_typed_request(None, &req, "/generate", None)
+            .await;
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(worker.load(), baseline);
     }
 }
