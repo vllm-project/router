@@ -579,13 +579,6 @@ impl Router {
                     false
                 };
 
-                // Keep a clone for potential cleanup on retry
-                let worker_for_cleanup = if load_incremented {
-                    Some(worker.clone())
-                } else {
-                    None
-                };
-
                 let response = self
                     .send_typed_request(
                         headers,
@@ -601,18 +594,6 @@ impl Router {
                 // should count against the circuit breaker.
                 let status = response.status();
                 worker.record_outcome(status.is_success() || status.is_client_error());
-
-                // For retryable failures, we need to decrement load since send_typed_request
-                // won't have done it (it only decrements on success or non-retryable failures)
-                if is_retryable_status(response.status()) && load_incremented {
-                    if let Some(cleanup_worker) = worker_for_cleanup {
-                        cleanup_worker.decrement_load();
-                        RouterMetrics::set_running_requests(
-                            cleanup_worker.url(),
-                            cleanup_worker.load(),
-                        );
-                    }
-                }
 
                 response
             },
@@ -887,14 +868,6 @@ impl Router {
                     response
                 }
                 Err(e) => {
-                    // IMPORTANT: Decrement load on error before returning
-                    if load_incremented {
-                        if let Some(worker) = self.worker_registry.get_by_url(worker_url) {
-                            worker.decrement_load();
-                            RouterMetrics::set_running_requests(worker_url, worker.load());
-                        }
-                    }
-
                     let error_msg = format!("Failed to get response body: {}", e);
                     (StatusCode::INTERNAL_SERVER_ERROR, error_msg).into_response()
                 }
@@ -2214,5 +2187,74 @@ mod tests {
         );
 
         health_checker.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_load_counter_not_double_decremented_on_retryable_status() {
+        use axum::{http::StatusCode, routing::post, Router as AxumRouter};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = AxumRouter::new().route(
+            "/generate",
+            post(|| async { StatusCode::SERVICE_UNAVAILABLE }),
+        );
+        let _handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        let worker_url = format!("http://{}", addr);
+
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        let worker = Arc::new(BasicWorker::new(worker_url, WorkerType::Regular));
+        worker_registry.register(worker.clone());
+
+        let policy_registry = Arc::new(PolicyRegistry::new(
+            crate::config::types::PolicyConfig::CacheAware {
+                cache_threshold: 0.5,
+                balance_abs_threshold: 32,
+                balance_rel_threshold: 1.5,
+                eviction_interval_secs: 60,
+                max_tree_size: 1000,
+            },
+        ));
+
+        let (_, rx) = tokio::sync::watch::channel(HashMap::new());
+        let router = Router {
+            worker_registry,
+            policy_registry,
+            worker_startup_timeout_secs: 5,
+            worker_startup_check_interval_secs: 1,
+            intra_node_data_parallel_size: 1,
+            api_key: None,
+            client: Client::new(),
+            retry_config: RetryConfig {
+                max_retries: 1,
+                ..RetryConfig::default()
+            },
+            circuit_breaker_config: CircuitBreakerConfig::default(),
+            _worker_loads: Arc::new(rx),
+            _load_monitor_handle: None,
+        };
+
+        let baseline = 5;
+        for _ in 0..baseline {
+            worker.increment_load();
+        }
+        assert_eq!(worker.load(), baseline);
+
+        let req: GenerateRequest =
+            serde_json::from_str(r#"{"text":"hello","stream":false}"#).unwrap();
+        let response = router
+            .route_typed_request(None, &req, "/generate", None)
+            .await;
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            worker.load(),
+            baseline,
+            "worker load must return exactly to baseline (no double decrement)"
+        );
     }
 }
