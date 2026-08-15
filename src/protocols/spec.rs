@@ -64,7 +64,7 @@ use std::collections::HashMap;
 pub enum ChatMessage {
     System {
         role: String,
-        content: String,
+        content: UserMessageContent,
         #[serde(skip_serializing_if = "Option::is_none")]
         name: Option<String>,
     },
@@ -159,9 +159,11 @@ impl<'de> Deserialize<'de> for ChatMessage {
                 role: role.to_string(),
                 content: value
                     .get("content")
-                    .and_then(|c| c.as_str())
-                    .unwrap_or("")
-                    .to_string(),
+                    .map(|c| {
+                        serde_json::from_value(c.clone())
+                            .unwrap_or(UserMessageContent::Text(String::new()))
+                    })
+                    .unwrap_or(UserMessageContent::Text(String::new())),
                 name: value.get("name").and_then(|n| {
                     if n.is_null() {
                         None
@@ -3683,9 +3685,54 @@ mod tests {
         let message: ChatMessage = serde_json::from_str(json).unwrap();
 
         match message {
-            ChatMessage::System { content, .. } => {
-                assert_eq!(content, "You are a helpful assistant.");
-            }
+            ChatMessage::System { content, .. } => match content {
+                UserMessageContent::Text(text) => {
+                    assert_eq!(text, "You are a helpful assistant.");
+                }
+                _ => panic!("Expected Text content"),
+            },
+            _ => panic!("Expected System message"),
+        }
+    }
+
+    #[test]
+    fn test_chat_message_system_array_content_roundtrip() {
+        // Regression (issue #201): array-formatted system content must survive
+        // deserialization and re-serialization instead of being dropped to "".
+        let json = r#"{
+            "role": "system",
+            "content": [{"type": "text", "text": "You are GLM-5.2."}]
+        }"#;
+
+        let message: ChatMessage = serde_json::from_str(json).unwrap();
+
+        match &message {
+            ChatMessage::System { content, .. } => match content {
+                UserMessageContent::Parts(parts) => {
+                    assert_eq!(parts.len(), 1);
+                    match &parts[0] {
+                        ContentPart::Text { text } => assert_eq!(text, "You are GLM-5.2."),
+                        _ => panic!("Expected text part"),
+                    }
+                }
+                other => panic!("Expected Parts content, got: {:?}", other),
+            },
+            _ => panic!("Expected System message"),
+        }
+
+        // Re-serialization must preserve the array form for forwarding.
+        let serialized = serde_json::to_value(&message).unwrap();
+        assert_eq!(
+            serialized.get("content"),
+            Some(&serde_json::json!([{"type": "text", "text": "You are GLM-5.2."}])),
+        );
+
+        let reparsed: ChatMessage = serde_json::from_value(serialized).unwrap();
+        match reparsed {
+            ChatMessage::System { content, .. } => match content {
+                UserMessageContent::Parts(parts) => assert_eq!(parts.len(), 1),
+                other => panic!("Expected Parts content, got: {:?}", other),
+            },
             _ => panic!("Expected System message"),
         }
     }
