@@ -543,19 +543,41 @@ impl GenerationRequest for ChatCompletionRequest {
     }
 
     fn extract_text_for_routing(&self) -> String {
-        // Use session_id from session_params for session-based routing
-        if let Some(ref session_params) = self.session_params {
-            if let Some(session_id) = session_params.get("session_id") {
-                if let Some(session_id_str) = session_id.as_str() {
-                    if !session_id_str.trim().is_empty() {
-                        return session_id_str.to_string();
-                    }
-                }
+        // The conversation text, like the Completion and Responses impls: cache_aware
+        // matches on it with a radix tree, so returning a session id (or the empty
+        // string when there is none) collapses every request onto one prefix and the
+        // policy silently degrades to min-load. Session affinity is a separate
+        // concern, resolved from headers and the body by `hash_key::extract_hash_key`.
+        let mut buffer = String::new();
+        for message in &self.messages {
+            let text = match message {
+                ChatMessage::System { content, .. } => content.clone(),
+                ChatMessage::User { content, .. } => match content {
+                    UserMessageContent::Text(text) => text.clone(),
+                    UserMessageContent::Parts(parts) => parts
+                        .iter()
+                        .filter_map(|part| match part {
+                            ContentPart::Text { text } => Some(text.as_str()),
+                            ContentPart::ImageUrl { .. } => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                },
+                ChatMessage::Assistant { content, .. } => match content {
+                    Some(text) => text.clone(),
+                    None => continue,
+                },
+                _ => continue,
+            };
+            if text.is_empty() {
+                continue;
             }
+            if !buffer.is_empty() {
+                buffer.push('\n');
+            }
+            buffer.push_str(&text);
         }
-
-        // Return empty string if no session_id - let routing policy handle this case
-        String::new()
+        buffer
     }
 }
 
@@ -3232,6 +3254,41 @@ mod tests {
         let request: ChatCompletionRequest = serde_json::from_str(json).unwrap();
         assert!(request.model.is_none());
         assert_eq!(request.get_model(), None);
+    }
+
+    #[test]
+    fn test_chat_completion_routing_text_is_the_conversation() {
+        // cache_aware matches routing text with a radix tree, so a continued
+        // conversation must extend the text of the turn before it.
+        let first: ChatCompletionRequest = serde_json::from_str(
+            r#"{"messages": [{"role": "system", "content": "be brief"},
+                             {"role": "user", "content": "hello"}]}"#,
+        )
+        .unwrap();
+        let second: ChatCompletionRequest = serde_json::from_str(
+            r#"{"messages": [{"role": "system", "content": "be brief"},
+                             {"role": "user", "content": "hello"},
+                             {"role": "assistant", "content": "hi"},
+                             {"role": "user", "content": "again"}]}"#,
+        )
+        .unwrap();
+
+        let first_text = first.extract_text_for_routing();
+        assert_eq!(first_text, "be brief\nhello");
+        assert!(second.extract_text_for_routing().starts_with(&first_text));
+    }
+
+    #[test]
+    fn test_chat_completion_routing_text_ignores_session_params() {
+        // session_params used to be returned instead of the conversation, which
+        // left cache_aware matching on an empty string for every request.
+        let request: ChatCompletionRequest = serde_json::from_str(
+            r#"{"messages": [{"role": "user", "content": "hello"}],
+                "session_params": {"session_id": "abc"}}"#,
+        )
+        .unwrap();
+
+        assert_eq!(request.extract_text_for_routing(), "hello");
     }
 
     #[test]
