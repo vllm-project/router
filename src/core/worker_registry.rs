@@ -4,6 +4,7 @@
 
 use crate::core::{ConnectionMode, Worker, WorkerType};
 use dashmap::DashMap;
+use futures;
 use std::sync::{Arc, RwLock};
 use uuid::Uuid;
 
@@ -364,10 +365,6 @@ impl WorkerRegistry {
             let mut interval =
                 tokio::time::interval(tokio::time::Duration::from_secs(check_interval_secs));
 
-            // Counter for periodic load reset (every 10 health check cycles)
-            let mut check_count = 0u64;
-            const LOAD_RESET_INTERVAL: u64 = 10;
-
             loop {
                 interval.tick().await;
 
@@ -383,19 +380,29 @@ impl WorkerRegistry {
                     .map(|entry| entry.value().clone())
                     .collect();
 
-                // Perform health checks
-                for worker in &workers {
-                    let _ = worker.check_health_async().await; // Use async version directly
-                }
-
-                // Reset loads periodically
-                check_count += 1;
-                if check_count.is_multiple_of(LOAD_RESET_INTERVAL) {
-                    tracing::debug!("Resetting worker loads (cycle {})", check_count);
-                    for worker in &workers {
-                        worker.reset_load();
-                    }
-                }
+                // Perform health checks in parallel. Health checking must not
+                // mutate load accounting: the only reset happens when a worker
+                // transitions from unhealthy back to healthy, because any load
+                // it still reports is drift accumulated while it was down
+                // (no new requests are routed to unhealthy workers).
+                let health_futures: Vec<_> = workers
+                    .iter()
+                    .map(|worker| {
+                        let worker = worker.clone();
+                        let was_healthy = worker.is_healthy();
+                        async move {
+                            let _ = worker.check_health_async().await;
+                            if !was_healthy && worker.is_healthy() {
+                                tracing::info!(
+                                    "Worker {} recovered; resetting stale load counter",
+                                    worker.url()
+                                );
+                                worker.reset_load();
+                            }
+                        }
+                    })
+                    .collect();
+                futures::future::join_all(health_futures).await;
             }
         });
 
@@ -424,7 +431,7 @@ pub struct WorkerRegistryStats {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::{CircuitBreakerConfig, WorkerFactory};
+    use crate::core::{BasicWorker, CircuitBreakerConfig, HealthConfig, WorkerFactory};
     use std::collections::HashMap;
 
     #[test]
@@ -522,5 +529,89 @@ mod tests {
         let llama_workers_after = registry.get_by_model_fast("llama-3");
         assert_eq!(llama_workers_after.len(), 1);
         assert_eq!(llama_workers_after[0].url(), "http://worker2:8080");
+    }
+
+    /// Start a mock HTTP server whose /health endpoint always returns 200.
+    async fn start_healthy_mock_server() -> (String, tokio::task::JoinHandle<()>) {
+        use axum::{http::StatusCode, routing::get, Router as AxumRouter};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = AxumRouter::new().route("/health", get(|| async { StatusCode::OK }));
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        (format!("http://{}", addr), handle)
+    }
+
+    fn registry_worker(url: &str) -> Arc<dyn Worker> {
+        Arc::new(
+            BasicWorker::new(url.to_string(), WorkerType::Regular).with_health_config(
+                HealthConfig {
+                    timeout_secs: 2,
+                    check_interval_secs: 1,
+                    endpoint: "/health".to_string(),
+                    failure_threshold: 3,
+                    success_threshold: 1,
+                },
+            ),
+        )
+    }
+
+    /// Regression test for issue #197: health checks must not reset the load
+    /// counters of workers with requests in flight.
+    #[tokio::test]
+    async fn test_health_checker_preserves_inflight_load() {
+        let (url, _server) = start_healthy_mock_server().await;
+        let registry = WorkerRegistry::new();
+        let worker = registry_worker(&url);
+        registry.register(worker.clone());
+
+        // Simulate 5 requests in flight.
+        for _ in 0..5 {
+            worker.increment_load();
+        }
+        assert_eq!(worker.load(), 5);
+
+        // Run several health-check cycles while the "requests" are still
+        // in flight. The old implementation reset the counters every 10
+        // cycles; ensure no reset happens at all.
+        let checker = registry.start_health_checker(1);
+        tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+        checker.shutdown().await;
+
+        assert_eq!(
+            worker.load(),
+            5,
+            "health checker must not reset the load counter of a worker with in-flight requests"
+        );
+    }
+
+    /// Load counters are only reset when a worker recovers from an unhealthy
+    /// state: any remaining load is drift from the down period.
+    #[tokio::test]
+    async fn test_health_checker_resets_load_on_recovery_only() {
+        let (url, _server) = start_healthy_mock_server().await;
+        let registry = WorkerRegistry::new();
+        let worker = registry_worker(&url);
+        worker.set_healthy(false);
+        // Stale load accumulated while the worker was down.
+        for _ in 0..3 {
+            worker.increment_load();
+        }
+        registry.register(worker.clone());
+
+        let checker = registry.start_health_checker(1);
+        tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+        checker.shutdown().await;
+
+        assert!(worker.is_healthy(), "worker should have recovered");
+        assert_eq!(
+            worker.load(),
+            0,
+            "stale load must be reset on the unhealthy->healthy transition"
+        );
     }
 }
