@@ -381,24 +381,20 @@ impl WorkerRegistry {
                     .collect();
 
                 // Perform health checks in parallel. Health checking must not
-                // mutate load accounting: the only reset happens when a worker
-                // transitions from unhealthy back to healthy, because any load
-                // it still reports is drift accumulated while it was down
-                // (no new requests are routed to unhealthy workers).
+                // mutate load accounting: a failed /health probe does not
+                // cancel in-flight requests, so a worker marked unhealthy can
+                // still hold valid load when it recovers. Reset on recovery
+                // would erase that load (or erase a newly routed request's
+                // increment racing the reset), recreating the undercount that
+                // this checker previously caused. WorkerLoadGuard keeps
+                // increments and decrements paired on every request path, so
+                // no reset is needed.
                 let health_futures: Vec<_> = workers
                     .iter()
                     .map(|worker| {
                         let worker = worker.clone();
-                        let was_healthy = worker.is_healthy();
                         async move {
                             let _ = worker.check_health_async().await;
-                            if !was_healthy && worker.is_healthy() {
-                                tracing::info!(
-                                    "Worker {} recovered; resetting stale load counter",
-                                    worker.url()
-                                );
-                                worker.reset_load();
-                            }
                         }
                     })
                     .collect();
@@ -431,8 +427,75 @@ pub struct WorkerRegistryStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::error::WorkerResult;
+    use crate::core::worker::WorkerMetadata;
     use crate::core::{BasicWorker, CircuitBreakerConfig, HealthConfig, WorkerFactory};
+    use async_trait::async_trait;
     use std::collections::HashMap;
+
+    /// Test worker that skips real HTTP health checks so the health-checker
+    /// loop can be driven deterministically under paused Tokio time (no I/O).
+    #[derive(Debug)]
+    struct NoopHealthWorker(Arc<BasicWorker>);
+
+    #[async_trait]
+    impl Worker for NoopHealthWorker {
+        fn url(&self) -> &str {
+            self.0.url()
+        }
+
+        fn worker_type(&self) -> WorkerType {
+            self.0.worker_type()
+        }
+
+        fn connection_mode(&self) -> ConnectionMode {
+            self.0.connection_mode()
+        }
+
+        fn is_healthy(&self) -> bool {
+            self.0.is_healthy()
+        }
+
+        fn set_healthy(&self, healthy: bool) {
+            self.0.set_healthy(healthy);
+        }
+
+        async fn check_health_async(&self) -> WorkerResult<()> {
+            Ok(())
+        }
+
+        fn load(&self) -> usize {
+            self.0.load()
+        }
+
+        fn increment_load(&self) {
+            self.0.increment_load();
+        }
+
+        fn decrement_load(&self) {
+            self.0.decrement_load();
+        }
+
+        fn reset_load(&self) {
+            self.0.reset_load();
+        }
+
+        fn processed_requests(&self) -> usize {
+            self.0.processed_requests()
+        }
+
+        fn increment_processed(&self) {
+            self.0.increment_processed();
+        }
+
+        fn metadata(&self) -> &WorkerMetadata {
+            self.0.metadata()
+        }
+
+        fn circuit_breaker(&self) -> &crate::core::CircuitBreaker {
+            self.0.circuit_breaker()
+        }
+    }
 
     #[test]
     fn test_worker_registry() {
@@ -542,7 +605,6 @@ mod tests {
         let handle = tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         (format!("http://{}", addr), handle)
     }
 
@@ -562,11 +624,18 @@ mod tests {
 
     /// Regression test for issue #197: health checks must not reset the load
     /// counters of workers with requests in flight.
-    #[tokio::test]
+    ///
+    /// Uses paused Tokio time and a no-I/O health check to advance through
+    /// well over 10 health-check cycles, the cadence at which the previous
+    /// implementation reset load counters. This test fails against that
+    /// implementation and passes with the fix.
+    #[tokio::test(start_paused = true)]
     async fn test_health_checker_preserves_inflight_load() {
-        let (url, _server) = start_healthy_mock_server().await;
         let registry = WorkerRegistry::new();
-        let worker = registry_worker(&url);
+        let worker: Arc<dyn Worker> = Arc::new(NoopHealthWorker(Arc::new(BasicWorker::new(
+            "http://worker:8080".to_string(),
+            WorkerType::Regular,
+        ))));
         registry.register(worker.clone());
 
         // Simulate 5 requests in flight.
@@ -575,29 +644,38 @@ mod tests {
         }
         assert_eq!(worker.load(), 5);
 
-        // Run several health-check cycles while the "requests" are still
-        // in flight. The old implementation reset the counters every 10
-        // cycles; ensure no reset happens at all.
+        // Advance through 12 health-check cycles (the first tick fires
+        // immediately, so this covers check counts well past the old
+        // 10-cycle reset interval).
         let checker = registry.start_health_checker(1);
-        tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
-        checker.shutdown().await;
+        for _ in 0..12 {
+            tokio::time::advance(std::time::Duration::from_secs(1)).await;
+            tokio::task::yield_now().await;
+        }
 
         assert_eq!(
             worker.load(),
             5,
             "health checker must not reset the load counter of a worker with in-flight requests"
         );
+
+        // Under paused time the checker task cannot observe a shutdown flag
+        // until the next tick fires, so drop the handle instead of awaiting
+        // shutdown; the test runtime aborts the task.
+        drop(checker);
     }
 
-    /// Load counters are only reset when a worker recovers from an unhealthy
-    /// state: any remaining load is drift from the down period.
+    /// Load must survive an unhealthy->healthy recovery transition: a failed
+    /// /health probe does not cancel in-flight requests, so the load a worker
+    /// reports at recovery time may be real work, not drift.
     #[tokio::test]
-    async fn test_health_checker_resets_load_on_recovery_only() {
+    async fn test_health_checker_preserves_load_across_recovery() {
         let (url, _server) = start_healthy_mock_server().await;
         let registry = WorkerRegistry::new();
         let worker = registry_worker(&url);
         worker.set_healthy(false);
-        // Stale load accumulated while the worker was down.
+        // Load accumulated while the worker was down. Some of it may still
+        // be in flight when the worker recovers.
         for _ in 0..3 {
             worker.increment_load();
         }
@@ -610,8 +688,8 @@ mod tests {
         assert!(worker.is_healthy(), "worker should have recovered");
         assert_eq!(
             worker.load(),
-            0,
-            "stale load must be reset on the unhealthy->healthy transition"
+            3,
+            "load must be preserved across the unhealthy->healthy transition"
         );
     }
 }
