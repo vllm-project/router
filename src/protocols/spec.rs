@@ -294,7 +294,14 @@ pub enum SystemMessageContent {
 #[serde(tag = "type")]
 pub enum SystemContentPart {
     #[serde(rename = "text")]
-    Text { text: String },
+    Text {
+        text: String,
+        // Unknown extension fields (e.g. prompt_cache_breakpoint) are
+        // preserved for transparent forwarding instead of being silently
+        // dropped by the typed parse/reserialize round-trip.
+        #[serde(flatten)]
+        extra: serde_json::Map<String, Value>,
+    },
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -3736,7 +3743,9 @@ mod tests {
                 SystemMessageContent::Parts(parts) => {
                     assert_eq!(parts.len(), 1);
                     match &parts[0] {
-                        SystemContentPart::Text { text } => assert_eq!(text, "You are GLM-5.2."),
+                        SystemContentPart::Text { text, .. } => {
+                            assert_eq!(text, "You are GLM-5.2.");
+                        }
                     }
                 }
                 other => panic!("Expected Parts content, got: {:?}", other),
@@ -3804,6 +3813,40 @@ mod tests {
                 _ => panic!("Expected System message"),
             }
         }
+    }
+
+    #[test]
+    fn test_chat_message_system_text_part_preserves_extension_fields() {
+        // PR review P2: valid extra fields on text parts (e.g.
+        // prompt_cache_breakpoint) must survive the parse/reserialize
+        // forwarding round-trip instead of being silently dropped.
+        let json = r#"{
+            "role": "system",
+            "content": [
+                {
+                    "type": "text",
+                    "text": "Be helpful",
+                    "prompt_cache_breakpoint": {"mode": "explicit"}
+                }
+            ]
+        }"#;
+
+        let message: ChatMessage = serde_json::from_str(json).unwrap();
+        let serialized = serde_json::to_value(&message).unwrap();
+
+        assert_eq!(
+            serialized,
+            serde_json::json!({
+                "role": "system",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "Be helpful",
+                        "prompt_cache_breakpoint": {"mode": "explicit"}
+                    }
+                ]
+            }),
+        );
     }
 
     #[test]
