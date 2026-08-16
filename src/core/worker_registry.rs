@@ -388,12 +388,24 @@ impl WorkerRegistry {
                     let _ = worker.check_health_async().await; // Use async version directly
                 }
 
-                // Reset loads periodically
+                // Periodically reset load counters to clear drift, but only
+                // when all workers appear idle: an unconditional reset wipes
+                // real in-flight load for long-running requests, permanently
+                // disabling load-based routing decisions (e.g. cache_aware's
+                // min-load balance fallback). Mirrors the guarded variant in
+                // worker.rs::start_health_checker.
                 check_count += 1;
                 if check_count.is_multiple_of(LOAD_RESET_INTERVAL) {
-                    tracing::debug!("Resetting worker loads (cycle {})", check_count);
-                    for worker in &workers {
-                        worker.reset_load();
+                    let max_load = workers.iter().map(|w| w.load()).max().unwrap_or(0);
+                    if max_load <= 2 {
+                        tracing::debug!(
+                            "Resetting worker loads to clear drift (cycle {}, max_load {})",
+                            check_count,
+                            max_load
+                        );
+                        for worker in &workers {
+                            worker.reset_load();
+                        }
                     }
                 }
             }
