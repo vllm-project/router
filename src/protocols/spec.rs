@@ -64,7 +64,7 @@ use std::collections::HashMap;
 pub enum ChatMessage {
     System {
         role: String,
-        content: UserMessageContent,
+        content: SystemMessageContent,
         #[serde(skip_serializing_if = "Option::is_none")]
         name: Option<String>,
     },
@@ -157,13 +157,19 @@ impl<'de> Deserialize<'de> for ChatMessage {
             }),
             "system" => Ok(ChatMessage::System {
                 role: role.to_string(),
-                content: value
-                    .get("content")
-                    .map(|c| {
-                        serde_json::from_value(c.clone())
-                            .unwrap_or(UserMessageContent::Text(String::new()))
-                    })
-                    .unwrap_or(UserMessageContent::Text(String::new())),
+                // Strict OpenAI compatibility: array-formatted content may only
+                // contain text parts. A present but unparseable content (e.g.
+                // image_url parts) is a hard error (400) instead of silently
+                // degrading to an empty string; missing/null still defaults to
+                // empty text for backward compatibility.
+                content: match value.get("content") {
+                    None | Some(Value::Null) => SystemMessageContent::Text(String::new()),
+                    Some(c) => serde_json::from_value(c.clone()).map_err(|e| {
+                        D::Error::custom(format!(
+                            "system message content must be a string or an array of text parts: {e}"
+                        ))
+                    })?,
+                },
                 name: value.get("name").and_then(|n| {
                     if n.is_null() {
                         None
@@ -270,6 +276,24 @@ pub struct StructuredOutputsParams {
 pub enum UserMessageContent {
     Text(String),
     Parts(Vec<ContentPart>),
+}
+
+// System messages are strictly OpenAI-compatible: array-formatted content may
+// only contain text parts. Unlike User messages, non-text parts (e.g.
+// image_url) are rejected at deserialization time and surface as a 400 instead
+// of being silently dropped or forwarded.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum SystemMessageContent {
+    Text(String),
+    Parts(Vec<SystemContentPart>),
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(tag = "type")]
+pub enum SystemContentPart {
+    #[serde(rename = "text")]
+    Text { text: String },
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -3686,7 +3710,7 @@ mod tests {
 
         match message {
             ChatMessage::System { content, .. } => match content {
-                UserMessageContent::Text(text) => {
+                SystemMessageContent::Text(text) => {
                     assert_eq!(text, "You are a helpful assistant.");
                 }
                 _ => panic!("Expected Text content"),
@@ -3708,11 +3732,10 @@ mod tests {
 
         match &message {
             ChatMessage::System { content, .. } => match content {
-                UserMessageContent::Parts(parts) => {
+                SystemMessageContent::Parts(parts) => {
                     assert_eq!(parts.len(), 1);
                     match &parts[0] {
-                        ContentPart::Text { text } => assert_eq!(text, "You are GLM-5.2."),
-                        _ => panic!("Expected text part"),
+                        SystemContentPart::Text { text } => assert_eq!(text, "You are GLM-5.2."),
                     }
                 }
                 other => panic!("Expected Parts content, got: {:?}", other),
@@ -3730,10 +3753,55 @@ mod tests {
         let reparsed: ChatMessage = serde_json::from_value(serialized).unwrap();
         match reparsed {
             ChatMessage::System { content, .. } => match content {
-                UserMessageContent::Parts(parts) => assert_eq!(parts.len(), 1),
+                SystemMessageContent::Parts(parts) => assert_eq!(parts.len(), 1),
                 other => panic!("Expected Parts content, got: {:?}", other),
             },
             _ => panic!("Expected System message"),
+        }
+    }
+
+    #[test]
+    fn test_chat_message_system_rejects_non_text_parts() {
+        // Strict OpenAI compatibility: system arrays may only contain text
+        // parts. image_url (and any other non-text part) must be rejected with
+        // a deserialization error instead of being silently dropped or
+        // forwarded.
+        let cases = [
+            r#"{
+                "role": "system",
+                "content": [{"type": "image_url", "image_url": {"url": "https://example.com/x.png"}}]
+            }"#,
+            r#"{
+                "role": "system",
+                "content": [{"type": "text", "text": "ok"}, {"type": "image_url", "image_url": {"url": "x"}}]
+            }"#,
+            r#"{
+                "role": "system",
+                "content": [{"type": "text"}]
+            }"#,
+        ];
+
+        for json in cases {
+            let result: Result<ChatMessage, _> = serde_json::from_str(json);
+            assert!(
+                result.is_err(),
+                "expected deserialization error for: {json}"
+            );
+        }
+
+        // Missing or null content still defaults to empty text.
+        for json in [
+            r#"{"role": "system"}"#,
+            r#"{"role": "system", "content": null}"#,
+        ] {
+            let message: ChatMessage = serde_json::from_str(json).unwrap();
+            match message {
+                ChatMessage::System { content, .. } => match content {
+                    SystemMessageContent::Text(text) => assert_eq!(text, ""),
+                    other => panic!("Expected Text content, got: {:?}", other),
+                },
+                _ => panic!("Expected System message"),
+            }
         }
     }
 
