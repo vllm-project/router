@@ -159,9 +159,10 @@ impl<'de> Deserialize<'de> for ChatMessage {
                 role: role.to_string(),
                 // Strict OpenAI compatibility: array-formatted content may only
                 // contain text parts. A present but unparseable content (e.g.
-                // image_url parts) is a hard error (400) instead of silently
-                // degrading to an empty string; missing/null still defaults to
-                // empty text for backward compatibility.
+                // image_url parts) is a hard error (4xx, 422 via axum's Json
+                // extractor) instead of silently degrading to an empty string;
+                // missing/null still defaults to empty text for backward
+                // compatibility.
                 content: match value.get("content") {
                     None | Some(Value::Null) => SystemMessageContent::Text(String::new()),
                     Some(c) => serde_json::from_value(c.clone()).map_err(|e| {
@@ -280,8 +281,8 @@ pub enum UserMessageContent {
 
 // System messages are strictly OpenAI-compatible: array-formatted content may
 // only contain text parts. Unlike User messages, non-text parts (e.g.
-// image_url) are rejected at deserialization time and surface as a 400 instead
-// of being silently dropped or forwarded.
+// image_url) are rejected at deserialization time and surface as a 4xx (422
+// via axum's Json extractor) instead of being silently dropped or forwarded.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(untagged)]
 pub enum SystemMessageContent {
