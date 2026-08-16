@@ -502,13 +502,42 @@ impl Router {
         })
     }
 
-    /// Select worker for a specific model considering circuit breaker state
+    /// Select worker for a specific model considering circuit breaker state.
+    /// Test helper; production routing uses `_with_fallback_trace`.
+    #[cfg(test)]
     fn select_worker_for_model(
         &self,
         model_id: Option<&str>,
         text: Option<&str>,
         headers: Option<&HeaderMap>,
     ) -> Option<Arc<dyn Worker>> {
+        self.select_worker_for_model_with_fallback(model_id, text, None, headers)
+    }
+
+    /// Select worker for a specific model, optionally allowing policies to use
+    /// a fallback routing key when the primary key has weak affinity.
+    /// Test helper; production routing uses `_with_fallback_trace`.
+    #[cfg(test)]
+    fn select_worker_for_model_with_fallback(
+        &self,
+        model_id: Option<&str>,
+        text: Option<&str>,
+        fallback_text: Option<&str>,
+        headers: Option<&HeaderMap>,
+    ) -> Option<Arc<dyn Worker>> {
+        self.select_worker_for_model_with_fallback_trace(model_id, text, fallback_text, headers)
+            .map(|(worker, _decision)| worker)
+    }
+
+    /// Select worker and return a policy-specific routing decision label when
+    /// available. Used only for per-request tracing headers.
+    fn select_worker_for_model_with_fallback_trace(
+        &self,
+        model_id: Option<&str>,
+        text: Option<&str>,
+        fallback_text: Option<&str>,
+        headers: Option<&HeaderMap>,
+    ) -> Option<(Arc<dyn Worker>, Option<&'static str>)> {
         // Get workers for the specified model (O(1) lookup if model_id is provided)
         let workers = match model_id {
             Some(model) => self.worker_registry.get_by_model_fast(model),
@@ -533,8 +562,42 @@ impl Router {
         // Convert headers for policies that need them (e.g., consistent_hash)
         let request_headers = Self::headers_to_request_headers(headers);
 
-        let idx = policy.select_worker_with_headers(&available, text, request_headers.as_ref())?;
-        Some(available[idx].clone())
+        let selection = policy.select_worker_with_fallback_headers_with_decision(
+            &available,
+            text,
+            fallback_text,
+            request_headers.as_ref(),
+        )?;
+        Some((available[selection.index].clone(), selection.decision))
+    }
+
+    /// Compute the chat routing keys for the policy that will serve this
+    /// model. cache_aware gets the \x1f-terminated session key plus the
+    /// full-history fallback; every other policy keeps the pre-change
+    /// routing text (raw session id, no fallback) so hash-based policies
+    /// do not see the terminator.
+    fn chat_routing_keys(
+        &self,
+        model_id: Option<&str>,
+        body: &ChatCompletionRequest,
+    ) -> (String, Option<String>) {
+        let policy = match model_id {
+            Some(model) => self.policy_registry.get_policy_or_default(model),
+            None => self.policy_registry.get_default_policy(),
+        };
+
+        if policy.name() == "cache_aware" {
+            (
+                body.extract_session_id_key_for_routing()
+                    .unwrap_or_default(),
+                Some(body.extract_full_history_routing_text()),
+            )
+        } else {
+            (
+                body.extract_session_id_for_routing().unwrap_or_default(),
+                None,
+            )
+        }
     }
 
     pub async fn route_typed_request<T: GenerationRequest + serde::Serialize + Clone>(
@@ -544,15 +607,63 @@ impl Router {
         route: &str,
         model_id: Option<&str>,
     ) -> Response {
+        let text = typed_req.extract_text_for_routing();
+
+        self.route_typed_request_with_routing_text(headers, typed_req, route, model_id, text)
+            .await
+    }
+
+    pub async fn route_typed_request_with_routing_text<
+        T: GenerationRequest + serde::Serialize + Clone,
+    >(
+        &self,
+        headers: Option<&HeaderMap>,
+        typed_req: &T,
+        route: &str,
+        model_id: Option<&str>,
+        text: String,
+    ) -> Response {
+        self.route_typed_request_with_routing_text_fallback(
+            headers, typed_req, route, model_id, text, None,
+        )
+        .await
+    }
+
+    pub async fn route_typed_request_with_routing_text_fallback<
+        T: GenerationRequest + serde::Serialize + Clone,
+    >(
+        &self,
+        headers: Option<&HeaderMap>,
+        typed_req: &T,
+        route: &str,
+        model_id: Option<&str>,
+        text: String,
+        fallback_text: Option<String>,
+    ) -> Response {
         let start = Instant::now();
         let is_stream = typed_req.is_stream();
-        let text = typed_req.extract_text_for_routing();
 
         let response = RetryExecutor::execute_response_with_retry(
             &self.retry_config,
             // operation per attempt
             |_: u32| async {
-                let worker = match self.select_worker_for_model(model_id, Some(&text), headers) {
+                let selected_worker = if fallback_text.is_some() {
+                    self.select_worker_for_model_with_fallback_trace(
+                        model_id,
+                        Some(&text),
+                        fallback_text.as_deref(),
+                        headers,
+                    )
+                } else {
+                    self.select_worker_for_model_with_fallback_trace(
+                        model_id,
+                        Some(&text),
+                        None,
+                        headers,
+                    )
+                };
+
+                let (worker, routing_decision) = match selected_worker {
                     Some(w) => w,
                     None => {
                         RouterMetrics::record_request_error(route, "no_available_workers");
@@ -594,6 +705,7 @@ impl Router {
                         worker.url(),
                         is_stream,
                         load_incremented,
+                        routing_decision,
                     )
                     .await;
 
@@ -647,6 +759,34 @@ impl Router {
             }
         }
         worker_url.to_string()
+    }
+
+    fn add_routing_trace_headers(
+        headers: &mut HeaderMap,
+        worker_url: &str,
+        dp_rank: Option<usize>,
+        decision: Option<&str>,
+    ) {
+        if let Ok(value) = HeaderValue::from_str(worker_url) {
+            headers.insert("x-vllm-router-worker", value);
+        }
+        let base_worker = match dp_utils::extract_dp_rank(worker_url) {
+            Ok((base, _)) => base,
+            Err(_) => worker_url,
+        };
+        if let Ok(value) = HeaderValue::from_str(base_worker) {
+            headers.insert("x-vllm-router-base-worker", value);
+        }
+        if let Some(rank) = dp_rank {
+            if let Ok(value) = HeaderValue::from_str(&rank.to_string()) {
+                headers.insert("x-vllm-router-dp-rank", value);
+            }
+        }
+        if let Some(decision) = decision {
+            if let Ok(value) = HeaderValue::from_str(decision) {
+                headers.insert("x-vllm-router-decision", value);
+            }
+        }
     }
 
     // Generic simple routing for GET/POST without JSON body
@@ -764,6 +904,7 @@ impl Router {
     }
 
     // Send typed request directly without conversion
+    #[allow(clippy::too_many_arguments)]
     async fn send_typed_request<T: serde::Serialize>(
         &self,
         headers: Option<&HeaderMap>,
@@ -772,6 +913,7 @@ impl Router {
         worker_url: &str,
         is_stream: bool,
         load_incremented: bool, // Whether load was incremented for this request
+        routing_decision: Option<&str>,
     ) -> Response {
         let (mut request_builder, extracted_dp_rank, request_url) =
             if self.intra_node_data_parallel_size > 1 {
@@ -877,7 +1019,13 @@ impl Router {
 
         if !is_stream {
             // For non-streaming requests, preserve headers
-            let response_headers = header_utils::preserve_response_headers(res.headers());
+            let mut response_headers = header_utils::preserve_response_headers(res.headers());
+            Self::add_routing_trace_headers(
+                &mut response_headers,
+                worker_url,
+                extracted_dp_rank,
+                routing_decision,
+            );
 
             let response = match res.bytes().await {
                 Ok(body) => {
@@ -918,6 +1066,12 @@ impl Router {
             let mut response_headers = header_utils::preserve_response_headers(res.headers());
             // Ensure we set the correct content-type for SSE
             response_headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+            Self::add_routing_trace_headers(
+                &mut response_headers,
+                &worker_url,
+                extracted_dp_rank,
+                routing_decision,
+            );
 
             let stream = res.bytes_stream();
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
@@ -972,6 +1126,12 @@ impl Router {
             let mut response_headers = header_utils::preserve_response_headers(res.headers());
             // Ensure we set the correct content-type for SSE
             response_headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+            Self::add_routing_trace_headers(
+                &mut response_headers,
+                worker_url,
+                extracted_dp_rank,
+                routing_decision,
+            );
 
             let stream = res.bytes_stream();
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1464,8 +1624,19 @@ impl RouterTrait for Router {
         body: &ChatCompletionRequest,
         model_id: Option<&str>,
     ) -> Response {
-        self.route_typed_request(headers, body, "/v1/chat/completions", model_id)
-            .await
+        // Chat routing key: try session_id affinity first, then fall back to
+        // prefix-matching the full chat history (cache_aware only).
+        let (text, fallback_text) = self.chat_routing_keys(model_id, body);
+
+        self.route_typed_request_with_routing_text_fallback(
+            headers,
+            body,
+            "/v1/chat/completions",
+            model_id,
+            text,
+            fallback_text,
+        )
+        .await
     }
 
     async fn route_completion(
@@ -1876,6 +2047,79 @@ mod tests {
             circuit_breaker_config: CircuitBreakerConfig::default(),
             _worker_loads: Arc::new(rx),
             _load_monitor_handle: None,
+        }
+    }
+
+    /// Create a test router with the cache_aware policy.
+    fn create_test_cache_aware_router() -> Router {
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        let policy_registry = Arc::new(PolicyRegistry::new(
+            crate::config::types::PolicyConfig::CacheAware {
+                cache_threshold: 0.3,
+                balance_abs_threshold: 64,
+                balance_rel_threshold: 1.5,
+                eviction_interval_secs: 0,
+                max_tree_size: 10000,
+            },
+        ));
+
+        let worker1 = BasicWorker::new("http://worker1:8080".to_string(), WorkerType::Regular);
+        let worker2 = BasicWorker::new("http://worker2:8080".to_string(), WorkerType::Regular);
+        worker_registry.register(Arc::new(worker1));
+        worker_registry.register(Arc::new(worker2));
+
+        let (_, rx) = tokio::sync::watch::channel(HashMap::new());
+        Router {
+            worker_registry,
+            policy_registry,
+            worker_startup_timeout_secs: 5,
+            worker_startup_check_interval_secs: 1,
+            intra_node_data_parallel_size: 1,
+            api_key: None,
+            client: Client::new(),
+            retry_config: RetryConfig::default(),
+            circuit_breaker_config: CircuitBreakerConfig::default(),
+            _worker_loads: Arc::new(rx),
+            _load_monitor_handle: None,
+        }
+    }
+
+    fn chat_request_with_session() -> ChatCompletionRequest {
+        serde_json::from_str(
+            r#"{
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "hello"}],
+                "session_params": {"session_id": "session-123"}
+            }"#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn test_chat_routing_keys_cache_aware_uses_terminated_key_and_fallback() {
+        let router = create_test_cache_aware_router();
+        let body = chat_request_with_session();
+
+        let (text, fallback) = router.chat_routing_keys(Some("test-model"), &body);
+        assert_eq!(text, "session-123\u{1f}");
+        assert_eq!(fallback.as_deref(), Some("user:hello"));
+    }
+
+    #[test]
+    fn test_chat_routing_keys_hash_policies_keep_raw_session_id() {
+        // Hash-based policies must keep the pre-change routing text: the raw
+        // session id without the cache_aware \x1f terminator, so existing
+        // session affinities survive rolling router upgrades.
+        let routers = [
+            create_test_regular_router(),
+            create_test_consistent_hash_router(),
+        ];
+        let body = chat_request_with_session();
+
+        for router in routers {
+            let (text, fallback) = router.chat_routing_keys(Some("test-model"), &body);
+            assert_eq!(text, "session-123", "policy must not see the terminator");
+            assert_eq!(fallback, None);
         }
     }
 

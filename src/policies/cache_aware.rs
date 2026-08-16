@@ -59,7 +59,11 @@
     during the next eviction cycle.
 */
 
-use super::{get_healthy_worker_indices, CacheAwareConfig, LoadBalancingPolicy, RequestHeaders};
+use super::hash_key::extract_hash_key_from_headers;
+use super::{
+    get_healthy_worker_indices, CacheAwareConfig, LoadBalancingPolicy, RequestHeaders,
+    RoutingSelection,
+};
 use crate::core::Worker;
 use crate::metrics::RouterMetrics;
 use crate::policies::normalize_model_key;
@@ -71,6 +75,8 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 use tracing::{debug, info};
+
+const FALLBACK_SESSION_CACHE_THRESHOLD: f32 = 0.999;
 
 /// Cache-aware routing policy
 ///
@@ -171,15 +177,17 @@ impl CacheAwarePolicy {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn select_worker_min_load(
         &self,
         workers: &[Arc<dyn Worker>],
         request_text: Option<&str>,
+        fallback_text: Option<&str>,
         healthy_indices: &[usize],
         model_id: &str,
         max_load: usize,
         min_load: usize,
-    ) -> Option<usize> {
+    ) -> Option<RoutingSelection> {
         // Log load balancing trigger (only compute worker loads if debug enabled)
         if tracing::enabled!(tracing::Level::DEBUG) {
             let worker_loads: Vec<(&str, usize)> =
@@ -191,6 +199,7 @@ impl CacheAwarePolicy {
         }
 
         RouterMetrics::record_load_balancing_event();
+        RouterMetrics::record_cache_aware_decision("load_balance");
         RouterMetrics::set_load_range(max_load, min_load);
 
         // Use shortest queue when imbalanced
@@ -199,21 +208,24 @@ impl CacheAwarePolicy {
             .min_by_key(|&&idx| workers[idx].load())
             .copied()?;
 
-        // Even in imbalanced mode, update the tree to maintain cache state
-        if let Some(text) = request_text {
-            // Get the tree reference without locking the entire HashMap
-            // DashMap only locks the specific shard containing this key
-            let tree = self.trees.get(model_id).map(|entry| entry.value().clone());
+        // Even in imbalanced mode, update the tree to maintain cache state.
+        // Teach it the session key and the full chat history: the worker has
+        // just processed and cached the whole prompt, so a later balanced
+        // request sharing the same prefix must be able to discover it.
+        let tree = self.trees.get(model_id).map(|entry| entry.value().clone());
 
-            if let Some(tree) = tree {
-                let worker_url = workers[min_load_idx].url();
-                tree.insert(text, worker_url);
-            } else {
-                debug!(
-                    "Warning: No tree found for model '{}', skipping cache update",
-                    model_id
-                );
+        if let Some(tree) = tree {
+            let worker_url = workers[min_load_idx].url();
+            for text in [request_text, fallback_text].into_iter().flatten() {
+                if !text.is_empty() {
+                    tree.insert(text, worker_url);
+                }
             }
+        } else {
+            debug!(
+                "Warning: No tree found for model '{}', skipping cache update",
+                model_id
+            );
         }
 
         // Increment processed counter
@@ -221,17 +233,19 @@ impl CacheAwarePolicy {
         RouterMetrics::record_processed_request(workers[min_load_idx].url());
         RouterMetrics::record_policy_decision(self.name(), workers[min_load_idx].url());
 
-        Some(min_load_idx)
+        Some(RoutingSelection {
+            index: min_load_idx,
+            decision: Some("load_balance"),
+        })
     }
-}
 
-impl LoadBalancingPolicy for CacheAwarePolicy {
-    fn select_worker_with_headers(
+    fn select_worker_cache_aware_with_decision(
         &self,
         workers: &[Arc<dyn Worker>],
         request_text: Option<&str>,
-        _headers: Option<&RequestHeaders>,
-    ) -> Option<usize> {
+        fallback_text: Option<&str>,
+        headers: Option<&RequestHeaders>,
+    ) -> Option<RoutingSelection> {
         let healthy_indices = get_healthy_worker_indices(workers);
 
         if healthy_indices.is_empty() {
@@ -239,17 +253,17 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         }
 
         // Determine the model for this set of workers (router pre-filters by model)
-        // All workers should be from the same model
+        // All workers should be from the same model.
         let model_id = normalize_model_key(workers[healthy_indices[0]].model_id());
 
-        // Get current load statistics - compute min/max in single pass without allocation
+        // Get current load statistics - compute min/max in single pass without allocation.
         let (min_load, max_load) = workers.iter().fold((usize::MAX, 0usize), |(min, max), w| {
             let load = w.load();
             (min.min(load), max.max(load))
         });
         let min_load = if min_load == usize::MAX { 0 } else { min_load };
 
-        // Check if load is imbalanced
+        // Check if load is imbalanced.
         let is_imbalanced = max_load.saturating_sub(min_load) > self.config.balance_abs_threshold
             && (max_load as f32) > (min_load as f32 * self.config.balance_rel_threshold);
 
@@ -262,6 +276,7 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
             return self.select_worker_min_load(
                 workers,
                 request_text,
+                fallback_text,
                 &healthy_indices,
                 model_id,
                 max_load,
@@ -269,23 +284,41 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
             );
         }
 
-        // Use cache-aware routing when balanced
-        let text = request_text.unwrap_or("");
+        // Use explicit routing text first; fall back to session headers for
+        // clients that carry affinity only in HTTP metadata.
+        let header_key = headers.and_then(extract_hash_key_from_headers);
+        let primary_text = request_text
+            .filter(|text| !text.trim().is_empty())
+            .or(header_key.as_deref())
+            .unwrap_or("");
+        // A chat request may carry a session key with no extractable history
+        // (e.g. an image-only user message). Keep the two-stage session
+        // semantics in that case: probe the session key at the strict 0.999
+        // threshold and fall back to min-load instead of probing the empty
+        // history at cache_threshold, which would let prefix-related session
+        // ids (session-1\x1f vs session-12\x1f) pass as cache hits.
+        let fallback_provided = fallback_text.is_some();
+        let fallback_text = fallback_text.filter(|text| !text.trim().is_empty());
+        let use_fallback_probe = fallback_provided && !primary_text.is_empty();
+        let primary_text = if primary_text.is_empty() {
+            fallback_text.unwrap_or("")
+        } else {
+            primary_text
+        };
 
-        // Get the tree reference without locking the entire HashMap
-        // DashMap only locks the specific shard containing this key
+        // Get the tree reference without locking the entire HashMap.
+        // DashMap only locks the specific shard containing this key.
         let tree = self.trees.get(model_id).map(|entry| entry.value().clone());
 
         let keys: Vec<_> = self.trees.iter().map(|entry| entry.key().clone()).collect();
         debug!("Available tree keys: {:?}", keys);
 
         let Some(tree) = tree else {
-            // No tree for this model, log warning and use random selection
             debug!(
                 "Warning: No tree found for model '{}', using random worker selection",
                 model_id
             );
-            // Return a random healthy worker
+            RouterMetrics::record_cache_aware_decision("no_tree_random");
             let mut rng = rand::rng();
             let random_idx = rng.random_range(0..healthy_indices.len());
             let selected_idx = healthy_indices[random_idx];
@@ -294,67 +327,200 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
             RouterMetrics::record_processed_request(workers[selected_idx].url());
             RouterMetrics::record_policy_decision(self.name(), workers[selected_idx].url());
 
-            return Some(selected_idx);
+            return Some(RoutingSelection {
+                index: selected_idx,
+                decision: Some("no_tree_random"),
+            });
         };
         debug!("Using cache-aware routing for model '{}'", model_id);
-        // Now we work with the tree without holding the HashMap lock
-        // Use prefix_match_with_counts to avoid redundant chars().count() calls
-        let result = tree.prefix_match_with_counts(text);
-        let match_rate = if result.input_char_count == 0 {
-            0.0
-        } else {
-            result.matched_char_count as f32 / result.input_char_count as f32
+
+        let probe = |text: &str, cache_threshold: f32| {
+            let result = tree.prefix_match_with_counts(text);
+            let match_rate = if result.input_char_count == 0 {
+                0.0
+            } else {
+                result.matched_char_count as f32 / result.input_char_count as f32
+            };
+            let selected_idx = if match_rate > cache_threshold {
+                let tenant_url: &str = &result.tenant;
+                workers
+                    .iter()
+                    .position(|w| w.url() == tenant_url)
+                    .filter(|&idx| workers[idx].is_healthy())
+            } else {
+                healthy_indices
+                    .iter()
+                    .min_by_key(|&&idx| workers[idx].load())
+                    .copied()
+            };
+
+            (selected_idx, match_rate, result.tenant.to_string())
         };
 
-        debug!(
-            "Cache match for model '{}': matched_chars={}, input_chars={}, match_rate={:.2}",
-            model_id, result.matched_char_count, result.input_char_count, match_rate
-        );
-        // Select worker without String allocation
-        let selected_idx = if match_rate > self.config.cache_threshold {
-            // Cache hit path: find worker by URL (compare &str directly, no allocation)
-            let tenant_url: &str = &result.tenant;
-            workers
-                .iter()
-                .position(|w| w.url() == tenant_url)
-                .filter(|&idx| workers[idx].is_healthy())
+        // Probe the full-history fallback at the configured threshold; when no
+        // usable history text exists, select min-load directly so the strict
+        // session semantics (0.999) still apply to the session key itself.
+        let probe_fallback_or_min_load =
+            |fallback_text: Option<&str>| -> (Option<usize>, &'static str, Option<String>, bool) {
+                match fallback_text {
+                    Some(fallback_text) => {
+                        let (fallback_idx, fallback_match_rate, fallback_tenant) =
+                            probe(fallback_text, self.config.cache_threshold);
+                        if fallback_match_rate > self.config.cache_threshold {
+                            if let Some(idx) = fallback_idx {
+                                (Some(idx), "full_history_match", None, true)
+                            } else {
+                                (
+                                    healthy_indices.first().copied(),
+                                    "stale_tenant_fallback",
+                                    Some(fallback_tenant),
+                                    true,
+                                )
+                            }
+                        } else {
+                            (fallback_idx, "full_history_low_match", None, true)
+                        }
+                    }
+                    None => {
+                        let min_load_idx = healthy_indices
+                            .iter()
+                            .min_by_key(|&&idx| workers[idx].load())
+                            .copied();
+                        (min_load_idx, "empty_history_min_load", None, false)
+                    }
+                }
+            };
+
+        let (selected_idx, decision, stale_tenant, used_fallback) = if use_fallback_probe {
+            let (primary_idx, primary_match_rate, primary_tenant) =
+                probe(primary_text, FALLBACK_SESSION_CACHE_THRESHOLD);
+
+            let session_hit = primary_match_rate > FALLBACK_SESSION_CACHE_THRESHOLD;
+            if session_hit {
+                if let Some(idx) = primary_idx {
+                    (Some(idx), "session_id_match", None, false)
+                } else {
+                    // Stale worker for the session key; drop it and probe
+                    // the history.
+                    tree.remove_tenant(&primary_tenant);
+                    debug!("Removed stale worker {} from cache tree", primary_tenant);
+                    RouterMetrics::record_cache_aware_decision("session_id_fallback");
+                    probe_fallback_or_min_load(fallback_text)
+                }
+            } else {
+                RouterMetrics::record_cache_aware_decision("session_id_fallback");
+                probe_fallback_or_min_load(fallback_text)
+            }
         } else {
-            // Low cache match: use worker with minimum load
-            healthy_indices
-                .iter()
-                .min_by_key(|&&idx| workers[idx].load())
-                .copied()
+            let (idx, match_rate, tenant) = probe(primary_text, self.config.cache_threshold);
+            let decision = if match_rate > self.config.cache_threshold {
+                "cache_affinity"
+            } else {
+                "low_match_min_load"
+            };
+            let stale_tenant = if idx.is_none() && match_rate > self.config.cache_threshold {
+                Some(tenant)
+            } else {
+                None
+            };
+
+            (idx, decision, stale_tenant, false)
         };
+
+        let selected_text = if used_fallback {
+            fallback_text.unwrap_or(primary_text)
+        } else {
+            primary_text
+        };
+
+        if let Some(tenant) = stale_tenant {
+            tree.remove_tenant(&tenant);
+            debug!("Removed stale worker {} from cache tree", tenant);
+        }
 
         if let Some(idx) = selected_idx {
-            // Update the tree with this request (use worker URL directly, no allocation)
-            tree.insert(text, workers[idx].url());
+            RouterMetrics::record_cache_aware_decision(decision);
 
-            // Increment processed counter
+            let worker_url = workers[idx].url();
+            tree.insert(selected_text, worker_url);
+
+            if used_fallback && !primary_text.is_empty() && primary_text != selected_text {
+                tree.insert(primary_text, worker_url);
+            }
+
             workers[idx].increment_processed();
             RouterMetrics::record_processed_request(workers[idx].url());
             RouterMetrics::record_policy_decision(self.name(), workers[idx].url());
 
-            return Some(idx);
+            return Some(RoutingSelection {
+                index: idx,
+                decision: Some(decision),
+            });
         }
 
-        // Selected worker no longer exists or unhealthy, remove stale tenant from tree
-        if match_rate > self.config.cache_threshold {
-            let tenant_url: &str = &result.tenant;
-            tree.remove_tenant(tenant_url);
-            debug!("Removed stale worker {} from cache tree", tenant_url);
+        if decision == "stale_tenant_fallback" {
+            RouterMetrics::record_cache_aware_decision("stale_tenant_fallback");
+        } else {
+            RouterMetrics::record_cache_aware_decision("first_healthy_fallback");
         }
-
-        // Fallback to first healthy worker
         if let Some(idx) = healthy_indices.first().copied() {
             workers[idx].increment_processed();
             RouterMetrics::record_processed_request(workers[idx].url());
             RouterMetrics::record_policy_decision(self.name(), workers[idx].url());
 
-            Some(idx)
+            Some(RoutingSelection {
+                index: idx,
+                decision: Some(if decision == "stale_tenant_fallback" {
+                    "stale_tenant_fallback"
+                } else {
+                    "first_healthy_fallback"
+                }),
+            })
         } else {
             None
         }
+    }
+
+    fn select_worker_cache_aware(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        request_text: Option<&str>,
+        fallback_text: Option<&str>,
+        headers: Option<&RequestHeaders>,
+    ) -> Option<usize> {
+        self.select_worker_cache_aware_with_decision(workers, request_text, fallback_text, headers)
+            .map(|selection| selection.index)
+    }
+}
+
+impl LoadBalancingPolicy for CacheAwarePolicy {
+    fn select_worker_with_headers(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        request_text: Option<&str>,
+        headers: Option<&RequestHeaders>,
+    ) -> Option<usize> {
+        self.select_worker_cache_aware(workers, request_text, None, headers)
+    }
+
+    fn select_worker_with_fallback_headers(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        request_text: Option<&str>,
+        fallback_text: Option<&str>,
+        headers: Option<&RequestHeaders>,
+    ) -> Option<usize> {
+        self.select_worker_cache_aware(workers, request_text, fallback_text, headers)
+    }
+
+    fn select_worker_with_fallback_headers_with_decision(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        request_text: Option<&str>,
+        fallback_text: Option<&str>,
+        headers: Option<&RequestHeaders>,
+    ) -> Option<RoutingSelection> {
+        self.select_worker_cache_aware_with_decision(workers, request_text, fallback_text, headers)
     }
 
     fn name(&self) -> &'static str {
@@ -511,6 +677,273 @@ mod tests {
         // Similar request should also go to same worker
         let idx3 = policy.select_worker(&workers, Some("hello")).unwrap();
         assert_eq!(idx1, idx3);
+    }
+
+    #[test]
+    fn test_cache_aware_falls_back_to_session_header_when_text_empty() {
+        let config = CacheAwareConfig {
+            eviction_interval_secs: 0,
+            ..Default::default()
+        };
+        let policy = CacheAwarePolicy::with_config(config);
+        let workers: Vec<Arc<dyn Worker>> = vec![
+            Arc::new(BasicWorker::new(
+                "http://w1:8000".to_string(),
+                WorkerType::Regular,
+            )),
+            Arc::new(BasicWorker::new(
+                "http://w2:8000".to_string(),
+                WorkerType::Regular,
+            )),
+        ];
+        policy.init_workers(&workers);
+
+        let mut headers = RequestHeaders::new();
+        headers.insert("x-session-id".to_string(), "agent-session-1".to_string());
+
+        let idx1 = policy
+            .select_worker_with_headers(&workers, Some(""), Some(&headers))
+            .unwrap();
+        let idx2 = policy
+            .select_worker_with_headers(&workers, None, Some(&headers))
+            .unwrap();
+
+        assert_eq!(idx1, idx2);
+    }
+
+    #[test]
+    fn test_cache_aware_stable_text_precedes_session_header() {
+        let config = CacheAwareConfig {
+            eviction_interval_secs: 0,
+            ..Default::default()
+        };
+        let policy = CacheAwarePolicy::with_config(config);
+        let workers: Vec<Arc<dyn Worker>> = vec![
+            Arc::new(BasicWorker::new(
+                "http://w1:8000".to_string(),
+                WorkerType::Regular,
+            )),
+            Arc::new(BasicWorker::new(
+                "http://w2:8000".to_string(),
+                WorkerType::Regular,
+            )),
+        ];
+        policy.init_workers(&workers);
+
+        let mut headers_a = RequestHeaders::new();
+        headers_a.insert("x-session-id".to_string(), "session-a".to_string());
+        let mut headers_b = RequestHeaders::new();
+        headers_b.insert("x-session-id".to_string(), "session-b".to_string());
+
+        let stable_agent_prefix = "system:You are a coding agent\ntool:read_file";
+        let idx1 = policy
+            .select_worker_with_headers(&workers, Some(stable_agent_prefix), Some(&headers_a))
+            .unwrap();
+        let idx2 = policy
+            .select_worker_with_headers(&workers, Some(stable_agent_prefix), Some(&headers_b))
+            .unwrap();
+
+        assert_eq!(idx1, idx2);
+    }
+
+    #[test]
+    fn test_cache_aware_session_id_falls_back_to_full_history() {
+        let config = CacheAwareConfig {
+            cache_threshold: 0.3,
+            eviction_interval_secs: 0,
+            ..Default::default()
+        };
+        let policy = CacheAwarePolicy::with_config(config);
+        let workers: Vec<Arc<dyn Worker>> = vec![
+            Arc::new(BasicWorker::new(
+                "http://w1:8000".to_string(),
+                WorkerType::Regular,
+            )),
+            Arc::new(BasicWorker::new(
+                "http://w2:8000".to_string(),
+                WorkerType::Regular,
+            )),
+        ];
+        policy.init_workers(&workers);
+
+        let shared_history = "system:bench\nuser:shared long prefix";
+        let idx1 = policy
+            .select_worker_with_fallback_headers(
+                &workers,
+                Some("session-a"),
+                Some(shared_history),
+                None,
+            )
+            .unwrap();
+
+        let idx2 = policy
+            .select_worker_with_fallback_headers(
+                &workers,
+                Some("session-b"),
+                Some(shared_history),
+                None,
+            )
+            .unwrap();
+        assert_eq!(idx1, idx2);
+
+        let idx3 = policy
+            .select_worker_with_fallback_headers(
+                &workers,
+                Some("session-a"),
+                Some("system:bench\nuser:different prefix"),
+                None,
+            )
+            .unwrap();
+        assert_eq!(idx1, idx3);
+    }
+
+    #[test]
+    fn test_cache_aware_fallback_uses_strict_session_threshold() {
+        let config = CacheAwareConfig {
+            cache_threshold: 0.3,
+            eviction_interval_secs: 0,
+            ..Default::default()
+        };
+        let policy = CacheAwarePolicy::with_config(config);
+        let workers: Vec<Arc<dyn Worker>> = vec![
+            Arc::new(BasicWorker::new(
+                "http://w1:8000".to_string(),
+                WorkerType::Regular,
+            )),
+            Arc::new(BasicWorker::new(
+                "http://w2:8000".to_string(),
+                WorkerType::Regular,
+            )),
+        ];
+        policy.init_workers(&workers);
+
+        let idx1 = policy
+            .select_worker_with_fallback_headers(
+                &workers,
+                Some("session-1\x1f"),
+                Some("system:first unrelated prefix"),
+                None,
+            )
+            .unwrap();
+        assert_eq!(idx1, 0);
+
+        workers[0].increment_load();
+
+        let idx2 = policy
+            .select_worker_with_fallback_headers(
+                &workers,
+                Some("session-12\x1f"),
+                Some("system:second unrelated prefix"),
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(idx2, 1);
+    }
+
+    #[test]
+    fn test_cache_aware_empty_history_keeps_strict_session_threshold() {
+        // A session key with no extractable history (e.g. image-only chat)
+        // must still be probed at the strict 0.999 threshold. session-1\x1f
+        // and session-12\x1f share 80% of their chars, which would pass the
+        // configured 0.3 threshold and falsely count as a session hit.
+        let config = CacheAwareConfig {
+            cache_threshold: 0.3,
+            eviction_interval_secs: 0,
+            ..Default::default()
+        };
+        let policy = CacheAwarePolicy::with_config(config);
+        let workers: Vec<Arc<dyn Worker>> = vec![
+            Arc::new(BasicWorker::new(
+                "http://w1:8000".to_string(),
+                WorkerType::Regular,
+            )),
+            Arc::new(BasicWorker::new(
+                "http://w2:8000".to_string(),
+                WorkerType::Regular,
+            )),
+        ];
+        policy.init_workers(&workers);
+
+        let sel1 = policy
+            .select_worker_with_fallback_headers_with_decision(
+                &workers,
+                Some("session-1\x1f"),
+                Some(""),
+                None,
+            )
+            .unwrap();
+        assert_eq!(sel1.index, 0);
+        assert_eq!(sel1.decision, Some("empty_history_min_load"));
+
+        workers[0].increment_load();
+
+        let sel2 = policy
+            .select_worker_with_fallback_headers_with_decision(
+                &workers,
+                Some("session-12\x1f"),
+                Some(""),
+                None,
+            )
+            .unwrap();
+        // Not a session hit (0.8 < 0.999): must fall back to min-load
+        // instead of following the session-1 affinity.
+        assert_eq!(sel2.index, 1);
+        assert_eq!(sel2.decision, Some("empty_history_min_load"));
+    }
+
+    #[test]
+    fn test_cache_aware_imbalanced_path_teaches_full_history() {
+        let config = CacheAwareConfig {
+            cache_threshold: 0.3,
+            balance_abs_threshold: 1,
+            balance_rel_threshold: 1.1,
+            eviction_interval_secs: 0,
+            ..Default::default()
+        };
+        let policy = CacheAwarePolicy::with_config(config);
+        let workers: Vec<Arc<dyn Worker>> = vec![
+            Arc::new(BasicWorker::new(
+                "http://w1:8000".to_string(),
+                WorkerType::Regular,
+            )),
+            Arc::new(BasicWorker::new(
+                "http://w2:8000".to_string(),
+                WorkerType::Regular,
+            )),
+        ];
+        policy.init_workers(&workers);
+
+        // Force an imbalance so the selection takes the min-load path.
+        workers[0].increment_load();
+        workers[0].increment_load();
+
+        let shared_history = "system:bench\nuser:shared long prefix";
+        let idx1 = policy
+            .select_worker_with_fallback_headers(
+                &workers,
+                Some("session-a\x1f"),
+                Some(shared_history),
+                None,
+            )
+            .unwrap();
+        assert_eq!(idx1, 1, "imbalanced selection must pick min-load worker");
+
+        // Rebalance. The full history must have been learned during the
+        // imbalanced request, so a new session with the same prefix is
+        // attracted to the same worker.
+        workers[0].decrement_load();
+        workers[0].decrement_load();
+
+        let idx2 = policy
+            .select_worker_with_fallback_headers(
+                &workers,
+                Some("session-b\x1f"),
+                Some(shared_history),
+                None,
+            )
+            .unwrap();
+        assert_eq!(idx2, idx1, "learned history must attract the new session");
     }
 
     #[test]

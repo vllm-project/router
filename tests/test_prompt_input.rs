@@ -1,5 +1,7 @@
 /// Tests for PromptInput enum supporting str, list[str], list[int], list[list[int]]
-use vllm_router_rs::protocols::spec::{CompletionRequest, PromptInput};
+use vllm_router_rs::protocols::spec::{
+    ChatCompletionRequest, CompletionRequest, GenerationRequest, PromptInput,
+};
 
 #[test]
 fn test_prompt_input_single_string() {
@@ -20,6 +22,179 @@ fn test_prompt_input_single_string() {
     assert!(!req.prompt.is_empty());
     assert!(!req.prompt.is_token_based());
     assert_eq!(req.prompt.extract_text_for_routing(), "Hello, world!");
+}
+
+#[test]
+fn test_chat_routing_extracts_array_developer_content() {
+    let request: ChatCompletionRequest = serde_json::from_str(
+        r#"{
+            "model": "test-model",
+            "messages": [
+                {"role": "developer", "content": [
+                    {"type": "text", "text": "Inspect before editing."}
+                ]},
+                {"role": "user", "content": "Fix bug A"}
+            ]
+        }"#,
+    )
+    .unwrap();
+
+    let routing = request.extract_text_for_routing();
+    assert!(routing.contains("developer:Inspect before editing."));
+    assert!(routing.contains("user:Fix bug A"));
+}
+
+#[test]
+fn test_chat_routing_uses_full_history_by_default() {
+    let request_a: ChatCompletionRequest = serde_json::from_str(
+        r#"{
+            "model": "test-model",
+            "messages": [
+                {"role": "system", "content": "You are a coding agent."},
+                {"role": "developer", "content": "Always inspect before editing."},
+                {"role": "user", "content": "Fix bug A"}
+            ],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "description": "Read a file",
+                        "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}
+                    }
+                }
+            ]
+        }"#,
+    )
+    .unwrap();
+
+    let request_b: ChatCompletionRequest = serde_json::from_str(
+        r#"{
+            "model": "test-model",
+            "messages": [
+                {"role": "system", "content": "You are a coding agent."},
+                {"role": "developer", "content": "Always inspect before editing."},
+                {"role": "user", "content": "Fix bug B with a different suffix"}
+            ],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "description": "Read a file",
+                        "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}
+                    }
+                }
+            ]
+        }"#,
+    )
+    .unwrap();
+
+    let routing_a = request_a.extract_text_for_routing();
+    let routing_b = request_b.extract_text_for_routing();
+
+    assert_ne!(routing_a, routing_b);
+    assert!(routing_a.contains("system:You are a coding agent."));
+    assert!(routing_a.contains("developer:Always inspect before editing."));
+    assert!(routing_a.contains("user:Fix bug A"));
+    assert!(routing_a.contains("tool_schema:read_file:Read a file:"));
+    assert!(routing_b.contains("user:Fix bug B with a different suffix"));
+}
+
+#[test]
+fn test_chat_routing_sorts_tools_for_full_history() {
+    let request_a: ChatCompletionRequest = serde_json::from_str(
+        r#"{
+            "model": "test-model",
+            "messages": [{"role": "system", "content": "Use tools."}],
+            "tools": [
+                {"type": "function", "function": {"name": "write_file", "parameters": {"type": "object"}}},
+                {"type": "function", "function": {"name": "read_file", "parameters": {"type": "object"}}}
+            ]
+        }"#,
+    )
+    .unwrap();
+
+    let request_b: ChatCompletionRequest = serde_json::from_str(
+        r#"{
+            "model": "test-model",
+            "messages": [{"role": "system", "content": "Use tools."}],
+            "tools": [
+                {"type": "function", "function": {"name": "read_file", "parameters": {"type": "object"}}},
+                {"type": "function", "function": {"name": "write_file", "parameters": {"type": "object"}}}
+            ]
+        }"#,
+    )
+    .unwrap();
+
+    assert_eq!(
+        request_a.extract_text_for_routing(),
+        request_b.extract_text_for_routing()
+    );
+}
+
+#[test]
+fn test_chat_routing_falls_back_to_session_id_without_history_text() {
+    let request: ChatCompletionRequest = serde_json::from_str(
+        r#"{
+            "model": "test-model",
+            "messages": [],
+            "session_params": {"session_id": "session-123"}
+        }"#,
+    )
+    .unwrap();
+
+    // The session key carries the \x1f terminator to avoid prefix collisions.
+    assert_eq!(request.extract_text_for_routing(), "session-123\u{1f}");
+}
+
+#[test]
+fn test_chat_full_history_routing_includes_volatile_turns() {
+    let request_a: ChatCompletionRequest = serde_json::from_str(
+        r#"{
+            "model": "test-model",
+            "messages": [
+                {"role": "system", "content": "You are a coding agent."},
+                {"role": "developer", "content": "Always inspect before editing."},
+                {"role": "user", "content": "Fix bug A"},
+                {"role": "assistant", "content": "I will inspect it.", "tool_calls": [
+                    {"id": "call_1", "type": "function", "function": {"name": "read_file", "arguments": "{\"path\":\"a.rs\"}"}}
+                ]},
+                {"role": "tool", "tool_call_id": "call_1", "content": [{"type": "text", "text": "file contents"}]}
+            ],
+            "tools": [
+                {"type": "function", "function": {"name": "read_file", "description": "Read a file", "parameters": {"type": "object"}}}
+            ]
+        }"#,
+    )
+    .unwrap();
+
+    let request_b: ChatCompletionRequest = serde_json::from_str(
+        r#"{
+            "model": "test-model",
+            "messages": [
+                {"role": "system", "content": "You are a coding agent."},
+                {"role": "developer", "content": "Always inspect before editing."},
+                {"role": "user", "content": "Fix bug B"}
+            ],
+            "tools": [
+                {"type": "function", "function": {"name": "read_file", "description": "Read a file", "parameters": {"type": "object"}}}
+            ]
+        }"#,
+    )
+    .unwrap();
+
+    let full_a = request_a.extract_full_history_routing_text();
+    let full_b = request_b.extract_full_history_routing_text();
+    assert_eq!(request_a.extract_text_for_routing(), full_a);
+    assert_eq!(request_b.extract_text_for_routing(), full_b);
+    assert_ne!(full_a, full_b);
+    assert!(full_a.contains("user:Fix bug A"));
+    assert!(full_a.contains("assistant:I will inspect it."));
+    assert!(full_a.contains("assistant_tool_call:read_file:{\"path\":\"a.rs\"}"));
+    assert!(full_a.contains("tool:file contents"));
+    assert!(full_a.contains("tool_schema:read_file:Read a file:"));
+    assert!(full_b.contains("user:Fix bug B"));
 }
 
 #[test]
