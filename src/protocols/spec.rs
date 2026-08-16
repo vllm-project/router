@@ -605,6 +605,44 @@ impl ChatCompletionRequest {
     pub fn extract_full_history_routing_text(&self) -> String {
         let mut parts = Vec::new();
 
+        // Tool/function schemas come first: they are stable across turns of a
+        // conversation, so prefix-matching a later turn can keep matching the
+        // unchanged schema block. Appending them after the (growing) message
+        // history would stop the match at the first new message.
+        if let Some(tools) = &self.tools {
+            let mut tools_by_name: Vec<&Tool> = tools.iter().collect();
+            tools_by_name.sort_by(|a, b| a.function.name.cmp(&b.function.name));
+
+            for tool in tools_by_name {
+                let parameters = serde_json::to_string(&tool.function.parameters)
+                    .unwrap_or_else(|_| "{}".to_string());
+                let description = tool.function.description.as_deref().unwrap_or("").trim();
+                parts.push(format!(
+                    "tool_schema:{}:{}:{}",
+                    tool.function.name.trim(),
+                    description,
+                    parameters
+                ));
+            }
+        }
+
+        if let Some(functions) = &self.functions {
+            let mut functions_by_name: Vec<&Function> = functions.iter().collect();
+            functions_by_name.sort_by(|a, b| a.name.cmp(&b.name));
+
+            for function in functions_by_name {
+                let parameters = serde_json::to_string(&function.parameters)
+                    .unwrap_or_else(|_| "{}".to_string());
+                let description = function.description.as_deref().unwrap_or("").trim();
+                parts.push(format!(
+                    "function_schema:{}:{}:{}",
+                    function.name.trim(),
+                    description,
+                    parameters
+                ));
+            }
+        }
+
         for message in &self.messages {
             match message {
                 ChatMessage::System { content, .. } => match content {
@@ -707,40 +745,6 @@ impl ChatCompletionRequest {
                     parts.push(format!("function:{}:{}", name.trim(), content.trim()));
                 }
                 _ => {}
-            }
-        }
-
-        if let Some(tools) = &self.tools {
-            let mut tools_by_name: Vec<&Tool> = tools.iter().collect();
-            tools_by_name.sort_by(|a, b| a.function.name.cmp(&b.function.name));
-
-            for tool in tools_by_name {
-                let parameters = serde_json::to_string(&tool.function.parameters)
-                    .unwrap_or_else(|_| "{}".to_string());
-                let description = tool.function.description.as_deref().unwrap_or("").trim();
-                parts.push(format!(
-                    "tool_schema:{}:{}:{}",
-                    tool.function.name.trim(),
-                    description,
-                    parameters
-                ));
-            }
-        }
-
-        if let Some(functions) = &self.functions {
-            let mut functions_by_name: Vec<&Function> = functions.iter().collect();
-            functions_by_name.sort_by(|a, b| a.name.cmp(&b.name));
-
-            for function in functions_by_name {
-                let parameters = serde_json::to_string(&function.parameters)
-                    .unwrap_or_else(|_| "{}".to_string());
-                let description = function.description.as_deref().unwrap_or("").trim();
-                parts.push(format!(
-                    "function_schema:{}:{}:{}",
-                    function.name.trim(),
-                    description,
-                    parameters
-                ));
             }
         }
 

@@ -404,11 +404,9 @@ impl CacheAwarePolicy {
                     // the history.
                     tree.remove_tenant(&primary_tenant);
                     debug!("Removed stale worker {} from cache tree", primary_tenant);
-                    RouterMetrics::record_cache_aware_decision("session_id_fallback");
                     probe_fallback_or_min_load(fallback_text)
                 }
             } else {
-                RouterMetrics::record_cache_aware_decision("session_id_fallback");
                 probe_fallback_or_min_load(fallback_text)
             }
         } else {
@@ -444,7 +442,20 @@ impl CacheAwarePolicy {
             let worker_url = workers[idx].url();
             tree.insert(selected_text, worker_url);
 
-            if used_fallback && !primary_text.is_empty() && primary_text != selected_text {
+            // Teach the tree the full history even on a session hit: the
+            // client may later drop or change the session id, and the
+            // history key must reflect the most recent prefix the worker
+            // cached, not the shorter one from an earlier turn.
+            if let Some(history_text) = fallback_text {
+                if history_text != selected_text {
+                    tree.insert(history_text, worker_url);
+                }
+            }
+            if used_fallback
+                && !primary_text.is_empty()
+                && primary_text != selected_text
+                && Some(primary_text) != fallback_text
+            {
                 tree.insert(primary_text, worker_url);
             }
 
@@ -839,6 +850,68 @@ mod tests {
             .unwrap();
 
         assert_eq!(idx2, 1);
+    }
+
+    #[test]
+    fn test_cache_aware_session_hit_records_full_history() {
+        // On a session hit the tree must also learn the current full
+        // history: the client may later drop the session id, and the tree
+        // must know the grown conversation prefix the worker cached, not
+        // the shorter one from an earlier turn.
+        let config = CacheAwareConfig {
+            cache_threshold: 0.5,
+            eviction_interval_secs: 0,
+            ..Default::default()
+        };
+        let policy = CacheAwarePolicy::with_config(config);
+        let workers: Vec<Arc<dyn Worker>> = vec![
+            Arc::new(BasicWorker::new(
+                "http://w1:8000".to_string(),
+                WorkerType::Regular,
+            )),
+            Arc::new(BasicWorker::new(
+                "http://w2:8000".to_string(),
+                WorkerType::Regular,
+            )),
+        ];
+        policy.init_workers(&workers);
+
+        let short_history = "system:bench\nuser:turn one";
+        let long_history = format!(
+            "{}\nassistant:{}\nuser:turn two",
+            short_history,
+            "x".repeat(150)
+        );
+
+        // Turn 1: session-a learns the short history.
+        let idx1 = policy
+            .select_worker_with_fallback_headers(
+                &workers,
+                Some("session-a\x1f"),
+                Some(short_history),
+                None,
+            )
+            .unwrap();
+
+        // Turn 2: exact session hit, with a much longer history.
+        let idx2 = policy
+            .select_worker_with_fallback_headers(
+                &workers,
+                Some("session-a\x1f"),
+                Some(&long_history),
+                None,
+            )
+            .unwrap();
+        assert_eq!(idx1, idx2);
+
+        // A request without a session id must still match the grown
+        // history (0.5 threshold): the stale short history alone would
+        // only match ~13% of the long key and fall to min-load.
+        workers[0].increment_load();
+        let idx3 = policy
+            .select_worker_with_fallback_headers(&workers, Some(""), Some(&long_history), None)
+            .unwrap();
+        assert_eq!(idx3, idx1, "grown history must be learned on session hit");
     }
 
     #[test]

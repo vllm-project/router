@@ -45,6 +45,31 @@ fn test_chat_routing_extracts_array_developer_content() {
 }
 
 #[test]
+fn test_chat_routing_schemas_precede_growing_history() {
+    // Stable tool schemas must come before the message history so later
+    // turns keep a matchable prefix: appending schemas after the growing
+    // history would stop prefix matching at the first new message.
+    let request: ChatCompletionRequest = serde_json::from_str(
+        r#"{
+            "model": "test-model",
+            "messages": [{"role": "system", "content": "Use tools."}],
+            "tools": [
+                {"type": "function", "function": {"name": "read_file", "parameters": {"type": "object"}}}
+            ]
+        }"#,
+    )
+    .unwrap();
+
+    let routing = request.extract_full_history_routing_text();
+    let tool_pos = routing.find("tool_schema:").unwrap();
+    let msg_pos = routing.find("system:").unwrap();
+    assert!(
+        tool_pos < msg_pos,
+        "tool schemas must precede message history in the routing key: {routing}"
+    );
+}
+
+#[test]
 fn test_chat_routing_uses_full_history_by_default() {
     let request_a: ChatCompletionRequest = serde_json::from_str(
         r#"{

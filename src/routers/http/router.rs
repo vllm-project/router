@@ -613,7 +613,7 @@ impl Router {
             .await
     }
 
-    pub async fn route_typed_request_with_routing_text<
+    async fn route_typed_request_with_routing_text<
         T: GenerationRequest + serde::Serialize + Clone,
     >(
         &self,
@@ -629,7 +629,7 @@ impl Router {
         .await
     }
 
-    pub async fn route_typed_request_with_routing_text_fallback<
+    async fn route_typed_request_with_routing_text_fallback<
         T: GenerationRequest + serde::Serialize + Clone,
     >(
         &self,
