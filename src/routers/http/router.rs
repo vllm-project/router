@@ -922,25 +922,38 @@ impl Router {
             tokio::spawn(async move {
                 let mut stream = stream;
                 let mut guard = Some(guard);
-                while let Some(chunk) = stream.next().await {
-                    match chunk {
-                        Ok(bytes) => {
-                            // Release the load count as soon as generation
-                            // finishes rather than when the connection closes
-                            if bytes
-                                .as_ref()
-                                .windows(12)
-                                .any(|window| window == b"data: [DONE]")
-                            {
-                                guard.take();
-                            }
-                            if tx.send(Ok(bytes)).is_err() {
-                                break;
-                            }
-                        }
-                        Err(e) => {
-                            let _ = tx.send(Err(format!("Stream error: {}", e)));
+                loop {
+                    tokio::select! {
+                        // Client went away: drop the upstream stream (which
+                        // cancels the request to the worker) and release the
+                        // guard now, instead of waiting for the worker's next
+                        // chunk — a stalled worker would otherwise pin the
+                        // load count until the request timeout.
+                        _ = tx.closed() => {
                             break;
+                        }
+                        chunk = stream.next() => {
+                            match chunk {
+                                Some(Ok(bytes)) => {
+                                    // Release the load count as soon as generation
+                                    // finishes rather than when the connection closes
+                                    if bytes
+                                        .as_ref()
+                                        .windows(12)
+                                        .any(|window| window == b"data: [DONE]")
+                                    {
+                                        guard.take();
+                                    }
+                                    if tx.send(Ok(bytes)).is_err() {
+                                        break;
+                                    }
+                                }
+                                Some(Err(e)) => {
+                                    let _ = tx.send(Err(format!("Stream error: {}", e)));
+                                    break;
+                                }
+                                None => break,
+                            }
                         }
                     }
                 }
@@ -968,16 +981,27 @@ impl Router {
             // Spawn task to forward stream
             tokio::spawn(async move {
                 let mut stream = stream;
-                while let Some(chunk) = stream.next().await {
-                    match chunk {
-                        Ok(bytes) => {
-                            if tx.send(Ok(bytes)).is_err() {
-                                break;
-                            }
-                        }
-                        Err(e) => {
-                            let _ = tx.send(Err(format!("Stream error: {}", e)));
+                loop {
+                    tokio::select! {
+                        // Client went away: drop the upstream stream so the
+                        // worker request is cancelled promptly instead of on
+                        // the next chunk
+                        _ = tx.closed() => {
                             break;
+                        }
+                        chunk = stream.next() => {
+                            match chunk {
+                                Some(Ok(bytes)) => {
+                                    if tx.send(Ok(bytes)).is_err() {
+                                        break;
+                                    }
+                                }
+                                Some(Err(e)) => {
+                                    let _ = tx.send(Err(format!("Stream error: {}", e)));
+                                    break;
+                                }
+                                None => break,
+                            }
                         }
                     }
                 }
