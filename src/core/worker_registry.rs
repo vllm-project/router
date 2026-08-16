@@ -4,7 +4,6 @@
 
 use crate::core::{ConnectionMode, Worker, WorkerType};
 use dashmap::DashMap;
-use futures;
 use std::sync::{Arc, RwLock};
 use uuid::Uuid;
 
