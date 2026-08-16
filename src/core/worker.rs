@@ -57,9 +57,10 @@ pub trait Worker: Send + Sync + fmt::Debug {
     /// Decrement the load counter
     fn decrement_load(&self);
 
-    /// Reset the load counter to 0. Recovery-only: called exclusively when a
-    /// worker transitions back to healthy, never periodically. Health checks
-    /// must not discard active request accounting.
+    /// Reset the load counter to 0. Administrative operation: only safe when
+    /// the caller has independently established that no requests are in
+    /// flight for this worker. The runtime never calls this automatically;
+    /// health checks and routing must not discard active request accounting.
     fn reset_load(&self) {
         // Default implementation - does nothing
         // Workers that track load should override this
@@ -468,10 +469,9 @@ impl Worker for BasicWorker {
         RouterMetrics::set_worker_load(self.url(), self.load());
     }
 
-    /// Recovery-only: clears the load counter after the worker transitions
-    /// back to healthy. While unhealthy no new requests are routed to this
-    /// worker, so any remaining load is drift from the down period. Never
-    /// called periodically.
+    /// Administrative operation: resets the load counter to 0. Only safe when
+    /// the caller has independently established that no requests are in
+    /// flight for this worker; the runtime never calls this automatically.
     fn reset_load(&self) {
         self.load_counter.store(0, Ordering::Relaxed);
         RouterMetrics::set_worker_load(self.url(), 0);
