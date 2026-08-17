@@ -169,8 +169,8 @@ fn test_chat_routing_falls_back_to_session_id_without_history_text() {
     )
     .unwrap();
 
-    // The session key carries the \x1f terminator to avoid prefix collisions.
-    assert_eq!(request.extract_text_for_routing(), "session-123\u{1f}");
+    // Session affinity is exact-match: the routing key is the raw session id.
+    assert_eq!(request.extract_text_for_routing(), "session-123");
 }
 
 #[test]

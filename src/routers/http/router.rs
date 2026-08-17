@@ -572,10 +572,9 @@ impl Router {
     }
 
     /// Compute the chat routing keys for the policy that will serve this
-    /// model. cache_aware gets the \x1f-terminated session key plus the
-    /// full-history fallback; every other policy keeps the pre-change
-    /// routing text (raw session id, no fallback) so hash-based policies
-    /// do not see the terminator.
+    /// model. cache_aware gets the raw session id (exact-match affinity) plus
+    /// the full-history fallback; every other policy keeps the same raw
+    /// session id with no fallback, preserving pre-change hash behavior.
     fn chat_routing_keys(
         &self,
         model_id: Option<&str>,
@@ -586,17 +585,11 @@ impl Router {
             None => self.policy_registry.get_default_policy(),
         };
 
+        let session_id = body.extract_session_id_for_routing().unwrap_or_default();
         if policy.name() == "cache_aware" {
-            (
-                body.extract_session_id_key_for_routing()
-                    .unwrap_or_default(),
-                Some(body.extract_full_history_routing_text()),
-            )
+            (session_id, Some(body.extract_full_history_routing_text()))
         } else {
-            (
-                body.extract_session_id_for_routing().unwrap_or_default(),
-                None,
-            )
+            (session_id, None)
         }
     }
 
@@ -2096,20 +2089,20 @@ mod tests {
     }
 
     #[test]
-    fn test_chat_routing_keys_cache_aware_uses_terminated_key_and_fallback() {
+    fn test_chat_routing_keys_cache_aware_uses_session_key_and_fallback() {
         let router = create_test_cache_aware_router();
         let body = chat_request_with_session();
 
         let (text, fallback) = router.chat_routing_keys(Some("test-model"), &body);
-        assert_eq!(text, "session-123\u{1f}");
+        assert_eq!(text, "session-123");
         assert_eq!(fallback.as_deref(), Some("user:hello"));
     }
 
     #[test]
     fn test_chat_routing_keys_hash_policies_keep_raw_session_id() {
         // Hash-based policies must keep the pre-change routing text: the raw
-        // session id without the cache_aware \x1f terminator, so existing
-        // session affinities survive rolling router upgrades.
+        // session id with no fallback, so existing session affinities survive
+        // rolling router upgrades.
         let routers = [
             create_test_regular_router(),
             create_test_consistent_hash_router(),
@@ -2118,7 +2111,7 @@ mod tests {
 
         for router in routers {
             let (text, fallback) = router.chat_routing_keys(Some("test-model"), &body);
-            assert_eq!(text, "session-123", "policy must not see the terminator");
+            assert_eq!(text, "session-123", "policy must see the raw session id");
             assert_eq!(fallback, None);
         }
     }

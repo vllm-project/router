@@ -73,21 +73,58 @@ use rand::Rng;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{debug, info};
 
-const FALLBACK_SESSION_CACHE_THRESHOLD: f32 = 0.999;
+/// How long an untouched session entry survives before eviction.
+const SESSION_ENTRY_TTL_SECS: u64 = 3600;
+
+/// Value of a session entry: the worker URL and the last-access timestamp.
+pub type SessionEntry = (String, u64);
+/// Per-model session map: session_id -> SessionEntry.
+pub type SessionMap = DashMap<String, SessionEntry>;
 
 /// Cache-aware routing policy
 ///
 /// Routes requests based on cache affinity when load is balanced,
 /// switches to shortest-queue routing when load is imbalanced.
 /// Maintains separate trees per model for multi-model support.
+///
+/// Session keys are matched by exact string equality in a dedicated
+/// per-model map; the prefix tree only holds text-like keys (full chat
+/// history for chat requests, plain prompts otherwise).
 #[derive(Debug)]
 pub struct CacheAwarePolicy {
     config: CacheAwareConfig,
     trees: Arc<DashMap<String, Arc<Tree>>>, // model_id -> Arc<Tree>
+    // model_id -> session_id -> SessionEntry
+    session_keys: Arc<DashMap<String, Arc<SessionMap>>>,
     eviction_handle: Option<thread::JoinHandle<()>>,
+}
+
+/// Current unix time in milliseconds, for session-entry aging.
+fn session_now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Drop session entries that were not touched for the TTL, then enforce the
+/// per-model capacity by evicting the least recently accessed entries.
+fn evict_session_entries(map: &SessionMap, max_entries: usize) {
+    let cutoff = session_now_ms().saturating_sub(SESSION_ENTRY_TTL_SECS * 1000);
+    map.retain(|_, (_, last_access_ms)| *last_access_ms >= cutoff);
+
+    if map.len() > max_entries {
+        let mut entries: Vec<(String, u64)> =
+            map.iter().map(|e| (e.key().clone(), e.value().1)).collect();
+        entries.sort_by_key(|(_, last_access_ms)| *last_access_ms);
+        let to_remove = entries.len() - max_entries;
+        for (key, _) in entries.into_iter().take(to_remove) {
+            map.remove(&key);
+        }
+    }
 }
 
 impl CacheAwarePolicy {
@@ -97,10 +134,12 @@ impl CacheAwarePolicy {
 
     pub fn with_config(config: CacheAwareConfig) -> Self {
         let trees = Arc::new(DashMap::<String, Arc<Tree>>::new());
+        let session_keys = Arc::new(DashMap::<String, Arc<SessionMap>>::new());
 
         // Start background eviction thread if configured
         let eviction_handle = if config.eviction_interval_secs > 0 {
             let trees_clone = Arc::clone(&trees);
+            let session_keys_clone = Arc::clone(&session_keys);
             let max_tree_size = config.max_tree_size;
             let interval = config.eviction_interval_secs;
 
@@ -117,6 +156,14 @@ impl CacheAwarePolicy {
                         model_id, max_tree_size
                     );
                 }
+
+                // Sweep stale/overflowing session entries
+                for entry in session_keys_clone.iter() {
+                    let model_id = entry.key().clone();
+                    let map = entry.value();
+                    evict_session_entries(map, max_tree_size);
+                    debug!("Session key eviction completed for model {}", model_id);
+                }
             }))
         } else {
             None
@@ -125,6 +172,7 @@ impl CacheAwarePolicy {
         Self {
             config,
             trees,
+            session_keys,
             eviction_handle,
         }
     }
@@ -137,6 +185,9 @@ impl CacheAwarePolicy {
             .entry(tree_key.to_string())
             .or_insert_with(|| Arc::new(Tree::new()));
         tree.insert("", worker.url());
+        self.session_keys
+            .entry(tree_key.to_string())
+            .or_insert_with(|| Arc::new(DashMap::new()));
     }
 
     /// Add a worker by URL and model (for backward compatibility)
@@ -146,6 +197,9 @@ impl CacheAwarePolicy {
             .entry(model_id.to_string())
             .or_insert_with(|| Arc::new(Tree::new()));
         tree.insert("", url);
+        self.session_keys
+            .entry(model_id.to_string())
+            .or_insert_with(|| Arc::new(DashMap::new()));
     }
 
     /// Remove a worker from the tree
@@ -154,6 +208,9 @@ impl CacheAwarePolicy {
         if let Some(tree) = self.trees.get(tree_key) {
             tree.remove_tenant(worker.url());
         }
+        if let Some(map) = self.session_keys.get(tree_key) {
+            map.retain(|_, (url, _)| url != worker.url());
+        }
     }
 
     /// Remove a worker by URL (removes from all model trees for backward compatibility)
@@ -161,6 +218,9 @@ impl CacheAwarePolicy {
         // Remove from all trees since we don't know which model it belongs to
         for tree_ref in self.trees.iter() {
             tree_ref.value().remove_tenant(url);
+        }
+        for map_ref in self.session_keys.iter() {
+            map_ref.value().retain(|_, (entry_url, _)| entry_url != url);
         }
     }
 
@@ -174,6 +234,9 @@ impl CacheAwarePolicy {
                 "Cache eviction for model {}, max_size: {}",
                 model_id, max_size
             );
+        }
+        for map_ref in self.session_keys.iter() {
+            evict_session_entries(map_ref.value(), max_size);
         }
     }
 
@@ -208,24 +271,36 @@ impl CacheAwarePolicy {
             .min_by_key(|&&idx| workers[idx].load())
             .copied()?;
 
-        // Even in imbalanced mode, update the tree to maintain cache state.
-        // Teach it the session key and the full chat history: the worker has
-        // just processed and cached the whole prompt, so a later balanced
-        // request sharing the same prefix must be able to discover it.
-        let tree = self.trees.get(model_id).map(|entry| entry.value().clone());
-
-        if let Some(tree) = tree {
-            let worker_url = workers[min_load_idx].url();
-            for text in [request_text, fallback_text].into_iter().flatten() {
+        // Even in imbalanced mode, maintain cache state: the session map
+        // learns the session key (exact match) and the tree learns the full
+        // chat history, so a later balanced request sharing the same prefix
+        // can discover the worker that already cached it.
+        let worker_url = workers[min_load_idx].url();
+        if fallback_text.is_some() {
+            if let Some(request_text) = request_text {
+                if !request_text.trim().is_empty() {
+                    self.session_keys
+                        .entry(model_id.to_string())
+                        .or_insert_with(|| Arc::new(DashMap::new()))
+                        .insert(
+                            request_text.to_string(),
+                            (worker_url.to_string(), session_now_ms()),
+                        );
+                }
+            }
+            if let Some(tree) = self.trees.get(model_id).map(|entry| entry.value().clone()) {
+                if let Some(text) = fallback_text {
+                    if !text.is_empty() {
+                        tree.insert(text, worker_url);
+                    }
+                }
+            }
+        } else if let Some(tree) = self.trees.get(model_id).map(|entry| entry.value().clone()) {
+            if let Some(text) = request_text {
                 if !text.is_empty() {
                     tree.insert(text, worker_url);
                 }
             }
-        } else {
-            debug!(
-                "Warning: No tree found for model '{}', skipping cache update",
-                model_id
-            );
         }
 
         // Increment processed counter
@@ -291,19 +366,29 @@ impl CacheAwarePolicy {
             .filter(|text| !text.trim().is_empty())
             .or(header_key.as_deref())
             .unwrap_or("");
-        // A chat request may carry a session key with no extractable history
-        // (e.g. an image-only user message). Keep the two-stage session
-        // semantics in that case: probe the session key at the strict 0.999
-        // threshold and fall back to min-load instead of probing the empty
-        // history at cache_threshold, which would let prefix-related session
-        // ids (session-1\x1f vs session-12\x1f) pass as cache hits.
+        // A fallback key marks the chat path: the primary key is a session id
+        // matched by exact string equality against the session map (no prefix
+        // semantics, so session-1 can never collide with session-12). When
+        // there is no extractable history (e.g. an image-only chat), a session
+        // miss falls back to min-load instead of probing an empty history key.
         let fallback_provided = fallback_text.is_some();
         let fallback_text = fallback_text.filter(|text| !text.trim().is_empty());
-        let use_fallback_probe = fallback_provided && !primary_text.is_empty();
+        let session_keyed = fallback_provided && !primary_text.is_empty();
         let primary_text = if primary_text.is_empty() {
             fallback_text.unwrap_or("")
         } else {
             primary_text
+        };
+
+        let session_map = if session_keyed {
+            Some(
+                self.session_keys
+                    .entry(model_id.to_string())
+                    .or_insert_with(|| Arc::new(DashMap::new()))
+                    .clone(),
+            )
+        } else {
+            None
         };
 
         // Get the tree reference without locking the entire HashMap.
@@ -358,27 +443,26 @@ impl CacheAwarePolicy {
         };
 
         // Probe the full-history fallback at the configured threshold; when no
-        // usable history text exists, select min-load directly so the strict
-        // session semantics (0.999) still apply to the session key itself.
+        // usable history text exists, select min-load directly so the session
+        // key still gets exact-match semantics instead of a text probe.
         let probe_fallback_or_min_load =
-            |fallback_text: Option<&str>| -> (Option<usize>, &'static str, Option<String>, bool) {
+            |fallback_text: Option<&str>| -> (Option<usize>, &'static str, Option<String>) {
                 match fallback_text {
                     Some(fallback_text) => {
                         let (fallback_idx, fallback_match_rate, fallback_tenant) =
                             probe(fallback_text, self.config.cache_threshold);
                         if fallback_match_rate > self.config.cache_threshold {
                             if let Some(idx) = fallback_idx {
-                                (Some(idx), "full_history_match", None, true)
+                                (Some(idx), "full_history_match", None)
                             } else {
                                 (
                                     healthy_indices.first().copied(),
                                     "stale_tenant_fallback",
                                     Some(fallback_tenant),
-                                    true,
                                 )
                             }
                         } else {
-                            (fallback_idx, "full_history_low_match", None, true)
+                            (fallback_idx, "full_history_low_match", None)
                         }
                     }
                     None => {
@@ -386,28 +470,38 @@ impl CacheAwarePolicy {
                             .iter()
                             .min_by_key(|&&idx| workers[idx].load())
                             .copied();
-                        (min_load_idx, "empty_history_min_load", None, false)
+                        (min_load_idx, "empty_history_min_load", None)
                     }
                 }
             };
 
-        let (selected_idx, decision, stale_tenant, used_fallback) = if use_fallback_probe {
-            let (primary_idx, primary_match_rate, primary_tenant) =
-                probe(primary_text, FALLBACK_SESSION_CACHE_THRESHOLD);
-
-            let session_hit = primary_match_rate > FALLBACK_SESSION_CACHE_THRESHOLD;
-            if session_hit {
-                if let Some(idx) = primary_idx {
-                    (Some(idx), "session_id_match", None, false)
-                } else {
-                    // Stale worker for the session key; drop it and probe
-                    // the history.
-                    tree.remove_tenant(&primary_tenant);
-                    debug!("Removed stale worker {} from cache tree", primary_tenant);
-                    probe_fallback_or_min_load(fallback_text)
+        let (selected_idx, decision, stale_tenant) = if session_keyed {
+            // Exact-match session lookup: the session key never enters the
+            // prefix tree, so session ids cannot prefix-collide.
+            let session_map = session_map
+                .as_ref()
+                .expect("session map must exist when session_keyed");
+            let cached = session_map
+                .get(primary_text)
+                .map(|entry| entry.value().clone());
+            match cached {
+                Some((worker_url, _last_access)) => {
+                    match workers
+                        .iter()
+                        .position(|w| w.url() == worker_url)
+                        .filter(|&idx| workers[idx].is_healthy())
+                    {
+                        Some(idx) => (Some(idx), "session_id_match", None),
+                        None => {
+                            // Stale worker for this session: drop the entry and
+                            // fall back to the history probe.
+                            session_map.remove(primary_text);
+                            debug!("Removed stale session entry for worker {}", worker_url);
+                            probe_fallback_or_min_load(fallback_text)
+                        }
+                    }
                 }
-            } else {
-                probe_fallback_or_min_load(fallback_text)
+                None => probe_fallback_or_min_load(fallback_text),
             }
         } else {
             let (idx, match_rate, tenant) = probe(primary_text, self.config.cache_threshold);
@@ -422,13 +516,7 @@ impl CacheAwarePolicy {
                 None
             };
 
-            (idx, decision, stale_tenant, false)
-        };
-
-        let selected_text = if used_fallback {
-            fallback_text.unwrap_or(primary_text)
-        } else {
-            primary_text
+            (idx, decision, stale_tenant)
         };
 
         if let Some(tenant) = stale_tenant {
@@ -440,22 +528,22 @@ impl CacheAwarePolicy {
             RouterMetrics::record_cache_aware_decision(decision);
 
             let worker_url = workers[idx].url();
-            tree.insert(selected_text, worker_url);
-
-            // Teach the tree the full history even on a session hit: the
-            // client may later drop or change the session id, and the
-            // history key must reflect the most recent prefix the worker
-            // cached, not the shorter one from an earlier turn.
-            if let Some(history_text) = fallback_text {
-                if history_text != selected_text {
+            if session_keyed {
+                // The session map is authoritative for the session key; the
+                // prefix tree only learns text-like history keys. Teaching the
+                // history on a session hit keeps the grown conversation prefix
+                // available for clients that later drop the session id.
+                session_map
+                    .as_ref()
+                    .expect("session map must exist when session_keyed")
+                    .insert(
+                        primary_text.to_string(),
+                        (worker_url.to_string(), session_now_ms()),
+                    );
+                if let Some(history_text) = fallback_text {
                     tree.insert(history_text, worker_url);
                 }
-            }
-            if used_fallback
-                && !primary_text.is_empty()
-                && primary_text != selected_text
-                && Some(primary_text) != fallback_text
-            {
+            } else {
                 tree.insert(primary_text, worker_url);
             }
 
@@ -809,7 +897,7 @@ mod tests {
     }
 
     #[test]
-    fn test_cache_aware_fallback_uses_strict_session_threshold() {
+    fn test_cache_aware_fallback_uses_exact_session_match() {
         let config = CacheAwareConfig {
             cache_threshold: 0.3,
             eviction_interval_secs: 0,
@@ -831,7 +919,7 @@ mod tests {
         let idx1 = policy
             .select_worker_with_fallback_headers(
                 &workers,
-                Some("session-1\x1f"),
+                Some("session-1"),
                 Some("system:first unrelated prefix"),
                 None,
             )
@@ -840,10 +928,12 @@ mod tests {
 
         workers[0].increment_load();
 
+        // session-12 is a different key under exact equality even though it
+        // shares a long string prefix with session-1.
         let idx2 = policy
             .select_worker_with_fallback_headers(
                 &workers,
-                Some("session-12\x1f"),
+                Some("session-12"),
                 Some("system:second unrelated prefix"),
                 None,
             )
@@ -887,7 +977,7 @@ mod tests {
         let idx1 = policy
             .select_worker_with_fallback_headers(
                 &workers,
-                Some("session-a\x1f"),
+                Some("session-a"),
                 Some(short_history),
                 None,
             )
@@ -897,7 +987,7 @@ mod tests {
         let idx2 = policy
             .select_worker_with_fallback_headers(
                 &workers,
-                Some("session-a\x1f"),
+                Some("session-a"),
                 Some(&long_history),
                 None,
             )
@@ -915,11 +1005,11 @@ mod tests {
     }
 
     #[test]
-    fn test_cache_aware_empty_history_keeps_strict_session_threshold() {
+    fn test_cache_aware_empty_history_uses_exact_session_match() {
         // A session key with no extractable history (e.g. image-only chat)
-        // must still be probed at the strict 0.999 threshold. session-1\x1f
-        // and session-12\x1f share 80% of their chars, which would pass the
-        // configured 0.3 threshold and falsely count as a session hit.
+        // is matched by exact equality against the session map: session-12
+        // never collides with session-1 no matter how long their shared
+        // string prefix is.
         let config = CacheAwareConfig {
             cache_threshold: 0.3,
             eviction_interval_secs: 0,
@@ -941,7 +1031,7 @@ mod tests {
         let sel1 = policy
             .select_worker_with_fallback_headers_with_decision(
                 &workers,
-                Some("session-1\x1f"),
+                Some("session-1"),
                 Some(""),
                 None,
             )
@@ -954,15 +1044,122 @@ mod tests {
         let sel2 = policy
             .select_worker_with_fallback_headers_with_decision(
                 &workers,
-                Some("session-12\x1f"),
+                Some("session-12"),
                 Some(""),
                 None,
             )
             .unwrap();
-        // Not a session hit (0.8 < 0.999): must fall back to min-load
-        // instead of following the session-1 affinity.
+        // Not the session-1 affinity: exact equality says this is a
+        // different session, so fall back to min-load.
         assert_eq!(sel2.index, 1);
         assert_eq!(sel2.decision, Some("empty_history_min_load"));
+    }
+
+    #[test]
+    fn test_cache_aware_session_id_match_is_exact() {
+        let config = CacheAwareConfig {
+            cache_threshold: 0.3,
+            eviction_interval_secs: 0,
+            ..Default::default()
+        };
+        let policy = CacheAwarePolicy::with_config(config);
+        let workers: Vec<Arc<dyn Worker>> = vec![
+            Arc::new(BasicWorker::new(
+                "http://w1:8000".to_string(),
+                WorkerType::Regular,
+            )),
+            Arc::new(BasicWorker::new(
+                "http://w2:8000".to_string(),
+                WorkerType::Regular,
+            )),
+        ];
+        policy.init_workers(&workers);
+
+        let sel1 = policy
+            .select_worker_with_fallback_headers_with_decision(
+                &workers,
+                Some("session-1"),
+                Some("system:first prefix"),
+                None,
+            )
+            .unwrap();
+        workers[0].increment_load();
+
+        // Exact key: session affinity wins over the min-load worker even
+        // though worker 0 is busier (loads are still balanced).
+        let sel2 = policy
+            .select_worker_with_fallback_headers_with_decision(
+                &workers,
+                Some("session-1"),
+                Some("system:first prefix with more text"),
+                None,
+            )
+            .unwrap();
+        assert_eq!(sel2.index, sel1.index);
+        assert_eq!(sel2.decision, Some("session_id_match"));
+    }
+
+    #[test]
+    fn test_cache_aware_removed_worker_clears_session_entries() {
+        // remove_worker must drop the worker's session entries eagerly so a
+        // session can never exact-hit a worker that was removed from the
+        // policy.
+        let config = CacheAwareConfig {
+            cache_threshold: 0.5,
+            eviction_interval_secs: 0,
+            ..Default::default()
+        };
+        let policy = CacheAwarePolicy::with_config(config);
+        let workers: Vec<Arc<dyn Worker>> = vec![
+            Arc::new(BasicWorker::new(
+                "http://w1:8000".to_string(),
+                WorkerType::Regular,
+            )),
+            Arc::new(BasicWorker::new(
+                "http://w2:8000".to_string(),
+                WorkerType::Regular,
+            )),
+        ];
+        policy.init_workers(&workers);
+
+        let history = "system:bench\nuser:hello";
+        let idx1 = policy
+            .select_worker_with_fallback_headers(&workers, Some("session-a"), Some(history), None)
+            .unwrap();
+        assert_eq!(idx1, 0);
+
+        policy.remove_worker(workers[idx1].as_ref());
+        workers[0].increment_load();
+
+        // The session entry for the removed worker must be gone, so
+        // session-a cannot exact-hit it; with the history tenant also
+        // removed, the request lands on min-load (worker 2).
+        let idx2 = policy
+            .select_worker_with_fallback_headers(&workers, Some("session-a"), Some(history), None)
+            .unwrap();
+        assert_ne!(idx2, idx1);
+    }
+
+    #[test]
+    fn test_evict_session_entries_ttl_and_capacity() {
+        let map: SessionMap = DashMap::new();
+        let now = session_now_ms();
+        map.insert("fresh".to_string(), ("w1".to_string(), now));
+        map.insert(
+            "stale".to_string(),
+            ("w1".to_string(), now - (SESSION_ENTRY_TTL_SECS * 1000) - 1),
+        );
+        map.insert("oldest-fresh".to_string(), ("w1".to_string(), now - 1000));
+        map.insert("newest".to_string(), ("w2".to_string(), now));
+
+        evict_session_entries(&map, 2);
+
+        // TTL removes the stale entry; capacity then keeps the two most
+        // recently accessed entries.
+        assert!(map.contains_key("fresh"));
+        assert!(map.contains_key("newest"));
+        assert!(!map.contains_key("stale"));
+        assert!(!map.contains_key("oldest-fresh"));
     }
 
     #[test]
@@ -995,7 +1192,7 @@ mod tests {
         let idx1 = policy
             .select_worker_with_fallback_headers(
                 &workers,
-                Some("session-a\x1f"),
+                Some("session-a"),
                 Some(shared_history),
                 None,
             )
@@ -1011,7 +1208,7 @@ mod tests {
         let idx2 = policy
             .select_worker_with_fallback_headers(
                 &workers,
-                Some("session-b\x1f"),
+                Some("session-b"),
                 Some(shared_history),
                 None,
             )
