@@ -383,12 +383,7 @@ steps:
         artifact_paths:
           - "target/ci-logs/moriio-*/*.log"
 
-  # ROCm NIXL P/D coverage. This mirrors the NVIDIA NIXL lane on MI300 hardware
-  # and reuses the same dedicated MoRI MI300X queue (router_rocm_mi300_2), which
-  # runs with --no-plugins, so the Docker plugin supplies the pinned vLLM/NIXL
-  # userspace on a two-GPU xGMI host. Unlike MoRI, NIXL has no read/write mode,
-  # so this lane runs a single configuration rather than a matrix. Keep the
-  # trust-boundary condition on the group so fork builds cannot run plugin hooks.
+  # ROCm NIXL P/D coverage.
   - group: ":large_blue_circle: ROCm NIXL XGMI P/D"
     key: "pd-disagg-nixl-rocm-tests"
     if: |
