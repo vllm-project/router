@@ -7,9 +7,6 @@ set -Eeuo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 
-# Shared ROCm P/D scaffolding: defaults, preflight, cleanup trap, health waits,
-# router-binary resolution, GPU detection, and the accuracy harness call.
-# shellcheck source=py_test/e2e/pd_disagg_vllm/rocm/_pd_rocm_common.sh
 source "${SCRIPT_DIR}/_pd_rocm_common.sh"
 
 # Connector-specific configuration.

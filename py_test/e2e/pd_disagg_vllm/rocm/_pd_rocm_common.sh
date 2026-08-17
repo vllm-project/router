@@ -1,23 +1,13 @@
 #!/usr/bin/env bash
-# Shared scaffolding for the same-host ROCm P/D disaggregation runners
-# (run_moriio_accuracy_test.sh and run_nixl_rocm_accuracy_test.sh).
+# Utils for the ROCm P/D disaggregation runners.
 #
 # This file is meant to be *sourced*, not executed. It defines functions and
-# applies defaults for configuration that is genuinely identical across the
+# applies defaults for configuration that is identical across the
 # connector-specific runners. Connector-specific logic (kv-transfer JSON,
 # engine env vars, router launch flags/ordering, package installs) stays in the
 # individual scripts.
 #
-# Contract with the sourcing script:
-#   - The sourcing script owns `set -Eeuo pipefail` and installs the traps
-#     (`trap pd_rocm_cleanup EXIT`). This library only defines the functions
-#     those traps call; it installs no traps of its own.
-#   - All default assignments use `:=`, which is safe under `set -u`.
-#   - The sourcing script assigns PREFILL_PID / DECODE_PID / ROUTER_PID as it
-#     launches each component; they are pre-initialized here so the cleanup
-#     trap is safe even if it fires before a launch.
-#   - The sourcing script must set LOG_DIR (its default value differs per
-#     connector) before installing the trap.
+# Note: The sourcing script must set LOG_DIR.
 
 # Guard against double-sourcing.
 if [[ -n "${_PD_ROCM_COMMON_SOURCED:-}" ]]; then
@@ -29,9 +19,7 @@ _PD_ROCM_COMMON_SOURCED=1
 # accuracy harnesses live one level up, in the parent pd_disagg_vllm/ dir.
 _PD_ROCM_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# ---------------------------------------------------------------------------
-# Shared configuration defaults (identical values across both runners).
-# ---------------------------------------------------------------------------
+# Shared configuration defaults
 : "${MODEL_NAMES:=Qwen/Qwen3-0.6B}"
 : "${PREFILLER_TP_SIZE:=1}"
 : "${DECODER_TP_SIZE:=1}"
@@ -53,9 +41,6 @@ PREFILL_PID=${PREFILL_PID:-""}
 DECODE_PID=${DECODE_PID:-""}
 ROUTER_PID=${ROUTER_PID:-""}
 
-# ---------------------------------------------------------------------------
-# Preflight
-# ---------------------------------------------------------------------------
 pd_rocm_require_commands() {
   local command_name
   for command_name in "$@"; do
@@ -66,9 +51,7 @@ pd_rocm_require_commands() {
   done
 }
 
-# ---------------------------------------------------------------------------
 # Process teardown + cleanup trap
-# ---------------------------------------------------------------------------
 pd_rocm_terminate_process_tree() {
   local pid=$1
   local child
@@ -126,9 +109,6 @@ pd_rocm_cleanup() {
   exit "${exit_code}"
 }
 
-# ---------------------------------------------------------------------------
-# Health polling
-# ---------------------------------------------------------------------------
 pd_rocm_wait_for_health() {
   local name=$1
   local port=$2
@@ -155,9 +135,6 @@ pd_rocm_wait_for_health() {
   echo "${name} is healthy"
 }
 
-# ---------------------------------------------------------------------------
-# Router binary resolution (sets the ROUTER_BIN global)
-# ---------------------------------------------------------------------------
 pd_rocm_resolve_router_bin() {
   if [[ -n "${ROUTER_BIN:-}" ]]; then
     if [[ ! -x "${ROUTER_BIN}" ]]; then
@@ -178,10 +155,7 @@ pd_rocm_resolve_router_bin() {
   fi
 }
 
-# ---------------------------------------------------------------------------
 # GPU detection + prefill/decode GPU split
-# Sets: AVAILABLE_GPUS, ROCM_VERSION, PREFILL_GPUS, DECODE_GPUS
-# ---------------------------------------------------------------------------
 pd_rocm_detect_gpus() {
   read -r AVAILABLE_GPUS ROCM_VERSION < <(
     python3 - <<'PY'
@@ -206,9 +180,7 @@ PY
   DECODE_GPUS=$(seq -s, "${decode_gpu_start}" "${decode_gpu_end}")
 }
 
-# ---------------------------------------------------------------------------
-# Accuracy harness: sanity completions + bounded GSM8K evaluation
-# ---------------------------------------------------------------------------
+# Accuracy harness: sanity completions + GSM8K evaluation
 pd_rocm_run_accuracy() {
   local router_port=$1
 

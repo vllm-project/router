@@ -1,27 +1,18 @@
 #!/usr/bin/env bash
 # Same-host ROCm P/D disaggregation coverage using vLLM's NixlConnector.
-# This is the ROCm/MI300 analogue of the NVIDIA `run_accuracy_test.sh` NIXL
-# lane. It launches a TP1 prefill and a TP1 decode engine on two GPUs of one
-# ROCm host, wires them through the router, and validates accuracy.
-#
-# Unlike MoRI, NIXL has no read/write transfer mode, so there is no matrix
-# dimension here: the connector negotiates a single pull-based transfer path
-# over its UCX side channel.
+# Tests:
+#   - 1P1D
+#   - TP1
+#   - UCX backend
 
 set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 
-# Shared ROCm P/D scaffolding: defaults, preflight, cleanup trap, health waits,
-# router-binary resolution, GPU detection, and the accuracy harness call.
-# shellcheck source=py_test/e2e/pd_disagg_vllm/rocm/_pd_rocm_common.sh
 source "${SCRIPT_DIR}/_pd_rocm_common.sh"
 
 # Connector-specific configuration.
-# On ROCm, PyTorch exposes AMD GPUs through the "cuda" device namespace, so the
-# NIXL buffer device stays "cuda" here. GDS is NVIDIA GPUDirect Storage and is
-# unavailable on ROCm, so only the UCX backend is requested.
 KV_BUFFER_DEVICE=${KV_BUFFER_DEVICE:-"cuda"}
 NIXL_BACKENDS=${NIXL_BACKENDS:-'["UCX"]'}
 PREFILL_NIXL_PORT=${PREFILL_NIXL_PORT:-9100}
@@ -38,18 +29,6 @@ trap pd_rocm_cleanup EXIT
 trap 'exit 130' INT TERM
 
 pd_rocm_resolve_router_bin
-
-# The pinned ROCm vLLM image is expected to ship a ROCm-enabled NIXL runtime
-# (UCX built with ROCm support). If the module is missing, install the generic
-# `nixl` package, which builds against the system UCX/ROCm at import time.
-# NOTE: the exact ROCm NIXL wheel name is not yet stable upstream; adjust
-# NIXL_PACKAGE if the image ever drops the bundled runtime.
-NIXL_PACKAGE=${NIXL_PACKAGE:-"nixl"}
-if ! python3 -c "import nixl" >/dev/null 2>&1; then
-  echo "nixl module not found in image; installing ${NIXL_PACKAGE}"
-  python3 -m pip install --no-cache-dir "${NIXL_PACKAGE}"
-fi
-
 pd_rocm_detect_gpus
 
 echo "ROCm ${ROCM_VERSION}; connector=NixlConnector (kv_both); buffer=${KV_BUFFER_DEVICE}"
