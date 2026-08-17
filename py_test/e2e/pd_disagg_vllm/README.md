@@ -9,9 +9,23 @@ These tests validate that the vLLM router correctly handles P/D disaggregated in
 - **Decode instances** handle token generation using the transferred KV cache
 - **Router** manages request routing between prefill and decode instances
 
+## Layout
+
+Vendor-specific runner scripts live in subfolders, while the shared Python
+harnesses (`test_pd_accuracy.py`, `test_lm_eval_accuracy.py`) stay at this
+top level so both vendors reach them via `../`:
+
+```
+pd_disagg_vllm/
+  test_pd_accuracy.py
+  test_lm_eval_accuracy.py
+  nvidia/    # NVIDIA/CUDA NIXL runners
+  rocm/      # ROCm/MI300 MoRI + NIXL runners and shared helper
+```
+
 ## Test Components
 
-### 1. `run_accuracy_test.sh`
+### 1. `nvidia/run_accuracy_test.sh`
 Main test script that:
 - Launches vLLM prefill and decode instances in Docker containers
 - Starts the vLLM router with P/D disaggregation enabled
@@ -35,7 +49,7 @@ Python script that validates accuracy by:
 - Validating response structure and content
 - Checking router health
 
-### 3. `tp_config_sweep_test.sh`
+### 3. `nvidia/tp_config_sweep_test.sh`
 Wrapper script that runs tests with multiple TP configurations:
 - TP=2 for both prefill and decode
 - TP=1 for prefill, TP=2 for decode (asymmetric)
@@ -44,19 +58,39 @@ Wrapper script that runs tests with multiple TP configurations:
 
 ### 4. ROCm MoRI runners
 
-`run_moriio_accuracy_test.sh` runs TP1 prefill and TP1 decode on two GPUs of
-one ROCm host with MoRI's xGMI backend. `run_moriio_rdma_accuracy_test.sh` runs
-prefill on the coordinator and decode on a second ROCm host over GPU-memory
+`rocm/run_moriio_accuracy_test.sh` runs TP1 prefill and TP1 decode on two GPUs
+of one ROCm host with MoRI's xGMI backend. `rocm/run_moriio_rdma_accuracy_test.sh`
+runs prefill on the coordinator and decode on a second ROCm host over GPU-memory
 RDMA. Both runners cover MoRI read and write modes, Router discovery, sanity
-requests, and a bounded GSM8K accuracy evaluation with `Qwen/Qwen3-0.6B`.
+requests, and a bounded GSM8K accuracy evaluation with `Qwen/Qwen3-0.6B`. They
+share scaffolding from `rocm/_pd_rocm_common.sh`.
 
 The two-node runner requires the coordinator's `vllm-router-rocm-worker` SSH
 alias, the pinned ROCm vLLM image and model cache on both hosts, and access to
 `/dev/kfd`, `/dev/dri`, and `/dev/infiniband`. For example:
 
 ```bash
-MORIIO_READ_MODE=true bash ./run_moriio_accuracy_test.sh
-MORIIO_READ_MODE=false bash ./run_moriio_rdma_accuracy_test.sh
+MORIIO_READ_MODE=true bash ./rocm/run_moriio_accuracy_test.sh
+MORIIO_READ_MODE=false bash ./rocm/run_moriio_rdma_accuracy_test.sh
+```
+
+### 5. ROCm NIXL runner
+
+`rocm/run_nixl_rocm_accuracy_test.sh` is the ROCm/MI300 analogue of the NVIDIA
+NIXL lane in `nvidia/run_accuracy_test.sh`. It runs TP1 prefill and TP1 decode on two GPUs
+of one ROCm host with vLLM's `NixlConnector` (`kv_role=kv_both`) over the UCX
+side channel, then drives Router discovery, sanity requests, and a bounded
+GSM8K accuracy evaluation with `Qwen/Qwen3-0.6B`. NIXL has no read/write
+transfer mode, so this runner is a single configuration rather than a matrix.
+
+Unlike the CUDA path, which installs `nixl-cu13`, the ROCm path expects a
+ROCm-enabled NIXL runtime to ship in the pinned ROCm vLLM image; the script
+falls back to `pip install nixl` (override with `NIXL_PACKAGE`) if the module is
+missing. The GDS backend is NVIDIA-only, so only `["UCX"]` is requested. For
+example:
+
+```bash
+ROUTER_BIN=/path/to/target/release/vllm-router bash ./rocm/run_nixl_rocm_accuracy_test.sh
 ```
 
 ## Running Tests
@@ -72,7 +106,7 @@ MORIIO_READ_MODE=false bash ./run_moriio_rdma_accuracy_test.sh
 Run all tests with default configuration:
 ```bash
 cd py_test/e2e/pd_disagg_vllm
-./tp_config_sweep_test.sh
+./nvidia/tp_config_sweep_test.sh
 ```
 
 ### Run Single Configuration
@@ -82,7 +116,7 @@ Run with specific settings:
 GPU_MEMORY_UTILIZATION=0.6 \
 PREFILLER_TP_SIZE=2 \
 DECODER_TP_SIZE=2 \
-./run_accuracy_test.sh
+./nvidia/run_accuracy_test.sh
 ```
 
 ### Custom Docker Image
@@ -90,7 +124,7 @@ DECODER_TP_SIZE=2 \
 Use a specific vLLM Docker image:
 ```bash
 VLLM_DOCKER_IMAGE=vllm/vllm-openai:v0.6.0 \
-./run_accuracy_test.sh
+./nvidia/run_accuracy_test.sh
 ```
 
 ### Test Different Models
@@ -99,14 +133,14 @@ Test with a different model:
 ```bash
 MODEL_NAMES=Qwen/Qwen2.5-1.5B-Instruct \
 GPU_MEMORY_UTILIZATION=0.6 \
-./run_accuracy_test.sh
+./nvidia/run_accuracy_test.sh
 ```
 
 ### Enable FlashInfer Backend
 
 Test with FlashInfer attention backend:
 ```bash
-TEST_FLASHINFER=1 ./tp_config_sweep_test.sh
+TEST_FLASHINFER=1 ./nvidia/tp_config_sweep_test.sh
 ```
 
 ## Test Flow
@@ -187,12 +221,12 @@ docker logs vllm_decode_0
 ### GPU out of memory
 Reduce `GPU_MEMORY_UTILIZATION`:
 ```bash
-GPU_MEMORY_UTILIZATION=0.4 ./run_accuracy_test.sh
+GPU_MEMORY_UTILIZATION=0.4 ./nvidia/run_accuracy_test.sh
 ```
 
 Or use a smaller model:
 ```bash
-MODEL_NAMES=facebook/opt-125m ./run_accuracy_test.sh
+MODEL_NAMES=facebook/opt-125m ./nvidia/run_accuracy_test.sh
 ```
 
 ### Port conflicts
@@ -201,7 +235,7 @@ Change base ports:
 PREFILL_BASE_PORT=9100 \
 DECODE_BASE_PORT=9200 \
 ROUTER_PORT=9300 \
-./run_accuracy_test.sh
+./nvidia/run_accuracy_test.sh
 ```
 
 ### Clean up manually
