@@ -76,22 +76,8 @@ MORIIO_READ_MODE=false bash ./rocm/run_moriio_rdma_accuracy_test.sh
 
 ### 5. ROCm NIXL runner
 
-`rocm/run_nixl_rocm_accuracy_test.sh` is the ROCm/MI300 analogue of the NVIDIA
-NIXL lane in `nvidia/run_accuracy_test.sh`. It runs TP1 prefill and TP1 decode on two GPUs
-of one ROCm host with vLLM's `NixlConnector` (`kv_role=kv_both`) over the UCX
-side channel, then drives Router discovery, sanity requests, and a bounded
-GSM8K accuracy evaluation with `Qwen/Qwen3-0.6B`. NIXL has no read/write
-transfer mode, so this runner is a single configuration rather than a matrix.
-
-Unlike the CUDA path, which installs `nixl-cu13`, the ROCm path expects a
-ROCm-enabled NIXL runtime to ship in the pinned ROCm vLLM image; the script
-falls back to `pip install nixl` (override with `NIXL_PACKAGE`) if the module is
-missing. The GDS backend is NVIDIA-only, so only `["UCX"]` is requested. For
-example:
-
-```bash
-ROUTER_BIN=/path/to/target/release/vllm-router bash ./rocm/run_nixl_rocm_accuracy_test.sh
-```
+`rocm/run_nixl_rocm_accuracy_test.sh` runs a TP1 1P1D deployment with `NixlConnector` using the UCX backend,
+validating GSM8k accuracy.
 
 ## Running Tests
 
