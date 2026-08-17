@@ -89,20 +89,10 @@ controls the second host through the strict `vllm-router-rocm-worker` SSH alias.
 
 ### ROCm NIXL coverage
 
-The same `router_rocm_mi300_2` queue also runs the ROCm NIXL P/D lane, the
-MI300X analogue of the NVIDIA NIXL four-GPU step. It runs
-`rocm/run_nixl_rocm_accuracy_test.sh`, which launches TP1 prefill and TP1 decode on
-two GPUs of one host with vLLM's `NixlConnector` (`kv_role=kv_both`) over the
-UCX side channel. NIXL has no read/write transfer mode, so this lane is a
-single configuration rather than a matrix. It reuses the same digest-pinned
-ROCm vLLM image and the same trust-boundary gating as the MoRI xGMI group:
-same-repository pull requests, the default branch, and merge-queue builds run
-it automatically, and trusted manual/API builds can opt in with
-`RUN_ROCM_NIXL=1`. Group-level filtering keeps Docker plugin hooks off
-untrusted fork pull requests. Where the CUDA NIXL lane installs `nixl-cu13`,
-the ROCm lane relies on the NIXL runtime bundled in the pinned image (falling
-back to `pip install nixl`), and requests only the `["UCX"]` backend since GDS
-is NVIDIA-only.
+
+The same `router_rocm_mi300_2` queue also runs the ROCm NIXL P/D lane.
+`rocm/run_nixl_rocm_accuracy_test.sh` runs a TP1 1P1D deployment with `NixlConnector` using the UCX backend,
+validating GSM8k accuracy.
 
 ### Environment Variables
 
