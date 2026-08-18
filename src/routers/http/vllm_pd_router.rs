@@ -6,7 +6,7 @@ use super::pd_router::PdRouterBase;
 use super::pd_types::{error_chain, PDRouterError};
 use super::vllm_service_discovery::{MoriIOTransferMode, ServiceRegistry, ServiceType};
 use crate::config::KvConnector;
-use crate::core::{BasicWorker, Worker, WorkerType};
+use crate::core::{BasicWorker, Worker, WorkerLoadGuard, WorkerType};
 use crate::metrics::RouterMetrics;
 use crate::otel_http::{self, ClientRequestOptions};
 use crate::policies::PolicyRegistry;
@@ -1174,8 +1174,7 @@ impl VllmPDRouter {
             path
         );
 
-        // Increment prefill load at the start of the prefill phase
-        prefill_worker.increment_load();
+        let prefill_load = WorkerLoadGuard::new(prefill_worker.as_ref());
 
         let prefill_zmq_addr =
             self.get_zmq_address(prefill_worker.base_url(), ServiceType::Prefill);
@@ -1270,7 +1269,6 @@ impl VllmPDRouter {
         {
             Ok(resp) => resp,
             Err(e) => {
-                prefill_worker.decrement_load();
                 let full_error = error_chain(&e);
                 let duration = start_time.elapsed();
                 RouterMetrics::record_pd_prefill_error(&prefill_base_url);
@@ -1292,7 +1290,6 @@ impl VllmPDRouter {
         let prefill_bytes = match prefill_response.bytes().await {
             Ok(bytes) => bytes,
             Err(e) => {
-                prefill_worker.decrement_load();
                 let full_error = error_chain(&e);
                 let duration = start_time.elapsed();
                 RouterMetrics::record_pd_prefill_error(&prefill_base_url);
@@ -1322,7 +1319,6 @@ impl VllmPDRouter {
         let prefill_response_json: Value = match serde_json::from_slice(&prefill_bytes) {
             Ok(json) => json,
             Err(e) => {
-                prefill_worker.decrement_load();
                 let duration = start_time.elapsed();
                 RouterMetrics::record_pd_prefill_error(&prefill_base_url);
                 RouterMetrics::record_pd_request(path);
@@ -1348,9 +1344,8 @@ impl VllmPDRouter {
         // Stop profiling on prefill server after its work is done
         self.stop_profiling(&prefill_base_url).await;
 
-        // Prefill phase complete: decrement prefill load, increment decode load
-        prefill_worker.decrement_load();
-        decode_worker.increment_load();
+        drop(prefill_load);
+        let decode_load = WorkerLoadGuard::new(decode_worker.as_ref());
 
         debug!("✅ vLLM Stage 1 completed, starting Stage 2 - Decode");
 
@@ -1451,7 +1446,6 @@ impl VllmPDRouter {
         {
             Ok(resp) => resp,
             Err(e) => {
-                decode_worker.decrement_load();
                 let full_error = error_chain(&e);
                 let duration = start_time.elapsed();
                 RouterMetrics::record_pd_decode_error(&decode_base_url);
@@ -1467,8 +1461,7 @@ impl VllmPDRouter {
         // Stop profiling on decode server after response received
         self.stop_profiling(&decode_base_url).await;
 
-        // Decode phase complete: decrement decode load
-        decode_worker.decrement_load();
+        drop(decode_load);
 
         let status = decode_response.status();
         let headers = decode_response.headers().clone();
@@ -2419,6 +2412,29 @@ impl WorkerManagement for VllmPDRouter {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn worker_load_guard_releases_load_when_cancelled() {
+        let worker = Arc::new(BasicWorker::new(
+            "http://worker:8080".to_string(),
+            WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+        ));
+        let worker_for_request = worker.clone();
+        let request = tokio::spawn(async move {
+            let _guard = WorkerLoadGuard::new(worker_for_request.as_ref());
+            std::future::pending::<()>().await;
+        });
+
+        while worker.load() == 0 {
+            tokio::task::yield_now().await;
+        }
+        request.abort();
+        let _ = request.await;
+
+        assert_eq!(worker.load(), 0);
+    }
 
     #[test]
     fn test_discovery_health_requires_prefill_and_decode_workers() {
