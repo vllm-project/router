@@ -18,7 +18,8 @@ use axum::{
     body::Body,
     extract::Request,
     http::{
-        header::CONTENT_LENGTH, header::CONTENT_TYPE, HeaderMap, HeaderValue, Method, StatusCode,
+        header::CONTENT_LENGTH, header::CONTENT_TYPE, header::HOST, HeaderMap, HeaderValue, Method,
+        StatusCode,
     },
     response::{IntoResponse, Response},
     Json,
@@ -435,6 +436,7 @@ impl Router {
                     let name_lc = name.to_lowercase();
                     if name_lc != "content-type"
                         && name_lc != "content-length"
+                        && name_lc != "host"
                         && !header_utils::TRACE_HEADER_NAMES.contains(&name_lc.as_str())
                     {
                         request_builder = request_builder.header(name, value);
@@ -687,6 +689,7 @@ impl Router {
                     let name_lc = name.as_str().to_lowercase();
                     if name_lc != "content-type"
                         && name_lc != "content-length"
+                        && name_lc != "host"
                         && !header_utils::TRACE_HEADER_NAMES.contains(&name_lc.as_str())
                     {
                         request_builder = request_builder.header(name, value);
@@ -823,6 +826,7 @@ impl Router {
             for (name, value) in headers {
                 if *name != CONTENT_TYPE
                     && *name != CONTENT_LENGTH
+                    && *name != HOST
                     && !header_utils::TRACE_HEADER_NAMES
                         .iter()
                         .any(|&th| name.as_str().eq_ignore_ascii_case(th))
