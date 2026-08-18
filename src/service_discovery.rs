@@ -389,7 +389,10 @@ async fn handle_pod_event(
                     // Support --vllm-pd-disaggregation mode with K8s service discovery
                     match &pod_info.pod_type {
                         Some(PodType::Prefill) => vllm_pd_router
-                            .add_prefill_server(worker_url.clone(), pod_info.bootstrap_port)
+                            .add_discovered_prefill_server(
+                                worker_url.clone(),
+                                pod_info.bootstrap_port,
+                            )
                             .await
                             .map_err(|e| e.to_string()),
                         Some(PodType::Decode) => vllm_pd_router
