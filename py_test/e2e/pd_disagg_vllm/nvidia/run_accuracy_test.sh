@@ -265,7 +265,7 @@ if ! command -v vllm-router &> /dev/null; then
   fi
 
   # Build router from repository root
-  REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
+  REPO_ROOT="$(cd "${SCRIPT_DIR}/../../../.." && pwd)"
   pushd "$REPO_ROOT" > /dev/null
   cargo build --release
   export PATH="${REPO_ROOT}/target/release:$PATH"
@@ -344,7 +344,7 @@ echo "✓ Router started"
 echo "=== Running Router P/D Disaggregation Sanity Test ==="
 
 # Test basic completion through router
-python3 "${SCRIPT_DIR}/test_pd_accuracy.py" \
+python3 "${SCRIPT_DIR}/../test_pd_accuracy.py" \
   --router-url "http://localhost:${ROUTER_PORT}" \
   --model "$MODEL_NAMES" \
   --num-requests 20 \
@@ -361,7 +361,7 @@ else
   echo "=== Running LM-Eval Accuracy Test ==="
 
   # Run LM-Eval benchmark to validate accuracy through P/D disaggregation
-  python3 "${SCRIPT_DIR}/test_lm_eval_accuracy.py" \
+  python3 "${SCRIPT_DIR}/../test_lm_eval_accuracy.py" \
     --router-url "http://localhost:${ROUTER_PORT}" \
     --model "$MODEL_NAMES" \
     --num-concurrent 10
