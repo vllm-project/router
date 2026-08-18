@@ -1600,6 +1600,91 @@ mod cache_tests {
         assert!(body_json.is_object());
         // The exact structure depends on the implementation
         // but should contain worker load information
+        assert!(body_json.get("workers").is_some());
+        let workers = body_json["workers"].as_array().unwrap();
+        assert_eq!(workers.len(), 2);
+        // Each worker entry should have "worker" (url) and "load" fields
+        for entry in workers {
+            assert!(entry.get("worker").is_some());
+            assert!(entry.get("load").is_some());
+        }
+
+        ctx.shutdown().await;
+    }
+
+    // Verify that the mock worker's /load endpoint returns {"server_load": N}
+    // matching the vLLM API format that the router now expects
+    #[tokio::test]
+    async fn test_worker_load_endpoint_format() {
+        let mut worker = MockWorker::new(MockWorkerConfig {
+            port: 0, // ephemeral port
+            worker_type: WorkerType::Regular,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 0.0,
+        });
+        let url = worker.start().await.unwrap();
+
+        let client = Client::new();
+        let resp = client.get(format!("{}/load", url)).send().await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body: serde_json::Value = resp.json().await.unwrap();
+        // vLLM returns {"server_load": N}, not {"load": N}
+        assert!(
+            body.get("server_load").is_some(),
+            "Expected 'server_load' key in /load response, got: {:?}",
+            body
+        );
+        assert!(
+            body.get("server_load").unwrap().is_i64(),
+            "server_load should be an integer, got: {:?}",
+            body["server_load"]
+        );
+
+        worker.stop().await;
+    }
+
+    // Verify that the router successfully fetches load from workers via /load
+    // and that the returned load value is non-negative (not -1 fallback).
+    #[tokio::test]
+    async fn test_router_fetches_load_via_server_load_key() {
+        let ctx = TestContext::new(vec![MockWorkerConfig {
+            port: 0,
+            worker_type: WorkerType::Regular,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 0.0,
+        }])
+        .await;
+
+        let app = ctx.create_app().await;
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/get_loads")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        let workers = body_json["workers"].as_array().unwrap();
+        assert_eq!(workers.len(), 1);
+        // The load value should be 0 (mock default), NOT -1 (fallback for
+        // failed fetch), proving the router correctly calls GET /load and
+        // parses the "server_load" key.
+        let load_val = workers[0]["load"].as_i64().unwrap();
+        assert!(
+            load_val >= 0,
+            "Load should be >= 0 when /load endpoint is reachable, got: {}",
+            load_val
+        );
 
         ctx.shutdown().await;
     }
