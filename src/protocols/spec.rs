@@ -64,7 +64,7 @@ use std::collections::HashMap;
 pub enum ChatMessage {
     System {
         role: String,
-        content: String,
+        content: SystemMessageContent,
         #[serde(skip_serializing_if = "Option::is_none")]
         name: Option<String>,
     },
@@ -157,11 +157,20 @@ impl<'de> Deserialize<'de> for ChatMessage {
             }),
             "system" => Ok(ChatMessage::System {
                 role: role.to_string(),
-                content: value
-                    .get("content")
-                    .and_then(|c| c.as_str())
-                    .unwrap_or("")
-                    .to_string(),
+                // Strict OpenAI compatibility: array-formatted content may only
+                // contain text parts. A present but unparseable content (e.g.
+                // image_url parts) is a hard error (4xx, 422 via axum's Json
+                // extractor) instead of silently degrading to an empty string;
+                // missing/null still defaults to empty text for backward
+                // compatibility.
+                content: match value.get("content") {
+                    None | Some(Value::Null) => SystemMessageContent::Text(String::new()),
+                    Some(c) => serde_json::from_value(c.clone()).map_err(|e| {
+                        D::Error::custom(format!(
+                            "system message content must be a string or an array of text parts: {e}"
+                        ))
+                    })?,
+                },
                 name: value.get("name").and_then(|n| {
                     if n.is_null() {
                         None
@@ -268,6 +277,31 @@ pub struct StructuredOutputsParams {
 pub enum UserMessageContent {
     Text(String),
     Parts(Vec<ContentPart>),
+}
+
+// System messages are strictly OpenAI-compatible: array-formatted content may
+// only contain text parts. Unlike User messages, non-text parts (e.g.
+// image_url) are rejected at deserialization time and surface as a 4xx (422
+// via axum's Json extractor) instead of being silently dropped or forwarded.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum SystemMessageContent {
+    Text(String),
+    Parts(Vec<SystemContentPart>),
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(tag = "type")]
+pub enum SystemContentPart {
+    #[serde(rename = "text")]
+    Text {
+        text: String,
+        // Unknown extension fields (e.g. prompt_cache_breakpoint) are
+        // preserved for transparent forwarding instead of being silently
+        // dropped by the typed parse/reserialize round-trip.
+        #[serde(flatten)]
+        extra: serde_json::Map<String, Value>,
+    },
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -3683,11 +3717,136 @@ mod tests {
         let message: ChatMessage = serde_json::from_str(json).unwrap();
 
         match message {
-            ChatMessage::System { content, .. } => {
-                assert_eq!(content, "You are a helpful assistant.");
-            }
+            ChatMessage::System { content, .. } => match content {
+                SystemMessageContent::Text(text) => {
+                    assert_eq!(text, "You are a helpful assistant.");
+                }
+                _ => panic!("Expected Text content"),
+            },
             _ => panic!("Expected System message"),
         }
+    }
+
+    #[test]
+    fn test_chat_message_system_array_content_roundtrip() {
+        // Regression (issue #201): array-formatted system content must survive
+        // deserialization and re-serialization instead of being dropped to "".
+        let json = r#"{
+            "role": "system",
+            "content": [{"type": "text", "text": "You are GLM-5.2."}]
+        }"#;
+
+        let message: ChatMessage = serde_json::from_str(json).unwrap();
+
+        match &message {
+            ChatMessage::System { content, .. } => match content {
+                SystemMessageContent::Parts(parts) => {
+                    assert_eq!(parts.len(), 1);
+                    match &parts[0] {
+                        SystemContentPart::Text { text, .. } => {
+                            assert_eq!(text, "You are GLM-5.2.");
+                        }
+                    }
+                }
+                other => panic!("Expected Parts content, got: {:?}", other),
+            },
+            _ => panic!("Expected System message"),
+        }
+
+        // Re-serialization must preserve the array form for forwarding.
+        let serialized = serde_json::to_value(&message).unwrap();
+        assert_eq!(
+            serialized.get("content"),
+            Some(&serde_json::json!([{"type": "text", "text": "You are GLM-5.2."}])),
+        );
+
+        let reparsed: ChatMessage = serde_json::from_value(serialized).unwrap();
+        match reparsed {
+            ChatMessage::System { content, .. } => match content {
+                SystemMessageContent::Parts(parts) => assert_eq!(parts.len(), 1),
+                other => panic!("Expected Parts content, got: {:?}", other),
+            },
+            _ => panic!("Expected System message"),
+        }
+    }
+
+    #[test]
+    fn test_chat_message_system_rejects_non_text_parts() {
+        // Strict OpenAI compatibility: system arrays may only contain text
+        // parts. image_url (and any other non-text part) must be rejected with
+        // a deserialization error instead of being silently dropped or
+        // forwarded.
+        let cases = [
+            r#"{
+                "role": "system",
+                "content": [{"type": "image_url", "image_url": {"url": "https://example.com/x.png"}}]
+            }"#,
+            r#"{
+                "role": "system",
+                "content": [{"type": "text", "text": "ok"}, {"type": "image_url", "image_url": {"url": "x"}}]
+            }"#,
+            r#"{
+                "role": "system",
+                "content": [{"type": "text"}]
+            }"#,
+        ];
+
+        for json in cases {
+            let result: Result<ChatMessage, _> = serde_json::from_str(json);
+            assert!(
+                result.is_err(),
+                "expected deserialization error for: {json}"
+            );
+        }
+
+        // Missing or null content still defaults to empty text.
+        for json in [
+            r#"{"role": "system"}"#,
+            r#"{"role": "system", "content": null}"#,
+        ] {
+            let message: ChatMessage = serde_json::from_str(json).unwrap();
+            match message {
+                ChatMessage::System { content, .. } => match content {
+                    SystemMessageContent::Text(text) => assert_eq!(text, ""),
+                    other => panic!("Expected Text content, got: {:?}", other),
+                },
+                _ => panic!("Expected System message"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_chat_message_system_text_part_preserves_extension_fields() {
+        // PR review P2: valid extra fields on text parts (e.g.
+        // prompt_cache_breakpoint) must survive the parse/reserialize
+        // forwarding round-trip instead of being silently dropped.
+        let json = r#"{
+            "role": "system",
+            "content": [
+                {
+                    "type": "text",
+                    "text": "Be helpful",
+                    "prompt_cache_breakpoint": {"mode": "explicit"}
+                }
+            ]
+        }"#;
+
+        let message: ChatMessage = serde_json::from_str(json).unwrap();
+        let serialized = serde_json::to_value(&message).unwrap();
+
+        assert_eq!(
+            serialized,
+            serde_json::json!({
+                "role": "system",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "Be helpful",
+                        "prompt_cache_breakpoint": {"mode": "explicit"}
+                    }
+                ]
+            }),
+        );
     }
 
     #[test]
