@@ -59,7 +59,7 @@
     during the next eviction cycle.
 */
 
-use super::hash_key::extract_hash_key_from_headers;
+use super::hash_key::{extract_hash_key_from_body, extract_hash_key_from_headers};
 use super::{
     get_healthy_worker_indices, CacheAwareConfig, LoadBalancingPolicy, RequestHeaders,
     RoutingSelection,
@@ -359,21 +359,34 @@ impl CacheAwarePolicy {
             );
         }
 
-        // Use explicit routing text first; fall back to session headers for
-        // clients that carry affinity only in HTTP metadata.
+        // Session identity is derived the same way hash policies derive their
+        // key (extract_hash_key priority: HTTP headers, then body fields),
+        // with the explicit routing text winning when present: for chat
+        // requests the routing text already IS the session id extracted from
+        // session_params, and text-like prompts keep their prefix semantics.
         let header_key = headers.and_then(extract_hash_key_from_headers);
-        let primary_text = request_text
-            .filter(|text| !text.trim().is_empty())
+        let body_key = extract_hash_key_from_body(request_text);
+        let request_text_non_empty = request_text.filter(|text| !text.trim().is_empty());
+        let primary_text = request_text_non_empty
             .or(header_key.as_deref())
+            .or(body_key.as_deref())
             .unwrap_or("");
-        // A fallback key marks the chat path: the primary key is a session id
-        // matched by exact string equality against the session map (no prefix
-        // semantics, so session-1 can never collide with session-12). When
-        // there is no extractable history (e.g. an image-only chat), a session
-        // miss falls back to min-load instead of probing an empty history key.
+        // A fallback key marks the chat path. Session-derived keys (HTTP
+        // headers or body fields) use exact-match session semantics even
+        // without a fallback key, so a request carrying only an x-session-id
+        // header still gets sticky session affinity. Plain text keys keep
+        // prefix-tree semantics even when unrelated headers are present.
+        // Session keys are matched by exact string equality against the
+        // session map (no prefix semantics, so session-1 can never collide
+        // with session-12). When there is no extractable history (e.g. an
+        // image-only chat), a session miss falls back to min-load instead of
+        // probing an empty history key.
         let fallback_provided = fallback_text.is_some();
         let fallback_text = fallback_text.filter(|text| !text.trim().is_empty());
-        let session_keyed = fallback_provided && !primary_text.is_empty();
+        let session_keyed = !primary_text.is_empty()
+            && (fallback_provided
+                || (request_text_non_empty.is_none()
+                    && (header_key.is_some() || body_key.is_some())));
         let primary_text = if primary_text.is_empty() {
             fallback_text.unwrap_or("")
         } else {
@@ -807,6 +820,110 @@ mod tests {
             .select_worker_with_headers(&workers, None, Some(&headers))
             .unwrap();
 
+        assert_eq!(idx1, idx2);
+    }
+
+    #[test]
+    fn test_cache_aware_header_session_key_uses_exact_match_without_fallback() {
+        // A session-derived header key (x-session-id) on a request without a
+        // fallback key must use exact-match session semantics: repeated
+        // requests stick to one worker and prefix-related header values do
+        // not collide.
+        let config = CacheAwareConfig {
+            eviction_interval_secs: 0,
+            ..Default::default()
+        };
+        let policy = CacheAwarePolicy::with_config(config);
+        let workers: Vec<Arc<dyn Worker>> = vec![
+            Arc::new(BasicWorker::new(
+                "http://w1:8000".to_string(),
+                WorkerType::Regular,
+            )),
+            Arc::new(BasicWorker::new(
+                "http://w2:8000".to_string(),
+                WorkerType::Regular,
+            )),
+        ];
+        policy.init_workers(&workers);
+
+        let mut headers_a = RequestHeaders::new();
+        headers_a.insert("x-session-id".to_string(), "agent-session-1".to_string());
+
+        let idx1 = policy
+            .select_worker_with_headers(&workers, Some(""), Some(&headers_a))
+            .unwrap();
+
+        // Same header again: exact hit on the session map.
+        let sel2 = policy
+            .select_worker_with_fallback_headers_with_decision(
+                &workers,
+                Some(""),
+                None,
+                Some(&headers_a),
+            )
+            .unwrap();
+        assert_eq!(sel2.index, idx1);
+        assert_eq!(sel2.decision, Some("session_id_match"));
+
+        // A prefix-related header value is a different session under exact
+        // equality: it must not ride on agent-session-1's worker.
+        workers[idx1].increment_load();
+        let mut headers_b = RequestHeaders::new();
+        headers_b.insert("x-session-id".to_string(), "agent-session-12".to_string());
+        let sel3 = policy
+            .select_worker_with_fallback_headers_with_decision(
+                &workers,
+                Some(""),
+                None,
+                Some(&headers_b),
+            )
+            .unwrap();
+        assert_ne!(sel3.index, idx1);
+    }
+
+    #[test]
+    fn test_cache_aware_text_key_keeps_prefix_semantics_with_headers_present() {
+        // Non-chat text keys keep prefix-tree semantics even when a session
+        // header is present: the explicit routing text wins, so prompt
+        // prefix affinity is not replaced by exact matching.
+        let config = CacheAwareConfig {
+            cache_threshold: 0.3,
+            eviction_interval_secs: 0,
+            ..Default::default()
+        };
+        let policy = CacheAwarePolicy::with_config(config);
+        let workers: Vec<Arc<dyn Worker>> = vec![
+            Arc::new(BasicWorker::new(
+                "http://w1:8000".to_string(),
+                WorkerType::Regular,
+            )),
+            Arc::new(BasicWorker::new(
+                "http://w2:8000".to_string(),
+                WorkerType::Regular,
+            )),
+        ];
+        policy.init_workers(&workers);
+
+        let mut headers = RequestHeaders::new();
+        headers.insert("x-session-id".to_string(), "some-session".to_string());
+
+        let shared_prefix = "system:You are a coding agent\ntool:read_file";
+        let idx1 = policy
+            .select_worker_with_headers(&workers, Some(shared_prefix), Some(&headers))
+            .unwrap();
+
+        // Same prefix, different suffix, different header: prefix affinity
+        // still routes to the same worker (prefix-tree semantics, not exact
+        // matching on the full text).
+        let mut headers_b = RequestHeaders::new();
+        headers_b.insert("x-session-id".to_string(), "another-session".to_string());
+        let idx2 = policy
+            .select_worker_with_headers(
+                &workers,
+                Some(&format!("{shared_prefix}\nuser:different suffix")),
+                Some(&headers_b),
+            )
+            .unwrap();
         assert_eq!(idx1, idx2);
     }
 
