@@ -297,6 +297,11 @@ pub enum ResponseFormat {
     JsonObject,
     #[serde(rename = "json_schema")]
     JsonSchema { json_schema: JsonSchemaFormat },
+    #[serde(rename = "structural_tag")]
+    StructuralTag {
+        #[serde(flatten)]
+        extra: serde_json::Map<String, Value>,
+    },
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -3284,6 +3289,32 @@ mod tests {
         let request: ChatCompletionRequest = serde_json::from_str(json).unwrap();
         assert!(request.model.is_none());
         assert!(request.validate().is_ok());
+    }
+
+    #[test]
+    fn test_chat_completion_request_with_structural_tag_response_format() {
+        let json = r#"{
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "response_format": {
+                "type": "structural_tag",
+                "structures": [{"begin": "<answer>", "schema": {"type": "string"}, "end": "</answer>"}],
+                "triggers": ["<answer>"]
+            }
+        }"#;
+
+        let request: ChatCompletionRequest = serde_json::from_str(json).unwrap();
+        assert!(matches!(
+            request.response_format,
+            Some(ResponseFormat::StructuralTag { .. })
+        ));
+
+        let serialized = serde_json::to_string(&request).unwrap();
+        let roundtrip: ChatCompletionRequest = serde_json::from_str(&serialized).unwrap();
+        assert!(matches!(
+            roundtrip.response_format,
+            Some(ResponseFormat::StructuralTag { .. })
+        ));
     }
 
     #[test]
