@@ -83,6 +83,14 @@ ROCm-only scheduled builds should set both `NIGHTLY=1` and `ROCM_ONLY=1`.
 `ROCM_ONLY=1` skips the unrelated NVIDIA four-GPU P/D step while retaining the
 CPU build that supplies the router artifact to both ROCm matrices.
 
+Both ROCm steps share the organization-wide concurrency group
+`vllm/router-rocm-mi300x-pair` with a limit of one. This prevents jobs from
+different builds or pipelines from owning the coordinator/worker pair at the
+same time, even if the queue gains more agents later. Automatic retries are
+limited to Buildkite's lost-agent exit status (`-1`); test, GPU, and RDMA
+failures require an inspected manual retry so regressions cannot be hidden by a
+second green attempt.
+
 Both matrices use a digest-pinned ROCm vLLM image and run health, sanity, and
 500-example GSM8K accuracy checks. The RDMA job is coordinator-owned and
 controls the second host through the strict `vllm-router-rocm-worker` SSH alias.
