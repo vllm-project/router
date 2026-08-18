@@ -26,7 +26,7 @@ The `consistent_hash` policy routes requests with the same session/user identifi
 
 ```bash
 # Using CLI
-vllm-router --policy consistent_hash --worker-urls http://worker1:8000,http://worker2:8000
+vllm-router --policy consistent_hash --worker-urls http://worker1:8000 http://worker2:8000
 
 # Using Python
 from vllm_router import Router
@@ -123,7 +123,7 @@ The `round_robin` policy distributes requests evenly across all healthy workers 
 ### Configuration
 
 ```bash
-vllm-router --policy round_robin --worker-urls http://worker1:8000,http://worker2:8000
+vllm-router --policy round_robin --worker-urls http://worker1:8000 http://worker2:8000
 ```
 
 ### Behavior
@@ -148,7 +148,7 @@ The `random` policy selects a random healthy worker for each request.
 ### Configuration
 
 ```bash
-vllm-router --policy random --worker-urls http://worker1:8000,http://worker2:8000
+vllm-router --policy random --worker-urls http://worker1:8000 http://worker2:8000
 ```
 
 ### Behavior
@@ -172,7 +172,7 @@ The `power_of_two` policy randomly selects two workers and routes to the one wit
 ### Configuration
 
 ```bash
-vllm-router --policy power_of_two --worker-urls http://worker1:8000,http://worker2:8000,http://worker3:8000
+vllm-router --policy power_of_two --worker-urls http://worker1:8000 http://worker2:8000 http://worker3:8000
 ```
 
 ### Behavior
@@ -204,7 +204,7 @@ vllm-router --policy cache_aware \
   --cache-threshold 0.5 \
   --balance-abs-threshold 32 \
   --balance-rel-threshold 1.1 \
-  --worker-urls http://worker1:8000,http://worker2:8000
+  --worker-urls http://worker1:8000 http://worker2:8000
 ```
 
 ### Parameters
