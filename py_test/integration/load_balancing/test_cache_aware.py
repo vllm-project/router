@@ -34,6 +34,62 @@ def test_cache_aware_affinity(mock_workers, router_manager):
 
 
 @pytest.mark.integration
+def test_cache_aware_chat_affinity_uses_stable_agent_prefix(
+    mock_workers, router_manager
+):
+    # Same system/tools but changing user suffix should stick to one worker.
+    _, urls, ids = mock_workers(n=2)
+    rh = router_manager.start_router(worker_urls=urls, policy="cache_aware")
+
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "description": "Read a file",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                },
+            },
+        }
+    ]
+
+    counts = collections.Counter()
+    with requests.Session() as s:
+        for i in range(12):
+            r = s.post(
+                f"{rh.url}/v1/chat/completions",
+                json={
+                    "model": "test-model",
+                    "messages": [
+                        {
+                            "role": "system",
+                            "content": "You are a coding agent.",
+                        },
+                        {
+                            "role": "developer",
+                            "content": "Inspect before editing.",
+                        },
+                        {
+                            "role": "user",
+                            "content": f"Fix changing task suffix {i}",
+                        },
+                    ],
+                    "tools": tools,
+                    "max_tokens": 1,
+                    "stream": False,
+                },
+            )
+            assert r.status_code == 200
+            wid = r.headers.get("X-Worker-Id") or r.json().get("worker_id")
+            counts[wid] += 1
+
+    top = max(counts.values())
+    assert top >= 10, counts
+
+
+@pytest.mark.integration
 def test_cache_aware_diverse_prompts_balances(mock_workers, router_manager):
     # Add latency so concurrent requests overlap and influence load-based selection
     _, urls, ids = mock_workers(n=3, args=["--latency-ms", "30"])
