@@ -107,7 +107,7 @@ struct CliArgs {
     worker_urls: Vec<String>,
 
     /// Load balancing policy to use
-    #[arg(long, default_value = "cache_aware", value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "consistent_hash", "rendezvous_hash"])]
+    #[arg(long, default_value = "cache_aware", value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "consistent_hash", "rendezvous_hash", "sticky_table"])]
     policy: String,
 
     /// Enable vLLM PD (Prefill-Decode) disaggregated mode with vLLM-specific two-stage processing
@@ -124,11 +124,11 @@ struct CliArgs {
     decode: Vec<String>,
 
     /// Specific policy for prefill nodes in PD mode
-    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "consistent_hash", "rendezvous_hash"])]
+    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "consistent_hash", "rendezvous_hash", "sticky_table"])]
     prefill_policy: Option<String>,
 
     /// Specific policy for decode nodes in PD mode
-    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "consistent_hash", "rendezvous_hash"])]
+    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "consistent_hash", "rendezvous_hash", "sticky_table"])]
     decode_policy: Option<String>,
 
     /// Timeout in seconds for worker startup
@@ -373,6 +373,7 @@ impl CliArgs {
                 virtual_nodes: 160, // Default value
             },
             "rendezvous_hash" => PolicyConfig::RendezvousHash,
+            "sticky_table" => PolicyConfig::StickyTable,
             _ => PolicyConfig::RoundRobin, // Fallback
         }
     }
