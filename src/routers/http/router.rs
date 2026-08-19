@@ -1397,6 +1397,72 @@ impl WorkerManagement for Router {
     }
 }
 
+impl Router {
+    async fn aggregate_models(&self) -> Response {
+        let workers = self.worker_registry.get_all_urls();
+
+        if workers.is_empty() {
+            return (StatusCode::SERVICE_UNAVAILABLE, "No workers available").into_response();
+        }
+
+        let client = &self.client;
+        let futures: Vec<_> = workers
+            .into_iter()
+            .map(|worker_url| async move {
+                let url = format!("{}/v1/models", worker_url.trim_end_matches('/'));
+                match client.get(&url).send().await {
+                    Ok(res) => {
+                        if res.status().is_success() {
+                            match res.json::<serde_json::Value>().await {
+                                Ok(json) => Some(json),
+                                Err(e) => {
+                                    warn!("Failed to parse models from {}: {}", worker_url, e);
+                                    None
+                                }
+                            }
+                        } else {
+                            warn!("Worker {} returned status {}", worker_url, res.status());
+                            None
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Failed to fetch models from {}: {}", worker_url, e);
+                        None
+                    }
+                }
+            })
+            .collect();
+
+        let results: Vec<_> = futures_util::future::join_all(futures).await;
+
+        let mut all_models: Vec<serde_json::Value> = Vec::new();
+        let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        for result in results.into_iter().flatten() {
+            if let Some(data) = result.get("data").and_then(|d| d.as_array()) {
+                for model in data {
+                    if let Some(id) = model.get("id").and_then(|i| i.as_str()) {
+                        if !seen_ids.contains(id) {
+                            seen_ids.insert(id.to_string());
+                            all_models.push(model.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        if all_models.is_empty() {
+            (StatusCode::SERVICE_UNAVAILABLE, "No models available from workers").into_response()
+        } else {
+            let response = serde_json::json!({
+                "object": "list",
+                "data": all_models
+            });
+            Json(response).into_response()
+        }
+    }
+}
+
 #[async_trait]
 impl RouterTrait for Router {
     fn as_any(&self) -> &dyn std::any::Any {
@@ -1431,7 +1497,7 @@ impl RouterTrait for Router {
     }
 
     async fn get_models(&self, req: Request<Body>) -> Response {
-        self.proxy_get_request(req, "v1/models").await
+        self.aggregate_models().await
     }
 
     async fn get_model_info(&self, req: Request<Body>) -> Response {

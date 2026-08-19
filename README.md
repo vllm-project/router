@@ -219,6 +219,48 @@ curl -X POST http://router:8000/v1/chat/completions \
 
 For detailed configuration options, hash key priorities, and usage examples, see [Load Balancing Documentation](docs/load_balancing/README.md).
 
+## Systemd Service Installation
+
+For production deployments, you can install the vLLM Router as a systemd service for automatic startup and management.
+
+### Quick Installation
+
+```bash
+# Build the router
+cargo build --release
+
+# Install and enable the systemd service
+sudo ./scripts/install_service.sh install --binary-path $(pwd)/target/release/vllm-router
+sudo ./scripts/install_service.sh enable
+sudo ./scripts/install_service.sh start
+```
+
+### Using Makefile
+
+```bash
+# Build and install
+make install-service
+make service-enable
+make service-start
+```
+
+### Service Management
+
+```bash
+# Check service status
+systemctl status vllm-router
+
+# View logs
+sudo journalctl -u vllm-router -f
+
+# Stop/start/restart
+sudo systemctl stop vllm-router
+sudo systemctl start vllm-router
+sudo systemctl restart vllm-router
+```
+
+For detailed installation options, troubleshooting, and advanced configuration, see [Systemd Service Documentation](docs/SYSTEMD_SERVICE.md).
+
 ## Advanced Features
 
 ### Kubernetes Service Discovery
