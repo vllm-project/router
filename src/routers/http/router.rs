@@ -428,9 +428,11 @@ impl Router {
 
         match self.select_first_worker() {
             Ok(worker_url) => {
-                let url = format!("{}/{}", worker_url, endpoint);
+                let (base_url, dp_rank) = dp_utils::parse_worker_url(&worker_url);
+                let url = format!("{}/{}", base_url, endpoint);
                 let route_name = format!("/{}", endpoint);
-                let mut request_builder = self.client.get(&url);
+                let mut request_builder =
+                    dp_utils::add_dp_rank_header(self.client.get(&url), dp_rank);
                 for (name, value) in headers {
                     let name_lc = name.to_lowercase();
                     if name_lc != "content-type"
