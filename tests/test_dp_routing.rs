@@ -449,6 +449,53 @@ mod dp_e2e_tests {
         worker.stop().await;
     }
 
+    // GET /v1/models used to send hostname:port@rank to reqwest as userinfo,
+    // routing the request to the rank digit as host instead of the worker.
+    #[tokio::test]
+    async fn test_regular_router_dp2_get_v1_models() {
+        let mut worker = MockWorker::new(MockWorkerConfig::default());
+        let worker_url = worker.start().await.unwrap();
+        let port: u16 = worker_url.split(':').next_back().unwrap().parse().unwrap();
+        clear_captured_requests(port);
+
+        let config = make_regular_config(vec![worker_url.clone()], 2);
+        let app_context = common::create_test_context(config.clone());
+        let router = RouterFactory::create_router(&app_context).await.unwrap();
+        let router = Arc::from(router);
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+        let app = common::test_app::create_test_app(Arc::clone(&router), Client::new(), &config);
+
+        let req = Request::builder()
+            .uri("/v1/models")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status().as_u16(),
+            200,
+            "GET /v1/models must succeed when DP > 1 (got {}). @rank in the worker URL was misinterpreted as userinfo.",
+            resp.status()
+        );
+
+        // The 200 alone could be misleading if a fallback were added later;
+        // assert the body is the mock worker's model list.
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            body["data"][0]["id"].as_str(),
+            Some("mock-model"),
+            "GET /v1/models should return the worker's model list. Body: {:?}",
+            body
+        );
+
+        worker.stop().await;
+    }
+
     // -----------------------------------------------------------------
     // Regular Router + DP > 1: worker registry verification
     // -----------------------------------------------------------------
