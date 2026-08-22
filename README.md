@@ -28,7 +28,7 @@ cargo --version
 
 ```
 
-**Python with pip installed**
+**Python with pip installed:**
 
 ### Installation & Basic Usage
 
@@ -39,12 +39,15 @@ cargo build --release
 ```
 
 #### Python Package
-Install from PyPI
-```bash
-pip install vllm-router                                                                                                                                                        ```
 
-To build from source:
-```bash    
+Install from PyPI:
+
+```bash
+pip install vllm-router
+```
+
+Build from source:
+```bash
 pip install setuptools-rust wheel build
 python -m build
 pip install dist/*.whl
