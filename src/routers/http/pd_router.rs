@@ -3,8 +3,8 @@
 use super::dp_utils;
 use super::pd_types::PDRouterError;
 use crate::core::{
-    BasicWorker, CircuitBreakerConfig, DPAwareWorker, HealthConfig, Worker, WorkerFactory,
-    WorkerRegistry, WorkerType,
+    BasicWorker, CircuitBreakerConfig, DPAwareWorker, HealthConfig, Worker, WorkerRegistry,
+    WorkerType,
 };
 use crate::policies::{LoadBalancingPolicy, PolicyRegistry};
 use crate::routers::header_utils;
@@ -32,8 +32,45 @@ pub struct PdRouterBase {
     pub load_monitor_handle: Option<Arc<tokio::task::JoinHandle<()>>>,
     pub client: Client,
     pub circuit_breaker_config: CircuitBreakerConfig,
-    // Intra-node data parallel size for creating DPAwareWorker in add_*_server()
+    // Fallback DP size for servers that report no engine metrics
     pub dp_size: usize,
+}
+
+/// Build the workers backing one server URL, one per engine the server fronts.
+fn build_dp_workers(
+    url: &str,
+    dp_size: usize,
+    worker_type: WorkerType,
+    circuit_breaker_config: &CircuitBreakerConfig,
+    health_config: Option<&HealthConfig>,
+) -> Vec<Arc<dyn Worker>> {
+    let (base_url, pinned_rank) = dp_utils::parse_worker_url(url);
+
+    // DPAwareWorker strips the @rank suffix in endpoint_url(), preventing
+    // IPv6+DP URL corruption where HTTP clients read @N as userinfo (RFC 3986).
+    let dp_worker = |rank: usize| -> Arc<dyn Worker> {
+        let worker = DPAwareWorker::new(base_url.clone(), rank, dp_size, worker_type.clone())
+            .with_circuit_breaker_config(circuit_breaker_config.clone());
+        let worker = match health_config {
+            Some(config) => worker.with_health_config(config.clone()),
+            None => worker,
+        };
+        Arc::new(worker)
+    };
+
+    match pinned_rank {
+        Some(rank) => vec![dp_worker(rank)],
+        None if dp_size > 1 => (0..dp_size).map(dp_worker).collect(),
+        None => {
+            let worker = BasicWorker::new(url.to_string(), worker_type.clone())
+                .with_circuit_breaker_config(circuit_breaker_config.clone());
+            let worker = match health_config {
+                Some(config) => worker.with_health_config(config.clone()),
+                None => worker,
+            };
+            vec![Arc::new(worker) as Arc<dyn Worker>]
+        }
+    }
 }
 
 impl PdRouterBase {
@@ -235,125 +272,50 @@ impl PdRouterBase {
         url: String,
         bootstrap_port: Option<u16>,
     ) -> Result<String, PDRouterError> {
-        // Wait for the new server to be healthy
-        self.wait_for_server_health(&url).await?;
-
-        let worker_type = WorkerType::Prefill { bootstrap_port };
-
-        if self.dp_size > 1 {
-            let (_base_url, dp_rank) = dp_utils::parse_worker_url(&url);
-            if dp_rank.is_some() {
-                // URL already has @rank suffix (e.g., from direct URL mode).
-                // Create a single DPAwareWorker. DPAwareWorker strips the @rank
-                // suffix in endpoint_url(), preventing IPv6+DP URL corruption
-                // where HTTP clients interpret @N as a userinfo separator per RFC 3986.
-                if self.worker_registry.get_by_url(&url).is_some() {
-                    return Err(PDRouterError::WorkerAlreadyExists { url: url.clone() });
-                }
-                let (base_url, dp_rank) = dp_utils::parse_worker_url(&url);
-                let worker_arc: Arc<dyn Worker> = Arc::new(
-                    DPAwareWorker::new(base_url, dp_rank.unwrap_or(0), self.dp_size, worker_type)
-                        .with_circuit_breaker_config(self.circuit_breaker_config.clone()),
-                );
-                self.register_and_notify(worker_arc);
-                info!("Added prefill server: {}", url);
-            } else {
-                // Bare URL without @rank (e.g., from K8s service discovery).
-                // Expand into dp_size workers, one per DP rank, matching the
-                // expansion logic in router.rs::add_worker() and PdRouterBase::new().
-                // Without this, all traffic pins to rank 0 via unwrap_or(0),
-                // bypassing vLLM's hybrid load balancer.
-                let first_dp_url = format!("{}@0", url);
-                if self.worker_registry.get_by_url(&first_dp_url).is_some() {
-                    return Err(PDRouterError::WorkerAlreadyExists { url: url.clone() });
-                }
-                for rank in 0..self.dp_size {
-                    let dp_url = format!("{}@{}", url, rank);
-                    let worker_arc: Arc<dyn Worker> = Arc::new(
-                        DPAwareWorker::new(url.clone(), rank, self.dp_size, worker_type.clone())
-                            .with_circuit_breaker_config(self.circuit_breaker_config.clone()),
-                    );
-                    self.register_and_notify(worker_arc);
-                    info!("Added prefill server: {} (rank {})", dp_url, rank);
-                }
-                info!(
-                    "Expanded prefill server {} into {} DP-aware workers",
-                    url, self.dp_size
-                );
-            }
-        } else {
-            // dp_size == 1: no DP-aware routing, use BasicWorker
-            if self.worker_registry.get_by_url(&url).is_some() {
-                return Err(PDRouterError::WorkerAlreadyExists { url: url.clone() });
-            }
-            let worker_arc: Arc<dyn Worker> = Arc::from(WorkerFactory::create_prefill_with_config(
-                url.clone(),
-                bootstrap_port,
-                self.circuit_breaker_config.clone(),
-            ));
-            self.register_and_notify(worker_arc);
-            info!("Added prefill server: {}", url);
-        }
-
-        Ok(format!("Successfully added prefill server: {}", url))
+        self.add_server(url, "prefill", WorkerType::Prefill { bootstrap_port })
+            .await
     }
 
     pub async fn add_decode_server(&self, url: String) -> Result<String, PDRouterError> {
+        self.add_server(url, "decode", WorkerType::Decode).await
+    }
+
+    async fn add_server(
+        &self,
+        url: String,
+        role: &str,
+        worker_type: WorkerType,
+    ) -> Result<String, PDRouterError> {
         // Wait for the new server to be healthy
         self.wait_for_server_health(&url).await?;
 
-        if self.dp_size > 1 {
-            let (_base_url, dp_rank) = dp_utils::parse_worker_url(&url);
-            if dp_rank.is_some() {
-                // URL already has @rank suffix — single DPAwareWorker
-                if self.worker_registry.get_by_url(&url).is_some() {
-                    return Err(PDRouterError::WorkerAlreadyExists { url: url.clone() });
-                }
-                let (base_url, dp_rank) = dp_utils::parse_worker_url(&url);
-                let worker_arc: Arc<dyn Worker> = Arc::new(
-                    DPAwareWorker::new(
-                        base_url,
-                        dp_rank.unwrap_or(0),
-                        self.dp_size,
-                        WorkerType::Decode,
-                    )
-                    .with_circuit_breaker_config(self.circuit_breaker_config.clone()),
-                );
-                self.register_and_notify(worker_arc);
-                info!("Added decode server: {}", url);
-            } else {
-                // Bare URL — expand into dp_size workers (same as add_prefill_server)
-                let first_dp_url = format!("{}@0", url);
-                if self.worker_registry.get_by_url(&first_dp_url).is_some() {
-                    return Err(PDRouterError::WorkerAlreadyExists { url: url.clone() });
-                }
-                for rank in 0..self.dp_size {
-                    let dp_url = format!("{}@{}", url, rank);
-                    let worker_arc: Arc<dyn Worker> = Arc::new(
-                        DPAwareWorker::new(url.clone(), rank, self.dp_size, WorkerType::Decode)
-                            .with_circuit_breaker_config(self.circuit_breaker_config.clone()),
-                    );
-                    self.register_and_notify(worker_arc);
-                    info!("Added decode server: {} (rank {})", dp_url, rank);
-                }
-                info!(
-                    "Expanded decode server {} into {} DP-aware workers",
-                    url, self.dp_size
-                );
-            }
-        } else {
-            if self.worker_registry.get_by_url(&url).is_some() {
-                return Err(PDRouterError::WorkerAlreadyExists { url: url.clone() });
-            }
-            let worker_arc: Arc<dyn Worker> = Arc::from(WorkerFactory::create_decode_with_config(
-                url.clone(),
-                self.circuit_breaker_config.clone(),
-            ));
-            self.register_and_notify(worker_arc);
-            info!("Added decode server: {}", url);
+        let dp_size = dp_utils::discover_dp_size(&self.client, &url, self.dp_size).await;
+        let workers = build_dp_workers(
+            &url,
+            dp_size,
+            worker_type,
+            &self.circuit_breaker_config,
+            None,
+        );
+
+        if workers
+            .iter()
+            .any(|worker| self.worker_registry.get_by_url(worker.url()).is_some())
+        {
+            return Err(PDRouterError::WorkerAlreadyExists { url });
         }
 
-        Ok(format!("Successfully added decode server: {}", url))
+        info!(
+            "Added {} server {} as {} worker(s)",
+            role,
+            url,
+            workers.len()
+        );
+        for worker in workers {
+            self.register_and_notify(worker);
+        }
+
+        Ok(format!("Successfully added {} server: {}", role, url))
     }
 
     /// Register a worker and notify the policy registry.
@@ -373,10 +335,8 @@ impl PdRouterBase {
     }
 
     pub async fn remove_prefill_server(&self, url: &str) -> Result<String, PDRouterError> {
-        if self.dp_size > 1 && !url.contains('@') {
-            // Bare URL: remove all DP-expanded workers by prefix match,
-            // mirroring the expansion in add_prefill_server and the
-            // prefix-match removal in router.rs::remove_worker().
+        // A bare URL that is not registered as-is was expanded per DP rank.
+        if !url.contains('@') && self.worker_registry.get_by_url(url).is_none() {
             return self.remove_dp_expanded_workers(url, "prefill");
         }
 
@@ -417,7 +377,7 @@ impl PdRouterBase {
     }
 
     pub async fn remove_decode_server(&self, url: &str) -> Result<String, PDRouterError> {
-        if self.dp_size > 1 && !url.contains('@') {
+        if !url.contains('@') && self.worker_registry.get_by_url(url).is_none() {
             return self.remove_dp_expanded_workers(url, "decode");
         }
 
@@ -516,68 +476,21 @@ impl PdRouterBase {
             window_duration: Duration::from_secs(circuit_breaker_config.window_duration_secs),
         };
 
-        // Automatically expand to DP-aware format when intra_node_data_parallel_size > 1
-        // This creates multiple worker URLs with @rank suffixes (e.g., "http://host:8000@0", "@1", etc.)
-        // without querying the workers. The router will add X-data-parallel-rank headers to route to specific ranks.
-        let (expanded_prefill_urls, expanded_decode_urls) =
-            if ctx.router_config.intra_node_data_parallel_size > 1 {
-                info!(
-                "DP-aware mode enabled (intra_node_data_parallel_size={}), expanding worker URLs",
-                ctx.router_config.intra_node_data_parallel_size
-            );
-
-                // Extract base URLs from prefill_urls (url, port) tuples
-                let prefill_base_urls: Vec<String> =
-                    prefill_urls.iter().map(|(url, _)| url.clone()).collect();
-
-                // Expand prefill URLs with DP ranks (0..intra_node_data_parallel_size-1)
-                let expanded_prefill = super::dp_utils::get_dp_aware_workers(
-                    &prefill_base_urls,
-                    &ctx.router_config.api_key,
-                    ctx.router_config.intra_node_data_parallel_size,
+        // Workers must be up before they can report their engine count.
+        let prefill_base_urls: Vec<String> =
+            prefill_urls.iter().map(|(url, _)| url.clone()).collect();
+        for urls in [&prefill_base_urls, &decode_urls] {
+            if !urls.is_empty() {
+                crate::routers::http::router::Router::wait_for_healthy_workers(
+                    urls,
+                    ctx.router_config.worker_startup_timeout_secs,
+                    ctx.router_config.worker_startup_check_interval_secs,
                 )
-                .await
-                .map_err(|e| format!("Failed to expand prefill workers: {}", e))?;
+                .await?;
+            }
+        }
 
-                // Expand decode URLs with DP ranks (0..intra_node_data_parallel_size-1)
-                let expanded_decode = super::dp_utils::get_dp_aware_workers(
-                    &decode_urls,
-                    &ctx.router_config.api_key,
-                    ctx.router_config.intra_node_data_parallel_size,
-                )
-                .await
-                .map_err(|e| format!("Failed to expand decode workers: {}", e))?;
-
-                info!(
-                    "Expanded {} prefill URLs to {} DP-aware URLs",
-                    prefill_base_urls.len(),
-                    expanded_prefill.len()
-                );
-                info!(
-                    "Expanded {} decode URLs to {} DP-aware URLs",
-                    decode_urls.len(),
-                    expanded_decode.len()
-                );
-
-                // Keep the bootstrap_port from the original URLs, apply to all expanded URLs
-                let prefill_with_ports: Vec<(String, Option<u16>)> = expanded_prefill
-                    .into_iter()
-                    .map(|url| {
-                        // Use the port from the first original URL (all DP replicas share the same port config)
-                        let port = prefill_urls.first().and_then(|(_, p)| *p);
-                        (url, port)
-                    })
-                    .collect();
-
-                (prefill_with_ports, expanded_decode)
-            } else {
-                info!("DP-aware mode disabled, using original worker URLs");
-                (prefill_urls, decode_urls)
-            };
-
-        let mut prefill_workers_urls = vec![];
-        let mut decode_workers_urls = vec![];
-        let dp_size = ctx.router_config.intra_node_data_parallel_size;
+        let fallback_dp_size = ctx.router_config.intra_node_data_parallel_size.max(1);
         let health_config = HealthConfig {
             timeout_secs: ctx.router_config.health_check.timeout_secs,
             check_interval_secs: ctx.router_config.health_check.check_interval_secs,
@@ -586,73 +499,34 @@ impl PdRouterBase {
             success_threshold: ctx.router_config.health_check.success_threshold,
         };
 
-        // Register prefill workers in the registry
-        for (url, port) in expanded_prefill_urls {
-            prefill_workers_urls.push(url.clone());
-            let worker_type = WorkerType::Prefill {
-                bootstrap_port: port,
-            };
-            let worker: Arc<dyn Worker> = if dp_size > 1 {
-                let (base_url, dp_rank) = dp_utils::parse_worker_url(&url);
-                Arc::new(
-                    DPAwareWorker::new(base_url, dp_rank.unwrap_or(0), dp_size, worker_type)
-                        .with_circuit_breaker_config(core_cb_config.clone())
-                        .with_health_config(health_config.clone()),
-                )
-            } else {
-                Arc::new(
-                    BasicWorker::new(url, worker_type)
-                        .with_circuit_breaker_config(core_cb_config.clone())
-                        .with_health_config(health_config.clone()),
-                )
-            };
-            ctx.worker_registry.register(worker);
+        let prefill_workers = prefill_urls.iter().map(|(url, bootstrap_port)| {
+            (
+                url,
+                WorkerType::Prefill {
+                    bootstrap_port: *bootstrap_port,
+                },
+            )
+        });
+        let decode_workers = decode_urls.iter().map(|url| (url, WorkerType::Decode));
+        for (url, worker_type) in prefill_workers.chain(decode_workers) {
+            let dp_size = dp_utils::discover_dp_size(&ctx.client, url, fallback_dp_size).await;
+            for worker in build_dp_workers(
+                url,
+                dp_size,
+                worker_type,
+                &core_cb_config,
+                Some(&health_config),
+            ) {
+                ctx.worker_registry.register(worker);
+            }
         }
 
-        // Register decode workers in the registry
-        for url in expanded_decode_urls {
-            decode_workers_urls.push(url.clone());
-            let worker: Arc<dyn Worker> = if dp_size > 1 {
-                let (base_url, dp_rank) = dp_utils::parse_worker_url(&url);
-                Arc::new(
-                    DPAwareWorker::new(base_url, dp_rank.unwrap_or(0), dp_size, WorkerType::Decode)
-                        .with_circuit_breaker_config(core_cb_config.clone())
-                        .with_health_config(health_config.clone()),
-                )
-            } else {
-                Arc::new(
-                    BasicWorker::new(url, WorkerType::Decode)
-                        .with_circuit_breaker_config(core_cb_config.clone())
-                        .with_health_config(health_config.clone()),
-                )
-            };
-            ctx.worker_registry.register(worker);
-        }
-
-        // Get all workers from registry for health check
+        // Get all workers from registry for load monitoring
         let all_workers = ctx.worker_registry.get_all();
         let all_urls: Vec<String> = all_workers
             .iter()
             .map(|worker| worker.url().to_string())
             .collect();
-        // At least one prefill and one decode are up
-        if !prefill_workers_urls.is_empty() {
-            crate::routers::http::router::Router::wait_for_healthy_workers(
-                &prefill_workers_urls,
-                ctx.router_config.worker_startup_timeout_secs,
-                ctx.router_config.worker_startup_check_interval_secs,
-            )
-            .await?;
-        }
-
-        if !decode_workers_urls.is_empty() {
-            crate::routers::http::router::Router::wait_for_healthy_workers(
-                &decode_workers_urls,
-                ctx.router_config.worker_startup_timeout_secs,
-                ctx.router_config.worker_startup_check_interval_secs,
-            )
-            .await?;
-        }
 
         // Initialize cache-aware policies with workers from registry
         // Note: We need to get workers by type and convert to Box<dyn Worker> for CacheAwarePolicy
@@ -704,7 +578,7 @@ impl PdRouterBase {
             load_monitor_handle,
             client: ctx.client.clone(),
             circuit_breaker_config: core_cb_config,
-            dp_size,
+            dp_size: fallback_dp_size,
         })
     }
 
@@ -1225,7 +1099,7 @@ impl PdRouterBase {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::{BasicWorker, DPAwareWorker, Worker, WorkerType};
+    use crate::core::{BasicWorker, DPAwareWorker, Worker, WorkerFactory, WorkerType};
 
     fn create_test_pd_router() -> PdRouterBase {
         let worker_registry = Arc::new(WorkerRegistry::new());

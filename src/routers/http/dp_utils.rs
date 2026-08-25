@@ -2,7 +2,71 @@
 // This module provides common functions for data-parallel aware routing
 // that can be reused across different router implementations.
 
-use tracing::info;
+use std::collections::HashSet;
+
+use tracing::{info, warn};
+
+/// Count the engines a vLLM server exposes on `/metrics`. It emits one series
+/// per engine it can address, the same set `X-data-parallel-rank` selects from.
+/// Hybrid load balancing labels them with global ranks, so count distinct
+/// labels rather than taking the maximum.
+fn count_engine_labels(metrics_body: &str) -> Option<usize> {
+    let engines: HashSet<&str> = metrics_body
+        .lines()
+        .filter(|line| line.starts_with("vllm:"))
+        .filter_map(|line| {
+            let (_, after_label) = line.split_once("engine=\"")?;
+            let (engine, _) = after_label.split_once('"')?;
+            Some(engine)
+        })
+        .collect();
+
+    (!engines.is_empty()).then_some(engines.len())
+}
+
+/// Number of engines a worker fronts, so prefill and decode can run different
+/// data-parallel sizes. Falls back to `fallback_dp_size` for workers exposing
+/// no vLLM metrics, e.g. under `--disable-log-stats`.
+pub async fn discover_dp_size(
+    client: &reqwest::Client,
+    worker_url: &str,
+    fallback_dp_size: usize,
+) -> usize {
+    let fallback_dp_size = fallback_dp_size.max(1);
+    let (base_url, _) = parse_worker_url(worker_url);
+    // /metrics sits outside vLLM's authenticated path prefixes.
+    let metrics_url = format!("{}/metrics", base_url.trim_end_matches('/'));
+
+    let body = match client.get(&metrics_url).send().await {
+        Ok(response) if response.status().is_success() => response.text().await.ok(),
+        Ok(response) => {
+            warn!(
+                "DP discovery for {} returned {}",
+                metrics_url,
+                response.status()
+            );
+            None
+        }
+        Err(error) => {
+            warn!("DP discovery for {} failed: {}", metrics_url, error);
+            None
+        }
+    };
+
+    match body.as_deref().and_then(count_engine_labels) {
+        Some(dp_size) => {
+            info!("Worker {} reports {} engine(s)", base_url, dp_size);
+            dp_size
+        }
+        None => {
+            info!(
+                "Worker {} reports no engine metrics; assuming {} engine(s)",
+                base_url, fallback_dp_size
+            );
+            fallback_dp_size
+        }
+    }
+}
 
 /// Given a list of worker URLs, expand them into DP-aware URLs
 /// with dp_rank as suffix (format: "http://host:port@rank")
