@@ -57,6 +57,9 @@ pub struct VllmPDRouter {
     intra_node_data_parallel_size: usize,
     /// Round-robin counter for prefill DP rank selection
     prefill_dp_round_robin: Arc<AtomicUsize>,
+    /// Total (cross-pod) MoRI-IO DP world size for Wide-EP (e.g. 16 for 2P2D DP=16).
+    /// 0 -> fall back to intra_node_data_parallel_size.
+    moriio_dp_size: usize,
     /// KV connector type
     kv_connector: KvConnector,
     /// Mooncake bootstrap info: prefill base_url -> MooncakePrefillInfo
@@ -205,6 +208,18 @@ impl VllmPDRouter {
         }
     }
 
+    /// Effective MoRI-IO DP world size: the total cross-pod DP size when configured
+    /// (--moriio-dp-size, e.g. 16 for 2P2D DP=16), else the intra-node size. Used to
+    /// round-robin a single per-request DP rank over the whole world and to stamp
+    /// remote_dp_size so the MoRIIO connector's rank arithmetic matches the topology.
+    fn effective_dp_size(&self) -> usize {
+        if self.moriio_dp_size > 0 {
+            self.moriio_dp_size
+        } else {
+            self.intra_node_data_parallel_size
+        }
+    }
+
     /// Build kv_transfer_params for the prefill request.
     ///
     /// Returns an error for MoRI-IO when no transfer mode has been registered yet, so that
@@ -242,7 +257,7 @@ impl VllmPDRouter {
                         "do_remote_prefill": false,
                         "remote_engine_id": serde_json::Value::Null,
                         "remote_block_ids": serde_json::Value::Null,
-                        "remote_dp_size": self.intra_node_data_parallel_size,
+                        "remote_dp_size": self.effective_dp_size(),
                         "remote_tp_size": remote_tp_size,
                         "transfer_id": transfer_id.unwrap_or(""),
                     });
@@ -258,7 +273,7 @@ impl VllmPDRouter {
                         "remote_engine_id": serde_json::Value::Null,
                         "remote_block_ids": serde_json::Value::Null,
                         "transfer_id": transfer_id.unwrap_or(""),
-                        "remote_dp_size": self.intra_node_data_parallel_size,
+                        "remote_dp_size": self.effective_dp_size(),
                     }))
                 }
             }
@@ -315,12 +330,18 @@ impl VllmPDRouter {
                         "remote_engine_id": serde_json::Value::Null,
                         "remote_block_ids": serde_json::Value::Null,
                         "transfer_id": transfer_id.unwrap_or(""),
-                        "remote_dp_size": self.intra_node_data_parallel_size,
+                        "remote_dp_size": self.effective_dp_size(),
                         "remote_tp_size": tp_size,
                     });
-                    if self.intra_node_data_parallel_size > 1 {
+                    if self.effective_dp_size() > 1 {
                         if let Some(rank) = prefill_dp_rank {
                             params["remote_dp_rank"] = json!(rank);
+                            // Sentinel: tell the MoRIIO connector (vllm#45043) to honor
+                            // this rank VERBATIM on both legs instead of re-hashing
+                            // blake2s(rid)%dp_size for the decode notify. Without it the
+                            // decode notify targets a different rank than the prefill was
+                            // pinned to -> "remote blocks never arrived" write expiry.
+                            params["remote_dp_rank_override"] = json!(true);
                         }
                     }
                     Some(params)
@@ -803,13 +824,21 @@ impl VllmPDRouter {
 
         let (prefill_base_http, mut prefill_dp_rank) =
             extract_base_http_and_dp_rank(prefill_http, self.intra_node_data_parallel_size);
-        let (decode_base_http, decode_dp_rank) =
+        let (decode_base_http, mut decode_dp_rank) =
             extract_base_http_and_dp_rank(decode_http, self.intra_node_data_parallel_size);
 
-        if self.intra_node_data_parallel_size > 1 && prefill_dp_rank.is_none() {
+        // Round-robin a single DP rank H over the FULL (cross-pod) DP world (effective_dp_size:
+        // --moriio-dp-size when set, else intra-node) so the prefill request is pinned to rank H
+        // and the decode kv_transfer_params carry remote_dp_rank=H (+ override).
+        let _eff_dp = self.effective_dp_size();
+        if _eff_dp > 1 && prefill_dp_rank.is_none() {
             let rank = self.prefill_dp_round_robin.fetch_add(1, Ordering::Relaxed)
-                % self.intra_node_data_parallel_size;
+                % _eff_dp;
             prefill_dp_rank = Some(rank);
+        }
+        // Pin decode to the SAME rank as prefill (override contract requires it).
+        if prefill_dp_rank.is_some() {
+            decode_dp_rank = prefill_dp_rank;
         }
 
         // Add kv_transfer_params for KV connector support at top level
@@ -1618,6 +1647,7 @@ impl VllmPDRouter {
                 profiling_tasks: Arc::new(Mutex::new(HashMap::new())),
                 intra_node_data_parallel_size: ctx.router_config.intra_node_data_parallel_size,
                 prefill_dp_round_robin: Arc::new(AtomicUsize::new(0)),
+                moriio_dp_size: ctx.router_config.moriio_dp_size,
                 kv_connector,
                 mooncake_prefill_info: Arc::new(Mutex::new(HashMap::new())),
             })
@@ -1707,6 +1737,7 @@ impl VllmPDRouter {
                 profiling_tasks: Arc::new(Mutex::new(HashMap::new())),
                 intra_node_data_parallel_size: ctx.router_config.intra_node_data_parallel_size,
                 prefill_dp_round_robin: Arc::new(AtomicUsize::new(0)),
+                moriio_dp_size: ctx.router_config.moriio_dp_size,
                 kv_connector,
                 mooncake_prefill_info,
             })
