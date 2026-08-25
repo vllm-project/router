@@ -17,16 +17,16 @@ import openai
 
 # Test configuration
 TASK = "gsm8k"
-FILTER = "exact_match,strict-match"
+DEFAULT_FILTER = "exact_match,strict-match"
 RTOL = 0.03  # Relative tolerance for accuracy comparison
 
 # Model-specific expected values (from vLLM benchmarks)
 EXPECTED_VALUES = {
-    "meta-llama/Llama-3.2-1B-Instruct": 0.33,  # Lowered to accept >30% accuracy
-    "Qwen/Qwen3-0.6B": 0.41,
-    "deepseek-ai/deepseek-vl2-small": 0.59,
-    "deepseek-ai/deepseek-vl2-tiny": 0.19,
-    "deepseek-ai/DeepSeek-V2-Lite-Chat": 0.65,
+    ("meta-llama/Llama-3.2-1B-Instruct", DEFAULT_FILTER): 0.33,
+    ("Qwen/Qwen3-0.6B", "exact_match,flexible-extract"): 0.41,
+    ("deepseek-ai/deepseek-vl2-small", DEFAULT_FILTER): 0.59,
+    ("deepseek-ai/deepseek-vl2-tiny", DEFAULT_FILTER): 0.19,
+    ("deepseek-ai/DeepSeek-V2-Lite-Chat", DEFAULT_FILTER): 0.65,
 }
 
 # Simple prompt for connectivity test
@@ -62,7 +62,11 @@ def print_warning(msg: str):
     print(f"{Colors.YELLOW}⚠ {msg}{Colors.RESET}")
 
 
-def run_simple_prompt(base_url: str, model_name: str) -> bool:
+def run_simple_prompt(
+    base_url: str,
+    model_name: str,
+    disable_thinking: bool = False,
+) -> bool:
     """
     Run a simple prompt to verify connectivity before running full evaluation.
 
@@ -79,10 +83,16 @@ def run_simple_prompt(base_url: str, model_name: str) -> bool:
         # Use a very long timeout (10 minutes) for connectivity test
         client = openai.OpenAI(api_key="EMPTY", base_url=base_url, timeout=600.0)
         # Use chat completions for Instruct models
+        extra_body = None
+        if disable_thinking:
+            extra_body = {"chat_template_kwargs": {"enable_thinking": False}}
+
         completion = client.chat.completions.create(
             model=model_name,
             messages=[{"role": "user", "content": SIMPLE_PROMPT}],
             max_tokens=50,
+            temperature=0.0,
+            extra_body=extra_body,
         )
 
         output = completion.choices[0].message.content if completion.choices else ""
@@ -109,6 +119,11 @@ def run_accuracy_evaluation(
     base_url: str,
     model_name: str,
     num_concurrent: int = 20,
+    max_gen_toks: int = 256,
+    disable_thinking: bool = False,
+    sample: bool = False,
+    limit: int = 500,
+    log_samples: bool = False,
 ) -> dict:
     """
     Run LM Evaluation Harness on gsm8k task.
@@ -127,6 +142,28 @@ def run_accuracy_evaluation(
     # Use Chat Completions API for Instruct models (native format)
     # This fixes 422 errors from endpoint mismatch
     try:
+        gen_kwargs = {
+            "max_gen_toks": max_gen_toks,
+            "do_sample": sample,
+        }
+        if disable_thinking:
+            # Qwen3 defaults to thinking mode, which can consume the entire
+            # short CI generation budget before emitting a final answer.
+            gen_kwargs["chat_template_kwargs"] = {"enable_thinking": False}
+        if sample:
+            gen_kwargs.update(
+                {
+                    "temperature": 0.7,
+                    "top_p": 0.8,
+                    "top_k": 20,
+                    "min_p": 0.0,
+                }
+            )
+        else:
+            # Accuracy gates should be reproducible. This also avoids compiling
+            # vLLM's top-k/top-p sampling kernel for every dynamic batch shape.
+            gen_kwargs["temperature"] = 0.0
+
         results = lm_eval.simple_evaluate(
             model="local-chat-completions",
             model_args={
@@ -138,10 +175,11 @@ def run_accuracy_evaluation(
             },
             tasks=TASK,
             num_fewshot=5,
-            limit=500,
+            limit=limit,
             apply_chat_template=True,  # Enable chat template for Instruct models
             fewshot_as_multiturn=True,  # Format few-shot examples as conversation turns
-            log_samples=False,
+            gen_kwargs=gen_kwargs,
+            log_samples=log_samples,
         )
         return results
 
@@ -153,6 +191,7 @@ def run_accuracy_evaluation(
 def validate_accuracy(
     results: dict,
     model_name: str,
+    filter_name: str,
 ) -> bool:
     """
     Validate that accuracy meets expected thresholds.
@@ -164,15 +203,15 @@ def validate_accuracy(
     Returns:
         True if accuracy is within acceptable range, False otherwise
     """
-    measured_value = results["results"][TASK][FILTER]
-    expected_value = EXPECTED_VALUES.get(model_name)
+    measured_value = results["results"][TASK][filter_name]
+    expected_value = EXPECTED_VALUES.get((model_name, filter_name))
 
     print()
     print("=" * 60)
     print_info("Accuracy Results:")
     print_info(f"  Model:              {model_name}")
     print_info(f"  Task:               {TASK}")
-    print_info(f"  Metric:             {FILTER}")
+    print_info(f"  Metric:             {filter_name}")
     print_info(f"  Measured Accuracy:  {measured_value:.4f}")
 
     if expected_value is None:
@@ -242,6 +281,39 @@ def main():
         action="store_true",
         help="Skip initial connectivity test",
     )
+    parser.add_argument(
+        "--max-gen-toks",
+        type=int,
+        default=256,
+        help="Maximum generated tokens per benchmark request (default: 256)",
+    )
+    parser.add_argument(
+        "--disable-thinking",
+        action="store_true",
+        help="Pass enable_thinking=false to chat templates for bounded CI runs",
+    )
+    parser.add_argument(
+        "--sample",
+        action="store_true",
+        help="Use Qwen's top-k/top-p sampling settings instead of greedy decoding",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=500,
+        help="Number of benchmark examples to evaluate (default: 500)",
+    )
+    parser.add_argument(
+        "--log-samples",
+        action="store_true",
+        help="Print the first three benchmark responses and filtered values",
+    )
+    parser.add_argument(
+        "--filter",
+        choices=("exact_match,strict-match", "exact_match,flexible-extract"),
+        default=DEFAULT_FILTER,
+        help="LM-Eval GSM8K metric key to validate",
+    )
 
     args = parser.parse_args()
 
@@ -263,12 +335,20 @@ def main():
     print_info(f"Model:              {model_name}")
     print_info(f"Task:               {TASK}")
     print_info(f"Concurrent Reqs:    {args.num_concurrent}")
+    print_info(f"Max Generated Toks: {args.max_gen_toks}")
+    print_info(f"Thinking Enabled:   {not args.disable_thinking}")
+    print_info(f"Sampling Enabled:   {args.sample}")
+    print_info(f"Example Limit:      {args.limit}")
     print("=" * 60)
     print()
 
     # Step 1: Connectivity test (optional)
     if not args.skip_connectivity:
-        if not run_simple_prompt(base_url, model_name):
+        if not run_simple_prompt(
+            base_url,
+            model_name,
+            disable_thinking=args.disable_thinking,
+        ):
             print_error("Connectivity test failed. Aborting evaluation.")
             return 1
         print()
@@ -279,13 +359,25 @@ def main():
             base_url=base_url,
             model_name=model_name,
             num_concurrent=args.num_concurrent,
+            max_gen_toks=args.max_gen_toks,
+            disable_thinking=args.disable_thinking,
+            sample=args.sample,
+            limit=args.limit,
+            log_samples=args.log_samples,
         )
     except Exception as e:
         print_error(f"Evaluation failed: {e}")
         return 1
 
+    if args.log_samples:
+        print_info("First benchmark samples:")
+        for sample in results.get("samples", {}).get(TASK, [])[:3]:
+            print_info(f"  Target:   {sample.get('target')}")
+            print_info(f"  Response: {sample.get('resps')}")
+            print_info(f"  Filtered: {sample.get('filtered_resps')}")
+
     # Step 3: Validate accuracy
-    if not validate_accuracy(results, model_name):
+    if not validate_accuracy(results, model_name, args.filter):
         print_error("Accuracy validation failed!")
         return 1
 

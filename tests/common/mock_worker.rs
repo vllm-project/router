@@ -61,18 +61,14 @@ impl MockWorker {
     /// Start the mock worker server
     pub async fn start(&mut self) -> Result<String, Box<dyn std::error::Error>> {
         let config = self.config.clone();
-        let port = config.read().await.port;
+        let requested_port = config.read().await.port;
 
-        // If port is 0, find an available port
-        let port = if port == 0 {
-            let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
-            let port = listener.local_addr()?.port();
-            drop(listener);
-            config.write().await.port = port;
-            port
-        } else {
-            port
-        };
+        // Bind once and pass the listener directly to axum. Reserving a port
+        // with a temporary listener and rebinding it later creates a TOCTOU
+        // race when integration tests start mock workers concurrently.
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", requested_port)).await?;
+        let port = listener.local_addr()?.port();
+        config.write().await.port = port;
 
         let app = Router::new()
             .route("/health", get(health_handler))
@@ -98,14 +94,6 @@ impl MockWorker {
 
         // Spawn the server in a separate task
         let handle = tokio::spawn(async move {
-            let listener = match tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
-                Ok(l) => l,
-                Err(e) => {
-                    eprintln!("Failed to bind to port {}: {}", port, e);
-                    return;
-                }
-            };
-
             let server = axum::serve(listener, app).with_graceful_shutdown(async move {
                 let _ = shutdown_rx.await;
             });

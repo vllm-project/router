@@ -64,6 +64,29 @@ The test runs in the pipeline at `.buildkite/pipeline.yml:97-132`:
 - Automatic retry (up to 2 attempts) for flaky failures
 - Manual retry option available
 
+### ROCm MoRI coverage
+
+The dedicated `router_rocm_mi300_2` queue adds two MI300X matrices, each with
+`read_mode=true` and `read_mode=false`:
+
+- `run_moriio_accuracy_test.sh` uses two GPUs on one host with the xGMI backend.
+- `run_moriio_rdma_accuracy_test.sh` uses one GPU on each of two hosts with the
+  RDMA backend.
+
+The xGMI group runs for same-repository pull requests, the default branch, and
+merge-queue builds. Trusted manual/API builds can set `RUN_ROCM_XGMI=1`. The
+RDMA matrix runs for scheduled builds with `NIGHTLY=1`, or trusted manual/API
+builds with `RUN_ROCM_RDMA=1`. Group-level filtering prevents Docker plugin
+hooks from running for untrusted fork pull requests.
+
+ROCm-only scheduled builds should set both `NIGHTLY=1` and `ROCM_ONLY=1`.
+`ROCM_ONLY=1` skips the unrelated NVIDIA four-GPU P/D step while retaining the
+CPU build that supplies the router artifact to both ROCm matrices.
+
+Both matrices use a digest-pinned ROCm vLLM image and run health, sanity, and
+500-example GSM8K accuracy checks. The RDMA job is coordinator-owned and
+controls the second host through the strict `vllm-router-rocm-worker` SSH alias.
+
 ### Environment Variables
 
 The test script supports these environment variables for customization:
@@ -145,6 +168,7 @@ Builds Docker image for the router.
 
 - `cpu_queue_premerge`: CPU-only tasks (builds, lints, unit tests)
 - `gpu_4_queue`: GPU tests requiring 4+ GPUs
+- `router_rocm_mi300_2`: dedicated two-node MI300X MoRI tests (`spawn=1`)
 - `default`: General purpose queue
 
 ## Adding New Tests

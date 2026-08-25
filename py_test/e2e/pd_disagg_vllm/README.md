@@ -42,6 +42,23 @@ Wrapper script that runs tests with multiple TP configurations:
 - Baseline single TP configuration
 - Various block size configurations
 
+### 4. ROCm MoRI runners
+
+`run_moriio_accuracy_test.sh` runs TP1 prefill and TP1 decode on two GPUs of
+one ROCm host with MoRI's xGMI backend. `run_moriio_rdma_accuracy_test.sh` runs
+prefill on the coordinator and decode on a second ROCm host over GPU-memory
+RDMA. Both runners cover MoRI read and write modes, Router discovery, sanity
+requests, and a bounded GSM8K accuracy evaluation with `Qwen/Qwen3-0.6B`.
+
+The two-node runner requires the coordinator's `vllm-router-rocm-worker` SSH
+alias, the pinned ROCm vLLM image and model cache on both hosts, and access to
+`/dev/kfd`, `/dev/dri`, and `/dev/infiniband`. For example:
+
+```bash
+MORIIO_READ_MODE=true bash ./run_moriio_accuracy_test.sh
+MORIIO_READ_MODE=false bash ./run_moriio_rdma_accuracy_test.sh
+```
+
 ## Running Tests
 
 ### Prerequisites
