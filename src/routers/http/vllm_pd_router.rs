@@ -18,10 +18,14 @@ use axum::{
     http::{HeaderMap, Method, StatusCode},
     response::{IntoResponse, Response},
 };
+use bytes::Bytes;
+use futures_util::Stream;
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Instant;
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
@@ -72,6 +76,86 @@ const MORIIO_TRANSFER_PREFIX: &str = "tx";
 /// reports success before a discovered prefill/decode pair can serve requests.
 fn discovery_is_ready(prefill_count: usize, decode_count: usize) -> bool {
     prefill_count > 0 && decode_count > 0
+}
+
+/// Complete an OpenAI-compatible SSE response when its terminal event arrives.
+///
+/// Some upstream HTTP bodies can remain pending after emitting `[DONE]`. Forwarding
+/// their `bytes_stream()` directly leaves the downstream client waiting forever even
+/// though inference has completed. This wrapper treats the protocol-level terminal
+/// event as EOF and detects it even when the marker is split across chunks.
+struct SseDoneStream {
+    inner: Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>,
+    marker_pos: usize,
+    at_line_start: bool,
+    awaiting_line_end: bool,
+    done: bool,
+}
+
+impl SseDoneStream {
+    const DONE_MARKER: &'static [u8] = b"data: [DONE]";
+
+    fn new(stream: impl Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static) -> Self {
+        Self {
+            inner: Box::pin(stream),
+            marker_pos: 0,
+            at_line_start: true,
+            awaiting_line_end: false,
+            done: false,
+        }
+    }
+
+    fn observe(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            if self.awaiting_line_end {
+                if byte == b'\n' {
+                    self.done = true;
+                    return;
+                }
+                if byte != b'\r' {
+                    self.awaiting_line_end = false;
+                }
+            } else if self.marker_pos > 0 {
+                if byte == Self::DONE_MARKER[self.marker_pos] {
+                    self.marker_pos += 1;
+                    if self.marker_pos == Self::DONE_MARKER.len() {
+                        self.marker_pos = 0;
+                        self.awaiting_line_end = true;
+                    }
+                    continue;
+                }
+                self.marker_pos = 0;
+            } else if self.at_line_start && byte == Self::DONE_MARKER[0] {
+                self.marker_pos = 1;
+                self.at_line_start = false;
+                continue;
+            }
+
+            if byte == b'\n' {
+                self.at_line_start = true;
+            } else {
+                self.at_line_start = false;
+            }
+        }
+    }
+}
+
+impl Stream for SseDoneStream {
+    type Item = Result<Bytes, reqwest::Error>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if self.done {
+            return Poll::Ready(None);
+        }
+
+        match self.inner.as_mut().poll_next(cx) {
+            Poll::Ready(Some(Ok(bytes))) => {
+                self.observe(&bytes);
+                Poll::Ready(Some(Ok(bytes)))
+            }
+            other => other,
+        }
+    }
 }
 
 /// Strip the DP-rank suffix from a worker's HTTP address and return the base address
@@ -743,7 +827,8 @@ impl VllmPDRouter {
             for (name, value) in decode_headers.iter() {
                 response_builder = response_builder.header(name, value);
             }
-            let body = axum::body::Body::from_stream(decode_response.bytes_stream());
+            let body =
+                axum::body::Body::from_stream(SseDoneStream::new(decode_response.bytes_stream()));
             return response_builder.body(body).map_err(|e| {
                 format!(
                     "Failed to build streaming response from {}: {}",
@@ -1561,7 +1646,7 @@ impl VllmPDRouter {
                 }
             }
 
-            let body = Body::from_stream(decode_response.bytes_stream());
+            let body = Body::from_stream(SseDoneStream::new(decode_response.bytes_stream()));
             response_builder
                 .body(body)
                 .map_err(|e| PDRouterError::NetworkError {
@@ -2418,6 +2503,8 @@ impl WorkerManagement for VllmPDRouter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
+    use futures_util::{stream, StreamExt};
     use serde_json::json;
 
     #[test]
@@ -2608,6 +2695,74 @@ mod tests {
         // Verify the KvConnector::Nixl variant exists and is the default.
         let connector = KvConnector::default();
         assert_eq!(connector, KvConnector::Nixl);
+    }
+
+    #[tokio::test]
+    async fn test_sse_done_stream_closes_without_upstream_eof() {
+        let upstream = stream::iter(vec![
+            Ok::<Bytes, reqwest::Error>(Bytes::from_static(b"data: {\"token\":1}\n\n")),
+            Ok::<Bytes, reqwest::Error>(Bytes::from_static(b"data: [DONE]\n\n")),
+        ])
+        .chain(stream::pending());
+
+        let chunks = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            SseDoneStream::new(upstream).collect::<Vec<_>>(),
+        )
+        .await
+        .expect("the downstream stream must close at the SSE terminal event");
+
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[1].as_ref().unwrap().as_ref(), b"data: [DONE]\n\n");
+    }
+
+    #[tokio::test]
+    async fn test_sse_done_stream_detects_marker_across_chunks() {
+        let upstream = stream::iter(vec![
+            Ok::<Bytes, reqwest::Error>(Bytes::from_static(b"data: [DO")),
+            Ok::<Bytes, reqwest::Error>(Bytes::from_static(b"NE]\n\n")),
+        ])
+        .chain(stream::pending());
+
+        let chunks = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            SseDoneStream::new(upstream).collect::<Vec<_>>(),
+        )
+        .await
+        .expect("a chunk boundary must not hide the SSE terminal event");
+
+        assert_eq!(chunks.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_sse_done_stream_preserves_normal_eof() {
+        let upstream = stream::iter(vec![Ok::<Bytes, reqwest::Error>(Bytes::from_static(
+            b"plain response",
+        ))]);
+        let chunks = SseDoneStream::new(upstream).collect::<Vec<_>>().await;
+
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].as_ref().unwrap().as_ref(), b"plain response");
+    }
+
+    #[tokio::test]
+    async fn test_sse_done_stream_ignores_marker_inside_payload() {
+        let upstream = stream::iter(vec![
+            Ok::<Bytes, reqwest::Error>(Bytes::from_static(
+                b"data: {\"text\":\"say data: [DONE] literally\"}\n\n",
+            )),
+            Ok::<Bytes, reqwest::Error>(Bytes::from_static(b"data: [DONE]\r\n\r\n")),
+        ])
+        .chain(stream::pending());
+
+        let chunks = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            SseDoneStream::new(upstream).collect::<Vec<_>>(),
+        )
+        .await
+        .expect("only an exact terminal SSE data line should close the stream");
+
+        assert_eq!(chunks.len(), 2);
     }
 
     // --- MoRI-IO WRITE mode parameter tests ---
