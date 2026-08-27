@@ -160,7 +160,7 @@ mod dp_routing_tests {
     async fn test_get_dp_aware_workers_discovers_global_ranks() {
         let (url, shutdown) = spawn_metrics_server(&[4, 5, 6, 7]).await;
 
-        let expanded = dp_utils::get_dp_aware_workers(&[url.clone()], &None, 4)
+        let expanded = dp_utils::get_dp_aware_workers(std::slice::from_ref(&url), &None, 4)
             .await
             .unwrap();
 
