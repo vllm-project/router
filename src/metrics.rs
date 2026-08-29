@@ -44,6 +44,22 @@ pub fn init_metrics() {
         "vllm_router_retries_exhausted_total",
         "Total number of requests that exhausted retries by route"
     );
+    describe_counter!(
+        "vllm_router_queue_enqueued_total",
+        "Total number of requests enqueued in the concurrency queue"
+    );
+    describe_gauge!(
+        "vllm_router_queue_size",
+        "Current number of requests in the concurrency queue"
+    );
+    describe_counter!(
+        "vllm_router_queue_timeouts_total",
+        "Total number of queued requests that timed out"
+    );
+    describe_counter!(
+        "vllm_router_queue_rejections_total",
+        "Total number of requests rejected because the queue was full"
+    );
 
     // Circuit breaker metrics
     describe_gauge!(
@@ -281,6 +297,8 @@ pub fn start_prometheus(config: PrometheusConfig) {
 pub struct RouterMetrics;
 
 pub struct TokenizerMetrics;
+
+pub struct QueueMetrics;
 
 impl RouterMetrics {
     // Request metrics
@@ -626,6 +644,28 @@ impl TokenizerMetrics {
     }
 }
 
+impl QueueMetrics {
+    pub fn inc_request_queue_size() {
+        gauge!("vllm_router_queue_size").increment(1);
+    }
+
+    pub fn record_request_queued() {
+        counter!("vllm_router_queue_enqueued_total").increment(1);
+    }
+
+    pub fn dec_request_queue_size() {
+        gauge!("vllm_router_queue_size").decrement(1);
+    }
+
+    pub fn record_queued_request_timeout() {
+        counter!("vllm_router_queue_timeouts_total").increment(1);
+    }
+
+    pub fn record_queued_request_rejected() {
+        counter!("vllm_router_queue_rejections_total").increment(1);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -926,6 +966,17 @@ mod tests {
 
         // Vocabulary metrics
         TokenizerMetrics::set_vocab_size("huggingface", 50000);
+    }
+
+    #[test]
+    fn test_queue_metrics_static_methods() {
+        // Test that all static methods can be called without panic.
+        // Pair inc/dec so the gauge nets to zero across the test.
+        QueueMetrics::inc_request_queue_size();
+        QueueMetrics::record_request_queued();
+        QueueMetrics::dec_request_queue_size();
+        QueueMetrics::record_queued_request_timeout();
+        QueueMetrics::record_queued_request_rejected();
     }
 
     // ============= Port Availability Tests =============
