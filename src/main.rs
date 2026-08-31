@@ -9,39 +9,46 @@ use vllm_router_rs::metrics::PrometheusConfig;
 use vllm_router_rs::server::{self, ServerConfig};
 use vllm_router_rs::service_discovery::ServiceDiscoveryConfig;
 
-// Helper function to parse prefill arguments from command line
-// Returns prefill_entries with (URL, optional_bootstrap_port)
-fn parse_prefill_args() -> Vec<(String, Option<u16>)> {
-    let args: Vec<String> = std::env::args().collect();
-    let mut prefill_entries = Vec::new();
-    let mut i = 0;
+type PrefillArgs = (String, Option<u16>);
+fn split_prefill_args_from_others(
+    args: impl IntoIterator<Item = String>,
+) -> Result<(Vec<PrefillArgs>, Vec<String>), String> {
+    let mut args = args.into_iter().peekable();
+    let mut prefill = vec![];
+    let mut other = vec![];
 
-    while i < args.len() {
-        if args[i] == "--prefill" && i + 1 < args.len() {
-            let url = args[i + 1].clone();
-
-            let bootstrap_port = if i + 2 < args.len() && !args[i + 2].starts_with("--") {
-                // Check if next arg is a port number
-                if let Ok(port) = args[i + 2].parse::<u16>() {
-                    i += 1; // Skip the port argument
-                    Some(port)
-                } else if args[i + 2].to_lowercase() == "none" {
-                    i += 1; // Skip the "none" argument
-                    None
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-            prefill_entries.push((url, bootstrap_port));
-            i += 2; // Skip --prefill and URL
-        } else {
-            i += 1;
+    while let Some(arg) = args.next() {
+        if arg != ("--prefill") {
+            other.push(arg);
+            continue;
         }
+        // require a URL after we see the --prefill argument
+        let url = args
+            .next()
+            .ok_or("--prefill requires a URL immediately after")?;
+        if url.starts_with("-") {
+            return Err(format!("Invalid url {url}"));
+        }
+
+        // optional port afterwards
+        let port = match args.peek() {
+            Some(arg) if arg.eq_ignore_ascii_case("none") => {
+                args.next(); // consume it and ignore
+                None
+            }
+            Some(arg) if !arg.starts_with("-") => match arg.parse::<u16>() {
+                Ok(port) => {
+                    args.next();
+                    Some(port)
+                }
+                Err(_) => None,
+            },
+            _ => None,
+        };
+        prefill.push((url, port))
     }
 
-    prefill_entries
+    Ok((prefill, other))
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
@@ -624,34 +631,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Parse prefill arguments manually before clap parsing
     println!("DEBUG: Parsing prefill arguments");
-    let prefill_urls = parse_prefill_args();
+    let (prefill_urls, filtered_args) = split_prefill_args_from_others(std::env::args())?;
     println!("DEBUG: Prefill URLs parsed: {:?}", prefill_urls);
-
-    // Filter out prefill arguments and their values before passing to clap
-    println!("DEBUG: Filtering CLI arguments");
-    let mut filtered_args: Vec<String> = Vec::new();
-    let raw_args: Vec<String> = std::env::args().collect();
-    println!("DEBUG: Raw args: {:?}", raw_args);
-    let mut i = 0;
-
-    while i < raw_args.len() {
-        if raw_args[i] == "--prefill" && i + 1 < raw_args.len() {
-            // Skip --prefill and its URL
-            i += 2;
-
-            // Also skip bootstrap port if present
-            if i < raw_args.len()
-                && !raw_args[i].starts_with("--")
-                && (raw_args[i].parse::<u16>().is_ok() || raw_args[i].to_lowercase() == "none")
-            {
-                i += 1;
-            }
-        } else {
-            filtered_args.push(raw_args[i].clone());
-            i += 1;
-        }
-    }
-
     // Parse CLI arguments with clap using filtered args
     println!("DEBUG: Parsing CLI arguments with clap");
     println!("DEBUG: Filtered args: {:?}", filtered_args);
@@ -737,4 +718,70 @@ Provide --worker-urls or PD flags as usual.",
     })?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::split_prefill_args_from_others;
+
+    #[test]
+    fn splits_prefill_args_and_preserves_other_args() {
+        let args = [
+            "vllm-router",
+            "--port",
+            "3000",
+            "--prefill",
+            "http://prefill-0:8000",
+            "9000",
+            "--policy",
+            "random",
+            "--prefill",
+            "http://prefill-1:8000",
+            "none",
+            "--prefill",
+            "http://prefill-2:8000",
+            "-h",
+        ]
+        .map(String::from);
+
+        let (prefill, other) = split_prefill_args_from_others(args).unwrap();
+
+        assert_eq!(
+            prefill,
+            vec![
+                ("http://prefill-0:8000".to_string(), Some(9000)),
+                ("http://prefill-1:8000".to_string(), None),
+                ("http://prefill-2:8000".to_string(), None),
+            ]
+        );
+        assert_eq!(
+            other,
+            ["vllm-router", "--port", "3000", "--policy", "random", "-h"]
+        );
+    }
+
+    #[test]
+    fn rejects_missing_or_flag_prefill_urls() {
+        let missing_url = ["vllm-router", "--prefill"].map(String::from);
+        assert_eq!(
+            split_prefill_args_from_others(missing_url).unwrap_err(),
+            "--prefill requires a URL immediately after"
+        );
+
+        let flag_as_url = ["vllm-router", "--prefill", "--help"].map(String::from);
+        assert_eq!(
+            split_prefill_args_from_others(flag_as_url).unwrap_err(),
+            "Invalid url --help"
+        );
+    }
+
+    #[test]
+    fn preserves_out_of_range_prefill_port_for_clap() {
+        let args = ["vllm-router", "--prefill", "http://prefill:8000", "65536"].map(String::from);
+
+        let (prefill, other) = split_prefill_args_from_others(args).unwrap();
+
+        assert_eq!(prefill, vec![("http://prefill:8000".to_string(), None)]);
+        assert_eq!(other, ["vllm-router", "65536"]);
+    }
 }
