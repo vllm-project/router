@@ -338,11 +338,12 @@ impl Router {
     }
 
     fn select_first_worker(&self) -> Result<String, String> {
+        // Prefer a healthy worker so proxy GETs (e.g. /v1/models) don't 500
+        // when the first registered worker is temporarily down.
         let workers = self.worker_registry.get_all();
-        if workers.is_empty() {
-            Err("No workers are available".to_string())
-        } else {
-            Ok(workers[0].url().to_string())
+        match workers.into_iter().find(|w| w.is_healthy()) {
+            Some(worker) => Ok(worker.url().to_string()),
+            None => Err("No healthy workers are available".to_string()),
         }
     }
 
@@ -1826,6 +1827,30 @@ mod tests {
         let url = result.unwrap();
         // DashMap doesn't guarantee order, so just check we get one of the workers
         assert!(url == "http://worker1:8080" || url == "http://worker2:8080");
+    }
+
+    #[test]
+    fn test_select_first_worker_skips_unhealthy() {
+        let router = create_test_regular_router();
+        // Mark worker1 unhealthy; select_first_worker must not return it.
+        for w in router.worker_registry.get_all() {
+            if w.url() == "http://worker1:8080" {
+                w.set_healthy(false);
+            }
+        }
+        let result = router.select_first_worker();
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "http://worker2:8080");
+    }
+
+    #[test]
+    fn test_select_first_worker_all_unhealthy() {
+        let router = create_test_regular_router();
+        for w in router.worker_registry.get_all() {
+            w.set_healthy(false);
+        }
+        let result = router.select_first_worker();
+        assert!(result.is_err());
     }
 
     #[tokio::test]
