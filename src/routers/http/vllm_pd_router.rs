@@ -694,45 +694,6 @@ impl VllmPDRouter {
             RouterMetrics::record_pd_decode_error(decode_http);
         }
 
-        if needs_logprobs && !is_streaming {
-            debug!("Logprobs requested and non-streaming - merging prefill and decode logprobs");
-
-            let status = decode_response.status();
-            let resp_headers = decode_response.headers().clone();
-            let decode_body = decode_response
-                .bytes()
-                .await
-                .map_err(|e| format!("Failed to read decode response: {}", e))?;
-
-            let mut decode_json: Value = serde_json::from_slice(&decode_body)
-                .map_err(|e| format!("Failed to parse decode response as JSON: {}", e))?;
-
-            let empty_json = Value::Null;
-            let prefill_json_ref = prefill_response_json.unwrap_or(&empty_json);
-            let merged = logprobs_merge::merge_logprobs_in_json(prefill_json_ref, &mut decode_json);
-            if merged {
-                debug!("Successfully merged logprobs from prefill and decode responses");
-            } else {
-                warn!("No logprobs were merged (might be expected if logprobs not in response)");
-            }
-
-            let merged_body = serde_json::to_vec(&decode_json)
-                .map_err(|e| format!("Failed to serialize merged response: {}", e))?;
-
-            let mut response_builder = axum::http::Response::builder().status(status);
-            for (name, value) in resp_headers.iter() {
-                response_builder = response_builder.header(name, value);
-            }
-            return response_builder
-                .body(axum::body::Body::from(merged_body))
-                .map_err(|e| format!("Failed to build response: {}", e));
-        }
-
-        debug!(
-            "No logprobs merging needed (streaming={}, needs_logprobs={})",
-            is_streaming, needs_logprobs
-        );
-
         let status = decode_response.status();
 
         if is_streaming {
@@ -752,18 +713,66 @@ impl VllmPDRouter {
             });
         }
 
-        // Non-streaming, no logprobs: read entire body
-        let decode_headers = decode_response.headers().clone();
-        let body = decode_response
+        // All non-streaming PD responses must normalize usage before returning.
+        // This is required even when logprobs are not requested because decode-side
+        // cached_tokens can temporarily report invalid placeholders like -1 and would
+        // otherwise override the valid value from prefill.
+        debug!("Non-streaming PD response: normalizing usage and optional logprobs before return");
+
+        let resp_headers = decode_response.headers().clone();
+        let decode_body = decode_response
             .bytes()
             .await
             .map_err(|e| format!("Failed to read decode response: {}", e))?;
+
+        let mut decode_json: Value = match serde_json::from_slice(&decode_body) {
+            Ok(json) => json,
+            Err(_) => {
+                let mut response_builder = axum::http::Response::builder().status(status);
+                for (name, value) in resp_headers.iter() {
+                    if name != axum::http::header::CONTENT_LENGTH
+                        && name != axum::http::header::TRANSFER_ENCODING
+                    {
+                        response_builder = response_builder.header(name, value);
+                    }
+                }
+                return response_builder
+                    .body(axum::body::Body::from(decode_body))
+                    .map_err(|e| format!("Failed to build response from decode: {}", e));
+            }
+        };
+
+        let empty_json = Value::Null;
+        let prefill_json_ref = prefill_response_json.unwrap_or(&empty_json);
+
+        let merged_usage = logprobs_merge::merge_usage_in_json(prefill_json_ref, &mut decode_json);
+        let merged_logprobs = if needs_logprobs {
+            logprobs_merge::merge_logprobs_in_json(prefill_json_ref, &mut decode_json)
+        } else {
+            false
+        };
+
+        if merged_usage || merged_logprobs {
+            debug!(
+                "Successfully normalized prefill metadata in decode response (usage={}, logprobs={})",
+                merged_usage,
+                merged_logprobs
+            );
+        }
+
+        let merged_body = serde_json::to_vec(&decode_json)
+            .map_err(|e| format!("Failed to serialize merged response: {}", e))?;
+
         let mut response_builder = axum::http::Response::builder().status(status);
-        for (name, value) in decode_headers.iter() {
-            response_builder = response_builder.header(name, value);
+        for (name, value) in resp_headers.iter() {
+            if name != axum::http::header::CONTENT_LENGTH
+                && name != axum::http::header::TRANSFER_ENCODING
+            {
+                response_builder = response_builder.header(name, value);
+            }
         }
         response_builder
-            .body(axum::body::Body::from(body))
+            .body(axum::body::Body::from(merged_body))
             .map_err(|e| format!("Failed to build response: {}", e))
     }
 
@@ -1498,11 +1507,13 @@ impl VllmPDRouter {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
-        // If logprobs requested and non-streaming, merge prefill and decode logprobs
-        if needs_logprobs && !is_streaming {
-            debug!("Logprobs requested and non-streaming - merging prefill and decode logprobs");
+        // For non-streaming responses, always prefer the prefill-side cached token metadata
+        // if the decode-side value is missing or invalid (for example, -1 from a partial decode).
+        if !is_streaming {
+            debug!(
+                "Non-streaming PD response: merging usage metadata from prefill into decode result"
+            );
 
-            // Read decode response body
             let decode_body =
                 decode_response
                     .bytes()
@@ -1514,22 +1525,39 @@ impl VllmPDRouter {
                         ),
                     })?;
 
-            // Parse decode response as JSON
-            let mut decode_json: Value =
-                serde_json::from_slice(&decode_body).map_err(|e| PDRouterError::NetworkError {
-                    message: format!("Failed to parse decode response as JSON: {}", e),
-                })?;
+            let mut decode_json: Value = match serde_json::from_slice(&decode_body) {
+                Ok(json) => json,
+                Err(_) => {
+                    let mut response_builder = Response::builder().status(status);
+                    for (key, value) in headers.iter() {
+                        if key != "transfer-encoding" && key != "content-length" {
+                            response_builder = response_builder.header(key, value);
+                        }
+                    }
+                    return response_builder.body(Body::from(decode_body)).map_err(|e| {
+                        PDRouterError::NetworkError {
+                            message: format!("Failed to build response from {}: {}", decode_url, e),
+                        }
+                    });
+                }
+            };
 
-            // Merge logprobs from prefill into decode response
-            let merged =
-                logprobs_merge::merge_logprobs_in_json(&prefill_response_json, &mut decode_json);
-            if merged {
-                debug!("Successfully merged logprobs from prefill and decode responses");
+            let merged_usage =
+                logprobs_merge::merge_usage_in_json(&prefill_response_json, &mut decode_json);
+            let merged_logprobs = if needs_logprobs {
+                logprobs_merge::merge_logprobs_in_json(&prefill_response_json, &mut decode_json)
             } else {
-                warn!("No logprobs were merged (might be expected if logprobs not in response)");
+                false
+            };
+
+            if merged_usage || merged_logprobs {
+                debug!(
+                    "Successfully merged prefill metadata into decode response (usage={}, logprobs={})",
+                    merged_usage,
+                    merged_logprobs
+                );
             }
 
-            // Serialize merged response
             let merged_body =
                 serde_json::to_vec(&decode_json).map_err(|e| PDRouterError::NetworkError {
                     message: format!("Failed to serialize merged response: {}", e),
@@ -1542,32 +1570,32 @@ impl VllmPDRouter {
                 }
             }
 
-            response_builder.body(Body::from(merged_body)).map_err(|e| {
+            return response_builder.body(Body::from(merged_body)).map_err(|e| {
                 PDRouterError::NetworkError {
                     message: format!("Failed to build response from {}: {}", decode_url, e),
                 }
-            })
-        } else {
-            // No logprobs merging needed - return decode response as-is (streaming or no logprobs)
-            debug!(
-                "No logprobs merging needed (streaming={}, needs_logprobs={})",
-                is_streaming, needs_logprobs
-            );
-
-            let mut response_builder = Response::builder().status(status);
-            for (key, value) in headers.iter() {
-                if key != "transfer-encoding" && key != "content-length" {
-                    response_builder = response_builder.header(key, value);
-                }
-            }
-
-            let body = Body::from_stream(decode_response.bytes_stream());
-            response_builder
-                .body(body)
-                .map_err(|e| PDRouterError::NetworkError {
-                    message: format!("Failed to build response from {}: {}", decode_url, e),
-                })
+            });
         }
+
+        // Streaming responses are returned directly without any merge step.
+        debug!(
+            "No logprobs merging needed (streaming={}, needs_logprobs={})",
+            is_streaming, needs_logprobs
+        );
+
+        let mut response_builder = Response::builder().status(status);
+        for (key, value) in headers.iter() {
+            if key != "transfer-encoding" && key != "content-length" {
+                response_builder = response_builder.header(key, value);
+            }
+        }
+
+        let body = Body::from_stream(decode_response.bytes_stream());
+        response_builder
+            .body(body)
+            .map_err(|e| PDRouterError::NetworkError {
+                message: format!("Failed to build response from {}: {}", decode_url, e),
+            })
     }
 
     /// Create a new vLLM PD router

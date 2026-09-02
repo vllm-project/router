@@ -6,6 +6,73 @@
 use serde_json::Value;
 use tracing::debug;
 
+/// Merge usage metadata from prefill response into decode response.
+///
+/// Prefer the prefill-side cached_tokens, because vLLM decode-side cached token
+/// accounting may temporarily report invalid placeholder values such as -1.
+pub fn merge_usage_in_json(prefill_json: &Value, decode_json: &mut Value) -> bool {
+    let Some(prefill_usage) = prefill_json.get("usage") else {
+        return false;
+    };
+
+    let prefill_cached = prefill_usage
+        .get("prompt_tokens_details")
+        .and_then(|v| v.get("cached_tokens"))
+        .or_else(|| {
+            prefill_usage
+                .get("input_tokens_details")
+                .and_then(|v| v.get("cached_tokens"))
+        });
+
+    let Some(prefill_cached) = prefill_cached else {
+        return false;
+    };
+
+    let decode_usage = match decode_json.get_mut("usage") {
+        Some(v) => v,
+        None => {
+            decode_json["usage"] = prefill_usage.clone();
+            return true;
+        }
+    };
+
+    let Some(decode_usage_obj) = decode_usage.as_object_mut() else {
+        return false;
+    };
+
+    let details_target = if decode_usage_obj.contains_key("prompt_tokens_details") {
+        "prompt_tokens_details"
+    } else if decode_usage_obj.contains_key("input_tokens_details") {
+        "input_tokens_details"
+    } else {
+        "prompt_tokens_details"
+    };
+
+    let decode_details = decode_usage_obj
+        .entry(details_target.to_string())
+        .or_insert(Value::Object(serde_json::Map::new()));
+
+    let Some(decode_details_obj) = decode_details.as_object_mut() else {
+        return false;
+    };
+
+    let should_replace = match decode_details_obj.get("cached_tokens") {
+        Some(existing) => existing.as_i64().is_none_or(|v| v <= 0),
+        None => true,
+    };
+
+    if should_replace {
+        decode_details_obj.insert("cached_tokens".to_string(), prefill_cached.clone());
+        debug!(
+            "[USAGE MERGE] Replaced decode cached_tokens with prefill value {}",
+            prefill_cached
+        );
+        return true;
+    }
+
+    false
+}
+
 /// Merge prompt_logprobs from prefill response into decode response.
 ///
 /// Handles both Completions API (prompt_logprobs in choices) and
@@ -25,7 +92,7 @@ use tracing::debug;
 /// # Returns
 /// * `bool` - Whether any logprobs were merged
 pub fn merge_logprobs_in_json(prefill_json: &Value, decode_json: &mut Value) -> bool {
-    let mut merged = false;
+    let mut merged = merge_usage_in_json(prefill_json, decode_json);
 
     // 1. Try to merge meta_info/input_token_logprobs (for Generate API)
     if let (Some(prefill_meta), Some(decode_meta)) = (
@@ -335,6 +402,179 @@ mod tests {
         assert_eq!(merged_offsets[2].as_i64().unwrap(), 11); // Prompt token " test"
         assert_eq!(merged_offsets[3].as_i64().unwrap(), 16); // Decode token " output" (0 + 16)
         assert_eq!(merged_offsets[4].as_i64().unwrap(), 23); // Decode token " token" (7 + 16)
+    }
+
+    #[test]
+    fn test_merge_usage_prefill_cached_tokens_over_decode_invalid_value() {
+        let prefill_json = json!({
+            "usage": {
+                "prompt_tokens": 100,
+                "completion_tokens": 1,
+                "total_tokens": 101,
+                "prompt_tokens_details": {
+                    "cached_tokens": 50
+                }
+            }
+        });
+
+        let mut decode_json = json!({
+            "usage": {
+                "prompt_tokens": 100,
+                "completion_tokens": 10,
+                "total_tokens": 110,
+                "prompt_tokens_details": {
+                    "cached_tokens": -1
+                }
+            }
+        });
+
+        let merged = merge_usage_in_json(&prefill_json, &mut decode_json);
+        assert!(merged);
+        assert_eq!(
+            decode_json["usage"]["prompt_tokens_details"]["cached_tokens"],
+            json!(50)
+        );
+    }
+
+    #[test]
+    fn test_merge_usage_keeps_valid_decode_cached_tokens() {
+        let prefill_json = json!({
+            "usage": {
+                "prompt_tokens": 100,
+                "completion_tokens": 1,
+                "total_tokens": 101,
+                "prompt_tokens_details": {
+                    "cached_tokens": 50
+                }
+            }
+        });
+
+        let mut decode_json = json!({
+            "usage": {
+                "prompt_tokens": 100,
+                "completion_tokens": 10,
+                "total_tokens": 110,
+                "prompt_tokens_details": {
+                    "cached_tokens": 12
+                }
+            }
+        });
+
+        let merged = merge_usage_in_json(&prefill_json, &mut decode_json);
+        assert!(!merged);
+        assert_eq!(
+            decode_json["usage"]["prompt_tokens_details"]["cached_tokens"],
+            json!(12)
+        );
+    }
+
+    #[test]
+    fn test_merge_usage_fills_missing_cached_tokens() {
+        let prefill_json = json!({
+            "usage": {
+                "prompt_tokens": 100,
+                "completion_tokens": 1,
+                "total_tokens": 101,
+                "prompt_tokens_details": {
+                    "cached_tokens": 50
+                }
+            }
+        });
+
+        let mut decode_json = json!({
+            "usage": {
+                "prompt_tokens": 100,
+                "completion_tokens": 10,
+                "total_tokens": 110,
+                "prompt_tokens_details": {}
+            }
+        });
+
+        let merged = merge_usage_in_json(&prefill_json, &mut decode_json);
+        assert!(merged);
+        assert_eq!(
+            decode_json["usage"]["prompt_tokens_details"]["cached_tokens"],
+            json!(50)
+        );
+    }
+
+    #[test]
+    fn test_merge_usage_uses_input_tokens_details_fallback() {
+        let prefill_json = json!({
+            "usage": {
+                "input_tokens": 100,
+                "output_tokens": 1,
+                "total_tokens": 101,
+                "input_tokens_details": {
+                    "cached_tokens": 41
+                }
+            }
+        });
+
+        let mut decode_json = json!({
+            "usage": {
+                "input_tokens": 100,
+                "output_tokens": 10,
+                "total_tokens": 110,
+                "prompt_tokens_details": {
+                    "cached_tokens": -1
+                }
+            }
+        });
+
+        let merged = merge_usage_in_json(&prefill_json, &mut decode_json);
+        assert!(merged);
+        assert_eq!(
+            decode_json["usage"]["prompt_tokens_details"]["cached_tokens"],
+            json!(41)
+        );
+    }
+
+    #[test]
+    fn test_merge_usage_copies_usage_when_decode_missing() {
+        let prefill_json = json!({
+            "usage": {
+                "prompt_tokens": 100,
+                "completion_tokens": 1,
+                "total_tokens": 101,
+                "prompt_tokens_details": {
+                    "cached_tokens": 50
+                }
+            }
+        });
+
+        let mut decode_json = json!({
+            "choices": [{ "message": { "content": "ok" } }]
+        });
+
+        let merged = merge_usage_in_json(&prefill_json, &mut decode_json);
+        assert!(merged);
+        assert_eq!(
+            decode_json["usage"]["prompt_tokens_details"]["cached_tokens"],
+            json!(50)
+        );
+    }
+
+    #[test]
+    fn test_merge_usage_noop_without_prefill_usage() {
+        let prefill_json = json!({ "choices": [{ "message": { "content": "ok" } }] });
+        let mut decode_json = json!({
+            "usage": {
+                "prompt_tokens": 100,
+                "completion_tokens": 10,
+                "total_tokens": 110,
+                "prompt_tokens_details": {
+                    "cached_tokens": -1
+                }
+            }
+        });
+
+        let merged = merge_usage_in_json(&prefill_json, &mut decode_json);
+        assert!(!merged);
+        assert_eq!(
+            decode_json["usage"]["prompt_tokens_details"]["cached_tokens"],
+            json!(-1)
+        );
     }
 
     #[test]
