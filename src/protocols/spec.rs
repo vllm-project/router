@@ -2336,8 +2336,6 @@ pub enum PromptInput {
     String(String),
 }
 
-/// Serialize a token-id sequence into a stable, prefix-preserving routing key.
-/// Matches the space-separated encoding used by InferenceGenerateRequest.
 fn encode_token_ids(ids: &[i32]) -> String {
     ids.iter()
         .map(|id| id.to_string())
@@ -2367,9 +2365,7 @@ impl PromptInput {
     }
 
     /// Extract text representation for routing decisions
-    /// For token IDs, serialize the ids themselves so prefix-based cache-aware
-    /// routing can match shared prefixes (e.g. multiturn conversations); a
-    /// count-only key would collide every same-length prompt onto one node.
+    /// For token IDs, converts to a string representation
     pub fn extract_text_for_routing(&self) -> String {
         match self {
             PromptInput::String(s) => s.clone(),
@@ -2434,8 +2430,6 @@ mod tests {
 
     #[test]
     fn test_prompt_input_token_ids_routing_key() {
-        // Token-id prompts must serialize their ids (not a count) so cache-aware
-        // routing can prefix-match shared conversation prefixes.
         let single = PromptInput::IntArray(vec![151644, 8948, 198, 2610]);
         assert_eq!(single.extract_text_for_routing(), "151644 8948 198 2610");
         let batch = PromptInput::IntBatch(vec![vec![1, 2], vec![3, 4]]);
