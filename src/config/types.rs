@@ -244,6 +244,14 @@ pub enum PolicyConfig {
         virtual_nodes: u32,
     },
 
+    /// Session-aware routing that combines session stickiness with load
+    /// balancing: existing sessions stick to their assigned replica, new
+    /// sessions are routed to the least-loaded replica (ties broken by
+    /// consistent hashing). Session expiry is configured via the
+    /// `VLLM_ROUTER_SLL_SESSION_EXPIRATION_IN_S` environment variable.
+    #[serde(rename = "sticky_least_loaded")]
+    StickyLeastLoaded,
+
     #[serde(rename = "rendezvous_hash")]
     RendezvousHash,
 }
@@ -256,6 +264,7 @@ impl PolicyConfig {
             PolicyConfig::CacheAware { .. } => "cache_aware",
             PolicyConfig::PowerOfTwo { .. } => "power_of_two",
             PolicyConfig::ConsistentHash { .. } => "consistent_hash",
+            PolicyConfig::StickyLeastLoaded => "sticky_least_loaded",
             PolicyConfig::RendezvousHash => "rendezvous_hash",
         }
     }

@@ -188,6 +188,10 @@ impl ConfigValidator {
                     });
                 }
             }
+            PolicyConfig::StickyLeastLoaded => {
+                // Session expiration is sourced from the environment; no
+                // structured config to validate here.
+            }
             PolicyConfig::RendezvousHash => {
                 // No specific validation needed
             }

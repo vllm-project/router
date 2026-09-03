@@ -546,7 +546,24 @@ impl Router {
     ) -> Response {
         let start = Instant::now();
         let is_stream = typed_req.is_stream();
-        let text = typed_req.extract_text_for_routing();
+        let policy = match model_id {
+            Some(model) => self.policy_registry.get_policy_or_default(model),
+            None => self.policy_registry.get_default_policy(),
+        };
+        let text = if policy.needs_request_body() {
+            match serde_json::to_string(typed_req) {
+                Ok(body) => body,
+                Err(error) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Serialization error: {error}"),
+                    )
+                        .into_response();
+                }
+            }
+        } else {
+            typed_req.extract_text_for_routing()
+        };
 
         let response = RetryExecutor::execute_response_with_retry(
             &self.retry_config,

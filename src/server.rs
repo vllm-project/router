@@ -519,6 +519,31 @@ async fn get_loads(State(state): State<Arc<AppState>>, headers: http::HeaderMap)
     state.router.get_worker_loads().await
 }
 
+#[derive(Deserialize)]
+struct FinishSessionQuery {
+    session_id: String,
+}
+
+/// POST /finish_session?session_id=<id>
+///
+/// Marks a session (e.g. an RL trajectory) as finished so that session-aware
+/// routing policies (e.g. `sticky_least_loaded`) can release the
+/// active-session assignment. For policies that don't track
+/// sessions, this is a no-op. Unknown session ids are ignored.
+async fn finish_session(
+    State(state): State<Arc<AppState>>,
+    Query(FinishSessionQuery { session_id }): Query<FinishSessionQuery>,
+    headers: http::HeaderMap,
+) -> Response {
+    if let Err(response) = authorize_request(&state, &headers).await {
+        return response;
+    }
+
+    state.context.policy_registry.finish_session(&session_id);
+
+    Json(json!({ "status": "ok", "session_id": session_id })).into_response()
+}
+
 // ---------- Worker management endpoints (RESTful) ----------
 
 /// POST /workers - Add a new worker with full configuration
@@ -756,7 +781,8 @@ pub fn build_app_with_request_tracing(
         .route("/remove_worker", post(remove_worker))
         .route("/list_workers", get(list_workers))
         .route("/flush_cache", post(flush_cache))
-        .route("/get_loads", get(get_loads));
+        .route("/get_loads", get(get_loads))
+        .route("/finish_session", post(finish_session));
 
     // Worker management routes
     let worker_routes = Router::new()

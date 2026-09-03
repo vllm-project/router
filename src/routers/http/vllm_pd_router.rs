@@ -533,6 +533,7 @@ impl VllmPDRouter {
         instances: &[(String, String)],
         is_prefill: bool,
         request_text: Option<&str>,
+        request_headers: Option<&HashMap<String, String>>,
     ) -> Option<usize> {
         if instances.is_empty() {
             return None;
@@ -549,7 +550,7 @@ impl VllmPDRouter {
         };
 
         // Use policy to select worker
-        policy.select_worker(&workers, request_text)
+        policy.select_worker_with_headers(&workers, request_text, request_headers)
     }
 
     /// Process vLLM request using pure service discovery
@@ -591,22 +592,40 @@ impl VllmPDRouter {
         // Use policy-based load balancing to select prefill and decode workers
         let request_text = serde_json::to_string(&request_json).ok();
         let request_str = request_text.as_deref();
+        let request_headers: Option<HashMap<String, String>> = headers.map(|h| {
+            h.iter()
+                .filter_map(|(name, value)| {
+                    value
+                        .to_str()
+                        .ok()
+                        .map(|v| (name.as_str().to_lowercase(), v.to_string()))
+                })
+                .collect()
+        });
 
-        let prefill_idx =
-            match self.select_worker_with_policy(&prefill_instances, true, request_str) {
-                Some(idx) => idx,
-                None => {
-                    RouterMetrics::record_pd_error("server_selection");
-                    return (
-                        axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                        "Prefill policy failed to select a worker".to_string(),
-                    )
-                        .into_response();
-                }
-            };
+        let prefill_idx = match self.select_worker_with_policy(
+            &prefill_instances,
+            true,
+            request_str,
+            request_headers.as_ref(),
+        ) {
+            Some(idx) => idx,
+            None => {
+                RouterMetrics::record_pd_error("server_selection");
+                return (
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                    "Prefill policy failed to select a worker".to_string(),
+                )
+                    .into_response();
+            }
+        };
 
-        let decode_idx = match self.select_worker_with_policy(&decode_instances, false, request_str)
-        {
+        let decode_idx = match self.select_worker_with_policy(
+            &decode_instances,
+            false,
+            request_str,
+            request_headers.as_ref(),
+        ) {
             Some(idx) => idx,
             None => {
                 RouterMetrics::record_pd_error("server_selection");
@@ -2419,6 +2438,80 @@ impl WorkerManagement for VllmPDRouter {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn test_discovered_pd_preserves_header_session_across_turns() {
+        use crate::config::RouterConfig;
+        use crate::policies::StickyLeastLoadedPolicy;
+        use crate::server::AppContext;
+
+        let context = Arc::new(
+            AppContext::new(
+                RouterConfig::default(),
+                reqwest::Client::new(),
+                10,
+                None,
+                vec![],
+            )
+            .unwrap(),
+        );
+        context
+            .policy_registry
+            .set_prefill_policy(Arc::new(StickyLeastLoadedPolicy::new()));
+        context
+            .policy_registry
+            .set_decode_policy(Arc::new(StickyLeastLoadedPolicy::new()));
+        let router = VllmPDRouter::new(vec![], vec![], None, &context)
+            .await
+            .unwrap();
+        let mut servers = Vec::new();
+        for service_type in [ServiceType::Prefill, ServiceType::Decode] {
+            for _ in 0..2 {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let address = listener.local_addr().unwrap().to_string();
+                router.service_registry.register_service(
+                    address.clone(),
+                    address,
+                    service_type.clone(),
+                );
+                let app = axum::Router::new().route(
+                    "/v1/completions",
+                    axum::routing::post(|| async {
+                        axum::Json(json!({"choices": [], "kv_transfer_params": {}}))
+                    }),
+                );
+                servers.push(tokio::spawn(async move {
+                    axum::serve(listener, app).await.unwrap();
+                }));
+            }
+        }
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-session-id", "multi-turn-session".parse().unwrap());
+        for prompt in ["first turn", "different second turn"] {
+            let response = router
+                .process_vllm_request(
+                    json!({"model": "test", "prompt": prompt, "max_tokens": 2}),
+                    "/v1/completions",
+                    Some(&headers),
+                )
+                .await;
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        for policy in [
+            context.policy_registry.get_prefill_policy(),
+            context.policy_registry.get_decode_policy(),
+        ] {
+            let policy = policy
+                .as_any()
+                .downcast_ref::<StickyLeastLoadedPolicy>()
+                .unwrap();
+            assert_eq!(policy.active_session_count(), 1);
+        }
+        for server in servers {
+            server.abort();
+        }
+    }
 
     #[test]
     fn test_discovery_health_requires_prefill_and_decode_workers() {
