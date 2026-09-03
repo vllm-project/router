@@ -2336,6 +2336,13 @@ pub enum PromptInput {
     String(String),
 }
 
+fn encode_token_ids(ids: &[i32]) -> String {
+    ids.iter()
+        .map(|id| id.to_string())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 impl PromptInput {
     /// Get the number of items in the PromptInput
     pub fn len(&self) -> usize {
@@ -2363,16 +2370,12 @@ impl PromptInput {
         match self {
             PromptInput::String(s) => s.clone(),
             PromptInput::StringArray(arr) => arr.join(" "),
-            PromptInput::IntArray(ids) => {
-                // Convert token IDs to string representation for routing
-                // Format: "token_ids:<count>" to indicate this is a token-based prompt
-                format!("token_ids:{}", ids.len())
-            }
-            PromptInput::IntBatch(batches) => {
-                // For batches, use total token count
-                let total_tokens: usize = batches.iter().map(|b| b.len()).sum();
-                format!("token_ids_batch:{}:{}", batches.len(), total_tokens)
-            }
+            PromptInput::IntArray(ids) => encode_token_ids(ids),
+            PromptInput::IntBatch(batches) => batches
+                .iter()
+                .map(|b| encode_token_ids(b))
+                .collect::<Vec<_>>()
+                .join(";"),
         }
     }
 
@@ -2423,6 +2426,14 @@ mod tests {
         });
         let req: InferenceGenerateRequest = serde_json::from_value(body).unwrap();
         assert_eq!(req.extract_text_for_routing(), "151644 8948 198 2610");
+    }
+
+    #[test]
+    fn test_prompt_input_token_ids_routing_key() {
+        let single = PromptInput::IntArray(vec![151644, 8948, 198, 2610]);
+        assert_eq!(single.extract_text_for_routing(), "151644 8948 198 2610");
+        let batch = PromptInput::IntBatch(vec![vec![1, 2], vec![3, 4]]);
+        assert_eq!(batch.extract_text_for_routing(), "1 2;3 4");
     }
 
     #[test]
