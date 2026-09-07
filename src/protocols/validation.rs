@@ -1193,15 +1193,45 @@ mod tests {
             assert!(request.reasoning_effort.is_none());
             assert!(request.validate().is_ok());
 
-            // Valid reasoning_effort values: Low, Medium, High
-            request.reasoning_effort = Some(ReasoningEffort::Low);
-            assert!(request.validate().is_ok());
+            // All OpenAI ReasoningEffort values are accepted by the router.
+            for effort in [
+                ReasoningEffort::None,
+                ReasoningEffort::Minimal,
+                ReasoningEffort::Low,
+                ReasoningEffort::Medium,
+                ReasoningEffort::High,
+                ReasoningEffort::Xhigh,
+                ReasoningEffort::Max,
+            ] {
+                request.reasoning_effort = Some(effort);
+                assert!(
+                    request.validate().is_ok(),
+                    "effort {:?} should be valid",
+                    effort
+                );
+            }
+        }
 
-            request.reasoning_effort = Some(ReasoningEffort::Medium);
-            assert!(request.validate().is_ok());
-
-            request.reasoning_effort = Some(ReasoningEffort::High);
-            assert!(request.validate().is_ok());
+        #[test]
+        fn test_reasoning_effort_serde_roundtrip_all_values() {
+            // Every OpenAI effort string must deserialize and re-serialize to
+            // the same snake_case token — this is the regression the enum was
+            // widened for (previously unknown variants 400'd at the router).
+            for (s, expected) in [
+                ("none", ReasoningEffort::None),
+                ("minimal", ReasoningEffort::Minimal),
+                ("low", ReasoningEffort::Low),
+                ("medium", ReasoningEffort::Medium),
+                ("high", ReasoningEffort::High),
+                ("xhigh", ReasoningEffort::Xhigh),
+                ("max", ReasoningEffort::Max),
+            ] {
+                let parsed: ReasoningEffort = serde_json::from_str(&format!("\"{}\"", s))
+                    .unwrap_or_else(|e| panic!("{} should deserialize: {}", s, e));
+                assert_eq!(parsed, expected);
+                let reser = serde_json::to_string(&expected).unwrap();
+                assert_eq!(reser, format!("\"{}\"", s));
+            }
         }
 
         #[test]
