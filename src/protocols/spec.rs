@@ -518,12 +518,6 @@ pub struct ChatCompletionRequest {
     pub echo: Option<bool>,
 
     /// Reasoning effort level for reasoning models
-    ///
-    /// Mirrors OpenAI's ReasoningEffort values (`none`, `minimal`, `low`,
-    /// `medium`, `high`, `xhigh`, `max`) so the router forwards them to the
-    /// backend instead of rejecting the request. Not every backend model
-    /// supports every value; the router only validates the shape, not model
-    /// compatibility.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<ReasoningEffort>,
 
