@@ -26,8 +26,6 @@ RUN apt-get update && apt-get upgrade -y && apt-get install -y \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-RUN pip3 install --upgrade pip
-
 # Create app directory
 WORKDIR /app
 
@@ -42,8 +40,14 @@ COPY py_src ./py_src
 COPY pyproject.toml ./
 COPY README.md ./
 
-# Install Python dependencies if using Python launcher
-RUN pip install setuptools-rust wheel build requests
+# Install the Python launcher's runtime dependency, then drop pip from the
+# final image: the router does not need pip at runtime, and pip's vendored
+# msgpack/setuptools trip vulnerability scanners (GHSA-6v7p-g79w-8964,
+# CVE-2025-47273, CVE-2026-59890). Removing ensurepip also removes the
+# bundled pip wheel, which carries the same vendored copies.
+RUN pip3 install --no-cache-dir requests \
+    && pip3 uninstall -y pip \
+    && rm -rf /usr/local/lib/python3.12/ensurepip
 
 # Expose default router port
 EXPOSE 8080
