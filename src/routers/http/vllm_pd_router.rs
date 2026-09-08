@@ -6,7 +6,7 @@ use super::pd_router::PdRouterBase;
 use super::pd_types::{error_chain, PDRouterError};
 use super::vllm_service_discovery::{MoriIOTransferMode, ServiceRegistry, ServiceType};
 use crate::config::KvConnector;
-use crate::core::{BasicWorker, Worker, WorkerType};
+use crate::core::{BasicWorker, Worker, WorkerLoadGuard, WorkerType};
 use crate::metrics::RouterMetrics;
 use crate::otel_http::{self, ClientRequestOptions};
 use crate::policies::PolicyRegistry;
@@ -1174,8 +1174,11 @@ impl VllmPDRouter {
             path
         );
 
-        // Increment prefill load at the start of the prefill phase
-        prefill_worker.increment_load();
+        // Increment prefill load at the start of the prefill phase. The guard
+        // releases the load on every exit path, including task cancellation
+        // (e.g. client disconnect dropping the handler future), which the
+        // previous manual decrements leaked.
+        let prefill_guard = WorkerLoadGuard::new(prefill_worker.clone());
 
         let prefill_zmq_addr =
             self.get_zmq_address(prefill_worker.base_url(), ServiceType::Prefill);
@@ -1270,7 +1273,6 @@ impl VllmPDRouter {
         {
             Ok(resp) => resp,
             Err(e) => {
-                prefill_worker.decrement_load();
                 let full_error = error_chain(&e);
                 let duration = start_time.elapsed();
                 RouterMetrics::record_pd_prefill_error(&prefill_base_url);
@@ -1292,7 +1294,6 @@ impl VllmPDRouter {
         let prefill_bytes = match prefill_response.bytes().await {
             Ok(bytes) => bytes,
             Err(e) => {
-                prefill_worker.decrement_load();
                 let full_error = error_chain(&e);
                 let duration = start_time.elapsed();
                 RouterMetrics::record_pd_prefill_error(&prefill_base_url);
@@ -1322,7 +1323,6 @@ impl VllmPDRouter {
         let prefill_response_json: Value = match serde_json::from_slice(&prefill_bytes) {
             Ok(json) => json,
             Err(e) => {
-                prefill_worker.decrement_load();
                 let duration = start_time.elapsed();
                 RouterMetrics::record_pd_prefill_error(&prefill_base_url);
                 RouterMetrics::record_pd_request(path);
@@ -1348,9 +1348,10 @@ impl VllmPDRouter {
         // Stop profiling on prefill server after its work is done
         self.stop_profiling(&prefill_base_url).await;
 
-        // Prefill phase complete: decrement prefill load, increment decode load
-        prefill_worker.decrement_load();
-        decode_worker.increment_load();
+        // Prefill phase complete: release prefill load, track decode load.
+        // The decode guard releases on every exit path, including cancellation.
+        prefill_guard.release();
+        let decode_guard = WorkerLoadGuard::new(decode_worker.clone());
 
         debug!("✅ vLLM Stage 1 completed, starting Stage 2 - Decode");
 
@@ -1451,7 +1452,6 @@ impl VllmPDRouter {
         {
             Ok(resp) => resp,
             Err(e) => {
-                decode_worker.decrement_load();
                 let full_error = error_chain(&e);
                 let duration = start_time.elapsed();
                 RouterMetrics::record_pd_decode_error(&decode_base_url);
@@ -1467,8 +1467,8 @@ impl VllmPDRouter {
         // Stop profiling on decode server after response received
         self.stop_profiling(&decode_base_url).await;
 
-        // Decode phase complete: decrement decode load
-        decode_worker.decrement_load();
+        // Decode phase complete: release decode load
+        decode_guard.release();
 
         let status = decode_response.status();
         let headers = decode_response.headers().clone();
@@ -2418,6 +2418,7 @@ impl WorkerManagement for VllmPDRouter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::extract::Json;
     use serde_json::json;
 
     #[test]
@@ -2688,5 +2689,222 @@ mod tests {
     fn test_moriio_write_decode_params_includes_remote_dp_rank_when_dp_size_gt_1() {
         let params = moriio_write_decode_params(Some("tx-abc"), 4, Some(2));
         assert_eq!(params["remote_dp_rank"], 2);
+    }
+
+    // --- Load-accounting cancellation tests (regression for #197 review P1) ---
+
+    /// Build a VllmPDRouter without AppContext for focused tests.
+    fn test_vllm_pd_router() -> VllmPDRouter {
+        let worker_registry = Arc::new(crate::core::WorkerRegistry::new());
+        let policy_registry =
+            Arc::new(PolicyRegistry::new(crate::config::PolicyConfig::RoundRobin));
+        let pd_router = PdRouterBase {
+            worker_registry,
+            policy_registry: policy_registry.clone(),
+            worker_startup_timeout_secs: 5,
+            worker_startup_check_interval_secs: 1,
+            worker_loads: Arc::new(tokio::sync::watch::channel(HashMap::new()).1),
+            load_monitor_handle: None,
+            client: reqwest::Client::new(),
+            circuit_breaker_config: crate::core::CircuitBreakerConfig::default(),
+            dp_size: 1,
+        };
+        VllmPDRouter {
+            pd_router,
+            service_registry: Arc::new(ServiceRegistry::new()),
+            http_client: reqwest::Client::new(),
+            policy_registry,
+            use_discovery: false,
+            enable_profiling: false,
+            profile_timeout_secs: 0,
+            profiling_tasks: Arc::new(Mutex::new(HashMap::new())),
+            intra_node_data_parallel_size: 1,
+            prefill_dp_round_robin: Arc::new(AtomicUsize::new(0)),
+            kv_connector: KvConnector::Nixl,
+            mooncake_prefill_info: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Mock server whose POST /v1/chat/completions handler signals `entered`
+    /// and then waits for `release` before responding.
+    async fn start_pending_mock_server() -> (
+        String,
+        Arc<tokio::sync::Notify>,
+        Arc<tokio::sync::Notify>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use axum::routing::post;
+        use tokio::net::TcpListener;
+
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let entered_clone = entered.clone();
+        let release_clone = release.clone();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let app = axum::Router::new().route(
+            "/v1/chat/completions",
+            post(move |Json(_body): Json<serde_json::Value>| {
+                let entered = entered_clone.clone();
+                let release = release_clone.clone();
+                async move {
+                    entered.notify_one();
+                    release.notified().await;
+                    (axum::http::StatusCode::OK, "{}")
+                }
+            }),
+        );
+
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{}", addr), entered, release, handle)
+    }
+
+    /// Mock server whose POST /v1/chat/completions responds immediately with a
+    /// JSON body containing kv_transfer_params (prefill stage).
+    async fn start_immediate_prefill_mock_server() -> (String, tokio::task::JoinHandle<()>) {
+        use axum::routing::post;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let app = axum::Router::new().route(
+            "/v1/chat/completions",
+            post(|Json(_body): Json<serde_json::Value>| async move {
+                (
+                    axum::http::StatusCode::OK,
+                    "{\"kv_transfer_params\":{\"dummy\":true}}",
+                )
+            }),
+        );
+
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{}", addr), handle)
+    }
+
+    async fn wait_for_load(worker: &Arc<dyn Worker>, expected: usize) {
+        for _ in 0..200 {
+            if worker.load() == expected {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!(
+            "timed out waiting for worker load to reach {}, got {}",
+            expected,
+            worker.load()
+        );
+    }
+
+    /// Cancelling a two-stage request while the prefill response is pending
+    /// must release the prefill worker's load.
+    #[tokio::test]
+    async fn test_pd_request_cancellation_releases_prefill_load() {
+        let router = test_vllm_pd_router();
+        let (prefill_url, entered, _release, _server) = start_pending_mock_server().await;
+
+        let prefill_worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+            prefill_url.clone(),
+            WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+        ));
+        let decode_worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+            "http://127.0.0.1:1".to_string(),
+            WorkerType::Decode,
+        ));
+
+        let prefill_task_worker = prefill_worker.clone();
+        let decode_task_worker = decode_worker.clone();
+        let handle = tokio::spawn(async move {
+            let request = json!({
+                "model": "test",
+                "messages": [{"role": "user", "content": "hi"}],
+            });
+            let _ = router
+                .process_vllm_two_stage_request(
+                    request,
+                    prefill_task_worker,
+                    decode_task_worker,
+                    "/v1/chat/completions",
+                    None,
+                )
+                .await;
+        });
+
+        // Wait until the request reached the prefill worker and its load is
+        // counted, then cancel the whole request task.
+        entered.notified().await;
+        wait_for_load(&prefill_worker, 1).await;
+        handle.abort();
+        let _ = handle.await;
+
+        assert_eq!(
+            prefill_worker.load(),
+            0,
+            "cancelling a P/D request must release its prefill load"
+        );
+        assert_eq!(decode_worker.load(), 0);
+    }
+
+    /// Cancelling a two-stage request while the decode response is pending
+    /// must release both the decode and prefill workers' load.
+    #[tokio::test]
+    async fn test_pd_request_cancellation_releases_decode_load() {
+        let router = test_vllm_pd_router();
+        let (prefill_url, _prefill_server) = start_immediate_prefill_mock_server().await;
+        let (decode_url, decode_entered, _release, _decode_server) =
+            start_pending_mock_server().await;
+
+        let prefill_worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+            prefill_url.clone(),
+            WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+        ));
+        let decode_worker: Arc<dyn Worker> =
+            Arc::new(BasicWorker::new(decode_url.clone(), WorkerType::Decode));
+
+        let prefill_task_worker = prefill_worker.clone();
+        let decode_task_worker = decode_worker.clone();
+        let handle = tokio::spawn(async move {
+            let request = json!({
+                "model": "test",
+                "messages": [{"role": "user", "content": "hi"}],
+            });
+            let _ = router
+                .process_vllm_two_stage_request(
+                    request,
+                    prefill_task_worker,
+                    decode_task_worker,
+                    "/v1/chat/completions",
+                    None,
+                )
+                .await;
+        });
+
+        // Wait until the prefill stage completed and the request reached the
+        // decode worker, then cancel the whole request task.
+        decode_entered.notified().await;
+        wait_for_load(&decode_worker, 1).await;
+        handle.abort();
+        let _ = handle.await;
+
+        assert_eq!(
+            decode_worker.load(),
+            0,
+            "cancelling a P/D request must release its decode load"
+        );
+        assert_eq!(
+            prefill_worker.load(),
+            0,
+            "the prefill load must have been released at the transition"
+        );
     }
 }
