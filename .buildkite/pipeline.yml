@@ -2,8 +2,6 @@
 # This pipeline runs automated checks, builds, and tests for the vLLM Router project
 
 env:
-  # Debian 11 (bullseye) LTS ended 2026-08-31; bullseye-security metadata is
-  # expired, which breaks `apt-get update` and the Python wheel build job.
   RUST_IMAGE: "rust:1.95.0-bookworm"
   # Pin the ROCm nightly used by the MoRI lane so dependency changes are explicit.
   ROCM_VLLM_IMAGE: "vllm/vllm-openai-rocm:nightly@sha256:d22922d540810d90c5a3eafe91d3b4a62c2b881f3e990d0b7180b2875a5d176d"
