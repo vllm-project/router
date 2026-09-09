@@ -469,10 +469,11 @@ steps:
     command: |
       df -h / || true
       # Reclaim disk leaked by earlier builds: old per-commit vllm-router
-      # tags, dangling layers, and stale build cache.
-      docker images --format '{{.Repository}}:{{.Tag}} {{.ID}}' \
-        | awk '$1 ~ /^vllm-router:/ && $1 != "vllm-router:latest" {print $2}' \
-        | xargs -r docker rmi -f || true
+      # tags, dangling layers, and stale build cache. All vllm-router images
+      # can go: latest is re-tagged below in this same step.
+      # NB: no awk positional args here — the pipeline uploader's env
+      # interpolation rejects identifiers that don't start with a letter.
+      docker images -q vllm-router | xargs -r docker rmi -f || true
       docker image prune -f --filter "until=168h" || true
       docker builder prune -f --filter "until=168h" --keep-storage 10GB || true
       df -h / || true
