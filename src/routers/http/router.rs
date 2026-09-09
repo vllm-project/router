@@ -47,6 +47,27 @@ pub struct Router {
     _load_monitor_handle: Option<Arc<tokio::task::JoinHandle<()>>>,
 }
 
+/// RAII guard that releases a worker's in-flight load on Drop, covering every
+/// return path (including early returns and the deferred streaming task).
+struct RequestLoadGuard {
+    worker: Arc<dyn Worker>,
+}
+
+impl RequestLoadGuard {
+    fn new(worker: Arc<dyn Worker>) -> Self {
+        worker.increment_load();
+        RouterMetrics::set_running_requests(worker.url(), worker.load());
+        Self { worker }
+    }
+}
+
+impl Drop for RequestLoadGuard {
+    fn drop(&mut self) {
+        self.worker.decrement_load();
+        RouterMetrics::set_running_requests(self.worker.url(), self.worker.load());
+    }
+}
+
 impl Router {
     /// Create a new router with injected policy and client
     #[allow(clippy::too_many_arguments)]
@@ -571,17 +592,8 @@ impl Router {
                     None => self.policy_registry.get_default_policy(),
                 };
 
-                let load_incremented = if policy.name() == "cache_aware" {
-                    worker.increment_load();
-                    RouterMetrics::set_running_requests(worker.url(), worker.load());
-                    true
-                } else {
-                    false
-                };
-
-                // Keep a clone for potential cleanup on retry
-                let worker_for_cleanup = if load_incremented {
-                    Some(worker.clone())
+                let load_guard = if policy.name() == "cache_aware" {
+                    Some(RequestLoadGuard::new(worker.clone()))
                 } else {
                     None
                 };
@@ -593,7 +605,7 @@ impl Router {
                         route,
                         worker.url(),
                         is_stream,
-                        load_incremented,
+                        load_guard,
                     )
                     .await;
 
@@ -601,18 +613,6 @@ impl Router {
                 // should count against the circuit breaker.
                 let status = response.status();
                 worker.record_outcome(status.is_success() || status.is_client_error());
-
-                // For retryable failures, we need to decrement load since send_typed_request
-                // won't have done it (it only decrements on success or non-retryable failures)
-                if is_retryable_status(response.status()) && load_incremented {
-                    if let Some(cleanup_worker) = worker_for_cleanup {
-                        cleanup_worker.decrement_load();
-                        RouterMetrics::set_running_requests(
-                            cleanup_worker.url(),
-                            cleanup_worker.load(),
-                        );
-                    }
-                }
 
                 response
             },
@@ -771,7 +771,7 @@ impl Router {
         route: &str,
         worker_url: &str,
         is_stream: bool,
-        load_incremented: bool, // Whether load was incremented for this request
+        load_guard: Option<RequestLoadGuard>,
     ) -> Response {
         let (mut request_builder, extracted_dp_rank, request_url) =
             if self.intra_node_data_parallel_size > 1 {
@@ -856,14 +856,6 @@ impl Router {
                     worker_url, route, e
                 );
 
-                // Decrement load on error if it was incremented
-                if load_incremented {
-                    if let Some(worker) = self.worker_registry.get_by_url(worker_url) {
-                        worker.decrement_load();
-                        RouterMetrics::set_running_requests(worker_url, worker.load());
-                    }
-                }
-
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     format!("Request failed: {}", e),
@@ -887,60 +879,28 @@ impl Router {
                     response
                 }
                 Err(e) => {
-                    // IMPORTANT: Decrement load on error before returning
-                    if load_incremented {
-                        if let Some(worker) = self.worker_registry.get_by_url(worker_url) {
-                            worker.decrement_load();
-                            RouterMetrics::set_running_requests(worker_url, worker.load());
-                        }
-                    }
-
                     let error_msg = format!("Failed to get response body: {}", e);
                     (StatusCode::INTERNAL_SERVER_ERROR, error_msg).into_response()
                 }
             };
 
-            // Decrement load counter for non-streaming requests if it was incremented
-            if load_incremented {
-                if let Some(worker) = self.worker_registry.get_by_url(worker_url) {
-                    worker.decrement_load();
-                    RouterMetrics::set_running_requests(worker_url, worker.load());
-                }
-            }
-
+            // load_guard drops on return, decrementing once.
             response
-        } else if load_incremented {
-            // For streaming with load tracking, we need to manually decrement when done
-            let registry = Arc::clone(&self.worker_registry);
-            let worker_url = worker_url.to_string();
-
-            // Preserve headers for streaming response
+        } else if status.is_success() {
+            // Successful SSE stream: move the guard into the forwarding task so the
+            // decrement is deferred until the stream ends.
             let mut response_headers = header_utils::preserve_response_headers(res.headers());
-            // Ensure we set the correct content-type for SSE
             response_headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
 
             let stream = res.bytes_stream();
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
 
-            // Spawn task to forward stream and detect completion
             tokio::spawn(async move {
+                let _load_guard = load_guard;
                 let mut stream = stream;
-                let mut decremented = false;
                 while let Some(chunk) = stream.next().await {
                     match chunk {
                         Ok(bytes) => {
-                            // Check for stream end marker
-                            if bytes
-                                .as_ref()
-                                .windows(12)
-                                .any(|window| window == b"data: [DONE]")
-                            {
-                                if let Some(worker) = registry.get_by_url(&worker_url) {
-                                    worker.decrement_load();
-                                    RouterMetrics::set_running_requests(&worker_url, worker.load());
-                                    decremented = true;
-                                }
-                            }
                             if tx.send(Ok(bytes)).is_err() {
                                 break;
                             }
@@ -949,12 +909,6 @@ impl Router {
                             let _ = tx.send(Err(format!("Stream error: {}", e)));
                             break;
                         }
-                    }
-                }
-                if !decremented {
-                    if let Some(worker) = registry.get_by_url(&worker_url) {
-                        worker.decrement_load();
-                        RouterMetrics::set_running_requests(&worker_url, worker.load());
                     }
                 }
             });
@@ -967,16 +921,13 @@ impl Router {
             *response.headers_mut() = response_headers;
             response
         } else {
-            // For requests without load tracking, just stream
-            // Preserve headers for streaming response
+            // Non-success streaming (retried, body dropped): guard drops on return.
             let mut response_headers = header_utils::preserve_response_headers(res.headers());
-            // Ensure we set the correct content-type for SSE
             response_headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
 
             let stream = res.bytes_stream();
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
 
-            // Spawn task to forward stream
             tokio::spawn(async move {
                 let mut stream = stream;
                 while let Some(chunk) = stream.next().await {
@@ -2214,5 +2165,378 @@ mod tests {
         );
 
         health_checker.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_load_counter_not_double_decremented_on_retryable_status() {
+        use axum::{http::StatusCode, routing::post, Router as AxumRouter};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = AxumRouter::new().route(
+            "/generate",
+            post(|| async { StatusCode::SERVICE_UNAVAILABLE }),
+        );
+        let _handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        let worker_url = format!("http://{}", addr);
+
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        let worker = Arc::new(BasicWorker::new(worker_url, WorkerType::Regular));
+        worker_registry.register(worker.clone());
+
+        let policy_registry = Arc::new(PolicyRegistry::new(
+            crate::config::types::PolicyConfig::CacheAware {
+                cache_threshold: 0.5,
+                balance_abs_threshold: 32,
+                balance_rel_threshold: 1.5,
+                eviction_interval_secs: 60,
+                max_tree_size: 1000,
+            },
+        ));
+
+        let (_, rx) = tokio::sync::watch::channel(HashMap::new());
+        let router = Router {
+            worker_registry,
+            policy_registry,
+            worker_startup_timeout_secs: 5,
+            worker_startup_check_interval_secs: 1,
+            intra_node_data_parallel_size: 1,
+            api_key: None,
+            client: Client::new(),
+            retry_config: RetryConfig {
+                max_retries: 1,
+                ..RetryConfig::default()
+            },
+            circuit_breaker_config: CircuitBreakerConfig::default(),
+            _worker_loads: Arc::new(rx),
+            _load_monitor_handle: None,
+        };
+
+        let baseline = 5;
+        for _ in 0..baseline {
+            worker.increment_load();
+        }
+        assert_eq!(worker.load(), baseline);
+
+        let req: GenerateRequest =
+            serde_json::from_str(r#"{"text":"hello","stream":false}"#).unwrap();
+        let response = router
+            .route_typed_request(None, &req, "/generate", None)
+            .await;
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            worker.load(),
+            baseline,
+            "worker load must return exactly to baseline (no double decrement)"
+        );
+    }
+
+    fn build_load_test_router(worker_url: String, max_retries: u32) -> (Router, Arc<BasicWorker>) {
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        let worker = Arc::new(BasicWorker::new(worker_url, WorkerType::Regular));
+        worker_registry.register(worker.clone());
+
+        let policy_registry = Arc::new(PolicyRegistry::new(
+            crate::config::types::PolicyConfig::CacheAware {
+                cache_threshold: 0.5,
+                balance_abs_threshold: 32,
+                balance_rel_threshold: 1.5,
+                eviction_interval_secs: 60,
+                max_tree_size: 1000,
+            },
+        ));
+
+        let (_, rx) = tokio::sync::watch::channel(HashMap::new());
+        let router = Router {
+            worker_registry,
+            policy_registry,
+            worker_startup_timeout_secs: 5,
+            worker_startup_check_interval_secs: 1,
+            intra_node_data_parallel_size: 1,
+            api_key: None,
+            client: Client::new(),
+            retry_config: RetryConfig {
+                max_retries,
+                initial_backoff_ms: 1,
+                max_backoff_ms: 5,
+                backoff_multiplier: 2.0,
+                jitter_factor: 0.0,
+            },
+            circuit_breaker_config: CircuitBreakerConfig::default(),
+            _worker_loads: Arc::new(rx),
+            _load_monitor_handle: None,
+        };
+        (router, worker)
+    }
+
+    async fn spawn_backend(app: axum::Router) -> String {
+        use tokio::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        format!("http://{}", addr)
+    }
+
+    async fn settle_load(worker: &Arc<BasicWorker>, expected: usize) -> usize {
+        for _ in 0..200 {
+            if worker.load() == expected {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        worker.load()
+    }
+
+    #[tokio::test]
+    async fn test_load_returns_to_baseline_non_streaming_retries_exhausted() {
+        use axum::{http::StatusCode, routing::post, Router as AxumRouter};
+
+        let url = spawn_backend(AxumRouter::new().route(
+            "/generate",
+            post(|| async { StatusCode::SERVICE_UNAVAILABLE }),
+        ))
+        .await;
+        let (router, worker) = build_load_test_router(url, 3);
+
+        let baseline = 5;
+        for _ in 0..baseline {
+            worker.increment_load();
+        }
+
+        let req: GenerateRequest = serde_json::from_str(r#"{"text":"hi","stream":false}"#).unwrap();
+        let response = router
+            .route_typed_request(None, &req, "/generate", None)
+            .await;
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(worker.load(), baseline);
+    }
+
+    #[tokio::test]
+    async fn test_load_returns_to_baseline_non_streaming_success() {
+        use axum::{routing::post, Json, Router as AxumRouter};
+
+        let url = spawn_backend(AxumRouter::new().route(
+            "/generate",
+            post(|| async { Json(serde_json::json!({"text": "ok"})) }),
+        ))
+        .await;
+        let (router, worker) = build_load_test_router(url, 1);
+
+        let baseline = 5;
+        for _ in 0..baseline {
+            worker.increment_load();
+        }
+
+        let req: GenerateRequest = serde_json::from_str(r#"{"text":"hi","stream":false}"#).unwrap();
+        let response = router
+            .route_typed_request(None, &req, "/generate", None)
+            .await;
+
+        assert!(response.status().is_success());
+        assert_eq!(worker.load(), baseline);
+    }
+
+    #[tokio::test]
+    async fn test_load_returns_to_baseline_non_streaming_non_retryable() {
+        use axum::{http::StatusCode, routing::post, Router as AxumRouter};
+
+        let url = spawn_backend(
+            AxumRouter::new().route("/generate", post(|| async { StatusCode::BAD_REQUEST })),
+        )
+        .await;
+        let (router, worker) = build_load_test_router(url, 3);
+
+        let baseline = 5;
+        for _ in 0..baseline {
+            worker.increment_load();
+        }
+
+        let req: GenerateRequest = serde_json::from_str(r#"{"text":"hi","stream":false}"#).unwrap();
+        let response = router
+            .route_typed_request(None, &req, "/generate", None)
+            .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(worker.load(), baseline);
+    }
+
+    #[tokio::test]
+    async fn test_load_returns_to_baseline_streaming_success() {
+        use axum::{http::header::CONTENT_TYPE, routing::post, Router as AxumRouter};
+
+        let url = spawn_backend(AxumRouter::new().route(
+            "/generate",
+            post(|| async {
+                (
+                    [(CONTENT_TYPE, "text/event-stream")],
+                    "data: {\"text\":\"hi\"}\n\ndata: [DONE]\n\n",
+                )
+            }),
+        ))
+        .await;
+        let (router, worker) = build_load_test_router(url, 1);
+
+        let baseline = 5;
+        for _ in 0..baseline {
+            worker.increment_load();
+        }
+
+        let req: GenerateRequest = serde_json::from_str(r#"{"text":"hi","stream":true}"#).unwrap();
+        let response = router
+            .route_typed_request(None, &req, "/generate", None)
+            .await;
+        assert!(response.status().is_success());
+
+        let _ = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(settle_load(&worker, baseline).await, baseline);
+    }
+
+    #[tokio::test]
+    async fn test_load_returns_to_baseline_streaming_with_retries() {
+        use axum::{http::StatusCode, routing::post, Router as AxumRouter};
+
+        let url = spawn_backend(AxumRouter::new().route(
+            "/generate",
+            post(|| async { StatusCode::SERVICE_UNAVAILABLE }),
+        ))
+        .await;
+        let (router, worker) = build_load_test_router(url, 3);
+
+        let baseline = 5;
+        for _ in 0..baseline {
+            worker.increment_load();
+        }
+
+        let req: GenerateRequest = serde_json::from_str(r#"{"text":"hi","stream":true}"#).unwrap();
+        let response = router
+            .route_typed_request(None, &req, "/generate", None)
+            .await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let _ = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(settle_load(&worker, baseline).await, baseline);
+    }
+
+    #[tokio::test]
+    async fn test_load_returns_to_baseline_on_send_failure() {
+        let (router, worker) = build_load_test_router("http://127.0.0.1:1".to_string(), 1);
+
+        let baseline = 5;
+        for _ in 0..baseline {
+            worker.increment_load();
+        }
+
+        let req: GenerateRequest = serde_json::from_str(r#"{"text":"hi","stream":false}"#).unwrap();
+        let response = router
+            .route_typed_request(None, &req, "/generate", None)
+            .await;
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(worker.load(), baseline);
+    }
+
+    #[tokio::test]
+    async fn test_streaming_retryable_does_not_leak_load() {
+        use axum::{
+            http::StatusCode, response::Response as AxumResponse, routing::post,
+            Router as AxumRouter,
+        };
+
+        let url = spawn_backend(AxumRouter::new().route(
+            "/generate",
+            post(|| async {
+                let body = axum::body::Body::from_stream(futures::stream::pending::<
+                    Result<bytes::Bytes, std::io::Error>,
+                >());
+                let mut resp = AxumResponse::new(body);
+                *resp.status_mut() = StatusCode::SERVICE_UNAVAILABLE;
+                resp
+            }),
+        ))
+        .await;
+        let (router, worker) = build_load_test_router(url, 3);
+
+        let baseline = 5;
+        for _ in 0..baseline {
+            worker.increment_load();
+        }
+
+        let req: GenerateRequest = serde_json::from_str(r#"{"text":"hi","stream":true}"#).unwrap();
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            router.route_typed_request(None, &req, "/generate", None),
+        )
+        .await
+        .expect("route_typed_request should return promptly once headers arrive");
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(settle_load(&worker, baseline).await, baseline);
+    }
+
+    #[tokio::test]
+    async fn test_load_returns_to_baseline_on_dp_parse_error() {
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        let worker = Arc::new(BasicWorker::new(
+            "http://127.0.0.1:59999".to_string(),
+            WorkerType::Regular,
+        ));
+        worker_registry.register(worker.clone());
+
+        let policy_registry = Arc::new(PolicyRegistry::new(
+            crate::config::types::PolicyConfig::CacheAware {
+                cache_threshold: 0.5,
+                balance_abs_threshold: 32,
+                balance_rel_threshold: 1.5,
+                eviction_interval_secs: 60,
+                max_tree_size: 1000,
+            },
+        ));
+
+        let (_, rx) = tokio::sync::watch::channel(HashMap::new());
+        let router = Router {
+            worker_registry,
+            policy_registry,
+            worker_startup_timeout_secs: 5,
+            worker_startup_check_interval_secs: 1,
+            intra_node_data_parallel_size: 2,
+            api_key: None,
+            client: Client::new(),
+            retry_config: RetryConfig {
+                max_retries: 3,
+                initial_backoff_ms: 1,
+                max_backoff_ms: 5,
+                backoff_multiplier: 2.0,
+                jitter_factor: 0.0,
+            },
+            circuit_breaker_config: CircuitBreakerConfig::default(),
+            _worker_loads: Arc::new(rx),
+            _load_monitor_handle: None,
+        };
+
+        let baseline = 5;
+        for _ in 0..baseline {
+            worker.increment_load();
+        }
+
+        let req: GenerateRequest = serde_json::from_str(r#"{"text":"hi","stream":false}"#).unwrap();
+        let response = router
+            .route_typed_request(None, &req, "/generate", None)
+            .await;
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(worker.load(), baseline);
     }
 }
