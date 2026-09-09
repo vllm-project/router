@@ -433,6 +433,7 @@ impl Router {
                 let route_name = format!("/{}", endpoint);
                 let mut request_builder =
                     dp_utils::add_dp_rank_header(self.client.get(&url), dp_rank);
+
                 for (name, value) in headers {
                     let name_lc = name.to_lowercase();
                     if name_lc != "content-type"

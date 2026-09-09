@@ -449,8 +449,6 @@ mod dp_e2e_tests {
         worker.stop().await;
     }
 
-    // GET /v1/models used to send hostname:port@rank to reqwest as userinfo,
-    // routing the request to the rank digit as host instead of the worker.
     #[tokio::test]
     async fn test_regular_router_dp2_get_v1_models() {
         let mut worker = MockWorker::new(MockWorkerConfig::default());
