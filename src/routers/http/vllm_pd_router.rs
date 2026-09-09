@@ -21,7 +21,7 @@ use axum::{
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
@@ -61,6 +61,12 @@ pub struct VllmPDRouter {
     kv_connector: KvConnector,
     /// Mooncake bootstrap info: prefill base_url -> MooncakePrefillInfo
     mooncake_prefill_info: Arc<Mutex<HashMap<String, MooncakePrefillInfo>>>,
+    /// Enable concurrent P/D dispatch (NIXL pull mode only)
+    pd_concurrent_dispatch: bool,
+    /// NIXL transfer mode ("pull"/"push") learned from the first prefill
+    /// response's kv_transfer_params; concurrent dispatch stays off until
+    /// pull mode is confirmed.
+    nixl_transfer_mode: Arc<OnceLock<String>>,
 }
 
 /// Transfer ID prefix used by MoRI-IO to correlate prefill and decode legs.
@@ -331,7 +337,11 @@ impl VllmPDRouter {
                     Some(params)
                 }
             }
-            KvConnector::Nixl => Some(prefill_response_json?.get("kv_transfer_params")?.clone()),
+            KvConnector::Nixl => {
+                let params = prefill_response_json?.get("kv_transfer_params")?.clone();
+                self.note_nixl_transfer_mode(&params);
+                Some(params)
+            }
         }
     }
 
@@ -1152,6 +1162,393 @@ impl VllmPDRouter {
         .await
     }
 
+    /// Record the NIXL transfer mode ("pull"/"push") advertised in a prefill
+    /// response's kv_transfer_params. Concurrent dispatch relies on the
+    /// decode worker pulling KV from the prefill worker, so it only activates
+    /// once pull mode is confirmed; the first request always runs serially.
+    fn note_nixl_transfer_mode(&self, kv_transfer_params: &Value) {
+        let Some(mode) = kv_transfer_params
+            .get("transfer_mode")
+            .and_then(|v| v.as_str())
+        else {
+            return;
+        };
+        if self.nixl_transfer_mode.set(mode.to_string()).is_ok() {
+            info!(
+                "Learned NIXL transfer mode '{}' from prefill response{}",
+                mode,
+                if self.pd_concurrent_dispatch && mode == "pull" {
+                    "; concurrent P/D dispatch active for subsequent requests"
+                } else {
+                    ""
+                }
+            );
+        }
+    }
+
+    /// Concurrent P/D dispatch gate: opt-in via config, NIXL pull mode only.
+    fn concurrent_dispatch_enabled(&self) -> bool {
+        self.pd_concurrent_dispatch
+            && matches!(self.kv_connector, KvConnector::Nixl)
+            && self.nixl_transfer_mode.get().map(String::as_str) == Some("pull")
+    }
+
+    /// Concurrent P/D dispatch (NIXL only): both legs are dispatched at
+    /// once; the decode leg parks in the scheduler until the router
+    /// forwards the prefill's kv_transfer_params via POST /v1/pd_kv_ready.
+    /// On any failure the decode leg is aborted; a ready notification lost
+    /// after a 2xx is covered by the decode-side park timeout.
+    async fn process_vllm_concurrent_request(
+        &self,
+        original_request: Value,
+        prefill_worker: Arc<dyn Worker>,
+        decode_worker: Arc<dyn Worker>,
+        path: &str,
+        headers: Option<&HeaderMap>,
+    ) -> Result<Response, PDRouterError> {
+        let start_time = Instant::now();
+
+        let prefill_zmq_addr =
+            self.get_zmq_address(prefill_worker.base_url(), ServiceType::Prefill);
+        let decode_zmq_addr = self.get_zmq_address(decode_worker.base_url(), ServiceType::Decode);
+        let request_id = Self::generate_vllm_request_id(&prefill_zmq_addr, &decode_zmq_addr);
+
+        info!(
+            "pd_concurrent_dispatch request_id={} prefill={} decode={}",
+            request_id,
+            prefill_worker.url(),
+            decode_worker.url()
+        );
+
+        // Prefill request: same shape as the serial path.
+        let mut prefill_request = Self::prepare_prefill_request(original_request.clone(), path);
+        let decode_base_url = decode_worker.base_url().to_string();
+        prefill_request["kv_transfer_params"] = self
+            .build_prefill_kv_transfer_params(None, Some(&decode_base_url), decode_worker.dp_rank())
+            .map_err(|reason| PDRouterError::InvalidConfiguration { reason })?;
+
+        // Decode prepare request: marks the request for scheduler parking.
+        let mut decode_request = original_request.clone();
+        decode_request["kv_transfer_params"] = json!({
+            "do_remote_decode": false,
+            "do_remote_prefill": true,
+            "remote_ready": false
+        });
+
+        let prefill_base_url = prefill_worker.base_url().to_string();
+        let decode_base_http = decode_base_url.clone();
+        let prefill_url = prefill_worker.endpoint_url(path);
+        let decode_url = decode_worker.endpoint_url(path);
+
+        prefill_worker.increment_load();
+        decode_worker.increment_load();
+
+        // Dispatch the decode leg in the background: send() only resolves on
+        // completion for non-streaming requests, so a join would deadlock on
+        // the ready notification we have not sent yet.
+        let mut decode_request_builder = self
+            .pd_router
+            .client
+            .post(&decode_url)
+            .header("Content-Type", "application/json")
+            .header(
+                "Authorization",
+                format!(
+                    "Bearer {}",
+                    std::env::var("OPENAI_API_KEY").unwrap_or_default()
+                ),
+            )
+            .header("X-Request-Id", &request_id);
+        decode_request_builder =
+            header_utils::propagate_trace_headers(decode_request_builder, headers);
+        decode_request_builder =
+            dp_utils::add_dp_rank_header(decode_request_builder, decode_worker.dp_rank());
+        let decode_handle =
+            tokio::spawn(async move { decode_request_builder.json(&decode_request).send().await });
+        // Abort the detached decode task if this handler future is dropped
+        // (client disconnect); no-op once the task finished.
+        struct AbortOnDrop(tokio::task::AbortHandle);
+        impl Drop for AbortOnDrop {
+            fn drop(&mut self) {
+                self.0.abort();
+            }
+        }
+        let _decode_abort_guard = AbortOnDrop(decode_handle.abort_handle());
+
+        let mut prefill_request_builder = self
+            .pd_router
+            .client
+            .post(&prefill_url)
+            .header("Content-Type", "application/json")
+            .header(
+                "Authorization",
+                format!(
+                    "Bearer {}",
+                    std::env::var("OPENAI_API_KEY").unwrap_or_default()
+                ),
+            )
+            .header("X-Request-Id", &request_id);
+        prefill_request_builder =
+            dp_utils::add_dp_rank_header(prefill_request_builder, prefill_worker.dp_rank());
+
+        type DecodeHandle = tokio::task::JoinHandle<Result<reqwest::Response, reqwest::Error>>;
+        let fail = |message: String, is_prefill_error: bool, decode_handle: &DecodeHandle| {
+            decode_handle.abort();
+            prefill_worker.decrement_load();
+            decode_worker.decrement_load();
+            let duration = start_time.elapsed();
+            if is_prefill_error {
+                RouterMetrics::record_pd_prefill_error(&prefill_base_url);
+            } else {
+                RouterMetrics::record_pd_decode_error(&decode_base_http);
+            }
+            RouterMetrics::record_pd_request(path);
+            RouterMetrics::record_pd_request_duration(path, duration);
+            PDRouterError::NetworkError { message }
+        };
+
+        let prefill_response = match otel_http::send_client_request(
+            prefill_request_builder.json(&prefill_request),
+            headers,
+            ClientRequestOptions {
+                method: "POST",
+                url: &prefill_url,
+                route: Some(path),
+                request_phase: Some("prefill"),
+            },
+        )
+        .await
+        {
+            Ok(resp) => resp,
+            Err(e) => {
+                return Err(fail(
+                    format!(
+                        "Prefill request failed to {}: {}",
+                        prefill_url,
+                        error_chain(&e)
+                    ),
+                    true,
+                    &decode_handle,
+                ));
+            }
+        };
+
+        let prefill_status = prefill_response.status();
+        let prefill_bytes = match prefill_response.bytes().await {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                return Err(fail(
+                    format!(
+                        "Failed to read prefill response from {}: {}",
+                        prefill_url,
+                        error_chain(&e)
+                    ),
+                    true,
+                    &decode_handle,
+                ));
+            }
+        };
+        if !prefill_status.is_success() {
+            return Err(fail(
+                format!(
+                    "Prefill server error {}: {}",
+                    prefill_status,
+                    String::from_utf8_lossy(&prefill_bytes)
+                ),
+                true,
+                &decode_handle,
+            ));
+        }
+
+        let prefill_response_json: Value = match serde_json::from_slice(&prefill_bytes) {
+            Ok(json) => json,
+            Err(e) => {
+                return Err(fail(
+                    format!("Failed to parse prefill response as JSON: {}", e),
+                    true,
+                    &decode_handle,
+                ));
+            }
+        };
+
+        let kv_transfer_params = match prefill_response_json.get("kv_transfer_params") {
+            Some(params) if params.is_object() => params.clone(),
+            _ => {
+                return Err(fail(
+                    "Prefill response has no kv_transfer_params; cannot resume \
+                     the concurrently dispatched decode request"
+                        .to_string(),
+                    true,
+                    &decode_handle,
+                ));
+            }
+        };
+
+        // Forward the ready notification to the decode worker, with retries.
+        let ready_url = decode_worker.endpoint_url("/v1/pd_kv_ready");
+        let ready_payload = json!({
+            "request_id": request_id,
+            "kv_transfer_params": kv_transfer_params,
+        });
+        let mut ready_ok = false;
+        for attempt in 0..3 {
+            // Match the decode leg's headers: auth plus the DP-rank header,
+            // since endpoint_url() drops the @rank suffix.
+            let mut ready_request_builder = self
+                .pd_router
+                .client
+                .post(&ready_url)
+                .header("Content-Type", "application/json")
+                .header(
+                    "Authorization",
+                    format!(
+                        "Bearer {}",
+                        std::env::var("OPENAI_API_KEY").unwrap_or_default()
+                    ),
+                )
+                .header("X-Request-Id", &request_id);
+            ready_request_builder =
+                dp_utils::add_dp_rank_header(ready_request_builder, decode_worker.dp_rank());
+            match ready_request_builder.json(&ready_payload).send().await {
+                Ok(resp) if resp.status().is_success() => {
+                    ready_ok = true;
+                    break;
+                }
+                Ok(resp) => {
+                    warn!(
+                        "pd_kv_ready POST attempt {} to {} returned {}",
+                        attempt + 1,
+                        ready_url,
+                        resp.status()
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        "pd_kv_ready POST attempt {} to {} failed: {}",
+                        attempt + 1,
+                        ready_url,
+                        error_chain(&e)
+                    );
+                }
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        }
+        if !ready_ok {
+            return Err(fail(
+                format!("Failed to deliver pd_kv_ready to {}", ready_url),
+                false,
+                &decode_handle,
+            ));
+        }
+        debug!(
+            "pd_kv_ready forwarded request_id={} decode={}",
+            request_id, decode_base_http
+        );
+        prefill_worker.decrement_load();
+
+        // Wait for the decode response.
+        let decode_response = match decode_handle.await {
+            Ok(Ok(resp)) => resp,
+            Ok(Err(e)) => {
+                decode_worker.decrement_load();
+                let duration = start_time.elapsed();
+                RouterMetrics::record_pd_decode_error(&decode_base_http);
+                RouterMetrics::record_pd_request(path);
+                RouterMetrics::record_pd_request_duration(path, duration);
+                RouterMetrics::record_pd_prefill_request(&prefill_base_url);
+                return Err(PDRouterError::NetworkError {
+                    message: format!(
+                        "Decode request failed to {}: {}",
+                        decode_url,
+                        error_chain(&e)
+                    ),
+                });
+            }
+            Err(e) => {
+                decode_worker.decrement_load();
+                let duration = start_time.elapsed();
+                RouterMetrics::record_pd_decode_error(&decode_base_http);
+                RouterMetrics::record_pd_request(path);
+                RouterMetrics::record_pd_request_duration(path, duration);
+                RouterMetrics::record_pd_prefill_request(&prefill_base_url);
+                return Err(PDRouterError::NetworkError {
+                    message: format!("Decode request task failed: {}", e),
+                });
+            }
+        };
+
+        decode_worker.decrement_load();
+
+        let status = decode_response.status();
+        let response_headers = decode_response.headers().clone();
+
+        let duration = start_time.elapsed();
+        RouterMetrics::record_pd_request(path);
+        RouterMetrics::record_pd_request_duration(path, duration);
+        RouterMetrics::record_pd_prefill_request(&prefill_base_url);
+        RouterMetrics::record_pd_decode_request(&decode_base_http);
+        if !status.is_success() {
+            RouterMetrics::record_pd_decode_error(&decode_base_http);
+        }
+
+        // Same response handling as the serial path.
+        let needs_logprobs = original_request.get("logprobs").is_some()
+            || original_request
+                .get("echo")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+        let is_streaming = original_request
+            .get("stream")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        if needs_logprobs && !is_streaming {
+            let decode_body =
+                decode_response
+                    .bytes()
+                    .await
+                    .map_err(|e| PDRouterError::NetworkError {
+                        message: format!(
+                            "Failed to read decode response from {}: {}",
+                            decode_url, e
+                        ),
+                    })?;
+            let mut decode_json: Value =
+                serde_json::from_slice(&decode_body).map_err(|e| PDRouterError::NetworkError {
+                    message: format!("Failed to parse decode response as JSON: {}", e),
+                })?;
+            logprobs_merge::merge_logprobs_in_json(&prefill_response_json, &mut decode_json);
+            let merged_body =
+                serde_json::to_vec(&decode_json).map_err(|e| PDRouterError::NetworkError {
+                    message: format!("Failed to serialize merged response: {}", e),
+                })?;
+            let mut response_builder = Response::builder().status(status);
+            for (key, value) in response_headers.iter() {
+                if key != "transfer-encoding" && key != "content-length" {
+                    response_builder = response_builder.header(key, value);
+                }
+            }
+            response_builder.body(Body::from(merged_body)).map_err(|e| {
+                PDRouterError::NetworkError {
+                    message: format!("Failed to build response from {}: {}", decode_url, e),
+                }
+            })
+        } else {
+            let mut response_builder = Response::builder().status(status);
+            for (key, value) in response_headers.iter() {
+                if key != "transfer-encoding" && key != "content-length" {
+                    response_builder = response_builder.header(key, value);
+                }
+            }
+            let body = Body::from_stream(decode_response.bytes_stream());
+            response_builder
+                .body(body)
+                .map_err(|e| PDRouterError::NetworkError {
+                    message: format!("Failed to build response from {}: {}", decode_url, e),
+                })
+        }
+    }
+
     /// Two-stage request processing for vLLM disaggregated mode
     ///
     /// This function handles fine-grained load tracking: the prefill worker's load is only
@@ -1165,6 +1562,17 @@ impl VllmPDRouter {
         path: &str,
         headers: Option<&HeaderMap>,
     ) -> Result<Response, PDRouterError> {
+        if self.concurrent_dispatch_enabled() {
+            return self
+                .process_vllm_concurrent_request(
+                    original_request,
+                    prefill_worker,
+                    decode_worker,
+                    path,
+                    headers,
+                )
+                .await;
+        }
         debug!("ENTERED process_vllm_two_stage_request method");
         let start_time = Instant::now();
         debug!(
@@ -1620,6 +2028,8 @@ impl VllmPDRouter {
                 prefill_dp_round_robin: Arc::new(AtomicUsize::new(0)),
                 kv_connector,
                 mooncake_prefill_info: Arc::new(Mutex::new(HashMap::new())),
+                pd_concurrent_dispatch: ctx.router_config.pd_concurrent_dispatch,
+                nixl_transfer_mode: Arc::new(OnceLock::new()),
             })
         } else {
             // Direct URL mode (same as PdRouterBase)
@@ -1709,6 +2119,8 @@ impl VllmPDRouter {
                 prefill_dp_round_robin: Arc::new(AtomicUsize::new(0)),
                 kv_connector,
                 mooncake_prefill_info,
+                pd_concurrent_dispatch: ctx.router_config.pd_concurrent_dispatch,
+                nixl_transfer_mode: Arc::new(OnceLock::new()),
             })
         }
     }

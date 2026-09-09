@@ -338,6 +338,11 @@ struct CliArgs {
     /// KV connector type for PD disaggregation (nixl or mooncake)
     #[arg(long, value_enum, default_value_t = KvConnector::Nixl)]
     kv_connector: KvConnector,
+
+    /// Enable concurrent P/D dispatch for the NIXL pull connector (requires
+    /// vLLM-side prepare-parking support: POST /v1/pd_kv_ready)
+    #[arg(long, default_value_t = false)]
+    pd_concurrent_dispatch: bool,
 }
 
 impl CliArgs {
@@ -557,6 +562,7 @@ impl CliArgs {
             enable_profiling: self.profile,
             profile_timeout_secs: 10, // Default profiling timeout
             kv_connector: self.kv_connector,
+            pd_concurrent_dispatch: self.pd_concurrent_dispatch,
         })
     }
 
