@@ -1,12 +1,31 @@
 use super::*;
 
 async fn queue_results(queue_timeout: Duration, age: Duration) -> [Result<(), StatusCode>; 2] {
+    let now = Instant::now();
+    queue_results_with_timestamp(queue_timeout, age, now, now.checked_sub(age)).await
+}
+
+async fn queue_results_with_timestamp(
+    queue_timeout: Duration,
+    age: Duration,
+    now: Instant,
+    backdated: Option<Instant>,
+) -> [Result<(), StatusCode>; 2] {
+    let queued_at = match backdated {
+        Some(queued_at) => queued_at,
+        None => {
+            // Preserve the requested age even if the clock cannot be backdated.
+            // Falling back to `now` without waiting would change the test case.
+            tokio::time::sleep(age).await;
+            now
+        }
+    };
+    // Start token replenishment only after any fallback aging delay.
     let bucket = Arc::new(TokenBucket::new(1, 1));
     bucket.try_acquire(1.0).await.unwrap();
     let (tx, rx) = mpsc::channel(2);
     let (first_tx, first_rx) = oneshot::channel();
     let (second_tx, second_rx) = oneshot::channel();
-    let queued_at = Instant::now() - age;
     for permit_tx in [first_tx, second_tx] {
         tx.send(QueuedRequest {
             queued_at,
@@ -23,6 +42,20 @@ async fn queue_results(queue_timeout: Duration, age: Duration) -> [Result<(), St
     })
     .await
     .expect("queue permits must resolve within the test deadline")
+}
+
+#[tokio::test]
+async fn unrepresentable_backdate_preserves_age_without_refilling_bucket() {
+    assert_eq!(
+        queue_results_with_timestamp(
+            Duration::from_secs(4),
+            Duration::from_millis(3970),
+            Instant::now(),
+            None,
+        )
+        .await,
+        [Err(StatusCode::REQUEST_TIMEOUT); 2],
+    );
 }
 
 #[tokio::test]
