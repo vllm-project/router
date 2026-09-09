@@ -167,6 +167,11 @@ struct CliArgs {
     #[arg(long, default_value_t = 1)]
     intra_node_data_parallel_size: usize,
 
+    /// Total (cross-pod) MoRI-IO DP world size for Wide-EP (e.g. 16 for 2P2D DP=16,
+    /// vs intra_node=8). 0 -> fall back to intra_node_data_parallel_size.
+    #[arg(long, default_value_t = 0)]
+    moriio_dp_size: usize,
+
     /// API key for worker authorization
     #[arg(long)]
     api_key: Option<String>,
@@ -511,6 +516,7 @@ impl CliArgs {
             worker_startup_timeout_secs: self.worker_startup_timeout_secs,
             worker_startup_check_interval_secs: self.worker_startup_check_interval,
             intra_node_data_parallel_size: self.intra_node_data_parallel_size,
+            moriio_dp_size: self.moriio_dp_size,
             api_key: self.api_key.clone(),
             api_key_validation_urls,
             discovery,

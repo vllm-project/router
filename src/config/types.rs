@@ -28,6 +28,13 @@ pub struct RouterConfig {
     /// Intra-node data parallel size (number of DP replicas per worker URL). When > 1, the router will create multiple worker instances per URL, one for each DP rank.
     #[serde(default = "default_intra_node_data_parallel_size")]
     pub intra_node_data_parallel_size: usize,
+    /// Total (cross-pod) MoRI-IO DP world size for Wide-EP. For multi-pod 2P2D
+    /// DP=16 this is 16 (vs intra_node=8). Used to round-robin a single per-request
+    /// DP rank over the FULL world and to stamp remote_dp_size/remote_dp_rank_override
+    /// so the MoRIIO connector pins both prefill and decode legs to the same rank
+    /// (no decode-side re-hash). 0 -> fall back to intra_node_data_parallel_size.
+    #[serde(default)]
+    pub moriio_dp_size: usize,
     /// The api key used for the authorization with the worker
     pub api_key: Option<String>,
     /// API key validation URLs (if set, incoming requests must validate against them)
@@ -456,6 +463,7 @@ impl Default for RouterConfig {
             worker_startup_timeout_secs: 600,
             worker_startup_check_interval_secs: 30,
             intra_node_data_parallel_size: 1,
+            moriio_dp_size: 0,
             api_key: None,
             api_key_validation_urls: vec![],
             discovery: None,
@@ -1023,6 +1031,7 @@ mod tests {
             worker_startup_timeout_secs: 60,
             worker_startup_check_interval_secs: 5,
             intra_node_data_parallel_size: 1,
+            moriio_dp_size: 0,
             api_key: None,
             api_key_validation_urls: vec![],
             discovery: Some(DiscoveryConfig {
@@ -1089,6 +1098,7 @@ mod tests {
             worker_startup_timeout_secs: 180,
             worker_startup_check_interval_secs: 15,
             intra_node_data_parallel_size: 1,
+            moriio_dp_size: 0,
             api_key: None,
             api_key_validation_urls: vec![],
             discovery: Some(DiscoveryConfig {
@@ -1146,6 +1156,7 @@ mod tests {
             worker_startup_timeout_secs: 600,
             worker_startup_check_interval_secs: 20,
             intra_node_data_parallel_size: 1,
+            moriio_dp_size: 0,
             api_key: None,
             api_key_validation_urls: vec![],
             discovery: Some(DiscoveryConfig {
