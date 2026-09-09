@@ -53,6 +53,9 @@ steps:
                   apt-get update && apt-get install -y pkg-config libssl-dev protobuf-compiler
                   rustup component add clippy
                   cargo clippy --all-targets --all-features -- -D warnings
+                  # Free agent disk: target/ holds multi-GB of build artifacts
+                  # that are never reused across jobs (separate checkouts).
+                  rm -rf target || true
         agents:
           queue: "cpu_queue_premerge"
 
@@ -90,6 +93,9 @@ steps:
                 - |
                   apt-get update && apt-get install -y pkg-config libssl-dev protobuf-compiler
                   cargo build --release
+                  # Keep only the binary (uploaded as artifact below); the
+                  # intermediate artifacts are multi-GB and leak agent disk.
+                  rm -rf target/release/build target/release/deps target/release/.fingerprint target/release/incremental target/debug || true
         artifact_paths:
           - "target/release/vllm-router"
         agents:
@@ -114,6 +120,8 @@ steps:
                   source /tmp/venv/bin/activate
                   pip install -U pip setuptools wheel setuptools-rust build
                   python -m build
+                  # Free agent disk: cargo intermediates from the wheel build.
+                  rm -rf target || true
         artifact_paths:
           - "dist/*.whl"
           - "dist/*.tar.gz"
@@ -146,6 +154,8 @@ steps:
                 - |
                   apt-get update && apt-get install -y pkg-config libssl-dev protobuf-compiler
                   cargo test --lib --bins
+                  # Free agent disk: cargo intermediates are never reused.
+                  rm -rf target || true
         agents:
           queue: "cpu_queue_premerge"
 
@@ -165,6 +175,8 @@ steps:
                 - |
                   apt-get update && apt-get install -y pkg-config libssl-dev protobuf-compiler
                   cargo test --test '*'
+                  # Free agent disk: cargo intermediates are never reused.
+                  rm -rf target || true
         agents:
           queue: "cpu_queue_premerge"
 
@@ -189,6 +201,8 @@ steps:
                   pip install -e .[dev]
                   pip install pytest pytest-cov pytest-asyncio
                   pytest py_test/ -v --ignore=py_test/e2e --cov=vllm_router --cov-report=xml --cov-report=term
+                  # Free agent disk: editable install's cargo intermediates.
+                  rm -rf target || true
         artifact_paths:
           - "coverage.xml"
         agents:
@@ -240,6 +254,12 @@ steps:
                 exit 1
               fi
               echo "HF_TOKEN is configured."
+
+              # Disk hygiene: previous runs leave ~20GB venv (vllm + torch
+              # cu130) and cargo intermediates in the /workdir checkout on
+              # this shared GPU agent. Clean up even when the job fails.
+              rm -rf .venv target || true
+              trap 'rm -rf /workdir/.venv /workdir/target || true' EXIT
 
               # Install system dependencies
               apt-get update && apt-get install -y \
@@ -439,10 +459,32 @@ steps:
   # ============================================================================
   # Docker Build - Parallel with tests
   # ============================================================================
+  # NOTE on disk hygiene: this step used to leave a multi-GB image tagged
+  # vllm-router:<commit> on the agent's Docker daemon on every build. Nothing
+  # consumes the local tags downstream (release images are built and pushed to
+  # DockerHub by release-pipeline.yml), so after ~800 builds the shared
+  # cpu_queue_premerge agents ran out of disk. We now prune stale images/cache
+  # before building and remove the produced image after a smoke test.
   - label: ":docker: Build Docker Image"
     command: |
+      df -h / || true
+      # Reclaim disk leaked by earlier builds: old per-commit vllm-router
+      # tags, dangling layers, and stale build cache.
+      docker images --format '{{.Repository}}:{{.Tag}} {{.ID}}' \
+        | awk '$1 ~ /^vllm-router:/ && $1 != "vllm-router:latest" {print $2}' \
+        | xargs -r docker rmi -f || true
+      docker image prune -f --filter "until=168h" || true
+      docker builder prune -f --filter "until=168h" --keep-storage 10GB || true
+      df -h / || true
+
       docker build -f Dockerfile.router -t vllm-router:${BUILDKITE_COMMIT} .
       docker tag vllm-router:${BUILDKITE_COMMIT} vllm-router:latest
+
+      # Smoke test the image, then drop it: keeping one multi-GB image per
+      # commit fills the agent disk.
+      docker run --rm --entrypoint /bin/sh vllm-router:latest -c 'vllm-router --version'
+      docker rmi vllm-router:${BUILDKITE_COMMIT} vllm-router:latest || true
+      df -h / || true
     agents:
       queue: "cpu_queue_premerge"
     depends_on: "build"
