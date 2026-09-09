@@ -1,0 +1,42 @@
+name: WASM Middleware
+
+on:
+  pull_request:
+    paths:
+      - "src/wasm_middleware.rs"
+      - "src/server.rs"
+      - "src/main.rs"
+      - "src/lib.rs"
+      - "wit/**"
+      - "examples/wasm_middleware/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/wasm-middleware.yml"
+  push:
+    branches: [main]
+    paths:
+      - "src/wasm_middleware.rs"
+      - "wit/**"
+      - "examples/wasm_middleware/**"
+      - ".github/workflows/wasm-middleware.yml"
+
+jobs:
+  wasm-middleware:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip2
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build example WASM plugin
+        working-directory: examples/wasm_middleware
+        run: ./build.sh
+
+      - name: Run WASM middleware tests
+        run: cargo test --lib wasm_middleware:: -- --nocapture

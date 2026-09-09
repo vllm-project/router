@@ -33,6 +33,9 @@ class RouterArgs:
     eviction_interval_secs: int = 120
     max_tree_size: int = 2**26
     max_payload_size: int = 512 * 1024 * 1024  # 512MB default for large batches
+    wasm_middleware: Optional[str] = None
+    wasm_middleware_sha256: Optional[str] = None
+    wasm_middleware_routes: List[str] = dataclasses.field(default_factory=list)
     intra_node_data_parallel_size: int = (
         1  # Intra-node data parallel size (DP-aware routing automatically enabled when > 1)
     )
@@ -243,6 +246,31 @@ class RouterArgs:
             type=int,
             default=RouterArgs.max_payload_size,
             help="Maximum payload size in bytes",
+        )
+        parser.add_argument(
+            f"--{prefix}wasm-middleware",
+            type=str,
+            default=None,
+            help=(
+                "Path to a WASM Component Model OnRequest middleware artifact. "
+                "Fail-closed: plugin errors reject the request."
+            ),
+        )
+        parser.add_argument(
+            f"--{prefix}wasm-middleware-sha256",
+            type=str,
+            default=None,
+            help="Optional SHA-256 hex digest that must match --wasm-middleware.",
+        )
+        parser.add_argument(
+            f"--{prefix}wasm-middleware-route",
+            action="append",
+            dest="wasm_middleware_routes",
+            default=[],
+            help=(
+                "HTTP path that invokes the WASM middleware. Repeatable. "
+                "Defaults to /v1/chat/completions when --wasm-middleware is set."
+            ),
         )
         parser.add_argument(
             f"--{prefix}intra-node-data-parallel-size",
@@ -518,6 +546,9 @@ class RouterArgs:
         return cls(**args_dict)
 
     def _validate_router_args(self):
+        if self.wasm_middleware_sha256 and not self.wasm_middleware:
+            raise ValueError("wasm_middleware_sha256 requires wasm_middleware")
+
         # Validate configuration based on mode
         if self.vllm_pd_disaggregation:
             # Validate PD configuration - skip URL requirements if using service discovery
