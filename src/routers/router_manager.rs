@@ -21,6 +21,7 @@ use axum::{
     extract::Request,
     http::{HeaderMap, Method, StatusCode},
     response::{IntoResponse, Response},
+    Json,
 };
 use dashmap::DashMap;
 use std::sync::Arc;
@@ -442,6 +443,70 @@ impl RouterManager {
 
         best_router
     }
+
+    async fn aggregate_models(&self) -> Response {
+        let workers = self.worker_registry.get_all_urls();
+
+        if workers.is_empty() {
+            return (StatusCode::SERVICE_UNAVAILABLE, "No workers available").into_response();
+        }
+
+        let client = &self.client;
+        let futures: Vec<_> = workers
+            .into_iter()
+            .map(|worker_url| async move {
+                let url = format!("{}/v1/models", worker_url.trim_end_matches('/'));
+                match client.get(&url).send().await {
+                    Ok(res) => {
+                        if res.status().is_success() {
+                            match res.json::<serde_json::Value>().await {
+                                Ok(json) => Some(json),
+                                Err(e) => {
+                                    warn!("Failed to parse models from {}: {}", worker_url, e);
+                                    None
+                                }
+                            }
+                        } else {
+                            warn!("Worker {} returned status {}", worker_url, res.status());
+                            None
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Failed to fetch models from {}: {}", worker_url, e);
+                        None
+                    }
+                }
+            })
+            .collect();
+
+        let results: Vec<_> = futures_util::future::join_all(futures).await;
+
+        let mut all_models: Vec<serde_json::Value> = Vec::new();
+        let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        for result in results.into_iter().flatten() {
+            if let Some(data) = result.get("data").and_then(|d| d.as_array()) {
+                for model in data {
+                    if let Some(id) = model.get("id").and_then(|i| i.as_str()) {
+                        if !seen_ids.contains(id) {
+                            seen_ids.insert(id.to_string());
+                            all_models.push(model.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        if all_models.is_empty() {
+            (StatusCode::SERVICE_UNAVAILABLE, "No models available from workers").into_response()
+        } else {
+            let response = serde_json::json!({
+                "object": "list",
+                "data": all_models
+            });
+            Json(response).into_response()
+        }
+    }
 }
 
 /// RouterManager implements RouterTrait to act as a meta-router
@@ -518,23 +583,9 @@ impl RouterTrait for RouterManager {
             .into_response()
     }
 
-    /// Get available models - query from worker registry
+    /// Get available models - aggregate from all workers
     async fn get_models(&self, _req: Request<Body>) -> Response {
-        // Get models from worker registry
-        let models = self.worker_registry.get_models();
-
-        if models.is_empty() {
-            (StatusCode::SERVICE_UNAVAILABLE, "No models available").into_response()
-        } else {
-            (
-                StatusCode::OK,
-                serde_json::json!({
-                    "models": models
-                })
-                .to_string(),
-            )
-                .into_response()
-        }
+        self.aggregate_models().await
     }
 
     /// Get model information
