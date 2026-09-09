@@ -241,8 +241,8 @@ impl PdRouterBase {
         let worker_type = WorkerType::Prefill { bootstrap_port };
 
         if self.dp_size > 1 {
-            let (_base_url, dp_rank) = dp_utils::parse_worker_url(&url);
-            if dp_rank.is_some() {
+            let (base_url, dp_rank) = dp_utils::parse_worker_url(&url);
+            if let Some(rank) = dp_rank {
                 // URL already has @rank suffix (e.g., from direct URL mode).
                 // Create a single DPAwareWorker. DPAwareWorker strips the @rank
                 // suffix in endpoint_url(), preventing IPv6+DP URL corruption
@@ -250,9 +250,8 @@ impl PdRouterBase {
                 if self.worker_registry.get_by_url(&url).is_some() {
                     return Err(PDRouterError::WorkerAlreadyExists { url: url.clone() });
                 }
-                let (base_url, dp_rank) = dp_utils::parse_worker_url(&url);
                 let worker_arc: Arc<dyn Worker> = Arc::new(
-                    DPAwareWorker::new(base_url, dp_rank.unwrap_or(0), self.dp_size, worker_type)
+                    DPAwareWorker::new(base_url, rank, self.dp_size, worker_type)
                         .with_circuit_breaker_config(self.circuit_breaker_config.clone()),
                 );
                 self.register_and_notify(worker_arc);
@@ -303,21 +302,15 @@ impl PdRouterBase {
         self.wait_for_server_health(&url).await?;
 
         if self.dp_size > 1 {
-            let (_base_url, dp_rank) = dp_utils::parse_worker_url(&url);
-            if dp_rank.is_some() {
+            let (base_url, dp_rank) = dp_utils::parse_worker_url(&url);
+            if let Some(rank) = dp_rank {
                 // URL already has @rank suffix — single DPAwareWorker
                 if self.worker_registry.get_by_url(&url).is_some() {
                     return Err(PDRouterError::WorkerAlreadyExists { url: url.clone() });
                 }
-                let (base_url, dp_rank) = dp_utils::parse_worker_url(&url);
                 let worker_arc: Arc<dyn Worker> = Arc::new(
-                    DPAwareWorker::new(
-                        base_url,
-                        dp_rank.unwrap_or(0),
-                        self.dp_size,
-                        WorkerType::Decode,
-                    )
-                    .with_circuit_breaker_config(self.circuit_breaker_config.clone()),
+                    DPAwareWorker::new(base_url, rank, self.dp_size, WorkerType::Decode)
+                        .with_circuit_breaker_config(self.circuit_breaker_config.clone()),
                 );
                 self.register_and_notify(worker_arc);
                 info!("Added decode server: {}", url);
