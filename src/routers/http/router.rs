@@ -34,6 +34,7 @@ use tracing::{debug, error, info, warn};
 /// Regular router that uses injected load balancing policies
 #[derive(Debug)]
 pub struct Router {
+    epd: Option<super::epd::EncoderStage>,
     worker_registry: Arc<WorkerRegistry>,
     policy_registry: Arc<PolicyRegistry>,
     client: Client,
@@ -168,6 +169,11 @@ impl Router {
         };
 
         Ok(Router {
+            epd: ctx
+                .router_config
+                .epd
+                .clone()
+                .map(super::epd::EncoderStage::new),
             worker_registry: ctx.worker_registry.clone(),
             policy_registry: ctx.policy_registry.clone(),
             client: ctx.client.clone(),
@@ -1696,6 +1702,28 @@ impl RouterTrait for Router {
         let worker: &dyn Worker = workers[worker_idx].as_ref();
         let url = worker.endpoint_url(path);
 
+        let (body, mut transfers) = if let Some(epd) = &self.epd {
+            if *method == Method::POST && path == "/v1/chat/completions" {
+                match epd
+                    .prepare(
+                        &self.client,
+                        body,
+                        worker.url(),
+                        headers,
+                        self.api_key.as_deref(),
+                    )
+                    .await
+                {
+                    Ok(value) => value,
+                    Err(error) => return error.into_response(),
+                }
+            } else {
+                (body, None)
+            }
+        } else {
+            (body, None)
+        };
+
         debug!("Transparent proxy: forwarding to {}", url);
 
         // Build the request
@@ -1724,6 +1752,23 @@ impl RouterTrait for Router {
         }
 
         // Add authorization if configured
+        if self.epd.is_some() {
+            if let Some(headers) = headers {
+                for (name, value) in headers {
+                    if !matches!(
+                        name.as_str(),
+                        "host"
+                            | "content-length"
+                            | "content-type"
+                            | "connection"
+                            | "transfer-encoding"
+                    ) && !header_utils::TRACE_HEADER_NAMES.contains(&name.as_str())
+                    {
+                        request_builder = request_builder.header(name, value);
+                    }
+                }
+            }
+        }
         if let Some(ref key) = self.api_key {
             request_builder = request_builder.header("Authorization", format!("Bearer {}", key));
         }
@@ -1743,6 +1788,11 @@ impl RouterTrait for Router {
         {
             Ok(response) => {
                 let status = response.status();
+                if status.is_success() {
+                    if let Some(transfers) = transfers.as_mut() {
+                        transfers.disarm();
+                    }
+                }
                 let headers = response.headers().clone();
 
                 // Stream the response body
@@ -1793,6 +1843,7 @@ mod tests {
 
         let (_, rx) = tokio::sync::watch::channel(HashMap::new());
         Router {
+            epd: None,
             worker_registry,
             policy_registry,
             worker_startup_timeout_secs: 5,
@@ -1867,6 +1918,7 @@ mod tests {
         Router {
             worker_registry,
             policy_registry,
+            epd: None,
             worker_startup_timeout_secs: 5,
             worker_startup_check_interval_secs: 1,
             intra_node_data_parallel_size: 1,

@@ -37,6 +37,7 @@ struct MooncakePrefillInfo {
 /// vLLM PD Router that extends PdRouterBase with vLLM-specific request handling
 #[derive(Debug)]
 pub struct VllmPDRouter {
+    epd: Option<super::epd::EncoderStage>,
     /// Underlying PD router for most functionality
     pd_router: PdRouterBase,
     /// Service discovery registry for dynamic ZMQ address resolution
@@ -1174,6 +1175,28 @@ impl VllmPDRouter {
             path
         );
 
+        let (original_request, mut ec_transfers) = if path == "/v1/chat/completions" {
+            if let Some(epd) = &self.epd {
+                match epd
+                    .prepare(
+                        &self.http_client,
+                        original_request,
+                        prefill_worker.base_url(),
+                        headers,
+                        std::env::var("OPENAI_API_KEY").ok().as_deref(),
+                    )
+                    .await
+                {
+                    Ok(prepared) => prepared,
+                    Err(error) => return Ok(error.into_response()),
+                }
+            } else {
+                (original_request, None)
+            }
+        } else {
+            (original_request, None)
+        };
+
         // Increment prefill load at the start of the prefill phase
         prefill_worker.increment_load();
 
@@ -1288,6 +1311,15 @@ impl VllmPDRouter {
             prefill_response.headers()
         );
 
+        if !prefill_response.status().is_success() {
+            prefill_worker.decrement_load();
+            let status = prefill_response.status();
+            let detail = prefill_response.text().await.unwrap_or_default();
+            return Err(PDRouterError::NetworkError {
+                message: format!("Prefill server {prefill_url} returned {status}: {detail}"),
+            });
+        }
+
         // Extract prefill response body to get kv_transfer_params
         let prefill_bytes = match prefill_response.bytes().await {
             Ok(bytes) => bytes,
@@ -1336,6 +1368,21 @@ impl VllmPDRouter {
         // Extract kv_transfer_params from prefill response if present
         let kv_transfer_params = prefill_response_json.get("kv_transfer_params").cloned();
 
+        if let Some(transfers) = ec_transfers.as_mut() {
+            transfers.disarm();
+        }
+        if self.epd.is_some()
+            && !matches!(self.kv_connector, KvConnector::Mooncake)
+            && !kv_transfer_params.as_ref().is_some_and(Value::is_object)
+        {
+            prefill_worker.decrement_load();
+            return Err(PDRouterError::NetworkError {
+                message:
+                    "Prefill returned no KV transfer parameters; refusing metadata-only decode"
+                        .into(),
+            });
+        }
+
         if let Some(ref params) = kv_transfer_params {
             debug!(
                 "Extracted kv_transfer_params from prefill response: {}",
@@ -1356,6 +1403,13 @@ impl VllmPDRouter {
 
         // Stage 2: Prepare decode request with kv_transfer_params
         let mut decode_request = original_request.clone();
+        if self.epd.is_some() {
+            // D receives the prompt layout and KV, not P's EC reservations.
+            decode_request
+                .as_object_mut()
+                .unwrap()
+                .remove("ec_transfer_params");
+        }
         if matches!(self.kv_connector, KvConnector::Mooncake) {
             // Mooncake: set decode params proactively from bootstrap info
             if let Some((bootstrap_addr, engine_id)) = self
@@ -1608,6 +1662,11 @@ impl VllmPDRouter {
             );
 
             Ok(Self {
+                epd: ctx
+                    .router_config
+                    .epd
+                    .clone()
+                    .map(super::epd::EncoderStage::new),
                 pd_router,
                 service_registry: Arc::new(service_registry),
                 http_client,
@@ -1697,6 +1756,11 @@ impl VllmPDRouter {
             }
 
             Ok(Self {
+                epd: ctx
+                    .router_config
+                    .epd
+                    .clone()
+                    .map(super::epd::EncoderStage::new),
                 pd_router,
                 service_registry: Arc::new(service_registry),
                 http_client,
