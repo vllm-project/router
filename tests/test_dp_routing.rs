@@ -491,6 +491,97 @@ mod dp_e2e_tests {
             body
         );
 
+        // Verify the forwarded X-data-parallel-rank matches the selected
+        // worker's rank (0 or 1 here; both DP ranks share this mock worker,
+        // and worker selection order is not deterministic).
+        let captured = get_captured_requests(port);
+        let models_req = captured
+            .iter()
+            .find(|r| r.path == "/v1/models")
+            .expect("Mock worker should have received the GET /v1/models request");
+        let rank_values = models_req
+            .headers
+            .get("x-data-parallel-rank")
+            .expect("GET proxy must forward X-data-parallel-rank when DP > 1");
+        assert_eq!(
+            rank_values.len(),
+            1,
+            "exactly one X-data-parallel-rank value expected, got {:?}",
+            rank_values
+        );
+        let rank: usize = rank_values[0]
+            .parse()
+            .expect("X-data-parallel-rank must be numeric");
+        assert!(
+            rank < 2,
+            "forwarded rank must be one of the router's DP ranks (0 or 1), got {}",
+            rank
+        );
+
+        worker.stop().await;
+    }
+
+    #[tokio::test]
+    async fn test_regular_router_dp2_get_v1_models_overrides_client_dp_rank() {
+        // A client-supplied X-data-parallel-rank must not leak through or
+        // duplicate the router-selected rank: the worker should receive
+        // exactly one value, matching the router's selection.
+        let mut worker = MockWorker::new(MockWorkerConfig::default());
+        let worker_url = worker.start().await.unwrap();
+        let port: u16 = worker_url.split(':').next_back().unwrap().parse().unwrap();
+        clear_captured_requests(port);
+
+        let config = make_regular_config(vec![worker_url.clone()], 2);
+        let app_context = common::create_test_context(config.clone());
+        let router = RouterFactory::create_router(&app_context).await.unwrap();
+        let router = Arc::from(router);
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+        let app = common::test_app::create_test_app(Arc::clone(&router), Client::new(), &config);
+
+        let req = Request::builder()
+            .uri("/v1/models")
+            .header("x-data-parallel-rank", "99")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status().as_u16(),
+            200,
+            "GET /v1/models must succeed even when the client sends a conflicting rank (got {})",
+            resp.status()
+        );
+
+        let captured = get_captured_requests(port);
+        let models_req = captured
+            .iter()
+            .find(|r| r.path == "/v1/models")
+            .expect("Mock worker should have received the GET /v1/models request");
+        let rank_values = models_req
+            .headers
+            .get("x-data-parallel-rank")
+            .expect("router-selected X-data-parallel-rank must be forwarded");
+        assert_eq!(
+            rank_values.len(),
+            1,
+            "client-supplied rank must be filtered out; worker received {:?}",
+            rank_values
+        );
+        assert_ne!(
+            rank_values[0], "99",
+            "worker must receive the router's selection, not the client's value"
+        );
+        let rank: usize = rank_values[0]
+            .parse()
+            .expect("X-data-parallel-rank must be numeric");
+        assert!(
+            rank < 2,
+            "forwarded rank must be one of the router's DP ranks (0 or 1), got {}",
+            rank
+        );
+
         worker.stop().await;
     }
 

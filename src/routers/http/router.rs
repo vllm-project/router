@@ -436,8 +436,12 @@ impl Router {
 
                 for (name, value) in headers {
                     let name_lc = name.to_lowercase();
+                    // When the router selects a DP rank, it owns the
+                    // X-data-parallel-rank header: skip any client-supplied
+                    // value so the worker sees exactly one rank (ours).
                     if name_lc != "content-type"
                         && name_lc != "content-length"
+                        && !(dp_rank.is_some() && name_lc == "x-data-parallel-rank")
                         && !header_utils::TRACE_HEADER_NAMES.contains(&name_lc.as_str())
                     {
                         request_builder = request_builder.header(name, value);

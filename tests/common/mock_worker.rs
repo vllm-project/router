@@ -684,8 +684,14 @@ async fn flush_cache_handler(State(config): State<Arc<RwLock<MockWorkerConfig>>>
     .into_response()
 }
 
-async fn v1_models_handler(State(config): State<Arc<RwLock<MockWorkerConfig>>>) -> Response {
+async fn v1_models_handler(
+    State(config): State<Arc<RwLock<MockWorkerConfig>>>,
+    headers: axum::http::HeaderMap,
+) -> Response {
     let config = config.read().await;
+
+    // Capture request for test inspection (e.g. X-data-parallel-rank)
+    capture_request(config.port, "/v1/models", &headers);
 
     if should_fail(&config).await {
         return (
@@ -872,10 +878,14 @@ impl Default for MockWorkerConfig {
 // --- Request header capture for verifying router behavior (e.g., X-data-parallel-rank) ---
 
 /// A captured request with headers and path
+///
+/// `headers` maps each header name to *all* values received for that name,
+/// so duplicate headers (e.g. a client-supplied and a router-injected
+/// X-data-parallel-rank) are preserved for inspection.
 #[derive(Debug, Clone)]
 pub struct CapturedRequest {
     pub path: String,
-    pub headers: HashMap<String, String>,
+    pub headers: HashMap<String, Vec<String>>,
 }
 
 static REQ_CAPTURE_STORE: OnceLock<Mutex<HashMap<u16, Vec<CapturedRequest>>>> = OnceLock::new();
@@ -886,17 +896,18 @@ fn get_capture_store() -> &'static Mutex<HashMap<u16, Vec<CapturedRequest>>> {
 
 /// Record a request for a given worker port
 pub fn capture_request(port: u16, path: &str, headers: &axum::http::HeaderMap) {
+    let mut captured_headers: HashMap<String, Vec<String>> = HashMap::new();
+    for (name, value) in headers.iter() {
+        if let Ok(v) = value.to_str() {
+            captured_headers
+                .entry(name.as_str().to_string())
+                .or_default()
+                .push(v.to_string());
+        }
+    }
     let captured = CapturedRequest {
         path: path.to_string(),
-        headers: headers
-            .iter()
-            .filter_map(|(name, value)| {
-                value
-                    .to_str()
-                    .ok()
-                    .map(|v| (name.as_str().to_string(), v.to_string()))
-            })
-            .collect(),
+        headers: captured_headers,
     };
     let mut store = get_capture_store().lock().unwrap();
     store.entry(port).or_default().push(captured);
