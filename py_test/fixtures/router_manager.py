@@ -32,20 +32,34 @@ class RouterManager:
         decode_urls: Optional[List[str]] = None,
         prefill_policy: Optional[str] = None,
         decode_policy: Optional[str] = None,
+        # Prefer the Rust binary when testing features that live in the host crate
+        # (e.g. WASM middleware) without requiring a rebuilt Python wheel.
+        router_bin: Optional[str] = None,
     ) -> ProcHandle:
         worker_urls = worker_urls or []
         port = port or find_free_port()
-        cmd = [
-            "python3",
-            "-m",
-            "vllm_router.launch_router",
-            "--host",
-            "127.0.0.1",
-            "--port",
-            str(port),
-            "--policy",
-            policy,
-        ]
+        if router_bin:
+            cmd = [
+                router_bin,
+                "--host",
+                "127.0.0.1",
+                "--port",
+                str(port),
+                "--policy",
+                policy,
+            ]
+        else:
+            cmd = [
+                "python3",
+                "-m",
+                "vllm_router.launch_router",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                str(port),
+                "--policy",
+                policy,
+            ]
         # Avoid Prometheus port collisions by assigning a free port per router
         prom_port = find_free_port()
         cmd.extend(
@@ -79,6 +93,7 @@ class RouterManager:
                 "api_key": "--api-key",
                 # Health/monitoring
                 "worker_startup_check_interval": "--worker-startup-check-interval",
+                "worker_startup_timeout_secs": "--worker-startup-timeout-secs",
                 # Cache-aware tuning
                 "cache_threshold": "--cache-threshold",
                 "balance_abs_threshold": "--balance-abs-threshold",
@@ -101,9 +116,16 @@ class RouterManager:
                 "queue_size": "--queue-size",
                 "queue_timeout_secs": "--queue-timeout-secs",
                 "rate_limit_tokens_per_second": "--rate-limit-tokens-per-second",
+                # WASM OnRequest middleware
+                "wasm_middleware": "--wasm-middleware",
+                "wasm_middleware_sha256": "--wasm-middleware-sha256",
             }
             for k, v in extra.items():
                 if v is None:
+                    continue
+                if k == "wasm_middleware_routes":
+                    for route in v:
+                        cmd.extend(["--wasm-middleware-route", str(route)])
                     continue
                 flag = flag_map.get(k)
                 if not flag:
