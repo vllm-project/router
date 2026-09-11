@@ -201,21 +201,23 @@ The `cache_aware` policy optimizes for prefix caching by maintaining an approxim
 
 ```bash
 vllm-router --policy cache_aware \
-  --cache-threshold 0.5 \
-  --balance-abs-threshold 32 \
-  --balance-rel-threshold 1.1 \
-  --worker-urls http://worker1:8000,http://worker2:8000
+  --cache-threshold 0.3 \
+  --balance-abs-threshold 64 \
+  --balance-rel-threshold 1.5 \
+  --worker-urls http://worker1:8000 http://worker2:8000
 ```
+
+Chat routing key is always session id first, then full chat history fallback.
 
 ### Parameters
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `cache_threshold` | 0.5 | Minimum prefix match ratio to use cache-based routing |
-| `balance_abs_threshold` | 32 | Absolute load difference threshold for load balancing |
-| `balance_rel_threshold` | 1.1 | Relative load ratio threshold for load balancing |
-| `eviction_interval_secs` | 30 | Interval for cache eviction |
-| `max_tree_size` | 10000 | Maximum nodes per radix tree |
+| `cache_threshold` | 0.3 | Minimum prefix match ratio to use cache-based routing |
+| `balance_abs_threshold` | 64 | Absolute load difference that allows breaking affinity |
+| `balance_rel_threshold` | 1.5 | Relative load ratio that allows breaking affinity |
+| `eviction_interval_secs` | 120 | Interval for cache eviction |
+| `max_tree_size` | 2^26 | Maximum nodes per radix tree |
 
 ### Behavior
 
@@ -231,6 +233,7 @@ vllm-router --policy cache_aware \
 ### Best For
 
 - Workloads with repeated prompt prefixes (system prompts, few-shot examples)
+- Multi-turn chat / agent sessions when prefix caching is enabled on workers
 - When prefix caching is enabled on vLLM workers
 - Multi-tenant deployments with distinct prompt patterns
 
@@ -260,8 +263,8 @@ vllm-router --policy cache_aware \
                  │                       │       │                       │
                  ▼                       ▼       ▼                       ▼
         ┌────────────────┐     ┌────────────────┐ ┌────────────────┐ ┌────────────────┐
-        │ consistent_hash│     │  cache_aware   │ │  power_of_two  │ │  round_robin   │
-        │                │     │                │ │                │ │  or random     │
+        │ cache_aware    │     │ consistent_hash│ │  power_of_two  │ │  round_robin   │
+        │ (chat default) │     │                │ │                │ │  or random     │
         └────────────────┘     └────────────────┘ └────────────────┘ └────────────────┘
 ```
 
@@ -269,7 +272,8 @@ vllm-router --policy cache_aware \
 
 | Scenario | Recommended Policy |
 |----------|-------------------|
-| Chat applications with conversation history | `consistent_hash` |
+| Chat / multi-turn agent with prefix caching | `cache_aware` (default chat key: session then full history) |
+| Session stickiness without prefix matching | `consistent_hash` |
 | Batch inference with no state | `round_robin` |
 | Variable request complexity | `power_of_two` |
 | Repeated system prompts / few-shot | `cache_aware` |

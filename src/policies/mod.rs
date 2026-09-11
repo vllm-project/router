@@ -32,6 +32,14 @@ pub use round_robin::RoundRobinPolicy;
 /// Key is lowercase header name, value is header value
 pub type RequestHeaders = HashMap<String, String>;
 
+/// Per-request routing metadata returned by policies that can explain why a
+/// worker was selected. Older/simple policies can leave `decision` unset.
+#[derive(Debug, Clone)]
+pub struct RoutingSelection {
+    pub index: usize,
+    pub decision: Option<&'static str>,
+}
+
 /// Core trait for load balancing policies
 ///
 /// This trait provides a unified interface for implementing routing algorithms
@@ -60,6 +68,37 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
         request_text: Option<&str>,
         headers: Option<&RequestHeaders>,
     ) -> Option<usize>;
+
+    /// Select a single worker with an optional fallback routing key.
+    ///
+    /// Most policies only understand one routing key, so the default implementation
+    /// ignores the fallback and preserves existing behavior.
+    fn select_worker_with_fallback_headers(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        request_text: Option<&str>,
+        fallback_text: Option<&str>,
+        headers: Option<&RequestHeaders>,
+    ) -> Option<usize> {
+        let _ = fallback_text;
+        self.select_worker_with_headers(workers, request_text, headers)
+    }
+
+    /// Select a worker and optionally return an implementation-specific
+    /// decision label for per-request tracing.
+    fn select_worker_with_fallback_headers_with_decision(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        request_text: Option<&str>,
+        fallback_text: Option<&str>,
+        headers: Option<&RequestHeaders>,
+    ) -> Option<RoutingSelection> {
+        self.select_worker_with_fallback_headers(workers, request_text, fallback_text, headers)
+            .map(|index| RoutingSelection {
+                index,
+                decision: None,
+            })
+    }
 
     /// Select a pair of workers (prefill and decode) for PD routing
     ///
