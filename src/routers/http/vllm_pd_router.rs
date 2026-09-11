@@ -463,13 +463,13 @@ impl VllmPDRouter {
     }
 
     /// Modify request for prefill stage (limit output to 1 token)
-    /// - For inference/v1/generate: patch sampling_params.max_tokens and sampling_params.min_tokens
+    /// - For generate endpoints: patch sampling_params.max_tokens and sampling_params.min_tokens
     /// - For /v1/responses: patch max_output_tokens (the only token-limit field for Responses API)
     /// - For other OpenAI endpoints (chat/completions): patch max_tokens, max_completion_tokens, min_tokens
     ///
     /// stream=false and stream_options removal are always applied at top level.
     fn prepare_prefill_request(mut request: Value, path: &str) -> Value {
-        if path.contains("inference/v1/generate") {
+        if request.get("token_ids").is_some() {
             // Generate API: max_tokens and min_tokens are in sampling_params
             if let Some(sampling_params) = request.get_mut("sampling_params") {
                 sampling_params["max_tokens"] = json!(1);
@@ -1836,6 +1836,27 @@ impl RouterTrait for VllmPDRouter {
         .await
     }
 
+    async fn route_inference_generate_path(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &crate::protocols::spec::InferenceGenerateRequest,
+        path: &str,
+        _model_id: Option<&str>,
+    ) -> Response {
+        let request_json = match serde_json::to_value(body) {
+            Ok(json) => json,
+            Err(e) => {
+                return (
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Serialization error: {}", e),
+                )
+                    .into_response()
+            }
+        };
+        self.route_transparent(headers, path, &Method::POST, request_json)
+            .await
+    }
+
     // Override OpenAI-compatible routes for vLLM two-stage processing
     async fn route_chat(
         &self,
@@ -2544,6 +2565,23 @@ mod tests {
         // temperature should be preserved
         assert_eq!(result["sampling_params"]["temperature"], 0.7);
         // top-level max_tokens should NOT be set
+        assert!(result.get("max_tokens").is_none());
+    }
+
+    #[test]
+    fn test_prefill_additional_generate_path_patches_sampling_params() {
+        let request = json!({
+            "token_ids": [123, 456],
+            "sampling_params": {
+                "max_tokens": 512,
+                "min_tokens": 50,
+                "temperature": 0.7
+            }
+        });
+        let result = VllmPDRouter::prepare_prefill_request(request, "/custom/v1/generate");
+        assert_eq!(result["sampling_params"]["max_tokens"], 1);
+        assert_eq!(result["sampling_params"]["min_tokens"], 1);
+        assert_eq!(result["sampling_params"]["temperature"], 0.7);
         assert!(result.get("max_tokens").is_none());
     }
 

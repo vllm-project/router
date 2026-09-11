@@ -399,6 +399,29 @@ class TestConfigurationValidation:
 class TestLaunchValidation:
     """Test launch-time validation logic."""
 
+    def test_extra_generate_paths_accept_distinct_extension_routes(self):
+        args = RouterArgs(
+            extra_generate_paths=["/custom/v1/generate", "/extension/generate"]
+        )
+
+        args._validate_router_args()
+
+    @pytest.mark.parametrize(
+        "paths",
+        [
+            ["custom/v1/generate"],
+            ["/custom/{path}"],
+            ["/custom/v1/generate", "/custom/v1/generate"],
+        ],
+    )
+    def test_extra_generate_paths_reject_invalid_or_duplicate_routes(self, paths):
+        args = RouterArgs(extra_generate_paths=paths)
+
+        with pytest.raises(
+            ValueError, match="extra_generate_paths|extra generate path"
+        ):
+            args._validate_router_args()
+
     def test_pd_mode_requires_urls(self):
         """Test that PD mode requires prefill and decode URLs."""
         # PD mode without URLs should fail

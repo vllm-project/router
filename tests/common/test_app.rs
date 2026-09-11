@@ -5,7 +5,7 @@ use vllm_router_rs::{
     config::RouterConfig,
     otel_trace,
     routers::RouterTrait,
-    server::{build_app_with_request_tracing, AppContext, AppState},
+    server::{build_app_with_request_tracing_and_generate_paths, AppContext, AppState},
 };
 
 /// Create a test Axum application using the actual server's build_app function
@@ -25,6 +25,23 @@ pub fn create_test_app_with_tracing(
     client: Client,
     router_config: &RouterConfig,
     enable_request_tracing: bool,
+) -> Router {
+    create_test_app_with_tracing_and_generate_paths(
+        router,
+        client,
+        router_config,
+        enable_request_tracing,
+        &[],
+    )
+}
+
+#[allow(dead_code)]
+pub fn create_test_app_with_tracing_and_generate_paths(
+    router: Arc<dyn RouterTrait>,
+    client: Client,
+    router_config: &RouterConfig,
+    enable_request_tracing: bool,
+    extra_generate_paths: &[String],
 ) -> Router {
     // Create AppContext
     let app_context = Arc::new(
@@ -57,12 +74,13 @@ pub fn create_test_app_with_tracing(
     });
 
     // Use the actual server's build_app function
-    build_app_with_request_tracing(
+    build_app_with_request_tracing_and_generate_paths(
         app_state,
         router_config.max_payload_size,
         request_id_headers,
         router_config.cors_allowed_origins.clone(),
         true, // enable_transparent_proxy
         enable_request_tracing,
+        extra_generate_paths,
     )
 }

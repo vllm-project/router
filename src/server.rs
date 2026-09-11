@@ -20,7 +20,7 @@ use crate::{
     service_discovery::{start_service_discovery, ServiceDiscoveryConfig},
 };
 use axum::{
-    extract::{DefaultBodyLimit, Path, Query, Request, State},
+    extract::{DefaultBodyLimit, OriginalUri, Path, Query, Request, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{delete, get, post},
@@ -30,7 +30,7 @@ use reqwest::Client;
 use serde::Deserialize;
 use serde_json::json;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::atomic::{AtomicBool, Ordering},
     sync::Arc,
     time::Duration,
@@ -239,6 +239,22 @@ async fn inference_generate(
     state
         .router
         .route_inference_generate(Some(&headers), &body, None)
+        .await
+}
+
+async fn extra_inference_generate(
+    State(state): State<Arc<AppState>>,
+    OriginalUri(uri): OriginalUri,
+    headers: http::HeaderMap,
+    Json(body): Json<InferenceGenerateRequest>,
+) -> Response {
+    if let Err(response) = authorize_request(&state, &headers).await {
+        return response;
+    }
+
+    state
+        .router
+        .route_inference_generate_path(Some(&headers), &body, uri.path(), None)
         .await
 }
 
@@ -689,6 +705,48 @@ pub struct ServerConfig {
     pub trace_config: Option<TraceConfig>,
 }
 
+fn validate_extra_generate_paths(paths: &[String]) -> std::io::Result<()> {
+    const RESERVED_PATHS: &[&str] = &[
+        "/generate",
+        "/inference/v1/generate",
+        "/v1/chat/completions",
+        "/v1/completions",
+        "/rerank",
+        "/v1/rerank",
+        "/v1/responses",
+        "/v1/embeddings",
+        "/liveness",
+        "/readiness",
+        "/health",
+        "/health_generate",
+        "/v1/models",
+        "/get_model_info",
+        "/get_server_info",
+        "/add_worker",
+        "/remove_worker",
+        "/list_workers",
+        "/flush_cache",
+        "/get_loads",
+        "/workers",
+    ];
+
+    let mut seen = HashSet::new();
+    for path in paths {
+        let invalid_shape =
+            path.len() < 2 || !path.starts_with('/') || path.contains(['?', '#', '{', '}', '*']);
+        let conflicts_with_builtin = RESERVED_PATHS.contains(&path.as_str())
+            || path.starts_with("/v1/responses/")
+            || path.starts_with("/workers/");
+        if invalid_shape || conflicts_with_builtin || !seen.insert(path) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("invalid or conflicting extra generate path: {path}"),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Build the Axum application with all routes and middleware using the
 /// current runtime OpenTelemetry state.
 pub fn build_app(
@@ -698,13 +756,32 @@ pub fn build_app(
     cors_allowed_origins: Vec<String>,
     enable_transparent_proxy: bool,
 ) -> Router {
-    build_app_with_request_tracing(
+    build_app_with_generate_paths(
+        app_state,
+        max_payload_size,
+        request_id_headers,
+        cors_allowed_origins,
+        enable_transparent_proxy,
+        &[],
+    )
+}
+
+pub fn build_app_with_generate_paths(
+    app_state: Arc<AppState>,
+    max_payload_size: usize,
+    request_id_headers: Vec<String>,
+    cors_allowed_origins: Vec<String>,
+    enable_transparent_proxy: bool,
+    extra_generate_paths: &[String],
+) -> Router {
+    build_app_with_request_tracing_and_generate_paths(
         app_state,
         max_payload_size,
         request_id_headers,
         cors_allowed_origins,
         enable_transparent_proxy,
         crate::otel_trace::is_otel_enabled(),
+        extra_generate_paths,
     )
 }
 
@@ -717,8 +794,28 @@ pub fn build_app_with_request_tracing(
     enable_transparent_proxy: bool,
     enable_request_tracing: bool,
 ) -> Router {
+    build_app_with_request_tracing_and_generate_paths(
+        app_state,
+        max_payload_size,
+        request_id_headers,
+        cors_allowed_origins,
+        enable_transparent_proxy,
+        enable_request_tracing,
+        &[],
+    )
+}
+
+pub fn build_app_with_request_tracing_and_generate_paths(
+    app_state: Arc<AppState>,
+    max_payload_size: usize,
+    request_id_headers: Vec<String>,
+    cors_allowed_origins: Vec<String>,
+    enable_transparent_proxy: bool,
+    enable_request_tracing: bool,
+    extra_generate_paths: &[String],
+) -> Router {
     // Create routes
-    let protected_routes = Router::new()
+    let mut protected_routes = Router::new()
         .route("/generate", post(generate))
         .route("/inference/v1/generate", post(inference_generate))
         .route("/v1/chat/completions", post(v1_chat_completions))
@@ -736,11 +833,16 @@ pub fn build_app_with_request_tracing(
         .route(
             "/v1/responses/{response_id}/input",
             get(v1_responses_list_input_items),
-        )
-        .route_layer(axum::middleware::from_fn_with_state(
-            app_state.clone(),
-            middleware::concurrency_limit_middleware,
-        ));
+        );
+
+    for path in extra_generate_paths {
+        protected_routes = protected_routes.route(path, post(extra_inference_generate));
+    }
+
+    let protected_routes = protected_routes.route_layer(axum::middleware::from_fn_with_state(
+        app_state.clone(),
+        middleware::concurrency_limit_middleware,
+    ));
 
     let public_routes = Router::new()
         .route("/liveness", get(liveness))
@@ -798,7 +900,16 @@ pub fn build_app_with_request_tracing(
 }
 
 pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Error>> {
+    startup_with_generate_paths(config, vec![]).await
+}
+
+pub async fn startup_with_generate_paths(
+    config: ServerConfig,
+    extra_generate_paths: Vec<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
     println!("DEBUG: Server startup function called");
+
+    validate_extra_generate_paths(&extra_generate_paths)?;
 
     // Only initialize logging if not already done (for Python bindings support)
     static LOGGING_INITIALIZED: AtomicBool = AtomicBool::new(false);
@@ -1023,13 +1134,14 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     // Enable transparent proxy for all routing modes
     let enable_transparent_proxy = true;
 
-    let app = build_app_with_request_tracing(
+    let app = build_app_with_request_tracing_and_generate_paths(
         app_state,
         config.max_payload_size,
         request_id_headers,
         config.router_config.cors_allowed_origins.clone(),
         enable_transparent_proxy,
         crate::otel_trace::is_otel_enabled(),
+        &extra_generate_paths,
     );
 
     let addr = format!("{}:{}", config.host, config.port);
@@ -1098,4 +1210,21 @@ fn create_cors_layer(allowed_origins: Vec<String>) -> tower_http::cors::CorsLaye
     };
 
     cors.max_age(Duration::from_secs(3600))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_extra_generate_paths;
+
+    #[test]
+    fn validates_extra_generate_paths() {
+        assert!(validate_extra_generate_paths(&["/custom/v1/generate".to_string()]).is_ok());
+        assert!(validate_extra_generate_paths(&["custom/v1/generate".to_string()]).is_err());
+        assert!(validate_extra_generate_paths(&["/inference/v1/generate".to_string()]).is_err());
+        assert!(validate_extra_generate_paths(&[
+            "/custom/v1/generate".to_string(),
+            "/custom/v1/generate".to_string(),
+        ])
+        .is_err());
+    }
 }

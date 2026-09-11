@@ -106,6 +106,10 @@ struct CliArgs {
     #[arg(long, num_args = 0..)]
     worker_urls: Vec<String>,
 
+    /// Additional HTTP paths using the inference-generate request schema
+    #[arg(long, num_args = 0..)]
+    extra_generate_paths: Vec<String>,
+
     /// Load balancing policy to use
     #[arg(long, default_value = "cache_aware", value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "consistent_hash", "rendezvous_hash"])]
     policy: String,
@@ -713,6 +717,7 @@ Provide --worker-urls or PD flags as usual.",
         "DEBUG: CLI host: {}, port: {}",
         cli_args.host, cli_args.port
     );
+    let extra_generate_paths = cli_args.extra_generate_paths.clone();
     let server_config = cli_args.to_server_config(router_config);
     println!(
         "DEBUG: ServerConfig created successfully - host: {}, port: {}",
@@ -727,7 +732,7 @@ Provide --worker-urls or PD flags as usual.",
     // Block on the async startup function
     println!("DEBUG: Starting server startup function");
     runtime.block_on(async move {
-        let result = server::startup(server_config).await;
+        let result = server::startup_with_generate_paths(server_config, extra_generate_paths).await;
         // Shut down OTel while the Tokio runtime is still alive so the
         // BatchSpanProcessor can flush its final batch.
         if vllm_router_rs::otel_trace::is_otel_enabled() {
