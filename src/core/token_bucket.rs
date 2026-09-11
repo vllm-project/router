@@ -101,32 +101,34 @@ impl TokenBucket {
         );
 
         // Wait for tokens to be available
-        tokio::time::timeout(wait_time, async {
-            loop {
-                // Check if we can acquire now
-                if self.try_acquire(tokens).await.is_ok() {
-                    return;
-                }
-
-                // Wait for notification or small interval
-                tokio::select! {
-                    _ = self.notify.notified() => {},
-                    _ = tokio::time::sleep(Duration::from_millis(10)) => {},
-                }
-            }
-        })
-        .await?;
+        tokio::time::timeout(wait_time, self.wait_for_tokens(tokens)).await?;
 
         Ok(())
     }
 
     /// Acquire tokens with custom timeout
+    ///
+    /// Waiting under contention uses the caller's budget, rather than an
+    /// estimate of the time until the next refill.
     pub async fn acquire_timeout(
         &self,
         tokens: f64,
         timeout: Duration,
     ) -> Result<(), tokio::time::error::Elapsed> {
-        tokio::time::timeout(timeout, self.acquire(tokens)).await?
+        tokio::time::timeout(timeout, self.wait_for_tokens(tokens)).await
+    }
+
+    async fn wait_for_tokens(&self, tokens: f64) {
+        loop {
+            if self.try_acquire(tokens).await.is_ok() {
+                return;
+            }
+
+            tokio::select! {
+                _ = self.notify.notified() => {},
+                _ = tokio::time::sleep(Duration::from_millis(10)) => {},
+            }
+        }
     }
 
     /// Return tokens to the bucket (for cancelled requests)
