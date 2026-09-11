@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
+use std::fmt::Write;
 
 // # Protocol Specifications
 //
@@ -2001,11 +2002,7 @@ impl GenerationRequest for InferenceGenerateRequest {
     }
 
     fn extract_text_for_routing(&self) -> String {
-        self.token_ids
-            .iter()
-            .map(|id| id.to_string())
-            .collect::<Vec<String>>()
-            .join(" ")
+        encode_token_ids(&self.token_ids)
     }
 }
 
@@ -2336,6 +2333,52 @@ pub enum PromptInput {
     String(String),
 }
 
+/// Record separator that opens every encoded token-id routing key, and separates the
+/// sequences of a batch. Routing keys that do not start with it are user text.
+pub(crate) const TOKEN_ID_TAG: char = '\u{1e}';
+
+/// Unit separator that terminates each encoded token id, so cache-aware routing
+/// (a character radix) credits only complete token IDs rather than shared
+/// leading digits of two different tokens.
+pub(crate) const TOKEN_ID_SEPARATOR: char = '\u{1f}';
+
+/// Upper bound on the characters one encoded token id occupies (`-2147483648` plus separator).
+const TOKEN_ID_ENCODED_LEN: usize = 12;
+
+fn write_token_ids(out: &mut String, ids: &[i32]) {
+    for id in ids {
+        let _ = write!(out, "{id}{TOKEN_ID_SEPARATOR}");
+    }
+}
+
+pub(crate) fn encode_token_ids(ids: &[i32]) -> String {
+    let mut out = String::with_capacity(1 + ids.len() * TOKEN_ID_ENCODED_LEN);
+    out.push(TOKEN_ID_TAG);
+    write_token_ids(&mut out, ids);
+    out
+}
+
+pub(crate) fn encode_token_id_batches(batches: &[Vec<i32>]) -> String {
+    let total_ids: usize = batches.iter().map(|b| b.len()).sum();
+    let mut out = String::with_capacity(batches.len() + total_ids * TOKEN_ID_ENCODED_LEN);
+    for batch in batches {
+        out.push(TOKEN_ID_TAG);
+        write_token_ids(&mut out, batch);
+    }
+    out
+}
+
+/// Whether a routing key is an encoded token-id sequence rather than user text.
+///
+/// Only keys that carry the tag and consist entirely of encoded-token characters
+/// qualify, so arbitrary prompt text can never be scored as if it were token ids.
+pub(crate) fn is_token_id_key(key: &str) -> bool {
+    let mut chars = key.chars();
+    chars.next() == Some(TOKEN_ID_TAG)
+        && chars
+            .all(|c| c.is_ascii_digit() || c == '-' || c == TOKEN_ID_SEPARATOR || c == TOKEN_ID_TAG)
+}
+
 impl PromptInput {
     /// Get the number of items in the PromptInput
     pub fn len(&self) -> usize {
@@ -2363,16 +2406,8 @@ impl PromptInput {
         match self {
             PromptInput::String(s) => s.clone(),
             PromptInput::StringArray(arr) => arr.join(" "),
-            PromptInput::IntArray(ids) => {
-                // Convert token IDs to string representation for routing
-                // Format: "token_ids:<count>" to indicate this is a token-based prompt
-                format!("token_ids:{}", ids.len())
-            }
-            PromptInput::IntBatch(batches) => {
-                // For batches, use total token count
-                let total_tokens: usize = batches.iter().map(|b| b.len()).sum();
-                format!("token_ids_batch:{}:{}", batches.len(), total_tokens)
-            }
+            PromptInput::IntArray(ids) => encode_token_ids(ids),
+            PromptInput::IntBatch(batches) => encode_token_id_batches(batches),
         }
     }
 
@@ -2422,7 +2457,35 @@ mod tests {
             "sampling_params": {"max_tokens": 4096, "seed": 42, "logprobs": 1}
         });
         let req: InferenceGenerateRequest = serde_json::from_value(body).unwrap();
-        assert_eq!(req.extract_text_for_routing(), "151644 8948 198 2610");
+        assert_eq!(
+            req.extract_text_for_routing(),
+            "\u{1e}151644\u{1f}8948\u{1f}198\u{1f}2610\u{1f}"
+        );
+    }
+
+    #[test]
+    fn test_prompt_input_token_ids_routing_key() {
+        let single = PromptInput::IntArray(vec![151644, 8948, 198, 2610]);
+        assert_eq!(
+            single.extract_text_for_routing(),
+            "\u{1e}151644\u{1f}8948\u{1f}198\u{1f}2610\u{1f}"
+        );
+        let batch = PromptInput::IntBatch(vec![vec![1, 2], vec![3, 4]]);
+        assert_eq!(
+            batch.extract_text_for_routing(),
+            "\u{1e}1\u{1f}2\u{1f}\u{1e}3\u{1f}4\u{1f}"
+        );
+    }
+
+    #[test]
+    fn test_is_token_id_key_rejects_user_text() {
+        assert!(is_token_id_key(
+            &PromptInput::IntArray(vec![1, 2]).extract_text_for_routing()
+        ));
+        assert!(!is_token_id_key("hello\u{1f}world"));
+        assert!(!is_token_id_key("\u{1e}hello\u{1f}world"));
+        assert!(!is_token_id_key("plain text"));
+        assert!(!is_token_id_key(""));
     }
 
     #[test]
