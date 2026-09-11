@@ -6,7 +6,7 @@ use super::pd_router::PdRouterBase;
 use super::pd_types::{error_chain, PDRouterError};
 use super::vllm_service_discovery::{MoriIOTransferMode, ServiceRegistry, ServiceType};
 use crate::config::KvConnector;
-use crate::core::{BasicWorker, Worker, WorkerType};
+use crate::core::{BasicWorker, Worker, WorkerLoadGuard, WorkerType};
 use crate::metrics::RouterMetrics;
 use crate::otel_http::{self, ClientRequestOptions};
 use crate::policies::PolicyRegistry;
@@ -18,10 +18,14 @@ use axum::{
     http::{HeaderMap, Method, StatusCode},
     response::{IntoResponse, Response},
 };
+use bytes::Bytes;
+use futures_util::Stream;
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Instant;
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
@@ -66,6 +70,35 @@ pub struct VllmPDRouter {
 /// Transfer ID prefix used by MoRI-IO to correlate prefill and decode legs.
 /// Must match `MoRIIOConstants.TRANSFER_PREFIX` in the vLLM Python connector.
 const MORIIO_TRANSFER_PREFIX: &str = "tx";
+
+struct LoadTrackedDecodeStream<E> {
+    inner: Pin<Box<dyn Stream<Item = Result<Bytes, E>> + Send>>,
+    load_guard: Option<WorkerLoadGuard<'static>>,
+}
+
+impl<E: 'static> LoadTrackedDecodeStream<E> {
+    fn new(
+        stream: impl Stream<Item = Result<Bytes, E>> + Send + 'static,
+        load_guard: WorkerLoadGuard<'static>,
+    ) -> Self {
+        Self {
+            inner: Box::pin(stream),
+            load_guard: Some(load_guard),
+        }
+    }
+}
+
+impl<E: 'static> Stream for LoadTrackedDecodeStream<E> {
+    type Item = Result<Bytes, E>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let poll = self.inner.as_mut().poll_next(cx);
+        if matches!(&poll, Poll::Ready(None) | Poll::Ready(Some(Err(_)))) {
+            self.load_guard.take();
+        }
+        poll
+    }
+}
 
 /// Discovery-backed P/D routing is ready only after both worker types register.
 /// Without this guard, `PdRouterBase::health` sees the unused static registry and
@@ -1174,8 +1207,7 @@ impl VllmPDRouter {
             path
         );
 
-        // Increment prefill load at the start of the prefill phase
-        prefill_worker.increment_load();
+        let prefill_load = WorkerLoadGuard::new(prefill_worker.as_ref());
 
         let prefill_zmq_addr =
             self.get_zmq_address(prefill_worker.base_url(), ServiceType::Prefill);
@@ -1270,7 +1302,6 @@ impl VllmPDRouter {
         {
             Ok(resp) => resp,
             Err(e) => {
-                prefill_worker.decrement_load();
                 let full_error = error_chain(&e);
                 let duration = start_time.elapsed();
                 RouterMetrics::record_pd_prefill_error(&prefill_base_url);
@@ -1292,7 +1323,6 @@ impl VllmPDRouter {
         let prefill_bytes = match prefill_response.bytes().await {
             Ok(bytes) => bytes,
             Err(e) => {
-                prefill_worker.decrement_load();
                 let full_error = error_chain(&e);
                 let duration = start_time.elapsed();
                 RouterMetrics::record_pd_prefill_error(&prefill_base_url);
@@ -1322,7 +1352,6 @@ impl VllmPDRouter {
         let prefill_response_json: Value = match serde_json::from_slice(&prefill_bytes) {
             Ok(json) => json,
             Err(e) => {
-                prefill_worker.decrement_load();
                 let duration = start_time.elapsed();
                 RouterMetrics::record_pd_prefill_error(&prefill_base_url);
                 RouterMetrics::record_pd_request(path);
@@ -1348,9 +1377,8 @@ impl VllmPDRouter {
         // Stop profiling on prefill server after its work is done
         self.stop_profiling(&prefill_base_url).await;
 
-        // Prefill phase complete: decrement prefill load, increment decode load
-        prefill_worker.decrement_load();
-        decode_worker.increment_load();
+        drop(prefill_load);
+        let decode_load = WorkerLoadGuard::new_owned(decode_worker.clone());
 
         debug!("✅ vLLM Stage 1 completed, starting Stage 2 - Decode");
 
@@ -1451,7 +1479,6 @@ impl VllmPDRouter {
         {
             Ok(resp) => resp,
             Err(e) => {
-                decode_worker.decrement_load();
                 let full_error = error_chain(&e);
                 let duration = start_time.elapsed();
                 RouterMetrics::record_pd_decode_error(&decode_base_url);
@@ -1466,9 +1493,6 @@ impl VllmPDRouter {
 
         // Stop profiling on decode server after response received
         self.stop_profiling(&decode_base_url).await;
-
-        // Decode phase complete: decrement decode load
-        decode_worker.decrement_load();
 
         let status = decode_response.status();
         let headers = decode_response.headers().clone();
@@ -1513,6 +1537,7 @@ impl VllmPDRouter {
                             decode_url, e
                         ),
                     })?;
+            drop(decode_load);
 
             // Parse decode response as JSON
             let mut decode_json: Value =
@@ -1548,7 +1573,6 @@ impl VllmPDRouter {
                 }
             })
         } else {
-            // No logprobs merging needed - return decode response as-is (streaming or no logprobs)
             debug!(
                 "No logprobs merging needed (streaming={}, needs_logprobs={})",
                 is_streaming, needs_logprobs
@@ -1561,7 +1585,10 @@ impl VllmPDRouter {
                 }
             }
 
-            let body = Body::from_stream(decode_response.bytes_stream());
+            let body = Body::from_stream(LoadTrackedDecodeStream::new(
+                decode_response.bytes_stream(),
+                decode_load,
+            ));
             response_builder
                 .body(body)
                 .map_err(|e| PDRouterError::NetworkError {
@@ -2419,6 +2446,170 @@ impl WorkerManagement for VllmPDRouter {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn test_vllm_pd_router() -> VllmPDRouter {
+        let worker_registry = Arc::new(crate::core::WorkerRegistry::new());
+        let policy_registry =
+            Arc::new(PolicyRegistry::new(crate::config::PolicyConfig::RoundRobin));
+        let pd_router = PdRouterBase {
+            worker_registry,
+            policy_registry: policy_registry.clone(),
+            worker_startup_timeout_secs: 5,
+            worker_startup_check_interval_secs: 1,
+            worker_loads: Arc::new(tokio::sync::watch::channel(HashMap::new()).1),
+            load_monitor_handle: None,
+            client: reqwest::Client::new(),
+            circuit_breaker_config: crate::core::CircuitBreakerConfig::default(),
+            dp_size: 1,
+        };
+        VllmPDRouter {
+            pd_router,
+            service_registry: Arc::new(ServiceRegistry::new()),
+            http_client: reqwest::Client::new(),
+            policy_registry,
+            use_discovery: false,
+            enable_profiling: false,
+            profile_timeout_secs: 0,
+            profiling_tasks: Arc::new(Mutex::new(HashMap::new())),
+            intra_node_data_parallel_size: 1,
+            prefill_dp_round_robin: Arc::new(AtomicUsize::new(0)),
+            kv_connector: KvConnector::Nixl,
+            mooncake_prefill_info: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    async fn spawn_test_server(app: axum::Router) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        url
+    }
+
+    #[tokio::test]
+    async fn worker_load_guard_releases_load_when_cancelled() {
+        let worker = Arc::new(BasicWorker::new(
+            "http://worker:8080".to_string(),
+            WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+        ));
+        let worker_for_request = worker.clone();
+        let request = tokio::spawn(async move {
+            let _guard = WorkerLoadGuard::new(worker_for_request.as_ref());
+            std::future::pending::<()>().await;
+        });
+
+        while worker.load() == 0 {
+            tokio::task::yield_now().await;
+        }
+        request.abort();
+        let _ = request.await;
+
+        assert_eq!(worker.load(), 0);
+    }
+
+    #[tokio::test]
+    async fn decode_load_follows_stalled_response_body() {
+        use axum::{http::header::CONTENT_TYPE, routing::post};
+        use std::convert::Infallible;
+
+        let prefill_url = spawn_test_server(axum::Router::new().route(
+            "/v1/chat/completions",
+            post(|| async { axum::Json(json!({"kv_transfer_params": {}})) }),
+        ))
+        .await;
+        let decode_url = spawn_test_server(axum::Router::new().route(
+            "/v1/chat/completions",
+            post(|| async {
+                let body =
+                    Body::from_stream(futures_util::stream::pending::<Result<Bytes, Infallible>>());
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header(CONTENT_TYPE, "text/event-stream")
+                    .body(body)
+                    .unwrap()
+            }),
+        ))
+        .await;
+
+        let prefill_worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+            prefill_url,
+            WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+        ));
+        let decode_worker: Arc<dyn Worker> =
+            Arc::new(BasicWorker::new(decode_url, WorkerType::Decode));
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            test_vllm_pd_router().process_vllm_two_stage_request(
+                json!({
+                    "model": "test",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "stream": true,
+                }),
+                prefill_worker.clone(),
+                decode_worker.clone(),
+                "/v1/chat/completions",
+                None,
+            ),
+        )
+        .await
+        .expect("decode headers should arrive while the body is stalled")
+        .unwrap();
+
+        assert_eq!(prefill_worker.load(), 0);
+        assert_eq!(decode_worker.load(), 1);
+
+        drop(response);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while decode_worker.load() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("dropping the response body should release decode load");
+    }
+
+    #[tokio::test]
+    async fn decode_load_releases_at_response_eof() {
+        use futures_util::StreamExt;
+
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+            "http://decode".to_string(),
+            WorkerType::Decode,
+        ));
+        let guard = WorkerLoadGuard::new_owned(worker.clone());
+        let mut stream = LoadTrackedDecodeStream::new(
+            futures_util::stream::empty::<Result<Bytes, reqwest::Error>>(),
+            guard,
+        );
+
+        assert_eq!(worker.load(), 1);
+        assert!(stream.next().await.is_none());
+        assert_eq!(worker.load(), 0);
+    }
+
+    #[tokio::test]
+    async fn decode_load_releases_on_response_error() {
+        use futures_util::StreamExt;
+
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+            "http://decode".to_string(),
+            WorkerType::Decode,
+        ));
+        let guard = WorkerLoadGuard::new_owned(worker.clone());
+        let mut stream = LoadTrackedDecodeStream::new(
+            futures_util::stream::iter([Err::<Bytes, _>(std::io::Error::other("disconnected"))]),
+            guard,
+        );
+
+        assert_eq!(worker.load(), 1);
+        assert!(stream.next().await.unwrap().is_err());
+        assert_eq!(worker.load(), 0);
+    }
 
     #[test]
     fn test_discovery_health_requires_prefill_and_decode_workers() {
