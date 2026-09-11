@@ -920,6 +920,172 @@ mod worker_management_tests {
 #[cfg(test)]
 mod router_policy_tests {
     use super::*;
+    use vllm_router_rs::policies::StickyLeastLoadedPolicy;
+    use vllm_router_rs::server::{build_app, AppContext, AppState};
+
+    #[tokio::test]
+    async fn test_sticky_least_loaded_typed_sessions_and_release() {
+        let mut workers = Vec::new();
+        let mut urls = Vec::new();
+        for _ in 0..2 {
+            let mut worker = MockWorker::new(MockWorkerConfig {
+                port: 0,
+                worker_type: WorkerType::Regular,
+                health_status: HealthStatus::Healthy,
+                response_delay_ms: 0,
+                fail_rate: 0.0,
+            });
+            urls.push(worker.start().await.unwrap());
+            workers.push(worker);
+        }
+        let config = RouterConfig {
+            mode: RoutingMode::Regular {
+                worker_urls: urls.clone(),
+            },
+            policy: PolicyConfig::StickyLeastLoaded,
+            api_key_validation_urls: vec!["http://127.0.0.1:1".to_string()],
+            ..RouterConfig::default()
+        };
+        let context: Arc<AppContext> = common::create_test_context(config);
+        context
+            .api_key_cache
+            .write()
+            .await
+            .insert("test-token".to_string(), true);
+        let router = Arc::from(RouterFactory::create_router(&context).await.unwrap());
+        let app = build_app(
+            Arc::new(AppState {
+                router,
+                context: context.clone(),
+                concurrency_queue_tx: None,
+                router_manager: None,
+            }),
+            1024 * 1024,
+            vec![],
+            vec![],
+            true,
+        );
+        let policy = context.policy_registry.get_default_policy();
+        let policy = policy
+            .as_any()
+            .downcast_ref::<StickyLeastLoadedPolicy>()
+            .unwrap();
+
+        for session in ["body-a", "body-b", "body-a"] {
+            let request = Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header(CONTENT_TYPE, "application/json")
+                .header("authorization", "Bearer test-token")
+                .body(Body::from(
+                    json!({
+                        "messages": [{"role": "user", "content": "hello"}],
+                        "session_params": {"session_id": session}
+                    })
+                    .to_string(),
+                ))
+                .unwrap();
+            assert_eq!(
+                app.clone().oneshot(request).await.unwrap().status(),
+                StatusCode::OK
+            );
+        }
+        assert_eq!(policy.active_session_count(), 2);
+        for url in &urls {
+            assert_eq!(policy.active_count_for(url), 1);
+        }
+
+        for (uri, body, active_sessions) in [
+            (
+                "/generate",
+                json!({"prompt": "hello", "session_id": "generate-session"}),
+                3,
+            ),
+            (
+                "/generate",
+                json!({"prompt": "hello", "user_id": "generate-user"}),
+                4,
+            ),
+            (
+                "/v1/responses",
+                json!({"input": "hello", "session_id": "responses-session"}),
+                5,
+            ),
+            (
+                "/v1/responses",
+                json!({"input": "hello", "user_id": "responses-user"}),
+                6,
+            ),
+        ] {
+            let request = Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header(CONTENT_TYPE, "application/json")
+                .header("authorization", "Bearer test-token")
+                .body(Body::from(body.to_string()))
+                .unwrap();
+            assert_eq!(
+                app.clone().oneshot(request).await.unwrap().status(),
+                StatusCode::OK
+            );
+            assert_eq!(policy.active_session_count(), active_sessions);
+        }
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/completions")
+            .header(CONTENT_TYPE, "application/json")
+            .header("authorization", "Bearer test-token")
+            .header("x-session-id", "header-session")
+            .body(Body::from(
+                json!({"prompt": "hello", "session_id": "ignored-body"}).to_string(),
+            ))
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(request).await.unwrap().status(),
+            StatusCode::OK
+        );
+        assert_eq!(policy.active_session_count(), 7);
+
+        let unauthorized = Request::builder()
+            .method("POST")
+            .uri("/finish_session?session_id=header-session")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(unauthorized).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(policy.active_session_count(), 7);
+
+        for (session, remaining) in [
+            ("ignored-body", 7),
+            ("header-session", 6),
+            ("header-session", 6),
+            ("generate-session", 5),
+            ("generate-user", 4),
+            ("responses-session", 3),
+            ("responses-user", 2),
+            ("body-a", 1),
+            ("body-b", 0),
+        ] {
+            let request = Request::builder()
+                .method("POST")
+                .uri(format!("/finish_session?session_id={session}"))
+                .header("authorization", "Bearer test-token")
+                .body(Body::empty())
+                .unwrap();
+            assert_eq!(
+                app.clone().oneshot(request).await.unwrap().status(),
+                StatusCode::OK
+            );
+            assert_eq!(policy.active_session_count(), remaining);
+        }
+        assert_eq!(policy.active_session_count(), 0);
+        for worker in &mut workers {
+            worker.stop().await;
+        }
+    }
 
     #[tokio::test]
     async fn test_random_policy() {

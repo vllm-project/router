@@ -1921,6 +1921,14 @@ pub struct GenerateRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_params: Option<HashMap<String, serde_json::Value>>,
 
+    /// Legacy session identifier
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+
+    /// Legacy user identifier
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<String>,
+
     /// Return model hidden states
     #[serde(default)]
     pub return_hidden_states: bool,

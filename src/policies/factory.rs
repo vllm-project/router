@@ -3,6 +3,7 @@
 use super::{
     CacheAwareConfig, CacheAwarePolicy, ConsistentHashPolicy, LoadBalancingPolicy,
     PowerOfTwoPolicy, RandomPolicy, RendezvousHashPolicy, RoundRobinPolicy,
+    StickyLeastLoadedPolicy,
 };
 use crate::config::PolicyConfig;
 use std::sync::Arc;
@@ -38,6 +39,7 @@ impl PolicyFactory {
                 // The consistent hash policy uses a hardcoded value for now
                 Arc::new(ConsistentHashPolicy::new())
             }
+            PolicyConfig::StickyLeastLoaded => Arc::new(StickyLeastLoadedPolicy::new()),
             PolicyConfig::RendezvousHash => Arc::new(RendezvousHashPolicy::new()),
         }
     }
@@ -50,6 +52,9 @@ impl PolicyFactory {
             "power_of_two" | "poweroftwo" => Some(Arc::new(PowerOfTwoPolicy::new())),
             "cache_aware" | "cacheaware" => Some(Arc::new(CacheAwarePolicy::new())),
             "consistent_hash" | "consistenthash" => Some(Arc::new(ConsistentHashPolicy::new())),
+            "sticky_least_loaded" | "stickyleastloaded" => {
+                Some(Arc::new(StickyLeastLoadedPolicy::new()))
+            }
             "rendezvous_hash" | "rendezvoushash" => Some(Arc::new(RendezvousHashPolicy::new())),
             _ => None,
         }
@@ -94,6 +99,10 @@ mod tests {
         // Test RendezvousHash
         let policy = PolicyFactory::create_from_config(&PolicyConfig::RendezvousHash);
         assert_eq!(policy.name(), "rendezvous_hash");
+
+        // Test StickyLeastLoaded
+        let policy = PolicyFactory::create_from_config(&PolicyConfig::StickyLeastLoaded);
+        assert_eq!(policy.name(), "sticky_least_loaded");
     }
 
     #[test]
@@ -108,6 +117,8 @@ mod tests {
         assert!(PolicyFactory::create_by_name("CacheAware").is_some());
         assert!(PolicyFactory::create_by_name("consistent_hash").is_some());
         assert!(PolicyFactory::create_by_name("ConsistentHash").is_some());
+        assert!(PolicyFactory::create_by_name("sticky_least_loaded").is_some());
+        assert!(PolicyFactory::create_by_name("StickyLeastLoaded").is_some());
         assert!(PolicyFactory::create_by_name("rendezvous_hash").is_some());
         assert!(PolicyFactory::create_by_name("RendezvousHash").is_some());
         assert!(PolicyFactory::create_by_name("unknown").is_none());
