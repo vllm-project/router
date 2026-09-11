@@ -254,6 +254,25 @@ async fn v1_chat_completions(
     state.router.route_chat(Some(&headers), &body, None).await
 }
 
+async fn epd_chat_completions(
+    State(state): State<Arc<AppState>>,
+    headers: http::HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    if let Err(response) = authorize_request(&state, &headers).await {
+        return response;
+    }
+    state
+        .router
+        .route_transparent(
+            Some(&headers),
+            "/v1/chat/completions",
+            &http::Method::POST,
+            body,
+        )
+        .await
+}
+
 async fn v1_completions(
     State(state): State<Arc<AppState>>,
     headers: http::HeaderMap,
@@ -721,7 +740,14 @@ pub fn build_app_with_request_tracing(
     let protected_routes = Router::new()
         .route("/generate", post(generate))
         .route("/inference/v1/generate", post(inference_generate))
-        .route("/v1/chat/completions", post(v1_chat_completions))
+        .route(
+            "/v1/chat/completions",
+            if app_state.context.router_config.epd.is_some() {
+                post(epd_chat_completions)
+            } else {
+                post(v1_chat_completions)
+            },
+        )
         .route("/v1/completions", post(v1_completions))
         .route("/rerank", post(rerank))
         .route("/v1/rerank", post(v1_rerank))

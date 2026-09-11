@@ -94,6 +94,9 @@ Examples:
 
 "#)]
 struct CliArgs {
+    /// E+PD or E/P/D encoder orchestration as JSON (encoder_urls, consumer_zmq_addrs).
+    #[arg(long)]
+    epd_config: Option<String>,
     /// Host address to bind the router server
     #[arg(long, default_value = "127.0.0.1")]
     host: String,
@@ -501,6 +504,14 @@ impl CliArgs {
 
         // Build RouterConfig
         Ok(RouterConfig {
+            epd: self
+                .epd_config
+                .as_deref()
+                .map(serde_json::from_str)
+                .transpose()
+                .map_err(|e| vllm_router_rs::config::ConfigError::ValidationFailed {
+                    reason: format!("Invalid --epd-config: {e}"),
+                })?,
             mode,
             policy,
             connection_mode,
