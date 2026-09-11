@@ -680,6 +680,9 @@ pub struct ServerConfig {
     pub port: u16,
     pub router_config: RouterConfig,
     pub max_payload_size: usize,
+    pub wasm_middleware: Option<String>,
+    pub wasm_middleware_sha256: Option<String>,
+    pub wasm_middleware_routes: Vec<String>,
     pub log_dir: Option<String>,
     pub log_level: Option<String>,
     pub service_discovery_config: Option<ServiceDiscoveryConfig>,
@@ -698,13 +701,14 @@ pub fn build_app(
     cors_allowed_origins: Vec<String>,
     enable_transparent_proxy: bool,
 ) -> Router {
-    build_app_with_request_tracing(
+    build_app_with_wasm_middleware(
         app_state,
         max_payload_size,
         request_id_headers,
         cors_allowed_origins,
         enable_transparent_proxy,
         crate::otel_trace::is_otel_enabled(),
+        None,
     )
 }
 
@@ -717,8 +721,30 @@ pub fn build_app_with_request_tracing(
     enable_transparent_proxy: bool,
     enable_request_tracing: bool,
 ) -> Router {
-    // Create routes
-    let protected_routes = Router::new()
+    build_app_with_wasm_middleware(
+        app_state,
+        max_payload_size,
+        request_id_headers,
+        cors_allowed_origins,
+        enable_transparent_proxy,
+        enable_request_tracing,
+        None,
+    )
+}
+
+/// Build the Axum application with optional WASM OnRequest middleware.
+pub fn build_app_with_wasm_middleware(
+    app_state: Arc<AppState>,
+    max_payload_size: usize,
+    request_id_headers: Vec<String>,
+    cors_allowed_origins: Vec<String>,
+    enable_transparent_proxy: bool,
+    enable_request_tracing: bool,
+    wasm_runtime: Option<Arc<crate::wasm_middleware::WasmMiddlewareRuntime>>,
+) -> Router {
+    // Layer order on the request path (outer → inner):
+    //   concurrency_limit → optional WASM OnRequest → handler
+    let mut protected_routes = Router::new()
         .route("/generate", post(generate))
         .route("/inference/v1/generate", post(inference_generate))
         .route("/v1/chat/completions", post(v1_chat_completions))
@@ -736,11 +762,22 @@ pub fn build_app_with_request_tracing(
         .route(
             "/v1/responses/{response_id}/input",
             get(v1_responses_list_input_items),
-        )
-        .route_layer(axum::middleware::from_fn_with_state(
-            app_state.clone(),
-            middleware::concurrency_limit_middleware,
+        );
+
+    if let Some(runtime) = wasm_runtime {
+        protected_routes = protected_routes.route_layer(axum::middleware::from_fn_with_state(
+            crate::wasm_middleware::WasmRouteMiddlewareState {
+                runtime,
+                max_payload_size,
+            },
+            crate::wasm_middleware::wasm_on_request_middleware,
         ));
+    }
+
+    let protected_routes = protected_routes.route_layer(axum::middleware::from_fn_with_state(
+        app_state.clone(),
+        middleware::concurrency_limit_middleware,
+    ));
 
     let public_routes = Router::new()
         .route("/liveness", get(liveness))
@@ -1023,13 +1060,62 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     // Enable transparent proxy for all routing modes
     let enable_transparent_proxy = true;
 
-    let app = build_app_with_request_tracing(
+    let wasm_runtime = if let Some(path) = config
+        .wasm_middleware
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+    {
+        let mut wasm_config = crate::wasm_middleware::WasmMiddlewareConfig::from_path(path);
+        wasm_config.max_input_bytes = wasm_config.max_input_bytes.min(config.max_payload_size);
+        if let Some(digest) = config
+            .wasm_middleware_sha256
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+        {
+            wasm_config = wasm_config.with_sha256_hex(digest);
+        }
+        if !config.wasm_middleware_routes.is_empty() {
+            wasm_config = wasm_config.with_routes(config.wasm_middleware_routes.clone());
+        }
+        info!(
+            "Loading WASM OnRequest middleware from {} for routes {:?}",
+            wasm_config.component_path.display(),
+            wasm_config.routes
+        );
+        Some(Arc::new(
+            crate::wasm_middleware::WasmMiddlewareRuntime::load(wasm_config).map_err(|err| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("failed to load --wasm-middleware: {err}"),
+                )
+            })?,
+        ))
+    } else {
+        if config
+            .wasm_middleware_sha256
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .is_some()
+        {
+            return Err(Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "--wasm-middleware-sha256 requires --wasm-middleware <path>",
+            )));
+        }
+        None
+    };
+
+    let app = build_app_with_wasm_middleware(
         app_state,
         config.max_payload_size,
         request_id_headers,
         config.router_config.cors_allowed_origins.clone(),
         enable_transparent_proxy,
         crate::otel_trace::is_otel_enabled(),
+        wasm_runtime,
     );
 
     let addr = format!("{}:{}", config.host, config.port);

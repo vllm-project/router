@@ -16,6 +16,7 @@ pub mod server;
 pub mod service_discovery;
 pub mod tokenizer;
 pub mod tree;
+pub mod wasm_middleware;
 use crate::metrics::PrometheusConfig;
 
 #[pyclass(eq)]
@@ -43,6 +44,9 @@ struct Router {
     eviction_interval_secs: u64,
     max_tree_size: usize,
     max_payload_size: usize,
+    wasm_middleware: Option<String>,
+    wasm_middleware_sha256: Option<String>,
+    wasm_middleware_routes: Vec<String>,
     intra_node_data_parallel_size: usize,
     api_key: Option<String>,
     api_key_validation_urls: Vec<String>,
@@ -310,6 +314,9 @@ impl Router {
         otlp_traces_endpoint = None,
         // KV connector default (PD disaggregation)
         kv_connector = String::from("nixl"),
+        wasm_middleware = None,
+        wasm_middleware_sha256 = None,
+        wasm_middleware_routes = vec![],
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -372,7 +379,25 @@ impl Router {
         enable_trace: bool,
         otlp_traces_endpoint: Option<String>,
         kv_connector: String,
+        wasm_middleware: Option<String>,
+        wasm_middleware_sha256: Option<String>,
+        wasm_middleware_routes: Vec<String>,
     ) -> PyResult<Self> {
+        if wasm_middleware_sha256
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .is_some()
+            && wasm_middleware
+                .as_deref()
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .is_none()
+        {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "wasm_middleware_sha256 requires wasm_middleware",
+            ));
+        }
         Ok(Router {
             host,
             port,
@@ -386,6 +411,9 @@ impl Router {
             eviction_interval_secs,
             max_tree_size,
             max_payload_size,
+            wasm_middleware,
+            wasm_middleware_sha256,
+            wasm_middleware_routes,
             intra_node_data_parallel_size,
             api_key,
             api_key_validation_urls,
@@ -488,6 +516,9 @@ impl Router {
                 port: self.port,
                 router_config,
                 max_payload_size: self.max_payload_size,
+                wasm_middleware: self.wasm_middleware.clone(),
+                wasm_middleware_sha256: self.wasm_middleware_sha256.clone(),
+                wasm_middleware_routes: self.wasm_middleware_routes.clone(),
                 log_dir: self.log_dir.clone(),
                 log_level: self.log_level.clone(),
                 service_discovery_config,

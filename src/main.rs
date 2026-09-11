@@ -163,6 +163,19 @@ struct CliArgs {
     #[arg(long, default_value_t = 536870912)] // 512MB
     max_payload_size: usize,
 
+    /// Path to a WASM Component Model OnRequest middleware artifact
+    #[arg(long)]
+    wasm_middleware: Option<String>,
+
+    /// Optional SHA-256 hex digest that must match --wasm-middleware
+    #[arg(long)]
+    wasm_middleware_sha256: Option<String>,
+
+    /// HTTP paths that invoke the WASM middleware (repeatable).
+    /// Defaults to /v1/chat/completions when --wasm-middleware is set.
+    #[arg(long = "wasm-middleware-route", action = ArgAction::Append)]
+    wasm_middleware_routes: Vec<String>,
+
     /// Intra-node data parallel size (number of DP replicas per worker URL). When > 1, the router will create multiple worker instances per URL, one for each DP rank.
     #[arg(long, default_value_t = 1)]
     intra_node_data_parallel_size: usize,
@@ -591,6 +604,9 @@ impl CliArgs {
             port: self.port,
             router_config,
             max_payload_size: self.max_payload_size,
+            wasm_middleware: self.wasm_middleware.clone(),
+            wasm_middleware_sha256: self.wasm_middleware_sha256.clone(),
+            wasm_middleware_routes: self.wasm_middleware_routes.clone(),
             log_dir: self.log_dir.clone(),
             log_level: Some(self.log_level.clone()),
             service_discovery_config,
@@ -737,4 +753,33 @@ Provide --worker-urls or PD flags as usual.",
     })?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_wasm_middleware_options() {
+        let args = CliArgs::try_parse_from([
+            "vllm-router",
+            "--wasm-middleware",
+            "/tmp/example.component.wasm",
+            "--wasm-middleware-sha256",
+            "0000000000000000000000000000000000000000000000000000000000000000",
+            "--wasm-middleware-route",
+            "/v1/chat/completions",
+            "--wasm-middleware-route",
+            "/v1/completions",
+        ])
+        .unwrap();
+        assert_eq!(
+            args.wasm_middleware.as_deref(),
+            Some("/tmp/example.component.wasm")
+        );
+        assert_eq!(
+            args.wasm_middleware_routes,
+            vec!["/v1/chat/completions", "/v1/completions"]
+        );
+    }
 }
