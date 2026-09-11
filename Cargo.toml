@@ -89,6 +89,7 @@ portpicker = "0.1"
 tempfile = "3.8"
 lazy_static = "1.4"
 opentelemetry_sdk = { version = "0.27", features = ["testing"] }
+tokio = { version = "1.42.0", features = ["full", "test-util"] }
 
 [[bench]]
 name = "request_processing"
