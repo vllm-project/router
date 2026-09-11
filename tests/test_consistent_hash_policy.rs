@@ -58,6 +58,43 @@ mod consistent_hash_policy_tests {
     }
 
     #[test]
+    fn test_concurrent_stateless_requests_use_every_healthy_worker() {
+        let policy = Arc::new(ConsistentHashPolicy::new());
+        let workers = Arc::new(create_test_workers());
+        let selections = (0..64)
+            .map(|_| {
+                let policy = Arc::clone(&policy);
+                let workers = Arc::clone(&workers);
+                std::thread::spawn(move || {
+                    policy
+                        .select_worker_with_headers(workers.as_slice(), Some(""), None)
+                        .expect("a healthy worker must be selected")
+                })
+            })
+            .map(|thread| thread.join().expect("routing thread must not panic"))
+            .collect::<Vec<_>>();
+
+        for worker_idx in 0..workers.len() {
+            assert!(
+                selections.contains(&worker_idx),
+                "stateless requests never reached worker {worker_idx}: {selections:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_explicit_empty_session_id_fails_closed() {
+        let policy = ConsistentHashPolicy::new();
+        let workers = create_test_workers();
+        let headers = create_headers(&[("x-session-id", "")]);
+
+        assert_eq!(
+            policy.select_worker_with_headers(&workers, Some(""), Some(&headers)),
+            None
+        );
+    }
+
+    #[test]
     fn test_consistent_routing_same_session() {
         let policy = ConsistentHashPolicy::new();
         let workers = create_test_workers();
