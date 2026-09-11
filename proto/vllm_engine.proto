@@ -1,0 +1,109 @@
+syntax = "proto3";
+
+package vllm.engine.v1;
+
+// vLLM-specific Engine gRPC service implemented by VllmEngineServicer.
+service VllmEngine {
+  // Bi-directional / Server streaming for token generation
+  rpc GenerateStream (GenerateRequest) returns (stream GenerateStreamResponse);
+
+  // Unary generation (returns complete output after finishing)
+  rpc Generate (GenerateRequest) returns (GenerateResponse);
+
+  // Model and backend capability discovery
+  rpc GetModelInfo (ModelInfoRequest) returns (ModelInfoResponse);
+
+  // Health and readiness probing
+  rpc HealthCheck (HealthCheckRequest) returns (HealthCheckResponse);
+
+  // Prefix KV cache admin. Start/Stop profile RPCs are omitted until
+  // the Servicer can actually enable vLLM's profiler (--profiler-config).
+  rpc ResetPrefixCache (EmptyRequest) returns (AdminResponse);
+}
+
+// Request message for generation
+message GenerateRequest {
+  string request_id = 1;
+  repeated uint32 prompt_token_ids = 2;
+  uint32 dp_rank = 3;
+  SamplingParams sampling_params = 4;
+  repeated MultimodalItem multimodal_data = 5;
+  ExecutionMode execution_mode = 6;
+  string prompt_text = 7; // Optional fallback text prompt
+}
+
+message SamplingParams {
+  float temperature = 1;
+  float top_p = 2;
+  int32 max_tokens = 3;
+  repeated string stop_sequences = 4;
+  repeated uint32 stop_token_ids = 5;
+  float frequency_penalty = 6;
+  float presence_penalty = 7;
+  bool ignore_eos = 8;
+  optional uint64 seed = 9;
+  int32 top_k = 10;
+}
+
+enum ExecutionMode {
+  NORMAL = 0;
+  PREFILL_ONLY = 1;
+  DECODE_ONLY = 2;
+}
+
+message MultimodalItem {
+  string modality_type = 1; // "image", "audio", "video"
+  bytes raw_data = 2;       // Raw byte buffer (avoids Base64 overhead)
+  repeated int64 shape = 3; // Tensor dimensions if preprocessed
+}
+
+message GenerateStreamResponse {
+  string request_id = 1;
+  optional uint32 token_id = 2;
+  string text_delta = 3;
+  bool is_finished = 4;
+  string finish_reason = 5;
+  WorkerMetrics metrics = 6;
+}
+
+message GenerateResponse {
+  string request_id = 1;
+  repeated uint32 output_token_ids = 2;
+  string output_text = 3;
+  string finish_reason = 4;
+  WorkerMetrics metrics = 5;
+}
+
+message WorkerMetrics {
+  uint32 running_requests = 1;
+  uint32 waiting_requests = 2;
+  float kv_cache_usage_percent = 3;
+}
+
+message ModelInfoRequest {}
+
+message ModelInfoResponse {
+  string model_name = 1;
+  uint32 max_model_len = 2;
+  uint32 dp_size = 3;
+  uint32 block_size = 4;
+  repeated string stop_tokens = 5;
+}
+
+message HealthCheckRequest {}
+
+message HealthCheckResponse {
+  enum ServingStatus {
+    UNKNOWN = 0;
+    SERVING = 1;
+    NOT_SERVING = 2;
+  }
+  ServingStatus status = 1;
+}
+
+message EmptyRequest {}
+
+message AdminResponse {
+  bool success = 1;
+  string message = 2;
+}
