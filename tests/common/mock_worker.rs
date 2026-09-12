@@ -61,18 +61,14 @@ impl MockWorker {
     /// Start the mock worker server
     pub async fn start(&mut self) -> Result<String, Box<dyn std::error::Error>> {
         let config = self.config.clone();
-        let port = config.read().await.port;
+        let requested_port = config.read().await.port;
 
-        // If port is 0, find an available port
-        let port = if port == 0 {
-            let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
-            let port = listener.local_addr()?.port();
-            drop(listener);
-            config.write().await.port = port;
-            port
-        } else {
-            port
-        };
+        // Bind once and pass the listener directly to axum. Reserving a port
+        // with a temporary listener and rebinding it later creates a TOCTOU
+        // race when integration tests start mock workers concurrently.
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", requested_port)).await?;
+        let port = listener.local_addr()?.port();
+        config.write().await.port = port;
 
         let app = Router::new()
             .route("/health", get(health_handler))
@@ -98,14 +94,6 @@ impl MockWorker {
 
         // Spawn the server in a separate task
         let handle = tokio::spawn(async move {
-            let listener = match tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
-                Ok(l) => l,
-                Err(e) => {
-                    eprintln!("Failed to bind to port {}: {}", port, e);
-                    return;
-                }
-            };
-
             let server = axum::serve(listener, app).with_graceful_shutdown(async move {
                 let _ = shutdown_rx.await;
             });
@@ -696,8 +684,14 @@ async fn flush_cache_handler(State(config): State<Arc<RwLock<MockWorkerConfig>>>
     .into_response()
 }
 
-async fn v1_models_handler(State(config): State<Arc<RwLock<MockWorkerConfig>>>) -> Response {
+async fn v1_models_handler(
+    State(config): State<Arc<RwLock<MockWorkerConfig>>>,
+    headers: axum::http::HeaderMap,
+) -> Response {
     let config = config.read().await;
+
+    // Capture request for test inspection (e.g. X-data-parallel-rank)
+    capture_request(config.port, "/v1/models", &headers);
 
     if should_fail(&config).await {
         return (
@@ -884,10 +878,14 @@ impl Default for MockWorkerConfig {
 // --- Request header capture for verifying router behavior (e.g., X-data-parallel-rank) ---
 
 /// A captured request with headers and path
+///
+/// `headers` maps each header name to *all* values received for that name,
+/// so duplicate headers (e.g. a client-supplied and a router-injected
+/// X-data-parallel-rank) are preserved for inspection.
 #[derive(Debug, Clone)]
 pub struct CapturedRequest {
     pub path: String,
-    pub headers: HashMap<String, String>,
+    pub headers: HashMap<String, Vec<String>>,
 }
 
 static REQ_CAPTURE_STORE: OnceLock<Mutex<HashMap<u16, Vec<CapturedRequest>>>> = OnceLock::new();
@@ -898,17 +896,18 @@ fn get_capture_store() -> &'static Mutex<HashMap<u16, Vec<CapturedRequest>>> {
 
 /// Record a request for a given worker port
 pub fn capture_request(port: u16, path: &str, headers: &axum::http::HeaderMap) {
+    let mut captured_headers: HashMap<String, Vec<String>> = HashMap::new();
+    for (name, value) in headers.iter() {
+        if let Ok(v) = value.to_str() {
+            captured_headers
+                .entry(name.as_str().to_string())
+                .or_default()
+                .push(v.to_string());
+        }
+    }
     let captured = CapturedRequest {
         path: path.to_string(),
-        headers: headers
-            .iter()
-            .filter_map(|(name, value)| {
-                value
-                    .to_str()
-                    .ok()
-                    .map(|v| (name.as_str().to_string(), v.to_string()))
-            })
-            .collect(),
+        headers: captured_headers,
     };
     let mut store = get_capture_store().lock().unwrap();
     store.entry(port).or_default().push(captured);

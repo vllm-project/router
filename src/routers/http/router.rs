@@ -428,13 +428,20 @@ impl Router {
 
         match self.select_first_worker() {
             Ok(worker_url) => {
-                let url = format!("{}/{}", worker_url, endpoint);
+                let (base_url, dp_rank) = dp_utils::parse_worker_url(&worker_url);
+                let url = format!("{}/{}", base_url, endpoint);
                 let route_name = format!("/{}", endpoint);
-                let mut request_builder = self.client.get(&url);
+                let mut request_builder =
+                    dp_utils::add_dp_rank_header(self.client.get(&url), dp_rank);
+
                 for (name, value) in headers {
                     let name_lc = name.to_lowercase();
+                    // When the router selects a DP rank, it owns the
+                    // X-data-parallel-rank header: skip any client-supplied
+                    // value so the worker sees exactly one rank (ours).
                     if name_lc != "content-type"
                         && name_lc != "content-length"
+                        && !(dp_rank.is_some() && name_lc == "x-data-parallel-rank")
                         && !header_utils::TRACE_HEADER_NAMES.contains(&name_lc.as_str())
                     {
                         request_builder = request_builder.header(name, value);

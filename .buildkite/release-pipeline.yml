@@ -95,8 +95,8 @@ steps:
     command: |
       buildkite-agent artifact download "target/release/vllm-router" .
       chmod +x target/release/vllm-router
-      docker run --rm -v "$$PWD:/workdir" -w /workdir debian:bullseye ./target/release/vllm-router --version
-      docker run --rm -v "$$PWD:/workdir" -w /workdir debian:bullseye ./target/release/vllm-router --help
+      docker run --rm -v "$$PWD:/workdir" -w /workdir debian:bookworm ./target/release/vllm-router --version
+      docker run --rm -v "$$PWD:/workdir" -w /workdir debian:bookworm ./target/release/vllm-router --help
     agents:
       queue: "cpu_queue_release"
 

@@ -2,7 +2,7 @@
 # This pipeline runs automated checks, builds, and tests for the vLLM Router project
 
 env:
-  RUST_IMAGE: "rust:1.95.0-bullseye"
+  RUST_IMAGE: "rust:1.95.0-bookworm"
   # Pin the ROCm nightly used by the MoRI lane so dependency changes are explicit.
   ROCM_VLLM_IMAGE: "vllm/vllm-openai-rocm:nightly@sha256:d22922d540810d90c5a3eafe91d3b4a62c2b881f3e990d0b7180b2875a5d176d"
   # Disable incremental compilation for consistent CI builds
@@ -109,9 +109,11 @@ steps:
                 - bash
                 - -c
                 - |
-                  apt-get update && apt-get install -y pkg-config libssl-dev protobuf-compiler python3 python3-pip
-                  pip3 install -U pip setuptools wheel setuptools-rust build
-                  python3 -m build
+                  apt-get update && apt-get install -y pkg-config libssl-dev protobuf-compiler python3 python3-pip python3-dev python3-venv
+                  python3 -m venv /tmp/venv
+                  source /tmp/venv/bin/activate
+                  pip install -U pip setuptools wheel setuptools-rust build
+                  python -m build
         artifact_paths:
           - "dist/*.whl"
           - "dist/*.tar.gz"
@@ -180,10 +182,12 @@ steps:
                 - bash
                 - -c
                 - |
-                  apt-get update && apt-get install -y pkg-config libssl-dev protobuf-compiler python3 python3-pip
-                  pip3 install -U pip setuptools wheel setuptools-rust
-                  pip3 install -e .[dev]
-                  pip3 install pytest pytest-cov pytest-asyncio
+                  apt-get update && apt-get install -y pkg-config libssl-dev protobuf-compiler python3 python3-pip python3-dev python3-venv
+                  python3 -m venv /tmp/venv
+                  source /tmp/venv/bin/activate
+                  pip install -U pip setuptools wheel setuptools-rust
+                  pip install -e .[dev]
+                  pip install pytest pytest-cov pytest-asyncio
                   pytest py_test/ -v --ignore=py_test/e2e --cov=vllm_router --cov-report=xml --cov-report=term
         artifact_paths:
           - "coverage.xml"
