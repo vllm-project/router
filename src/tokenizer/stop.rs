@@ -196,11 +196,14 @@ impl StopSequenceDecoder {
             .iter()
             .chain(&self.config.visible_stop_sequences)
         {
-            // Check all possible suffixes that could be a prefix of stop_seq
-            for i in 1..=check_text.len().min(stop_seq.len() - 1) {
-                let suffix = &check_text[check_text.len() - i..];
+            // Check suffixes at UTF-8 character boundaries, shortest first.
+            for (start, _) in check_text.char_indices().rev() {
+                let suffix = &check_text[start..];
+                if suffix.len() >= stop_seq.len() {
+                    break;
+                }
                 if stop_seq.starts_with(suffix) {
-                    partial_match_len = partial_match_len.max(i);
+                    partial_match_len = partial_match_len.max(suffix.len());
                 }
             }
         }
@@ -319,7 +322,107 @@ impl StopSequenceDecoderBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tokenizer::huggingface::HuggingFaceTokenizer;
     use crate::tokenizer::mock::MockTokenizer;
+    use tokenizers::{decoders::fuse::Fuse, models::wordlevel::WordLevel};
+
+    fn piece_tokenizer(pieces: &[&str]) -> Arc<dyn traits::Tokenizer> {
+        let vocab = pieces
+            .iter()
+            .enumerate()
+            .map(|(id, piece)| (piece.to_string(), id as u32))
+            .collect();
+        let model = WordLevel::builder().vocab(vocab).build().unwrap();
+        let mut tokenizer = tokenizers::Tokenizer::new(model);
+        tokenizer.with_decoder(Some(Fuse::new()));
+        Arc::new(HuggingFaceTokenizer::from_tokenizer(tokenizer))
+    }
+
+    #[test]
+    fn test_partial_hidden_stop_completion() {
+        for (stop, prefix, suffix) in [
+            ("éx", "é", "x"),
+            ("结束", "结", "束"),
+            ("🙂x", "🙂", "x"),
+            ("STOP", "ST", "OP"),
+        ] {
+            let tokenizer = piece_tokenizer(&[prefix, suffix]);
+            let config = StopSequenceConfig::default().with_stop_sequence(stop);
+            let mut decoder = StopSequenceDecoder::new(tokenizer, config, false);
+
+            assert_eq!(
+                decoder.process_tokens(&[0, 1, 0]).unwrap(),
+                vec![
+                    SequenceDecoderOutput::Held,
+                    SequenceDecoderOutput::Stopped,
+                    SequenceDecoderOutput::Stopped,
+                ],
+                "stop sequence: {stop:?}"
+            );
+            assert!(decoder.is_stopped());
+            assert_eq!(decoder.flush(), SequenceDecoderOutput::Text(String::new()));
+        }
+    }
+
+    #[test]
+    fn test_partial_visible_stop_completion() {
+        let tokenizer = piece_tokenizer(&["before é", "🙂", "x after"]);
+        let config = StopSequenceConfig::default().with_visible_stop_sequence("é🙂x");
+        let mut decoder = StopSequenceDecoder::new(tokenizer, config, false);
+
+        assert_eq!(
+            decoder.process_tokens(&[0, 1, 2]).unwrap(),
+            vec![
+                SequenceDecoderOutput::Text("before ".to_string()),
+                SequenceDecoderOutput::Held,
+                SequenceDecoderOutput::StoppedWithText("é🙂x".to_string()),
+            ]
+        );
+        assert!(decoder.is_stopped());
+        assert_eq!(decoder.flush(), SequenceDecoderOutput::Text(String::new()));
+    }
+
+    #[test]
+    fn test_partial_stop_released_after_mismatch() {
+        for (stop, pieces, safe_text, released_text) in [
+            ("é🙂x", ["before é", "🙂", "!"], "before ", "é🙂!"),
+            ("abc", ["éa", "b", "x"], "é", "abx"),
+        ] {
+            for visible in [false, true] {
+                let tokenizer = piece_tokenizer(&pieces);
+                let config = if visible {
+                    StopSequenceConfig::default().with_visible_stop_sequence(stop)
+                } else {
+                    StopSequenceConfig::default().with_stop_sequence(stop)
+                };
+                let mut decoder = StopSequenceDecoder::new(tokenizer, config, false);
+
+                assert_eq!(
+                    decoder.process_tokens(&[0, 1, 2]).unwrap(),
+                    vec![
+                        SequenceDecoderOutput::Text(safe_text.to_string()),
+                        SequenceDecoderOutput::Held,
+                        SequenceDecoderOutput::Text(released_text.to_string()),
+                    ],
+                    "stop sequence: {stop:?}, visible: {visible}"
+                );
+                assert!(!decoder.is_stopped());
+                assert_eq!(decoder.flush(), SequenceDecoderOutput::Text(String::new()));
+            }
+        }
+    }
+
+    #[test]
+    fn test_unicode_text_without_partial_stop() {
+        let tokenizer = piece_tokenizer(&["é🙂"]);
+        let config = StopSequenceConfig::default().with_stop_sequence("STOP");
+        let mut decoder = StopSequenceDecoder::new(tokenizer, config, false);
+
+        assert_eq!(
+            decoder.process_token(0).unwrap(),
+            SequenceDecoderOutput::Text("é🙂".to_string())
+        );
+    }
 
     #[test]
     fn test_stop_token_detection() {
