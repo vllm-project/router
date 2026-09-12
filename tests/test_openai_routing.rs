@@ -471,3 +471,24 @@ async fn test_openai_router_chat_with_reasoning_fields() {
     // Verify it's a valid chat completion response
     assert_eq!(chat_response["object"], "chat.completion");
 }
+
+#[test]
+fn reasoning_effort_accepts_current_vllm_values() {
+    for value in ["none", "minimal", "low", "medium", "high", "xhigh", "max"] {
+        let request: vllm_router_rs::protocols::spec::ChatCompletionRequest =
+            serde_json::from_value(serde_json::json!({
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "hello"}],
+                "reasoning_effort": value
+            }))
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(request).unwrap()["reasoning_effort"],
+            value
+        );
+
+        let reasoning: vllm_router_rs::protocols::spec::ResponseReasoningParam =
+            serde_json::from_value(serde_json::json!({"effort": value})).unwrap();
+        assert_eq!(serde_json::to_value(reasoning).unwrap()["effort"], value);
+    }
+}

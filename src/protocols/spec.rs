@@ -517,7 +517,7 @@ pub struct ChatCompletionRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub echo: Option<bool>,
 
-    /// Reasoning effort level for reasoning models (low, medium, high)
+    /// Reasoning effort level supported by OpenAI-compatible vLLM servers.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<ReasoningEffort>,
 
@@ -855,9 +855,14 @@ fn default_reasoning_effort() -> Option<ReasoningEffort> {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReasoningEffort {
+    None,
+    Minimal,
     Low,
     Medium,
     High,
+    #[serde(rename = "xhigh")]
+    XHigh,
+    Max,
 }
 
 // ============= Input/Output Items =============
