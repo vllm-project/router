@@ -29,7 +29,7 @@ pub fn preserve_response_headers(reqwest_headers: &HeaderMap) -> HeaderMap {
         let name_str = name.as_str().to_lowercase();
         if should_forward_header(&name_str) {
             // The original name and value are already valid, so we can just clone them
-            headers.insert(name.clone(), value.clone());
+            headers.append(name.clone(), value.clone());
         }
     }
 
@@ -92,4 +92,39 @@ pub fn propagate_headers(
         }
     }
     request
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_preserve_repeated_set_cookie_headers() {
+        let mut headers = HeaderMap::new();
+        headers.append("set-cookie", "a=1; Path=/".parse().unwrap());
+        headers.append("set-cookie", "b=2; Path=/".parse().unwrap());
+
+        let result = preserve_response_headers(&headers);
+        let cookies: Vec<_> = result
+            .get_all("set-cookie")
+            .iter()
+            .map(|value| value.to_str().unwrap())
+            .collect();
+
+        assert_eq!(cookies, ["a=1; Path=/", "b=2; Path=/"]);
+    }
+
+    #[test]
+    fn test_preserve_response_headers_filters_hop_by_hop_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", "application/json".parse().unwrap());
+        headers.append("connection", "keep-alive".parse().unwrap());
+        headers.append("connection", "close".parse().unwrap());
+        headers.insert("transfer-encoding", "chunked".parse().unwrap());
+
+        let result = preserve_response_headers(&headers);
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result["content-type"], "application/json");
+    }
 }
