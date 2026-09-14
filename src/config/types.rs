@@ -80,6 +80,9 @@ pub struct RouterConfig {
     /// KV connector type for PD disaggregation
     #[serde(default)]
     pub kv_connector: KvConnector,
+    /// Enable concurrent P/D dispatch for the NIXL pull connector
+    #[serde(default)]
+    pub pd_concurrent_dispatch: bool,
 }
 
 fn default_profile_timeout_secs() -> u64 {
@@ -479,6 +482,7 @@ impl Default for RouterConfig {
             enable_profiling: false,
             profile_timeout_secs: default_profile_timeout_secs(),
             kv_connector: KvConnector::default(),
+            pd_concurrent_dispatch: false,
         }
     }
 }
@@ -1053,6 +1057,7 @@ mod tests {
             enable_profiling: false,
             profile_timeout_secs: default_profile_timeout_secs(),
             kv_connector: KvConnector::default(),
+            pd_concurrent_dispatch: false,
         };
 
         assert!(config.mode.is_pd_mode());
@@ -1119,6 +1124,7 @@ mod tests {
             enable_profiling: false,
             profile_timeout_secs: default_profile_timeout_secs(),
             kv_connector: KvConnector::default(),
+            pd_concurrent_dispatch: false,
         };
 
         assert!(!config.mode.is_pd_mode());
@@ -1181,6 +1187,7 @@ mod tests {
             enable_profiling: false,
             profile_timeout_secs: default_profile_timeout_secs(),
             kv_connector: KvConnector::default(),
+            pd_concurrent_dispatch: false,
         };
 
         assert!(config.has_service_discovery());
