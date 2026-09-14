@@ -16,7 +16,7 @@ use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 pub use crate::core::token_bucket::TokenBucket;
 
-use crate::metrics::RouterMetrics;
+use crate::metrics::{QueueMetrics, RouterMetrics};
 use crate::server::AppState;
 
 /// Generate OpenAI-compatible request ID based on endpoint
@@ -388,15 +388,6 @@ pub struct QueuedRequest {
     permit_tx: oneshot::Sender<Result<(), StatusCode>>,
 }
 
-/// Queue metrics for monitoring
-#[derive(Debug, Default)]
-pub struct QueueMetrics {
-    pub total_queued: std::sync::atomic::AtomicU64,
-    pub current_queued: std::sync::atomic::AtomicU64,
-    pub total_timeout: std::sync::atomic::AtomicU64,
-    pub total_rejected: std::sync::atomic::AtomicU64,
-}
-
 /// Queue processor that handles queued requests
 pub struct QueueProcessor {
     token_bucket: Arc<TokenBucket>,
@@ -426,6 +417,8 @@ impl QueueProcessor {
             let elapsed = queued.queued_at.elapsed();
             if elapsed >= self.queue_timeout {
                 warn!("Request already timed out in queue");
+                QueueMetrics::record_queued_request_timeout();
+                QueueMetrics::dec_request_queue_size();
                 let _ = queued.permit_tx.send(Err(StatusCode::REQUEST_TIMEOUT));
                 continue;
             }
@@ -436,6 +429,7 @@ impl QueueProcessor {
             if self.token_bucket.try_acquire(1.0).await.is_ok() {
                 // Got token immediately
                 debug!("Queue: acquired token immediately for queued request");
+                QueueMetrics::dec_request_queue_size();
                 let _ = queued.permit_tx.send(Ok(()));
             } else {
                 // Need to wait for token
@@ -449,9 +443,12 @@ impl QueueProcessor {
                         .is_ok()
                     {
                         debug!("Queue: acquired token after waiting");
+                        QueueMetrics::dec_request_queue_size();
                         let _ = queued.permit_tx.send(Ok(()));
                     } else {
                         warn!("Queue: request timed out waiting for token");
+                        QueueMetrics::record_queued_request_timeout();
+                        QueueMetrics::dec_request_queue_size();
                         let _ = queued.permit_tx.send(Err(StatusCode::REQUEST_TIMEOUT));
                     }
                 });
@@ -525,10 +522,12 @@ pub async fn concurrency_limit_middleware(
                 permit_tx,
             };
 
-            // Try to send to queue
+            // Increment the gauge eagerly to avoid it being decremented below zero by QueueProcessor
+            QueueMetrics::inc_request_queue_size();
             match queue_tx.try_send(queued) {
                 Ok(_) => {
-                    // On successful enqueue, update embeddings queue gauge if applicable
+                    QueueMetrics::record_request_queued();
+                    // Update embeddings-specific queue gauge if applicable
                     if is_embeddings {
                         let new_val = EMBEDDINGS_QUEUE_SIZE.fetch_add(1, Ordering::Relaxed) + 1;
                         RouterMetrics::set_embeddings_queue_size(new_val as usize);
@@ -575,6 +574,8 @@ pub async fn concurrency_limit_middleware(
                     }
                 }
                 Err(_) => {
+                    QueueMetrics::record_queued_request_rejected();
+                    QueueMetrics::dec_request_queue_size();
                     warn!("Request queue is full, returning 429");
                     StatusCode::TOO_MANY_REQUESTS.into_response()
                 }
