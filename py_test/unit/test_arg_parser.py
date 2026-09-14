@@ -409,6 +409,7 @@ class TestPolicyFromStr:
         assert policy_from_str("cache_aware") == PolicyType.CacheAware
         assert policy_from_str("power_of_two") == PolicyType.PowerOfTwo
         assert policy_from_str("consistent_hash") == PolicyType.ConsistentHash
+        assert policy_from_str("sticky_least_loaded") == PolicyType.StickyLeastLoaded
 
     def test_invalid_policy(self):
         """Test conversion of invalid policy string."""
@@ -418,6 +419,21 @@ class TestPolicyFromStr:
 
 class TestParseRouterArgs:
     """Test the parse_router_args function."""
+
+    def test_parse_sticky_least_loaded_for_each_pool(self):
+        args = parse_router_args(
+            [
+                "--policy",
+                "sticky_least_loaded",
+                "--prefill-policy",
+                "sticky_least_loaded",
+                "--decode-policy",
+                "sticky_least_loaded",
+            ]
+        )
+        assert args.policy == "sticky_least_loaded"
+        assert args.prefill_policy == "sticky_least_loaded"
+        assert args.decode_policy == "sticky_least_loaded"
 
     def test_parse_basic_args(self):
         """Test parsing basic router arguments."""
