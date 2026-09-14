@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
+use std::fmt::Write;
 
 // # Protocol Specifications
 //
@@ -548,14 +549,14 @@ impl GenerationRequest for ChatCompletionRequest {
             if let Some(session_id) = session_params.get("session_id") {
                 if let Some(session_id_str) = session_id.as_str() {
                     if !session_id_str.trim().is_empty() {
-                        return session_id_str.to_string();
+                        return encode_text(session_id_str);
                     }
                 }
             }
         }
 
         // Return empty string if no session_id - let routing policy handle this case
-        String::new()
+        encode_text("")
     }
 }
 
@@ -1346,7 +1347,7 @@ impl GenerationRequest for ResponsesRequest {
     }
 
     fn extract_text_for_routing(&self) -> String {
-        match &self.input {
+        let text = match &self.input {
             ResponseInput::Text(text) => text.clone(),
             ResponseInput::Items(items) => items
                 .iter()
@@ -1383,7 +1384,8 @@ impl GenerationRequest for ResponsesRequest {
                 })
                 .collect::<Vec<String>>()
                 .join(" "),
-        }
+        };
+        encode_text(&text)
     }
 }
 
@@ -1947,33 +1949,25 @@ impl GenerationRequest for GenerateRequest {
     fn extract_text_for_routing(&self) -> String {
         // Check fields in priority order: text, prompt, inputs
         if let Some(ref text) = self.text {
-            return text.clone();
+            return encode_text(text);
         }
 
         if let Some(ref prompt) = self.prompt {
             return match prompt {
-                StringOrArray::String(s) => s.clone(),
-                StringOrArray::Array(v) => v.join(" "),
+                StringOrArray::String(s) => encode_text(s),
+                StringOrArray::Array(v) => encode_text(&v.join(" ")),
             };
         }
 
         if let Some(ref input_ids) = self.input_ids {
             return match input_ids {
-                InputIds::Single(ids) => ids
-                    .iter()
-                    .map(|&id| id.to_string())
-                    .collect::<Vec<String>>()
-                    .join(" "),
-                InputIds::Batch(batches) => batches
-                    .iter()
-                    .flat_map(|batch| batch.iter().map(|&id| id.to_string()))
-                    .collect::<Vec<String>>()
-                    .join(" "),
+                InputIds::Single(ids) => encode_token_ids(ids),
+                InputIds::Batch(batches) => encode_token_id_batches(batches),
             };
         }
 
         // No text input found
-        String::new()
+        encode_text("")
     }
 }
 
@@ -2005,11 +1999,7 @@ impl GenerationRequest for InferenceGenerateRequest {
     }
 
     fn extract_text_for_routing(&self) -> String {
-        self.token_ids
-            .iter()
-            .map(|id| id.to_string())
-            .collect::<Vec<String>>()
-            .join(" ")
+        encode_token_ids(&self.token_ids)
     }
 }
 
@@ -2136,7 +2126,7 @@ impl GenerationRequest for RerankRequest {
     }
 
     fn extract_text_for_routing(&self) -> String {
-        self.query.clone()
+        encode_text(&self.query)
     }
 }
 
@@ -2258,7 +2248,7 @@ impl GenerationRequest for EmbeddingRequest {
 
     fn extract_text_for_routing(&self) -> String {
         // Best effort: extract text content for routing decisions
-        match &self.input {
+        let text = match &self.input {
             serde_json::Value::String(s) => s.clone(),
             serde_json::Value::Array(arr) => arr
                 .iter()
@@ -2266,7 +2256,8 @@ impl GenerationRequest for EmbeddingRequest {
                 .collect::<Vec<_>>()
                 .join(" "),
             _ => String::new(),
-        }
+        };
+        encode_text(&text)
     }
 }
 
@@ -2287,7 +2278,11 @@ pub trait GenerationRequest: Send + Sync {
     /// Get the model name if specified
     fn get_model(&self) -> Option<&str>;
 
-    /// Extract text content for routing decisions
+    /// Extract the routing key for routing decisions.
+    ///
+    /// The key is always tagged: [`TEXT_TAG`] for text and [`TOKEN_ID_TAG`] for token ids,
+    /// so the two kinds occupy disjoint namespaces and prompt content can never be
+    /// mistaken for the other kind.
     fn extract_text_for_routing(&self) -> String;
 }
 
@@ -2340,6 +2335,60 @@ pub enum PromptInput {
     String(String),
 }
 
+/// Record separator that opens every encoded token-id routing key, and separates the
+/// sequences of a batch.
+pub(crate) const TOKEN_ID_TAG: char = '\u{1e}';
+
+/// Group separator that opens every text routing key.
+///
+/// Text and token-id keys live in disjoint namespaces: the leading tag is written by
+/// the router, never by the client, so the kind of a key is always known from its
+/// first character and can never be forged by prompt content.
+pub(crate) const TEXT_TAG: char = '\u{1d}';
+
+/// Unit separator that terminates each encoded token id, so cache-aware routing
+/// (a character radix) credits only complete token IDs rather than shared
+/// leading digits of two different tokens.
+pub(crate) const TOKEN_ID_SEPARATOR: char = '\u{1f}';
+
+/// Upper bound on the characters one encoded token id occupies (`-2147483648` plus separator).
+const TOKEN_ID_ENCODED_LEN: usize = 12;
+
+fn write_token_ids(out: &mut String, ids: &[i32]) {
+    for id in ids {
+        let _ = write!(out, "{id}{TOKEN_ID_SEPARATOR}");
+    }
+}
+
+pub(crate) fn encode_token_ids(ids: &[i32]) -> String {
+    let mut out = String::with_capacity(1 + ids.len() * TOKEN_ID_ENCODED_LEN);
+    out.push(TOKEN_ID_TAG);
+    write_token_ids(&mut out, ids);
+    out
+}
+
+pub(crate) fn encode_token_id_batches(batches: &[Vec<i32>]) -> String {
+    let total_ids: usize = batches.iter().map(|b| b.len()).sum();
+    let mut out = String::with_capacity(batches.len() + total_ids * TOKEN_ID_ENCODED_LEN);
+    for batch in batches {
+        out.push(TOKEN_ID_TAG);
+        write_token_ids(&mut out, batch);
+    }
+    out
+}
+
+pub(crate) fn encode_text(text: &str) -> String {
+    let mut out = String::with_capacity(1 + text.len());
+    out.push(TEXT_TAG);
+    out.push_str(text);
+    out
+}
+
+/// Whether a routing key is an encoded token-id sequence rather than user text.
+pub(crate) fn is_token_id_key(key: &str) -> bool {
+    key.starts_with(TOKEN_ID_TAG)
+}
+
 impl PromptInput {
     /// Get the number of items in the PromptInput
     pub fn len(&self) -> usize {
@@ -2365,18 +2414,10 @@ impl PromptInput {
     /// For token IDs, converts to a string representation
     pub fn extract_text_for_routing(&self) -> String {
         match self {
-            PromptInput::String(s) => s.clone(),
-            PromptInput::StringArray(arr) => arr.join(" "),
-            PromptInput::IntArray(ids) => {
-                // Convert token IDs to string representation for routing
-                // Format: "token_ids:<count>" to indicate this is a token-based prompt
-                format!("token_ids:{}", ids.len())
-            }
-            PromptInput::IntBatch(batches) => {
-                // For batches, use total token count
-                let total_tokens: usize = batches.iter().map(|b| b.len()).sum();
-                format!("token_ids_batch:{}:{}", batches.len(), total_tokens)
-            }
+            PromptInput::String(s) => encode_text(s),
+            PromptInput::StringArray(arr) => encode_text(&arr.join(" ")),
+            PromptInput::IntArray(ids) => encode_token_ids(ids),
+            PromptInput::IntBatch(batches) => encode_token_id_batches(batches),
         }
     }
 
@@ -2426,7 +2467,45 @@ mod tests {
             "sampling_params": {"max_tokens": 4096, "seed": 42, "logprobs": 1}
         });
         let req: InferenceGenerateRequest = serde_json::from_value(body).unwrap();
-        assert_eq!(req.extract_text_for_routing(), "151644 8948 198 2610");
+        assert_eq!(
+            req.extract_text_for_routing(),
+            "\u{1e}151644\u{1f}8948\u{1f}198\u{1f}2610\u{1f}"
+        );
+    }
+
+    #[test]
+    fn test_prompt_input_token_ids_routing_key() {
+        let single = PromptInput::IntArray(vec![151644, 8948, 198, 2610]);
+        assert_eq!(
+            single.extract_text_for_routing(),
+            "\u{1e}151644\u{1f}8948\u{1f}198\u{1f}2610\u{1f}"
+        );
+        let batch = PromptInput::IntBatch(vec![vec![1, 2], vec![3, 4]]);
+        assert_eq!(
+            batch.extract_text_for_routing(),
+            "\u{1e}1\u{1f}2\u{1f}\u{1e}3\u{1f}4\u{1f}"
+        );
+    }
+
+    #[test]
+    fn test_is_token_id_key_rejects_user_text() {
+        assert!(is_token_id_key(
+            &PromptInput::IntArray(vec![1, 2]).extract_text_for_routing()
+        ));
+        assert!(!is_token_id_key(
+            &PromptInput::String("plain text".to_string()).extract_text_for_routing()
+        ));
+        assert!(!is_token_id_key(""));
+    }
+
+    #[test]
+    fn test_text_prompt_cannot_forge_token_id_key() {
+        let forged = PromptInput::IntArray(vec![1]).extract_text_for_routing();
+        let text = PromptInput::String(forged.clone()).extract_text_for_routing();
+
+        assert_ne!(text, forged);
+        assert!(!is_token_id_key(&text));
+        assert!(is_token_id_key(&forged));
     }
 
     #[test]
@@ -2939,7 +3018,10 @@ mod tests {
 
         assert_eq!(request.get_model(), Some("test-model"));
         assert!(!request.is_stream());
-        assert_eq!(request.extract_text_for_routing(), "test query");
+        assert_eq!(
+            request.extract_text_for_routing(),
+            encode_text("test query")
+        );
     }
 
     // ==================================================================
@@ -3180,7 +3262,7 @@ mod tests {
         };
         assert!(!req.is_stream());
         assert_eq!(req.get_model(), Some("emb-model"));
-        assert_eq!(req.extract_text_for_routing(), "hello");
+        assert_eq!(req.extract_text_for_routing(), encode_text("hello"));
     }
 
     #[test]
@@ -3193,7 +3275,7 @@ mod tests {
             dimensions: None,
             rid: None,
         };
-        assert_eq!(req.extract_text_for_routing(), "hello world");
+        assert_eq!(req.extract_text_for_routing(), encode_text("hello world"));
     }
 
     #[test]
@@ -3206,7 +3288,7 @@ mod tests {
             dimensions: None,
             rid: None,
         };
-        assert_eq!(req.extract_text_for_routing(), "");
+        assert_eq!(req.extract_text_for_routing(), encode_text(""));
     }
 
     #[test]
@@ -3220,7 +3302,7 @@ mod tests {
             rid: None,
         };
         // Only top-level string elements are extracted
-        assert_eq!(req.extract_text_for_routing(), "a");
+        assert_eq!(req.extract_text_for_routing(), encode_text("a"));
     }
 
     // ==================================================================
