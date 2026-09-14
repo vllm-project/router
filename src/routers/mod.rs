@@ -79,6 +79,21 @@ pub trait RouterTrait: Send + Sync + Debug + WorkerManagement {
         model_id: Option<&str>,
     ) -> Response;
 
+    /// Route an inference-generate request on an additional configured path.
+    async fn route_inference_generate_path(
+        &self,
+        _headers: Option<&HeaderMap>,
+        _body: &InferenceGenerateRequest,
+        _path: &str,
+        _model_id: Option<&str>,
+    ) -> Response {
+        (
+            StatusCode::NOT_IMPLEMENTED,
+            "Additional generate paths are not supported by this router",
+        )
+            .into_response()
+    }
+
     /// Route a chat completion request
     async fn route_chat(
         &self,
