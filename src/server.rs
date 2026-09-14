@@ -166,20 +166,10 @@ async fn readiness(State(state): State<Arc<AppState>>, req: Request) -> Response
 }
 
 async fn health(State(state): State<Arc<AppState>>, req: Request) -> Response {
-    let headers = req.headers().clone();
-    if let Err(response) = authorize_request(&state, &headers).await {
-        return response;
-    }
-
     state.router.health(req).await
 }
 
 async fn health_generate(State(state): State<Arc<AppState>>, req: Request) -> Response {
-    let headers = req.headers().clone();
-    if let Err(response) = authorize_request(&state, &headers).await {
-        return response;
-    }
-
     state.router.health_generate(req).await
 }
 

@@ -11,6 +11,7 @@ else
 endif
 
 .PHONY: help bench bench-quick bench-baseline bench-compare test build clean
+.PHONY: install-service uninstall-service install-systemd uninstall-systemd
 
 help: ## Show this help message
 	@echo "VLLM Router Development Commands"
@@ -129,3 +130,51 @@ sccache-stop: ## Stop the sccache server
 	else \
 		echo "sccache not installed"; \
 	fi
+
+install-service: build ## Install systemd service (requires root)
+	@echo "Installing vLLM Router systemd service..."
+	@if [ $$(id -u) -ne 0 ]; then \
+		echo "Error: This command requires root privileges. Run with sudo."; \
+		exit 1; \
+	fi
+	@./scripts/install_service.sh install --binary-path $$(pwd)/target/release/vllm-router
+
+uninstall-service: ## Uninstall systemd service (requires root)
+	@echo "Uninstalling vLLM Router systemd service..."
+	@if [ $$(id -u) -ne 0 ]; then \
+		echo "Error: This command requires root privileges. Run with sudo."; \
+		exit 1; \
+	fi
+	@./scripts/install_service.sh uninstall
+
+install-systemd: install-service ## Alias for install-service
+	@echo "Systemd service installed successfully."
+
+uninstall-systemd: uninstall-service ## Alias for uninstall-service
+	@echo "Systemd service uninstalled successfully."
+
+service-enable: ## Enable systemd service to start on boot (requires root)
+	@if [ $$(id -u) -ne 0 ]; then \
+		echo "Error: This command requires root privileges. Run with sudo."; \
+		exit 1; \
+	fi
+	@./scripts/install_service.sh enable
+
+service-disable: ## Disable systemd service from auto-start (requires root)
+	@if [ $$(id -u) -ne 0 ]; then \
+		echo "Error: This command requires root privileges. Run with sudo."; \
+		exit 1; \
+	fi
+	@./scripts/install_service.sh disable
+
+service-start: ## Start the systemd service
+	@./scripts/install_service.sh start
+
+service-stop: ## Stop the systemd service
+	@./scripts/install_service.sh stop
+
+service-restart: ## Restart the systemd service
+	@./scripts/install_service.sh restart
+
+service-status: ## Show service status
+	@./scripts/install_service.sh status
