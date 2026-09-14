@@ -34,6 +34,21 @@ __pycache__/
 *.py[cod]
 *$py.class
 
+# Generated gRPC stubs (compiled from proto/vllm_engine.proto by setup.py)
+py_src/vllm_router/proto/vllm_engine_pb2.py
+py_src/vllm_router/proto/vllm_engine_pb2_grpc.py
+py_src/vllm_router/proto/engine_client_pb2.py
+py_src/vllm_router/proto/engine_client_pb2_grpc.py
+
+# Local bench / scrape / driver dumps. Keep them outside this repo
+# (e.g. ../logs or ../bench_artifacts), not on the feature branch.
+logs/
+logs_*/
+*.log
+*.err
+*.prom
+*.prom.err
+
 # C extensions
 *.so
 
