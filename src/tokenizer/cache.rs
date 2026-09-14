@@ -39,7 +39,7 @@
 //!
 //! Estimates count heap bytes that an entry keeps alive, using lengths rather
 //! than capacities, plus a fixed per-entry bookkeeping overhead
-//! ([`ENTRY_OVERHEAD_BYTES`]). Per entry:
+//! (`ENTRY_OVERHEAD_BYTES`). Per entry:
 //!
 //! - the input string: `input.len()`
 //! - `Encoding::Sp` and `Encoding::Tiktoken`: the `Vec` header plus
@@ -154,7 +154,7 @@ struct CacheState {
 
 /// Approximate fixed cost of one cache entry: the LRU node (key, value and two
 /// list links) and its hash-map slot (key reference and node pointer).
-pub const ENTRY_OVERHEAD_BYTES: usize =
+const ENTRY_OVERHEAD_BYTES: usize =
     size_of::<String>() + size_of::<CacheEntry>() + 4 * size_of::<usize>();
 
 /// Occupancy summed over every live cache in the process. Guarded by a lock
@@ -228,11 +228,6 @@ impl CachedTokenizer {
         &self.config
     }
 
-    /// The wrapped tokenizer.
-    pub fn inner(&self) -> &Arc<dyn TokenizerTrait> {
-        &self.inner
-    }
-
     /// Number of entries currently retained.
     pub fn len(&self) -> usize {
         self.state.lock().lru.len()
@@ -286,20 +281,16 @@ impl CachedTokenizer {
             let entries_before = state.lru.len();
             let bytes_before = state.bytes;
 
-            // Another thread may have inserted this input while we were
-            // tokenizing. `push` then returns the entry it replaced rather
-            // than an LRU victim, so account for it as a replacement.
-            let replaced_bytes = state.lru.peek(input).map(|entry| entry.bytes);
-            let displaced = state
+            if let Some((old_key, old_entry)) = state
                 .lru
-                .push(input.to_owned(), CacheEntry { encoding, bytes });
-            match (replaced_bytes, displaced) {
-                (Some(previous), Some(_)) => state.bytes -= previous,
-                (None, Some((_, victim))) => {
-                    state.bytes -= victim.bytes;
+                .push(input.to_owned(), CacheEntry { encoding, bytes })
+            {
+                state.bytes -= old_entry.bytes;
+                // A concurrent miss may have inserted the same key.
+                // Replacing it does not count as an eviction.
+                if old_key != input {
                     evicted += 1;
                 }
-                (_, None) => {}
             }
             state.bytes += bytes;
 
@@ -398,7 +389,7 @@ pub fn estimate_entry_bytes(input: &str, encoding: &Encoding) -> usize {
 }
 
 /// Estimated bytes retained by `encoding` alone.
-pub fn estimate_encoding_bytes(encoding: &Encoding) -> usize {
+fn estimate_encoding_bytes(encoding: &Encoding) -> usize {
     match encoding {
         Encoding::Sp(ids) | Encoding::Tiktoken(ids) => {
             size_of::<Vec<TokenIdType>>() + ids.len() * size_of::<TokenIdType>()

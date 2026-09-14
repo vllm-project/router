@@ -778,48 +778,30 @@ impl HuggingFaceTokenizer {
 
 ### 3.12 cache.rs (Exact-Match Encode Cache)
 
-**Location**: `src/tokenizer/cache.rs`
-
-**Purpose:** Bounded L0 cache that memoizes successful `encode()` results by exact input string. Wraps any `Arc<dyn Tokenizer>` and delegates everything else.
-
-**Public API:**
+`CachedTokenizer` wraps an `Arc<dyn Tokenizer>` and caches successful `encode()`
+results by exact input string. Hits return an owned `Encoding` with all metadata.
+Other methods, including `encode_batch()`, delegate to the wrapped tokenizer.
 
 ```rust
-pub struct TokenizerCacheConfig {
-    pub max_entries: usize,     // default 10_000
-    pub max_bytes: usize,       // default 64 MiB, estimated retained bytes
-    pub max_entry_bytes: usize, // default 1 MiB, larger results are not stored
-}
-
-pub struct CachedTokenizer { /* implements Encoder + Decoder + Tokenizer */ }
-
-impl CachedTokenizer {
-    pub fn new(inner: Arc<dyn Tokenizer>, config: TokenizerCacheConfig) -> Result<Self>
-    pub fn stats(&self) -> TokenizerCacheStats   // hits, misses, evictions, oversized, entries, bytes
-    pub fn clear(&self)
-}
-
-pub fn estimate_entry_bytes(input: &str, encoding: &Encoding) -> usize
+let cache = CachedTokenizer::new(tokenizer, TokenizerCacheConfig::default())?;
+let encoding = cache.encode("Hello world")?;
 ```
 
-**Behavior:**
-- Hits return an owned clone of the stored `Encoding` with all backend metadata
-- Only successful `encode()` results are stored; errors pass through
-- `encode_batch()` neither reads from nor populates the cache
-- Each `CachedTokenizer` owns its entries; instances never share
-- LRU eviction when either the entry or byte budget is exceeded (`LruCache::sparse`, so the map grows on demand)
-- Results larger than `max_entry_bytes` are returned but not stored
-- Defaults (10,000 entries, 64 MiB, 1 MiB per entry) are initial values, not tuned against production traffic
+Defaults are 10,000 entries, 64 MiB total and 1 MiB per entry. LRU eviction
+keeps the cache within both budgets; oversized results are returned without
+being stored. These defaults have not been tuned against production traffic.
+The byte estimate is not a resident-memory bound.
 
-**Preconditions:** the wrapped tokenizer must be deterministic for the same input, and every setting that affects encoding (normalization, truncation, added tokens, BPE dropout or other sampling) must stay fixed for the cache's lifetime. A fixed configuration does not by itself disable stochastic tokenization.
+The wrapped tokenizer must be deterministic, with stochastic tokenization
+disabled and encoding settings fixed for the cache's lifetime.
 
-**Byte estimation:** heap bytes kept alive by an entry, using lengths rather than capacities: the input string, the token ID vector for `Sp`/`Tiktoken`, and for `Hf` the per-token `u32` vectors, word index, offsets, token string headers and token text (overflowing encodings recursively), plus a fixed per-entry overhead (`ENTRY_OVERHEAD_BYTES`). Not counted: allocator padding, hash-map load factor, unused `Vec` capacity, clones held by callers, and evicted encodings kept alive by an in-flight `Arc` from a concurrent hit. The estimate is a lower bound, not a resident-memory bound.
+`stats()` reports per-instance counters and occupancy; `clear()` removes entries
+and keeps counters. Exported counters are process-wide; occupancy gauges sum
+over live caches. See the
+[module documentation in cache.rs](cache.rs) for byte accounting, locking and
+metric semantics.
 
-**Concurrency:** one `parking_lot::Mutex` around the LRU. Lookups clone an `Arc<Encoding>` under the lock and clone the `Encoding` outside it; tokenization on a miss also runs outside the lock. Concurrent misses on the same input both tokenize and the later insert replaces the earlier one.
-
-**Metrics:** counters sum across instances. The `entries` and `bytes` gauges hold the total occupancy of every live cache in the process: each instance applies its change to a process-wide aggregate and publishes the new totals while still holding its own lock (lock order: instance state, then aggregate), and `clear()` and `Drop` subtract the instance's share. After any `encode`, `clear` or drop the gauges equal the sum of live instances' `stats()`.
-
-**Not wired yet:** construction is library-level only. Request-path integration and CLI flags are follow-up work.
+Request-path integration and CLI flags are follow-up work.
 
 ## 4. Traits & Contracts
 

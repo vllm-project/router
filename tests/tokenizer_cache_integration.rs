@@ -61,17 +61,6 @@ fn load_fixture_with_overflow() -> Arc<dyn Tokenizer> {
 fn assert_hf_equal(expected: &Encoding, actual: &Encoding) {
     match (expected, actual) {
         (Encoding::Hf(expected), Encoding::Hf(actual)) => {
-            assert_eq!(expected.get_ids(), actual.get_ids());
-            assert_eq!(expected.get_tokens(), actual.get_tokens());
-            assert_eq!(expected.get_offsets(), actual.get_offsets());
-            assert_eq!(expected.get_type_ids(), actual.get_type_ids());
-            assert_eq!(expected.get_word_ids(), actual.get_word_ids());
-            assert_eq!(
-                expected.get_special_tokens_mask(),
-                actual.get_special_tokens_mask()
-            );
-            assert_eq!(expected.get_attention_mask(), actual.get_attention_mask());
-            assert_eq!(expected.get_overflowing(), actual.get_overflowing());
             assert_eq!(expected, actual);
         }
         _ => panic!("expected HuggingFace encodings"),
@@ -87,7 +76,6 @@ fn assert_cached_matches_uncached(inner: Arc<dyn Tokenizer>, prompts: &[&str]) {
         let second = cache.encode(prompt).unwrap();
         assert_hf_equal(&uncached, &first);
         assert_hf_equal(&uncached, &second);
-        assert_eq!(uncached.get_hash(), second.get_hash());
     }
 
     let stats = cache.stats();
@@ -145,17 +133,7 @@ fn overflowing_encodings_are_preserved() {
         "fixture truncation must produce overflowing encodings"
     );
 
-    assert_cached_matches_uncached(inner.clone(), PROMPTS);
-
-    let cache = CachedTokenizer::new(inner.clone(), TokenizerCacheConfig::default()).unwrap();
-    let hit = {
-        cache.encode(long).unwrap();
-        cache.encode(long).unwrap()
-    };
-    let Encoding::Hf(hit) = hit else {
-        panic!("expected HuggingFace encoding");
-    };
-    assert_eq!(hit.get_overflowing(), reference.get_overflowing());
+    assert_cached_matches_uncached(inner, PROMPTS);
 
     let without_overflow = load_fixture().encode(long).unwrap();
     assert!(
