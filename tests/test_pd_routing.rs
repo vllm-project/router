@@ -5,6 +5,192 @@ mod test_pd_routing {
     };
     use vllm_router_rs::routers::RouterFactory;
 
+    #[tokio::test]
+    async fn test_epd_handoff_preserves_metadata_and_isolates_ec_handles() {
+        use axum::{
+            extract::State,
+            http::StatusCode,
+            response::IntoResponse,
+            routing::{get, post},
+            Json, Router,
+        };
+        use serde_json::{json, Value};
+        use std::sync::{Arc, Mutex};
+        use vllm_router_rs::config::{ConfigValidator, EpdConfig};
+
+        type Seen = Arc<Mutex<Vec<(String, Value)>>>;
+        async fn encode(
+            State(seen): State<Seen>,
+            Json(body): Json<Value>,
+        ) -> axum::response::Response {
+            seen.lock().unwrap().push(("E".into(), body.clone()));
+            if body["model"] == "encoder-fail" {
+                return (StatusCode::SERVICE_UNAVAILABLE, "injected encoder error").into_response();
+            }
+            let hash = body["messages"][0]["content"][0]["uuid"].as_str().unwrap();
+            Json(json!({
+                "ec_transfer_params": {
+                    (hash): {"metadata": {"image_grid_thw": [[1, 2, 3]]}},
+                },
+            }))
+            .into_response()
+        }
+        async fn prefill(
+            State(seen): State<Seen>,
+            Json(body): Json<Value>,
+        ) -> axum::response::Response {
+            seen.lock().unwrap().push(("P".into(), body.clone()));
+            if body["model"] == "fail" {
+                return (StatusCode::INTERNAL_SERVER_ERROR, "injected prefill error")
+                    .into_response();
+            }
+            if body["model"] == "missing-kv" {
+                return Json(json!({"choices":[]})).into_response();
+            }
+            Json(json!({
+                "kv_transfer_params": {
+                    "remote_engine_id": "P",
+                    "do_remote_prefill": true,
+                },
+            }))
+            .into_response()
+        }
+        async fn decode(
+            State(seen): State<Seen>,
+            Json(body): Json<Value>,
+        ) -> axum::response::Response {
+            seen.lock().unwrap().push(("D".into(), body.clone()));
+            if body["stream"] == true {
+                return ([("content-type", "text/event-stream")], "data: [DONE]\n\n")
+                    .into_response();
+            }
+            Json(json!({"choices":[{"message":{"content":"A"}}]})).into_response()
+        }
+        let seen: Seen = Arc::new(Mutex::new(Vec::new()));
+        let app = Router::new()
+            .route("/e/health", get(|| async { "ok" }))
+            .route("/p/health", get(|| async { "ok" }))
+            .route("/d/health", get(|| async { "ok" }))
+            .route("/e/v1/chat/completions", post(encode))
+            .route("/p/v1/chat/completions", post(prefill))
+            .route("/d/v1/chat/completions", post(decode))
+            .with_state(seen.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let mut config = RouterConfig {
+            mode: RoutingMode::VllmPrefillDecode {
+                prefill_urls: vec![(format!("{base}/p"), None)],
+                decode_urls: vec![format!("{base}/d")],
+                prefill_policy: None,
+                decode_policy: None,
+                discovery_address: None,
+            },
+            policy: PolicyConfig::Random,
+            epd: Some(EpdConfig {
+                encoder_urls: vec![format!("{base}/e")],
+                consumer_zmq_addrs: Default::default(),
+            }),
+            worker_startup_timeout_secs: 5,
+            ..RouterConfig::default()
+        };
+        // Mooncake EC reservations belong to P, not D.
+        config
+            .epd
+            .as_mut()
+            .unwrap()
+            .consumer_zmq_addrs
+            .insert(format!("{base}/d"), "tcp://localhost:1234".into());
+        assert!(ConfigValidator::validate(&config).is_err());
+        config.epd.as_mut().unwrap().consumer_zmq_addrs.clear();
+        ConfigValidator::validate(&config).unwrap();
+        let context = Arc::new(
+            vllm_router_rs::server::AppContext::new(
+                config,
+                reqwest::Client::new(),
+                64,
+                None,
+                vec![],
+            )
+            .unwrap(),
+        );
+        let router = RouterFactory::create_router(&context).await.unwrap();
+        for (model, stream, status) in [
+            ("test", false, StatusCode::OK),
+            ("test", true, StatusCode::OK),
+            ("fail", false, StatusCode::INTERNAL_SERVER_ERROR),
+            ("missing-kv", false, StatusCode::INTERNAL_SERVER_ERROR),
+            ("encoder-fail", false, StatusCode::SERVICE_UNAVAILABLE),
+            ("bad-input", false, StatusCode::BAD_REQUEST),
+        ] {
+            seen.lock().unwrap().clear();
+            let mut body = json!({
+                "model": model,
+                "stream": stream,
+                "max_tokens": 16,
+                "structured_outputs": {"choice": ["A", "B"]},
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}},
+                        {"type": "text", "text": "choose"},
+                    ],
+                }],
+            });
+            if model == "bad-input" {
+                body["messages"] = Value::Null;
+            }
+            let response = router
+                .route_transparent(
+                    None,
+                    "/v1/chat/completions",
+                    &axum::http::Method::POST,
+                    body,
+                )
+                .await;
+            assert_eq!(response.status(), status, "model={model}, stream={stream}");
+            let bytes = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+            if stream {
+                assert!(String::from_utf8_lossy(&bytes).contains("[DONE]"));
+            }
+            let seen = seen.lock().unwrap();
+            let phases: Vec<_> = seen.iter().map(|(phase, _)| phase.as_str()).collect();
+            assert_eq!(
+                phases,
+                match model {
+                    "bad-input" => vec![],
+                    "encoder-fail" => vec!["E"],
+                    "test" => vec!["E", "P", "D"],
+                    _ => vec!["E", "P"],
+                }
+            );
+            if seen.len() < 2 {
+                continue;
+            }
+            let p = &seen[1].1;
+            assert_eq!(p["max_tokens"], 1);
+            assert_eq!(p["stream"], false);
+            assert!(p["ec_transfer_params"]["ec_items"].is_array());
+            assert_eq!(
+                p["messages"][0]["content"][0]["image_embeds"]["image_grid_thw"],
+                json!([1, 2, 3])
+            );
+            if status.is_success() {
+                let d = &seen[2].1;
+                assert_eq!(d["max_tokens"], 16);
+                assert_eq!(d["messages"], p["messages"]);
+                assert_eq!(d["structured_outputs"], p["structured_outputs"]);
+                assert!(d.get("ec_transfer_params").is_none());
+                assert_eq!(d["kv_transfer_params"]["remote_engine_id"], "P");
+            }
+        }
+        server.abort();
+    }
+
     // ========================================================================
     // Phase 1: Basic PD Components and Router Creation
     // ========================================================================
@@ -129,6 +315,7 @@ mod test_pd_routing {
                 history_backend: vllm_router_rs::config::HistoryBackend::Memory,
                 enable_profiling: false,
                 profile_timeout_secs: 30,
+                epd: None,
                 kv_connector: vllm_router_rs::config::KvConnector::Nixl,
             };
 
