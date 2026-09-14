@@ -1,4 +1,7 @@
 # vLLM Router
+<p align="center">
+| <a href="docs/load_balancing/README.md"><b>Documentation</b></a> | <a href="https://deepwiki.com/vllm-project/router"><b>DeepWiki</b></a> | <a href="https://discuss.vllm.ai"><b>User Forum</b></a> | <a href="https://vllm-dev.slack.com/archives/C085AUU43NK"><b>Developer Slack</b></a> | <a href="docs/assets/WeChat.png"><b>WeChat</b></a> |
+</p>
 
 A high-performance and light-weight request forwarding system for vLLM large scale deployments, providing advanced load balancing methods and prefill/decode disaggregation support.
 

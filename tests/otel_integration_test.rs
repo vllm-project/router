@@ -207,6 +207,7 @@ async fn test_otel_integration() {
         let backend_tp = backend_req
             .headers
             .get("traceparent")
+            .and_then(|values| values.first())
             .expect("Backend should receive traceparent header");
         let parts: Vec<&str> = backend_tp.split('-').collect();
         assert_eq!(parts.len(), 4, "traceparent should have 4 parts");
@@ -223,6 +224,7 @@ async fn test_otel_integration() {
         let backend_baggage = backend_req
             .headers
             .get("baggage")
+            .and_then(|values| values.first())
             .expect("Backend should receive baggage header");
         assert!(
             backend_baggage.contains("userId=alice"),
