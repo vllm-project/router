@@ -4,6 +4,7 @@ use super::dp_utils;
 use super::logprobs_merge;
 use super::pd_router::PdRouterBase;
 use super::pd_types::{error_chain, PDRouterError};
+use super::routed_experts_merge;
 use super::vllm_service_discovery::{MoriIOTransferMode, ServiceRegistry, ServiceType};
 use crate::config::KvConnector;
 use crate::core::{BasicWorker, Worker, WorkerType};
@@ -694,8 +695,14 @@ impl VllmPDRouter {
             RouterMetrics::record_pd_decode_error(decode_http);
         }
 
-        if needs_logprobs && !is_streaming {
-            debug!("Logprobs requested and non-streaming - merging prefill and decode logprobs");
+        // Routed-experts capture also needs a prefill->decode splice (D's
+        // prompt-region rows are invalid since it never forwards the prompt).
+        let needs_routed_experts = prefill_response_json
+            .map(routed_experts_merge::has_routed_experts)
+            .unwrap_or(false);
+
+        if (needs_logprobs || needs_routed_experts) && !is_streaming {
+            debug!("Non-streaming prefill->decode merge (logprobs and/or routed_experts)");
 
             let status = decode_response.status();
             let resp_headers = decode_response.headers().clone();
@@ -709,11 +716,24 @@ impl VllmPDRouter {
 
             let empty_json = Value::Null;
             let prefill_json_ref = prefill_response_json.unwrap_or(&empty_json);
-            let merged = logprobs_merge::merge_logprobs_in_json(prefill_json_ref, &mut decode_json);
-            if merged {
-                debug!("Successfully merged logprobs from prefill and decode responses");
-            } else {
-                warn!("No logprobs were merged (might be expected if logprobs not in response)");
+            if needs_logprobs {
+                let merged =
+                    logprobs_merge::merge_logprobs_in_json(prefill_json_ref, &mut decode_json);
+                if merged {
+                    debug!("Successfully merged logprobs from prefill and decode responses");
+                } else {
+                    warn!(
+                        "No logprobs were merged (might be expected if logprobs not in response)"
+                    );
+                }
+            }
+            if needs_routed_experts
+                && routed_experts_merge::merge_routed_experts_in_json(
+                    prefill_json_ref,
+                    &mut decode_json,
+                )
+            {
+                debug!("Successfully merged routed_experts from prefill and decode responses");
             }
 
             let merged_body = serde_json::to_vec(&decode_json)
@@ -1498,9 +1518,12 @@ impl VllmPDRouter {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
-        // If logprobs requested and non-streaming, merge prefill and decode logprobs
-        if needs_logprobs && !is_streaming {
-            debug!("Logprobs requested and non-streaming - merging prefill and decode logprobs");
+        // Routed-experts capture also needs a prefill->decode splice (D's
+        // prompt-region rows are invalid since it never forwards the prompt).
+        let needs_routed_experts = routed_experts_merge::has_routed_experts(&prefill_response_json);
+
+        if (needs_logprobs || needs_routed_experts) && !is_streaming {
+            debug!("Non-streaming prefill->decode merge (logprobs and/or routed_experts)");
 
             // Read decode response body
             let decode_body =
@@ -1521,12 +1544,28 @@ impl VllmPDRouter {
                 })?;
 
             // Merge logprobs from prefill into decode response
-            let merged =
-                logprobs_merge::merge_logprobs_in_json(&prefill_response_json, &mut decode_json);
-            if merged {
-                debug!("Successfully merged logprobs from prefill and decode responses");
-            } else {
-                warn!("No logprobs were merged (might be expected if logprobs not in response)");
+            if needs_logprobs {
+                let merged = logprobs_merge::merge_logprobs_in_json(
+                    &prefill_response_json,
+                    &mut decode_json,
+                );
+                if merged {
+                    debug!("Successfully merged logprobs from prefill and decode responses");
+                } else {
+                    warn!(
+                        "No logprobs were merged (might be expected if logprobs not in response)"
+                    );
+                }
+            }
+
+            // Merge routed_experts from prefill into decode response
+            if needs_routed_experts
+                && routed_experts_merge::merge_routed_experts_in_json(
+                    &prefill_response_json,
+                    &mut decode_json,
+                )
+            {
+                debug!("Successfully merged routed_experts from prefill and decode responses");
             }
 
             // Serialize merged response
