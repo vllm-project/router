@@ -309,8 +309,9 @@ steps:
   - group: ":large_purple_circle: ROCm MoRI XGMI P/D"
     key: "pd-disagg-moriio-tests"
     if: |
-      build.branch == pipeline.default_branch ||
-      build.merge_queue.base_branch == pipeline.default_branch ||
+      (build.pull_request.id == null && build.branch == pipeline.default_branch) ||
+      (build.pull_request.id == null &&
+       build.merge_queue.base_branch == pipeline.default_branch) ||
       (build.pull_request.id != null && build.pull_request.repository.fork == false) ||
       ((build.source == "ui" || build.source == "api") &&
        build.env("RUN_ROCM_XGMI") == "1")
@@ -391,8 +392,9 @@ steps:
   - group: ":large_blue_circle: ROCm NIXL XGMI P/D"
     key: "pd-disagg-nixl-rocm-tests"
     if: |
-      build.branch == pipeline.default_branch ||
-      build.merge_queue.base_branch == pipeline.default_branch ||
+      (build.pull_request.id == null && build.branch == pipeline.default_branch) ||
+      (build.pull_request.id == null &&
+       build.merge_queue.base_branch == pipeline.default_branch) ||
       (build.pull_request.id != null && build.pull_request.repository.fork == false) ||
       ((build.source == "ui" || build.source == "api") &&
        build.env("RUN_ROCM_NIXL") == "1")
