@@ -325,7 +325,9 @@ steps:
               - "false"
         retry:
           automatic:
-            - exit_status: "*"
+            # Retry only when Buildkite loses the agent. Test, GPU, and
+            # transport failures must remain visible for inspection.
+            - exit_status: -1
               limit: 1
           manual:
             allowed: true
@@ -383,6 +385,10 @@ steps:
                   bash py_test/e2e/pd_disagg_vllm/run_moriio_accuracy_test.sh
         agents:
           queue: "router_rocm_mi300_2"
+        # Serialize every job that owns the paired MI300X cluster, including
+        # jobs from separate builds and other pipelines in the organization.
+        concurrency: 1
+        concurrency_group: "vllm/router-rocm-mi300x-pair"
         depends_on: "build"
         artifact_paths:
           - "target/ci-logs/moriio-*/*.log"
@@ -404,7 +410,9 @@ steps:
           - "false"
     retry:
       automatic:
-        - exit_status: "*"
+        # Retry only when Buildkite loses the agent. A functional RDMA failure
+        # should fail the nightly and alert an operator.
+        - exit_status: -1
           limit: 1
       manual:
         allowed: true
@@ -432,6 +440,8 @@ steps:
       bash py_test/e2e/pd_disagg_vllm/run_moriio_rdma_accuracy_test.sh
     agents:
       queue: "router_rocm_mi300_2"
+    concurrency: 1
+    concurrency_group: "vllm/router-rocm-mi300x-pair"
     depends_on: "build"
     artifact_paths:
       - "target/ci-logs/moriio-rdma-*/*"
