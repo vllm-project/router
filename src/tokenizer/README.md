@@ -299,6 +299,7 @@ impl Tokenizer {
 - Types: `Sequence`, `StopSequenceConfig`, `DecodeStream`, `Encoding`, `TokenizerType`
 - Chat template: `ChatMessage`
 - Tokenizer implementations: `HuggingFaceTokenizer`, `TiktokenTokenizer`
+- Encode cache: `CachedTokenizer`, `TokenizerCacheConfig`, `TokenizerCacheStats`
 
 ### 3.2 traits.rs (Trait Definitions)
 
@@ -775,6 +776,33 @@ impl HuggingFaceTokenizer {
 - Runtime template modification
 - Special token handling
 
+### 3.12 cache.rs (Exact-Match Encode Cache)
+
+`CachedTokenizer` wraps an `Arc<dyn Tokenizer>` and caches successful `encode()`
+results by exact input string. Hits return an owned `Encoding` with all metadata.
+Other methods, including `encode_batch()`, delegate to the wrapped tokenizer.
+
+```rust
+let cache = CachedTokenizer::new(tokenizer, TokenizerCacheConfig::default())?;
+let encoding = cache.encode("Hello world")?;
+```
+
+Defaults are 10,000 entries, 64 MiB total and 1 MiB per entry. LRU eviction
+keeps the cache within both budgets; oversized results are returned without
+being stored. These defaults have not been tuned against production traffic.
+The byte estimate is not a resident-memory bound.
+
+The wrapped tokenizer must be deterministic, with stochastic tokenization
+disabled and encoding settings fixed for the cache's lifetime.
+
+`stats()` reports per-instance counters and occupancy; `clear()` removes entries
+and keeps counters. Exported counters are process-wide; occupancy gauges sum
+over live caches. See the
+[module documentation in cache.rs](cache.rs) for byte accounting, locking and
+metric semantics.
+
+Request-path integration and CLI flags are follow-up work.
+
 ## 4. Traits & Contracts
 
 ### Core Trait Hierarchy
@@ -895,6 +923,7 @@ The `Encoding` enum must:
 - `tiktoken.rs`: 7 tests - Model detection, encode/decode roundtrip
 - `chat_template.rs`: 3 tests - Template rendering, loading
 - `tests.rs`: 9 tests - Cross-module integration
+- `cache.rs`: 19 tests - Hit/miss, eviction by count and bytes, oversized bypass, batch bypass, concurrency, byte estimates
 
 **Integration Tests (10 tests in tokenizer_integration.rs):**
 - HuggingFace tokenizer hash verification
@@ -906,6 +935,19 @@ The `Encoding` enum must:
 - Batch encoding verification
 - Special token handling
 - Thread safety validation
+
+**Cache Integration Tests (8 tests + 1 ignored in tokenizer_cache_integration.rs):**
+- Use `tests/fixtures/tokenizer/byte_level_bpe.json`, a checked-in byte-level BPE tokenizer (256 byte symbols, 34 merges, `<s>`/`</s>`/`<unk>`); no network needed
+- Fixture pinned by vocab size, special tokens and token IDs
+- Cached vs uncached HuggingFace encodings compared field by field, including overflowing encodings from truncation
+- Byte accounting against `estimate_entry_bytes`
+- Byte-budget eviction and oversized bypass with real encodings
+- Decode and streaming through the `Tokenizer` wrapper
+- Concurrent access with eviction
+- `#[ignore]` TinyLlama repeat of the comparison plus the hash fixtures (`cargo test --test tokenizer_cache_integration -- --ignored`)
+
+**Cache Metrics Tests (4 tests in tokenizer_cache_metrics.rs):**
+- Capturing `metrics::Recorder` checks the occupancy gauges sum over live instances, follow eviction, `clear()` and `Drop`, and stay consistent under concurrent inserts and clears, including a delayed publication that must not overwrite a later clear
 
 ### Benchmark Suite (tokenizer_benchmark.rs)
 
@@ -927,6 +969,16 @@ The `Encoding` enum must:
 - Short: 30 chars ("What is the capital of France?")
 - Medium: 201 chars (Quantum computing explanation)
 - Long: 638 chars (Software engineering review)
+
+### Cache Benchmark Suite (tokenizer_cache_benchmark.rs)
+
+Run with `cargo bench --bench tokenizer_cache_benchmark`.
+
+1. **encode**: uncached encode, cache hit, `Encoding` clone alone, and miss into an empty cache, per prompt size (30 B to 16 KB)
+2. **mixed**: 64 hot prompts at 50/90/99% hit ratio with unique cold prompts, cached vs uncached
+3. **concurrent_short**: all-hit encodes across 1/2/4/8 threads sharing one cache, cached vs uncached
+
+Prints estimated retained bytes per entry for each prompt size before running.
 
 ## 8. Operational Concerns
 
@@ -953,6 +1005,12 @@ The `Encoding` enum must:
 - `vllm_tokenizer_factory_load_duration_seconds`
 - `vllm_tokenizer_stop_sequence_detected`
 - `vllm_tokenizer_stream_incomplete_utf8_total`
+- `vllm_tokenizer_cache_hits_total`
+- `vllm_tokenizer_cache_misses_total`
+- `vllm_tokenizer_cache_evictions_total`
+- `vllm_tokenizer_cache_oversized_total`
+- `vllm_tokenizer_cache_entries` (gauge, total over live caches)
+- `vllm_tokenizer_cache_bytes` (gauge, estimated, total over live caches)
 
 **Labels:**
 - `tokenizer_type`: huggingface, tiktoken, mock

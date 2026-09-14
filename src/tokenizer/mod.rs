@@ -2,6 +2,7 @@ use anyhow::Result;
 use std::ops::Deref;
 use std::sync::Arc;
 
+pub mod cache;
 pub mod factory;
 pub mod hub;
 pub mod mock;
@@ -22,6 +23,7 @@ pub mod tiktoken;
 mod tests;
 
 // Re-exports
+pub use cache::{CachedTokenizer, TokenizerCacheConfig, TokenizerCacheStats};
 pub use factory::{
     create_tokenizer, create_tokenizer_async, create_tokenizer_from_file,
     create_tokenizer_with_chat_template, TokenizerType,

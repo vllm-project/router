@@ -251,6 +251,32 @@ pub fn init_metrics() {
         "vllm_tokenizer_factory_load_duration_seconds",
         "Time to load and initialize tokenizer"
     );
+
+    // Tokenizer encode cache metrics
+    describe_counter!(
+        "vllm_tokenizer_cache_hits_total",
+        "Total tokenizer encode calls served from the exact-match cache"
+    );
+    describe_counter!(
+        "vllm_tokenizer_cache_misses_total",
+        "Total tokenizer encode calls that ran the underlying tokenizer"
+    );
+    describe_counter!(
+        "vllm_tokenizer_cache_evictions_total",
+        "Total tokenizer cache entries evicted to satisfy the entry or byte budget"
+    );
+    describe_counter!(
+        "vllm_tokenizer_cache_oversized_total",
+        "Total tokenizer encode results not cached because they exceeded the per-entry byte limit"
+    );
+    describe_gauge!(
+        "vllm_tokenizer_cache_entries",
+        "Current number of entries in the tokenizer encode cache"
+    );
+    describe_gauge!(
+        "vllm_tokenizer_cache_bytes",
+        "Estimated bytes retained by the tokenizer encode cache"
+    );
 }
 
 pub fn start_prometheus(config: PrometheusConfig) {
@@ -623,6 +649,31 @@ impl TokenizerMetrics {
             "tokenizer_type" => tokenizer_type.to_string()
         )
         .set(size as f64);
+    }
+
+    // Encode cache metrics
+    pub fn record_cache_hit() {
+        counter!("vllm_tokenizer_cache_hits_total").increment(1);
+    }
+
+    pub fn record_cache_miss() {
+        counter!("vllm_tokenizer_cache_misses_total").increment(1);
+    }
+
+    pub fn record_cache_evictions(count: u64) {
+        counter!("vllm_tokenizer_cache_evictions_total").increment(count);
+    }
+
+    pub fn record_cache_oversized() {
+        counter!("vllm_tokenizer_cache_oversized_total").increment(1);
+    }
+
+    pub fn set_cache_entries(entries: usize) {
+        gauge!("vllm_tokenizer_cache_entries").set(entries as f64);
+    }
+
+    pub fn set_cache_bytes(bytes: usize) {
+        gauge!("vllm_tokenizer_cache_bytes").set(bytes as f64);
     }
 }
 
