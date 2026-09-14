@@ -37,7 +37,7 @@ See `scripts/llama3.1/` for example setup scripts showing the proper configurati
 
 ### Test Script
 
-Location: `py_test/e2e/pd_disagg_vllm/run_accuracy_test.sh`
+Location: `py_test/e2e/pd_disagg_vllm/nvidia/run_accuracy_test.sh`
 
 The test script:
 - Launches prefill and decode vLLM instances in Docker containers
@@ -69,8 +69,8 @@ The test runs in the pipeline at `.buildkite/pipeline.yml:97-132`:
 The dedicated `router_rocm_mi300_2` queue adds two MI300X matrices, each with
 `read_mode=true` and `read_mode=false`:
 
-- `run_moriio_accuracy_test.sh` uses two GPUs on one host with the xGMI backend.
-- `run_moriio_rdma_accuracy_test.sh` uses one GPU on each of two hosts with the
+- `rocm/run_moriio_accuracy_test.sh` uses two GPUs on one host with the xGMI backend.
+- `rocm/run_moriio_rdma_accuracy_test.sh` uses one GPU on each of two hosts with the
   RDMA backend.
 
 The xGMI group runs for same-repository pull requests, the default branch, and
@@ -86,6 +86,13 @@ CPU build that supplies the router artifact to both ROCm matrices.
 Both matrices use a digest-pinned ROCm vLLM image and run health, sanity, and
 500-example GSM8K accuracy checks. The RDMA job is coordinator-owned and
 controls the second host through the strict `vllm-router-rocm-worker` SSH alias.
+
+### ROCm NIXL coverage
+
+
+The same `router_rocm_mi300_2` queue also runs the ROCm NIXL P/D lane.
+`rocm/run_nixl_rocm_accuracy_test.sh` runs a TP1 1P1D deployment with `NixlConnector` using the UCX backend,
+validating GSM8k accuracy.
 
 ### Environment Variables
 
@@ -117,13 +124,13 @@ To run the test locally:
 cd py_test/e2e/pd_disagg_vllm
 
 # Run with defaults
-bash ./run_accuracy_test.sh
+bash ./nvidia/run_accuracy_test.sh
 
 # Run with custom configuration
 export GPU_MEMORY_UTILIZATION=0.8
 export PREFILLER_TP_SIZE=2
 export DECODER_TP_SIZE=2
-bash ./run_accuracy_test.sh
+bash ./nvidia/run_accuracy_test.sh
 ```
 
 **Requirements:**
@@ -168,7 +175,7 @@ Builds Docker image for the router.
 
 - `cpu_queue_premerge`: CPU-only tasks (builds, lints, unit tests)
 - `gpu_4_queue`: GPU tests requiring 4+ GPUs
-- `router_rocm_mi300_2`: dedicated two-node MI300X MoRI tests (`spawn=1`)
+- `router_rocm_mi300_2`: dedicated MI300X ROCm P/D tests (MoRI and NIXL; `spawn=1`)
 - `default`: General purpose queue
 
 ## Adding New Tests
