@@ -14,7 +14,7 @@ steps:
   # ============================================================================
   # Fast Checks - Run in parallel for quick feedback
   # ============================================================================
-  - group: ":mag: Fast Checks"
+  - group: ":mag: Fast Checkss"
     key: "fast-checks"
     steps:
       - label: ":rust: Rust Format Check"
