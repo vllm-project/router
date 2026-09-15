@@ -166,6 +166,10 @@ impl ProgramRuntime {
                 && self.request_pool.program_len(&program.reference) == 0
             {
                 program.status = ProgramStatus::Acting;
+                if program.state == ProgramState::Active {
+                    program.state = ProgramState::Paused;
+                    program.placement = None;
+                }
             }
         }
         true
@@ -218,6 +222,33 @@ impl ProgramRuntime {
                 && self.request_pool.program_len(program_ref) == 0
         });
         releasable && self.programs.remove(&key).is_some()
+    }
+
+    /// Invalidate a placement whose backend disappeared from discovery.
+    pub(crate) fn invalidate_placement(
+        &mut self,
+        program_ref: &ProgramRef,
+        removed_targets: &[String],
+    ) -> bool {
+        let key = RuntimeKey::from(program_ref);
+        let Some(program) = self.programs.get_mut(&key) else {
+            return false;
+        };
+        if &program.reference != program_ref
+            || program
+                .placement
+                .as_ref()
+                .is_none_or(|target| !removed_targets.contains(target))
+        {
+            return false;
+        }
+        self.next_placement_epoch = self.next_placement_epoch.saturating_add(1);
+        program.state = ProgramState::Paused;
+        program.placement = None;
+        program.placement_epoch = self.next_placement_epoch;
+        program.placement_start_request_pending = false;
+        program.in_flight_requests = 0;
+        true
     }
 
     /// Current state and demand status for diagnostics and policy snapshots.
@@ -423,5 +454,23 @@ mod tests {
         );
         assert!(runtime.complete_request(&first_dispatch, None.into()));
         assert!(runtime.complete_request(&second_dispatch, None.into()));
+    }
+
+    #[test]
+    fn cancelling_only_waiter_releases_active_reasoning_placement() {
+        let mut runtime = ProgramRuntime::default();
+        let program = identity("p");
+        let first = runtime.retain_request(&program, 100, None, Instant::now());
+        let dispatch = runtime
+            .admit_front(&first, "rank-0".into(), Instant::now())
+            .unwrap();
+        assert!(runtime.complete_request(&dispatch, None.into()));
+        let waiting = runtime.retain_request(&program, 110, None, Instant::now());
+        assert!(runtime.cancel_request(&waiting));
+        assert_eq!(runtime.placement(dispatch.program()), None);
+        assert_eq!(
+            runtime.state(dispatch.program()),
+            Some((ProgramState::Paused, ProgramStatus::Acting))
+        );
     }
 }

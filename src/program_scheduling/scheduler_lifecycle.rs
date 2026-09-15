@@ -13,6 +13,13 @@ use std::time::Instant;
 
 const CACHE_CONTINUITY_HIT_RATIO: f64 = 0.9;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CompletionAction {
+    Terminate,
+    Pause(ProgramPauseReason),
+    StartActingTtl,
+}
+
 impl ProgramScheduler {
     /// Record one backend completion and run the same follow-up decisions as a tick.
     pub fn complete(
@@ -72,10 +79,36 @@ impl ProgramScheduler {
         }
         let runtime_after = state.runtime.view(dispatch.program());
 
+        let completion_action = state
+            .decisions
+            .get_mut(dispatch.program())
+            .and_then(|decision| {
+                decision.terminate_when_idle |= terminate;
+                runtime_after
+                    .as_ref()
+                    .filter(|runtime| {
+                        runtime.in_flight_requests == 0 && runtime.waiting_requests == 0
+                    })
+                    .map(|_| {
+                        if decision.terminate_when_idle {
+                            CompletionAction::Terminate
+                        } else if decision.pause_when_idle || !success {
+                            CompletionAction::Pause(if decision.pause_when_idle {
+                                ProgramPauseReason::CapacityRepair
+                            } else {
+                                ProgramPauseReason::RequestFailed
+                            })
+                        } else {
+                            CompletionAction::StartActingTtl
+                        }
+                    })
+            });
+        if let Some(CompletionAction::Pause(reason)) = completion_action {
+            self.pause_idle(&mut state, dispatch.program(), reason, now);
+        }
+
         let mut request_sample = None;
-        let mut pause_after_completion = None;
         if let Some(decision) = state.decisions.get_mut(dispatch.program()) {
-            decision.terminate_when_idle |= terminate;
             let previous_context = decision.last_context_tokens;
             let context_growth_tokens = previous_context.and_then(|previous| {
                 let growth = observed_prompt_tokens.saturating_sub(previous);
@@ -142,21 +175,9 @@ impl ProgramScheduler {
                     finished_at: now,
                 });
             }
-            if runtime_after.as_ref().is_some_and(|runtime| {
-                runtime.in_flight_requests == 0 && runtime.waiting_requests == 0
-            }) {
-                if decision.terminate_when_idle {
-                    pause_after_completion = Some(None);
-                } else if decision.pause_when_idle || !success {
-                    pause_after_completion = Some(Some(if decision.pause_when_idle {
-                        ProgramPauseReason::CapacityRepair
-                    } else {
-                        ProgramPauseReason::RequestFailed
-                    }));
-                } else {
-                    decision.acting_since = Some(now);
-                    decision.ttl_deadline = Some(now + acting_ttl);
-                }
+            if completion_action == Some(CompletionAction::StartActingTtl) {
+                decision.acting_since = Some(now);
+                decision.ttl_deadline = Some(now + acting_ttl);
             }
         }
         if let Some(sample) = request_sample {
@@ -166,12 +187,8 @@ impl ProgramScheduler {
                 .or_default()
                 .push_request(sample, self.config.progress_ttl.stats_window_size);
         }
-        match pause_after_completion {
-            Some(None) => self.release_program(&mut state, dispatch.program(), now),
-            Some(Some(reason)) => {
-                self.pause_idle(&mut state, dispatch.program(), reason, now);
-            }
-            None => {}
+        if completion_action == Some(CompletionAction::Terminate) {
+            self.release_program(&mut state, dispatch.program(), now);
         }
         if !self.config.binding_only {
             self.yield_completed_segment(&mut state, dispatch.program(), now);

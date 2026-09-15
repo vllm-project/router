@@ -588,7 +588,7 @@ impl ProgramScheduler {
         true
     }
 
-    fn restart_shared_prefix_freshness(
+    pub(crate) fn restart_shared_prefix_freshness(
         decision: &mut super::scheduler_state::ProgramDecisionState,
         pause_at: Instant,
     ) {

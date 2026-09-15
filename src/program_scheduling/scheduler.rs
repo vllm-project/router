@@ -71,6 +71,75 @@ impl ProgramScheduler {
             state.rank_factors.remove(target_id);
             state.observations.remove(target_id);
         }
+        let affected = state
+            .runtime
+            .views()
+            .into_iter()
+            .filter(|program| program.reference.model_pool() == model_pool)
+            .filter_map(|program| {
+                let decision = state.decisions.get(&program.reference)?;
+                let needs_rebinding = decision
+                    .last_target
+                    .as_ref()
+                    .is_none_or(|target| !current_ids.contains(target));
+                needs_rebinding.then(|| {
+                    (
+                        program.reference,
+                        program.expected_resume,
+                        program.waiting_requests,
+                        decision.placement_key.clone(),
+                        decision.placement_hash_key.clone(),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        for (program, expected_resume, waiting_requests, placement_key, placement_hash_key) in
+            affected
+        {
+            let placement_invalidated = state.runtime.invalidate_placement(&program, &removed);
+            state.bindings.release_program(&program);
+            for queue in state.rank_queues.values_mut() {
+                queue.retain(|queued| queued != &program);
+            }
+            for queue in state.global_queues.values_mut() {
+                queue.retain(|queued| queued != &program);
+            }
+            let identity = ProgramIdentity::for_rebinding(
+                &program,
+                placement_hash_key,
+                placement_key,
+                expected_resume,
+            );
+            let candidates = self.binding_candidates(&state, &identity);
+            let replacement = state.bindings.bind(&identity, &candidates);
+            if let Some(decision) = state.decisions.get_mut(&program) {
+                decision.home_target = replacement.clone();
+                decision.last_target = replacement.clone();
+                if placement_invalidated {
+                    let now = Instant::now();
+                    decision.paused_at = Some(now);
+                    decision.pause_when_idle = false;
+                    decision.ttl_deadline = None;
+                    decision.segment_started_at = None;
+                    Self::restart_shared_prefix_freshness(decision, now);
+                }
+            }
+            if waiting_requests > 0 {
+                if self.config.global_queue {
+                    state
+                        .global_queues
+                        .entry(model_pool.to_string())
+                        .or_default()
+                        .push_back(program);
+                } else if let Some(target) = replacement {
+                    state
+                        .rank_queues
+                        .entry(target)
+                        .or_default()
+                        .push_back(program);
+                }
+            }
+        }
         let referenced = state
             .model_targets
             .values()
@@ -253,6 +322,7 @@ impl ProgramScheduler {
             reference,
             ProgramDecisionState::new(
                 identity.placement_key().to_string(),
+                identity.placement_hash_key().to_string(),
                 home_target,
                 estimated_context_tokens,
                 now,
@@ -330,6 +400,7 @@ struct ObservationCheckpoint {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn observation_epoch_preserves_post_checkpoint_delta() {
@@ -363,6 +434,45 @@ mod tests {
         assert_eq!(
             scheduler.target_usage(&state, "rank-0", Instant::now()),
             550.0
+        );
+    }
+
+    #[tokio::test]
+    async fn removed_target_invalidates_placement_and_rebinds_program() {
+        let scheduler = ProgramScheduler::new(ProgramSchedulerConfig::default());
+        let old_target = ProgramTarget {
+            id: "rank-0".into(),
+            base_url: "http://old".into(),
+            dp_rank: Some(0),
+        };
+        let new_target = ProgramTarget {
+            id: "rank-1".into(),
+            base_url: "http://new".into(),
+            dp_rank: Some(1),
+        };
+        let identity = ProgramIdentity::from_request(
+            None,
+            Some(&json!({"vllm_xargs":{"agentic_context":{
+                "program_id":"p","task_id":null,"expected_resume":true
+            }}})),
+            Some("model"),
+        )
+        .unwrap()
+        .unwrap();
+        let dispatch = scheduler
+            .acquire(identity, 100, std::slice::from_ref(&old_target), None)
+            .await
+            .unwrap();
+        scheduler.sync_targets("model", std::slice::from_ref(&new_target));
+        let state = scheduler.state.lock();
+        assert_eq!(state.runtime.placement(dispatch.program()), None);
+        assert_eq!(
+            state.runtime.state(dispatch.program()),
+            Some((ProgramState::Paused, ProgramStatus::Reasoning))
+        );
+        assert_eq!(
+            state.decisions[dispatch.program()].last_target.as_deref(),
+            Some("rank-1")
         );
     }
 }

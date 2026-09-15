@@ -101,6 +101,7 @@ impl ProgramPauseReason {
 #[derive(Debug, Clone)]
 pub(crate) struct ProgramDecisionState {
     pub(crate) placement_key: String,
+    pub(crate) placement_hash_key: String,
     pub(crate) home_target: Option<String>,
     pub(crate) last_target: Option<String>,
     pub(crate) estimated_context_tokens: usize,
@@ -135,12 +136,14 @@ pub(crate) struct ProgramDecisionState {
 impl ProgramDecisionState {
     pub(crate) fn new(
         placement_key: String,
+        placement_hash_key: String,
         home_target: Option<String>,
         estimated_context_tokens: usize,
         now: Instant,
     ) -> Self {
         Self {
             placement_key,
+            placement_hash_key,
             last_target: home_target.clone(),
             home_target,
             estimated_context_tokens,
@@ -256,7 +259,13 @@ mod tests {
     #[test]
     fn context_shrink_requires_two_authoritative_observations() {
         let now = Instant::now();
-        let mut state = ProgramDecisionState::new("task".into(), Some("rank-0".into()), 100, now);
+        let mut state = ProgramDecisionState::new(
+            "task".into(),
+            "hash".into(),
+            Some("rank-0".into()),
+            100,
+            now,
+        );
         state.observe_completed_context(80);
         assert_eq!(state.estimated_context_tokens, 100);
         state.observe_completed_context(80);

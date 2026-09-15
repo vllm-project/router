@@ -31,6 +31,21 @@ pub struct ProgramIdentity {
 }
 
 impl ProgramIdentity {
+    pub(crate) fn for_rebinding(
+        reference: &super::ProgramRef,
+        placement_hash_key: String,
+        placement_key: String,
+        expected_resume: bool,
+    ) -> Self {
+        Self {
+            model_pool: reference.model_pool().to_string(),
+            program_id: reference.program_id().to_string(),
+            placement_hash_key,
+            placement_key,
+            expected_resume,
+        }
+    }
+
     /// Resolve the existing Program identity contract at the Router boundary.
     ///
     /// `headers` contains the framework HTTP headers, `request` is the
