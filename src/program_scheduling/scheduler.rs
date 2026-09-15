@@ -360,11 +360,11 @@ impl ProgramScheduler {
                     .cloned()
                     .into_iter()
                     .filter(|program| {
-                        let home = state
+                        let last_target = state
                             .decisions
                             .get(&program.reference)
-                            .and_then(|decision| decision.home_target.as_deref());
-                        home == Some(target_id.as_str())
+                            .and_then(|decision| decision.last_target.as_deref());
+                        last_target == Some(target_id.as_str())
                             && (program.state == ProgramState::Active
                                 || program.status == ProgramStatus::Reasoning)
                     })

@@ -99,6 +99,13 @@ impl ProgramScheduler {
             .get(candidate.model_pool())
             .into_iter()
             .flatten()
+            .filter(|program| {
+                state.runtime.view(program).is_some_and(|runtime| {
+                    runtime.state == ProgramState::Paused
+                        && runtime.status == ProgramStatus::Reasoning
+                        && runtime.waiting_requests > 0
+                })
+            })
             .cloned()
             .collect::<Vec<_>>();
         queued.sort_by(|left, right| self.local_resume_cmp(state, left, right, now));
@@ -169,7 +176,11 @@ impl ProgramScheduler {
                     runtime.state == ProgramState::Paused
                         && runtime.status == ProgramStatus::Reasoning
                         && runtime.waiting_requests > 0
-                })
+                }) && state
+                    .decisions
+                    .get(program)
+                    .and_then(|decision| decision.last_target.as_deref())
+                    == Some(target_id)
             })
             .cloned()
             .collect::<Vec<_>>();
@@ -232,6 +243,11 @@ impl ProgramScheduler {
                 state.decisions[right]
                     .lifetime_generated_tokens
                     .cmp(&state.decisions[left].lifetime_generated_tokens)
+                    .then_with(|| {
+                        state.decisions[right]
+                            .completed_requests
+                            .cmp(&state.decisions[left].completed_requests)
+                    })
                     .then_with(|| left.program_id().cmp(right.program_id()))
             });
             let mut retained_tasks = BTreeSet::new();
@@ -280,6 +296,14 @@ impl ProgramScheduler {
                             .completed_requests
                             .cmp(&state.decisions[left].completed_requests)
                     })
+                    .then_with(|| {
+                        state.decisions[right]
+                            .private_tokens(self.config.progress_ttl.decode_buffer_tokens)
+                            .total_cmp(
+                                &state.decisions[left]
+                                    .private_tokens(self.config.progress_ttl.decode_buffer_tokens),
+                            )
+                    })
                     .then_with(|| left.program_id().cmp(right.program_id()))
             });
             for program in candidates.into_iter().take(limit - retained) {
@@ -322,27 +346,71 @@ impl ProgramScheduler {
         let Some(target_id) = runtime.placement else {
             return false;
         };
-        let has_waiter = if self.config.global_queue {
-            state
+        let mut queued = if self.config.global_queue {
+            let mut queued = state
                 .global_queues
                 .get(program.model_pool())
                 .into_iter()
                 .flatten()
-                .any(|waiter| {
-                    waiter != program
-                        && state.decisions.get(waiter).is_some_and(|candidate| {
-                            candidate.last_target.as_deref() == Some(target_id.as_str())
-                        })
+                .filter(|waiter| {
+                    state.runtime.view(waiter).is_some_and(|runtime| {
+                        runtime.state == ProgramState::Paused
+                            && runtime.status == ProgramStatus::Reasoning
+                            && runtime.waiting_requests > 0
+                    })
                 })
+                .cloned()
+                .collect::<Vec<_>>();
+            queued.sort_by(|left, right| self.local_resume_cmp(state, left, right, now));
+            queued.retain(|waiter| {
+                state.decisions.get(waiter).is_some_and(|candidate| {
+                    candidate.last_target.as_deref() == Some(target_id.as_str())
+                })
+            });
+            queued
         } else {
-            state
+            let mut queued = state
                 .rank_queues
                 .get(&target_id)
                 .into_iter()
                 .flatten()
-                .any(|waiter| waiter != program)
+                .filter(|waiter| {
+                    state.runtime.view(waiter).is_some_and(|runtime| {
+                        runtime.state == ProgramState::Paused
+                            && runtime.status == ProgramStatus::Reasoning
+                            && runtime.waiting_requests > 0
+                    })
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            queued.sort_by(|left, right| self.local_resume_cmp(state, left, right, now));
+            queued
         };
-        has_waiter && self.pause_idle(state, program, ProgramPauseReason::MaxSegmentYield, now)
+        let Some(waiter) = queued.drain(..).find(|waiter| waiter != program) else {
+            return false;
+        };
+        let waiter_required = state.decisions.get(&waiter).map_or(0.0, |decision| {
+            decision.private_tokens(self.config.progress_ttl.decode_buffer_tokens)
+        });
+        let future_relief = state
+            .runtime
+            .views()
+            .into_iter()
+            .filter(|runtime| {
+                runtime.state == ProgramState::Active
+                    && runtime.status == ProgramStatus::Reasoning
+                    && runtime.placement.as_deref() == Some(target_id.as_str())
+            })
+            .filter_map(|runtime| {
+                state
+                    .decisions
+                    .get(&runtime.reference)
+                    .filter(|decision| decision.pause_when_idle)
+            })
+            .map(|decision| decision.private_tokens(self.config.progress_ttl.decode_buffer_tokens))
+            .sum::<f64>();
+        waiter_required > future_relief
+            && self.pause_idle(state, program, ProgramPauseReason::MaxSegmentYield, now)
     }
 }
 

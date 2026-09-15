@@ -159,9 +159,12 @@ impl ProgramScheduler {
                         .and_then(|observation| observation.waiting_requests)
                         .unwrap_or(0)
                 };
-                let pressure = |plan: &RankAdmissionPlan| {
-                    plan.capacity_tokens.map_or(
-                        plan.used_tokens + plan.required_tokens + plan.reserve_tokens,
+                let pressure = |target_id: &str, plan: &RankAdmissionPlan| {
+                    plan.capacity_tokens.map_or_else(
+                        || {
+                            (self.active_program_count(state, target_id) + 1) as f64
+                                / self.config.max_active_programs_per_target.max(1) as f64
+                        },
                         |capacity| {
                             (plan.used_tokens + plan.required_tokens + plan.reserve_tokens)
                                 / capacity.max(1) as f64
@@ -172,7 +175,7 @@ impl ProgramScheduler {
                     .len()
                     .cmp(&right.victims.len())
                     .then_with(|| waiting(left_id).cmp(&waiting(right_id)))
-                    .then_with(|| pressure(left).total_cmp(&pressure(right)))
+                    .then_with(|| pressure(left_id, left).total_cmp(&pressure(right_id, right)))
                     .then_with(|| {
                         self.active_program_count(state, left_id)
                             .cmp(&self.active_program_count(state, right_id))

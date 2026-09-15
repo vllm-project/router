@@ -43,8 +43,7 @@ impl ProgramRuntime {
                 .last_generations
                 .get(&key)
                 .copied()
-                .unwrap_or(0)
-                .saturating_add(1);
+                .map_or(0, |generation| generation.saturating_add(1));
             self.last_generations.insert(key.clone(), generation);
             let reference = ProgramRef::new(
                 identity.model_pool().to_string(),
@@ -464,7 +463,8 @@ mod tests {
             .unwrap();
         assert!(!runtime.complete_request(&old_dispatch, None.into()));
         assert_eq!(runtime.placement(new_dispatch.program()), Some("rank-1"));
-        assert_eq!(new_dispatch.program().generation(), 2);
+        assert_eq!(old_dispatch.program().generation(), 0);
+        assert_eq!(new_dispatch.program().generation(), 1);
     }
 
     #[test]

@@ -136,7 +136,11 @@ impl ProgramScheduler {
                 .view(&reference)
                 .and_then(|program| program.placement)
             {
-                if current_tokens > previous_tokens {
+                let account_growth = state
+                    .decisions
+                    .get(&reference)
+                    .is_some_and(|decision| !decision.pause_when_idle);
+                if account_growth && current_tokens > previous_tokens {
                     Self::adjust_usage(&mut state, &placement, current_tokens - previous_tokens);
                 }
             } else {
@@ -164,7 +168,7 @@ impl ProgramScheduler {
             if self.config.binding_only {
                 self.activate_binding_only(&mut state, &reference);
             } else {
-                self.schedule_waiting(&mut state, arrived_at);
+                self.run_request_arrival_decisions(&mut state, arrived_at);
             }
             handle
         };
@@ -194,7 +198,7 @@ impl ProgramScheduler {
                 .is_err()
             {
                 let mut state = self.state.lock();
-                self.schedule_waiting(&mut state, Instant::now());
+                self.run_request_arrival_decisions(&mut state, Instant::now());
             }
         }
     }
@@ -426,8 +430,7 @@ impl ProgramScheduler {
         let privileged = decision
             .privilege_deadline
             .is_some_and(|deadline| deadline > now);
-        if !forced
-            && self.config.admission_waiting_request_threshold > 0
+        if self.config.admission_waiting_request_threshold > 0
             && state
                 .observations
                 .get(target_id)
@@ -494,6 +497,10 @@ impl ProgramScheduler {
         if self.config.resume_reclaim_acting_programs
             && used_tokens + required_tokens + reserve_before_reclaim > low
         {
+            let average_prompt = state
+                .rank_factors
+                .get(target_id)
+                .map_or(1.0, |factors| factors.average_prompt_tokens().max(1.0));
             let mut acting = active
                 .iter()
                 .filter(|program| program.status == ProgramStatus::Acting)
@@ -509,9 +516,30 @@ impl ProgramScheduler {
                 })
                 .collect::<Vec<_>>();
             acting.sort_by(|left, right| {
-                state.decisions[&right.reference]
-                    .segment_served_rounds
-                    .cmp(&state.decisions[&left.reference].segment_served_rounds)
+                let score = |program: &&super::runtime::RuntimeProgramView| {
+                    let decision = &state.decisions[&program.reference];
+                    let elapsed = decision.segment_started_at.map_or(0.0, |started| {
+                        now.saturating_duration_since(started).as_secs_f64()
+                    });
+                    elapsed
+                        * (1.0
+                            / (decision.estimated_context_tokens as f64 / average_prompt)
+                                .max(1e-6)
+                                .sqrt())
+                        .max(0.5)
+                };
+                score(right)
+                    .total_cmp(&score(left))
+                    .then_with(|| {
+                        state.decisions[&left.reference]
+                            .segment_served_rounds
+                            .cmp(&state.decisions[&right.reference].segment_served_rounds)
+                    })
+                    .then_with(|| {
+                        state.decisions[&right.reference]
+                            .estimated_context_tokens
+                            .cmp(&state.decisions[&left.reference].estimated_context_tokens)
+                    })
                     .then_with(|| {
                         left.reference
                             .program_id()
@@ -579,7 +607,12 @@ impl ProgramScheduler {
             batch_size_before: running.len(),
             total_context_tokens_before: running
                 .iter()
-                .map(|active| active.estimated_context_tokens)
+                .filter_map(|active| {
+                    state
+                        .decisions
+                        .get(&active.reference)
+                        .map(|decision| decision.estimated_context_tokens)
+                })
                 .sum(),
             candidate_context_tokens: decision.estimated_context_tokens,
             used_tokens,
@@ -790,6 +823,7 @@ impl Drop for AdmissionGuard<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::program_scheduling::scheduler_state::RankObservationState;
     use crate::program_scheduling::ProgramSchedulerConfig;
     use serde_json::json;
     use std::time::Duration;
@@ -926,5 +960,77 @@ mod tests {
         let state = scheduler.state.lock();
         assert!(state.runtime.view(handle.program()).is_none());
         assert!(!state.decisions.contains_key(handle.program()));
+    }
+
+    #[test]
+    fn backend_waiting_gate_also_blocks_forced_resume() {
+        let mut config = ProgramSchedulerConfig::default();
+        config.admission_waiting_request_threshold = 1;
+        let scheduler = ProgramScheduler::new(config);
+        let target = target();
+        scheduler.sync_targets("model", std::slice::from_ref(&target));
+        let now = Instant::now();
+        let identity = identity("forced");
+        let mut state = scheduler.state.lock();
+        let handle = state.runtime.retain_request(&identity, 100, None, now);
+        scheduler.ensure_decision_state(
+            &mut state,
+            &identity,
+            handle.program().clone(),
+            100,
+            now,
+            None,
+        );
+        state
+            .decisions
+            .get_mut(handle.program())
+            .unwrap()
+            .force_resume_deadline = Some(now);
+        state.observations.insert(
+            "rank-0".into(),
+            RankObservationState {
+                waiting_requests: Some(1),
+                observed_at: Some(now),
+                ..RankObservationState::default()
+            },
+        );
+        assert!(scheduler
+            .rank_admission_plan(&state, handle.program(), "rank-0", now)
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn marked_program_continuation_does_not_double_count_growth() {
+        let scheduler = ProgramScheduler::new(ProgramSchedulerConfig::default());
+        let target = target();
+        let first = scheduler
+            .acquire(identity("marked"), 100, std::slice::from_ref(&target), None)
+            .await
+            .unwrap();
+        {
+            let mut state = scheduler.state.lock();
+            state
+                .decisions
+                .get_mut(first.program())
+                .unwrap()
+                .pause_when_idle = true;
+            state
+                .observations
+                .get_mut("rank-0")
+                .unwrap()
+                .active_program_token_delta = 100.0;
+        }
+        let second = scheduler
+            .acquire(identity("marked"), 200, &[target], None)
+            .await
+            .unwrap();
+        let state = scheduler.state.lock();
+        assert_eq!(
+            state.observations["rank-0"].active_program_token_delta,
+            100.0
+        );
+        drop(state);
+        scheduler.complete(&first, true, false, Some(100), Some(0.1));
+        scheduler.complete(&second, true, true, Some(200), Some(0.1));
     }
 }

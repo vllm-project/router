@@ -23,6 +23,19 @@ enum CompletionAction {
 }
 
 impl ProgramScheduler {
+    /// Run the historical request-arrival decision sequence before dispatch.
+    pub(crate) fn run_request_arrival_decisions(
+        &self,
+        state: &mut ProgramSchedulerState,
+        now: Instant,
+    ) {
+        self.reconcile_privileges(state, now);
+        self.release_expired_paused(state, now);
+        self.expire_acting_ttls(state, now);
+        self.repair_capacity(state, now);
+        self.schedule_waiting(state, now);
+    }
+
     /// Record one backend completion and run the same follow-up decisions as a tick.
     pub fn complete(
         &self,
@@ -90,6 +103,19 @@ impl ProgramScheduler {
             return;
         }
         let runtime_after = state.runtime.view(dispatch.program());
+
+        // A retained successor continues the same reasoning placement. Match
+        // the historical Router behavior by cancelling a deferred capacity
+        // pause; capacity repair can select the Program again after the
+        // successor completes if pressure still exists.
+        if runtime_after
+            .as_ref()
+            .is_some_and(|runtime| runtime.in_flight_requests == 0 && runtime.waiting_requests > 0)
+        {
+            if let Some(decision) = state.decisions.get_mut(dispatch.program()) {
+                decision.pause_when_idle = false;
+            }
+        }
 
         let completion_action = state
             .decisions
@@ -238,8 +264,8 @@ impl ProgramScheduler {
         }
         if !self.config.binding_only {
             self.yield_completed_segment(&mut state, dispatch.program(), now);
-            self.run_periodic_decisions(&mut state, now);
         }
+        self.run_periodic_decisions(&mut state, now);
     }
 
     /// Evaluate deadlines, repair capacity, and admit rank-local waiters.
@@ -259,9 +285,11 @@ impl ProgramScheduler {
         );
         self.expire_acting_ttls(state, now);
         self.release_expired_paused(state, now);
-        self.reconcile_privileges(state, now);
-        self.repair_capacity(state, now);
-        self.schedule_waiting(state, now);
+        if !self.config.binding_only {
+            self.reconcile_privileges(state, now);
+            self.repair_capacity(state, now);
+            self.schedule_waiting(state, now);
+        }
     }
 
     fn expire_acting_ttls(&self, state: &mut ProgramSchedulerState, now: Instant) -> bool {
@@ -519,11 +547,21 @@ impl ProgramScheduler {
                     };
                     elapsed * (1.0 / (input as f64 / average_prompt).max(1e-6).sqrt()).max(0.5)
                 };
-                score(right).total_cmp(&score(left)).then_with(|| {
-                    left.reference
-                        .program_id()
-                        .cmp(right.reference.program_id())
-                })
+                score(right)
+                    .total_cmp(&score(left))
+                    .then_with(|| {
+                        state.decisions[&right.reference]
+                            .private_tokens(self.config.progress_ttl.decode_buffer_tokens)
+                            .total_cmp(
+                                &state.decisions[&left.reference]
+                                    .private_tokens(self.config.progress_ttl.decode_buffer_tokens),
+                            )
+                    })
+                    .then_with(|| {
+                        left.reference
+                            .program_id()
+                            .cmp(right.reference.program_id())
+                    })
             });
             for victim in victims {
                 if projected <= low {
