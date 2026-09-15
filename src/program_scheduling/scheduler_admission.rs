@@ -293,11 +293,7 @@ impl ProgramScheduler {
                 other.state == ProgramState::Active && other.placement.as_deref() == Some(target_id)
             })
             .collect::<Vec<_>>();
-        if self.config.progress_ttl.token_capacity.is_none()
-            && !forced
-            && !privileged
-            && active.len() >= self.config.max_active_programs_per_target
-        {
+        if !forced && !privileged && active.len() >= self.config.max_active_programs_per_target {
             return None;
         }
         let used_tokens = self.target_usage(state, target_id, now);

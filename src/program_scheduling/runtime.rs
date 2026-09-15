@@ -142,10 +142,7 @@ impl ProgramRuntime {
         let prompt_tokens = usage
             .prompt_tokens
             .unwrap_or(dispatch.estimated_context_tokens());
-        let completion_tokens = usage.completion_tokens.unwrap_or(0);
-        program.estimated_context_tokens = program
-            .estimated_context_tokens
-            .max(prompt_tokens.saturating_add(completion_tokens));
+        program.estimated_context_tokens = program.estimated_context_tokens.max(prompt_tokens);
         program.in_flight_requests -= 1;
         if program.in_flight_requests == 0 && self.request_pool.program_len(&program.reference) == 0
         {

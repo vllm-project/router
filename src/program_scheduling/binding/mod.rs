@@ -4,6 +4,7 @@
 //! and cross-rank runtime placement remain ProgramScheduler responsibilities.
 
 use super::ProgramIdentity;
+use super::ProgramRef;
 use crate::policies::ConsistentHashPolicy;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Debug;
@@ -108,6 +109,14 @@ impl ProgramBindings {
     /// Release the binding for one Program generation.
     pub fn release(&mut self, identity: &ProgramIdentity) -> Option<String> {
         self.bindings.remove(&ProgramBindingKey::from(identity))
+    }
+
+    /// Release by exact runtime reference after lifecycle termination.
+    pub(crate) fn release_program(&mut self, program: &ProgramRef) -> Option<String> {
+        self.bindings.remove(&ProgramBindingKey {
+            model_pool: program.model_pool().to_string(),
+            program_id: program.program_id().to_string(),
+        })
     }
 
     /// Invalidate bindings whose backend disappeared from discovery.
