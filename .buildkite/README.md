@@ -59,7 +59,7 @@ The test runs in the pipeline at `.buildkite/pipeline.yml:97-132`:
 ```
 
 **Key features:**
-- Requires 4 GPUs (runs on `gpu_4_queue`)
+- Requires 4 GPUs (runs on `l4-k8s`)
 - 30 minute timeout
 - Automatic retry (up to 2 attempts) for flaky failures
 - Manual retry option available
@@ -167,7 +167,7 @@ Builds Docker image for the router.
 ## Agent Queues
 
 - `cpu_queue_premerge`: CPU-only tasks (builds, lints, unit tests)
-- `gpu_4_queue`: GPU tests requiring 4+ GPUs
+- `l4-k8s`: NVIDIA L4 GPU tests on EKS (4-GPU P/D disaggregation)
 - `router_rocm_mi300_2`: dedicated two-node MI300X MoRI tests (`spawn=1`)
 - `default`: General purpose queue
 

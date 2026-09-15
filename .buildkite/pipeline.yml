@@ -195,7 +195,7 @@ steps:
           queue: "cpu_queue_premerge"
 
   # ============================================================================
-  # P/D Disaggregation Integration Test - Run on GPU queue
+  # P/D Disaggregation Integration Test - Run on EKS l4-k8s (4x L4)
   # ============================================================================
   - label: ":satellite: P/D Disaggregation Test (4 GPUs)"
     key: "pd-disagg-test"
@@ -210,94 +210,134 @@ steps:
       manual:
         allowed: true
         reason: "GPU tests can be flaky - retry if needed"
+    # agent-stack-k8s on the l4x4 pool. Docker plugin does not run on this queue.
+    # Resource requests match ci-infra l4_plugin_template (10 CPU / 40Gi / 24Gi shm per GPU).
     plugins:
-      - docker#v5.11.0:
-          image: "nvidia/cuda:13.0.2-devel-ubuntu22.04"
-          workdir: /workdir
-          volumes:
-            - ".:/workdir"
-            - "/root/.cache/huggingface:/root/.cache/huggingface"
-          runtime: nvidia
-          gpus: all
-          shm-size: "16g"
-          environment:
-            - "HF_TOKEN"
-            - "VLLM_USE_V1=1"
-            - "VLLM_LOGGING_LEVEL=INFO"
-            - "UCX_TLS=all"
-            - "UCX_NET_DEVICES=all"
-          propagate-environment: true
-          command:
-            - bash
-            - -c
-            - |
-              set -euo pipefail
+      - kubernetes:
+          metadata:
+            annotations:
+              cluster-autoscaler.kubernetes.io/safe-to-evict: "false"
+              karpenter.sh/do-not-disrupt: "true"
+          podSpec:
+            priorityClassName: ci
+            serviceAccountName: buildkite-gpu-jobs
+            tolerations:
+              - key: nvidia.com/gpu
+                operator: Exists
+                effect: NoSchedule
+            nodeSelector:
+              vllm.ci/gpu-pool: l4x4
+            containers:
+              - image: nvidia/cuda:13.0.2-devel-ubuntu22.04
+                resources:
+                  limits:
+                    nvidia.com/gpu: 4
+                  requests:
+                    nvidia.com/gpu: 4
+                    cpu: "40"
+                    memory: 160Gi
+                volumeMounts:
+                  - name: devshm
+                    mountPath: /dev/shm
+                  - name: hf-cache
+                    mountPath: /fsx/hf_cache
+                env:
+                  - name: HF_HOME
+                    value: /fsx/hf_cache
+                  - name: HF_HUB_ENABLE_HF_TRANSFER
+                    value: "1"
+                  - name: NCCL_CUMEM_HOST_ENABLE
+                    value: "0"
+                  - name: VLLM_USE_V1
+                    value: "1"
+                  - name: VLLM_LOGGING_LEVEL
+                    value: INFO
+                  - name: UCX_TLS
+                    value: all
+                  - name: UCX_NET_DEVICES
+                    value: all
+                  - name: HF_TOKEN
+                    valueFrom:
+                      secretKeyRef:
+                        name: hf-token-secret
+                        key: token
+            volumes:
+              - name: devshm
+                emptyDir:
+                  medium: Memory
+                  sizeLimit: 96Gi
+              - name: hf-cache
+                hostPath:
+                  path: /fsx/hf_cache
+                  type: DirectoryOrCreate
+    command: |
+      set -euo pipefail
 
-              # Verify HF_TOKEN is set (required for gated models like Llama)
-              if [ -z "$${HF_TOKEN:-}" ]; then
-                echo "ERROR: HF_TOKEN is not set. This is required for gated models."
-                echo "Please configure HF_TOKEN as a Buildkite Secret in Organization Settings."
-                exit 1
-              fi
-              echo "HF_TOKEN is configured."
+      # Verify HF_TOKEN is set (required for gated models like Llama)
+      if [ -z "$${HF_TOKEN:-}" ]; then
+        echo "ERROR: HF_TOKEN is not set. This is required for gated models."
+        echo "Please configure the hf-token-secret Kubernetes secret."
+        exit 1
+      fi
+      echo "HF_TOKEN is configured."
 
-              # Install system dependencies
-              apt-get update && apt-get install -y \
-                curl \
-                ffmpeg \
-                python3 \
-                python3-pip \
-                pkg-config \
-                libssl-dev \
-                protobuf-compiler \
-                git
+      # Install system dependencies
+      apt-get update && apt-get install -y \
+        curl \
+        ffmpeg \
+        python3 \
+        python3-pip \
+        pkg-config \
+        libssl-dev \
+        protobuf-compiler \
+        git
 
-              # Install uv for fast Python package management
-              curl -LsSf https://astral.sh/uv/install.sh | sh
-              source /root/.local/bin/env
+      # Install uv for fast Python package management
+      curl -LsSf https://astral.sh/uv/install.sh | sh
+      source /root/.local/bin/env
 
-              # Create Python virtual environment (as recommended by vLLM)
-              uv venv --python 3.12 --seed
-              source .venv/bin/activate
+      # Create Python virtual environment (as recommended by vLLM)
+      uv venv --python 3.12 --seed
+      source .venv/bin/activate
 
-              # Install vLLM with CUDA 13 support
-              uv pip install vllm --torch-backend=cu130
+      # Install vLLM with CUDA 13 support
+      uv pip install vllm --torch-backend=cu130
 
-              # Install NIXL library for P/D disaggregation
-              uv pip install nixl-cu13
-              uv pip install nixl --no-deps
+      # Install NIXL library for P/D disaggregation
+      uv pip install nixl-cu13
+      uv pip install nixl --no-deps
 
-              # Fail fast if CUDA-specific wheels do not match the CI image.
-              python - <<'PY'
-              import nixl
-              import nixl_ep
-              import torch
-              import vllm
+      # Fail fast if CUDA-specific wheels do not match the CI image.
+      python - <<'PY'
+      import nixl
+      import nixl_ep
+      import torch
+      import vllm
 
-              assert torch.version.cuda and torch.version.cuda.startswith("13."), torch.version.cuda
-              assert nixl._api.__name__.startswith("nixl_cu13."), nixl._api.__name__
-              print(f"vLLM {vllm.__version__}, torch CUDA {torch.version.cuda}, {nixl._api.__name__}, {nixl_ep.__name__}")
-              PY
+      assert torch.version.cuda and torch.version.cuda.startswith("13."), torch.version.cuda
+      assert nixl._api.__name__.startswith("nixl_cu13."), nixl._api.__name__
+      print(f"vLLM {vllm.__version__}, torch CUDA {torch.version.cuda}, {nixl._api.__name__}, {nixl_ep.__name__}")
+      PY
 
-              # Install test dependencies
-              uv pip install requests pytest openai
+      # Install test dependencies
+      uv pip install requests pytest openai
 
-              # Install LM Evaluation Harness with API extras for accuracy testing
-              uv pip install 'lm-eval[api]>=0.4.0' hf_transfer
+      # Install LM Evaluation Harness with API extras for accuracy testing
+      uv pip install 'lm-eval[api]>=0.4.0' hf_transfer
 
-              # Install Rust for building the router
-              curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-              source /root/.cargo/env
+      # Install Rust for building the router
+      curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+      source /root/.cargo/env
 
-              # Build the router
-              cargo build --release
-              export PATH="/workdir/target/release:$$PATH"
+      # Build the router
+      cargo build --release
+      export PATH="$$PWD/target/release:$$PATH"
 
-              # Run P/D disaggregation test
-              cd py_test/e2e/pd_disagg_vllm
-              bash ./run_accuracy_test.sh
+      # Run P/D disaggregation test
+      cd py_test/e2e/pd_disagg_vllm
+      bash ./run_accuracy_test.sh
     agents:
-      queue: "gpu_4_queue"
+      queue: "l4-k8s"
     depends_on: "build"
     artifact_paths:
       - "/tmp/router.log"
