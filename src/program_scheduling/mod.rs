@@ -9,6 +9,7 @@ mod domain;
 mod factors;
 mod identity;
 mod observations;
+mod policy;
 mod request_pool;
 mod runtime;
 
@@ -25,6 +26,10 @@ pub use identity::ProgramIdentity;
 pub use observations::{
     BackendObservation, BackendObservationFailure, BackendObservationProvider,
     VllmMetricsObservationProvider,
+};
+pub use policy::{
+    BatchGainEstimate, BatchGainInputs, DecodeThroughputModel, PrefillCostModel, ProgressTtlConfig,
+    ProgressTtlPolicyMath,
 };
 pub use request_pool::ProgramRequestHandle;
 pub use runtime::ProgramRuntime;
