@@ -10,6 +10,7 @@ pub mod middleware;
 pub mod otel_http;
 pub mod otel_trace;
 pub mod policies;
+pub mod program_scheduling;
 pub mod protocols;
 pub mod routers;
 pub mod server;
