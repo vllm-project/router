@@ -74,7 +74,14 @@ impl ProgramScheduler {
                     .get(&reference)
                     .and_then(|decision| decision.last_target.clone())
                     .ok_or(ScheduleError::NoTargets)?;
-                let queue = state.rank_queues.entry(target_id.clone()).or_default();
+                let queue = if self.config.global_queue {
+                    state
+                        .global_queues
+                        .entry(identity.model_pool().to_string())
+                        .or_default()
+                } else {
+                    state.rank_queues.entry(target_id.clone()).or_default()
+                };
                 if !queue.iter().any(|queued| queued == &reference) {
                     queue.push_back(reference.clone());
                 }
@@ -86,7 +93,7 @@ impl ProgramScheduler {
             if self.config.binding_only {
                 self.activate_binding_only(&mut state, &reference);
             } else {
-                self.schedule_rank_local(&mut state, arrived_at);
+                self.schedule_waiting(&mut state, arrived_at);
             }
             handle
         };
@@ -116,7 +123,7 @@ impl ProgramScheduler {
                 .is_err()
             {
                 let mut state = self.state.lock();
-                self.schedule_rank_local(&mut state, Instant::now());
+                self.schedule_waiting(&mut state, Instant::now());
             }
         }
     }
@@ -207,7 +214,7 @@ impl ProgramScheduler {
                 queue.retain(|queued| queued != program);
             }
         }
-        self.schedule_rank_local(&mut state, Instant::now());
+        self.schedule_waiting(&mut state, Instant::now());
     }
 
     pub(crate) fn schedule_rank_local(
@@ -245,6 +252,14 @@ impl ProgramScheduler {
             }
         }
         changed
+    }
+
+    pub(crate) fn schedule_waiting(&self, state: &mut ProgramSchedulerState, now: Instant) -> bool {
+        if self.config.global_queue {
+            self.schedule_global_waiting(state, now)
+        } else {
+            self.schedule_rank_local(state, now)
+        }
     }
 
     pub(crate) fn local_resume_cmp(
@@ -289,6 +304,9 @@ impl ProgramScheduler {
     ) -> Option<RankAdmissionPlan> {
         let runtime = state.runtime.view(program)?;
         let decision = state.decisions.get(program)?;
+        if !self.config.global_queue && decision.last_target.as_deref() != Some(target_id) {
+            return None;
+        }
         if runtime.state != ProgramState::Paused
             || runtime.status != ProgramStatus::Reasoning
             || runtime.waiting_requests == 0

@@ -18,10 +18,87 @@ impl ProgramScheduler {
         candidate: &ProgramRef,
         now: Instant,
     ) {
-        let timeout = self.force_resume_timeout(state, target_id, candidate, now);
+        let timeout = if self.config.global_queue {
+            self.global_force_resume_timeout(state, candidate, now)
+        } else {
+            self.force_resume_timeout(state, target_id, candidate, now)
+        };
         if let Some(decision) = state.decisions.get_mut(candidate) {
             decision.force_resume_deadline = Some(now + timeout);
         }
+    }
+
+    fn global_force_resume_timeout(
+        &self,
+        state: &ProgramSchedulerState,
+        candidate: &ProgramRef,
+        now: Instant,
+    ) -> Duration {
+        let Some(targets) = state.model_targets.get(candidate.model_pool()) else {
+            return self.config.force_resume_timeout;
+        };
+        if targets.is_empty() {
+            return self.config.force_resume_timeout;
+        }
+        let mut target_rounds = std::collections::HashMap::new();
+        let mut aggregate_throughput = 0.0;
+        for target in targets {
+            let Some(factors) = state.rank_factors.get(target) else {
+                return self.config.force_resume_timeout;
+            };
+            let rounds = self.policy.target_rounds(factors);
+            let throughput = factors.request_throughput_per_second();
+            if rounds <= 0.0 || throughput <= 0.0 {
+                return self.config.force_resume_timeout;
+            }
+            target_rounds.insert(target.as_str(), rounds);
+            aggregate_throughput += throughput;
+        }
+        if aggregate_throughput <= 0.0 {
+            return self.config.force_resume_timeout;
+        }
+        let active_remaining = state
+            .runtime
+            .views()
+            .into_iter()
+            .filter(|program| program.state == ProgramState::Active)
+            .filter_map(|program| {
+                let rounds = target_rounds.get(program.placement.as_deref()?)?;
+                let decision = state.decisions.get(&program.reference)?;
+                let floor = usize::from(program.status == ProgramStatus::Reasoning) as f64;
+                Some((*rounds - decision.rounds_since_activation as f64).max(floor))
+            })
+            .sum::<f64>();
+        let fallback_rounds =
+            target_rounds.values().sum::<f64>() / target_rounds.len().max(1) as f64;
+        let mut queued = state
+            .global_queues
+            .get(candidate.model_pool())
+            .into_iter()
+            .flatten()
+            .cloned()
+            .collect::<Vec<_>>();
+        queued.sort_by(|left, right| self.local_resume_cmp(state, left, right, now));
+        let pool_remaining = queued
+            .into_iter()
+            .take_while(|program| program != candidate)
+            .filter_map(|program| state.decisions.get(&program))
+            .map(|decision| {
+                decision
+                    .last_target
+                    .as_deref()
+                    .and_then(|target| target_rounds.get(target))
+                    .copied()
+                    .unwrap_or(fallback_rounds)
+                    .max(1.0)
+            })
+            .sum::<f64>();
+        let maximum = self.config.force_resume_timeout.as_secs_f64();
+        let minimum = 30.0_f64.min(maximum);
+        Duration::from_secs_f64(
+            (3.0 * (active_remaining + pool_remaining) / aggregate_throughput)
+                .clamp(minimum, maximum),
+        )
     }
 
     fn force_resume_timeout(

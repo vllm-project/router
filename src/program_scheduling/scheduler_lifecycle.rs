@@ -191,7 +191,7 @@ impl ProgramScheduler {
         self.release_expired_paused(state, now);
         self.reconcile_privileges(state, now);
         self.repair_capacity(state, now);
-        self.schedule_rank_local(state, now);
+        self.schedule_waiting(state, now);
     }
 
     fn expire_acting_ttls(&self, state: &mut ProgramSchedulerState, now: Instant) -> bool {
