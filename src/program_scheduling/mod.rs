@@ -5,10 +5,19 @@
 
 mod binding;
 mod contracts;
+mod domain;
 mod identity;
+mod request_pool;
+mod runtime;
 
 pub use binding::{
     ProgramBindingCandidate, ProgramBindingPolicy, ProgramBindingStrategy, ProgramBindings,
 };
 pub use contracts::ScheduleError;
+pub use domain::{
+    ProgramDispatch, ProgramRef, ProgramState, ProgramStatus, ProgramTarget,
+    ProgramUsageObservation,
+};
 pub use identity::ProgramIdentity;
+pub use request_pool::ProgramRequestHandle;
+pub use runtime::ProgramRuntime;
