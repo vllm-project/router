@@ -1,3 +1,6 @@
 # Must include:
 include Cargo.toml        # Rust project configuration
+include Cargo.lock        # Locked Rust dependency graph for reproducible builds
 recursive-include src *.rs  # Rust source files
+# Required by wasmtime::component::bindgen!({ path: "wit", ... }) in src/wasm_middleware.rs
+recursive-include wit *

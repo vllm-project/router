@@ -11,9 +11,10 @@ RUN apt-get update && apt-get install -y \
 # Set working directory
 WORKDIR /app
 
-# Copy Rust source files
+# Copy Rust source files (wit/ is required by wasmtime bindgen in wasm_middleware)
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
+COPY wit ./wit
 
 # Build the Rust binary
 RUN cargo build --release

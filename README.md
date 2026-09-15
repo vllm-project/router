@@ -80,6 +80,29 @@ vllm-router \
     --intra-node-data-parallel-size 8
 ```
 
+#### Optional WASM OnRequest middleware
+
+Load an independently built WASM Component plugin (see `examples/wasm_middleware/` and [RFC #236](https://github.com/vllm-project/router/issues/236)). By default it attaches only to `POST /v1/chat/completions` and fails closed on plugin errors:
+
+```bash
+./examples/wasm_middleware/build.sh
+
+./target/release/vllm-router \
+    --worker-urls http://localhost:8000 \
+    --wasm-middleware ./examples/wasm_middleware/wasm_middleware_example.component.wasm \
+    --wasm-middleware-route /v1/chat/completions
+```
+
+Additional paths can be attached with repeated `--wasm-middleware-route` flags (must be one of the protected inference routes). Without `--wasm-middleware`, the Router does not initialize Wasmtime.
+
+v0.1 resource / fail-closed defaults on attached routes (not configurable via CLI yet):
+
+- **Input body cap**: `min(10 MiB, --max-payload-size)`. Requests larger than this get **413** before the plugin runs, even if the plugin would only `Continue`. This is intentionally tighter than the Router's default 512 MiB payload limit.
+- **Execution deadline**: **100 ms** per invocation (Wasmtime epoch interruption). Deadline / trap failures fail closed with **500**.
+- **Queue full**: when the bounded worker queue is saturated, matching requests get **503**.
+
+Prometheus metrics for the WASM runtime are deferred to a later revision.
+
 #### Prefill-Decode Disaggregation
 ```bash
 # When vLLM runs the NIXL connector, prefill/decode URLs are required.

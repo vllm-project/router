@@ -196,6 +196,13 @@ def create_app(args: argparse.Namespace) -> FastAPI:
             ],
             "worker_id": worker_id,
             "echo": data,
+            # Helpful for middleware e2e assertions (e.g. WASM header injection).
+            "request_headers": {
+                k: v
+                for k, v in request.headers.items()
+                if k.lower().startswith("x-wasm")
+                or k.lower() in {"content-type", "authorization"}
+            },
         }
         return make_json_response(ret, status_code=200)
 
