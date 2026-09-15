@@ -225,6 +225,58 @@ impl ProgramRuntime {
     pub fn request_pool_is_empty(&self) -> bool {
         self.request_pool.is_empty()
     }
+
+    /// Immutable lifecycle view used by scheduling decisions under one lock.
+    pub(crate) fn view(&self, program_ref: &ProgramRef) -> Option<RuntimeProgramView> {
+        self.programs
+            .get(&RuntimeKey::from(program_ref))
+            .filter(|program| &program.reference == program_ref)
+            .map(|program| RuntimeProgramView {
+                reference: program.reference.clone(),
+                state: program.state,
+                status: program.status,
+                expected_resume: program.expected_resume,
+                placement: program.placement.clone(),
+                estimated_context_tokens: program.estimated_context_tokens,
+                in_flight_requests: program.in_flight_requests,
+                waiting_requests: self.request_pool.program_len(&program.reference),
+            })
+    }
+
+    /// Snapshot all live Program lifecycle facts without imposing order.
+    pub(crate) fn views(&self) -> Vec<RuntimeProgramView> {
+        self.programs
+            .values()
+            .map(|program| RuntimeProgramView {
+                reference: program.reference.clone(),
+                state: program.state,
+                status: program.status,
+                expected_resume: program.expected_resume,
+                placement: program.placement.clone(),
+                estimated_context_tokens: program.estimated_context_tokens,
+                in_flight_requests: program.in_flight_requests,
+                waiting_requests: self.request_pool.program_len(&program.reference),
+            })
+            .collect()
+    }
+
+    /// Wake the front retained request after an accepted transition.
+    pub(crate) fn notify_front(&self, program_ref: &ProgramRef) {
+        self.request_pool.notify_front(program_ref);
+    }
+}
+
+/// Immutable lifecycle facts consumed by Program scheduling policy modules.
+#[derive(Debug, Clone)]
+pub(crate) struct RuntimeProgramView {
+    pub(crate) reference: ProgramRef,
+    pub(crate) state: ProgramState,
+    pub(crate) status: ProgramStatus,
+    pub(crate) expected_resume: bool,
+    pub(crate) placement: Option<String>,
+    pub(crate) estimated_context_tokens: usize,
+    pub(crate) in_flight_requests: usize,
+    pub(crate) waiting_requests: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

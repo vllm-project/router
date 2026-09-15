@@ -12,6 +12,8 @@ mod observations;
 mod policy;
 mod request_pool;
 mod runtime;
+mod scheduler;
+mod scheduler_state;
 
 pub use binding::{
     ProgramBindingCandidate, ProgramBindingPolicy, ProgramBindingStrategy, ProgramBindings,
@@ -33,3 +35,5 @@ pub use policy::{
 };
 pub use request_pool::ProgramRequestHandle;
 pub use runtime::ProgramRuntime;
+pub use scheduler::{BackendObservationEpoch, ProgramScheduler};
+pub use scheduler_state::ProgramSchedulerConfig;
