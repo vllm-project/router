@@ -680,21 +680,21 @@ impl Router {
         let start = Instant::now();
         let is_stream = typed_req.is_stream();
         let text = typed_req.extract_text_for_routing();
-        let program_completion = match self
-            .acquire_program_completion(headers, typed_req, model_id, route, &text)
-            .await
-        {
-            Ok(completion) => completion,
-            Err(error) => return Self::schedule_error_response(error),
-        };
-        let forced_worker_url = program_completion
-            .as_ref()
-            .map(|completion| completion.dispatch().target_id.clone());
 
         let response = RetryExecutor::execute_response_with_retry(
             &self.retry_config,
             // operation per attempt
             |_: u32| async {
+                let program_completion = match self
+                    .acquire_program_completion(headers, typed_req, model_id, route, &text)
+                    .await
+                {
+                    Ok(completion) => completion,
+                    Err(error) => return Self::schedule_error_response(error),
+                };
+                let forced_worker_url = program_completion
+                    .as_ref()
+                    .map(|completion| completion.dispatch().target_id.as_str());
                 let selected_worker = if let Some(target) = forced_worker_url.as_deref() {
                     self.worker_registry
                         .get_by_url(target)
@@ -779,12 +779,6 @@ impl Router {
             || RouterMetrics::record_retries_exhausted(route),
         )
         .await;
-
-        if let Some(completion) = &program_completion {
-            if !is_stream || !response.status().is_success() {
-                completion.finish(response.status().is_success());
-            }
-        }
 
         if response.status().is_success() {
             let duration = start.elapsed();
@@ -1068,6 +1062,10 @@ impl Router {
                     worker.decrement_load();
                     RouterMetrics::set_running_requests(worker_url, worker.load());
                 }
+            }
+
+            if let Some(completion) = &program_completion {
+                completion.finish(response.status().is_success());
             }
 
             response
