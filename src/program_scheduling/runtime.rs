@@ -58,6 +58,7 @@ impl ProgramRuntime {
                     expected_resume: identity.expected_resume(),
                     placement: None,
                     placement_epoch: 0,
+                    placement_start_request_pending: false,
                     estimated_context_tokens,
                     in_flight_requests: 0,
                 },
@@ -102,9 +103,10 @@ impl ProgramRuntime {
                 if program.placement.as_deref() != Some(target_id.as_str()) {
                     return None;
                 }
-                false
+                program.placement_start_request_pending
             }
         };
+        program.placement_start_request_pending = false;
         let request = self.request_pool.take_front(handle)?;
         program.status = ProgramStatus::Reasoning;
         program.in_flight_requests = program.in_flight_requests.saturating_add(1);
@@ -186,6 +188,27 @@ impl ProgramRuntime {
         }
         program.state = ProgramState::Paused;
         program.placement = None;
+        true
+    }
+
+    /// Activate one paused Program without consuming its retained request.
+    pub(crate) fn activate(&mut self, program_ref: &ProgramRef, target_id: String) -> bool {
+        let key = RuntimeKey::from(program_ref);
+        let Some(program) = self.programs.get_mut(&key) else {
+            return false;
+        };
+        if &program.reference != program_ref
+            || program.state != ProgramState::Paused
+            || self.request_pool.program_len(program_ref) == 0
+        {
+            return false;
+        }
+        self.next_placement_epoch = self.next_placement_epoch.saturating_add(1);
+        program.state = ProgramState::Active;
+        program.status = ProgramStatus::Reasoning;
+        program.placement = Some(target_id);
+        program.placement_epoch = self.next_placement_epoch;
+        program.placement_start_request_pending = true;
         true
     }
 
@@ -311,6 +334,7 @@ struct RuntimeProgram {
     expected_resume: bool,
     placement: Option<String>,
     placement_epoch: u64,
+    placement_start_request_pending: bool,
     estimated_context_tokens: usize,
     in_flight_requests: usize,
 }

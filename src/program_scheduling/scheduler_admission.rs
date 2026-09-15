@@ -1,0 +1,590 @@
+//! Request retention and rank-local Program admission.
+//!
+//! This module preserves the existing local-resume ordering and capacity
+//! checks. Global Queue placement is intentionally implemented separately.
+
+use super::scheduler::ProgramScheduler;
+use super::scheduler_state::{ProgramPauseReason, ProgramSchedulerState};
+use super::{
+    BatchGainInputs, ProgramDispatch, ProgramIdentity, ProgramRef, ProgramRequestHandle,
+    ProgramSchedulerConfig, ProgramState, ProgramStatus, ProgramTarget, ScheduleError,
+};
+use std::cmp::Ordering;
+use std::time::{Duration, Instant};
+
+#[derive(Debug, Clone)]
+pub(crate) struct RankAdmissionPlan {
+    pub(crate) used_tokens: f64,
+    pub(crate) required_tokens: f64,
+    pub(crate) reserve_tokens: f64,
+    pub(crate) capacity_tokens: Option<usize>,
+    pub(crate) forced: bool,
+    pub(crate) privileged: bool,
+    pub(crate) batch_gain: bool,
+}
+
+impl ProgramScheduler {
+    /// Retain one Program request until rank-local admission permits dispatch.
+    pub async fn acquire(
+        &self,
+        identity: ProgramIdentity,
+        estimated_context_tokens: usize,
+        targets: &[ProgramTarget],
+        routing_text: Option<String>,
+    ) -> Result<ProgramDispatch, ScheduleError> {
+        self.sync_targets(identity.model_pool(), targets);
+        if targets.is_empty() {
+            return Err(ScheduleError::NoTargets);
+        }
+        let arrived_at = Instant::now();
+        let handle = {
+            let mut state = self.state.lock();
+            let handle = state.runtime.retain_request(
+                &identity,
+                estimated_context_tokens,
+                routing_text,
+                arrived_at,
+            );
+            let reference = handle.program().clone();
+            let previous_tokens = state.decisions.get(&reference).map_or(0.0, |decision| {
+                decision.private_tokens(self.config.progress_ttl.decode_buffer_tokens)
+            });
+            self.ensure_decision_state(
+                &mut state,
+                &identity,
+                reference.clone(),
+                estimated_context_tokens,
+                arrived_at,
+            );
+            let current_tokens = state.decisions[&reference]
+                .private_tokens(self.config.progress_ttl.decode_buffer_tokens);
+            if let Some(placement) = state
+                .runtime
+                .view(&reference)
+                .and_then(|program| program.placement)
+            {
+                if current_tokens > previous_tokens {
+                    Self::adjust_usage(&mut state, &placement, current_tokens - previous_tokens);
+                }
+            } else {
+                let target_id = state
+                    .decisions
+                    .get(&reference)
+                    .and_then(|decision| decision.last_target.clone())
+                    .ok_or(ScheduleError::NoTargets)?;
+                let queue = state.rank_queues.entry(target_id).or_default();
+                if !queue.iter().any(|queued| queued == &reference) {
+                    queue.push_back(reference.clone());
+                }
+                if let Some(decision) = state.decisions.get_mut(&reference) {
+                    decision.queued_at.get_or_insert(arrived_at);
+                    decision
+                        .force_resume_deadline
+                        .get_or_insert(arrived_at + self.config.force_resume_timeout);
+                }
+            }
+            if self.config.binding_only {
+                self.activate_binding_only(&mut state, &reference);
+            } else {
+                self.schedule_rank_local(&mut state, arrived_at);
+            }
+            handle
+        };
+        let mut guard = AdmissionGuard::new(self, handle);
+        let deadline = arrived_at + self.config.queue_timeout;
+        loop {
+            let wait_handle = guard.handle().clone();
+            let notified = wait_handle.notified();
+            if let Some(dispatch) = self.claim_dispatch(guard.handle()) {
+                guard.disarm();
+                return Ok(dispatch);
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(ScheduleError::QueueTimeout);
+            }
+            let force_deadline = {
+                let state = self.state.lock();
+                state
+                    .decisions
+                    .get(guard.handle().program())
+                    .and_then(|decision| decision.force_resume_deadline)
+            };
+            let wake_at = force_deadline.map_or(deadline, |force| force.min(deadline));
+            if tokio::time::timeout(wake_at.saturating_duration_since(now), notified)
+                .await
+                .is_err()
+            {
+                let mut state = self.state.lock();
+                self.schedule_rank_local(&mut state, Instant::now());
+            }
+        }
+    }
+
+    fn activate_binding_only(&self, state: &mut ProgramSchedulerState, program: &ProgramRef) {
+        if state
+            .runtime
+            .view(program)
+            .is_some_and(|view| view.state == ProgramState::Active)
+        {
+            state.runtime.notify_front(program);
+            return;
+        }
+        let Some(target_id) = state
+            .decisions
+            .get(program)
+            .and_then(|decision| decision.last_target.clone())
+        else {
+            return;
+        };
+        self.commit_admission(
+            state,
+            program,
+            &target_id,
+            false,
+            false,
+            false,
+            Instant::now(),
+        );
+    }
+
+    fn claim_dispatch(&self, handle: &ProgramRequestHandle) -> Option<ProgramDispatch> {
+        let mut state = self.state.lock();
+        let target = state.runtime.placement(handle.program())?.to_string();
+        state.runtime.admit_front(handle, target, Instant::now())
+    }
+
+    pub(crate) fn cancel_retained_request(&self, handle: &ProgramRequestHandle) {
+        let mut state = self.state.lock();
+        if !state.runtime.cancel_request(handle) {
+            return;
+        }
+        let program = handle.program();
+        let keep_queued = state
+            .runtime
+            .view(program)
+            .is_some_and(|view| view.waiting_requests > 0);
+        if !keep_queued {
+            for queue in state.rank_queues.values_mut() {
+                queue.retain(|queued| queued != program);
+            }
+            for queue in state.global_queues.values_mut() {
+                queue.retain(|queued| queued != program);
+            }
+        }
+        self.schedule_rank_local(&mut state, Instant::now());
+    }
+
+    pub(crate) fn schedule_rank_local(
+        &self,
+        state: &mut ProgramSchedulerState,
+        now: Instant,
+    ) -> bool {
+        let target_ids = state.rank_queues.keys().cloned().collect::<Vec<_>>();
+        let mut changed = false;
+        for target_id in target_ids {
+            loop {
+                let mut queued = state
+                    .rank_queues
+                    .get(&target_id)
+                    .into_iter()
+                    .flatten()
+                    .filter(|program| {
+                        state.runtime.view(program).is_some_and(|view| {
+                            view.state == ProgramState::Paused
+                                && view.status == ProgramStatus::Reasoning
+                                && view.waiting_requests > 0
+                        })
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                queued.sort_by(|left, right| self.local_resume_cmp(state, left, right, now));
+                let Some((candidate, plan)) = queued.into_iter().find_map(|candidate| {
+                    self.rank_admission_plan(state, &candidate, &target_id, now)
+                        .map(|plan| (candidate, plan))
+                }) else {
+                    break;
+                };
+                self.commit_admission(
+                    state,
+                    &candidate,
+                    &target_id,
+                    plan.forced,
+                    plan.privileged,
+                    plan.batch_gain,
+                    now,
+                );
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    fn local_resume_cmp(
+        &self,
+        state: &ProgramSchedulerState,
+        left: &ProgramRef,
+        right: &ProgramRef,
+        now: Instant,
+    ) -> Ordering {
+        let left_state = &state.decisions[left];
+        let right_state = &state.decisions[right];
+        let left_forced = left_state
+            .force_resume_deadline
+            .is_some_and(|deadline| deadline <= now);
+        let right_forced = right_state
+            .force_resume_deadline
+            .is_some_and(|deadline| deadline <= now);
+        let left_privileged = left_state
+            .privilege_deadline
+            .is_some_and(|deadline| deadline > now);
+        let right_privileged = right_state
+            .privilege_deadline
+            .is_some_and(|deadline| deadline > now);
+        right_forced
+            .cmp(&left_forced)
+            .then_with(|| right_privileged.cmp(&left_privileged))
+            .then_with(|| {
+                right_state
+                    .last_request_finished_at
+                    .cmp(&left_state.last_request_finished_at)
+            })
+            .then_with(|| left_state.queued_at.cmp(&right_state.queued_at))
+            .then_with(|| left.program_id().cmp(right.program_id()))
+    }
+
+    pub(crate) fn rank_admission_plan(
+        &self,
+        state: &ProgramSchedulerState,
+        program: &ProgramRef,
+        target_id: &str,
+        now: Instant,
+    ) -> Option<RankAdmissionPlan> {
+        let runtime = state.runtime.view(program)?;
+        let decision = state.decisions.get(program)?;
+        if runtime.state != ProgramState::Paused
+            || runtime.status != ProgramStatus::Reasoning
+            || runtime.waiting_requests == 0
+        {
+            return None;
+        }
+        let forced = decision
+            .force_resume_deadline
+            .is_some_and(|deadline| deadline <= now);
+        let privileged = decision
+            .privilege_deadline
+            .is_some_and(|deadline| deadline > now);
+        if !forced
+            && self.config.admission_waiting_request_threshold > 0
+            && state
+                .observations
+                .get(target_id)
+                .filter(|observation| self.observation_is_fresh(observation, now))
+                .and_then(|observation| observation.waiting_requests)
+                .is_some_and(|waiting| waiting >= self.config.admission_waiting_request_threshold)
+        {
+            return None;
+        }
+        let active = state
+            .runtime
+            .views()
+            .into_iter()
+            .filter(|other| {
+                other.state == ProgramState::Active && other.placement.as_deref() == Some(target_id)
+            })
+            .collect::<Vec<_>>();
+        if self.config.progress_ttl.token_capacity.is_none()
+            && !forced
+            && !privileged
+            && active.len() >= self.config.max_active_programs_per_target
+        {
+            return None;
+        }
+        let used_tokens = self.target_usage(state, target_id, now);
+        let required_tokens =
+            decision.private_tokens(self.config.progress_ttl.decode_buffer_tokens);
+        let capacity = self.config.progress_ttl.token_capacity;
+        let Some(capacity_tokens) = capacity else {
+            return Some(RankAdmissionPlan {
+                used_tokens,
+                required_tokens,
+                reserve_tokens: 0.0,
+                capacity_tokens: None,
+                forced,
+                privileged,
+                batch_gain: false,
+            });
+        };
+        let low = capacity_tokens as f64 * self.config.progress_ttl.low_watermark_ratio;
+        let immediate_fits = used_tokens + required_tokens <= low;
+        let factors = state.rank_factors.get(target_id)?;
+        let target_rounds = self.policy.target_rounds(factors);
+        let active_remaining = active.iter().filter_map(|active| {
+            state.decisions.get(&active.reference).map(|active_state| {
+                (target_rounds - active_state.rounds_since_activation as f64).max(0.0)
+            })
+        });
+        let reserve_tokens = self
+            .policy
+            .continuous_growth_reserve_tokens(factors, active_remaining);
+        let reserve_fits = used_tokens + required_tokens + reserve_tokens <= low;
+        if forced || privileged || (immediate_fits && reserve_fits) {
+            return Some(RankAdmissionPlan {
+                used_tokens,
+                required_tokens,
+                reserve_tokens,
+                capacity_tokens: capacity,
+                forced,
+                privileged,
+                batch_gain: false,
+            });
+        }
+        if !immediate_fits {
+            return None;
+        }
+        let running = active
+            .iter()
+            .filter(|active| active.status == ProgramStatus::Reasoning)
+            .collect::<Vec<_>>();
+        let protected = active
+            .iter()
+            .filter_map(|active| {
+                let state = state.decisions.get(&active.reference)?;
+                let remaining = (target_rounds - state.rounds_since_activation as f64).max(0.0);
+                (remaining > 0.0).then_some((remaining, state.last_cache_miss_impact_seconds))
+            })
+            .collect::<Vec<_>>();
+        let protected_rounds = protected
+            .iter()
+            .map(|(rounds, _)| *rounds)
+            .collect::<Vec<_>>();
+        let protected_costs = protected.iter().map(|(_, cost)| *cost).collect::<Vec<_>>();
+        let estimate = self.policy.estimate_batch_gain(BatchGainInputs {
+            factors,
+            batch_size_before: running.len(),
+            total_context_tokens_before: running
+                .iter()
+                .map(|active| active.estimated_context_tokens)
+                .sum(),
+            candidate_context_tokens: decision.estimated_context_tokens,
+            used_tokens,
+            required_tokens,
+            protected_remaining_rounds: &protected_rounds,
+            protected_recovery_cost_seconds: &protected_costs,
+            candidate_recovery_cost_seconds: self.policy.cache_miss_impact_seconds(
+                decision
+                    .estimated_context_tokens
+                    .saturating_sub(decision.shared_prefix_tokens),
+            ),
+        });
+        estimate.admits.then_some(RankAdmissionPlan {
+            used_tokens,
+            required_tokens,
+            reserve_tokens,
+            capacity_tokens: capacity,
+            forced,
+            privileged,
+            batch_gain: true,
+        })
+    }
+
+    pub(crate) fn commit_admission(
+        &self,
+        state: &mut ProgramSchedulerState,
+        program: &ProgramRef,
+        target_id: &str,
+        _forced: bool,
+        _privileged: bool,
+        _batch_gain: bool,
+        now: Instant,
+    ) -> bool {
+        let Some(tokens) = state
+            .decisions
+            .get(program)
+            .map(|decision| decision.private_tokens(self.config.progress_ttl.decode_buffer_tokens))
+        else {
+            return false;
+        };
+        if !state.runtime.activate(program, target_id.to_string()) {
+            return false;
+        }
+        if let Some(decision) = state.decisions.get_mut(program) {
+            decision.last_target = Some(target_id.to_string());
+            decision.rounds_since_activation = 0;
+            decision.acting_since = None;
+            decision.ttl_deadline = None;
+            decision.segment_started_at = Some(now);
+            decision.paused_at = None;
+            decision.last_pause_reason = None;
+            decision.pause_when_idle = false;
+            decision.queued_at = None;
+            decision.force_resume_deadline = None;
+        }
+        Self::adjust_usage(state, target_id, tokens);
+        for queue in state.rank_queues.values_mut() {
+            queue.retain(|queued| queued != program);
+        }
+        for queue in state.global_queues.values_mut() {
+            queue.retain(|queued| queued != program);
+        }
+        state.runtime.notify_front(program);
+        true
+    }
+
+    pub(crate) fn pause_idle(
+        &self,
+        state: &mut ProgramSchedulerState,
+        program: &ProgramRef,
+        reason: ProgramPauseReason,
+        now: Instant,
+    ) -> bool {
+        let Some(target_id) = state.runtime.placement(program).map(str::to_string) else {
+            return false;
+        };
+        let Some(tokens) = state
+            .decisions
+            .get(program)
+            .map(|decision| decision.private_tokens(self.config.progress_ttl.decode_buffer_tokens))
+        else {
+            return false;
+        };
+        if !state.runtime.pause_idle(program) {
+            return false;
+        }
+        if let Some(decision) = state.decisions.get_mut(program) {
+            decision.paused_at = Some(now);
+            decision.last_pause_reason = Some(reason);
+            decision.rounds_since_activation = 0;
+            decision.acting_since = None;
+            decision.ttl_deadline = None;
+            decision.segment_started_at = None;
+            decision.pause_when_idle = false;
+            Self::restart_shared_prefix_freshness(decision, now);
+        }
+        Self::adjust_usage(state, &target_id, -tokens);
+        true
+    }
+
+    fn restart_shared_prefix_freshness(
+        decision: &mut super::scheduler_state::ProgramDecisionState,
+        pause_at: Instant,
+    ) {
+        let duration = decision.shared_prefix_fresh_until.map(|deadline| {
+            deadline.saturating_duration_since(decision.shared_prefix_freshness_anchor_at)
+        });
+        decision.shared_prefix_freshness_anchor_at = pause_at;
+        if let Some(duration) = duration {
+            decision.shared_prefix_fresh_until = Some(pause_at + duration);
+        }
+    }
+}
+
+struct AdmissionGuard<'a> {
+    scheduler: &'a ProgramScheduler,
+    handle: Option<ProgramRequestHandle>,
+}
+
+impl<'a> AdmissionGuard<'a> {
+    fn new(scheduler: &'a ProgramScheduler, handle: ProgramRequestHandle) -> Self {
+        Self {
+            scheduler,
+            handle: Some(handle),
+        }
+    }
+
+    fn handle(&self) -> &ProgramRequestHandle {
+        self.handle
+            .as_ref()
+            .expect("admission guard must remain armed while waiting")
+    }
+
+    fn disarm(&mut self) {
+        self.handle = None;
+    }
+}
+
+impl Drop for AdmissionGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(handle) = &self.handle {
+            self.scheduler.cancel_retained_request(handle);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn identity(program: &str) -> ProgramIdentity {
+        ProgramIdentity::from_request(
+            None,
+            Some(&json!({"vllm_xargs":{"agentic_context":{
+                "program_id":program,"task_id":null,"expected_resume":true
+            }}})),
+            Some("model"),
+        )
+        .unwrap()
+        .unwrap()
+    }
+
+    fn target() -> ProgramTarget {
+        ProgramTarget {
+            id: "rank-0".into(),
+            base_url: "http://rank-0".into(),
+            dp_rank: Some(0),
+        }
+    }
+
+    #[tokio::test]
+    async fn first_program_is_admitted_and_dispatched() {
+        let scheduler = ProgramScheduler::new(ProgramSchedulerConfig::default());
+        let dispatch = scheduler
+            .acquire(identity("p"), 100, &[target()], None)
+            .await
+            .unwrap();
+        assert_eq!(dispatch.target_id, "rank-0");
+        assert!(dispatch.placement_start_request());
+    }
+
+    #[test]
+    fn local_order_prefers_forced_then_privileged_then_mru() {
+        let scheduler = ProgramScheduler::new(ProgramSchedulerConfig::default());
+        let target = target();
+        scheduler.sync_targets("model", std::slice::from_ref(&target));
+        let now = Instant::now();
+        let mut state = scheduler.state.lock();
+        let mut refs = Vec::new();
+        for name in ["old", "new", "forced"] {
+            let identity = identity(name);
+            let handle = state.runtime.retain_request(&identity, 100, None, now);
+            let reference = handle.program().clone();
+            scheduler.ensure_decision_state(&mut state, &identity, reference.clone(), 100, now);
+            state
+                .rank_queues
+                .entry("rank-0".into())
+                .or_default()
+                .push_back(reference.clone());
+            refs.push(reference);
+        }
+        state
+            .decisions
+            .get_mut(&refs[0])
+            .unwrap()
+            .last_request_finished_at = Some(now - Duration::from_secs(10));
+        state
+            .decisions
+            .get_mut(&refs[1])
+            .unwrap()
+            .last_request_finished_at = Some(now - Duration::from_secs(1));
+        state
+            .decisions
+            .get_mut(&refs[2])
+            .unwrap()
+            .force_resume_deadline = Some(now);
+        let mut ordered = refs.clone();
+        ordered.sort_by(|left, right| scheduler.local_resume_cmp(&state, left, right, now));
+        assert_eq!(ordered[0], refs[2]);
+        assert_eq!(ordered[1], refs[1]);
+    }
+}

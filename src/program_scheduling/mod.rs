@@ -13,6 +13,7 @@ mod policy;
 mod request_pool;
 mod runtime;
 mod scheduler;
+mod scheduler_admission;
 mod scheduler_state;
 
 pub use binding::{
