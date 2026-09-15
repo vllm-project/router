@@ -92,6 +92,11 @@ impl ProgressTtlFactors {
         self.continuities.len()
     }
 
+    /// Number of retained segment-length samples captured by TTL pause.
+    pub fn ttl_pause_sample_count(&self) -> usize {
+        self.ttl_pause_rounds.len()
+    }
+
     /// Mean positive Program context growth per completed request.
     pub fn average_context_growth_tokens(&self) -> f64 {
         Self::average(

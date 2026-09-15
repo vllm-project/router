@@ -7,10 +7,11 @@ use super::scheduler::ProgramScheduler;
 use super::scheduler_state::{ProgramPauseReason, ProgramSchedulerState};
 use super::{
     BatchGainInputs, ProgramDispatch, ProgramIdentity, ProgramRef, ProgramRequestHandle,
-    ProgramSchedulerConfig, ProgramState, ProgramStatus, ProgramTarget, ScheduleError,
+    ProgramState, ProgramStatus, ProgramTarget, ScheduleError,
 };
 use std::cmp::Ordering;
-use std::time::{Duration, Instant};
+use std::time::Instant;
+use tracing::info;
 
 #[derive(Debug, Clone)]
 pub(crate) struct RankAdmissionPlan {
@@ -551,6 +552,19 @@ impl ProgramScheduler {
             queue.retain(|queued| queued != program);
         }
         state.runtime.notify_front(program);
+        info!(
+            event = "program_admit",
+            program = %program.redacted_id(),
+            target = target_id,
+            forced = plan.forced,
+            privileged = plan.privileged,
+            batch_gain = plan.batch_gain,
+            used_tokens = plan.used_tokens,
+            required_tokens = plan.required_tokens,
+            reserve_tokens = plan.reserve_tokens,
+            capacity_tokens = ?plan.capacity_tokens,
+            "Program scheduling decision"
+        );
         true
     }
 
@@ -585,6 +599,14 @@ impl ProgramScheduler {
             Self::restart_shared_prefix_freshness(decision, now);
         }
         Self::adjust_usage(state, &target_id, -tokens);
+        info!(
+            event = "program_pause",
+            program = %program.redacted_id(),
+            target = target_id,
+            reason = reason.as_str(),
+            released_private_tokens = tokens,
+            "Program scheduling decision"
+        );
         true
     }
 
@@ -637,7 +659,9 @@ impl Drop for AdmissionGuard<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::program_scheduling::ProgramSchedulerConfig;
     use serde_json::json;
+    use std::time::Duration;
 
     fn identity(program: &str) -> ProgramIdentity {
         ProgramIdentity::from_request(

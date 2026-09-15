@@ -78,6 +78,7 @@ impl RequestPool {
     }
 
     /// Return the front request only when `handle` still names that request.
+    #[cfg(test)]
     pub(crate) fn front(&self, handle: &ProgramRequestHandle) -> Option<&PendingProgramRequest> {
         self.requests
             .get(handle.program())

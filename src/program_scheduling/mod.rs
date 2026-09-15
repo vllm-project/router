@@ -5,6 +5,7 @@
 
 mod binding;
 mod contracts;
+mod diagnostics;
 mod domain;
 mod factors;
 mod identity;
@@ -23,6 +24,9 @@ pub use binding::{
     ProgramBindingCandidate, ProgramBindingPolicy, ProgramBindingStrategy, ProgramBindings,
 };
 pub use contracts::ScheduleError;
+pub use diagnostics::{
+    ProgramDiagnostic, ProgramSchedulerDiagnostic, RankDiagnostic, RankRollingDiagnostic,
+};
 pub use domain::{
     ProgramDispatch, ProgramRef, ProgramState, ProgramStatus, ProgramTarget,
     ProgramUsageObservation,
