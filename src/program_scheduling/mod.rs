@@ -7,6 +7,7 @@ mod binding;
 mod contracts;
 mod domain;
 mod identity;
+mod observations;
 mod request_pool;
 mod runtime;
 
@@ -19,5 +20,9 @@ pub use domain::{
     ProgramUsageObservation,
 };
 pub use identity::ProgramIdentity;
+pub use observations::{
+    BackendObservation, BackendObservationFailure, BackendObservationProvider,
+    VllmMetricsObservationProvider,
+};
 pub use request_pool::ProgramRequestHandle;
 pub use runtime::ProgramRuntime;
