@@ -2,8 +2,8 @@ use clap::{ArgAction, Parser, ValueEnum};
 use std::collections::HashMap;
 use vllm_router_rs::config::{
     CircuitBreakerConfig, ConfigError, ConfigResult, ConnectionMode, DiscoveryConfig,
-    HealthCheckConfig, HistoryBackend, KvConnector, MetricsConfig, PolicyConfig, RetryConfig,
-    RouterConfig, RoutingMode, TraceConfig,
+    HealthCheckConfig, HistoryBackend, KvConnector, MetricsConfig, PolicyConfig,
+    ProgramSchedulingConfig, RetryConfig, RouterConfig, RoutingMode, TraceConfig,
 };
 use vllm_router_rs::metrics::PrometheusConfig;
 use vllm_router_rs::server::{self, ServerConfig};
@@ -116,6 +116,11 @@ struct CliArgs {
     /// Load balancing policy to use
     #[arg(long, default_value = "cache_aware", value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "consistent_hash", "rendezvous_hash"])]
     policy: String,
+
+    /// Optional JSON object configuring Program-level scheduling independently
+    /// of the request-level load-balancing policy.
+    #[arg(long)]
+    program_scheduling_config_json: Option<String>,
 
     /// Enable vLLM PD (Prefill-Decode) disaggregated mode with vLLM-specific two-stage processing
     #[arg(long, default_value_t = false)]
@@ -519,6 +524,15 @@ impl CliArgs {
             Vec::new()
         };
 
+        let program_scheduling = self
+            .program_scheduling_config_json
+            .as_deref()
+            .map(serde_json::from_str::<ProgramSchedulingConfig>)
+            .transpose()
+            .map_err(|error| ConfigError::ValidationFailed {
+                reason: format!("Invalid --program-scheduling-config-json: {error}"),
+            })?;
+
         // Build RouterConfig
         Ok(RouterConfig {
             mode,
@@ -577,6 +591,7 @@ impl CliArgs {
             enable_profiling: self.profile,
             profile_timeout_secs: 10, // Default profiling timeout
             kv_connector: self.kv_connector,
+            program_scheduling,
         })
     }
 

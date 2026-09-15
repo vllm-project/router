@@ -11,7 +11,8 @@ use serde_json::json;
 use std::sync::Arc;
 use tower::ServiceExt;
 use vllm_router_rs::config::{
-    CircuitBreakerConfig, ConnectionMode, PolicyConfig, RetryConfig, RouterConfig, RoutingMode,
+    CircuitBreakerConfig, ConnectionMode, PolicyConfig, ProgramSchedulingConfig, RetryConfig,
+    RouterConfig, RoutingMode,
 };
 use vllm_router_rs::routers::{RouterFactory, RouterTrait};
 
@@ -61,6 +62,7 @@ impl TestContext {
             enable_profiling: false,
             profile_timeout_secs: 30,
             kv_connector: vllm_router_rs::config::KvConnector::Nixl,
+            program_scheduling: None,
         };
 
         Self::new_with_config(config, worker_configs).await
@@ -422,6 +424,58 @@ mod generation_tests {
         let body_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert!(body_json.get("choices").is_some());
 
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_program_request_is_tracked_without_changing_response() {
+        let mut config = RouterConfig::default();
+        config.policy = PolicyConfig::RoundRobin;
+        config.program_scheduling = Some(ProgramSchedulingConfig::default());
+        let ctx = TestContext::new_with_config(
+            config,
+            vec![MockWorkerConfig {
+                port: 0,
+                worker_type: WorkerType::Regular,
+                health_status: HealthStatus::Healthy,
+                response_delay_ms: 0,
+                fail_rate: 0.0,
+            }],
+        )
+        .await;
+        let app = ctx.create_app().await;
+        let payload = json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "Hello!"}],
+            "stream": false,
+            "vllm_xargs": {"agentic_context": {
+                "program_id": "program-1",
+                "task_id": null,
+                "expected_resume": true
+            }}
+        });
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_vec(&payload).unwrap()))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(serde_json::from_slice::<serde_json::Value>(&body)
+            .unwrap()
+            .get("choices")
+            .is_some());
+
+        let diagnostics = ctx.router.scheduling_diagnostics().unwrap();
+        assert_eq!(
+            diagnostics["ranks"][0]["programs"][0]["estimated_context_tokens"],
+            10
+        );
+        assert_eq!(diagnostics["ranks"][0]["programs"][0]["state"], "paused");
         ctx.shutdown().await;
     }
 }
@@ -1393,6 +1447,7 @@ mod error_tests {
             enable_profiling: false,
             profile_timeout_secs: 30,
             kv_connector: vllm_router_rs::config::KvConnector::Nixl,
+            program_scheduling: None,
         };
 
         let ctx = TestContext::new_with_config(
@@ -1755,6 +1810,7 @@ mod pd_mode_tests {
             enable_profiling: false,
             profile_timeout_secs: 30,
             kv_connector: vllm_router_rs::config::KvConnector::Nixl,
+            program_scheduling: None,
         };
 
         // Create app context
@@ -1920,6 +1976,7 @@ mod request_id_tests {
             enable_profiling: false,
             profile_timeout_secs: 30,
             kv_connector: vllm_router_rs::config::KvConnector::Nixl,
+            program_scheduling: None,
         };
 
         let ctx = TestContext::new_with_config(

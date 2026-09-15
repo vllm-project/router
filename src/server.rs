@@ -519,6 +519,26 @@ async fn get_loads(State(state): State<Arc<AppState>>, headers: http::HeaderMap)
     state.router.get_worker_loads().await
 }
 
+async fn scheduling_diagnostics(
+    State(state): State<Arc<AppState>>,
+    headers: http::HeaderMap,
+) -> Response {
+    if let Err(response) = authorize_request(&state, &headers).await {
+        return response;
+    }
+    match state.router.scheduling_diagnostics() {
+        Some(diagnostics) => Json(diagnostics).into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "enabled": false,
+                "error": "This Router does not own Program scheduling"
+            })),
+        )
+            .into_response(),
+    }
+}
+
 // ---------- Worker management endpoints (RESTful) ----------
 
 /// POST /workers - Add a new worker with full configuration
@@ -793,7 +813,8 @@ pub fn build_app_with_wasm_middleware(
         .route("/remove_worker", post(remove_worker))
         .route("/list_workers", get(list_workers))
         .route("/flush_cache", post(flush_cache))
-        .route("/get_loads", get(get_loads));
+        .route("/get_loads", get(get_loads))
+        .route("/scheduling/diagnostics", get(scheduling_diagnostics));
 
     // Worker management routes
     let worker_routes = Router::new()

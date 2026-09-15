@@ -162,6 +162,12 @@ impl ProgramScheduler {
             .collect()
     }
 
+    /// Snapshot every concrete target across model pools without duplicates.
+    pub fn all_targets(&self) -> Vec<ProgramTarget> {
+        let state = self.state.lock();
+        state.targets.values().cloned().collect()
+    }
+
     /// Capture the Router ledger before a non-blocking metrics scrape begins.
     pub fn begin_observation(&self, targets: &[ProgramTarget]) -> BackendObservationEpoch {
         let state = self.state.lock();

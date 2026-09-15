@@ -73,6 +73,42 @@ impl Default for ProgramSchedulerConfig {
     }
 }
 
+impl From<&crate::config::types::ProgramSchedulingConfig> for ProgramSchedulerConfig {
+    fn from(config: &crate::config::types::ProgramSchedulingConfig) -> Self {
+        Self {
+            binding_only: config.binding_only,
+            global_queue: config.global_queue,
+            cross_rank_headroom_ratio: config.cross_rank_headroom_ratio,
+            binding_strategy: config.binding_strategy,
+            hash_virtual_nodes: config.hash_virtual_nodes,
+            max_active_programs_per_target: config.max_active_programs_per_target,
+            metrics_interval: Duration::from_secs_f64(config.metrics_interval_seconds),
+            admission_waiting_request_threshold: config.admission_waiting_request_threshold,
+            queue_timeout: Duration::from_secs_f64(config.queue_timeout_seconds),
+            force_resume_timeout: Duration::from_secs_f64(config.force_resume_timeout_seconds),
+            paused_retention_ttl: Duration::from_secs_f64(config.paused_retention_ttl_seconds),
+            shared_prefix_freshness_warmup: Duration::from_secs_f64(
+                config.shared_prefix_freshness_warmup_seconds,
+            ),
+            shared_prefix_freshness_kv_turnovers: config.shared_prefix_freshness_kv_turnovers,
+            privileged_max_context_tokens: config.privileged_max_context_tokens,
+            privileged_ttl: Duration::from_secs_f64(config.privileged_ttl_seconds),
+            resume_reclaim_acting_programs: config.resume_reclaim_acting_programs,
+            progress_ttl: ProgressTtlConfig {
+                token_capacity: config.token_capacity_per_target,
+                decode_buffer_tokens: config.decode_buffer_tokens,
+                acting_ttl: Duration::from_secs_f64(config.acting_ttl_seconds),
+                high_watermark_ratio: config.high_watermark_ratio,
+                low_watermark_ratio: config.low_watermark_ratio,
+                max_segment_rounds: config.max_segment_rounds,
+                stats_window_size: config.stats_window_size,
+                enable_batch_gain_admission: config.enable_batch_gain_admission,
+                ..ProgressTtlConfig::default()
+            },
+        }
+    }
+}
+
 /// Cause of the most recently committed pause.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProgramPauseReason {

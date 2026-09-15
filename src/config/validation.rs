@@ -19,6 +19,9 @@ impl ConfigValidator {
         Self::validate_mode(&config.mode, has_service_discovery)?;
         Self::validate_policy(&config.policy)?;
         Self::validate_server_settings(config)?;
+        if let Some(program_scheduling) = &config.program_scheduling {
+            Self::validate_program_scheduling(program_scheduling)?;
+        }
 
         if let Some(discovery) = &config.discovery {
             Self::validate_discovery(discovery, &config.mode)?;
@@ -36,6 +39,77 @@ impl ConfigValidator {
         Self::validate_retry(&retry_cfg)?;
         Self::validate_circuit_breaker(&cb_cfg)?;
 
+        Ok(())
+    }
+
+    fn validate_program_scheduling(config: &ProgramSchedulingConfig) -> ConfigResult<()> {
+        let positive_finite = [
+            ("metrics_interval_seconds", config.metrics_interval_seconds),
+            ("queue_timeout_seconds", config.queue_timeout_seconds),
+            (
+                "force_resume_timeout_seconds",
+                config.force_resume_timeout_seconds,
+            ),
+            (
+                "paused_retention_ttl_seconds",
+                config.paused_retention_ttl_seconds,
+            ),
+            (
+                "shared_prefix_freshness_warmup_seconds",
+                config.shared_prefix_freshness_warmup_seconds,
+            ),
+        ];
+        for (field, value) in positive_finite {
+            if !value.is_finite() || value <= 0.0 {
+                return Err(ConfigError::InvalidValue {
+                    field: field.to_string(),
+                    value: value.to_string(),
+                    reason: "Must be finite and > 0".to_string(),
+                });
+            }
+        }
+        let nonnegative_finite = [
+            ("acting_ttl_seconds", config.acting_ttl_seconds),
+            ("privileged_ttl_seconds", config.privileged_ttl_seconds),
+        ];
+        for (field, value) in nonnegative_finite {
+            if !value.is_finite() || value < 0.0 {
+                return Err(ConfigError::InvalidValue {
+                    field: field.to_string(),
+                    value: value.to_string(),
+                    reason: "Must be finite and >= 0".to_string(),
+                });
+            }
+        }
+        if config.hash_virtual_nodes == 0
+            || config.max_active_programs_per_target == 0
+            || config.stats_window_size == 0
+            || config.privileged_max_context_tokens == 0
+            || config.token_capacity_per_target == Some(0)
+        {
+            return Err(ConfigError::ValidationFailed {
+                reason: "Program scheduling counts and configured token capacity must be > 0"
+                    .to_string(),
+            });
+        }
+        if !config.cross_rank_headroom_ratio.is_finite()
+            || config.cross_rank_headroom_ratio < 0.0
+            || !config.shared_prefix_freshness_kv_turnovers.is_finite()
+            || config.shared_prefix_freshness_kv_turnovers < 0.0
+        {
+            return Err(ConfigError::ValidationFailed {
+                reason: "Program scheduling multipliers must be finite and >= 0".to_string(),
+            });
+        }
+        if !(0.0..=1.0).contains(&config.low_watermark_ratio)
+            || !(0.0..=1.0).contains(&config.high_watermark_ratio)
+            || config.low_watermark_ratio > config.high_watermark_ratio
+        {
+            return Err(ConfigError::ValidationFailed {
+                reason: "Program scheduling watermarks must satisfy 0 <= low <= high <= 1"
+                    .to_string(),
+            });
+        }
         Ok(())
     }
 
@@ -386,6 +460,14 @@ impl ConfigValidator {
 
     /// Validate compatibility between different configuration sections
     fn validate_compatibility(config: &RouterConfig) -> ConfigResult<()> {
+        if config.program_scheduling.is_some()
+            && !matches!(config.mode, RoutingMode::Regular { .. })
+        {
+            return Err(ConfigError::IncompatibleConfig {
+                reason: "Program scheduling currently requires regular HTTP routing mode"
+                    .to_string(),
+            });
+        }
         // IGW mode is independent - skip other compatibility checks when enabled
         if config.enable_igw {
             return Ok(());

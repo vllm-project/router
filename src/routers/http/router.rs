@@ -1,3 +1,4 @@
+use super::program_adapter::ProgramCompletion;
 use crate::config::types::RetryConfig;
 use crate::core::{
     is_retryable_status, BasicWorker, CircuitBreakerConfig, DPAwareWorker, HealthConfig,
@@ -6,6 +7,10 @@ use crate::core::{
 use crate::metrics::RouterMetrics;
 use crate::otel_http::{self, ClientRequestOptions};
 use crate::policies::{LoadBalancingPolicy, PolicyRegistry};
+use crate::program_scheduling::{
+    BackendObservationProvider, ProgramIdentity, ProgramScheduler, ProgramSchedulerConfig,
+    ProgramTarget, ScheduleError, VllmMetricsObservationProvider,
+};
 use crate::protocols::spec::{
     ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest, GenerationRequest,
     InferenceGenerateRequest, RerankRequest, RerankResponse, RerankResult, ResponsesRequest,
@@ -13,6 +18,7 @@ use crate::protocols::spec::{
 use crate::routers::header_utils;
 use crate::routers::http::dp_utils;
 use crate::routers::{RouterTrait, WorkerManagement};
+use crate::token_estimator::{MomentumTokenEstimator, TokenEstimateScope};
 use axum::body::to_bytes;
 use axum::{
     body::Body,
@@ -45,6 +51,9 @@ pub struct Router {
     circuit_breaker_config: CircuitBreakerConfig,
     _worker_loads: Arc<tokio::sync::watch::Receiver<HashMap<String, isize>>>,
     _load_monitor_handle: Option<Arc<tokio::task::JoinHandle<()>>>,
+    program_scheduler: Option<Arc<ProgramScheduler>>,
+    _program_observation_handle: Option<Arc<tokio::task::JoinHandle<()>>>,
+    program_token_estimator: Arc<MomentumTokenEstimator>,
 }
 
 impl Router {
@@ -167,6 +176,43 @@ impl Router {
             None
         };
 
+        let program_scheduler = ctx
+            .router_config
+            .program_scheduling
+            .as_ref()
+            .map(ProgramSchedulerConfig::from)
+            .map(ProgramScheduler::new)
+            .map(Arc::new);
+        let program_observation_handle = program_scheduler.as_ref().map(|scheduler| {
+            let scheduler = scheduler.clone();
+            let provider = VllmMetricsObservationProvider::new(
+                ctx.client.clone(),
+                ctx.router_config.api_key.clone(),
+            );
+            Arc::new(tokio::spawn(async move {
+                let mut interval = tokio::time::interval(scheduler.metrics_interval());
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    interval.tick().await;
+                    let targets = scheduler.all_targets();
+                    if targets.is_empty() {
+                        continue;
+                    }
+                    let epoch = scheduler.begin_observation(&targets);
+                    let (observations, failures) = provider.observe(&targets).await;
+                    for failure in failures {
+                        warn!(
+                            base_url = failure.base_url,
+                            error = failure.error,
+                            "Program scheduling backend observation failed"
+                        );
+                    }
+                    scheduler.apply_observations(epoch, observations);
+                    scheduler.tick();
+                }
+            }))
+        });
+
         Ok(Router {
             worker_registry: ctx.worker_registry.clone(),
             policy_registry: ctx.policy_registry.clone(),
@@ -181,7 +227,87 @@ impl Router {
             circuit_breaker_config: core_cb_config,
             _worker_loads: worker_loads,
             _load_monitor_handle: load_monitor_handle,
+            program_scheduler,
+            _program_observation_handle: program_observation_handle,
+            program_token_estimator: Arc::new(MomentumTokenEstimator::default()),
         })
+    }
+
+    fn program_targets(&self, model_id: Option<&str>) -> Vec<ProgramTarget> {
+        let workers = match model_id {
+            Some(model) => self.worker_registry.get_by_model_fast(model),
+            None => self.worker_registry.get_all(),
+        };
+        workers
+            .into_iter()
+            .filter(|worker| worker.is_available())
+            .map(|worker| {
+                let (base_url, parsed_rank) = dp_utils::parse_worker_url(worker.url());
+                ProgramTarget {
+                    id: worker.url().to_string(),
+                    base_url,
+                    dp_rank: worker.dp_rank().or(parsed_rank),
+                }
+            })
+            .collect()
+    }
+
+    fn program_model_pool(model_id: Option<&str>) -> String {
+        model_id.unwrap_or("__default__").to_string()
+    }
+
+    fn schedule_error_response(error: ScheduleError) -> Response {
+        match error {
+            ScheduleError::InvalidIdentity(_) => {
+                (StatusCode::BAD_REQUEST, error.to_string()).into_response()
+            }
+            ScheduleError::NoTargets => {
+                (StatusCode::SERVICE_UNAVAILABLE, error.to_string()).into_response()
+            }
+            ScheduleError::QueueTimeout => {
+                (StatusCode::TOO_MANY_REQUESTS, error.to_string()).into_response()
+            }
+        }
+    }
+
+    async fn acquire_program_completion<T: serde::Serialize>(
+        &self,
+        headers: Option<&HeaderMap>,
+        typed_req: &T,
+        model_id: Option<&str>,
+        endpoint: &str,
+        input_text: &str,
+    ) -> Result<Option<ProgramCompletion>, ScheduleError> {
+        let Some(scheduler) = &self.program_scheduler else {
+            return Ok(None);
+        };
+        let model_pool = Self::program_model_pool(model_id);
+        let request = serde_json::to_value(typed_req).map_err(|error| {
+            ScheduleError::InvalidIdentity(format!("request serialization failed: {error}"))
+        })?;
+        let Some(identity) =
+            ProgramIdentity::from_request(headers, Some(&request), Some(&model_pool))?
+        else {
+            return Ok(None);
+        };
+        let (estimated_context_tokens, calibration) = self
+            .program_token_estimator
+            .estimate(TokenEstimateScope::new(&model_pool, endpoint), input_text);
+        let targets = self.program_targets(model_id);
+        let dispatch = scheduler
+            .acquire(
+                identity,
+                estimated_context_tokens,
+                &targets,
+                Some(input_text.to_string()),
+            )
+            .await?;
+        Ok(Some(ProgramCompletion::new(
+            scheduler.clone(),
+            dispatch,
+            self.program_token_estimator.clone(),
+            calibration,
+        )))
     }
 
     /// Get the current list of worker URLs
@@ -554,12 +680,29 @@ impl Router {
         let start = Instant::now();
         let is_stream = typed_req.is_stream();
         let text = typed_req.extract_text_for_routing();
+        let program_completion = match self
+            .acquire_program_completion(headers, typed_req, model_id, route, &text)
+            .await
+        {
+            Ok(completion) => completion,
+            Err(error) => return Self::schedule_error_response(error),
+        };
+        let forced_worker_url = program_completion
+            .as_ref()
+            .map(|completion| completion.dispatch().target_id.clone());
 
         let response = RetryExecutor::execute_response_with_retry(
             &self.retry_config,
             // operation per attempt
             |_: u32| async {
-                let worker = match self.select_worker_for_model(model_id, Some(&text), headers) {
+                let selected_worker = if let Some(target) = forced_worker_url.as_deref() {
+                    self.worker_registry
+                        .get_by_url(target)
+                        .filter(|worker| worker.is_available())
+                } else {
+                    self.select_worker_for_model(model_id, Some(&text), headers)
+                };
+                let worker = match selected_worker {
                     Some(w) => w,
                     None => {
                         RouterMetrics::record_request_error(route, "no_available_workers");
@@ -578,13 +721,14 @@ impl Router {
                     None => self.policy_registry.get_default_policy(),
                 };
 
-                let load_incremented = if policy.name() == "cache_aware" {
-                    worker.increment_load();
-                    RouterMetrics::set_running_requests(worker.url(), worker.load());
-                    true
-                } else {
-                    false
-                };
+                let load_incremented =
+                    if policy.name() == "cache_aware" || program_completion.is_some() {
+                        worker.increment_load();
+                        RouterMetrics::set_running_requests(worker.url(), worker.load());
+                        true
+                    } else {
+                        false
+                    };
 
                 // Keep a clone for potential cleanup on retry
                 let worker_for_cleanup = if load_incremented {
@@ -601,6 +745,7 @@ impl Router {
                         worker.url(),
                         is_stream,
                         load_incremented,
+                        program_completion.clone(),
                     )
                     .await;
 
@@ -634,6 +779,12 @@ impl Router {
             || RouterMetrics::record_retries_exhausted(route),
         )
         .await;
+
+        if let Some(completion) = &program_completion {
+            if !is_stream || !response.status().is_success() {
+                completion.finish(response.status().is_success());
+            }
+        }
 
         if response.status().is_success() {
             let duration = start.elapsed();
@@ -779,6 +930,7 @@ impl Router {
         worker_url: &str,
         is_stream: bool,
         load_incremented: bool, // Whether load was incremented for this request
+        program_completion: Option<ProgramCompletion>,
     ) -> Response {
         let (mut request_builder, extracted_dp_rank, request_url) =
             if self.intra_node_data_parallel_size > 1 {
@@ -888,6 +1040,9 @@ impl Router {
 
             let response = match res.bytes().await {
                 Ok(body) => {
+                    if let Some(completion) = &program_completion {
+                        completion.observe_json(&body);
+                    }
                     let mut response = Response::new(axum::body::Body::from(body));
                     *response.status_mut() = status;
                     *response.headers_mut() = response_headers;
@@ -920,6 +1075,11 @@ impl Router {
             // For streaming with load tracking, we need to manually decrement when done
             let registry = Arc::clone(&self.worker_registry);
             let worker_url = worker_url.to_string();
+            let completion = if status.is_success() {
+                program_completion
+            } else {
+                None
+            };
 
             // Preserve headers for streaming response
             let mut response_headers = header_utils::preserve_response_headers(res.headers());
@@ -933,9 +1093,13 @@ impl Router {
             tokio::spawn(async move {
                 let mut stream = stream;
                 let mut decremented = false;
+                let mut stream_succeeded = true;
                 while let Some(chunk) = stream.next().await {
                     match chunk {
                         Ok(bytes) => {
+                            if let Some(completion) = &completion {
+                                completion.observe_sse_chunk(&bytes);
+                            }
                             // Check for stream end marker
                             if bytes
                                 .as_ref()
@@ -949,10 +1113,12 @@ impl Router {
                                 }
                             }
                             if tx.send(Ok(bytes)).is_err() {
+                                stream_succeeded = false;
                                 break;
                             }
                         }
                         Err(e) => {
+                            stream_succeeded = false;
                             let _ = tx.send(Err(format!("Stream error: {}", e)));
                             break;
                         }
@@ -963,6 +1129,9 @@ impl Router {
                         worker.decrement_load();
                         RouterMetrics::set_running_requests(&worker_url, worker.load());
                     }
+                }
+                if let Some(completion) = &completion {
+                    completion.finish(stream_succeeded);
                 }
             });
 
@@ -982,22 +1151,36 @@ impl Router {
 
             let stream = res.bytes_stream();
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            let completion = if status.is_success() {
+                program_completion
+            } else {
+                None
+            };
 
             // Spawn task to forward stream
             tokio::spawn(async move {
                 let mut stream = stream;
+                let mut stream_succeeded = true;
                 while let Some(chunk) = stream.next().await {
                     match chunk {
                         Ok(bytes) => {
+                            if let Some(completion) = &completion {
+                                completion.observe_sse_chunk(&bytes);
+                            }
                             if tx.send(Ok(bytes)).is_err() {
+                                stream_succeeded = false;
                                 break;
                             }
                         }
                         Err(e) => {
+                            stream_succeeded = false;
                             let _ = tx.send(Err(format!("Stream error: {}", e)));
                             break;
                         }
                     }
+                }
+                if let Some(completion) = &completion {
+                    completion.finish(stream_succeeded);
                 }
             });
 
@@ -1410,6 +1593,14 @@ impl RouterTrait for Router {
         self
     }
 
+    fn scheduling_diagnostics(&self) -> Option<serde_json::Value> {
+        let scheduler = self.program_scheduler.as_ref()?;
+        let mut diagnostics = serde_json::to_value(scheduler.diagnostics()).ok()?;
+        diagnostics["token_estimation"] =
+            serde_json::to_value(self.program_token_estimator.diagnostics()).ok()?;
+        Some(diagnostics)
+    }
+
     async fn health(&self, _req: Request<Body>) -> Response {
         let workers = self.worker_registry.get_all();
         let unhealthy_servers: Vec<_> = workers
@@ -1811,6 +2002,9 @@ mod tests {
             circuit_breaker_config: CircuitBreakerConfig::default(),
             _worker_loads: Arc::new(rx),
             _load_monitor_handle: None,
+            program_scheduler: None,
+            _program_observation_handle: None,
+            program_token_estimator: Arc::new(MomentumTokenEstimator::default()),
         }
     }
 
@@ -1883,6 +2077,9 @@ mod tests {
             circuit_breaker_config: CircuitBreakerConfig::default(),
             _worker_loads: Arc::new(rx),
             _load_monitor_handle: None,
+            program_scheduler: None,
+            _program_observation_handle: None,
+            program_token_estimator: Arc::new(MomentumTokenEstimator::default()),
         }
     }
 

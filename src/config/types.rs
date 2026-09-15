@@ -3,6 +3,8 @@ use crate::config::validation::ConfigValidator;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+use crate::program_scheduling::ProgramBindingStrategy;
+
 /// Main router configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RouterConfig {
@@ -80,6 +82,9 @@ pub struct RouterConfig {
     /// KV connector type for PD disaggregation
     #[serde(default)]
     pub kv_connector: KvConnector,
+    /// Optional Program-level admission and continuity scheduling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub program_scheduling: Option<ProgramSchedulingConfig>,
 }
 
 fn default_profile_timeout_secs() -> u64 {
@@ -92,6 +97,173 @@ fn default_history_backend() -> HistoryBackend {
 
 fn default_intra_node_data_parallel_size() -> usize {
     1
+}
+
+/// Router-level Program scheduling configuration.
+///
+/// This is intentionally separate from request-level `PolicyConfig`. The
+/// binding policy is evaluated once for a new Program generation; admission
+/// and resume remain ProgramScheduler decisions.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ProgramSchedulingConfig {
+    #[serde(default)]
+    pub binding_only: bool,
+    #[serde(default)]
+    pub global_queue: bool,
+    #[serde(default = "default_program_cross_rank_headroom_ratio")]
+    pub cross_rank_headroom_ratio: f64,
+    #[serde(default)]
+    pub binding_strategy: ProgramBindingStrategy,
+    #[serde(default = "default_program_hash_virtual_nodes")]
+    pub hash_virtual_nodes: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_capacity_per_target: Option<usize>,
+    #[serde(default = "default_program_max_active_programs_per_target")]
+    pub max_active_programs_per_target: usize,
+    #[serde(default = "default_program_metrics_interval_seconds")]
+    pub metrics_interval_seconds: f64,
+    #[serde(default = "default_program_admission_waiting_request_threshold")]
+    pub admission_waiting_request_threshold: usize,
+    #[serde(default = "default_program_queue_timeout_seconds")]
+    pub queue_timeout_seconds: f64,
+    #[serde(default = "default_program_force_resume_timeout_seconds")]
+    pub force_resume_timeout_seconds: f64,
+    #[serde(default = "default_program_paused_retention_ttl_seconds")]
+    pub paused_retention_ttl_seconds: f64,
+    #[serde(default = "default_program_shared_prefix_freshness_warmup_seconds")]
+    pub shared_prefix_freshness_warmup_seconds: f64,
+    #[serde(default = "default_program_shared_prefix_freshness_kv_turnovers")]
+    pub shared_prefix_freshness_kv_turnovers: f64,
+    #[serde(default = "default_program_privileged_max_context_tokens")]
+    pub privileged_max_context_tokens: usize,
+    #[serde(default = "default_program_privileged_ttl_seconds")]
+    pub privileged_ttl_seconds: f64,
+    #[serde(default)]
+    pub resume_reclaim_acting_programs: bool,
+    #[serde(default = "default_program_decode_buffer_tokens")]
+    pub decode_buffer_tokens: usize,
+    #[serde(default = "default_program_acting_ttl_seconds")]
+    pub acting_ttl_seconds: f64,
+    #[serde(default = "default_program_high_watermark_ratio")]
+    pub high_watermark_ratio: f64,
+    #[serde(default = "default_program_low_watermark_ratio")]
+    pub low_watermark_ratio: f64,
+    #[serde(default = "default_program_max_segment_rounds")]
+    pub max_segment_rounds: usize,
+    #[serde(default = "default_program_stats_window_size")]
+    pub stats_window_size: usize,
+    #[serde(default = "default_program_enable_batch_gain_admission")]
+    pub enable_batch_gain_admission: bool,
+}
+
+impl Default for ProgramSchedulingConfig {
+    fn default() -> Self {
+        Self {
+            binding_only: false,
+            global_queue: false,
+            cross_rank_headroom_ratio: default_program_cross_rank_headroom_ratio(),
+            binding_strategy: ProgramBindingStrategy::default(),
+            hash_virtual_nodes: default_program_hash_virtual_nodes(),
+            token_capacity_per_target: None,
+            max_active_programs_per_target: default_program_max_active_programs_per_target(),
+            metrics_interval_seconds: default_program_metrics_interval_seconds(),
+            admission_waiting_request_threshold:
+                default_program_admission_waiting_request_threshold(),
+            queue_timeout_seconds: default_program_queue_timeout_seconds(),
+            force_resume_timeout_seconds: default_program_force_resume_timeout_seconds(),
+            paused_retention_ttl_seconds: default_program_paused_retention_ttl_seconds(),
+            shared_prefix_freshness_warmup_seconds:
+                default_program_shared_prefix_freshness_warmup_seconds(),
+            shared_prefix_freshness_kv_turnovers:
+                default_program_shared_prefix_freshness_kv_turnovers(),
+            privileged_max_context_tokens: default_program_privileged_max_context_tokens(),
+            privileged_ttl_seconds: default_program_privileged_ttl_seconds(),
+            resume_reclaim_acting_programs: false,
+            decode_buffer_tokens: default_program_decode_buffer_tokens(),
+            acting_ttl_seconds: default_program_acting_ttl_seconds(),
+            high_watermark_ratio: default_program_high_watermark_ratio(),
+            low_watermark_ratio: default_program_low_watermark_ratio(),
+            max_segment_rounds: default_program_max_segment_rounds(),
+            stats_window_size: default_program_stats_window_size(),
+            enable_batch_gain_admission: default_program_enable_batch_gain_admission(),
+        }
+    }
+}
+
+fn default_program_cross_rank_headroom_ratio() -> f64 {
+    1.2
+}
+
+fn default_program_hash_virtual_nodes() -> u32 {
+    160
+}
+
+fn default_program_max_active_programs_per_target() -> usize {
+    64
+}
+
+fn default_program_metrics_interval_seconds() -> f64 {
+    1.0
+}
+
+fn default_program_admission_waiting_request_threshold() -> usize {
+    1
+}
+
+fn default_program_queue_timeout_seconds() -> f64 {
+    600.0
+}
+
+fn default_program_force_resume_timeout_seconds() -> f64 {
+    300.0
+}
+
+fn default_program_paused_retention_ttl_seconds() -> f64 {
+    1800.0
+}
+
+fn default_program_shared_prefix_freshness_warmup_seconds() -> f64 {
+    100.0
+}
+
+fn default_program_shared_prefix_freshness_kv_turnovers() -> f64 {
+    2.0
+}
+
+fn default_program_privileged_max_context_tokens() -> usize {
+    262_144
+}
+
+fn default_program_privileged_ttl_seconds() -> f64 {
+    5.0
+}
+
+fn default_program_decode_buffer_tokens() -> usize {
+    100
+}
+
+fn default_program_acting_ttl_seconds() -> f64 {
+    10.0
+}
+
+fn default_program_high_watermark_ratio() -> f64 {
+    1.0
+}
+
+fn default_program_low_watermark_ratio() -> f64 {
+    1.0
+}
+
+fn default_program_max_segment_rounds() -> usize {
+    14
+}
+
+fn default_program_stats_window_size() -> usize {
+    100
+}
+
+fn default_program_enable_batch_gain_admission() -> bool {
+    true
 }
 
 /// History backend configuration
@@ -479,6 +651,7 @@ impl Default for RouterConfig {
             enable_profiling: false,
             profile_timeout_secs: default_profile_timeout_secs(),
             kv_connector: KvConnector::default(),
+            program_scheduling: None,
         }
     }
 }
@@ -1053,6 +1226,7 @@ mod tests {
             enable_profiling: false,
             profile_timeout_secs: default_profile_timeout_secs(),
             kv_connector: KvConnector::default(),
+            program_scheduling: None,
         };
 
         assert!(config.mode.is_pd_mode());
@@ -1119,6 +1293,7 @@ mod tests {
             enable_profiling: false,
             profile_timeout_secs: default_profile_timeout_secs(),
             kv_connector: KvConnector::default(),
+            program_scheduling: None,
         };
 
         assert!(!config.mode.is_pd_mode());
@@ -1181,6 +1356,7 @@ mod tests {
             enable_profiling: false,
             profile_timeout_secs: default_profile_timeout_secs(),
             kv_connector: KvConnector::default(),
+            program_scheduling: None,
         };
 
         assert!(config.has_service_discovery());

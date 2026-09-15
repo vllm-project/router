@@ -15,6 +15,7 @@ pub mod protocols;
 pub mod routers;
 pub mod server;
 pub mod service_discovery;
+mod token_estimator;
 pub mod tokenizer;
 pub mod tree;
 pub mod wasm_middleware;
@@ -242,6 +243,7 @@ impl Router {
                     });
                 }
             },
+            program_scheduling: None,
         })
     }
 }

@@ -6,11 +6,13 @@
 use super::ProgramIdentity;
 use super::ProgramRef;
 use crate::policies::ConsistentHashPolicy;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Debug;
 
 /// Initial binding algorithm selected for Program generations.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ProgramBindingStrategy {
     /// Preserve stable session/task affinity with a consistent hash ring.
     #[default]
