@@ -289,12 +289,26 @@ impl ProgramScheduler {
         let Some(target_id) = runtime.placement else {
             return false;
         };
-        let has_waiter = state
-            .rank_queues
-            .get(&target_id)
-            .into_iter()
-            .flatten()
-            .any(|waiter| waiter != program);
+        let has_waiter = if self.config.global_queue {
+            state
+                .global_queues
+                .get(program.model_pool())
+                .into_iter()
+                .flatten()
+                .any(|waiter| {
+                    waiter != program
+                        && state.decisions.get(waiter).is_some_and(|candidate| {
+                            candidate.last_target.as_deref() == Some(target_id.as_str())
+                        })
+                })
+        } else {
+            state
+                .rank_queues
+                .get(&target_id)
+                .into_iter()
+                .flatten()
+                .any(|waiter| waiter != program)
+        };
         has_waiter && self.pause_idle(state, program, ProgramPauseReason::MaxSegmentYield, now)
     }
 }

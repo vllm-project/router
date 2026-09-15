@@ -213,7 +213,7 @@ impl ProgramScheduler {
             .collect::<Vec<_>>();
         let mut changed = false;
         for program in expired {
-            let (target, rounds, segment_rounds) = state
+            let (target, rounds, segment_rounds, placement_key, was_privileged) = state
                 .decisions
                 .get(&program)
                 .map(|decision| {
@@ -223,13 +223,57 @@ impl ProgramScheduler {
                             .segment_served_rounds
                             .saturating_sub(decision.ttl_pause_sampled_segment_rounds),
                         decision.segment_served_rounds,
+                        decision.placement_key.clone(),
+                        decision
+                            .privilege_deadline
+                            .is_some_and(|deadline| deadline > now),
                     )
                 })
                 .unwrap_or_default();
+            let privilege_target = was_privileged
+                .then(|| {
+                    let mut related = state
+                        .runtime
+                        .views()
+                        .into_iter()
+                        .filter(|candidate| candidate.reference != program)
+                        .filter(|candidate| {
+                            state
+                                .decisions
+                                .get(&candidate.reference)
+                                .is_some_and(|decision| {
+                                    decision.placement_key == placement_key
+                                        && decision.last_target == target
+                                })
+                        })
+                        .map(|candidate| candidate.reference)
+                        .collect::<Vec<_>>();
+                    related.sort_by_key(|candidate| {
+                        let runtime = state.runtime.view(candidate).unwrap();
+                        let tier = match (runtime.state, runtime.status) {
+                            (ProgramState::Active, ProgramStatus::Reasoning) => 0,
+                            (ProgramState::Paused, ProgramStatus::Reasoning) => 1,
+                            (ProgramState::Active, ProgramStatus::Acting) => 2,
+                            _ => 3,
+                        };
+                        (tier, candidate.program_id().to_string())
+                    });
+                    related.into_iter().next()
+                })
+                .flatten();
             if self.pause_idle(state, &program, ProgramPauseReason::TtlExpired, now) {
                 if let Some(decision) = state.decisions.get_mut(&program) {
                     decision.ttl_pause_sampled_segment_rounds = segment_rounds;
                     decision.rounds_since_ttl_pause = 0;
+                    if was_privileged {
+                        decision.privilege_deadline = None;
+                    }
+                }
+                if let Some(target) = privilege_target {
+                    if let Some(decision) = state.decisions.get_mut(&target) {
+                        decision.privilege_deadline = Some(now + self.config.privileged_ttl);
+                        decision.privilege_ttl_expired = false;
+                    }
                 }
                 if let Some(target) = target {
                     state
@@ -432,6 +476,70 @@ impl ProgramScheduler {
                 if relieved {
                     projected = (projected - relief).max(0.0);
                     changed = true;
+                }
+            }
+            if projected > low {
+                let mut privileged = state
+                    .runtime
+                    .views()
+                    .into_iter()
+                    .filter(|program| {
+                        program.state == ProgramState::Active
+                            && program.placement.as_deref() == Some(target_id.as_str())
+                            && state
+                                .decisions
+                                .get(&program.reference)
+                                .is_some_and(|decision| {
+                                    decision
+                                        .privilege_deadline
+                                        .is_some_and(|deadline| deadline > now)
+                                })
+                    })
+                    .collect::<Vec<_>>();
+                privileged.sort_by(|left, right| {
+                    state.decisions[&left.reference]
+                        .lifetime_generated_tokens
+                        .cmp(&state.decisions[&right.reference].lifetime_generated_tokens)
+                        .then_with(|| {
+                            left.reference
+                                .program_id()
+                                .cmp(right.reference.program_id())
+                        })
+                });
+                for victim in privileged {
+                    if projected <= low {
+                        break;
+                    }
+                    let private = state.decisions[&victim.reference]
+                        .private_tokens(self.config.progress_ttl.decode_buffer_tokens);
+                    let relief = private
+                        + if victim.status == ProgramStatus::Reasoning {
+                            average_completion
+                        } else {
+                            0.0
+                        };
+                    state
+                        .decisions
+                        .get_mut(&victim.reference)
+                        .unwrap()
+                        .privilege_deadline = None;
+                    let relieved = if victim.status == ProgramStatus::Acting {
+                        self.pause_idle(
+                            state,
+                            &victim.reference,
+                            ProgramPauseReason::CapacityRepair,
+                            now,
+                        )
+                    } else if let Some(decision) = state.decisions.get_mut(&victim.reference) {
+                        decision.pause_when_idle = true;
+                        true
+                    } else {
+                        false
+                    };
+                    if relieved {
+                        projected = (projected - relief).max(0.0);
+                        changed = true;
+                    }
                 }
             }
         }
