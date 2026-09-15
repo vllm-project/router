@@ -333,7 +333,7 @@ impl ProgramScheduler {
         !expired.is_empty()
     }
 
-    fn release_program(
+    pub(crate) fn release_program(
         &self,
         state: &mut ProgramSchedulerState,
         program: &ProgramRef,

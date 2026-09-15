@@ -215,6 +215,17 @@ impl ProgramScheduler {
                 queue.retain(|queued| queued != program);
             }
         }
+        let remove_unstarted = state
+            .runtime
+            .view(program)
+            .is_some_and(|view| view.in_flight_requests == 0 && view.waiting_requests == 0)
+            && state
+                .decisions
+                .get(program)
+                .is_some_and(|decision| decision.completed_requests == 0);
+        if remove_unstarted {
+            self.release_program(&mut state, program, Instant::now());
+        }
         self.schedule_waiting(&mut state, Instant::now());
     }
 
@@ -733,5 +744,35 @@ mod tests {
         ordered.sort_by(|left, right| scheduler.local_resume_cmp(&state, left, right, now));
         assert_eq!(ordered[0], refs[2]);
         assert_eq!(ordered[1], refs[1]);
+    }
+
+    #[test]
+    fn cancelling_unstarted_request_removes_transient_program() {
+        let scheduler = ProgramScheduler::new(ProgramSchedulerConfig::default());
+        let target = target();
+        scheduler.sync_targets("model", std::slice::from_ref(&target));
+        let identity = identity("cancelled");
+        let now = Instant::now();
+        let handle = {
+            let mut state = scheduler.state.lock();
+            let handle = state.runtime.retain_request(&identity, 100, None, now);
+            scheduler.ensure_decision_state(
+                &mut state,
+                &identity,
+                handle.program().clone(),
+                100,
+                now,
+            );
+            state
+                .rank_queues
+                .entry("rank-0".into())
+                .or_default()
+                .push_back(handle.program().clone());
+            handle
+        };
+        scheduler.cancel_retained_request(&handle);
+        let state = scheduler.state.lock();
+        assert!(state.runtime.view(handle.program()).is_none());
+        assert!(!state.decisions.contains_key(handle.program()));
     }
 }

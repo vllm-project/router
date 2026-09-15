@@ -87,14 +87,24 @@ impl ProgramScheduler {
                         program.reference,
                         program.expected_resume,
                         program.waiting_requests,
+                        decision
+                            .last_target
+                            .as_ref()
+                            .is_some_and(|target| removed.contains(target)),
                         decision.placement_key.clone(),
                         decision.placement_hash_key.clone(),
                     )
                 })
             })
             .collect::<Vec<_>>();
-        for (program, expected_resume, waiting_requests, placement_key, placement_hash_key) in
-            affected
+        for (
+            program,
+            expected_resume,
+            waiting_requests,
+            target_disappeared,
+            placement_key,
+            placement_hash_key,
+        ) in affected
         {
             let placement_invalidated = state.runtime.invalidate_placement(&program, &removed);
             state.bindings.release_program(&program);
@@ -115,7 +125,7 @@ impl ProgramScheduler {
             if let Some(decision) = state.decisions.get_mut(&program) {
                 decision.home_target = replacement.clone();
                 decision.last_target = replacement.clone();
-                if placement_invalidated {
+                if placement_invalidated || target_disappeared {
                     let now = Instant::now();
                     decision.paused_at = Some(now);
                     decision.pause_when_idle = false;
