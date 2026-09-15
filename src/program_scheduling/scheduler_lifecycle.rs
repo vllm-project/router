@@ -204,6 +204,12 @@ impl ProgramScheduler {
     }
 
     pub(crate) fn run_periodic_decisions(&self, state: &mut ProgramSchedulerState, now: Instant) {
+        state.runtime.prune_released_generations(
+            now,
+            self.config
+                .paused_retention_ttl
+                .max(std::time::Duration::from_secs(60)),
+        );
         self.expire_acting_ttls(state, now);
         self.release_expired_paused(state, now);
         self.reconcile_privileges(state, now);
@@ -337,7 +343,7 @@ impl ProgramScheduler {
         &self,
         state: &mut ProgramSchedulerState,
         program: &ProgramRef,
-        _now: Instant,
+        now: Instant,
     ) {
         for queue in state.rank_queues.values_mut() {
             queue.retain(|queued| queued != program);
@@ -345,7 +351,7 @@ impl ProgramScheduler {
         for queue in state.global_queues.values_mut() {
             queue.retain(|queued| queued != program);
         }
-        if state.runtime.release_idle(program) {
+        if state.runtime.release_idle(program, now) {
             state.decisions.remove(program);
             state.bindings.release_program(program);
         }

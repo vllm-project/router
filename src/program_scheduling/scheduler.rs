@@ -10,6 +10,7 @@ use super::{
 };
 use parking_lot::Mutex;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Router-owned Program scheduler.
@@ -37,15 +38,48 @@ impl ProgramScheduler {
         self.config.metrics_interval
     }
 
+    /// Whether initial Program binding needs the request text for prefix affinity.
+    pub fn uses_cache_aware_binding(&self) -> bool {
+        self.config.binding_strategy == super::ProgramBindingStrategy::CacheAware
+    }
+
     /// Synchronize one model pool's concrete backend and internal-DP targets.
     pub fn sync_targets(&self, model_pool: &str, targets: &[ProgramTarget]) {
+        self.sync_target_snapshot(model_pool, Arc::from(targets));
+    }
+
+    /// Synchronize a cached immutable target snapshot.
+    pub fn sync_target_snapshot(&self, model_pool: &str, targets: Arc<[ProgramTarget]>) {
         let mut state = self.state.lock();
+        if state
+            .model_target_snapshots
+            .get(model_pool)
+            .is_some_and(|current| Arc::ptr_eq(current, &targets))
+        {
+            return;
+        }
         let incoming = targets
             .iter()
             .cloned()
             .map(|target| (target.id.clone(), target))
             .collect::<BTreeMap<_, _>>();
         let current_ids = incoming.keys().cloned().collect::<BTreeSet<_>>();
+        let unchanged = state
+            .model_targets
+            .get(model_pool)
+            .is_some_and(|ids| ids == &current_ids)
+            && incoming
+                .iter()
+                .all(|(target_id, target)| state.targets.get(target_id) == Some(target));
+        if unchanged {
+            state
+                .model_target_snapshots
+                .insert(model_pool.to_string(), targets);
+            return;
+        }
+        state
+            .model_target_snapshots
+            .insert(model_pool.to_string(), targets);
         let previous_ids = state
             .model_targets
             .insert(model_pool.to_string(), current_ids.clone())
@@ -282,15 +316,16 @@ impl ProgramScheduler {
         identity: &ProgramIdentity,
         now: Instant,
     ) -> Vec<ProgramBindingCandidate> {
+        let runtime_views = state.runtime.views();
         state
             .model_targets
             .get(identity.model_pool())
             .into_iter()
             .flatten()
             .map(|target_id| {
-                let accounted = state
-                    .runtime
-                    .views()
+                let accounted = runtime_views
+                    .iter()
+                    .cloned()
                     .into_iter()
                     .filter(|program| {
                         let home = state
@@ -309,23 +344,61 @@ impl ProgramScheduler {
                         decision.private_tokens(self.config.progress_ttl.decode_buffer_tokens)
                     })
                     .sum();
+                let pending_new_program_tokens = runtime_views
+                    .iter()
+                    .filter(|program| {
+                        program.state == ProgramState::Paused
+                            && program.status == ProgramStatus::Reasoning
+                            && program.placement.is_none()
+                            && program.waiting_requests > 0
+                    })
+                    .filter_map(|program| state.decisions.get(&program.reference))
+                    .filter(|decision| {
+                        decision.completed_requests == 0
+                            && decision.last_target.as_deref() == Some(target_id.as_str())
+                    })
+                    .map(|decision| {
+                        decision.private_tokens(self.config.progress_ttl.decode_buffer_tokens)
+                    })
+                    .sum::<f64>();
+                let active_programs = runtime_views
+                    .iter()
+                    .filter(|program| {
+                        program.state == ProgramState::Active
+                            && program.placement.as_deref() == Some(target_id.as_str())
+                    })
+                    .count();
+                let target_usage = self.target_usage(state, target_id, now);
+                let capacity = self.config.progress_ttl.token_capacity;
+                let required_tokens = runtime_views
+                    .iter()
+                    .find(|program| {
+                        program.reference.model_pool() == identity.model_pool()
+                            && program.reference.program_id() == identity.program_id()
+                    })
+                    .map_or(0, |program| program.estimated_context_tokens)
+                    .saturating_add(self.config.progress_ttl.decode_buffer_tokens)
+                    as f64;
+                let immediately_admissible = active_programs.saturating_add(1)
+                    <= self.config.max_active_programs_per_target
+                    && capacity.is_none_or(|capacity| {
+                        target_usage + required_tokens
+                            <= capacity as f64 * self.config.progress_ttl.low_watermark_ratio
+                    });
                 ProgramBindingCandidate {
                     target_id: target_id.clone(),
                     accounted_programs: accounted.len(),
                     accounted_tokens,
                     capacity_tokens: self.config.progress_ttl.token_capacity,
-                    kv_pressure: self
-                        .config
-                        .progress_ttl
-                        .token_capacity
-                        .map_or(0.0, |capacity| {
-                            if capacity == 0 {
-                                1.0
-                            } else {
-                                (self.target_usage(state, target_id, now) / capacity as f64)
-                                    .clamp(0.0, 1.0)
-                            }
-                        }),
+                    kv_pressure: capacity.map_or(0.0, |capacity| {
+                        if capacity == 0 {
+                            1.0
+                        } else {
+                            ((target_usage + pending_new_program_tokens) / capacity as f64)
+                                .clamp(0.0, 1.0)
+                        }
+                    }),
+                    immediately_admissible,
                 }
             })
             .collect()
@@ -431,6 +504,7 @@ struct ObservationCheckpoint {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::program_scheduling::{ProgramBindingStrategy, ProgramIdentity};
     use serde_json::json;
 
     #[test]
@@ -465,6 +539,76 @@ mod tests {
         assert_eq!(
             scheduler.target_usage(&state, "rank-0", Instant::now()),
             550.0
+        );
+    }
+
+    #[test]
+    fn cache_aware_cold_burst_accounts_bound_unadmitted_programs() {
+        let mut config = ProgramSchedulerConfig::default();
+        config.binding_strategy = ProgramBindingStrategy::CacheAware;
+        config.progress_ttl.token_capacity = Some(1_000);
+        let scheduler = ProgramScheduler::new(config);
+        let targets = [
+            ProgramTarget {
+                id: "rank-0".into(),
+                base_url: "http://worker-0".into(),
+                dp_rank: Some(0),
+            },
+            ProgramTarget {
+                id: "rank-1".into(),
+                base_url: "http://worker-1".into(),
+                dp_rank: Some(1),
+            },
+        ];
+        scheduler.sync_targets("model", &targets);
+        let identity = |program: &str| {
+            ProgramIdentity::from_request(
+                None,
+                Some(&json!({"vllm_xargs":{"agentic_context":{
+                    "program_id":program,"task_id":null,"expected_resume":true
+                }}})),
+                Some("model"),
+            )
+            .unwrap()
+            .unwrap()
+        };
+        let now = Instant::now();
+        let mut state = scheduler.state.lock();
+        let first = identity("first");
+        let first_handle = state
+            .runtime
+            .retain_request(&first, 100, Some("cold-a"), now);
+        scheduler.ensure_decision_state(
+            &mut state,
+            &first,
+            first_handle.program().clone(),
+            100,
+            now,
+            Some("cold-a"),
+        );
+        let second = identity("second");
+        let second_handle = state
+            .runtime
+            .retain_request(&second, 100, Some("cold-b"), now);
+        scheduler.ensure_decision_state(
+            &mut state,
+            &second,
+            second_handle.program().clone(),
+            100,
+            now,
+            Some("cold-b"),
+        );
+        assert_eq!(
+            state.decisions[first_handle.program()]
+                .last_target
+                .as_deref(),
+            Some("rank-0")
+        );
+        assert_eq!(
+            state.decisions[second_handle.program()]
+                .last_target
+                .as_deref(),
+            Some("rank-1")
         );
     }
 

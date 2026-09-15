@@ -1088,6 +1088,57 @@ mod responses_endpoint_tests {
     }
 
     #[tokio::test]
+    async fn test_v1_responses_program_request_is_tracked() {
+        let mut config = RouterConfig::default();
+        config.policy = PolicyConfig::RoundRobin;
+        config.program_scheduling = Some(ProgramSchedulingConfig::default());
+        let ctx = TestContext::new_with_config(
+            config,
+            vec![MockWorkerConfig {
+                port: 0,
+                worker_type: WorkerType::Regular,
+                health_status: HealthStatus::Healthy,
+                response_delay_ms: 0,
+                fail_rate: 0.0,
+            }],
+        )
+        .await;
+        let app = ctx.create_app().await;
+        let payload = json!({
+            "input": "Hello Responses API",
+            "model": "mock-model",
+            "stream": false,
+            "vllm_xargs": {"agentic_context": {
+                "program_id": "responses-program",
+                "task_id": null,
+                "expected_resume": true
+            }}
+        });
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_vec(&payload).unwrap()))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let diagnostics = ctx.router.scheduling_diagnostics().unwrap();
+        assert_eq!(
+            diagnostics["ranks"][0]["programs"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            diagnostics["ranks"][0]["rolling"]["avg_prompt_tokens"],
+            10.0
+        );
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn test_v1_responses_streaming() {
         let ctx = TestContext::new(vec![MockWorkerConfig {
             port: 18951,

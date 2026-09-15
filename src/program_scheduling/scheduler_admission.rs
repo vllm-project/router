@@ -6,10 +6,11 @@
 use super::scheduler::ProgramScheduler;
 use super::scheduler_state::{ProgramPauseReason, ProgramSchedulerState};
 use super::{
-    BatchGainInputs, ProgramDispatch, ProgramIdentity, ProgramRef, ProgramRequestHandle,
-    ProgramState, ProgramStatus, ProgramTarget, ScheduleError,
+    BatchGainInputs, ContinuitySample, ProgramDispatch, ProgramIdentity, ProgramRef,
+    ProgramRequestHandle, ProgramState, ProgramStatus, ProgramTarget, ScheduleError,
 };
 use std::cmp::Ordering;
+use std::sync::Arc;
 use std::time::Instant;
 use tracing::info;
 
@@ -36,6 +37,35 @@ impl ProgramScheduler {
         routing_text: Option<String>,
     ) -> Result<ProgramDispatch, ScheduleError> {
         self.sync_targets(identity.model_pool(), targets);
+        self.acquire_synced(identity, estimated_context_tokens, targets, routing_text)
+            .await
+    }
+
+    /// Retain a request using a Router-cached immutable target snapshot.
+    pub async fn acquire_from_snapshot(
+        &self,
+        identity: ProgramIdentity,
+        estimated_context_tokens: usize,
+        targets: Arc<[ProgramTarget]>,
+        routing_text: Option<String>,
+    ) -> Result<ProgramDispatch, ScheduleError> {
+        self.sync_target_snapshot(identity.model_pool(), targets.clone());
+        self.acquire_synced(
+            identity,
+            estimated_context_tokens,
+            targets.as_ref(),
+            routing_text,
+        )
+        .await
+    }
+
+    async fn acquire_synced(
+        &self,
+        identity: ProgramIdentity,
+        estimated_context_tokens: usize,
+        targets: &[ProgramTarget],
+        routing_text: Option<String>,
+    ) -> Result<ProgramDispatch, ScheduleError> {
         if targets.is_empty() {
             return Err(ScheduleError::NoTargets);
         }
@@ -49,6 +79,44 @@ impl ProgramScheduler {
                 arrived_at,
             );
             let reference = handle.program().clone();
+            let continuity = state
+                .runtime
+                .view(&reference)
+                .filter(|runtime| runtime.in_flight_requests == 0)
+                .and_then(|_| {
+                    state.decisions.get(&reference).and_then(|decision| {
+                        decision.last_request_finished_at.map(|finished_at| {
+                            (
+                                decision.last_target.clone(),
+                                ContinuitySample {
+                                    interval_seconds: arrived_at
+                                        .saturating_duration_since(finished_at)
+                                        .as_secs_f64(),
+                                    cache_miss_impact_seconds: decision
+                                        .last_cache_miss_impact_seconds,
+                                },
+                            )
+                        })
+                    })
+                });
+            if let Some((Some(target_id), sample)) = continuity {
+                if sample.interval_seconds.is_finite() && sample.interval_seconds >= 0.0 {
+                    let factors = state.rank_factors.entry(target_id.clone()).or_default();
+                    info!(
+                        event = "continuity_sample",
+                        program = %reference.redacted_id(),
+                        target = %target_id,
+                        interval_seconds = sample.interval_seconds,
+                        previous_cache_miss_impact_seconds = sample.cache_miss_impact_seconds,
+                        window_samples_before = factors.continuity_sample_count(),
+                        window_complete_before = factors.continuity_window_complete(
+                            self.config.progress_ttl.stats_window_size
+                        ),
+                        "Program scheduling diagnostic"
+                    );
+                    factors.push_continuity(sample, self.config.progress_ttl.stats_window_size);
+                }
+            }
             let previous_tokens = state.decisions.get(&reference).map_or(0.0, |decision| {
                 decision.private_tokens(self.config.progress_ttl.decode_buffer_tokens)
             });
@@ -710,6 +778,30 @@ mod tests {
             .unwrap();
         assert_eq!(dispatch.target_id, "rank-0");
         assert!(dispatch.placement_start_request());
+    }
+
+    #[tokio::test]
+    async fn repeated_program_arrival_populates_continuity_window() {
+        let scheduler = ProgramScheduler::new(ProgramSchedulerConfig::default());
+        let target = target();
+        let first = scheduler
+            .acquire(
+                identity("program"),
+                100,
+                std::slice::from_ref(&target),
+                None,
+            )
+            .await
+            .unwrap();
+        scheduler.complete(&first, true, false, Some(100), Some(0.1));
+        let second = scheduler
+            .acquire(identity("program"), 110, &[target], None)
+            .await
+            .unwrap();
+        let state = scheduler.state.lock();
+        assert_eq!(state.rank_factors["rank-0"].continuity_sample_count(), 1);
+        drop(state);
+        scheduler.complete(&second, true, true, Some(110), Some(0.1));
     }
 
     #[test]

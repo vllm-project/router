@@ -16,6 +16,7 @@ use std::time::Instant;
 pub struct ProgramRuntime {
     programs: HashMap<RuntimeKey, RuntimeProgram>,
     last_generations: HashMap<RuntimeKey, u64>,
+    released_generations_at: HashMap<RuntimeKey, Instant>,
     request_pool: RequestPool,
     next_placement_epoch: u64,
 }
@@ -30,6 +31,7 @@ impl ProgramRuntime {
         arrived_at: Instant,
     ) -> ProgramRequestHandle {
         let key = RuntimeKey::from(identity);
+        self.released_generations_at.remove(&key);
         let program_ref = if let Some(program) = self.programs.get_mut(&key) {
             program.expected_resume = identity.expected_resume();
             program.estimated_context_tokens = program
@@ -214,14 +216,44 @@ impl ProgramRuntime {
     }
 
     /// Release an idle Program generation with no retained requests.
-    pub fn release_idle(&mut self, program_ref: &ProgramRef) -> bool {
+    pub fn release_idle(&mut self, program_ref: &ProgramRef, now: Instant) -> bool {
         let key = RuntimeKey::from(program_ref);
         let releasable = self.programs.get(&key).is_some_and(|program| {
             &program.reference == program_ref
                 && program.in_flight_requests == 0
                 && self.request_pool.program_len(program_ref) == 0
         });
-        releasable && self.programs.remove(&key).is_some()
+        if !releasable {
+            return false;
+        }
+        let Some(program) = self.programs.remove(&key) else {
+            return false;
+        };
+        self.last_generations
+            .insert(key.clone(), program.reference.generation());
+        self.released_generations_at.insert(key, now);
+        true
+    }
+
+    /// Bound generation fencing history after released Programs age out.
+    pub(crate) fn prune_released_generations(
+        &mut self,
+        now: Instant,
+        retention: std::time::Duration,
+    ) {
+        let expired = self
+            .released_generations_at
+            .iter()
+            .filter(|(key, released_at)| {
+                !self.programs.contains_key(*key)
+                    && now.saturating_duration_since(**released_at) >= retention
+            })
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+        for key in expired {
+            self.released_generations_at.remove(&key);
+            self.last_generations.remove(&key);
+        }
     }
 
     /// Invalidate a placement whose backend disappeared from discovery.
@@ -412,7 +444,7 @@ mod tests {
         );
         assert!(runtime.pause_idle(dispatch.program()));
         assert_eq!(runtime.placement(dispatch.program()), None);
-        assert!(runtime.release_idle(dispatch.program()));
+        assert!(runtime.release_idle(dispatch.program(), Instant::now()));
     }
 
     #[test]
@@ -424,7 +456,7 @@ mod tests {
             .unwrap();
         assert!(runtime.complete_request(&old_dispatch, None.into()));
         assert!(runtime.pause_idle(old_dispatch.program()));
-        assert!(runtime.release_idle(old_dispatch.program()));
+        assert!(runtime.release_idle(old_dispatch.program(), Instant::now()));
 
         let new_handle = runtime.retain_request(&identity("p"), 200, None, Instant::now());
         let new_dispatch = runtime
@@ -433,6 +465,24 @@ mod tests {
         assert!(!runtime.complete_request(&old_dispatch, None.into()));
         assert_eq!(runtime.placement(new_dispatch.program()), Some("rank-1"));
         assert_eq!(new_dispatch.program().generation(), 2);
+    }
+
+    #[test]
+    fn released_generation_history_is_ttl_bounded() {
+        let now = Instant::now();
+        let mut runtime = ProgramRuntime::default();
+        let identity = identity("bounded");
+        let handle = runtime.retain_request(&identity, 10, None, now);
+        let dispatch = runtime.admit_front(&handle, "rank-0".into(), now).unwrap();
+        assert!(runtime.complete_request(&dispatch, Some(10).into()));
+        assert!(runtime.pause_idle(dispatch.program()));
+        assert!(runtime.release_idle(dispatch.program(), now));
+        runtime.prune_released_generations(
+            now + std::time::Duration::from_secs(61),
+            std::time::Duration::from_secs(60),
+        );
+        assert!(runtime.last_generations.is_empty());
+        assert!(runtime.released_generations_at.is_empty());
     }
 
     #[test]

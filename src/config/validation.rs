@@ -63,8 +63,8 @@ impl ConfigValidator {
                 config.paused_retention_ttl_seconds,
             ),
             (
-                "shared_prefix_freshness_warmup_seconds",
-                config.shared_prefix_freshness_warmup_seconds,
+                "shared_prefix_freshness_kv_turnovers",
+                config.shared_prefix_freshness_kv_turnovers,
             ),
         ];
         for (field, value) in positive_finite {
@@ -79,6 +79,10 @@ impl ConfigValidator {
         let nonnegative_finite = [
             ("acting_ttl_seconds", config.acting_ttl_seconds),
             ("privileged_ttl_seconds", config.privileged_ttl_seconds),
+            (
+                "shared_prefix_freshness_warmup_seconds",
+                config.shared_prefix_freshness_warmup_seconds,
+            ),
         ];
         for (field, value) in nonnegative_finite {
             if !value.is_finite() || value < 0.0 {
@@ -93,6 +97,7 @@ impl ConfigValidator {
             || config.max_active_programs_per_target == 0
             || config.stats_window_size == 0
             || config.privileged_max_context_tokens == 0
+            || config.max_segment_rounds == 0
             || config.token_capacity_per_target == Some(0)
         {
             return Err(ConfigError::ValidationFailed {
@@ -100,21 +105,23 @@ impl ConfigValidator {
                     .to_string(),
             });
         }
-        if !config.cross_rank_headroom_ratio.is_finite()
-            || config.cross_rank_headroom_ratio < 0.0
-            || !config.shared_prefix_freshness_kv_turnovers.is_finite()
-            || config.shared_prefix_freshness_kv_turnovers < 0.0
-        {
+        if !config.cross_rank_headroom_ratio.is_finite() || config.cross_rank_headroom_ratio < 1.0 {
             return Err(ConfigError::ValidationFailed {
-                reason: "Program scheduling multipliers must be finite and >= 0".to_string(),
+                reason: "cross_rank_headroom_ratio must be finite and >= 1".to_string(),
             });
         }
-        if !(0.0..=1.0).contains(&config.low_watermark_ratio)
-            || !(0.0..=1.0).contains(&config.high_watermark_ratio)
+        if !(0.0 < config.low_watermark_ratio && config.low_watermark_ratio <= 1.0)
+            || !(0.0 < config.high_watermark_ratio && config.high_watermark_ratio <= 1.0)
             || config.low_watermark_ratio > config.high_watermark_ratio
         {
             return Err(ConfigError::ValidationFailed {
-                reason: "Program scheduling watermarks must satisfy 0 <= low <= high <= 1"
+                reason: "Program scheduling watermarks must satisfy 0 < low <= high <= 1"
+                    .to_string(),
+            });
+        }
+        if config.force_resume_timeout_seconds > config.queue_timeout_seconds {
+            return Err(ConfigError::ValidationFailed {
+                reason: "force_resume_timeout_seconds must not exceed queue_timeout_seconds"
                     .to_string(),
             });
         }
@@ -604,6 +611,51 @@ impl ConfigValidator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_validate_program_scheduling_boundaries() {
+        let valid = ProgramSchedulingConfig::default();
+        assert!(ConfigValidator::validate_program_scheduling(&valid).is_ok());
+
+        let invalid = [
+            ProgramSchedulingConfig {
+                cross_rank_headroom_ratio: f64::NAN,
+                ..valid.clone()
+            },
+            ProgramSchedulingConfig {
+                low_watermark_ratio: 0.0,
+                ..valid.clone()
+            },
+            ProgramSchedulingConfig {
+                high_watermark_ratio: 1.1,
+                ..valid.clone()
+            },
+            ProgramSchedulingConfig {
+                low_watermark_ratio: 0.9,
+                high_watermark_ratio: 0.8,
+                ..valid.clone()
+            },
+            ProgramSchedulingConfig {
+                force_resume_timeout_seconds: valid.queue_timeout_seconds + 1.0,
+                ..valid.clone()
+            },
+            ProgramSchedulingConfig {
+                shared_prefix_freshness_warmup_seconds: -1.0,
+                ..valid.clone()
+            },
+            ProgramSchedulingConfig {
+                shared_prefix_freshness_kv_turnovers: 0.0,
+                ..valid.clone()
+            },
+            ProgramSchedulingConfig {
+                max_segment_rounds: 0,
+                ..valid
+            },
+        ];
+        for config in invalid {
+            assert!(ConfigValidator::validate_program_scheduling(&config).is_err());
+        }
+    }
 
     #[test]
     fn test_validate_regular_mode() {

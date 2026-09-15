@@ -666,6 +666,10 @@ impl GenerationRequest for ChatCompletionRequest {
             .unwrap_or_default()
             .to_string()
     }
+
+    fn extract_program_identity_payload(&self) -> Option<serde_json::Value> {
+        program_identity_payload(&self.other, self.user.as_deref())
+    }
 }
 
 // ============= Regular Response =============
@@ -875,6 +879,10 @@ impl GenerationRequest for CompletionRequest {
 
     fn extract_text_for_routing(&self) -> String {
         self.prompt.extract_text_for_routing()
+    }
+
+    fn extract_program_identity_payload(&self) -> Option<serde_json::Value> {
+        program_identity_payload(&self.other, self.user.as_deref())
     }
 }
 
@@ -2120,6 +2128,10 @@ impl GenerationRequest for InferenceGenerateRequest {
             .collect::<Vec<String>>()
             .join(" ")
     }
+
+    fn extract_program_identity_payload(&self) -> Option<serde_json::Value> {
+        program_identity_payload(&self.other, None)
+    }
 }
 
 // ==================================================================
@@ -2398,6 +2410,36 @@ pub trait GenerationRequest: Send + Sync {
 
     /// Extract text content for routing decisions
     fn extract_text_for_routing(&self) -> String;
+
+    /// Extract only the small body subset used for Program identity parsing.
+    fn extract_program_identity_payload(&self) -> Option<serde_json::Value> {
+        None
+    }
+}
+
+fn program_identity_payload(
+    other: &serde_json::Map<String, serde_json::Value>,
+    user: Option<&str>,
+) -> Option<serde_json::Value> {
+    let mut payload = serde_json::Map::new();
+    for field in [
+        "vllm_xargs",
+        "agent_hint",
+        "session_params",
+        "session_id",
+        "user_id",
+    ] {
+        if let Some(value) = other.get(field) {
+            payload.insert(field.to_string(), value.clone());
+        }
+    }
+    if let Some(user) = user {
+        payload.insert(
+            "user".to_string(),
+            serde_json::Value::String(user.to_string()),
+        );
+    }
+    (!payload.is_empty()).then_some(serde_json::Value::Object(payload))
 }
 
 /// Helper type for string or array of strings
@@ -2522,6 +2564,24 @@ pub enum LoRAPath {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn program_identity_payload_excludes_generation_content() {
+        let other = serde_json::from_value::<serde_json::Map<String, Value>>(serde_json::json!({
+            "vllm_xargs": {"agentic_context": {"program_id": "program-a"}},
+            "agent_hint": {"session_id": "session-a"},
+            "prompt": "must-not-be-copied",
+            "messages": ["must-not-be-copied"]
+        }))
+        .unwrap();
+        let payload = program_identity_payload(&other, Some("user-a")).unwrap();
+        assert_eq!(payload.as_object().unwrap().len(), 3);
+        assert!(payload.get("vllm_xargs").is_some());
+        assert!(payload.get("agent_hint").is_some());
+        assert_eq!(payload.get("user").unwrap(), "user-a");
+        assert!(payload.get("prompt").is_none());
+        assert!(payload.get("messages").is_none());
+    }
     use serde_json;
 
     // ==================================================================

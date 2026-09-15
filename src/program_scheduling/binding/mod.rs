@@ -40,6 +40,8 @@ pub struct ProgramBindingCandidate {
     pub capacity_tokens: Option<usize>,
     /// Current target KV pressure normalized to [0, 1].
     pub kv_pressure: f64,
+    /// Whether the new Program fits the Cache-aware immediate-admission gate.
+    pub immediately_admissible: bool,
 }
 
 /// One initial Program binding algorithm.
@@ -313,13 +315,21 @@ impl ProgramBindingPolicy for CacheAwareBinding {
         candidates: &[ProgramBindingCandidate],
         routing_text: Option<&str>,
     ) -> Option<String> {
-        let candidates = candidates
+        let eligible = candidates
             .iter()
-            .map(|candidate| CacheAwareCandidate {
-                target_id: &candidate.target_id,
-                kv_pressure: candidate.kv_pressure,
-            })
+            .filter(|candidate| candidate.immediately_admissible)
             .collect::<Vec<_>>();
+        let candidates = if eligible.is_empty() {
+            candidates.iter().collect::<Vec<_>>()
+        } else {
+            eligible
+        }
+        .into_iter()
+        .map(|candidate| CacheAwareCandidate {
+            target_id: &candidate.target_id,
+            kv_pressure: candidate.kv_pressure,
+        })
+        .collect::<Vec<_>>();
         self.affinity
             .evaluate_initial_placement(
                 identity.model_pool(),
@@ -366,6 +376,7 @@ mod tests {
             accounted_tokens: used,
             capacity_tokens: Some(capacity),
             kv_pressure: used / capacity as f64,
+            immediately_admissible: true,
         }
     }
 
@@ -484,6 +495,29 @@ mod tests {
                 .bind(&identity("program-b"), &candidates, Some("shared second"))
                 .as_deref(),
             Some(first_target.as_str())
+        );
+    }
+
+    #[test]
+    fn cache_aware_prefers_immediately_admissible_candidates() {
+        let mut bindings = ProgramBindings::new(ProgramBindingStrategy::CacheAware, 160);
+        let mut full = candidate("rank-a", 1, 90.0, 100);
+        full.immediately_admissible = false;
+        let available = candidate("rank-b", 0, 0.0, 100);
+        bindings.commit_placement(
+            &ProgramRef::new("model".into(), "owner".into(), 1),
+            "shared-prefix/first",
+            "rank-a",
+        );
+        assert_eq!(
+            bindings
+                .bind(
+                    &identity("program-b"),
+                    &[full, available],
+                    Some("shared-prefix/second")
+                )
+                .as_deref(),
+            Some("rank-b")
         );
     }
 }

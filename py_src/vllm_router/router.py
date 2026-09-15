@@ -91,6 +91,8 @@ class Router:
         health_check_timeout_secs: Timeout in seconds for health check requests. Default: 5
         health_check_interval_secs: Interval in seconds between runtime health checks. Default: 60
         health_check_endpoint: Health check endpoint path. Default: '/health'
+        program_scheduling_config_json: Optional JSON object configuring Program-level scheduling.
+            Default: None
     """
 
     def __init__(self, router: Optional[_Router] = None, **kwargs):

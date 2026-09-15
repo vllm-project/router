@@ -8,6 +8,7 @@ use super::{
     ProgressTtlConfig, ProgressTtlFactors,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Complete opt-in Program scheduler configuration.
@@ -254,6 +255,7 @@ pub(crate) struct ProgramSchedulerState {
     pub(crate) decisions: HashMap<ProgramRef, ProgramDecisionState>,
     pub(crate) targets: BTreeMap<String, ProgramTarget>,
     pub(crate) model_targets: HashMap<String, BTreeSet<String>>,
+    pub(crate) model_target_snapshots: HashMap<String, Arc<[ProgramTarget]>>,
     pub(crate) rank_queues: HashMap<String, VecDeque<ProgramRef>>,
     pub(crate) global_queues: HashMap<String, VecDeque<ProgramRef>>,
     pub(crate) observations: HashMap<String, RankObservationState>,
@@ -268,6 +270,7 @@ impl ProgramSchedulerState {
             decisions: HashMap::new(),
             targets: BTreeMap::new(),
             model_targets: HashMap::new(),
+            model_target_snapshots: HashMap::new(),
             rank_queues: HashMap::new(),
             global_queues: HashMap::new(),
             observations: HashMap::new(),
