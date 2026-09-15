@@ -14,6 +14,7 @@ mod request_pool;
 mod runtime;
 mod scheduler;
 mod scheduler_admission;
+mod scheduler_fairness;
 mod scheduler_lifecycle;
 mod scheduler_state;
 

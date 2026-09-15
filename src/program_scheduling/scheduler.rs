@@ -251,7 +251,12 @@ impl ProgramScheduler {
         let home_target = state.bindings.bind(identity, &candidates);
         state.decisions.insert(
             reference,
-            ProgramDecisionState::new(home_target, estimated_context_tokens, now),
+            ProgramDecisionState::new(
+                identity.placement_key().to_string(),
+                home_target,
+                estimated_context_tokens,
+                now,
+            ),
         );
     }
 

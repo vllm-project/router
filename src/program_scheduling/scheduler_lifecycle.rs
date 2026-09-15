@@ -174,6 +174,7 @@ impl ProgramScheduler {
             None => {}
         }
         if !self.config.binding_only {
+            self.yield_completed_segment(&mut state, dispatch.program(), now);
             self.run_periodic_decisions(&mut state, now);
         }
     }
@@ -188,6 +189,7 @@ impl ProgramScheduler {
     pub(crate) fn run_periodic_decisions(&self, state: &mut ProgramSchedulerState, now: Instant) {
         self.expire_acting_ttls(state, now);
         self.release_expired_paused(state, now);
+        self.reconcile_privileges(state, now);
         self.repair_capacity(state, now);
         self.schedule_rank_local(state, now);
     }

@@ -14,6 +14,8 @@ use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone)]
 pub(crate) struct RankAdmissionPlan {
+    pub(crate) victims: Vec<ProgramRef>,
+    pub(crate) privilege_source: Option<ProgramRef>,
     pub(crate) used_tokens: f64,
     pub(crate) required_tokens: f64,
     pub(crate) reserve_tokens: f64,
@@ -72,16 +74,14 @@ impl ProgramScheduler {
                     .get(&reference)
                     .and_then(|decision| decision.last_target.clone())
                     .ok_or(ScheduleError::NoTargets)?;
-                let queue = state.rank_queues.entry(target_id).or_default();
+                let queue = state.rank_queues.entry(target_id.clone()).or_default();
                 if !queue.iter().any(|queued| queued == &reference) {
                     queue.push_back(reference.clone());
                 }
                 if let Some(decision) = state.decisions.get_mut(&reference) {
                     decision.queued_at.get_or_insert(arrived_at);
-                    decision
-                        .force_resume_deadline
-                        .get_or_insert(arrived_at + self.config.force_resume_timeout);
                 }
+                self.set_force_resume_deadline(&mut state, &target_id, &reference, arrived_at);
             }
             if self.config.binding_only {
                 self.activate_binding_only(&mut state, &reference);
@@ -141,9 +141,17 @@ impl ProgramScheduler {
             state,
             program,
             &target_id,
-            false,
-            false,
-            false,
+            RankAdmissionPlan {
+                victims: Vec::new(),
+                privilege_source: None,
+                used_tokens: 0.0,
+                required_tokens: 0.0,
+                reserve_tokens: 0.0,
+                capacity_tokens: self.config.progress_ttl.token_capacity,
+                forced: false,
+                privileged: false,
+                batch_gain: false,
+            },
             Instant::now(),
         );
     }
@@ -156,8 +164,35 @@ impl ProgramScheduler {
 
     pub(crate) fn cancel_retained_request(&self, handle: &ProgramRequestHandle) {
         let mut state = self.state.lock();
+        let before = state.runtime.view(handle.program());
+        let before_tokens = state
+            .decisions
+            .get(handle.program())
+            .map(|decision| decision.private_tokens(self.config.progress_ttl.decode_buffer_tokens));
         if !state.runtime.cancel_request(handle) {
             return;
+        }
+        let after = state.runtime.view(handle.program());
+        if let (Some(before), Some(after), Some(tokens), Some(target_id)) = (
+            before,
+            after,
+            before_tokens,
+            state
+                .decisions
+                .get(handle.program())
+                .and_then(|decision| decision.last_target.clone()),
+        ) {
+            if before.state == ProgramState::Active && after.state == ProgramState::Paused {
+                Self::adjust_usage(&mut state, &target_id, -tokens);
+                if let Some(decision) = state.decisions.get_mut(handle.program()) {
+                    let now = Instant::now();
+                    decision.paused_at = Some(now);
+                    decision.last_pause_reason = Some(ProgramPauseReason::RequestCancelled);
+                    decision.rounds_since_activation = 0;
+                    decision.pause_when_idle = false;
+                    Self::restart_shared_prefix_freshness(decision, now);
+                }
+            }
         }
         let program = handle.program();
         let keep_queued = state
@@ -205,22 +240,14 @@ impl ProgramScheduler {
                 }) else {
                     break;
                 };
-                self.commit_admission(
-                    state,
-                    &candidate,
-                    &target_id,
-                    plan.forced,
-                    plan.privileged,
-                    plan.batch_gain,
-                    now,
-                );
+                self.commit_admission(state, &candidate, &target_id, plan, now);
                 changed = true;
             }
         }
         changed
     }
 
-    fn local_resume_cmp(
+    pub(crate) fn local_resume_cmp(
         &self,
         state: &ProgramSchedulerState,
         left: &ProgramRef,
@@ -293,15 +320,27 @@ impl ProgramScheduler {
                 other.state == ProgramState::Active && other.placement.as_deref() == Some(target_id)
             })
             .collect::<Vec<_>>();
+        let privilege_source = active.iter().find_map(|other| {
+            let other_state = state.decisions.get(&other.reference)?;
+            (other.status == ProgramStatus::Acting
+                && other_state.placement_key == decision.placement_key
+                && other_state
+                    .privilege_deadline
+                    .is_some_and(|deadline| deadline > now))
+            .then(|| other.reference.clone())
+        });
+        let privileged = privileged || privilege_source.is_some();
         if !forced && !privileged && active.len() >= self.config.max_active_programs_per_target {
             return None;
         }
-        let used_tokens = self.target_usage(state, target_id, now);
+        let mut used_tokens = self.target_usage(state, target_id, now);
         let required_tokens =
             decision.private_tokens(self.config.progress_ttl.decode_buffer_tokens);
         let capacity = self.config.progress_ttl.token_capacity;
         let Some(capacity_tokens) = capacity else {
             return Some(RankAdmissionPlan {
+                victims: Vec::new(),
+                privilege_source,
                 used_tokens,
                 required_tokens,
                 reserve_tokens: 0.0,
@@ -312,6 +351,59 @@ impl ProgramScheduler {
             });
         };
         let low = capacity_tokens as f64 * self.config.progress_ttl.low_watermark_ratio;
+        let mut victims = Vec::new();
+        let reserve_before_reclaim = state
+            .rank_factors
+            .get(target_id)
+            .map(|factors| {
+                let target_rounds = self.policy.target_rounds(factors);
+                let active_remaining = active.iter().filter_map(|active| {
+                    state.decisions.get(&active.reference).map(|active_state| {
+                        (target_rounds - active_state.rounds_since_activation as f64).max(0.0)
+                    })
+                });
+                self.policy
+                    .continuous_growth_reserve_tokens(factors, active_remaining)
+            })
+            .unwrap_or(0.0);
+        if self.config.resume_reclaim_acting_programs
+            && used_tokens + required_tokens + reserve_before_reclaim > low
+        {
+            let mut acting = active
+                .iter()
+                .filter(|program| program.status == ProgramStatus::Acting)
+                .filter(|program| {
+                    state
+                        .decisions
+                        .get(&program.reference)
+                        .is_some_and(|decision| {
+                            decision
+                                .privilege_deadline
+                                .is_none_or(|deadline| deadline <= now)
+                        })
+                })
+                .collect::<Vec<_>>();
+            acting.sort_by(|left, right| {
+                state.decisions[&right.reference]
+                    .segment_served_rounds
+                    .cmp(&state.decisions[&left.reference].segment_served_rounds)
+                    .then_with(|| {
+                        left.reference
+                            .program_id()
+                            .cmp(right.reference.program_id())
+                    })
+            });
+            for victim in acting {
+                used_tokens = (used_tokens
+                    - state.decisions[&victim.reference]
+                        .private_tokens(self.config.progress_ttl.decode_buffer_tokens))
+                .max(0.0);
+                victims.push(victim.reference.clone());
+                if used_tokens + required_tokens + reserve_before_reclaim <= low {
+                    break;
+                }
+            }
+        }
         let immediate_fits = used_tokens + required_tokens <= low;
         let factors = state.rank_factors.get(target_id)?;
         let target_rounds = self.policy.target_rounds(factors);
@@ -326,6 +418,8 @@ impl ProgramScheduler {
         let reserve_fits = used_tokens + required_tokens + reserve_tokens <= low;
         if forced || privileged || (immediate_fits && reserve_fits) {
             return Some(RankAdmissionPlan {
+                victims,
+                privilege_source,
                 used_tokens,
                 required_tokens,
                 reserve_tokens,
@@ -374,6 +468,8 @@ impl ProgramScheduler {
             ),
         });
         estimate.admits.then_some(RankAdmissionPlan {
+            victims,
+            privilege_source,
             used_tokens,
             required_tokens,
             reserve_tokens,
@@ -389,9 +485,7 @@ impl ProgramScheduler {
         state: &mut ProgramSchedulerState,
         program: &ProgramRef,
         target_id: &str,
-        _forced: bool,
-        _privileged: bool,
-        _batch_gain: bool,
+        plan: RankAdmissionPlan,
         now: Instant,
     ) -> bool {
         let Some(tokens) = state
@@ -401,6 +495,21 @@ impl ProgramScheduler {
         else {
             return false;
         };
+        if let Some(source) = &plan.privilege_source {
+            self.pause_idle(state, source, ProgramPauseReason::PrivilegeHandoff, now);
+            if let Some(source_state) = state.decisions.get_mut(source) {
+                source_state.privilege_deadline = None;
+            }
+            if let Some(candidate_state) = state.decisions.get_mut(program) {
+                candidate_state.privilege_deadline = Some(now + self.config.privileged_ttl);
+                candidate_state.privilege_ttl_expired = false;
+            }
+        }
+        for victim in &plan.victims {
+            if plan.privilege_source.as_ref() != Some(victim) {
+                self.pause_idle(state, victim, ProgramPauseReason::CapacityRepair, now);
+            }
+        }
         if !state.runtime.activate(program, target_id.to_string()) {
             return false;
         }
