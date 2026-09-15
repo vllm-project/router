@@ -6,6 +6,7 @@
 mod binding;
 mod contracts;
 mod domain;
+mod factors;
 mod identity;
 mod observations;
 mod request_pool;
@@ -19,6 +20,7 @@ pub use domain::{
     ProgramDispatch, ProgramRef, ProgramState, ProgramStatus, ProgramTarget,
     ProgramUsageObservation,
 };
+pub use factors::{ContinuitySample, ProgressTtlFactors, RequestSample};
 pub use identity::ProgramIdentity;
 pub use observations::{
     BackendObservation, BackendObservationFailure, BackendObservationProvider,
