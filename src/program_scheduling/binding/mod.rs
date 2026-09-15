@@ -5,7 +5,7 @@
 
 use super::ProgramIdentity;
 use super::ProgramRef;
-use crate::policies::ConsistentHashPolicy;
+use crate::policies::{CacheAwareCandidate, CacheAwarePolicy, ConsistentHashPolicy};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Debug;
@@ -23,6 +23,8 @@ pub enum ProgramBindingStrategy {
     LeastProgramCount,
     /// Select the backend with the greatest unaccounted token capacity.
     ReasoningTokenBalance,
+    /// Combine request-text prefix affinity with current KV headroom.
+    CacheAware,
 }
 
 /// Program-level load snapshot used only for initial binding.
@@ -36,6 +38,8 @@ pub struct ProgramBindingCandidate {
     pub accounted_tokens: f64,
     /// Explicit per-target token capacity required by token balance.
     pub capacity_tokens: Option<usize>,
+    /// Current target KV pressure normalized to [0, 1].
+    pub kv_pressure: f64,
 }
 
 /// One initial Program binding algorithm.
@@ -48,7 +52,12 @@ pub trait ProgramBindingPolicy: Send + Sync + Debug {
         &mut self,
         identity: &ProgramIdentity,
         candidates: &[ProgramBindingCandidate],
+        routing_text: Option<&str>,
     ) -> Option<String>;
+
+    fn commit_placement(&self, _model_pool: &str, _text: &str, _target_id: &str) {}
+
+    fn remove_target(&self, _model_pool: &str, _target_id: &str) {}
 }
 
 /// Stable Program binding table plus one selected initial-binding policy.
@@ -71,6 +80,7 @@ impl ProgramBindings {
             ProgramBindingStrategy::ProgramRoundRobin => Box::new(RoundRobinBinding::default()),
             ProgramBindingStrategy::LeastProgramCount => Box::new(LeastProgramCountBinding),
             ProgramBindingStrategy::ReasoningTokenBalance => Box::new(ReasoningTokenBalanceBinding),
+            ProgramBindingStrategy::CacheAware => Box::new(CacheAwareBinding::default()),
         };
         Self {
             policy,
@@ -83,6 +93,7 @@ impl ProgramBindings {
         &mut self,
         identity: &ProgramIdentity,
         candidates: &[ProgramBindingCandidate],
+        routing_text: Option<&str>,
     ) -> Option<String> {
         let key = ProgramBindingKey::from(identity);
         let live_targets: BTreeSet<&str> = candidates
@@ -96,7 +107,7 @@ impl ProgramBindings {
         }
         let mut ordered = candidates.to_vec();
         ordered.sort_by(|left, right| left.target_id.cmp(&right.target_id));
-        let target_id = self.policy.select(identity, &ordered)?;
+        let target_id = self.policy.select(identity, &ordered, routing_text)?;
         self.bindings.insert(key, target_id.clone());
         Some(target_id)
     }
@@ -129,6 +140,15 @@ impl ProgramBindings {
         let previous_len = self.bindings.len();
         self.bindings.retain(|_, bound| bound != target_id);
         previous_len - self.bindings.len()
+    }
+
+    pub(crate) fn commit_placement(&self, program: &ProgramRef, text: &str, target_id: &str) {
+        self.policy
+            .commit_placement(program.model_pool(), text, target_id);
+    }
+
+    pub(crate) fn remove_affinity_target(&self, model_pool: &str, target_id: &str) {
+        self.policy.remove_target(model_pool, target_id);
     }
 }
 
@@ -193,6 +213,7 @@ impl ProgramBindingPolicy for ConsistentHashBinding {
         &mut self,
         identity: &ProgramIdentity,
         candidates: &[ProgramBindingCandidate],
+        _routing_text: Option<&str>,
     ) -> Option<String> {
         let targets: Vec<String> = candidates
             .iter()
@@ -220,6 +241,7 @@ impl ProgramBindingPolicy for RoundRobinBinding {
         &mut self,
         identity: &ProgramIdentity,
         candidates: &[ProgramBindingCandidate],
+        _routing_text: Option<&str>,
     ) -> Option<String> {
         if candidates.is_empty() {
             return None;
@@ -242,6 +264,7 @@ impl ProgramBindingPolicy for LeastProgramCountBinding {
         &mut self,
         _identity: &ProgramIdentity,
         candidates: &[ProgramBindingCandidate],
+        _routing_text: Option<&str>,
     ) -> Option<String> {
         candidates
             .iter()
@@ -258,6 +281,7 @@ impl ProgramBindingPolicy for ReasoningTokenBalanceBinding {
         &mut self,
         _identity: &ProgramIdentity,
         candidates: &[ProgramBindingCandidate],
+        _routing_text: Option<&str>,
     ) -> Option<String> {
         candidates
             .iter()
@@ -274,6 +298,43 @@ impl ProgramBindingPolicy for ReasoningTokenBalanceBinding {
                     .then_with(|| right.target_id.cmp(&left.target_id))
             })
             .map(|(candidate, _)| candidate.target_id.clone())
+    }
+}
+
+#[derive(Debug, Default)]
+struct CacheAwareBinding {
+    affinity: CacheAwarePolicy,
+}
+
+impl ProgramBindingPolicy for CacheAwareBinding {
+    fn select(
+        &mut self,
+        identity: &ProgramIdentity,
+        candidates: &[ProgramBindingCandidate],
+        routing_text: Option<&str>,
+    ) -> Option<String> {
+        let candidates = candidates
+            .iter()
+            .map(|candidate| CacheAwareCandidate {
+                target_id: &candidate.target_id,
+                kv_pressure: candidate.kv_pressure,
+            })
+            .collect::<Vec<_>>();
+        self.affinity
+            .evaluate_initial_placement(
+                identity.model_pool(),
+                routing_text.unwrap_or_default(),
+                &candidates,
+            )
+            .map(|placement| placement.target_id)
+    }
+
+    fn commit_placement(&self, model_pool: &str, text: &str, target_id: &str) {
+        self.affinity.commit_placement(model_pool, text, target_id);
+    }
+
+    fn remove_target(&self, model_pool: &str, target_id: &str) {
+        self.affinity.remove_placement_target(model_pool, target_id);
     }
 }
 
@@ -304,6 +365,7 @@ mod tests {
             accounted_programs: programs,
             accounted_tokens: used,
             capacity_tokens: Some(capacity),
+            kv_pressure: used / capacity as f64,
         }
     }
 
@@ -316,17 +378,17 @@ mod tests {
             candidate("rank-0", 0, 0.0, 100),
         ];
         assert_eq!(
-            bindings.bind(&program, &candidates).as_deref(),
+            bindings.bind(&program, &candidates, None).as_deref(),
             Some("rank-0")
         );
         assert_eq!(
-            bindings.bind(&program, &candidates).as_deref(),
+            bindings.bind(&program, &candidates, None).as_deref(),
             Some("rank-0")
         );
         assert_eq!(bindings.binding(&program), Some("rank-0"));
         assert_eq!(bindings.remove_target("rank-0"), 1);
         assert_eq!(
-            bindings.bind(&program, &candidates).as_deref(),
+            bindings.bind(&program, &candidates, None).as_deref(),
             Some("rank-1")
         );
         assert_eq!(bindings.release(&program).as_deref(), Some("rank-1"));
@@ -342,13 +404,13 @@ mod tests {
         ];
         assert_eq!(
             bindings
-                .bind(&identity("program-a"), &candidates)
+                .bind(&identity("program-a"), &candidates, None)
                 .as_deref(),
             Some("rank-0")
         );
         assert_eq!(
             bindings
-                .bind(&identity("program-b"), &candidates)
+                .bind(&identity("program-b"), &candidates, None)
                 .as_deref(),
             Some("rank-1")
         );
@@ -364,7 +426,7 @@ mod tests {
         ];
         assert_eq!(
             bindings
-                .bind(&identity("program-a"), &candidates)
+                .bind(&identity("program-a"), &candidates, None)
                 .as_deref(),
             Some("rank-1")
         );
@@ -379,7 +441,7 @@ mod tests {
         ];
         assert_eq!(
             bindings
-                .bind(&identity("program-a"), &candidates)
+                .bind(&identity("program-a"), &candidates, None)
                 .as_deref(),
             Some("rank-1")
         );
@@ -398,6 +460,30 @@ mod tests {
         ];
         let mut left = ProgramBindings::new(ProgramBindingStrategy::ConsistentHash, 160);
         let mut right = ProgramBindings::new(ProgramBindingStrategy::ConsistentHash, 160);
-        assert_eq!(left.bind(&program, &first), right.bind(&program, &second));
+        assert_eq!(
+            left.bind(&program, &first, None),
+            right.bind(&program, &second, None)
+        );
+    }
+
+    #[test]
+    fn cache_aware_binding_learns_only_after_committed_dispatch() {
+        let mut bindings = ProgramBindings::new(ProgramBindingStrategy::CacheAware, 160);
+        let candidates = vec![
+            candidate("rank-0", 0, 10.0, 100),
+            candidate("rank-1", 0, 10.0, 100),
+        ];
+        let first = identity("program-a");
+        let first_target = bindings
+            .bind(&first, &candidates, Some("shared first"))
+            .unwrap();
+        let first_ref = ProgramRef::new("model".into(), "program-a".into(), 1);
+        bindings.commit_placement(&first_ref, "shared first", &first_target);
+        assert_eq!(
+            bindings
+                .bind(&identity("program-b"), &candidates, Some("shared second"))
+                .as_deref(),
+            Some(first_target.as_str())
+        );
     }
 }

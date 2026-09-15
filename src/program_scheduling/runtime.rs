@@ -26,7 +26,7 @@ impl ProgramRuntime {
         &mut self,
         identity: &ProgramIdentity,
         estimated_context_tokens: usize,
-        routing_text: Option<String>,
+        routing_text: Option<&str>,
         arrived_at: Instant,
     ) -> ProgramRequestHandle {
         let key = RuntimeKey::from(identity);

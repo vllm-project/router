@@ -67,6 +67,7 @@ impl ProgramScheduler {
             .collect::<Vec<_>>();
         for target_id in &removed {
             state.bindings.remove_target(target_id);
+            state.bindings.remove_affinity_target(model_pool, target_id);
             state.rank_queues.remove(target_id);
             state.rank_factors.remove(target_id);
             state.observations.remove(target_id);
@@ -120,8 +121,8 @@ impl ProgramScheduler {
                 placement_key,
                 expected_resume,
             );
-            let candidates = self.binding_candidates(&state, &identity);
-            let replacement = state.bindings.bind(&identity, &candidates);
+            let candidates = self.binding_candidates(&state, &identity, Instant::now());
+            let replacement = state.bindings.bind(&identity, &candidates, None);
             if let Some(decision) = state.decisions.get_mut(&program) {
                 decision.home_target = replacement.clone();
                 decision.last_target = replacement.clone();
@@ -279,6 +280,7 @@ impl ProgramScheduler {
         &self,
         state: &ProgramSchedulerState,
         identity: &ProgramIdentity,
+        now: Instant,
     ) -> Vec<ProgramBindingCandidate> {
         state
             .model_targets
@@ -312,6 +314,18 @@ impl ProgramScheduler {
                     accounted_programs: accounted.len(),
                     accounted_tokens,
                     capacity_tokens: self.config.progress_ttl.token_capacity,
+                    kv_pressure: self
+                        .config
+                        .progress_ttl
+                        .token_capacity
+                        .map_or(0.0, |capacity| {
+                            if capacity == 0 {
+                                1.0
+                            } else {
+                                (self.target_usage(state, target_id, now) / capacity as f64)
+                                    .clamp(0.0, 1.0)
+                            }
+                        }),
                 }
             })
             .collect()
@@ -324,6 +338,7 @@ impl ProgramScheduler {
         reference: ProgramRef,
         estimated_context_tokens: usize,
         now: Instant,
+        routing_text: Option<&str>,
     ) {
         if let Some(decision) = state.decisions.get_mut(&reference) {
             if estimated_context_tokens >= decision.estimated_context_tokens {
@@ -332,8 +347,8 @@ impl ProgramScheduler {
             }
             return;
         }
-        let candidates = self.binding_candidates(state, identity);
-        let home_target = state.bindings.bind(identity, &candidates);
+        let candidates = self.binding_candidates(state, identity, now);
+        let home_target = state.bindings.bind(identity, &candidates, routing_text);
         state.decisions.insert(
             reference,
             ProgramDecisionState::new(

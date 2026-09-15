@@ -54,7 +54,7 @@ impl RequestPool {
         program: ProgramRef,
         arrived_at: Instant,
         estimated_context_tokens: usize,
-        routing_text: Option<String>,
+        routing_text: Option<&str>,
     ) -> ProgramRequestHandle {
         self.next_request_id = self.next_request_id.wrapping_add(1);
         let request_id = self.next_request_id;
@@ -66,7 +66,7 @@ impl RequestPool {
                 id: request_id,
                 arrived_at,
                 estimated_context_tokens,
-                routing_text,
+                routing_text: routing_text.map(str::to_string),
                 notifier: Arc::clone(&notifier),
             });
         self.retained_request_count = self.retained_request_count.saturating_add(1);
@@ -160,7 +160,7 @@ mod tests {
         let mut pool = RequestPool::default();
         let program = program(1);
         let first = pool.retain(program.clone(), Instant::now(), 100, None);
-        let second = pool.retain(program.clone(), Instant::now(), 200, Some("text".into()));
+        let second = pool.retain(program.clone(), Instant::now(), 200, Some("text"));
         assert_eq!(pool.len(), 2);
         assert_eq!(pool.program_len(&program), 2);
         assert!(pool.front(&second).is_none());

@@ -1,4 +1,5 @@
 use super::*;
+use crate::program_scheduling::ProgramBindingStrategy;
 
 /// Configuration validator
 pub struct ConfigValidator;
@@ -43,6 +44,13 @@ impl ConfigValidator {
     }
 
     fn validate_program_scheduling(config: &ProgramSchedulingConfig) -> ConfigResult<()> {
+        if config.binding_strategy == ProgramBindingStrategy::ReasoningTokenBalance
+            && config.token_capacity_per_target.is_none()
+        {
+            return Err(ConfigError::ValidationFailed {
+                reason: "reasoning_token_balance requires token_capacity_per_target".to_string(),
+            });
+        }
         let positive_finite = [
             ("metrics_interval_seconds", config.metrics_interval_seconds),
             ("queue_timeout_seconds", config.queue_timeout_seconds),

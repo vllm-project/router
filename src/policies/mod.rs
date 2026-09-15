@@ -18,7 +18,7 @@ mod registry;
 mod rendezvous_hash;
 mod round_robin;
 
-pub use cache_aware::CacheAwarePolicy;
+pub use cache_aware::{CacheAwareCandidate, CacheAwarePlacement, CacheAwarePolicy};
 pub use consistent_hash::ConsistentHashPolicy;
 pub use consistent_hash::VIRTUAL_NODES_PER_WORKER;
 pub use factory::PolicyFactory;

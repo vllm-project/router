@@ -45,7 +45,7 @@ impl ProgramScheduler {
             let handle = state.runtime.retain_request(
                 &identity,
                 estimated_context_tokens,
-                routing_text,
+                routing_text.as_deref(),
                 arrived_at,
             );
             let reference = handle.program().clone();
@@ -58,6 +58,7 @@ impl ProgramScheduler {
                 reference.clone(),
                 estimated_context_tokens,
                 arrived_at,
+                routing_text.as_deref(),
             );
             let current_tokens = state.decisions[&reference]
                 .private_tokens(self.config.progress_ttl.decode_buffer_tokens);
@@ -167,7 +168,13 @@ impl ProgramScheduler {
     fn claim_dispatch(&self, handle: &ProgramRequestHandle) -> Option<ProgramDispatch> {
         let mut state = self.state.lock();
         let target = state.runtime.placement(handle.program())?.to_string();
-        state.runtime.admit_front(handle, target, Instant::now())
+        let dispatch = state.runtime.admit_front(handle, target, Instant::now())?;
+        if let Some(text) = dispatch.routing_text() {
+            state
+                .bindings
+                .commit_placement(dispatch.program(), text, &dispatch.target_id);
+        }
+        Some(dispatch)
     }
 
     pub(crate) fn cancel_retained_request(&self, handle: &ProgramRequestHandle) {
@@ -717,7 +724,14 @@ mod tests {
             let identity = identity(name);
             let handle = state.runtime.retain_request(&identity, 100, None, now);
             let reference = handle.program().clone();
-            scheduler.ensure_decision_state(&mut state, &identity, reference.clone(), 100, now);
+            scheduler.ensure_decision_state(
+                &mut state,
+                &identity,
+                reference.clone(),
+                100,
+                now,
+                None,
+            );
             state
                 .rank_queues
                 .entry("rank-0".into())
@@ -762,6 +776,7 @@ mod tests {
                 handle.program().clone(),
                 100,
                 now,
+                None,
             );
             state
                 .rank_queues

@@ -354,7 +354,14 @@ mod tests {
         let mut state = scheduler.state.lock();
         let identity = identity("p");
         let handle = state.runtime.retain_request(&identity, 100, None, now);
-        scheduler.ensure_decision_state(&mut state, &identity, handle.program().clone(), 100, now);
+        scheduler.ensure_decision_state(
+            &mut state,
+            &identity,
+            handle.program().clone(),
+            100,
+            now,
+            None,
+        );
         state
             .global_queues
             .entry("model".into())

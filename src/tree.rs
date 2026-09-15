@@ -628,54 +628,7 @@ impl Tree {
 
     #[allow(dead_code)]
     pub fn prefix_match_tenant(&self, text: &str, tenant: &str) -> String {
-        // Use slice-based traversal - no Vec<char> allocation
-
-        // Intern tenant ID once for efficient lookups
-        let tenant_id = intern_tenant(tenant);
-
-        let mut remaining = text;
-        let mut matched_chars = 0;
-        let mut prev = Arc::clone(&self.root);
-
-        while !remaining.is_empty() {
-            let first_char = remaining.chars().next().unwrap();
-
-            let child_node = prev.children.get(&first_char).map(|e| e.value().clone());
-
-            if let Some(matched_node) = child_node {
-                // Only continue matching if this node belongs to the specified tenant
-                if !matched_node
-                    .tenant_last_access_time
-                    .contains_key(tenant_id.as_ref())
-                {
-                    break;
-                }
-
-                let matched_text_guard = matched_node.text.read().unwrap();
-                let matched_node_text_count = matched_text_guard.char_count();
-
-                // Use slice-based comparison - no allocation
-                let shared_count = shared_prefix_count(remaining, matched_text_guard.as_str());
-                drop(matched_text_guard);
-
-                if shared_count == matched_node_text_count {
-                    // Full match with current node's text, continue to next node
-                    matched_chars += shared_count;
-                    remaining = advance_by_chars(remaining, shared_count);
-                    prev = matched_node;
-                } else {
-                    // Partial match - still use this node for timestamp update
-                    matched_chars += shared_count;
-                    prev = matched_node;
-                    break;
-                }
-            } else {
-                // No match found, stop here
-                break;
-            }
-        }
-
-        let curr = prev;
+        let (matched_chars, curr, tenant_id) = self.prefix_match_tenant_state(text, tenant);
 
         // Only update timestamp if we found a match for the specified tenant.
         // Update matched node only - ancestor propagation is unnecessary.
@@ -690,6 +643,45 @@ impl Tree {
 
         // Build result from original input using char count
         take_chars(text, matched_chars)
+    }
+
+    /// Return one tenant's matched character count without updating LRU state.
+    pub fn prefix_match_tenant_char_count(&self, text: &str, tenant: &str) -> usize {
+        self.prefix_match_tenant_state(text, tenant).0
+    }
+
+    fn prefix_match_tenant_state(&self, text: &str, tenant: &str) -> (usize, NodeRef, TenantId) {
+        let tenant_id = intern_tenant(tenant);
+        let mut remaining = text;
+        let mut matched_chars = 0;
+        let mut previous = Arc::clone(&self.root);
+        while !remaining.is_empty() {
+            let first_char = remaining.chars().next().unwrap();
+            let Some(matched_node) = previous
+                .children
+                .get(&first_char)
+                .map(|entry| entry.value().clone())
+            else {
+                break;
+            };
+            if !matched_node
+                .tenant_last_access_time
+                .contains_key(tenant_id.as_ref())
+            {
+                break;
+            }
+            let matched_text = matched_node.text.read().unwrap();
+            let node_chars = matched_text.char_count();
+            let shared_chars = shared_prefix_count(remaining, matched_text.as_str());
+            drop(matched_text);
+            matched_chars += shared_chars;
+            previous = matched_node;
+            if shared_chars != node_chars {
+                break;
+            }
+            remaining = advance_by_chars(remaining, shared_chars);
+        }
+        (matched_chars, previous, tenant_id)
     }
 
     /// Return the list of tenants for which this node is a leaf.

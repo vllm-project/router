@@ -72,6 +72,20 @@ use std::thread;
 use std::time::Duration;
 use tracing::{debug, info};
 
+/// Backend candidate for a side-effect-free cache-affinity query.
+#[derive(Debug, Clone, Copy)]
+pub struct CacheAwareCandidate<'a> {
+    pub target_id: &'a str,
+    pub kv_pressure: f64,
+}
+
+/// Cache-affinity result committed separately by the caller.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CacheAwarePlacement {
+    pub target_id: String,
+    pub match_rate: f32,
+}
+
 /// Cache-aware routing policy
 ///
 /// Routes requests based on cache affinity when load is balanced,
@@ -120,6 +134,60 @@ impl CacheAwarePolicy {
             config,
             trees,
             eviction_handle,
+        }
+    }
+
+    /// Select by the product of text-prefix affinity and current KV headroom.
+    pub fn evaluate_initial_placement(
+        &self,
+        model_id: &str,
+        request_text: &str,
+        candidates: &[CacheAwareCandidate<'_>],
+    ) -> Option<CacheAwarePlacement> {
+        let tree = self.trees.get(normalize_model_key(model_id));
+        let input_chars = request_text.chars().count();
+        candidates
+            .iter()
+            .map(|candidate| {
+                let matched_chars = tree.as_ref().map_or(0, |tree| {
+                    tree.prefix_match_tenant_char_count(request_text, candidate.target_id)
+                });
+                let affinity = if input_chars == 0 {
+                    0.0
+                } else {
+                    matched_chars as f64 / input_chars as f64
+                };
+                let headroom = 1.0 - candidate.kv_pressure.clamp(0.0, 1.0);
+                (candidate, affinity, headroom, (1.0 + affinity) * headroom)
+            })
+            .max_by(|left, right| {
+                left.3
+                    .total_cmp(&right.3)
+                    .then_with(|| left.2.total_cmp(&right.2))
+                    .then_with(|| left.1.total_cmp(&right.1))
+                    .then_with(|| right.0.target_id.cmp(left.0.target_id))
+            })
+            .map(|(candidate, affinity, _, _)| CacheAwarePlacement {
+                target_id: candidate.target_id.to_string(),
+                match_rate: affinity as f32,
+            })
+    }
+
+    /// Update the affinity tree after the selected target is committed.
+    pub fn commit_placement(&self, model_id: &str, request_text: &str, target_id: &str) {
+        if request_text.is_empty() {
+            return;
+        }
+        self.trees
+            .entry(normalize_model_key(model_id).to_string())
+            .or_insert_with(|| Arc::new(Tree::new()))
+            .insert(request_text, target_id);
+    }
+
+    /// Remove one unavailable target from a model's affinity tree.
+    pub fn remove_placement_target(&self, model_id: &str, target_id: &str) {
+        if let Some(tree) = self.trees.get(normalize_model_key(model_id)) {
+            tree.remove_tenant(target_id);
         }
     }
 
@@ -573,5 +641,48 @@ mod tests {
         // All requests should now go to worker2
         let idx = policy.select_worker(&workers, Some("test1")).unwrap();
         assert_eq!(idx, 1);
+    }
+
+    #[test]
+    fn initial_placement_combines_affinity_and_headroom_without_mutation() {
+        let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+            eviction_interval_secs: 0,
+            ..Default::default()
+        });
+        let candidates = [
+            CacheAwareCandidate {
+                target_id: "rank-0",
+                kv_pressure: 0.2,
+            },
+            CacheAwareCandidate {
+                target_id: "rank-1",
+                kv_pressure: 0.1,
+            },
+        ];
+        assert_eq!(
+            policy
+                .evaluate_initial_placement("model", "shared suffix", &candidates)
+                .unwrap()
+                .target_id,
+            "rank-1"
+        );
+        policy.commit_placement("model", "shared first", "rank-0");
+        let equal_pressure = [
+            CacheAwareCandidate {
+                target_id: "rank-0",
+                kv_pressure: 0.1,
+            },
+            CacheAwareCandidate {
+                target_id: "rank-1",
+                kv_pressure: 0.1,
+            },
+        ];
+        assert_eq!(
+            policy
+                .evaluate_initial_placement("model", "shared second", &equal_pressure)
+                .unwrap()
+                .target_id,
+            "rank-0"
+        );
     }
 }
