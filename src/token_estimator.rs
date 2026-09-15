@@ -3,6 +3,7 @@
 //! Each model and endpoint pair owns an exponentially smoothed tokens-per-byte
 //! coefficient. Backend prompt usage updates the coefficient after completion.
 
+use crate::metrics::RouterMetrics;
 use parking_lot::Mutex;
 use serde::Serialize;
 use std::collections::HashMap;
@@ -100,6 +101,21 @@ impl MomentumTokenEstimator {
             .mul_add(previous, (1.0 - self.momentum) * observed);
         coefficients.insert(calibration.scope.clone(), updated);
         Some(updated)
+    }
+
+    pub(crate) fn observe_feedback(
+        &self,
+        calibration: &TokenEstimateCalibration,
+        actual_prompt_tokens: Option<usize>,
+    ) -> Option<f64> {
+        let coefficient = actual_prompt_tokens.and_then(|tokens| self.observe(calibration, tokens));
+        RouterMetrics::record_agent_aware_token_estimate_feedback(
+            &calibration.scope.model_pool,
+            &calibration.scope.endpoint,
+            actual_prompt_tokens.is_some(),
+            coefficient,
+        );
+        coefficient
     }
 
     pub(crate) fn diagnostics(&self) -> Vec<TokenEstimatorDiagnostic> {

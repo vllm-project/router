@@ -9,6 +9,7 @@ use super::{
     BatchGainInputs, ContinuitySample, ProgramDispatch, ProgramIdentity, ProgramRef,
     ProgramRequestHandle, ProgramState, ProgramStatus, ProgramTarget, ScheduleError,
 };
+use crate::metrics::RouterMetrics;
 use std::cmp::Ordering;
 use std::sync::Arc;
 use std::time::Instant;
@@ -237,11 +238,30 @@ impl ProgramScheduler {
         let mut state = self.state.lock();
         let target = state.runtime.placement(handle.program())?.to_string();
         let dispatch = state.runtime.admit_front(handle, target, Instant::now())?;
+        RouterMetrics::record_agent_aware_queue_wait(
+            &dispatch.target_id,
+            dispatch
+                .dispatched_at()
+                .saturating_duration_since(dispatch.request_arrived_at()),
+        );
         if let Some(text) = dispatch.routing_text() {
             state
                 .bindings
                 .commit_placement(dispatch.program(), text, &dispatch.target_id);
         }
+        info!(
+            event = "request_dispatch",
+            program = %dispatch.redacted_program_id(),
+            target = %dispatch.target_id,
+            router_queue_seconds = dispatch
+                .dispatched_at()
+                .saturating_duration_since(dispatch.request_arrived_at())
+                .as_secs_f64(),
+            estimated_context_tokens = dispatch.estimated_context_tokens(),
+            placement_epoch = dispatch.placement_epoch(),
+            placement_start_request = dispatch.placement_start_request(),
+            "Program scheduling diagnostic"
+        );
         Some(dispatch)
     }
 
@@ -593,6 +613,10 @@ impl ProgramScheduler {
         plan: RankAdmissionPlan,
         now: Instant,
     ) -> bool {
+        let previous_target = state
+            .decisions
+            .get(program)
+            .and_then(|decision| decision.last_target.clone());
         let Some(tokens) = state
             .decisions
             .get(program)
@@ -629,6 +653,10 @@ impl ProgramScheduler {
             decision.pause_when_idle = false;
             decision.queued_at = None;
             decision.force_resume_deadline = None;
+            decision.force_resume_timeout = None;
+            decision.force_resume_active_remaining_rounds = 0.0;
+            decision.force_resume_pool_remaining_rounds = 0.0;
+            decision.force_resume_request_throughput_per_second = 0.0;
         }
         Self::adjust_usage(state, target_id, tokens);
         for queue in state.rank_queues.values_mut() {
@@ -651,6 +679,22 @@ impl ProgramScheduler {
             capacity_tokens = ?plan.capacity_tokens,
             "Program scheduling decision"
         );
+        let reason = if plan.forced {
+            "force_resume"
+        } else if plan.privileged {
+            "privileged_resume"
+        } else if plan.batch_gain {
+            "batch_gain_admit"
+        } else {
+            "program_admit"
+        };
+        RouterMetrics::record_agent_aware_transition(target_id, reason);
+        if previous_target
+            .as_deref()
+            .is_some_and(|previous| previous != target_id)
+        {
+            RouterMetrics::record_agent_aware_transition(target_id, "cross_rank_resume");
+        }
         true
     }
 
@@ -693,6 +737,7 @@ impl ProgramScheduler {
             released_private_tokens = tokens,
             "Program scheduling decision"
         );
+        RouterMetrics::record_agent_aware_transition(&target_id, reason.as_str());
         true
     }
 

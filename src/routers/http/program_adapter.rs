@@ -78,10 +78,8 @@ impl ProgramCompletionInner {
             accumulator.observation
         };
         if success {
-            if let Some(prompt_tokens) = usage.prompt_tokens {
-                self.token_estimator
-                    .observe(&self.token_estimate_calibration, prompt_tokens);
-            }
+            self.token_estimator
+                .observe_feedback(&self.token_estimate_calibration, usage.prompt_tokens);
         }
         let decode_seconds = self.first_stream_output_at.get().map(|first_output| {
             Instant::now()

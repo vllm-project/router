@@ -9,6 +9,24 @@ use super::{ProgramRef, ProgramState, ProgramStatus};
 use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
 
+struct ForceResumeEstimate {
+    timeout: Duration,
+    active_remaining_rounds: f64,
+    pool_remaining_rounds: f64,
+    request_throughput_per_second: f64,
+}
+
+impl ForceResumeEstimate {
+    fn fallback(timeout: Duration) -> Self {
+        Self {
+            timeout,
+            active_remaining_rounds: 0.0,
+            pool_remaining_rounds: 0.0,
+            request_throughput_per_second: 0.0,
+        }
+    }
+}
+
 impl ProgramScheduler {
     /// Freeze the current work-ahead estimate when a Program enters a rank queue.
     pub(crate) fn set_force_resume_deadline(
@@ -18,13 +36,18 @@ impl ProgramScheduler {
         candidate: &ProgramRef,
         now: Instant,
     ) {
-        let timeout = if self.config.global_queue {
+        let estimate = if self.config.global_queue {
             self.global_force_resume_timeout(state, candidate, now)
         } else {
             self.force_resume_timeout(state, target_id, candidate, now)
         };
         if let Some(decision) = state.decisions.get_mut(candidate) {
-            decision.force_resume_deadline = Some(now + timeout);
+            decision.force_resume_deadline = Some(now + estimate.timeout);
+            decision.force_resume_timeout = Some(estimate.timeout);
+            decision.force_resume_active_remaining_rounds = estimate.active_remaining_rounds;
+            decision.force_resume_pool_remaining_rounds = estimate.pool_remaining_rounds;
+            decision.force_resume_request_throughput_per_second =
+                estimate.request_throughput_per_second;
         }
     }
 
@@ -33,29 +56,29 @@ impl ProgramScheduler {
         state: &ProgramSchedulerState,
         candidate: &ProgramRef,
         now: Instant,
-    ) -> Duration {
+    ) -> ForceResumeEstimate {
         let Some(targets) = state.model_targets.get(candidate.model_pool()) else {
-            return self.config.force_resume_timeout;
+            return ForceResumeEstimate::fallback(self.config.force_resume_timeout);
         };
         if targets.is_empty() {
-            return self.config.force_resume_timeout;
+            return ForceResumeEstimate::fallback(self.config.force_resume_timeout);
         }
         let mut target_rounds = std::collections::HashMap::new();
         let mut aggregate_throughput = 0.0;
         for target in targets {
             let Some(factors) = state.rank_factors.get(target) else {
-                return self.config.force_resume_timeout;
+                return ForceResumeEstimate::fallback(self.config.force_resume_timeout);
             };
             let rounds = self.policy.target_rounds(factors);
             let throughput = factors.request_throughput_per_second();
             if rounds <= 0.0 || throughput <= 0.0 {
-                return self.config.force_resume_timeout;
+                return ForceResumeEstimate::fallback(self.config.force_resume_timeout);
             }
             target_rounds.insert(target.as_str(), rounds);
             aggregate_throughput += throughput;
         }
         if aggregate_throughput <= 0.0 {
-            return self.config.force_resume_timeout;
+            return ForceResumeEstimate::fallback(self.config.force_resume_timeout);
         }
         let active_remaining = state
             .runtime
@@ -95,10 +118,15 @@ impl ProgramScheduler {
             .sum::<f64>();
         let maximum = self.config.force_resume_timeout.as_secs_f64();
         let minimum = 30.0_f64.min(maximum);
-        Duration::from_secs_f64(
-            (3.0 * (active_remaining + pool_remaining) / aggregate_throughput)
-                .clamp(minimum, maximum),
-        )
+        ForceResumeEstimate {
+            timeout: Duration::from_secs_f64(
+                (3.0 * (active_remaining + pool_remaining) / aggregate_throughput)
+                    .clamp(minimum, maximum),
+            ),
+            active_remaining_rounds: active_remaining,
+            pool_remaining_rounds: pool_remaining,
+            request_throughput_per_second: aggregate_throughput,
+        }
     }
 
     fn force_resume_timeout(
@@ -107,14 +135,14 @@ impl ProgramScheduler {
         target_id: &str,
         candidate: &ProgramRef,
         now: Instant,
-    ) -> Duration {
+    ) -> ForceResumeEstimate {
         let Some(factors) = state.rank_factors.get(target_id) else {
-            return self.config.force_resume_timeout;
+            return ForceResumeEstimate::fallback(self.config.force_resume_timeout);
         };
         let throughput = factors.request_throughput_per_second();
         let target_rounds = self.policy.target_rounds(factors);
         if target_rounds <= 0.0 || throughput <= 0.0 {
-            return self.config.force_resume_timeout;
+            return ForceResumeEstimate::fallback(self.config.force_resume_timeout);
         }
         let active_remaining = state
             .runtime
@@ -153,9 +181,14 @@ impl ProgramScheduler {
             * target_rounds.max(1.0);
         let maximum = self.config.force_resume_timeout.as_secs_f64();
         let minimum = 30.0_f64.min(maximum);
-        Duration::from_secs_f64(
-            (3.0 * (active_remaining + pool_remaining) / throughput).clamp(minimum, maximum),
-        )
+        ForceResumeEstimate {
+            timeout: Duration::from_secs_f64(
+                (3.0 * (active_remaining + pool_remaining) / throughput).clamp(minimum, maximum),
+            ),
+            active_remaining_rounds: active_remaining,
+            pool_remaining_rounds: pool_remaining,
+            request_throughput_per_second: throughput,
+        }
     }
 
     pub(crate) fn reconcile_privileges(

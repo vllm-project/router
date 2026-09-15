@@ -9,7 +9,9 @@ use super::{
     ProgramDispatch, ProgramRef, ProgramState, ProgramStatus, ProgramUsageObservation,
     RequestSample,
 };
+use crate::metrics::RouterMetrics;
 use std::time::Instant;
+use tracing::info;
 
 const CACHE_CONTINUITY_HIT_RATIO: f64 = 0.9;
 
@@ -73,6 +75,16 @@ impl ProgramScheduler {
                     .fitted_acting_ttl(factors, cache_miss_impact_seconds)
             })
             .unwrap_or_default();
+        let ttl_window_samples = state
+            .rank_factors
+            .get(&target_id)
+            .map_or(0, |factors| factors.continuity_sample_count());
+        let ttl_window_complete = state.rank_factors.get(&target_id).is_some_and(|factors| {
+            factors.continuity_window_complete(self.config.progress_ttl.stats_window_size)
+        });
+        let uncached_prompt_tokens = observed_prompt_tokens.saturating_sub(cached_prompt_tokens);
+        let estimated_cache_miss_tokens =
+            observed_prompt_tokens.saturating_sub(shared_prefix_for_cost);
         let freshness = self.shared_prefix_freshness(&state, &target_id);
         if !state.runtime.complete_request(dispatch, usage) {
             return;
@@ -158,6 +170,25 @@ impl ProgramScheduler {
                     .saturating_add(completion_tokens);
                 decision.last_request_finished_at = Some(now);
                 decision.last_cache_miss_impact_seconds = cache_miss_impact_seconds;
+                info!(
+                    event = "cache_observation",
+                    program = %dispatch.redacted_program_id(),
+                    target = %target_id,
+                    prompt_tokens = observed_prompt_tokens,
+                    cached_prompt_tokens,
+                    previous_context_tokens = previous_context.unwrap_or(0),
+                    uncached_prompt_tokens,
+                    shared_prefix_tokens_for_cost = shared_prefix_for_cost,
+                    estimated_cache_miss_tokens,
+                    cache_miss_impact_seconds,
+                    cache_continuous,
+                    placement_start_request = dispatch.placement_start_request(),
+                    starts_new_segment,
+                    segment_served_rounds = decision.segment_served_rounds,
+                    shared_prefix_observation_due = freshness_due,
+                    shared_prefix_tokens_after = decision.shared_prefix_tokens,
+                    "Program scheduling diagnostic"
+                );
                 request_sample = Some(RequestSample {
                     prompt_tokens: observed_prompt_tokens,
                     completion_tokens,
@@ -178,6 +209,21 @@ impl ProgramScheduler {
             if completion_action == Some(CompletionAction::StartActingTtl) {
                 decision.acting_since = Some(now);
                 decision.ttl_deadline = Some(now + acting_ttl);
+                info!(
+                    event = "ttl_armed",
+                    program = %dispatch.redacted_program_id(),
+                    target = %target_id,
+                    prompt_tokens = observed_prompt_tokens,
+                    cached_prompt_tokens,
+                    uncached_prompt_tokens,
+                    shared_prefix_tokens_for_cost = shared_prefix_for_cost,
+                    estimated_cache_miss_tokens,
+                    request_cache_miss_impact_seconds = cache_miss_impact_seconds,
+                    request_ttl_seconds = acting_ttl.as_secs_f64(),
+                    ttl_window_samples,
+                    ttl_window_complete,
+                    "Program scheduling diagnostic"
+                );
             }
         }
         if let Some(sample) = request_sample {
@@ -201,6 +247,7 @@ impl ProgramScheduler {
         let now = Instant::now();
         let mut state = self.state.lock();
         self.run_periodic_decisions(&mut state, now);
+        self.publish_metrics(&state);
     }
 
     pub(crate) fn run_periodic_decisions(&self, state: &mut ProgramSchedulerState, now: Instant) {
@@ -334,6 +381,13 @@ impl ProgramScheduler {
             .map(|runtime| runtime.reference)
             .collect::<Vec<_>>();
         for program in &expired {
+            if let Some(target_id) = state
+                .decisions
+                .get(program)
+                .and_then(|decision| decision.last_target.as_deref())
+            {
+                RouterMetrics::record_agent_aware_transition(target_id, "paused_retention_release");
+            }
             self.release_program(state, program, now);
         }
         !expired.is_empty()
@@ -492,6 +546,10 @@ impl ProgramScheduler {
                     )
                 } else if let Some(decision) = state.decisions.get_mut(&victim.reference) {
                     decision.pause_when_idle = true;
+                    RouterMetrics::record_agent_aware_transition(
+                        &target_id,
+                        "capacity_repair_mark",
+                    );
                     true
                 } else {
                     false
@@ -555,12 +613,20 @@ impl ProgramScheduler {
                         )
                     } else if let Some(decision) = state.decisions.get_mut(&victim.reference) {
                         decision.pause_when_idle = true;
+                        RouterMetrics::record_agent_aware_transition(
+                            &target_id,
+                            "capacity_repair_mark",
+                        );
                         true
                     } else {
                         false
                     };
                     if relieved {
                         projected = (projected - relief).max(0.0);
+                        RouterMetrics::record_agent_aware_transition(
+                            &target_id,
+                            "progress_privilege_demote",
+                        );
                         changed = true;
                     }
                 }

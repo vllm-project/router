@@ -8,10 +8,12 @@ use super::{
     BackendObservation, ProgramBindingCandidate, ProgramIdentity, ProgramRef,
     ProgramSchedulerConfig, ProgramState, ProgramStatus, ProgramTarget, ProgressTtlPolicyMath,
 };
+use crate::metrics::RouterMetrics;
 use parking_lot::Mutex;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tracing::info;
 
 /// Router-owned Program scheduler.
 #[derive(Debug)]
@@ -142,6 +144,15 @@ impl ProgramScheduler {
         ) in affected
         {
             let placement_invalidated = state.runtime.invalidate_placement(&program, &removed);
+            if target_disappeared {
+                if let Some(target) = state
+                    .decisions
+                    .get(&program)
+                    .and_then(|decision| decision.last_target.as_deref())
+                {
+                    RouterMetrics::record_agent_aware_transition(target, "health_failover");
+                }
+            }
             state.bindings.release_program(&program);
             for queue in state.rank_queues.values_mut() {
                 queue.retain(|queued| queued != &program);
@@ -278,6 +289,7 @@ impl ProgramScheduler {
     ) {
         let mut state = self.state.lock();
         for raw in observations {
+            let target_id = raw.target_id.clone();
             let Some(checkpoint) = epoch.checkpoints.get(&raw.target_id) else {
                 continue;
             };
@@ -298,15 +310,35 @@ impl ProgramScheduler {
             });
             let estimated_active_program_tokens = estimated_reasoning_tokens
                 .map(|reasoning| reasoning + checkpoint.active_acting_private_tokens);
-            let observation = state.observations.entry(raw.target_id).or_default();
+            let observation = state.observations.entry(target_id.clone()).or_default();
             observation.active_program_token_delta -= checkpoint.ledger_checkpoint;
             observation.kv_cache_usage = raw.kv_cache_usage;
             observation.running_requests = raw.running_requests;
             observation.waiting_requests = raw.waiting_requests;
             observation.router_active_reasoning_programs = checkpoint.active_reasoning_programs;
             observation.router_active_reasoning_requests = checkpoint.active_reasoning_requests;
+            observation.estimated_active_reasoning_tokens = estimated_reasoning_tokens;
             observation.estimated_active_program_tokens = estimated_active_program_tokens;
             observation.observed_at = Some(raw.observed_at);
+            let active_program_token_delta = observation.active_program_token_delta;
+            let estimated_total_tokens = self.target_usage(&state, &target_id, raw.observed_at);
+            info!(
+                event = "capacity_observation",
+                target = %target_id,
+                kv_cache_usage = ?raw.kv_cache_usage,
+                native_used_tokens = ?native_used_tokens,
+                vllm_running_requests = ?raw.running_requests,
+                vllm_waiting_requests = ?raw.waiting_requests,
+                router_active_reasoning_programs = checkpoint.active_reasoning_programs,
+                router_active_reasoning_requests = checkpoint.active_reasoning_requests,
+                estimated_reasoning_tokens = ?estimated_reasoning_tokens,
+                active_acting_private_tokens = checkpoint.active_acting_private_tokens,
+                observed_active_program_tokens = ?estimated_active_program_tokens,
+                active_program_token_delta,
+                estimated_total_tokens,
+                capacity_tokens = ?self.config.progress_ttl.token_capacity,
+                "Program scheduling diagnostic"
+            );
         }
     }
 
