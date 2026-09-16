@@ -143,11 +143,6 @@ bash ./run_accuracy_test.sh
 
 ## Additional Pipeline Steps
 
-### Fast Checks
-Formatting and linting (Rust format, clippy, black/ruff) previously ran here;
-they now run in GitHub Actions (`.github/workflows/rust-format.yml`,
-`.github/workflows/clippy.yml`, and `.github/workflows/python-format.yml`).
-
 ### Build
 Creates release artifacts:
 - Rust binary (`target/release/vllm-router`)
