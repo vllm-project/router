@@ -433,7 +433,23 @@ impl ProgramScheduler {
         for queue in state.global_queues.values_mut() {
             queue.retain(|queued| queued != program);
         }
+        let active_relief = state
+            .runtime
+            .view(program)
+            .filter(|runtime| runtime.state == ProgramState::Active)
+            .and_then(|runtime| runtime.placement)
+            .and_then(|target_id| {
+                state.decisions.get(program).map(|decision| {
+                    (
+                        target_id,
+                        decision.private_tokens(self.config.progress_ttl.decode_buffer_tokens),
+                    )
+                })
+            });
         if state.runtime.release_idle(program, now) {
+            if let Some((target_id, tokens)) = active_relief {
+                Self::adjust_usage(state, &target_id, -tokens);
+            }
             state.decisions.remove(program);
             state.bindings.release_program(program);
         }
@@ -501,8 +517,36 @@ impl ProgramScheduler {
                         && program.placement.as_deref() == Some(target_id.as_str())
                 })
                 .count();
-            let mut projected = self.target_usage(state, &target_id, now)
-                + average_completion * reasoning_count as f64;
+            let marked_reasoning = views
+                .iter()
+                .filter(|program| {
+                    program.state == ProgramState::Active
+                        && program.status == ProgramStatus::Reasoning
+                        && program.placement.as_deref() == Some(target_id.as_str())
+                        && state
+                            .decisions
+                            .get(&program.reference)
+                            .is_some_and(|decision| decision.pause_when_idle)
+                })
+                .collect::<Vec<_>>();
+            // Admission and resume use current occupancy: a reasoning Program
+            // marked to pause still owns its KV until the request finishes.
+            // Capacity repair is different: it is selecting any *additional*
+            // victims for the same future idle boundary, so relief already
+            // committed by earlier repair decisions must be subtracted here.
+            let future_private_relief = marked_reasoning
+                .iter()
+                .filter_map(|program| state.decisions.get(&program.reference))
+                .map(|decision| {
+                    decision.private_tokens(self.config.progress_ttl.decode_buffer_tokens)
+                })
+                .sum::<f64>();
+            let future_completion_relief = average_completion * marked_reasoning.len() as f64;
+            let mut projected = (self.target_usage(state, &target_id, now)
+                + average_completion * reasoning_count as f64
+                - future_private_relief
+                - future_completion_relief)
+                .max(0.0);
             if projected <= high {
                 continue;
             }
@@ -680,11 +724,11 @@ mod tests {
     use crate::program_scheduling::{ProgramIdentity, ProgramSchedulerConfig, ProgramTarget};
     use serde_json::json;
 
-    fn identity() -> ProgramIdentity {
+    fn identity(name: &str) -> ProgramIdentity {
         ProgramIdentity::from_request(
             None,
             Some(&json!({"vllm_xargs":{"agentic_context":{
-                "program_id":"p","task_id":null,"expected_resume":true
+                "program_id":name,"task_id":null,"expected_resume":true
             }}})),
             Some("model"),
         )
@@ -701,7 +745,7 @@ mod tests {
             dp_rank: Some(0),
         };
         let dispatch = scheduler
-            .acquire(identity(), 100, &[target], None)
+            .acquire(identity("p"), 100, &[target], None)
             .await
             .unwrap();
         scheduler.complete(
@@ -726,5 +770,149 @@ mod tests {
             state.runtime.state(dispatch.program()),
             Some((ProgramState::Paused, ProgramStatus::Acting))
         );
+    }
+
+    #[tokio::test]
+    async fn capacity_repair_does_not_remark_committed_future_relief() {
+        let mut config = ProgramSchedulerConfig::default();
+        config.progress_ttl.token_capacity = Some(400);
+        let scheduler = ProgramScheduler::new(config);
+        let target = ProgramTarget {
+            id: "rank-0".into(),
+            base_url: "http://rank-0".into(),
+            dp_rank: Some(0),
+        };
+        let first = scheduler
+            .acquire(identity("first"), 100, std::slice::from_ref(&target), None)
+            .await
+            .unwrap();
+        let second = scheduler
+            .acquire(identity("second"), 100, &[target], None)
+            .await
+            .unwrap();
+        let now = Instant::now();
+        {
+            let mut state = scheduler.state.lock();
+            state
+                .decisions
+                .get_mut(first.program())
+                .unwrap()
+                .pause_when_idle = true;
+            state
+                .decisions
+                .get_mut(first.program())
+                .unwrap()
+                .estimated_context_tokens = 140;
+            state
+                .decisions
+                .get_mut(second.program())
+                .unwrap()
+                .estimated_context_tokens = 140;
+            assert!(!scheduler.repair_capacity(&mut state, now));
+            assert!(state.decisions[first.program()].pause_when_idle);
+            assert!(!state.decisions[second.program()].pause_when_idle);
+        }
+        scheduler.complete(&first, true, true, Some(140), Some(0.1));
+        scheduler.complete(&second, true, true, Some(140), Some(0.1));
+    }
+
+    #[tokio::test]
+    async fn low_hit_without_a_placement_restart_keeps_the_cache_segment() {
+        let scheduler = ProgramScheduler::new(ProgramSchedulerConfig::default());
+        let target = ProgramTarget {
+            id: "rank-0".into(),
+            base_url: "http://rank-0".into(),
+            dp_rank: Some(0),
+        };
+        let first = scheduler
+            .acquire(
+                identity("segment"),
+                100,
+                std::slice::from_ref(&target),
+                None,
+            )
+            .await
+            .unwrap();
+        let second = scheduler
+            .acquire(identity("segment"), 130, &[target], None)
+            .await
+            .unwrap();
+        assert!(first.placement_start_request());
+        assert!(!second.placement_start_request());
+        scheduler.complete(
+            &first,
+            true,
+            false,
+            ProgramUsageObservation {
+                prompt_tokens: Some(100),
+                completion_tokens: Some(10),
+                cached_prompt_tokens: Some(20),
+            },
+            Some(0.1),
+        );
+        scheduler.complete(
+            &second,
+            true,
+            false,
+            ProgramUsageObservation {
+                prompt_tokens: Some(130),
+                completion_tokens: Some(5),
+                cached_prompt_tokens: Some(30),
+            },
+            Some(0.1),
+        );
+        let state = scheduler.state.lock();
+        let decision = &state.decisions[second.program()];
+        assert_eq!(decision.segment_served_rounds, 2);
+        assert_eq!(decision.shared_prefix_tokens, 20);
+    }
+
+    #[tokio::test]
+    async fn missing_cache_usage_never_becomes_shared_prefix_evidence() {
+        let scheduler = ProgramScheduler::new(ProgramSchedulerConfig::default());
+        let target = ProgramTarget {
+            id: "rank-0".into(),
+            base_url: "http://rank-0".into(),
+            dp_rank: Some(0),
+        };
+        let dispatch = scheduler
+            .acquire(identity("missing-cache"), 100, &[target], None)
+            .await
+            .unwrap();
+        scheduler.complete(
+            &dispatch,
+            true,
+            false,
+            ProgramUsageObservation {
+                prompt_tokens: Some(100),
+                completion_tokens: Some(5),
+                cached_prompt_tokens: None,
+            },
+            Some(0.1),
+        );
+        let state = scheduler.state.lock();
+        assert_eq!(state.decisions[dispatch.program()].shared_prefix_tokens, 0);
+    }
+
+    #[tokio::test]
+    async fn terminal_completion_releases_active_epoch_occupancy() {
+        let scheduler = ProgramScheduler::new(ProgramSchedulerConfig::default());
+        let target = ProgramTarget {
+            id: "rank-0".into(),
+            base_url: "http://rank-0".into(),
+            dp_rank: Some(0),
+        };
+        let dispatch = scheduler
+            .acquire(identity("terminal"), 100, &[target], None)
+            .await
+            .unwrap();
+        assert_eq!(
+            scheduler.state.lock().observations["rank-0"].active_program_token_delta,
+            200.0
+        );
+        scheduler.complete(&dispatch, true, true, Some(100), Some(0.1));
+        let state = scheduler.state.lock();
+        assert_eq!(state.observations["rank-0"].active_program_token_delta, 0.0);
+        assert!(!state.decisions.contains_key(dispatch.program()));
     }
 }

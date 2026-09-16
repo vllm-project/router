@@ -320,8 +320,10 @@ impl ProgramScheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::program_scheduling::scheduler_state::ProgramPauseReason;
     use crate::program_scheduling::{ProgramIdentity, ProgramSchedulerConfig, ProgramTarget};
     use serde_json::json;
+    use std::time::Duration;
 
     fn identity(name: &str) -> ProgramIdentity {
         ProgramIdentity::from_request(
@@ -373,5 +375,54 @@ mod tests {
         assert!(scheduler
             .select_cross_rank_admission(&state, handle.program(), now)
             .is_none());
+    }
+
+    #[test]
+    fn cross_rank_order_inverts_ordinary_mru_but_preserves_priority_tiers() {
+        let mut config = ProgramSchedulerConfig::default();
+        config.global_queue = true;
+        let scheduler = ProgramScheduler::new(config);
+        let targets = [
+            ProgramTarget {
+                id: "rank-0".into(),
+                base_url: "http://worker".into(),
+                dp_rank: Some(0),
+            },
+            ProgramTarget {
+                id: "rank-1".into(),
+                base_url: "http://worker".into(),
+                dp_rank: Some(1),
+            },
+        ];
+        scheduler.sync_targets("model", &targets);
+        let now = Instant::now();
+        let mut state = scheduler.state.lock();
+        let mut programs = Vec::new();
+        for (name, finished_at) in [("recent", now), ("old", now - Duration::from_secs(10))] {
+            let identity = identity(name);
+            let handle = state.runtime.retain_request(&identity, 100, None, now);
+            scheduler.ensure_decision_state(
+                &mut state,
+                &identity,
+                handle.program().clone(),
+                100,
+                now,
+                None,
+            );
+            let decision = state.decisions.get_mut(handle.program()).unwrap();
+            decision.last_target = Some("rank-0".into());
+            decision.last_pause_reason = Some(ProgramPauseReason::TtlExpired);
+            decision.last_request_finished_at = Some(finished_at);
+            state
+                .global_queues
+                .entry("model".into())
+                .or_default()
+                .push_back(handle.program().clone());
+            programs.push(handle.program().clone());
+        }
+        let local = scheduler.global_local_resume_order(&state, "model", now);
+        let cross = scheduler.global_cross_rank_order(&state, "model", now);
+        assert_eq!(local, vec![programs[0].clone(), programs[1].clone()]);
+        assert_eq!(cross, vec![programs[1].clone(), programs[0].clone()]);
     }
 }

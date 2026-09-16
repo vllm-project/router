@@ -458,27 +458,11 @@ impl ProgramScheduler {
             .then(|| other.reference.clone())
         });
         let privileged = privileged || privilege_source.is_some();
-        if !forced && !privileged && active.len() >= self.config.max_active_programs_per_target {
-            return None;
-        }
         let mut used_tokens = self.target_usage(state, target_id, now);
+        let mut active_count = active.len();
         let required_tokens =
             decision.private_tokens(self.config.progress_ttl.decode_buffer_tokens);
         let capacity = self.config.progress_ttl.token_capacity;
-        let Some(capacity_tokens) = capacity else {
-            return Some(RankAdmissionPlan {
-                victims: Vec::new(),
-                privilege_source,
-                used_tokens,
-                required_tokens,
-                reserve_tokens: 0.0,
-                capacity_tokens: None,
-                forced,
-                privileged,
-                batch_gain: false,
-            });
-        };
-        let low = capacity_tokens as f64 * self.config.progress_ttl.low_watermark_ratio;
         let mut victims = Vec::new();
         let reserve_before_reclaim = state
             .rank_factors
@@ -494,8 +478,15 @@ impl ProgramScheduler {
                     .continuous_growth_reserve_tokens(factors, active_remaining)
             })
             .unwrap_or(0.0);
+        let low =
+            capacity.map(|tokens| tokens as f64 * self.config.progress_ttl.low_watermark_ratio);
+        let token_fits = |usage: f64| {
+            low.is_none_or(|limit| usage + required_tokens + reserve_before_reclaim <= limit)
+        };
+        let count_fits =
+            |count: usize| count.saturating_add(1) <= self.config.max_active_programs_per_target;
         if self.config.resume_reclaim_acting_programs
-            && used_tokens + required_tokens + reserve_before_reclaim > low
+            && (!token_fits(used_tokens) || !count_fits(active_count))
         {
             let average_prompt = state
                 .rank_factors
@@ -551,25 +542,44 @@ impl ProgramScheduler {
                     - state.decisions[&victim.reference]
                         .private_tokens(self.config.progress_ttl.decode_buffer_tokens))
                 .max(0.0);
+                active_count = active_count.saturating_sub(1);
                 victims.push(victim.reference.clone());
-                if used_tokens + required_tokens + reserve_before_reclaim <= low {
+                if token_fits(used_tokens) && count_fits(active_count) {
                     break;
                 }
             }
         }
+        let Some(capacity_tokens) = capacity else {
+            if !forced && !privileged && !count_fits(active_count) {
+                return None;
+            }
+            return Some(RankAdmissionPlan {
+                victims,
+                privilege_source,
+                used_tokens,
+                required_tokens,
+                reserve_tokens: 0.0,
+                capacity_tokens: None,
+                forced,
+                privileged,
+                batch_gain: false,
+            });
+        };
+        let low = capacity_tokens as f64 * self.config.progress_ttl.low_watermark_ratio;
         let immediate_fits = used_tokens + required_tokens <= low;
-        let factors = state.rank_factors.get(target_id)?;
-        let target_rounds = self.policy.target_rounds(factors);
-        let active_remaining = active.iter().filter_map(|active| {
-            state.decisions.get(&active.reference).map(|active_state| {
-                (target_rounds - active_state.rounds_since_activation as f64).max(0.0)
-            })
+        let factors = state.rank_factors.get(target_id);
+        let reserve_tokens = factors.map_or(0.0, |factors| {
+            let target_rounds = self.policy.target_rounds(factors);
+            let active_remaining = active.iter().filter_map(|active| {
+                state.decisions.get(&active.reference).map(|active_state| {
+                    (target_rounds - active_state.rounds_since_activation as f64).max(0.0)
+                })
+            });
+            self.policy
+                .continuous_growth_reserve_tokens(factors, active_remaining)
         });
-        let reserve_tokens = self
-            .policy
-            .continuous_growth_reserve_tokens(factors, active_remaining);
         let reserve_fits = used_tokens + required_tokens + reserve_tokens <= low;
-        if forced || privileged || (immediate_fits && reserve_fits) {
+        if forced || privileged || (count_fits(active_count) && immediate_fits && reserve_fits) {
             return Some(RankAdmissionPlan {
                 victims,
                 privilege_source,
@@ -582,9 +592,11 @@ impl ProgramScheduler {
                 batch_gain: false,
             });
         }
-        if !immediate_fits {
+        if !count_fits(active_count) || !immediate_fits {
             return None;
         }
+        let factors = factors?;
+        let target_rounds = self.policy.target_rounds(factors);
         let running = active
             .iter()
             .filter(|active| active.status == ProgramStatus::Reasoning)
@@ -857,6 +869,36 @@ mod tests {
             .unwrap();
         assert_eq!(dispatch.target_id, "rank-0");
         assert!(dispatch.placement_start_request());
+    }
+
+    #[tokio::test]
+    async fn opt_in_acting_reclaim_applies_to_program_count_pressure() {
+        let mut config = ProgramSchedulerConfig::default();
+        config.max_active_programs_per_target = 1;
+        config.resume_reclaim_acting_programs = true;
+        let scheduler = ProgramScheduler::new(config);
+        let target = target();
+        let first = scheduler
+            .acquire(identity("first"), 100, std::slice::from_ref(&target), None)
+            .await
+            .unwrap();
+        {
+            let mut state = scheduler.state.lock();
+            assert!(state.runtime.complete_request(&first, Some(100).into()));
+        }
+        let second = scheduler
+            .acquire(identity("second"), 100, &[target], None)
+            .await
+            .unwrap();
+        let state = scheduler.state.lock();
+        assert_eq!(
+            state.runtime.state(first.program()),
+            Some((ProgramState::Paused, ProgramStatus::Acting))
+        );
+        assert_eq!(
+            state.runtime.state(second.program()),
+            Some((ProgramState::Active, ProgramStatus::Reasoning))
+        );
     }
 
     #[tokio::test]
