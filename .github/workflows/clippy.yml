@@ -1,4 +1,3 @@
-# Rust lint check (moved from Buildkite "Clippy")
 name: clippy
 
 on: [push, pull_request]

@@ -1,4 +1,3 @@
-# Rust formatting check (moved from Buildkite "Rust Format Check")
 name: rust-format
 
 on: [push, pull_request]

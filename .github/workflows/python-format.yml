@@ -1,4 +1,3 @@
-# Python format/lint check (moved from Buildkite "Python Format Check")
 name: python-format
 
 on: [push, pull_request]

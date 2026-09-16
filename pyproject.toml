@@ -48,8 +48,8 @@ license-files = []
 py_limited_api = "cp38"
 
 
-# Lint config for `ruff check py_src/ py_test/` (CI: .buildkite/pipeline.yml).
-# The CI installs ruff unpinned; newer ruff releases expanded the *default*
+# Lint config for `ruff check py_src/ py_test/` (CI: .github/workflows/python-format.yml,
+# which pins ruff==0.16.0). Newer ruff releases expanded the *default*
 # ruleset, which reddened py_src/py_test repo-wide even though nothing in the
 # code changed. Pin the selection to ruff's historical default (E4/E7/E9 + F)
 # so the lint is deterministic across ruff versions. A broader ruleset +
