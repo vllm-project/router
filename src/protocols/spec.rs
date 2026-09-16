@@ -77,7 +77,7 @@ pub enum ChatMessage {
     Assistant {
         role: String, // "assistant"
         #[serde(skip_serializing_if = "Option::is_none")]
-        content: Option<String>,
+        content: Option<UserMessageContent>,
         #[serde(skip_serializing_if = "Option::is_none")]
         name: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -117,12 +117,10 @@ impl<'de> Deserialize<'de> for ChatMessage {
         match role {
             "assistant" => Ok(ChatMessage::Assistant {
                 role: role.to_string(),
-                content: value.get("content").and_then(|c| {
-                    if c.is_null() {
-                        None
-                    } else {
-                        c.as_str().map(String::from)
-                    }
+                content: value.get("content").and_then(|content| {
+                    (!content.is_null())
+                        .then(|| serde_json::from_value(content.clone()).ok())
+                        .flatten()
                 }),
                 name: value.get("name").and_then(|n| {
                     if n.is_null() {
@@ -579,8 +577,8 @@ impl GenerationRequest for ChatCompletionRequest {
                     ..
                 } => {
                     if let Some(content) = content {
-                        if !content.trim().is_empty() {
-                            parts.push(format!("assistant:{}", content.trim()));
+                        for text in content.routing_texts() {
+                            parts.push(format!("assistant:{}", text.trim()));
                         }
                     }
                     if let Some(calls) = tool_calls {
@@ -3726,7 +3724,10 @@ mod tests {
             ChatMessage::Assistant {
                 content, reasoning, ..
             } => {
-                assert_eq!(content.as_ref().unwrap(), "Hello there!");
+                assert!(matches!(
+                    content.as_ref(),
+                    Some(UserMessageContent::Text(text)) if text == "Hello there!"
+                ));
                 assert_eq!(
                     reasoning.as_ref().unwrap(),
                     "Let me think about how to greet the user..."
@@ -3845,6 +3846,41 @@ mod tests {
     }
 
     #[test]
+    fn test_chat_message_assistant_content_blocks_round_trip() {
+        let json = serde_json::json!({
+            "role": "assistant",
+            "content": [
+                {"type": "text", "text": "previous completion"}
+            ]
+        });
+
+        let message: ChatMessage = serde_json::from_value(json.clone()).unwrap();
+
+        assert_eq!(serde_json::to_value(message).unwrap(), json);
+    }
+
+    #[test]
+    fn test_chat_request_routes_on_assistant_content_blocks() {
+        let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "test-model",
+            "messages": [
+                {"role": "user", "content": "first turn"},
+                {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "previous completion"}]
+                },
+                {"role": "user", "content": "next turn"}
+            ]
+        }))
+        .unwrap();
+
+        assert_eq!(
+            request.extract_text_for_routing(),
+            "user:first turn\nassistant:previous completion\nuser:next turn"
+        );
+    }
+
+    #[test]
     fn test_chat_message_user_text() {
         let json = r#"{
             "role": "user",
@@ -3934,7 +3970,7 @@ mod tests {
     fn test_chat_message_roundtrip_serialization() {
         let original = ChatMessage::Assistant {
             role: "assistant".to_string(),
-            content: Some("Hello!".to_string()),
+            content: Some(UserMessageContent::Text("Hello!".to_string())),
             name: None,
             tool_calls: None,
             function_call: None,
@@ -3948,7 +3984,10 @@ mod tests {
             ChatMessage::Assistant {
                 content, reasoning, ..
             } => {
-                assert_eq!(content.as_ref().unwrap(), "Hello!");
+                assert!(matches!(
+                    content.as_ref(),
+                    Some(UserMessageContent::Text(text)) if text == "Hello!"
+                ));
                 assert_eq!(reasoning.as_ref().unwrap(), "Thinking...");
             }
             _ => panic!("Expected Assistant message"),
