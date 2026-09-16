@@ -64,7 +64,7 @@ use std::collections::HashMap;
 pub enum ChatMessage {
     System {
         role: String,
-        content: String,
+        content: UserMessageContent,
         #[serde(skip_serializing_if = "Option::is_none")]
         name: Option<String>,
     },
@@ -159,9 +159,8 @@ impl<'de> Deserialize<'de> for ChatMessage {
                 role: role.to_string(),
                 content: value
                     .get("content")
-                    .and_then(|c| c.as_str())
-                    .unwrap_or("")
-                    .to_string(),
+                    .and_then(|content| serde_json::from_value(content.clone()).ok())
+                    .unwrap_or(UserMessageContent::Text(String::new())),
                 name: value.get("name").and_then(|n| {
                     if n.is_null() {
                         None
@@ -268,6 +267,23 @@ pub struct StructuredOutputsParams {
 pub enum UserMessageContent {
     Text(String),
     Parts(Vec<ContentPart>),
+}
+
+impl UserMessageContent {
+    /// Return non-empty textual parts in wire order for prefix-aware routing.
+    fn routing_texts(&self) -> Vec<&str> {
+        match self {
+            Self::Text(text) if !text.trim().is_empty() => vec![text.as_str()],
+            Self::Text(_) => Vec::new(),
+            Self::Parts(parts) => parts
+                .iter()
+                .filter_map(|part| match part {
+                    ContentPart::Text { text } if !text.trim().is_empty() => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -543,19 +559,114 @@ impl GenerationRequest for ChatCompletionRequest {
     }
 
     fn extract_text_for_routing(&self) -> String {
-        // Use session_id from session_params for session-based routing
-        if let Some(ref session_params) = self.session_params {
-            if let Some(session_id) = session_params.get("session_id") {
-                if let Some(session_id_str) = session_id.as_str() {
-                    if !session_id_str.trim().is_empty() {
-                        return session_id_str.to_string();
+        let mut parts = Vec::new();
+        for message in &self.messages {
+            match message {
+                ChatMessage::System { content, .. } => {
+                    for text in content.routing_texts() {
+                        parts.push(format!("system:{}", text.trim()));
                     }
                 }
+                ChatMessage::User { content, .. } => {
+                    for text in content.routing_texts() {
+                        parts.push(format!("user:{}", text.trim()));
+                    }
+                }
+                ChatMessage::Assistant {
+                    content,
+                    tool_calls,
+                    function_call,
+                    ..
+                } => {
+                    if let Some(content) = content {
+                        if !content.trim().is_empty() {
+                            parts.push(format!("assistant:{}", content.trim()));
+                        }
+                    }
+                    if let Some(calls) = tool_calls {
+                        for call in calls {
+                            if let Some(arguments) = &call.function.arguments {
+                                if !arguments.trim().is_empty() {
+                                    parts.push(format!(
+                                        "assistant_tool_call:{}:{}",
+                                        call.function.name.trim(),
+                                        arguments.trim()
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                    if let Some(call) = function_call {
+                        if let Some(arguments) = &call.arguments {
+                            if !arguments.trim().is_empty() {
+                                parts.push(format!(
+                                    "assistant_function_call:{}:{}",
+                                    call.name.trim(),
+                                    arguments.trim()
+                                ));
+                            }
+                        }
+                    }
+                }
+                ChatMessage::Tool { content, .. } => {
+                    if let Some(text) = content.as_str() {
+                        if !text.trim().is_empty() {
+                            parts.push(format!("tool:{}", text.trim()));
+                        }
+                    } else if let Some(items) = content.as_array() {
+                        for item in items {
+                            if let Some(text) = item.get("text").and_then(Value::as_str) {
+                                if !text.trim().is_empty() {
+                                    parts.push(format!("tool:{}", text.trim()));
+                                }
+                            }
+                        }
+                    }
+                }
+                ChatMessage::Function { content, name, .. } if !content.trim().is_empty() => {
+                    parts.push(format!("function:{}:{}", name.trim(), content.trim()));
+                }
+                _ => {}
             }
         }
-
-        // Return empty string if no session_id - let routing policy handle this case
-        String::new()
+        if let Some(tools) = &self.tools {
+            let mut tools = tools.iter().collect::<Vec<_>>();
+            tools.sort_by(|left, right| left.function.name.cmp(&right.function.name));
+            for tool in tools {
+                let parameters = serde_json::to_string(&tool.function.parameters)
+                    .unwrap_or_else(|_| "{}".to_string());
+                parts.push(format!(
+                    "tool_schema:{}:{}:{}",
+                    tool.function.name.trim(),
+                    tool.function.description.as_deref().unwrap_or("").trim(),
+                    parameters
+                ));
+            }
+        }
+        if let Some(functions) = &self.functions {
+            let mut functions = functions.iter().collect::<Vec<_>>();
+            functions.sort_by(|left, right| left.name.cmp(&right.name));
+            for function in functions {
+                let parameters = serde_json::to_string(&function.parameters)
+                    .unwrap_or_else(|_| "{}".to_string());
+                parts.push(format!(
+                    "function_schema:{}:{}:{}",
+                    function.name.trim(),
+                    function.description.as_deref().unwrap_or("").trim(),
+                    parameters
+                ));
+            }
+        }
+        if !parts.is_empty() {
+            return parts.join("\n");
+        }
+        self.session_params
+            .as_ref()
+            .and_then(|params| params.get("session_id"))
+            .and_then(Value::as_str)
+            .filter(|session_id| !session_id.trim().is_empty())
+            .unwrap_or_default()
+            .to_string()
     }
 }
 
@@ -3687,11 +3798,50 @@ mod tests {
         let message: ChatMessage = serde_json::from_str(json).unwrap();
 
         match message {
-            ChatMessage::System { content, .. } => {
-                assert_eq!(content, "You are a helpful assistant.");
-            }
+            ChatMessage::System {
+                content: UserMessageContent::Text(content),
+                ..
+            } => assert_eq!(content, "You are a helpful assistant."),
             _ => panic!("Expected System message"),
         }
+    }
+
+    #[test]
+    fn test_chat_message_system_content_blocks_round_trip() {
+        let json = serde_json::json!({
+            "role": "system",
+            "content": [
+                {"type": "text", "text": "shared prefix"},
+                {"type": "text", "text": "session prefix"}
+            ]
+        });
+
+        let message: ChatMessage = serde_json::from_value(json.clone()).unwrap();
+
+        assert_eq!(serde_json::to_value(message).unwrap(), json);
+    }
+
+    #[test]
+    fn test_chat_request_routes_on_system_content_blocks() {
+        let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "test-model",
+            "messages": [
+                {
+                    "role": "system",
+                    "content": [
+                        {"type": "text", "text": "shared prefix"},
+                        {"type": "text", "text": "session prefix"}
+                    ]
+                },
+                {"role": "user", "content": "next turn"}
+            ]
+        }))
+        .unwrap();
+
+        assert_eq!(
+            request.extract_text_for_routing(),
+            "system:shared prefix\nsystem:session prefix\nuser:next turn"
+        );
     }
 
     #[test]
