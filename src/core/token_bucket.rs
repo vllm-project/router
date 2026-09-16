@@ -140,6 +140,17 @@ impl TokenBucket {
         );
     }
 
+    /// Seconds until `tokens` are expected to be available again.
+    ///
+    /// Derived from the current level and the refill rate, so it is a lower bound:
+    /// a slot freed by a finishing request can make them available sooner. Returns
+    /// 0.0 when they are available now.
+    pub async fn seconds_until_available(&self, tokens: f64) -> f64 {
+        let available = self.available_tokens().await;
+        let deficit = (tokens - available).max(0.0);
+        deficit / self.refill_rate
+    }
+
     /// Get current available tokens (for monitoring)
     pub async fn available_tokens(&self) -> f64 {
         let mut inner = self.inner.lock().await;
