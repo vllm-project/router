@@ -25,8 +25,11 @@ struct TestContext {
 
 impl TestContext {
     async fn new(worker_configs: Vec<MockWorkerConfig>) -> Self {
-        // Create default router config
-        let config = RouterConfig {
+        Self::new_with_config(Self::default_config(), worker_configs).await
+    }
+
+    fn default_config() -> RouterConfig {
+        RouterConfig {
             mode: RoutingMode::Regular {
                 worker_urls: vec![],
             },
@@ -61,9 +64,7 @@ impl TestContext {
             enable_profiling: false,
             profile_timeout_secs: 30,
             kv_connector: vllm_router_rs::config::KvConnector::Nixl,
-        };
-
-        Self::new_with_config(config, worker_configs).await
+        }
     }
 
     async fn new_with_config(
@@ -125,6 +126,16 @@ impl TestContext {
             Arc::clone(&self.router),
             self.client.clone(),
             &self.config,
+        )
+    }
+
+    async fn create_app_with_generate_paths(&self, paths: &[String]) -> axum::Router {
+        common::test_app::create_test_app_with_tracing_and_generate_paths(
+            Arc::clone(&self.router),
+            self.client.clone(),
+            &self.config,
+            false,
+            paths,
         )
     }
 
@@ -276,6 +287,7 @@ mod health_tests {
 #[cfg(test)]
 mod generation_tests {
     use super::*;
+    use common::mock_worker::{clear_captured_requests, get_captured_requests};
 
     #[tokio::test]
     async fn test_generate_success() {
@@ -314,6 +326,91 @@ mod generation_tests {
         let meta_info = &body_json["meta_info"];
         assert!(meta_info.get("finish_reason").is_some());
         assert_eq!(meta_info["finish_reason"]["type"], "stop");
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_extra_generate_path_cache_aware_tracks_inflight_load() {
+        let config = RouterConfig {
+            policy: PolicyConfig::CacheAware {
+                cache_threshold: 0.0,
+                balance_abs_threshold: 0,
+                balance_rel_threshold: 1.0,
+                eviction_interval_secs: 30,
+                max_tree_size: 10_000,
+            },
+            ..TestContext::default_config()
+        };
+
+        let ctx = TestContext::new_with_config(
+            config,
+            (0..2)
+                .map(|_| MockWorkerConfig {
+                    port: 0,
+                    worker_type: WorkerType::Regular,
+                    health_status: HealthStatus::Healthy,
+                    response_delay_ms: 500,
+                    fail_rate: 0.0,
+                })
+                .collect(),
+        )
+        .await;
+        let ports = [ctx.workers[0].port().await, ctx.workers[1].port().await];
+        for port in ports {
+            clear_captured_requests(port);
+        }
+        let app = ctx
+            .create_app_with_generate_paths(&["/custom/v1/generate".to_string()])
+            .await;
+
+        let request = || {
+            Request::builder()
+                .method("POST")
+                .uri("/custom/v1/generate")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "token_ids": [1, 2, 3],
+                        "sampling_params": {"max_tokens": 4},
+                        "custom_request_field": "preserved"
+                    })
+                    .to_string(),
+                ))
+                .unwrap()
+        };
+
+        let first = tokio::spawn(app.clone().oneshot(request()));
+        tokio::time::timeout(tokio::time::Duration::from_secs(2), async {
+            loop {
+                if ports
+                    .iter()
+                    .map(|port| get_captured_requests(*port).len())
+                    .sum::<usize>()
+                    == 1
+                {
+                    break;
+                }
+                tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let second = tokio::spawn(app.oneshot(request()));
+        let first_response = first.await.unwrap().unwrap();
+        assert_eq!(first_response.status(), StatusCode::OK);
+        let first_body = axum::body::to_bytes(first_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let first_body: serde_json::Value = serde_json::from_slice(&first_body).unwrap();
+        assert_eq!(first_body["choices"][0]["token_ids"], json!([1, 2, 3]));
+        assert_eq!(first_body["custom_request_field"], "preserved");
+
+        assert_eq!(second.await.unwrap().unwrap().status(), StatusCode::OK);
+
+        assert_eq!(get_captured_requests(ports[0]).len(), 1);
+        assert_eq!(get_captured_requests(ports[1]).len(), 1);
 
         ctx.shutdown().await;
     }
