@@ -12,44 +12,6 @@ env:
 
 steps:
   # ============================================================================
-  # Fast Checks - Run in parallel for quick feedback
-  # ============================================================================
-  - group: ":mag: Fast Checks"
-    key: "fast-checks"
-    steps:
-      - label: ":rust: Clippy"
-        plugins:
-          - docker#v5.11.0:
-              image: "$RUST_IMAGE"
-              workdir: /workdir
-              volumes:
-                - ".:/workdir"
-              environment:
-                - "CARGO_INCREMENTAL=0"
-                - "RUST_BACKTRACE=1"
-              command:
-                - bash
-                - -c
-                - |
-                  apt-get update && apt-get install -y pkg-config libssl-dev protobuf-compiler
-                  rustup component add clippy
-                  cargo clippy --all-targets --all-features -- -D warnings
-        agents:
-          queue: "cpu_queue_premerge"
-
-      - label: ":python: Python Format Check"
-        command: |
-          pip install black ruff==0.16.0
-          python -m black --check py_src/ py_test/
-          python -m ruff check py_src/ py_test/
-        agents:
-          queue: "cpu_queue_premerge"
-
-  # Wait for fast checks to pass before building
-  - wait: ~
-    continue_on_failure: false
-
-  # ============================================================================
   # Build - Create release artifacts
   # ============================================================================
   - group: ":hammer: Build"

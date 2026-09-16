@@ -1,0 +1,20 @@
+# Python format/lint check (moved from Buildkite "Python Format Check")
+name: python-format
+
+on: [push, pull_request]
+
+jobs:
+  format:
+    name: Python Format Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Install black and ruff
+        run: pip install black ruff==0.16.0
+      - name: black
+        run: python -m black --check py_src/ py_test/
+      - name: ruff
+        run: python -m ruff check py_src/ py_test/
