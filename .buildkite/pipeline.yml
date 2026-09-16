@@ -17,25 +17,6 @@ steps:
   - group: ":mag: Fast Checks"
     key: "fast-checks"
     steps:
-      - label: ":rust: Rust Format Check"
-        plugins:
-          - docker#v5.11.0:
-              image: "$RUST_IMAGE"
-              workdir: /workdir
-              volumes:
-                - ".:/workdir"
-              environment:
-                - "CARGO_INCREMENTAL=0"
-                - "RUST_BACKTRACE=1"
-              command:
-                - bash
-                - -c
-                - |
-                  rustup component add rustfmt
-                  cargo fmt --check
-        agents:
-          queue: "cpu_queue_premerge"
-
       - label: ":rust: Clippy"
         plugins:
           - docker#v5.11.0:

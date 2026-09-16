@@ -1,0 +1,16 @@
+# Rust formatting check (moved from Buildkite "Rust Format Check")
+name: rust-format
+
+on: [push, pull_request]
+
+jobs:
+  rustfmt:
+    name: Rust Format Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          components: rustfmt
+      - name: Run cargo fmt
+        run: cargo fmt --check
