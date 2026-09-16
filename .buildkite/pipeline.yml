@@ -261,6 +261,10 @@ steps:
                       secretKeyRef:
                         name: hf-token-secret
                         key: token
+                  # agent-stack-k8s defaults to /bin/sh; this job needs bash
+                  # (pipefail, source, nested heredocs).
+                  - name: BUILDKITE_SHELL
+                    value: "/bin/bash -e -c"
             volumes:
               - name: devshm
                 emptyDir:
@@ -270,7 +274,10 @@ steps:
                 hostPath:
                   path: /fsx/hf_cache
                   type: DirectoryOrCreate
+    # agent-stack-k8s invokes the step with /bin/sh. Dash rejects
+    # `set -o pipefail` and `source`, so run the job body under bash.
     command: |
+      bash <<'BASH'
       set -euo pipefail
 
       # Verify HF_TOKEN is set (required for gated models like Llama)
@@ -336,6 +343,7 @@ steps:
       # Run P/D disaggregation test
       cd py_test/e2e/pd_disagg_vllm
       bash ./run_accuracy_test.sh
+      BASH
     agents:
       queue: "l4-k8s"
     depends_on: "build"
