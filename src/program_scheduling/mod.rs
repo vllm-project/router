@@ -44,4 +44,4 @@ pub use policy::{
 pub use request_pool::ProgramRequestHandle;
 pub use runtime::ProgramRuntime;
 pub use scheduler::{BackendObservationEpoch, ProgramScheduler};
-pub use scheduler_state::ProgramSchedulerConfig;
+pub use scheduler_state::{ProgramResumeOrder, ProgramSchedulerConfig};

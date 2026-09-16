@@ -5,7 +5,7 @@
 
 use super::scheduler::ProgramScheduler;
 use super::scheduler_admission::RankAdmissionPlan;
-use super::scheduler_state::ProgramSchedulerState;
+use super::scheduler_state::{ProgramResumeOrder, ProgramSchedulerState};
 use super::{ProgramRef, ProgramState, ProgramStatus};
 use std::time::Instant;
 
@@ -57,7 +57,8 @@ impl ProgramScheduler {
         queued
     }
 
-    /// Cross-rank escape uses inverse ordinary MRU while retaining force and privilege tiers.
+    /// Cross-rank escape reverses the configured ordinary local order while
+    /// retaining force-resume and privilege tiers.
     fn global_cross_rank_order(
         &self,
         state: &ProgramSchedulerState,
@@ -89,16 +90,23 @@ impl ProgramScheduler {
             let right_privileged = right_state
                 .privilege_deadline
                 .is_some_and(|deadline| deadline > now);
-            right_forced
+            let priority = right_forced
                 .cmp(&left_forced)
-                .then_with(|| right_privileged.cmp(&left_privileged))
-                .then_with(|| {
-                    left_state
-                        .last_request_finished_at
-                        .cmp(&right_state.last_request_finished_at)
-                })
-                .then_with(|| left_state.queued_at.cmp(&right_state.queued_at))
-                .then_with(|| left.program_id().cmp(right.program_id()))
+                .then_with(|| right_privileged.cmp(&left_privileged));
+            if priority != std::cmp::Ordering::Equal {
+                return priority;
+            }
+            match self.config.resume_order {
+                ProgramResumeOrder::Fcfs => right_state
+                    .queued_at
+                    .cmp(&left_state.queued_at)
+                    .then_with(|| left.program_id().cmp(right.program_id())),
+                ProgramResumeOrder::Mru => left_state
+                    .last_request_finished_at
+                    .cmp(&right_state.last_request_finished_at)
+                    .then_with(|| left_state.queued_at.cmp(&right_state.queued_at))
+                    .then_with(|| left.program_id().cmp(right.program_id())),
+            }
         });
         queued
     }
@@ -381,6 +389,7 @@ mod tests {
     fn cross_rank_order_inverts_ordinary_mru_but_preserves_priority_tiers() {
         let mut config = ProgramSchedulerConfig::default();
         config.global_queue = true;
+        config.resume_order = ProgramResumeOrder::Mru;
         let scheduler = ProgramScheduler::new(config);
         let targets = [
             ProgramTarget {
@@ -413,6 +422,55 @@ mod tests {
             decision.last_target = Some("rank-0".into());
             decision.last_pause_reason = Some(ProgramPauseReason::TtlExpired);
             decision.last_request_finished_at = Some(finished_at);
+            state
+                .global_queues
+                .entry("model".into())
+                .or_default()
+                .push_back(handle.program().clone());
+            programs.push(handle.program().clone());
+        }
+        let local = scheduler.global_local_resume_order(&state, "model", now);
+        let cross = scheduler.global_cross_rank_order(&state, "model", now);
+        assert_eq!(local, vec![programs[0].clone(), programs[1].clone()]);
+        assert_eq!(cross, vec![programs[1].clone(), programs[0].clone()]);
+    }
+
+    #[test]
+    fn cross_rank_order_inverts_default_fcfs() {
+        let mut config = ProgramSchedulerConfig::default();
+        config.global_queue = true;
+        let scheduler = ProgramScheduler::new(config);
+        let targets = [
+            ProgramTarget {
+                id: "rank-0".into(),
+                base_url: "http://worker".into(),
+                dp_rank: Some(0),
+            },
+            ProgramTarget {
+                id: "rank-1".into(),
+                base_url: "http://worker".into(),
+                dp_rank: Some(1),
+            },
+        ];
+        scheduler.sync_targets("model", &targets);
+        let now = Instant::now();
+        let mut state = scheduler.state.lock();
+        let mut programs = Vec::new();
+        for (index, name) in ["first", "second"].into_iter().enumerate() {
+            let identity = identity(name);
+            let handle = state.runtime.retain_request(&identity, 100, None, now);
+            scheduler.ensure_decision_state(
+                &mut state,
+                &identity,
+                handle.program().clone(),
+                100,
+                now,
+                None,
+            );
+            let decision = state.decisions.get_mut(handle.program()).unwrap();
+            decision.last_target = Some("rank-0".into());
+            decision.last_pause_reason = Some(ProgramPauseReason::TtlExpired);
+            decision.queued_at = Some(now + Duration::from_secs(index as u64));
             state
                 .global_queues
                 .entry("model".into())

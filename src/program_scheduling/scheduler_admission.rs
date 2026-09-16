@@ -4,7 +4,7 @@
 //! checks. Global Queue placement is intentionally implemented separately.
 
 use super::scheduler::ProgramScheduler;
-use super::scheduler_state::{ProgramPauseReason, ProgramSchedulerState};
+use super::scheduler_state::{ProgramPauseReason, ProgramResumeOrder, ProgramSchedulerState};
 use super::{
     BatchGainInputs, ContinuitySample, ProgramDispatch, ProgramIdentity, ProgramRef,
     ProgramRequestHandle, ProgramState, ProgramStatus, ProgramTarget, ScheduleError,
@@ -394,16 +394,23 @@ impl ProgramScheduler {
         let right_privileged = right_state
             .privilege_deadline
             .is_some_and(|deadline| deadline > now);
-        right_forced
+        let priority = right_forced
             .cmp(&left_forced)
-            .then_with(|| right_privileged.cmp(&left_privileged))
-            .then_with(|| {
-                right_state
-                    .last_request_finished_at
-                    .cmp(&left_state.last_request_finished_at)
-            })
-            .then_with(|| left_state.queued_at.cmp(&right_state.queued_at))
-            .then_with(|| left.program_id().cmp(right.program_id()))
+            .then_with(|| right_privileged.cmp(&left_privileged));
+        if priority != Ordering::Equal {
+            return priority;
+        }
+        match self.config.resume_order {
+            ProgramResumeOrder::Fcfs => left_state
+                .queued_at
+                .cmp(&right_state.queued_at)
+                .then_with(|| left.program_id().cmp(right.program_id())),
+            ProgramResumeOrder::Mru => right_state
+                .last_request_finished_at
+                .cmp(&left_state.last_request_finished_at)
+                .then_with(|| left_state.queued_at.cmp(&right_state.queued_at))
+                .then_with(|| left.program_id().cmp(right.program_id())),
+        }
     }
 
     pub(crate) fn rank_admission_plan(
@@ -926,8 +933,10 @@ mod tests {
     }
 
     #[test]
-    fn local_order_prefers_forced_then_privileged_then_mru() {
-        let scheduler = ProgramScheduler::new(ProgramSchedulerConfig::default());
+    fn local_order_prefers_forced_then_privileged_then_mru_when_configured() {
+        let mut config = ProgramSchedulerConfig::default();
+        config.resume_order = ProgramResumeOrder::Mru;
+        let scheduler = ProgramScheduler::new(config);
         let target = target();
         scheduler.sync_targets("model", std::slice::from_ref(&target));
         let now = Instant::now();
@@ -971,6 +980,36 @@ mod tests {
         ordered.sort_by(|left, right| scheduler.local_resume_cmp(&state, left, right, now));
         assert_eq!(ordered[0], refs[2]);
         assert_eq!(ordered[1], refs[1]);
+    }
+
+    #[test]
+    fn local_order_defaults_to_fcfs_after_priority_tiers() {
+        let scheduler = ProgramScheduler::new(ProgramSchedulerConfig::default());
+        let target = target();
+        scheduler.sync_targets("model", std::slice::from_ref(&target));
+        let now = Instant::now();
+        let mut state = scheduler.state.lock();
+        let mut refs = Vec::new();
+        for (index, name) in ["first", "second"].into_iter().enumerate() {
+            let identity = identity(name);
+            let handle = state.runtime.retain_request(&identity, 100, None, now);
+            let reference = handle.program().clone();
+            scheduler.ensure_decision_state(
+                &mut state,
+                &identity,
+                reference.clone(),
+                100,
+                now,
+                None,
+            );
+            let decision = state.decisions.get_mut(&reference).unwrap();
+            decision.queued_at = Some(now + Duration::from_secs(index as u64));
+            decision.last_request_finished_at = Some(now - Duration::from_secs(index as u64));
+            refs.push(reference);
+        }
+        let mut ordered = refs.clone();
+        ordered.sort_by(|left, right| scheduler.local_resume_cmp(&state, left, right, now));
+        assert_eq!(ordered, refs);
     }
 
     #[test]

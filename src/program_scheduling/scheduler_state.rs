@@ -11,6 +11,17 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+/// Ordinary paused-Program resume order within each priority tier.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProgramResumeOrder {
+    /// Resume the Program whose retained request entered the RequestPool first.
+    #[default]
+    Fcfs,
+    /// Prefer the Program that most recently completed a request.
+    Mru,
+}
+
 /// Complete opt-in Program scheduler configuration.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProgramSchedulerConfig {
@@ -18,6 +29,8 @@ pub struct ProgramSchedulerConfig {
     pub binding_only: bool,
     /// Permit paused reasoning Programs to resume on another target.
     pub global_queue: bool,
+    /// Ordinary resume order after force-resume and privilege tiers.
+    pub resume_order: ProgramResumeOrder,
     /// Required destination-over-source headroom in complete Program contexts.
     pub cross_rank_headroom_ratio: f64,
     /// Initial Program generation binding policy.
@@ -55,6 +68,7 @@ impl Default for ProgramSchedulerConfig {
         Self {
             binding_only: false,
             global_queue: false,
+            resume_order: ProgramResumeOrder::default(),
             cross_rank_headroom_ratio: 1.2,
             binding_strategy: ProgramBindingStrategy::ConsistentHash,
             hash_virtual_nodes: 160,
@@ -79,6 +93,7 @@ impl From<&crate::config::types::ProgramSchedulingConfig> for ProgramSchedulerCo
         Self {
             binding_only: config.binding_only,
             global_queue: config.global_queue,
+            resume_order: config.resume_order,
             cross_rank_headroom_ratio: config.cross_rank_headroom_ratio,
             binding_strategy: config.binding_strategy,
             hash_virtual_nodes: config.hash_virtual_nodes,
@@ -297,6 +312,7 @@ mod tests {
         let config = ProgramSchedulerConfig::default();
         assert!(!config.binding_only);
         assert!(!config.global_queue);
+        assert_eq!(config.resume_order, ProgramResumeOrder::Fcfs);
         assert_eq!(config.cross_rank_headroom_ratio, 1.2);
         assert_eq!(config.progress_ttl.stats_window_size, 100);
         assert_eq!(config.progress_ttl.acting_ttl, Duration::from_secs(10));

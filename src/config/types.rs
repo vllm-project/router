@@ -3,7 +3,7 @@ use crate::config::validation::ConfigValidator;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-use crate::program_scheduling::ProgramBindingStrategy;
+use crate::program_scheduling::{ProgramBindingStrategy, ProgramResumeOrder};
 
 /// Main router configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -110,6 +110,8 @@ pub struct ProgramSchedulingConfig {
     pub binding_only: bool,
     #[serde(default)]
     pub global_queue: bool,
+    #[serde(default)]
+    pub resume_order: ProgramResumeOrder,
     #[serde(default = "default_program_cross_rank_headroom_ratio")]
     pub cross_rank_headroom_ratio: f64,
     #[serde(default)]
@@ -161,6 +163,7 @@ impl Default for ProgramSchedulingConfig {
         Self {
             binding_only: false,
             global_queue: false,
+            resume_order: ProgramResumeOrder::default(),
             cross_rank_headroom_ratio: default_program_cross_rank_headroom_ratio(),
             binding_strategy: ProgramBindingStrategy::default(),
             hash_virtual_nodes: default_program_hash_virtual_nodes(),
