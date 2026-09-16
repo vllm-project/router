@@ -13,9 +13,6 @@ Main CI/CD pipeline that runs on all commits and pull requests. Includes:
 - **Benchmarks**: Optional performance benchmarks
 - **Docker Build**: Container image creation
 
-Code formatting and linting (rustfmt, clippy, black/ruff) run in GitHub
-Actions (`.github/workflows/`), not in this pipeline.
-
 ### `release-pipeline.yml`
 Release pipeline triggered on version tags (e.g., `v1.2.3`). Handles:
 
