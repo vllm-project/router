@@ -171,57 +171,16 @@ impl CacheAwarePolicy {
         }
     }
 
-    fn select_worker_min_load(
-        &self,
-        workers: &[Arc<dyn Worker>],
-        request_text: Option<&str>,
-        healthy_indices: &[usize],
-        model_id: &str,
-        max_load: usize,
-        min_load: usize,
-    ) -> Option<usize> {
-        // Log load balancing trigger (only compute worker loads if debug enabled)
-        if tracing::enabled!(tracing::Level::DEBUG) {
-            let worker_loads: Vec<(&str, usize)> =
-                workers.iter().map(|w| (w.url(), w.load())).collect();
-            debug!(
-                "Load balancing triggered | max: {} | min: {} | workers: {:?}",
-                max_load, min_load, worker_loads
-            );
-        }
-
-        RouterMetrics::record_load_balancing_event();
-        RouterMetrics::set_load_range(max_load, min_load);
-
-        // Use shortest queue when imbalanced
-        let min_load_idx = healthy_indices
-            .iter()
-            .min_by_key(|&&idx| workers[idx].load())
-            .copied()?;
-
-        // Even in imbalanced mode, update the tree to maintain cache state
-        if let Some(text) = request_text {
-            // Get the tree reference without locking the entire HashMap
-            // DashMap only locks the specific shard containing this key
-            let tree = self.trees.get(model_id).map(|entry| entry.value().clone());
-
-            if let Some(tree) = tree {
-                let worker_url = workers[min_load_idx].url();
-                tree.insert(text, worker_url);
-            } else {
-                debug!(
-                    "Warning: No tree found for model '{}', skipping cache update",
-                    model_id
-                );
-            }
-        }
-
-        // Increment processed counter
-        workers[min_load_idx].increment_processed();
-        RouterMetrics::record_processed_request(workers[min_load_idx].url());
-        RouterMetrics::record_policy_decision(self.name(), workers[min_load_idx].url());
-
-        Some(min_load_idx)
+    /// Is this specific worker hot enough that a request should be steered away
+    /// from it, even at the cost of a cache miss?
+    ///
+    /// Same thresholds as before, but the comparison is `this worker` against the
+    /// least-loaded worker, not `the busiest worker` against the least-loaded one.
+    /// A worker that is merely busier than its peers keeps serving its cached
+    /// prefixes; only one that is genuinely running away gives them up.
+    fn is_worker_overloaded(&self, worker_load: usize, min_load: usize) -> bool {
+        worker_load.saturating_sub(min_load) > self.config.balance_abs_threshold
+            && (worker_load as f32) > (min_load as f32 * self.config.balance_rel_threshold)
     }
 }
 
@@ -249,27 +208,28 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         });
         let min_load = if min_load == usize::MAX { 0 } else { min_load };
 
-        // Check if load is imbalanced
-        let is_imbalanced = max_load.saturating_sub(min_load) > self.config.balance_abs_threshold
-            && (max_load as f32) > (min_load as f32 * self.config.balance_rel_threshold);
-
         debug!(
-            "Load status for model: max_load={}, min_load={}, is_imbalanced={}",
-            max_load, min_load, is_imbalanced
+            "Load status for model: max_load={}, min_load={}",
+            max_load, min_load
         );
 
-        if is_imbalanced {
-            return self.select_worker_min_load(
-                workers,
-                request_text,
-                &healthy_indices,
-                model_id,
-                max_load,
-                min_load,
-            );
-        }
+        // NOTE: the load check is applied per request, against the worker this
+        // request actually wants, rather than fleet-wide. The previous behaviour
+        // asked "is any pair of workers imbalanced?" and, if so, discarded cache
+        // affinity for *every* request -- including requests whose preferred
+        // worker was idle. Under prefill/decode disaggregation that is
+        // catastrophic: prefill worker load includes queued requests, so at high
+        // concurrency the fleet spread clears the threshold almost permanently,
+        // routing degenerates to shortest-queue, and the prefix cache stops being
+        // used at all. Measured on SWE-bench Pro (4 prefill / 6 decode, 1024 in
+        // parallel), that took the prefill prefix cache hit rate from 88.9% to
+        // 68.5% -- a 2.8x increase in prompt tokens actually computed -- and
+        // halved end-to-end throughput.
+        //
+        // Shedding load only matters for the worker that is actually hot, so that
+        // is the only case where affinity is given up. See is_worker_overloaded.
 
-        // Use cache-aware routing when balanced
+        // Use cache-aware routing
         let text = request_text.unwrap_or("");
 
         // Get the tree reference without locking the entire HashMap
@@ -314,10 +274,31 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         let selected_idx = if match_rate > self.config.cache_threshold {
             // Cache hit path: find worker by URL (compare &str directly, no allocation)
             let tenant_url: &str = &result.tenant;
-            workers
+            let cached_idx = workers
                 .iter()
                 .position(|w| w.url() == tenant_url)
-                .filter(|&idx| workers[idx].is_healthy())
+                .filter(|&idx| workers[idx].is_healthy());
+
+            match cached_idx {
+                // The worker holding this prefix is running away from the rest of
+                // the fleet, so pay the cache miss and shed the load. This is the
+                // hot-spot case that load balancing exists for.
+                Some(idx) if self.is_worker_overloaded(workers[idx].load(), min_load) => {
+                    RouterMetrics::record_load_balancing_event();
+                    RouterMetrics::set_load_range(max_load, min_load);
+                    debug!(
+                        "Cached worker {} overloaded (load={}, min={}), steering away",
+                        workers[idx].url(),
+                        workers[idx].load(),
+                        min_load
+                    );
+                    healthy_indices
+                        .iter()
+                        .min_by_key(|&&idx| workers[idx].load())
+                        .copied()
+                }
+                other => other,
+            }
         } else {
             // Low cache match: use worker with minimum load
             healthy_indices
@@ -540,6 +521,140 @@ mod tests {
             let idx = policy.select_worker(&workers, Some("test")).unwrap();
             assert_eq!(idx, 1); // Should always pick worker2
         }
+    }
+
+    /// Helper: pin a worker's load counter to an exact value.
+    fn set_load(worker: &Arc<dyn Worker>, n: usize) {
+        worker.reset_load();
+        for _ in 0..n {
+            worker.increment_load();
+        }
+    }
+
+    fn three_workers() -> Vec<Arc<dyn Worker>> {
+        vec![
+            Arc::new(BasicWorker::new(
+                "http://w1:8000".to_string(),
+                WorkerType::Regular,
+            )),
+            Arc::new(BasicWorker::new(
+                "http://w2:8000".to_string(),
+                WorkerType::Regular,
+            )),
+            Arc::new(BasicWorker::new(
+                "http://w3:8000".to_string(),
+                WorkerType::Regular,
+            )),
+        ]
+    }
+
+    fn balance_policy() -> CacheAwarePolicy {
+        CacheAwarePolicy::with_config(CacheAwareConfig {
+            cache_threshold: 0.5,
+            balance_abs_threshold: 5,
+            balance_rel_threshold: 2.0,
+            eviction_interval_secs: 0,
+            max_tree_size: 10000,
+        })
+    }
+
+    /// Regression test: a hot worker elsewhere in the fleet must not cost cache
+    /// affinity for requests that want an idle worker.
+    ///
+    /// The previous implementation gated on `max_load - min_load` across the whole
+    /// fleet, so one runaway worker disabled prefix routing for every request. Under
+    /// P/D disaggregation, where prefill load counters include queued requests, that
+    /// gate is essentially always open at high concurrency and the prefix cache stops
+    /// being used at all.
+    #[test]
+    fn test_affinity_survives_unrelated_hot_worker() {
+        let policy = balance_policy();
+        let workers = three_workers();
+        policy.init_workers(&workers);
+
+        // Make w3 strictly the least loaded so the first request tenants to it.
+        set_load(&workers[0], 2);
+        set_load(&workers[1], 1);
+        set_load(&workers[2], 0);
+        let primed = policy
+            .select_worker(&workers, Some("conversation-A"))
+            .unwrap();
+        assert_eq!(primed, 2, "setup: first request should tenant to w3");
+
+        // Now w1 runs away. Fleet is wildly imbalanced (100 vs 0), which the old
+        // fleet-wide gate would have treated as "ignore the cache entirely".
+        // w3 -- the worker actually holding this prefix -- stays cold.
+        set_load(&workers[0], 100);
+        set_load(&workers[1], 0);
+        set_load(&workers[2], 1);
+
+        for _ in 0..5 {
+            let idx = policy
+                .select_worker(&workers, Some("conversation-A"))
+                .unwrap();
+            assert_eq!(
+                idx, 2,
+                "affinity must be preserved: the cached worker w3 is not the hot one"
+            );
+        }
+    }
+
+    /// The other half of the contract: when the worker holding the prefix is itself
+    /// the runaway, the cache miss is worth paying and the request is steered away.
+    /// This is the hot-spot case load balancing exists for.
+    #[test]
+    fn test_affinity_yields_when_cached_worker_is_the_hot_one() {
+        let policy = balance_policy();
+        let workers = three_workers();
+        policy.init_workers(&workers);
+
+        // Tenant "conversation-B" to w1.
+        set_load(&workers[0], 0);
+        set_load(&workers[1], 1);
+        set_load(&workers[2], 2);
+        let primed = policy
+            .select_worker(&workers, Some("conversation-B"))
+            .unwrap();
+        assert_eq!(primed, 0, "setup: first request should tenant to w1");
+
+        // w1 is now the runaway and holds the prefix.
+        set_load(&workers[0], 100);
+        set_load(&workers[1], 0);
+        set_load(&workers[2], 0);
+
+        for _ in 0..5 {
+            let idx = policy
+                .select_worker(&workers, Some("conversation-B"))
+                .unwrap();
+            assert_ne!(idx, 0, "must steer away from the overloaded cached worker");
+        }
+    }
+
+    /// A worker that is merely busier than its peers keeps serving its cached
+    /// prefixes -- the override is for runaways, not for ordinary variation.
+    #[test]
+    fn test_affinity_survives_mild_load_difference() {
+        let policy = balance_policy();
+        let workers = three_workers();
+        policy.init_workers(&workers);
+
+        set_load(&workers[0], 2);
+        set_load(&workers[1], 1);
+        set_load(&workers[2], 0);
+        let primed = policy
+            .select_worker(&workers, Some("conversation-C"))
+            .unwrap();
+        assert_eq!(primed, 2);
+
+        // w3 is busier than the others but well inside balance_abs_threshold (5).
+        set_load(&workers[0], 0);
+        set_load(&workers[1], 0);
+        set_load(&workers[2], 4);
+
+        let idx = policy
+            .select_worker(&workers, Some("conversation-C"))
+            .unwrap();
+        assert_eq!(idx, 2, "a 4-request lead is not a hot spot");
     }
 
     #[test]
