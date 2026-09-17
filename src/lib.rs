@@ -241,6 +241,7 @@ impl Router {
                     });
                 }
             },
+            pd_concurrent_dispatch: false, // Not exposed in the Python binding
         })
     }
 }

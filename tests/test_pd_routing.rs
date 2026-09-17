@@ -130,6 +130,7 @@ mod test_pd_routing {
                 enable_profiling: false,
                 profile_timeout_secs: 30,
                 kv_connector: vllm_router_rs::config::KvConnector::Nixl,
+                pd_concurrent_dispatch: false,
             };
 
             // Router creation will fail due to health checks, but config should be valid
