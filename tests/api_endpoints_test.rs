@@ -60,6 +60,7 @@ impl TestContext {
             history_backend: vllm_router_rs::config::HistoryBackend::Memory,
             enable_profiling: false,
             profile_timeout_secs: 30,
+            epd: None,
             kv_connector: vllm_router_rs::config::KvConnector::Nixl,
         };
 
@@ -1392,6 +1393,7 @@ mod error_tests {
             history_backend: vllm_router_rs::config::HistoryBackend::Memory,
             enable_profiling: false,
             profile_timeout_secs: 30,
+            epd: None,
             kv_connector: vllm_router_rs::config::KvConnector::Nixl,
         };
 
@@ -1754,6 +1756,7 @@ mod pd_mode_tests {
             history_backend: vllm_router_rs::config::HistoryBackend::Memory,
             enable_profiling: false,
             profile_timeout_secs: 30,
+            epd: None,
             kv_connector: vllm_router_rs::config::KvConnector::Nixl,
         };
 
@@ -1919,6 +1922,7 @@ mod request_id_tests {
             history_backend: vllm_router_rs::config::HistoryBackend::Memory,
             enable_profiling: false,
             profile_timeout_secs: 30,
+            epd: None,
             kv_connector: vllm_router_rs::config::KvConnector::Nixl,
         };
 

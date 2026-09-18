@@ -180,6 +180,7 @@ impl Router {
         };
 
         Ok(config::RouterConfig {
+            epd: None,
             mode,
             policy,
             host: self.host.clone(),

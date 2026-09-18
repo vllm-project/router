@@ -6,6 +6,9 @@ use std::collections::HashMap;
 /// Main router configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RouterConfig {
+    /// Optional encoder orchestration for E+PD or E/P/D routing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub epd: Option<EpdConfig>,
     /// Routing mode configuration
     pub mode: RoutingMode,
     /// Worker connection mode
@@ -84,6 +87,16 @@ pub struct RouterConfig {
 
 fn default_profile_timeout_secs() -> u64 {
     10
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EpdConfig {
+    pub encoder_urls: Vec<String>,
+    /// Mooncake consumer control addresses, keyed by the P or combined PD HTTP URL.
+    /// Omit for pull-based NIXL or the shared-file example connector.
+    #[serde(default)]
+    pub consumer_zmq_addrs: HashMap<String, String>,
 }
 
 fn default_history_backend() -> HistoryBackend {
@@ -478,6 +491,7 @@ impl Default for RouterConfig {
             history_backend: default_history_backend(),
             enable_profiling: false,
             profile_timeout_secs: default_profile_timeout_secs(),
+            epd: None,
             kv_connector: KvConnector::default(),
         }
     }
@@ -1052,6 +1066,7 @@ mod tests {
             history_backend: default_history_backend(),
             enable_profiling: false,
             profile_timeout_secs: default_profile_timeout_secs(),
+            epd: None,
             kv_connector: KvConnector::default(),
         };
 
@@ -1118,6 +1133,7 @@ mod tests {
             history_backend: default_history_backend(),
             enable_profiling: false,
             profile_timeout_secs: default_profile_timeout_secs(),
+            epd: None,
             kv_connector: KvConnector::default(),
         };
 
@@ -1180,6 +1196,7 @@ mod tests {
             history_backend: default_history_backend(),
             enable_profiling: false,
             profile_timeout_secs: default_profile_timeout_secs(),
+            epd: None,
             kv_connector: KvConnector::default(),
         };
 
