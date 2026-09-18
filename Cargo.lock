@@ -5307,6 +5307,7 @@ dependencies = [
  "k8s-openapi",
  "kube",
  "lazy_static",
+ "libc",
  "lru",
  "metrics",
  "metrics-exporter-prometheus",

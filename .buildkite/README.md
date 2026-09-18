@@ -152,7 +152,9 @@ Comprehensive test suite:
 - Python tests with coverage
 
 ### Benchmarks
-Optional manual trigger for performance benchmarks.
+Not part of the pipeline. Run them locally with `scripts/run_benchmarks.py`
+(criterion) or the router overhead harness; see
+`docs/benchmarks/router_overhead.md`.
 
 ### Docker Build
 Builds Docker image for the router.
