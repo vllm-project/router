@@ -284,6 +284,7 @@ pub struct WorkerMetadata {
 #[derive(Clone)]
 pub struct BasicWorker {
     metadata: WorkerMetadata,
+    api_key: Option<String>,
     load_counter: Arc<AtomicUsize>,
     processed_counter: Arc<AtomicUsize>,
     healthy: Arc<AtomicBool>,
@@ -322,6 +323,7 @@ impl BasicWorker {
 
         Self {
             metadata,
+            api_key: None,
             load_counter: Arc::new(AtomicUsize::new(0)),
             processed_counter: Arc::new(AtomicUsize::new(0)),
             healthy: Arc::new(AtomicBool::new(true)),
@@ -338,6 +340,12 @@ impl BasicWorker {
 
     pub fn with_health_config(mut self, config: HealthConfig) -> Self {
         self.metadata.health_config = config;
+        self
+    }
+
+    /// Configure the API key used to authenticate worker health checks.
+    pub fn with_api_key(mut self, api_key: Option<String>) -> Self {
+        self.api_key = api_key;
         self
     }
 
@@ -402,7 +410,11 @@ impl Worker for BasicWorker {
                 let timeout = Duration::from_secs(self.metadata.health_config.timeout_secs);
 
                 // Use the shared client with a custom timeout for this request
-                match WORKER_CLIENT.get(&health_url).timeout(timeout).send().await {
+                let mut request = WORKER_CLIENT.get(&health_url).timeout(timeout);
+                if let Some(api_key) = self.api_key.as_deref() {
+                    request = request.bearer_auth(api_key);
+                }
+                match request.send().await {
                     Ok(response) => response.status().is_success(),
                     Err(_) => false,
                 }
@@ -516,6 +528,12 @@ impl DPAwareWorker {
     /// Configure health check settings for this worker
     pub fn with_health_config(mut self, config: HealthConfig) -> Self {
         self.base_worker = self.base_worker.with_health_config(config);
+        self
+    }
+
+    /// Configure the API key used to authenticate worker health checks.
+    pub fn with_api_key(mut self, api_key: Option<String>) -> Self {
+        self.base_worker = self.base_worker.with_api_key(api_key);
         self
     }
 }
@@ -1080,6 +1098,15 @@ mod tests {
         assert_eq!(worker.metadata().health_config.timeout_secs, 15);
         assert_eq!(worker.metadata().health_config.check_interval_secs, 45);
         assert_eq!(worker.metadata().health_config.endpoint, "/custom-health");
+    }
+
+    #[test]
+    fn test_worker_api_key_is_redacted_from_debug_output() {
+        let api_key = "worker-secret";
+        let worker = BasicWorker::new("http://test:8080".to_string(), WorkerType::Regular)
+            .with_api_key(Some(api_key.to_string()));
+
+        assert!(!format!("{:?}", worker).contains(api_key));
     }
 
     // Test Worker trait implementation
