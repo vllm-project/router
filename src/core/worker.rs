@@ -1,7 +1,6 @@
 use super::{CircuitBreaker, CircuitBreakerConfig, WorkerError, WorkerResult};
 use crate::metrics::RouterMetrics;
 use async_trait::async_trait;
-use futures;
 use serde_json;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -58,7 +57,10 @@ pub trait Worker: Send + Sync + fmt::Debug {
     /// Decrement the load counter
     fn decrement_load(&self);
 
-    /// Reset the load counter to 0 (for sync/recovery)
+    /// Reset the load counter to 0. Administrative operation: only safe when
+    /// the caller has independently established that no requests are in
+    /// flight for this worker. The runtime never calls this automatically;
+    /// health checks and routing must not discard active request accounting.
     fn reset_load(&self) {
         // Default implementation - does nothing
         // Workers that track load should override this
@@ -448,18 +450,31 @@ impl Worker for BasicWorker {
 
     fn increment_load(&self) {
         self.load_counter.fetch_add(1, Ordering::Relaxed);
+        RouterMetrics::set_worker_load(self.url(), self.load());
     }
 
     fn decrement_load(&self) {
-        self.load_counter
+        if self
+            .load_counter
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 current.checked_sub(1)
             })
-            .ok();
+            .is_err()
+        {
+            tracing::warn!(
+                worker_url = %self.metadata.url,
+                "Attempted to decrement load counter that is already at 0"
+            );
+        }
+        RouterMetrics::set_worker_load(self.url(), self.load());
     }
 
+    /// Administrative operation: resets the load counter to 0. Only safe when
+    /// the caller has independently established that no requests are in
+    /// flight for this worker; the runtime never calls this automatically.
     fn reset_load(&self) {
         self.load_counter.store(0, Ordering::Relaxed);
+        RouterMetrics::set_worker_load(self.url(), 0);
     }
 
     fn processed_requests(&self) -> usize {
@@ -812,36 +827,73 @@ pub fn workers_to_urls(workers: &[Box<dyn Worker>]) -> Vec<String> {
     workers.iter().map(|w| w.url().to_string()).collect()
 }
 
-/// RAII guard for worker load management
-pub struct WorkerLoadGuard<'a> {
-    workers: Vec<&'a dyn Worker>,
+/// RAII guard for worker load management.
+///
+/// Increments the load counter of the tracked worker(s) on creation and
+/// decrements exactly once when released (explicitly or on drop). Handles can
+/// be shared via [`WorkerLoadGuard::share`] so that a streaming forward task
+/// can own the guard while the routing task releases it early on retryable
+/// failures; only the first release decrements.
+pub struct WorkerLoadGuard {
+    inner: Arc<WorkerLoadGuardInner>,
 }
 
-impl<'a> WorkerLoadGuard<'a> {
+struct WorkerLoadGuardInner {
+    workers: Vec<Arc<dyn Worker>>,
+    released: AtomicBool,
+}
+
+impl WorkerLoadGuard {
     /// Create a new load guard for a single worker
-    pub fn new(worker: &'a dyn Worker) -> Self {
+    pub fn new(worker: Arc<dyn Worker>) -> Self {
         worker.increment_load();
+        RouterMetrics::set_running_requests(worker.url(), worker.load());
         Self {
-            workers: vec![worker],
+            inner: Arc::new(WorkerLoadGuardInner {
+                workers: vec![worker],
+                released: AtomicBool::new(false),
+            }),
         }
     }
 
     /// Create a new load guard for multiple workers
-    pub fn new_multi(workers: Vec<&'a dyn Worker>) -> Self {
+    pub fn new_multi(workers: Vec<Arc<dyn Worker>>) -> Self {
         // Increment load counters for all workers
         for worker in &workers {
             worker.increment_load();
+            RouterMetrics::set_running_requests(worker.url(), worker.load());
         }
-        Self { workers }
+        Self {
+            inner: Arc::new(WorkerLoadGuardInner {
+                workers,
+                released: AtomicBool::new(false),
+            }),
+        }
+    }
+
+    /// Share the guard without touching load counters. All shared handles
+    /// refer to the same release state: only the first release decrements.
+    pub fn share(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+
+    /// Decrement the tracked workers' load counters exactly once. Safe to
+    /// call multiple times; subsequent calls are no-ops.
+    pub fn release(&self) {
+        if !self.inner.released.swap(true, Ordering::AcqRel) {
+            for worker in &self.inner.workers {
+                worker.decrement_load();
+                RouterMetrics::set_running_requests(worker.url(), worker.load());
+            }
+        }
     }
 }
 
-impl<'a> Drop for WorkerLoadGuard<'a> {
+impl Drop for WorkerLoadGuard {
     fn drop(&mut self) {
-        // Decrement load counters for all workers
-        for worker in &self.workers {
-            worker.decrement_load();
-        }
+        self.release();
     }
 }
 
@@ -872,95 +924,90 @@ impl HealthChecker {
     }
 }
 
-/// Start an async background health checker for a collection of workers
-pub fn start_health_checker(
-    workers: std::sync::Arc<std::sync::RwLock<Vec<std::sync::Arc<dyn Worker>>>>,
-    check_interval_secs: u64,
-) -> HealthChecker {
-    let shutdown = Arc::new(AtomicBool::new(false));
-    let shutdown_clone = shutdown.clone();
-
-    let handle = tokio::spawn(async move {
-        let mut interval =
-            tokio::time::interval(tokio::time::Duration::from_secs(check_interval_secs));
-
-        // Counter for periodic load reset (every 10 health check cycles)
-        let mut check_count = 0u64;
-        const LOAD_RESET_INTERVAL: u64 = 10;
-
-        loop {
-            interval.tick().await;
-
-            // Check for shutdown signal
-            if shutdown_clone.load(Ordering::Acquire) {
-                tracing::debug!("Health checker shutting down");
-                break;
-            }
-
-            check_count += 1;
-
-            // Check health of all workers
-            let workers_to_check = match workers.read() {
-                Ok(guard) => guard.clone(),
-                Err(poisoned) => {
-                    tracing::error!("Worker lock poisoned: {}", poisoned);
-                    continue;
-                }
-            };
-
-            // Periodically reset load counters to prevent drift
-            // Only do this when we believe all workers should be idle
-            if check_count.is_multiple_of(LOAD_RESET_INTERVAL) {
-                let max_load = workers_to_check.iter().map(|w| w.load()).max().unwrap_or(0);
-                // Only reset if load appears to be very low (likely drift)
-                if max_load <= 2 {
-                    tracing::debug!(
-                        "Resetting load counters to prevent drift (max_load: {})",
-                        max_load
-                    );
-                    for worker in &workers_to_check {
-                        worker.reset_load();
-                    }
-                }
-            }
-
-            // Perform health checks concurrently
-            let health_checks = workers_to_check.iter().map(|worker| {
-                let worker_url = worker.url().to_string();
-                let was_healthy = worker.is_healthy();
-
-                async move {
-                    match worker.check_health_async().await {
-                        Ok(_) => {
-                            if !was_healthy {
-                                tracing::info!("Worker {} is now healthy", worker_url);
-                            }
-                        }
-                        Err(e) => {
-                            if was_healthy {
-                                tracing::warn!("Worker {} health check failed: {}", worker_url, e);
-                            } else {
-                                // Worker was already unhealthy, log at debug level
-                                tracing::debug!("Worker {} remains unhealthy: {}", worker_url, e);
-                            }
-                        }
-                    }
-                }
-            });
-
-            // Execute all health checks concurrently
-            futures::future::join_all(health_checks).await;
-        }
-    });
-
-    HealthChecker { handle, shutdown }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::thread;
     use std::time::Duration;
+
+    fn test_worker() -> Arc<dyn Worker> {
+        Arc::new(BasicWorker::new(
+            "http://test:8080".to_string(),
+            WorkerType::Regular,
+        ))
+    }
+
+    #[test]
+    fn test_worker_load_guard_drop_decrements() {
+        let worker = test_worker();
+        {
+            let _guard = WorkerLoadGuard::new(worker.clone());
+            assert_eq!(worker.load(), 1);
+        }
+        assert_eq!(worker.load(), 0);
+    }
+
+    #[test]
+    fn test_worker_load_guard_release_is_idempotent() {
+        let worker = test_worker();
+        let guard = WorkerLoadGuard::new(worker.clone());
+        assert_eq!(worker.load(), 1);
+        guard.release();
+        assert_eq!(worker.load(), 0);
+        guard.release();
+        assert_eq!(worker.load(), 0);
+        drop(guard);
+        assert_eq!(worker.load(), 0);
+    }
+
+    #[test]
+    fn test_worker_load_guard_shared_handle_decrements_once() {
+        let worker = test_worker();
+        let guard = WorkerLoadGuard::new(worker.clone());
+        let shared = guard.share();
+        assert_eq!(worker.load(), 1);
+        // First release wins regardless of which handle triggers it.
+        drop(shared);
+        assert_eq!(worker.load(), 0);
+        drop(guard);
+        assert_eq!(worker.load(), 0, "second release must be a no-op");
+    }
+
+    #[test]
+    fn test_worker_load_guard_release_then_shared_drop_is_noop() {
+        // Streaming retryable path: release immediately, then hand a shared
+        // handle to the forward task; its drop must not decrement again.
+        let worker = test_worker();
+        let guard = WorkerLoadGuard::new(worker.clone());
+        guard.release();
+        assert_eq!(worker.load(), 0);
+        let shared = guard.share();
+        drop(shared);
+        drop(guard);
+        assert_eq!(worker.load(), 0);
+    }
+
+    #[test]
+    fn test_worker_load_guard_multi() {
+        let worker1 = test_worker();
+        let worker2 = Arc::new(BasicWorker::new(
+            "http://test:8081".to_string(),
+            WorkerType::Regular,
+        )) as Arc<dyn Worker>;
+        let guard = WorkerLoadGuard::new_multi(vec![worker1.clone(), worker2.clone()]);
+        assert_eq!(worker1.load(), 1);
+        assert_eq!(worker2.load(), 1);
+        guard.release();
+        assert_eq!(worker1.load(), 0);
+        assert_eq!(worker2.load(), 0);
+    }
+
+    #[test]
+    fn test_decrement_at_zero_clamps() {
+        let worker = test_worker();
+        worker.decrement_load();
+        assert_eq!(worker.load(), 0);
+    }
 
     // Test WorkerType
     #[test]
@@ -1398,11 +1445,14 @@ mod tests {
     // Test WorkerLoadGuard
     #[test]
     fn test_load_guard_single_worker() {
-        let worker = BasicWorker::new("http://test:8080".to_string(), WorkerType::Regular);
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+            "http://test:8080".to_string(),
+            WorkerType::Regular,
+        ));
         assert_eq!(worker.load(), 0);
 
         {
-            let _guard = WorkerLoadGuard::new(&worker);
+            let _guard = WorkerLoadGuard::new(worker.clone());
             assert_eq!(worker.load(), 1);
         }
 
@@ -1412,16 +1462,23 @@ mod tests {
 
     #[test]
     fn test_load_guard_multiple_workers() {
-        let workers: Vec<Box<dyn Worker>> = vec![
-            WorkerFactory::create_regular("http://w1:8080".to_string()),
-            WorkerFactory::create_regular("http://w2:8080".to_string()),
-            WorkerFactory::create_regular("http://w3:8080".to_string()),
+        let workers: Vec<Arc<dyn Worker>> = vec![
+            Arc::new(BasicWorker::new(
+                "http://w1:8080".to_string(),
+                WorkerType::Regular,
+            )),
+            Arc::new(BasicWorker::new(
+                "http://w2:8080".to_string(),
+                WorkerType::Regular,
+            )),
+            Arc::new(BasicWorker::new(
+                "http://w3:8080".to_string(),
+                WorkerType::Regular,
+            )),
         ];
 
-        let worker_refs: Vec<&dyn Worker> = workers.iter().map(|w| w.as_ref()).collect();
-
         {
-            let _guard = WorkerLoadGuard::new_multi(worker_refs);
+            let _guard = WorkerLoadGuard::new_multi(workers.clone());
             // All loads incremented
             assert_eq!(workers[0].load(), 1);
             assert_eq!(workers[1].load(), 1);
@@ -1436,14 +1493,11 @@ mod tests {
 
     #[test]
     fn test_load_guard_panic_safety() {
-        let worker = Arc::new(BasicWorker::new(
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(
             "http://test:8080".to_string(),
             WorkerType::Regular,
         ));
         assert_eq!(worker.load(), 0);
-
-        // Clone for use inside catch_unwind
-        let worker_clone = Arc::clone(&worker);
 
         // Use AssertUnwindSafe wrapper for the test
         // This is safe because we're only testing the load counter behavior.
@@ -1451,8 +1505,8 @@ mod tests {
 
         // This will panic, but the guard should still clean up
         let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
-            let _guard = WorkerLoadGuard::new(worker_clone.as_ref());
-            assert_eq!(worker_clone.load(), 1);
+            let _guard = WorkerLoadGuard::new(worker.clone());
+            assert_eq!(worker.load(), 1);
             panic!("Test panic");
         }));
 
