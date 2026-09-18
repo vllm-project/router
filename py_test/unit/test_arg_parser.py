@@ -440,7 +440,7 @@ class TestParseRouterArgs:
         assert router_args.worker_urls == ["http://worker1:8000", "http://worker2:8000"]
         assert router_args.policy == "round_robin"
 
-    def test_parse_pd_args(self):
+    def test_parse_pd_disaggregation_args(self):
         """Test parsing PD disaggregated mode arguments."""
         args = [
             "--vllm-pd-disaggregation",
