@@ -15,7 +15,7 @@ Program scheduling is configured by `program_scheduling` or `--program-schedulin
 {
   "program_scheduling_enable_key": "vllm_xargs.agentic_context",
   "global_queue": false,
-  "resume_order": "fcfs",
+  "resume_order": "mru",
   "token_capacity_per_target": 266864,
   "metrics_interval_seconds": 1.0,
   "prefill_cost_model": {
@@ -75,7 +75,7 @@ For `agent_hint`, `session_id` becomes both Program ID and session ID, `task_id`
 
 ## Resume ordering and capacity
 
-Resume first selects expired force-resume deadlines, then larger request priorities. Within each equal force/priority cohort, a Program paused because it reached `max_segment_rounds` ranks behind other candidates. Configured FCFS or MRU orders Rank-local candidates within each group, while cross-Rank candidates always use FCFS. Successful resume clears the one-shot yield marker. Priority and yield ordering only change selection order and never grant a new capacity bypass; established force-resume admission behavior remains unchanged.
+Resume first selects expired force-resume deadlines, then larger request priorities. Within each equal force/priority cohort, a Program paused because it reached `max_segment_rounds` ranks behind other candidates. Rank-local ordering defaults to MRU and can be changed to FCFS, while cross-Rank candidates always use FCFS. Successful resume clears the one-shot yield marker. Priority and yield ordering only change selection order and never grant a new capacity bypass; established force-resume admission behavior remains unchanged.
 
 The first implementation contains no automatic privileged Program, relationship handoff, privileged TTL, or privileged capacity demotion. Programs that consume a complete continuous segment yield once to other waiters, while force resume bounds starvation.
 

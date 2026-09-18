@@ -962,7 +962,7 @@ mod tests {
     }
 
     #[test]
-    fn local_order_defaults_to_fcfs_after_priority_tiers() {
+    fn local_order_defaults_to_mru_after_priority_tiers() {
         let scheduler = ProgramScheduler::new(ProgramSchedulerConfig::default());
         let target = target();
         scheduler.sync_targets("model", std::slice::from_ref(&target));
@@ -983,12 +983,12 @@ mod tests {
             );
             let decision = state.decisions.get_mut(&reference).unwrap();
             decision.queued_at = Some(now + Duration::from_secs(index as u64));
-            decision.last_request_finished_at = Some(now - Duration::from_secs(index as u64));
+            decision.last_request_finished_at = Some(now - Duration::from_secs((2 - index) as u64));
             refs.push(reference);
         }
         let mut ordered = refs.clone();
         ordered.sort_by(|left, right| scheduler.local_resume_cmp(&state, left, right, now));
-        assert_eq!(ordered, refs);
+        assert_eq!(ordered, vec![refs[1].clone(), refs[0].clone()]);
     }
 
     #[test]

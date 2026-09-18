@@ -17,9 +17,9 @@ use std::time::{Duration, Instant};
 #[serde(rename_all = "snake_case")]
 pub enum ProgramResumeOrder {
     /// Resume the Program whose retained request entered the RequestPool first.
-    #[default]
     Fcfs,
     /// Prefer the Program that most recently completed a request.
+    #[default]
     Mru,
 }
 
@@ -333,7 +333,7 @@ mod tests {
         let config = ProgramSchedulerConfig::default();
         assert!(!config.binding_only);
         assert!(!config.global_queue);
-        assert_eq!(config.resume_order, ProgramResumeOrder::Fcfs);
+        assert_eq!(config.resume_order, ProgramResumeOrder::Mru);
         assert_eq!(config.cross_rank_headroom_ratio, 1.2);
         assert_eq!(config.progress_ttl.stats_window_size, 100);
         assert_eq!(config.progress_ttl.acting_ttl, Duration::from_secs(10));
