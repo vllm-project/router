@@ -144,7 +144,7 @@ impl ConfigValidator {
                     });
                 }
 
-                if *balance_rel_threshold < 1.0 {
+                if !(1.0..).contains(balance_rel_threshold) {
                     return Err(ConfigError::InvalidValue {
                         field: "balance_rel_threshold".to_string(),
                         value: balance_rel_threshold.to_string(),
@@ -334,7 +334,7 @@ impl ConfigValidator {
                 reason: "Must be >= initial_backoff_ms".to_string(),
             });
         }
-        if retry.backoff_multiplier < 1.0 {
+        if !(1.0..).contains(&retry.backoff_multiplier) {
             return Err(ConfigError::InvalidValue {
                 field: "retry.backoff_multiplier".to_string(),
                 value: retry.backoff_multiplier.to_string(),
@@ -596,6 +596,32 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_cache_aware_balance_rel_threshold_bounds() {
+        let make_config = |balance_rel_threshold| {
+            RouterConfig::new(
+                RoutingMode::Regular {
+                    worker_urls: vec!["http://worker1:8000".to_string()],
+                },
+                PolicyConfig::CacheAware {
+                    cache_threshold: 0.5,
+                    balance_abs_threshold: 32,
+                    balance_rel_threshold,
+                    eviction_interval_secs: 60,
+                    max_tree_size: 1000,
+                },
+            )
+        };
+
+        assert!(ConfigValidator::validate(&make_config(1.0)).is_ok());
+
+        let result = ConfigValidator::validate(&make_config(f32::NAN));
+        assert!(matches!(
+            result,
+            Err(ConfigError::InvalidValue { ref field, .. }) if field == "balance_rel_threshold"
+        ));
+    }
+
+    #[test]
     fn test_validate_cache_aware_single_worker() {
         // Cache-aware with single worker should be allowed (even if not optimal)
         let config = RouterConfig::new(
@@ -747,6 +773,26 @@ mod tests {
         if let Err(e) = result {
             assert!(e.to_string().contains("prefill requires at least 2"));
         }
+    }
+
+    #[test]
+    fn test_validate_retry_backoff_multiplier_bounds() {
+        let mut config = RouterConfig::new(
+            RoutingMode::Regular {
+                worker_urls: vec!["http://worker:8000".to_string()],
+            },
+            PolicyConfig::Random,
+        );
+
+        config.retry.backoff_multiplier = 1.0;
+        assert!(ConfigValidator::validate(&config).is_ok());
+
+        config.retry.backoff_multiplier = f32::NAN;
+        let result = ConfigValidator::validate(&config);
+        assert!(matches!(
+            result,
+            Err(ConfigError::InvalidValue { ref field, .. }) if field == "retry.backoff_multiplier"
+        ));
     }
 
     #[test]
