@@ -477,8 +477,8 @@ pub struct ChatCompletionRequest {
     pub ignore_eos: bool,
 
     /// Add generation prompt to the chat template
-    #[serde(default = "default_true")]
-    pub add_generation_prompt: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub add_generation_prompt: Option<bool>,
 
     /// Continue generating from final assistant message
     #[serde(default)]

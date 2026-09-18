@@ -201,12 +201,15 @@ pub trait Worker: Send + Sync + fmt::Debug {
 pub enum ConnectionMode {
     /// HTTP/REST connection
     Http,
+    /// vLLM rust Inference gRPC (`grpc://host:port`)
+    Grpc,
 }
 
 impl fmt::Display for ConnectionMode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ConnectionMode::Http => write!(f, "HTTP"),
+            ConnectionMode::Grpc => write!(f, "gRPC"),
         }
     }
 }
@@ -304,7 +307,8 @@ impl fmt::Debug for BasicWorker {
 
 impl BasicWorker {
     pub fn new(url: String, worker_type: WorkerType) -> Self {
-        Self::with_connection_mode(url, worker_type, ConnectionMode::Http)
+        let connection_mode = crate::backend::connection_mode_from_url(&url);
+        Self::with_connection_mode(url, worker_type, connection_mode)
     }
 
     pub fn with_connection_mode(
@@ -406,6 +410,12 @@ impl Worker for BasicWorker {
                     Ok(response) => response.status().is_success(),
                     Err(_) => false,
                 }
+            }
+            ConnectionMode::Grpc => {
+                let timeout = Duration::from_secs(self.metadata.health_config.timeout_secs);
+                crate::backend::check_grpc_health(self.url(), timeout)
+                    .await
+                    .is_ok()
             }
         };
 

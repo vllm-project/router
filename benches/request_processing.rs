@@ -61,7 +61,7 @@ fn default_chat_completion_request() -> ChatCompletionRequest {
         stop_token_ids: None,
         no_stop_trim: false,
         ignore_eos: false,
-        add_generation_prompt: true,
+        add_generation_prompt: Some(true),
         continue_final_message: false,
         skip_special_tokens: true,
         // VLLM Extensions

@@ -46,6 +46,7 @@ impl ConfigValidator {
                 // Validate URLs if any are provided
                 if !worker_urls.is_empty() {
                     Self::validate_urls(worker_urls)?;
+                    Self::reject_mixed_worker_urls(worker_urls)?;
                 }
                 // Note: We allow empty worker URLs even without service discovery
                 // to let the router start and fail at runtime when routing requests.
@@ -79,9 +80,17 @@ impl ConfigValidator {
                     let prefill_url_strings: Vec<String> =
                         prefill_urls.iter().map(|(url, _)| url.clone()).collect();
                     Self::validate_urls(&prefill_url_strings)?;
+                    Self::reject_mixed_worker_urls(&prefill_url_strings)?;
                 }
                 if !decode_urls.is_empty() {
                     Self::validate_urls(decode_urls)?;
+                    Self::reject_mixed_worker_urls(decode_urls)?;
+                }
+                if !prefill_urls.is_empty() && !decode_urls.is_empty() {
+                    let mut all: Vec<String> =
+                        prefill_urls.iter().map(|(url, _)| url.clone()).collect();
+                    all.extend(decode_urls.iter().cloned());
+                    Self::reject_mixed_worker_urls(&all)?;
                 }
 
                 // Validate bootstrap ports
@@ -467,6 +476,18 @@ impl ConfigValidator {
         Ok(())
     }
 
+    /// Mixed `http://` + `grpc://` is rejected, not a silent fallback.
+    ///
+    /// Today gRPC chat is `token_ids` only and HTTP chat is text-only reverse
+    /// proxy. `EngineFrontend` is the gRPC path (`prepare` → ids → dispatch);
+    /// HTTP never enters that frontend. Those two wires cannot share one
+    /// request path, so handling a mixed pool is left as future work.
+    fn reject_mixed_worker_urls(urls: &[String]) -> ConfigResult<()> {
+        crate::backend::classify_worker_urls(urls)
+            .map_err(|reason| ConfigError::ValidationFailed { reason })?;
+        Ok(())
+    }
+
     /// Validate URL format
     fn validate_urls(urls: &[String]) -> ConfigResult<()> {
         for url in urls {
@@ -478,16 +499,27 @@ impl ConfigValidator {
                 });
             }
 
-            if !url.starts_with("http://") && !url.starts_with("https://") {
+            let scheme_ok = url.starts_with("http://")
+                || url.starts_with("https://")
+                || url.starts_with("grpc://")
+                || url.starts_with("grpcs://");
+            if !scheme_ok {
                 return Err(ConfigError::InvalidValue {
                     field: "worker_url".to_string(),
                     value: url.clone(),
-                    reason: "URL must start with http:// or https://".to_string(),
+                    reason: "URL must start with http://, https://, grpc://, or grpcs://"
+                        .to_string(),
                 });
             }
 
+            // Strip optional `@dp_rank` before URL parse (`grpc://host:port@0`).
+            let to_parse = url
+                .rsplit_once('@')
+                .and_then(|(prefix, rank)| rank.parse::<u32>().ok().map(|_| prefix))
+                .unwrap_or(url.as_str());
+
             // Basic URL validation
-            match ::url::Url::parse(url) {
+            match ::url::Url::parse(to_parse) {
                 Ok(parsed) => {
                     // Additional validation
                     if parsed.host_str().is_none() {
@@ -572,6 +604,38 @@ mod tests {
         );
 
         assert!(ConfigValidator::validate(&config).is_err());
+    }
+
+    #[test]
+    fn test_validate_rejects_mixed_http_grpc_workers() {
+        let config = RouterConfig::new(
+            RoutingMode::Regular {
+                worker_urls: vec![
+                    "http://worker:8000".to_string(),
+                    "grpc://worker:50051".to_string(),
+                ],
+            },
+            PolicyConfig::Random,
+        );
+
+        let err = ConfigValidator::validate(&config).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("mixed"), "{msg}");
+    }
+
+    #[test]
+    fn test_validate_all_grpc_workers() {
+        let config = RouterConfig::new(
+            RoutingMode::Regular {
+                worker_urls: vec![
+                    "grpc://worker:50051".to_string(),
+                    "grpc://worker:50052@0".to_string(),
+                ],
+            },
+            PolicyConfig::Random,
+        );
+
+        assert!(ConfigValidator::validate(&config).is_ok());
     }
 
     #[test]

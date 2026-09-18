@@ -12,6 +12,7 @@ A high-performance and light-weight request forwarding system for vLLM large sca
 - **Prefill-Decode Disaggregation**: Specialized routing for separated processing phases
 - **Service Discovery**: Kubernetes-native worker management and health monitoring
 - **Enterprise Features**: Circuit breakers, retry logic, metrics collection
+- **gRPC workers**: `grpc://` URLs speak vLLM rust `Inference` with router-side `token_ids` (see [gRPC worker backend](#grpc-worker-backend))
 
 ## Quick Start
 
@@ -269,6 +270,203 @@ vllm-router \
 - `--selector`: Label selectors for regular mode (format: `key1=value1 key2=value2`)
 
 ## Development
+
+### gRPC worker backend
+
+`grpc://` workers speak vLLM’s rust `Inference` API. Bindings come from
+crates.io [`vllm-proto`](https://crates.io/crates/vllm-proto) (`0.2`).
+HTTP `http://` workers stay a reverse proxy of OpenAI `messages`.
+`grpc://` workers receive **`token_ids`** produced on the router
+(`vllm-chat` + `vllm-tokenizer`, Cargo git tag `v0.29.0`, not
+`pip install`). There is no in-repo tokenizer fallback.
+`vllm-tokenizer` pulls `fastokens`, which depends on PCRE2; this repo
+sets `PCRE2_SYS_STATIC=1` in `.cargo/config.toml` so plain `cargo build`
+does not depend on a system `libpcre2-8` installation.
+
+This is the **current default wire**, not a forever ban on a gRPC text
+prompt or HTTP token-id input. Chat-only on `grpc://` is a **router
+501** (`/v1/chat/completions` only); other OpenAI routes still work on
+`http://`.
+
+A worker pool is **all-`http(s)://` or all-`grpc(s)://`**. Mixed
+schemes fail at init / `add_worker` (gRPC does not accept text).
+All-HTTP keeps `policy.select` then reverse-proxy (no chat/tokenizer
+frontend on the critical path). All-gRPC is
+`Frontend.prepare(chat) → token_ids`, then `policy.select`, then
+`Frontend.dispatch(ids, url)` (convert + GenerateStream + detok).
+Policy still uses `extract_text_for_routing()` this version.
+
+`TokenizerCache` (in `src/backend/preprocess.rs`) caches loaded
+`vllm-chat` / `vllm-tokenizer` objects per model key in-process. It
+does not reuse prior-request token ids or engine KV. Cold loads are
+single-flight, and one model no longer pins the cache for later model keys.
+
+The request lowering in `vllm_frontend.rs` intentionally tracks vLLM
+0.29's private `prepare_chat_request` conversion. That upstream function
+is `pub(super)` and coupled to `vllm-server`, so it cannot be imported by
+this crate. Replace the local adapter if vLLM exposes a public
+frontend-only lowering API.
+
+Omitted sampling temperature is resolved from the loaded model's
+`generation_config.json`, then falls back to OpenAI's `1.0`; protobuf
+omission is not used because vLLM 0.29 gRPC rewrites it to greedy `0.0`.
+When hidden stop strings/tokens are configured, the router requests worker
+text so the exact character trim boundary is preserved; token IDs alone
+cannot encode that boundary.
+
+Reasoning/tool history, tool definitions, tool choice, template kwargs,
+documents, and response format are preserved while rendering. Active
+tool calling and `reasoning_effort` currently return a clear 400 because
+the gRPC response adapter does not yet expose `vllm-chat`'s output
+parsers; returning raw text as `content` would silently violate OpenAI
+tool/reasoning response semantics. Multimodal content is likewise rejected
+until media features are sent in `GenerateRequest.media`.
+
+#### Backend modules (`src/backend/`)
+
+Northbound is always HTTP `/v1/chat/completions` in
+`routers/http/router.rs`. Detect runs at init (and `add_worker`) to
+lock the pool kind and strip `@dp_rank` / tonic URI. Pipeline on an
+all-`grpc://` pool:
+`frontend.prepare → policy → frontend.dispatch` (dispatch =
+`convert + grpc + openai`; all router-local; the worker is reached
+inside `grpc.rs`). Startup and periodic probes use `health.rs`
+(`grpc.health.v1`), not that generate path.
+
+| File | Role |
+|---|---|
+| `mod.rs` | `stages_enabled()`, re-exports, `pb` = crates.io `vllm-proto` |
+| `detect.rs` | `grpc://` / `grpcs://`, `WorkerPoolKind`, reject mixed schemes, strip `@dp_rank`, tonic URI (`grpc://host:port` → h2c `http://host:port`; still gRPC) |
+| `frontend.rs` | `EngineFrontend`: `prepare(chat)` then `dispatch(ids, url)`. Wraps preprocess + convert + grpc |
+| `health.rs` | `grpc.health.v1` Check on `--grpc-port` (empty service = overall `SERVING`). Used for worker + startup probes |
+| `preprocess.rs` | `TokenizerCache` + chat template/encode → `token_ids`. Load key: valid local `VLLM_ROUTER_TOKENIZER`, else `VLLM_ROUTER_MODEL`, else request `model`. Required on `grpc://`; HTTP remains a transparent reverse proxy |
+| `vllm_frontend.rs` | Private adapter onto `vllm-chat` / `vllm-tokenizer` / `vllm-text` (`load_model_backends`, render, encode, detok) |
+| `convert.rs` | OpenAI fields → `GenerateRequest` with `prompt = TokenIds` (does not fill proto `media` / KV-transfer fields) |
+| `grpc.rs` | Cached tonic `InferenceClient`, `GenerateStream` |
+| `openai.rs` | Proto chunks → OpenAI JSON/SSE for the **client** (not a southbound hop) |
+
+The diagnostic `engine_ms` stage is a first-output residual, not direct
+EngineCore telemetry: it includes queueing/prefill/generation effects left
+after subtracting router frontend and transfer spans. Compare it only when
+the first-output boundary is equivalent across arms.
+
+Set `VLLM_ROUTER_TOKENIZER` to a local tokenizer/model directory (or a
+tokenizer file inside it, which is normalized to its parent directory)
+when the northbound served model name is an alias. Otherwise
+`VLLM_ROUTER_MODEL`, then request `model`, supplies the load key. The
+request model remains the southbound protobuf model name; a tokenizer
+filesystem path no longer overwrites that alias.
+
+#### How to start `vllm-rs` (v0.29)
+
+As of **vLLM 0.29**, `vllm-rs` is a binary **inside the Python wheel**, next
+to the package (`…/site-packages/vllm/vllm-rs`). This router does not
+vendor or Cargo-pull that binary.
+
+Two different entrypoints, easy to mix up:
+
+| How you start the worker | What actually runs | `--grpc-port` |
+|---|---|---|
+| `VLLM_USE_RUST_FRONTEND=1 vllm serve …` | Python `vllm serve` execs **`vllm-rs frontend`** (inherited listen fd, OpenAI HTTP) | **cannot** be set this way |
+| `vllm-rs serve MODEL --grpc-port …` | The wheel binary in **`serve`** mode (HTTP `--port` **and** Inference gRPC) | **this** is the `grpc://` worker |
+
+`VLLM_USE_RUST_FRONTEND` only switches the Python launcher onto rust HTTP.
+It is ignored if you invoke `vllm-rs` yourself. There is no
+`VLLM_RUST_FRONTEND` flag.
+
+Locate the wheel binary (`./scripts/backend/check_vllm_rs.sh` prints
+path, `--version`, and a copy-paste `export VLLM_RS=…`):
+
+```bash
+./scripts/backend/check_vllm_rs.sh
+# then: export VLLM_RS=...
+"$VLLM_RS" serve "$MODEL" \
+  --host 127.0.0.1 \
+  --port 8000 \
+  --grpc-port 50051 \
+  --tensor-parallel-size 1 \
+  --max-model-len 8192 \
+  --max-num-seqs 16 \
+  --enable-prefix-caching
+vllm-router \
+  --host 127.0.0.1 \
+  --port 30000 \
+  --worker-urls grpc://127.0.0.1:50051
+```
+
+`--max-num-seqs`, `--max-model-len`, and prefix-cache flags are **worker**
+options. `bench_prefix_kvhit.py` only tunes body length (`--chars` / `--tokens`)
+and hit rate (`--hit-rate`). See [`scripts/backend`](scripts/backend).
+
+`grpc://host:port` is rewritten to h2c `http://host:port` for tonic; that
+is still gRPC, not the OpenAI `--port`. Worker liveness on that port is
+`grpc.health.v1` Check (empty service = overall `SERVING`), not TCP
+connect and not HTTP `GET /health` (that stays on `--port` for `http://`
+workers). `--health-check-endpoint` is ignored for `grpc://`.
+
+#### If the wheel has no `vllm-rs`
+
+Some installs omit the rust artifact. Build it in a **separate** vLLM
+checkout (not inside this router tree). Do **not** add `vllm-server` /
+`vllm-rs` as a router Cargo dep.
+
+The rust binary and the Python EngineCore it spawns must speak the same
+**ZMQ/msgpack** handshake. Same release line (e.g. both 0.29.x) is the
+safe default; an exact git tag is **not** required if the protocol has
+not moved. Mixing a new `vllm-rs` with an old `vllm` package is what
+breaks.
+
+`build_rust.sh` → `tools/build_rust.py` (setuptools-rust) and a raw
+`cargo build -p vllm-cmd --release` compile the **same** `vllm-cmd`
+crate (`[[bin]] name = "vllm-rs"`). They are not two frontends. The
+script additionally: vendors TLS (`native-tls-vendored`), builds
+`vllm._rust_tool_parser`, copies the binary to `vllm/vllm-rs` in that
+checkout, and ([#52593](https://github.com/vllm-project/vllm/pull/52593))
+embeds the setuptools-scm version via `VLLM_RS_BUILD_VERSION`. Plain
+`cargo` writes `target/release/vllm-rs` and reports crate `0.1.0` unless
+you set `VLLM_RS_BUILD_VERSION` yourself.
+
+Then `VLLM_RS=/path/to/vllm-rs` for `serve_rust_grpc.sh`. Prefer a 0.29
+wheel that already ships the binary.
+
+Worker + router launch examples (python HTTP, rust HTTP, rust gRPC)
+and a prefix miss/hit client live in
+[`scripts/backend`](scripts/backend).
+
+#### Tests
+
+These lock **this version’s wire**, not a policy that gRPC may never
+grow a text prompt. No GPU and no live `vllm-rs` except `bench_prefix_kvhit.py`.
+
+| What | Purpose | How |
+|---|---|---|
+| `tests/grpc_vs_http_e2e.rs` | HTTP body has `messages` (no `token_ids`); gRPC proto has `token_ids` (no text prompt). Same OpenAI JSON in | `cargo test --test grpc_vs_http_e2e` |
+| `tests/common/mock_vllm_rs.rs` | In-process `Inference` + `grpc.health.v1` (SERVING) used by that e2e test | pulled in automatically |
+| `src/backend/detect.rs` / `convert.rs` / `openai.rs` / `health.rs` | Scheme/URI, `TokenIds`-only proto, SSE shape, health helper | `cargo test --lib backend::` |
+| `src/backend/preprocess.rs` + `tests/python_vllm_chat_ids.py` | rust `vllm-chat` ids vs Python `vllm.tokenizers` on the same messages. **Skips** unless `VLLM_ROUTER_MODEL` is a model dir with `tokenizer.json` and Python can `import vllm` | see below |
+| `scripts/backend/bench_prefix_kvhit.py` | Live miss-then-hit against a running router | after `serve_*.sh` (see [`scripts/backend`](scripts/backend)) |
+
+Always-on (CI):
+
+```bash
+cargo test --test grpc_vs_http_e2e
+cargo test --lib backend::
+```
+
+Optional rust-vs-Python id check (skips if env/import missing):
+
+```bash
+export VLLM_ROUTER_MODEL=/path/to/hf-model   # dir must contain tokenizer.json
+# optional: PYTHON=...  or activate VIRTUAL_ENV
+cargo test --lib vllm_chat_tokenize_matches_python_vllm -- --nocapture
+```
+
+Hand-run the helper the preprocess tests spawn:
+
+```bash
+python tests/python_vllm_chat_ids.py /path/to/hf-model \
+  '[{"role":"user","content":"hello"}]'
+```
 
 ### Troubleshooting
 

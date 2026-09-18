@@ -87,8 +87,11 @@ This launcher enables starting a router with individual worker instances. It is 
 multi-node setups or when you want to start workers and router separately.
 
 Examples:
-  # Regular mode
+  # Regular mode (HTTP reverse-proxy of OpenAI messages)
   vllm-router --worker-urls http://worker1:8000 http://worker2:8000
+
+  # Regular mode with a vLLM rust Inference worker (router sends token_ids)
+  vllm-router --worker-urls grpc://worker1:50051
 
   # vLLM PD mode with pure service discovery (workers register themselves)
   vllm-router --vllm-pd-disaggregation \
@@ -109,7 +112,7 @@ struct CliArgs {
     #[arg(long, default_value_t = 30000)]
     port: u16,
 
-    /// List of worker URLs (e.g., http://worker1:8000 http://worker2:8000)
+    /// List of worker URLs (`http(s)://` reverse-proxy, or `grpc(s)://` Inference)
     #[arg(long, num_args = 0..)]
     worker_urls: Vec<String>,
 
