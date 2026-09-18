@@ -106,7 +106,7 @@ impl From<&crate::config::types::ProgramSchedulingConfig> for ProgramSchedulerCo
             progress_ttl: ProgressTtlConfig {
                 token_capacity: config.token_capacity_per_target,
                 decode_buffer_tokens: config.decode_buffer_tokens,
-                acting_ttl: Duration::from_secs_f64(config.acting_ttl_seconds),
+                max_acting_ttl: Duration::from_secs_f64(config.max_acting_ttl_seconds),
                 high_watermark_ratio: config.high_watermark_ratio,
                 low_watermark_ratio: config.low_watermark_ratio,
                 max_segment_rounds: config.max_segment_rounds,
@@ -336,7 +336,7 @@ mod tests {
         assert_eq!(config.resume_order, ProgramResumeOrder::Mru);
         assert_eq!(config.cross_rank_headroom_ratio, 1.2);
         assert_eq!(config.progress_ttl.stats_window_size, 100);
-        assert_eq!(config.progress_ttl.acting_ttl, Duration::from_secs(10));
+        assert_eq!(config.progress_ttl.max_acting_ttl, Duration::from_secs(10));
         assert_eq!(config.progress_ttl.max_segment_rounds, 14);
         assert_eq!(config.progress_ttl.prefill, PrefillCostModel::default());
         assert_eq!(config.progress_ttl.decode, DecodeThroughputModel::default());

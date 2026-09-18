@@ -148,8 +148,8 @@ pub struct ProgramSchedulingConfig {
     pub shared_prefix_freshness_kv_turnovers: f64,
     #[serde(default = "default_program_decode_buffer_tokens")]
     pub decode_buffer_tokens: usize,
-    #[serde(default = "default_program_acting_ttl_seconds")]
-    pub acting_ttl_seconds: f64,
+    #[serde(default = "default_program_max_acting_ttl_seconds")]
+    pub max_acting_ttl_seconds: f64,
     #[serde(default = "default_program_high_watermark_ratio")]
     pub high_watermark_ratio: f64,
     #[serde(default = "default_program_low_watermark_ratio")]
@@ -191,7 +191,7 @@ impl Default for ProgramSchedulingConfig {
             shared_prefix_freshness_kv_turnovers:
                 default_program_shared_prefix_freshness_kv_turnovers(),
             decode_buffer_tokens: default_program_decode_buffer_tokens(),
-            acting_ttl_seconds: default_program_acting_ttl_seconds(),
+            max_acting_ttl_seconds: default_program_max_acting_ttl_seconds(),
             high_watermark_ratio: default_program_high_watermark_ratio(),
             low_watermark_ratio: default_program_low_watermark_ratio(),
             max_segment_rounds: default_program_max_segment_rounds(),
@@ -247,7 +247,7 @@ fn default_program_decode_buffer_tokens() -> usize {
     100
 }
 
-fn default_program_acting_ttl_seconds() -> f64 {
+fn default_program_max_acting_ttl_seconds() -> f64 {
     10.0
 }
 

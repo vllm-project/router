@@ -60,8 +60,8 @@ pub struct ProgressTtlConfig {
     pub token_capacity: Option<usize>,
     /// Logical tokens reserved for immediate decode growth.
     pub decode_buffer_tokens: usize,
-    /// Bootstrap and maximum acting TTL.
-    pub acting_ttl: Duration,
+    /// Maximum request-specific acting TTL.
+    pub max_acting_ttl: Duration,
     /// Capacity-repair trigger ratio.
     pub high_watermark_ratio: f64,
     /// Admission and resume capacity ratio.
@@ -83,7 +83,7 @@ impl Default for ProgressTtlConfig {
         Self {
             token_capacity: None,
             decode_buffer_tokens: 100,
-            acting_ttl: Duration::from_secs(10),
+            max_acting_ttl: Duration::from_secs(10),
             high_watermark_ratio: 1.0,
             low_watermark_ratio: 1.0,
             max_segment_rounds: 14,
@@ -190,7 +190,7 @@ impl ProgressTtlPolicyMath {
         let log_sigma = log_variance.sqrt().max(1e-6);
         let max_ttl = self
             .config
-            .acting_ttl
+            .max_acting_ttl
             .as_secs_f64()
             .min(cache_miss_impact_seconds);
         if max_ttl <= 0.0 || cache_miss_impact_seconds <= 0.0 {

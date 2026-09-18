@@ -77,7 +77,7 @@ impl ConfigValidator {
             }
         }
         let nonnegative_finite = [
-            ("acting_ttl_seconds", config.acting_ttl_seconds),
+            ("max_acting_ttl_seconds", config.max_acting_ttl_seconds),
             (
                 "shared_prefix_freshness_warmup_seconds",
                 config.shared_prefix_freshness_warmup_seconds,
