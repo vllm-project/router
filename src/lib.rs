@@ -10,10 +10,12 @@ pub mod middleware;
 pub mod otel_http;
 pub mod otel_trace;
 pub mod policies;
+pub mod program_scheduling;
 pub mod protocols;
 pub mod routers;
 pub mod server;
 pub mod service_discovery;
+mod token_estimator;
 pub mod tokenizer;
 pub mod tree;
 pub mod wasm_middleware;
@@ -101,6 +103,8 @@ struct Router {
     otlp_traces_endpoint: Option<String>,
     // KV connector for PD disaggregation ("nixl" or "mooncake")
     kv_connector: String,
+    // Optional JSON object for Program-level scheduling.
+    program_scheduling_config_json: Option<String>,
 }
 
 impl Router {
@@ -241,6 +245,14 @@ impl Router {
                     });
                 }
             },
+            program_scheduling: self
+                .program_scheduling_config_json
+                .as_deref()
+                .map(serde_json::from_str::<config::ProgramSchedulingConfig>)
+                .transpose()
+                .map_err(|error| config::ConfigError::ValidationFailed {
+                    reason: format!("Invalid program_scheduling_config_json: {error}"),
+                })?,
         })
     }
 }
@@ -317,6 +329,7 @@ impl Router {
         wasm_middleware = None,
         wasm_middleware_sha256 = None,
         wasm_middleware_routes = vec![],
+        program_scheduling_config_json = None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -382,6 +395,7 @@ impl Router {
         wasm_middleware: Option<String>,
         wasm_middleware_sha256: Option<String>,
         wasm_middleware_routes: Vec<String>,
+        program_scheduling_config_json: Option<String>,
     ) -> PyResult<Self> {
         if wasm_middleware_sha256
             .as_deref()
@@ -461,6 +475,7 @@ impl Router {
             enable_trace,
             otlp_traces_endpoint,
             kv_connector,
+            program_scheduling_config_json,
         })
     }
 

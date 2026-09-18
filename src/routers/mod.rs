@@ -48,6 +48,11 @@ pub trait RouterTrait: Send + Sync + Debug + WorkerManagement {
     /// Get a reference to self as Any for downcasting
     fn as_any(&self) -> &dyn std::any::Any;
 
+    /// Return an operator snapshot when this Router owns Program scheduling.
+    fn scheduling_diagnostics(&self) -> Option<serde_json::Value> {
+        None
+    }
+
     /// Route a health check request
     async fn health(&self, req: Request<Body>) -> Response;
 

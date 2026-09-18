@@ -151,7 +151,7 @@ fn create_sample_chat_completion_request() -> ChatCompletionRequest {
         messages: vec![
             ChatMessage::System {
                 role: "system".to_string(),
-                content: "You are a helpful assistant".to_string(),
+                content: UserMessageContent::Text("You are a helpful assistant".to_string()),
                 name: None,
             },
             ChatMessage::User {
@@ -192,7 +192,9 @@ fn create_sample_completion_request() -> CompletionRequest {
 fn create_large_chat_completion_request() -> ChatCompletionRequest {
     let mut messages = vec![ChatMessage::System {
         role: "system".to_string(),
-        content: "You are a helpful assistant with extensive knowledge.".to_string(),
+        content: UserMessageContent::Text(
+            "You are a helpful assistant with extensive knowledge.".to_string(),
+        ),
         name: None,
     }];
 
@@ -205,7 +207,7 @@ fn create_large_chat_completion_request() -> ChatCompletionRequest {
         });
         messages.push(ChatMessage::Assistant {
             role: "assistant".to_string(),
-            content: Some(format!("Answer {}: This is a detailed response about topic {} that covers multiple aspects and provides comprehensive analysis of the interconnected systems you mentioned.", i, i)),
+            content: Some(UserMessageContent::Text(format!("Answer {}: This is a detailed response about topic {} that covers multiple aspects and provides comprehensive analysis of the interconnected systems you mentioned.", i, i))),
             name: None,
             tool_calls: None,
             function_call: None,

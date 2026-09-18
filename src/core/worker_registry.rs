@@ -4,7 +4,10 @@
 
 use crate::core::{ConnectionMode, Worker, WorkerType};
 use dashmap::DashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc, RwLock,
+};
 use uuid::Uuid;
 
 /// Unique identifier for a worker
@@ -57,6 +60,9 @@ pub struct WorkerRegistry {
 
     /// URL to worker ID mapping (for backward compatibility)
     url_to_id: Arc<DashMap<String, WorkerId>>,
+
+    /// Monotonic topology and availability revision for read-side caches.
+    revision: Arc<AtomicU64>,
 }
 
 impl WorkerRegistry {
@@ -69,6 +75,7 @@ impl WorkerRegistry {
             type_workers: Arc::new(DashMap::new()),
             connection_workers: Arc::new(DashMap::new()),
             url_to_id: Arc::new(DashMap::new()),
+            revision: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -115,6 +122,8 @@ impl WorkerRegistry {
             .or_default()
             .push(worker_id.clone());
 
+        self.notify_worker_state_change();
+
         worker_id
     }
 
@@ -150,6 +159,7 @@ impl WorkerRegistry {
                 conn_workers.retain(|id| id != worker_id);
             }
 
+            self.notify_worker_state_change();
             Some(worker)
         } else {
             None
@@ -195,6 +205,26 @@ impl WorkerRegistry {
                     .clone()
             })
             .unwrap_or_default()
+    }
+
+    /// Whether the optimized model index contains at least one worker.
+    pub fn has_model(&self, model_id: &str) -> bool {
+        self.model_index.get(model_id).is_some_and(|workers| {
+            !workers
+                .read()
+                .expect("RwLock for model_index is poisoned")
+                .is_empty()
+        })
+    }
+
+    /// Current worker topology and availability revision.
+    pub fn revision(&self) -> u64 {
+        self.revision.load(Ordering::Acquire)
+    }
+
+    /// Invalidate target caches after topology or availability changes.
+    pub fn notify_worker_state_change(&self) {
+        self.revision.fetch_add(1, Ordering::AcqRel);
     }
 
     /// Get all workers by worker type
@@ -359,6 +389,7 @@ impl WorkerRegistry {
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_clone = shutdown.clone();
         let workers_ref = self.workers.clone();
+        let revision = self.revision.clone();
 
         let handle = tokio::spawn(async move {
             let mut interval =
@@ -385,7 +416,11 @@ impl WorkerRegistry {
 
                 // Perform health checks
                 for worker in &workers {
+                    let was_available = worker.is_available();
                     let _ = worker.check_health_async().await; // Use async version directly
+                    if was_available != worker.is_available() {
+                        revision.fetch_add(1, Ordering::AcqRel);
+                    }
                 }
 
                 // Reset loads periodically

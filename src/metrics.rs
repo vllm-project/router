@@ -92,6 +92,43 @@ pub fn init_metrics() {
     describe_gauge!("vllm_router_max_load", "Maximum worker load");
     describe_gauge!("vllm_router_min_load", "Minimum worker load");
 
+    describe_gauge!(
+        "vllm_router_agent_aware_rank_queue_size",
+        "Queued Programs attributed to each Program-scheduling target"
+    );
+    describe_gauge!(
+        "vllm_router_agent_aware_rank_active_programs",
+        "Active Programs on each Program-scheduling target"
+    );
+    describe_counter!(
+        "vllm_router_agent_aware_transitions_total",
+        "Committed Program scheduling transitions by target and reason"
+    );
+    describe_histogram!(
+        "vllm_router_agent_aware_queue_wait_seconds",
+        "Time retained in the Program RequestPool before dispatch"
+    );
+    describe_gauge!(
+        "vllm_router_agent_aware_fitted_ttl_seconds",
+        "Representative fitted acting TTL by target"
+    );
+    describe_gauge!(
+        "vllm_router_agent_aware_context_growth_tokens",
+        "Rolling mean Program context growth by target"
+    );
+    describe_gauge!(
+        "vllm_router_agent_aware_rolling_samples",
+        "Retained Program-scheduling samples by target and window"
+    );
+    describe_gauge!(
+        "vllm_router_agent_aware_token_estimate_coefficient",
+        "Current prompt tokens-per-byte coefficient by model pool and endpoint"
+    );
+    describe_counter!(
+        "vllm_router_agent_aware_token_estimate_feedback_total",
+        "Prompt-token estimator feedback outcomes"
+    );
+
     // PD-specific metrics
     describe_counter!(
         "vllm_router_pd_requests_total",
@@ -410,6 +447,84 @@ impl RouterMetrics {
     pub fn set_load_range(max_load: usize, min_load: usize) {
         gauge!("vllm_router_max_load").set(max_load as f64);
         gauge!("vllm_router_min_load").set(min_load as f64);
+    }
+
+    pub fn set_agent_aware_rank_state(target: &str, queued: usize, active: usize) {
+        gauge!(
+            "vllm_router_agent_aware_rank_queue_size",
+            "target" => target.to_string()
+        )
+        .set(queued as f64);
+        gauge!(
+            "vllm_router_agent_aware_rank_active_programs",
+            "target" => target.to_string()
+        )
+        .set(active as f64);
+    }
+
+    pub fn record_agent_aware_transition(target: &str, reason: &'static str) {
+        counter!(
+            "vllm_router_agent_aware_transitions_total",
+            "target" => target.to_string(),
+            "reason" => reason
+        )
+        .increment(1);
+    }
+
+    pub fn record_agent_aware_queue_wait(target: &str, duration: Duration) {
+        histogram!(
+            "vllm_router_agent_aware_queue_wait_seconds",
+            "target" => target.to_string()
+        )
+        .record(duration.as_secs_f64());
+    }
+
+    pub fn record_agent_aware_token_estimate_feedback(
+        model_pool: &str,
+        endpoint: &str,
+        observed: bool,
+        coefficient: Option<f64>,
+    ) {
+        counter!(
+            "vllm_router_agent_aware_token_estimate_feedback_total",
+            "model_pool" => model_pool.to_string(),
+            "endpoint" => endpoint.to_string(),
+            "outcome" => if observed { "observed" } else { "missing" }
+        )
+        .increment(1);
+        if let Some(coefficient) = coefficient {
+            gauge!(
+                "vllm_router_agent_aware_token_estimate_coefficient",
+                "model_pool" => model_pool.to_string(),
+                "endpoint" => endpoint.to_string()
+            )
+            .set(coefficient);
+        }
+    }
+
+    pub fn set_agent_aware_adaptive_state(
+        target: &str,
+        fitted_ttl: Duration,
+        context_growth_tokens: f64,
+        request_samples: usize,
+        continuity_samples: usize,
+    ) {
+        gauge!("vllm_router_agent_aware_fitted_ttl_seconds", "target" => target.to_string())
+            .set(fitted_ttl.as_secs_f64());
+        gauge!("vllm_router_agent_aware_context_growth_tokens", "target" => target.to_string())
+            .set(context_growth_tokens);
+        gauge!(
+            "vllm_router_agent_aware_rolling_samples",
+            "target" => target.to_string(),
+            "window" => "request"
+        )
+        .set(request_samples as f64);
+        gauge!(
+            "vllm_router_agent_aware_rolling_samples",
+            "target" => target.to_string(),
+            "window" => "continuity"
+        )
+        .set(continuity_samples as f64);
     }
 
     // PD-specific metrics

@@ -1,4 +1,5 @@
 use super::*;
+use crate::program_scheduling::ProgramBindingStrategy;
 
 /// Configuration validator
 pub struct ConfigValidator;
@@ -19,6 +20,9 @@ impl ConfigValidator {
         Self::validate_mode(&config.mode, has_service_discovery)?;
         Self::validate_policy(&config.policy)?;
         Self::validate_server_settings(config)?;
+        if let Some(program_scheduling) = &config.program_scheduling {
+            Self::validate_program_scheduling(program_scheduling)?;
+        }
 
         if let Some(discovery) = &config.discovery {
             Self::validate_discovery(discovery, &config.mode)?;
@@ -36,6 +40,145 @@ impl ConfigValidator {
         Self::validate_retry(&retry_cfg)?;
         Self::validate_circuit_breaker(&cb_cfg)?;
 
+        Ok(())
+    }
+
+    fn validate_program_scheduling(config: &ProgramSchedulingConfig) -> ConfigResult<()> {
+        if config.binding_strategy == ProgramBindingStrategy::ReasoningTokenBalance
+            && config.token_capacity_per_target.is_none()
+        {
+            return Err(ConfigError::ValidationFailed {
+                reason: "reasoning_token_balance requires token_capacity_per_target".to_string(),
+            });
+        }
+        let positive_finite = [
+            ("metrics_interval_seconds", config.metrics_interval_seconds),
+            ("queue_timeout_seconds", config.queue_timeout_seconds),
+            (
+                "force_resume_timeout_seconds",
+                config.force_resume_timeout_seconds,
+            ),
+            (
+                "paused_retention_ttl_seconds",
+                config.paused_retention_ttl_seconds,
+            ),
+            (
+                "shared_prefix_freshness_kv_turnovers",
+                config.shared_prefix_freshness_kv_turnovers,
+            ),
+        ];
+        for (field, value) in positive_finite {
+            if !value.is_finite() || value <= 0.0 {
+                return Err(ConfigError::InvalidValue {
+                    field: field.to_string(),
+                    value: value.to_string(),
+                    reason: "Must be finite and > 0".to_string(),
+                });
+            }
+        }
+        let nonnegative_finite = [
+            ("max_acting_ttl_seconds", config.max_acting_ttl_seconds),
+            (
+                "shared_prefix_freshness_warmup_seconds",
+                config.shared_prefix_freshness_warmup_seconds,
+            ),
+            (
+                "prefill_cost_model.intercept_seconds",
+                config.prefill_cost_model.intercept_seconds,
+            ),
+            (
+                "prefill_cost_model.linear_seconds_per_1k_tokens",
+                config.prefill_cost_model.linear_seconds_per_1k_tokens,
+            ),
+            (
+                "prefill_cost_model.quadratic_seconds_per_1k_tokens_squared",
+                config
+                    .prefill_cost_model
+                    .quadratic_seconds_per_1k_tokens_squared,
+            ),
+            (
+                "decode_throughput_model.batch_step_seconds_per_request",
+                config
+                    .decode_throughput_model
+                    .batch_step_seconds_per_request,
+            ),
+            (
+                "decode_throughput_model.context_step_seconds_per_token",
+                config
+                    .decode_throughput_model
+                    .context_step_seconds_per_token,
+            ),
+        ];
+        for (field, value) in nonnegative_finite {
+            if !value.is_finite() || value < 0.0 {
+                return Err(ConfigError::InvalidValue {
+                    field: field.to_string(),
+                    value: value.to_string(),
+                    reason: "Must be finite and >= 0".to_string(),
+                });
+            }
+        }
+        if !config
+            .prefill_cost_model
+            .decode_throughput_alpha
+            .is_finite()
+            || !(0.0..=1.0).contains(&config.prefill_cost_model.decode_throughput_alpha)
+        {
+            return Err(ConfigError::InvalidValue {
+                field: "prefill_cost_model.decode_throughput_alpha".to_string(),
+                value: config
+                    .prefill_cost_model
+                    .decode_throughput_alpha
+                    .to_string(),
+                reason: "Must be finite and between 0 and 1 inclusive".to_string(),
+            });
+        }
+        if !config
+            .decode_throughput_model
+            .fixed_step_seconds
+            .is_finite()
+            || config.decode_throughput_model.fixed_step_seconds <= 0.0
+        {
+            return Err(ConfigError::InvalidValue {
+                field: "decode_throughput_model.fixed_step_seconds".to_string(),
+                value: config
+                    .decode_throughput_model
+                    .fixed_step_seconds
+                    .to_string(),
+                reason: "Must be finite and > 0".to_string(),
+            });
+        }
+        if config.hash_virtual_nodes == 0
+            || config.max_active_programs_per_target == 0
+            || config.stats_window_size == 0
+            || config.max_segment_rounds == 0
+            || config.token_capacity_per_target == Some(0)
+        {
+            return Err(ConfigError::ValidationFailed {
+                reason: "Program scheduling counts and configured token capacity must be > 0"
+                    .to_string(),
+            });
+        }
+        if !config.cross_rank_headroom_ratio.is_finite() || config.cross_rank_headroom_ratio < 1.0 {
+            return Err(ConfigError::ValidationFailed {
+                reason: "cross_rank_headroom_ratio must be finite and >= 1".to_string(),
+            });
+        }
+        if !(0.0 < config.low_watermark_ratio && config.low_watermark_ratio <= 1.0)
+            || !(0.0 < config.high_watermark_ratio && config.high_watermark_ratio <= 1.0)
+            || config.low_watermark_ratio > config.high_watermark_ratio
+        {
+            return Err(ConfigError::ValidationFailed {
+                reason: "Program scheduling watermarks must satisfy 0 < low <= high <= 1"
+                    .to_string(),
+            });
+        }
+        if config.force_resume_timeout_seconds > config.queue_timeout_seconds {
+            return Err(ConfigError::ValidationFailed {
+                reason: "force_resume_timeout_seconds must not exceed queue_timeout_seconds"
+                    .to_string(),
+            });
+        }
         Ok(())
     }
 
@@ -386,6 +529,14 @@ impl ConfigValidator {
 
     /// Validate compatibility between different configuration sections
     fn validate_compatibility(config: &RouterConfig) -> ConfigResult<()> {
+        if config.program_scheduling.is_some()
+            && !matches!(config.mode, RoutingMode::Regular { .. })
+        {
+            return Err(ConfigError::IncompatibleConfig {
+                reason: "Program scheduling currently requires regular HTTP routing mode"
+                    .to_string(),
+            });
+        }
         // IGW mode is independent - skip other compatibility checks when enabled
         if config.enable_igw {
             return Ok(());
@@ -514,6 +665,79 @@ impl ConfigValidator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_validate_program_scheduling_boundaries() {
+        let valid = ProgramSchedulingConfig::default();
+        assert!(ConfigValidator::validate_program_scheduling(&valid).is_ok());
+
+        let invalid = [
+            ProgramSchedulingConfig {
+                cross_rank_headroom_ratio: f64::NAN,
+                ..valid.clone()
+            },
+            ProgramSchedulingConfig {
+                low_watermark_ratio: 0.0,
+                ..valid.clone()
+            },
+            ProgramSchedulingConfig {
+                high_watermark_ratio: 1.1,
+                ..valid.clone()
+            },
+            ProgramSchedulingConfig {
+                low_watermark_ratio: 0.9,
+                high_watermark_ratio: 0.8,
+                ..valid.clone()
+            },
+            ProgramSchedulingConfig {
+                force_resume_timeout_seconds: valid.queue_timeout_seconds + 1.0,
+                ..valid.clone()
+            },
+            ProgramSchedulingConfig {
+                shared_prefix_freshness_warmup_seconds: -1.0,
+                ..valid.clone()
+            },
+            ProgramSchedulingConfig {
+                shared_prefix_freshness_kv_turnovers: 0.0,
+                ..valid.clone()
+            },
+            ProgramSchedulingConfig {
+                prefill_cost_model: crate::program_scheduling::PrefillCostModel {
+                    linear_seconds_per_1k_tokens: f64::NAN,
+                    ..valid.prefill_cost_model
+                },
+                ..valid.clone()
+            },
+            ProgramSchedulingConfig {
+                prefill_cost_model: crate::program_scheduling::PrefillCostModel {
+                    decode_throughput_alpha: 1.1,
+                    ..valid.prefill_cost_model
+                },
+                ..valid.clone()
+            },
+            ProgramSchedulingConfig {
+                decode_throughput_model: crate::program_scheduling::DecodeThroughputModel {
+                    fixed_step_seconds: 0.0,
+                    ..valid.decode_throughput_model
+                },
+                ..valid.clone()
+            },
+            ProgramSchedulingConfig {
+                decode_throughput_model: crate::program_scheduling::DecodeThroughputModel {
+                    context_step_seconds_per_token: -1.0,
+                    ..valid.decode_throughput_model
+                },
+                ..valid.clone()
+            },
+            ProgramSchedulingConfig {
+                max_segment_rounds: 0,
+                ..valid
+            },
+        ];
+        for config in invalid {
+            assert!(ConfigValidator::validate_program_scheduling(&config).is_err());
+        }
+    }
 
     #[test]
     fn test_validate_regular_mode() {
