@@ -48,7 +48,7 @@ fn test_responses_request_creation() {
     assert!(!request.is_stream());
     assert_eq!(request.get_model(), Some("test-model"));
     let routing_text = request.extract_text_for_routing();
-    assert_eq!(routing_text, "Hello, world!");
+    assert_eq!(routing_text, "\u{1d}Hello, world!");
 }
 
 #[test]
