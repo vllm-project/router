@@ -78,10 +78,35 @@ impl ConfigValidator {
         }
         let nonnegative_finite = [
             ("acting_ttl_seconds", config.acting_ttl_seconds),
-            ("privileged_ttl_seconds", config.privileged_ttl_seconds),
             (
                 "shared_prefix_freshness_warmup_seconds",
                 config.shared_prefix_freshness_warmup_seconds,
+            ),
+            (
+                "prefill_cost_model.intercept_seconds",
+                config.prefill_cost_model.intercept_seconds,
+            ),
+            (
+                "prefill_cost_model.linear_seconds_per_1k_tokens",
+                config.prefill_cost_model.linear_seconds_per_1k_tokens,
+            ),
+            (
+                "prefill_cost_model.quadratic_seconds_per_1k_tokens_squared",
+                config
+                    .prefill_cost_model
+                    .quadratic_seconds_per_1k_tokens_squared,
+            ),
+            (
+                "decode_throughput_model.batch_step_seconds_per_request",
+                config
+                    .decode_throughput_model
+                    .batch_step_seconds_per_request,
+            ),
+            (
+                "decode_throughput_model.context_step_seconds_per_token",
+                config
+                    .decode_throughput_model
+                    .context_step_seconds_per_token,
             ),
         ];
         for (field, value) in nonnegative_finite {
@@ -93,10 +118,39 @@ impl ConfigValidator {
                 });
             }
         }
+        if !config
+            .prefill_cost_model
+            .decode_throughput_alpha
+            .is_finite()
+            || !(0.0..=1.0).contains(&config.prefill_cost_model.decode_throughput_alpha)
+        {
+            return Err(ConfigError::InvalidValue {
+                field: "prefill_cost_model.decode_throughput_alpha".to_string(),
+                value: config
+                    .prefill_cost_model
+                    .decode_throughput_alpha
+                    .to_string(),
+                reason: "Must be finite and between 0 and 1 inclusive".to_string(),
+            });
+        }
+        if !config
+            .decode_throughput_model
+            .fixed_step_seconds
+            .is_finite()
+            || config.decode_throughput_model.fixed_step_seconds <= 0.0
+        {
+            return Err(ConfigError::InvalidValue {
+                field: "decode_throughput_model.fixed_step_seconds".to_string(),
+                value: config
+                    .decode_throughput_model
+                    .fixed_step_seconds
+                    .to_string(),
+                reason: "Must be finite and > 0".to_string(),
+            });
+        }
         if config.hash_virtual_nodes == 0
             || config.max_active_programs_per_target == 0
             || config.stats_window_size == 0
-            || config.privileged_max_context_tokens == 0
             || config.max_segment_rounds == 0
             || config.token_capacity_per_target == Some(0)
         {
@@ -645,6 +699,34 @@ mod tests {
             },
             ProgramSchedulingConfig {
                 shared_prefix_freshness_kv_turnovers: 0.0,
+                ..valid.clone()
+            },
+            ProgramSchedulingConfig {
+                prefill_cost_model: crate::program_scheduling::PrefillCostModel {
+                    linear_seconds_per_1k_tokens: f64::NAN,
+                    ..valid.prefill_cost_model
+                },
+                ..valid.clone()
+            },
+            ProgramSchedulingConfig {
+                prefill_cost_model: crate::program_scheduling::PrefillCostModel {
+                    decode_throughput_alpha: 1.1,
+                    ..valid.prefill_cost_model
+                },
+                ..valid.clone()
+            },
+            ProgramSchedulingConfig {
+                decode_throughput_model: crate::program_scheduling::DecodeThroughputModel {
+                    fixed_step_seconds: 0.0,
+                    ..valid.decode_throughput_model
+                },
+                ..valid.clone()
+            },
+            ProgramSchedulingConfig {
+                decode_throughput_model: crate::program_scheduling::DecodeThroughputModel {
+                    context_step_seconds_per_token: -1.0,
+                    ..valid.decode_throughput_model
+                },
                 ..valid.clone()
             },
             ProgramSchedulingConfig {

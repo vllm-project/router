@@ -7,7 +7,8 @@ use super::ProgressTtlFactors;
 use std::time::Duration;
 
 /// Offline-calibrated cold-prefill cost model.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct PrefillCostModel {
     /// Fixed request cost in seconds.
     pub intercept_seconds: f64,
@@ -31,7 +32,8 @@ impl Default for PrefillCostModel {
 }
 
 /// Offline-calibrated decode throughput surface.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct DecodeThroughputModel {
     /// Fixed per-step latency component.
     pub fixed_step_seconds: f64,

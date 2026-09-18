@@ -9,6 +9,7 @@ A high-performance and light-weight request forwarding system for vLLM large sca
 
 - **Core Architecture**: Request routing framework and async processing patterns
 - **Load Balancing**: Multiple algorithms (cache-aware, power of two, consistent hashing, random, round robin)
+- **Program Scheduling**: Optional Program identity, RequestPool admission, Progress-TTL, and Global Queue placement for agent workloads
 - **Prefill-Decode Disaggregation**: Specialized routing for separated processing phases
 - **Service Discovery**: Kubernetes-native worker management and health monitoring
 - **Enterprise Features**: Circuit breakers, retry logic, metrics collection
@@ -244,6 +245,8 @@ curl -X POST http://router:8000/v1/chat/completions \
 ```
 
 For detailed configuration options, hash key priorities, and usage examples, see [Load Balancing Documentation](docs/load_balancing/README.md).
+
+For the optional agent metadata contract, scheduling enablement, request-scoped hints, and engine KV-control boundary, see [Program Scheduling](docs/program_scheduling.md).
 
 ## Advanced Features
 

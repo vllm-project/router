@@ -3,7 +3,10 @@ use crate::config::validation::ConfigValidator;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-use crate::program_scheduling::{ProgramBindingStrategy, ProgramResumeOrder};
+use crate::program_scheduling::{
+    DecodeThroughputModel, PrefillCostModel, ProgramBindingStrategy, ProgramResumeOrder,
+    ProgramSchedulingEnableKey,
+};
 
 /// Main router configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -106,6 +109,13 @@ fn default_intra_node_data_parallel_size() -> usize {
 /// and resume remain ProgramScheduler decisions.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ProgramSchedulingConfig {
+    /// Metadata source that opts an individual request into Program scheduling.
+    #[serde(
+        default,
+        rename = "program_scheduling_enable_key",
+        alias = "enable_key"
+    )]
+    pub enable_key: ProgramSchedulingEnableKey,
     #[serde(default)]
     pub binding_only: bool,
     #[serde(default)]
@@ -136,12 +146,6 @@ pub struct ProgramSchedulingConfig {
     pub shared_prefix_freshness_warmup_seconds: f64,
     #[serde(default = "default_program_shared_prefix_freshness_kv_turnovers")]
     pub shared_prefix_freshness_kv_turnovers: f64,
-    #[serde(default = "default_program_privileged_max_context_tokens")]
-    pub privileged_max_context_tokens: usize,
-    #[serde(default = "default_program_privileged_ttl_seconds")]
-    pub privileged_ttl_seconds: f64,
-    #[serde(default)]
-    pub resume_reclaim_acting_programs: bool,
     #[serde(default = "default_program_decode_buffer_tokens")]
     pub decode_buffer_tokens: usize,
     #[serde(default = "default_program_acting_ttl_seconds")]
@@ -156,11 +160,18 @@ pub struct ProgramSchedulingConfig {
     pub stats_window_size: usize,
     #[serde(default = "default_program_enable_batch_gain_admission")]
     pub enable_batch_gain_admission: bool,
+    /// Offline-calibrated cold-prefill cost and mixed-batch decode impact.
+    #[serde(default)]
+    pub prefill_cost_model: PrefillCostModel,
+    /// Offline-calibrated aggregate decode-throughput surface.
+    #[serde(default)]
+    pub decode_throughput_model: DecodeThroughputModel,
 }
 
 impl Default for ProgramSchedulingConfig {
     fn default() -> Self {
         Self {
+            enable_key: ProgramSchedulingEnableKey::default(),
             binding_only: false,
             global_queue: false,
             resume_order: ProgramResumeOrder::default(),
@@ -179,9 +190,6 @@ impl Default for ProgramSchedulingConfig {
                 default_program_shared_prefix_freshness_warmup_seconds(),
             shared_prefix_freshness_kv_turnovers:
                 default_program_shared_prefix_freshness_kv_turnovers(),
-            privileged_max_context_tokens: default_program_privileged_max_context_tokens(),
-            privileged_ttl_seconds: default_program_privileged_ttl_seconds(),
-            resume_reclaim_acting_programs: false,
             decode_buffer_tokens: default_program_decode_buffer_tokens(),
             acting_ttl_seconds: default_program_acting_ttl_seconds(),
             high_watermark_ratio: default_program_high_watermark_ratio(),
@@ -189,6 +197,8 @@ impl Default for ProgramSchedulingConfig {
             max_segment_rounds: default_program_max_segment_rounds(),
             stats_window_size: default_program_stats_window_size(),
             enable_batch_gain_admission: default_program_enable_batch_gain_admission(),
+            prefill_cost_model: PrefillCostModel::default(),
+            decode_throughput_model: DecodeThroughputModel::default(),
         }
     }
 }
@@ -231,14 +241,6 @@ fn default_program_shared_prefix_freshness_warmup_seconds() -> f64 {
 
 fn default_program_shared_prefix_freshness_kv_turnovers() -> f64 {
     2.0
-}
-
-fn default_program_privileged_max_context_tokens() -> usize {
-    262_144
-}
-
-fn default_program_privileged_ttl_seconds() -> f64 {
-    5.0
 }
 
 fn default_program_decode_buffer_tokens() -> usize {
@@ -792,6 +794,83 @@ mod tests {
         // discovery and metrics are None in Default implementation
         assert!(deserialized.discovery.is_none());
         assert!(deserialized.metrics.is_none());
+    }
+
+    #[test]
+    fn program_scheduling_enable_key_uses_the_roadmap_contract_name() {
+        let default: ProgramSchedulingConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(
+            default.enable_key,
+            ProgramSchedulingEnableKey::AgenticContext
+        );
+        let auto: ProgramSchedulingConfig =
+            serde_json::from_str(r#"{"program_scheduling_enable_key":"auto"}"#).unwrap();
+        assert_eq!(auto.enable_key, ProgramSchedulingEnableKey::Auto);
+        let serialized = serde_json::to_value(default).unwrap();
+        assert_eq!(
+            serialized["program_scheduling_enable_key"],
+            "vllm_xargs.agentic_context"
+        );
+    }
+
+    #[test]
+    fn program_scheduling_calibration_models_are_configurable() {
+        let config: ProgramSchedulingConfig = serde_json::from_str(
+            r#"{
+                "prefill_cost_model": {
+                    "intercept_seconds": 0.1,
+                    "linear_seconds_per_1k_tokens": 0.2,
+                    "quadratic_seconds_per_1k_tokens_squared": 0.3,
+                    "decode_throughput_alpha": 0.4
+                },
+                "decode_throughput_model": {
+                    "fixed_step_seconds": 0.5,
+                    "batch_step_seconds_per_request": 0.6,
+                    "context_step_seconds_per_token": 0.7
+                }
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(config.prefill_cost_model.intercept_seconds, 0.1);
+        assert_eq!(
+            config
+                .prefill_cost_model
+                .quadratic_seconds_per_1k_tokens_squared,
+            0.3
+        );
+        assert_eq!(config.prefill_cost_model.decode_throughput_alpha, 0.4);
+        assert_eq!(
+            config
+                .decode_throughput_model
+                .batch_step_seconds_per_request,
+            0.6
+        );
+        let scheduler = crate::program_scheduling::ProgramSchedulerConfig::from(&config);
+        assert_eq!(scheduler.progress_ttl.prefill, config.prefill_cost_model);
+        assert_eq!(
+            scheduler.progress_ttl.decode,
+            config.decode_throughput_model
+        );
+
+        let partial: ProgramSchedulingConfig = serde_json::from_str(
+            r#"{
+                "prefill_cost_model": {"decode_throughput_alpha": 0.8},
+                "decode_throughput_model": {"fixed_step_seconds": 0.25}
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(partial.prefill_cost_model.decode_throughput_alpha, 0.8);
+        assert_eq!(
+            partial.prefill_cost_model.linear_seconds_per_1k_tokens,
+            PrefillCostModel::default().linear_seconds_per_1k_tokens
+        );
+        assert_eq!(partial.decode_throughput_model.fixed_step_seconds, 0.25);
+        assert_eq!(
+            partial
+                .decode_throughput_model
+                .context_step_seconds_per_token,
+            DecodeThroughputModel::default().context_step_seconds_per_token
+        );
     }
 
     // ============= RoutingMode Tests =============

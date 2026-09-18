@@ -354,7 +354,12 @@ impl Router {
             return Ok(None);
         };
         let model_pool = self.resolved_program_model_pool(model_id);
-        let Some(identity) = ProgramIdentity::from_request(headers, request, Some(&model_pool))?
+        let Some(identity) = ProgramIdentity::from_request_with_enable_key(
+            headers,
+            request,
+            Some(&model_pool),
+            scheduler.enable_key(),
+        )?
         else {
             return Ok(None);
         };

@@ -9,6 +9,7 @@ mod diagnostics;
 mod domain;
 mod factors;
 mod identity;
+mod lineage;
 mod observations;
 mod policy;
 mod request_pool;
@@ -32,7 +33,7 @@ pub use domain::{
     ProgramUsageObservation,
 };
 pub use factors::{ContinuitySample, ProgressTtlFactors, RequestSample};
-pub use identity::ProgramIdentity;
+pub use identity::{ProgramIdentity, ProgramRequestHints, ProgramSchedulingEnableKey};
 pub use observations::{
     BackendObservation, BackendObservationFailure, BackendObservationProvider,
     VllmMetricsObservationProvider,

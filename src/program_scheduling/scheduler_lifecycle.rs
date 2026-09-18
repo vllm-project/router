@@ -29,7 +29,6 @@ impl ProgramScheduler {
         state: &mut ProgramSchedulerState,
         now: Instant,
     ) {
-        self.reconcile_privileges(state, now);
         self.release_expired_paused(state, now);
         self.expire_acting_ttls(state, now);
         self.repair_capacity(state, now);
@@ -74,13 +73,15 @@ impl ProgramScheduler {
         let Some(decision_before) = state.decisions.get(dispatch.program()) else {
             return;
         };
+        let accounted_tokens_before =
+            decision_before.private_tokens(self.config.progress_ttl.decode_buffer_tokens);
         let shared_prefix_for_cost = decision_before
             .shared_prefix_tokens
             .min(observed_prompt_tokens);
         let cache_miss_impact_seconds = self.policy.cache_miss_impact_seconds(
             observed_prompt_tokens.saturating_sub(shared_prefix_for_cost),
         );
-        let acting_ttl = state
+        let policy_acting_ttl = state
             .rank_factors
             .get(&target_id)
             .map(|factors| {
@@ -88,6 +89,10 @@ impl ProgramScheduler {
                     .fitted_acting_ttl(factors, cache_miss_impact_seconds)
             })
             .unwrap_or_default();
+        let acting_ttl = dispatch
+            .request_hints()
+            .kv_retention_ttl
+            .unwrap_or(policy_acting_ttl);
         let ttl_window_samples = state
             .rank_factors
             .get(&target_id)
@@ -251,6 +256,20 @@ impl ProgramScheduler {
                     "Program scheduling diagnostic"
                 );
             }
+            decision.output_token_reservation = None;
+        }
+        if state
+            .runtime
+            .view(dispatch.program())
+            .is_some_and(|runtime| runtime.state == ProgramState::Active)
+        {
+            let accounted_tokens_after = state.decisions[dispatch.program()]
+                .private_tokens(self.config.progress_ttl.decode_buffer_tokens);
+            Self::adjust_usage(
+                &mut state,
+                &target_id,
+                accounted_tokens_after - accounted_tokens_before,
+            );
         }
         if let Some(sample) = request_sample {
             state
@@ -286,7 +305,6 @@ impl ProgramScheduler {
         self.expire_acting_ttls(state, now);
         self.release_expired_paused(state, now);
         if !self.config.binding_only {
-            self.reconcile_privileges(state, now);
             self.repair_capacity(state, now);
             self.schedule_waiting(state, now);
         }
@@ -311,7 +329,7 @@ impl ProgramScheduler {
             .collect::<Vec<_>>();
         let mut changed = false;
         for program in expired {
-            let (target, rounds, segment_rounds, placement_key, was_privileged) = state
+            let (target, rounds, segment_rounds) = state
                 .decisions
                 .get(&program)
                 .map(|decision| {
@@ -321,57 +339,13 @@ impl ProgramScheduler {
                             .segment_served_rounds
                             .saturating_sub(decision.ttl_pause_sampled_segment_rounds),
                         decision.segment_served_rounds,
-                        decision.placement_key.clone(),
-                        decision
-                            .privilege_deadline
-                            .is_some_and(|deadline| deadline > now),
                     )
                 })
                 .unwrap_or_default();
-            let privilege_target = was_privileged
-                .then(|| {
-                    let mut related = state
-                        .runtime
-                        .views()
-                        .into_iter()
-                        .filter(|candidate| candidate.reference != program)
-                        .filter(|candidate| {
-                            state
-                                .decisions
-                                .get(&candidate.reference)
-                                .is_some_and(|decision| {
-                                    decision.placement_key == placement_key
-                                        && decision.last_target == target
-                                })
-                        })
-                        .map(|candidate| candidate.reference)
-                        .collect::<Vec<_>>();
-                    related.sort_by_key(|candidate| {
-                        let runtime = state.runtime.view(candidate).unwrap();
-                        let tier = match (runtime.state, runtime.status) {
-                            (ProgramState::Active, ProgramStatus::Reasoning) => 0,
-                            (ProgramState::Paused, ProgramStatus::Reasoning) => 1,
-                            (ProgramState::Active, ProgramStatus::Acting) => 2,
-                            _ => 3,
-                        };
-                        (tier, candidate.program_id().to_string())
-                    });
-                    related.into_iter().next()
-                })
-                .flatten();
             if self.pause_idle(state, &program, ProgramPauseReason::TtlExpired, now) {
                 if let Some(decision) = state.decisions.get_mut(&program) {
                     decision.ttl_pause_sampled_segment_rounds = segment_rounds;
                     decision.rounds_since_ttl_pause = 0;
-                    if was_privileged {
-                        decision.privilege_deadline = None;
-                    }
-                }
-                if let Some(target) = privilege_target {
-                    if let Some(decision) = state.decisions.get_mut(&target) {
-                        decision.privilege_deadline = Some(now + self.config.privileged_ttl);
-                        decision.privilege_ttl_expired = false;
-                    }
                 }
                 if let Some(target) = target {
                     state
@@ -558,17 +532,11 @@ impl ProgramScheduler {
                         && state
                             .decisions
                             .get(&program.reference)
-                            .is_some_and(|decision| {
-                                decision
-                                    .privilege_deadline
-                                    .is_none_or(|deadline| deadline <= now)
-                                    && match program.status {
-                                        ProgramStatus::Acting => program.in_flight_requests == 0,
-                                        ProgramStatus::Reasoning => {
-                                            !decision.pause_when_idle
-                                                && program.in_flight_requests > 0
-                                        }
-                                    }
+                            .is_some_and(|decision| match program.status {
+                                ProgramStatus::Acting => program.in_flight_requests == 0,
+                                ProgramStatus::Reasoning => {
+                                    !decision.pause_when_idle && program.in_flight_requests > 0
+                                }
                             })
                 })
                 .collect::<Vec<_>>();
@@ -641,78 +609,6 @@ impl ProgramScheduler {
                     changed = true;
                 }
             }
-            if projected > low {
-                let mut privileged = state
-                    .runtime
-                    .views()
-                    .into_iter()
-                    .filter(|program| {
-                        program.state == ProgramState::Active
-                            && program.placement.as_deref() == Some(target_id.as_str())
-                            && state
-                                .decisions
-                                .get(&program.reference)
-                                .is_some_and(|decision| {
-                                    decision
-                                        .privilege_deadline
-                                        .is_some_and(|deadline| deadline > now)
-                                })
-                    })
-                    .collect::<Vec<_>>();
-                privileged.sort_by(|left, right| {
-                    state.decisions[&left.reference]
-                        .lifetime_generated_tokens
-                        .cmp(&state.decisions[&right.reference].lifetime_generated_tokens)
-                        .then_with(|| {
-                            left.reference
-                                .program_id()
-                                .cmp(right.reference.program_id())
-                        })
-                });
-                for victim in privileged {
-                    if projected <= low {
-                        break;
-                    }
-                    let private = state.decisions[&victim.reference]
-                        .private_tokens(self.config.progress_ttl.decode_buffer_tokens);
-                    let relief = private
-                        + if victim.status == ProgramStatus::Reasoning {
-                            average_completion
-                        } else {
-                            0.0
-                        };
-                    state
-                        .decisions
-                        .get_mut(&victim.reference)
-                        .unwrap()
-                        .privilege_deadline = None;
-                    let relieved = if victim.status == ProgramStatus::Acting {
-                        self.pause_idle(
-                            state,
-                            &victim.reference,
-                            ProgramPauseReason::CapacityRepair,
-                            now,
-                        )
-                    } else if let Some(decision) = state.decisions.get_mut(&victim.reference) {
-                        decision.pause_when_idle = true;
-                        RouterMetrics::record_agent_aware_transition(
-                            &target_id,
-                            "capacity_repair_mark",
-                        );
-                        true
-                    } else {
-                        false
-                    };
-                    if relieved {
-                        projected = (projected - relief).max(0.0);
-                        RouterMetrics::record_agent_aware_transition(
-                            &target_id,
-                            "progress_privilege_demote",
-                        );
-                        changed = true;
-                    }
-                }
-            }
         }
         changed
     }
@@ -723,6 +619,7 @@ mod tests {
     use super::*;
     use crate::program_scheduling::{ProgramIdentity, ProgramSchedulerConfig, ProgramTarget};
     use serde_json::json;
+    use std::time::Duration;
 
     fn identity(name: &str) -> ProgramIdentity {
         ProgramIdentity::from_request(
@@ -770,6 +667,33 @@ mod tests {
             state.runtime.state(dispatch.program()),
             Some((ProgramState::Paused, ProgramStatus::Acting))
         );
+    }
+
+    #[tokio::test]
+    async fn request_retention_ttl_overrides_the_policy_ttl_once() {
+        let scheduler = ProgramScheduler::new(ProgramSchedulerConfig::default());
+        let target = ProgramTarget {
+            id: "rank-0".into(),
+            base_url: "http://rank-0".into(),
+            dp_rank: Some(0),
+        };
+        let request = json!({"vllm_xargs":{"agentic_context":{
+            "program_id":"ttl-override",
+            "task_id":null,
+            "expected_resume":true,
+            "kv_retention_ttl_seconds":7.0
+        }}});
+        let identity = ProgramIdentity::from_request(None, Some(&request), Some("model"))
+            .unwrap()
+            .unwrap();
+        let dispatch = scheduler
+            .acquire(identity, 100, &[target], None)
+            .await
+            .unwrap();
+        scheduler.complete(&dispatch, true, false, Some(100), Some(0.1));
+        let state = scheduler.state.lock();
+        let deadline = state.decisions[dispatch.program()].ttl_deadline.unwrap();
+        assert!(deadline.saturating_duration_since(Instant::now()) > Duration::from_secs(6));
     }
 
     #[tokio::test]

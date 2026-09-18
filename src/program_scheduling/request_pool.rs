@@ -3,7 +3,7 @@
 //! RequestPool owns request blocking data only. It does not select targets,
 //! estimate capacity, run retries, or decide Program state transitions.
 
-use super::ProgramRef;
+use super::{ProgramRef, ProgramRequestHints};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::Instant;
@@ -36,6 +36,7 @@ pub(crate) struct PendingProgramRequest {
     pub(crate) arrived_at: Instant,
     pub(crate) estimated_context_tokens: usize,
     pub(crate) routing_text: Option<String>,
+    pub(crate) hints: ProgramRequestHints,
     notifier: Arc<Notify>,
 }
 
@@ -55,6 +56,7 @@ impl RequestPool {
         arrived_at: Instant,
         estimated_context_tokens: usize,
         routing_text: Option<&str>,
+        hints: ProgramRequestHints,
     ) -> ProgramRequestHandle {
         self.next_request_id = self.next_request_id.wrapping_add(1);
         let request_id = self.next_request_id;
@@ -67,6 +69,7 @@ impl RequestPool {
                 arrived_at,
                 estimated_context_tokens,
                 routing_text: routing_text.map(str::to_string),
+                hints,
                 notifier: Arc::clone(&notifier),
             });
         self.retained_request_count = self.retained_request_count.saturating_add(1);
@@ -145,6 +148,14 @@ impl RequestPool {
     pub(crate) fn program_len(&self, program: &ProgramRef) -> usize {
         self.requests.get(program).map_or(0, VecDeque::len)
     }
+
+    /// Request-scoped scheduling hints for the Program's front request.
+    pub(crate) fn front_hints(&self, program: &ProgramRef) -> Option<&ProgramRequestHints> {
+        self.requests
+            .get(program)
+            .and_then(VecDeque::front)
+            .map(|request| &request.hints)
+    }
 }
 
 #[cfg(test)]
@@ -159,8 +170,20 @@ mod tests {
     fn retains_fifo_order_per_exact_generation() {
         let mut pool = RequestPool::default();
         let program = program(1);
-        let first = pool.retain(program.clone(), Instant::now(), 100, None);
-        let second = pool.retain(program.clone(), Instant::now(), 200, Some("text"));
+        let first = pool.retain(
+            program.clone(),
+            Instant::now(),
+            100,
+            None,
+            ProgramRequestHints::default(),
+        );
+        let second = pool.retain(
+            program.clone(),
+            Instant::now(),
+            200,
+            Some("text"),
+            ProgramRequestHints::default(),
+        );
         assert_eq!(pool.len(), 2);
         assert_eq!(pool.program_len(&program), 2);
         assert!(pool.front(&second).is_none());
@@ -185,9 +208,27 @@ mod tests {
         let mut pool = RequestPool::default();
         let old = program(1);
         let replacement = program(2);
-        let old_front = pool.retain(old.clone(), Instant::now(), 100, None);
-        let old_tail = pool.retain(old.clone(), Instant::now(), 110, None);
-        let new_front = pool.retain(replacement.clone(), Instant::now(), 120, None);
+        let old_front = pool.retain(
+            old.clone(),
+            Instant::now(),
+            100,
+            None,
+            ProgramRequestHints::default(),
+        );
+        let old_tail = pool.retain(
+            old.clone(),
+            Instant::now(),
+            110,
+            None,
+            ProgramRequestHints::default(),
+        );
+        let new_front = pool.retain(
+            replacement.clone(),
+            Instant::now(),
+            120,
+            None,
+            ProgramRequestHints::default(),
+        );
         assert_eq!(pool.cancel(&old_tail), Some(false));
         assert_eq!(pool.cancel(&old_front), Some(true));
         assert_eq!(pool.program_len(&old), 0);
@@ -202,8 +243,20 @@ mod tests {
     async fn notification_wakes_only_the_program_front() {
         let mut pool = RequestPool::default();
         let program = program(1);
-        let front = pool.retain(program.clone(), Instant::now(), 100, None);
-        let tail = pool.retain(program.clone(), Instant::now(), 110, None);
+        let front = pool.retain(
+            program.clone(),
+            Instant::now(),
+            100,
+            None,
+            ProgramRequestHints::default(),
+        );
+        let tail = pool.retain(
+            program.clone(),
+            Instant::now(),
+            110,
+            None,
+            ProgramRequestHints::default(),
+        );
         pool.notify_front(&program);
         tokio::time::timeout(std::time::Duration::from_millis(10), front.notified())
             .await

@@ -8,15 +8,44 @@ use super::ScheduleError;
 use crate::policies::{hash_key, RequestHeaders};
 use http::HeaderMap;
 use serde_json::{Map as JsonMap, Value as JsonValue};
+use std::time::Duration;
 
 const MAX_IDENTITY_COMPONENT_BYTES: usize = 256;
 const MAX_PLACEMENT_HASH_KEY_BYTES: usize = 512;
 const MAX_AGENTIC_CONTEXT_BYTES: usize = 16 * 1024;
 const CLAUDE_SESSION_HEADER: &str = "x-claude-code-session-id";
 const CLAUDE_AGENT_HEADER: &str = "x-claude-code-agent-id";
+const CLAUDE_PARENT_AGENT_HEADER: &str = "x-claude-code-parent-agent-id";
 const CODEX_SESSION_HEADER: &str = "session-id";
 const CODEX_THREAD_HEADER: &str = "thread-id";
 const GENERIC_SESSION_HEADER: &str = "x-session-id";
+
+/// Metadata source that opts one request into Program scheduling.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProgramSchedulingEnableKey {
+    /// Require the canonical `vllm_xargs.agentic_context` body contract.
+    #[default]
+    #[serde(rename = "vllm_xargs.agentic_context")]
+    AgenticContext,
+    /// Also accept supported `agent_hint` and framework-header identities.
+    Auto,
+}
+
+/// Scheduling hints whose lifetime is exactly one retained request.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProgramRequestHints {
+    /// Optional upstream correlation ID; never participates in identity.
+    pub request_id: Option<String>,
+    /// Larger values are resumed before smaller values after force-resume.
+    pub priority: i64,
+    /// Optional upper bound on time spent waiting in the Router RequestPool.
+    pub deadline: Option<Duration>,
+    /// Optional replacement for the default per-request decode capacity.
+    pub expected_output_tokens: Option<usize>,
+    /// Optional replacement for the TTL computed after this request completes.
+    pub kv_retention_ttl: Option<Duration>,
+}
 
 /// Stable scheduling identity for one Program generation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,6 +57,16 @@ pub struct ProgramIdentity {
     /// Stable task/session group used by Program-scoped scheduling.
     placement_key: String,
     expected_resume: bool,
+    task_id: Option<String>,
+    session_id: Option<String>,
+    agent_id: Option<String>,
+    parent_program_id: Option<String>,
+    root_program_id: Option<String>,
+    blocks_parent: bool,
+    agent_role: Option<String>,
+    spawn_reason: Option<String>,
+    step_id: Option<u64>,
+    request_hints: ProgramRequestHints,
 }
 
 impl ProgramIdentity {
@@ -43,6 +82,16 @@ impl ProgramIdentity {
             placement_hash_key,
             placement_key,
             expected_resume,
+            task_id: None,
+            session_id: None,
+            agent_id: None,
+            parent_program_id: None,
+            root_program_id: None,
+            blocks_parent: false,
+            agent_role: None,
+            spawn_reason: None,
+            step_id: None,
+            request_hints: ProgramRequestHints::default(),
         }
     }
 
@@ -56,29 +105,70 @@ impl ProgramIdentity {
         request: Option<&JsonValue>,
         model_pool: Option<&str>,
     ) -> Result<Option<Self>, ScheduleError> {
+        Self::from_request_with_enable_key(
+            headers,
+            request,
+            model_pool,
+            ProgramSchedulingEnableKey::Auto,
+        )
+    }
+
+    /// Resolve identity only when the configured metadata source enables it.
+    pub fn from_request_with_enable_key(
+        headers: Option<&HeaderMap>,
+        request: Option<&JsonValue>,
+        model_pool: Option<&str>,
+        enable_key: ProgramSchedulingEnableKey,
+    ) -> Result<Option<Self>, ScheduleError> {
         let request_object = request.and_then(JsonValue::as_object);
-        let identity = if let Some(context) = canonical_context(request_object)? {
+        let canonical = canonical_context(request_object)?;
+        if enable_key == ProgramSchedulingEnableKey::AgenticContext && canonical.is_none() {
+            return Ok(None);
+        }
+        let identity = if let Some(context) = canonical {
             canonical_identity(&context, headers, model_pool)?
-        } else if let Some(identity) = agent_hint_identity(request_object, model_pool)? {
-            Some(identity)
-        } else {
-            let (session_id, actor_id) = framework_identity_headers(headers)?;
-            match session_id {
-                Some(session_id) => {
-                    let actor_id = normalized_agent_component(Some(&session_id), actor_id)?;
-                    let expected_resume = actor_id
-                        .as_deref()
-                        .is_none_or(|actor_id| actor_id == "lead");
-                    let program_id = scoped_program_id(&session_id, actor_id.as_deref());
-                    Some(Self::build(
-                        program_id,
-                        session_id,
-                        expected_resume,
-                        model_pool,
-                    )?)
+        } else if enable_key == ProgramSchedulingEnableKey::Auto {
+            if let Some(identity) = agent_hint_identity(request_object, model_pool)? {
+                Some(identity)
+            } else {
+                let (session_id, actor_id, parent_actor_id) = framework_identity_headers(headers)?;
+                match session_id {
+                    Some(session_id) => {
+                        let actor_id = normalized_agent_component(Some(&session_id), actor_id)?;
+                        let expected_resume = actor_id
+                            .as_deref()
+                            .is_none_or(|actor_id| actor_id == "lead");
+                        let program_id = scoped_program_id(&session_id, actor_id.as_deref());
+                        let mut identity = Self::build(
+                            program_id,
+                            session_id.clone(),
+                            expected_resume,
+                            model_pool,
+                        )?;
+                        identity.task_id = Some(session_id.clone());
+                        identity.session_id = Some(session_id.clone());
+                        identity.agent_id = actor_id.clone();
+                        identity.agent_role =
+                            Some(if actor_id.as_deref().is_none_or(|id| id == "lead") {
+                                "lead".to_string()
+                            } else {
+                                "subagent".to_string()
+                            });
+                        identity.parent_program_id =
+                            normalized_agent_component(Some(&session_id), parent_actor_id)?
+                                .map(|parent| scoped_program_id(&session_id, Some(&parent)))
+                                .or_else(|| {
+                                    (identity.agent_role.as_deref() == Some("subagent"))
+                                        .then(|| scoped_program_id(&session_id, Some("lead")))
+                                });
+                        identity.blocks_parent = identity.agent_role.as_deref() == Some("subagent");
+                        Some(identity)
+                    }
+                    None => None,
                 }
-                None => None,
             }
+        } else {
+            None
         };
         let Some(identity) = identity else {
             return Ok(None);
@@ -112,6 +202,16 @@ impl ProgramIdentity {
             placement_hash_key: placement_key.clone(),
             placement_key,
             expected_resume,
+            task_id: None,
+            session_id: None,
+            agent_id: None,
+            parent_program_id: None,
+            root_program_id: None,
+            blocks_parent: false,
+            agent_role: None,
+            spawn_reason: None,
+            step_id: None,
+            request_hints: ProgramRequestHints::default(),
         })
     }
 
@@ -151,6 +251,46 @@ impl ProgramIdentity {
     /// Whether upstream expects another model request after this round.
     pub fn expected_resume(&self) -> bool {
         self.expected_resume
+    }
+
+    pub fn task_id(&self) -> Option<&str> {
+        self.task_id.as_deref()
+    }
+
+    pub fn session_id(&self) -> Option<&str> {
+        self.session_id.as_deref()
+    }
+
+    pub fn agent_id(&self) -> Option<&str> {
+        self.agent_id.as_deref()
+    }
+
+    pub fn parent_program_id(&self) -> Option<&str> {
+        self.parent_program_id.as_deref()
+    }
+
+    pub fn root_program_id(&self) -> Option<&str> {
+        self.root_program_id.as_deref()
+    }
+
+    pub fn blocks_parent(&self) -> bool {
+        self.blocks_parent
+    }
+
+    pub fn agent_role(&self) -> Option<&str> {
+        self.agent_role.as_deref()
+    }
+
+    pub fn spawn_reason(&self) -> Option<&str> {
+        self.spawn_reason.as_deref()
+    }
+
+    pub fn step_id(&self) -> Option<u64> {
+        self.step_id
+    }
+
+    pub fn request_hints(&self) -> &ProgramRequestHints {
+        &self.request_hints
     }
 }
 
@@ -192,7 +332,8 @@ fn canonical_identity(
     headers: Option<&HeaderMap>,
     model_pool: Option<&str>,
 ) -> Result<Option<ProgramIdentity>, ScheduleError> {
-    let (header_session_id, header_agent_id) = framework_identity_headers(headers)?;
+    let (header_session_id, header_agent_id, header_parent_agent_id) =
+        framework_identity_headers(headers)?;
     let explicit_program_id = context_string(context, &["program_id"])?;
     let body_task_id = context_string(context, &["task_id"])?;
     let session_id = context_string(context, &["session_id"])?.or(header_session_id);
@@ -228,14 +369,83 @@ fn canonical_identity(
     };
     let placement_key = task_id
         .clone()
-        .or(session_id)
+        .or(session_id.clone())
         .unwrap_or_else(|| program_id.clone());
 
+    let parent_program_id = context_string(context, &["parent_program_id", "parent_id"])?;
+    let parent_agent_id = normalized_agent_component(
+        task_id.as_deref(),
+        context_string(context, &["parent_agent_id"])?.or(header_parent_agent_id),
+    )?;
+    let parent_program_id = parent_program_id
+        .or_else(|| {
+            parent_agent_id.as_deref().and_then(|parent| {
+                related_program_id(&program_id, agent_id.as_deref(), parent, task_id.as_deref())
+            })
+        })
+        .or_else(|| {
+            (agent_role.as_deref() == Some("subagent"))
+                .then(|| {
+                    related_program_id(&program_id, agent_id.as_deref(), "lead", task_id.as_deref())
+                })
+                .flatten()
+        });
+    let root_program_id = context_string(context, &["root_program_id", "root_id"])?;
     let blocks_parent = context_bool(context, &["blocks_parent", "blocking_parent"])?
         .unwrap_or(agent_role.as_deref() == Some("subagent"));
+    if parent_program_id.as_deref() == Some(program_id.as_str()) {
+        return Err(ScheduleError::InvalidIdentity(
+            "parent_program_id must differ from program_id".to_string(),
+        ));
+    }
+    if blocks_parent && parent_program_id.is_none() {
+        return Err(ScheduleError::InvalidIdentity(
+            "blocks_parent requires parent_program_id".to_string(),
+        ));
+    }
     let expected_resume = context_bool(context, &["expected_resume"])?
         .unwrap_or_else(|| !(blocks_parent && agent_role.as_deref() == Some("subagent")));
-    ProgramIdentity::build(program_id, placement_key, expected_resume, model_pool).map(Some)
+    let mut identity =
+        ProgramIdentity::build(program_id, placement_key, expected_resume, model_pool)?;
+    identity.task_id = task_id;
+    identity.session_id = session_id;
+    identity.agent_id = agent_id;
+    identity.parent_program_id = parent_program_id;
+    identity.root_program_id = root_program_id;
+    identity.blocks_parent = blocks_parent;
+    identity.agent_role = agent_role;
+    identity.spawn_reason =
+        context_string(context, &["spawn_reason", "subagent_type", "agent_type"])?;
+    identity.step_id = context_u64(context, &["step_id"])?;
+    identity.request_hints = ProgramRequestHints {
+        request_id: context_string(context, &["request_id"])?,
+        priority: context_i64(context, &["priority"])?.unwrap_or_default(),
+        deadline: context_duration(context, &["deadline", "deadline_seconds"])?,
+        expected_output_tokens: context_usize(
+            context,
+            &["expected_output_length", "expected_output_tokens"],
+        )?,
+        kv_retention_ttl: context_duration(
+            context,
+            &["kv_retention_ttl", "kv_retention_ttl_seconds"],
+        )?,
+    };
+    Ok(Some(identity))
+}
+
+fn related_program_id(
+    program_id: &str,
+    agent_id: Option<&str>,
+    related_agent_id: &str,
+    task_id: Option<&str>,
+) -> Option<String> {
+    if let Some(agent_id) = agent_id {
+        let suffix = format!(":{agent_id}");
+        if let Some(prefix) = program_id.strip_suffix(&suffix) {
+            return Some(format!("{prefix}:{related_agent_id}"));
+        }
+    }
+    task_id.map(|task_id| scoped_program_id(task_id, Some(related_agent_id)))
 }
 
 fn normalized_agent_component(
@@ -322,19 +532,32 @@ fn agent_hint_identity(
         ));
     }
     let expected_resume = context_bool(hint, &["expected_resume"])?.unwrap_or(!blocks_parent);
-    ProgramIdentity::build(session_id.clone(), session_id, expected_resume, model_pool).map(Some)
+    let mut identity = ProgramIdentity::build(
+        session_id.clone(),
+        session_id.clone(),
+        expected_resume,
+        model_pool,
+    )?;
+    identity.session_id = Some(session_id);
+    identity.parent_program_id = parent_session_id;
+    identity.blocks_parent = blocks_parent;
+    Ok(Some(identity))
 }
 
 fn framework_identity_headers(
     headers: Option<&HeaderMap>,
-) -> Result<(Option<String>, Option<String>), ScheduleError> {
+) -> Result<(Option<String>, Option<String>, Option<String>), ScheduleError> {
     let Some(headers) = headers else {
-        return Ok((None, None));
+        return Ok((None, None, None));
     };
-    for (session_header, agent_header) in [
-        (CLAUDE_SESSION_HEADER, Some(CLAUDE_AGENT_HEADER)),
-        (CODEX_SESSION_HEADER, Some(CODEX_THREAD_HEADER)),
-        (GENERIC_SESSION_HEADER, None),
+    for (session_header, agent_header, parent_header) in [
+        (
+            CLAUDE_SESSION_HEADER,
+            Some(CLAUDE_AGENT_HEADER),
+            Some(CLAUDE_PARENT_AGENT_HEADER),
+        ),
+        (CODEX_SESSION_HEADER, Some(CODEX_THREAD_HEADER), None),
+        (GENERIC_SESSION_HEADER, None, None),
     ] {
         let Some(session_id) = read_nonempty_header(headers, session_header)? else {
             continue;
@@ -343,9 +566,13 @@ fn framework_identity_headers(
             Some(name) => read_nonempty_header(headers, name)?,
             None => None,
         };
-        return Ok((Some(session_id), agent_id));
+        let parent_agent_id = match parent_header {
+            Some(name) => read_nonempty_header(headers, name)?,
+            None => None,
+        };
+        return Ok((Some(session_id), agent_id, parent_agent_id));
     }
-    Ok((None, None))
+    Ok((None, None, None))
 }
 
 fn read_nonempty_header(headers: &HeaderMap, name: &str) -> Result<Option<String>, ScheduleError> {
@@ -410,6 +637,80 @@ fn context_bool(
     Ok(None)
 }
 
+fn context_u64(
+    context: &JsonMap<String, JsonValue>,
+    keys: &[&str],
+) -> Result<Option<u64>, ScheduleError> {
+    for key in keys {
+        let Some(value) = context.get(*key) else {
+            continue;
+        };
+        if value.is_null() {
+            continue;
+        }
+        return value.as_u64().map(Some).ok_or_else(|| {
+            ScheduleError::InvalidIdentity(format!("{key} must be a non-negative integer"))
+        });
+    }
+    Ok(None)
+}
+
+fn context_i64(
+    context: &JsonMap<String, JsonValue>,
+    keys: &[&str],
+) -> Result<Option<i64>, ScheduleError> {
+    for key in keys {
+        let Some(value) = context.get(*key) else {
+            continue;
+        };
+        if value.is_null() {
+            continue;
+        }
+        return value
+            .as_i64()
+            .map(Some)
+            .ok_or_else(|| ScheduleError::InvalidIdentity(format!("{key} must be an integer")));
+    }
+    Ok(None)
+}
+
+fn context_usize(
+    context: &JsonMap<String, JsonValue>,
+    keys: &[&str],
+) -> Result<Option<usize>, ScheduleError> {
+    let value = context_u64(context, keys)?;
+    value
+        .map(|value| {
+            usize::try_from(value)
+                .map_err(|_| ScheduleError::InvalidIdentity(format!("{} is too large", keys[0])))
+        })
+        .transpose()
+}
+
+fn context_duration(
+    context: &JsonMap<String, JsonValue>,
+    keys: &[&str],
+) -> Result<Option<Duration>, ScheduleError> {
+    for key in keys {
+        let Some(value) = context.get(*key) else {
+            continue;
+        };
+        if value.is_null() {
+            continue;
+        }
+        let seconds = value.as_f64().ok_or_else(|| {
+            ScheduleError::InvalidIdentity(format!("{key} must be seconds as a number"))
+        })?;
+        if !seconds.is_finite() || seconds < 0.0 {
+            return Err(ScheduleError::InvalidIdentity(format!(
+                "{key} must be finite and non-negative"
+            )));
+        }
+        return Ok(Some(Duration::from_secs_f64(seconds)));
+    }
+    Ok(None)
+}
+
 fn scoped_program_id(session_id: &str, actor_id: Option<&str>) -> String {
     let actor_id = actor_id.unwrap_or("lead");
     let prefix = format!("{session_id}:");
@@ -446,6 +747,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(identity.program_id(), "session-a:worker");
+        assert_eq!(identity.parent_program_id(), Some("session-a:lead"));
         assert_eq!(identity.placement_hash_key(), "header:session-id:session-a");
         assert!(!identity.expected_resume());
 
@@ -461,6 +763,7 @@ mod tests {
             "header:x-claude-code-session-id:session-c"
         );
         assert_eq!(identity.placement_key(), "session-c");
+        assert_eq!(identity.parent_program_id(), Some("session-c:lead"));
         assert!(!identity.expected_resume());
 
         let mut generic_headers = HeaderMap::new();
@@ -565,5 +868,76 @@ mod tests {
             ProgramIdentity::from_request(None, Some(&blocking_root), Some("model")),
             Err(ScheduleError::InvalidIdentity(_))
         ));
+    }
+
+    #[test]
+    fn canonical_contract_carries_relationships_and_request_hints() {
+        let request = serde_json::json!({
+            "vllm_xargs": {"agentic_context": {
+                "program_id": "workflow:child",
+                "task_id": "workflow",
+                "session_id": "session-a",
+                "agent_id": "child",
+                "parent_agent_id": "lead",
+                "root_program_id": "workflow:root",
+                "blocks_parent": false,
+                "expected_resume": true,
+                "agent_role": "subagent",
+                "spawn_reason": "research",
+                "request_id": "request-a",
+                "step_id": 7,
+                "priority": 9,
+                "deadline_seconds": 12.5,
+                "expected_output_length": 2048,
+                "kv_retention_ttl_seconds": 4.5
+            }}
+        });
+        let identity = ProgramIdentity::from_request_with_enable_key(
+            None,
+            Some(&request),
+            Some("model"),
+            ProgramSchedulingEnableKey::AgenticContext,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(identity.parent_program_id(), Some("workflow:lead"));
+        assert_eq!(identity.root_program_id(), Some("workflow:root"));
+        assert_eq!(identity.step_id(), Some(7));
+        assert_eq!(
+            identity.request_hints().request_id.as_deref(),
+            Some("request-a")
+        );
+        assert_eq!(identity.request_hints().priority, 9);
+        assert_eq!(
+            identity.request_hints().deadline,
+            Some(Duration::from_secs_f64(12.5))
+        );
+        assert_eq!(identity.request_hints().expected_output_tokens, Some(2048));
+        assert_eq!(
+            identity.request_hints().kv_retention_ttl,
+            Some(Duration::from_secs_f64(4.5))
+        );
+    }
+
+    #[test]
+    fn enable_key_defaults_to_canonical_and_auto_enables_compatibility_inputs() {
+        let mut headers = HeaderMap::new();
+        headers.insert(CLAUDE_SESSION_HEADER, "session-a".parse().unwrap());
+        assert!(ProgramIdentity::from_request_with_enable_key(
+            Some(&headers),
+            None,
+            Some("model"),
+            ProgramSchedulingEnableKey::AgenticContext,
+        )
+        .unwrap()
+        .is_none());
+        assert!(ProgramIdentity::from_request_with_enable_key(
+            Some(&headers),
+            None,
+            Some("model"),
+            ProgramSchedulingEnableKey::Auto,
+        )
+        .unwrap()
+        .is_some());
     }
 }

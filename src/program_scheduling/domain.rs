@@ -3,6 +3,8 @@
 use std::hash::{Hash, Hasher};
 use std::time::Instant;
 
+use super::ProgramRequestHints;
+
 /// Whether a Program currently owns logical admission capacity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProgramState {
@@ -88,6 +90,7 @@ pub struct ProgramDispatch {
     estimated_context_tokens: usize,
     placement_start_request: bool,
     routing_text: Option<String>,
+    request_hints: ProgramRequestHints,
 }
 
 impl ProgramDispatch {
@@ -102,6 +105,7 @@ impl ProgramDispatch {
         estimated_context_tokens: usize,
         placement_start_request: bool,
         routing_text: Option<String>,
+        request_hints: ProgramRequestHints,
     ) -> Self {
         Self {
             program,
@@ -112,6 +116,7 @@ impl ProgramDispatch {
             estimated_context_tokens,
             placement_start_request,
             routing_text,
+            request_hints,
         }
     }
 
@@ -148,6 +153,11 @@ impl ProgramDispatch {
     /// Request text retained for a deferred Cache-aware binding commit.
     pub fn routing_text(&self) -> Option<&str> {
         self.routing_text.as_deref()
+    }
+
+    /// Request-scoped metadata that affected admission and completion TTL.
+    pub fn request_hints(&self) -> &ProgramRequestHints {
+        &self.request_hints
     }
 
     /// Stable privacy-preserving Program identifier for logs and metrics.

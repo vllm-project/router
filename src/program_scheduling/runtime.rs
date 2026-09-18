@@ -5,8 +5,8 @@
 
 use super::request_pool::RequestPool;
 use super::{
-    ProgramDispatch, ProgramIdentity, ProgramRef, ProgramRequestHandle, ProgramState,
-    ProgramStatus, ProgramUsageObservation,
+    ProgramDispatch, ProgramIdentity, ProgramRef, ProgramRequestHandle, ProgramRequestHints,
+    ProgramState, ProgramStatus, ProgramUsageObservation,
 };
 use std::collections::HashMap;
 use std::time::Instant;
@@ -74,6 +74,7 @@ impl ProgramRuntime {
             arrived_at,
             estimated_context_tokens,
             routing_text,
+            identity.request_hints().clone(),
         )
     }
 
@@ -121,6 +122,7 @@ impl ProgramRuntime {
             request.estimated_context_tokens,
             starts_placement,
             request.routing_text,
+            request.hints,
         ))
     }
 
@@ -306,6 +308,14 @@ impl ProgramRuntime {
     /// Whether no request is currently retained for admission.
     pub fn request_pool_is_empty(&self) -> bool {
         self.request_pool.is_empty()
+    }
+
+    /// Request-scoped hints associated with the Program's front waiter.
+    pub(crate) fn front_request_hints(
+        &self,
+        program_ref: &ProgramRef,
+    ) -> Option<&ProgramRequestHints> {
+        self.request_pool.front_hints(program_ref)
     }
 
     /// Immutable lifecycle view used by scheduling decisions under one lock.

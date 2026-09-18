@@ -1,7 +1,7 @@
 //! Request retention and rank-local Program admission.
 //!
-//! This module preserves the existing local-resume ordering and capacity
-//! checks. Global Queue placement is intentionally implemented separately.
+//! This module owns request-scoped ordering hints, yield-aware resume order,
+//! and capacity checks. Global Queue placement is implemented separately.
 
 use super::scheduler::ProgramScheduler;
 use super::scheduler_state::{ProgramPauseReason, ProgramResumeOrder, ProgramSchedulerState};
@@ -17,14 +17,11 @@ use tracing::info;
 
 #[derive(Debug, Clone)]
 pub(crate) struct RankAdmissionPlan {
-    pub(crate) victims: Vec<ProgramRef>,
-    pub(crate) privilege_source: Option<ProgramRef>,
     pub(crate) used_tokens: f64,
     pub(crate) required_tokens: f64,
     pub(crate) reserve_tokens: f64,
     pub(crate) capacity_tokens: Option<usize>,
     pub(crate) forced: bool,
-    pub(crate) privileged: bool,
     pub(crate) batch_gain: bool,
 }
 
@@ -224,14 +221,11 @@ impl ProgramScheduler {
             program,
             &target_id,
             RankAdmissionPlan {
-                victims: Vec::new(),
-                privilege_source: None,
                 used_tokens: 0.0,
                 required_tokens: 0.0,
                 reserve_tokens: 0.0,
                 capacity_tokens: self.config.progress_ttl.token_capacity,
                 forced: false,
-                privileged: false,
                 batch_gain: false,
             },
             Instant::now(),
@@ -351,7 +345,7 @@ impl ProgramScheduler {
                     })
                     .cloned()
                     .collect::<Vec<_>>();
-                queued.sort_by(|left, right| self.local_resume_cmp(state, left, right, now));
+                self.order_resume_candidates(state, &mut queued, now);
                 let Some((candidate, plan)) = queued.into_iter().find_map(|candidate| {
                     self.rank_admission_plan(state, &candidate, &target_id, now)
                         .map(|plan| (candidate, plan))
@@ -380,6 +374,50 @@ impl ProgramScheduler {
         right: &ProgramRef,
         now: Instant,
     ) -> Ordering {
+        self.resume_tier_cmp(state, left, right, now)
+            .then_with(|| self.segment_yield_cmp(state, left, right))
+            .then_with(|| self.ordinary_resume_cmp(state, left, right))
+    }
+
+    /// Apply force-resume, request priority, one-shot yield, and local order.
+    ///
+    /// A Program paused after reaching the segment limit ranks behind peers in
+    /// the same force/priority tier. Successful admission clears the pause
+    /// reason, so this penalty applies to exactly one resume.
+    pub(crate) fn order_resume_candidates(
+        &self,
+        state: &ProgramSchedulerState,
+        queued: &mut [ProgramRef],
+        now: Instant,
+    ) {
+        queued.sort_by(|left, right| {
+            self.resume_tier_cmp(state, left, right, now)
+                .then_with(|| self.segment_yield_cmp(state, left, right))
+                .then_with(|| self.ordinary_resume_cmp(state, left, right))
+        });
+    }
+
+    /// Keep cross-rank escape fair and predictable regardless of local order.
+    pub(crate) fn order_cross_rank_candidates(
+        &self,
+        state: &ProgramSchedulerState,
+        queued: &mut [ProgramRef],
+        now: Instant,
+    ) {
+        queued.sort_by(|left, right| {
+            self.resume_tier_cmp(state, left, right, now)
+                .then_with(|| self.segment_yield_cmp(state, left, right))
+                .then_with(|| self.fcfs_resume_cmp(state, left, right))
+        });
+    }
+
+    fn resume_tier_cmp(
+        &self,
+        state: &ProgramSchedulerState,
+        left: &ProgramRef,
+        right: &ProgramRef,
+        now: Instant,
+    ) -> Ordering {
         let left_state = &state.decisions[left];
         let right_state = &state.decisions[right];
         let left_forced = left_state
@@ -388,29 +426,59 @@ impl ProgramScheduler {
         let right_forced = right_state
             .force_resume_deadline
             .is_some_and(|deadline| deadline <= now);
-        let left_privileged = left_state
-            .privilege_deadline
-            .is_some_and(|deadline| deadline > now);
-        let right_privileged = right_state
-            .privilege_deadline
-            .is_some_and(|deadline| deadline > now);
-        let priority = right_forced
+        let left_priority = state
+            .runtime
+            .front_request_hints(left)
+            .map_or(0, |hints| hints.priority);
+        let right_priority = state
+            .runtime
+            .front_request_hints(right)
+            .map_or(0, |hints| hints.priority);
+        right_forced
             .cmp(&left_forced)
-            .then_with(|| right_privileged.cmp(&left_privileged));
-        if priority != Ordering::Equal {
-            return priority;
-        }
+            .then_with(|| right_priority.cmp(&left_priority))
+    }
+
+    fn segment_yield_cmp(
+        &self,
+        state: &ProgramSchedulerState,
+        left: &ProgramRef,
+        right: &ProgramRef,
+    ) -> Ordering {
+        let yielded = |program: &ProgramRef| {
+            state.decisions[program].last_pause_reason == Some(ProgramPauseReason::MaxSegmentYield)
+        };
+        yielded(left).cmp(&yielded(right))
+    }
+
+    fn ordinary_resume_cmp(
+        &self,
+        state: &ProgramSchedulerState,
+        left: &ProgramRef,
+        right: &ProgramRef,
+    ) -> Ordering {
+        let left_state = &state.decisions[left];
+        let right_state = &state.decisions[right];
         match self.config.resume_order {
-            ProgramResumeOrder::Fcfs => left_state
-                .queued_at
-                .cmp(&right_state.queued_at)
-                .then_with(|| left.program_id().cmp(right.program_id())),
+            ProgramResumeOrder::Fcfs => self.fcfs_resume_cmp(state, left, right),
             ProgramResumeOrder::Mru => right_state
                 .last_request_finished_at
                 .cmp(&left_state.last_request_finished_at)
                 .then_with(|| left_state.queued_at.cmp(&right_state.queued_at))
                 .then_with(|| left.program_id().cmp(right.program_id())),
         }
+    }
+
+    fn fcfs_resume_cmp(
+        &self,
+        state: &ProgramSchedulerState,
+        left: &ProgramRef,
+        right: &ProgramRef,
+    ) -> Ordering {
+        state.decisions[left]
+            .queued_at
+            .cmp(&state.decisions[right].queued_at)
+            .then_with(|| left.program_id().cmp(right.program_id()))
     }
 
     pub(crate) fn rank_admission_plan(
@@ -434,9 +502,6 @@ impl ProgramScheduler {
         let forced = decision
             .force_resume_deadline
             .is_some_and(|deadline| deadline <= now);
-        let privileged = decision
-            .privilege_deadline
-            .is_some_and(|deadline| deadline > now);
         if self.config.admission_waiting_request_threshold > 0
             && state
                 .observations
@@ -455,120 +520,29 @@ impl ProgramScheduler {
                 other.state == ProgramState::Active && other.placement.as_deref() == Some(target_id)
             })
             .collect::<Vec<_>>();
-        let privilege_source = active.iter().find_map(|other| {
-            let other_state = state.decisions.get(&other.reference)?;
-            (other.status == ProgramStatus::Acting
-                && other_state.placement_key == decision.placement_key
-                && other_state
-                    .privilege_deadline
-                    .is_some_and(|deadline| deadline > now))
-            .then(|| other.reference.clone())
-        });
-        let privileged = privileged || privilege_source.is_some();
-        let mut used_tokens = self.target_usage(state, target_id, now);
-        let mut active_count = active.len();
-        let required_tokens =
-            decision.private_tokens(self.config.progress_ttl.decode_buffer_tokens);
+        let used_tokens = self.target_usage(state, target_id, now);
+        let active_count = active.len();
+        let expected_output_tokens = state
+            .runtime
+            .front_request_hints(program)
+            .and_then(|hints| hints.expected_output_tokens);
+        let required_tokens = decision.private_tokens_with_output(
+            self.config.progress_ttl.decode_buffer_tokens,
+            expected_output_tokens,
+        );
         let capacity = self.config.progress_ttl.token_capacity;
-        let mut victims = Vec::new();
-        let reserve_before_reclaim = state
-            .rank_factors
-            .get(target_id)
-            .map(|factors| {
-                let target_rounds = self.policy.target_rounds(factors);
-                let active_remaining = active.iter().filter_map(|active| {
-                    state.decisions.get(&active.reference).map(|active_state| {
-                        (target_rounds - active_state.rounds_since_activation as f64).max(0.0)
-                    })
-                });
-                self.policy
-                    .continuous_growth_reserve_tokens(factors, active_remaining)
-            })
-            .unwrap_or(0.0);
-        let low =
-            capacity.map(|tokens| tokens as f64 * self.config.progress_ttl.low_watermark_ratio);
-        let token_fits = |usage: f64| {
-            low.is_none_or(|limit| usage + required_tokens + reserve_before_reclaim <= limit)
-        };
         let count_fits =
             |count: usize| count.saturating_add(1) <= self.config.max_active_programs_per_target;
-        if self.config.resume_reclaim_acting_programs
-            && (!token_fits(used_tokens) || !count_fits(active_count))
-        {
-            let average_prompt = state
-                .rank_factors
-                .get(target_id)
-                .map_or(1.0, |factors| factors.average_prompt_tokens().max(1.0));
-            let mut acting = active
-                .iter()
-                .filter(|program| program.status == ProgramStatus::Acting)
-                .filter(|program| {
-                    state
-                        .decisions
-                        .get(&program.reference)
-                        .is_some_and(|decision| {
-                            decision
-                                .privilege_deadline
-                                .is_none_or(|deadline| deadline <= now)
-                        })
-                })
-                .collect::<Vec<_>>();
-            acting.sort_by(|left, right| {
-                let score = |program: &&super::runtime::RuntimeProgramView| {
-                    let decision = &state.decisions[&program.reference];
-                    let elapsed = decision.segment_started_at.map_or(0.0, |started| {
-                        now.saturating_duration_since(started).as_secs_f64()
-                    });
-                    elapsed
-                        * (1.0
-                            / (decision.estimated_context_tokens as f64 / average_prompt)
-                                .max(1e-6)
-                                .sqrt())
-                        .max(0.5)
-                };
-                score(right)
-                    .total_cmp(&score(left))
-                    .then_with(|| {
-                        state.decisions[&left.reference]
-                            .segment_served_rounds
-                            .cmp(&state.decisions[&right.reference].segment_served_rounds)
-                    })
-                    .then_with(|| {
-                        state.decisions[&right.reference]
-                            .estimated_context_tokens
-                            .cmp(&state.decisions[&left.reference].estimated_context_tokens)
-                    })
-                    .then_with(|| {
-                        left.reference
-                            .program_id()
-                            .cmp(right.reference.program_id())
-                    })
-            });
-            for victim in acting {
-                used_tokens = (used_tokens
-                    - state.decisions[&victim.reference]
-                        .private_tokens(self.config.progress_ttl.decode_buffer_tokens))
-                .max(0.0);
-                active_count = active_count.saturating_sub(1);
-                victims.push(victim.reference.clone());
-                if token_fits(used_tokens) && count_fits(active_count) {
-                    break;
-                }
-            }
-        }
         let Some(capacity_tokens) = capacity else {
-            if !forced && !privileged && !count_fits(active_count) {
+            if !forced && !count_fits(active_count) {
                 return None;
             }
             return Some(RankAdmissionPlan {
-                victims,
-                privilege_source,
                 used_tokens,
                 required_tokens,
                 reserve_tokens: 0.0,
                 capacity_tokens: None,
                 forced,
-                privileged,
                 batch_gain: false,
             });
         };
@@ -586,16 +560,13 @@ impl ProgramScheduler {
                 .continuous_growth_reserve_tokens(factors, active_remaining)
         });
         let reserve_fits = used_tokens + required_tokens + reserve_tokens <= low;
-        if forced || privileged || (count_fits(active_count) && immediate_fits && reserve_fits) {
+        if forced || (count_fits(active_count) && immediate_fits && reserve_fits) {
             return Some(RankAdmissionPlan {
-                victims,
-                privilege_source,
                 used_tokens,
                 required_tokens,
                 reserve_tokens,
                 capacity_tokens: capacity,
                 forced,
-                privileged,
                 batch_gain: false,
             });
         }
@@ -645,14 +616,11 @@ impl ProgramScheduler {
             ),
         });
         estimate.admits.then_some(RankAdmissionPlan {
-            victims,
-            privilege_source,
             used_tokens,
             required_tokens,
             reserve_tokens,
             capacity_tokens: capacity,
             forced,
-            privileged,
             batch_gain: true,
         })
     }
@@ -676,21 +644,6 @@ impl ProgramScheduler {
         else {
             return false;
         };
-        if let Some(source) = &plan.privilege_source {
-            self.pause_idle(state, source, ProgramPauseReason::PrivilegeHandoff, now);
-            if let Some(source_state) = state.decisions.get_mut(source) {
-                source_state.privilege_deadline = None;
-            }
-            if let Some(candidate_state) = state.decisions.get_mut(program) {
-                candidate_state.privilege_deadline = Some(now + self.config.privileged_ttl);
-                candidate_state.privilege_ttl_expired = false;
-            }
-        }
-        for victim in &plan.victims {
-            if plan.privilege_source.as_ref() != Some(victim) {
-                self.pause_idle(state, victim, ProgramPauseReason::CapacityRepair, now);
-            }
-        }
         if !state.runtime.activate(program, target_id.to_string()) {
             return false;
         }
@@ -699,7 +652,7 @@ impl ProgramScheduler {
             decision.rounds_since_activation = 0;
             decision.acting_since = None;
             decision.ttl_deadline = None;
-            decision.segment_started_at = Some(now);
+            decision.segment_started_at.get_or_insert(now);
             decision.paused_at = None;
             decision.last_pause_reason = None;
             decision.pause_when_idle = false;
@@ -723,7 +676,6 @@ impl ProgramScheduler {
             program = %program.redacted_id(),
             target = target_id,
             forced = plan.forced,
-            privileged = plan.privileged,
             batch_gain = plan.batch_gain,
             used_tokens = plan.used_tokens,
             required_tokens = plan.required_tokens,
@@ -733,8 +685,6 @@ impl ProgramScheduler {
         );
         let reason = if plan.forced {
             "force_resume"
-        } else if plan.privileged {
-            "privileged_resume"
         } else if plan.batch_gain {
             "batch_gain_admit"
         } else {
@@ -776,7 +726,6 @@ impl ProgramScheduler {
             decision.rounds_since_activation = 0;
             decision.acting_since = None;
             decision.ttl_deadline = None;
-            decision.segment_started_at = None;
             decision.pause_when_idle = false;
             Self::restart_shared_prefix_freshness(decision, now);
         }
@@ -859,6 +808,36 @@ mod tests {
         .unwrap()
     }
 
+    fn identity_with_priority(program: &str, priority: i64) -> ProgramIdentity {
+        ProgramIdentity::from_request(
+            None,
+            Some(&json!({"vllm_xargs":{"agentic_context":{
+                "program_id":program,
+                "task_id":null,
+                "expected_resume":true,
+                "priority":priority
+            }}})),
+            Some("model"),
+        )
+        .unwrap()
+        .unwrap()
+    }
+
+    fn identity_with_expected_output(program: &str, output_tokens: usize) -> ProgramIdentity {
+        ProgramIdentity::from_request(
+            None,
+            Some(&json!({"vllm_xargs":{"agentic_context":{
+                "program_id":program,
+                "task_id":null,
+                "expected_resume":true,
+                "expected_output_length":output_tokens
+            }}})),
+            Some("model"),
+        )
+        .unwrap()
+        .unwrap()
+    }
+
     fn target() -> ProgramTarget {
         ProgramTarget {
             id: "rank-0".into(),
@@ -879,10 +858,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn opt_in_acting_reclaim_applies_to_program_count_pressure() {
+    async fn admission_does_not_reclaim_active_acting_programs() {
         let mut config = ProgramSchedulerConfig::default();
         config.max_active_programs_per_target = 1;
-        config.resume_reclaim_acting_programs = true;
         let scheduler = ProgramScheduler::new(config);
         let target = target();
         let first = scheduler
@@ -893,18 +871,16 @@ mod tests {
             let mut state = scheduler.state.lock();
             assert!(state.runtime.complete_request(&first, Some(100).into()));
         }
-        let second = scheduler
-            .acquire(identity("second"), 100, &[target], None)
-            .await
-            .unwrap();
+        let second = tokio::time::timeout(
+            std::time::Duration::from_millis(10),
+            scheduler.acquire(identity("second"), 100, &[target], None),
+        )
+        .await;
+        assert!(second.is_err());
         let state = scheduler.state.lock();
         assert_eq!(
             state.runtime.state(first.program()),
-            Some((ProgramState::Paused, ProgramStatus::Acting))
-        );
-        assert_eq!(
-            state.runtime.state(second.program()),
-            Some((ProgramState::Active, ProgramStatus::Reasoning))
+            Some((ProgramState::Active, ProgramStatus::Acting))
         );
     }
 
@@ -933,7 +909,7 @@ mod tests {
     }
 
     #[test]
-    fn local_order_prefers_forced_then_privileged_then_mru_when_configured() {
+    fn local_order_prefers_forced_then_non_yielded_then_mru() {
         let mut config = ProgramSchedulerConfig::default();
         config.resume_order = ProgramResumeOrder::Mru;
         let scheduler = ProgramScheduler::new(config);
@@ -966,6 +942,8 @@ mod tests {
             .get_mut(&refs[0])
             .unwrap()
             .last_request_finished_at = Some(now - Duration::from_secs(10));
+        state.decisions.get_mut(&refs[0]).unwrap().last_pause_reason =
+            Some(ProgramPauseReason::MaxSegmentYield);
         state
             .decisions
             .get_mut(&refs[1])
@@ -980,6 +958,7 @@ mod tests {
         ordered.sort_by(|left, right| scheduler.local_resume_cmp(&state, left, right, now));
         assert_eq!(ordered[0], refs[2]);
         assert_eq!(ordered[1], refs[1]);
+        assert_eq!(ordered[2], refs[0]);
     }
 
     #[test]
@@ -1010,6 +989,96 @@ mod tests {
         let mut ordered = refs.clone();
         ordered.sort_by(|left, right| scheduler.local_resume_cmp(&state, left, right, now));
         assert_eq!(ordered, refs);
+    }
+
+    #[test]
+    fn resume_order_applies_priority_before_one_shot_yield() {
+        let scheduler = ProgramScheduler::new(ProgramSchedulerConfig::default());
+        scheduler.sync_targets("model", &[target()]);
+        let now = Instant::now();
+        let mut state = scheduler.state.lock();
+        let specifications = [
+            ("normal", 0, false),
+            ("yielded", 0, true),
+            ("priority", 9, true),
+        ];
+        let mut queued = Vec::new();
+        for (name, priority, yielded) in specifications {
+            let identity = identity_with_priority(name, priority);
+            let handle = state.runtime.retain_request(&identity, 100, None, now);
+            let reference = handle.program().clone();
+            scheduler.ensure_decision_state(
+                &mut state,
+                &identity,
+                reference.clone(),
+                100,
+                now,
+                None,
+            );
+            let decision = state.decisions.get_mut(&reference).unwrap();
+            decision.last_request_finished_at = Some(now - Duration::from_secs(1));
+            if yielded {
+                decision.last_pause_reason = Some(ProgramPauseReason::MaxSegmentYield);
+            }
+            queued.push(reference);
+        }
+        scheduler.order_resume_candidates(&state, &mut queued, now);
+        assert_eq!(queued[0].program_id(), "priority");
+        assert_eq!(queued[1].program_id(), "normal");
+        assert_eq!(queued[2].program_id(), "yielded");
+    }
+
+    #[test]
+    fn successful_resume_clears_max_segment_yield_marker() {
+        let scheduler = ProgramScheduler::new(ProgramSchedulerConfig::default());
+        scheduler.sync_targets("model", &[target()]);
+        let now = Instant::now();
+        let identity = identity("yielded");
+        let mut state = scheduler.state.lock();
+        let handle = state.runtime.retain_request(&identity, 100, None, now);
+        scheduler.ensure_decision_state(
+            &mut state,
+            &identity,
+            handle.program().clone(),
+            100,
+            now,
+            None,
+        );
+        state
+            .decisions
+            .get_mut(handle.program())
+            .unwrap()
+            .last_pause_reason = Some(ProgramPauseReason::MaxSegmentYield);
+        let plan = scheduler
+            .rank_admission_plan(&state, handle.program(), "rank-0", now)
+            .unwrap();
+        assert!(scheduler.commit_admission(&mut state, handle.program(), "rank-0", plan, now));
+        assert_eq!(state.decisions[handle.program()].last_pause_reason, None);
+    }
+
+    #[test]
+    fn expected_output_length_replaces_default_request_capacity() {
+        let mut config = ProgramSchedulerConfig::default();
+        config.progress_ttl.token_capacity = Some(1_000);
+        config.progress_ttl.low_watermark_ratio = 1.0;
+        let scheduler = ProgramScheduler::new(config);
+        scheduler.sync_targets("model", &[target()]);
+        let now = Instant::now();
+        let identity = identity_with_expected_output("program", 200);
+        let mut state = scheduler.state.lock();
+        let handle = state.runtime.retain_request(&identity, 100, None, now);
+        scheduler.ensure_decision_state(
+            &mut state,
+            &identity,
+            handle.program().clone(),
+            100,
+            now,
+            None,
+        );
+        let plan = scheduler
+            .rank_admission_plan(&state, handle.program(), "rank-0", now)
+            .unwrap();
+        assert_eq!(plan.required_tokens, 300.0);
     }
 
     #[test]

@@ -3,9 +3,10 @@
 //! All values in this module are protected by the ProgramScheduler mutex.
 //! They are decision facts, not an additional Program lifecycle state machine.
 
+use super::lineage::ProgramLineage;
 use super::{
-    ProgramBindingStrategy, ProgramBindings, ProgramRef, ProgramRuntime, ProgramTarget,
-    ProgressTtlConfig, ProgressTtlFactors,
+    ProgramBindingStrategy, ProgramBindings, ProgramRef, ProgramRuntime,
+    ProgramSchedulingEnableKey, ProgramTarget, ProgressTtlConfig, ProgressTtlFactors,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::Arc;
@@ -25,11 +26,13 @@ pub enum ProgramResumeOrder {
 /// Complete opt-in Program scheduler configuration.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProgramSchedulerConfig {
+    /// Metadata source that opts an individual request into Program scheduling.
+    pub enable_key: ProgramSchedulingEnableKey,
     /// Preserve Program identity and binding but bypass Router admission.
     pub binding_only: bool,
     /// Permit paused reasoning Programs to resume on another target.
     pub global_queue: bool,
-    /// Ordinary resume order after force-resume and privilege tiers.
+    /// Ordinary resume order after force-resume, priority, and one-shot yield.
     pub resume_order: ProgramResumeOrder,
     /// Required destination-over-source headroom in complete Program contexts.
     pub cross_rank_headroom_ratio: f64,
@@ -53,12 +56,6 @@ pub struct ProgramSchedulerConfig {
     pub shared_prefix_freshness_warmup: Duration,
     /// Estimated whole-KV-pool turnovers before refreshing shared prefix.
     pub shared_prefix_freshness_kv_turnovers: f64,
-    /// Context size used to derive bounded per-rank privilege slots.
-    pub privileged_max_context_tokens: usize,
-    /// Maximum lifetime of one progress privilege lease.
-    pub privileged_ttl: Duration,
-    /// Allow resume to reclaim active acting Programs before TTL expiry.
-    pub resume_reclaim_acting_programs: bool,
     /// Rank-local Progress-TTL formulas and calibration.
     pub progress_ttl: ProgressTtlConfig,
 }
@@ -66,6 +63,7 @@ pub struct ProgramSchedulerConfig {
 impl Default for ProgramSchedulerConfig {
     fn default() -> Self {
         Self {
+            enable_key: ProgramSchedulingEnableKey::default(),
             binding_only: false,
             global_queue: false,
             resume_order: ProgramResumeOrder::default(),
@@ -80,9 +78,6 @@ impl Default for ProgramSchedulerConfig {
             paused_retention_ttl: Duration::from_secs(1800),
             shared_prefix_freshness_warmup: Duration::from_secs(100),
             shared_prefix_freshness_kv_turnovers: 2.0,
-            privileged_max_context_tokens: 262_144,
-            privileged_ttl: Duration::from_secs(5),
-            resume_reclaim_acting_programs: false,
             progress_ttl: ProgressTtlConfig::default(),
         }
     }
@@ -91,6 +86,7 @@ impl Default for ProgramSchedulerConfig {
 impl From<&crate::config::types::ProgramSchedulingConfig> for ProgramSchedulerConfig {
     fn from(config: &crate::config::types::ProgramSchedulingConfig) -> Self {
         Self {
+            enable_key: config.enable_key,
             binding_only: config.binding_only,
             global_queue: config.global_queue,
             resume_order: config.resume_order,
@@ -107,9 +103,6 @@ impl From<&crate::config::types::ProgramSchedulingConfig> for ProgramSchedulerCo
                 config.shared_prefix_freshness_warmup_seconds,
             ),
             shared_prefix_freshness_kv_turnovers: config.shared_prefix_freshness_kv_turnovers,
-            privileged_max_context_tokens: config.privileged_max_context_tokens,
-            privileged_ttl: Duration::from_secs_f64(config.privileged_ttl_seconds),
-            resume_reclaim_acting_programs: config.resume_reclaim_acting_programs,
             progress_ttl: ProgressTtlConfig {
                 token_capacity: config.token_capacity_per_target,
                 decode_buffer_tokens: config.decode_buffer_tokens,
@@ -119,7 +112,8 @@ impl From<&crate::config::types::ProgramSchedulingConfig> for ProgramSchedulerCo
                 max_segment_rounds: config.max_segment_rounds,
                 stats_window_size: config.stats_window_size,
                 enable_batch_gain_admission: config.enable_batch_gain_admission,
-                ..ProgressTtlConfig::default()
+                prefill: config.prefill_cost_model,
+                decode: config.decode_throughput_model,
             },
         }
     }
@@ -131,7 +125,6 @@ pub(crate) enum ProgramPauseReason {
     TtlExpired,
     CapacityRepair,
     MaxSegmentYield,
-    PrivilegeHandoff,
     RequestFailed,
     RequestCancelled,
 }
@@ -142,7 +135,6 @@ impl ProgramPauseReason {
             Self::TtlExpired => "ttl_expired",
             Self::CapacityRepair => "capacity_repair",
             Self::MaxSegmentYield => "max_segment_yield",
-            Self::PrivilegeHandoff => "privilege_handoff",
             Self::RequestFailed => "request_failed",
             Self::RequestCancelled => "request_cancelled",
         }
@@ -154,9 +146,18 @@ impl ProgramPauseReason {
 pub(crate) struct ProgramDecisionState {
     pub(crate) placement_key: String,
     pub(crate) placement_hash_key: String,
+    pub(crate) task_id: Option<String>,
+    pub(crate) session_id: Option<String>,
+    pub(crate) agent_id: Option<String>,
+    pub(crate) parent_program_id: Option<String>,
+    pub(crate) blocks_parent: bool,
+    pub(crate) agent_role: Option<String>,
+    pub(crate) spawn_reason: Option<String>,
+    pub(crate) step_id: u64,
     pub(crate) home_target: Option<String>,
     pub(crate) last_target: Option<String>,
     pub(crate) estimated_context_tokens: usize,
+    pub(crate) output_token_reservation: Option<usize>,
     pub(crate) context_shrink_observations: u8,
     pub(crate) completed_requests: usize,
     pub(crate) segment_served_rounds: usize,
@@ -173,8 +174,6 @@ pub(crate) struct ProgramDecisionState {
     pub(crate) lifetime_generated_tokens: usize,
     pub(crate) last_request_finished_at: Option<Instant>,
     pub(crate) last_cache_miss_impact_seconds: f64,
-    pub(crate) privilege_deadline: Option<Instant>,
-    pub(crate) privilege_ttl_expired: bool,
     pub(crate) acting_since: Option<Instant>,
     pub(crate) ttl_deadline: Option<Instant>,
     pub(crate) queued_at: Option<Instant>,
@@ -200,9 +199,18 @@ impl ProgramDecisionState {
         Self {
             placement_key,
             placement_hash_key,
+            task_id: None,
+            session_id: None,
+            agent_id: None,
+            parent_program_id: None,
+            blocks_parent: false,
+            agent_role: None,
+            spawn_reason: None,
+            step_id: 0,
             last_target: home_target.clone(),
             home_target,
             estimated_context_tokens,
+            output_token_reservation: None,
             context_shrink_observations: 0,
             completed_requests: 0,
             segment_served_rounds: 0,
@@ -219,8 +227,6 @@ impl ProgramDecisionState {
             lifetime_generated_tokens: 0,
             last_request_finished_at: None,
             last_cache_miss_impact_seconds: 0.0,
-            privilege_deadline: None,
-            privilege_ttl_expired: false,
             acting_since: None,
             ttl_deadline: None,
             queued_at: Some(now),
@@ -237,9 +243,21 @@ impl ProgramDecisionState {
     }
 
     pub(crate) fn private_tokens(&self, decode_buffer_tokens: usize) -> f64 {
+        self.private_tokens_with_output(decode_buffer_tokens, None)
+    }
+
+    pub(crate) fn private_tokens_with_output(
+        &self,
+        decode_buffer_tokens: usize,
+        expected_output_tokens: Option<usize>,
+    ) -> f64 {
         self.estimated_context_tokens
             .saturating_sub(self.shared_prefix_tokens)
-            .saturating_add(decode_buffer_tokens) as f64
+            .saturating_add(
+                expected_output_tokens
+                    .or(self.output_token_reservation)
+                    .unwrap_or(decode_buffer_tokens),
+            ) as f64
     }
 
     pub(crate) fn observe_completed_context(&mut self, observed_context_tokens: usize) {
@@ -284,6 +302,7 @@ pub(crate) struct ProgramSchedulerState {
     pub(crate) global_queues: HashMap<String, VecDeque<ProgramRef>>,
     pub(crate) observations: HashMap<String, RankObservationState>,
     pub(crate) rank_factors: HashMap<String, ProgressTtlFactors>,
+    pub(crate) lineage: ProgramLineage,
 }
 
 impl ProgramSchedulerState {
@@ -299,6 +318,7 @@ impl ProgramSchedulerState {
             global_queues: HashMap::new(),
             observations: HashMap::new(),
             rank_factors: HashMap::new(),
+            lineage: ProgramLineage::default(),
         }
     }
 }
@@ -306,6 +326,7 @@ impl ProgramSchedulerState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::program_scheduling::{DecodeThroughputModel, PrefillCostModel};
 
     #[test]
     fn defaults_match_the_current_router_scheduler() {
@@ -317,7 +338,8 @@ mod tests {
         assert_eq!(config.progress_ttl.stats_window_size, 100);
         assert_eq!(config.progress_ttl.acting_ttl, Duration::from_secs(10));
         assert_eq!(config.progress_ttl.max_segment_rounds, 14);
-        assert!(!config.resume_reclaim_acting_programs);
+        assert_eq!(config.progress_ttl.prefill, PrefillCostModel::default());
+        assert_eq!(config.progress_ttl.decode, DecodeThroughputModel::default());
     }
 
     #[test]

@@ -5,7 +5,7 @@
 
 use super::scheduler::ProgramScheduler;
 use super::scheduler_admission::RankAdmissionPlan;
-use super::scheduler_state::{ProgramResumeOrder, ProgramSchedulerState};
+use super::scheduler_state::ProgramSchedulerState;
 use super::{ProgramRef, ProgramState, ProgramStatus};
 use std::time::Instant;
 
@@ -53,12 +53,12 @@ impl ProgramScheduler {
         now: Instant,
     ) -> Vec<ProgramRef> {
         let mut queued = self.global_reasoning_waiters(state, model_pool);
-        queued.sort_by(|left, right| self.local_resume_cmp(state, left, right, now));
+        self.order_resume_candidates(state, &mut queued, now);
         queued
     }
 
-    /// Cross-rank escape reverses the configured ordinary local order while
-    /// retaining force-resume and privilege tiers.
+    /// Cross-rank escape preserves force, priority, and one-shot yield tiers,
+    /// then uses FCFS independently of the configured local resume order.
     fn global_cross_rank_order(
         &self,
         state: &ProgramSchedulerState,
@@ -75,39 +75,7 @@ impl ProgramScheduler {
                     .is_some_and(|decision| decision.last_pause_reason.is_some())
             })
             .collect::<Vec<_>>();
-        queued.sort_by(|left, right| {
-            let left_state = &state.decisions[left];
-            let right_state = &state.decisions[right];
-            let left_forced = left_state
-                .force_resume_deadline
-                .is_some_and(|deadline| deadline <= now);
-            let right_forced = right_state
-                .force_resume_deadline
-                .is_some_and(|deadline| deadline <= now);
-            let left_privileged = left_state
-                .privilege_deadline
-                .is_some_and(|deadline| deadline > now);
-            let right_privileged = right_state
-                .privilege_deadline
-                .is_some_and(|deadline| deadline > now);
-            let priority = right_forced
-                .cmp(&left_forced)
-                .then_with(|| right_privileged.cmp(&left_privileged));
-            if priority != std::cmp::Ordering::Equal {
-                return priority;
-            }
-            match self.config.resume_order {
-                ProgramResumeOrder::Fcfs => right_state
-                    .queued_at
-                    .cmp(&left_state.queued_at)
-                    .then_with(|| left.program_id().cmp(right.program_id())),
-                ProgramResumeOrder::Mru => left_state
-                    .last_request_finished_at
-                    .cmp(&right_state.last_request_finished_at)
-                    .then_with(|| left_state.queued_at.cmp(&right_state.queued_at))
-                    .then_with(|| left.program_id().cmp(right.program_id())),
-            }
-        });
+        self.order_cross_rank_candidates(state, &mut queued, now);
         queued
     }
 
@@ -179,10 +147,8 @@ impl ProgramScheduler {
                         },
                     )
                 };
-                left.victims
-                    .len()
-                    .cmp(&right.victims.len())
-                    .then_with(|| waiting(left_id).cmp(&waiting(right_id)))
+                waiting(left_id)
+                    .cmp(&waiting(right_id))
                     .then_with(|| pressure(left_id, left).total_cmp(&pressure(right_id, right)))
                     .then_with(|| {
                         self.active_program_count(state, left_id)
@@ -329,7 +295,9 @@ impl ProgramScheduler {
 mod tests {
     use super::*;
     use crate::program_scheduling::scheduler_state::ProgramPauseReason;
-    use crate::program_scheduling::{ProgramIdentity, ProgramSchedulerConfig, ProgramTarget};
+    use crate::program_scheduling::{
+        ProgramIdentity, ProgramResumeOrder, ProgramSchedulerConfig, ProgramTarget,
+    };
     use serde_json::json;
     use std::time::Duration;
 
@@ -386,7 +354,7 @@ mod tests {
     }
 
     #[test]
-    fn cross_rank_order_inverts_ordinary_mru_but_preserves_priority_tiers() {
+    fn cross_rank_order_is_fcfs_when_local_order_is_mru() {
         let mut config = ProgramSchedulerConfig::default();
         config.global_queue = true;
         config.resume_order = ProgramResumeOrder::Mru;
@@ -407,7 +375,10 @@ mod tests {
         let now = Instant::now();
         let mut state = scheduler.state.lock();
         let mut programs = Vec::new();
-        for (name, finished_at) in [("recent", now), ("old", now - Duration::from_secs(10))] {
+        for (name, finished_at, queued_at) in [
+            ("recent", now, now + Duration::from_secs(1)),
+            ("old", now - Duration::from_secs(10), now),
+        ] {
             let identity = identity(name);
             let handle = state.runtime.retain_request(&identity, 100, None, now);
             scheduler.ensure_decision_state(
@@ -422,6 +393,7 @@ mod tests {
             decision.last_target = Some("rank-0".into());
             decision.last_pause_reason = Some(ProgramPauseReason::TtlExpired);
             decision.last_request_finished_at = Some(finished_at);
+            decision.queued_at = Some(queued_at);
             state
                 .global_queues
                 .entry("model".into())
@@ -436,7 +408,7 @@ mod tests {
     }
 
     #[test]
-    fn cross_rank_order_inverts_default_fcfs() {
+    fn cross_rank_order_remains_fcfs_when_local_order_is_fcfs() {
         let mut config = ProgramSchedulerConfig::default();
         config.global_queue = true;
         let scheduler = ProgramScheduler::new(config);
@@ -481,6 +453,6 @@ mod tests {
         let local = scheduler.global_local_resume_order(&state, "model", now);
         let cross = scheduler.global_cross_rank_order(&state, "model", now);
         assert_eq!(local, vec![programs[0].clone(), programs[1].clone()]);
-        assert_eq!(cross, vec![programs[1].clone(), programs[0].clone()]);
+        assert_eq!(cross, vec![programs[0].clone(), programs[1].clone()]);
     }
 }

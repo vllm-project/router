@@ -40,6 +40,11 @@ impl ProgramScheduler {
         self.config.metrics_interval
     }
 
+    /// Metadata source that opts one request into Program scheduling.
+    pub fn enable_key(&self) -> super::ProgramSchedulingEnableKey {
+        self.config.enable_key
+    }
+
     /// Whether initial Program binding needs the request text for prefix affinity.
     pub fn uses_cache_aware_binding(&self) -> bool {
         self.config.binding_strategy == super::ProgramBindingStrategy::CacheAware
@@ -445,25 +450,49 @@ impl ProgramScheduler {
         now: Instant,
         routing_text: Option<&str>,
     ) {
+        let _ = state.lineage.observe(
+            identity.model_pool(),
+            identity.program_id(),
+            identity.parent_program_id(),
+            identity.root_program_id(),
+        );
         if let Some(decision) = state.decisions.get_mut(&reference) {
             if estimated_context_tokens >= decision.estimated_context_tokens {
                 decision.estimated_context_tokens = estimated_context_tokens;
                 decision.context_shrink_observations = 0;
             }
+            decision.task_id = identity.task_id().map(str::to_string);
+            decision.session_id = identity.session_id().map(str::to_string);
+            decision.agent_id = identity.agent_id().map(str::to_string);
+            decision.parent_program_id = identity.parent_program_id().map(str::to_string);
+            decision.blocks_parent = identity.blocks_parent();
+            decision.agent_role = identity.agent_role().map(str::to_string);
+            decision.spawn_reason = identity.spawn_reason().map(str::to_string);
+            decision.output_token_reservation = identity.request_hints().expected_output_tokens;
+            decision.step_id = identity
+                .step_id()
+                .unwrap_or_else(|| decision.step_id.saturating_add(1));
             return;
         }
         let candidates = self.binding_candidates(state, identity, now);
         let home_target = state.bindings.bind(identity, &candidates, routing_text);
-        state.decisions.insert(
-            reference,
-            ProgramDecisionState::new(
-                identity.placement_key().to_string(),
-                identity.placement_hash_key().to_string(),
-                home_target,
-                estimated_context_tokens,
-                now,
-            ),
+        let mut decision = ProgramDecisionState::new(
+            identity.placement_key().to_string(),
+            identity.placement_hash_key().to_string(),
+            home_target,
+            estimated_context_tokens,
+            now,
         );
+        decision.task_id = identity.task_id().map(str::to_string);
+        decision.session_id = identity.session_id().map(str::to_string);
+        decision.agent_id = identity.agent_id().map(str::to_string);
+        decision.parent_program_id = identity.parent_program_id().map(str::to_string);
+        decision.blocks_parent = identity.blocks_parent();
+        decision.agent_role = identity.agent_role().map(str::to_string);
+        decision.spawn_reason = identity.spawn_reason().map(str::to_string);
+        decision.output_token_reservation = identity.request_hints().expected_output_tokens;
+        decision.step_id = identity.step_id().unwrap_or(0);
+        state.decisions.insert(reference, decision);
     }
 
     pub(crate) fn observation_is_fresh(
@@ -642,6 +671,54 @@ mod tests {
                 .as_deref(),
             Some("rank-1")
         );
+    }
+
+    #[test]
+    fn omitted_step_advances_the_previous_program_step() {
+        let scheduler = ProgramScheduler::new(ProgramSchedulerConfig::default());
+        let target = ProgramTarget {
+            id: "rank-0".into(),
+            base_url: "http://worker".into(),
+            dp_rank: Some(0),
+        };
+        scheduler.sync_targets("model", std::slice::from_ref(&target));
+        let identity = |step_id: Option<u64>| {
+            ProgramIdentity::from_request(
+                None,
+                Some(&json!({"vllm_xargs":{"agentic_context":{
+                    "program_id":"program",
+                    "task_id":null,
+                    "expected_resume":true,
+                    "step_id":step_id
+                }}})),
+                Some("model"),
+            )
+            .unwrap()
+            .unwrap()
+        };
+        let now = Instant::now();
+        let mut state = scheduler.state.lock();
+        let explicit = identity(Some(7));
+        let handle = state.runtime.retain_request(&explicit, 100, None, now);
+        scheduler.ensure_decision_state(
+            &mut state,
+            &explicit,
+            handle.program().clone(),
+            100,
+            now,
+            None,
+        );
+        let inferred = identity(None);
+        state.runtime.retain_request(&inferred, 110, None, now);
+        scheduler.ensure_decision_state(
+            &mut state,
+            &inferred,
+            handle.program().clone(),
+            110,
+            now,
+            None,
+        );
+        assert_eq!(state.decisions[handle.program()].step_id, 8);
     }
 
     #[tokio::test]

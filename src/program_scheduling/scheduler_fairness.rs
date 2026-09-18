@@ -1,12 +1,11 @@
-//! Progress privilege, dynamic force-resume deadline, and segment yielding.
+//! Dynamic force-resume deadlines and segment-yield fairness.
 //!
-//! These mechanisms bound starvation while ordinary local resume remains MRU
-//! to favor cache-resident Programs.
+//! These mechanisms bound starvation while ordinary local resume remains
+//! configurable as FCFS or MRU.
 
 use super::scheduler::ProgramScheduler;
 use super::scheduler_state::{ProgramPauseReason, ProgramSchedulerState};
 use super::{ProgramRef, ProgramState, ProgramStatus};
-use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
 
 struct ForceResumeEstimate {
@@ -41,9 +40,15 @@ impl ProgramScheduler {
         } else {
             self.force_resume_timeout(state, target_id, candidate, now)
         };
+        let timeout = state
+            .runtime
+            .front_request_hints(candidate)
+            .and_then(|hints| hints.deadline)
+            .unwrap_or(estimate.timeout)
+            .min(self.config.queue_timeout);
         if let Some(decision) = state.decisions.get_mut(candidate) {
-            decision.force_resume_deadline = Some(now + estimate.timeout);
-            decision.force_resume_timeout = Some(estimate.timeout);
+            decision.force_resume_deadline = Some(now + timeout);
+            decision.force_resume_timeout = Some(timeout);
             decision.force_resume_active_remaining_rounds = estimate.active_remaining_rounds;
             decision.force_resume_pool_remaining_rounds = estimate.pool_remaining_rounds;
             decision.force_resume_request_throughput_per_second =
@@ -108,7 +113,7 @@ impl ProgramScheduler {
             })
             .cloned()
             .collect::<Vec<_>>();
-        queued.sort_by(|left, right| self.local_resume_cmp(state, left, right, now));
+        self.order_resume_candidates(state, &mut queued, now);
         let pool_remaining = queued
             .into_iter()
             .take_while(|program| program != candidate)
@@ -184,7 +189,7 @@ impl ProgramScheduler {
             })
             .cloned()
             .collect::<Vec<_>>();
-        queued.sort_by(|left, right| self.local_resume_cmp(state, left, right, now));
+        self.order_resume_candidates(state, &mut queued, now);
         let pool_remaining = queued
             .into_iter()
             .take_while(|program| program != candidate)
@@ -200,125 +205,6 @@ impl ProgramScheduler {
             pool_remaining_rounds: pool_remaining,
             request_throughput_per_second: throughput,
         }
-    }
-
-    pub(crate) fn reconcile_privileges(
-        &self,
-        state: &mut ProgramSchedulerState,
-        now: Instant,
-    ) -> bool {
-        let mut changed = false;
-        for decision in state.decisions.values_mut() {
-            if decision
-                .privilege_deadline
-                .is_some_and(|deadline| deadline <= now)
-            {
-                decision.privilege_deadline = None;
-                decision.privilege_ttl_expired = true;
-                changed = true;
-            }
-        }
-        let target_ids = state.targets.keys().cloned().collect::<Vec<_>>();
-        for target_id in target_ids {
-            let slots = self
-                .config
-                .progress_ttl
-                .token_capacity
-                .map(|capacity| capacity / self.config.privileged_max_context_tokens)
-                .unwrap_or(1);
-            let limit = (slots / 2).max(1);
-            let mut privileged = state
-                .decisions
-                .iter()
-                .filter(|(program, decision)| {
-                    decision.last_target.as_deref() == Some(target_id.as_str())
-                        && decision
-                            .privilege_deadline
-                            .is_some_and(|deadline| deadline > now)
-                        && state.runtime.view(program).is_some()
-                })
-                .map(|(program, _)| program.clone())
-                .collect::<Vec<_>>();
-            privileged.sort_by(|left, right| {
-                state.decisions[right]
-                    .lifetime_generated_tokens
-                    .cmp(&state.decisions[left].lifetime_generated_tokens)
-                    .then_with(|| {
-                        state.decisions[right]
-                            .completed_requests
-                            .cmp(&state.decisions[left].completed_requests)
-                    })
-                    .then_with(|| left.program_id().cmp(right.program_id()))
-            });
-            let mut retained_tasks = BTreeSet::new();
-            let mut retained = 0;
-            for program in privileged {
-                let task = state.decisions[&program].placement_key.clone();
-                if retained >= limit || !retained_tasks.insert(task) {
-                    state
-                        .decisions
-                        .get_mut(&program)
-                        .unwrap()
-                        .privilege_deadline = None;
-                    changed = true;
-                } else {
-                    retained += 1;
-                }
-            }
-            if retained >= limit || self.config.privileged_ttl.is_zero() {
-                continue;
-            }
-            let mut candidates = state
-                .runtime
-                .views()
-                .into_iter()
-                .filter(|program| {
-                    program.state == ProgramState::Active
-                        && program.placement.as_deref() == Some(target_id.as_str())
-                        && state
-                            .decisions
-                            .get(&program.reference)
-                            .is_some_and(|decision| {
-                                decision.privilege_deadline.is_none()
-                                    && !decision.privilege_ttl_expired
-                                    && decision.completed_requests > 0
-                                    && !retained_tasks.contains(&decision.placement_key)
-                            })
-                })
-                .map(|program| program.reference)
-                .collect::<Vec<_>>();
-            candidates.sort_by(|left, right| {
-                state.decisions[right]
-                    .lifetime_generated_tokens
-                    .cmp(&state.decisions[left].lifetime_generated_tokens)
-                    .then_with(|| {
-                        state.decisions[right]
-                            .completed_requests
-                            .cmp(&state.decisions[left].completed_requests)
-                    })
-                    .then_with(|| {
-                        state.decisions[right]
-                            .private_tokens(self.config.progress_ttl.decode_buffer_tokens)
-                            .total_cmp(
-                                &state.decisions[left]
-                                    .private_tokens(self.config.progress_ttl.decode_buffer_tokens),
-                            )
-                    })
-                    .then_with(|| left.program_id().cmp(right.program_id()))
-            });
-            for program in candidates.into_iter().take(limit - retained) {
-                let task = state.decisions[&program].placement_key.clone();
-                if retained_tasks.insert(task) {
-                    state
-                        .decisions
-                        .get_mut(&program)
-                        .unwrap()
-                        .privilege_deadline = Some(now + self.config.privileged_ttl);
-                    changed = true;
-                }
-            }
-        }
-        changed
     }
 
     /// Yield an idle Program at the soft segment limit only for a local waiter.
@@ -337,9 +223,6 @@ impl ProgramScheduler {
         if runtime.state != ProgramState::Active
             || runtime.status != ProgramStatus::Acting
             || decision.rounds_since_activation < self.config.progress_ttl.max_segment_rounds
-            || decision
-                .privilege_deadline
-                .is_some_and(|deadline| deadline > now)
         {
             return false;
         }
@@ -361,7 +244,7 @@ impl ProgramScheduler {
                 })
                 .cloned()
                 .collect::<Vec<_>>();
-            queued.sort_by(|left, right| self.local_resume_cmp(state, left, right, now));
+            self.order_resume_candidates(state, &mut queued, now);
             queued.retain(|waiter| {
                 state.decisions.get(waiter).is_some_and(|candidate| {
                     candidate.last_target.as_deref() == Some(target_id.as_str())
@@ -383,7 +266,7 @@ impl ProgramScheduler {
                 })
                 .cloned()
                 .collect::<Vec<_>>();
-            queued.sort_by(|left, right| self.local_resume_cmp(state, left, right, now));
+            self.order_resume_candidates(state, &mut queued, now);
             queued
         };
         let Some(waiter) = queued.drain(..).find(|waiter| waiter != program) else {

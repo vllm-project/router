@@ -18,6 +18,20 @@ pub struct ProgramDiagnostic {
     pub state: &'static str,
     pub status: &'static str,
     pub expected_resume: bool,
+    pub task_id: Option<String>,
+    pub session_id: Option<String>,
+    pub agent_id: Option<String>,
+    pub parent_program_id: Option<String>,
+    pub root_program_id: String,
+    pub blocks_parent: bool,
+    pub agent_role: Option<String>,
+    pub spawn_reason: Option<String>,
+    pub step_id: u64,
+    pub request_id: Option<String>,
+    pub request_priority: i64,
+    pub request_deadline_seconds: Option<f64>,
+    pub expected_output_tokens: Option<usize>,
+    pub kv_retention_ttl_seconds: Option<f64>,
     pub home_target: Option<String>,
     pub last_target: Option<String>,
     pub placement: Option<String>,
@@ -33,7 +47,6 @@ pub struct ProgramDiagnostic {
     pub rounds_since_ttl_pause: usize,
     pub pause_when_idle: bool,
     pub pause_reason: Option<&'static str>,
-    pub privileged: bool,
     pub acting_seconds: Option<f64>,
     pub queued_seconds: Option<f64>,
     pub ttl_remaining_seconds: Option<f64>,
@@ -115,7 +128,6 @@ pub struct ProgramSchedulerDiagnostic {
 impl ProgramScheduler {
     /// Refresh bounded-cardinality gauges only from the periodic tick path.
     pub(crate) fn publish_metrics(&self, state: &ProgramSchedulerState) {
-        let now = Instant::now();
         let views = state.runtime.views();
         for target_id in state.targets.keys() {
             let queued = views
@@ -138,20 +150,6 @@ impl ProgramScheduler {
                         && program.placement.as_deref() == Some(target_id.as_str())
                 })
                 .count();
-            let privileged = views
-                .iter()
-                .filter(|program| {
-                    state
-                        .decisions
-                        .get(&program.reference)
-                        .is_some_and(|decision| {
-                            decision.last_target.as_deref() == Some(target_id.as_str())
-                                && decision
-                                    .privilege_deadline
-                                    .is_some_and(|deadline| deadline > now)
-                        })
-                })
-                .count();
             let factors = state.rank_factors.get(target_id);
             let average_impact = factors.map_or(0.0, |value| {
                 super::ProgressTtlFactors::average(
@@ -167,7 +165,6 @@ impl ProgramScheduler {
                     self.policy.fitted_acting_ttl(value, average_impact)
                 }),
                 factors.map_or(0.0, |value| value.average_context_growth_tokens()),
-                privileged,
                 factors.map_or(0, |value| value.request_sample_count()),
                 factors.map_or(0, |value| value.continuity_sample_count()),
             );
@@ -196,6 +193,7 @@ impl ProgramScheduler {
                 })
                 .map(|runtime| {
                     let decision = &state.decisions[&runtime.reference];
+                    let request_hints = state.runtime.front_request_hints(&runtime.reference);
                     ProgramDiagnostic {
                         program: runtime.reference.redacted_id(),
                         generation: runtime.reference.generation(),
@@ -208,6 +206,29 @@ impl ProgramScheduler {
                             ProgramStatus::Acting => "acting",
                         },
                         expected_resume: runtime.expected_resume,
+                        task_id: decision.task_id.clone(),
+                        session_id: decision.session_id.clone(),
+                        agent_id: decision.agent_id.clone(),
+                        parent_program_id: decision.parent_program_id.clone(),
+                        root_program_id: state.lineage.root_readonly(
+                            runtime.reference.model_pool(),
+                            runtime.reference.program_id(),
+                        ),
+                        blocks_parent: decision.blocks_parent,
+                        agent_role: decision.agent_role.clone(),
+                        spawn_reason: decision.spawn_reason.clone(),
+                        step_id: decision.step_id,
+                        request_id: request_hints.and_then(|hints| hints.request_id.clone()),
+                        request_priority: request_hints.map_or(0, |hints| hints.priority),
+                        request_deadline_seconds: request_hints
+                            .and_then(|hints| hints.deadline)
+                            .map(|deadline| deadline.as_secs_f64()),
+                        expected_output_tokens: request_hints
+                            .and_then(|hints| hints.expected_output_tokens)
+                            .or(decision.output_token_reservation),
+                        kv_retention_ttl_seconds: request_hints
+                            .and_then(|hints| hints.kv_retention_ttl)
+                            .map(|ttl| ttl.as_secs_f64()),
                         home_target: decision.home_target.clone(),
                         last_target: decision.last_target.clone(),
                         placement: runtime.placement,
@@ -229,9 +250,6 @@ impl ProgramScheduler {
                         rounds_since_ttl_pause: decision.rounds_since_ttl_pause,
                         pause_when_idle: decision.pause_when_idle,
                         pause_reason: decision.last_pause_reason.map(|reason| reason.as_str()),
-                        privileged: decision
-                            .privilege_deadline
-                            .is_some_and(|deadline| deadline > now),
                         acting_seconds: decision
                             .acting_since
                             .map(|started| now.saturating_duration_since(started).as_secs_f64()),

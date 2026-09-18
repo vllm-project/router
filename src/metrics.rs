@@ -117,10 +117,6 @@ pub fn init_metrics() {
         "Rolling mean Program context growth by target"
     );
     describe_gauge!(
-        "vllm_router_agent_aware_privileged_programs",
-        "Programs with an active privilege lease by target"
-    );
-    describe_gauge!(
         "vllm_router_agent_aware_rolling_samples",
         "Retained Program-scheduling samples by target and window"
     );
@@ -510,7 +506,6 @@ impl RouterMetrics {
         target: &str,
         fitted_ttl: Duration,
         context_growth_tokens: f64,
-        privileged_programs: usize,
         request_samples: usize,
         continuity_samples: usize,
     ) {
@@ -518,8 +513,6 @@ impl RouterMetrics {
             .set(fitted_ttl.as_secs_f64());
         gauge!("vllm_router_agent_aware_context_growth_tokens", "target" => target.to_string())
             .set(context_growth_tokens);
-        gauge!("vllm_router_agent_aware_privileged_programs", "target" => target.to_string())
-            .set(privileged_programs as f64);
         gauge!(
             "vllm_router_agent_aware_rolling_samples",
             "target" => target.to_string(),
