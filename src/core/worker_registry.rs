@@ -4,7 +4,7 @@
 
 use crate::core::{ConnectionMode, Worker, WorkerType};
 use dashmap::DashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use uuid::Uuid;
 
 /// Unique identifier for a worker
@@ -57,6 +57,9 @@ pub struct WorkerRegistry {
 
     /// URL to worker ID mapping (for backward compatibility)
     url_to_id: Arc<DashMap<String, WorkerId>>,
+
+    /// Serializes mutations across the primary map and secondary indexes
+    mutation_lock: Mutex<()>,
 }
 
 impl WorkerRegistry {
@@ -69,14 +72,21 @@ impl WorkerRegistry {
             type_workers: Arc::new(DashMap::new()),
             connection_workers: Arc::new(DashMap::new()),
             url_to_id: Arc::new(DashMap::new()),
+            mutation_lock: Mutex::new(()),
         }
     }
 
     /// Register a new worker
     pub fn register(&self, worker: Arc<dyn Worker>) -> WorkerId {
-        let worker_id = if let Some(existing_id) = self.url_to_id.get(worker.url()) {
+        let _mutation_guard = self
+            .mutation_lock
+            .lock()
+            .expect("WorkerRegistry mutation lock is poisoned");
+        let existing_id = self.url_to_id.get(worker.url()).map(|id| id.clone());
+        let worker_id = if let Some(existing_id) = existing_id {
             // Worker with this URL already exists, update it
-            existing_id.clone()
+            self.remove_inner(&existing_id);
+            existing_id
         } else {
             WorkerId::new()
         };
@@ -120,6 +130,14 @@ impl WorkerRegistry {
 
     /// Remove a worker by ID
     pub fn remove(&self, worker_id: &WorkerId) -> Option<Arc<dyn Worker>> {
+        let _mutation_guard = self
+            .mutation_lock
+            .lock()
+            .expect("WorkerRegistry mutation lock is poisoned");
+        self.remove_inner(worker_id)
+    }
+
+    fn remove_inner(&self, worker_id: &WorkerId) -> Option<Arc<dyn Worker>> {
         if let Some((_, worker)) = self.workers.remove(worker_id) {
             // Remove from URL mapping
             self.url_to_id.remove(worker.url());
@@ -158,8 +176,12 @@ impl WorkerRegistry {
 
     /// Remove a worker by URL
     pub fn remove_by_url(&self, url: &str) -> Option<Arc<dyn Worker>> {
+        let _mutation_guard = self
+            .mutation_lock
+            .lock()
+            .expect("WorkerRegistry mutation lock is poisoned");
         if let Some((_, worker_id)) = self.url_to_id.remove(url) {
-            self.remove(&worker_id)
+            self.remove_inner(&worker_id)
         } else {
             None
         }
@@ -522,5 +544,42 @@ mod tests {
         let llama_workers_after = registry.get_by_model_fast("llama-3");
         assert_eq!(llama_workers_after.len(), 1);
         assert_eq!(llama_workers_after[0].url(), "http://worker2:8080");
+    }
+
+    #[test]
+    fn test_reregister_worker_cleans_secondary_indexes() {
+        let registry = WorkerRegistry::new();
+        let url = "http://worker:8080";
+
+        let mut old_labels = HashMap::new();
+        old_labels.insert("model_id".to_string(), "old-model".to_string());
+        let old_worker = crate::core::BasicWorker::new(url.to_string(), WorkerType::Regular)
+            .with_labels(old_labels);
+        let old_id = registry.register(Arc::new(old_worker));
+
+        let mut new_labels = HashMap::new();
+        new_labels.insert("model_id".to_string(), "new-model".to_string());
+        let new_worker = crate::core::BasicWorker::new(url.to_string(), WorkerType::Decode)
+            .with_labels(new_labels);
+        let new_id = registry.register(Arc::new(new_worker));
+
+        assert_eq!(new_id, old_id);
+        assert_eq!(registry.get_all().len(), 1);
+        assert_eq!(registry.get_by_url(url).unwrap().model_id(), "new-model");
+        assert!(registry.get_by_model("old-model").is_empty());
+        assert!(registry.get_by_model_fast("old-model").is_empty());
+        assert_eq!(registry.get_by_model("new-model").len(), 1);
+        assert_eq!(registry.get_by_model_fast("new-model").len(), 1);
+        assert!(registry.get_by_type(&WorkerType::Regular).is_empty());
+        assert_eq!(registry.get_by_type(&WorkerType::Decode).len(), 1);
+        assert_eq!(registry.get_by_connection(&ConnectionMode::Http).len(), 1);
+
+        assert!(registry.remove(&new_id).is_some());
+        assert!(registry.get_all().is_empty());
+        assert!(registry.get_by_url(url).is_none());
+        assert!(registry.get_by_model("new-model").is_empty());
+        assert!(registry.get_by_model_fast("new-model").is_empty());
+        assert!(registry.get_by_type(&WorkerType::Decode).is_empty());
+        assert!(registry.get_by_connection(&ConnectionMode::Http).is_empty());
     }
 }
