@@ -344,7 +344,7 @@ impl Router {
         let workers = self.worker_registry.get_all();
         match workers.into_iter().find(|w| w.is_available()) {
             Some(worker) => Ok(worker.url().to_string()),
-            None => Err("No available workers are available".to_string()),
+            None => Err("No workers are currently available".to_string()),
         }
     }
 
