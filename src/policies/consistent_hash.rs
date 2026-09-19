@@ -26,6 +26,8 @@ pub const VIRTUAL_NODES_PER_WORKER: u32 = 160;
 /// ensuring that requests from the same user/session consistently go to the same worker.
 #[derive(Debug)]
 pub struct ConsistentHashPolicy {
+    /// Number of virtual nodes per physical worker
+    virtual_nodes: u32,
     /// Hash ring mapping hash values to worker URLs
     hash_ring: RwLock<BTreeMap<u64, String>>,
     /// Current set of workers (for detecting changes)
@@ -34,7 +36,13 @@ pub struct ConsistentHashPolicy {
 
 impl ConsistentHashPolicy {
     pub fn new() -> Self {
+        Self::with_virtual_nodes(VIRTUAL_NODES_PER_WORKER)
+    }
+
+    /// Create a consistent hashing policy with a custom number of virtual nodes.
+    pub fn with_virtual_nodes(virtual_nodes: u32) -> Self {
         Self {
+            virtual_nodes,
             hash_ring: RwLock::new(BTreeMap::new()),
             current_workers: RwLock::new(Vec::new()),
         }
@@ -262,7 +270,7 @@ impl ConsistentHashPolicy {
 
         for worker_url in &worker_urls {
             // Create virtual nodes for better distribution
-            for i in 0..VIRTUAL_NODES_PER_WORKER {
+            for i in 0..self.virtual_nodes {
                 let virtual_key = format!("{}:{}", worker_url, i);
                 let hash_value = Self::fbi_hash(&virtual_key);
                 new_ring.insert(hash_value, worker_url.clone());
@@ -282,7 +290,7 @@ impl ConsistentHashPolicy {
         info!(
             "Updated consistent hash ring with {} workers and {} virtual nodes",
             workers.len(),
-            workers.len() as u32 * VIRTUAL_NODES_PER_WORKER
+            workers.len() as u32 * self.virtual_nodes
         );
     }
 
