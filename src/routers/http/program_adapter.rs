@@ -214,6 +214,8 @@ fn first_u64(value: &serde_json::Value, fields: &[&str]) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::program_scheduling::{ProgramIdentity, ProgramSchedulerConfig, ProgramTarget};
+    use crate::token_estimator::TokenEstimateScope;
 
     #[test]
     fn parses_openai_and_anthropic_usage_without_double_counting() {
@@ -224,5 +226,68 @@ mod tests {
         assert_eq!(accumulator.observation.prompt_tokens, Some(60));
         assert_eq!(accumulator.observation.cached_prompt_tokens, Some(30));
         assert_eq!(accumulator.observation.completion_tokens, Some(5));
+    }
+
+    #[tokio::test]
+    async fn retry_attempts_complete_exactly_once_without_occupancy_leak() {
+        let scheduler = Arc::new(ProgramScheduler::new(ProgramSchedulerConfig::default()));
+        let target = ProgramTarget {
+            id: "rank-0".into(),
+            base_url: "http://worker".into(),
+            dp_rank: None,
+        };
+        let identity = ProgramIdentity::from_request(
+            None,
+            Some(&serde_json::json!({"vllm_xargs":{"agentic_context":{
+                "program_id":"program","task_id":null,"expected_resume":true
+            }}})),
+            Some("model"),
+        )
+        .unwrap()
+        .unwrap();
+        let estimator = Arc::new(MomentumTokenEstimator::default());
+
+        let first_dispatch = scheduler
+            .acquire(identity.clone(), 100, std::slice::from_ref(&target), None)
+            .await
+            .unwrap();
+        let (_, first_calibration) = estimator.estimate(
+            TokenEstimateScope::new("model", "/v1/chat/completions"),
+            "first attempt",
+        );
+        let first = ProgramCompletion::new(
+            scheduler.clone(),
+            first_dispatch,
+            estimator.clone(),
+            first_calibration,
+        );
+        first.finish(false);
+        first.finish(false);
+        drop(first);
+
+        let second_dispatch = scheduler
+            .acquire(identity, 100, std::slice::from_ref(&target), None)
+            .await
+            .unwrap();
+        let (_, second_calibration) = estimator.estimate(
+            TokenEstimateScope::new("model", "/v1/chat/completions"),
+            "second attempt",
+        );
+        let second = ProgramCompletion::new(
+            scheduler.clone(),
+            second_dispatch,
+            estimator,
+            second_calibration,
+        );
+        second.finish(true);
+        second.finish(true);
+        drop(second);
+
+        let snapshot = scheduler.diagnostics();
+        assert_eq!(snapshot.ranks.len(), 1);
+        assert_eq!(snapshot.ranks[0].programs.len(), 1);
+        assert_eq!(snapshot.ranks[0].programs[0].in_flight_requests, 0);
+        assert_eq!(snapshot.ranks[0].programs[0].waiting_requests, 0);
+        assert_eq!(snapshot.ranks[0].router_in_flight_requests, 0);
     }
 }

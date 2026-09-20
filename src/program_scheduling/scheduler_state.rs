@@ -298,6 +298,8 @@ pub(crate) struct ProgramSchedulerState {
     pub(crate) targets: BTreeMap<String, ProgramTarget>,
     pub(crate) model_targets: HashMap<String, BTreeSet<String>>,
     pub(crate) model_target_snapshots: HashMap<String, Arc<[ProgramTarget]>>,
+    /// Monotonic fence for target topology or target-attribute changes.
+    pub(crate) target_snapshot_revision: u64,
     pub(crate) rank_queues: HashMap<String, VecDeque<ProgramRef>>,
     pub(crate) global_queues: HashMap<String, VecDeque<ProgramRef>>,
     pub(crate) observations: HashMap<String, RankObservationState>,
@@ -314,6 +316,7 @@ impl ProgramSchedulerState {
             targets: BTreeMap::new(),
             model_targets: HashMap::new(),
             model_target_snapshots: HashMap::new(),
+            target_snapshot_revision: 0,
             rank_queues: HashMap::new(),
             global_queues: HashMap::new(),
             observations: HashMap::new(),

@@ -193,6 +193,7 @@ impl Router {
             .map(Arc::new);
         let program_observation_handle = program_scheduler.as_ref().map(|scheduler| {
             let scheduler = scheduler.clone();
+            let worker_registry = ctx.worker_registry.clone();
             let provider = VllmMetricsObservationProvider::new(
                 ctx.client.clone(),
                 ctx.router_config.api_key.clone(),
@@ -202,6 +203,7 @@ impl Router {
                 interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 loop {
                     interval.tick().await;
+                    Self::sync_program_targets_from_registry(&scheduler, &worker_registry);
                     let targets = scheduler.all_targets();
                     if targets.is_empty() {
                         continue;
@@ -255,6 +257,39 @@ impl Router {
                 }
             })
             .collect()
+    }
+
+    /// Refresh every tracked model pool from one revision-stable registry view.
+    fn sync_program_targets_from_registry(
+        scheduler: &ProgramScheduler,
+        worker_registry: &WorkerRegistry,
+    ) {
+        let model_pools = scheduler.model_pools();
+        if model_pools.is_empty() {
+            return;
+        }
+        loop {
+            let revision = worker_registry.revision();
+            let snapshots = model_pools
+                .iter()
+                .map(|model_pool| {
+                    let workers = match model_pool.as_str() {
+                        "default" => worker_registry.get_all(),
+                        "unknown" => Vec::new(),
+                        model => worker_registry.get_by_model_fast(model),
+                    };
+                    let targets: Arc<[ProgramTarget]> = Self::program_targets(&workers).into();
+                    (model_pool.clone(), targets)
+                })
+                .collect::<Vec<_>>();
+            if worker_registry.revision() != revision {
+                continue;
+            }
+            for (model_pool, targets) in snapshots {
+                scheduler.sync_target_snapshot(&model_pool, targets);
+            }
+            return;
+        }
     }
 
     fn resolved_program_model_pool(&self, model_id: Option<&str>) -> String {
@@ -313,6 +348,15 @@ impl Router {
                 (StatusCode::TOO_MANY_REQUESTS, error.to_string()).into_response()
             }
         }
+    }
+
+    fn program_target_unavailable_response(route: &str) -> Response {
+        RouterMetrics::record_request_error(route, "program_target_unavailable");
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Program-bound worker is unavailable",
+        )
+            .into_response()
     }
 
     fn should_buffer_transparent_response(is_stream: bool, tracked: bool) -> bool {
@@ -756,6 +800,9 @@ impl Router {
             &self.retry_config,
             // operation per attempt
             |_: u32| async {
+                // Each backend attempt is a fresh scheduling arrival. The
+                // previous ProgramCompletion finishes exactly once before a
+                // retry invokes this closure again.
                 let program_completion = match self
                     .acquire_program_completion(headers, typed_req, model_id, route, &text)
                     .await
@@ -767,9 +814,14 @@ impl Router {
                     .as_ref()
                     .map(|completion| completion.dispatch().target_id.as_str());
                 let selected_worker = if let Some(target) = forced_worker_url.as_deref() {
-                    self.worker_registry
+                    let worker = self
+                        .worker_registry
                         .get_by_url(target)
-                        .filter(|worker| worker.is_available())
+                        .filter(|worker| worker.is_available());
+                    let Some(worker) = worker else {
+                        return Self::program_target_unavailable_response(route);
+                    };
+                    Some(worker)
                 } else {
                     self.select_worker_for_model(model_id, Some(&text), headers)
                 };
@@ -2232,6 +2284,38 @@ mod tests {
     }
 
     #[test]
+    fn observation_refreshes_tracked_pools_without_request_arrival() {
+        let registry = WorkerRegistry::new();
+        let mut labels = HashMap::new();
+        labels.insert("model_id".to_string(), "model-a".to_string());
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorker::new("http://worker-a:8080".to_string(), WorkerType::Regular)
+                .with_labels(labels),
+        );
+        registry.register(worker.clone());
+
+        let scheduler = ProgramScheduler::new(ProgramSchedulerConfig::default());
+        scheduler.sync_targets("default", &[]);
+        scheduler.sync_targets("model-a", &[]);
+        scheduler.sync_targets("unknown", &[]);
+        Router::sync_program_targets_from_registry(&scheduler, &registry);
+
+        assert_eq!(scheduler.targets("default").len(), 1);
+        assert_eq!(scheduler.targets("model-a").len(), 1);
+        assert!(scheduler.targets("unknown").is_empty());
+
+        worker.set_healthy(false);
+        registry.notify_worker_state_change();
+        Router::sync_program_targets_from_registry(&scheduler, &registry);
+        assert!(scheduler.targets("default").is_empty());
+        assert!(scheduler.targets("model-a").is_empty());
+
+        registry.remove_by_url("http://worker-a:8080");
+        Router::sync_program_targets_from_registry(&scheduler, &registry);
+        assert!(scheduler.all_targets().is_empty());
+    }
+
+    #[test]
     fn test_router_get_worker_urls_regular() {
         let router = create_test_regular_router();
         let urls = router.get_worker_urls();
@@ -2330,6 +2414,14 @@ mod tests {
         // Test that None headers produce None output
         let result = Router::headers_to_request_headers(None);
         assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn program_target_unavailable_has_distinct_retryable_response() {
+        let response = Router::program_target_unavailable_response("/v1/chat/completions");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(body, "Program-bound worker is unavailable");
     }
 
     #[test]

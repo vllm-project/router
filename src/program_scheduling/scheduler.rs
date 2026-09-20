@@ -84,6 +84,10 @@ impl ProgramScheduler {
                 .insert(model_pool.to_string(), targets);
             return;
         }
+        state.target_snapshot_revision = state
+            .target_snapshot_revision
+            .checked_add(1)
+            .expect("Program target snapshot revision exhausted");
         state
             .model_target_snapshots
             .insert(model_pool.to_string(), targets);
@@ -229,6 +233,14 @@ impl ProgramScheduler {
         state.targets.values().cloned().collect()
     }
 
+    /// Model pools whose target snapshots must be refreshed by observation.
+    pub fn model_pools(&self) -> Vec<String> {
+        let state = self.state.lock();
+        let mut pools = state.model_targets.keys().cloned().collect::<Vec<_>>();
+        pools.sort();
+        pools
+    }
+
     /// Capture the Router ledger before a non-blocking metrics scrape begins.
     pub fn begin_observation(&self, targets: &[ProgramTarget]) -> BackendObservationEpoch {
         let state = self.state.lock();
@@ -283,7 +295,10 @@ impl ProgramScheduler {
                 )
             })
             .collect();
-        BackendObservationEpoch { checkpoints }
+        BackendObservationEpoch {
+            target_snapshot_revision: state.target_snapshot_revision,
+            checkpoints,
+        }
     }
 
     /// Install raw observations and preserve transitions committed during I/O.
@@ -293,11 +308,23 @@ impl ProgramScheduler {
         observations: impl IntoIterator<Item = BackendObservation>,
     ) {
         let mut state = self.state.lock();
+        if epoch.target_snapshot_revision != state.target_snapshot_revision {
+            info!(
+                event = "stale_capacity_observation_dropped",
+                epoch_revision = epoch.target_snapshot_revision,
+                current_revision = state.target_snapshot_revision,
+                "Dropping backend observations collected against a stale target snapshot"
+            );
+            return;
+        }
         for raw in observations {
             let target_id = raw.target_id.clone();
             let Some(checkpoint) = epoch.checkpoints.get(&raw.target_id) else {
                 continue;
             };
+            if !state.targets.contains_key(&target_id) {
+                continue;
+            }
             let native_used_tokens = raw
                 .kv_cache_usage
                 .zip(self.config.progress_ttl.token_capacity)
@@ -550,6 +577,7 @@ impl ProgramScheduler {
 /// Router-side fence captured before backend observation I/O.
 #[derive(Debug, Clone, Default)]
 pub struct BackendObservationEpoch {
+    target_snapshot_revision: u64,
     checkpoints: HashMap<String, ObservationCheckpoint>,
 }
 
@@ -600,6 +628,68 @@ mod tests {
         assert_eq!(
             scheduler.target_usage(&state, "rank-0", Instant::now()),
             550.0
+        );
+    }
+
+    #[test]
+    fn stale_observation_epoch_cannot_restore_removed_target() {
+        let scheduler = ProgramScheduler::new(ProgramSchedulerConfig::default());
+        let target = ProgramTarget {
+            id: "rank-0".into(),
+            base_url: "http://worker".into(),
+            dp_rank: Some(0),
+        };
+        scheduler.sync_targets("model", std::slice::from_ref(&target));
+        let epoch = scheduler.begin_observation(std::slice::from_ref(&target));
+        scheduler.sync_targets("model", &[]);
+        scheduler.apply_observations(
+            epoch,
+            [BackendObservation {
+                target_id: target.id.clone(),
+                base_url: target.base_url.clone(),
+                dp_rank: target.dp_rank,
+                kv_cache_usage: Some(0.5),
+                running_requests: Some(1),
+                waiting_requests: Some(0),
+                observed_at: Instant::now(),
+            }],
+        );
+        let state = scheduler.state.lock();
+        assert!(!state.targets.contains_key(&target.id));
+        assert!(!state.observations.contains_key(&target.id));
+    }
+
+    #[test]
+    fn stale_observation_epoch_cannot_cross_remove_and_readd() {
+        let scheduler = ProgramScheduler::new(ProgramSchedulerConfig::default());
+        let target = ProgramTarget {
+            id: "rank-0".into(),
+            base_url: "http://worker".into(),
+            dp_rank: Some(0),
+        };
+        scheduler.sync_targets("model", std::slice::from_ref(&target));
+        let epoch = scheduler.begin_observation(std::slice::from_ref(&target));
+        scheduler.sync_targets("model", &[]);
+        scheduler.sync_targets("model", std::slice::from_ref(&target));
+        scheduler.apply_observations(
+            epoch,
+            [BackendObservation {
+                target_id: target.id.clone(),
+                base_url: target.base_url.clone(),
+                dp_rank: target.dp_rank,
+                kv_cache_usage: Some(0.5),
+                running_requests: Some(1),
+                waiting_requests: Some(0),
+                observed_at: Instant::now(),
+            }],
+        );
+        let state = scheduler.state.lock();
+        assert_eq!(
+            state
+                .observations
+                .get(&target.id)
+                .and_then(|observation| observation.kv_cache_usage),
+            None
         );
     }
 

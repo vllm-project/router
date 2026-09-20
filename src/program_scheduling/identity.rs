@@ -173,9 +173,10 @@ impl ProgramIdentity {
         let Some(identity) = identity else {
             return Ok(None);
         };
-        identity
-            .with_placement_hash_key(consistent_hash_request_key(headers, request))
-            .map(Some)
+        let identity =
+            identity.with_placement_hash_key(consistent_hash_request_key(headers, request))?;
+        identity.validate_persisted_strings()?;
+        Ok(Some(identity))
     }
 
     fn build(
@@ -226,6 +227,31 @@ impl ProgramIdentity {
         }
         self.placement_hash_key = placement_hash_key;
         Ok(self)
+    }
+
+    /// Bound every string retained beyond request parsing.
+    fn validate_persisted_strings(&self) -> Result<(), ScheduleError> {
+        let fields = [
+            ("model_pool", Some(self.model_pool.as_str())),
+            ("program_id", Some(self.program_id.as_str())),
+            ("placement_key", Some(self.placement_key.as_str())),
+            ("task_id", self.task_id.as_deref()),
+            ("session_id", self.session_id.as_deref()),
+            ("agent_id", self.agent_id.as_deref()),
+            ("parent_program_id", self.parent_program_id.as_deref()),
+            ("root_program_id", self.root_program_id.as_deref()),
+            ("agent_role", self.agent_role.as_deref()),
+            ("spawn_reason", self.spawn_reason.as_deref()),
+            ("request_id", self.request_hints.request_id.as_deref()),
+        ];
+        for (name, value) in fields {
+            if value.is_some_and(|value| value.len() > MAX_IDENTITY_COMPONENT_BYTES) {
+                return Err(ScheduleError::InvalidIdentity(format!(
+                    "{name} exceeds {MAX_IDENTITY_COMPONENT_BYTES} bytes"
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Model pool that scopes this Program ID.
@@ -917,6 +943,96 @@ mod tests {
             identity.request_hints().kv_retention_ttl,
             Some(Duration::from_secs_f64(4.5))
         );
+    }
+
+    #[test]
+    fn every_persisted_identity_string_is_bounded() {
+        for field in [
+            "task_id",
+            "session_id",
+            "agent_id",
+            "parent_program_id",
+            "root_program_id",
+            "agent_role",
+            "spawn_reason",
+            "request_id",
+        ] {
+            let mut context = serde_json::json!({
+                "program_id": "program",
+                "task_id": null,
+                "blocks_parent": false,
+                "expected_resume": true
+            });
+            context[field] = JsonValue::String("x".repeat(MAX_IDENTITY_COMPONENT_BYTES + 1));
+            let request = serde_json::json!({
+                "vllm_xargs": {"agentic_context": context}
+            });
+            assert!(matches!(
+                ProgramIdentity::from_request(None, Some(&request), Some("model")),
+                Err(ScheduleError::InvalidIdentity(_))
+            ));
+        }
+
+        let accepted = serde_json::json!({
+            "vllm_xargs": {"agentic_context": {
+                "program_id": "program",
+                "task_id": null,
+                "spawn_reason": "x".repeat(MAX_IDENTITY_COMPONENT_BYTES),
+                "expected_resume": true
+            }}
+        });
+        assert!(ProgramIdentity::from_request(None, Some(&accepted), Some("model")).is_ok());
+
+        let multibyte = serde_json::json!({
+            "vllm_xargs": {"agentic_context": {
+                "program_id": "program",
+                "task_id": null,
+                "spawn_reason": "é".repeat(MAX_IDENTITY_COMPONENT_BYTES / 2 + 1),
+                "expected_resume": true
+            }}
+        });
+        assert!(matches!(
+            ProgramIdentity::from_request(None, Some(&multibyte), Some("model")),
+            Err(ScheduleError::InvalidIdentity(_))
+        ));
+    }
+
+    #[test]
+    fn persisted_string_bounds_cover_headers_hints_and_derived_ids() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            GENERIC_SESSION_HEADER,
+            "x".repeat(MAX_IDENTITY_COMPONENT_BYTES + 1)
+                .parse()
+                .unwrap(),
+        );
+        assert!(matches!(
+            ProgramIdentity::from_request(Some(&headers), None, Some("model")),
+            Err(ScheduleError::InvalidIdentity(_))
+        ));
+
+        let hint = serde_json::json!({
+            "agent_hint": {
+                "session_id": "child",
+                "parent_session_id": "x".repeat(MAX_IDENTITY_COMPONENT_BYTES + 1),
+                "blocks_parent": true
+            }
+        });
+        assert!(matches!(
+            ProgramIdentity::from_request(None, Some(&hint), Some("model")),
+            Err(ScheduleError::InvalidIdentity(_))
+        ));
+
+        let derived = serde_json::json!({
+            "vllm_xargs": {"agentic_context": {
+                "task_id": "x".repeat(MAX_IDENTITY_COMPONENT_BYTES - 2),
+                "agent_id": "worker"
+            }}
+        });
+        assert!(matches!(
+            ProgramIdentity::from_request(None, Some(&derived), Some("model")),
+            Err(ScheduleError::InvalidIdentity(_))
+        ));
     }
 
     #[test]
