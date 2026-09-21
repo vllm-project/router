@@ -8,6 +8,7 @@ use super::ScheduleError;
 use crate::policies::{hash_key, RequestHeaders};
 use http::HeaderMap;
 use serde_json::{Map as JsonMap, Value as JsonValue};
+use std::io::{self, Write};
 use std::time::Duration;
 
 const MAX_IDENTITY_COMPONENT_BYTES: usize = 256;
@@ -514,24 +515,68 @@ fn canonical_context(
     if raw_context.is_null() {
         return Ok(None);
     }
-    let decoded = match raw_context {
+    let context = match raw_context {
         JsonValue::String(value) => {
             if value.len() > MAX_AGENTIC_CONTEXT_BYTES {
-                return Err(ScheduleError::InvalidIdentity(
-                    "vllm_xargs.agentic_context must contain a bounded JSON object".to_string(),
-                ));
+                return Err(bounded_agentic_context_error());
             }
-            serde_json::from_str::<JsonValue>(value).map_err(|_| {
-                ScheduleError::InvalidIdentity(
-                    "vllm_xargs.agentic_context must contain a bounded JSON object".to_string(),
-                )
-            })?
+            let decoded = serde_json::from_str::<JsonValue>(value)
+                .map_err(|_| bounded_agentic_context_error())?;
+            decoded
+                .as_object()
+                .cloned()
+                .ok_or_else(|| bounded_agentic_context_error())?
         }
-        value => value.clone(),
+        JsonValue::Object(context) => {
+            ensure_bounded_agentic_context(raw_context)?;
+            context.clone()
+        }
+        _ => {
+            return Err(ScheduleError::InvalidIdentity(
+                "vllm_xargs.agentic_context must be an object".to_string(),
+            ))
+        }
     };
-    decoded.as_object().cloned().map(Some).ok_or_else(|| {
-        ScheduleError::InvalidIdentity("vllm_xargs.agentic_context must be an object".to_string())
-    })
+    Ok(Some(context))
+}
+
+fn bounded_agentic_context_error() -> ScheduleError {
+    ScheduleError::InvalidIdentity(
+        "vllm_xargs.agentic_context must contain a bounded JSON object".to_string(),
+    )
+}
+
+fn ensure_bounded_agentic_context(context: &JsonValue) -> Result<(), ScheduleError> {
+    let mut writer = BoundedJsonWriter::default();
+    serde_json::to_writer(&mut writer, context).map_err(|_| bounded_agentic_context_error())
+}
+
+#[derive(Default)]
+struct BoundedJsonWriter {
+    written: usize,
+}
+
+impl Write for BoundedJsonWriter {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        let Some(total) = self.written.checked_add(buffer.len()) else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "agentic context size overflow",
+            ));
+        };
+        if total > MAX_AGENTIC_CONTEXT_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "agentic context exceeds size limit",
+            ));
+        }
+        self.written = total;
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 fn agent_hint_identity(
@@ -993,6 +1038,47 @@ mod tests {
         });
         assert!(matches!(
             ProgramIdentity::from_request(None, Some(&multibyte), Some("model")),
+            Err(ScheduleError::InvalidIdentity(_))
+        ));
+    }
+
+    #[test]
+    fn canonical_context_total_size_is_bounded_for_string_and_object_forms() {
+        let accepted_context = serde_json::json!({
+            "program_id": "program",
+            "task_id": null,
+            "expected_resume": true,
+            "ignored": "x".repeat(1024)
+        });
+        let accepted_object = serde_json::json!({
+            "vllm_xargs": {"agentic_context": accepted_context.clone()}
+        });
+        assert!(ProgramIdentity::from_request(None, Some(&accepted_object), Some("model")).is_ok());
+
+        let accepted_string = serde_json::json!({
+            "vllm_xargs": {"agentic_context": serde_json::to_string(&accepted_context).unwrap()}
+        });
+        assert!(ProgramIdentity::from_request(None, Some(&accepted_string), Some("model")).is_ok());
+
+        let oversized_context = serde_json::json!({
+            "program_id": "program",
+            "task_id": null,
+            "expected_resume": true,
+            "ignored": "x".repeat(MAX_AGENTIC_CONTEXT_BYTES)
+        });
+        let oversized_object = serde_json::json!({
+            "vllm_xargs": {"agentic_context": oversized_context.clone()}
+        });
+        assert!(matches!(
+            ProgramIdentity::from_request(None, Some(&oversized_object), Some("model")),
+            Err(ScheduleError::InvalidIdentity(_))
+        ));
+
+        let oversized_string = serde_json::json!({
+            "vllm_xargs": {"agentic_context": serde_json::to_string(&oversized_context).unwrap()}
+        });
+        assert!(matches!(
+            ProgramIdentity::from_request(None, Some(&oversized_string), Some("model")),
             Err(ScheduleError::InvalidIdentity(_))
         ));
     }
