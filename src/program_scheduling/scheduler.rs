@@ -57,7 +57,26 @@ impl ProgramScheduler {
 
     /// Synchronize a cached immutable target snapshot.
     pub fn sync_target_snapshot(&self, model_pool: &str, targets: Arc<[ProgramTarget]>) {
+        self.sync_target_snapshots([(model_pool.to_string(), targets)]);
+    }
+
+    /// Atomically synchronize cached target snapshots for multiple model pools.
+    pub fn sync_target_snapshots(
+        &self,
+        snapshots: impl IntoIterator<Item = (String, Arc<[ProgramTarget]>)>,
+    ) {
         let mut state = self.state.lock();
+        for (model_pool, targets) in snapshots {
+            self.sync_target_snapshot_locked(&mut state, &model_pool, targets);
+        }
+    }
+
+    fn sync_target_snapshot_locked(
+        &self,
+        state: &mut ProgramSchedulerState,
+        model_pool: &str,
+        targets: Arc<[ProgramTarget]>,
+    ) {
         if state
             .model_target_snapshots
             .get(model_pool)

@@ -275,6 +275,14 @@ impl Router {
         scheduler: &ProgramScheduler,
         worker_registry: &WorkerRegistry,
     ) {
+        Self::sync_program_targets_from_registry_with_hook(scheduler, worker_registry, || {});
+    }
+
+    fn sync_program_targets_from_registry_with_hook(
+        scheduler: &ProgramScheduler,
+        worker_registry: &WorkerRegistry,
+        mut after_collection: impl FnMut(),
+    ) {
         let model_pools = scheduler.model_pools();
         if model_pools.is_empty() {
             return;
@@ -292,8 +300,10 @@ impl Router {
             if worker_registry.revision() != revision {
                 continue;
             }
-            for (model_pool, targets) in snapshots {
-                scheduler.sync_target_snapshot(&model_pool, targets);
+            after_collection();
+            scheduler.sync_target_snapshots(snapshots);
+            if worker_registry.revision() != revision {
+                continue;
             }
             return;
         }
@@ -2357,6 +2367,31 @@ mod tests {
 
         registry.remove_by_url("http://worker-a:8080");
         Router::sync_program_targets_from_registry(&scheduler, &registry);
+        assert!(scheduler.all_targets().is_empty());
+    }
+
+    #[test]
+    fn observation_refresh_retries_registry_change_across_install_boundary() {
+        let registry = WorkerRegistry::new();
+        let worker_url = "http://worker-a:8080";
+        registry.register(Arc::new(BasicWorker::new(
+            worker_url.to_string(),
+            WorkerType::Regular,
+        )));
+
+        let scheduler = ProgramScheduler::new(ProgramSchedulerConfig::default());
+        scheduler.sync_targets(PROGRAM_MODEL_POOL_ALL, &[]);
+
+        let mut removed = false;
+        Router::sync_program_targets_from_registry_with_hook(&scheduler, &registry, || {
+            if !removed {
+                registry.remove_by_url(worker_url);
+                removed = true;
+            }
+        });
+
+        assert!(removed);
+        assert!(scheduler.targets(PROGRAM_MODEL_POOL_ALL).is_empty());
         assert!(scheduler.all_targets().is_empty());
     }
 
