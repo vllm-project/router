@@ -278,6 +278,53 @@ mod health_tests {
 #[cfg(test)]
 mod generation_tests {
     use super::*;
+    use axum::{
+        extract::State,
+        response::IntoResponse,
+        routing::{get, post},
+        Json, Router as AxumRouter,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    async fn start_retry_once_chat_backend(
+    ) -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = AxumRouter::new()
+            .route("/health", get(|| async { StatusCode::OK }))
+            .route(
+                "/v1/chat/completions",
+                post(
+                    |State(attempts): State<Arc<AtomicUsize>>,
+                     Json(_request): Json<serde_json::Value>| async move {
+                        if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+                        }
+                        Json(json!({
+                            "id": "chatcmpl-retry",
+                            "object": "chat.completion",
+                            "choices": [{
+                                "index": 0,
+                                "message": {"role": "assistant", "content": "ok"},
+                                "finish_reason": "stop"
+                            }],
+                            "usage": {
+                                "prompt_tokens": 10,
+                                "completion_tokens": 1,
+                                "total_tokens": 11
+                            }
+                        }))
+                        .into_response()
+                    },
+                ),
+            )
+            .with_state(attempts.clone());
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{address}"), attempts, handle)
+    }
 
     #[tokio::test]
     async fn test_generate_success() {
@@ -477,6 +524,61 @@ mod generation_tests {
         );
         assert_eq!(diagnostics["ranks"][0]["programs"][0]["state"], "paused");
         ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_program_retry_completes_each_route_attempt_without_occupancy_leak() {
+        let (backend_url, attempts, backend_handle) = start_retry_once_chat_backend().await;
+        let mut config = RouterConfig::default();
+        config.mode = RoutingMode::Regular {
+            worker_urls: vec![backend_url],
+        };
+        config.policy = PolicyConfig::RoundRobin;
+        config.program_scheduling = Some(ProgramSchedulingConfig::default());
+        config.retry = RetryConfig {
+            max_retries: 2,
+            initial_backoff_ms: 1,
+            max_backoff_ms: 1,
+            backoff_multiplier: 1.0,
+            jitter_factor: 0.0,
+        };
+        let ctx = TestContext::new_with_config(config, vec![]).await;
+        let app = ctx.create_app().await;
+        let payload = json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "Retry once"}],
+            "stream": false,
+            "vllm_xargs": {"agentic_context": {
+                "program_id": "retry-program",
+                "task_id": null,
+                "expected_resume": true
+            }}
+        });
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_vec(&payload).unwrap()))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+
+        let diagnostics = ctx.router.scheduling_diagnostics().unwrap();
+        assert_eq!(diagnostics["retained_requests"], 0);
+        let ranks = diagnostics["ranks"].as_array().unwrap();
+        assert_eq!(ranks.len(), 1);
+        assert_eq!(ranks[0]["router_in_flight_requests"], 0);
+        assert_eq!(ranks[0]["router_queued_requests"], 0);
+        let programs = ranks[0]["programs"].as_array().unwrap();
+        assert_eq!(programs.len(), 1);
+        assert_eq!(programs[0]["generation"], 0);
+        assert_eq!(programs[0]["in_flight_requests"], 0);
+        assert_eq!(programs[0]["waiting_requests"], 0);
+
+        ctx.shutdown().await;
+        backend_handle.abort();
     }
 }
 
