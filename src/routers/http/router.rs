@@ -64,6 +64,17 @@ struct ProgramTargetCacheEntry {
     targets: Arc<[ProgramTarget]>,
 }
 
+const PROGRAM_MODEL_POOL_ALL: &str = "program:all";
+const PROGRAM_MODEL_POOL_FALLBACK: &str = "program:fallback:unlabeled";
+const PROGRAM_MODEL_POOL_NAMED_PREFIX: &str = "program:model:";
+const UNLABELED_WORKER_MODEL_ID: &str = "unknown";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedProgramModelPool {
+    scheduler_key: String,
+    registry_model: Option<String>,
+}
+
 impl Router {
     /// Create a new router with injected policy and client
     #[allow(clippy::too_many_arguments)]
@@ -273,11 +284,7 @@ impl Router {
             let snapshots = model_pools
                 .iter()
                 .map(|model_pool| {
-                    let workers = match model_pool.as_str() {
-                        "default" => worker_registry.get_all(),
-                        "unknown" => Vec::new(),
-                        model => worker_registry.get_by_model_fast(model),
-                    };
+                    let workers = Self::workers_for_program_model_pool(worker_registry, model_pool);
                     let targets: Arc<[ProgramTarget]> = Self::program_targets(&workers).into();
                     (model_pool.clone(), targets)
                 })
@@ -292,33 +299,52 @@ impl Router {
         }
     }
 
-    fn resolved_program_model_pool(&self, model_id: Option<&str>) -> String {
+    fn resolved_program_model_pool(&self, model_id: Option<&str>) -> ResolvedProgramModelPool {
         match model_id {
-            Some(model) if self.worker_registry.has_model(model) => model.to_string(),
-            Some(_) => "unknown".to_string(),
-            None => "default".to_string(),
+            Some(model) if self.worker_registry.has_model(model) => ResolvedProgramModelPool {
+                scheduler_key: format!("{PROGRAM_MODEL_POOL_NAMED_PREFIX}{model}"),
+                registry_model: Some(model.to_string()),
+            },
+            Some(_) => ResolvedProgramModelPool {
+                scheduler_key: PROGRAM_MODEL_POOL_FALLBACK.to_string(),
+                registry_model: Some(UNLABELED_WORKER_MODEL_ID.to_string()),
+            },
+            None => ResolvedProgramModelPool {
+                scheduler_key: PROGRAM_MODEL_POOL_ALL.to_string(),
+                registry_model: None,
+            },
+        }
+    }
+
+    fn workers_for_program_model_pool(
+        worker_registry: &WorkerRegistry,
+        model_pool: &str,
+    ) -> Vec<Arc<dyn Worker>> {
+        if model_pool == PROGRAM_MODEL_POOL_ALL {
+            worker_registry.get_all()
+        } else if model_pool == PROGRAM_MODEL_POOL_FALLBACK {
+            worker_registry.get_by_model_fast(UNLABELED_WORKER_MODEL_ID)
+        } else if let Some(model) = model_pool.strip_prefix(PROGRAM_MODEL_POOL_NAMED_PREFIX) {
+            worker_registry.get_by_model_fast(model)
+        } else {
+            Vec::new()
         }
     }
 
     fn program_targets_for_model(
         &self,
-        model_id: Option<&str>,
-        model_pool: &str,
+        model_pool: &ResolvedProgramModelPool,
     ) -> Arc<[ProgramTarget]> {
         loop {
             let registry_revision = self.worker_registry.revision();
-            let cache_key = if model_id.is_some() {
-                format!("model:{model_pool}")
-            } else {
-                "all-workers".to_string()
-            };
+            let cache_key = model_pool.scheduler_key.clone();
             if let Some(entry) = self.program_targets_cache.lock().get(&cache_key) {
                 if entry.registry_revision == registry_revision {
                     return entry.targets.clone();
                 }
             }
-            let workers = match model_id {
-                Some(_) => self.worker_registry.get_by_model_fast(model_pool),
+            let workers = match model_pool.registry_model.as_deref() {
+                Some(model) => self.worker_registry.get_by_model_fast(model),
                 None => self.worker_registry.get_all(),
             };
             let targets: Arc<[ProgramTarget]> = Self::program_targets(&workers).into();
@@ -401,16 +427,17 @@ impl Router {
         let Some(identity) = ProgramIdentity::from_request_with_enable_key(
             headers,
             request,
-            Some(&model_pool),
+            Some(&model_pool.scheduler_key),
             scheduler.enable_key(),
         )?
         else {
             return Ok(None);
         };
-        let (estimated_context_tokens, calibration) = self
-            .program_token_estimator
-            .estimate(TokenEstimateScope::new(&model_pool, endpoint), input_text);
-        let targets = self.program_targets_for_model(model_id, &model_pool);
+        let (estimated_context_tokens, calibration) = self.program_token_estimator.estimate(
+            TokenEstimateScope::new(&model_pool.scheduler_key, endpoint),
+            input_text,
+        );
+        let targets = self.program_targets_for_model(&model_pool);
         let routing_text = scheduler
             .uses_cache_aware_binding()
             .then(|| input_text.to_string());
@@ -2263,22 +2290,39 @@ mod tests {
     #[test]
     fn program_targets_cache_tracks_worker_registry_revision() {
         let router = create_test_regular_router();
-        let first = router.program_targets_for_model(None, "default");
-        let second = router.program_targets_for_model(None, "default");
+        let all_pool = router.resolved_program_model_pool(None);
+        let first = router.program_targets_for_model(&all_pool);
+        let second = router.program_targets_for_model(&all_pool);
         assert!(Arc::ptr_eq(&first, &second));
+
+        let first_missing_pool = router.resolved_program_model_pool(Some("missing-a"));
+        let second_missing_pool = router.resolved_program_model_pool(Some("missing-b"));
         assert_eq!(
-            router.resolved_program_model_pool(Some("missing-a")),
-            "unknown"
+            first_missing_pool.scheduler_key,
+            PROGRAM_MODEL_POOL_FALLBACK
         );
-        let first_miss = router.program_targets_for_model(Some("missing-a"), "unknown");
-        let second_miss = router.program_targets_for_model(Some("missing-b"), "unknown");
+        assert_eq!(first_missing_pool, second_missing_pool);
+        let first_miss = router.program_targets_for_model(&first_missing_pool);
+        let second_miss = router.program_targets_for_model(&second_missing_pool);
         assert!(Arc::ptr_eq(&first_miss, &second_miss));
+        assert_eq!(first_miss.len(), 2);
+
+        let literal_unknown = router.resolved_program_model_pool(Some("unknown"));
+        assert_eq!(
+            literal_unknown.scheduler_key,
+            format!("{PROGRAM_MODEL_POOL_NAMED_PREFIX}unknown")
+        );
+        assert_ne!(
+            literal_unknown.scheduler_key,
+            first_missing_pool.scheduler_key
+        );
+        assert_eq!(router.program_targets_for_model(&literal_unknown).len(), 2);
 
         router.worker_registry.register(Arc::new(BasicWorker::new(
             "http://worker3:8080".to_string(),
             WorkerType::Regular,
         )));
-        let third = router.program_targets_for_model(None, "default");
+        let third = router.program_targets_for_model(&all_pool);
         assert!(!Arc::ptr_eq(&first, &third));
         assert_eq!(third.len(), 3);
     }
@@ -2295,20 +2339,21 @@ mod tests {
         registry.register(worker.clone());
 
         let scheduler = ProgramScheduler::new(ProgramSchedulerConfig::default());
-        scheduler.sync_targets("default", &[]);
-        scheduler.sync_targets("model-a", &[]);
-        scheduler.sync_targets("unknown", &[]);
+        let named_model_a = format!("{PROGRAM_MODEL_POOL_NAMED_PREFIX}model-a");
+        scheduler.sync_targets(PROGRAM_MODEL_POOL_ALL, &[]);
+        scheduler.sync_targets(&named_model_a, &[]);
+        scheduler.sync_targets(PROGRAM_MODEL_POOL_FALLBACK, &[]);
         Router::sync_program_targets_from_registry(&scheduler, &registry);
 
-        assert_eq!(scheduler.targets("default").len(), 1);
-        assert_eq!(scheduler.targets("model-a").len(), 1);
-        assert!(scheduler.targets("unknown").is_empty());
+        assert_eq!(scheduler.targets(PROGRAM_MODEL_POOL_ALL).len(), 1);
+        assert_eq!(scheduler.targets(&named_model_a).len(), 1);
+        assert!(scheduler.targets(PROGRAM_MODEL_POOL_FALLBACK).is_empty());
 
         worker.set_healthy(false);
         registry.notify_worker_state_change();
         Router::sync_program_targets_from_registry(&scheduler, &registry);
-        assert!(scheduler.targets("default").is_empty());
-        assert!(scheduler.targets("model-a").is_empty());
+        assert!(scheduler.targets(PROGRAM_MODEL_POOL_ALL).is_empty());
+        assert!(scheduler.targets(&named_model_a).is_empty());
 
         registry.remove_by_url("http://worker-a:8080");
         Router::sync_program_targets_from_registry(&scheduler, &registry);
