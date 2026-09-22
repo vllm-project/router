@@ -525,7 +525,7 @@ fn canonical_context(
             decoded
                 .as_object()
                 .cloned()
-                .ok_or_else(|| bounded_agentic_context_error())?
+                .ok_or_else(bounded_agentic_context_error)?
         }
         JsonValue::Object(context) => {
             ensure_bounded_agentic_context(raw_context)?;
@@ -615,9 +615,11 @@ fn agent_hint_identity(
     Ok(Some(identity))
 }
 
+type FrameworkIdentityHeaders = (Option<String>, Option<String>, Option<String>);
+
 fn framework_identity_headers(
     headers: Option<&HeaderMap>,
-) -> Result<(Option<String>, Option<String>, Option<String>), ScheduleError> {
+) -> Result<FrameworkIdentityHeaders, ScheduleError> {
     let Some(headers) = headers else {
         return Ok((None, None, None));
     };

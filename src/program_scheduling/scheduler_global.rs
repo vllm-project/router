@@ -107,9 +107,7 @@ impl ProgramScheduler {
         now: Instant,
     ) -> Option<(String, RankAdmissionPlan)> {
         let decision = state.decisions.get(program)?;
-        if decision.last_pause_reason.is_none() {
-            return None;
-        }
+        decision.last_pause_reason?;
         let source_target = decision.last_target.as_deref()?;
         let targets = state.model_targets.get(program.model_pool())?;
         let candidates = targets
@@ -315,8 +313,10 @@ mod tests {
 
     #[test]
     fn new_program_remains_on_initial_binding_in_global_mode() {
-        let mut config = ProgramSchedulerConfig::default();
-        config.global_queue = true;
+        let config = ProgramSchedulerConfig {
+            global_queue: true,
+            ..ProgramSchedulerConfig::default()
+        };
         let scheduler = ProgramScheduler::new(config);
         let targets = [
             ProgramTarget {
@@ -355,9 +355,11 @@ mod tests {
 
     #[test]
     fn cross_rank_order_is_fcfs_when_local_order_is_mru() {
-        let mut config = ProgramSchedulerConfig::default();
-        config.global_queue = true;
-        config.resume_order = ProgramResumeOrder::Mru;
+        let config = ProgramSchedulerConfig {
+            global_queue: true,
+            resume_order: ProgramResumeOrder::Mru,
+            ..ProgramSchedulerConfig::default()
+        };
         let scheduler = ProgramScheduler::new(config);
         let targets = [
             ProgramTarget {
@@ -409,8 +411,10 @@ mod tests {
 
     #[test]
     fn cross_rank_order_remains_fcfs_when_local_order_is_fcfs() {
-        let mut config = ProgramSchedulerConfig::default();
-        config.global_queue = true;
+        let config = ProgramSchedulerConfig {
+            global_queue: true,
+            ..ProgramSchedulerConfig::default()
+        };
         let scheduler = ProgramScheduler::new(config);
         let targets = [
             ProgramTarget {

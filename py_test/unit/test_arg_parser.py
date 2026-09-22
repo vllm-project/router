@@ -444,9 +444,7 @@ class TestParseRouterArgs:
     def test_parse_program_scheduling_json(self):
         """Keep the opt-in scheduler configuration opaque until Rust validation."""
         config = '{"global_queue":true,"binding_strategy":"program_round_robin"}'
-        router_args = parse_router_args(
-            ["--program-scheduling-config-json", config]
-        )
+        router_args = parse_router_args(["--program-scheduling-config-json", config])
         assert router_args.program_scheduling_config_json == config
 
     def test_parse_pd_args(self):

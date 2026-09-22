@@ -859,8 +859,10 @@ mod tests {
 
     #[tokio::test]
     async fn admission_does_not_reclaim_active_acting_programs() {
-        let mut config = ProgramSchedulerConfig::default();
-        config.max_active_programs_per_target = 1;
+        let config = ProgramSchedulerConfig {
+            max_active_programs_per_target: 1,
+            ..ProgramSchedulerConfig::default()
+        };
         let scheduler = ProgramScheduler::new(config);
         let target = target();
         let first = scheduler
@@ -910,8 +912,10 @@ mod tests {
 
     #[test]
     fn local_order_prefers_forced_then_non_yielded_then_mru() {
-        let mut config = ProgramSchedulerConfig::default();
-        config.resume_order = ProgramResumeOrder::Mru;
+        let config = ProgramSchedulerConfig {
+            resume_order: ProgramResumeOrder::Mru,
+            ..ProgramSchedulerConfig::default()
+        };
         let scheduler = ProgramScheduler::new(config);
         let target = target();
         scheduler.sync_targets("model", std::slice::from_ref(&target));
@@ -1114,8 +1118,10 @@ mod tests {
 
     #[test]
     fn backend_waiting_gate_also_blocks_forced_resume() {
-        let mut config = ProgramSchedulerConfig::default();
-        config.admission_waiting_request_threshold = 1;
+        let config = ProgramSchedulerConfig {
+            admission_waiting_request_threshold: 1,
+            ..ProgramSchedulerConfig::default()
+        };
         let scheduler = ProgramScheduler::new(config);
         let target = target();
         scheduler.sync_targets("model", std::slice::from_ref(&target));

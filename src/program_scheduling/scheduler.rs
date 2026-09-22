@@ -194,7 +194,7 @@ impl ProgramScheduler {
                 placement_key,
                 expected_resume,
             );
-            let candidates = self.binding_candidates(&state, &identity, Instant::now());
+            let candidates = self.binding_candidates(state, &identity, Instant::now());
             let replacement = state.bindings.bind(&identity, &candidates, None);
             if let Some(decision) = state.decisions.get_mut(&program) {
                 decision.home_target = replacement.clone();
@@ -408,8 +408,6 @@ impl ProgramScheduler {
             .map(|target_id| {
                 let accounted = runtime_views
                     .iter()
-                    .cloned()
-                    .into_iter()
                     .filter(|program| {
                         let last_target = state
                             .decisions
@@ -419,6 +417,7 @@ impl ProgramScheduler {
                             && (program.state == ProgramState::Active
                                 || program.status == ProgramStatus::Reasoning)
                     })
+                    .cloned()
                     .collect::<Vec<_>>();
                 let accounted_tokens = accounted
                     .iter()
@@ -612,6 +611,7 @@ struct ObservationCheckpoint {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::program_scheduling::ProgressTtlConfig;
     use crate::program_scheduling::{ProgramBindingStrategy, ProgramIdentity};
     use serde_json::json;
 
@@ -714,9 +714,14 @@ mod tests {
 
     #[test]
     fn cache_aware_cold_burst_accounts_bound_unadmitted_programs() {
-        let mut config = ProgramSchedulerConfig::default();
-        config.binding_strategy = ProgramBindingStrategy::CacheAware;
-        config.progress_ttl.token_capacity = Some(1_000);
+        let config = ProgramSchedulerConfig {
+            binding_strategy: ProgramBindingStrategy::CacheAware,
+            progress_ttl: ProgressTtlConfig {
+                token_capacity: Some(1_000),
+                ..ProgressTtlConfig::default()
+            },
+            ..ProgramSchedulerConfig::default()
+        };
         let scheduler = ProgramScheduler::new(config);
         let targets = [
             ProgramTarget {

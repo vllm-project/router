@@ -850,7 +850,7 @@ impl Router {
                 let forced_worker_url = program_completion
                     .as_ref()
                     .map(|completion| completion.dispatch().target_id.as_str());
-                let selected_worker = if let Some(target) = forced_worker_url.as_deref() {
+                let selected_worker = if let Some(target) = forced_worker_url {
                     let worker = self
                         .worker_registry
                         .get_by_url(target)
@@ -1080,6 +1080,7 @@ impl Router {
     }
 
     // Send typed request directly without conversion
+    #[allow(clippy::too_many_arguments)]
     async fn send_typed_request<T: serde::Serialize>(
         &self,
         headers: Option<&HeaderMap>,

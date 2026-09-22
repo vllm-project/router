@@ -476,9 +476,11 @@ mod generation_tests {
 
     #[tokio::test]
     async fn test_program_request_is_tracked_without_changing_response() {
-        let mut config = RouterConfig::default();
-        config.policy = PolicyConfig::RoundRobin;
-        config.program_scheduling = Some(ProgramSchedulingConfig::default());
+        let config = RouterConfig {
+            policy: PolicyConfig::RoundRobin,
+            program_scheduling: Some(ProgramSchedulingConfig::default()),
+            ..Default::default()
+        };
         let ctx = TestContext::new_with_config(
             config,
             vec![MockWorkerConfig {
@@ -529,18 +531,20 @@ mod generation_tests {
     #[tokio::test]
     async fn test_program_retry_completes_each_route_attempt_without_occupancy_leak() {
         let (backend_url, attempts, backend_handle) = start_retry_once_chat_backend().await;
-        let mut config = RouterConfig::default();
-        config.mode = RoutingMode::Regular {
-            worker_urls: vec![backend_url],
-        };
-        config.policy = PolicyConfig::RoundRobin;
-        config.program_scheduling = Some(ProgramSchedulingConfig::default());
-        config.retry = RetryConfig {
-            max_retries: 2,
-            initial_backoff_ms: 1,
-            max_backoff_ms: 1,
-            backoff_multiplier: 1.0,
-            jitter_factor: 0.0,
+        let config = RouterConfig {
+            mode: RoutingMode::Regular {
+                worker_urls: vec![backend_url],
+            },
+            policy: PolicyConfig::RoundRobin,
+            program_scheduling: Some(ProgramSchedulingConfig::default()),
+            retry: RetryConfig {
+                max_retries: 2,
+                initial_backoff_ms: 1,
+                max_backoff_ms: 1,
+                backoff_multiplier: 1.0,
+                jitter_factor: 0.0,
+            },
+            ..Default::default()
         };
         let ctx = TestContext::new_with_config(config, vec![]).await;
         let app = ctx.create_app().await;
@@ -1191,9 +1195,11 @@ mod responses_endpoint_tests {
 
     #[tokio::test]
     async fn test_v1_responses_program_request_is_tracked() {
-        let mut config = RouterConfig::default();
-        config.policy = PolicyConfig::RoundRobin;
-        config.program_scheduling = Some(ProgramSchedulingConfig::default());
+        let config = RouterConfig {
+            policy: PolicyConfig::RoundRobin,
+            program_scheduling: Some(ProgramSchedulingConfig::default()),
+            ..Default::default()
+        };
         let ctx = TestContext::new_with_config(
             config,
             vec![MockWorkerConfig {

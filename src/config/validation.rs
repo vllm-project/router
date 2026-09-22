@@ -164,9 +164,9 @@ impl ConfigValidator {
                 reason: "cross_rank_headroom_ratio must be finite and >= 1".to_string(),
             });
         }
-        if !(0.0 < config.low_watermark_ratio && config.low_watermark_ratio <= 1.0)
-            || !(0.0 < config.high_watermark_ratio && config.high_watermark_ratio <= 1.0)
-            || config.low_watermark_ratio > config.high_watermark_ratio
+        if !(0.0 < config.low_watermark_ratio
+            && config.low_watermark_ratio <= config.high_watermark_ratio
+            && config.high_watermark_ratio <= 1.0)
         {
             return Err(ConfigError::ValidationFailed {
                 reason: "Program scheduling watermarks must satisfy 0 < low <= high <= 1"
