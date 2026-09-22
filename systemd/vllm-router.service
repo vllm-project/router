@@ -1,0 +1,34 @@
+[Unit]
+Description=vLLM Router - High-performance load balancer for VLLM
+Documentation=https://github.com/blablador/vllm-router-auth
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=vllm-router
+Group=vllm-router
+WorkingDirectory=/var/lib/vllm-router
+
+# Restart policy
+Restart=always
+RestartSec=10
+
+# Security settings
+NoNewPrivileges=false
+PrivateTmp=true
+
+# Command - this will be replaced by install script with actual binary path
+ExecStart=/usr/local/bin/vllm-router \
+    --config /etc/vllm-router/config.toml
+
+# Resource limits
+LimitNOFILE=65536
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=vllm-router
+
+[Install]
+WantedBy=multi-user.target
