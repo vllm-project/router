@@ -2,7 +2,10 @@
 //!
 //! Provides centralized registry for workers with model-based indexing
 
-use crate::core::{ConnectionMode, Worker, WorkerType};
+use crate::{
+    core::{ConnectionMode, Worker, WorkerType},
+    metrics::RouterMetrics,
+};
 use dashmap::DashMap;
 use std::sync::{Arc, RwLock};
 use uuid::Uuid;
@@ -114,6 +117,9 @@ impl WorkerRegistry {
             .entry(worker.connection_mode())
             .or_default()
             .push(worker_id.clone());
+
+        // Publish the initial state even if no health transition occurs.
+        RouterMetrics::set_worker_health(worker.url(), worker.is_healthy());
 
         worker_id
     }
