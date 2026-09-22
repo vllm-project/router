@@ -9,11 +9,11 @@ use super::{
     BatchGainInputs, ContinuitySample, ProgramDispatch, ProgramIdentity, ProgramRef,
     ProgramRequestHandle, ProgramState, ProgramStatus, ProgramTarget, ScheduleError,
 };
-use crate::metrics::RouterMetrics;
+use crate::metrics::{AgentAwareAdmissionMetrics, RouterMetrics};
 use std::cmp::Ordering;
 use std::sync::Arc;
 use std::time::Instant;
-use tracing::info;
+use tracing::{debug, info};
 
 #[derive(Debug, Clone)]
 pub(crate) struct RankAdmissionPlan {
@@ -100,7 +100,7 @@ impl ProgramScheduler {
             if let Some((Some(target_id), sample)) = continuity {
                 if sample.interval_seconds.is_finite() && sample.interval_seconds >= 0.0 {
                     let factors = state.rank_factors.entry(target_id.clone()).or_default();
-                    info!(
+                    debug!(
                         event = "continuity_sample",
                         program = %reference.redacted_id(),
                         target = %target_id,
@@ -111,6 +111,10 @@ impl ProgramScheduler {
                             self.config.progress_ttl.stats_window_size
                         ),
                         "Program scheduling diagnostic"
+                    );
+                    RouterMetrics::record_agent_aware_request_interval(
+                        &target_id,
+                        sample.interval_seconds,
                     );
                     factors.push_continuity(sample, self.config.progress_ttl.stats_window_size);
                 }
@@ -247,7 +251,7 @@ impl ProgramScheduler {
                 .bindings
                 .commit_placement(dispatch.program(), text, &dispatch.target_id);
         }
-        info!(
+        debug!(
             event = "request_dispatch",
             program = %dispatch.redacted_program_id(),
             target = %dispatch.target_id,
@@ -683,6 +687,24 @@ impl ProgramScheduler {
             capacity_tokens = ?plan.capacity_tokens,
             "Program scheduling decision"
         );
+        if !self.config.binding_only {
+            let observation = state.observations.get(target_id);
+            RouterMetrics::record_agent_aware_admission(
+                target_id,
+                AgentAwareAdmissionMetrics {
+                    used_tokens: plan.used_tokens,
+                    required_tokens: plan.required_tokens,
+                    reserve_tokens: plan.reserve_tokens,
+                    capacity_tokens: plan.capacity_tokens,
+                    backend_kv_usage_ratio: observation.and_then(|value| value.kv_cache_usage),
+                    backend_running_requests: observation.and_then(|value| value.running_requests),
+                    backend_waiting_requests: observation.and_then(|value| value.waiting_requests),
+                    observation_age: observation
+                        .and_then(|value| value.observed_at)
+                        .map(|observed_at| now.saturating_duration_since(observed_at)),
+                },
+            );
+        }
         let reason = if plan.forced {
             "force_resume"
         } else if plan.batch_gain {

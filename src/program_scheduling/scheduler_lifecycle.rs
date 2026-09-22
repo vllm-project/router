@@ -11,7 +11,7 @@ use super::{
 };
 use crate::metrics::RouterMetrics;
 use std::time::Instant;
-use tracing::info;
+use tracing::{debug, info};
 
 const CACHE_CONTINUITY_HIT_RATIO: f64 = 0.9;
 
@@ -174,6 +174,10 @@ impl ProgramScheduler {
                 decision.context_shrink_observations = 0;
             }
             if success {
+                RouterMetrics::record_agent_aware_cache_miss_impact(
+                    &target_id,
+                    cache_miss_impact_seconds,
+                );
                 if starts_new_segment {
                     decision.segment_served_rounds = 0;
                     decision.ttl_pause_sampled_segment_rounds = 0;
@@ -183,6 +187,12 @@ impl ProgramScheduler {
                         decision.shared_prefix_observed = true;
                         decision.shared_prefix_fresh_until =
                             Some(decision.shared_prefix_freshness_anchor_at + freshness);
+                        if usage.cached_prompt_tokens.is_some() {
+                            RouterMetrics::record_agent_aware_shared_prefix_observation(
+                                &target_id,
+                                explicitly_observed_cache_tokens,
+                            );
+                        }
                     }
                 }
                 let completion_tokens = usage.completion_tokens.unwrap_or(0);
@@ -201,7 +211,30 @@ impl ProgramScheduler {
                     .saturating_add(completion_tokens);
                 decision.last_request_finished_at = Some(now);
                 decision.last_cache_miss_impact_seconds = cache_miss_impact_seconds;
-                info!(
+                if usage.cached_prompt_tokens.is_some()
+                    && previous_context.is_some()
+                    && !dispatch.placement_start_request()
+                    && !cache_continuous
+                {
+                    let previous_context_tokens = previous_context.unwrap_or_default();
+                    info!(
+                        event = "unexpected_cache_discontinuity",
+                        program = %dispatch.redacted_program_id(),
+                        target = %target_id,
+                        prompt_tokens = observed_prompt_tokens,
+                        cached_prompt_tokens,
+                        previous_context_tokens,
+                        cache_hit_vs_previous_context = cached_prompt_tokens as f64
+                            / previous_context_tokens as f64,
+                        uncached_prompt_tokens,
+                        estimated_cache_miss_tokens,
+                        cache_miss_impact_seconds,
+                        segment_served_rounds = decision.segment_served_rounds,
+                        placement_start_request = false,
+                        "Unexpected cache discontinuity within a Program placement"
+                    );
+                }
+                debug!(
                     event = "cache_observation",
                     program = %dispatch.redacted_program_id(),
                     target = %target_id,
@@ -240,7 +273,16 @@ impl ProgramScheduler {
             if completion_action == Some(CompletionAction::StartActingTtl) {
                 decision.acting_since = Some(now);
                 decision.ttl_deadline = Some(now + acting_ttl);
-                info!(
+                RouterMetrics::record_agent_aware_armed_ttl(
+                    &target_id,
+                    if dispatch.request_hints().kv_retention_ttl.is_some() {
+                        "request_hint"
+                    } else {
+                        "fitted"
+                    },
+                    acting_ttl,
+                );
+                debug!(
                     event = "ttl_armed",
                     program = %dispatch.redacted_program_id(),
                     target = %target_id,
@@ -292,6 +334,7 @@ impl ProgramScheduler {
         let now = Instant::now();
         let mut state = self.state.lock();
         self.run_periodic_decisions(&mut state, now);
+        self.report_capacity_accounting_transitions(&mut state, now);
         self.publish_metrics(&state);
     }
 

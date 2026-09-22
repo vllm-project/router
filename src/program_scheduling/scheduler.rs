@@ -3,7 +3,9 @@
 //! Rank-local and global decision algorithms live in sibling modules. This
 //! file owns atomic state access, target discovery, and observation rebasing.
 
-use super::scheduler_state::{ProgramDecisionState, ProgramSchedulerState, RankObservationState};
+use super::scheduler_state::{
+    CapacityAccountingSource, ProgramDecisionState, ProgramSchedulerState, RankObservationState,
+};
 use super::{
     BackendObservation, ProgramBindingCandidate, ProgramIdentity, ProgramRef,
     ProgramSchedulerConfig, ProgramState, ProgramStatus, ProgramTarget, ProgressTtlPolicyMath,
@@ -13,7 +15,7 @@ use parking_lot::Mutex;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tracing::info;
+use tracing::{debug, info, warn};
 
 /// Router-owned Program scheduler.
 #[derive(Debug)]
@@ -328,7 +330,7 @@ impl ProgramScheduler {
     ) {
         let mut state = self.state.lock();
         if epoch.target_snapshot_revision != state.target_snapshot_revision {
-            info!(
+            warn!(
                 event = "stale_capacity_observation_dropped",
                 epoch_revision = epoch.target_snapshot_revision,
                 current_revision = state.target_snapshot_revision,
@@ -373,7 +375,7 @@ impl ProgramScheduler {
             observation.observed_at = Some(raw.observed_at);
             let active_program_token_delta = observation.active_program_token_delta;
             let estimated_total_tokens = self.target_usage(&state, &target_id, raw.observed_at);
-            info!(
+            debug!(
                 event = "capacity_observation",
                 target = %target_id,
                 kv_cache_usage = ?raw.kv_cache_usage,
@@ -549,6 +551,69 @@ impl ProgramScheduler {
             now.saturating_duration_since(observed_at)
                 <= self.config.metrics_interval.saturating_mul(3)
         })
+    }
+
+    pub(crate) fn capacity_accounting_source(
+        &self,
+        observation: Option<&RankObservationState>,
+        now: Instant,
+    ) -> CapacityAccountingSource {
+        let Some(observation) = observation else {
+            return CapacityAccountingSource::RouterLedgerMissingObservation;
+        };
+        let Some(observed_at) = observation.observed_at else {
+            return CapacityAccountingSource::RouterLedgerMissingObservation;
+        };
+        if now.saturating_duration_since(observed_at)
+            > self.config.metrics_interval.saturating_mul(3)
+        {
+            return CapacityAccountingSource::RouterLedgerStaleObservation;
+        }
+        if observation.estimated_active_program_tokens.is_none() {
+            return CapacityAccountingSource::RouterLedgerMissingTokenEstimate;
+        }
+        CapacityAccountingSource::BackendObservation
+    }
+
+    pub(crate) fn report_capacity_accounting_transitions(
+        &self,
+        state: &mut ProgramSchedulerState,
+        now: Instant,
+    ) {
+        let target_ids = state.targets.keys().cloned().collect::<Vec<_>>();
+        for target_id in target_ids {
+            let source = self.capacity_accounting_source(state.observations.get(&target_id), now);
+            let observation = state.observations.entry(target_id.clone()).or_default();
+            let previous = observation.reported_capacity_source.replace(source);
+            if previous == Some(source) {
+                continue;
+            }
+            let observation_age_seconds = observation
+                .observed_at
+                .map(|observed_at| now.saturating_duration_since(observed_at).as_secs_f64());
+            if source == CapacityAccountingSource::BackendObservation {
+                if let Some(previous) = previous {
+                    info!(
+                        event = "capacity_observation_recovered",
+                        target = %target_id,
+                        previous_capacity_accounting_source = previous.as_str(),
+                        capacity_accounting_source = source.as_str(),
+                        observation_age_seconds = ?observation_age_seconds,
+                        "Program scheduling resumed backend-observation capacity accounting"
+                    );
+                }
+            } else {
+                warn!(
+                    event = "capacity_observation_fallback",
+                    target = %target_id,
+                    previous_capacity_accounting_source = previous.map(|value| value.as_str()),
+                    capacity_accounting_source = source.as_str(),
+                    observation_age_seconds = ?observation_age_seconds,
+                    freshness_threshold_seconds = self.config.metrics_interval.saturating_mul(3).as_secs_f64(),
+                    "Program scheduling is using Router-ledger capacity accounting"
+                );
+            }
+        }
     }
 
     pub(crate) fn target_usage(

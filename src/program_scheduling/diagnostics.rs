@@ -109,6 +109,8 @@ pub struct RankDiagnostic {
     pub vllm_running_requests: Option<usize>,
     pub vllm_waiting_requests: Option<usize>,
     pub observation_age_seconds: Option<f64>,
+    pub observation_fresh: bool,
+    pub capacity_accounting_source: &'static str,
     pub rolling: RankRollingDiagnostic,
     pub programs: Vec<ProgramDiagnostic>,
 }
@@ -128,6 +130,7 @@ pub struct ProgramSchedulerDiagnostic {
 impl ProgramScheduler {
     /// Refresh bounded-cardinality gauges only from the periodic tick path.
     pub(crate) fn publish_metrics(&self, state: &ProgramSchedulerState) {
+        let now = Instant::now();
         let views = state.runtime.views();
         for target_id in state.targets.keys() {
             let queued = views
@@ -159,6 +162,13 @@ impl ProgramScheduler {
                 )
             });
             RouterMetrics::set_agent_aware_rank_state(target_id, queued, active);
+            RouterMetrics::set_agent_aware_capacity_observation_fresh(
+                target_id,
+                state
+                    .observations
+                    .get(target_id)
+                    .is_some_and(|observation| self.observation_is_fresh(observation, now)),
+            );
             RouterMetrics::set_agent_aware_adaptive_state(
                 target_id,
                 factors.map_or(std::time::Duration::ZERO, |value| {
@@ -167,6 +177,7 @@ impl ProgramScheduler {
                 factors.map_or(0.0, |value| value.average_context_growth_tokens()),
                 factors.map_or(0, |value| value.request_sample_count()),
                 factors.map_or(0, |value| value.continuity_sample_count()),
+                average_impact,
             );
         }
     }
@@ -179,6 +190,7 @@ impl ProgramScheduler {
         let mut ranks = Vec::with_capacity(state.targets.len());
         for (target_id, target) in &state.targets {
             let observation = state.observations.get(target_id);
+            let capacity_accounting_source = self.capacity_accounting_source(observation, now);
             let mut programs = state
                 .runtime
                 .views()
@@ -406,6 +418,9 @@ impl ProgramScheduler {
                         .observed_at
                         .map(|at| now.saturating_duration_since(at).as_secs_f64())
                 }),
+                observation_fresh: observation
+                    .is_some_and(|value| self.observation_is_fresh(value, now)),
+                capacity_accounting_source: capacity_accounting_source.as_str(),
                 rolling,
                 programs,
             });
@@ -456,5 +471,70 @@ mod tests {
         assert_eq!(snapshot.ranks[0].router_active_reasoning_programs, 1);
         assert_eq!(snapshot.ranks[0].programs[0].estimated_context_tokens, 123);
         assert!(snapshot.ranks[0].programs[0].expected_resume);
+        assert!(!snapshot.ranks[0].observation_fresh);
+        assert_eq!(
+            snapshot.ranks[0].capacity_accounting_source,
+            "router_ledger_missing_observation"
+        );
+    }
+
+    #[test]
+    fn snapshot_identifies_fresh_backend_capacity_accounting() {
+        let mut config = ProgramSchedulerConfig::default();
+        config.progress_ttl.token_capacity = Some(1_000);
+        let scheduler = ProgramScheduler::new(config);
+        let target = ProgramTarget {
+            id: "rank-0".into(),
+            base_url: "http://worker".into(),
+            dp_rank: Some(0),
+        };
+        scheduler.sync_targets("model", std::slice::from_ref(&target));
+        let epoch = scheduler.begin_observation(std::slice::from_ref(&target));
+        scheduler.apply_observations(
+            epoch,
+            [super::super::BackendObservation {
+                target_id: target.id.clone(),
+                base_url: target.base_url.clone(),
+                dp_rank: target.dp_rank,
+                kv_cache_usage: Some(0.25),
+                running_requests: Some(1),
+                waiting_requests: Some(0),
+                observed_at: Instant::now(),
+            }],
+        );
+
+        let snapshot = scheduler.diagnostics();
+        assert!(snapshot.ranks[0].observation_fresh);
+        assert_eq!(
+            snapshot.ranks[0].capacity_accounting_source,
+            "backend_observation"
+        );
+    }
+
+    #[test]
+    fn snapshot_identifies_stale_backend_capacity_fallback() {
+        let mut config = ProgramSchedulerConfig::default();
+        config.metrics_interval = std::time::Duration::from_secs(1);
+        config.progress_ttl.token_capacity = Some(1_000);
+        let scheduler = ProgramScheduler::new(config);
+        let target = ProgramTarget {
+            id: "rank-0".into(),
+            base_url: "http://worker".into(),
+            dp_rank: Some(0),
+        };
+        scheduler.sync_targets("model", std::slice::from_ref(&target));
+        {
+            let mut state = scheduler.state.lock();
+            let observation = state.observations.get_mut(&target.id).unwrap();
+            observation.observed_at = Some(Instant::now() - std::time::Duration::from_secs(4));
+            observation.estimated_active_program_tokens = Some(250.0);
+        }
+
+        let snapshot = scheduler.diagnostics();
+        assert!(!snapshot.ranks[0].observation_fresh);
+        assert_eq!(
+            snapshot.ranks[0].capacity_accounting_source,
+            "router_ledger_stale_observation"
+        );
     }
 }

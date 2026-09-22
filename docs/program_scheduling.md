@@ -63,6 +63,10 @@ curl -fsS http://127.0.0.1:3001/health
 curl -fsS http://127.0.0.1:3001/scheduling/diagnostics | python -m json.tool
 ```
 
+The diagnostics report `observation_age_seconds`, `observation_fresh`, and `capacity_accounting_source` for each target. If a capacity observation is missing, stale (older than three polling intervals), or cannot produce a token estimate, scheduling preserves its existing Router-ledger fallback. The Router emits one `capacity_observation_fallback` warning when the source changes into a fallback state and one `capacity_observation_recovered` event when usable backend accounting returns; it does not repeat the same warning every polling interval.
+
+At INFO level, Program scheduling logs committed `program_admit` and `program_pause` transitions plus `unexpected_cache_discontinuity` when an explicitly observed cache hit unexpectedly breaks within one placement. High-frequency `capacity_observation`, `cache_observation`, `ttl_armed`, `request_dispatch`, and `continuity_sample` events remain available at DEBUG. Their normal-path numerical data is also exposed through the `vllm_router_agent_aware_*` Prometheus metrics, including cache-miss impact, request intervals, armed TTL, explicit shared-prefix observations, and admission capacity snapshots. Metric labels are limited to target IDs and bounded enums.
+
 Identity-free requests do not create Program state, enter RequestPool, or trigger Program backend polling. Existing `x-session-id` Consistent Hash routing therefore remains the fallback unless `auto` is explicitly configured.
 
 ## Configuration reference

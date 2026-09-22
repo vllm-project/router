@@ -287,6 +287,26 @@ pub(crate) struct RankObservationState {
     pub(crate) estimated_active_program_tokens: Option<f64>,
     pub(crate) observed_at: Option<Instant>,
     pub(crate) active_program_token_delta: f64,
+    pub(crate) reported_capacity_source: Option<CapacityAccountingSource>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CapacityAccountingSource {
+    BackendObservation,
+    RouterLedgerMissingObservation,
+    RouterLedgerStaleObservation,
+    RouterLedgerMissingTokenEstimate,
+}
+
+impl CapacityAccountingSource {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::BackendObservation => "backend_observation",
+            Self::RouterLedgerMissingObservation => "router_ledger_missing_observation",
+            Self::RouterLedgerStaleObservation => "router_ledger_stale_observation",
+            Self::RouterLedgerMissingTokenEstimate => "router_ledger_missing_token_estimate",
+        }
+    }
 }
 
 /// All mutable data committed under one scheduler lock.
