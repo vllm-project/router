@@ -99,6 +99,9 @@ pub enum ChatMessage {
         content: String,
         name: String,
     },
+    /// Unknown or model-specific message roles are preserved verbatim so the
+    /// downstream inference backend can validate and interpret them.
+    Other(Value),
 }
 
 impl<'de> Deserialize<'de> for ChatMessage {
@@ -215,7 +218,7 @@ impl<'de> Deserialize<'de> for ChatMessage {
                     .unwrap_or("")
                     .to_string(),
             }),
-            _ => Err(D::Error::custom(format!("unknown role: {}", role))),
+            _ => Ok(ChatMessage::Other(value)),
         }
     }
 }
@@ -3777,6 +3780,70 @@ mod tests {
                 assert_eq!(name, "my_function");
             }
             _ => panic!("Expected Function message"),
+        }
+    }
+
+    #[test]
+    fn test_chat_message_latest_reminder_roundtrip() {
+        let original = serde_json::json!({
+            "role": "latest_reminder",
+            "content": "Follow the latest instructions.",
+            "model_specific_field": {
+                "priority": 1,
+                "enabled": true
+            }
+        });
+
+        let message: ChatMessage = serde_json::from_value(original.clone()).unwrap();
+        match &message {
+            ChatMessage::Other(value) => assert_eq!(value, &original),
+            _ => panic!("Expected unknown role to use the Other variant"),
+        }
+
+        assert_eq!(serde_json::to_value(message).unwrap(), original);
+    }
+
+    #[test]
+    fn test_chat_message_arbitrary_role_roundtrip() {
+        let original = serde_json::json!({
+            "role": "developer",
+            "content": [
+                {"type": "text", "text": "Model-specific instructions"}
+            ],
+            "future_field": [1, 2, 3]
+        });
+
+        let message: ChatMessage = serde_json::from_value(original.clone()).unwrap();
+        assert!(matches!(message, ChatMessage::Other(_)));
+        assert_eq!(serde_json::to_value(message).unwrap(), original);
+    }
+
+    #[test]
+    fn test_chat_completion_request_preserves_unknown_role_message() {
+        let original = serde_json::json!({
+            "model": "deepseek-model",
+            "messages": [{
+                "role": "latest_reminder",
+                "content": "Remember the latest user request.",
+                "metadata": {"source": "deepseek"}
+            }]
+        });
+
+        let request: ChatCompletionRequest = serde_json::from_value(original.clone()).unwrap();
+        assert!(matches!(&request.messages[0], ChatMessage::Other(_)));
+
+        let serialized = serde_json::to_value(request).unwrap();
+        assert_eq!(serialized["messages"], original["messages"]);
+    }
+
+    #[test]
+    fn test_chat_message_rejects_missing_or_non_string_role() {
+        for invalid in [
+            serde_json::json!({"content": "missing role"}),
+            serde_json::json!({"role": 42, "content": "invalid role"}),
+        ] {
+            let error = serde_json::from_value::<ChatMessage>(invalid).unwrap_err();
+            assert!(error.to_string().contains("missing role field"));
         }
     }
 
