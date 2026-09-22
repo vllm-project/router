@@ -23,6 +23,15 @@ target
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 .idea/
 
+# --- 本地构建产物 / 导出物（勿提交）---
+# dist-arm64 是 ARM64 镜像构建时导出的完整 Linux rootfs（约 6.7 万文件 / 3 GB），
+# 注意上面的 `dist/` 不匹配 `dist-arm64/`，所以必须单独写。
+# 放在仓库内会让 VS Code 文件监听、devcontainer 同步、跨 /mnt/c 扫描全部变慢。
+dist-arm64/
+# 构建好的 wheel 与编译日志
+*.whl
+build.log
+
 # Local test cache
 .tokenizer_cache/
 # Python virtual environment

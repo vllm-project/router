@@ -704,7 +704,93 @@ impl VllmPDRouter {
             for (name, value) in decode_headers.iter() {
                 response_builder = response_builder.header(name, value);
             }
-            let body = axum::body::Body::from_stream(decode_response.bytes_stream());
+
+            // Streaming requests also need usage normalization.
+            //
+            // vLLM emits the usage object only in the last chunk before `data: [DONE]`
+            // (stream_options.include_usage), and decode-side cached_tokens may carry an
+            // invalid placeholder such as -1. Without this merge, a streaming client sees
+            // that placeholder instead of the value prefill actually computed — the
+            // non-streaming path already normalizes usage below.
+            //
+            // The transform is line-oriented and deliberately holds back at most one SSE
+            // line, so bytes still flow through incrementally; see SseUsageMerger.
+            let prefill_for_stream: Option<Value> = prefill_response_json.cloned();
+            // 用 info! 而非 debug!：这条决定"合不合并"，是排查流式 cached_tokens 的
+            // 第一现场，默认 INFO 级别必须可见。
+            info!(
+                "Streaming PD response: usage merge {} (prefill usage={:?})",
+                if prefill_for_stream.is_some() {
+                    "enabled"
+                } else {
+                    "SKIPPED — no prefill response JSON, will pass through verbatim"
+                },
+                prefill_for_stream
+                    .as_ref()
+                    .and_then(|p| p.get("usage"))
+                    .is_some()
+            );
+            let merger = logprobs_merge::SseUsageMerger::default();
+            let decode_stream = decode_response.bytes_stream();
+
+            // 用 futures::stream::unfold 做增量转换（不引入 async-stream 新依赖）。
+            // 状态里带一个 `done` 标志：主循环结束后再跑一次，把 SseUsageMerger 扣住的
+            // 最后一行放出去（流异常中断、没等到 [DONE] 时也要放，否则那行会丢）。
+            let merged_stream = futures::stream::unfold(
+                (decode_stream, merger, prefill_for_stream, false),
+                |(mut stream, mut merger, prefill, mut done)| async move {
+                    loop {
+                        if done {
+                            return None;
+                        }
+                        match futures_util::StreamExt::next(&mut stream).await {
+                            Some(Ok(chunk)) => {
+                                let passthrough = match prefill.as_ref() {
+                                    Some(prefill) => merger.feed(&chunk, prefill),
+                                    None => chunk.to_vec(),
+                                };
+                                if passthrough.is_empty() {
+                                    continue;
+                                }
+                                return Some((
+                                    Ok::<_, std::io::Error>(bytes::Bytes::from(passthrough)),
+                                    (stream, merger, prefill, done),
+                                ));
+                            }
+                            Some(Err(e)) => {
+                                done = true;
+                                return Some((
+                                    Err(std::io::Error::other(e)),
+                                    (stream, merger, prefill, done),
+                                ));
+                            }
+                            None => {
+                                done = true;
+                                let tail = match prefill.as_ref() {
+                                    Some(prefill) => merger.finish(prefill),
+                                    None => Vec::new(),
+                                };
+                                // 结果日志用 info!：这是"到底合并了没有"的结论，
+                                // debug! 在默认级别下看不见，会让排查无从下手。
+                                info!(
+                                    "Streaming PD response finished: merged={}, tail_bytes={}",
+                                    merger.did_merge(),
+                                    tail.len()
+                                );
+                                if tail.is_empty() {
+                                    return None;
+                                }
+                                return Some((
+                                    Ok(bytes::Bytes::from(tail)),
+                                    (stream, merger, prefill, done),
+                                ));
+                            }
+                        }
+                    }
+                },
+            );
+
+            let body = axum::body::Body::from_stream(merged_stream);
             return response_builder.body(body).map_err(|e| {
                 format!(
                     "Failed to build streaming response from {}: {}",
@@ -1577,10 +1663,16 @@ impl VllmPDRouter {
             });
         }
 
-        // Streaming responses are returned directly without any merge step.
+        // Streaming responses need usage normalization, same as the non-streaming
+        // branch above.
+        //
+        // ⚠️ 这里是**第二个**流式透传点：`route_chat` 的 direct URL 模式走
+        // `process_vllm_two_stage_request`（本函数），而不是 `handle_decode_response`。
+        // 两处都要接 SseUsageMerger，只改一处会漏（实测踩过：单元测试全绿，
+        // 但端到端仍返回 -1）。
         debug!(
-            "No logprobs merging needed (streaming={}, needs_logprobs={})",
-            is_streaming, needs_logprobs
+            "Streaming PD response (two-stage): merging usage (needs_logprobs={})",
+            needs_logprobs
         );
 
         let mut response_builder = Response::builder().status(status);
@@ -1590,7 +1682,75 @@ impl VllmPDRouter {
             }
         }
 
-        let body = Body::from_stream(decode_response.bytes_stream());
+        let prefill_for_stream: Option<Value> = Some(prefill_response_json.clone());
+        info!(
+            "Streaming PD response (two-stage): usage merge {} (prefill has usage={})",
+            if prefill_for_stream.is_some() {
+                "enabled"
+            } else {
+                "SKIPPED"
+            },
+            prefill_for_stream
+                .as_ref()
+                .and_then(|p| p.get("usage"))
+                .is_some()
+        );
+
+        let merger = logprobs_merge::SseUsageMerger::default();
+        let decode_stream = decode_response.bytes_stream();
+        let merged_stream = futures::stream::unfold(
+            (decode_stream, merger, prefill_for_stream, false),
+            |(mut stream, mut merger, prefill, mut done)| async move {
+                loop {
+                    if done {
+                        return None;
+                    }
+                    match futures_util::StreamExt::next(&mut stream).await {
+                        Some(Ok(chunk)) => {
+                            let passthrough = match prefill.as_ref() {
+                                Some(prefill) => merger.feed(&chunk, prefill),
+                                None => chunk.to_vec(),
+                            };
+                            if passthrough.is_empty() {
+                                continue;
+                            }
+                            return Some((
+                                Ok::<_, std::io::Error>(bytes::Bytes::from(passthrough)),
+                                (stream, merger, prefill, done),
+                            ));
+                        }
+                        Some(Err(e)) => {
+                            done = true;
+                            return Some((
+                                Err(std::io::Error::other(e)),
+                                (stream, merger, prefill, done),
+                            ));
+                        }
+                        None => {
+                            done = true;
+                            let tail = match prefill.as_ref() {
+                                Some(prefill) => merger.finish(prefill),
+                                None => Vec::new(),
+                            };
+                            info!(
+                                "Streaming PD response (two-stage) finished: merged={}, tail_bytes={}",
+                                merger.did_merge(),
+                                tail.len()
+                            );
+                            if tail.is_empty() {
+                                return None;
+                            }
+                            return Some((
+                                Ok(bytes::Bytes::from(tail)),
+                                (stream, merger, prefill, done),
+                            ));
+                        }
+                    }
+                }
+            },
+        );
+
+        let body = Body::from_stream(merged_stream);
         response_builder
             .body(body)
             .map_err(|e| PDRouterError::NetworkError {
