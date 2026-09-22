@@ -34,7 +34,7 @@ Library users configure Program scheduling through `RouterConfig.program_schedul
 
 `global_queue: true` is the recommended deployment mode. The Router first tries to resume a paused Program on its previous Rank and considers cross-Rank placement only when the configured capacity and headroom checks allow it. Set it to `false` only when strict Rank-local scheduling is required.
 
-To adapt Program scheduling to a different model or hardware configuration, operators generally only need to recalibrate `prefill_cost_model` and `decode_throughput_model`. The calibration tools in [openJiuwen AgentInfer](https://github.com/openJiuwen-ai/agent-infer/tree/main/tools) can be used to derive these coefficients for the target deployment.
+To adapt Program scheduling to a different model or hardware configuration, operators generally only need to recalibrate `prefill_cost_model` and `decode_throughput_model`. The [AgentInfer backend calibration README](https://github.com/openJiuwen-ai/agent-infer/blob/main/tools/calibration/README.md) describes how to measure these coefficients for the target deployment.
 
 ## Launch the Router
 
@@ -151,7 +151,20 @@ Acting Programs are not reclaimed by admission or resume. Their TTL and terminal
 
 ## Offline calibration models
 
-The prefill and decode coefficients depend on the model, accelerator, parallel configuration, inference-engine version, and execution settings. Operators should measure them on the deployed backend rather than copying values calibrated for a different system. The built-in values remain backward-compatible defaults.
+The prefill and decode coefficients depend on the model, accelerator, parallel configuration, inference-engine version, and execution settings. Operators should measure them on the deployed backend rather than copying values calibrated for a different system. Follow the [AgentInfer backend calibration procedure](https://github.com/openJiuwen-ai/agent-infer/blob/main/tools/calibration/README.md), retain its fit-quality evidence, and copy the constrained coefficients from `calibration.json` into the Router configuration:
+
+| AgentInfer `calibration.json` coefficient | Router field |
+|---|---|
+| `ttl_prefill_model_intercept_seconds` | `prefill_cost_model.intercept_seconds` |
+| `ttl_prefill_model_linear_seconds_per_1k_tokens` | `prefill_cost_model.linear_seconds_per_1k_tokens` |
+| `ttl_prefill_model_quadratic_seconds_per_1k_tokens_squared` | `prefill_cost_model.quadratic_seconds_per_1k_tokens_squared` |
+| `decode_step_fixed_seconds` | `decode_throughput_model.fixed_step_seconds` |
+| `decode_step_seconds_per_request` | `decode_throughput_model.batch_step_seconds_per_request` |
+| `decode_step_seconds_per_context_token` | `decode_throughput_model.context_step_seconds_per_token` |
+
+`prefill_cost_model.decode_throughput_alpha` represents retained decode throughput while prefill is mixed into the batch and is configured separately; the current cold-prefill and warm-prefix decode calibration artifact does not derive it.
+
+The built-in values remain backward-compatible defaults. When Program scheduling is enabled with `binding_only: false` and one or more coefficient fields are omitted, startup emits `program_scheduling_reference_calibration`. The warning lists exactly which fields used defaults, reports the effective reference estimates (about `13.93` seconds for a 50,000-token cold prefill and `98.23` aggregate tokens/second for batch size 4 with 200,000 total context tokens when all reference defaults apply), and warns that a deployment mismatch can degrade scheduling decisions. Explicitly configuring all seven fields suppresses the warning; invalid explicit values remain configuration errors.
 
 For `x = uncached_prompt_tokens / 1000`, the cold-prefill estimate is `prefill_seconds = intercept_seconds + linear_seconds_per_1k_tokens * x + quadratic_seconds_per_1k_tokens_squared * x^2`. Progress-TTL includes mixed-batch decode interference as `cache_miss_impact_seconds = prefill_seconds * (2 - decode_throughput_alpha)`.
 

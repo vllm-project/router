@@ -1,6 +1,6 @@
 use super::ConfigResult;
 use crate::config::validation::ConfigValidator;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
 
 use crate::program_scheduling::{
@@ -107,7 +107,7 @@ fn default_intra_node_data_parallel_size() -> usize {
 /// This is intentionally separate from request-level `PolicyConfig`. The
 /// binding policy is evaluated once for a new Program generation; admission
 /// and resume remain ProgramScheduler decisions.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct ProgramSchedulingConfig {
     /// Metadata source that opts an individual request into Program scheduling.
     #[serde(
@@ -166,6 +166,63 @@ pub struct ProgramSchedulingConfig {
     /// Offline-calibrated aggregate decode-throughput surface.
     #[serde(default)]
     pub decode_throughput_model: DecodeThroughputModel,
+    /// Tracks which offline calibration coefficients were explicitly supplied.
+    #[serde(skip)]
+    pub(crate) explicit_calibration_fields: ExplicitCalibrationFields,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct ExplicitCalibrationFields(u8);
+
+impl PartialEq for ExplicitCalibrationFields {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+const PREFILL_INTERCEPT_EXPLICIT: u8 = 1 << 0;
+const PREFILL_LINEAR_EXPLICIT: u8 = 1 << 1;
+const PREFILL_QUADRATIC_EXPLICIT: u8 = 1 << 2;
+const PREFILL_DECODE_ALPHA_EXPLICIT: u8 = 1 << 3;
+const DECODE_FIXED_EXPLICIT: u8 = 1 << 4;
+const DECODE_BATCH_EXPLICIT: u8 = 1 << 5;
+const DECODE_CONTEXT_EXPLICIT: u8 = 1 << 6;
+impl ProgramSchedulingConfig {
+    pub(crate) fn defaulted_calibration_fields(&self) -> Vec<&'static str> {
+        [
+            (
+                PREFILL_INTERCEPT_EXPLICIT,
+                "prefill_cost_model.intercept_seconds",
+            ),
+            (
+                PREFILL_LINEAR_EXPLICIT,
+                "prefill_cost_model.linear_seconds_per_1k_tokens",
+            ),
+            (
+                PREFILL_QUADRATIC_EXPLICIT,
+                "prefill_cost_model.quadratic_seconds_per_1k_tokens_squared",
+            ),
+            (
+                PREFILL_DECODE_ALPHA_EXPLICIT,
+                "prefill_cost_model.decode_throughput_alpha",
+            ),
+            (
+                DECODE_FIXED_EXPLICIT,
+                "decode_throughput_model.fixed_step_seconds",
+            ),
+            (
+                DECODE_BATCH_EXPLICIT,
+                "decode_throughput_model.batch_step_seconds_per_request",
+            ),
+            (
+                DECODE_CONTEXT_EXPLICIT,
+                "decode_throughput_model.context_step_seconds_per_token",
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(mask, name)| (self.explicit_calibration_fields.0 & mask == 0).then_some(name))
+        .collect()
+    }
 }
 
 impl Default for ProgramSchedulingConfig {
@@ -199,7 +256,176 @@ impl Default for ProgramSchedulingConfig {
             enable_batch_gain_admission: default_program_enable_batch_gain_admission(),
             prefill_cost_model: PrefillCostModel::default(),
             decode_throughput_model: DecodeThroughputModel::default(),
+            explicit_calibration_fields: ExplicitCalibrationFields::default(),
         }
+    }
+}
+
+#[derive(Deserialize)]
+struct ProgramSchedulingConfigInput {
+    #[serde(
+        default,
+        rename = "program_scheduling_enable_key",
+        alias = "enable_key"
+    )]
+    enable_key: ProgramSchedulingEnableKey,
+    #[serde(default)]
+    binding_only: bool,
+    #[serde(default)]
+    global_queue: bool,
+    #[serde(default)]
+    resume_order: ProgramResumeOrder,
+    #[serde(default = "default_program_cross_rank_headroom_ratio")]
+    cross_rank_headroom_ratio: f64,
+    #[serde(default)]
+    binding_strategy: ProgramBindingStrategy,
+    #[serde(default = "default_program_hash_virtual_nodes")]
+    hash_virtual_nodes: u32,
+    #[serde(default)]
+    token_capacity_per_target: Option<usize>,
+    #[serde(default = "default_program_max_active_programs_per_target")]
+    max_active_programs_per_target: usize,
+    #[serde(default = "default_program_metrics_interval_seconds")]
+    metrics_interval_seconds: f64,
+    #[serde(default = "default_program_admission_waiting_request_threshold")]
+    admission_waiting_request_threshold: usize,
+    #[serde(default = "default_program_queue_timeout_seconds")]
+    queue_timeout_seconds: f64,
+    #[serde(default = "default_program_force_resume_timeout_seconds")]
+    force_resume_timeout_seconds: f64,
+    #[serde(default = "default_program_paused_retention_ttl_seconds")]
+    paused_retention_ttl_seconds: f64,
+    #[serde(default = "default_program_shared_prefix_freshness_warmup_seconds")]
+    shared_prefix_freshness_warmup_seconds: f64,
+    #[serde(default = "default_program_shared_prefix_freshness_kv_turnovers")]
+    shared_prefix_freshness_kv_turnovers: f64,
+    #[serde(default = "default_program_decode_buffer_tokens")]
+    decode_buffer_tokens: usize,
+    #[serde(default = "default_program_max_acting_ttl_seconds")]
+    max_acting_ttl_seconds: f64,
+    #[serde(default = "default_program_high_watermark_ratio")]
+    high_watermark_ratio: f64,
+    #[serde(default = "default_program_low_watermark_ratio")]
+    low_watermark_ratio: f64,
+    #[serde(default = "default_program_max_segment_rounds")]
+    max_segment_rounds: usize,
+    #[serde(default = "default_program_stats_window_size")]
+    stats_window_size: usize,
+    #[serde(default = "default_program_enable_batch_gain_admission")]
+    enable_batch_gain_admission: bool,
+    #[serde(default)]
+    prefill_cost_model: PrefillCostModelInput,
+    #[serde(default)]
+    decode_throughput_model: DecodeThroughputModelInput,
+}
+
+#[derive(Default, Deserialize)]
+struct PrefillCostModelInput {
+    intercept_seconds: Option<f64>,
+    linear_seconds_per_1k_tokens: Option<f64>,
+    quadratic_seconds_per_1k_tokens_squared: Option<f64>,
+    decode_throughput_alpha: Option<f64>,
+}
+
+#[derive(Default, Deserialize)]
+struct DecodeThroughputModelInput {
+    fixed_step_seconds: Option<f64>,
+    batch_step_seconds_per_request: Option<f64>,
+    context_step_seconds_per_token: Option<f64>,
+}
+
+impl<'de> Deserialize<'de> for ProgramSchedulingConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let input = ProgramSchedulingConfigInput::deserialize(deserializer)?;
+        let mut explicit_calibration_fields = 0;
+        let prefill_defaults = PrefillCostModel::default();
+        let decode_defaults = DecodeThroughputModel::default();
+
+        macro_rules! configured_or_default {
+            ($value:expr, $default:expr, $mask:expr) => {
+                match $value {
+                    Some(value) => {
+                        explicit_calibration_fields |= $mask;
+                        value
+                    }
+                    None => $default,
+                }
+            };
+        }
+
+        let prefill_cost_model = PrefillCostModel {
+            intercept_seconds: configured_or_default!(
+                input.prefill_cost_model.intercept_seconds,
+                prefill_defaults.intercept_seconds,
+                PREFILL_INTERCEPT_EXPLICIT
+            ),
+            linear_seconds_per_1k_tokens: configured_or_default!(
+                input.prefill_cost_model.linear_seconds_per_1k_tokens,
+                prefill_defaults.linear_seconds_per_1k_tokens,
+                PREFILL_LINEAR_EXPLICIT
+            ),
+            quadratic_seconds_per_1k_tokens_squared: configured_or_default!(
+                input
+                    .prefill_cost_model
+                    .quadratic_seconds_per_1k_tokens_squared,
+                prefill_defaults.quadratic_seconds_per_1k_tokens_squared,
+                PREFILL_QUADRATIC_EXPLICIT
+            ),
+            decode_throughput_alpha: configured_or_default!(
+                input.prefill_cost_model.decode_throughput_alpha,
+                prefill_defaults.decode_throughput_alpha,
+                PREFILL_DECODE_ALPHA_EXPLICIT
+            ),
+        };
+        let decode_throughput_model = DecodeThroughputModel {
+            fixed_step_seconds: configured_or_default!(
+                input.decode_throughput_model.fixed_step_seconds,
+                decode_defaults.fixed_step_seconds,
+                DECODE_FIXED_EXPLICIT
+            ),
+            batch_step_seconds_per_request: configured_or_default!(
+                input.decode_throughput_model.batch_step_seconds_per_request,
+                decode_defaults.batch_step_seconds_per_request,
+                DECODE_BATCH_EXPLICIT
+            ),
+            context_step_seconds_per_token: configured_or_default!(
+                input.decode_throughput_model.context_step_seconds_per_token,
+                decode_defaults.context_step_seconds_per_token,
+                DECODE_CONTEXT_EXPLICIT
+            ),
+        };
+
+        Ok(Self {
+            enable_key: input.enable_key,
+            binding_only: input.binding_only,
+            global_queue: input.global_queue,
+            resume_order: input.resume_order,
+            cross_rank_headroom_ratio: input.cross_rank_headroom_ratio,
+            binding_strategy: input.binding_strategy,
+            hash_virtual_nodes: input.hash_virtual_nodes,
+            token_capacity_per_target: input.token_capacity_per_target,
+            max_active_programs_per_target: input.max_active_programs_per_target,
+            metrics_interval_seconds: input.metrics_interval_seconds,
+            admission_waiting_request_threshold: input.admission_waiting_request_threshold,
+            queue_timeout_seconds: input.queue_timeout_seconds,
+            force_resume_timeout_seconds: input.force_resume_timeout_seconds,
+            paused_retention_ttl_seconds: input.paused_retention_ttl_seconds,
+            shared_prefix_freshness_warmup_seconds: input.shared_prefix_freshness_warmup_seconds,
+            shared_prefix_freshness_kv_turnovers: input.shared_prefix_freshness_kv_turnovers,
+            decode_buffer_tokens: input.decode_buffer_tokens,
+            max_acting_ttl_seconds: input.max_acting_ttl_seconds,
+            high_watermark_ratio: input.high_watermark_ratio,
+            low_watermark_ratio: input.low_watermark_ratio,
+            max_segment_rounds: input.max_segment_rounds,
+            stats_window_size: input.stats_window_size,
+            enable_batch_gain_admission: input.enable_batch_gain_admission,
+            prefill_cost_model,
+            decode_throughput_model,
+            explicit_calibration_fields: ExplicitCalibrationFields(explicit_calibration_fields),
+        })
     }
 }
 
@@ -871,6 +1097,28 @@ mod tests {
                 .context_step_seconds_per_token,
             DecodeThroughputModel::default().context_step_seconds_per_token
         );
+        assert_eq!(
+            partial.defaulted_calibration_fields(),
+            vec![
+                "prefill_cost_model.intercept_seconds",
+                "prefill_cost_model.linear_seconds_per_1k_tokens",
+                "prefill_cost_model.quadratic_seconds_per_1k_tokens_squared",
+                "decode_throughput_model.batch_step_seconds_per_request",
+                "decode_throughput_model.context_step_seconds_per_token",
+            ]
+        );
+        assert!(config.defaulted_calibration_fields().is_empty());
+
+        let omitted: ProgramSchedulingConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(omitted.defaulted_calibration_fields().len(), 7);
+        assert_eq!(
+            serde_json::to_value(&omitted).unwrap()["prefill_cost_model"]["intercept_seconds"],
+            PrefillCostModel::default().intercept_seconds
+        );
+        let explicit_defaults: ProgramSchedulingConfig =
+            serde_json::from_value(serde_json::to_value(&omitted).unwrap()).unwrap();
+        assert!(explicit_defaults.defaulted_calibration_fields().is_empty());
+        assert_eq!(explicit_defaults, omitted);
     }
 
     // ============= RoutingMode Tests =============

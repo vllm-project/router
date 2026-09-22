@@ -195,6 +195,9 @@ impl Router {
             None
         };
 
+        if let Some(config) = ctx.router_config.program_scheduling.as_ref() {
+            Self::warn_on_default_program_calibration(config);
+        }
         let program_scheduler = ctx
             .router_config
             .program_scheduling
@@ -253,6 +256,44 @@ impl Router {
             program_targets_cache: Mutex::new(HashMap::new()),
             program_token_estimator: Arc::new(MomentumTokenEstimator::default()),
         })
+    }
+
+    fn warn_on_default_program_calibration(config: &crate::config::types::ProgramSchedulingConfig) {
+        if config.binding_only {
+            return;
+        }
+        let defaulted_fields = config.defaulted_calibration_fields();
+        if defaulted_fields.is_empty() {
+            return;
+        }
+
+        const REFERENCE_PROMPT_TOKENS: f64 = 50_000.0;
+        const REFERENCE_DECODE_BATCH_SIZE: f64 = 4.0;
+        const REFERENCE_DECODE_CONTEXT_TOKENS_PER_REQUEST: f64 = 50_000.0;
+        const REFERENCE_DECODE_CONTEXT_TOKENS: f64 = 200_000.0;
+        let prompt_1k = REFERENCE_PROMPT_TOKENS / 1_000.0;
+        let prefill = config.prefill_cost_model;
+        let reference_prefill_seconds = prefill.intercept_seconds
+            + prefill.linear_seconds_per_1k_tokens * prompt_1k
+            + prefill.quadratic_seconds_per_1k_tokens_squared * prompt_1k * prompt_1k;
+        let decode = config.decode_throughput_model;
+        let reference_decode_throughput_tokens_per_second = REFERENCE_DECODE_BATCH_SIZE
+            / (decode.fixed_step_seconds
+                + decode.batch_step_seconds_per_request * REFERENCE_DECODE_BATCH_SIZE
+                + decode.context_step_seconds_per_token * REFERENCE_DECODE_CONTEXT_TOKENS);
+
+        warn!(
+            event = "program_scheduling_reference_calibration",
+            defaulted_fields = %defaulted_fields.join(","),
+            reference_prefill_tokens = REFERENCE_PROMPT_TOKENS as u64,
+            reference_prefill_seconds,
+            reference_decode_batch_size = REFERENCE_DECODE_BATCH_SIZE as u64,
+            reference_decode_context_tokens_per_request = REFERENCE_DECODE_CONTEXT_TOKENS_PER_REQUEST as u64,
+            reference_decode_context_tokens = REFERENCE_DECODE_CONTEXT_TOKENS as u64,
+            reference_decode_throughput_tokens_per_second,
+            calibration_docs = "docs/program_scheduling.md#offline-calibration-models",
+            "Program scheduling is using one or more reference calibration coefficients; deployment-specific performance differences may degrade scheduling decisions"
+        );
     }
 
     fn program_targets(workers: &[Arc<dyn Worker>]) -> Vec<ProgramTarget> {
