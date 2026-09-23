@@ -197,6 +197,44 @@ For batch size `B` and the sum of full Program contexts `C`, aggregate decode th
 | `batch_step_seconds_per_request` | additional step seconds per batched request | finite and >= 0 | `0.0004192803698834784` |
 | `context_step_seconds_per_token` | additional step seconds per total context token | finite and >= 0 | `1.420458414996201e-7` |
 
+## Performance tuning workflow
+
+Program scheduling improves an HBM-only deployment by retaining reusable Program KV across short tool calls while limiting how many Programs concurrently own logical capacity. Tune it as a sequence of controlled checks: first establish that the baseline has meaningful KV pressure, then verify that scheduling improves token-weighted cache reuse, and only then adjust admission if protection reduces useful backend concurrency too much.
+
+### Establish a comparable pressure point
+
+Use the same task population, concurrency, sampling settings, model, engine configuration, and DP layout for the baseline and candidate. Replay is preferred because it fixes request dependencies and tool-call intervals. For a live, non-replay comparison, confirm that the completed-task set and total input/output token counts remain close. A large workload difference makes job-completion time incomparable, although throughput can still be reported with that limitation.
+
+Measure prompt-token reuse as `vllm:prompt_tokens_cached_total / vllm:prompt_tokens_total` from the backend metrics. These counters describe the cached portion of the prompt-token workload actually served. Do not substitute `vllm:prefix_cache_queries_total` and `vllm:prefix_cache_hits_total`, which describe prefix-cache lookup accounting and need not match end-to-end prompt-token accounting. If the native baseline already has nearly perfect token cache reuse, the experiment does not exercise the intended mechanism. Increase concurrency or reduce available KV capacity until eviction pressure is visible. A baseline around 80% token cache hit has been useful for controlled evaluation, but it is an experimental pressure point rather than a production target.
+
+Check that the workload contains reuse opportunities before tuning the policy. From a replay `requests.jsonl`, compare completion-to-next-request intervals for each Program with the calibrated cold-prefill or cache-miss impact for its context size. Progress-TTL is most useful when many Programs return from tool calls before recomputing their context would have been cheaper. A workload dominated by long tool calls should naturally produce short or zero automatic TTLs and is primarily a non-regression case.
+
+### Verify KV protection before tuning admission
+
+First compare the baseline and candidate token cache-hit ratio. If it does not improve:
+
+- Confirm that `vllm_router_agent_aware_request_interval_seconds` and `vllm_router_agent_aware_cache_miss_impact_seconds` describe the expected short-tool-call regime.
+- Inspect `vllm_router_agent_aware_armed_ttl_seconds`. A predominance of zero TTLs can mean that the continuity window has not matured, the tool gaps are too long, or the prefill/decode calibration understates recomputation cost.
+- Check `vllm_router_agent_aware_transitions_total` for TTL and `max_segment_yield` pauses. A Program that was not paused but returns with a very low cache hit should also produce `unexpected_cache_discontinuity`; that points to backend eviction or insufficient logical growth reserve rather than an overly short Router TTL.
+- Compare `vllm_router_agent_aware_context_growth_tokens`, the observed shared-prefix tokens, and the configured capacity. Repeatedly exhausting the reserved growth segment before the next request can erase the expected continuity benefit.
+- Use `binding_only: true` as an A/B diagnostic when necessary. It preserves Program-to-Rank affinity while bypassing RequestPool admission and Progress-TTL, separating affinity gains from admission/retention behavior.
+
+Do not lengthen TTL or loosen fairness limits solely to increase cache hit. Validate that the retained KV reduces cold-prefill work and improves the end-to-end objective without starving other Programs.
+
+### Diagnose throughput or job-completion regressions
+
+If token cache hit improves but throughput and job completion time regress, admission is probably suppressing useful backend concurrency more than the avoided recomputation is worth. Inspect these signals together:
+
+- `vllm_router_agent_aware_rank_queue_size` and `vllm_router_agent_aware_queue_wait_seconds` for Router-side retention;
+- `vllm_router_agent_aware_rank_active_programs` for the admitted Program set;
+- admission used, required, growth-reserve, capacity-pressure, and projected-pressure metrics for the committed decisions;
+- backend running/waiting requests and `capacity_accounting_source` for each Rank;
+- fitted decode throughput and cold-prefill coefficients for the exact model, accelerator, parallel layout, engine version, and serving configuration.
+
+Common causes are an underestimated shared prefix, an oversized growth reserve, a token capacity that does not match one DP Rank, stale backend observations, or prefill/decode coefficients calibrated on a different deployment. Correct observation and calibration errors before changing watermarks or waiting gates. Then adjust one admission control at a time and repeat the same trace; simultaneous changes make cache-retention gains indistinguishable from concurrency changes.
+
+Report absolute and relative results for job completion time, request throughput/latency, prompt-token cache hit, completed tasks, input/output tokens, cross-Rank migrations, queue-time distribution, and force-resume or maximum-segment-yield events. A higher cache-hit ratio by itself is an intermediate mechanism result, not sufficient evidence of an end-to-end improvement.
+
 ## Engine KV-control boundary
 
 Progress-TTL currently protects KV indirectly by controlling request admission. Physical eviction, offload, and prefetch are not executed by this feature. A future Router-to-engine KV hint must receive explicit `accepted`, `rejected`, or `unsupported` feedback and an eventual `applied`, `failed`, or `expired` result. Router residency accounting must not change until the engine reports `applied`.
