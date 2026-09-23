@@ -103,7 +103,8 @@ struct Router {
     otlp_traces_endpoint: Option<String>,
     // KV connector for PD disaggregation ("nixl" or "mooncake")
     kv_connector: String,
-    // Optional JSON object for Program-level scheduling.
+    // Explicit Program-level scheduling feature switch and optional overrides.
+    enable_program_scheduling: bool,
     program_scheduling_config_json: Option<String>,
 }
 
@@ -245,14 +246,10 @@ impl Router {
                     });
                 }
             },
-            program_scheduling: self
-                .program_scheduling_config_json
-                .as_deref()
-                .map(serde_json::from_str::<config::ProgramSchedulingConfig>)
-                .transpose()
-                .map_err(|error| config::ConfigError::ValidationFailed {
-                    reason: format!("Invalid program_scheduling_config_json: {error}"),
-                })?,
+            program_scheduling: config::ProgramSchedulingConfig::resolve(
+                self.enable_program_scheduling,
+                self.program_scheduling_config_json.as_deref(),
+            )?,
         })
     }
 }
@@ -329,6 +326,7 @@ impl Router {
         wasm_middleware = None,
         wasm_middleware_sha256 = None,
         wasm_middleware_routes = vec![],
+        enable_program_scheduling = false,
         program_scheduling_config_json = None,
     ))]
     #[allow(clippy::too_many_arguments)]
@@ -395,6 +393,7 @@ impl Router {
         wasm_middleware: Option<String>,
         wasm_middleware_sha256: Option<String>,
         wasm_middleware_routes: Vec<String>,
+        enable_program_scheduling: bool,
         program_scheduling_config_json: Option<String>,
     ) -> PyResult<Self> {
         if wasm_middleware_sha256
@@ -428,6 +427,7 @@ impl Router {
             wasm_middleware,
             wasm_middleware_sha256,
             wasm_middleware_routes,
+            enable_program_scheduling,
             intra_node_data_parallel_size,
             api_key,
             api_key_validation_urls,

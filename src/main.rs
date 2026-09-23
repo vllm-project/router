@@ -117,8 +117,13 @@ struct CliArgs {
     #[arg(long, default_value = "cache_aware", value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "consistent_hash", "rendezvous_hash"])]
     policy: String,
 
-    /// Optional JSON object configuring Program-level scheduling independently
-    /// of the request-level load-balancing policy.
+    /// Enable Program-level scheduling independently of the request-level
+    /// load-balancing policy.
+    #[arg(long, default_value_t = false)]
+    enable_program_scheduling: bool,
+
+    /// Optional JSON object overriding Program-level scheduling defaults.
+    /// Requires --enable-program-scheduling.
     #[arg(long)]
     program_scheduling_config_json: Option<String>,
 
@@ -524,14 +529,10 @@ impl CliArgs {
             Vec::new()
         };
 
-        let program_scheduling = self
-            .program_scheduling_config_json
-            .as_deref()
-            .map(serde_json::from_str::<ProgramSchedulingConfig>)
-            .transpose()
-            .map_err(|error| ConfigError::ValidationFailed {
-                reason: format!("Invalid --program-scheduling-config-json: {error}"),
-            })?;
+        let program_scheduling = ProgramSchedulingConfig::resolve(
+            self.enable_program_scheduling,
+            self.program_scheduling_config_json.as_deref(),
+        )?;
 
         // Build RouterConfig
         Ok(RouterConfig {

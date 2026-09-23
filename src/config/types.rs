@@ -188,6 +188,29 @@ const DECODE_FIXED_EXPLICIT: u8 = 1 << 4;
 const DECODE_BATCH_EXPLICIT: u8 = 1 << 5;
 const DECODE_CONTEXT_EXPLICIT: u8 = 1 << 6;
 impl ProgramSchedulingConfig {
+    /// Resolve the explicit feature switch and its optional JSON overrides.
+    ///
+    /// Supplying configuration without enabling Program scheduling is rejected
+    /// so the configuration argument cannot act as a second, implicit switch.
+    pub fn resolve(
+        enabled: bool,
+        config_json: Option<&str>,
+    ) -> ConfigResult<Option<ProgramSchedulingConfig>> {
+        match (enabled, config_json) {
+            (false, None) => Ok(None),
+            (false, Some(_)) => Err(super::ConfigError::ValidationFailed {
+                reason: "program_scheduling_config_json requires enable_program_scheduling"
+                    .to_string(),
+            }),
+            (true, None) => Ok(Some(Self::default())),
+            (true, Some(raw)) => serde_json::from_str(raw).map(Some).map_err(|error| {
+                super::ConfigError::ValidationFailed {
+                    reason: format!("Invalid program_scheduling_config_json: {error}"),
+                }
+            }),
+        }
+    }
+
     pub(crate) fn defaulted_calibration_fields(&self) -> Vec<&'static str> {
         [
             (
@@ -1037,6 +1060,35 @@ mod tests {
             serialized["program_scheduling_enable_key"],
             "vllm_xargs.agentic_context"
         );
+    }
+
+    #[test]
+    fn program_scheduling_requires_explicit_enablement() {
+        assert!(ProgramSchedulingConfig::resolve(false, None)
+            .unwrap()
+            .is_none());
+
+        let defaults = ProgramSchedulingConfig::resolve(true, None)
+            .unwrap()
+            .expect("the enable switch should select the default configuration");
+        assert_eq!(defaults, ProgramSchedulingConfig::default());
+
+        let configured = ProgramSchedulingConfig::resolve(true, Some(r#"{"binding_only":true}"#))
+            .unwrap()
+            .expect("enabled JSON overrides should be parsed");
+        assert!(configured.binding_only);
+
+        let missing_switch =
+            ProgramSchedulingConfig::resolve(false, Some(r#"{"binding_only":true}"#))
+                .unwrap_err()
+                .to_string();
+        assert!(missing_switch
+            .contains("program_scheduling_config_json requires enable_program_scheduling"));
+
+        let invalid = ProgramSchedulingConfig::resolve(true, Some("not-json"))
+            .unwrap_err()
+            .to_string();
+        assert!(invalid.contains("Invalid program_scheduling_config_json"));
     }
 
     #[test]

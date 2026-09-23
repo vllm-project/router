@@ -27,6 +27,7 @@ class TestRouterArgs:
         assert args.vllm_pd_disaggregation is False
         assert args.prefill_urls == []
         assert args.decode_urls == []
+        assert args.enable_program_scheduling is False
         assert args.program_scheduling_config_json is None
 
         # Test PD-specific defaults
@@ -444,7 +445,14 @@ class TestParseRouterArgs:
     def test_parse_program_scheduling_json(self):
         """Keep the opt-in scheduler configuration opaque until Rust validation."""
         config = '{"global_queue":true,"binding_strategy":"program_round_robin"}'
-        router_args = parse_router_args(["--program-scheduling-config-json", config])
+        router_args = parse_router_args(
+            [
+                "--enable-program-scheduling",
+                "--program-scheduling-config-json",
+                config,
+            ]
+        )
+        assert router_args.enable_program_scheduling is True
         assert router_args.program_scheduling_config_json == config
 
     def test_parse_pd_args(self):
