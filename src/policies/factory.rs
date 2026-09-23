@@ -1,8 +1,8 @@
 //! Factory for creating load balancing policies
 
 use super::{
-    CacheAwareConfig, CacheAwarePolicy, ConsistentHashPolicy, LoadBalancingPolicy,
-    PowerOfTwoPolicy, RandomPolicy, RendezvousHashPolicy, RoundRobinPolicy,
+    CacheAwareConfig, CacheAwarePolicy, ConsistentHashPolicy, LeastConnStickyPolicy,
+    LoadBalancingPolicy, PowerOfTwoPolicy, RandomPolicy, RendezvousHashPolicy, RoundRobinPolicy,
 };
 use crate::config::PolicyConfig;
 use std::sync::Arc;
@@ -39,6 +39,7 @@ impl PolicyFactory {
                 Arc::new(ConsistentHashPolicy::new())
             }
             PolicyConfig::RendezvousHash => Arc::new(RendezvousHashPolicy::new()),
+            PolicyConfig::LeastConnSticky => Arc::new(LeastConnStickyPolicy::new()),
         }
     }
 
@@ -51,6 +52,9 @@ impl PolicyFactory {
             "cache_aware" | "cacheaware" => Some(Arc::new(CacheAwarePolicy::new())),
             "consistent_hash" | "consistenthash" => Some(Arc::new(ConsistentHashPolicy::new())),
             "rendezvous_hash" | "rendezvoushash" => Some(Arc::new(RendezvousHashPolicy::new())),
+            "least_conn_sticky" | "leastconnsticky" => {
+                Some(Arc::new(LeastConnStickyPolicy::new()))
+            }
             _ => None,
         }
     }

@@ -191,6 +191,9 @@ impl ConfigValidator {
             PolicyConfig::RendezvousHash => {
                 // No specific validation needed
             }
+            PolicyConfig::LeastConnSticky => {
+                // No specific validation needed
+            }
         }
         Ok(())
     }
