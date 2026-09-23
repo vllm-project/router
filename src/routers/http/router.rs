@@ -450,15 +450,28 @@ impl Router {
         typed_req: &T,
         model_id: Option<&str>,
         endpoint: &str,
-        input_text: &str,
     ) -> Result<Option<ProgramCompletion>, ScheduleError> {
+        let Some(scheduler) = &self.program_scheduler else {
+            return Ok(None);
+        };
         let request = typed_req.extract_program_identity_payload();
-        self.acquire_program_completion_from_payload(
+        let model_pool = self.resolved_program_model_pool(model_id);
+        let Some(identity) = ProgramIdentity::from_request_with_enable_key(
             headers,
             request.as_ref(),
-            model_id,
+            Some(&model_pool.scheduler_key),
+            scheduler.enable_key(),
+        )?
+        else {
+            return Ok(None);
+        };
+        let input_text = typed_req.extract_text_for_program_scheduling();
+        self.acquire_program_completion_for_identity(
+            scheduler,
+            identity,
+            &model_pool,
             endpoint,
-            input_text,
+            &input_text,
         )
         .await
     }
@@ -484,11 +497,29 @@ impl Router {
         else {
             return Ok(None);
         };
+        self.acquire_program_completion_for_identity(
+            scheduler,
+            identity,
+            &model_pool,
+            endpoint,
+            input_text,
+        )
+        .await
+    }
+
+    async fn acquire_program_completion_for_identity(
+        &self,
+        scheduler: &Arc<ProgramScheduler>,
+        identity: ProgramIdentity,
+        model_pool: &ResolvedProgramModelPool,
+        endpoint: &str,
+        input_text: &str,
+    ) -> Result<Option<ProgramCompletion>, ScheduleError> {
         let (estimated_context_tokens, calibration) = self.program_token_estimator.estimate(
             TokenEstimateScope::new(&model_pool.scheduler_key, endpoint),
             input_text,
         );
-        let targets = self.program_targets_for_model(&model_pool);
+        let targets = self.program_targets_for_model(model_pool);
         let routing_text = scheduler
             .uses_cache_aware_binding()
             .then(|| input_text.to_string());
@@ -882,7 +913,7 @@ impl Router {
                 // previous ProgramCompletion finishes exactly once before a
                 // retry invokes this closure again.
                 let program_completion = match self
-                    .acquire_program_completion(headers, typed_req, model_id, route, &text)
+                    .acquire_program_completion(headers, typed_req, model_id, route)
                     .await
                 {
                     Ok(completion) => completion,
@@ -2152,19 +2183,6 @@ impl RouterTrait for Router {
         // Add JSON body if not null/empty
         if !body.is_null() {
             request_builder = request_builder.json(&body);
-        }
-
-        if let Some(headers) = headers {
-            for (name, value) in headers {
-                if *name != CONTENT_TYPE
-                    && *name != CONTENT_LENGTH
-                    && !header_utils::TRACE_HEADER_NAMES
-                        .iter()
-                        .any(|&trace_name| name.as_str().eq_ignore_ascii_case(trace_name))
-                {
-                    request_builder = request_builder.header(name, value);
-                }
-            }
         }
 
         // Add authorization if configured

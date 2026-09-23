@@ -557,6 +557,16 @@ impl GenerationRequest for ChatCompletionRequest {
     }
 
     fn extract_text_for_routing(&self) -> String {
+        self.session_params
+            .as_ref()
+            .and_then(|params| params.get("session_id"))
+            .and_then(Value::as_str)
+            .filter(|session_id| !session_id.trim().is_empty())
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    fn extract_text_for_program_scheduling(&self) -> String {
         let mut parts = Vec::new();
         for message in &self.messages {
             match message {
@@ -658,13 +668,7 @@ impl GenerationRequest for ChatCompletionRequest {
         if !parts.is_empty() {
             return parts.join("\n");
         }
-        self.session_params
-            .as_ref()
-            .and_then(|params| params.get("session_id"))
-            .and_then(Value::as_str)
-            .filter(|session_id| !session_id.trim().is_empty())
-            .unwrap_or_default()
-            .to_string()
+        self.extract_text_for_routing()
     }
 
     fn extract_program_identity_payload(&self) -> Option<serde_json::Value> {
@@ -2411,6 +2415,11 @@ pub trait GenerationRequest: Send + Sync {
     /// Extract text content for routing decisions
     fn extract_text_for_routing(&self) -> String;
 
+    /// Extract prompt content used only by opted-in Program scheduling.
+    fn extract_text_for_program_scheduling(&self) -> String {
+        self.extract_text_for_routing()
+    }
+
     /// Extract only the small body subset used for Program identity parsing.
     fn extract_program_identity_payload(&self) -> Option<serde_json::Value> {
         None
@@ -3883,7 +3892,7 @@ mod tests {
     }
 
     #[test]
-    fn test_chat_request_routes_on_system_content_blocks() {
+    fn test_chat_request_program_text_includes_system_content_blocks() {
         let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
             "model": "test-model",
             "messages": [
@@ -3900,8 +3909,28 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            request.extract_text_for_routing(),
+            request.extract_text_for_program_scheduling(),
             "system:shared prefix\nsystem:session prefix\nuser:next turn"
+        );
+    }
+
+    #[test]
+    fn test_chat_request_keeps_session_id_for_native_routing() {
+        let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "test-model",
+            "messages": [
+                {"role": "user", "content": "first turn"},
+                {"role": "assistant", "content": "previous completion"},
+                {"role": "user", "content": "next turn"}
+            ],
+            "session_params": {"session_id": "stable-session"}
+        }))
+        .unwrap();
+
+        assert_eq!(request.extract_text_for_routing(), "stable-session");
+        assert_eq!(
+            request.extract_text_for_program_scheduling(),
+            "user:first turn\nassistant:previous completion\nuser:next turn"
         );
     }
 
@@ -3920,7 +3949,7 @@ mod tests {
     }
 
     #[test]
-    fn test_chat_request_routes_on_assistant_content_blocks() {
+    fn test_chat_request_program_text_includes_assistant_content_blocks() {
         let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
             "model": "test-model",
             "messages": [
@@ -3935,7 +3964,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            request.extract_text_for_routing(),
+            request.extract_text_for_program_scheduling(),
             "user:first turn\nassistant:previous completion\nuser:next turn"
         );
     }
