@@ -26,7 +26,7 @@ struct CapacityVictim {
     reference: ProgramRef,
     status: ProgramStatus,
     score: f64,
-    private_tokens: f64,
+    sort_private_tokens: f64,
 }
 
 impl ProgramScheduler {
@@ -576,7 +576,7 @@ impl ProgramScheduler {
                             reference: program.reference.clone(),
                             status: program.status,
                             score,
-                            private_tokens,
+                            sort_private_tokens: private_tokens,
                         });
                     }
                 }
@@ -604,7 +604,11 @@ impl ProgramScheduler {
                 right
                     .score
                     .total_cmp(&left.score)
-                    .then_with(|| right.private_tokens.total_cmp(&left.private_tokens))
+                    .then_with(|| {
+                        right
+                            .sort_private_tokens
+                            .total_cmp(&left.sort_private_tokens)
+                    })
                     .then_with(|| {
                         left.reference
                             .program_id()
@@ -615,7 +619,12 @@ impl ProgramScheduler {
                 if projected <= low {
                     break;
                 }
-                let relief = victim.private_tokens
+                // Preserve the original commit-time accounting point: an earlier
+                // victim may have changed scheduler state since candidates were
+                // ranked, so only the sort key is frozen by the runtime scan.
+                let private_tokens = state.decisions[&victim.reference]
+                    .private_tokens(self.config.progress_ttl.decode_buffer_tokens);
+                let relief = private_tokens
                     + if victim.status == ProgramStatus::Reasoning {
                         average_completion
                     } else {
