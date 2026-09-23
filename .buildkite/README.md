@@ -14,12 +14,14 @@ Main CI/CD pipeline that runs on all commits and pull requests. Includes:
 - **Docker Build**: Container image creation
 
 ### `release-pipeline.yml`
-Release pipeline triggered on version tags (e.g., `v1.2.3`). Handles:
+Release pipeline for tagged versions, nightly Docker images, and versioned
+Docker releases.
 
-- Building release artifacts
-- Publishing to PyPI
-- Building and pushing Docker images
-- Creating GitHub releases
+- **Git tags (`v*`):** build wheels, smoke-test, publish to PyPI
+- **`NIGHTLY=1`:** build and push `vllm/vllm-router:nightly` (multi-arch)
+- **Manual / API (no `NIGHTLY`):** fill **Provide Release version here**
+  (`X.Y.Z`), unblock the two Docker gates, and publish
+  `vllm/vllm-router:vX.Y.Z` plus `:latest` (and per-arch tags)
 
 ## P/D Disaggregation Test
 

@@ -1,6 +1,9 @@
 # vLLM Router Release Pipeline
 # This pipeline is triggered on version tags (v*) to build and publish releases.
-# It also supports nightly Docker builds when triggered with NIGHTLY=1.
+# It also supports:
+#   - nightly Docker builds when triggered with NIGHTLY=1
+#   - versioned Docker releases via the "Provide Release version here" input
+#     (X.Y.Z → vllm/vllm-router:vX.Y.Z and :latest)
 
 env:
   CARGO_INCREMENTAL: "0"
@@ -206,11 +209,7 @@ steps:
         agents:
           queue: cpu_queue_release
         commands:
-          # Create and push multi-arch manifests
-          - "docker manifest create vllm/vllm-router:nightly vllm/vllm-router:nightly-x86_64 vllm/vllm-router:nightly-aarch64 --amend"
-          - "docker manifest create vllm/vllm-router:nightly-$$(date +%Y%m%d)-$${BUILDKITE_COMMIT:0:7} vllm/vllm-router:nightly-x86_64 vllm/vllm-router:nightly-aarch64 --amend"
-          - "docker manifest push vllm/vllm-router:nightly"
-          - "docker manifest push vllm/vllm-router:nightly-$$(date +%Y%m%d)-$${BUILDKITE_COMMIT:0:7}"
+          - "bash .buildkite/scripts/publish-release-images.sh nightly"
           # Clean up old nightly builds (keep only last 14)
           - "bash .buildkite/scripts/cleanup-nightly-router-builds.sh"
         plugins:
@@ -219,3 +218,101 @@ steps:
               password-env: DOCKERHUB_TOKEN
         env:
           DOCKERHUB_USERNAME: "vllmbot"
+
+  # ============================================================================
+  # Versioned Docker release (when NIGHTLY != 1)
+  # Fill "Provide Release version here" (X.Y.Z), then unblock the two gates.
+  # Publishes vllm/vllm-router:vX.Y.Z and :latest (plus per-arch tags).
+  # ============================================================================
+  - input: "Provide Release version here"
+    key: input-release-version
+    if: build.env("NIGHTLY") != "1"
+    fields:
+      - text: "What is the release version?"
+        key: release-version
+        hint: "Format: X.Y.Z (leading v is optional). Published as vllm/vllm-router:vX.Y.Z and :latest."
+        required: true
+
+  # Auto-skip when NIGHTLY=1 (scheduled); otherwise require manual unblock.
+  - block: "Unblock to build release Docker images"
+    key: block-build-release-images
+    if: build.env("NIGHTLY") != "1"
+    depends_on: input-release-version
+
+  - group: ":docker: Build and push release Docker images"
+    key: "build-release-docker-images"
+    if: build.env("NIGHTLY") != "1"
+    depends_on: block-build-release-images
+    steps:
+      - label: ":docker: Build and push release image - x86_64"
+        key: build-release-docker-x86
+        depends_on: ~
+        agents:
+          queue: cpu_queue_release
+        command: |
+          set -euo pipefail
+          RELEASE_VERSION=$$(buildkite-agent meta-data get release-version --default "" | sed 's/^v//')
+          if [ -z "$${RELEASE_VERSION}" ]; then
+            echo "ERROR: release-version metadata not set. Fill the input step first."
+            exit 1
+          fi
+          echo "Building vllm/vllm-router:v$${RELEASE_VERSION}-x86_64"
+          DOCKER_BUILDKIT=1 docker build \
+            --tag "vllm/vllm-router:v$${RELEASE_VERSION}-x86_64" \
+            --progress plain \
+            -f Dockerfile.router .
+          docker push "vllm/vllm-router:v$${RELEASE_VERSION}-x86_64"
+        plugins:
+          - docker-login#v3.0.0:
+              username: vllmbot
+              password-env: DOCKERHUB_TOKEN
+        env:
+          DOCKER_BUILDKIT: "1"
+
+      - label: ":docker: Build and push release image - aarch64"
+        key: build-release-docker-arm64
+        depends_on: ~
+        agents:
+          queue: arm64_cpu_queue_release
+        command: |
+          set -euo pipefail
+          RELEASE_VERSION=$$(buildkite-agent meta-data get release-version --default "" | sed 's/^v//')
+          if [ -z "$${RELEASE_VERSION}" ]; then
+            echo "ERROR: release-version metadata not set. Fill the input step first."
+            exit 1
+          fi
+          echo "Building vllm/vllm-router:v$${RELEASE_VERSION}-aarch64"
+          DOCKER_BUILDKIT=1 docker build \
+            --tag "vllm/vllm-router:v$${RELEASE_VERSION}-aarch64" \
+            --progress plain \
+            -f Dockerfile.router .
+          docker push "vllm/vllm-router:v$${RELEASE_VERSION}-aarch64"
+        plugins:
+          - docker-login#v3.0.0:
+              username: vllmbot
+              password-env: DOCKERHUB_TOKEN
+        env:
+          DOCKER_BUILDKIT: "1"
+
+  - block: "Publish release images to DockerHub"
+    key: block-publish-release-images
+    if: build.env("NIGHTLY") != "1"
+    depends_on:
+      - build-release-docker-x86
+      - build-release-docker-arm64
+      - input-release-version
+
+  - label: ":rocket: Publish release images to DockerHub"
+    key: publish-release-images-dockerhub
+    if: build.env("NIGHTLY") != "1"
+    depends_on: block-publish-release-images
+    command: bash .buildkite/scripts/publish-release-images.sh release
+    plugins:
+      - docker-login#v3.0.0:
+          username: vllmbot
+          password-env: DOCKERHUB_TOKEN
+    agents:
+      queue: cpu_queue_release
+    env:
+      DOCKER_BUILDKIT: "1"
+      DOCKERHUB_USERNAME: "vllmbot"
