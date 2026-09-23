@@ -129,7 +129,7 @@ pub struct ProgramSchedulingConfig {
     #[serde(default = "default_program_hash_virtual_nodes")]
     pub hash_virtual_nodes: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub token_capacity_per_target: Option<usize>,
+    pub token_capacity_per_dp_rank: Option<usize>,
     #[serde(default = "default_program_max_active_programs_per_target")]
     pub max_active_programs_per_target: usize,
     #[serde(default = "default_program_metrics_interval_seconds")]
@@ -235,7 +235,7 @@ impl Default for ProgramSchedulingConfig {
             cross_rank_headroom_ratio: default_program_cross_rank_headroom_ratio(),
             binding_strategy: ProgramBindingStrategy::default(),
             hash_virtual_nodes: default_program_hash_virtual_nodes(),
-            token_capacity_per_target: None,
+            token_capacity_per_dp_rank: None,
             max_active_programs_per_target: default_program_max_active_programs_per_target(),
             metrics_interval_seconds: default_program_metrics_interval_seconds(),
             admission_waiting_request_threshold:
@@ -281,8 +281,8 @@ struct ProgramSchedulingConfigInput {
     binding_strategy: ProgramBindingStrategy,
     #[serde(default = "default_program_hash_virtual_nodes")]
     hash_virtual_nodes: u32,
-    #[serde(default)]
-    token_capacity_per_target: Option<usize>,
+    #[serde(default, alias = "token_capacity_per_target")]
+    token_capacity_per_dp_rank: Option<usize>,
     #[serde(default = "default_program_max_active_programs_per_target")]
     max_active_programs_per_target: usize,
     #[serde(default = "default_program_metrics_interval_seconds")]
@@ -406,7 +406,7 @@ impl<'de> Deserialize<'de> for ProgramSchedulingConfig {
             cross_rank_headroom_ratio: input.cross_rank_headroom_ratio,
             binding_strategy: input.binding_strategy,
             hash_virtual_nodes: input.hash_virtual_nodes,
-            token_capacity_per_target: input.token_capacity_per_target,
+            token_capacity_per_dp_rank: input.token_capacity_per_dp_rank,
             max_active_programs_per_target: input.max_active_programs_per_target,
             metrics_interval_seconds: input.metrics_interval_seconds,
             admission_waiting_request_threshold: input.admission_waiting_request_threshold,
@@ -1037,6 +1037,20 @@ mod tests {
             serialized["program_scheduling_enable_key"],
             "vllm_xargs.agentic_context"
         );
+    }
+
+    #[test]
+    fn program_scheduling_capacity_is_named_per_dp_rank() {
+        let current: ProgramSchedulingConfig =
+            serde_json::from_str(r#"{"token_capacity_per_dp_rank":123}"#).unwrap();
+        assert_eq!(current.token_capacity_per_dp_rank, Some(123));
+
+        let legacy: ProgramSchedulingConfig =
+            serde_json::from_str(r#"{"token_capacity_per_target":456}"#).unwrap();
+        assert_eq!(legacy.token_capacity_per_dp_rank, Some(456));
+        let serialized = serde_json::to_value(legacy).unwrap();
+        assert_eq!(serialized["token_capacity_per_dp_rank"], 456);
+        assert!(serialized.get("token_capacity_per_target").is_none());
     }
 
     #[test]

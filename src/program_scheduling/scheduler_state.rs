@@ -104,7 +104,7 @@ impl From<&crate::config::types::ProgramSchedulingConfig> for ProgramSchedulerCo
             ),
             shared_prefix_freshness_kv_turnovers: config.shared_prefix_freshness_kv_turnovers,
             progress_ttl: ProgressTtlConfig {
-                token_capacity: config.token_capacity_per_target,
+                token_capacity: config.token_capacity_per_dp_rank,
                 decode_buffer_tokens: config.decode_buffer_tokens,
                 max_acting_ttl: Duration::from_secs_f64(config.max_acting_ttl_seconds),
                 high_watermark_ratio: config.high_watermark_ratio,

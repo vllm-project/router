@@ -45,10 +45,10 @@ impl ConfigValidator {
 
     fn validate_program_scheduling(config: &ProgramSchedulingConfig) -> ConfigResult<()> {
         if config.binding_strategy == ProgramBindingStrategy::ReasoningTokenBalance
-            && config.token_capacity_per_target.is_none()
+            && config.token_capacity_per_dp_rank.is_none()
         {
             return Err(ConfigError::ValidationFailed {
-                reason: "reasoning_token_balance requires token_capacity_per_target".to_string(),
+                reason: "reasoning_token_balance requires token_capacity_per_dp_rank".to_string(),
             });
         }
         let positive_finite = [
@@ -152,7 +152,7 @@ impl ConfigValidator {
             || config.max_active_programs_per_target == 0
             || config.stats_window_size == 0
             || config.max_segment_rounds == 0
-            || config.token_capacity_per_target == Some(0)
+            || config.token_capacity_per_dp_rank == Some(0)
         {
             return Err(ConfigError::ValidationFailed {
                 reason: "Program scheduling counts and configured token capacity must be > 0"
