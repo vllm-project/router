@@ -4,7 +4,7 @@ Program scheduling is an optional layer before native vLLM Router forwarding. It
 
 ## Enablement
 
-Library users configure Program scheduling through `RouterConfig.program_scheduling`. The standalone Rust and Python CLIs accept the same object through `--program-scheduling-config-json`; individual scheduling fields are not exposed as separate CLI flags. The `program_scheduling_enable_key` field controls which requests opt in:
+Library users configure Program scheduling through `RouterConfig.program_scheduling`. The standalone Rust and Python CLIs use `--enable-program-scheduling` as the explicit feature switch; `--program-scheduling-config-json` optionally overrides the default configuration and is rejected when the switch is absent. Individual scheduling fields are not exposed as separate CLI flags. The `program_scheduling_enable_key` field controls which requests opt in after the feature is enabled:
 
 | Value | Behavior |
 |---|---|
@@ -45,10 +45,10 @@ No file is required to enable Program scheduling with every default:
 ```bash
 vllm-router \
   --worker-urls http://worker-0:8000 http://worker-1:8000 \
-  --program-scheduling-config-json '{}'
+  --enable-program-scheduling
 ```
 
-The empty JSON object is the feature-presence switch with all fields defaulted; omitting `--program-scheduling-config-json` disables Program scheduling. The defaults use the Program-count guard because token capacity is unset and emit a calibration warning because the built-in performance coefficients are reference values. For a production deployment, save the calibrated configuration above as `program-scheduling.json`, compact it into one CLI argument, and start the Router with the backend API endpoints. One Worker URL may expose multiple internal DP Ranks; `--intra-node-data-parallel-size` is the number of internal Ranks behind each Worker URL.
+The enable flag selects `ProgramSchedulingConfig` with every field defaulted; omitting the flag disables Program scheduling. The JSON option is configuration only: pass it together with the enable flag for overrides, and the Router reports a configuration error if JSON is supplied without explicit enablement. The defaults use the Program-count guard because token capacity is unset and emit a calibration warning because the built-in performance coefficients are reference values. For a production deployment, save the calibrated configuration above as `program-scheduling.json`, compact it into one CLI argument, and start the Router with the backend API endpoints. One Worker URL may expose multiple internal DP Ranks; `--intra-node-data-parallel-size` is the number of internal Ranks behind each Worker URL.
 
 ```bash
 export PROGRAM_CONFIG_JSON="$(python -c \
@@ -63,6 +63,7 @@ vllm-router \
   --policy consistent_hash \
   --prometheus-host 0.0.0.0 \
   --prometheus-port 29000 \
+  --enable-program-scheduling \
   --program-scheduling-config-json "${PROGRAM_CONFIG_JSON}"
 ```
 
