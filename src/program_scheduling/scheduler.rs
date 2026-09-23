@@ -264,41 +264,9 @@ impl ProgramScheduler {
     /// Capture the Router ledger before a non-blocking metrics scrape begins.
     pub fn begin_observation(&self, targets: &[ProgramTarget]) -> BackendObservationEpoch {
         let state = self.state.lock();
-        let views = state.runtime.iter_views().collect::<Vec<_>>();
-        let checkpoints = targets
+        let mut checkpoints = targets
             .iter()
             .map(|target| {
-                let active_reasoning = views
-                    .iter()
-                    .filter(|program| {
-                        program.state == ProgramState::Active
-                            && program.status == ProgramStatus::Reasoning
-                            && program.placement == Some(target.id.as_str())
-                    })
-                    .collect::<Vec<_>>();
-                let active_acting_private_tokens = views
-                    .iter()
-                    .filter(|program| {
-                        program.state == ProgramState::Active
-                            && program.status == ProgramStatus::Acting
-                            && program.placement == Some(target.id.as_str())
-                    })
-                    .filter_map(|program| state.decisions.get(program.reference))
-                    .map(|decision| {
-                        decision.private_tokens(self.config.progress_ttl.decode_buffer_tokens)
-                    })
-                    .sum::<f64>();
-                let active_reasoning_private_tokens = active_reasoning
-                    .iter()
-                    .filter_map(|program| state.decisions.get(program.reference))
-                    .map(|decision| {
-                        decision.private_tokens(self.config.progress_ttl.decode_buffer_tokens)
-                    })
-                    .sum::<f64>();
-                let active_reasoning_requests = active_reasoning
-                    .iter()
-                    .map(|program| program.in_flight_requests)
-                    .sum::<usize>();
                 let ledger_checkpoint = state
                     .observations
                     .get(&target.id)
@@ -307,14 +275,39 @@ impl ProgramScheduler {
                     target.id.clone(),
                     ObservationCheckpoint {
                         ledger_checkpoint,
-                        active_reasoning_programs: active_reasoning.len(),
-                        active_reasoning_requests,
-                        active_reasoning_private_tokens,
-                        active_acting_private_tokens,
+                        ..ObservationCheckpoint::default()
                     },
                 )
             })
-            .collect();
+            .collect::<HashMap<_, _>>();
+        for program in state.runtime.iter_views() {
+            if program.state != ProgramState::Active {
+                continue;
+            }
+            let Some(target_id) = program.placement else {
+                continue;
+            };
+            let Some(checkpoint) = checkpoints.get_mut(target_id) else {
+                continue;
+            };
+            let private_tokens = state.decisions.get(program.reference).map(|decision| {
+                decision.private_tokens(self.config.progress_ttl.decode_buffer_tokens)
+            });
+            match program.status {
+                ProgramStatus::Reasoning => {
+                    checkpoint.active_reasoning_programs += 1;
+                    checkpoint.active_reasoning_requests += program.in_flight_requests;
+                    if let Some(private_tokens) = private_tokens {
+                        checkpoint.active_reasoning_private_tokens += private_tokens;
+                    }
+                }
+                ProgramStatus::Acting => {
+                    if let Some(private_tokens) = private_tokens {
+                        checkpoint.active_acting_private_tokens += private_tokens;
+                    }
+                }
+            }
+        }
         BackendObservationEpoch {
             target_snapshot_revision: state.target_snapshot_revision,
             checkpoints,
@@ -400,69 +393,71 @@ impl ProgramScheduler {
         identity: &ProgramIdentity,
         now: Instant,
     ) -> Vec<ProgramBindingCandidate> {
-        let runtime_views = state.runtime.iter_views().collect::<Vec<_>>();
+        let Some(target_ids) = state.model_targets.get(identity.model_pool()) else {
+            return Vec::new();
+        };
+        let mut summaries = target_ids
+            .iter()
+            .map(|target_id| (target_id.as_str(), BindingRuntimeSummary::default()))
+            .collect::<HashMap<_, _>>();
+        let mut estimated_context_tokens = 0;
+        for program in state.runtime.iter_views() {
+            if program.reference.model_pool() == identity.model_pool()
+                && program.reference.program_id() == identity.program_id()
+            {
+                estimated_context_tokens = program.estimated_context_tokens;
+            }
+            if program.state == ProgramState::Active {
+                if let Some(summary) = program
+                    .placement
+                    .and_then(|target_id| summaries.get_mut(target_id))
+                {
+                    summary.active_programs += 1;
+                    if let Some(decision) = state.decisions.get(program.reference) {
+                        summary.router_usage +=
+                            decision.private_tokens(self.config.progress_ttl.decode_buffer_tokens);
+                    }
+                }
+            }
+            let Some(decision) = state.decisions.get(program.reference) else {
+                continue;
+            };
+            let Some(target_id) = decision.last_target.as_deref() else {
+                continue;
+            };
+            let Some(summary) = summaries.get_mut(target_id) else {
+                continue;
+            };
+            let private_tokens =
+                decision.private_tokens(self.config.progress_ttl.decode_buffer_tokens);
+            if program.state == ProgramState::Active || program.status == ProgramStatus::Reasoning {
+                summary.accounted_programs += 1;
+                summary.accounted_tokens += private_tokens;
+            }
+            if program.state == ProgramState::Paused
+                && program.status == ProgramStatus::Reasoning
+                && program.placement.is_none()
+                && program.waiting_requests > 0
+                && decision.completed_requests == 0
+            {
+                summary.pending_new_program_tokens += private_tokens;
+            }
+        }
+        let required_tokens = estimated_context_tokens
+            .saturating_add(self.config.progress_ttl.decode_buffer_tokens)
+            as f64;
+        let capacity = self.config.progress_ttl.token_capacity;
         state
             .model_targets
             .get(identity.model_pool())
             .into_iter()
             .flatten()
             .map(|target_id| {
-                let accounted = runtime_views
-                    .iter()
-                    .filter(|program| {
-                        let last_target = state
-                            .decisions
-                            .get(program.reference)
-                            .and_then(|decision| decision.last_target.as_deref());
-                        last_target == Some(target_id.as_str())
-                            && (program.state == ProgramState::Active
-                                || program.status == ProgramStatus::Reasoning)
-                    })
-                    .cloned()
-                    .collect::<Vec<_>>();
-                let accounted_tokens = accounted
-                    .iter()
-                    .filter_map(|program| state.decisions.get(program.reference))
-                    .map(|decision| {
-                        decision.private_tokens(self.config.progress_ttl.decode_buffer_tokens)
-                    })
-                    .sum();
-                let pending_new_program_tokens = runtime_views
-                    .iter()
-                    .filter(|program| {
-                        program.state == ProgramState::Paused
-                            && program.status == ProgramStatus::Reasoning
-                            && program.placement.is_none()
-                            && program.waiting_requests > 0
-                    })
-                    .filter_map(|program| state.decisions.get(program.reference))
-                    .filter(|decision| {
-                        decision.completed_requests == 0
-                            && decision.last_target.as_deref() == Some(target_id.as_str())
-                    })
-                    .map(|decision| {
-                        decision.private_tokens(self.config.progress_ttl.decode_buffer_tokens)
-                    })
-                    .sum::<f64>();
-                let active_programs = runtime_views
-                    .iter()
-                    .filter(|program| {
-                        program.state == ProgramState::Active
-                            && program.placement == Some(target_id.as_str())
-                    })
-                    .count();
-                let target_usage = self.target_usage(state, target_id, now);
-                let capacity = self.config.progress_ttl.token_capacity;
-                let required_tokens = runtime_views
-                    .iter()
-                    .find(|program| {
-                        program.reference.model_pool() == identity.model_pool()
-                            && program.reference.program_id() == identity.program_id()
-                    })
-                    .map_or(0, |program| program.estimated_context_tokens)
-                    .saturating_add(self.config.progress_ttl.decode_buffer_tokens)
-                    as f64;
-                let immediately_admissible = active_programs.saturating_add(1)
+                let summary = &summaries[target_id.as_str()];
+                let target_usage = self
+                    .observed_target_usage(state, target_id, now)
+                    .unwrap_or(summary.router_usage);
+                let immediately_admissible = summary.active_programs.saturating_add(1)
                     <= self.config.max_active_programs_per_target
                     && capacity.is_none_or(|capacity| {
                         target_usage + required_tokens
@@ -470,14 +465,14 @@ impl ProgramScheduler {
                     });
                 ProgramBindingCandidate {
                     target_id: target_id.clone(),
-                    accounted_programs: accounted.len(),
-                    accounted_tokens,
+                    accounted_programs: summary.accounted_programs,
+                    accounted_tokens: summary.accounted_tokens,
                     capacity_tokens: self.config.progress_ttl.token_capacity,
                     kv_pressure: capacity.map_or(0.0, |capacity| {
                         if capacity == 0 {
                             1.0
                         } else {
-                            ((target_usage + pending_new_program_tokens) / capacity as f64)
+                            ((target_usage + summary.pending_new_program_tokens) / capacity as f64)
                                 .clamp(0.0, 1.0)
                         }
                     }),
@@ -621,14 +616,8 @@ impl ProgramScheduler {
         target_id: &str,
         now: Instant,
     ) -> f64 {
-        if let Some(observation) = state
-            .observations
-            .get(target_id)
-            .filter(|observation| self.observation_is_fresh(observation, now))
-        {
-            if let Some(tokens) = observation.estimated_active_program_tokens {
-                return (tokens + observation.active_program_token_delta).max(0.0);
-            }
+        if let Some(tokens) = self.observed_target_usage(state, target_id, now) {
+            return tokens;
         }
         state
             .runtime
@@ -639,6 +628,23 @@ impl ProgramScheduler {
             .filter_map(|program| state.decisions.get(program.reference))
             .map(|decision| decision.private_tokens(self.config.progress_ttl.decode_buffer_tokens))
             .sum()
+    }
+
+    pub(crate) fn observed_target_usage(
+        &self,
+        state: &ProgramSchedulerState,
+        target_id: &str,
+        now: Instant,
+    ) -> Option<f64> {
+        state
+            .observations
+            .get(target_id)
+            .filter(|observation| self.observation_is_fresh(observation, now))
+            .and_then(|observation| {
+                observation
+                    .estimated_active_program_tokens
+                    .map(|tokens| (tokens + observation.active_program_token_delta).max(0.0))
+            })
     }
 
     pub(crate) fn adjust_usage(
@@ -652,6 +658,15 @@ impl ProgramScheduler {
             .or_default()
             .active_program_token_delta += delta_tokens;
     }
+}
+
+#[derive(Debug, Default)]
+struct BindingRuntimeSummary {
+    accounted_programs: usize,
+    accounted_tokens: f64,
+    pending_new_program_tokens: f64,
+    active_programs: usize,
+    router_usage: f64,
 }
 
 /// Router-side fence captured before backend observation I/O.

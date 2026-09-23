@@ -131,28 +131,32 @@ impl ProgramScheduler {
     /// Refresh bounded-cardinality gauges only from the periodic tick path.
     pub(crate) fn publish_metrics(&self, state: &ProgramSchedulerState) {
         let now = Instant::now();
-        let views = state.runtime.iter_views().collect::<Vec<_>>();
+        let mut rank_counts = state
+            .targets
+            .keys()
+            .map(|target_id| (target_id.as_str(), (0_usize, 0_usize)))
+            .collect::<std::collections::HashMap<_, _>>();
+        for program in state.runtime.iter_views() {
+            if program.state == ProgramState::Active {
+                if let Some(counts) = program
+                    .placement
+                    .and_then(|target_id| rank_counts.get_mut(target_id))
+                {
+                    counts.1 += 1;
+                }
+            } else if program.waiting_requests > 0 {
+                if let Some(counts) = state
+                    .decisions
+                    .get(program.reference)
+                    .and_then(|decision| decision.last_target.as_deref())
+                    .and_then(|target_id| rank_counts.get_mut(target_id))
+                {
+                    counts.0 += 1;
+                }
+            }
+        }
         for target_id in state.targets.keys() {
-            let queued = views
-                .iter()
-                .filter(|program| {
-                    program.state == ProgramState::Paused
-                        && program.waiting_requests > 0
-                        && state
-                            .decisions
-                            .get(program.reference)
-                            .is_some_and(|decision| {
-                                decision.last_target.as_deref() == Some(target_id.as_str())
-                            })
-                })
-                .count();
-            let active = views
-                .iter()
-                .filter(|program| {
-                    program.state == ProgramState::Active
-                        && program.placement == Some(target_id.as_str())
-                })
-                .count();
+            let (queued, active) = rank_counts[target_id.as_str()];
             let factors = state.rank_factors.get(target_id);
             let average_impact = factors.map_or(0.0, |value| {
                 super::ProgressTtlFactors::average(
@@ -187,105 +191,107 @@ impl ProgramScheduler {
         let now = Instant::now();
         let state = self.state.lock();
         let sample_limit = self.config.progress_ttl.stats_window_size;
-        let views = state.runtime.iter_views().collect::<Vec<_>>();
+        let mut programs_by_target =
+            std::collections::HashMap::<&str, Vec<ProgramDiagnostic>>::new();
+        for runtime in state.runtime.iter_views() {
+            let Some(decision) = state.decisions.get(runtime.reference) else {
+                continue;
+            };
+            let Some(target_id) = decision.last_target.as_deref() else {
+                continue;
+            };
+            if !state.targets.contains_key(target_id) {
+                continue;
+            }
+            let request_hints = state.runtime.front_request_hints(runtime.reference);
+            programs_by_target
+                .entry(target_id)
+                .or_default()
+                .push(ProgramDiagnostic {
+                    program: runtime.reference.redacted_id(),
+                    generation: runtime.reference.generation(),
+                    state: match runtime.state {
+                        ProgramState::Active => "active",
+                        ProgramState::Paused => "paused",
+                    },
+                    status: match runtime.status {
+                        ProgramStatus::Reasoning => "reasoning",
+                        ProgramStatus::Acting => "acting",
+                    },
+                    expected_resume: runtime.expected_resume,
+                    task_id: decision.task_id.clone(),
+                    session_id: decision.session_id.clone(),
+                    agent_id: decision.agent_id.clone(),
+                    parent_program_id: decision.parent_program_id.clone(),
+                    root_program_id: state.lineage.root_readonly(
+                        runtime.reference.model_pool(),
+                        runtime.reference.program_id(),
+                    ),
+                    blocks_parent: decision.blocks_parent,
+                    agent_role: decision.agent_role.clone(),
+                    spawn_reason: decision.spawn_reason.clone(),
+                    step_id: decision.step_id,
+                    request_id: request_hints.and_then(|hints| hints.request_id.clone()),
+                    request_priority: request_hints.map_or(0, |hints| hints.priority),
+                    request_deadline_seconds: request_hints
+                        .and_then(|hints| hints.deadline)
+                        .map(|deadline| deadline.as_secs_f64()),
+                    expected_output_tokens: request_hints
+                        .and_then(|hints| hints.expected_output_tokens)
+                        .or(decision.output_token_reservation),
+                    kv_retention_ttl_seconds: request_hints
+                        .and_then(|hints| hints.kv_retention_ttl)
+                        .map(|ttl| ttl.as_secs_f64()),
+                    home_target: decision.home_target.clone(),
+                    last_target: decision.last_target.clone(),
+                    placement: runtime.placement.map(str::to_string),
+                    estimated_context_tokens: decision.estimated_context_tokens,
+                    shared_prefix_tokens: decision.shared_prefix_tokens,
+                    shared_prefix_freshness_remaining_seconds: decision
+                        .shared_prefix_fresh_until
+                        .map(|deadline| deadline.saturating_duration_since(now).as_secs_f64()),
+                    logical_tokens: decision
+                        .estimated_context_tokens
+                        .saturating_add(self.config.progress_ttl.decode_buffer_tokens),
+                    private_tokens: decision
+                        .private_tokens(self.config.progress_ttl.decode_buffer_tokens)
+                        .round() as usize,
+                    in_flight_requests: runtime.in_flight_requests,
+                    waiting_requests: runtime.waiting_requests,
+                    segment_served_rounds: decision.segment_served_rounds,
+                    rounds_since_activation: decision.rounds_since_activation,
+                    rounds_since_ttl_pause: decision.rounds_since_ttl_pause,
+                    pause_when_idle: decision.pause_when_idle,
+                    pause_reason: decision.last_pause_reason.map(|reason| reason.as_str()),
+                    acting_seconds: decision
+                        .acting_since
+                        .map(|started| now.saturating_duration_since(started).as_secs_f64()),
+                    queued_seconds: decision
+                        .queued_at
+                        .map(|queued| now.saturating_duration_since(queued).as_secs_f64()),
+                    ttl_remaining_seconds: decision
+                        .ttl_deadline
+                        .map(|deadline| deadline.saturating_duration_since(now).as_secs_f64()),
+                    force_resume_remaining_seconds: decision
+                        .force_resume_deadline
+                        .map(|deadline| deadline.saturating_duration_since(now).as_secs_f64()),
+                    force_resume_timeout_seconds: decision
+                        .force_resume_timeout
+                        .map(|timeout| timeout.as_secs_f64()),
+                    force_resume_active_remaining_rounds: decision
+                        .force_resume_active_remaining_rounds,
+                    force_resume_pool_remaining_rounds: decision.force_resume_pool_remaining_rounds,
+                    force_resume_request_throughput_per_second: decision
+                        .force_resume_request_throughput_per_second,
+                });
+        }
         let mut ranks = Vec::with_capacity(state.targets.len());
         for (target_id, target) in &state.targets {
             let observation = state.observations.get(target_id);
             let capacity_accounting_source = self.capacity_accounting_source(observation, now);
-            let mut programs = views
-                .iter()
-                .copied()
-                .filter(|runtime| {
-                    state
-                        .decisions
-                        .get(runtime.reference)
-                        .is_some_and(|decision| {
-                            decision.last_target.as_deref() == Some(target_id.as_str())
-                        })
-                })
-                .map(|runtime| {
-                    let decision = &state.decisions[runtime.reference];
-                    let request_hints = state.runtime.front_request_hints(runtime.reference);
-                    ProgramDiagnostic {
-                        program: runtime.reference.redacted_id(),
-                        generation: runtime.reference.generation(),
-                        state: match runtime.state {
-                            ProgramState::Active => "active",
-                            ProgramState::Paused => "paused",
-                        },
-                        status: match runtime.status {
-                            ProgramStatus::Reasoning => "reasoning",
-                            ProgramStatus::Acting => "acting",
-                        },
-                        expected_resume: runtime.expected_resume,
-                        task_id: decision.task_id.clone(),
-                        session_id: decision.session_id.clone(),
-                        agent_id: decision.agent_id.clone(),
-                        parent_program_id: decision.parent_program_id.clone(),
-                        root_program_id: state.lineage.root_readonly(
-                            runtime.reference.model_pool(),
-                            runtime.reference.program_id(),
-                        ),
-                        blocks_parent: decision.blocks_parent,
-                        agent_role: decision.agent_role.clone(),
-                        spawn_reason: decision.spawn_reason.clone(),
-                        step_id: decision.step_id,
-                        request_id: request_hints.and_then(|hints| hints.request_id.clone()),
-                        request_priority: request_hints.map_or(0, |hints| hints.priority),
-                        request_deadline_seconds: request_hints
-                            .and_then(|hints| hints.deadline)
-                            .map(|deadline| deadline.as_secs_f64()),
-                        expected_output_tokens: request_hints
-                            .and_then(|hints| hints.expected_output_tokens)
-                            .or(decision.output_token_reservation),
-                        kv_retention_ttl_seconds: request_hints
-                            .and_then(|hints| hints.kv_retention_ttl)
-                            .map(|ttl| ttl.as_secs_f64()),
-                        home_target: decision.home_target.clone(),
-                        last_target: decision.last_target.clone(),
-                        placement: runtime.placement.map(str::to_string),
-                        estimated_context_tokens: decision.estimated_context_tokens,
-                        shared_prefix_tokens: decision.shared_prefix_tokens,
-                        shared_prefix_freshness_remaining_seconds: decision
-                            .shared_prefix_fresh_until
-                            .map(|deadline| deadline.saturating_duration_since(now).as_secs_f64()),
-                        logical_tokens: decision
-                            .estimated_context_tokens
-                            .saturating_add(self.config.progress_ttl.decode_buffer_tokens),
-                        private_tokens: decision
-                            .private_tokens(self.config.progress_ttl.decode_buffer_tokens)
-                            .round() as usize,
-                        in_flight_requests: runtime.in_flight_requests,
-                        waiting_requests: runtime.waiting_requests,
-                        segment_served_rounds: decision.segment_served_rounds,
-                        rounds_since_activation: decision.rounds_since_activation,
-                        rounds_since_ttl_pause: decision.rounds_since_ttl_pause,
-                        pause_when_idle: decision.pause_when_idle,
-                        pause_reason: decision.last_pause_reason.map(|reason| reason.as_str()),
-                        acting_seconds: decision
-                            .acting_since
-                            .map(|started| now.saturating_duration_since(started).as_secs_f64()),
-                        queued_seconds: decision
-                            .queued_at
-                            .map(|queued| now.saturating_duration_since(queued).as_secs_f64()),
-                        ttl_remaining_seconds: decision
-                            .ttl_deadline
-                            .map(|deadline| deadline.saturating_duration_since(now).as_secs_f64()),
-                        force_resume_remaining_seconds: decision
-                            .force_resume_deadline
-                            .map(|deadline| deadline.saturating_duration_since(now).as_secs_f64()),
-                        force_resume_timeout_seconds: decision
-                            .force_resume_timeout
-                            .map(|timeout| timeout.as_secs_f64()),
-                        force_resume_active_remaining_rounds: decision
-                            .force_resume_active_remaining_rounds,
-                        force_resume_pool_remaining_rounds: decision
-                            .force_resume_pool_remaining_rounds,
-                        force_resume_request_throughput_per_second: decision
-                            .force_resume_request_throughput_per_second,
-                    }
-                })
-                .collect::<Vec<_>>();
+            let mut programs = programs_by_target
+                .remove(target_id.as_str())
+                .unwrap_or_default();
             programs.sort_by(|left, right| left.program.cmp(&right.program));
             let counts = |state_value, status_value| {
                 programs

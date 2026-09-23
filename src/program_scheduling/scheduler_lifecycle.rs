@@ -22,6 +22,13 @@ enum CompletionAction {
     StartActingTtl,
 }
 
+struct CapacityVictim {
+    reference: ProgramRef,
+    status: ProgramStatus,
+    score: f64,
+    private_tokens: f64,
+}
+
 impl ProgramScheduler {
     /// Run the historical request-arrival decision sequence before dispatch.
     pub(crate) fn run_request_arrival_decisions(
@@ -522,118 +529,106 @@ impl ProgramScheduler {
                 .rank_factors
                 .get(&target_id)
                 .map_or(0.0, |factors| factors.average_completion_tokens().ceil());
-            let views = state.runtime.iter_views().collect::<Vec<_>>();
-            let reasoning_count = views
-                .iter()
-                .filter(|program| {
-                    program.state == ProgramState::Active
-                        && program.status == ProgramStatus::Reasoning
-                        && program.placement == Some(target_id.as_str())
-                })
-                .count();
-            let marked_reasoning = views
-                .iter()
-                .filter(|program| {
-                    program.state == ProgramState::Active
-                        && program.status == ProgramStatus::Reasoning
-                        && program.placement == Some(target_id.as_str())
-                        && state
-                            .decisions
-                            .get(program.reference)
-                            .is_some_and(|decision| decision.pause_when_idle)
-                })
-                .collect::<Vec<_>>();
+            let average_prompt = state
+                .rank_factors
+                .get(&target_id)
+                .map_or(1.0, |factors| factors.average_prompt_tokens().max(1.0));
+            let mut reasoning_count = 0;
+            let mut marked_reasoning_count = 0;
+            let mut future_private_relief = 0.0;
+            let mut router_usage = 0.0;
+            let mut victims = Vec::new();
+            for program in state.runtime.iter_views() {
+                if program.state != ProgramState::Active
+                    || program.placement != Some(target_id.as_str())
+                {
+                    continue;
+                }
+                let decision = state.decisions.get(program.reference);
+                if let Some(decision) = decision {
+                    let private_tokens =
+                        decision.private_tokens(self.config.progress_ttl.decode_buffer_tokens);
+                    router_usage += private_tokens;
+                    if program.status == ProgramStatus::Reasoning && decision.pause_when_idle {
+                        marked_reasoning_count += 1;
+                        future_private_relief += private_tokens;
+                    }
+                    let is_victim = match program.status {
+                        ProgramStatus::Acting => program.in_flight_requests == 0,
+                        ProgramStatus::Reasoning => {
+                            !decision.pause_when_idle && program.in_flight_requests > 0
+                        }
+                    };
+                    if is_victim {
+                        let elapsed = decision.segment_started_at.map_or(0.0, |started| {
+                            now.saturating_duration_since(started).as_secs_f64()
+                        });
+                        let input = if program.status == ProgramStatus::Acting {
+                            decision
+                                .last_context_tokens
+                                .unwrap_or(decision.estimated_context_tokens)
+                        } else {
+                            decision.estimated_context_tokens
+                        };
+                        let score = elapsed
+                            * (1.0 / (input as f64 / average_prompt).max(1e-6).sqrt()).max(0.5);
+                        victims.push(CapacityVictim {
+                            reference: program.reference.clone(),
+                            status: program.status,
+                            score,
+                            private_tokens,
+                        });
+                    }
+                }
+                if program.status == ProgramStatus::Reasoning {
+                    reasoning_count += 1;
+                }
+            }
             // Admission and resume use current occupancy: a reasoning Program
             // marked to pause still owns its KV until the request finishes.
             // Capacity repair is different: it is selecting any *additional*
             // victims for the same future idle boundary, so relief already
             // committed by earlier repair decisions must be subtracted here.
-            let future_private_relief = marked_reasoning
-                .iter()
-                .filter_map(|program| state.decisions.get(program.reference))
-                .map(|decision| {
-                    decision.private_tokens(self.config.progress_ttl.decode_buffer_tokens)
-                })
-                .sum::<f64>();
-            let future_completion_relief = average_completion * marked_reasoning.len() as f64;
-            let mut projected = (self.target_usage(state, &target_id, now)
-                + average_completion * reasoning_count as f64
+            let future_completion_relief = average_completion * marked_reasoning_count as f64;
+            let target_usage = self
+                .observed_target_usage(state, &target_id, now)
+                .unwrap_or(router_usage);
+            let mut projected = (target_usage + average_completion * reasoning_count as f64
                 - future_private_relief
                 - future_completion_relief)
                 .max(0.0);
             if projected <= high {
                 continue;
             }
-            let mut victims = views
-                .into_iter()
-                .filter(|program| {
-                    program.state == ProgramState::Active
-                        && program.placement == Some(target_id.as_str())
-                        && state
-                            .decisions
-                            .get(program.reference)
-                            .is_some_and(|decision| match program.status {
-                                ProgramStatus::Acting => program.in_flight_requests == 0,
-                                ProgramStatus::Reasoning => {
-                                    !decision.pause_when_idle && program.in_flight_requests > 0
-                                }
-                            })
-                })
-                .collect::<Vec<_>>();
-            let average_prompt = state
-                .rank_factors
-                .get(&target_id)
-                .map_or(1.0, |factors| factors.average_prompt_tokens().max(1.0));
             victims.sort_by(|left, right| {
-                let score = |program: &super::runtime::RuntimeProgramViewRef<'_>| {
-                    let decision = &state.decisions[program.reference];
-                    let elapsed = decision.segment_started_at.map_or(0.0, |started| {
-                        now.saturating_duration_since(started).as_secs_f64()
-                    });
-                    let input = if program.status == ProgramStatus::Acting {
-                        decision
-                            .last_context_tokens
-                            .unwrap_or(decision.estimated_context_tokens)
-                    } else {
-                        decision.estimated_context_tokens
-                    };
-                    elapsed * (1.0 / (input as f64 / average_prompt).max(1e-6).sqrt()).max(0.5)
-                };
-                score(right)
-                    .total_cmp(&score(left))
-                    .then_with(|| {
-                        state.decisions[right.reference]
-                            .private_tokens(self.config.progress_ttl.decode_buffer_tokens)
-                            .total_cmp(
-                                &state.decisions[left.reference]
-                                    .private_tokens(self.config.progress_ttl.decode_buffer_tokens),
-                            )
-                    })
+                right
+                    .score
+                    .total_cmp(&left.score)
+                    .then_with(|| right.private_tokens.total_cmp(&left.private_tokens))
                     .then_with(|| {
                         left.reference
                             .program_id()
                             .cmp(right.reference.program_id())
                     })
             });
-            let victims = victims
-                .into_iter()
-                .map(|victim| (victim.reference.clone(), victim.status))
-                .collect::<Vec<_>>();
-            for (victim, victim_status) in victims {
+            for victim in victims {
                 if projected <= low {
                     break;
                 }
-                let private = state.decisions[&victim]
-                    .private_tokens(self.config.progress_ttl.decode_buffer_tokens);
-                let relief = private
-                    + if victim_status == ProgramStatus::Reasoning {
+                let relief = victim.private_tokens
+                    + if victim.status == ProgramStatus::Reasoning {
                         average_completion
                     } else {
                         0.0
                     };
-                let relieved = if victim_status == ProgramStatus::Acting {
-                    self.pause_idle(state, &victim, ProgramPauseReason::CapacityRepair, now)
-                } else if let Some(decision) = state.decisions.get_mut(&victim) {
+                let relieved = if victim.status == ProgramStatus::Acting {
+                    self.pause_idle(
+                        state,
+                        &victim.reference,
+                        ProgramPauseReason::CapacityRepair,
+                        now,
+                    )
+                } else if let Some(decision) = state.decisions.get_mut(&victim.reference) {
                     decision.pause_when_idle = true;
                     RouterMetrics::record_agent_aware_transition(
                         &target_id,
