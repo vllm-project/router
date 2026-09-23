@@ -518,10 +518,9 @@ impl ProgramScheduler {
         }
         let active = state
             .runtime
-            .views()
-            .into_iter()
+            .iter_views()
             .filter(|other| {
-                other.state == ProgramState::Active && other.placement.as_deref() == Some(target_id)
+                other.state == ProgramState::Active && other.placement == Some(target_id)
             })
             .collect::<Vec<_>>();
         let used_tokens = self.target_usage(state, target_id, now);
@@ -556,7 +555,7 @@ impl ProgramScheduler {
         let reserve_tokens = factors.map_or(0.0, |factors| {
             let target_rounds = self.policy.target_rounds(factors);
             let active_remaining = active.iter().filter_map(|active| {
-                state.decisions.get(&active.reference).map(|active_state| {
+                state.decisions.get(active.reference).map(|active_state| {
                     (target_rounds - active_state.rounds_since_activation as f64).max(0.0)
                 })
             });
@@ -586,7 +585,7 @@ impl ProgramScheduler {
         let protected = active
             .iter()
             .filter_map(|active| {
-                let state = state.decisions.get(&active.reference)?;
+                let state = state.decisions.get(active.reference)?;
                 let remaining = (target_rounds - state.rounds_since_activation as f64).max(0.0);
                 (remaining > 0.0).then_some((remaining, state.last_cache_miss_impact_seconds))
             })
@@ -604,7 +603,7 @@ impl ProgramScheduler {
                 .filter_map(|active| {
                     state
                         .decisions
-                        .get(&active.reference)
+                        .get(active.reference)
                         .map(|decision| decision.estimated_context_tokens)
                 })
                 .sum(),

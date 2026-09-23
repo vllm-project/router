@@ -140,18 +140,17 @@ impl ProgramScheduler {
         }
         let affected = state
             .runtime
-            .views()
-            .into_iter()
+            .iter_views()
             .filter(|program| program.reference.model_pool() == model_pool)
             .filter_map(|program| {
-                let decision = state.decisions.get(&program.reference)?;
+                let decision = state.decisions.get(program.reference)?;
                 let needs_rebinding = decision
                     .last_target
                     .as_ref()
                     .is_none_or(|target| !current_ids.contains(target));
                 needs_rebinding.then(|| {
                     (
-                        program.reference,
+                        program.reference.clone(),
                         program.expected_resume,
                         program.waiting_requests,
                         decision
@@ -265,16 +264,16 @@ impl ProgramScheduler {
     /// Capture the Router ledger before a non-blocking metrics scrape begins.
     pub fn begin_observation(&self, targets: &[ProgramTarget]) -> BackendObservationEpoch {
         let state = self.state.lock();
+        let views = state.runtime.iter_views().collect::<Vec<_>>();
         let checkpoints = targets
             .iter()
             .map(|target| {
-                let views = state.runtime.views();
                 let active_reasoning = views
                     .iter()
                     .filter(|program| {
                         program.state == ProgramState::Active
                             && program.status == ProgramStatus::Reasoning
-                            && program.placement.as_deref() == Some(target.id.as_str())
+                            && program.placement == Some(target.id.as_str())
                     })
                     .collect::<Vec<_>>();
                 let active_acting_private_tokens = views
@@ -282,16 +281,16 @@ impl ProgramScheduler {
                     .filter(|program| {
                         program.state == ProgramState::Active
                             && program.status == ProgramStatus::Acting
-                            && program.placement.as_deref() == Some(target.id.as_str())
+                            && program.placement == Some(target.id.as_str())
                     })
-                    .filter_map(|program| state.decisions.get(&program.reference))
+                    .filter_map(|program| state.decisions.get(program.reference))
                     .map(|decision| {
                         decision.private_tokens(self.config.progress_ttl.decode_buffer_tokens)
                     })
                     .sum::<f64>();
                 let active_reasoning_private_tokens = active_reasoning
                     .iter()
-                    .filter_map(|program| state.decisions.get(&program.reference))
+                    .filter_map(|program| state.decisions.get(program.reference))
                     .map(|decision| {
                         decision.private_tokens(self.config.progress_ttl.decode_buffer_tokens)
                     })
@@ -401,7 +400,7 @@ impl ProgramScheduler {
         identity: &ProgramIdentity,
         now: Instant,
     ) -> Vec<ProgramBindingCandidate> {
-        let runtime_views = state.runtime.views();
+        let runtime_views = state.runtime.iter_views().collect::<Vec<_>>();
         state
             .model_targets
             .get(identity.model_pool())
@@ -413,7 +412,7 @@ impl ProgramScheduler {
                     .filter(|program| {
                         let last_target = state
                             .decisions
-                            .get(&program.reference)
+                            .get(program.reference)
                             .and_then(|decision| decision.last_target.as_deref());
                         last_target == Some(target_id.as_str())
                             && (program.state == ProgramState::Active
@@ -423,7 +422,7 @@ impl ProgramScheduler {
                     .collect::<Vec<_>>();
                 let accounted_tokens = accounted
                     .iter()
-                    .filter_map(|program| state.decisions.get(&program.reference))
+                    .filter_map(|program| state.decisions.get(program.reference))
                     .map(|decision| {
                         decision.private_tokens(self.config.progress_ttl.decode_buffer_tokens)
                     })
@@ -436,7 +435,7 @@ impl ProgramScheduler {
                             && program.placement.is_none()
                             && program.waiting_requests > 0
                     })
-                    .filter_map(|program| state.decisions.get(&program.reference))
+                    .filter_map(|program| state.decisions.get(program.reference))
                     .filter(|decision| {
                         decision.completed_requests == 0
                             && decision.last_target.as_deref() == Some(target_id.as_str())
@@ -449,7 +448,7 @@ impl ProgramScheduler {
                     .iter()
                     .filter(|program| {
                         program.state == ProgramState::Active
-                            && program.placement.as_deref() == Some(target_id.as_str())
+                            && program.placement == Some(target_id.as_str())
                     })
                     .count();
                 let target_usage = self.target_usage(state, target_id, now);
@@ -633,13 +632,11 @@ impl ProgramScheduler {
         }
         state
             .runtime
-            .views()
-            .into_iter()
+            .iter_views()
             .filter(|program| {
-                program.state == ProgramState::Active
-                    && program.placement.as_deref() == Some(target_id)
+                program.state == ProgramState::Active && program.placement == Some(target_id)
             })
-            .filter_map(|program| state.decisions.get(&program.reference))
+            .filter_map(|program| state.decisions.get(program.reference))
             .map(|decision| decision.private_tokens(self.config.progress_ttl.decode_buffer_tokens))
             .sum()
     }

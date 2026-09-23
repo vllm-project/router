@@ -87,12 +87,11 @@ impl ProgramScheduler {
         }
         let active_remaining = state
             .runtime
-            .views()
-            .into_iter()
+            .iter_views()
             .filter(|program| program.state == ProgramState::Active)
             .filter_map(|program| {
-                let rounds = target_rounds.get(program.placement.as_deref()?)?;
-                let decision = state.decisions.get(&program.reference)?;
+                let rounds = target_rounds.get(program.placement?)?;
+                let decision = state.decisions.get(program.reference)?;
                 let floor = usize::from(program.status == ProgramStatus::Reasoning) as f64;
                 Some((*rounds - decision.rounds_since_activation as f64).max(floor))
             })
@@ -158,14 +157,12 @@ impl ProgramScheduler {
         }
         let active_remaining = state
             .runtime
-            .views()
-            .into_iter()
+            .iter_views()
             .filter(|program| {
-                program.state == ProgramState::Active
-                    && program.placement.as_deref() == Some(target_id)
+                program.state == ProgramState::Active && program.placement == Some(target_id)
             })
             .filter_map(|program| {
-                state.decisions.get(&program.reference).map(|decision| {
+                state.decisions.get(program.reference).map(|decision| {
                     let floor = usize::from(program.status == ProgramStatus::Reasoning) as f64;
                     (target_rounds - decision.rounds_since_activation as f64).max(floor)
                 })
@@ -277,17 +274,16 @@ impl ProgramScheduler {
         });
         let future_relief = state
             .runtime
-            .views()
-            .into_iter()
+            .iter_views()
             .filter(|runtime| {
                 runtime.state == ProgramState::Active
                     && runtime.status == ProgramStatus::Reasoning
-                    && runtime.placement.as_deref() == Some(target_id.as_str())
+                    && runtime.placement == Some(target_id.as_str())
             })
             .filter_map(|runtime| {
                 state
                     .decisions
-                    .get(&runtime.reference)
+                    .get(runtime.reference)
                     .filter(|decision| decision.pause_when_idle)
             })
             .map(|decision| decision.private_tokens(self.config.progress_ttl.decode_buffer_tokens))

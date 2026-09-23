@@ -356,19 +356,18 @@ impl ProgramScheduler {
     fn expire_acting_ttls(&self, state: &mut ProgramSchedulerState, now: Instant) -> bool {
         let expired = state
             .runtime
-            .views()
-            .into_iter()
+            .iter_views()
             .filter(|runtime| {
                 runtime.state == ProgramState::Active
                     && runtime.status == ProgramStatus::Acting
                     && runtime.in_flight_requests == 0
                     && state
                         .decisions
-                        .get(&runtime.reference)
+                        .get(runtime.reference)
                         .and_then(|decision| decision.ttl_deadline)
                         .is_some_and(|deadline| deadline <= now)
             })
-            .map(|runtime| runtime.reference)
+            .map(|runtime| runtime.reference.clone())
             .collect::<Vec<_>>();
         let mut changed = false;
         for program in expired {
@@ -406,8 +405,7 @@ impl ProgramScheduler {
     fn release_expired_paused(&self, state: &mut ProgramSchedulerState, now: Instant) -> bool {
         let expired = state
             .runtime
-            .views()
-            .into_iter()
+            .iter_views()
             .filter(|runtime| {
                 runtime.state == ProgramState::Paused
                     && runtime.status == ProgramStatus::Acting
@@ -415,7 +413,7 @@ impl ProgramScheduler {
                     && runtime.waiting_requests == 0
                     && state
                         .decisions
-                        .get(&runtime.reference)
+                        .get(runtime.reference)
                         .is_some_and(|decision| {
                             decision.paused_at.is_some_and(|paused_at| {
                                 now.saturating_duration_since(paused_at)
@@ -423,7 +421,7 @@ impl ProgramScheduler {
                             })
                         })
             })
-            .map(|runtime| runtime.reference)
+            .map(|runtime| runtime.reference.clone())
             .collect::<Vec<_>>();
         for program in &expired {
             if let Some(target_id) = state
@@ -488,12 +486,11 @@ impl ProgramScheduler {
         };
         let active_reasoning = state
             .runtime
-            .views()
-            .into_iter()
+            .iter_views()
             .filter(|program| {
                 program.state == ProgramState::Active
                     && program.status == ProgramStatus::Reasoning
-                    && program.placement.as_deref() == Some(target_id)
+                    && program.placement == Some(target_id)
             })
             .count();
         let average_uncached = factors.average_uncached_prompt_tokens();
@@ -525,13 +522,13 @@ impl ProgramScheduler {
                 .rank_factors
                 .get(&target_id)
                 .map_or(0.0, |factors| factors.average_completion_tokens().ceil());
-            let views = state.runtime.views();
+            let views = state.runtime.iter_views().collect::<Vec<_>>();
             let reasoning_count = views
                 .iter()
                 .filter(|program| {
                     program.state == ProgramState::Active
                         && program.status == ProgramStatus::Reasoning
-                        && program.placement.as_deref() == Some(target_id.as_str())
+                        && program.placement == Some(target_id.as_str())
                 })
                 .count();
             let marked_reasoning = views
@@ -539,10 +536,10 @@ impl ProgramScheduler {
                 .filter(|program| {
                     program.state == ProgramState::Active
                         && program.status == ProgramStatus::Reasoning
-                        && program.placement.as_deref() == Some(target_id.as_str())
+                        && program.placement == Some(target_id.as_str())
                         && state
                             .decisions
-                            .get(&program.reference)
+                            .get(program.reference)
                             .is_some_and(|decision| decision.pause_when_idle)
                 })
                 .collect::<Vec<_>>();
@@ -553,7 +550,7 @@ impl ProgramScheduler {
             // committed by earlier repair decisions must be subtracted here.
             let future_private_relief = marked_reasoning
                 .iter()
-                .filter_map(|program| state.decisions.get(&program.reference))
+                .filter_map(|program| state.decisions.get(program.reference))
                 .map(|decision| {
                     decision.private_tokens(self.config.progress_ttl.decode_buffer_tokens)
                 })
@@ -571,10 +568,10 @@ impl ProgramScheduler {
                 .into_iter()
                 .filter(|program| {
                     program.state == ProgramState::Active
-                        && program.placement.as_deref() == Some(target_id.as_str())
+                        && program.placement == Some(target_id.as_str())
                         && state
                             .decisions
-                            .get(&program.reference)
+                            .get(program.reference)
                             .is_some_and(|decision| match program.status {
                                 ProgramStatus::Acting => program.in_flight_requests == 0,
                                 ProgramStatus::Reasoning => {
@@ -588,8 +585,8 @@ impl ProgramScheduler {
                 .get(&target_id)
                 .map_or(1.0, |factors| factors.average_prompt_tokens().max(1.0));
             victims.sort_by(|left, right| {
-                let score = |program: &super::runtime::RuntimeProgramView| {
-                    let decision = &state.decisions[&program.reference];
+                let score = |program: &super::runtime::RuntimeProgramViewRef<'_>| {
+                    let decision = &state.decisions[program.reference];
                     let elapsed = decision.segment_started_at.map_or(0.0, |started| {
                         now.saturating_duration_since(started).as_secs_f64()
                     });
@@ -605,10 +602,10 @@ impl ProgramScheduler {
                 score(right)
                     .total_cmp(&score(left))
                     .then_with(|| {
-                        state.decisions[&right.reference]
+                        state.decisions[right.reference]
                             .private_tokens(self.config.progress_ttl.decode_buffer_tokens)
                             .total_cmp(
-                                &state.decisions[&left.reference]
+                                &state.decisions[left.reference]
                                     .private_tokens(self.config.progress_ttl.decode_buffer_tokens),
                             )
                     })
@@ -618,26 +615,25 @@ impl ProgramScheduler {
                             .cmp(right.reference.program_id())
                     })
             });
-            for victim in victims {
+            let victims = victims
+                .into_iter()
+                .map(|victim| (victim.reference.clone(), victim.status))
+                .collect::<Vec<_>>();
+            for (victim, victim_status) in victims {
                 if projected <= low {
                     break;
                 }
-                let private = state.decisions[&victim.reference]
+                let private = state.decisions[&victim]
                     .private_tokens(self.config.progress_ttl.decode_buffer_tokens);
                 let relief = private
-                    + if victim.status == ProgramStatus::Reasoning {
+                    + if victim_status == ProgramStatus::Reasoning {
                         average_completion
                     } else {
                         0.0
                     };
-                let relieved = if victim.status == ProgramStatus::Acting {
-                    self.pause_idle(
-                        state,
-                        &victim.reference,
-                        ProgramPauseReason::CapacityRepair,
-                        now,
-                    )
-                } else if let Some(decision) = state.decisions.get_mut(&victim.reference) {
+                let relieved = if victim_status == ProgramStatus::Acting {
+                    self.pause_idle(state, &victim, ProgramPauseReason::CapacityRepair, now)
+                } else if let Some(decision) = state.decisions.get_mut(&victim) {
                     decision.pause_when_idle = true;
                     RouterMetrics::record_agent_aware_transition(
                         &target_id,

@@ -324,32 +324,26 @@ impl ProgramRuntime {
             .get(&RuntimeKey::from(program_ref))
             .filter(|program| &program.reference == program_ref)
             .map(|program| RuntimeProgramView {
-                reference: program.reference.clone(),
                 state: program.state,
                 status: program.status,
-                expected_resume: program.expected_resume,
                 placement: program.placement.clone(),
-                estimated_context_tokens: program.estimated_context_tokens,
                 in_flight_requests: program.in_flight_requests,
                 waiting_requests: self.request_pool.program_len(&program.reference),
             })
     }
 
-    /// Snapshot all live Program lifecycle facts without imposing order.
-    pub(crate) fn views(&self) -> Vec<RuntimeProgramView> {
-        self.programs
-            .values()
-            .map(|program| RuntimeProgramView {
-                reference: program.reference.clone(),
-                state: program.state,
-                status: program.status,
-                expected_resume: program.expected_resume,
-                placement: program.placement.clone(),
-                estimated_context_tokens: program.estimated_context_tokens,
-                in_flight_requests: program.in_flight_requests,
-                waiting_requests: self.request_pool.program_len(&program.reference),
-            })
-            .collect()
+    /// Borrow all live Program lifecycle facts without imposing order.
+    pub(crate) fn iter_views(&self) -> impl Iterator<Item = RuntimeProgramViewRef<'_>> {
+        self.programs.values().map(|program| RuntimeProgramViewRef {
+            reference: &program.reference,
+            state: program.state,
+            status: program.status,
+            expected_resume: program.expected_resume,
+            placement: program.placement.as_deref(),
+            estimated_context_tokens: program.estimated_context_tokens,
+            in_flight_requests: program.in_flight_requests,
+            waiting_requests: self.request_pool.program_len(&program.reference),
+        })
     }
 
     /// Wake the front retained request after an accepted transition.
@@ -361,11 +355,21 @@ impl ProgramRuntime {
 /// Immutable lifecycle facts consumed by Program scheduling policy modules.
 #[derive(Debug, Clone)]
 pub(crate) struct RuntimeProgramView {
-    pub(crate) reference: ProgramRef,
+    pub(crate) state: ProgramState,
+    pub(crate) status: ProgramStatus,
+    pub(crate) placement: Option<String>,
+    pub(crate) in_flight_requests: usize,
+    pub(crate) waiting_requests: usize,
+}
+
+/// Borrowed lifecycle facts for allocation-free scheduling scans.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RuntimeProgramViewRef<'a> {
+    pub(crate) reference: &'a ProgramRef,
     pub(crate) state: ProgramState,
     pub(crate) status: ProgramStatus,
     pub(crate) expected_resume: bool,
-    pub(crate) placement: Option<String>,
+    pub(crate) placement: Option<&'a str>,
     pub(crate) estimated_context_tokens: usize,
     pub(crate) in_flight_requests: usize,
     pub(crate) waiting_requests: usize,

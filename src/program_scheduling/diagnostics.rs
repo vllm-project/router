@@ -131,7 +131,7 @@ impl ProgramScheduler {
     /// Refresh bounded-cardinality gauges only from the periodic tick path.
     pub(crate) fn publish_metrics(&self, state: &ProgramSchedulerState) {
         let now = Instant::now();
-        let views = state.runtime.views();
+        let views = state.runtime.iter_views().collect::<Vec<_>>();
         for target_id in state.targets.keys() {
             let queued = views
                 .iter()
@@ -140,7 +140,7 @@ impl ProgramScheduler {
                         && program.waiting_requests > 0
                         && state
                             .decisions
-                            .get(&program.reference)
+                            .get(program.reference)
                             .is_some_and(|decision| {
                                 decision.last_target.as_deref() == Some(target_id.as_str())
                             })
@@ -150,7 +150,7 @@ impl ProgramScheduler {
                 .iter()
                 .filter(|program| {
                     program.state == ProgramState::Active
-                        && program.placement.as_deref() == Some(target_id.as_str())
+                        && program.placement == Some(target_id.as_str())
                 })
                 .count();
             let factors = state.rank_factors.get(target_id);
@@ -187,25 +187,25 @@ impl ProgramScheduler {
         let now = Instant::now();
         let state = self.state.lock();
         let sample_limit = self.config.progress_ttl.stats_window_size;
+        let views = state.runtime.iter_views().collect::<Vec<_>>();
         let mut ranks = Vec::with_capacity(state.targets.len());
         for (target_id, target) in &state.targets {
             let observation = state.observations.get(target_id);
             let capacity_accounting_source = self.capacity_accounting_source(observation, now);
-            let mut programs = state
-                .runtime
-                .views()
-                .into_iter()
+            let mut programs = views
+                .iter()
+                .copied()
                 .filter(|runtime| {
                     state
                         .decisions
-                        .get(&runtime.reference)
+                        .get(runtime.reference)
                         .is_some_and(|decision| {
                             decision.last_target.as_deref() == Some(target_id.as_str())
                         })
                 })
                 .map(|runtime| {
-                    let decision = &state.decisions[&runtime.reference];
-                    let request_hints = state.runtime.front_request_hints(&runtime.reference);
+                    let decision = &state.decisions[runtime.reference];
+                    let request_hints = state.runtime.front_request_hints(runtime.reference);
                     ProgramDiagnostic {
                         program: runtime.reference.redacted_id(),
                         generation: runtime.reference.generation(),
@@ -243,7 +243,7 @@ impl ProgramScheduler {
                             .map(|ttl| ttl.as_secs_f64()),
                         home_target: decision.home_target.clone(),
                         last_target: decision.last_target.clone(),
-                        placement: runtime.placement,
+                        placement: runtime.placement.map(str::to_string),
                         estimated_context_tokens: decision.estimated_context_tokens,
                         shared_prefix_tokens: decision.shared_prefix_tokens,
                         shared_prefix_freshness_remaining_seconds: decision
@@ -440,7 +440,9 @@ impl ProgramScheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::program_scheduling::{ProgramIdentity, ProgramSchedulerConfig, ProgramTarget};
+    use crate::program_scheduling::{
+        ProgramIdentity, ProgramSchedulerConfig, ProgramTarget, ProgressTtlConfig,
+    };
     use serde_json::json;
 
     #[tokio::test]
@@ -513,9 +515,14 @@ mod tests {
 
     #[test]
     fn snapshot_identifies_stale_backend_capacity_fallback() {
-        let mut config = ProgramSchedulerConfig::default();
-        config.metrics_interval = std::time::Duration::from_secs(1);
-        config.progress_ttl.token_capacity = Some(1_000);
+        let config = ProgramSchedulerConfig {
+            metrics_interval: std::time::Duration::from_secs(1),
+            progress_ttl: ProgressTtlConfig {
+                token_capacity: Some(1_000),
+                ..ProgressTtlConfig::default()
+            },
+            ..ProgramSchedulerConfig::default()
+        };
         let scheduler = ProgramScheduler::new(config);
         let target = ProgramTarget {
             id: "rank-0".into(),

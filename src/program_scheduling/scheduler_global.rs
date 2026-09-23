@@ -279,11 +279,9 @@ impl ProgramScheduler {
     fn active_program_count(&self, state: &ProgramSchedulerState, target_id: &str) -> usize {
         state
             .runtime
-            .views()
-            .into_iter()
+            .iter_views()
             .filter(|program| {
-                program.state == ProgramState::Active
-                    && program.placement.as_deref() == Some(target_id)
+                program.state == ProgramState::Active && program.placement == Some(target_id)
             })
             .count()
     }
