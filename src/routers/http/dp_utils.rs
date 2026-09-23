@@ -2,46 +2,159 @@
 // This module provides common functions for data-parallel aware routing
 // that can be reused across different router implementations.
 
-use tracing::info;
+use std::collections::BTreeSet;
+use std::time::Duration;
+
+use tracing::{info, warn};
+
+/// How long to wait for a worker's `/metrics` scrape during DP rank discovery.
+const DP_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Parse the set of DP ranks a vLLM server exposes on `/metrics`.
+///
+/// vLLM emits one series per engine it can address — the same set that
+/// `X-data-parallel-rank` selects from — labelled with the engine's **global**
+/// data-parallel rank. The ranks are returned sorted, so the caller's ordering
+/// is deterministic.
+///
+/// Returns `None` when the body carries no parseable vLLM engine labels (e.g.
+/// a server started with `--disable-log-stats`).
+fn parse_engine_ranks(metrics_body: &str) -> Option<Vec<usize>> {
+    let ranks: BTreeSet<usize> = metrics_body
+        .lines()
+        .filter(|line| line.starts_with("vllm:"))
+        .filter_map(|line| {
+            let (_, after_label) = line.split_once("engine=\"")?;
+            let (engine, _) = after_label.split_once('"')?;
+            engine.parse::<usize>().ok()
+        })
+        .collect();
+
+    (!ranks.is_empty()).then(|| ranks.into_iter().collect())
+}
+
+/// Ask a worker which global DP ranks it serves, via its `/metrics` endpoint.
+///
+/// Returns `None` if the worker is unreachable, answers non-2xx, or exposes no
+/// engine labels — the caller falls back to assuming ranks `0..dp_size`.
+async fn discover_engine_ranks(client: &reqwest::Client, base_url: &str) -> Option<Vec<usize>> {
+    // /metrics sits outside vLLM's authenticated path prefixes.
+    let metrics_url = format!("{}/metrics", base_url.trim_end_matches('/'));
+
+    let body = match client.get(&metrics_url).send().await {
+        Ok(response) if response.status().is_success() => response.text().await.ok()?,
+        Ok(response) => {
+            warn!(
+                "DP rank discovery for {} returned {}",
+                metrics_url,
+                response.status()
+            );
+            return None;
+        }
+        Err(error) => {
+            warn!("DP rank discovery for {} failed: {}", metrics_url, error);
+            return None;
+        }
+    };
+
+    parse_engine_ranks(&body)
+}
+
+/// Build the DP-aware URLs ("http://host:port@rank") for a single worker.
+fn dp_aware_urls(base_url: &str, ranks: &[usize]) -> Vec<String> {
+    ranks
+        .iter()
+        .map(|rank| format!("{}@{}", base_url, rank))
+        .collect()
+}
 
 /// Given a list of worker URLs, expand them into DP-aware URLs
 /// with dp_rank as suffix (format: "http://host:port@rank")
 ///
-/// This function does NOT query the workers - it uses the provided dp_size
-/// to expand each worker URL into multiple DP-aware URLs with rank suffixes.
+/// The rank suffix is the engine's **global** DP rank, which is what vLLM
+/// resolves the `X-data-parallel-rank` header against. Each worker is asked for
+/// its own ranks via `/metrics` rather than assuming every worker starts at
+/// rank 0: under `--data-parallel-hybrid-lb` the API server on the second node
+/// of a DP8 deployment owns global ranks 4..7, and addressing it as 0..3 makes
+/// it reject every request.
+///
+/// Workers that expose no engine metrics fall back to `0..dp_size`, preserving
+/// the previous behaviour for single-node and internal-LB deployments.
 ///
 /// # Arguments
 /// * `worker_urls` - List of base worker URLs
-/// * `_api_key` - Unused, kept for API compatibility
-/// * `dp_size` - Number of DP ranks to create for each worker
+/// * `_api_key` - Unused; `/metrics` is not behind vLLM's API-key prefixes
+/// * `dp_size` - Ranks per worker to assume when discovery is unavailable
 ///
 /// # Returns
 /// * `Ok(Vec<String>)` - List of expanded worker URLs with dp_rank suffixes
 ///
 /// # Example
 /// ```
-/// // For worker "http://host:8000" with dp_size=2:
-/// // Returns: ["http://host:8000@0", "http://host:8000@1"]
+/// // For worker "http://host:8000" reporting engines 4..7:
+/// // Returns: ["http://host:8000@4", ..., "http://host:8000@7"]
 /// ```
 pub async fn get_dp_aware_workers(
     worker_urls: &[String],
     _api_key: &Option<String>,
     dp_size: usize,
 ) -> Result<Vec<String>, String> {
+    let client = reqwest::Client::builder()
+        .timeout(DP_DISCOVERY_TIMEOUT)
+        .build()
+        .map_err(|e| format!("Failed to create HTTP client for DP rank discovery: {}", e))?;
+
+    // Discover every worker concurrently: a worker that does not answer costs a
+    // full DP_DISCOVERY_TIMEOUT, and serialising that over a large deployment
+    // would add it to router startup once per node.
+    let base_urls: Vec<String> = worker_urls
+        .iter()
+        .map(|url| parse_worker_url(url).0)
+        .collect();
+    let discovered = futures::future::join_all(
+        base_urls
+            .iter()
+            .map(|base_url| discover_engine_ranks(&client, base_url)),
+    )
+    .await;
+
     let mut dp_aware_workers: Vec<String> = Vec::new();
 
-    for url in worker_urls {
+    for (base_url, ranks) in base_urls.iter().zip(discovered) {
+        let ranks = match ranks {
+            Some(ranks) => {
+                if ranks.len() != dp_size {
+                    warn!(
+                        "Worker {} reports {} engine(s) {:?}, but \
+                         --intra-node-data-parallel-size is {}; using the reported ranks",
+                        base_url,
+                        ranks.len(),
+                        ranks,
+                        dp_size
+                    );
+                }
+                ranks
+            }
+            None => {
+                warn!(
+                    "Could not read engine ranks from {}/metrics; assuming ranks 0..{}. \
+                     If this worker is a non-zero-rank node of a --data-parallel-hybrid-lb \
+                     deployment, requests routed to it will be rejected.",
+                    base_url,
+                    dp_size.saturating_sub(1)
+                );
+                (0..dp_size).collect()
+            }
+        };
+
         info!(
-            "Expanding worker {} to {} DP-aware URLs (ranks 0..{})",
-            url,
-            dp_size,
-            dp_size - 1
+            "Expanding worker {} to {} DP-aware URLs (ranks {:?})",
+            base_url,
+            ranks.len(),
+            ranks
         );
 
-        // Expand each worker URL to multiple DP-aware URLs
-        for rank in 0..dp_size {
-            dp_aware_workers.push(format!("{}@{}", url, rank));
-        }
+        dp_aware_workers.extend(dp_aware_urls(base_url, &ranks));
     }
 
     Ok(dp_aware_workers)
@@ -222,22 +335,14 @@ mod tests {
         assert_eq!(rank, None);
     }
 
-    #[tokio::test]
-    async fn test_get_dp_aware_workers_ipv6() {
-        let urls = vec!["https://[2a03:83e4:5006:0090:5f5a:f8c5:0400:0000]:20009".to_string()];
-        let result = get_dp_aware_workers(&urls, &None, 4).await.unwrap();
+    #[test]
+    fn test_dp_aware_urls_ipv6() {
+        let base = "https://[2a03:83e4:5006:0090:5f5a:f8c5:0400:0000]:20009";
+        let result = dp_aware_urls(base, &[0, 1, 2, 3]);
         assert_eq!(result.len(), 4);
         assert_eq!(
             result[0],
             "https://[2a03:83e4:5006:0090:5f5a:f8c5:0400:0000]:20009@0"
-        );
-        assert_eq!(
-            result[1],
-            "https://[2a03:83e4:5006:0090:5f5a:f8c5:0400:0000]:20009@1"
-        );
-        assert_eq!(
-            result[2],
-            "https://[2a03:83e4:5006:0090:5f5a:f8c5:0400:0000]:20009@2"
         );
         assert_eq!(
             result[3],
@@ -246,12 +351,57 @@ mod tests {
 
         // Verify round-trip: extracting dp_rank from expanded URLs works
         for (i, url) in result.iter().enumerate() {
-            let (base, rank) = extract_dp_rank(url).unwrap();
-            assert_eq!(
-                base,
-                "https://[2a03:83e4:5006:0090:5f5a:f8c5:0400:0000]:20009"
-            );
+            let (parsed_base, rank) = extract_dp_rank(url).unwrap();
+            assert_eq!(parsed_base, base);
             assert_eq!(rank, i);
         }
+    }
+
+    /// The second node of a `--data-parallel-hybrid-lb` DP8 deployment owns
+    /// global ranks 4..7, so its URLs must carry those ranks, not 0..3.
+    #[test]
+    fn test_dp_aware_urls_uses_global_ranks() {
+        let result = dp_aware_urls("http://node2:8000", &[4, 5, 6, 7]);
+        assert_eq!(
+            result,
+            vec![
+                "http://node2:8000@4",
+                "http://node2:8000@5",
+                "http://node2:8000@6",
+                "http://node2:8000@7",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_parse_engine_ranks_hybrid_lb_second_node() {
+        // Abridged /metrics from the DP8 hybrid-LB node that owns ranks 4..7.
+        let body = r#"# HELP vllm:num_requests_running Number of requests in model execution batches.
+# TYPE vllm:num_requests_running gauge
+vllm:num_requests_running{engine="4",model_name="m"} 3.0
+vllm:num_requests_running{engine="5",model_name="m"} 1.0
+vllm:num_requests_running{engine="6",model_name="m"} 0.0
+vllm:num_requests_running{engine="7",model_name="m"} 2.0
+vllm:num_requests_waiting{engine="4",model_name="m"} 0.0
+process_resident_memory_bytes 1.234e+09
+"#;
+        assert_eq!(parse_engine_ranks(body), Some(vec![4, 5, 6, 7]));
+    }
+
+    #[test]
+    fn test_parse_engine_ranks_ignores_unparseable_and_foreign_labels() {
+        let body = r#"vllm:cache_config_info{engine="",model_name="m"} 1.0
+vllm:num_requests_running{engine="1",model_name="m"} 0.0
+vllm:num_requests_running{engine="0",model_name="m"} 0.0
+other:metric{engine="9"} 1.0
+"#;
+        // Sorted, deduped, and the empty/foreign labels dropped.
+        assert_eq!(parse_engine_ranks(body), Some(vec![0, 1]));
+    }
+
+    #[test]
+    fn test_parse_engine_ranks_none_without_engine_labels() {
+        assert_eq!(parse_engine_ranks(""), None);
+        assert_eq!(parse_engine_ranks("process_cpu_seconds_total 1.0\n"), None);
     }
 }
