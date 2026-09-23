@@ -1,6 +1,8 @@
 //! Protocol-neutral Program runtime values shared with Router adapters.
 
-use std::hash::{Hash, Hasher};
+use std::collections::hash_map::RandomState;
+use std::hash::{BuildHasher, Hash};
+use std::sync::OnceLock;
 use std::time::Instant;
 
 use super::ProgramRequestHints;
@@ -61,9 +63,9 @@ impl ProgramRef {
 
     /// Stable privacy-preserving identifier suitable for diagnostics.
     pub fn redacted_id(&self) -> String {
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        self.hash(&mut hasher);
-        format!("{:016x}", hasher.finish())
+        static HASHER: OnceLock<RandomState> = OnceLock::new();
+        let hash = HASHER.get_or_init(RandomState::new).hash_one(self);
+        format!("{hash:016x}")
     }
 }
 
@@ -222,5 +224,17 @@ mod tests {
         let second = ProgramRef::new("model".into(), "program".into(), 2);
         assert_ne!(first, second);
         assert_ne!(first.redacted_id(), second.redacted_id());
+    }
+
+    #[test]
+    fn diagnostic_identifier_is_process_stable_and_fixed_width() {
+        let reference = ProgramRef::new("model".into(), "program".into(), 1);
+        let first = reference.redacted_id();
+        assert_eq!(first, reference.redacted_id());
+        assert_eq!(first.len(), 16);
+        assert!(first.bytes().all(|byte| byte.is_ascii_hexdigit()));
+
+        let other_pool = ProgramRef::new("other-model".into(), "program".into(), 1);
+        assert_ne!(first, other_pool.redacted_id());
     }
 }
