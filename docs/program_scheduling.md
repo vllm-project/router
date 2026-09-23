@@ -11,12 +11,14 @@ Library users configure Program scheduling through `RouterConfig.program_schedul
 | `vllm_xargs.agentic_context` | Default. Only the canonical body object enables Program scheduling. |
 | `auto` | Also accepts `agent_hint`, Claude Code Headers, Codex/OpenCode Headers, and `x-session-id`. |
 
+The default is a strict per-request opt-in contract, not a claim that existing agents already emit this field. Program scheduling can retain requests and change admission, pause, resume, and capacity accounting, so requests without the configured metadata must remain on the native request-level path. AgentInfer adapters and [replay transport](https://github.com/openJiuwen-ai/agent-infer/blob/f764c9a7c387eef632defa96fb3ccae6f654c0f9/agentinfer/agentbench/replay/transport.py#L198-L204) currently inject `vllm_xargs.agentic_context`; other harnesses need an equivalent integration. This follows the general pattern of Dynamo's [`nvext.agent_hints`](https://docs.nvidia.com/dynamo/dev/agents/agent-hints), which defines an extensible serving-hint envelope even though its documented [Claude Code, Codex, and OpenCode integrations](https://docs.nvidia.com/dynamo/dev/agents/agent-harnesses) primarily emit session headers. Deployments that intentionally want those identity-only compatibility inputs to opt in can select `auto`; the canonical context still has precedence when several sources are present.
+
 ```json
 {
   "program_scheduling_enable_key": "vllm_xargs.agentic_context",
   "global_queue": true,
   "resume_order": "mru",
-  "token_capacity_per_target": 266864,
+  "token_capacity_per_dp_rank": 266864,
   "metrics_interval_seconds": 1.0,
   "prefill_cost_model": {
     "intercept_seconds": 0.06600061907132926,
@@ -38,7 +40,15 @@ To adapt Program scheduling to a different model or hardware configuration, oper
 
 ## Launch the Router
 
-Save the configuration above as `program-scheduling.json`, compact it into one CLI argument, and start the Router with the backend API endpoints. One Worker URL may expose multiple internal DP Ranks; `--intra-node-data-parallel-size` is the number of internal Ranks behind each Worker URL.
+No file is required to enable Program scheduling with every default:
+
+```bash
+vllm-router \
+  --worker-urls http://worker-0:8000 http://worker-1:8000 \
+  --program-scheduling-config-json '{}'
+```
+
+The empty JSON object is the feature-presence switch with all fields defaulted; omitting `--program-scheduling-config-json` disables Program scheduling. The defaults use the Program-count guard because token capacity is unset and emit a calibration warning because the built-in performance coefficients are reference values. For a production deployment, save the calibrated configuration above as `program-scheduling.json`, compact it into one CLI argument, and start the Router with the backend API endpoints. One Worker URL may expose multiple internal DP Ranks; `--intra-node-data-parallel-size` is the number of internal Ranks behind each Worker URL.
 
 ```bash
 export PROGRAM_CONFIG_JSON="$(python -c \
@@ -82,7 +92,7 @@ All fields below belong to `program_scheduling`. Values omitted from the JSON ob
 | `cross_rank_headroom_ratio` | `1.2` | Controls cross-Rank migration conservatism. A destination must have at least the source Rank's free capacity plus this multiple of the Program's complete estimated context. It has no effect when `global_queue` is `false`. |
 | `binding_strategy` | `consistent_hash` | Selects the initial home Rank for each new Program generation. Supported values are `consistent_hash`, `program_round_robin`, `least_program_count`, `reasoning_token_balance`, and `cache_aware`; it does not replace admission or resume decisions. |
 | `hash_virtual_nodes` | `160` | Sets the number of virtual nodes used by `consistent_hash` initial binding. It has no effect on the other binding strategies. |
-| `token_capacity_per_target` | `null` | Supplies the logical KV-token capacity of each concrete DP Rank. A value enables token-based admission, growth reserve, capacity repair, and cross-Rank headroom checks; `null` falls back to the Program-count guard. `reasoning_token_balance` requires this value. |
+| `token_capacity_per_dp_rank` | `null` | Supplies the logical KV-token capacity of each concrete DP Rank. A value enables token-based admission, growth reserve, capacity repair, and cross-Rank headroom checks; `null` falls back to the Program-count guard. `reasoning_token_balance` requires this value. The deprecated input alias `token_capacity_per_target` is accepted but is never emitted when the configuration is serialized. |
 | `max_active_programs_per_target` | `64` | Limits active Programs on one Rank as a coarse concurrency guard. It is the primary capacity guard when token capacity is absent and remains a count guard when token capacity is configured; forced resume may override it. |
 | `metrics_interval_seconds` | `1.0` | Sets the backend metrics polling and periodic scheduling interval. It also defines observation freshness and the minimum residence used by parts of cross-Rank resume. |
 | `admission_waiting_request_threshold` | `1` | Blocks ordinary admission or resume to a Rank when its native vLLM waiting-request count reaches this threshold. `0` disables this waiting gate. |
