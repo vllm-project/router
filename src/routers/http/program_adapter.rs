@@ -144,8 +144,12 @@ impl ProgramUsageAccumulator {
             return;
         };
         let data = data.trim();
-        if !data.is_empty() && data != "[DONE]" {
-            self.observe_json(data.as_bytes());
+        let data = data.as_bytes();
+        if data
+            .windows(b"\"usage\"".len())
+            .any(|window| window == b"\"usage\"")
+        {
+            self.observe_json(data);
         }
     }
 
@@ -226,6 +230,19 @@ mod tests {
         assert_eq!(accumulator.observation.prompt_tokens, Some(60));
         assert_eq!(accumulator.observation.cached_prompt_tokens, Some(30));
         assert_eq!(accumulator.observation.completion_tokens, Some(5));
+    }
+
+    #[test]
+    fn sse_prefilter_preserves_usage_across_chunk_boundaries() {
+        let mut accumulator = ProgramUsageAccumulator::default();
+        accumulator
+            .observe_sse_chunk(b"data: {\"choices\":[{\"delta\":{\"content\":\"usage-free\"}}]}\n");
+        assert_eq!(accumulator.observation, ProgramUsageObservation::default());
+
+        accumulator.observe_sse_chunk(b"data: {\"usage\":{\"prompt_tokens\":12,");
+        accumulator.observe_sse_chunk(b"\"completion_tokens\":3}}\n\ndata: [DONE]\n");
+        assert_eq!(accumulator.observation.prompt_tokens, Some(12));
+        assert_eq!(accumulator.observation.completion_tokens, Some(3));
     }
 
     #[tokio::test]
