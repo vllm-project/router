@@ -519,6 +519,31 @@ async fn get_loads(State(state): State<Arc<AppState>>, headers: http::HeaderMap)
     state.router.get_worker_loads().await
 }
 
+#[derive(Deserialize)]
+struct FinishSessionQuery {
+    session_id: String,
+}
+
+/// POST /finish_session?session_id=<id>
+///
+/// Marks a session (e.g. an RL trajectory) as finished so that session-aware
+/// routing policies (e.g. `sticky_least_loaded`) can release the
+/// active-session assignment. For policies that don't track
+/// sessions, this is a no-op. Unknown session ids are ignored.
+async fn finish_session(
+    State(state): State<Arc<AppState>>,
+    Query(FinishSessionQuery { session_id }): Query<FinishSessionQuery>,
+    headers: http::HeaderMap,
+) -> Response {
+    if let Err(response) = authorize_request(&state, &headers).await {
+        return response;
+    }
+
+    state.context.policy_registry.finish_session(&session_id);
+
+    Json(json!({ "status": "ok", "session_id": session_id })).into_response()
+}
+
 async fn scheduling_diagnostics(
     State(state): State<Arc<AppState>>,
     headers: http::HeaderMap,
@@ -526,6 +551,7 @@ async fn scheduling_diagnostics(
     if let Err(response) = authorize_request(&state, &headers).await {
         return response;
     }
+
     match state.router.scheduling_diagnostics() {
         Some(diagnostics) => Json(diagnostics).into_response(),
         None => (
@@ -814,6 +840,7 @@ pub fn build_app_with_wasm_middleware(
         .route("/list_workers", get(list_workers))
         .route("/flush_cache", post(flush_cache))
         .route("/get_loads", get(get_loads))
+        .route("/finish_session", post(finish_session))
         .route("/scheduling/diagnostics", get(scheduling_diagnostics));
 
     // Worker management routes
