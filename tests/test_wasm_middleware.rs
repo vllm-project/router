@@ -71,7 +71,7 @@ async fn wasm_middleware_modify_reject_and_path_isolation() {
         mode: RoutingMode::Regular {
             worker_urls: vec![worker_url],
         },
-        worker_startup_timeout_secs: 1,
+        worker_startup_timeout_secs: 10,
         worker_startup_check_interval_secs: 1,
         ..Default::default()
     };

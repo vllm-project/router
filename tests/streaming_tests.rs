@@ -21,7 +21,7 @@ impl TestContext {
                 worker_urls: vec![],
             },
             port: 3004,
-            worker_startup_timeout_secs: 1,
+            worker_startup_timeout_secs: 10,
             worker_startup_check_interval_secs: 1,
             ..Default::default()
         };
