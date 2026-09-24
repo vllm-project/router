@@ -63,13 +63,22 @@ impl ResponseStorage for MemoryResponseStorage {
         // Single lock acquisition for atomic update
         let mut store = self.store.write();
 
+        // Remove any previous index entry before replacing the response.
+        if let Some(old_user) = store
+            .responses
+            .get(&response_id)
+            .and_then(|existing| existing.user.clone())
+        {
+            if let Some(user_responses) = store.user_index.get_mut(&old_user) {
+                user_responses.retain(|id| id != &response_id);
+            }
+        }
+
         // Update user index if user is specified
         if let Some(ref user) = response.user {
-            store
-                .user_index
-                .entry(user.clone())
-                .or_default()
-                .push(response_id.clone());
+            let user_responses = store.user_index.entry(user.clone()).or_default();
+            user_responses.retain(|id| id != &response_id);
+            user_responses.push(response_id.clone());
         }
 
         // Store the response
@@ -304,6 +313,59 @@ mod tests {
         // User2's responses should still be there
         let user2_responses_after = store.list_user_responses("user2", None).await.unwrap();
         assert_eq!(user2_responses_after.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_overwriting_response_id_removes_old_user_index_entry() {
+        let store = MemoryResponseStorage::new();
+        let response_id = ResponseId::from_string("response-0".to_string());
+
+        let mut old_response =
+            StoredResponse::new("Old input".to_string(), "Old output".to_string(), None);
+        old_response.id = response_id.clone();
+        old_response.user = Some("user-0".to_string());
+        store.store_response(old_response).await.unwrap();
+
+        let mut new_response =
+            StoredResponse::new("New input".to_string(), "New output".to_string(), None);
+        new_response.id = response_id.clone();
+        new_response.user = Some("user-1".to_string());
+        store.store_response(new_response).await.unwrap();
+
+        assert!(store
+            .list_user_responses("user-0", None)
+            .await
+            .unwrap()
+            .is_empty());
+
+        let user1_responses = store.list_user_responses("user-1", None).await.unwrap();
+        assert_eq!(user1_responses.len(), 1);
+        assert_eq!(user1_responses[0].output, "New output");
+
+        let stored_response = store.get_response(&response_id).await.unwrap().unwrap();
+        assert_eq!(stored_response.output, "New output");
+    }
+
+    #[tokio::test]
+    async fn test_overwriting_response_id_does_not_duplicate_user_index_entry() {
+        let store = MemoryResponseStorage::new();
+        let response_id = ResponseId::from_string("response-0".to_string());
+
+        let mut old_response =
+            StoredResponse::new("Old input".to_string(), "Old output".to_string(), None);
+        old_response.id = response_id.clone();
+        old_response.user = Some("user-0".to_string());
+        store.store_response(old_response).await.unwrap();
+
+        let mut new_response =
+            StoredResponse::new("New input".to_string(), "New output".to_string(), None);
+        new_response.id = response_id;
+        new_response.user = Some("user-0".to_string());
+        store.store_response(new_response).await.unwrap();
+
+        let user_responses = store.list_user_responses("user-0", None).await.unwrap();
+        assert_eq!(user_responses.len(), 1);
+        assert_eq!(user_responses[0].output, "New output");
     }
 
     #[tokio::test]
