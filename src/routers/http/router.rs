@@ -144,6 +144,7 @@ struct TypedDispatch<'a> {
 /// Regular router that uses injected load balancing policies
 #[derive(Debug)]
 pub struct Router {
+    epd: Option<super::epd::EncoderStage>,
     worker_registry: Arc<WorkerRegistry>,
     policy_registry: Arc<PolicyRegistry>,
     client: Client,
@@ -346,6 +347,11 @@ impl Router {
         });
 
         Ok(Router {
+            epd: ctx
+                .router_config
+                .epd
+                .clone()
+                .map(super::epd::EncoderStage::new),
             worker_registry: ctx.worker_registry.clone(),
             policy_registry: ctx.policy_registry.clone(),
             client: ctx.client.clone(),
@@ -2437,7 +2443,14 @@ impl RouterTrait for Router {
                 .into_response();
         }
 
-        let request_text = serde_json::to_string(&body).ok();
+        let policy = self.policy_registry.get_default_policy();
+        // Serializing the whole body is expensive when it carries base64
+        // media; only consumers that actually read the text pay for it.
+        let request_text = if policy.needs_request_text() || self.program_scheduler.is_some() {
+            serde_json::to_string(&body).ok()
+        } else {
+            None
+        };
         let model_id = body.get("model").and_then(serde_json::Value::as_str);
         let is_stream = body
             .get("stream")
@@ -2465,7 +2478,6 @@ impl RouterTrait for Router {
                 .get_by_url(&completion.dispatch().target_id)
                 .filter(|worker| worker.is_available())
         } else {
-            let policy = self.policy_registry.get_default_policy();
             let request_headers = Self::headers_to_request_headers(headers);
             policy
                 .select_worker_with_headers(
@@ -2486,6 +2498,28 @@ impl RouterTrait for Router {
                 .into_response();
         };
         let url = worker.endpoint_url(path);
+
+        let (body, mut transfers) = if let Some(epd) = &self.epd {
+            if *method == Method::POST && path == "/v1/chat/completions" {
+                match epd
+                    .prepare(
+                        &self.client,
+                        body,
+                        worker.url(),
+                        headers,
+                        self.api_key.as_deref(),
+                    )
+                    .await
+                {
+                    Ok(value) => value,
+                    Err(error) => return error.into_response(),
+                }
+            } else {
+                (body, None)
+            }
+        } else {
+            (body, None)
+        };
 
         debug!("Transparent proxy: forwarding to {}", url);
 
@@ -2515,6 +2549,23 @@ impl RouterTrait for Router {
         }
 
         // Add authorization if configured
+        if self.epd.is_some() {
+            if let Some(headers) = headers {
+                for (name, value) in headers {
+                    if !matches!(
+                        name.as_str(),
+                        "host"
+                            | "content-length"
+                            | "content-type"
+                            | "connection"
+                            | "transfer-encoding"
+                    ) && !header_utils::TRACE_HEADER_NAMES.contains(&name.as_str())
+                    {
+                        request_builder = request_builder.header(name, value);
+                    }
+                }
+            }
+        }
         if let Some(ref key) = self.api_key {
             request_builder = request_builder.header("Authorization", format!("Bearer {}", key));
         }
@@ -2534,6 +2585,18 @@ impl RouterTrait for Router {
         {
             Ok(response) => {
                 let status = response.status();
+                // Keep the circuit breaker informed, as the typed path does:
+                // 2xx/4xx count as success, 5xx as worker failure.
+                let was_available = worker.is_available();
+                worker.record_outcome(status.is_success() || status.is_client_error());
+                if was_available != worker.is_available() {
+                    self.worker_registry.notify_worker_state_change();
+                }
+                if status.is_success() {
+                    if let Some(transfers) = transfers.as_mut() {
+                        transfers.disarm();
+                    }
+                }
                 let headers = response.headers().clone();
                 let mut response_builder = Response::builder().status(status.as_u16());
 
@@ -2638,6 +2701,12 @@ impl RouterTrait for Router {
                 if let Some(completion) = &program_completion {
                     completion.finish(false);
                 }
+                // Transport failure: the worker never produced a response.
+                let was_available = worker.is_available();
+                worker.record_outcome(false);
+                if was_available != worker.is_available() {
+                    self.worker_registry.notify_worker_state_change();
+                }
                 (
                     StatusCode::BAD_GATEWAY,
                     format!("Backend request failed: {error}"),
@@ -2668,6 +2737,7 @@ mod tests {
 
         let (_, rx) = tokio::sync::watch::channel(HashMap::new());
         Router {
+            epd: None,
             worker_registry,
             policy_registry,
             worker_startup_timeout_secs: 5,
@@ -2710,6 +2780,7 @@ mod tests {
             circuit_breaker_config: CircuitBreakerConfig::default(),
             health_config: HealthConfig::default(),
             frontend: crate::backend::EngineFrontend::new(),
+            epd: None,
             _worker_loads: Arc::new(rx),
             _load_monitor_handle: None,
             program_scheduler: None,
@@ -2965,6 +3036,7 @@ mod tests {
         Router {
             worker_registry,
             policy_registry,
+            epd: None,
             worker_startup_timeout_secs: 5,
             worker_startup_check_interval_secs: 1,
             intra_node_data_parallel_size: 1,
