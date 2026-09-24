@@ -33,10 +33,8 @@ impl PolicyFactory {
                 };
                 Arc::new(CacheAwarePolicy::with_config(config))
             }
-            PolicyConfig::ConsistentHash { virtual_nodes: _ } => {
-                // Note: virtual_nodes parameter is available but not currently used
-                // The consistent hash policy uses a hardcoded value for now
-                Arc::new(ConsistentHashPolicy::new())
+            PolicyConfig::ConsistentHash { virtual_nodes } => {
+                Arc::new(ConsistentHashPolicy::with_virtual_nodes(*virtual_nodes))
             }
             PolicyConfig::RendezvousHash => Arc::new(RendezvousHashPolicy::new()),
         }
