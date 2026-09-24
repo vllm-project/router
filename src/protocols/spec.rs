@@ -1836,7 +1836,10 @@ pub struct Function {
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
-    pub parameters: Value, // JSON Schema
+    /// JSON Schema. Optional per the OpenAI API: a function that takes no
+    /// arguments may omit it entirely.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parameters: Option<Value>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -4162,5 +4165,74 @@ mod tests {
                 _ => panic!("Expected Assistant message"),
             }
         }
+    }
+
+    #[test]
+    fn test_tool_function_without_parameters() {
+        let json = r#"{
+            "type": "function",
+            "function": {
+                "name": "get_current_time",
+                "description": "Returns the current time"
+            }
+        }"#;
+
+        let tool: Tool = serde_json::from_str(json).unwrap();
+
+        assert_eq!(tool.function.name, "get_current_time");
+        assert!(tool.function.parameters.is_none());
+    }
+
+    #[test]
+    fn test_tool_function_with_parameters() {
+        let json = r#"{
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}}
+                }
+            }
+        }"#;
+
+        let tool: Tool = serde_json::from_str(json).unwrap();
+
+        let expected = serde_json::json!({
+            "type": "object",
+            "properties": {"city": {"type": "string"}}
+        });
+        assert_eq!(tool.function.parameters, Some(expected));
+    }
+
+    #[test]
+    fn test_tool_function_absent_parameters_not_reserialized() {
+        let json = r#"{
+            "type": "function",
+            "function": {"name": "ping"}
+        }"#;
+
+        let tool: Tool = serde_json::from_str(json).unwrap();
+
+        assert_eq!(
+            serde_json::to_value(&tool).unwrap(),
+            serde_json::json!({"type": "function", "function": {"name": "ping"}})
+        );
+    }
+
+    #[test]
+    fn test_chat_completion_request_with_zero_arg_tool() {
+        let json = r#"{
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [
+                {"type": "function", "function": {"name": "no_args"}}
+            ]
+        }"#;
+
+        let request: ChatCompletionRequest = serde_json::from_str(json).unwrap();
+
+        let tools = request.tools.expect("tools should deserialize");
+        assert_eq!(tools.len(), 1);
+        assert!(tools[0].function.parameters.is_none());
     }
 }
