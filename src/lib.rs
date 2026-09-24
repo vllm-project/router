@@ -37,6 +37,7 @@ struct Router {
     host: String,
     port: u16,
     worker_urls: Vec<String>,
+    extra_generate_paths: Vec<String>,
     policy: PolicyType,
     worker_startup_timeout_secs: u64,
     worker_startup_check_interval: u64,
@@ -326,6 +327,7 @@ impl Router {
         wasm_middleware = None,
         wasm_middleware_sha256 = None,
         wasm_middleware_routes = vec![],
+        extra_generate_paths = vec![],
         enable_program_scheduling = false,
         program_scheduling_config_json = None,
     ))]
@@ -393,6 +395,7 @@ impl Router {
         wasm_middleware: Option<String>,
         wasm_middleware_sha256: Option<String>,
         wasm_middleware_routes: Vec<String>,
+        extra_generate_paths: Vec<String>,
         enable_program_scheduling: bool,
         program_scheduling_config_json: Option<String>,
     ) -> PyResult<Self> {
@@ -415,6 +418,7 @@ impl Router {
             host,
             port,
             worker_urls,
+            extra_generate_paths,
             policy,
             worker_startup_timeout_secs,
             worker_startup_check_interval,
@@ -526,29 +530,32 @@ impl Router {
 
         // Block on the async startup function
         runtime.block_on(async move {
-            server::startup(server::ServerConfig {
-                host: self.host.clone(),
-                port: self.port,
-                router_config,
-                max_payload_size: self.max_payload_size,
-                wasm_middleware: self.wasm_middleware.clone(),
-                wasm_middleware_sha256: self.wasm_middleware_sha256.clone(),
-                wasm_middleware_routes: self.wasm_middleware_routes.clone(),
-                log_dir: self.log_dir.clone(),
-                log_level: self.log_level.clone(),
-                service_discovery_config,
-                prometheus_config,
-                request_timeout_secs: self.request_timeout_secs,
-                request_id_headers: self.request_id_headers.clone(),
-                trace_config: if self.enable_trace {
-                    Some(config::TraceConfig {
-                        otlp_traces_endpoint: self.otlp_traces_endpoint.clone(),
-                        ..Default::default()
-                    })
-                } else {
-                    None
+            server::startup_with_generate_paths(
+                server::ServerConfig {
+                    host: self.host.clone(),
+                    port: self.port,
+                    router_config,
+                    max_payload_size: self.max_payload_size,
+                    wasm_middleware: self.wasm_middleware.clone(),
+                    wasm_middleware_sha256: self.wasm_middleware_sha256.clone(),
+                    wasm_middleware_routes: self.wasm_middleware_routes.clone(),
+                    log_dir: self.log_dir.clone(),
+                    log_level: self.log_level.clone(),
+                    service_discovery_config,
+                    prometheus_config,
+                    request_timeout_secs: self.request_timeout_secs,
+                    request_id_headers: self.request_id_headers.clone(),
+                    trace_config: if self.enable_trace {
+                        Some(config::TraceConfig {
+                            otlp_traces_endpoint: self.otlp_traces_endpoint.clone(),
+                            ..Default::default()
+                        })
+                    } else {
+                        None
+                    },
                 },
-            })
+                self.extra_generate_paths.clone(),
+            )
             .await
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
         })

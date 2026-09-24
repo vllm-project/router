@@ -81,6 +81,20 @@ vllm-router \
     --intra-node-data-parallel-size 8
 ```
 
+#### Additional Generate Paths
+
+Register extension endpoints that use the `/inference/v1/generate` request
+schema. Configured paths get typed routing, active-load accounting, retries,
+and circuit breaking. Built-in routes keep their existing handlers. Workers
+must expose same paths.
+
+```bash
+vllm-router \
+  --worker-urls http://worker1:8000 http://worker2:8000 \
+  --policy cache_aware \
+  --extra-generate-paths /custom/v1/generate
+```
+
 #### Optional WASM OnRequest middleware
 
 Load an independently built WASM Component plugin (see `examples/wasm_middleware/` and [RFC #236](https://github.com/vllm-project/router/issues/236)). By default it attaches only to `POST /v1/chat/completions` and fails closed on plugin errors:
