@@ -2,7 +2,7 @@
 
 use super::{
     CacheAwareConfig, CacheAwarePolicy, ConsistentHashPolicy, LoadBalancingPolicy,
-    PowerOfTwoPolicy, RandomPolicy, RendezvousHashPolicy, RoundRobinPolicy,
+    PowerOfTwoPolicy, RandomPolicy, RendezvousHashPolicy, RoundRobinPolicy, StickyTablePolicy,
 };
 use crate::config::PolicyConfig;
 use std::sync::Arc;
@@ -39,6 +39,7 @@ impl PolicyFactory {
                 Arc::new(ConsistentHashPolicy::new())
             }
             PolicyConfig::RendezvousHash => Arc::new(RendezvousHashPolicy::new()),
+            PolicyConfig::StickyTable => Arc::new(StickyTablePolicy::new()),
         }
     }
 
@@ -51,6 +52,7 @@ impl PolicyFactory {
             "cache_aware" | "cacheaware" => Some(Arc::new(CacheAwarePolicy::new())),
             "consistent_hash" | "consistenthash" => Some(Arc::new(ConsistentHashPolicy::new())),
             "rendezvous_hash" | "rendezvoushash" => Some(Arc::new(RendezvousHashPolicy::new())),
+            "sticky_table" | "stickytable" => Some(Arc::new(StickyTablePolicy::new())),
             _ => None,
         }
     }

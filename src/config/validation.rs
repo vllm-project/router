@@ -331,7 +331,7 @@ impl ConfigValidator {
                     });
                 }
             }
-            PolicyConfig::RendezvousHash => {
+            PolicyConfig::RendezvousHash | PolicyConfig::StickyTable => {
                 // No specific validation needed
             }
         }
