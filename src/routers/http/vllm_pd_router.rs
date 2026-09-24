@@ -74,6 +74,18 @@ fn discovery_is_ready(prefill_count: usize, decode_count: usize) -> bool {
     prefill_count > 0 && decode_count > 0
 }
 
+fn normalize_request_headers(headers: &HeaderMap) -> HashMap<String, String> {
+    headers
+        .iter()
+        .filter_map(|(name, value)| {
+            value
+                .to_str()
+                .ok()
+                .map(|v| (name.as_str().to_ascii_lowercase(), v.to_string()))
+        })
+        .collect()
+}
+
 /// Strip the DP-rank suffix from a worker's HTTP address and return the base address
 /// plus the parsed rank. Returns `(original, None)` when DP is disabled.
 fn extract_base_http_and_dp_rank(
@@ -529,10 +541,11 @@ impl VllmPDRouter {
 
     /// Select worker using policy-based load balancing
     fn select_worker_with_policy(
-        &self,
+        policy_registry: &PolicyRegistry,
         instances: &[(String, String)],
         is_prefill: bool,
         request_text: Option<&str>,
+        request_headers: Option<&HashMap<String, String>>,
     ) -> Option<usize> {
         if instances.is_empty() {
             return None;
@@ -543,13 +556,13 @@ impl VllmPDRouter {
 
         // Get the appropriate policy
         let policy = if is_prefill {
-            self.policy_registry.get_prefill_policy()
+            policy_registry.get_prefill_policy()
         } else {
-            self.policy_registry.get_decode_policy()
+            policy_registry.get_decode_policy()
         };
 
         // Use policy to select worker
-        policy.select_worker(&workers, request_text)
+        policy.select_worker_with_headers(&workers, request_text, request_headers)
     }
 
     /// Process vLLM request using pure service discovery
@@ -591,22 +604,37 @@ impl VllmPDRouter {
         // Use policy-based load balancing to select prefill and decode workers
         let request_text = serde_json::to_string(&request_json).ok();
         let request_str = request_text.as_deref();
+        let policies_need_headers = self.policy_registry.get_prefill_policy().needs_headers()
+            || self.policy_registry.get_decode_policy().needs_headers();
+        let request_headers = headers
+            .filter(|_| policies_need_headers)
+            .map(normalize_request_headers);
 
-        let prefill_idx =
-            match self.select_worker_with_policy(&prefill_instances, true, request_str) {
-                Some(idx) => idx,
-                None => {
-                    RouterMetrics::record_pd_error("server_selection");
-                    return (
-                        axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                        "Prefill policy failed to select a worker".to_string(),
-                    )
-                        .into_response();
-                }
-            };
+        let prefill_idx = match Self::select_worker_with_policy(
+            &self.policy_registry,
+            &prefill_instances,
+            true,
+            request_str,
+            request_headers.as_ref(),
+        ) {
+            Some(idx) => idx,
+            None => {
+                RouterMetrics::record_pd_error("server_selection");
+                return (
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                    "Prefill policy failed to select a worker".to_string(),
+                )
+                    .into_response();
+            }
+        };
 
-        let decode_idx = match self.select_worker_with_policy(&decode_instances, false, request_str)
-        {
+        let decode_idx = match Self::select_worker_with_policy(
+            &self.policy_registry,
+            &decode_instances,
+            false,
+            request_str,
+            request_headers.as_ref(),
+        ) {
             Some(idx) => idx,
             None => {
                 RouterMetrics::record_pd_error("server_selection");
@@ -2418,7 +2446,139 @@ impl WorkerManagement for VllmPDRouter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::types::PolicyConfig;
+    use crate::policies::{CacheAwareConfig, CacheAwarePolicy, ConsistentHashPolicy};
     use serde_json::json;
+
+    fn assert_discovery_selection_uses_session_header(request: Value) {
+        let registry = PolicyRegistry::new(PolicyConfig::ConsistentHash { virtual_nodes: 160 });
+        registry.set_prefill_policy(Arc::new(ConsistentHashPolicy::new()));
+        registry.set_decode_policy(Arc::new(ConsistentHashPolicy::new()));
+
+        let prefill_instances = vec![
+            ("prefill-1:8000".to_string(), "prefill-1:5555".to_string()),
+            ("prefill-2:8000".to_string(), "prefill-2:5555".to_string()),
+            ("prefill-3:8000".to_string(), "prefill-3:5555".to_string()),
+        ];
+        let decode_instances = vec![
+            ("decode-1:8000".to_string(), "decode-1:5555".to_string()),
+            ("decode-2:8000".to_string(), "decode-2:5555".to_string()),
+            ("decode-3:8000".to_string(), "decode-3:5555".to_string()),
+        ];
+        let request_text = serde_json::to_string(&request).unwrap();
+        let mut other_request = request;
+        other_request["user"] = json!("different request body");
+        let other_request_text = serde_json::to_string(&other_request).unwrap();
+
+        let selection = |text: &str, headers: &HashMap<String, String>| {
+            (
+                VllmPDRouter::select_worker_with_policy(
+                    &registry,
+                    &prefill_instances,
+                    true,
+                    Some(text),
+                    Some(headers),
+                ),
+                VllmPDRouter::select_worker_with_policy(
+                    &registry,
+                    &decode_instances,
+                    false,
+                    Some(text),
+                    Some(headers),
+                ),
+            )
+        };
+
+        let first_headers = HashMap::from([("x-session-id".to_string(), "session-0".to_string())]);
+        let first_selection = selection(&request_text, &first_headers);
+        assert_eq!(
+            first_selection,
+            selection(&other_request_text, &first_headers),
+            "the same session must select the same workers despite a different request body"
+        );
+
+        let (second_headers, second_selection) = (1..10_000)
+            .find_map(|id| {
+                let headers =
+                    HashMap::from([("x-session-id".to_string(), format!("session-{id}"))]);
+                let selected = selection(&request_text, &headers);
+                (selected.0 != first_selection.0 && selected.1 != first_selection.1)
+                    .then_some((headers, selected))
+            })
+            .expect("another session should select different prefill and decode workers");
+
+        assert_eq!(
+            second_selection,
+            selection(&other_request_text, &second_headers),
+            "the second session must also be invariant to the request body"
+        );
+    }
+
+    #[test]
+    fn test_discovery_completion_selection_uses_session_header() {
+        assert_discovery_selection_uses_session_header(json!({
+            "model": "test",
+            "prompt": "completion prompt",
+            "max_tokens": 16
+        }));
+    }
+
+    #[test]
+    fn test_discovery_chat_selection_uses_session_header() {
+        assert_discovery_selection_uses_session_header(json!({
+            "model": "test",
+            "messages": [{"role": "user", "content": "chat prompt"}],
+            "max_tokens": 16
+        }));
+    }
+
+    #[test]
+    fn test_discovery_cache_aware_selection_ignores_session_header() {
+        let config = CacheAwareConfig {
+            eviction_interval_secs: 0,
+            ..CacheAwareConfig::default()
+        };
+        let registry = PolicyRegistry::new(PolicyConfig::Random);
+        registry.set_prefill_policy(Arc::new(CacheAwarePolicy::with_config(config.clone())));
+        registry.set_decode_policy(Arc::new(CacheAwarePolicy::with_config(config)));
+        let prefill_instances = vec![
+            ("prefill-1:8000".to_string(), "prefill-1:5555".to_string()),
+            ("prefill-2:8000".to_string(), "prefill-2:5555".to_string()),
+        ];
+        let decode_instances = vec![
+            ("decode-1:8000".to_string(), "decode-1:5555".to_string()),
+            ("decode-2:8000".to_string(), "decode-2:5555".to_string()),
+        ];
+        registry
+            .get_prefill_policy()
+            .init_workers(&VllmPDRouter::instances_to_workers(&prefill_instances));
+        registry
+            .get_decode_policy()
+            .init_workers(&VllmPDRouter::instances_to_workers(&decode_instances));
+
+        let request = r#"{"model":"test","prompt":"stable cache-aware prefix"}"#;
+        let session_headers =
+            HashMap::from([("x-session-id".to_string(), "must-be-ignored".to_string())]);
+        // should map to the same instance since the prompt is identical, even though the
+        // session header is different
+        for (instances, is_prefill) in [(&prefill_instances, true), (&decode_instances, false)] {
+            let without_header = VllmPDRouter::select_worker_with_policy(
+                &registry,
+                instances,
+                is_prefill,
+                Some(request),
+                None,
+            );
+            let with_header = VllmPDRouter::select_worker_with_policy(
+                &registry,
+                instances,
+                is_prefill,
+                Some(request),
+                Some(&session_headers),
+            );
+            assert_eq!(with_header, without_header);
+        }
+    }
 
     #[test]
     fn test_discovery_health_requires_prefill_and_decode_workers() {
