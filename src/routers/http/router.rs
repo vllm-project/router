@@ -75,6 +75,25 @@ struct ResolvedProgramModelPool {
     registry_model: Option<String>,
 }
 
+struct RequestLoadGuard {
+    worker: Arc<dyn Worker>,
+}
+
+impl RequestLoadGuard {
+    fn new(worker: Arc<dyn Worker>) -> Self {
+        worker.increment_load();
+        RouterMetrics::set_running_requests(worker.url(), worker.load());
+        Self { worker }
+    }
+}
+
+impl Drop for RequestLoadGuard {
+    fn drop(&mut self) {
+        self.worker.decrement_load();
+        RouterMetrics::set_running_requests(self.worker.url(), self.worker.load());
+    }
+}
+
 impl Router {
     /// Create a new router with injected policy and client
     #[allow(clippy::too_many_arguments)]
@@ -902,7 +921,6 @@ impl Router {
         model_id: Option<&str>,
     ) -> Response {
         let start = Instant::now();
-        let is_stream = typed_req.is_stream();
         let text = typed_req.extract_text_for_routing();
 
         let response = RetryExecutor::execute_response_with_retry(
@@ -953,18 +971,8 @@ impl Router {
                     None => self.policy_registry.get_default_policy(),
                 };
 
-                let load_incremented =
-                    if policy.name() == "cache_aware" || program_completion.is_some() {
-                        worker.increment_load();
-                        RouterMetrics::set_running_requests(worker.url(), worker.load());
-                        true
-                    } else {
-                        false
-                    };
-
-                // Keep a clone for potential cleanup on retry
-                let worker_for_cleanup = if load_incremented {
-                    Some(worker.clone())
+                let load_guard = if policy.name() == "cache_aware" || program_completion.is_some() {
+                    Some(RequestLoadGuard::new(worker.clone()))
                 } else {
                     None
                 };
@@ -975,8 +983,7 @@ impl Router {
                         typed_req,
                         route,
                         worker.url(),
-                        is_stream,
-                        load_incremented,
+                        load_guard,
                         program_completion.clone(),
                     )
                     .await;
@@ -988,18 +995,6 @@ impl Router {
                 worker.record_outcome(status.is_success() || status.is_client_error());
                 if was_available != worker.is_available() {
                     self.worker_registry.notify_worker_state_change();
-                }
-
-                // For retryable failures, we need to decrement load since send_typed_request
-                // won't have done it (it only decrements on success or non-retryable failures)
-                if is_retryable_status(response.status()) && load_incremented {
-                    if let Some(cleanup_worker) = worker_for_cleanup {
-                        cleanup_worker.decrement_load();
-                        RouterMetrics::set_running_requests(
-                            cleanup_worker.url(),
-                            cleanup_worker.load(),
-                        );
-                    }
                 }
 
                 response
@@ -1152,17 +1147,16 @@ impl Router {
     }
 
     // Send typed request directly without conversion
-    #[allow(clippy::too_many_arguments)]
-    async fn send_typed_request<T: serde::Serialize>(
+    async fn send_typed_request<T: GenerationRequest + serde::Serialize>(
         &self,
         headers: Option<&HeaderMap>,
         typed_req: &T,
         route: &str,
         worker_url: &str,
-        is_stream: bool,
-        load_incremented: bool, // Whether load was incremented for this request
+        load_guard: Option<RequestLoadGuard>,
         program_completion: Option<ProgramCompletion>,
     ) -> Response {
+        let is_stream = typed_req.is_stream();
         let (mut request_builder, extracted_dp_rank, request_url) =
             if self.intra_node_data_parallel_size > 1 {
                 let (worker_url_prefix, dp_rank) = match dp_utils::extract_dp_rank(worker_url) {
@@ -1246,14 +1240,6 @@ impl Router {
                     worker_url, route, e
                 );
 
-                // Decrement load on error if it was incremented
-                if load_incremented {
-                    if let Some(worker) = self.worker_registry.get_by_url(worker_url) {
-                        worker.decrement_load();
-                        RouterMetrics::set_running_requests(worker_url, worker.load());
-                    }
-                }
-
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     format!("Request failed: {}", e),
@@ -1280,108 +1266,19 @@ impl Router {
                     response
                 }
                 Err(e) => {
-                    // IMPORTANT: Decrement load on error before returning
-                    if load_incremented {
-                        if let Some(worker) = self.worker_registry.get_by_url(worker_url) {
-                            worker.decrement_load();
-                            RouterMetrics::set_running_requests(worker_url, worker.load());
-                        }
-                    }
-
                     let error_msg = format!("Failed to get response body: {}", e);
                     (StatusCode::INTERNAL_SERVER_ERROR, error_msg).into_response()
                 }
             };
-
-            // Decrement load counter for non-streaming requests if it was incremented
-            if load_incremented {
-                if let Some(worker) = self.worker_registry.get_by_url(worker_url) {
-                    worker.decrement_load();
-                    RouterMetrics::set_running_requests(worker_url, worker.load());
-                }
-            }
 
             if let Some(completion) = &program_completion {
                 completion.finish(response.status().is_success());
             }
 
             response
-        } else if load_incremented {
-            // For streaming with load tracking, we need to manually decrement when done
-            let registry = Arc::clone(&self.worker_registry);
-            let worker_url = worker_url.to_string();
-            let completion = if status.is_success() {
-                program_completion
-            } else {
-                None
-            };
-
-            // Preserve headers for streaming response
-            let mut response_headers = header_utils::preserve_response_headers(res.headers());
-            // Ensure we set the correct content-type for SSE
-            response_headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
-
-            let stream = res.bytes_stream();
-            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-
-            // Spawn task to forward stream and detect completion
-            tokio::spawn(async move {
-                let mut stream = stream;
-                let mut decremented = false;
-                let mut stream_succeeded = true;
-                while let Some(chunk) = stream.next().await {
-                    match chunk {
-                        Ok(bytes) => {
-                            if let Some(completion) = &completion {
-                                completion.observe_sse_chunk(&bytes);
-                            }
-                            // Check for stream end marker
-                            if bytes
-                                .as_ref()
-                                .windows(12)
-                                .any(|window| window == b"data: [DONE]")
-                            {
-                                if let Some(worker) = registry.get_by_url(&worker_url) {
-                                    worker.decrement_load();
-                                    RouterMetrics::set_running_requests(&worker_url, worker.load());
-                                    decremented = true;
-                                }
-                            }
-                            if tx.send(Ok(bytes)).is_err() {
-                                stream_succeeded = false;
-                                break;
-                            }
-                        }
-                        Err(e) => {
-                            stream_succeeded = false;
-                            let _ = tx.send(Err(format!("Stream error: {}", e)));
-                            break;
-                        }
-                    }
-                }
-                if !decremented {
-                    if let Some(worker) = registry.get_by_url(&worker_url) {
-                        worker.decrement_load();
-                        RouterMetrics::set_running_requests(&worker_url, worker.load());
-                    }
-                }
-                if let Some(completion) = &completion {
-                    completion.finish(stream_succeeded);
-                }
-            });
-
-            let stream = UnboundedReceiverStream::new(rx);
-            let body = Body::from_stream(stream);
-
-            let mut response = Response::new(body);
-            *response.status_mut() = status;
-            *response.headers_mut() = response_headers;
-            response
         } else {
-            // For requests without load tracking, just stream
-            // Preserve headers for streaming response
+            // Keep load accounting alive until the stream finishes or the client disconnects.
             let mut response_headers = header_utils::preserve_response_headers(res.headers());
-            // Ensure we set the correct content-type for SSE
             response_headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
 
             let stream = res.bytes_stream();
@@ -1392,25 +1289,35 @@ impl Router {
                 None
             };
 
-            // Spawn task to forward stream
             tokio::spawn(async move {
+                let _load_guard = load_guard;
                 let mut stream = stream;
                 let mut stream_succeeded = true;
-                while let Some(chunk) = stream.next().await {
-                    match chunk {
-                        Ok(bytes) => {
-                            if let Some(completion) = &completion {
-                                completion.observe_sse_chunk(&bytes);
-                            }
-                            if tx.send(Ok(bytes)).is_err() {
-                                stream_succeeded = false;
-                                break;
-                            }
-                        }
-                        Err(e) => {
+
+                loop {
+                    tokio::select! {
+                        _ = tx.closed() => {
                             stream_succeeded = false;
-                            let _ = tx.send(Err(format!("Stream error: {}", e)));
                             break;
+                        }
+                        chunk = stream.next() => {
+                            match chunk {
+                                Some(Ok(bytes)) => {
+                                    if let Some(completion) = &completion {
+                                        completion.observe_sse_chunk(&bytes);
+                                    }
+                                    if tx.send(Ok(bytes)).is_err() {
+                                        stream_succeeded = false;
+                                        break;
+                                    }
+                                }
+                                Some(Err(e)) => {
+                                    stream_succeeded = false;
+                                    let _ = tx.send(Err(format!("Stream error: {}", e)));
+                                    break;
+                                }
+                                None => break,
+                            }
                         }
                     }
                 }
@@ -2323,6 +2230,119 @@ impl RouterTrait for Router {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn request_load_guard_preserves_concurrent_load() {
+        let worker = Arc::new(BasicWorker::new(
+            "http://worker:8080".to_string(),
+            WorkerType::Regular,
+        ));
+        worker.increment_load();
+
+        {
+            let _guard = RequestLoadGuard::new(worker.clone());
+            assert_eq!(worker.load(), 2);
+        }
+
+        assert_eq!(worker.load(), 1);
+    }
+
+    #[tokio::test]
+    async fn request_load_guard_releases_load_when_request_is_cancelled() {
+        let worker = Arc::new(BasicWorker::new(
+            "http://worker:8080".to_string(),
+            WorkerType::Regular,
+        ));
+        let worker_for_request: Arc<dyn Worker> = worker.clone();
+        let request = tokio::spawn(async move {
+            let _guard = RequestLoadGuard::new(worker_for_request);
+            std::future::pending::<()>().await;
+        });
+
+        while worker.load() == 0 {
+            tokio::task::yield_now().await;
+        }
+        request.abort();
+        let _ = request.await;
+
+        assert_eq!(worker.load(), 0);
+    }
+
+    #[tokio::test]
+    async fn streaming_client_drop_releases_load_while_upstream_stalls() {
+        use axum::{routing::post, Router as AxumRouter};
+        use std::convert::Infallible;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let worker_url = format!("http://{}", listener.local_addr().unwrap());
+        let app = AxumRouter::new().route(
+            "/generate",
+            post(|| async {
+                let body = Body::from_stream(futures_util::stream::pending::<
+                    Result<bytes::Bytes, Infallible>,
+                >());
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header(CONTENT_TYPE, "text/event-stream")
+                    .body(body)
+                    .unwrap()
+            }),
+        );
+        let _server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        let worker = Arc::new(BasicWorker::new(worker_url, WorkerType::Regular));
+        worker_registry.register(worker.clone());
+        let policy_registry = Arc::new(PolicyRegistry::new(
+            crate::config::types::PolicyConfig::CacheAware {
+                cache_threshold: 0.5,
+                balance_abs_threshold: 32,
+                balance_rel_threshold: 1.5,
+                eviction_interval_secs: 60,
+                max_tree_size: 1000,
+            },
+        ));
+        let (_, rx) = tokio::sync::watch::channel(HashMap::new());
+        let router = Router {
+            worker_registry,
+            policy_registry,
+            client: Client::new(),
+            worker_startup_timeout_secs: 5,
+            worker_startup_check_interval_secs: 1,
+            intra_node_data_parallel_size: 1,
+            api_key: None,
+            retry_config: RetryConfig::default(),
+            circuit_breaker_config: CircuitBreakerConfig::default(),
+            _worker_loads: Arc::new(rx),
+            _load_monitor_handle: None,
+            program_scheduler: None,
+            _program_observation_handle: None,
+            program_targets_cache: Mutex::new(HashMap::new()),
+            program_token_estimator: Arc::new(MomentumTokenEstimator::default()),
+        };
+        let request: GenerateRequest =
+            serde_json::from_str(r#"{"text":"hello","stream":true}"#).unwrap();
+
+        let response = tokio::time::timeout(
+            Duration::from_secs(5),
+            router.route_typed_request(None, &request, "/generate", None),
+        )
+        .await
+        .expect("response headers should arrive while the body is stalled");
+        assert_eq!(worker.load(), 1);
+
+        drop(response);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while worker.load() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("client disconnect should release the worker load");
+    }
 
     fn create_test_regular_router() -> Router {
         // Create registries
