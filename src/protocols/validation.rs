@@ -230,8 +230,16 @@ pub mod utils {
             validate_range(temp, &constants::TEMPERATURE_RANGE, "temperature")?;
         }
 
-        // Validate top_p (0.0 to 1.0)
+        // Validate top_p (0.0, 1.0]
         if let Some(top_p) = request.get_top_p() {
+            if top_p <= constants::TOP_P_RANGE.0 {
+                return Err(ValidationError::OutOfRange {
+                    parameter: "top_p".to_string(),
+                    value: top_p.to_string(),
+                    min: format!("{} (exclusive)", constants::TOP_P_RANGE.0),
+                    max: constants::TOP_P_RANGE.1.to_string(),
+                });
+            }
             validate_range(top_p, &constants::TOP_P_RANGE, "top_p")?;
         }
 
@@ -987,10 +995,14 @@ mod tests {
             request.temperature = Some(3.0);
             assert!(request.validate().is_err());
 
-            // Test top_p range (0.0 to 1.0)
+            // Test top_p range (0.0, 1.0]
             request.temperature = Some(1.0); // Reset
             request.top_p = Some(0.9);
             assert!(request.validate().is_ok());
+            request.top_p = Some(f32::EPSILON);
+            assert!(request.validate().is_ok());
+            request.top_p = Some(0.0);
+            assert!(request.validate().is_err());
             request.top_p = Some(-0.1);
             assert!(request.validate().is_err());
             request.top_p = Some(1.5);
