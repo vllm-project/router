@@ -85,6 +85,7 @@ impl Sequence {
     pub fn append_text(&mut self, input: &str) -> Result<()> {
         let encoding = self.tokenizer.encode(input)?;
         self.token_ids.extend(encoding.token_ids());
+        self.read_offset = self.token_ids.len();
         Ok(())
     }
 
@@ -207,6 +208,17 @@ mod tests {
         assert_eq!(text2, " world");
 
         // Verify the full text
+        assert_eq!(seq.text().unwrap(), "Hello world");
+    }
+
+    #[test]
+    fn test_sequence_append_token_after_text() {
+        let tokenizer = Arc::new(MockTokenizer::new());
+        let mut seq = Sequence::new(tokenizer);
+
+        seq.append_text("Hello").unwrap();
+
+        assert_eq!(seq.append_token(2).unwrap(), " world");
         assert_eq!(seq.text().unwrap(), "Hello world");
     }
 
