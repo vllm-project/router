@@ -2,9 +2,12 @@
 #![allow(dead_code)]
 
 // pub mod mock_mcp_server;
+pub mod bench_corpus;
+pub mod bench_mock;
 pub mod mock_openai_server;
 pub mod mock_vllm_rs;
 pub mod mock_worker;
+pub mod routing_edge;
 pub mod test_app;
 
 use std::fs;
