@@ -1,0 +1,129 @@
+name: CI
+
+# Trigger on all PRs, including from forks and external contributors
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  push:
+    branches:
+      - main
+      - master
+      - develop
+
+# Allow manual trigger for testing
+  workflow_dispatch:
+
+jobs:
+  # Trigger Buildkite pipeline
+  trigger-buildkite:
+    name: Trigger Buildkite Pipeline
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Fetch all history for proper git operations
+
+      - name: Trigger Buildkite Build
+        env:
+          BUILDKITE_API_TOKEN: ${{ secrets.BUILDKITE_API_TOKEN }}
+          BUILDKITE_ORG: ${{ secrets.BUILDKITE_ORG }}
+          BUILDKITE_PIPELINE: ${{ secrets.BUILDKITE_PIPELINE }}
+        run: |
+          if [ -z "$BUILDKITE_API_TOKEN" ]; then
+            echo "⚠️  BUILDKITE_API_TOKEN not configured. Skipping Buildkite trigger."
+            echo "Please add BUILDKITE_API_TOKEN, BUILDKITE_ORG, and BUILDKITE_PIPELINE as repository secrets."
+            exit 0
+          fi
+
+          # Determine branch and commit
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BRANCH="${{ github.event.pull_request.head.ref }}"
+            COMMIT="${{ github.event.pull_request.head.sha }}"
+            PR_NUMBER="${{ github.event.pull_request.number }}"
+            MESSAGE="PR #${PR_NUMBER}: ${{ github.event.pull_request.title }}"
+          else
+            BRANCH="${{ github.ref_name }}"
+            COMMIT="${{ github.sha }}"
+            MESSAGE="${{ github.event.head_commit.message }}"
+          fi
+
+          echo "🚀 Triggering Buildkite build for ${BRANCH}@${COMMIT}"
+
+          # Trigger Buildkite build via API
+          RESPONSE=$(curl -X POST \
+            "https://api.buildkite.com/v2/organizations/${BUILDKITE_ORG}/pipelines/${BUILDKITE_PIPELINE}/builds" \
+            -H "Authorization: Bearer ${BUILDKITE_API_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "commit": "'"${COMMIT}"'",
+              "branch": "'"${BRANCH}"'",
+              "message": "'"${MESSAGE}"'",
+              "env": {
+                "GITHUB_PR_NUMBER": "'"${PR_NUMBER:-}"'",
+                "GITHUB_ACTOR": "${{ github.actor }}",
+                "GITHUB_EVENT": "${{ github.event_name }}"
+              }
+            }')
+
+          BUILD_URL=$(echo "$RESPONSE" | jq -r '.web_url // empty')
+
+          if [ -n "$BUILD_URL" ]; then
+            echo "✅ Buildkite build triggered successfully"
+            echo "Build URL: ${BUILD_URL}"
+            echo "build_url=${BUILD_URL}" >> $GITHUB_OUTPUT
+          else
+            echo "❌ Failed to trigger Buildkite build"
+            echo "Response: $RESPONSE"
+            exit 1
+          fi
+
+  # Fast checks that can run in GitHub Actions for quick feedback
+  fast-checks:
+    name: Fast Checks (GitHub Actions)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: nightly
+          components: rustfmt, clippy
+          override: true
+
+      - name: Cache Rust dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libssl-dev protobuf-compiler
+
+      - name: Rust Format Check
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Python Format Check
+        run: |
+          pip install black ruff
+          python -m black --check py_src/ py_test/
+          python -m ruff check py_src/ py_test/
