@@ -325,6 +325,61 @@ impl ConsistentHashPolicy {
         }
         (worker_url.to_string(), None)
     }
+
+    /// Return healthy worker indices ordered by consistent-hash ring proximity for
+    /// the request's session key: the sticky (primary) worker first, then the next
+    /// distinct workers clockwise around the ring.
+    ///
+    /// `ranked_candidates(..)[0]` is identical to the worker chosen by
+    /// `select_worker_with_headers` for a healthy ring, so a load-aware caller can
+    /// keep the sticky choice by default and only overflow to later candidates when
+    /// the sticky rank is overloaded — preserving prefix-cache affinity while giving
+    /// a bounded-load escape hatch.
+    pub fn ranked_candidates(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        request_text: Option<&str>,
+        headers: Option<&RequestHeaders>,
+    ) -> Vec<usize> {
+        let healthy = get_healthy_worker_indices(workers);
+        if healthy.is_empty() {
+            return Vec::new();
+        }
+
+        // Ensure the ring reflects the current worker set.
+        self.update_hash_ring(workers);
+
+        let hash_key = hash_key::extract_hash_key(request_text, headers);
+        let hash_value = Self::fbi_hash(&hash_key);
+
+        let ring = self.hash_ring.read().unwrap();
+        if ring.is_empty() {
+            return healthy;
+        }
+
+        // Walk the ring clockwise from the key's hash, collecting distinct worker
+        // URLs in order and mapping each back to its (healthy) worker index.
+        let mut ordered_indices = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for (_, url) in ring.range(hash_value..).chain(ring.iter()) {
+            if !seen.insert(url.clone()) {
+                continue;
+            }
+            if let Some(idx) = workers.iter().position(|w| {
+                w.url() == url && w.is_healthy() && w.circuit_breaker().can_execute()
+            }) {
+                ordered_indices.push(idx);
+            }
+            if seen.len() >= workers.len() {
+                break;
+            }
+        }
+
+        if ordered_indices.is_empty() {
+            return healthy;
+        }
+        ordered_indices
+    }
 }
 
 impl LoadBalancingPolicy for ConsistentHashPolicy {
@@ -550,5 +605,38 @@ mod tests {
         assert_eq!(idx1, idx2);
         assert_eq!(idx2, idx3);
         assert!(idx1.is_some());
+    }
+
+    #[test]
+    fn test_ranked_candidates_primary_matches_select_and_is_a_permutation() {
+        use std::collections::HashSet;
+        let policy = ConsistentHashPolicy::new();
+        let workers: Vec<Arc<dyn Worker>> = (0..8)
+            .map(|r| {
+                Arc::new(BasicWorker::new(
+                    format!("http://10.0.0.1:20005@{}", r),
+                    WorkerType::Regular,
+                )) as Arc<dyn Worker>
+            })
+            .collect();
+
+        let mut headers = crate::policies::RequestHeaders::new();
+        headers.insert("x-session-id".to_string(), "sess-xyz".to_string());
+
+        let ranked = policy.ranked_candidates(&workers, Some("{\"prompt\":\"hi\"}"), Some(&headers));
+        // All 8 distinct ranks present exactly once (ordered permutation of the ring).
+        assert_eq!(ranked.len(), 8);
+        assert_eq!(ranked.iter().collect::<HashSet<_>>().len(), 8);
+
+        // Primary candidate equals the sticky choice from select_worker_with_headers.
+        let sticky = policy
+            .select_worker_with_headers(&workers, Some("{\"prompt\":\"hi\"}"), Some(&headers))
+            .unwrap();
+        assert_eq!(ranked[0], sticky, "ranked[0] must equal the sticky rank");
+
+        // Different session bodies keep the same first candidate (stickiness on header key).
+        let ranked2 =
+            policy.ranked_candidates(&workers, Some("{\"prompt\":\"a much longer turn 2\"}"), Some(&headers));
+        assert_eq!(ranked2[0], ranked[0]);
     }
 }

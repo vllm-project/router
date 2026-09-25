@@ -9,7 +9,7 @@ use crate::config::KvConnector;
 use crate::core::{BasicWorker, Worker, WorkerType};
 use crate::metrics::RouterMetrics;
 use crate::otel_http::{self, ClientRequestOptions};
-use crate::policies::PolicyRegistry;
+use crate::policies::{ConsistentHashPolicy, PolicyRegistry, RequestHeaders};
 use crate::routers::{header_utils, RouterTrait, WorkerManagement};
 use async_trait::async_trait;
 use axum::{
@@ -32,6 +32,38 @@ use uuid::Uuid;
 struct MooncakePrefillInfo {
     bootstrap_addr: String,
     dp_engine_ids: HashMap<usize, String>,
+}
+
+/// RAII guard tracking in-flight requests pinned to a prefill DP rank
+/// (keyed by `host:port@rank`). Incremented on selection, decremented on drop so
+/// every request-processing return path is covered. The counts feed the load-aware
+/// prefill selector, letting it overflow a session off a hot rank while keeping the
+/// sticky choice by default (prefix-cache affinity preserved).
+struct PrefillLoadGuard {
+    map: Arc<std::sync::Mutex<HashMap<String, i64>>>,
+    key: String,
+}
+
+impl PrefillLoadGuard {
+    fn acquire(map: Arc<std::sync::Mutex<HashMap<String, i64>>>, key: String) -> Self {
+        if let Ok(mut m) = map.lock() {
+            *m.entry(key.clone()).or_insert(0) += 1;
+        }
+        Self { map, key }
+    }
+}
+
+impl Drop for PrefillLoadGuard {
+    fn drop(&mut self) {
+        if let Ok(mut m) = self.map.lock() {
+            if let Some(v) = m.get_mut(&self.key) {
+                *v -= 1;
+                if *v <= 0 {
+                    m.remove(&self.key);
+                }
+            }
+        }
+    }
 }
 
 /// vLLM PD Router that extends PdRouterBase with vLLM-specific request handling
@@ -63,6 +95,17 @@ pub struct VllmPDRouter {
     mooncake_prefill_info: Arc<Mutex<HashMap<String, MooncakePrefillInfo>>>,
     /// NIXL push identity per prefill base_url and dp_rank; never held across an await.
     nixl_prefill_info: RwLock<HashMap<String, HashMap<usize, Value>>>,
+    /// Persistent in-flight request count per prefill DP rank (keyed by `host:port@rank`).
+    /// Drives the load-aware prefill selector so warm follow-up turns don't queue behind
+    /// a hot rank. Survives across requests (discovery workers are rebuilt per request).
+    prefill_inflight: Arc<std::sync::Mutex<HashMap<String, i64>>>,
+    /// Enable bounded-load overflow on the prefill leg (consistent_hash only). Env
+    /// `PREFILL_LOAD_AWARE` (default on); set to `0` to reproduce the v2 load-blind path.
+    prefill_load_aware: bool,
+    /// Overflow bound = max(`prefill_lb_load_factor` * mean_inflight, `prefill_lb_min_bound`).
+    /// Env `PREFILL_LB_LOAD_FACTOR` (default 1.25) and `PREFILL_LB_MIN_BOUND` (default 1.0).
+    prefill_lb_load_factor: f64,
+    prefill_lb_min_bound: f64,
 }
 
 /// Transfer ID prefix used by MoRI-IO to correlate prefill and decode legs.
@@ -634,12 +677,57 @@ impl VllmPDRouter {
             .collect()
     }
 
+    /// Expand each discovered instance into one entry per intra-node DP rank
+    /// (`host:port@rank`), mirroring the DP-aware expansion done in direct URL mode.
+    /// A DP engine registers a single HTTP address for all of its ranks, so without
+    /// this the policy sees one worker and no `X-data-parallel-rank` is ever sent.
+    ///
+    /// Only prefill is expanded: discovered workers are rebuilt per request and carry
+    /// no load state, so pinning decode ranks here would replace the engine's
+    /// load-aware DP balancer with a load-blind choice. Prefill needs the pin for
+    /// prefix-cache affinity and to set `remote_dp_rank` on the decode leg.
+    fn expand_dp_instances(
+        instances: Vec<(String, String)>,
+        intra_node_data_parallel_size: usize,
+    ) -> Vec<(String, String)> {
+        if intra_node_data_parallel_size <= 1 {
+            return instances;
+        }
+        instances
+            .into_iter()
+            .flat_map(|(http, zmq)| {
+                if http.contains('@') {
+                    vec![(http, zmq)]
+                } else {
+                    (0..intra_node_data_parallel_size)
+                        .map(|rank| (format!("{}@{}", http, rank), zmq.clone()))
+                        .collect()
+                }
+            })
+            .collect()
+    }
+
+    /// Convert request headers to the lowercase map consumed by routing policies.
+    fn to_request_headers(headers: Option<&HeaderMap>) -> Option<RequestHeaders> {
+        headers.map(|h| {
+            h.iter()
+                .filter_map(|(name, value)| {
+                    value
+                        .to_str()
+                        .ok()
+                        .map(|v| (name.as_str().to_lowercase(), v.to_string()))
+                })
+                .collect()
+        })
+    }
+
     /// Select worker using policy-based load balancing
     fn select_worker_with_policy(
         &self,
         instances: &[(String, String)],
         is_prefill: bool,
         request_text: Option<&str>,
+        request_headers: Option<&RequestHeaders>,
     ) -> Option<usize> {
         if instances.is_empty() {
             return None;
@@ -656,7 +744,101 @@ impl VllmPDRouter {
         };
 
         // Use policy to select worker
-        policy.select_worker(&workers, request_text)
+        policy.select_worker_with_headers(&workers, request_text, request_headers)
+    }
+
+    /// Pure bounded-load overflow decision.
+    ///
+    /// `scored` is the ring-ordered candidate list (sticky/primary first) paired with
+    /// each candidate's current in-flight count. A session keeps its sticky rank while
+    /// that rank's load is within `bound = max(load_factor * mean, min_bound)`; once it
+    /// exceeds the bound it overflows to the least-loaded candidate (ties break toward
+    /// ring order, i.e. the nearest rank). The `min_bound` floor prevents a single
+    /// in-flight request from breaking stickiness at low concurrency.
+    fn bounded_load_pick(scored: &[(usize, i64)], load_factor: f64, min_bound: f64) -> Option<usize> {
+        let (sticky_idx, sticky_load) = *scored.first()?;
+        let n = scored.len() as f64;
+        let total: i64 = scored.iter().map(|(_, l)| *l).sum();
+        let mean = total as f64 / n;
+        let bound = (mean * load_factor).max(min_bound);
+
+        if (sticky_load as f64) <= bound {
+            return Some(sticky_idx);
+        }
+
+        // Overflow: least-loaded candidate; first minimum wins so ties favor ring order.
+        let mut best = scored[0];
+        for &(idx, load) in scored.iter() {
+            if load < best.1 {
+                best = (idx, load);
+            }
+        }
+        Some(best.0)
+    }
+
+    /// Load-aware prefill worker selection.
+    ///
+    /// Preserves session stickiness (the consistent-hash primary choice) but overflows
+    /// a session to the next-lightest ring candidate when its sticky DP rank's in-flight
+    /// count exceeds a bound. This keeps prefix-cache locality (a session stays on its
+    /// rank while that rank is not hot) while flattening the per-rank prefill skew that
+    /// otherwise queues warm follow-up turns behind a single hot rank.
+    ///
+    /// Only active when the prefill policy is `consistent_hash` and DP is expanded
+    /// (>1 candidate); otherwise it falls back to the policy's own selection so behavior
+    /// is unchanged for round_robin / single-rank / direct-URL setups.
+    fn select_prefill_worker_load_aware(
+        &self,
+        instances: &[(String, String)],
+        request_text: Option<&str>,
+        request_headers: Option<&RequestHeaders>,
+    ) -> Option<usize> {
+        if instances.is_empty() {
+            return None;
+        }
+        let workers = Self::instances_to_workers(instances);
+        let policy = self.policy_registry.get_prefill_policy();
+
+        // Bounded-load overflow only applies to consistent_hash with >1 candidate.
+        let ch = policy.as_any().downcast_ref::<ConsistentHashPolicy>();
+        if !self.prefill_load_aware || instances.len() <= 1 || ch.is_none() {
+            return policy.select_worker_with_headers(&workers, request_text, request_headers);
+        }
+        let ch = ch.unwrap();
+
+        let candidates = ch.ranked_candidates(&workers, request_text, request_headers);
+        if candidates.is_empty() {
+            return policy.select_worker_with_headers(&workers, request_text, request_headers);
+        }
+        let sticky = candidates[0];
+
+        // Snapshot per-rank in-flight loads (parallel to `candidates`).
+        let scored: Vec<(usize, i64)> = {
+            let loads = self.prefill_inflight.lock().unwrap();
+            candidates
+                .iter()
+                .map(|&i| (i, *loads.get(&instances[i].0).unwrap_or(&0)))
+                .collect()
+        };
+
+        let chosen =
+            Self::bounded_load_pick(&scored, self.prefill_lb_load_factor, self.prefill_lb_min_bound)
+                .unwrap_or(sticky);
+
+        let sticky_load = scored.first().map(|(_, l)| *l).unwrap_or(0);
+        let chosen_load = scored
+            .iter()
+            .find(|(i, _)| *i == chosen)
+            .map(|(_, l)| *l)
+            .unwrap_or(0);
+        // Always emit an info line naming the chosen prefill worker (`host:port@rank`)
+        // so per-rank distribution stays greppable (mirrors consistent_hash's routing
+        // log, which the load-aware path bypasses), and flag overflows explicitly.
+        info!(
+            "Prefill load-aware routing: worker='{}' load={} sticky='{}' sticky_load={} overflow={}",
+            instances[chosen].0, chosen_load, instances[sticky].0, sticky_load, chosen != sticky
+        );
+        Some(chosen)
     }
 
     /// Process vLLM request using pure service discovery
@@ -673,7 +855,10 @@ impl VllmPDRouter {
         );
 
         // Get available instances from service discovery
-        let prefill_instances = self.service_registry.get_prefill_instances();
+        let prefill_instances = Self::expand_dp_instances(
+            self.service_registry.get_prefill_instances(),
+            self.intra_node_data_parallel_size,
+        );
         let decode_instances = self.service_registry.get_decode_instances();
 
         debug!(
@@ -698,22 +883,39 @@ impl VllmPDRouter {
         // Use policy-based load balancing to select prefill and decode workers
         let request_text = serde_json::to_string(&request_json).ok();
         let request_str = request_text.as_deref();
+        let request_headers = Self::to_request_headers(headers);
 
-        let prefill_idx =
-            match self.select_worker_with_policy(&prefill_instances, true, request_str) {
-                Some(idx) => idx,
-                None => {
-                    RouterMetrics::record_pd_error("server_selection");
-                    return (
-                        axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                        "Prefill policy failed to select a worker".to_string(),
-                    )
-                        .into_response();
-                }
-            };
+        let prefill_idx = match self.select_prefill_worker_load_aware(
+            &prefill_instances,
+            request_str,
+            request_headers.as_ref(),
+        ) {
+            Some(idx) => idx,
+            None => {
+                RouterMetrics::record_pd_error("server_selection");
+                return (
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                    "Prefill policy failed to select a worker".to_string(),
+                )
+                    .into_response();
+            }
+        };
 
-        let decode_idx = match self.select_worker_with_policy(&decode_instances, false, request_str)
-        {
+        // Track this request as in-flight on the chosen prefill rank for the whole
+        // request lifetime (dropped on every return path below). This keeps the
+        // per-rank load view current for concurrent selections so warm turns spread
+        // instead of piling on one hot rank.
+        let _prefill_load_guard = PrefillLoadGuard::acquire(
+            self.prefill_inflight.clone(),
+            prefill_instances[prefill_idx].0.clone(),
+        );
+
+        let decode_idx = match self.select_worker_with_policy(
+            &decode_instances,
+            false,
+            request_str,
+            request_headers.as_ref(),
+        ) {
             Some(idx) => idx,
             None => {
                 RouterMetrics::record_pd_error("server_selection");
@@ -1878,6 +2080,25 @@ impl VllmPDRouter {
         let kv_connector = ctx.router_config.kv_connector;
         let http_client = reqwest::Client::new();
 
+        // Load-aware prefill affinity config (bounded-load overflow on the prefill leg).
+        let prefill_load_aware = std::env::var("PREFILL_LOAD_AWARE")
+            .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+            .unwrap_or(true);
+        let prefill_lb_load_factor = std::env::var("PREFILL_LB_LOAD_FACTOR")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|f| *f > 0.0)
+            .unwrap_or(1.25);
+        let prefill_lb_min_bound = std::env::var("PREFILL_LB_MIN_BOUND")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|f| *f >= 0.0)
+            .unwrap_or(1.0);
+        info!(
+            "Prefill affinity: load_aware={}, load_factor={}, min_bound={}",
+            prefill_load_aware, prefill_lb_load_factor, prefill_lb_min_bound
+        );
+
         if let Some(ref addr) = discovery_address {
             // Discovery mode
             info!(
@@ -1916,6 +2137,10 @@ impl VllmPDRouter {
                 kv_connector,
                 mooncake_prefill_info: Arc::new(Mutex::new(HashMap::new())),
                 nixl_prefill_info: RwLock::new(HashMap::new()),
+                prefill_inflight: Arc::new(std::sync::Mutex::new(HashMap::new())),
+                prefill_load_aware,
+                prefill_lb_load_factor,
+                prefill_lb_min_bound,
             })
         } else {
             // Direct URL mode (same as PdRouterBase)
@@ -2006,6 +2231,10 @@ impl VllmPDRouter {
                 kv_connector,
                 mooncake_prefill_info,
                 nixl_prefill_info: RwLock::new(HashMap::new()),
+                prefill_inflight: Arc::new(std::sync::Mutex::new(HashMap::new())),
+                prefill_load_aware,
+                prefill_lb_load_factor,
+                prefill_lb_min_bound,
             })
         }
     }
@@ -2988,5 +3217,129 @@ mod tests {
     fn test_moriio_write_decode_params_includes_remote_dp_rank_when_dp_size_gt_1() {
         let params = moriio_write_decode_params(Some("tx-abc"), 4, Some(2));
         assert_eq!(params["remote_dp_rank"], 2);
+    }
+
+    fn discovered(http: &str) -> Vec<(String, String)> {
+        vec![(http.to_string(), "host:10.0.0.1,handshake:8405".to_string())]
+    }
+
+    #[test]
+    fn test_expand_dp_instances_noop_when_dp_size_is_1() {
+        let out = VllmPDRouter::expand_dp_instances(discovered("10.0.0.1:20005"), 1);
+        assert_eq!(out, discovered("10.0.0.1:20005"));
+    }
+
+    #[test]
+    fn test_expand_dp_instances_one_entry_per_rank() {
+        let out = VllmPDRouter::expand_dp_instances(discovered("10.0.0.1:20005"), 4);
+        let https: Vec<&str> = out.iter().map(|(h, _)| h.as_str()).collect();
+        assert_eq!(
+            https,
+            vec![
+                "10.0.0.1:20005@0",
+                "10.0.0.1:20005@1",
+                "10.0.0.1:20005@2",
+                "10.0.0.1:20005@3"
+            ]
+        );
+        assert!(out.iter().all(|(_, z)| z == "host:10.0.0.1,handshake:8405"));
+        for (i, (http, _)) in out.iter().enumerate() {
+            assert_eq!(
+                dp_utils::extract_dp_rank(http).unwrap(),
+                ("10.0.0.1:20005", i)
+            );
+        }
+    }
+
+    #[test]
+    fn test_expand_dp_instances_keeps_already_ranked_address() {
+        let out = VllmPDRouter::expand_dp_instances(discovered("10.0.0.1:20005@3"), 8);
+        assert_eq!(out, discovered("10.0.0.1:20005@3"));
+    }
+
+    #[test]
+    fn test_to_request_headers_lowercases_names() {
+        let mut h = HeaderMap::new();
+        h.insert("X-Session-ID", "sess-1".parse().unwrap());
+        let map = VllmPDRouter::to_request_headers(Some(&h)).unwrap();
+        assert_eq!(map.get("x-session-id").map(String::as_str), Some("sess-1"));
+        assert!(VllmPDRouter::to_request_headers(None).is_none());
+    }
+
+    #[test]
+    fn test_prefill_load_guard_increments_and_decrements() {
+        let map = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        {
+            let _g1 = PrefillLoadGuard::acquire(map.clone(), "10.0.0.1:20005@3".to_string());
+            let _g2 = PrefillLoadGuard::acquire(map.clone(), "10.0.0.1:20005@3".to_string());
+            assert_eq!(*map.lock().unwrap().get("10.0.0.1:20005@3").unwrap(), 2);
+        }
+        // Both guards dropped -> key removed (count hit 0).
+        assert!(map.lock().unwrap().get("10.0.0.1:20005@3").is_none());
+    }
+
+    #[test]
+    fn test_bounded_load_pick_keeps_sticky_when_within_bound() {
+        // sticky (idx 5) has load 1, others 0; mean=1/8, bound=max(1.25*0.125,1.0)=1.0.
+        // sticky_load 1 <= 1.0 -> keep sticky (a session's own single in-flight turn
+        // must NOT break its affinity).
+        let scored = vec![(5, 1), (6, 0), (7, 0), (0, 0), (1, 0), (2, 0), (3, 0), (4, 0)];
+        assert_eq!(VllmPDRouter::bounded_load_pick(&scored, 1.25, 1.0), Some(5));
+    }
+
+    #[test]
+    fn test_bounded_load_pick_overflows_to_least_loaded_when_hot() {
+        // sticky (idx 7) is hot with 3 concurrent turns from OTHER sessions; two others
+        // have 1 and 2, one is empty. mean=(3+1+2+0)/4=1.5, bound=max(1.25*1.5,1.0)=1.875.
+        // 3 > 1.875 -> overflow to the least-loaded candidate (idx 2, load 0).
+        let scored = vec![(7, 3), (0, 1), (1, 2), (2, 0)];
+        assert_eq!(VllmPDRouter::bounded_load_pick(&scored, 1.25, 1.0), Some(2));
+    }
+
+    #[test]
+    fn test_bounded_load_pick_overflow_ties_favor_ring_order() {
+        // sticky (idx 7) hot=4; candidates idx 0 and idx 3 both empty (load 0).
+        // Overflow picks the FIRST minimum in ring order (idx 0), not idx 3.
+        let scored = vec![(7, 4), (0, 0), (3, 0)];
+        assert_eq!(VllmPDRouter::bounded_load_pick(&scored, 1.25, 1.0), Some(0));
+    }
+
+    #[test]
+    fn test_bounded_load_pick_single_candidate() {
+        let scored = vec![(2, 9)];
+        assert_eq!(VllmPDRouter::bounded_load_pick(&scored, 1.25, 1.0), Some(2));
+    }
+
+    #[test]
+    fn test_discovered_dp_ranks_are_session_sticky_under_consistent_hash() {
+        use crate::policies::{ConsistentHashPolicy, LoadBalancingPolicy};
+
+        let instances = VllmPDRouter::expand_dp_instances(discovered("10.0.0.1:20005"), 8);
+        let workers = VllmPDRouter::instances_to_workers(&instances);
+        let policy = ConsistentHashPolicy::new();
+
+        let mut chosen = std::collections::HashSet::new();
+        for s in 0..64 {
+            let mut h = HeaderMap::new();
+            h.insert("X-Session-ID", format!("sess-{}", s).parse().unwrap());
+            let headers = VllmPDRouter::to_request_headers(Some(&h));
+            let first = policy
+                .select_worker_with_headers(
+                    &workers,
+                    Some("{\"prompt\":\"turn 1\"}"),
+                    headers.as_ref(),
+                )
+                .unwrap();
+            let later = policy
+                .select_worker_with_headers(
+                    &workers,
+                    Some("{\"prompt\":\"turn 2 longer\"}"),
+                    headers.as_ref(),
+                )
+                .unwrap();
+            assert_eq!(first, later, "session {} moved between turns", s);
+            chosen.insert(first);
+        }
+        assert!(chosen.len() > 1, "all sessions hashed to one DP rank");
     }
 }
