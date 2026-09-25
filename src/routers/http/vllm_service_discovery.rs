@@ -5,6 +5,7 @@
 use crate::config::KvConnector;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::broadcast;
@@ -78,6 +79,21 @@ pub struct ServiceInstance {
     pub expires_at: u64, // Unix timestamp
     pub tp_size: usize,
     pub dp_size: usize,
+    /// Unique identity for one continuous registration lifetime.
+    pub generation: u64,
+}
+
+static NEXT_REGISTRATION_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+fn next_registration_generation() -> u64 {
+    NEXT_REGISTRATION_GENERATION.fetch_add(1, Ordering::Relaxed)
+}
+
+fn registration_generation(existing: Option<&ServiceInstance>, current_time: u64) -> u64 {
+    existing
+        .filter(|instance| instance.expires_at > current_time)
+        .map(|instance| instance.generation)
+        .unwrap_or_else(next_registration_generation)
 }
 
 /// Service registry maintaining prefill and decode instances
@@ -267,13 +283,6 @@ impl ServiceRegistry {
             .unwrap()
             .as_secs();
 
-        let instance = ServiceInstance {
-            zmq_address: data.zmq_address.clone(),
-            expires_at: current_time + DEFAULT_PING_SECONDS,
-            tp_size,
-            dp_size,
-        };
-
         let remote_addr_str = String::from_utf8_lossy(remote_address);
 
         match data.service_type.as_str() {
@@ -291,7 +300,16 @@ impl ServiceRegistry {
         match data.service_type.as_str() {
             "P" => {
                 let mut prefill = prefill_instances.lock().unwrap();
-                let is_new = !prefill.contains_key(&data.http_address);
+                let old = prefill.get(&data.http_address);
+                let is_new = old.is_none_or(|i| i.expires_at <= current_time);
+                let generation = registration_generation(old, current_time);
+                let instance = ServiceInstance {
+                    zmq_address: data.zmq_address.clone(),
+                    expires_at: current_time + DEFAULT_PING_SECONDS,
+                    tp_size,
+                    dp_size,
+                    generation,
+                };
                 prefill.insert(data.http_address.clone(), instance);
 
                 if is_new {
@@ -308,7 +326,16 @@ impl ServiceRegistry {
             }
             "D" => {
                 let mut decode = decode_instances.lock().unwrap();
-                let is_new = !decode.contains_key(&data.http_address);
+                let old = decode.get(&data.http_address);
+                let is_new = old.is_none_or(|i| i.expires_at <= current_time);
+                let generation = registration_generation(old, current_time);
+                let instance = ServiceInstance {
+                    zmq_address: data.zmq_address.clone(),
+                    expires_at: current_time + DEFAULT_PING_SECONDS,
+                    tp_size,
+                    dp_size,
+                    generation,
+                };
                 decode.insert(data.http_address.clone(), instance);
 
                 if is_new {
@@ -393,16 +420,19 @@ impl ServiceRegistry {
             .unwrap()
             .as_secs();
 
-        let instance = ServiceInstance {
-            zmq_address: zmq_address.clone(),
-            expires_at: current_time + DEFAULT_PING_SECONDS,
-            tp_size: 1,
-            dp_size: 1,
-        };
-
         match service_type {
             ServiceType::Prefill => {
                 let mut prefill = self.prefill_instances.lock().unwrap();
+                // Lookup and insertion share this lock: concurrent heartbeats
+                // must never manufacture a new registration lifetime.
+                let generation = registration_generation(prefill.get(&http_address), current_time);
+                let instance = ServiceInstance {
+                    zmq_address: zmq_address.clone(),
+                    expires_at: current_time + DEFAULT_PING_SECONDS,
+                    tp_size: 1,
+                    dp_size: 1,
+                    generation,
+                };
                 prefill.insert(http_address.clone(), instance);
                 info!(
                     "🔵Manual register Prefill [HTTP:{}, ZMQ:{}]",
@@ -411,11 +441,33 @@ impl ServiceRegistry {
             }
             ServiceType::Decode => {
                 let mut decode = self.decode_instances.lock().unwrap();
+                // See the prefill branch: this must be one atomic registry
+                // operation, not a lookup under one lock and insert under another.
+                let generation = registration_generation(decode.get(&http_address), current_time);
+                let instance = ServiceInstance {
+                    zmq_address: zmq_address.clone(),
+                    expires_at: current_time + DEFAULT_PING_SECONDS,
+                    tp_size: 1,
+                    dp_size: 1,
+                    generation,
+                };
                 decode.insert(http_address.clone(), instance);
                 info!(
                     "🔵Manual register Decode [HTTP:{}, ZMQ:{}]",
                     http_address, zmq_address
                 );
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn remove_service_for_test(&self, http_address: &str, service_type: ServiceType) {
+        match service_type {
+            ServiceType::Prefill => {
+                self.prefill_instances.lock().unwrap().remove(http_address);
+            }
+            ServiceType::Decode => {
+                self.decode_instances.lock().unwrap().remove(http_address);
             }
         }
     }
@@ -461,6 +513,26 @@ impl ServiceRegistry {
         guard
             .iter()
             .map(|(http, instance)| (http.clone(), instance.zmq_address.clone()))
+            .collect()
+    }
+
+    /// Generation-aware snapshot used by persistent routing pools.
+    pub fn get_prefill_registration_snapshot(&self) -> Vec<(String, String, u64)> {
+        self.prefill_instances
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(http, i)| (http.clone(), i.zmq_address.clone(), i.generation))
+            .collect()
+    }
+
+    /// Generation-aware snapshot used by persistent routing pools.
+    pub fn get_decode_registration_snapshot(&self) -> Vec<(String, String, u64)> {
+        self.decode_instances
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(http, i)| (http.clone(), i.zmq_address.clone(), i.generation))
             .collect()
     }
 
@@ -543,5 +615,104 @@ mod tests {
         assert!(result.is_some());
         let (_, mode, _, _) = result.unwrap();
         assert_eq!(mode, Some(MoriIOTransferMode::Write));
+    }
+
+    #[test]
+    fn manual_registration_refresh_preserves_generation_and_reregister_changes_it() {
+        let registry = ServiceRegistry::new();
+        registry.register_service("worker:8000".into(), "z1".into(), ServiceType::Prefill);
+        let initial = registry.get_prefill_registration_snapshot()[0].2;
+        registry.register_service("worker:8000".into(), "z2".into(), ServiceType::Prefill);
+        assert_eq!(registry.get_prefill_registration_snapshot()[0].2, initial);
+        registry
+            .prefill_instances
+            .lock()
+            .unwrap()
+            .get_mut("worker:8000")
+            .unwrap()
+            .expires_at = 0;
+        registry.register_service("worker:8000".into(), "z3".into(), ServiceType::Prefill);
+        let after_expiry = registry.get_prefill_registration_snapshot()[0].2;
+        assert_ne!(after_expiry, initial);
+        registry
+            .prefill_instances
+            .lock()
+            .unwrap()
+            .remove("worker:8000");
+        registry.register_service("worker:8000".into(), "z4".into(), ServiceType::Prefill);
+        assert_ne!(
+            registry.get_prefill_registration_snapshot()[0].2,
+            after_expiry
+        );
+
+        registry.register_service("worker:8000".into(), "d1".into(), ServiceType::Decode);
+        let decode_initial = registry.get_decode_registration_snapshot()[0].2;
+        registry
+            .decode_instances
+            .lock()
+            .unwrap()
+            .get_mut("worker:8000")
+            .unwrap()
+            .expires_at = 0;
+        registry.register_service("worker:8000".into(), "d2".into(), ServiceType::Decode);
+        assert_ne!(
+            registry.get_decode_registration_snapshot()[0].2,
+            decode_initial
+        );
+    }
+
+    #[tokio::test]
+    async fn registration_heartbeat_preserves_generation() {
+        let registry = ServiceRegistry::new();
+        let registration = ServiceRegistration {
+            service_type: "P".into(),
+            http_address: "worker:8000".into(),
+            zmq_address: "z1".into(),
+        };
+        let first = rmp_serde::to_vec_named(&registration).unwrap();
+        ServiceRegistry::handle_registration_message(
+            &first,
+            b"peer",
+            &registry.prefill_instances,
+            &registry.decode_instances,
+            KvConnector::Nixl,
+            &registry.moriio_transfer_mode,
+        )
+        .await;
+        let initial = registry.get_prefill_registration_snapshot()[0].2;
+
+        let heartbeat = rmp_serde::to_vec_named(&ServiceRegistration {
+            zmq_address: "z2".into(),
+            ..registration
+        })
+        .unwrap();
+        ServiceRegistry::handle_registration_message(
+            &heartbeat,
+            b"peer",
+            &registry.prefill_instances,
+            &registry.decode_instances,
+            KvConnector::Nixl,
+            &registry.moriio_transfer_mode,
+        )
+        .await;
+        assert_eq!(registry.get_prefill_registration_snapshot()[0].2, initial);
+
+        registry
+            .prefill_instances
+            .lock()
+            .unwrap()
+            .get_mut("worker:8000")
+            .unwrap()
+            .expires_at = 0;
+        ServiceRegistry::handle_registration_message(
+            &heartbeat,
+            b"peer",
+            &registry.prefill_instances,
+            &registry.decode_instances,
+            KvConnector::Nixl,
+            &registry.moriio_transfer_mode,
+        )
+        .await;
+        assert_ne!(registry.get_prefill_registration_snapshot()[0].2, initial);
     }
 }
