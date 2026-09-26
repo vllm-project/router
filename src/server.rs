@@ -24,18 +24,25 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{delete, get, post},
-    serve, Json, Router,
+    serve,
+    serve::{Listener, ListenerExt},
+    Json, Router,
 };
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::json;
 use std::{
     collections::HashMap,
+    net::SocketAddr,
     sync::atomic::{AtomicBool, Ordering},
     sync::Arc,
     time::Duration,
 };
-use tokio::{net::TcpListener, signal, spawn, sync::RwLock};
+use tokio::{
+    net::{TcpListener, TcpStream},
+    signal, spawn,
+    sync::RwLock,
+};
 use tracing::{error, info, warn, Level};
 
 #[derive(Clone)]
@@ -1140,7 +1147,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     );
 
     let addr = format!("{}:{}", config.host, config.port);
-    let listener = TcpListener::bind(&addr).await?;
+    let listener = bind_listener(&addr).await?;
     info!("Starting server on {}", addr);
     serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
@@ -1148,6 +1155,22 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
 
     Ok(())
+}
+
+/// Bind the client-facing listener with `TCP_NODELAY` on every accepted connection.
+///
+/// Without it, Nagle's algorithm holds small streamed chunks until the client's
+/// delayed ACK arrives (about 40 ms on Linux), which delays TTFT on keep-alive
+/// connections.
+async fn bind_listener(
+    addr: &str,
+) -> std::io::Result<impl Listener<Io = TcpStream, Addr = SocketAddr>> {
+    let listener = TcpListener::bind(addr).await?;
+    Ok(listener.tap_io(|tcp| {
+        if let Err(err) = tcp.set_nodelay(true) {
+            warn!("Failed to set TCP_NODELAY on incoming connection: {err}");
+        }
+    }))
 }
 
 // Graceful shutdown handler
@@ -1205,4 +1228,20 @@ fn create_cors_layer(allowed_origins: Vec<String>) -> tower_http::cors::CorsLaye
     };
 
     cors.max_age(Duration::from_secs(3600))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_bind_listener_sets_tcp_nodelay_on_accepted_connections() {
+        let mut listener = bind_listener("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let _client = TcpStream::connect(addr).await.unwrap();
+        let (accepted, _) = listener.accept().await;
+
+        assert!(accepted.nodelay().unwrap());
+    }
 }
