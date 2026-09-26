@@ -6,7 +6,7 @@ use crate::core::{
 };
 use crate::metrics::RouterMetrics;
 use crate::otel_http::{self, ClientRequestOptions};
-use crate::policies::{LoadBalancingPolicy, PolicyRegistry};
+use crate::policies::{LoadBalancingPolicy, PolicyRegistry, PolicyRequestContext};
 use crate::program_scheduling::{
     BackendObservationProvider, ProgramIdentity, ProgramScheduler, ProgramSchedulerConfig,
     ProgramTarget, ScheduleError, VllmMetricsObservationProvider,
@@ -1000,6 +1000,17 @@ impl Router {
         text: Option<&str>,
         headers: Option<&HeaderMap>,
     ) -> Option<Arc<dyn Worker>> {
+        self.select_worker_for_model_with_token_ids(model_id, text, headers, None)
+    }
+
+    /// Select a worker while optionally reusing request-scoped prepared token IDs.
+    fn select_worker_for_model_with_token_ids(
+        &self,
+        model_id: Option<&str>,
+        text: Option<&str>,
+        headers: Option<&HeaderMap>,
+        token_ids: Option<&[u32]>,
+    ) -> Option<Arc<dyn Worker>> {
         // Get workers for the specified model (O(1) lookup if model_id is provided)
         let workers = match model_id {
             Some(model) => self.worker_registry.get_by_model_fast(model),
@@ -1024,7 +1035,11 @@ impl Router {
         // Convert headers for policies that need them (e.g., consistent_hash)
         let request_headers = Self::headers_to_request_headers(headers);
 
-        let idx = policy.select_worker_with_headers(&available, text, request_headers.as_ref())?;
+        let mut context = PolicyRequestContext::new(text, request_headers.as_ref());
+        if let Some(token_ids) = token_ids {
+            context = context.with_token_ids(token_ids);
+        }
+        let idx = policy.select_worker_with_context(&available, &context)?;
         Some(available[idx].clone())
     }
 
@@ -1110,7 +1125,17 @@ impl Router {
                     };
                     Some(worker)
                 } else {
-                    self.select_worker_for_model(model_id, Some(&text), headers)
+                    // Reuse token IDs prepared once by the merged gRPC frontend while
+                    // preserving the existing model-scoped worker eligibility rules.
+                    let token_ids = prepared
+                        .as_ref()
+                        .map(|prepared| prepared.tokenized.token_ids.as_ref());
+                    self.select_worker_for_model_with_token_ids(
+                        model_id,
+                        Some(&text),
+                        headers,
+                        token_ids,
+                    )
                 };
                 let worker = match selected_worker {
                     Some(w) => w,
@@ -3023,6 +3048,138 @@ mod tests {
         let result = Router::headers_to_request_headers(Some(&header_map));
         assert!(result.is_some());
         assert!(result.unwrap().is_empty());
+    }
+
+    #[derive(Debug)]
+    struct RecordingContextPolicy {
+        observations: std::sync::Mutex<Vec<(Option<String>, Option<String>, Option<usize>, Option<usize>)>>,
+    }
+
+    impl RecordingContextPolicy {
+        fn new() -> Self {
+            Self {
+                observations: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl LoadBalancingPolicy for RecordingContextPolicy {
+        fn select_worker_with_headers(
+            &self,
+            _workers: &[Arc<dyn Worker>],
+            request_text: Option<&str>,
+            headers: Option<&crate::policies::RequestHeaders>,
+        ) -> Option<usize> {
+            self.observations.lock().unwrap().push((
+                request_text.map(str::to_owned),
+                headers.and_then(|h| h.get("x-session-id").cloned()),
+                None,
+                None,
+            ));
+            Some(0)
+        }
+
+        fn select_worker_with_context(
+            &self,
+            _workers: &[Arc<dyn Worker>],
+            context: &PolicyRequestContext<'_>,
+        ) -> Option<usize> {
+            self.observations.lock().unwrap().push((
+                context.request_text.map(str::to_owned),
+                context
+                    .headers
+                    .and_then(|h| h.get("x-session-id").cloned()),
+                context.token_ids.map(|ids| ids.len()),
+                context.token_ids.map(|ids| ids.as_ptr() as usize),
+            ));
+            Some(0)
+        }
+
+        fn name(&self) -> &'static str {
+            "recording_context"
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    fn create_test_context_router(policy: Arc<dyn LoadBalancingPolicy>) -> Router {
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        worker_registry.register(Arc::new(BasicWorker::new(
+            "http://worker1:8080".to_string(),
+            WorkerType::Regular,
+        )));
+        let policy_registry = Arc::new(PolicyRegistry::with_default_policy_for_test(policy));
+        let (_, rx) = tokio::sync::watch::channel(HashMap::new());
+        Router {
+            worker_registry,
+            policy_registry,
+            worker_startup_timeout_secs: 5,
+            worker_startup_check_interval_secs: 1,
+            intra_node_data_parallel_size: 1,
+            api_key: None,
+            client: Client::new(),
+            retry_config: RetryConfig::default(),
+            circuit_breaker_config: CircuitBreakerConfig::default(),
+            health_config: HealthConfig::default(),
+            frontend: crate::backend::EngineFrontend::new(),
+            _worker_loads: Arc::new(rx),
+            _load_monitor_handle: None,
+            program_scheduler: None,
+            _program_observation_handle: None,
+            program_targets_cache: Mutex::new(HashMap::new()),
+            program_token_estimator: Arc::new(MomentumTokenEstimator::default()),
+        }
+    }
+
+    #[test]
+    fn test_policy_context_preserves_text_headers_without_prepared_tokens() {
+        let policy = Arc::new(RecordingContextPolicy::new());
+        let router = create_test_context_router(policy.clone());
+        let mut headers = HeaderMap::new();
+        headers.insert("x-session-id", HeaderValue::from_static("session-123"));
+
+        router
+            .select_worker_for_model(None, Some("hello"), Some(&headers))
+            .expect("worker should be selected");
+
+        let observations = policy.observations.lock().unwrap();
+        assert_eq!(
+            observations.as_slice(),
+            &[(
+                Some("hello".to_string()),
+                Some("session-123".to_string()),
+                None,
+                None,
+            )]
+        );
+    }
+
+    #[test]
+    fn test_prepared_token_ids_are_reused_across_worker_selection_attempts() {
+        let policy = Arc::new(RecordingContextPolicy::new());
+        let router = create_test_context_router(policy.clone());
+        let token_ids = vec![101_u32, 202, 303];
+        let expected_ptr = token_ids.as_ptr() as usize;
+
+        for _ in 0..2 {
+            router
+                .select_worker_for_model_with_token_ids(
+                    None,
+                    Some("hello"),
+                    None,
+                    Some(token_ids.as_slice()),
+                )
+                .expect("worker should be selected");
+        }
+
+        let observations = policy.observations.lock().unwrap();
+        assert_eq!(observations.len(), 2);
+        for observation in observations.iter() {
+            assert_eq!(observation.2, Some(3));
+            assert_eq!(observation.3, Some(expected_ptr));
+        }
     }
 
     #[test]
