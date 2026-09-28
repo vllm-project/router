@@ -25,6 +25,7 @@ pub struct ServiceDiscoveryConfig {
     pub selector: HashMap<String, String>,
     pub check_interval: Duration,
     pub port: u16,
+    pub additional_ports: Vec<u16>,
     pub namespace: Option<String>,
     // PD mode specific configuration
     pub pd_mode: bool,
@@ -40,13 +41,26 @@ impl Default for ServiceDiscoveryConfig {
             enabled: false,
             selector: HashMap::new(),
             check_interval: Duration::from_secs(60),
-            port: 8000,      // Standard port for modern services
+            port: 8000, // Standard port for modern services
+            additional_ports: Vec::new(),
             namespace: None, // None means watch all namespaces
             pd_mode: false,
             prefill_selector: HashMap::new(),
             decode_selector: HashMap::new(),
             bootstrap_port_annotation: "vllm.ai/bootstrap-port".to_string(),
         }
+    }
+}
+
+impl ServiceDiscoveryConfig {
+    fn worker_ports(&self) -> Vec<u16> {
+        let mut ports = vec![self.port];
+        for port in &self.additional_ports {
+            if !ports.contains(port) {
+                ports.push(*port);
+            }
+        }
+        ports
     }
 }
 
@@ -231,7 +245,11 @@ pub async fn start_service_discovery(
     // Create the task that will run in the background
     let handle = task::spawn(async move {
         // We'll track pods we've already added to avoid duplicates
-        let tracked_pods = Arc::new(Mutex::new(HashSet::new()));
+        let tracked_pods: Vec<_> = config
+            .worker_ports()
+            .into_iter()
+            .map(|port| (port, Arc::new(Mutex::new(HashSet::new()))))
+            .collect();
 
         // Create a watcher for pods
         let pods: Api<Pod> = if let Some(namespace) = &config.namespace {
@@ -244,7 +262,6 @@ pub async fn start_service_discovery(
 
         // Create Arcs for configuration data
         let config_arc = Arc::new(config.clone());
-        let port = config.port;
 
         let mut retry_delay = Duration::from_secs(1);
         const MAX_RETRY_DELAY: Duration = Duration::from_secs(300); // 5 minutes max
@@ -256,7 +273,7 @@ pub async fn start_service_discovery(
 
             // Clone Arcs for the closures
             let config_clone = Arc::clone(&config_arc);
-            let tracked_pods_clone = Arc::clone(&tracked_pods);
+            let tracked_pods_clone = tracked_pods.clone();
 
             // Simplified label selector filter using helper method
             let filtered_stream = watcher_stream.filter_map(move |obj_res| {
@@ -277,13 +294,13 @@ pub async fn start_service_discovery(
             });
 
             // Clone again for the next closure
-            let tracked_pods_clone2 = Arc::clone(&tracked_pods_clone);
+            let tracked_pods_clone2 = tracked_pods_clone.clone();
             let router_clone = Arc::clone(&router);
             let config_clone2 = Arc::clone(&config_arc);
 
             match filtered_stream
                 .try_for_each(move |pod| {
-                    let tracked_pods_inner = Arc::clone(&tracked_pods_clone2);
+                    let tracked_pods_inner = tracked_pods_clone2.clone();
                     let router_inner = Arc::clone(&router_clone);
                     let config_inner = Arc::clone(&config_clone2);
 
@@ -291,25 +308,14 @@ pub async fn start_service_discovery(
                         let pod_info = PodInfo::from_pod(&pod, Some(&config_inner));
 
                         if let Some(pod_info) = pod_info {
-                            if pod.metadata.deletion_timestamp.is_some() {
-                                handle_pod_deletion(
-                                    &pod_info,
-                                    tracked_pods_inner,
-                                    router_inner,
-                                    port,
-                                    config_inner.pd_mode,
-                                )
-                                .await;
-                            } else {
-                                handle_pod_event(
-                                    &pod_info,
-                                    tracked_pods_inner,
-                                    router_inner,
-                                    port,
-                                    config_inner.pd_mode,
-                                )
-                                .await;
-                            }
+                            handle_pod_ports(
+                                &pod_info,
+                                &tracked_pods_inner,
+                                router_inner,
+                                config_inner.pd_mode,
+                                pod.metadata.deletion_timestamp.is_some(),
+                            )
+                            .await;
                         }
                         Ok(())
                     }
@@ -343,6 +349,31 @@ pub async fn start_service_discovery(
     });
 
     Ok(handle)
+}
+
+type PortTracker = (u16, Arc<Mutex<HashSet<PodInfo>>>);
+
+async fn handle_pod_ports(
+    pod_info: &PodInfo,
+    tracked_ports: &[PortTracker],
+    router: Arc<dyn RouterTrait>,
+    pd_mode: bool,
+    deleted: bool,
+) {
+    // Each endpoint has its own registration state. A failed port must not
+    // stop other ports on the same pod from accepting requests.
+    futures::future::join_all(tracked_ports.iter().map(|(port, tracked)| {
+        let router = Arc::clone(&router);
+        let tracked = Arc::clone(tracked);
+        async move {
+            if deleted {
+                handle_pod_deletion(pod_info, tracked, router, *port, pd_mode).await;
+            } else {
+                handle_pod_event(pod_info, tracked, router, *port, pd_mode).await;
+            }
+        }
+    }))
+    .await;
 }
 
 async fn handle_pod_event(
@@ -624,6 +655,7 @@ mod tests {
             selector: HashMap::new(),
             check_interval: Duration::from_secs(60),
             port: 8080,
+            additional_ports: Vec::new(),
             namespace: None,
             pd_mode: true,
             prefill_selector,
@@ -1187,5 +1219,60 @@ mod tests {
 
         // Pod should be removed from tracking
         assert!(!tracked_pods.lock().unwrap().contains(&pod_info));
+    }
+
+    #[tokio::test]
+    async fn test_multiple_ports_register_retry_and_remove_independently() {
+        let first = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let second = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let first_port = first.local_addr().unwrap().port();
+        let second_port = second.local_addr().unwrap().port();
+        let app = axum::Router::new().route("/health", axum::routing::get(|| async { "ok" }));
+        let first_app = app.clone();
+        let first_server =
+            tokio::spawn(async move { axum::serve(first, first_app).await.unwrap() });
+        let pod = create_pd_k8s_pod("worker", "127.0.0.1", "worker", None);
+        let pod_info = PodInfo::from_pod(&pod, None).unwrap();
+        let router = create_test_router().await;
+        let tracked: Vec<PortTracker> = [second_port, first_port]
+            .into_iter()
+            .map(|port| (port, Arc::new(Mutex::new(HashSet::new()))))
+            .collect();
+
+        // The first endpoint in the list has no HTTP server yet.
+        handle_pod_ports(&pod_info, &tracked, router.clone(), false, false).await;
+        assert_eq!(
+            router.get_worker_urls(),
+            vec![pod_info.worker_url(first_port)]
+        );
+        assert!(tracked[0].1.lock().unwrap().is_empty());
+        assert_eq!(tracked[1].1.lock().unwrap().len(), 1);
+
+        let second_server = tokio::spawn(async move { axum::serve(second, app).await.unwrap() });
+        handle_pod_ports(&pod_info, &tracked, router.clone(), false, false).await;
+        let urls = router.get_worker_urls();
+        assert_eq!(urls.len(), 2);
+        assert!(urls.contains(&pod_info.worker_url(first_port)));
+        assert!(urls.contains(&pod_info.worker_url(second_port)));
+        handle_pod_ports(&pod_info, &tracked, router.clone(), false, false).await;
+        assert_eq!(router.get_worker_urls().len(), 2);
+
+        handle_pod_ports(&pod_info, &tracked, router.clone(), false, true).await;
+        assert!(router.get_worker_urls().is_empty());
+        assert!(tracked
+            .iter()
+            .all(|(_, pods)| pods.lock().unwrap().is_empty()));
+        first_server.abort();
+        second_server.abort();
+    }
+    #[test]
+    fn test_service_discovery_port_order_and_duplicates() {
+        let config = ServiceDiscoveryConfig {
+            port: 8000,
+            additional_ports: vec![8001, 8000, 8002, 8001],
+            ..Default::default()
+        };
+        assert_eq!(config.worker_ports(), vec![8000, 8001, 8002]);
+        assert_eq!(ServiceDiscoveryConfig::default().worker_ports(), vec![8000]);
     }
 }

@@ -58,8 +58,8 @@ class Router:
             automatically discover worker pods based on the selector. Default: False
         selector: Dictionary mapping of label keys to values for Kubernetes pod selection.
             Example: {"app": "vllm-worker"}. Default: {}
-        service_discovery_port: Port to use for service discovery. The router will generate
-            worker URLs using this port. Default: 80
+        service_discovery_port: One port or a list of ports for service discovery. The router
+            creates one worker URL per port on each pod. Default: 80
         service_discovery_namespace: Kubernetes namespace to watch for pods. If not provided,
             watches pods across all namespaces (requires cluster-wide permissions). Default: None
         prefill_selector: Dictionary mapping of label keys to values for Kubernetes pod selection

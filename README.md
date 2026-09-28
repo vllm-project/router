@@ -264,11 +264,22 @@ vllm-router \
     --service-discovery-namespace default
 ```
 
+For a pod with API servers on several ports, pass all ports in one option:
+
+```bash
+vllm-router --service-discovery --selector app=vllm-worker \
+    --service-discovery-port 8000 8001
+```
+
+You can also repeat the option: `--service-discovery-port 8000 --service-discovery-port 8001`.
+The Python API accepts `service_discovery_port=8000` or `service_discovery_port=[8000, 8001]`.
+Each port has its own worker registration and health checks. Duplicate ports register only once.
+
 ### Command Line Arguments Reference
 
 #### Service Discovery
 - `--service-discovery`: Enable Kubernetes service discovery
-- `--service-discovery-port`: Port for worker URLs (default: 8000)
+- `--service-discovery-port`: One or more ports for worker URLs (default: 80)
 - `--service-discovery-namespace`: Kubernetes namespace to watch
 - `--selector`: Label selectors for regular mode (format: `key1=value1 key2=value2`)
 
