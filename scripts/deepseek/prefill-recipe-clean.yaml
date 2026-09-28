@@ -1,0 +1,220 @@
+---
+# DeepSeek V3 Prefill Deployment - OOM Debugging
+# Issue: CUDA OOM despite TP=1, DP=8 configuration
+# Error: "GPU 0 has a total capacity of 79.19 GiB of which 89.06 MiB is free"
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm-prefill
+  namespace: vllm
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: vllm-prefill
+  template:
+    metadata:
+      labels:
+        app: vllm-prefill
+    spec:
+      containers:
+      - name: vllm
+        image: vllm/vllm-openai:latest
+
+        # ===========================================
+        # PARALLELISM CONFIGURATION
+        # ===========================================
+        # Model: DeepSeek V3 (671B params, 256 experts)
+        # Tensor Parallel: 1
+        # Data Parallel: 8
+        # Expert Parallel: Enabled (implicit with --enable-expert-parallel)
+        # GPUs per pod: 8x H100 80GB
+
+        command:
+        - vllm
+        - serve
+        - "deepseek-ai/DeepSeek-V3-0324"
+        args:
+        - --host=0.0.0.0
+        - --port=20003
+        - --tensor-parallel-size=1
+        - --intra-node-data-parallel-size=8
+        - --enable-expert-parallel
+        - --enforce-eager
+        - --trust-remote-code
+        - --gpu-memory-utilization=0.9
+        - --enable-prefix-caching
+        - --disable-log-stats
+        - --kv-transfer-config={"kv_connector":"NixlConnector","kv_role":"kv_both","kv_connector_extra_config":{"backends":["UCX","GDS"]}}
+
+        # ===========================================
+        # VLLM V1 AND MOE CONFIGURATION
+        # ===========================================
+        env:
+        # vLLM v1 Engine
+        - name: VLLM_USE_V1
+          value: "1"
+
+        # MOE Data Parallel Configuration
+        - name: VLLM_MOE_DP_CHUNK_SIZE
+          value: "512"
+
+        # DeepEP Backend (for prefill)
+        - name: VLLM_ALL2ALL_BACKEND
+          value: "deepep_high_throughput"
+
+        # Deep GEMM Optimization
+        - name: VLLM_USE_DEEP_GEMM
+          value: "1"
+
+        # ===========================================
+        # NIXL CONFIGURATION (KV Transfer)
+        # ===========================================
+        - name: POD_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+        - name: VLLM_NIXL_SIDE_CHANNEL_HOST
+          value: "$(POD_IP)"
+        - name: VLLM_NIXL_SIDE_CHANNEL_PORT
+          value: "5600"
+
+        # ===========================================
+        # CUDA AND GPU CONFIGURATION
+        # ===========================================
+        - name: CUDA_VISIBLE_DEVICES
+          value: "0,1,2,3,4,5,6,7"
+
+        # GPU Direct RDMA
+        - name: NVIDIA_GDRCOPY
+          value: "enabled"
+        - name: UCX_TLS
+          value: "all"
+        - name: UCX_NET_DEVICES
+          value: "all"
+
+        # ===========================================
+        # PERFORMANCE AND NETWORK
+        # ===========================================
+        - name: VLLM_SKIP_P2P_CHECK
+          value: "1"
+        - name: VLLM_RANDOMIZE_DP_DUMMY_INPUTS
+          value: "1"
+        - name: HF_HUB_DISABLE_XET
+          value: "1"
+        - name: TRITON_LIBCUDA_PATH
+          value: "/usr/lib64"
+
+        # ===========================================
+        # TIMEOUTS AND LOGGING
+        # ===========================================
+        - name: VLLM_RPC_TIMEOUT
+          value: "300"
+        - name: VLLM_WORKER_RPC_TIMEOUT
+          value: "300"
+        - name: VLLM_LOGGING_LEVEL
+          value: "DEBUG"
+        - name: VLLM_LOG_REQUESTS
+          value: "1"
+
+        # ===========================================
+        # HUGGING FACE TOKEN
+        # ===========================================
+        - name: HUGGING_FACE_HUB_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: hf-token
+              key: token
+
+        # ===========================================
+        # RESOURCE LIMITS
+        # ===========================================
+        resources:
+          limits:
+            nvidia.com/gpu: 8          # 8x H100 80GB
+            memory: 500Gi
+            cpu: 96
+          requests:
+            nvidia.com/gpu: 8
+            memory: 400Gi
+            cpu: 64
+
+        # ===========================================
+        # VOLUMES
+        # ===========================================
+        volumeMounts:
+        - name: shm
+          mountPath: /dev/shm
+        - name: model-cache
+          mountPath: /root/.cache/huggingface
+
+        # ===========================================
+        # HEALTH CHECKS
+        # ===========================================
+        # Extended timeouts: Model loading takes 20+ minutes
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 20003
+          initialDelaySeconds: 1800    # 30 minutes
+          periodSeconds: 60
+          timeoutSeconds: 10
+          failureThreshold: 3
+
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 20003
+          initialDelaySeconds: 1500    # 25 minutes
+          periodSeconds: 30
+          timeoutSeconds: 10
+          failureThreshold: 5
+
+        ports:
+        - containerPort: 20003
+          name: http
+        - containerPort: 5600
+          name: nixl
+
+      volumes:
+      - name: shm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 100Gi
+      - name: model-cache
+        hostPath:
+          path: /mnt/data/vllm-cache
+          type: DirectoryOrCreate
+
+      # ===========================================
+      # NODE SELECTION
+      # ===========================================
+      nodeSelector:
+        nvidia.com/gpu.product: NVIDIA-H100-80GB-HBM3
+
+      tolerations:
+      - key: nvidia.com/gpu
+        operator: Exists
+        effect: NoSchedule
+
+---
+# ===========================================
+# OBSERVED ERROR
+# ===========================================
+# torch.OutOfMemoryError: CUDA out of memory.
+# Tried to allocate 448.00 MiB.
+# GPU 0 has a total capacity of 79.19 GiB of which 89.06 MiB is free.
+# Including non-PyTorch memory, this process has 79.09 GiB memory in use.
+# Of the allocated memory 76.91 GiB is allocated by PyTorch,
+# and 199.35 MiB is reserved by PyTorch but unallocated.
+#
+# Error occurs in Worker_DP2_EP2 during model initialization
+# in SharedFusedMoE layer creation.
+#
+# QUESTIONS FOR EXPERTS:
+# 1. Why is each GPU using 79.09 GiB with TP=1, DP=8?
+# 2. Should DP=8 distribute the model across 8 GPUs?
+# 3. Does DeepSeek V3 MoE require minimum TP=2 or TP=4?
+# 4. Is there a conflict between DP and EP for MoE models?
+# 5. What is the correct parallelism strategy for DeepSeek V3 on 8x H100?

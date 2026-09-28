@@ -1,0 +1,36 @@
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ms-deepseek-v3-llm-d-modelservice-prefill
+  namespace: llm-d-deepseek-v3
+  labels:
+    app: llm-d-modelservice
+    component: prefill
+spec:
+  type: ClusterIP
+  selector:
+    llm-d.ai/role: prefill
+  ports:
+  - name: http
+    port: 8000
+    targetPort: 8000
+    protocol: TCP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ms-deepseek-v3-llm-d-modelservice-decode
+  namespace: llm-d-deepseek-v3
+  labels:
+    app: llm-d-modelservice
+    component: decode
+spec:
+  type: ClusterIP
+  selector:
+    llm-d.ai/role: decode
+  ports:
+  - name: http
+    port: 8200
+    targetPort: 8200
+    protocol: TCP

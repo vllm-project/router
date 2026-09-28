@@ -1,0 +1,318 @@
+# vLLM Router Release Pipeline
+# This pipeline is triggered on version tags (v*) to build and publish releases.
+# It also supports:
+#   - nightly Docker builds when triggered with NIGHTLY=1
+#   - versioned Docker releases via the "Provide Release version here" input
+#     (X.Y.Z → vllm/vllm-router:vX.Y.Z and :latest)
+
+env:
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
+
+steps:
+  # ============================================================================
+  # Version Consistency Check
+  # ============================================================================
+  - label: ":mag: Verify Version Tag Matches pyproject.toml"
+    key: "version-check"
+    command: |
+      set -euo pipefail
+
+      # Extract version from git tag (e.g., v0.1.0 -> 0.1.0)
+      TAG_VERSION="$${BUILDKITE_TAG#v}"
+      echo "Git tag version: $TAG_VERSION"
+
+      # Extract version from pyproject.toml
+      PYPROJECT_VERSION=$(grep -E '^version\s*=' pyproject.toml | sed 's/.*=\s*"\(.*\)"/\1/')
+      echo "pyproject.toml version: $PYPROJECT_VERSION"
+
+      # Compare versions
+      if [ "$TAG_VERSION" != "$PYPROJECT_VERSION" ]; then
+        echo "❌ ERROR: Version mismatch!"
+        echo "   Git tag version:       $TAG_VERSION"
+        echo "   pyproject.toml version: $PYPROJECT_VERSION"
+        echo ""
+        echo "Please update pyproject.toml to match the git tag before releasing."
+        exit 1
+      fi
+
+      echo "✅ Version check passed: $TAG_VERSION"
+    if: build.tag =~ /^v.*/
+    agents:
+      queue: "cpu_queue_release"
+
+  - wait
+
+  # ============================================================================
+  # Build Release Artifacts (x86_64 and aarch64 in parallel)
+  # ============================================================================
+  - label: ":package: Build Release Artifacts (x86_64)"
+    key: "build_wheels_x86_64"
+    plugins:
+      - docker#v5.11.0:
+          image: "quay.io/pypa/manylinux_2_28_x86_64"
+          workdir: /workdir
+          volumes:
+            - ".:/workdir"
+          environment:
+            - "CARGO_INCREMENTAL=0"
+            - "RUST_BACKTRACE=1"
+          command:
+            - "bash"
+            - ".buildkite/build-wheel.sh"
+    artifact_paths:
+      - "target/release/vllm-router"
+      - "dist/*.whl"
+      - "dist/*.tar.gz"
+    depends_on: "version-check"
+    agents:
+      queue: "cpu_queue_release"
+
+  - label: ":package: Build Release Artifacts (aarch64)"
+    key: "build_wheels_aarch64"
+    plugins:
+      - docker#v5.11.0:
+          image: "quay.io/pypa/manylinux_2_28_aarch64"
+          workdir: /workdir
+          volumes:
+            - ".:/workdir"
+          environment:
+            - "CARGO_INCREMENTAL=0"
+            - "RUST_BACKTRACE=1"
+          command:
+            - "bash"
+            - ".buildkite/build-wheel.sh"
+    artifact_paths:
+      - "dist/*.whl"
+    depends_on: "version-check"
+    agents:
+      queue: "arm64_cpu_queue_release"
+
+  - wait
+
+  # ============================================================================
+  # Run Release Tests
+  # ============================================================================
+  - label: ":test_tube: Smoke Test Release Binary (x86_64)"
+    key: "smoke-test-binary-x86_64"
+    command: |
+      buildkite-agent artifact download "target/release/vllm-router" .
+      chmod +x target/release/vllm-router
+      docker run --rm -v "$$PWD:/workdir" -w /workdir debian:bookworm ./target/release/vllm-router --version
+      docker run --rm -v "$$PWD:/workdir" -w /workdir debian:bookworm ./target/release/vllm-router --help
+    agents:
+      queue: "cpu_queue_release"
+
+  - label: ":python: Test Python Wheel (x86_64)"
+    key: "test-python-wheel-x86_64"
+    command: |
+      buildkite-agent artifact download "dist/*x86_64*.whl" .
+      pip install dist/*x86_64*.whl
+      python -c "import vllm_router; print(vllm_router.__version__)"
+    agents:
+      queue: "cpu_queue_release"
+
+  - label: ":python: Test Python Wheel (aarch64)"
+    key: "test-python-wheel-aarch64"
+    command: |
+      buildkite-agent artifact download "dist/*aarch64*.whl" .
+      pip install dist/*aarch64*.whl
+      python -c "import vllm_router; print(vllm_router.__version__)"
+    agents:
+      queue: "arm64_cpu_queue_release"
+
+  - wait
+
+  # ============================================================================
+  # Publish to PyPI
+  # ============================================================================
+  - label: ":python: Publish to PyPI"
+    key: "publish-pypi"
+    command: |
+      set -euo pipefail
+
+      # Download build artifacts from both architectures
+      buildkite-agent artifact download "dist/*.whl" .
+      buildkite-agent artifact download "dist/*.tar.gz" .
+
+      # Upload to PyPI using Docker
+      docker run --rm \
+        -v "$$PWD:/workdir" \
+        -w /workdir \
+        -e TWINE_USERNAME=__token__ \
+        -e TWINE_PASSWORD="$$PYPI_TOKEN" \
+        python:3.11-slim bash -c '
+          pip install twine
+          echo "📦 Uploading packages to PyPI..."
+          twine upload dist/* --verbose
+          echo "✅ Successfully published to PyPI!"
+        '
+    depends_on:
+      - "build_wheels_x86_64"
+      - "build_wheels_aarch64"
+      - "test-python-wheel-x86_64"
+      - "test-python-wheel-aarch64"
+      - "smoke-test-binary-x86_64"
+    if: build.tag =~ /^v.*/
+    soft_fail: false
+    agents:
+      queue: "cpu_queue_release"
+
+  # ============================================================================
+  # Nightly Docker Images (only when NIGHTLY=1)
+  # Builds multi-arch Docker images and publishes to DockerHub as
+  # vllm/vllm-router:nightly. Triggered daily via scheduled build.
+  # ============================================================================
+  - group: ":docker: Build and push nightly Docker images"
+    key: "build-nightly-docker-images"
+    if: build.env("NIGHTLY") == "1"
+    steps:
+      - label: ":docker: Build and push Docker image - x86_64"
+        depends_on: ~
+        id: build-nightly-docker-x86
+        agents:
+          queue: cpu_queue_release
+        commands:
+          - "DOCKER_BUILDKIT=1 docker build --tag vllm/vllm-router:nightly-x86_64 --progress plain -f Dockerfile.router ."
+          - "docker push vllm/vllm-router:nightly-x86_64"
+        plugins:
+          - docker-login#v3.0.0:
+              username: vllmbot
+              password-env: DOCKERHUB_TOKEN
+        env:
+          DOCKER_BUILDKIT: "1"
+
+      - label: ":docker: Build and push Docker image - aarch64"
+        depends_on: ~
+        id: build-nightly-docker-arm64
+        agents:
+          queue: arm64_cpu_queue_release
+        commands:
+          - "DOCKER_BUILDKIT=1 docker build --tag vllm/vllm-router:nightly-aarch64 --progress plain -f Dockerfile.router ."
+          - "docker push vllm/vllm-router:nightly-aarch64"
+        plugins:
+          - docker-login#v3.0.0:
+              username: vllmbot
+              password-env: DOCKERHUB_TOKEN
+        env:
+          DOCKER_BUILDKIT: "1"
+
+  - group: ":shipit: Publish nightly multi-arch manifest"
+    key: "publish-nightly-docker-images"
+    if: build.env("NIGHTLY") == "1"
+    steps:
+      - label: ":rocket: Create and push multi-arch manifest to DockerHub"
+        depends_on:
+          - build-nightly-docker-x86
+          - build-nightly-docker-arm64
+        id: publish-nightly-dockerhub
+        agents:
+          queue: cpu_queue_release
+        commands:
+          - "bash .buildkite/scripts/publish-release-images.sh nightly"
+          # Clean up old nightly builds (keep only last 14)
+          - "bash .buildkite/scripts/cleanup-nightly-router-builds.sh"
+        plugins:
+          - docker-login#v3.0.0:
+              username: vllmbot
+              password-env: DOCKERHUB_TOKEN
+        env:
+          DOCKERHUB_USERNAME: "vllmbot"
+
+  # ============================================================================
+  # Versioned Docker release (when NIGHTLY != 1)
+  # Fill "Provide Release version here" (X.Y.Z), then unblock the two gates.
+  # Publishes vllm/vllm-router:vX.Y.Z and :latest (plus per-arch tags).
+  # ============================================================================
+  - input: "Provide Release version here"
+    key: input-release-version
+    if: build.env("NIGHTLY") != "1"
+    fields:
+      - text: "What is the release version?"
+        key: release-version
+        hint: "Format: X.Y.Z (leading v is optional). Published as vllm/vllm-router:vX.Y.Z and :latest."
+        required: true
+
+  # Auto-skip when NIGHTLY=1 (scheduled); otherwise require manual unblock.
+  - block: "Unblock to build release Docker images"
+    key: block-build-release-images
+    if: build.env("NIGHTLY") != "1"
+    depends_on: input-release-version
+
+  - group: ":docker: Build and push release Docker images"
+    key: "build-release-docker-images"
+    if: build.env("NIGHTLY") != "1"
+    depends_on: block-build-release-images
+    steps:
+      - label: ":docker: Build and push release image - x86_64"
+        key: build-release-docker-x86
+        depends_on: ~
+        agents:
+          queue: cpu_queue_release
+        command: |
+          set -euo pipefail
+          RELEASE_VERSION=$$(buildkite-agent meta-data get release-version --default "" | sed 's/^v//')
+          if [ -z "$${RELEASE_VERSION}" ]; then
+            echo "ERROR: release-version metadata not set. Fill the input step first."
+            exit 1
+          fi
+          echo "Building vllm/vllm-router:v$${RELEASE_VERSION}-x86_64"
+          DOCKER_BUILDKIT=1 docker build \
+            --tag "vllm/vllm-router:v$${RELEASE_VERSION}-x86_64" \
+            --progress plain \
+            -f Dockerfile.router .
+          docker push "vllm/vllm-router:v$${RELEASE_VERSION}-x86_64"
+        plugins:
+          - docker-login#v3.0.0:
+              username: vllmbot
+              password-env: DOCKERHUB_TOKEN
+        env:
+          DOCKER_BUILDKIT: "1"
+
+      - label: ":docker: Build and push release image - aarch64"
+        key: build-release-docker-arm64
+        depends_on: ~
+        agents:
+          queue: arm64_cpu_queue_release
+        command: |
+          set -euo pipefail
+          RELEASE_VERSION=$$(buildkite-agent meta-data get release-version --default "" | sed 's/^v//')
+          if [ -z "$${RELEASE_VERSION}" ]; then
+            echo "ERROR: release-version metadata not set. Fill the input step first."
+            exit 1
+          fi
+          echo "Building vllm/vllm-router:v$${RELEASE_VERSION}-aarch64"
+          DOCKER_BUILDKIT=1 docker build \
+            --tag "vllm/vllm-router:v$${RELEASE_VERSION}-aarch64" \
+            --progress plain \
+            -f Dockerfile.router .
+          docker push "vllm/vllm-router:v$${RELEASE_VERSION}-aarch64"
+        plugins:
+          - docker-login#v3.0.0:
+              username: vllmbot
+              password-env: DOCKERHUB_TOKEN
+        env:
+          DOCKER_BUILDKIT: "1"
+
+  - block: "Publish release images to DockerHub"
+    key: block-publish-release-images
+    if: build.env("NIGHTLY") != "1"
+    depends_on:
+      - build-release-docker-x86
+      - build-release-docker-arm64
+      - input-release-version
+
+  - label: ":rocket: Publish release images to DockerHub"
+    key: publish-release-images-dockerhub
+    if: build.env("NIGHTLY") != "1"
+    depends_on: block-publish-release-images
+    command: bash .buildkite/scripts/publish-release-images.sh release
+    plugins:
+      - docker-login#v3.0.0:
+          username: vllmbot
+          password-env: DOCKERHUB_TOKEN
+    agents:
+      queue: cpu_queue_release
+    env:
+      DOCKER_BUILDKIT: "1"
+      DOCKERHUB_USERNAME: "vllmbot"

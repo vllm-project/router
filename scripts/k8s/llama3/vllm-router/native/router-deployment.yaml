@@ -1,0 +1,64 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm-router-llama31
+  namespace: vllm-router-llama31
+  labels:
+    app: vllm-router
+    mode: native
+    model: llama31
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: vllm-router
+      mode: native
+      model: llama31
+  template:
+    metadata:
+      labels:
+        app: vllm-router
+        mode: native
+        model: llama31
+    spec:
+      containers:
+      - name: router
+        image: 584868043064.dkr.ecr.us-west-2.amazonaws.com/dev-vllm-repo:router-dp-fallback
+        command:
+          - vllm-router
+          - --worker-urls
+          - http://ms-llama31-llm-d-modelservice-decode.vllm-router-llama31.svc.cluster.local:8000
+          - --host
+          - "0.0.0.0"
+          - --port
+          - "10001"
+          - --intra-node-data-parallel-size
+          - "8"
+          - --log-level
+          - info
+        ports:
+        - containerPort: 10001
+          name: router
+          protocol: TCP
+        - containerPort: 29000
+          name: metrics
+          protocol: TCP
+        resources:
+          requests:
+            cpu: "2"
+            memory: "4Gi"
+          limits:
+            cpu: "4"
+            memory: "8Gi"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 10001
+          initialDelaySeconds: 10
+          periodSeconds: 30
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 10001
+          initialDelaySeconds: 5
+          periodSeconds: 10

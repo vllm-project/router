@@ -1,0 +1,425 @@
+---
+# Namespace
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: vllm
+
+---
+# ConfigMap for vLLM Configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: vllm-config
+  namespace: vllm
+data:
+  MODEL: "deepseek-ai/DeepSeek-V3-0324"
+  TP_SIZE: "1"
+  DP_SIZE: "8"
+  DECODE_PORT: "20005"
+  PREFILL_PORT: "20003"
+
+---
+# Secret for Hugging Face Token
+apiVersion: v1
+kind: Secret
+metadata:
+  name: hf-token
+  namespace: vllm
+type: Opaque
+stringData:
+  token: "REPLACE_WITH_YOUR_HF_TOKEN"
+
+---
+# Decode Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm-decode
+  namespace: vllm
+  labels:
+    app: vllm-decode
+    role: decode
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: vllm-decode
+      role: decode
+  template:
+    metadata:
+      labels:
+        app: vllm-decode
+        role: decode
+    spec:
+      containers:
+      - name: vllm
+        image: vllm/vllm-openai:latest
+        imagePullPolicy: Always
+        env:
+        # Pod IP for NIXL
+        - name: POD_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+        # NIXL Configuration
+        - name: VLLM_NIXL_SIDE_CHANNEL_HOST
+          value: "$(POD_IP)"
+        - name: VLLM_NIXL_SIDE_CHANNEL_PORT
+          value: "5600"
+        # Hugging Face Token
+        - name: HUGGING_FACE_HUB_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: hf-token
+              key: token
+        # vLLM V1 and Expert Parallel
+        - name: VLLM_USE_V1
+          value: "1"
+        - name: VLLM_MOE_DP_CHUNK_SIZE
+          value: "512"
+        - name: VLLM_USE_DEEP_GEMM
+          value: "1"
+        - name: VLLM_ALL2ALL_BACKEND
+          value: "deepep_low_latency"
+        # Network and Performance
+        - name: VLLM_SKIP_P2P_CHECK
+          value: "1"
+        - name: VLLM_RANDOMIZE_DP_DUMMY_INPUTS
+          value: "1"
+        - name: HF_HUB_DISABLE_XET
+          value: "1"
+        - name: TRITON_LIBCUDA_PATH
+          value: "/usr/lib64"
+        # Logging
+        - name: VLLM_LOGGING_LEVEL
+          value: "DEBUG"
+        - name: VLLM_LOG_REQUESTS
+          value: "1"
+        # Timeouts
+        - name: VLLM_RPC_TIMEOUT
+          value: "300"
+        - name: VLLM_WORKER_RPC_TIMEOUT
+          value: "300"
+        # CUDA
+        - name: CUDA_VISIBLE_DEVICES
+          value: "0,1,2,3,4,5,6,7"
+        # GPU Direct RDMA
+        - name: NVIDIA_GDRCOPY
+          value: "enabled"
+        - name: UCX_TLS
+          value: "all"
+        - name: UCX_NET_DEVICES
+          value: "all"
+        # Model from ConfigMap
+        - name: MODEL
+          valueFrom:
+            configMapKeyRef:
+              name: vllm-config
+              key: MODEL
+        - name: DECODE_PORT
+          valueFrom:
+            configMapKeyRef:
+              name: vllm-config
+              key: DECODE_PORT
+        - name: TP_SIZE
+          valueFrom:
+            configMapKeyRef:
+              name: vllm-config
+              key: TP_SIZE
+        - name: DP_SIZE
+          valueFrom:
+            configMapKeyRef:
+              name: vllm-config
+              key: DP_SIZE
+        command:
+        - vllm
+        - serve
+        - "$(MODEL)"
+        args:
+        - --host
+        - "0.0.0.0"
+        - --port
+        - "$(DECODE_PORT)"
+        - --disable-log-requests
+        - --disable-uvicorn-access-log
+        - --enable-expert-parallel
+        - --tensor-parallel-size
+        - "$(TP_SIZE)"
+        - --intra-node-data-parallel-size
+        - "$(DP_SIZE)"
+        - --trust-remote-code
+        - --async-scheduling
+        - --compilation-config
+        - '{"cudagraph_mode":"FULL_DECODE_ONLY"}'
+        - --kv-transfer-config
+        - '{"kv_connector":"NixlConnector","kv_role":"kv_both","kv_connector_extra_config":{"backends":["UCX","GDS"]}}'
+        ports:
+        - containerPort: 20005
+          name: http
+        - containerPort: 5600
+          name: nixl
+        resources:
+          limits:
+            nvidia.com/gpu: 8
+            memory: 500Gi
+            cpu: 96
+          requests:
+            nvidia.com/gpu: 8
+            memory: 400Gi
+            cpu: 64
+        volumeMounts:
+        - name: shm
+          mountPath: /dev/shm
+        - name: model-cache
+          mountPath: /root/.cache/huggingface
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 20005
+          initialDelaySeconds: 1800
+          periodSeconds: 60
+          timeoutSeconds: 10
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 20005
+          initialDelaySeconds: 1500
+          periodSeconds: 30
+          timeoutSeconds: 10
+          failureThreshold: 5
+      volumes:
+      - name: shm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 100Gi
+      - name: model-cache
+        hostPath:
+          path: /mnt/data/vllm-cache
+          type: DirectoryOrCreate
+      nodeSelector:
+        nvidia.com/gpu.product: NVIDIA-H100-80GB-HBM3
+      tolerations:
+      - key: nvidia.com/gpu
+        operator: Exists
+        effect: NoSchedule
+
+---
+# Prefill Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm-prefill
+  namespace: vllm
+  labels:
+    app: vllm-prefill
+    role: prefill
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: vllm-prefill
+      role: prefill
+  template:
+    metadata:
+      labels:
+        app: vllm-prefill
+        role: prefill
+    spec:
+      containers:
+      - name: vllm
+        image: vllm/vllm-openai:latest
+        imagePullPolicy: Always
+        env:
+        # Pod IP for NIXL
+        - name: POD_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+        # NIXL Configuration
+        - name: VLLM_NIXL_SIDE_CHANNEL_HOST
+          value: "$(POD_IP)"
+        - name: VLLM_NIXL_SIDE_CHANNEL_PORT
+          value: "5600"
+        # Hugging Face Token
+        - name: HUGGING_FACE_HUB_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: hf-token
+              key: token
+        # vLLM V1 and Expert Parallel
+        - name: VLLM_USE_V1
+          value: "1"
+        - name: VLLM_MOE_DP_CHUNK_SIZE
+          value: "512"
+        - name: VLLM_USE_DEEP_GEMM
+          value: "1"
+        - name: VLLM_ALL2ALL_BACKEND
+          value: "deepep_high_throughput"
+        # Network and Performance
+        - name: VLLM_SKIP_P2P_CHECK
+          value: "1"
+        - name: VLLM_RANDOMIZE_DP_DUMMY_INPUTS
+          value: "1"
+        - name: HF_HUB_DISABLE_XET
+          value: "1"
+        - name: TRITON_LIBCUDA_PATH
+          value: "/usr/lib64"
+        # Logging
+        - name: VLLM_LOGGING_LEVEL
+          value: "DEBUG"
+        - name: VLLM_LOG_REQUESTS
+          value: "1"
+        # Timeouts
+        - name: VLLM_RPC_TIMEOUT
+          value: "300"
+        - name: VLLM_WORKER_RPC_TIMEOUT
+          value: "300"
+        # CUDA
+        - name: CUDA_VISIBLE_DEVICES
+          value: "0,1,2,3,4,5,6,7"
+        # GPU Direct RDMA
+        - name: NVIDIA_GDRCOPY
+          value: "enabled"
+        - name: UCX_TLS
+          value: "all"
+        - name: UCX_NET_DEVICES
+          value: "all"
+        # Model from ConfigMap
+        - name: MODEL
+          valueFrom:
+            configMapKeyRef:
+              name: vllm-config
+              key: MODEL
+        - name: PREFILL_PORT
+          valueFrom:
+            configMapKeyRef:
+              name: vllm-config
+              key: PREFILL_PORT
+        - name: TP_SIZE
+          valueFrom:
+            configMapKeyRef:
+              name: vllm-config
+              key: TP_SIZE
+        - name: DP_SIZE
+          valueFrom:
+            configMapKeyRef:
+              name: vllm-config
+              key: DP_SIZE
+        command:
+        - vllm
+        - serve
+        - "$(MODEL)"
+        args:
+        - --host
+        - "0.0.0.0"
+        - --port
+        - "$(PREFILL_PORT)"
+        - --enforce-eager
+        - --enable-expert-parallel
+        - --tensor-parallel-size
+        - "$(TP_SIZE)"
+        - --intra-node-data-parallel-size
+        - "$(DP_SIZE)"
+        - --trust-remote-code
+        - --gpu-memory-utilization
+        - "0.9"
+        - --enable-prefix-caching
+        - --disable-log-stats
+        - --kv-transfer-config
+        - '{"kv_connector":"NixlConnector","kv_role":"kv_both","kv_connector_extra_config":{"backends":["UCX","GDS"]}}'
+        ports:
+        - containerPort: 20003
+          name: http
+        - containerPort: 5600
+          name: nixl
+        resources:
+          limits:
+            nvidia.com/gpu: 8
+            memory: 500Gi
+            cpu: 96
+          requests:
+            nvidia.com/gpu: 8
+            memory: 400Gi
+            cpu: 64
+        volumeMounts:
+        - name: shm
+          mountPath: /dev/shm
+        - name: model-cache
+          mountPath: /root/.cache/huggingface
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 20003
+          initialDelaySeconds: 1800
+          periodSeconds: 60
+          timeoutSeconds: 10
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 20003
+          initialDelaySeconds: 1500
+          periodSeconds: 30
+          timeoutSeconds: 10
+          failureThreshold: 5
+      volumes:
+      - name: shm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 100Gi
+      - name: model-cache
+        hostPath:
+          path: /mnt/data/vllm-cache
+          type: DirectoryOrCreate
+      nodeSelector:
+        nvidia.com/gpu.product: NVIDIA-H100-80GB-HBM3
+      tolerations:
+      - key: nvidia.com/gpu
+        operator: Exists
+        effect: NoSchedule
+
+---
+# Decode Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-decode
+  namespace: vllm
+spec:
+  selector:
+    app: vllm-decode
+    role: decode
+  ports:
+  - name: http
+    port: 20005
+    targetPort: 20005
+    protocol: TCP
+  - name: nixl
+    port: 5600
+    targetPort: 5600
+    protocol: TCP
+  type: ClusterIP
+
+---
+# Prefill Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-prefill
+  namespace: vllm
+spec:
+  selector:
+    app: vllm-prefill
+    role: prefill
+  ports:
+  - name: http
+    port: 20003
+    targetPort: 20003
+    protocol: TCP
+  - name: nixl
+    port: 5600
+    targetPort: 5600
+    protocol: TCP
+  type: ClusterIP

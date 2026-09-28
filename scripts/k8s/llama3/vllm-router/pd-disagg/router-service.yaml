@@ -1,0 +1,51 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-router-llama31
+  namespace: vllm-router-pd-llama31
+  labels:
+    app: vllm-router
+    mode: pd-disaggregation
+    model: llama31
+spec:
+  selector:
+    app: vllm-router
+    mode: pd-disaggregation
+    model: llama31
+  ports:
+  - name: router
+    port: 10001
+    targetPort: 10001
+    protocol: TCP
+  - name: metrics
+    port: 29000
+    targetPort: 29000
+    protocol: TCP
+  type: ClusterIP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-router-llama31-nodeport
+  namespace: vllm-router-pd-llama31
+  labels:
+    app: vllm-router
+    mode: pd-disaggregation
+    model: llama31
+spec:
+  selector:
+    app: vllm-router
+    mode: pd-disaggregation
+    model: llama31
+  ports:
+  - name: router
+    port: 10001
+    targetPort: 10001
+    nodePort: 30005
+    protocol: TCP
+  - name: metrics
+    port: 29000
+    targetPort: 29000
+    nodePort: 30006
+    protocol: TCP
+  type: NodePort

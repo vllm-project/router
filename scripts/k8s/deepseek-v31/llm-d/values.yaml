@@ -1,0 +1,166 @@
+multinode: false
+
+modelArtifacts:
+  uri: "hf://deepseek-ai/DeepSeek-V3.1"
+  size: 1500Gi
+  authSecretName: "llm-d-hf-token"
+  name: "deepseek-ai/DeepSeek-V3.1"
+
+routing:
+  servicePort: 8000
+  proxy:
+    image: ghcr.io/llm-d/llm-d-routing-sidecar:v0.3.0
+    connector: nixlv2
+    secure: false
+
+  inferencePool:
+    create: false
+
+  httpRoute:
+    create: true
+
+  epp:
+    create: false
+
+decode:
+  parallelism:
+    tensor: 8
+    data: 1
+  create: true
+  replicas: 1
+  monitoring:
+    podmonitor:
+      enabled: true
+      portName: "metrics" # decode vLLM service port (from routing.proxy.targetPort)
+      path: "/metrics"
+      interval: "30s"
+  containers:
+  - name: "vllm"
+    image: ghcr.io/llm-d/llm-d-cuda:v0.3.0
+    modelCommand: vllmServe
+    args:
+      # Keep tensor-parallelism as the first set of arguments
+      - "--tensor-parallel-size"
+      - "8"
+      - "--block-size"
+      - "128"
+      - "--kv-transfer-config"
+      - '{"kv_connector":"NixlConnector", "kv_role":"kv_both"}'
+      - "--disable-uvicorn-access-log"
+      - "--max-model-len"
+      - "32000"
+      # DeepSeek V3 optimizations
+      - "--enable-chunked-prefill"
+      # Enable expert parallelism for MoE model (distributes 256 experts across GPUs)
+      - "--enable-expert-parallel"
+    env:
+      - name: VLLM_NIXL_SIDE_CHANNEL_HOST
+        valueFrom:
+          fieldRef:
+            fieldPath: status.podIP
+      - name: VLLM_LOGGING_LEVEL
+        value: INFO
+      # Enable CUDA graphs for better performance
+      - name: VLLM_USE_V1
+        value: "1"
+    ports:
+      - containerPort: 8200
+        name: metrics
+        protocol: TCP
+    resources:
+      limits:
+        memory: 1500Gi
+        cpu: "180"
+        nvidia.com/gpu: "8"
+      requests:
+        memory: 1500Gi
+        cpu: "180"
+        nvidia.com/gpu: "8"
+    mountModelVolume: true
+    volumeMounts:
+    - name: metrics-volume
+      mountPath: /.config
+    - name: shm
+      mountPath: /dev/shm
+    - name: torch-compile-cache
+      mountPath: /.cache
+  volumes:
+  - name: metrics-volume
+    emptyDir: {}
+  - name: shm
+    emptyDir:
+      medium: Memory
+      sizeLimit: "32Gi"
+  - name: torch-compile-cache
+    emptyDir: {}
+
+prefill:
+  parallelism:
+    tensor: 8
+    data: 1
+  create: true
+  replicas: 1
+  monitoring:
+    podmonitor:
+      enabled: true
+      portName: "metrics" # prefill vLLM service port (from routing.servicePort)
+      path: "/metrics"
+      interval: "30s"
+  containers:
+  - name: "vllm"
+    image: ghcr.io/llm-d/llm-d-cuda:v0.3.0
+    modelCommand: vllmServe
+    args:
+      - "--tensor-parallel-size"
+      - "8"
+      - "--block-size"
+      - "128"
+      - "--kv-transfer-config"
+      - '{"kv_connector":"NixlConnector", "kv_role":"kv_both"}'
+      - "--disable-uvicorn-access-log"
+      - "--max-model-len"
+      - "32000"
+      # DeepSeek V3 optimizations
+      - "--enable-chunked-prefill"
+      # Enable expert parallelism for MoE model (distributes 256 experts across GPUs)
+      - "--enable-expert-parallel"
+    env:
+      - name: VLLM_NIXL_SIDE_CHANNEL_HOST
+        valueFrom:
+          fieldRef:
+            fieldPath: status.podIP
+      - name: VLLM_LOGGING_LEVEL
+        value: INFO
+      # Enable CUDA graphs for better performance
+      - name: VLLM_USE_V1
+        value: "1"
+    ports:
+      - containerPort: 8000
+        name: metrics
+        protocol: TCP
+    resources:
+      limits:
+        memory: 1500Gi
+        cpu: "180"
+        nvidia.com/gpu: "8"
+      requests:
+        memory: 1500Gi
+        cpu: "180"
+        nvidia.com/gpu: "8"
+    mountModelVolume: true
+    volumeMounts:
+    - name: metrics-volume
+      mountPath: /.config
+    - name: shm
+      mountPath: /dev/shm
+    - name: torch-compile-cache
+      mountPath: /.cache
+  volumes:
+  - name: metrics-volume
+    emptyDir: {}
+  - name: shm
+    emptyDir:
+      medium: Memory
+      sizeLimit: "32Gi"
+  - name: torch-compile-cache
+    emptyDir: {}

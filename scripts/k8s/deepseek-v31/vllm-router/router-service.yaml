@@ -1,0 +1,51 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-router-deepseek-v31
+  namespace: vllm-router-deepseek-v31
+  labels:
+    app: vllm-router
+    mode: pd-disaggregation
+    model: deepseek-v31
+spec:
+  selector:
+    app: vllm-router
+    mode: pd-disaggregation
+    model: deepseek-v31
+  ports:
+  - name: router
+    port: 10001
+    targetPort: 10001
+    protocol: TCP
+  - name: metrics
+    port: 29000
+    targetPort: 29000
+    protocol: TCP
+  type: ClusterIP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-router-deepseek-v31-nodeport
+  namespace: vllm-router-deepseek-v31
+  labels:
+    app: vllm-router
+    mode: pd-disaggregation
+    model: deepseek-v31
+spec:
+  selector:
+    app: vllm-router
+    mode: pd-disaggregation
+    model: deepseek-v31
+  ports:
+  - name: router
+    port: 10001
+    targetPort: 10001
+    nodePort: 30015
+    protocol: TCP
+  - name: metrics
+    port: 29000
+    targetPort: 29000
+    nodePort: 30016
+    protocol: TCP
+  type: NodePort

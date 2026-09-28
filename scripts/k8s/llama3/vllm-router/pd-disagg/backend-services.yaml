@@ -1,0 +1,38 @@
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ms-llama31-llm-d-modelservice-prefill
+  namespace: vllm-router-pd-llama31
+  labels:
+    app: vllm-backend
+    role: prefill
+spec:
+  type: ClusterIP
+  ports:
+  - port: 8000
+    targetPort: 8000
+    protocol: TCP
+    name: http
+  selector:
+    llm-d.ai/role: prefill
+    llm-d.ai/inferenceServing: "true"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ms-llama31-llm-d-modelservice-decode
+  namespace: vllm-router-pd-llama31
+  labels:
+    app: vllm-backend
+    role: decode
+spec:
+  type: ClusterIP
+  ports:
+  - port: 8200
+    targetPort: 8200
+    protocol: TCP
+    name: http
+  selector:
+    llm-d.ai/role: decode
+    llm-d.ai/inferenceServing: "true"

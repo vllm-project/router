@@ -1,0 +1,13 @@
+# Infra values
+gateway:
+  gatewayClassName: gloo-gateway
+
+# MS values
+routing:
+  proxy:
+    debugLevel:
+  epp:
+    debugLevel:
+
+provider:
+  name: kgateway

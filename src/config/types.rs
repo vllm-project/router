@@ -1,0 +1,1964 @@
+use super::ConfigResult;
+use crate::config::validation::ConfigValidator;
+use serde::{Deserialize, Deserializer, Serialize};
+use std::collections::HashMap;
+
+use crate::program_scheduling::{
+    DecodeThroughputModel, PrefillCostModel, ProgramBindingStrategy, ProgramResumeOrder,
+    ProgramSchedulingEnableKey,
+};
+
+/// Main router configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RouterConfig {
+    /// Routing mode configuration
+    pub mode: RoutingMode,
+    /// Worker connection mode
+    #[serde(default)]
+    pub connection_mode: ConnectionMode,
+    /// Policy configuration
+    pub policy: PolicyConfig,
+    /// Server host address
+    pub host: String,
+    /// Server port
+    pub port: u16,
+    /// Maximum payload size in bytes
+    pub max_payload_size: usize,
+    /// Request timeout in seconds
+    pub request_timeout_secs: u64,
+    /// Worker startup timeout in seconds
+    pub worker_startup_timeout_secs: u64,
+    /// Worker health check interval in seconds
+    pub worker_startup_check_interval_secs: u64,
+    /// Intra-node data parallel size (number of DP replicas per worker URL). When > 1, the router will create multiple worker instances per URL, one for each DP rank.
+    #[serde(default = "default_intra_node_data_parallel_size")]
+    pub intra_node_data_parallel_size: usize,
+    /// The api key used for the authorization with the worker
+    pub api_key: Option<String>,
+    /// API key validation URLs (if set, incoming requests must validate against them)
+    #[serde(default)]
+    pub api_key_validation_urls: Vec<String>,
+    /// Service discovery configuration (optional)
+    pub discovery: Option<DiscoveryConfig>,
+    /// Metrics configuration (optional)
+    pub metrics: Option<MetricsConfig>,
+    /// Log directory (None = stdout only)
+    pub log_dir: Option<String>,
+    /// Log level (None = info)
+    pub log_level: Option<String>,
+    /// Custom request ID headers to check (defaults to common headers)
+    pub request_id_headers: Option<Vec<String>>,
+    /// Maximum concurrent requests allowed (for rate limiting)
+    pub max_concurrent_requests: usize,
+    /// Queue size for pending requests when max concurrent limit reached (0 = no queue, return 429 immediately)
+    pub queue_size: usize,
+    /// Maximum time (in seconds) a request can wait in queue before timing out
+    pub queue_timeout_secs: u64,
+    /// Token bucket refill rate (tokens per second). If not set, defaults to max_concurrent_requests
+    pub rate_limit_tokens_per_second: Option<usize>,
+    /// CORS allowed origins
+    pub cors_allowed_origins: Vec<String>,
+    /// Retry configuration
+    pub retry: RetryConfig,
+    /// Circuit breaker configuration
+    pub circuit_breaker: CircuitBreakerConfig,
+    /// Disable retries (overrides retry.max_retries to 1 when true)
+    #[serde(default)]
+    pub disable_retries: bool,
+    /// Disable circuit breaker (overrides circuit_breaker.failure_threshold to u32::MAX when true)
+    #[serde(default)]
+    pub disable_circuit_breaker: bool,
+    /// Health check configuration
+    pub health_check: HealthCheckConfig,
+    /// Enable Inference Gateway mode (false = proxy mode, true = IGW mode)
+    #[serde(default)]
+    pub enable_igw: bool,
+    /// History backend configuration (memory or none, default: memory)
+    #[serde(default = "default_history_backend")]
+    pub history_backend: HistoryBackend,
+    /// Enable profiling calls to vLLM workers
+    #[serde(default)]
+    pub enable_profiling: bool,
+    /// Profiling timeout in seconds (for vLLM profiling endpoints)
+    #[serde(default = "default_profile_timeout_secs")]
+    pub profile_timeout_secs: u64,
+    /// KV connector type for PD disaggregation
+    #[serde(default)]
+    pub kv_connector: KvConnector,
+    /// Optional Program-level admission and continuity scheduling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub program_scheduling: Option<ProgramSchedulingConfig>,
+}
+
+fn default_profile_timeout_secs() -> u64 {
+    10
+}
+
+fn default_history_backend() -> HistoryBackend {
+    HistoryBackend::Memory
+}
+
+fn default_intra_node_data_parallel_size() -> usize {
+    1
+}
+
+/// Router-level Program scheduling configuration.
+///
+/// This is intentionally separate from request-level `PolicyConfig`. The
+/// binding policy is evaluated once for a new Program generation; admission
+/// and resume remain ProgramScheduler decisions.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct ProgramSchedulingConfig {
+    /// Metadata source that opts an individual request into Program scheduling.
+    #[serde(
+        default,
+        rename = "program_scheduling_enable_key",
+        alias = "enable_key"
+    )]
+    pub enable_key: ProgramSchedulingEnableKey,
+    #[serde(default)]
+    pub binding_only: bool,
+    #[serde(default)]
+    pub global_queue: bool,
+    #[serde(default)]
+    pub resume_order: ProgramResumeOrder,
+    #[serde(default = "default_program_cross_rank_headroom_ratio")]
+    pub cross_rank_headroom_ratio: f64,
+    #[serde(default)]
+    pub binding_strategy: ProgramBindingStrategy,
+    #[serde(default = "default_program_hash_virtual_nodes")]
+    pub hash_virtual_nodes: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_capacity_per_dp_rank: Option<usize>,
+    #[serde(default = "default_program_max_active_programs_per_target")]
+    pub max_active_programs_per_target: usize,
+    #[serde(default = "default_program_metrics_interval_seconds")]
+    pub metrics_interval_seconds: f64,
+    #[serde(default = "default_program_admission_waiting_request_threshold")]
+    pub admission_waiting_request_threshold: usize,
+    #[serde(default = "default_program_queue_timeout_seconds")]
+    pub queue_timeout_seconds: f64,
+    #[serde(default = "default_program_force_resume_timeout_seconds")]
+    pub force_resume_timeout_seconds: f64,
+    #[serde(default = "default_program_paused_retention_ttl_seconds")]
+    pub paused_retention_ttl_seconds: f64,
+    #[serde(default = "default_program_shared_prefix_freshness_warmup_seconds")]
+    pub shared_prefix_freshness_warmup_seconds: f64,
+    #[serde(default = "default_program_shared_prefix_freshness_kv_turnovers")]
+    pub shared_prefix_freshness_kv_turnovers: f64,
+    #[serde(default = "default_program_decode_buffer_tokens")]
+    pub decode_buffer_tokens: usize,
+    #[serde(default = "default_program_max_acting_ttl_seconds")]
+    pub max_acting_ttl_seconds: f64,
+    #[serde(default = "default_program_high_watermark_ratio")]
+    pub high_watermark_ratio: f64,
+    #[serde(default = "default_program_low_watermark_ratio")]
+    pub low_watermark_ratio: f64,
+    #[serde(default = "default_program_max_segment_rounds")]
+    pub max_segment_rounds: usize,
+    #[serde(default = "default_program_stats_window_size")]
+    pub stats_window_size: usize,
+    #[serde(default = "default_program_enable_batch_gain_admission")]
+    pub enable_batch_gain_admission: bool,
+    /// Offline-calibrated cold-prefill cost and mixed-batch decode impact.
+    #[serde(default)]
+    pub prefill_cost_model: PrefillCostModel,
+    /// Offline-calibrated aggregate decode-throughput surface.
+    #[serde(default)]
+    pub decode_throughput_model: DecodeThroughputModel,
+    /// Tracks which offline calibration coefficients were explicitly supplied.
+    #[serde(skip)]
+    pub(crate) explicit_calibration_fields: ExplicitCalibrationFields,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct ExplicitCalibrationFields(u8);
+
+impl PartialEq for ExplicitCalibrationFields {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+const PREFILL_INTERCEPT_EXPLICIT: u8 = 1 << 0;
+const PREFILL_LINEAR_EXPLICIT: u8 = 1 << 1;
+const PREFILL_QUADRATIC_EXPLICIT: u8 = 1 << 2;
+const PREFILL_DECODE_ALPHA_EXPLICIT: u8 = 1 << 3;
+const DECODE_FIXED_EXPLICIT: u8 = 1 << 4;
+const DECODE_BATCH_EXPLICIT: u8 = 1 << 5;
+const DECODE_CONTEXT_EXPLICIT: u8 = 1 << 6;
+impl ProgramSchedulingConfig {
+    /// Resolve the explicit feature switch and its optional JSON overrides.
+    ///
+    /// Supplying configuration without enabling Program scheduling is rejected
+    /// so the configuration argument cannot act as a second, implicit switch.
+    pub fn resolve(
+        enabled: bool,
+        config_json: Option<&str>,
+    ) -> ConfigResult<Option<ProgramSchedulingConfig>> {
+        match (enabled, config_json) {
+            (false, None) => Ok(None),
+            (false, Some(_)) => Err(super::ConfigError::ValidationFailed {
+                reason: "program_scheduling_config_json requires enable_program_scheduling"
+                    .to_string(),
+            }),
+            (true, None) => Ok(Some(Self::default())),
+            (true, Some(raw)) => serde_json::from_str(raw).map(Some).map_err(|error| {
+                super::ConfigError::ValidationFailed {
+                    reason: format!("Invalid program_scheduling_config_json: {error}"),
+                }
+            }),
+        }
+    }
+
+    pub(crate) fn defaulted_calibration_fields(&self) -> Vec<&'static str> {
+        [
+            (
+                PREFILL_INTERCEPT_EXPLICIT,
+                "prefill_cost_model.intercept_seconds",
+            ),
+            (
+                PREFILL_LINEAR_EXPLICIT,
+                "prefill_cost_model.linear_seconds_per_1k_tokens",
+            ),
+            (
+                PREFILL_QUADRATIC_EXPLICIT,
+                "prefill_cost_model.quadratic_seconds_per_1k_tokens_squared",
+            ),
+            (
+                PREFILL_DECODE_ALPHA_EXPLICIT,
+                "prefill_cost_model.decode_throughput_alpha",
+            ),
+            (
+                DECODE_FIXED_EXPLICIT,
+                "decode_throughput_model.fixed_step_seconds",
+            ),
+            (
+                DECODE_BATCH_EXPLICIT,
+                "decode_throughput_model.batch_step_seconds_per_request",
+            ),
+            (
+                DECODE_CONTEXT_EXPLICIT,
+                "decode_throughput_model.context_step_seconds_per_token",
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(mask, name)| (self.explicit_calibration_fields.0 & mask == 0).then_some(name))
+        .collect()
+    }
+}
+
+impl Default for ProgramSchedulingConfig {
+    fn default() -> Self {
+        Self {
+            enable_key: ProgramSchedulingEnableKey::default(),
+            binding_only: false,
+            global_queue: false,
+            resume_order: ProgramResumeOrder::default(),
+            cross_rank_headroom_ratio: default_program_cross_rank_headroom_ratio(),
+            binding_strategy: ProgramBindingStrategy::default(),
+            hash_virtual_nodes: default_program_hash_virtual_nodes(),
+            token_capacity_per_dp_rank: None,
+            max_active_programs_per_target: default_program_max_active_programs_per_target(),
+            metrics_interval_seconds: default_program_metrics_interval_seconds(),
+            admission_waiting_request_threshold:
+                default_program_admission_waiting_request_threshold(),
+            queue_timeout_seconds: default_program_queue_timeout_seconds(),
+            force_resume_timeout_seconds: default_program_force_resume_timeout_seconds(),
+            paused_retention_ttl_seconds: default_program_paused_retention_ttl_seconds(),
+            shared_prefix_freshness_warmup_seconds:
+                default_program_shared_prefix_freshness_warmup_seconds(),
+            shared_prefix_freshness_kv_turnovers:
+                default_program_shared_prefix_freshness_kv_turnovers(),
+            decode_buffer_tokens: default_program_decode_buffer_tokens(),
+            max_acting_ttl_seconds: default_program_max_acting_ttl_seconds(),
+            high_watermark_ratio: default_program_high_watermark_ratio(),
+            low_watermark_ratio: default_program_low_watermark_ratio(),
+            max_segment_rounds: default_program_max_segment_rounds(),
+            stats_window_size: default_program_stats_window_size(),
+            enable_batch_gain_admission: default_program_enable_batch_gain_admission(),
+            prefill_cost_model: PrefillCostModel::default(),
+            decode_throughput_model: DecodeThroughputModel::default(),
+            explicit_calibration_fields: ExplicitCalibrationFields::default(),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct ProgramSchedulingConfigInput {
+    #[serde(
+        default,
+        rename = "program_scheduling_enable_key",
+        alias = "enable_key"
+    )]
+    enable_key: ProgramSchedulingEnableKey,
+    #[serde(default)]
+    binding_only: bool,
+    #[serde(default)]
+    global_queue: bool,
+    #[serde(default)]
+    resume_order: ProgramResumeOrder,
+    #[serde(default = "default_program_cross_rank_headroom_ratio")]
+    cross_rank_headroom_ratio: f64,
+    #[serde(default)]
+    binding_strategy: ProgramBindingStrategy,
+    #[serde(default = "default_program_hash_virtual_nodes")]
+    hash_virtual_nodes: u32,
+    #[serde(default, alias = "token_capacity_per_target")]
+    token_capacity_per_dp_rank: Option<usize>,
+    #[serde(default = "default_program_max_active_programs_per_target")]
+    max_active_programs_per_target: usize,
+    #[serde(default = "default_program_metrics_interval_seconds")]
+    metrics_interval_seconds: f64,
+    #[serde(default = "default_program_admission_waiting_request_threshold")]
+    admission_waiting_request_threshold: usize,
+    #[serde(default = "default_program_queue_timeout_seconds")]
+    queue_timeout_seconds: f64,
+    #[serde(default = "default_program_force_resume_timeout_seconds")]
+    force_resume_timeout_seconds: f64,
+    #[serde(default = "default_program_paused_retention_ttl_seconds")]
+    paused_retention_ttl_seconds: f64,
+    #[serde(default = "default_program_shared_prefix_freshness_warmup_seconds")]
+    shared_prefix_freshness_warmup_seconds: f64,
+    #[serde(default = "default_program_shared_prefix_freshness_kv_turnovers")]
+    shared_prefix_freshness_kv_turnovers: f64,
+    #[serde(default = "default_program_decode_buffer_tokens")]
+    decode_buffer_tokens: usize,
+    #[serde(default = "default_program_max_acting_ttl_seconds")]
+    max_acting_ttl_seconds: f64,
+    #[serde(default = "default_program_high_watermark_ratio")]
+    high_watermark_ratio: f64,
+    #[serde(default = "default_program_low_watermark_ratio")]
+    low_watermark_ratio: f64,
+    #[serde(default = "default_program_max_segment_rounds")]
+    max_segment_rounds: usize,
+    #[serde(default = "default_program_stats_window_size")]
+    stats_window_size: usize,
+    #[serde(default = "default_program_enable_batch_gain_admission")]
+    enable_batch_gain_admission: bool,
+    #[serde(default)]
+    prefill_cost_model: PrefillCostModelInput,
+    #[serde(default)]
+    decode_throughput_model: DecodeThroughputModelInput,
+}
+
+#[derive(Default, Deserialize)]
+struct PrefillCostModelInput {
+    intercept_seconds: Option<f64>,
+    linear_seconds_per_1k_tokens: Option<f64>,
+    quadratic_seconds_per_1k_tokens_squared: Option<f64>,
+    decode_throughput_alpha: Option<f64>,
+}
+
+#[derive(Default, Deserialize)]
+struct DecodeThroughputModelInput {
+    fixed_step_seconds: Option<f64>,
+    batch_step_seconds_per_request: Option<f64>,
+    context_step_seconds_per_token: Option<f64>,
+}
+
+impl<'de> Deserialize<'de> for ProgramSchedulingConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let input = ProgramSchedulingConfigInput::deserialize(deserializer)?;
+        let mut explicit_calibration_fields = 0;
+        let prefill_defaults = PrefillCostModel::default();
+        let decode_defaults = DecodeThroughputModel::default();
+
+        macro_rules! configured_or_default {
+            ($value:expr, $default:expr, $mask:expr) => {
+                match $value {
+                    Some(value) => {
+                        explicit_calibration_fields |= $mask;
+                        value
+                    }
+                    None => $default,
+                }
+            };
+        }
+
+        let prefill_cost_model = PrefillCostModel {
+            intercept_seconds: configured_or_default!(
+                input.prefill_cost_model.intercept_seconds,
+                prefill_defaults.intercept_seconds,
+                PREFILL_INTERCEPT_EXPLICIT
+            ),
+            linear_seconds_per_1k_tokens: configured_or_default!(
+                input.prefill_cost_model.linear_seconds_per_1k_tokens,
+                prefill_defaults.linear_seconds_per_1k_tokens,
+                PREFILL_LINEAR_EXPLICIT
+            ),
+            quadratic_seconds_per_1k_tokens_squared: configured_or_default!(
+                input
+                    .prefill_cost_model
+                    .quadratic_seconds_per_1k_tokens_squared,
+                prefill_defaults.quadratic_seconds_per_1k_tokens_squared,
+                PREFILL_QUADRATIC_EXPLICIT
+            ),
+            decode_throughput_alpha: configured_or_default!(
+                input.prefill_cost_model.decode_throughput_alpha,
+                prefill_defaults.decode_throughput_alpha,
+                PREFILL_DECODE_ALPHA_EXPLICIT
+            ),
+        };
+        let decode_throughput_model = DecodeThroughputModel {
+            fixed_step_seconds: configured_or_default!(
+                input.decode_throughput_model.fixed_step_seconds,
+                decode_defaults.fixed_step_seconds,
+                DECODE_FIXED_EXPLICIT
+            ),
+            batch_step_seconds_per_request: configured_or_default!(
+                input.decode_throughput_model.batch_step_seconds_per_request,
+                decode_defaults.batch_step_seconds_per_request,
+                DECODE_BATCH_EXPLICIT
+            ),
+            context_step_seconds_per_token: configured_or_default!(
+                input.decode_throughput_model.context_step_seconds_per_token,
+                decode_defaults.context_step_seconds_per_token,
+                DECODE_CONTEXT_EXPLICIT
+            ),
+        };
+
+        Ok(Self {
+            enable_key: input.enable_key,
+            binding_only: input.binding_only,
+            global_queue: input.global_queue,
+            resume_order: input.resume_order,
+            cross_rank_headroom_ratio: input.cross_rank_headroom_ratio,
+            binding_strategy: input.binding_strategy,
+            hash_virtual_nodes: input.hash_virtual_nodes,
+            token_capacity_per_dp_rank: input.token_capacity_per_dp_rank,
+            max_active_programs_per_target: input.max_active_programs_per_target,
+            metrics_interval_seconds: input.metrics_interval_seconds,
+            admission_waiting_request_threshold: input.admission_waiting_request_threshold,
+            queue_timeout_seconds: input.queue_timeout_seconds,
+            force_resume_timeout_seconds: input.force_resume_timeout_seconds,
+            paused_retention_ttl_seconds: input.paused_retention_ttl_seconds,
+            shared_prefix_freshness_warmup_seconds: input.shared_prefix_freshness_warmup_seconds,
+            shared_prefix_freshness_kv_turnovers: input.shared_prefix_freshness_kv_turnovers,
+            decode_buffer_tokens: input.decode_buffer_tokens,
+            max_acting_ttl_seconds: input.max_acting_ttl_seconds,
+            high_watermark_ratio: input.high_watermark_ratio,
+            low_watermark_ratio: input.low_watermark_ratio,
+            max_segment_rounds: input.max_segment_rounds,
+            stats_window_size: input.stats_window_size,
+            enable_batch_gain_admission: input.enable_batch_gain_admission,
+            prefill_cost_model,
+            decode_throughput_model,
+            explicit_calibration_fields: ExplicitCalibrationFields(explicit_calibration_fields),
+        })
+    }
+}
+
+fn default_program_cross_rank_headroom_ratio() -> f64 {
+    1.2
+}
+
+fn default_program_hash_virtual_nodes() -> u32 {
+    160
+}
+
+fn default_program_max_active_programs_per_target() -> usize {
+    64
+}
+
+fn default_program_metrics_interval_seconds() -> f64 {
+    1.0
+}
+
+fn default_program_admission_waiting_request_threshold() -> usize {
+    1
+}
+
+fn default_program_queue_timeout_seconds() -> f64 {
+    600.0
+}
+
+fn default_program_force_resume_timeout_seconds() -> f64 {
+    300.0
+}
+
+fn default_program_paused_retention_ttl_seconds() -> f64 {
+    1800.0
+}
+
+fn default_program_shared_prefix_freshness_warmup_seconds() -> f64 {
+    100.0
+}
+
+fn default_program_shared_prefix_freshness_kv_turnovers() -> f64 {
+    2.0
+}
+
+fn default_program_decode_buffer_tokens() -> usize {
+    100
+}
+
+fn default_program_max_acting_ttl_seconds() -> f64 {
+    10.0
+}
+
+fn default_program_high_watermark_ratio() -> f64 {
+    1.0
+}
+
+fn default_program_low_watermark_ratio() -> f64 {
+    1.0
+}
+
+fn default_program_max_segment_rounds() -> usize {
+    14
+}
+
+fn default_program_stats_window_size() -> usize {
+    100
+}
+
+fn default_program_enable_batch_gain_admission() -> bool {
+    true
+}
+
+/// History backend configuration
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum HistoryBackend {
+    /// In-memory storage (default)
+    Memory,
+    /// No history storage
+    None,
+}
+
+/// KV connector type for PD disaggregation
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum KvConnector {
+    /// NIXL pull-based KV transfer (default)
+    #[default]
+    #[serde(rename = "nixl")]
+    #[value(name = "nixl")]
+    Nixl,
+    /// Mooncake push-based KV transfer
+    #[serde(rename = "mooncake")]
+    #[value(name = "mooncake")]
+    Mooncake,
+    /// MoRI-IO KV transfer
+    #[serde(rename = "moriio")]
+    #[value(name = "moriio")]
+    MoriIO,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[serde(tag = "type")]
+pub enum ConnectionMode {
+    #[default]
+    #[serde(rename = "http")]
+    Http,
+    /// vLLM rust Inference (`grpc://` / `grpcs://` worker URLs)
+    #[serde(rename = "grpc")]
+    Grpc,
+}
+
+/// Routing mode configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum RoutingMode {
+    #[serde(rename = "regular")]
+    Regular {
+        /// Worker URLs: `http(s)://` or `grpc://`
+        worker_urls: Vec<String>,
+    },
+    #[serde(rename = "openai")]
+    OpenAI {
+        /// OpenAI-compatible API base(s), provided via worker URLs
+        worker_urls: Vec<String>,
+    },
+    #[serde(rename = "vllm_prefill_decode")]
+    VllmPrefillDecode {
+        /// Prefill worker URLs with optional bootstrap ports
+        prefill_urls: Vec<(String, Option<u16>)>,
+        /// Decode worker URLs
+        decode_urls: Vec<String>,
+        /// Optional separate policy for prefill workers
+        #[serde(skip_serializing_if = "Option::is_none")]
+        prefill_policy: Option<PolicyConfig>,
+        /// Optional separate policy for decode workers
+        #[serde(skip_serializing_if = "Option::is_none")]
+        decode_policy: Option<PolicyConfig>,
+        /// ZMQ service discovery address (e.g., "0.0.0.0:30001")
+        #[serde(skip_serializing_if = "Option::is_none")]
+        discovery_address: Option<String>,
+    },
+}
+
+impl RoutingMode {
+    pub fn is_pd_mode(&self) -> bool {
+        matches!(self, RoutingMode::VllmPrefillDecode { .. })
+    }
+
+    pub fn is_vllm_pd_mode(&self) -> bool {
+        matches!(self, RoutingMode::VllmPrefillDecode { .. })
+    }
+
+    pub fn worker_count(&self) -> usize {
+        match self {
+            RoutingMode::Regular { worker_urls } => worker_urls.len(),
+            RoutingMode::VllmPrefillDecode {
+                prefill_urls,
+                decode_urls,
+                ..
+            } => prefill_urls.len() + decode_urls.len(),
+            // OpenAI mode represents a single upstream
+            RoutingMode::OpenAI { .. } => 1,
+        }
+    }
+
+    /// Get the effective prefill policy for PD mode
+    /// Falls back to the main policy if no specific prefill policy is set
+    pub fn get_prefill_policy<'a>(&'a self, main_policy: &'a PolicyConfig) -> &'a PolicyConfig {
+        match self {
+            RoutingMode::VllmPrefillDecode { prefill_policy, .. } => {
+                prefill_policy.as_ref().unwrap_or(main_policy)
+            }
+            _ => main_policy,
+        }
+    }
+
+    /// Get the effective decode policy for PD mode
+    /// Falls back to the main policy if no specific decode policy is set
+    pub fn get_decode_policy<'a>(&'a self, main_policy: &'a PolicyConfig) -> &'a PolicyConfig {
+        match self {
+            RoutingMode::VllmPrefillDecode { decode_policy, .. } => {
+                decode_policy.as_ref().unwrap_or(main_policy)
+            }
+            _ => main_policy,
+        }
+    }
+}
+
+/// Policy configuration for routing
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum PolicyConfig {
+    #[serde(rename = "random")]
+    Random,
+
+    #[serde(rename = "round_robin")]
+    RoundRobin,
+
+    #[serde(rename = "cache_aware")]
+    CacheAware {
+        /// Minimum prefix match ratio to use cache-based routing
+        cache_threshold: f32,
+        /// Absolute load difference threshold for load balancing
+        balance_abs_threshold: usize,
+        /// Relative load ratio threshold for load balancing
+        balance_rel_threshold: f32,
+        /// Interval between cache eviction cycles (seconds)
+        eviction_interval_secs: u64,
+        /// Maximum cache tree size per tenant
+        max_tree_size: usize,
+    },
+
+    #[serde(rename = "power_of_two")]
+    PowerOfTwo {
+        /// Interval for load monitoring (seconds)
+        load_check_interval_secs: u64,
+    },
+
+    #[serde(rename = "consistent_hash")]
+    ConsistentHash {
+        /// Number of virtual nodes per worker for better distribution
+        virtual_nodes: u32,
+    },
+
+    #[serde(rename = "rendezvous_hash")]
+    RendezvousHash,
+
+    #[serde(rename = "ttft_aware")]
+    TtftAware {
+        /// Average task duration in milliseconds (for queue time estimation)
+        #[serde(default = "default_avg_task_duration_ms")]
+        avg_task_duration_ms: f64,
+        /// Per-token compute cost in milliseconds (for compute time estimation)
+        #[serde(default = "default_per_token_cost_ms")]
+        per_token_cost_ms: f64,
+        /// Weight for queue time vs compute time (0.0 = only compute, 1.0 = only queue)
+        #[serde(default = "default_queue_weight")]
+        queue_weight: f64,
+        /// Estimated characters per token for request size estimation
+        #[serde(default = "default_chars_per_token")]
+        chars_per_token: usize,
+    },
+}
+
+fn default_avg_task_duration_ms() -> f64 {
+    100.0
+}
+
+fn default_per_token_cost_ms() -> f64 {
+    0.5
+}
+
+fn default_queue_weight() -> f64 {
+    0.6
+}
+
+fn default_chars_per_token() -> usize {
+    4
+}
+
+impl PolicyConfig {
+    pub fn name(&self) -> &'static str {
+        match self {
+            PolicyConfig::Random => "random",
+            PolicyConfig::RoundRobin => "round_robin",
+            PolicyConfig::CacheAware { .. } => "cache_aware",
+            PolicyConfig::PowerOfTwo { .. } => "power_of_two",
+            PolicyConfig::ConsistentHash { .. } => "consistent_hash",
+            PolicyConfig::RendezvousHash => "rendezvous_hash",
+            PolicyConfig::TtftAware { .. } => "ttft_aware",
+        }
+    }
+}
+
+/// Service discovery configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiscoveryConfig {
+    /// Enable service discovery
+    pub enabled: bool,
+    /// Kubernetes namespace (None = all namespaces)
+    pub namespace: Option<String>,
+    /// Service discovery port
+    pub port: u16,
+    /// Check interval for service discovery
+    pub check_interval_secs: u64,
+    /// Regular mode selector
+    pub selector: HashMap<String, String>,
+    /// PD mode prefill selector
+    pub prefill_selector: HashMap<String, String>,
+    /// PD mode decode selector
+    pub decode_selector: HashMap<String, String>,
+    /// Bootstrap port annotation key
+    pub bootstrap_port_annotation: String,
+}
+
+impl Default for DiscoveryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            namespace: None,
+            port: 8000,
+            check_interval_secs: 120,
+            selector: HashMap::new(),
+            prefill_selector: HashMap::new(),
+            decode_selector: HashMap::new(),
+            bootstrap_port_annotation: "vllm.ai/bootstrap-port".to_string(),
+        }
+    }
+}
+
+/// Retry configuration for request handling
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetryConfig {
+    /// Maximum number of retry attempts
+    pub max_retries: u32,
+    /// Initial backoff delay in milliseconds
+    pub initial_backoff_ms: u64,
+    /// Maximum backoff delay in milliseconds
+    pub max_backoff_ms: u64,
+    /// Backoff multiplier for exponential backoff
+    pub backoff_multiplier: f32,
+    /// Jitter factor applied to backoff (0.0 - 1.0)
+    /// Effective delay D' = D * (1 + U[-j, +j])
+    #[serde(default = "default_retry_jitter_factor")]
+    pub jitter_factor: f32,
+}
+
+impl Default for RetryConfig {
+    fn default() -> Self {
+        Self {
+            max_retries: 5,
+            initial_backoff_ms: 50,
+            max_backoff_ms: 30000,
+            backoff_multiplier: 1.5,
+            jitter_factor: 0.2,
+        }
+    }
+}
+
+fn default_retry_jitter_factor() -> f32 {
+    0.2
+}
+
+/// Health check configuration for worker monitoring
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HealthCheckConfig {
+    /// Number of consecutive failures before marking unhealthy
+    pub failure_threshold: u32,
+    /// Number of consecutive successes before marking healthy
+    pub success_threshold: u32,
+    /// Timeout for health check requests in seconds
+    pub timeout_secs: u64,
+    /// Interval between health checks in seconds
+    pub check_interval_secs: u64,
+    /// Health check endpoint path
+    pub endpoint: String,
+}
+
+impl Default for HealthCheckConfig {
+    fn default() -> Self {
+        Self {
+            failure_threshold: 3,
+            success_threshold: 2,
+            timeout_secs: 5,
+            check_interval_secs: 60,
+            endpoint: "/health".to_string(),
+        }
+    }
+}
+
+/// Circuit breaker configuration for worker reliability
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CircuitBreakerConfig {
+    /// Number of consecutive failures before opening circuit
+    pub failure_threshold: u32,
+    /// Number of consecutive successes before closing circuit
+    pub success_threshold: u32,
+    /// Time before attempting to recover from open state (in seconds)
+    pub timeout_duration_secs: u64,
+    /// Window duration for failure tracking (in seconds)
+    pub window_duration_secs: u64,
+}
+
+impl Default for CircuitBreakerConfig {
+    fn default() -> Self {
+        Self {
+            failure_threshold: 10,
+            success_threshold: 3,
+            timeout_duration_secs: 60,
+            window_duration_secs: 120,
+        }
+    }
+}
+
+/// Metrics configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MetricsConfig {
+    /// Prometheus metrics port
+    pub port: u16,
+    /// Prometheus metrics host
+    pub host: String,
+}
+
+impl Default for MetricsConfig {
+    fn default() -> Self {
+        Self {
+            port: 29000,
+            host: "127.0.0.1".to_string(),
+        }
+    }
+}
+
+/// OpenTelemetry tracing configuration.
+///
+/// Presence of `Some(TraceConfig)` means tracing is enabled;
+/// `None` means tracing is disabled.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TraceConfig {
+    /// OTLP collector endpoint (format: host:port).
+    /// When None, the SDK respects OTEL_EXPORTER_OTLP_ENDPOINT.
+    #[serde(default)]
+    pub otlp_traces_endpoint: Option<String>,
+    /// Parent-based trace sampling ratio applied when there is no sampled parent.
+    #[serde(default = "TraceConfig::default_sampling_ratio")]
+    pub sampling_ratio: f64,
+    /// Exact HTTP paths whose server spans should be skipped even when tracing is enabled.
+    #[serde(default = "TraceConfig::default_excluded_paths")]
+    pub excluded_paths: Vec<String>,
+}
+
+impl TraceConfig {
+    pub fn default_sampling_ratio() -> f64 {
+        1.0
+    }
+
+    pub fn default_excluded_paths() -> Vec<String> {
+        vec![
+            "/health".to_string(),
+            "/health_generate".to_string(),
+            "/liveness".to_string(),
+            "/readiness".to_string(),
+        ]
+    }
+}
+
+impl Default for TraceConfig {
+    fn default() -> Self {
+        Self {
+            otlp_traces_endpoint: None,
+            sampling_ratio: Self::default_sampling_ratio(),
+            excluded_paths: Self::default_excluded_paths(),
+        }
+    }
+}
+
+impl Default for RouterConfig {
+    fn default() -> Self {
+        Self {
+            mode: RoutingMode::Regular {
+                worker_urls: vec![],
+            },
+            policy: PolicyConfig::Random,
+            host: "127.0.0.1".to_string(),
+            port: 3001,
+            max_payload_size: 536_870_912, // 512MB
+            request_timeout_secs: 1800,    // 30 minutes
+            worker_startup_timeout_secs: 600,
+            worker_startup_check_interval_secs: 30,
+            intra_node_data_parallel_size: 1,
+            api_key: None,
+            api_key_validation_urls: vec![],
+            discovery: None,
+            metrics: None,
+            log_dir: None,
+            log_level: None,
+            request_id_headers: None,
+            max_concurrent_requests: 32768,
+            queue_size: 100,
+            queue_timeout_secs: 60,
+            rate_limit_tokens_per_second: None,
+            cors_allowed_origins: vec![],
+            retry: RetryConfig::default(),
+            circuit_breaker: CircuitBreakerConfig::default(),
+            disable_retries: false,
+            disable_circuit_breaker: false,
+            health_check: HealthCheckConfig::default(),
+            enable_igw: false,
+            connection_mode: ConnectionMode::Http,
+            history_backend: default_history_backend(),
+            enable_profiling: false,
+            profile_timeout_secs: default_profile_timeout_secs(),
+            kv_connector: KvConnector::default(),
+            program_scheduling: None,
+        }
+    }
+}
+
+impl RouterConfig {
+    /// Create a new configuration with mode and policy
+    pub fn new(mode: RoutingMode, policy: PolicyConfig) -> Self {
+        Self {
+            mode,
+            policy,
+            ..Default::default()
+        }
+    }
+
+    /// Validate the configuration
+    pub fn validate(&self) -> ConfigResult<()> {
+        ConfigValidator::validate(self)
+    }
+
+    /// Get the routing mode type as a string
+    pub fn mode_type(&self) -> &'static str {
+        match self.mode {
+            RoutingMode::Regular { .. } => "regular",
+            RoutingMode::VllmPrefillDecode { .. } => "vllm_prefill_decode",
+            RoutingMode::OpenAI { .. } => "openai",
+        }
+    }
+
+    /// Check if service discovery is enabled
+    pub fn has_service_discovery(&self) -> bool {
+        self.discovery.as_ref().is_some_and(|d| d.enabled)
+    }
+
+    /// Check if metrics are enabled
+    pub fn has_metrics(&self) -> bool {
+        self.metrics.is_some()
+    }
+
+    /// Compute the effective retry config considering disable flag
+    pub fn effective_retry_config(&self) -> RetryConfig {
+        let mut cfg = self.retry.clone();
+        if self.disable_retries {
+            cfg.max_retries = 1;
+        }
+        cfg
+    }
+
+    /// Compute the effective circuit breaker config considering disable flag
+    pub fn effective_circuit_breaker_config(&self) -> CircuitBreakerConfig {
+        let mut cfg = self.circuit_breaker.clone();
+        if self.disable_circuit_breaker {
+            cfg.failure_threshold = u32::MAX;
+        }
+        cfg
+    }
+
+    /// Check if running in IGW (Inference Gateway) mode
+    pub fn is_igw_mode(&self) -> bool {
+        self.enable_igw
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ============= RouterConfig Tests =============
+
+    #[test]
+    fn test_router_config_default() {
+        let config = RouterConfig::default();
+
+        assert!(
+            matches!(config.mode, RoutingMode::Regular { worker_urls } if worker_urls.is_empty())
+        );
+        assert!(matches!(config.policy, PolicyConfig::Random));
+        assert_eq!(config.host, "127.0.0.1");
+        assert_eq!(config.port, 3001);
+        assert_eq!(config.max_payload_size, 536_870_912);
+        assert_eq!(config.request_timeout_secs, 1800);
+        assert_eq!(config.worker_startup_timeout_secs, 600);
+        assert_eq!(config.worker_startup_check_interval_secs, 30);
+        assert!(config.discovery.is_none());
+        assert!(config.metrics.is_none());
+        assert!(config.log_dir.is_none());
+        assert!(config.log_level.is_none());
+    }
+
+    #[test]
+    fn test_router_config_new() {
+        let mode = RoutingMode::Regular {
+            worker_urls: vec!["http://worker1".to_string(), "http://worker2".to_string()],
+        };
+        let policy = PolicyConfig::RoundRobin;
+
+        let config = RouterConfig::new(mode, policy);
+
+        match config.mode {
+            RoutingMode::Regular { worker_urls } => {
+                assert_eq!(worker_urls.len(), 2);
+                assert_eq!(worker_urls[0], "http://worker1");
+                assert_eq!(worker_urls[1], "http://worker2");
+            }
+            _ => panic!("Expected Regular mode"),
+        }
+
+        assert!(matches!(config.policy, PolicyConfig::RoundRobin));
+        // Other fields should be default
+        assert_eq!(config.host, "127.0.0.1");
+        assert_eq!(config.port, 3001);
+    }
+
+    #[test]
+    fn test_router_config_serialization() {
+        let config = RouterConfig {
+            mode: RoutingMode::Regular {
+                worker_urls: vec!["http://worker1".to_string()],
+            },
+            policy: PolicyConfig::Random,
+            host: "0.0.0.0".to_string(),
+            port: 8080,
+            log_dir: Some("/var/log".to_string()),
+            log_level: Some("debug".to_string()),
+            ..Default::default()
+        };
+
+        let json = serde_json::to_string(&config).unwrap();
+        let deserialized: RouterConfig = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(config.host, deserialized.host);
+        assert_eq!(config.port, deserialized.port);
+        assert_eq!(config.max_payload_size, deserialized.max_payload_size);
+        assert_eq!(config.log_dir, deserialized.log_dir);
+        assert_eq!(config.log_level, deserialized.log_level);
+        // discovery and metrics are None in Default implementation
+        assert!(deserialized.discovery.is_none());
+        assert!(deserialized.metrics.is_none());
+    }
+
+    #[test]
+    fn program_scheduling_enable_key_uses_the_roadmap_contract_name() {
+        let default: ProgramSchedulingConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(
+            default.enable_key,
+            ProgramSchedulingEnableKey::AgenticContext
+        );
+        let auto: ProgramSchedulingConfig =
+            serde_json::from_str(r#"{"program_scheduling_enable_key":"auto"}"#).unwrap();
+        assert_eq!(auto.enable_key, ProgramSchedulingEnableKey::Auto);
+        let serialized = serde_json::to_value(default).unwrap();
+        assert_eq!(
+            serialized["program_scheduling_enable_key"],
+            "vllm_xargs.agentic_context"
+        );
+    }
+
+    #[test]
+    fn program_scheduling_requires_explicit_enablement() {
+        assert!(ProgramSchedulingConfig::resolve(false, None)
+            .unwrap()
+            .is_none());
+
+        let defaults = ProgramSchedulingConfig::resolve(true, None)
+            .unwrap()
+            .expect("the enable switch should select the default configuration");
+        assert_eq!(defaults, ProgramSchedulingConfig::default());
+
+        let configured = ProgramSchedulingConfig::resolve(true, Some(r#"{"binding_only":true}"#))
+            .unwrap()
+            .expect("enabled JSON overrides should be parsed");
+        assert!(configured.binding_only);
+
+        let missing_switch =
+            ProgramSchedulingConfig::resolve(false, Some(r#"{"binding_only":true}"#))
+                .unwrap_err()
+                .to_string();
+        assert!(missing_switch
+            .contains("program_scheduling_config_json requires enable_program_scheduling"));
+
+        let invalid = ProgramSchedulingConfig::resolve(true, Some("not-json"))
+            .unwrap_err()
+            .to_string();
+        assert!(invalid.contains("Invalid program_scheduling_config_json"));
+    }
+
+    #[test]
+    fn program_scheduling_capacity_is_named_per_dp_rank() {
+        let current: ProgramSchedulingConfig =
+            serde_json::from_str(r#"{"token_capacity_per_dp_rank":123}"#).unwrap();
+        assert_eq!(current.token_capacity_per_dp_rank, Some(123));
+
+        let legacy: ProgramSchedulingConfig =
+            serde_json::from_str(r#"{"token_capacity_per_target":456}"#).unwrap();
+        assert_eq!(legacy.token_capacity_per_dp_rank, Some(456));
+        let serialized = serde_json::to_value(legacy).unwrap();
+        assert_eq!(serialized["token_capacity_per_dp_rank"], 456);
+        assert!(serialized.get("token_capacity_per_target").is_none());
+    }
+
+    #[test]
+    fn program_scheduling_calibration_models_are_configurable() {
+        let config: ProgramSchedulingConfig = serde_json::from_str(
+            r#"{
+                "prefill_cost_model": {
+                    "intercept_seconds": 0.1,
+                    "linear_seconds_per_1k_tokens": 0.2,
+                    "quadratic_seconds_per_1k_tokens_squared": 0.3,
+                    "decode_throughput_alpha": 0.4
+                },
+                "decode_throughput_model": {
+                    "fixed_step_seconds": 0.5,
+                    "batch_step_seconds_per_request": 0.6,
+                    "context_step_seconds_per_token": 0.7
+                }
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(config.prefill_cost_model.intercept_seconds, 0.1);
+        assert_eq!(
+            config
+                .prefill_cost_model
+                .quadratic_seconds_per_1k_tokens_squared,
+            0.3
+        );
+        assert_eq!(config.prefill_cost_model.decode_throughput_alpha, 0.4);
+        assert_eq!(
+            config
+                .decode_throughput_model
+                .batch_step_seconds_per_request,
+            0.6
+        );
+        let scheduler = crate::program_scheduling::ProgramSchedulerConfig::from(&config);
+        assert_eq!(scheduler.progress_ttl.prefill, config.prefill_cost_model);
+        assert_eq!(
+            scheduler.progress_ttl.decode,
+            config.decode_throughput_model
+        );
+
+        let partial: ProgramSchedulingConfig = serde_json::from_str(
+            r#"{
+                "prefill_cost_model": {"decode_throughput_alpha": 0.8},
+                "decode_throughput_model": {"fixed_step_seconds": 0.25}
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(partial.prefill_cost_model.decode_throughput_alpha, 0.8);
+        assert_eq!(
+            partial.prefill_cost_model.linear_seconds_per_1k_tokens,
+            PrefillCostModel::default().linear_seconds_per_1k_tokens
+        );
+        assert_eq!(partial.decode_throughput_model.fixed_step_seconds, 0.25);
+        assert_eq!(
+            partial
+                .decode_throughput_model
+                .context_step_seconds_per_token,
+            DecodeThroughputModel::default().context_step_seconds_per_token
+        );
+        assert_eq!(
+            partial.defaulted_calibration_fields(),
+            vec![
+                "prefill_cost_model.intercept_seconds",
+                "prefill_cost_model.linear_seconds_per_1k_tokens",
+                "prefill_cost_model.quadratic_seconds_per_1k_tokens_squared",
+                "decode_throughput_model.batch_step_seconds_per_request",
+                "decode_throughput_model.context_step_seconds_per_token",
+            ]
+        );
+        assert!(config.defaulted_calibration_fields().is_empty());
+
+        let omitted: ProgramSchedulingConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(omitted.defaulted_calibration_fields().len(), 7);
+        assert_eq!(
+            serde_json::to_value(&omitted).unwrap()["prefill_cost_model"]["intercept_seconds"],
+            PrefillCostModel::default().intercept_seconds
+        );
+        let explicit_defaults: ProgramSchedulingConfig =
+            serde_json::from_value(serde_json::to_value(&omitted).unwrap()).unwrap();
+        assert!(explicit_defaults.defaulted_calibration_fields().is_empty());
+        assert_eq!(explicit_defaults, omitted);
+    }
+
+    // ============= RoutingMode Tests =============
+
+    #[test]
+    fn test_routing_mode_is_pd_mode() {
+        let regular = RoutingMode::Regular {
+            worker_urls: vec!["http://worker1".to_string()],
+        };
+        assert!(!regular.is_pd_mode());
+
+        let pd = RoutingMode::VllmPrefillDecode {
+            prefill_urls: vec![("http://prefill1".to_string(), Some(8001))],
+            decode_urls: vec!["http://decode1".to_string()],
+            prefill_policy: None,
+            decode_policy: None,
+            discovery_address: None,
+        };
+        assert!(pd.is_pd_mode());
+    }
+
+    #[test]
+    fn test_routing_mode_worker_count() {
+        let regular = RoutingMode::Regular {
+            worker_urls: vec![
+                "http://worker1".to_string(),
+                "http://worker2".to_string(),
+                "http://worker3".to_string(),
+            ],
+        };
+        assert_eq!(regular.worker_count(), 3);
+
+        let pd = RoutingMode::VllmPrefillDecode {
+            prefill_urls: vec![
+                ("http://prefill1".to_string(), Some(8001)),
+                ("http://prefill2".to_string(), None),
+            ],
+            decode_urls: vec![
+                "http://decode1".to_string(),
+                "http://decode2".to_string(),
+                "http://decode3".to_string(),
+            ],
+            prefill_policy: None,
+            decode_policy: None,
+            discovery_address: None,
+        };
+        assert_eq!(pd.worker_count(), 5);
+
+        let empty_regular = RoutingMode::Regular {
+            worker_urls: vec![],
+        };
+        assert_eq!(empty_regular.worker_count(), 0);
+    }
+
+    #[test]
+    fn test_routing_mode_serialization() {
+        // Test Regular mode
+        let regular = RoutingMode::Regular {
+            worker_urls: vec!["http://worker1".to_string()],
+        };
+        let json = serde_json::to_string(&regular).unwrap();
+        assert!(json.contains("\"type\":\"regular\""));
+        assert!(json.contains("\"worker_urls\""));
+
+        // Test VllmPrefillDecode mode
+        let pd = RoutingMode::VllmPrefillDecode {
+            prefill_urls: vec![("http://prefill1".to_string(), Some(8001))],
+            decode_urls: vec!["http://decode1".to_string()],
+            prefill_policy: None,
+            decode_policy: None,
+            discovery_address: None,
+        };
+        let json = serde_json::to_string(&pd).unwrap();
+        assert!(json.contains("\"type\":\"vllm_prefill_decode\""));
+        assert!(json.contains("\"prefill_urls\""));
+        assert!(json.contains("\"decode_urls\""));
+    }
+
+    // ============= PolicyConfig Tests =============
+
+    #[test]
+    fn test_policy_config_name() {
+        assert_eq!(PolicyConfig::Random.name(), "random");
+        assert_eq!(PolicyConfig::RoundRobin.name(), "round_robin");
+
+        let cache_aware = PolicyConfig::CacheAware {
+            cache_threshold: 0.8,
+            balance_abs_threshold: 10,
+            balance_rel_threshold: 1.5,
+            eviction_interval_secs: 300,
+            max_tree_size: 1000,
+        };
+        assert_eq!(cache_aware.name(), "cache_aware");
+
+        let power_of_two = PolicyConfig::PowerOfTwo {
+            load_check_interval_secs: 60,
+        };
+        assert_eq!(power_of_two.name(), "power_of_two");
+    }
+
+    #[test]
+    fn test_policy_config_serialization() {
+        // Test Random
+        let random = PolicyConfig::Random;
+        let json = serde_json::to_string(&random).unwrap();
+        assert_eq!(json, r#"{"type":"random"}"#);
+
+        // Test CacheAware with all parameters
+        let cache_aware = PolicyConfig::CacheAware {
+            cache_threshold: 0.8,
+            balance_abs_threshold: 10,
+            balance_rel_threshold: 1.5,
+            eviction_interval_secs: 300,
+            max_tree_size: 1000,
+        };
+        let json = serde_json::to_string(&cache_aware).unwrap();
+        assert!(json.contains("\"type\":\"cache_aware\""));
+        assert!(json.contains("\"cache_threshold\":0.8"));
+        assert!(json.contains("\"balance_abs_threshold\":10"));
+
+        // Test PowerOfTwo
+        let power_of_two = PolicyConfig::PowerOfTwo {
+            load_check_interval_secs: 60,
+        };
+        let json = serde_json::to_string(&power_of_two).unwrap();
+        assert!(json.contains("\"type\":\"power_of_two\""));
+        assert!(json.contains("\"load_check_interval_secs\":60"));
+    }
+
+    #[test]
+    fn test_cache_aware_parameters() {
+        let cache_aware = PolicyConfig::CacheAware {
+            cache_threshold: 0.75,
+            balance_abs_threshold: 20,
+            balance_rel_threshold: 2.0,
+            eviction_interval_secs: 600,
+            max_tree_size: 5000,
+        };
+
+        match cache_aware {
+            PolicyConfig::CacheAware {
+                cache_threshold,
+                balance_abs_threshold,
+                balance_rel_threshold,
+                eviction_interval_secs,
+                max_tree_size,
+            } => {
+                assert!((cache_threshold - 0.75).abs() < 0.0001);
+                assert_eq!(balance_abs_threshold, 20);
+                assert!((balance_rel_threshold - 2.0).abs() < 0.0001);
+                assert_eq!(eviction_interval_secs, 600);
+                assert_eq!(max_tree_size, 5000);
+            }
+            _ => panic!("Expected CacheAware"),
+        }
+    }
+
+    #[test]
+    fn test_power_of_two_parameters() {
+        let power_of_two = PolicyConfig::PowerOfTwo {
+            load_check_interval_secs: 120,
+        };
+
+        match power_of_two {
+            PolicyConfig::PowerOfTwo {
+                load_check_interval_secs,
+            } => {
+                assert_eq!(load_check_interval_secs, 120);
+            }
+            _ => panic!("Expected PowerOfTwo"),
+        }
+    }
+
+    // ============= DiscoveryConfig Tests =============
+
+    #[test]
+    fn test_discovery_config_default() {
+        let config = DiscoveryConfig::default();
+
+        assert!(!config.enabled);
+        assert!(config.namespace.is_none());
+        assert_eq!(config.port, 8000);
+        assert_eq!(config.check_interval_secs, 120);
+        assert!(config.selector.is_empty());
+        assert!(config.prefill_selector.is_empty());
+        assert!(config.decode_selector.is_empty());
+        assert_eq!(config.bootstrap_port_annotation, "vllm.ai/bootstrap-port");
+    }
+
+    #[test]
+    fn test_discovery_config_with_selectors() {
+        let mut selector = HashMap::new();
+        selector.insert("app".to_string(), "vllm".to_string());
+        selector.insert("role".to_string(), "worker".to_string());
+
+        let config = DiscoveryConfig {
+            enabled: true,
+            namespace: Some("default".to_string()),
+            port: 9000,
+            check_interval_secs: 30,
+            selector: selector.clone(),
+            prefill_selector: selector.clone(),
+            decode_selector: selector.clone(),
+            bootstrap_port_annotation: "custom.io/port".to_string(),
+        };
+
+        assert!(config.enabled);
+        assert_eq!(config.namespace, Some("default".to_string()));
+        assert_eq!(config.port, 9000);
+        assert_eq!(config.selector.len(), 2);
+        assert_eq!(config.selector.get("app"), Some(&"vllm".to_string()));
+    }
+
+    #[test]
+    fn test_discovery_config_namespace() {
+        // Test None namespace (all namespaces)
+        let config = DiscoveryConfig {
+            namespace: None,
+            ..Default::default()
+        };
+        assert!(config.namespace.is_none());
+
+        // Test specific namespace
+        let config = DiscoveryConfig {
+            namespace: Some("production".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(config.namespace, Some("production".to_string()));
+    }
+
+    // ============= MetricsConfig Tests =============
+
+    #[test]
+    fn test_metrics_config_default() {
+        let config = MetricsConfig::default();
+
+        assert_eq!(config.port, 29000);
+        assert_eq!(config.host, "127.0.0.1");
+    }
+
+    #[test]
+    fn test_metrics_config_custom() {
+        let config = MetricsConfig {
+            port: 9090,
+            host: "0.0.0.0".to_string(),
+        };
+
+        assert_eq!(config.port, 9090);
+        assert_eq!(config.host, "0.0.0.0");
+    }
+
+    // ============= RouterConfig Utility Methods Tests =============
+
+    #[test]
+    fn test_mode_type() {
+        let config = RouterConfig {
+            mode: RoutingMode::Regular {
+                worker_urls: vec![],
+            },
+            ..Default::default()
+        };
+        assert_eq!(config.mode_type(), "regular");
+
+        let config = RouterConfig {
+            mode: RoutingMode::VllmPrefillDecode {
+                prefill_urls: vec![],
+                decode_urls: vec![],
+                prefill_policy: None,
+                decode_policy: None,
+                discovery_address: None,
+            },
+            ..Default::default()
+        };
+        assert_eq!(config.mode_type(), "vllm_prefill_decode");
+    }
+
+    #[test]
+    fn test_has_service_discovery() {
+        let config = RouterConfig::default();
+        assert!(!config.has_service_discovery());
+
+        let config = RouterConfig {
+            discovery: Some(DiscoveryConfig {
+                enabled: false,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(!config.has_service_discovery());
+
+        let config = RouterConfig {
+            discovery: Some(DiscoveryConfig {
+                enabled: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(config.has_service_discovery());
+    }
+
+    #[test]
+    fn test_has_metrics() {
+        let config = RouterConfig::default();
+        assert!(!config.has_metrics());
+
+        let config = RouterConfig {
+            metrics: Some(MetricsConfig::default()),
+            ..Default::default()
+        };
+        assert!(config.has_metrics());
+    }
+
+    // ============= Edge Cases =============
+
+    #[test]
+    fn test_large_worker_lists() {
+        let large_urls: Vec<String> = (0..1000).map(|i| format!("http://worker{}", i)).collect();
+
+        let mode = RoutingMode::Regular {
+            worker_urls: large_urls.clone(),
+        };
+
+        assert_eq!(mode.worker_count(), 1000);
+
+        // Test serialization with large list
+        let config = RouterConfig {
+            mode,
+            ..Default::default()
+        };
+
+        let json = serde_json::to_string(&config).unwrap();
+        let deserialized: RouterConfig = serde_json::from_str(&json).unwrap();
+
+        match deserialized.mode {
+            RoutingMode::Regular { worker_urls } => {
+                assert_eq!(worker_urls.len(), 1000);
+            }
+            _ => panic!("Expected Regular mode"),
+        }
+    }
+
+    #[test]
+    fn test_unicode_in_config() {
+        let config = RouterConfig {
+            mode: RoutingMode::Regular {
+                worker_urls: vec!["http://работник1".to_string(), "http://工作者2".to_string()],
+            },
+            log_dir: Some("/日志/目录".to_string()),
+            ..Default::default()
+        };
+
+        let json = serde_json::to_string(&config).unwrap();
+        let deserialized: RouterConfig = serde_json::from_str(&json).unwrap();
+
+        match deserialized.mode {
+            RoutingMode::Regular { worker_urls } => {
+                assert_eq!(worker_urls[0], "http://работник1");
+                assert_eq!(worker_urls[1], "http://工作者2");
+            }
+            _ => panic!("Expected Regular mode"),
+        }
+
+        assert_eq!(deserialized.log_dir, Some("/日志/目录".to_string()));
+    }
+
+    #[test]
+    fn test_empty_string_fields() {
+        let config = RouterConfig {
+            host: "".to_string(),
+            log_dir: Some("".to_string()),
+            log_level: Some("".to_string()),
+            ..Default::default()
+        };
+
+        assert_eq!(config.host, "");
+        assert_eq!(config.log_dir, Some("".to_string()));
+        assert_eq!(config.log_level, Some("".to_string()));
+    }
+
+    // ============= Complex Configuration Tests =============
+
+    #[test]
+    fn test_full_pd_mode_config() {
+        let config = RouterConfig {
+            mode: RoutingMode::VllmPrefillDecode {
+                prefill_urls: vec![
+                    ("http://prefill1:8000".to_string(), Some(8001)),
+                    ("http://prefill2:8000".to_string(), None),
+                ],
+                decode_urls: vec![
+                    "http://decode1:8000".to_string(),
+                    "http://decode2:8000".to_string(),
+                ],
+                prefill_policy: None,
+                decode_policy: None,
+                discovery_address: None,
+            },
+            policy: PolicyConfig::PowerOfTwo {
+                load_check_interval_secs: 30,
+            },
+            host: "0.0.0.0".to_string(),
+            port: 3000,
+            max_payload_size: 1048576,
+            request_timeout_secs: 120,
+            worker_startup_timeout_secs: 60,
+            worker_startup_check_interval_secs: 5,
+            intra_node_data_parallel_size: 1,
+            api_key: None,
+            api_key_validation_urls: vec![],
+            discovery: Some(DiscoveryConfig {
+                enabled: true,
+                namespace: Some("vllm".to_string()),
+                ..Default::default()
+            }),
+            metrics: Some(MetricsConfig {
+                port: 9090,
+                host: "0.0.0.0".to_string(),
+            }),
+            log_dir: Some("/var/log/vllm".to_string()),
+            log_level: Some("info".to_string()),
+            request_id_headers: None,
+            max_concurrent_requests: 64,
+            cors_allowed_origins: vec![],
+            retry: RetryConfig::default(),
+            circuit_breaker: CircuitBreakerConfig::default(),
+            disable_retries: false,
+            disable_circuit_breaker: false,
+            health_check: HealthCheckConfig::default(),
+            enable_igw: false,
+            queue_size: 100,
+            queue_timeout_secs: 60,
+            rate_limit_tokens_per_second: None,
+            connection_mode: ConnectionMode::Http,
+            history_backend: default_history_backend(),
+            enable_profiling: false,
+            profile_timeout_secs: default_profile_timeout_secs(),
+            kv_connector: KvConnector::default(),
+            program_scheduling: None,
+        };
+
+        assert!(config.mode.is_pd_mode());
+        assert_eq!(config.mode.worker_count(), 4);
+        assert_eq!(config.policy.name(), "power_of_two");
+        assert!(config.has_service_discovery());
+        assert!(config.has_metrics());
+    }
+
+    #[test]
+    fn test_full_regular_mode_config() {
+        let mut selector = HashMap::new();
+        selector.insert("app".to_string(), "vllm".to_string());
+
+        let config = RouterConfig {
+            mode: RoutingMode::Regular {
+                worker_urls: vec![
+                    "http://worker1:8000".to_string(),
+                    "http://worker2:8000".to_string(),
+                    "http://worker3:8000".to_string(),
+                ],
+            },
+            policy: PolicyConfig::CacheAware {
+                cache_threshold: 0.9,
+                balance_abs_threshold: 5,
+                balance_rel_threshold: 1.2,
+                eviction_interval_secs: 600,
+                max_tree_size: 10000,
+            },
+            host: "0.0.0.0".to_string(),
+            port: 3001,
+            max_payload_size: 536870912,
+            request_timeout_secs: 300,
+            worker_startup_timeout_secs: 180,
+            worker_startup_check_interval_secs: 15,
+            intra_node_data_parallel_size: 1,
+            api_key: None,
+            api_key_validation_urls: vec![],
+            discovery: Some(DiscoveryConfig {
+                enabled: true,
+                namespace: None,
+                port: 8080,
+                check_interval_secs: 45,
+                selector,
+                ..Default::default()
+            }),
+            metrics: Some(MetricsConfig::default()),
+            log_dir: None,
+            log_level: Some("debug".to_string()),
+            request_id_headers: None,
+            max_concurrent_requests: 64,
+            cors_allowed_origins: vec![],
+            retry: RetryConfig::default(),
+            circuit_breaker: CircuitBreakerConfig::default(),
+            disable_retries: false,
+            disable_circuit_breaker: false,
+            health_check: HealthCheckConfig::default(),
+            enable_igw: false,
+            queue_size: 100,
+            queue_timeout_secs: 60,
+            rate_limit_tokens_per_second: None,
+            connection_mode: ConnectionMode::Http,
+            history_backend: default_history_backend(),
+            enable_profiling: false,
+            profile_timeout_secs: default_profile_timeout_secs(),
+            kv_connector: KvConnector::default(),
+            program_scheduling: None,
+        };
+
+        assert!(!config.mode.is_pd_mode());
+        assert_eq!(config.mode.worker_count(), 3);
+        assert_eq!(config.policy.name(), "cache_aware");
+        assert!(config.has_service_discovery());
+        assert!(config.has_metrics());
+    }
+
+    #[test]
+    fn test_config_with_all_options() {
+        let mut selectors = HashMap::new();
+        selectors.insert("env".to_string(), "prod".to_string());
+        selectors.insert("version".to_string(), "v1".to_string());
+
+        let config = RouterConfig {
+            mode: RoutingMode::Regular {
+                worker_urls: vec!["http://worker1".to_string()],
+            },
+            policy: PolicyConfig::RoundRobin,
+            host: "::1".to_string(), // IPv6
+            port: 8888,
+            max_payload_size: 1024 * 1024 * 512, // 512MB
+            request_timeout_secs: 900,
+            worker_startup_timeout_secs: 600,
+            worker_startup_check_interval_secs: 20,
+            intra_node_data_parallel_size: 1,
+            api_key: None,
+            api_key_validation_urls: vec![],
+            discovery: Some(DiscoveryConfig {
+                enabled: true,
+                namespace: Some("production".to_string()),
+                port: 8443,
+                check_interval_secs: 120,
+                selector: selectors.clone(),
+                prefill_selector: selectors.clone(),
+                decode_selector: selectors,
+                bootstrap_port_annotation: "mycompany.io/bootstrap".to_string(),
+            }),
+            metrics: Some(MetricsConfig {
+                port: 9999,
+                host: "::".to_string(), // IPv6 any
+            }),
+            log_dir: Some("/opt/logs/vllm".to_string()),
+            log_level: Some("trace".to_string()),
+            request_id_headers: None,
+            max_concurrent_requests: 64,
+            cors_allowed_origins: vec![],
+            retry: RetryConfig::default(),
+            circuit_breaker: CircuitBreakerConfig::default(),
+            disable_retries: false,
+            disable_circuit_breaker: false,
+            health_check: HealthCheckConfig::default(),
+            enable_igw: false,
+            queue_size: 100,
+            queue_timeout_secs: 60,
+            rate_limit_tokens_per_second: None,
+            connection_mode: ConnectionMode::Http,
+            history_backend: default_history_backend(),
+            enable_profiling: false,
+            profile_timeout_secs: default_profile_timeout_secs(),
+            kv_connector: KvConnector::default(),
+            program_scheduling: None,
+        };
+
+        assert!(config.has_service_discovery());
+        assert!(config.has_metrics());
+        assert_eq!(config.mode_type(), "regular");
+
+        // Test round-trip serialization
+        let json = serde_json::to_string_pretty(&config).unwrap();
+        let deserialized: RouterConfig = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(deserialized.host, "::1");
+        assert_eq!(deserialized.port, 8888);
+        assert_eq!(
+            deserialized.discovery.unwrap().namespace,
+            Some("production".to_string())
+        );
+    }
+
+    // ============= Policy Fallback Tests =============
+
+    #[test]
+    fn test_pd_policy_fallback_both_specified() {
+        // When both prefill and decode policies are specified, they should be used
+        let pd = RoutingMode::VllmPrefillDecode {
+            prefill_urls: vec![("http://prefill1".to_string(), None)],
+            decode_urls: vec!["http://decode1".to_string()],
+            prefill_policy: Some(PolicyConfig::CacheAware {
+                cache_threshold: 0.5,
+                balance_abs_threshold: 32,
+                balance_rel_threshold: 1.1,
+                eviction_interval_secs: 60,
+                max_tree_size: 1000,
+            }),
+            decode_policy: Some(PolicyConfig::PowerOfTwo {
+                load_check_interval_secs: 60,
+            }),
+            discovery_address: None,
+        };
+
+        let main_policy = PolicyConfig::Random;
+
+        // Both specific policies should be used
+        match pd.get_prefill_policy(&main_policy) {
+            PolicyConfig::CacheAware { .. } => {} // Success
+            _ => panic!("Expected CacheAware for prefill"),
+        }
+
+        match pd.get_decode_policy(&main_policy) {
+            PolicyConfig::PowerOfTwo { .. } => {} // Success
+            _ => panic!("Expected PowerOfTwo for decode"),
+        }
+    }
+
+    #[test]
+    fn test_pd_policy_fallback_only_prefill() {
+        // When only prefill policy is specified, decode should use main policy
+        let pd = RoutingMode::VllmPrefillDecode {
+            prefill_urls: vec![("http://prefill1".to_string(), None)],
+            decode_urls: vec!["http://decode1".to_string()],
+            prefill_policy: Some(PolicyConfig::CacheAware {
+                cache_threshold: 0.5,
+                balance_abs_threshold: 32,
+                balance_rel_threshold: 1.1,
+                eviction_interval_secs: 60,
+                max_tree_size: 1000,
+            }),
+            decode_policy: None,
+            discovery_address: None,
+        };
+
+        let main_policy = PolicyConfig::RoundRobin;
+
+        // Prefill should use specific policy
+        match pd.get_prefill_policy(&main_policy) {
+            PolicyConfig::CacheAware { .. } => {} // Success
+            _ => panic!("Expected CacheAware for prefill"),
+        }
+
+        // Decode should fall back to main policy
+        match pd.get_decode_policy(&main_policy) {
+            PolicyConfig::RoundRobin => {} // Success
+            _ => panic!("Expected RoundRobin for decode"),
+        }
+    }
+
+    #[test]
+    fn test_pd_policy_fallback_only_decode() {
+        // When only decode policy is specified, prefill should use main policy
+        let pd = RoutingMode::VllmPrefillDecode {
+            prefill_urls: vec![("http://prefill1".to_string(), None)],
+            decode_urls: vec!["http://decode1".to_string()],
+            prefill_policy: None,
+            decode_policy: Some(PolicyConfig::PowerOfTwo {
+                load_check_interval_secs: 60,
+            }),
+            discovery_address: None,
+        };
+
+        let main_policy = PolicyConfig::Random;
+
+        // Prefill should fall back to main policy
+        match pd.get_prefill_policy(&main_policy) {
+            PolicyConfig::Random => {} // Success
+            _ => panic!("Expected Random for prefill"),
+        }
+
+        // Decode should use specific policy
+        match pd.get_decode_policy(&main_policy) {
+            PolicyConfig::PowerOfTwo { .. } => {} // Success
+            _ => panic!("Expected PowerOfTwo for decode"),
+        }
+    }
+
+    #[test]
+    fn test_pd_policy_fallback_none_specified() {
+        // When no specific policies are specified, both should use main policy
+        let pd = RoutingMode::VllmPrefillDecode {
+            prefill_urls: vec![("http://prefill1".to_string(), None)],
+            decode_urls: vec!["http://decode1".to_string()],
+            prefill_policy: None,
+            decode_policy: None,
+            discovery_address: None,
+        };
+
+        let main_policy = PolicyConfig::CacheAware {
+            cache_threshold: 0.7,
+            balance_abs_threshold: 20,
+            balance_rel_threshold: 1.5,
+            eviction_interval_secs: 300,
+            max_tree_size: 2000,
+        };
+
+        // Both should fall back to main policy
+        match pd.get_prefill_policy(&main_policy) {
+            PolicyConfig::CacheAware {
+                cache_threshold, ..
+            } => {
+                assert!((cache_threshold - 0.7).abs() < 0.0001);
+            }
+            _ => panic!("Expected CacheAware for prefill"),
+        }
+
+        match pd.get_decode_policy(&main_policy) {
+            PolicyConfig::CacheAware {
+                cache_threshold, ..
+            } => {
+                assert!((cache_threshold - 0.7).abs() < 0.0001);
+            }
+            _ => panic!("Expected CacheAware for decode"),
+        }
+    }
+
+    #[test]
+    fn test_regular_mode_policy_fallback() {
+        // For regular mode, the helper methods should just return the main policy
+        let regular = RoutingMode::Regular {
+            worker_urls: vec!["http://worker1".to_string()],
+        };
+
+        let main_policy = PolicyConfig::RoundRobin;
+
+        // Both methods should return main policy for regular mode
+        match regular.get_prefill_policy(&main_policy) {
+            PolicyConfig::RoundRobin => {} // Success
+            _ => panic!("Expected RoundRobin for regular mode"),
+        }
+
+        match regular.get_decode_policy(&main_policy) {
+            PolicyConfig::RoundRobin => {} // Success
+            _ => panic!("Expected RoundRobin for regular mode"),
+        }
+    }
+}

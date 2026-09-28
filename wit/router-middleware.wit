@@ -1,0 +1,39 @@
+package vllm:router-middleware@0.1.0;
+
+interface types {
+  record header {
+    name: string,
+    value: list<u8>,
+  }
+
+  record request {
+    method: string,
+    path: string,
+    query: string,
+    headers: list<header>,
+    body: list<u8>,
+    request-id: string,
+  }
+
+  record modify-action {
+    headers-set: list<header>,
+    headers-add: list<header>,
+    headers-remove: list<string>,
+    body-replace: option<list<u8>>,
+  }
+
+  variant action {
+    continue,
+    reject(u16),
+    modify(modify-action),
+  }
+}
+
+interface on-request {
+  use types.{request, action};
+  handle: func(req: request) -> action;
+}
+
+world middleware {
+  export on-request;
+}

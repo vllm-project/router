@@ -1,0 +1,20 @@
+[build]
+rustflags = []
+incremental = true
+
+# `vllm-tokenizer` pulls `fastokens` -> `pcre2`. Prefer the bundled static
+# PCRE2 build so normal `cargo build` does not require system libpcre2-8.
+[env]
+PCRE2_SYS_STATIC = "1"
+
+[target.aarch64-apple-darwin]
+rustflags = [
+    "-C", "link-arg=-undefined",
+    "-C", "link-arg=dynamic_lookup",
+]
+
+[target.x86_64-apple-darwin]
+rustflags = [
+    "-C", "link-arg=-undefined",
+    "-C", "link-arg=dynamic_lookup",
+]

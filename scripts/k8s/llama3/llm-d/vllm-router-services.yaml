@@ -1,0 +1,38 @@
+---
+# Headless service for prefill pods
+apiVersion: v1
+kind: Service
+metadata:
+  name: ms-llama31-llm-d-modelservice-prefill
+  namespace: llm-d-llama31
+  labels:
+    app: vllm-modelservice
+    role: prefill
+spec:
+  clusterIP: None  # Headless service
+  selector:
+    llm-d.ai/role: prefill
+  ports:
+  - name: vllm
+    port: 8000
+    targetPort: 8000
+    protocol: TCP
+---
+# Headless service for decode pods
+apiVersion: v1
+kind: Service
+metadata:
+  name: ms-llama31-llm-d-modelservice-decode
+  namespace: llm-d-llama31
+  labels:
+    app: vllm-modelservice
+    role: decode
+spec:
+  clusterIP: None  # Headless service
+  selector:
+    llm-d.ai/role: decode
+  ports:
+  - name: vllm
+    port: 8200
+    targetPort: 8200
+    protocol: TCP

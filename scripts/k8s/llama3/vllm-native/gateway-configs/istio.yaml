@@ -1,0 +1,19 @@
+# Infra values
+gateway:
+  gatewayClassName: istio
+
+# MS values - simplified for multinode (no EPP needed)
+routing:
+  proxy:
+    debugLevel:
+  epp:
+    debugLevel:
+
+provider:
+  name: istio
+istio:
+  destinationRule:
+    trafficPolicy:
+      tls:
+        mode: SIMPLE
+        insecureSkipVerify: true

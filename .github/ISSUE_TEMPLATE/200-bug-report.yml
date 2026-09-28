@@ -1,0 +1,152 @@
+name: 🐛 Bug report
+description: Raise an issue here if you find a bug.
+title: "[Bug]: "
+labels: ["bug"]
+
+body:
+- type: markdown
+  attributes:
+    value: >
+      #### Before submitting an issue, please make sure the issue hasn't been already addressed by searching through [the existing and past issues](https://github.com/vllm-project/vllm-router/issues?q=is%3Aissue+sort%3Acreated-desc+).
+- type: markdown
+  attributes:
+    value: |
+      ⚠️ **SECURITY WARNING:** Please review any text you paste to ensure it does not contain sensitive information such as:
+      - API tokens or keys (e.g., Hugging Face tokens, OpenAI API keys)
+      - Passwords or authentication credentials
+      - Private URLs or endpoints
+      - Personal or confidential data
+
+      Consider redacting or replacing sensitive values with placeholders like `<YOUR_TOKEN_HERE>` when sharing configuration or code examples.
+- type: textarea
+  attributes:
+    label: Your current environment
+    description: |
+      Please provide the following information about your environment:
+      - **vLLM Router version**: Run `vllm-router --version` or check `pyproject.toml`
+      - **Rust version**: Run `rustc --version`
+      - **Python version**: Run `python --version`
+      - **Operating System**: e.g., Ubuntu 22.04, macOS 14.0
+      - **Deployment environment**: e.g., Kubernetes, Docker, bare metal
+      - **vLLM backend version**: Version of vLLM workers being routed to
+    value: |
+      <details>
+      <summary>Environment Information</summary>
+
+      ```text
+      vLLM Router version:
+      Rust version:
+      Python version:
+      Operating System:
+      Deployment environment:
+      vLLM backend version:
+      ```
+
+      </details>
+  validations:
+    required: true
+- type: dropdown
+  attributes:
+    label: Component
+    description: Which component is the bug related to?
+    options:
+      - Load Balancing Policy (cache-aware, consistent-hash, power-of-two, etc.)
+      - Prefill/Decode Disaggregation
+      - Kubernetes Service Discovery
+      - Metrics/Prometheus
+      - Circuit Breaker/Retry Logic
+      - Request Routing
+      - Configuration/CLI
+      - Python Bindings
+      - Other
+  validations:
+    required: true
+- type: textarea
+  attributes:
+    label: Router Configuration
+    description: |
+      Please provide the command-line arguments or configuration you used to start the router.
+
+      Example:
+      ```bash
+      vllm-router \
+          --worker-urls http://worker1:8000 http://worker2:8000 \
+          --policy consistent_hash \
+          --intra-node-data-parallel-size 8 \
+          --host 0.0.0.0 \
+          --port 8090
+      ```
+    placeholder: |
+      ```bash
+      # Your router startup command here
+      ```
+  validations:
+    required: true
+- type: textarea
+  attributes:
+    label: 🐛 Describe the bug
+    description: |
+      Please provide a clear and concise description of what the bug is.
+
+      If relevant, add a minimal example so that we can reproduce the error. Include:
+      - The request you sent to the router (e.g., curl command or Python code)
+      - Expected behavior
+      - Actual behavior
+      - Any error messages or logs
+
+      **Example request:**
+      ```bash
+      curl -X POST http://localhost:8090/v1/chat/completions \
+        -H "Content-Type: application/json" \
+        -d '{
+          "model": "meta-llama/Llama-3.1-8B-Instruct",
+          "messages": [{"role": "user", "content": "Hello!"}]
+        }'
+      ```
+
+      **For debugging, enable verbose logging:**
+      ```bash
+      # Set log level to debug
+      vllm-router --log-level debug ...
+
+      # Or set environment variable
+      export RUST_LOG=debug
+      ```
+
+      If the code is too long, feel free to put it in a public gist and link it in the issue: https://gist.github.com.
+
+      Please paste the error message including the **full** traceback and any relevant router logs.
+    placeholder: |
+      A clear and concise description of what the bug is.
+
+      **Steps to reproduce:**
+      1. Start router with configuration X
+      2. Send request Y
+      3. Observe error Z
+
+      **Expected behavior:**
+      The router should...
+
+      **Actual behavior:**
+      Instead, the router...
+
+      **Error logs:**
+      ```
+      The error message you got, with the full traceback
+      ```
+  validations:
+    required: true
+- type: textarea
+  attributes:
+    label: Additional context
+    description: |
+      Add any other context about the problem here, such as:
+      - Does this happen consistently or intermittently?
+      - Did this work in a previous version?
+      - Are there any workarounds?
+      - Network topology or infrastructure details
+      - Worker health status at the time of the issue
+    placeholder: |
+      Any additional information that might help diagnose the issue.
+  validations:
+    required: false

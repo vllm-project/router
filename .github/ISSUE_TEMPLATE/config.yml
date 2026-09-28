@@ -1,0 +1,9 @@
+blank_issues_enabled: true
+
+contact_links:
+  - name: Questions
+    url: https://discuss.vllm.ai
+    about: Ask questions and discuss with other vLLM community members
+  - name: Chat on Slack
+    url: https://slack.vllm.ai/
+    about: Chat with the community on Slack
