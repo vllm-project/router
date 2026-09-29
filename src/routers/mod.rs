@@ -92,12 +92,13 @@ pub trait RouterTrait: Send + Sync + Debug + WorkerManagement {
         model_id: Option<&str>,
     ) -> Response;
 
-    /// Lossless HTTP ingress for policies that must inspect exact chat fields.
+    /// Original HTTP bytes plus the JSON view used for routing inspection.
     /// Existing routers keep their typed behavior.
     async fn route_chat_raw(
         &self,
         headers: Option<&HeaderMap>,
         _raw: &serde_json::Value,
+        _raw_bytes: &bytes::Bytes,
         body: &ChatCompletionRequest,
         model_id: Option<&str>,
     ) -> Response {
@@ -116,6 +117,7 @@ pub trait RouterTrait: Send + Sync + Debug + WorkerManagement {
         &self,
         headers: Option<&HeaderMap>,
         _raw: &serde_json::Value,
+        _raw_bytes: &bytes::Bytes,
         body: &CompletionRequest,
         model_id: Option<&str>,
     ) -> Response {

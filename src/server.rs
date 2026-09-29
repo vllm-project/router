@@ -20,7 +20,7 @@ use crate::{
     service_discovery::{start_service_discovery, ServiceDiscoveryConfig},
 };
 use axum::{
-    extract::{DefaultBodyLimit, Path, Query, Request, State},
+    extract::{DefaultBodyLimit, FromRequest, Path, Query, Request, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{delete, get, post},
@@ -250,41 +250,95 @@ async fn inference_generate(
         .await
 }
 
+/// Preserve the original HTTP body for the opt-in KV path. Keep both the
+/// configured Bytes limit and Axum's content-type/JSON rejection handling.
+/// Cloning Bytes is reference-counted; the body is not copied per retry.
+async fn kv_generation_ingress<S: Send + Sync>(
+    request: Request,
+    state: &S,
+) -> Result<(bytes::Bytes, serde_json::Value), Response> {
+    let (parts, body) = request.into_parts();
+    let raw_bytes = bytes::Bytes::from_request(Request::from_parts(parts.clone(), body), state)
+        .await
+        .map_err(IntoResponse::into_response)?;
+    let Json(raw) = Json::<serde_json::Value>::from_request(
+        Request::from_parts(parts, axum::body::Body::from(raw_bytes.clone())),
+        state,
+    )
+    .await
+    .map_err(IntoResponse::into_response)?;
+    Ok((raw_bytes, raw))
+}
+
 async fn v1_chat_completions(
     State(state): State<Arc<AppState>>,
-    headers: http::HeaderMap,
-    Json(raw): Json<serde_json::Value>,
+    request: Request,
 ) -> Response {
+    let headers = request.headers().clone();
+    if !matches!(
+        state.context.router_config.policy,
+        crate::config::PolicyConfig::KvAware { .. }
+    ) {
+        // Preserve the upstream typed extractor and its rejection semantics
+        // when KV routing is disabled (including duplicate-field handling).
+        let Json(body) = match Json::<ChatCompletionRequest>::from_request(request, &state).await {
+            Ok(body) => body,
+            Err(rejection) => return rejection.into_response(),
+        };
+        if let Err(response) = authorize_request(&state, &headers).await {
+            return response;
+        }
+        return state.router.route_chat(Some(&headers), &body, None).await;
+    }
+    let (raw_bytes, raw) = match kv_generation_ingress(request, &state).await {
+        Ok(ingress) => ingress,
+        Err(response) => return response,
+    };
     if let Err(response) = authorize_request(&state, &headers).await {
         return response;
     }
-
     let body: ChatCompletionRequest = match serde_json::from_value(raw.clone()) {
         Ok(body) => body,
         Err(error) => return (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
     };
     state
         .router
-        .route_chat_raw(Some(&headers), &raw, &body, None)
+        .route_chat_raw(Some(&headers), &raw, &raw_bytes, &body, None)
         .await
 }
 
 async fn v1_completions(
     State(state): State<Arc<AppState>>,
-    headers: http::HeaderMap,
-    Json(raw): Json<serde_json::Value>,
+    request: Request,
 ) -> Response {
+    let headers = request.headers().clone();
+    if !matches!(
+        state.context.router_config.policy,
+        crate::config::PolicyConfig::KvAware { .. }
+    ) {
+        let Json(body) = match Json::<CompletionRequest>::from_request(request, &state).await {
+            Ok(body) => body,
+            Err(rejection) => return rejection.into_response(),
+        };
+        if let Err(response) = authorize_request(&state, &headers).await {
+            return response;
+        }
+        return state.router.route_completion(Some(&headers), &body, None).await;
+    }
+    let (raw_bytes, raw) = match kv_generation_ingress(request, &state).await {
+        Ok(ingress) => ingress,
+        Err(response) => return response,
+    };
     if let Err(response) = authorize_request(&state, &headers).await {
         return response;
     }
-
     let body: CompletionRequest = match serde_json::from_value(raw.clone()) {
         Ok(body) => body,
         Err(error) => return (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
     };
     state
         .router
-        .route_completion_raw(Some(&headers), &raw, &body, None)
+        .route_completion_raw(Some(&headers), &raw, &raw_bytes, &body, None)
         .await
 }
 
@@ -1224,4 +1278,129 @@ fn create_cors_layer(allowed_origins: Vec<String>) -> tower_http::cors::CorsLaye
     };
 
     cors.max_age(Duration::from_secs(3600))
+}
+
+#[cfg(test)]
+mod kv_ingress_tests {
+    use super::*;
+    use axum::body::{to_bytes, Body};
+    use tower::ServiceExt;
+
+    async fn echo_original(request: Request) -> Response {
+        match kv_generation_ingress(request, &()).await {
+            Ok((bytes, _)) => bytes.into_response(),
+            Err(response) => response,
+        }
+    }
+
+    #[tokio::test]
+    async fn kv_ingress_retains_bytes_and_configured_body_limit() {
+        let app = Router::new()
+            .route("/", post(echo_original))
+            .layer(DefaultBodyLimit::max(3 * 1024 * 1024));
+        // Above Axum's default 2 MiB, below the explicit limit. The replayed
+        // request must keep the original body-limit extension.
+        let original = format!(
+            "{{ \"text\": \"{}\", \"n\":1e0 }}\n",
+            "x".repeat(2 * 1024 * 1024),
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(original.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            to_bytes(response.into_body(), 3 * 1024 * 1024)
+                .await
+                .unwrap()
+                .as_ref(),
+            original.as_bytes(),
+        );
+    }
+
+    #[tokio::test]
+    async fn kv_ingress_does_not_bypass_json_or_size_rejections() {
+        for (body, content_type, limit, expected) in [
+            ("{}", "text/plain", 64, StatusCode::UNSUPPORTED_MEDIA_TYPE),
+            ("{", "application/json", 64, StatusCode::BAD_REQUEST),
+            (
+                r#"{"long":"body"}"#,
+                "application/json",
+                8,
+                StatusCode::PAYLOAD_TOO_LARGE,
+            ),
+        ] {
+            let app = Router::new()
+                .route("/", post(echo_original))
+                .layer(DefaultBodyLimit::max(limit));
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .uri("/")
+                        .method("POST")
+                        .header("content-type", content_type)
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn non_kv_generation_retains_typed_duplicate_field_rejection() {
+        let config = RouterConfig {
+            mode: crate::config::RoutingMode::Regular {
+                worker_urls: vec![],
+            },
+            policy: crate::config::PolicyConfig::RoundRobin,
+            ..RouterConfig::default()
+        };
+        let context = Arc::new(AppContext::new(config, Client::new(), 16, None, vec![]).unwrap());
+        let router: Arc<dyn RouterTrait> =
+            Arc::from(RouterFactory::create_router(&context).await.unwrap());
+        let state = Arc::new(AppState {
+            router,
+            context,
+            concurrency_queue_tx: None,
+            router_manager: None,
+        });
+        let app = Router::new()
+            .route("/v1/completions", post(v1_completions))
+            .route("/v1/chat/completions", post(v1_chat_completions))
+            .with_state(state);
+        for (endpoint, body) in [
+            ("/v1/completions", r#"{"prompt":"first","prompt":"second"}"#),
+            (
+                "/v1/chat/completions",
+                r#"{"messages":[],"stream":false,"stream":true}"#,
+            ),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(endpoint)
+                        .method("POST")
+                        .header("content-type", "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+            let text = to_bytes(response.into_body(), 4096).await.unwrap();
+            assert!(std::str::from_utf8(&text)
+                .unwrap()
+                .contains("duplicate field"));
+        }
+    }
 }

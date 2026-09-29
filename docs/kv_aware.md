@@ -15,7 +15,8 @@ user message. Generation prompting is enabled; `enable_thinking` may be true
 or false. Tools, multimodal content, reasoning history, adapters, cache salt,
 prompt truncation, batched prompts, and unknown input transformations do not
 receive an approximate KV score. They use the policy's non-affinity fallback
-while the original request is forwarded.
+while the original HTTP request bytes are forwarded on the KV path.
+Internal typed calls and non-KV policies retain their existing behavior.
 
 Only complete blocks count. Worker lifecycle changes, publisher discontinuities,
 and cache-clear events invalidate ownership. A retained subscriber runtime is
@@ -28,6 +29,9 @@ purge ownership; a lost final event cannot be detected until a subsequent
 sequence or connection event reveals the discontinuity. Affinity never changes
 the request's inference semantics, and a selected worker may still need to
 recompute an evicted prefix.
+
+Publication-review validation and the original-candidate evidence boundary are
+recorded in [kv_aware_review.md](kv_aware_review.md).
 
 ## Runtime contract
 

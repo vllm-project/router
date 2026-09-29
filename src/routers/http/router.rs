@@ -141,31 +141,6 @@ struct TypedDispatch<'a> {
     prepared: Option<crate::backend::PreparedChat>,
 }
 
-/// Borrow the raw payload for forwarding and typed request for shared routing.
-#[derive(Clone)]
-struct RawGenerationRequest<'a, T> {
-    raw: &'a serde_json::Value,
-    typed: &'a T,
-}
-
-impl<T> serde::Serialize for RawGenerationRequest<'_, T> {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        self.raw.serialize(serializer)
-    }
-}
-
-impl<T: GenerationRequest> GenerationRequest for RawGenerationRequest<'_, T> {
-    fn is_stream(&self) -> bool {
-        self.typed.is_stream()
-    }
-    fn get_model(&self) -> Option<&str> {
-        self.typed.get_model()
-    }
-    fn extract_text_for_routing(&self) -> String {
-        self.typed.extract_text_for_routing()
-    }
-}
-
 #[derive(Debug)]
 struct KvRuntime {
     _pool: crate::kv_events::KVEventPool,
@@ -1152,7 +1127,7 @@ impl Router {
         route: &str,
         model_id: Option<&str>,
     ) -> Response {
-        self.route_request_with_tokens(headers, typed_req, route, model_id, None)
+        self.route_request_with_tokens(headers, typed_req, route, model_id, None, None)
             .await
     }
 
@@ -1163,6 +1138,7 @@ impl Router {
         route: &str,
         model_id: Option<&str>,
         token_ids: Option<Vec<u32>>,
+        raw_bytes: Option<&bytes::Bytes>,
     ) -> Response {
         let start = Instant::now();
         let is_stream = typed_req.is_stream();
@@ -1282,8 +1258,15 @@ impl Router {
                 };
 
                 let response = if self.kv_runtime.is_some() {
-                    self.send_kv_request(headers, typed_req, route, worker.clone(), is_stream)
-                        .await
+                    self.send_kv_request(
+                        headers,
+                        typed_req,
+                        route,
+                        worker.clone(),
+                        is_stream,
+                        raw_bytes,
+                    )
+                    .await
                 } else {
                     self.send_typed_request(
                         typed_req,
@@ -1365,10 +1348,18 @@ impl Router {
         route: &str,
         worker: Arc<dyn Worker>,
         is_stream: bool,
+        raw_bytes: Option<&bytes::Bytes>,
     ) -> Response {
         let lease = KvLoadLease::new(worker.clone());
         let url = format!("{}{}", worker.url().trim_end_matches('/'), route);
-        let mut request = self.client.post(&url).json(body);
+        let request = self.client.post(&url);
+        let mut request = if let Some(raw_bytes) = raw_bytes {
+            request
+                .header(CONTENT_TYPE, "application/json")
+                .body(raw_bytes.clone())
+        } else {
+            request.json(body)
+        };
         if let Some(headers) = headers {
             for (name, value) in headers {
                 if *name != CONTENT_TYPE
@@ -2473,6 +2464,7 @@ impl RouterTrait for Router {
         &self,
         headers: Option<&HeaderMap>,
         raw: &serde_json::Value,
+        raw_bytes: &bytes::Bytes,
         body: &ChatCompletionRequest,
         model_id: Option<&str>,
     ) -> Response {
@@ -2480,9 +2472,15 @@ impl RouterTrait for Router {
             return self.route_chat(headers, body, model_id).await;
         }
         let ids = self.kv_tokens(body.model.as_deref(), |tokenizer| tokenizer.chat_raw(raw));
-        let request = RawGenerationRequest { raw, typed: body };
-        self.route_request_with_tokens(headers, &request, "/v1/chat/completions", model_id, ids)
-            .await
+        self.route_request_with_tokens(
+            headers,
+            body,
+            "/v1/chat/completions",
+            model_id,
+            ids,
+            Some(raw_bytes),
+        )
+        .await
     }
 
     async fn route_completion(
@@ -2494,14 +2492,15 @@ impl RouterTrait for Router {
         let ids = self.kv_tokens(body.model.as_deref(), |tokenizer| {
             tokenizer.completion(body)
         });
-        self.route_request_with_tokens(headers, body, "/v1/completions", model_id, ids)
+        self.route_request_with_tokens(headers, body, "/v1/completions", model_id, ids, None)
             .await
     }
 
     async fn route_completion_raw(
         &self,
         headers: Option<&HeaderMap>,
-        raw: &serde_json::Value,
+        _raw: &serde_json::Value,
+        raw_bytes: &bytes::Bytes,
         body: &CompletionRequest,
         model_id: Option<&str>,
     ) -> Response {
@@ -2511,9 +2510,15 @@ impl RouterTrait for Router {
         let ids = self.kv_tokens(body.model.as_deref(), |tokenizer| {
             tokenizer.completion(body)
         });
-        let request = RawGenerationRequest { raw, typed: body };
-        self.route_request_with_tokens(headers, &request, "/v1/completions", model_id, ids)
-            .await
+        self.route_request_with_tokens(
+            headers,
+            body,
+            "/v1/completions",
+            model_id,
+            ids,
+            Some(raw_bytes),
+        )
+        .await
     }
 
     async fn route_responses(
@@ -2929,34 +2934,6 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
-    #[test]
-    fn kv_raw_payload_preserves_extensions_and_single_token_ids() {
-        let raw = serde_json::json!({"model": "Qwen/Qwen3-0.6B", "prompt": [42, 43],
-            "vendor_extension": {"keep": true}, "stream": false});
-        let typed: CompletionRequest = serde_json::from_value(raw.clone()).unwrap();
-        let forwarded = RawGenerationRequest {
-            raw: &raw,
-            typed: &typed,
-        };
-        assert_eq!(serde_json::to_value(&forwarded).unwrap(), raw);
-        assert!(!forwarded.is_stream());
-    }
-
-    #[test]
-    fn kv_chat_fallback_keeps_reasoning_and_unknown_fields() {
-        let raw = serde_json::json!({"messages": [
-            {"role": "user", "content": "public fixture", "vendor_message": 7},
-            {"role": "assistant", "content": "answer", "reasoning_content": "synthetic reasoning"},
-            {"role": "user", "content": "continue"}], "vendor_request": {"keep": true}});
-        assert!(crate::prompt_tokens::render_qwen3_chat(&raw).is_err());
-        let typed: ChatCompletionRequest = serde_json::from_value(raw.clone()).unwrap();
-        let forwarded = RawGenerationRequest {
-            raw: &raw,
-            typed: &typed,
-        };
-        assert_eq!(serde_json::to_value(forwarded).unwrap(), raw);
-    }
-
     async fn kv_test_server(app: axum::Router) -> (Arc<dyn Worker>, tokio::task::JoinHandle<()>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -2970,6 +2947,51 @@ mod tests {
             )),
             task,
         )
+    }
+
+    #[tokio::test]
+    async fn kv_dispatch_preserves_original_bytes_for_unsupported_chat() {
+        let app = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(|headers: HeaderMap, raw: bytes::Bytes| async move {
+                assert_eq!(headers[CONTENT_TYPE], "application/json");
+                assert_eq!(
+                    headers[CONTENT_LENGTH].to_str().unwrap(),
+                    raw.len().to_string(),
+                );
+                ([(CONTENT_TYPE, "application/json")], raw)
+            }),
+        );
+        let (worker, server) = kv_test_server(app).await;
+        let router = create_test_regular_router();
+        // Order, whitespace, exponent spelling, escaped Unicode and duplicate
+        // extension keys must survive. JSON value equality does not prove that.
+        let original = bytes::Bytes::from_static(br#"{ "vendor": {"z":1e0,"a":"\u4e2d"},
+            "messages": [{"role":"user","content":"public fixture"}],
+            "vendor_repeat": 1, "vendor_repeat": 2 }
+"#);
+        let raw: serde_json::Value = serde_json::from_slice(&original).unwrap();
+        assert!(crate::prompt_tokens::render_qwen3_chat(&raw).is_err());
+        assert_ne!(serde_json::to_vec(&raw).unwrap().as_slice(), original.as_ref());
+        let typed: ChatCompletionRequest = serde_json::from_value(raw).unwrap();
+        let response = tokio::time::timeout(
+            Duration::from_secs(5),
+            router.send_kv_request(
+                None,
+                &typed,
+                "/v1/chat/completions",
+                worker.clone(),
+                false,
+                Some(&original),
+            ),
+        )
+        .await
+        .expect("bounded raw-byte dispatch");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(to_bytes(response.into_body(), 4096).await.unwrap(), original);
+        assert_eq!(worker.load(), 0);
+        server.abort();
+        assert!(server.await.unwrap_err().is_cancelled());
     }
 
     #[tokio::test]
@@ -2987,7 +3009,7 @@ mod tests {
         let router = create_test_regular_router();
         let payload = serde_json::json!({"prompt": [1, 2], "unknown": "preserved"});
         let response = router
-            .send_kv_request(None, &payload, "/ok", worker.clone(), false)
+            .send_kv_request(None, &payload, "/ok", worker.clone(), false, None)
             .await;
         assert_eq!(worker.load(), 0);
         assert_eq!(
@@ -2998,7 +3020,7 @@ mod tests {
             payload
         );
         let response = router
-            .send_kv_request(None, &payload, "/error", worker.clone(), true)
+            .send_kv_request(None, &payload, "/error", worker.clone(), true, None)
             .await;
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(worker.load(), 0);
@@ -3018,11 +3040,11 @@ mod tests {
             }
         }
 
-        let attempts = Arc::new(Mutex::new(Vec::<(&'static str, serde_json::Value)>::new()));
+        let attempts = Arc::new(Mutex::new(Vec::<(&'static str, bytes::Bytes)>::new()));
         let seen0 = attempts.clone();
         let app0 = axum::Router::new().route(
             "/v1/completions",
-            axum::routing::post(move |Json(raw): Json<serde_json::Value>| {
+            axum::routing::post(move |raw: bytes::Bytes| {
                 let seen = seen0.clone();
                 async move {
                     seen.lock().push(("w0", raw));
@@ -3035,11 +3057,11 @@ mod tests {
         let seen1 = attempts.clone();
         let app1 = axum::Router::new().route(
             "/v1/completions",
-            axum::routing::post(move |Json(raw): Json<serde_json::Value>| {
+            axum::routing::post(move |raw: bytes::Bytes| {
                 let seen = seen1.clone();
                 async move {
                     seen.lock().push(("w1", raw.clone()));
-                    Json(raw)
+                    ([(CONTENT_TYPE, "application/json")], raw)
                 }
             }),
         );
@@ -3120,25 +3142,27 @@ mod tests {
         // Explicit null and omitted default fields distinguish lossless raw
         // forwarding from a typed reserialization. All fields remain within
         // the exact Completion profile, so neither attempt may cold-fallback.
-        let raw = serde_json::json!({
-            "model": "Qwen/Qwen3-0.6B", "prompt": token_ids,
-            "suffix": null, "max_tokens": 1, "temperature": 0.0,
-            "add_special_tokens": false, "user": "synthetic retry fixture"
-        });
+        let raw_bytes = bytes::Bytes::from(format!(
+            r#"{{ "user": "synthetic retry fixture", "prompt": {},
+                "model": "Qwen/Qwen3-0.6B", "suffix": null,
+                "max_tokens": 1, "temperature": 0e0, "add_special_tokens": false }}
+"#,
+            serde_json::to_string(&token_ids).unwrap(),
+        ));
+        let raw: serde_json::Value = serde_json::from_slice(&raw_bytes).unwrap();
         let typed: CompletionRequest = serde_json::from_value(raw.clone()).unwrap();
         let response = tokio::time::timeout(
             Duration::from_secs(10),
-            router.route_completion_raw(None, &raw, &typed, None),
+            router.route_completion_raw(None, &raw, &raw_bytes, &typed, None),
         )
         .await
         .expect("bounded two-attempt request");
         assert_eq!(response.status(), StatusCode::OK);
-        let returned: serde_json::Value =
-            serde_json::from_slice(&to_bytes(response.into_body(), 4096).await.unwrap()).unwrap();
-        assert_eq!(returned, raw);
+        let returned = to_bytes(response.into_body(), 4096).await.unwrap();
+        assert_eq!(returned, raw_bytes);
         assert_eq!(
             attempts.lock().as_slice(),
-            &[("w0", raw.clone()), ("w1", raw.clone())]
+            &[("w0", raw_bytes.clone()), ("w1", raw_bytes.clone())]
         );
         assert_eq!([worker0.load(), worker1.load()], initial_loads);
         assert!(
@@ -3191,6 +3215,7 @@ mod tests {
                 "/stream",
                 worker.clone(),
                 true,
+                None,
             )
             .await;
         assert_eq!(worker.load(), 1);
@@ -3223,6 +3248,7 @@ mod tests {
                     "/pending",
                     owned_worker,
                     false,
+                    None,
                 )
                 .await
         });
