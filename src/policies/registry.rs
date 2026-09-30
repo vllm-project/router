@@ -46,6 +46,17 @@ impl PolicyRegistry {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_default_policy_for_test(policy: Arc<dyn LoadBalancingPolicy>) -> Self {
+        Self {
+            model_policies: Arc::new(RwLock::new(HashMap::new())),
+            model_worker_counts: Arc::new(RwLock::new(HashMap::new())),
+            default_policy: policy,
+            prefill_policy: Arc::new(RwLock::new(None)),
+            decode_policy: Arc::new(RwLock::new(None)),
+        }
+    }
+
     /// Called when a worker is added
     /// Returns the policy that should be used for this worker's model
     pub fn on_worker_added(

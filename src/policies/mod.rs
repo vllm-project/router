@@ -32,6 +32,35 @@ pub use round_robin::RoundRobinPolicy;
 /// Key is lowercase header name, value is header value
 pub type RequestHeaders = HashMap<String, String>;
 
+/// Request-scoped inputs shared with routing policies.
+///
+/// Prepared token IDs are borrowed from the preprocessing owner so routing can
+/// reuse them without tokenizing again or cloning the token vector.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PolicyRequestContext<'a> {
+    pub request_text: Option<&'a str>,
+    pub headers: Option<&'a RequestHeaders>,
+    pub token_ids: Option<&'a [u32]>,
+}
+
+impl<'a> PolicyRequestContext<'a> {
+    pub fn new(
+        request_text: Option<&'a str>,
+        headers: Option<&'a RequestHeaders>,
+    ) -> Self {
+        Self {
+            request_text,
+            headers,
+            token_ids: None,
+        }
+    }
+
+    pub fn with_token_ids(mut self, token_ids: &'a [u32]) -> Self {
+        self.token_ids = Some(token_ids);
+        self
+    }
+}
+
 /// Core trait for load balancing policies
 ///
 /// This trait provides a unified interface for implementing routing algorithms
@@ -61,6 +90,15 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
         headers: Option<&RequestHeaders>,
     ) -> Option<usize>;
 
+    /// Select a worker with request-scoped preprocessing context.
+    fn select_worker_with_context(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        context: &PolicyRequestContext<'_>,
+    ) -> Option<usize> {
+        self.select_worker_with_headers(workers, context.request_text, context.headers)
+    }
+
     /// Select a pair of workers (prefill and decode) for PD routing
     ///
     /// Returns indices of (prefill_worker, decode_worker) from their respective arrays.
@@ -86,6 +124,18 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
         let prefill_idx =
             self.select_worker_with_headers(prefill_workers, request_text, headers)?;
         let decode_idx = self.select_worker_with_headers(decode_workers, request_text, headers)?;
+        Some((prefill_idx, decode_idx))
+    }
+
+    /// Select a worker pair with request-scoped preprocessing context.
+    fn select_worker_pair_with_context(
+        &self,
+        prefill_workers: &[Arc<dyn Worker>],
+        decode_workers: &[Arc<dyn Worker>],
+        context: &PolicyRequestContext<'_>,
+    ) -> Option<(usize, usize)> {
+        let prefill_idx = self.select_worker_with_context(prefill_workers, context)?;
+        let decode_idx = self.select_worker_with_context(decode_workers, context)?;
         Some((prefill_idx, decode_idx))
     }
 
@@ -215,5 +265,71 @@ mod tests {
         workers[1].set_healthy(false);
         let indices = get_healthy_worker_indices(&workers);
         assert_eq!(indices, vec![0, 2]);
+    }
+
+    #[derive(Debug)]
+    struct LegacyPolicy {
+        seen: std::sync::Mutex<Option<(String, String)>>,
+    }
+
+    impl LoadBalancingPolicy for LegacyPolicy {
+        fn select_worker_with_headers(
+            &self,
+            _workers: &[Arc<dyn Worker>],
+            request_text: Option<&str>,
+            headers: Option<&RequestHeaders>,
+        ) -> Option<usize> {
+            *self.seen.lock().unwrap() = Some((
+                request_text.unwrap_or_default().to_string(),
+                headers
+                    .and_then(|h| h.get("x-session-id"))
+                    .cloned()
+                    .unwrap_or_default(),
+            ));
+            Some(0)
+        }
+
+        fn name(&self) -> &'static str {
+            "legacy"
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    #[test]
+    fn test_default_context_method_preserves_legacy_text_and_headers() {
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+            "http://w1:8000".to_string(),
+            WorkerType::Regular,
+        ));
+        let workers = vec![worker];
+        let mut headers = RequestHeaders::new();
+        headers.insert("x-session-id".to_string(), "session-123".to_string());
+        let token_ids = [101_u32, 202];
+        let context = PolicyRequestContext::new(Some("hello"), Some(&headers))
+            .with_token_ids(&token_ids);
+        let policy = LegacyPolicy {
+            seen: std::sync::Mutex::new(None),
+        };
+
+        assert_eq!(policy.select_worker_with_context(&workers, &context), Some(0));
+        assert_eq!(
+            *policy.seen.lock().unwrap(),
+            Some(("hello".to_string(), "session-123".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_policy_request_context_borrows_prepared_token_ids() {
+        let token_ids = vec![101_u32, 202, 303];
+        let context =
+            PolicyRequestContext::new(Some("hello"), None).with_token_ids(&token_ids);
+        let borrowed = context.token_ids.expect("token ids should be attached");
+
+        assert_eq!(context.request_text, Some("hello"));
+        assert_eq!(borrowed, token_ids.as_slice());
+        assert_eq!(borrowed.as_ptr(), token_ids.as_ptr());
     }
 }
