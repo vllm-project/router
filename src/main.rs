@@ -248,9 +248,15 @@ struct CliArgs {
     #[arg(long, num_args = 0..)]
     selector: Vec<String>,
 
-    /// Port to use for discovered worker pods
-    #[arg(long, default_value_t = 80)]
-    service_discovery_port: u16,
+    /// Ports to use for discovered worker pods
+    #[arg(
+        long,
+        num_args = 1..,
+        action = clap::ArgAction::Append,
+        default_value = "80",
+        value_parser = clap::value_parser!(u16).range(1..)
+    )]
+    service_discovery_port: Vec<u16>,
 
     /// Kubernetes namespace to watch for pods
     #[arg(long)]
@@ -501,7 +507,8 @@ impl CliArgs {
             Some(DiscoveryConfig {
                 enabled: true,
                 namespace: self.service_discovery_namespace.clone(),
-                port: self.service_discovery_port,
+                port: self.service_discovery_port[0],
+                additional_ports: self.service_discovery_port[1..].to_vec(),
                 check_interval_secs: 60,
                 selector: Self::parse_selector(&self.selector),
                 prefill_selector: Self::parse_selector(&self.prefill_selector),
@@ -607,7 +614,8 @@ impl CliArgs {
                 enabled: true,
                 selector: Self::parse_selector(&self.selector),
                 check_interval: std::time::Duration::from_secs(60),
-                port: self.service_discovery_port,
+                port: self.service_discovery_port[0],
+                additional_ports: self.service_discovery_port[1..].to_vec(),
                 namespace: self.service_discovery_namespace.clone(),
                 // HTTP service discovery only supports the vLLM PD router.
                 pd_mode: self.vllm_pd_disaggregation,
@@ -842,5 +850,35 @@ mod tests {
 
         assert_eq!(prefill, vec![("http://prefill:8000".to_string(), None)]);
         assert_eq!(other, ["vllm-router", "65536"]);
+    }
+
+    #[test]
+    fn service_discovery_accepts_multiple_ports() {
+        for args in [
+            vec!["vllm-router", "--service-discovery-port", "8000", "8001"],
+            vec![
+                "vllm-router",
+                "--service-discovery-port",
+                "8000",
+                "--service-discovery-port",
+                "8001",
+            ],
+        ] {
+            let parsed = CliArgs::try_parse_from(args).unwrap();
+            assert_eq!(parsed.service_discovery_port, vec![8000, 8001]);
+        }
+        assert_eq!(
+            CliArgs::try_parse_from(["vllm-router"])
+                .unwrap()
+                .service_discovery_port,
+            vec![80]
+        );
+        for invalid in ["0", "65536", "invalid"] {
+            assert!(
+                CliArgs::try_parse_from(["vllm-router", "--service-discovery-port", invalid])
+                    .is_err()
+            );
+        }
+        assert!(CliArgs::try_parse_from(["vllm-router", "--service-discovery-port"]).is_err());
     }
 }

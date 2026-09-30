@@ -406,6 +406,14 @@ impl ConfigValidator {
             });
         }
 
+        if discovery.additional_ports.contains(&0) {
+            return Err(ConfigError::InvalidValue {
+                field: "discovery.additional_ports".to_string(),
+                value: format!("{:?}", discovery.additional_ports),
+                reason: "Ports must be > 0".to_string(),
+            });
+        }
+
         if discovery.check_interval_secs == 0 {
             return Err(ConfigError::InvalidValue {
                 field: "discovery.check_interval_secs".to_string(),
@@ -1086,5 +1094,21 @@ mod tests {
 
         let result = ConfigValidator::validate(&config);
         assert!(result.is_ok());
+    }
+    #[test]
+    fn test_service_discovery_rejects_invalid_additional_port() {
+        let discovery = DiscoveryConfig {
+            enabled: true,
+            additional_ports: vec![8001, 0],
+            selector: std::collections::HashMap::from([("app".into(), "vllm".into())]),
+            ..Default::default()
+        };
+        let mode = RoutingMode::Regular {
+            worker_urls: vec![],
+        };
+        assert!(
+            matches!(ConfigValidator::validate_discovery(&discovery, &mode),
+            Err(ConfigError::InvalidValue { field, .. }) if field == "discovery.additional_ports")
+        );
     }
 }
