@@ -99,6 +99,9 @@ pub enum ChatMessage {
         content: String,
         name: String,
     },
+    /// Unknown or model-specific message roles are preserved verbatim so the
+    /// downstream inference backend can validate and interpret them.
+    Other(Value),
 }
 
 impl<'de> Deserialize<'de> for ChatMessage {
@@ -111,8 +114,9 @@ impl<'de> Deserialize<'de> for ChatMessage {
         let value = Value::deserialize(deserializer)?;
         let role = value
             .get("role")
-            .and_then(|r| r.as_str())
-            .ok_or_else(|| D::Error::custom("missing role field"))?;
+            .ok_or_else(|| D::Error::custom("missing role field"))?
+            .as_str()
+            .ok_or_else(|| D::Error::custom("role field must be a string"))?;
 
         match role {
             "assistant" => Ok(ChatMessage::Assistant {
@@ -212,7 +216,7 @@ impl<'de> Deserialize<'de> for ChatMessage {
                     .unwrap_or("")
                     .to_string(),
             }),
-            _ => Err(D::Error::custom(format!("unknown role: {}", role))),
+            _ => Ok(ChatMessage::Other(value)),
         }
     }
 }
@@ -4053,6 +4057,82 @@ mod tests {
             }
             _ => panic!("Expected Function message"),
         }
+    }
+
+    #[test]
+    fn test_chat_message_latest_reminder_roundtrip() {
+        let original = serde_json::json!({
+            "role": "latest_reminder",
+            "content": "Follow the latest instructions.",
+            "model_specific_field": {
+                "priority": 1,
+                "enabled": true
+            }
+        });
+
+        let message: ChatMessage = serde_json::from_value(original.clone()).unwrap();
+        match &message {
+            ChatMessage::Other(value) => assert_eq!(value, &original),
+            _ => panic!("Expected unknown role to use the Other variant"),
+        }
+
+        assert_eq!(serde_json::to_value(message).unwrap(), original);
+    }
+
+    #[test]
+    fn test_chat_message_arbitrary_role_roundtrip() {
+        let original = serde_json::json!({
+            "role": "developer",
+            "content": [
+                {"type": "text", "text": "Model-specific instructions"}
+            ],
+            "future_field": [1, 2, 3]
+        });
+
+        let message: ChatMessage = serde_json::from_value(original.clone()).unwrap();
+        assert!(matches!(message, ChatMessage::Other(_)));
+        assert_eq!(serde_json::to_value(message).unwrap(), original);
+    }
+
+    #[test]
+    fn test_chat_completion_request_preserves_unknown_role_message() {
+        let original = serde_json::json!({
+            "model": "deepseek-model",
+            "messages": [{
+                "role": "latest_reminder",
+                "content": "Remember the latest user request.",
+                "metadata": {"source": "deepseek"}
+            }],
+            "temperature": 0.25,
+            "max_tokens": 128,
+            "stream": true,
+            "model_specific_request_field": {
+                "priority": 1,
+                "enabled": true
+            }
+        });
+
+        let request: ChatCompletionRequest = serde_json::from_value(original.clone()).unwrap();
+        assert!(matches!(&request.messages[0], ChatMessage::Other(_)));
+
+        let serialized = serde_json::to_value(request).unwrap();
+        for (key, expected) in original.as_object().unwrap() {
+            assert_eq!(
+                &serialized[key], expected,
+                "request field `{key}` must survive the round trip"
+            );
+        }
+    }
+
+    #[test]
+    fn test_chat_message_rejects_missing_or_non_string_role() {
+        let missing_role = serde_json::json!({"content": "missing role"});
+        let error = serde_json::from_value::<ChatMessage>(missing_role).unwrap_err();
+        assert!(error.to_string().contains("missing role field"));
+
+        let non_string_role = serde_json::json!({"role": 42, "content": "invalid role"});
+        let error = serde_json::from_value::<ChatMessage>(non_string_role).unwrap_err();
+        assert!(error.to_string().contains("role field must be a string"));
     }
 
     #[test]
