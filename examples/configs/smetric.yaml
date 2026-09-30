@@ -1,0 +1,11 @@
+# Illustrative cost units and TTFT seconds; calibrate for your deployment.
+# L, cache hits, and the TTFT length term use text characters, not token IDs.
+C_LIN: 1.0
+C_ATT: 0.0001
+# Omit PREFILL_RATE to estimate each worker's rate from streamed prefill responses.
+PREFILL_RATE: 10000.0
+SLACK: 1.0
+HIT_RATIO: 0.1
+TTFT_SLO_BASE: 0.2
+TTFT_SLO_PER_CHAR: 0.0001
+MAX_TREE_SIZE: 67108864

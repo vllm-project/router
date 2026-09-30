@@ -5,8 +5,8 @@
 /// All subsequent workers of the same model use the established policy.
 /// When the last worker of a model is removed, the policy mapping is cleaned up.
 use super::{
-    CacheAwareConfig, CacheAwarePolicy, ConsistentHashPolicy, LoadBalancingPolicy,
-    PowerOfTwoPolicy, RandomPolicy, RendezvousHashPolicy, RoundRobinPolicy,
+    CacheAwarePolicy, LoadBalancingPolicy, PowerOfTwoPolicy, RandomPolicy, RendezvousHashPolicy,
+    RoundRobinPolicy,
 };
 use crate::config::types::PolicyConfig;
 use std::collections::HashMap;
@@ -182,29 +182,7 @@ impl PolicyRegistry {
 
     /// Create a policy from a PolicyConfig
     fn create_policy_from_config(config: &PolicyConfig) -> Arc<dyn LoadBalancingPolicy> {
-        match config {
-            PolicyConfig::RoundRobin => Arc::new(RoundRobinPolicy::new()),
-            PolicyConfig::Random => Arc::new(RandomPolicy::new()),
-            PolicyConfig::CacheAware {
-                cache_threshold,
-                balance_abs_threshold,
-                balance_rel_threshold,
-                eviction_interval_secs,
-                max_tree_size,
-            } => {
-                let cache_config = CacheAwareConfig {
-                    cache_threshold: *cache_threshold,
-                    balance_abs_threshold: *balance_abs_threshold,
-                    balance_rel_threshold: *balance_rel_threshold,
-                    eviction_interval_secs: *eviction_interval_secs,
-                    max_tree_size: *max_tree_size,
-                };
-                Arc::new(CacheAwarePolicy::with_config(cache_config))
-            }
-            PolicyConfig::PowerOfTwo { .. } => Arc::new(PowerOfTwoPolicy::new()),
-            PolicyConfig::ConsistentHash { .. } => Arc::new(ConsistentHashPolicy::new()),
-            PolicyConfig::RendezvousHash => Arc::new(RendezvousHashPolicy::new()),
-        }
+        super::PolicyFactory::create_from_config(config)
     }
 
     /// Get current model->policy mappings (for debugging/monitoring)
