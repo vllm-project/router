@@ -183,6 +183,7 @@ impl PolicyRegistry {
     /// Create a policy from a PolicyConfig
     fn create_policy_from_config(config: &PolicyConfig) -> Arc<dyn LoadBalancingPolicy> {
         match config {
+            PolicyConfig::KvAware { config } => Arc::new(super::KvAwarePolicy::new(config)),
             PolicyConfig::RoundRobin => Arc::new(RoundRobinPolicy::new()),
             PolicyConfig::Random => Arc::new(RandomPolicy::new()),
             PolicyConfig::CacheAware {

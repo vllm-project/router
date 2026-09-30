@@ -12,6 +12,8 @@ mod cache_aware;
 mod consistent_hash;
 mod factory;
 pub(crate) mod hash_key;
+mod kv_aware;
+pub use kv_aware::KvAwarePolicy;
 mod power_of_two;
 mod random;
 mod registry;
@@ -60,6 +62,18 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
         request_text: Option<&str>,
         headers: Option<&RequestHeaders>,
     ) -> Option<usize>;
+
+    /// Exact serving token IDs, computed once before retry. Legacy policies
+    /// retain their text/header behavior; no serialized JSON is tokenized here.
+    fn select_worker_with_tokens(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        request_text: Option<&str>,
+        _token_ids: Option<&[u32]>,
+        headers: Option<&RequestHeaders>,
+    ) -> Option<usize> {
+        self.select_worker_with_headers(workers, request_text, headers)
+    }
 
     /// Select a pair of workers (prefill and decode) for PD routing
     ///

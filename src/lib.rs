@@ -6,12 +6,15 @@ use std::collections::HashMap;
 
 pub mod core;
 pub mod data_connector;
+pub mod kv_events;
+pub mod kv_index;
 pub mod metrics;
 pub mod middleware;
 pub mod otel_http;
 pub mod otel_trace;
 pub mod policies;
 pub mod program_scheduling;
+pub mod prompt_tokens;
 pub mod protocols;
 pub mod routers;
 pub mod server;

@@ -1,0 +1,313 @@
+{
+  "schema_version": 1,
+  "mode": "canonical-tokenizer",
+  "model": "Qwen/Qwen3-0.6B",
+  "revision": "c1899de289a04d12100db370d81485cdf75e47ca",
+  "tokenizer_sha256": "aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4",
+  "tokenizer_config_sha256": "d5d09f07b48c3086c508b30d1c9114bd1189145b74e982a265350c923acd8101",
+  "versions": {
+    "transformers": "4.57.6",
+    "tokenizers": "0.22.2",
+    "jinja2": "3.1.6"
+  },
+  "chat": [
+    {
+      "name": "default_thinking",
+      "request": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "Name one primary color."
+          }
+        ]
+      },
+      "rendered": "<|im_start|>user\nName one primary color.<|im_end|>\n<|im_start|>assistant\n",
+      "token_ids": [
+        151644,
+        872,
+        198,
+        675,
+        825,
+        6028,
+        1894,
+        13,
+        151645,
+        198,
+        151644,
+        77091,
+        198
+      ]
+    },
+    {
+      "name": "thinking_disabled",
+      "request": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "What is 2 + 3?"
+          }
+        ],
+        "chat_template_kwargs": {
+          "enable_thinking": false
+        }
+      },
+      "rendered": "<|im_start|>user\nWhat is 2 + 3?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+      "token_ids": [
+        151644,
+        872,
+        198,
+        3838,
+        374,
+        220,
+        17,
+        488,
+        220,
+        18,
+        30,
+        151645,
+        198,
+        151644,
+        77091,
+        198,
+        151667,
+        271,
+        151668,
+        271
+      ]
+    },
+    {
+      "name": "system_and_history",
+      "request": {
+        "messages": [
+          {
+            "role": "system",
+            "content": "Answer briefly."
+          },
+          {
+            "role": "user",
+            "content": "Name a shape."
+          },
+          {
+            "role": "assistant",
+            "content": "Circle."
+          },
+          {
+            "role": "user",
+            "content": "How many sides does a triangle have?"
+          }
+        ],
+        "chat_template_kwargs": {
+          "enable_thinking": true
+        }
+      },
+      "rendered": "<|im_start|>system\nAnswer briefly.<|im_end|>\n<|im_start|>user\nName a shape.<|im_end|>\n<|im_start|>assistant\nCircle.<|im_end|>\n<|im_start|>user\nHow many sides does a triangle have?<|im_end|>\n<|im_start|>assistant\n",
+      "token_ids": [
+        151644,
+        8948,
+        198,
+        16141,
+        26753,
+        13,
+        151645,
+        198,
+        151644,
+        872,
+        198,
+        675,
+        264,
+        6083,
+        13,
+        151645,
+        198,
+        151644,
+        77091,
+        198,
+        25199,
+        13,
+        151645,
+        198,
+        151644,
+        872,
+        198,
+        4340,
+        1657,
+        11067,
+        1558,
+        264,
+        21495,
+        614,
+        30,
+        151645,
+        198,
+        151644,
+        77091,
+        198
+      ]
+    },
+    {
+      "name": "unicode_and_newlines",
+      "request": {
+        "messages": [
+          {
+            "role": "system",
+            "content": "保留换行。"
+          },
+          {
+            "role": "user",
+            "content": "海水为什么是蓝色？\n🙂 café café\n"
+          }
+        ],
+        "chat_template_kwargs": {
+          "enable_thinking": false
+        }
+      },
+      "rendered": "<|im_start|>system\n保留换行。<|im_end|>\n<|im_start|>user\n海水为什么是蓝色？\n🙂 café café\n<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+      "token_ids": [
+        151644,
+        8948,
+        198,
+        104465,
+        71134,
+        22243,
+        1773,
+        151645,
+        198,
+        151644,
+        872,
+        198,
+        110326,
+        100678,
+        20412,
+        105681,
+        94432,
+        145080,
+        51950,
+        51950,
+        198,
+        151645,
+        198,
+        151644,
+        77091,
+        198,
+        151667,
+        271,
+        151668,
+        271
+      ]
+    },
+    {
+      "name": "empty_text_is_preserved",
+      "request": {
+        "messages": [
+          {
+            "role": "system",
+            "content": ""
+          },
+          {
+            "role": "user",
+            "content": ""
+          },
+          {
+            "role": "assistant",
+            "content": "\n\n"
+          },
+          {
+            "role": "user",
+            "content": " "
+          }
+        ]
+      },
+      "rendered": "<|im_start|>system\n<|im_end|>\n<|im_start|>user\n<|im_end|>\n<|im_start|>assistant\n\n\n<|im_end|>\n<|im_start|>user\n <|im_end|>\n<|im_start|>assistant\n",
+      "token_ids": [
+        151644,
+        8948,
+        198,
+        151645,
+        198,
+        151644,
+        872,
+        198,
+        151645,
+        198,
+        151644,
+        77091,
+        1406,
+        151645,
+        198,
+        151644,
+        872,
+        198,
+        220,
+        151645,
+        198,
+        151644,
+        77091,
+        198
+      ]
+    }
+  ],
+  "completion": [
+    {
+      "name": "string_default_special",
+      "request": {
+        "prompt": "A triangle has three sides."
+      },
+      "token_ids": [
+        32,
+        21495,
+        702,
+        2326,
+        11067,
+        13
+      ]
+    },
+    {
+      "name": "string_no_special",
+      "request": {
+        "prompt": "海洋\n🙂 café café",
+        "add_special_tokens": false
+      },
+      "token_ids": [
+        104419,
+        198,
+        145080,
+        51950,
+        51950
+      ]
+    },
+    {
+      "name": "literal_special_tokens",
+      "request": {
+        "prompt": "<|im_start|>user\nHello<|im_end|>\n",
+        "add_special_tokens": true
+      },
+      "token_ids": [
+        151644,
+        872,
+        198,
+        9707,
+        151645,
+        198
+      ]
+    },
+    {
+      "name": "direct_token_ids",
+      "request": {
+        "prompt": [
+          151644,
+          8948,
+          198,
+          42,
+          151645
+        ]
+      },
+      "token_ids": [
+        151644,
+        8948,
+        198,
+        42,
+        151645
+      ]
+    }
+  ]
+}

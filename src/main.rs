@@ -117,8 +117,31 @@ struct CliArgs {
     worker_urls: Vec<String>,
 
     /// Load balancing policy to use
-    #[arg(long, default_value = "cache_aware", value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "consistent_hash", "rendezvous_hash"])]
+    #[arg(long, default_value = "cache_aware", value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "consistent_hash", "rendezvous_hash", "kv_aware"])]
     policy: String,
+
+    /// Local Qwen3 Dense tokenizer.json or directory with model/tokenizer configs.
+    #[arg(long, help_heading = "KV Events")]
+    kv_tokenizer_path: Option<String>,
+    #[arg(long, default_value = "Qwen/Qwen3-0.6B", help_heading = "KV Events")]
+    kv_model: String,
+    /// Required with kv_aware; every worker must use the same algorithm.
+    #[arg(long, value_parser = ["sha256_cbor"], help_heading = "KV Events")]
+    kv_hash_algo: Option<String>,
+    #[arg(long, default_value_t = 16, help_heading = "KV Events")]
+    kv_block_size: usize,
+    /// Must equal the worker PYTHONHASHSEED (decimal).
+    #[arg(long, default_value_t = 0, help_heading = "KV Events")]
+    kv_hash_seed: u32,
+    #[arg(long, default_value = "", help_heading = "KV Events")]
+    kv_events_topic_filter: String,
+    #[arg(long, default_value_t = 5557, help_heading = "KV Events")]
+    kv_events_port: u16,
+    /// Repeat WORKER_HTTP_URL=tcp://HOST:PORT. Overrides the default port.
+    #[arg(long = "kv-events-endpoint", action = ArgAction::Append, help_heading = "KV Events")]
+    kv_events_endpoints: Vec<String>,
+    #[arg(long, default_value_t = 100_000, help_heading = "KV Events")]
+    kv_index_max_entries: usize,
 
     /// Enable Program-level scheduling independently of the request-level
     /// load-balancing policy.
@@ -494,7 +517,46 @@ impl CliArgs {
         };
 
         // Main policy
-        let policy = self.parse_policy(&self.policy);
+        let policy = if self.policy == "kv_aware" {
+            if self.kv_hash_algo.as_deref() != Some("sha256_cbor") || self.backend != Backend::Vllm
+            {
+                return Err(ConfigError::ValidationFailed { reason:
+                    "kv_aware requires --backend vllm --kv-hash-algo sha256_cbor and matching workers".into() });
+            }
+            let mut worker_endpoints = HashMap::new();
+            for entry in &self.kv_events_endpoints {
+                let (worker, endpoint) =
+                    vllm_router_rs::kv_events::parse_endpoint_mapping(entry)
+                        .map_err(|reason| ConfigError::ValidationFailed { reason })?;
+                if worker_endpoints.insert(worker, endpoint).is_some() {
+                    return Err(ConfigError::ValidationFailed {
+                        reason: "duplicate KV worker endpoint mapping".into(),
+                    });
+                }
+            }
+            PolicyConfig::KvAware {
+                config: Box::new(vllm_router_rs::config::KvAwareConfig {
+                    block_size: self.kv_block_size,
+                    hash_seed: self.kv_hash_seed,
+                    tokenizer_path: self.kv_tokenizer_path.clone().unwrap_or_default(),
+                    model: self.kv_model.clone(),
+                    topic: self.kv_events_topic_filter.clone(),
+                    default_port: self.kv_events_port,
+                    worker_endpoints,
+                    index_max_entries: self.kv_index_max_entries,
+                }),
+            }
+        } else {
+            if self.kv_tokenizer_path.is_some()
+                || self.kv_hash_algo.is_some()
+                || !self.kv_events_endpoints.is_empty()
+            {
+                return Err(ConfigError::ValidationFailed {
+                    reason: "KV options require --policy kv_aware".into(),
+                });
+            }
+            self.parse_policy(&self.policy)
+        };
 
         // Service discovery configuration
         let discovery = if self.service_discovery {
@@ -758,6 +820,60 @@ Provide --worker-urls or PD flags as usual.",
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn kv_cli_requires_explicit_hash_contract_and_preserves_endpoint_mapping() {
+        let common = [
+            "vllm-router",
+            "--backend",
+            "vllm",
+            "--policy",
+            "kv_aware",
+            "--worker-urls",
+            "http://worker:8000",
+            "http://worker:8001",
+            "--kv-tokenizer-path",
+            "/local/pinned/tokenizer.json",
+        ];
+        let missing_hash = CliArgs::try_parse_from(common).unwrap();
+        assert!(missing_hash.to_router_config(vec![]).is_err());
+        let mut args = common.to_vec();
+        args.extend([
+            "--kv-hash-algo",
+            "sha256_cbor",
+            "--kv-events-endpoint",
+            "http://worker:8000=tcp://worker:5557",
+            "--kv-events-endpoint",
+            "http://worker:8001=tcp://worker:5558",
+        ]);
+        let parsed = CliArgs::try_parse_from(args)
+            .unwrap()
+            .to_router_config(vec![])
+            .unwrap();
+        parsed.validate().unwrap();
+        let PolicyConfig::KvAware { config } = parsed.policy else {
+            panic!("wrong policy")
+        };
+        assert_eq!(config.worker_endpoints.len(), 2);
+        assert_eq!(
+            config.worker_endpoints["http://worker:8001"],
+            "tcp://worker:5558"
+        );
+        assert_eq!(config.hash_seed, 0);
+    }
+
+    #[test]
+    fn kv_cli_options_cannot_silently_activate_another_policy() {
+        let parsed = CliArgs::try_parse_from([
+            "vllm-router",
+            "--policy",
+            "round_robin",
+            "--kv-hash-algo",
+            "sha256_cbor",
+        ])
+        .unwrap();
+        assert!(parsed.to_router_config(vec![]).is_err());
+    }
 
     #[test]
     fn parses_wasm_middleware_options() {

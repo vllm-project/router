@@ -92,6 +92,19 @@ pub trait RouterTrait: Send + Sync + Debug + WorkerManagement {
         model_id: Option<&str>,
     ) -> Response;
 
+    /// Original HTTP bytes plus the JSON view used for routing inspection.
+    /// Existing routers keep their typed behavior.
+    async fn route_chat_raw(
+        &self,
+        headers: Option<&HeaderMap>,
+        _raw: &serde_json::Value,
+        _raw_bytes: &bytes::Bytes,
+        body: &ChatCompletionRequest,
+        model_id: Option<&str>,
+    ) -> Response {
+        self.route_chat(headers, body, model_id).await
+    }
+
     /// Route a completion request
     async fn route_completion(
         &self,
@@ -99,6 +112,17 @@ pub trait RouterTrait: Send + Sync + Debug + WorkerManagement {
         body: &CompletionRequest,
         model_id: Option<&str>,
     ) -> Response;
+
+    async fn route_completion_raw(
+        &self,
+        headers: Option<&HeaderMap>,
+        _raw: &serde_json::Value,
+        _raw_bytes: &bytes::Bytes,
+        body: &CompletionRequest,
+        model_id: Option<&str>,
+    ) -> Response {
+        self.route_completion(headers, body, model_id).await
+    }
 
     /// Route a responses request
     async fn route_responses(

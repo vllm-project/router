@@ -641,6 +641,9 @@ impl RoutingMode {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum PolicyConfig {
+    /// Real-event routing for static HTTP, Normal Dense, DP=1 workers.
+    #[serde(rename = "kv_aware")]
+    KvAware { config: Box<super::KvAwareConfig> },
     #[serde(rename = "random")]
     Random,
 
@@ -680,6 +683,7 @@ pub enum PolicyConfig {
 impl PolicyConfig {
     pub fn name(&self) -> &'static str {
         match self {
+            PolicyConfig::KvAware { .. } => "kv_aware",
             PolicyConfig::Random => "random",
             PolicyConfig::RoundRobin => "round_robin",
             PolicyConfig::CacheAware { .. } => "cache_aware",

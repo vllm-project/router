@@ -14,6 +14,7 @@ impl PolicyFactory {
     /// Create a policy from configuration
     pub fn create_from_config(config: &PolicyConfig) -> Arc<dyn LoadBalancingPolicy> {
         match config {
+            PolicyConfig::KvAware { config } => Arc::new(super::KvAwarePolicy::new(config)),
             PolicyConfig::Random => Arc::new(RandomPolicy::new()),
             PolicyConfig::RoundRobin => Arc::new(RoundRobinPolicy::new()),
             PolicyConfig::PowerOfTwo { .. } => Arc::new(PowerOfTwoPolicy::new()),

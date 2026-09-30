@@ -1,4 +1,6 @@
+mod kv_aware;
 pub mod types;
+pub use kv_aware::KvAwareConfig;
 pub mod validation;
 
 pub use types::*;

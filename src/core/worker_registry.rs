@@ -6,7 +6,7 @@ use crate::core::{ConnectionMode, Worker, WorkerType};
 use dashmap::DashMap;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
-    Arc, RwLock,
+    Arc, RwLock, Weak,
 };
 use uuid::Uuid;
 
@@ -63,6 +63,8 @@ pub struct WorkerRegistry {
 
     /// Monotonic topology and availability revision for read-side caches.
     revision: Arc<AtomicU64>,
+    /// Opt-in lifecycle fence; absent for every existing routing policy.
+    kv_index: Arc<RwLock<Option<Weak<crate::kv_index::KVBlockIndex>>>>,
 }
 
 impl WorkerRegistry {
@@ -76,6 +78,7 @@ impl WorkerRegistry {
             connection_workers: Arc::new(DashMap::new()),
             url_to_id: Arc::new(DashMap::new()),
             revision: Arc::new(AtomicU64::new(0)),
+            kv_index: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -88,8 +91,15 @@ impl WorkerRegistry {
             WorkerId::new()
         };
 
-        // Store worker
-        self.workers.insert(worker_id.clone(), worker.clone());
+        // A replacement must fence the old subscriber while holding the same
+        // map shard lock used by post-probe health updates. Otherwise an old
+        // probe can reactivate ownership between retirement and replacement.
+        if let Some(mut current) = self.workers.get_mut(&worker_id) {
+            self.retire_kv_worker(worker.url());
+            *current = worker.clone();
+        } else {
+            self.workers.insert(worker_id.clone(), worker.clone());
+        }
 
         // Update URL mapping
         self.url_to_id
@@ -130,6 +140,7 @@ impl WorkerRegistry {
     /// Remove a worker by ID
     pub fn remove(&self, worker_id: &WorkerId) -> Option<Arc<dyn Worker>> {
         if let Some((_, worker)) = self.workers.remove(worker_id) {
+            self.retire_kv_worker(worker.url());
             // Remove from URL mapping
             self.url_to_id.remove(worker.url());
 
@@ -225,6 +236,36 @@ impl WorkerRegistry {
     /// Invalidate target caches after topology or availability changes.
     pub fn notify_worker_state_change(&self) {
         self.revision.fetch_add(1, Ordering::AcqRel);
+    }
+
+    pub(crate) fn bind_kv_index(&self, index: &Arc<crate::kv_index::KVBlockIndex>) {
+        *self.kv_index.write().unwrap() = Some(Arc::downgrade(index));
+    }
+
+    pub(crate) fn retire_kv_worker(&self, url: &str) {
+        if let Some(index) = self
+            .kv_index
+            .read()
+            .unwrap()
+            .as_ref()
+            .and_then(Weak::upgrade)
+        {
+            index.retire_worker(url);
+        }
+    }
+
+    pub(crate) fn resume_kv_worker(&self, worker: &Arc<dyn Worker>) {
+        if let Some(index) = self
+            .kv_index
+            .read()
+            .unwrap()
+            .as_ref()
+            .and_then(Weak::upgrade)
+        {
+            if let Some(id) = self.url_to_id.get(worker.url()) {
+                update_kv_health(&self.workers, &id, worker, &index, worker.is_available());
+            }
+        }
     }
 
     /// Get all workers by worker type
@@ -390,6 +431,7 @@ impl WorkerRegistry {
         let shutdown_clone = shutdown.clone();
         let workers_ref = self.workers.clone();
         let revision = self.revision.clone();
+        let kv_index = self.kv_index.clone();
 
         let handle = tokio::spawn(async move {
             let mut interval =
@@ -409,15 +451,27 @@ impl WorkerRegistry {
                 }
 
                 // Get all workers from registry
-                let workers: Vec<Arc<dyn crate::core::Worker>> = workers_ref
+                let workers: Vec<(WorkerId, Arc<dyn crate::core::Worker>)> = workers_ref
                     .iter()
-                    .map(|entry| entry.value().clone())
+                    .map(|entry| (entry.key().clone(), entry.value().clone()))
                     .collect();
 
                 // Perform health checks
-                for worker in &workers {
+                for (id, worker) in &workers {
                     let was_available = worker.is_available();
-                    let _ = worker.check_health_async().await; // Use async version directly
+                    let health_result = worker.check_health_async().await;
+                    if let Some(index) = kv_index.read().unwrap().as_ref().and_then(Weak::upgrade) {
+                        // Purge on even the first failed probe. Recovery starts
+                        // a new subscription, so no pre-failure queued events
+                        // can restore ownership on the recovered worker.
+                        update_kv_health(
+                            &workers_ref,
+                            id,
+                            worker,
+                            &index,
+                            health_result.is_ok() && worker.is_available(),
+                        );
+                    }
                     if was_available != worker.is_available() {
                         revision.fetch_add(1, Ordering::AcqRel);
                     }
@@ -426,15 +480,48 @@ impl WorkerRegistry {
                 // Reset loads periodically
                 check_count += 1;
                 if check_count.is_multiple_of(LOAD_RESET_INTERVAL) {
-                    tracing::debug!("Resetting worker loads (cycle {})", check_count);
-                    for worker in &workers {
-                        worker.reset_load();
-                    }
+                    reset_legacy_worker_loads(&workers, &kv_index);
                 }
             }
         });
 
         crate::core::HealthChecker::new(handle, shutdown)
+    }
+}
+
+fn reset_legacy_worker_loads(
+    workers: &[(WorkerId, Arc<dyn Worker>)],
+    kv_index: &RwLock<Option<Weak<crate::kv_index::KVBlockIndex>>>,
+) {
+    // Keep the binding lock until the reset finishes, including at startup.
+    // Balanced KV leases must never have their in-flight counts zeroed.
+    let binding = kv_index.read().unwrap();
+    if binding.is_none() {
+        for (_, worker) in workers {
+            worker.reset_load();
+        }
+    }
+}
+
+fn update_kv_health(
+    workers: &DashMap<WorkerId, Arc<dyn Worker>>,
+    id: &WorkerId,
+    probed: &Arc<dyn Worker>,
+    index: &crate::kv_index::KVBlockIndex,
+    healthy: bool,
+) {
+    let Some(current) = workers.get(id) else {
+        return;
+    };
+    if !Arc::ptr_eq(current.value(), probed) {
+        return;
+    }
+    // Keep the map read guard until the index update finishes. Removal and
+    // replacement acquire its write lock before retiring the generation.
+    if !healthy {
+        index.retire_worker(probed.url());
+    } else if index.current_generation(probed.url()).is_none() {
+        index.begin_worker(probed.url());
     }
 }
 
@@ -461,6 +548,77 @@ mod tests {
     use super::*;
     use crate::core::{CircuitBreakerConfig, WorkerFactory};
     use std::collections::HashMap;
+
+    fn kv_test_worker() -> Arc<dyn Worker> {
+        Arc::from(WorkerFactory::create_regular_with_labels(
+            "http://worker:8000".to_string(),
+            HashMap::new(),
+            CircuitBreakerConfig::default(),
+        ))
+    }
+
+    #[test]
+    fn late_health_success_does_not_reactivate_removed_worker() {
+        let registry = WorkerRegistry::new();
+        let index = Arc::new(crate::kv_index::KVBlockIndex::new(8));
+        registry.bind_kv_index(&index);
+        let worker = kv_test_worker();
+        let id = registry.register(worker.clone());
+        let generation = index.begin_worker(worker.url());
+        index.store(worker.url(), generation, &[[1; 32]]);
+        registry.remove(&id);
+        update_kv_health(&registry.workers, &id, &worker, &index, true);
+        registry.resume_kv_worker(&worker);
+        assert_eq!(index.current_generation(worker.url()), None);
+        assert_eq!(index.ownership_count(), 0);
+    }
+
+    #[test]
+    fn replacement_fences_old_events_and_old_health_probe() {
+        let registry = WorkerRegistry::new();
+        let index = Arc::new(crate::kv_index::KVBlockIndex::new(8));
+        registry.bind_kv_index(&index);
+        let old = kv_test_worker();
+        let id = registry.register(old.clone());
+        let generation = index.begin_worker(old.url());
+        index.store(old.url(), generation, &[[1; 32]]);
+        let current = kv_test_worker();
+        assert_eq!(registry.register(current.clone()), id);
+        update_kv_health(&registry.workers, &id, &old, &index, true);
+        registry.resume_kv_worker(&old);
+        assert_eq!(index.current_generation(old.url()), None);
+        assert!(!index.store(old.url(), generation, &[[1; 32]]));
+        registry.resume_kv_worker(&current);
+        assert!(index.current_generation(current.url()).is_some());
+        assert_eq!(index.ownership_count(), 0);
+    }
+
+    #[test]
+    fn kv_health_recovery_preserves_live_load_leases() {
+        let registry = WorkerRegistry::new();
+        let index = Arc::new(crate::kv_index::KVBlockIndex::new(8));
+        registry.bind_kv_index(&index);
+        let worker = kv_test_worker();
+        let id = registry.register(worker.clone());
+        worker.increment_load();
+        worker.increment_load();
+        update_kv_health(&registry.workers, &id, &worker, &index, false);
+        update_kv_health(&registry.workers, &id, &worker, &index, true);
+        reset_legacy_worker_loads(&[(id, worker.clone())], &registry.kv_index);
+        assert_eq!(worker.load(), 2);
+        worker.decrement_load();
+        assert_eq!(worker.load(), 1);
+    }
+
+    #[test]
+    fn legacy_health_load_reset_still_applies_without_kv_binding() {
+        let registry = WorkerRegistry::new();
+        let worker = kv_test_worker();
+        let id = registry.register(worker.clone());
+        worker.increment_load();
+        reset_legacy_worker_loads(&[(id, worker.clone())], &registry.kv_index);
+        assert_eq!(worker.load(), 0);
+    }
 
     #[test]
     fn test_worker_registry() {

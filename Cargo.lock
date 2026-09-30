@@ -7446,6 +7446,7 @@ dependencies = [
  "regex",
  "reqwest 0.13.5",
  "rmp-serde",
+ "rmpv",
  "rustls",
  "serde",
  "serde_json",

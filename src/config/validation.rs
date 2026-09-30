@@ -278,6 +278,17 @@ impl ConfigValidator {
     /// Validate policy configuration
     fn validate_policy(policy: &PolicyConfig) -> ConfigResult<()> {
         match policy {
+            PolicyConfig::KvAware { config } => {
+                if config.block_size == 0
+                    || config.index_max_entries == 0
+                    || config.default_port == 0
+                    || config.tokenizer_path.trim().is_empty()
+                    || config.model.trim().is_empty()
+                {
+                    return Err(ConfigError::ValidationFailed { reason:
+                        "kv_aware requires positive block size/index capacity/port, a local Qwen3 Dense tokenizer profile and a served model alias".into() });
+                }
+            }
             PolicyConfig::Random | PolicyConfig::RoundRobin => {
                 // No specific validation needed
             }
@@ -538,6 +549,47 @@ impl ConfigValidator {
 
     /// Validate compatibility between different configuration sections
     fn validate_compatibility(config: &RouterConfig) -> ConfigResult<()> {
+        // Check before the IGW early return; nested PD policies are also gated.
+        if let RoutingMode::VllmPrefillDecode {
+            prefill_policy,
+            decode_policy,
+            ..
+        } = &config.mode
+        {
+            if prefill_policy
+                .iter()
+                .chain(decode_policy.iter())
+                .any(|p| matches!(p, PolicyConfig::KvAware { .. }))
+            {
+                return Err(ConfigError::IncompatibleConfig {
+                    reason: "kv_aware requires static Regular HTTP workers with DP=1".into(),
+                });
+            }
+        }
+        if let PolicyConfig::KvAware { config: kv } = &config.policy {
+            let RoutingMode::Regular { worker_urls } = &config.mode else {
+                return Err(ConfigError::IncompatibleConfig {
+                    reason: "kv_aware requires static Regular HTTP workers with DP=1".into(),
+                });
+            };
+            if config.enable_igw
+                || config.has_service_discovery()
+                || config.intra_node_data_parallel_size != 1
+                || config.connection_mode != ConnectionMode::Http
+                || config.program_scheduling.is_some()
+                || worker_urls.is_empty()
+            {
+                return Err(ConfigError::IncompatibleConfig { reason:
+                    "kv_aware requires a static Regular HTTP pool, DP=1, with IGW, discovery and Program scheduling disabled".into() });
+            }
+            let mappings: Vec<_> = kv
+                .worker_endpoints
+                .iter()
+                .map(|(w, e)| (w.clone(), e.clone()))
+                .collect();
+            crate::kv_events::resolve_endpoints(worker_urls, &mappings, kv.default_port)
+                .map_err(|reason| ConfigError::ValidationFailed { reason })?;
+        }
         if config.program_scheduling.is_some()
             && !matches!(config.mode, RoutingMode::Regular { .. })
         {
@@ -697,6 +749,66 @@ impl ConfigValidator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn static_kv_config() -> RouterConfig {
+        let mut kv = KvAwareConfig {
+            tokenizer_path: "/local/pinned/tokenizer.json".into(),
+            ..KvAwareConfig::default()
+        };
+        kv.worker_endpoints
+            .insert("http://worker:8000".into(), "tcp://worker:5557".into());
+        kv.worker_endpoints
+            .insert("http://worker:8001".into(), "tcp://worker:5558".into());
+        RouterConfig::new(
+            RoutingMode::Regular {
+                worker_urls: vec!["http://worker:8000".into(), "http://worker:8001".into()],
+            },
+            PolicyConfig::KvAware {
+                config: Box::new(kv),
+            },
+        )
+    }
+
+    #[test]
+    fn kv_requires_static_regular_dp_one_and_distinct_publishers() {
+        let config = static_kv_config();
+        assert!(ConfigValidator::validate(&config).is_ok());
+        let mut dp = config.clone();
+        dp.intra_node_data_parallel_size = 2;
+        assert!(ConfigValidator::validate(&dp).is_err());
+        let mut igw = config.clone();
+        igw.enable_igw = true;
+        assert!(ConfigValidator::validate(&igw).is_err());
+        let mut grpc = config.clone();
+        grpc.connection_mode = ConnectionMode::Grpc;
+        assert!(ConfigValidator::validate(&grpc).is_err());
+        let mut programs = config.clone();
+        programs.program_scheduling = Some(ProgramSchedulingConfig::default());
+        assert!(ConfigValidator::validate(&programs).is_err());
+        let mut ambiguous = config;
+        if let PolicyConfig::KvAware { config } = &mut ambiguous.policy {
+            config.worker_endpoints.clear();
+        }
+        // Both HTTP workers share a host: the legacy single-port fallback
+        // cannot distinguish their publisher ownership.
+        assert!(ConfigValidator::validate(&ambiguous).is_err());
+    }
+
+    #[test]
+    fn kv_nested_pd_policy_is_rejected_even_with_igw() {
+        let mut config = static_kv_config();
+        let kv = config.policy.clone();
+        config.policy = PolicyConfig::RoundRobin;
+        config.mode = RoutingMode::VllmPrefillDecode {
+            prefill_urls: vec![("http://prefill:8000".into(), None)],
+            decode_urls: vec!["http://decode:8000".into()],
+            prefill_policy: Some(kv),
+            decode_policy: None,
+            discovery_address: None,
+        };
+        config.enable_igw = true;
+        assert!(ConfigValidator::validate(&config).is_err());
+    }
 
     #[test]
     fn test_validate_program_scheduling_boundaries() {
