@@ -421,11 +421,15 @@ fn user_content_text(content: &UserMessageContent) -> Result<String> {
         UserMessageContent::Parts(parts) => {
             let mut text = String::new();
             for part in parts {
-                match part {
-                    crate::protocols::spec::ContentPart::Text { text: part } => {
-                        text.push_str(part);
+                match part.get("type").and_then(serde_json::Value::as_str) {
+                    Some("text") => {
+                        if let Some(part_text) =
+                            part.get("text").and_then(serde_json::Value::as_str)
+                        {
+                            text.push_str(part_text);
+                        }
                     }
-                    crate::protocols::spec::ContentPart::ImageUrl { .. } => {
+                    _ => {
                         return Err(anyhow!(
                             "multimodal chat is not supported by the token_ids-only gRPC path"
                         ));
@@ -442,6 +446,29 @@ mod tests {
     use super::*;
     use std::path::{Path, PathBuf};
     use std::process::Command;
+
+    #[test]
+    fn test_user_content_text_concatenates_text_parts() {
+        let content = UserMessageContent::Parts(vec![
+            serde_json::json!({"type": "text", "text": "hello "}),
+            serde_json::json!({"type": "text", "text": "world"}),
+        ]);
+        assert_eq!(user_content_text(&content).unwrap(), "hello world");
+    }
+
+    #[test]
+    fn test_user_content_text_rejects_non_text_parts() {
+        for part in [
+            serde_json::json!({"type": "audio_url", "audio_url": {"url": "data:audio/wav;base64,AAAA"}}),
+            serde_json::json!({"type": "input_audio", "input_audio": {"data": "AAAA", "format": "wav"}}),
+            serde_json::json!({"type": "video_url", "video_url": {"url": "https://example.com/clip.mp4"}}),
+            serde_json::json!({"type": "image_url", "image_url": {"url": "https://example.com/img.png"}}),
+        ] {
+            let content = UserMessageContent::Parts(vec![part]);
+            let err = user_content_text(&content).unwrap_err();
+            assert!(err.to_string().contains("multimodal chat is not supported"));
+        }
+    }
 
     fn model_dir() -> Option<String> {
         let dir = std::env::var("VLLM_ROUTER_MODEL")
