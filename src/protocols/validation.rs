@@ -14,7 +14,7 @@ pub mod constants {
     /// Temperature range: 0.0 to 2.0 (OpenAI spec)
     pub const TEMPERATURE_RANGE: (f32, f32) = (0.0, 2.0);
 
-    /// Top-p range: 0.0 to 1.0 (exclusive of 0.0)
+    /// Numeric bounds for top-p; validation rejects `0.0` separately.
     pub const TOP_P_RANGE: (f32, f32) = (0.0, 1.0);
 
     /// Presence penalty range: -2.0 to 2.0 (OpenAI spec)
@@ -230,8 +230,17 @@ pub mod utils {
             validate_range(temp, &constants::TEMPERATURE_RANGE, "temperature")?;
         }
 
-        // Validate top_p (0.0 to 1.0)
+        // Validate top_p (0.0, 1.0]
         if let Some(top_p) = request.get_top_p() {
+            if top_p <= constants::TOP_P_RANGE.0 {
+                return Err(ValidationError::OutOfRange {
+                    parameter: "top_p".to_string(),
+                    value: top_p.to_string(),
+                    min: constants::TOP_P_RANGE.0.to_string(),
+                    max: constants::TOP_P_RANGE.1.to_string(),
+                });
+            }
+            // Check the inclusive upper bound and reject NaN.
             validate_range(top_p, &constants::TOP_P_RANGE, "top_p")?;
         }
 
@@ -987,10 +996,16 @@ mod tests {
             request.temperature = Some(3.0);
             assert!(request.validate().is_err());
 
-            // Test top_p range (0.0 to 1.0)
+            // Test top_p range (0.0, 1.0]
             request.temperature = Some(1.0); // Reset
             request.top_p = Some(0.9);
             assert!(request.validate().is_ok());
+            request.top_p = Some(1.0);
+            assert!(request.validate().is_ok());
+            request.top_p = Some(f32::EPSILON);
+            assert!(request.validate().is_ok());
+            request.top_p = Some(0.0);
+            assert!(request.validate().is_err());
             request.top_p = Some(-0.1);
             assert!(request.validate().is_err());
             request.top_p = Some(1.5);
