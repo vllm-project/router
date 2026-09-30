@@ -264,7 +264,12 @@ pub struct StructuredOutputsParams {
 #[serde(untagged)]
 pub enum UserMessageContent {
     Text(String),
-    Parts(Vec<ContentPart>),
+    /// Content parts are kept as raw JSON so that every part type vLLM
+    /// understands (`text`, `image_url`, `audio_url`, `input_audio`,
+    /// `video_url`, ...) is forwarded verbatim. Typing only a subset made an
+    /// unknown part type fail the whole `Parts` deserialization, which the
+    /// `ChatMessage` deserializer then turned into empty text (see #322).
+    Parts(Vec<Value>),
 }
 
 impl UserMessageContent {
@@ -275,29 +280,11 @@ impl UserMessageContent {
             Self::Text(_) => Vec::new(),
             Self::Parts(parts) => parts
                 .iter()
-                .filter_map(|part| match part {
-                    ContentPart::Text { text } if !text.trim().is_empty() => Some(text.as_str()),
-                    _ => None,
-                })
+                .filter_map(|part| part.get("text").and_then(Value::as_str))
+                .filter(|text| !text.trim().is_empty())
                 .collect(),
         }
     }
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(tag = "type")]
-pub enum ContentPart {
-    #[serde(rename = "text")]
-    Text { text: String },
-    #[serde(rename = "image_url")]
-    ImageUrl { image_url: ImageUrl },
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct ImageUrl {
-    pub url: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub detail: Option<String>, // "auto", "low", or "high"
 }
 
 // ============= Response Format Types =============
@@ -3889,6 +3876,33 @@ mod tests {
         let message: ChatMessage = serde_json::from_value(json.clone()).unwrap();
 
         assert_eq!(serde_json::to_value(message).unwrap(), json);
+    }
+
+    #[test]
+    fn test_chat_message_user_multimodal_parts_are_preserved() {
+        let json = serde_json::json!({
+            "role": "user",
+            "content": [
+                {"type": "audio_url", "audio_url": {"url": "data:audio/wav;base64,AAAA"}},
+                {"type": "text", "text": "Return W0_TANGERINE_4931"}
+            ]
+        });
+
+        let message: ChatMessage = serde_json::from_value(json.clone()).unwrap();
+
+        // Parts pass through verbatim instead of collapsing to empty text (#322).
+        assert_eq!(serde_json::to_value(&message).unwrap(), json);
+
+        // Only the text part contributes to prefix-aware routing.
+        let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "test-model",
+            "messages": [json]
+        }))
+        .unwrap();
+        assert_eq!(
+            request.extract_text_for_program_scheduling(),
+            "user:Return W0_TANGERINE_4931"
+        );
     }
 
     #[test]

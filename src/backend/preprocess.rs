@@ -421,11 +421,16 @@ fn user_content_text(content: &UserMessageContent) -> Result<String> {
         UserMessageContent::Parts(parts) => {
             let mut text = String::new();
             for part in parts {
-                match part {
-                    crate::protocols::spec::ContentPart::Text { text: part } => {
-                        text.push_str(part);
+                match part.get("type").and_then(serde_json::Value::as_str) {
+                    Some("text") => {
+                        if let Some(part_text) =
+                            part.get("text").and_then(serde_json::Value::as_str)
+                        {
+                            text.push_str(part_text);
+                        }
                     }
-                    crate::protocols::spec::ContentPart::ImageUrl { .. } => {
+                    // The token_ids-only gRPC path cannot carry non-text parts.
+                    _ => {
                         return Err(anyhow!(
                             "multimodal chat is not supported by the token_ids-only gRPC path"
                         ));
