@@ -86,6 +86,7 @@ impl MockWorker {
                 post(responses_cancel_handler),
             )
             .route("/flush_cache", post(flush_cache_handler))
+            .route("/load", get(load_handler))
             .route("/v1/models", get(v1_models_handler))
             .with_state(config);
 
@@ -680,6 +681,26 @@ async fn flush_cache_handler(State(config): State<Arc<RwLock<MockWorkerConfig>>>
 
     Json(json!({
         "message": "Cache flushed successfully"
+    }))
+    .into_response()
+}
+
+// Mimics vLLM's GET /load endpoint returning {"server_load": N}
+async fn load_handler(State(config): State<Arc<RwLock<MockWorkerConfig>>>) -> Response {
+    let config = config.read().await;
+
+    if should_fail(&config).await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "error": "Random failure for testing"
+            })),
+        )
+            .into_response();
+    }
+
+    Json(json!({
+        "server_load": 0
     }))
     .into_response()
 }

@@ -9,7 +9,7 @@ import requests
 @pytest.mark.integration
 def test_power_of_two_prefers_less_loaded(mock_workers, router_manager):
     # Start two workers: one slow (higher inflight), one fast
-    # Router monitors /get_load and Power-of-Two uses cached loads to choose
+    # Router monitors /load (server_load) and Power-of-Two uses cached loads to choose
     # Start one slow and one fast worker using the fixture factory
     procs_slow, urls_slow, ids_slow = mock_workers(n=1, args=["--latency-ms", "200"])
     procs_fast, urls_fast, ids_fast = mock_workers(n=1, args=["--latency-ms", "0"])
