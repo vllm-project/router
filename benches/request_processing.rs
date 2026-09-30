@@ -233,6 +233,22 @@ fn create_large_chat_completion_request() -> ChatCompletionRequest {
     }
 }
 
+/// A `/v1/completions` request with a ~1 MiB CJK text prompt.
+///
+/// `PromptInput` is an untagged enum; before #310 the sequence variants were
+/// tried before `String`, so this request paid for formatting the whole prompt
+/// into discarded errors on every parse.
+fn create_large_completion_request() -> CompletionRequest {
+    let bytes = 1usize << 20;
+    let prompt = "汉".repeat(bytes / "汉".len());
+    CompletionRequest {
+        model: Some("benchmark-model".to_string()),
+        prompt: PromptInput::String(prompt),
+        max_tokens: Some(16),
+        ..default_completion_request()
+    }
+}
+
 // Benchmark JSON serialization
 fn bench_json_serialization(c: &mut Criterion) {
     let mut group = c.benchmark_group("json_serialization");
@@ -288,6 +304,7 @@ fn bench_json_deserialization(c: &mut Criterion) {
     let chat_json = to_string(&create_sample_chat_completion_request()).unwrap();
     let completion_json = to_string(&create_sample_completion_request()).unwrap();
     let large_chat_json = to_string(&create_large_chat_completion_request()).unwrap();
+    let large_completion_json = to_string(&create_large_completion_request()).unwrap();
 
     group.bench_function("generate_request", |b| {
         b.iter(|| {
@@ -313,6 +330,13 @@ fn bench_json_deserialization(c: &mut Criterion) {
     group.bench_function("large_chat_completion_request", |b| {
         b.iter(|| {
             let req: ChatCompletionRequest = from_str(black_box(&large_chat_json)).unwrap();
+            black_box(req);
+        });
+    });
+
+    group.bench_function("large_completion_request", |b| {
+        b.iter(|| {
+            let req: CompletionRequest = from_str(black_box(&large_completion_json)).unwrap();
             black_box(req);
         });
     });

@@ -2489,15 +2489,20 @@ impl StringOrArray {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(untagged)]
 pub enum PromptInput {
+    /// Single string: str
+    ///
+    /// Kept first because a JSON string can only match this variant. With
+    /// `untagged`, serde tries variants in order and formats the whole prompt
+    /// into a discarded error for every failed sequence attempt, which dominated
+    /// parsing latency for long prompts (#310).
+    String(String),
     /// Batch of token ID sequences: list[list[int]]
-    /// This must come first due to serde untagged matching order
+    /// Must come before the other sequence variants due to serde untagged matching order
     IntBatch(Vec<Vec<i32>>),
     /// Array of strings: list[str]
     StringArray(Vec<String>),
     /// Single token ID sequence: list[int]
     IntArray(Vec<i32>),
-    /// Single string: str
-    String(String),
 }
 
 impl PromptInput {
