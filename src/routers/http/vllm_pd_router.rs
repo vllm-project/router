@@ -9,7 +9,7 @@ use crate::config::KvConnector;
 use crate::core::{BasicWorker, Worker, WorkerType};
 use crate::metrics::RouterMetrics;
 use crate::otel_http::{self, ClientRequestOptions};
-use crate::policies::PolicyRegistry;
+use crate::policies::{CacheAwarePolicy, LoadBalancingPolicy, PolicyRegistry};
 use crate::routers::{header_utils, RouterTrait, WorkerManagement};
 use async_trait::async_trait;
 use axum::{
@@ -18,10 +18,12 @@ use axum::{
     http::{HeaderMap, Method, StatusCode},
     response::{IntoResponse, Response},
 };
+use futures_util::{Stream, StreamExt};
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex as StdMutex, RwLock};
 use std::time::Instant;
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
@@ -63,6 +65,221 @@ pub struct VllmPDRouter {
     mooncake_prefill_info: Arc<Mutex<HashMap<String, MooncakePrefillInfo>>>,
     /// NIXL push identity per prefill base_url and dp_rank; never held across an await.
     nixl_prefill_info: RwLock<HashMap<String, HashMap<usize, Value>>>,
+    prefill_discovery_pool: DiscoveryPool,
+    decode_discovery_pool: DiscoveryPool,
+}
+
+#[derive(Debug, Default)]
+struct DiscoveryPool {
+    /// One mutex covers the complete discovery transaction. In particular, do
+    /// not split generation and worker identity across independently locked
+    /// maps: a snapshot must reconcile atomically with the worker it names.
+    workers: StdMutex<HashMap<String, RegisteredDiscoveryWorker>>,
+}
+
+#[derive(Debug)]
+struct RegisteredDiscoveryWorker {
+    generation: u64,
+    worker: Arc<dyn Worker>,
+}
+
+#[derive(Debug)]
+struct DiscoveredSelection {
+    instance: (String, String),
+    worker: Arc<dyn Worker>,
+}
+
+/// Owns one reservation. Dropping the request future or response body releases it.
+struct DiscoveryLoadGuard(Arc<dyn Worker>);
+
+impl DiscoveryLoadGuard {
+    fn new(worker: Arc<dyn Worker>) -> Self {
+        worker.increment_load();
+        Self(worker)
+    }
+}
+
+impl Drop for DiscoveryLoadGuard {
+    fn drop(&mut self) {
+        self.0.decrement_load();
+    }
+}
+
+impl DiscoveryPool {
+    fn normalized_url(http: &str) -> String {
+        if http.starts_with("http://") || http.starts_with("https://") {
+            http.to_string()
+        } else {
+            format!("http://{http}")
+        }
+    }
+
+    fn reserve(&self, worker: Arc<dyn Worker>) -> DiscoveryLoadGuard {
+        // Serialize the phase start with selections, even if discovery has
+        // removed this worker since its endpoint tuple was selected.
+        let _workers = self.workers.lock().unwrap();
+        DiscoveryLoadGuard::new(worker)
+    }
+
+    #[cfg(test)]
+    fn reconcile(
+        &self,
+        instances: &[(String, String, u64)],
+        policy: &dyn LoadBalancingPolicy,
+        worker_type: WorkerType,
+    ) {
+        let mut workers_by_url = self.workers.lock().unwrap();
+        let current: std::collections::HashSet<_> = instances
+            .iter()
+            .map(|(http, _, _)| Self::normalized_url(http))
+            .collect();
+        let cache = policy.as_any().downcast_ref::<CacheAwarePolicy>();
+        workers_by_url.retain(|url, worker| {
+            if current.contains(url) {
+                true
+            } else {
+                if let Some(cache) = cache {
+                    cache.remove_worker(worker.worker.as_ref());
+                }
+                false
+            }
+        });
+        for (http, _, generation) in instances {
+            let url = Self::normalized_url(http);
+            if workers_by_url
+                .get(&url)
+                .is_some_and(|old| old.generation != *generation)
+            {
+                if let Some(old) = workers_by_url.remove(&url) {
+                    if let Some(cache) = cache {
+                        cache.remove_worker(old.worker.as_ref());
+                    }
+                }
+            }
+            workers_by_url.entry(url.clone()).or_insert_with(|| {
+                let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(url, worker_type.clone()));
+                if let Some(cache) = cache {
+                    cache.add_worker(worker.as_ref());
+                }
+                RegisteredDiscoveryWorker {
+                    generation: *generation,
+                    worker,
+                }
+            });
+        }
+    }
+
+    // The snapshot is read under this lock, so an older reconciliation cannot
+    // follow a newer selection. Discovery can still change before HTTP dispatch.
+    fn select(
+        &self,
+        snapshot: impl FnOnce() -> Vec<(String, String, u64)>,
+        policy: &dyn LoadBalancingPolicy,
+        worker_type: WorkerType,
+        request_text: Option<&str>,
+        reserve: bool,
+    ) -> (
+        usize,
+        Option<(DiscoveredSelection, Option<DiscoveryLoadGuard>)>,
+    ) {
+        let mut workers_by_url = self.workers.lock().unwrap();
+        let instances = snapshot();
+        let current: std::collections::HashSet<_> = instances
+            .iter()
+            .map(|(http, _, _)| Self::normalized_url(http))
+            .collect();
+        let cache = policy.as_any().downcast_ref::<CacheAwarePolicy>();
+        workers_by_url.retain(|url, worker| {
+            if current.contains(url) {
+                true
+            } else {
+                if let Some(cache) = cache {
+                    cache.remove_worker(worker.worker.as_ref());
+                }
+                false
+            }
+        });
+        let mut workers = Vec::with_capacity(instances.len());
+        for (http, _, generation) in &instances {
+            let url = Self::normalized_url(http);
+            if workers_by_url
+                .get(&url)
+                .is_some_and(|old| old.generation != *generation)
+            {
+                if let Some(old) = workers_by_url.remove(&url) {
+                    if let Some(cache) = cache {
+                        cache.remove_worker(old.worker.as_ref());
+                    }
+                }
+            }
+            let worker = workers_by_url.entry(url.clone()).or_insert_with(|| {
+                let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(url, worker_type.clone()));
+                if let Some(cache) = cache {
+                    cache.add_worker(worker.as_ref());
+                }
+                RegisteredDiscoveryWorker {
+                    generation: *generation,
+                    worker,
+                }
+            });
+            workers.push(Arc::clone(&worker.worker));
+        }
+        let count = instances.len();
+        let selected = policy
+            .select_worker(&workers, request_text)
+            .filter(|&idx| idx < count)
+            .map(|idx| {
+                let worker = Arc::clone(&workers[idx]);
+                let guard = reserve.then(|| DiscoveryLoadGuard::new(Arc::clone(&worker)));
+                (
+                    DiscoveredSelection {
+                        instance: (instances[idx].0.clone(), instances[idx].1.clone()),
+                        worker,
+                    },
+                    guard,
+                )
+            });
+        (count, selected)
+    }
+}
+
+fn discovered_response_body(response: reqwest::Response, guard: DiscoveryLoadGuard) -> Body {
+    body_with_load(response.bytes_stream(), guard)
+}
+
+async fn run_discovered_decode<F, Fut, T, E>(
+    pool: &DiscoveryPool,
+    worker: Arc<dyn Worker>,
+    request: F,
+) -> Result<(T, DiscoveryLoadGuard), E>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<T, E>>,
+{
+    let guard = pool.reserve(worker);
+    request().await.map(|response| (response, guard))
+}
+
+fn body_with_load<S, E>(stream: S, guard: DiscoveryLoadGuard) -> Body
+where
+    S: Stream<Item = Result<bytes::Bytes, E>> + Send + 'static,
+    E: Into<Box<dyn std::error::Error + Send + Sync>> + 'static,
+{
+    let stream = Box::pin(stream);
+    Body::from_stream(futures_util::stream::unfold(
+        (stream, Some(guard)),
+        |(mut stream, mut guard)| async move {
+            match stream.next().await {
+                Some(item) => {
+                    if item.is_err() {
+                        drop(guard.take());
+                    }
+                    Some((item, (stream, guard)))
+                }
+                None => None,
+            }
+        },
+    ))
 }
 
 /// Transfer ID prefix used by MoRI-IO to correlate prefill and decode legs.
@@ -618,47 +835,6 @@ impl VllmPDRouter {
         request
     }
 
-    /// Convert service discovery instances to Worker objects for policy selection
-    fn instances_to_workers(instances: &[(String, String)]) -> Vec<Arc<dyn Worker>> {
-        instances
-            .iter()
-            .map(|(http_addr, _zmq_addr)| {
-                let full_url =
-                    if http_addr.starts_with("http://") || http_addr.starts_with("https://") {
-                        http_addr.clone()
-                    } else {
-                        format!("http://{}", http_addr)
-                    };
-                Arc::new(BasicWorker::new(full_url, WorkerType::Regular)) as Arc<dyn Worker>
-            })
-            .collect()
-    }
-
-    /// Select worker using policy-based load balancing
-    fn select_worker_with_policy(
-        &self,
-        instances: &[(String, String)],
-        is_prefill: bool,
-        request_text: Option<&str>,
-    ) -> Option<usize> {
-        if instances.is_empty() {
-            return None;
-        }
-
-        // Convert instances to workers for policy selection
-        let workers = Self::instances_to_workers(instances);
-
-        // Get the appropriate policy
-        let policy = if is_prefill {
-            self.policy_registry.get_prefill_policy()
-        } else {
-            self.policy_registry.get_decode_policy()
-        };
-
-        // Use policy to select worker
-        policy.select_worker(&workers, request_text)
-    }
-
     /// Process vLLM request using pure service discovery
     async fn process_vllm_request(
         &self,
@@ -672,49 +848,64 @@ impl VllmPDRouter {
             serde_json::to_string_pretty(&request_json).unwrap_or_default()
         );
 
-        // Get available instances from service discovery
-        let prefill_instances = self.service_registry.get_prefill_instances();
-        let decode_instances = self.service_registry.get_decode_instances();
+        let request_text = serde_json::to_string(&request_json).ok();
+        let request_str = request_text.as_deref();
+        let prefill_policy = self.policy_registry.get_prefill_policy();
+        let decode_policy = self.policy_registry.get_decode_policy();
+        // Each pool takes its registry snapshot only after acquiring its role
+        // transaction lock. Taking either snapshot here would allow an older
+        // view to reconcile after a newer request has updated membership.
+        let (prefill_count, prefill_selection) = self.prefill_discovery_pool.select(
+            || self.service_registry.get_prefill_registration_snapshot(),
+            prefill_policy.as_ref(),
+            WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+            request_str,
+            true,
+        );
+        // Reconcile both roles even when either is empty, before returning 503.
+        // Decode metadata is needed in the prefill request ID. Selection does
+        // not count load until the decode HTTP phase actually begins below.
+        let (decode_count, decode_selection) = self.decode_discovery_pool.select(
+            || self.service_registry.get_decode_registration_snapshot(),
+            decode_policy.as_ref(),
+            WorkerType::Decode,
+            request_str,
+            false,
+        );
 
         debug!(
             "Found {} prefill instances, {} decode instances from service discovery",
-            prefill_instances.len(),
-            decode_instances.len()
+            prefill_count, decode_count
         );
 
-        if prefill_instances.is_empty() || decode_instances.is_empty() {
+        if prefill_count == 0 || decode_count == 0 {
             RouterMetrics::record_pd_error("server_selection");
             return (
                 axum::http::StatusCode::SERVICE_UNAVAILABLE,
                 format!(
                     "No workers available via service discovery: {} prefill, {} decode",
-                    prefill_instances.len(),
-                    decode_instances.len()
+                    prefill_count, decode_count
                 ),
             )
                 .into_response();
         }
 
-        // Use policy-based load balancing to select prefill and decode workers
-        let request_text = serde_json::to_string(&request_json).ok();
-        let request_str = request_text.as_deref();
+        let (prefill, prefill_guard) = match prefill_selection {
+            Some((selection, Some(guard))) => (selection, guard),
+            _ => {
+                RouterMetrics::record_pd_error("server_selection");
+                return (
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                    "Prefill policy failed to select a worker".to_string(),
+                )
+                    .into_response();
+            }
+        };
 
-        let prefill_idx =
-            match self.select_worker_with_policy(&prefill_instances, true, request_str) {
-                Some(idx) => idx,
-                None => {
-                    RouterMetrics::record_pd_error("server_selection");
-                    return (
-                        axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                        "Prefill policy failed to select a worker".to_string(),
-                    )
-                        .into_response();
-                }
-            };
-
-        let decode_idx = match self.select_worker_with_policy(&decode_instances, false, request_str)
-        {
-            Some(idx) => idx,
+        let decode = match decode_selection {
+            Some((selection, _)) => selection,
             None => {
                 RouterMetrics::record_pd_error("server_selection");
                 return (
@@ -725,8 +916,8 @@ impl VllmPDRouter {
             }
         };
 
-        let (prefill_http, prefill_zmq) = &prefill_instances[prefill_idx];
-        let (decode_http, decode_zmq) = &decode_instances[decode_idx];
+        let (prefill_http, prefill_zmq) = &prefill.instance;
+        let (decode_http, decode_zmq) = &decode.instance;
 
         let prefill_policy_name = self.policy_registry.get_prefill_policy().name();
         let decode_policy_name = self.policy_registry.get_decode_policy().name();
@@ -745,8 +936,10 @@ impl VllmPDRouter {
         match self
             .process_vllm_two_stage_request_discovered(
                 request_json,
-                &prefill_instances[prefill_idx],
-                &decode_instances[decode_idx],
+                &prefill.instance,
+                &decode.instance,
+                prefill_guard,
+                decode.worker,
                 path,
                 headers,
             )
@@ -782,6 +975,7 @@ impl VllmPDRouter {
         start_time: Instant,
         is_streaming: bool,
         needs_logprobs: bool,
+        decode_guard: Option<DiscoveryLoadGuard>,
     ) -> Result<Response, String> {
         debug!(
             "Decode server responded with status: {}",
@@ -850,7 +1044,11 @@ impl VllmPDRouter {
             for (name, value) in decode_headers.iter() {
                 response_builder = response_builder.header(name, value);
             }
-            let body = axum::body::Body::from_stream(decode_response.bytes_stream());
+            let body = if let Some(guard) = decode_guard {
+                discovered_response_body(decode_response, guard)
+            } else {
+                Body::from_stream(decode_response.bytes_stream())
+            };
             return response_builder.body(body).map_err(|e| {
                 format!(
                     "Failed to build streaming response from {}: {}",
@@ -865,6 +1063,7 @@ impl VllmPDRouter {
             .bytes()
             .await
             .map_err(|e| format!("Failed to read decode response: {}", e))?;
+        drop(decode_guard);
         let mut response_builder = axum::http::Response::builder().status(status);
         for (name, value) in decode_headers.iter() {
             response_builder = response_builder.header(name, value);
@@ -875,16 +1074,20 @@ impl VllmPDRouter {
     }
 
     /// Two-stage request processing for vLLM disaggregated mode using discovered endpoints
+    #[allow(clippy::too_many_arguments)]
     async fn process_vllm_two_stage_request_discovered(
         &self,
         request_json: Value,
         prefill_instance: &(String, String),
         decode_instance: &(String, String),
+        prefill_guard: DiscoveryLoadGuard,
+        decode_worker: Arc<dyn Worker>,
         path: &str,
         headers: Option<&HeaderMap>,
     ) -> Result<Response, String> {
         let (prefill_http, prefill_zmq) = prefill_instance;
         let (decode_http, decode_zmq) = decode_instance;
+        let mut prefill_guard = Some(prefill_guard);
 
         debug!("ENTERED process_vllm_two_stage_request_discovered method");
         let start_time = Instant::now();
@@ -908,8 +1111,11 @@ impl VllmPDRouter {
         // Generate a connector-specific transfer_id (None for NIXL)
         let transfer_id = self.generate_transfer_id();
 
-        let (prefill_base_http, mut prefill_dp_rank) = dp_utils::parse_worker_url(prefill_http);
-        let (decode_base_http, decode_dp_rank) = dp_utils::parse_worker_url(decode_http);
+        let (prefill_base_http, mut prefill_dp_rank) = dp_utils::parse_worker_url(
+            prefill_http.strip_prefix("http://").unwrap_or(prefill_http),
+        );
+        let (decode_base_http, decode_dp_rank) =
+            dp_utils::parse_worker_url(decode_http.strip_prefix("http://").unwrap_or(decode_http));
 
         if self.intra_node_data_parallel_size > 1 && prefill_dp_rank.is_none() {
             let rank = self.prefill_dp_round_robin.fetch_add(1, Ordering::Relaxed)
@@ -1029,6 +1235,8 @@ impl VllmPDRouter {
             let prefill_json: Value = serde_json::from_str(&prefill_response_text)
                 .map_err(|e| format!("Failed to parse prefill response as JSON: {}", e))?;
 
+            drop(prefill_guard.take());
+
             // Stop profiling on prefill server once we have its response.
             self.stop_profiling(&format!("http://{}", prefill_base_http))
                 .await;
@@ -1104,7 +1312,9 @@ impl VllmPDRouter {
             let enable_profiling = self.enable_profiling;
             let profiling_tasks = &self.profiling_tasks;
             let pd_router = &self.pd_router;
+            let phase_guard = prefill_guard.take().expect("prefill reservation");
             let prefill_fut = async move {
+                let _phase_guard = phase_guard;
                 let result = otel_http::send_client_request(
                     build_prefill_request_builder(
                         http_client,
@@ -1164,16 +1374,24 @@ impl VllmPDRouter {
                     }
                 }
             };
-            let decode_fut = otel_http::send_client_request(
-                decode_request_builder.body(decode_request_str),
-                headers,
-                ClientRequestOptions {
-                    method: "POST",
-                    url: &decode_request_url,
-                    route: Some(path),
-                    request_phase: Some("decode"),
-                },
-            );
+            let decode_pool = &self.decode_discovery_pool;
+            let decode_worker = Arc::clone(&decode_worker);
+            let decode_fut = async move {
+                run_discovered_decode(decode_pool, decode_worker, || async move {
+                    otel_http::send_client_request(
+                        decode_request_builder.body(decode_request_str),
+                        headers,
+                        ClientRequestOptions {
+                            method: "POST",
+                            url: &decode_request_url,
+                            route: Some(path),
+                            request_phase: Some("decode"),
+                        },
+                    )
+                    .await
+                })
+                .await
+            };
             let (prefill_result, decode_result) = tokio::join!(prefill_fut, decode_fut);
             let concurrent_prefill_response_json: Option<Value> = match prefill_result {
                 Err(prefill_err) => {
@@ -1198,8 +1416,8 @@ impl VllmPDRouter {
                     prefill_json,
                 );
             }
-            let decode_response = match decode_result {
-                Ok(resp) => resp,
+            let (decode_response, decode_guard) = match decode_result {
+                Ok((resp, guard)) => (resp, guard),
                 Err(e) => {
                     self.stop_profiling(&format!("http://{}", decode_base_http))
                         .await;
@@ -1226,36 +1444,41 @@ impl VllmPDRouter {
                     start_time,
                     is_streaming,
                     needs_logprobs,
+                    Some(decode_guard),
                 )
                 .await;
         }
 
-        let decode_response = match otel_http::send_client_request(
-            decode_request_builder.body(decode_request_str),
-            headers,
-            ClientRequestOptions {
-                method: "POST",
-                url: &decode_request_url,
-                route: Some(path),
-                request_phase: Some("decode"),
-            },
-        )
-        .await
-        {
-            Ok(resp) => resp,
-            Err(e) => {
-                let full_error = error_chain(&e);
-                let duration = start_time.elapsed();
-                RouterMetrics::record_pd_decode_error(decode_http);
-                RouterMetrics::record_pd_request(path);
-                RouterMetrics::record_pd_request_duration(path, duration);
-                RouterMetrics::record_pd_prefill_request(prefill_http);
-                return Err(format!(
-                    "Decode request failed to {}: {}",
-                    decode_http, full_error
-                ));
-            }
-        };
+        let (decode_response, decode_guard) =
+            match run_discovered_decode(&self.decode_discovery_pool, decode_worker, || async {
+                otel_http::send_client_request(
+                    decode_request_builder.body(decode_request_str),
+                    headers,
+                    ClientRequestOptions {
+                        method: "POST",
+                        url: &decode_request_url,
+                        route: Some(path),
+                        request_phase: Some("decode"),
+                    },
+                )
+                .await
+            })
+            .await
+            {
+                Ok(result) => result,
+                Err(e) => {
+                    let full_error = error_chain(&e);
+                    let duration = start_time.elapsed();
+                    RouterMetrics::record_pd_decode_error(decode_http);
+                    RouterMetrics::record_pd_request(path);
+                    RouterMetrics::record_pd_request_duration(path, duration);
+                    RouterMetrics::record_pd_prefill_request(prefill_http);
+                    return Err(format!(
+                        "Decode request failed to {}: {}",
+                        decode_http, full_error
+                    ));
+                }
+            };
 
         self.handle_decode_response(
             decode_response,
@@ -1267,6 +1490,7 @@ impl VllmPDRouter {
             start_time,
             is_streaming,
             needs_logprobs,
+            Some(decode_guard),
         )
         .await
     }
@@ -1860,6 +2084,7 @@ impl VllmPDRouter {
             start_time,
             is_streaming,
             needs_logprobs,
+            None,
         )
         .await
         .map_err(|message| PDRouterError::NetworkError { message })
@@ -1916,6 +2141,8 @@ impl VllmPDRouter {
                 kv_connector,
                 mooncake_prefill_info: Arc::new(Mutex::new(HashMap::new())),
                 nixl_prefill_info: RwLock::new(HashMap::new()),
+                prefill_discovery_pool: DiscoveryPool::default(),
+                decode_discovery_pool: DiscoveryPool::default(),
             })
         } else {
             // Direct URL mode (same as PdRouterBase)
@@ -2006,6 +2233,8 @@ impl VllmPDRouter {
                 kv_connector,
                 mooncake_prefill_info,
                 nixl_prefill_info: RwLock::new(HashMap::new()),
+                prefill_discovery_pool: DiscoveryPool::default(),
+                decode_discovery_pool: DiscoveryPool::default(),
             })
         }
     }
@@ -2718,7 +2947,469 @@ impl WorkerManagement for VllmPDRouter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::policies::CacheAwareConfig;
     use serde_json::json;
+
+    fn cache_policy() -> CacheAwarePolicy {
+        CacheAwarePolicy::with_config(CacheAwareConfig {
+            eviction_interval_secs: 0,
+            balance_abs_threshold: 0,
+            ..Default::default()
+        })
+    }
+
+    fn instance(http: &str, zmq: &str) -> (String, String, u64) {
+        (http.into(), zmq.into(), 1)
+    }
+
+    fn instance_generation(http: &str, zmq: &str, generation: u64) -> (String, String, u64) {
+        (http.into(), zmq.into(), generation)
+    }
+
+    #[test]
+    fn discovered_worker_identity_survives_a_second_selection() {
+        let pool = Arc::new(DiscoveryPool::default());
+        let policy = cache_policy();
+        let first_snapshot = vec![
+            instance("127.0.0.1:8000", "zmq0"),
+            instance("127.0.0.1:8001", "zmq1"),
+        ];
+        let (_, Some((first, guard))) = pool.select(
+            || first_snapshot,
+            &policy,
+            WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+            Some("first"),
+            true,
+        ) else {
+            panic!("first selection");
+        };
+        let guard = guard.unwrap();
+        assert_eq!(first.worker.load(), 1);
+        let reversed = vec![
+            instance("127.0.0.1:8001", "new-zmq1"),
+            instance("http://127.0.0.1:8000", "new-zmq0"),
+        ];
+        let (_, Some((second, _))) = pool.select(
+            || reversed,
+            &policy,
+            WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+            Some("unrelated"),
+            false,
+        ) else {
+            panic!("second selection");
+        };
+        assert_eq!(second.instance.1, "new-zmq1");
+        assert_eq!(second.worker.url(), "http://127.0.0.1:8001");
+        let same = pool
+            .workers
+            .lock()
+            .unwrap()
+            .get("http://127.0.0.1:8000")
+            .unwrap()
+            .worker
+            .clone();
+        assert!(Arc::ptr_eq(&first.worker, &same));
+        assert_eq!(same.load(), 1);
+        drop(guard);
+        assert_eq!(same.load(), 0);
+    }
+
+    #[test]
+    fn empty_snapshot_removes_workers_and_reregistration_starts_fresh() {
+        let prefill = DiscoveryPool::default();
+        let decode = DiscoveryPool::default();
+        let prefill_policy = cache_policy();
+        let decode_policy = cache_policy();
+        let snapshot = || vec![instance_generation("worker:8000", "zmq", 10)];
+        let (_, Some((old, _))) = prefill.select(
+            || vec![instance_generation("worker:8000", "zmq", 11)],
+            &prefill_policy,
+            WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+            Some("affinity"),
+            false,
+        ) else {
+            panic!("prefill");
+        };
+        let (_, Some((other_role, _))) =
+            decode.select(snapshot, &decode_policy, WorkerType::Decode, None, false)
+        else {
+            panic!("decode");
+        };
+        assert!(!Arc::ptr_eq(&old.worker, &other_role.worker));
+        assert!(matches!(
+            old.worker.worker_type(),
+            WorkerType::Prefill { .. }
+        ));
+        assert!(matches!(
+            other_role.worker.worker_type(),
+            WorkerType::Decode
+        ));
+        assert_eq!(
+            prefill_policy
+                .evaluate_initial_placement(
+                    "default",
+                    "affinity",
+                    &[crate::policies::CacheAwareCandidate {
+                        target_id: old.worker.url(),
+                        kv_pressure: 0.0
+                    }]
+                )
+                .unwrap()
+                .match_rate,
+            1.0
+        );
+        prefill.select(
+            Vec::new,
+            &prefill_policy,
+            WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+            None,
+            false,
+        );
+        decode.select(Vec::new, &decode_policy, WorkerType::Decode, None, false);
+        assert!(prefill.workers.lock().unwrap().is_empty());
+        assert!(decode.workers.lock().unwrap().is_empty());
+        let (_, Some((fresh, _))) = prefill.select(
+            snapshot,
+            &prefill_policy,
+            WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+            None,
+            false,
+        ) else {
+            panic!("reregister");
+        };
+        assert!(!Arc::ptr_eq(&old.worker, &fresh.worker));
+        assert_eq!(fresh.worker.load(), 0);
+        assert_eq!(fresh.worker.processed_requests(), 1);
+        assert_eq!(
+            prefill_policy
+                .evaluate_initial_placement(
+                    "default",
+                    "affinity",
+                    &[crate::policies::CacheAwareCandidate {
+                        target_id: fresh.worker.url(),
+                        kv_pressure: 0.0
+                    }]
+                )
+                .unwrap()
+                .match_rate,
+            0.0
+        );
+    }
+
+    #[test]
+    fn empty_required_role_reconciles_without_policy_accounting() {
+        let prefill = DiscoveryPool::default();
+        let decode = DiscoveryPool::default();
+        let prefill_policy = cache_policy();
+        let decode_policy = cache_policy();
+        prefill.reconcile(
+            &[instance("prefill:8000", "p")],
+            &prefill_policy,
+            WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+        );
+        decode.reconcile(&[], &decode_policy, WorkerType::Decode);
+        for _ in 0..2 {
+            prefill.reconcile(
+                &[instance("prefill:8000", "p")],
+                &prefill_policy,
+                WorkerType::Prefill {
+                    bootstrap_port: None,
+                },
+            );
+            decode.reconcile(&[], &decode_policy, WorkerType::Decode);
+            let worker = prefill
+                .workers
+                .lock()
+                .unwrap()
+                .get("http://prefill:8000")
+                .unwrap()
+                .worker
+                .clone();
+            assert_eq!(worker.processed_requests(), 0);
+            assert_eq!(worker.load(), 0);
+            assert_eq!(
+                prefill_policy
+                    .evaluate_initial_placement(
+                        "default",
+                        "affinity",
+                        &[crate::policies::CacheAwareCandidate {
+                            target_id: worker.url(),
+                            kv_pressure: 0.0
+                        }]
+                    )
+                    .unwrap()
+                    .match_rate,
+                0.0
+            );
+        }
+    }
+
+    #[test]
+    fn same_url_new_generation_replaces_worker_without_empty_snapshot() {
+        let pool = DiscoveryPool::default();
+        let policy = cache_policy();
+        let (_, Some((old, _))) = pool.select(
+            || vec![instance_generation("worker:8000", "z1", 4)],
+            &policy,
+            WorkerType::Decode,
+            Some("affinity"),
+            false,
+        ) else {
+            panic!("initial selection")
+        };
+        pool.reconcile(
+            &[instance_generation("worker:8000", "z2", 5)],
+            &policy,
+            WorkerType::Decode,
+        );
+        let fresh = pool
+            .workers
+            .lock()
+            .unwrap()
+            .get("http://worker:8000")
+            .unwrap()
+            .worker
+            .clone();
+        assert!(!Arc::ptr_eq(&old.worker, &fresh));
+        assert_eq!(fresh.processed_requests(), 0);
+        assert_eq!(fresh.load(), 0);
+        assert_eq!(
+            policy
+                .evaluate_initial_placement(
+                    "default",
+                    "affinity",
+                    &[crate::policies::CacheAwareCandidate {
+                        target_id: fresh.url(),
+                        kv_pressure: 0.0
+                    }]
+                )
+                .unwrap()
+                .match_rate,
+            0.0
+        );
+    }
+
+    #[test]
+    fn overlapping_selections_commit_load_before_next_selection() {
+        let pool = Arc::new(DiscoveryPool::default());
+        let policy = Arc::new(cache_policy());
+        let snapshot = || {
+            vec![
+                instance("worker0:8000", "zmq0"),
+                instance("worker1:8000", "zmq1"),
+            ]
+        };
+        let (_, Some((first, first_guard))) = pool.select(
+            snapshot,
+            policy.as_ref(),
+            WorkerType::Decode,
+            Some("first"),
+            true,
+        ) else {
+            panic!("first");
+        };
+        let first_guard = first_guard.unwrap();
+        let second_pool = Arc::clone(&pool);
+        let second_policy = Arc::clone(&policy);
+        let second = std::thread::spawn(move || {
+            second_pool
+                .select(
+                    snapshot,
+                    second_policy.as_ref(),
+                    WorkerType::Decode,
+                    Some("unrelated"),
+                    true,
+                )
+                .1
+                .unwrap()
+        })
+        .join()
+        .unwrap();
+        assert_ne!(first.worker.url(), second.0.worker.url());
+        assert_eq!(first.worker.load(), 1);
+        drop(first_guard);
+        drop(second.1);
+        assert_eq!(first.worker.load(), 0);
+        assert_eq!(second.0.worker.load(), 0);
+    }
+
+    #[test]
+    fn registry_snapshot_is_read_inside_router_pool_transaction() {
+        let pool = Arc::new(DiscoveryPool::default());
+        let policy = Arc::new(cache_policy());
+        let registry = Arc::new(ServiceRegistry::new());
+        registry.register_service("worker:8000".into(), "old-zmq".into(), ServiceType::Decode);
+        pool.select(
+            || registry.get_decode_registration_snapshot(),
+            policy.as_ref(),
+            WorkerType::Decode,
+            None,
+            false,
+        );
+
+        let snapshot_taken = Arc::new(std::sync::Barrier::new(2));
+        let release_barrier = Arc::new(std::sync::Barrier::new(2));
+        let first_pool = Arc::clone(&pool);
+        let first_policy = Arc::clone(&policy);
+        let first_registry = Arc::clone(&registry);
+        let first_snapshot_taken = Arc::clone(&snapshot_taken);
+        let first_release_barrier = Arc::clone(&release_barrier);
+        let first = std::thread::spawn(move || {
+            let snapshot_pool = Arc::clone(&first_pool);
+            first_pool.select(
+                || {
+                    // This assertion deterministically catches a registry read
+                    // moved before the pool transaction lock.
+                    let lock_held = snapshot_pool.workers.try_lock().is_err();
+                    let snapshot = first_registry.get_decode_registration_snapshot();
+                    first_snapshot_taken.wait();
+                    first_release_barrier.wait();
+                    assert!(lock_held, "registry snapshot read without the pool lock");
+                    snapshot
+                },
+                first_policy.as_ref(),
+                WorkerType::Decode,
+                None,
+                false,
+            )
+        });
+        snapshot_taken.wait();
+        registry.remove_service_for_test("worker:8000", ServiceType::Decode);
+        registry.register_service("worker:8001".into(), "new-zmq".into(), ServiceType::Decode);
+        let second_pool = Arc::clone(&pool);
+        let second_policy = Arc::clone(&policy);
+        let second_registry = Arc::clone(&registry);
+        let second = std::thread::spawn(move || {
+            second_pool.select(
+                || second_registry.get_decode_registration_snapshot(),
+                second_policy.as_ref(),
+                WorkerType::Decode,
+                None,
+                false,
+            )
+        });
+        release_barrier.wait();
+        first.join().unwrap();
+        second.join().unwrap();
+        let workers = pool.workers.lock().unwrap();
+        assert!(workers.contains_key("http://worker:8001"));
+        assert!(!workers.contains_key("http://worker:8000"));
+    }
+
+    #[tokio::test]
+    async fn phase_guards_follow_sequential_and_concurrent_lifetimes() {
+        let prefill: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+            "http://p:8000".into(),
+            WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+        ));
+        let decode: Arc<dyn Worker> =
+            Arc::new(BasicWorker::new("http://d:8000".into(), WorkerType::Decode));
+        let prefill_guard = DiscoveryLoadGuard::new(Arc::clone(&prefill));
+        assert_eq!((prefill.load(), decode.load()), (1, 0));
+        drop(prefill_guard);
+        let decode_guard = DiscoveryLoadGuard::new(Arc::clone(&decode));
+        assert_eq!((prefill.load(), decode.load()), (0, 1));
+        drop(decode_guard);
+
+        let prefill_guard = DiscoveryLoadGuard::new(Arc::clone(&prefill));
+        let decode_guard = DiscoveryLoadGuard::new(Arc::clone(&decode));
+        assert_eq!((prefill.load(), decode.load()), (1, 1));
+        drop(prefill_guard);
+        assert_eq!((prefill.load(), decode.load()), (0, 1));
+        drop(decode_guard);
+        assert_eq!((prefill.load(), decode.load()), (0, 0));
+
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let cancelled_worker = Arc::clone(&decode);
+        let task = tokio::spawn(async move {
+            let _guard = DiscoveryLoadGuard::new(cancelled_worker);
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        started_rx.await.unwrap();
+        assert_eq!(decode.load(), 1);
+        task.abort();
+        let _ = task.await;
+        assert_eq!(decode.load(), 0);
+    }
+
+    #[tokio::test]
+    async fn concurrent_decode_error_releases_load_while_prefill_is_held() {
+        let pool = Arc::new(DiscoveryPool::default());
+        let prefill: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+            "http://p:8000".into(),
+            WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+        ));
+        let decode: Arc<dyn Worker> =
+            Arc::new(BasicWorker::new("http://d:8000".into(), WorkerType::Decode));
+        let prefill_guard = DiscoveryLoadGuard::new(Arc::clone(&prefill));
+        let prefill_task = tokio::spawn(async move {
+            let _guard = prefill_guard;
+            std::future::pending::<()>().await;
+        });
+        let decode_pool = Arc::clone(&pool);
+        let decode_worker = Arc::clone(&decode);
+        let decode_task = tokio::spawn(async move {
+            run_discovered_decode(&decode_pool, decode_worker, || async {
+                Err::<(), _>("decode failed")
+            })
+            .await
+        });
+        assert!(decode_task.await.unwrap().is_err());
+        assert_eq!(decode.load(), 0);
+        assert_eq!(prefill.load(), 1);
+        prefill_task.abort();
+        let _ = prefill_task.await;
+        assert_eq!(prefill.load(), 0);
+    }
+
+    #[tokio::test]
+    async fn streaming_load_ends_at_eof_error_or_body_drop() {
+        let worker: Arc<dyn Worker> =
+            Arc::new(BasicWorker::new("http://d:8000".into(), WorkerType::Decode));
+        let ok = futures_util::stream::iter(vec![Ok::<_, std::io::Error>(
+            bytes::Bytes::from_static(b"done"),
+        )]);
+        let body = body_with_load(ok, DiscoveryLoadGuard::new(Arc::clone(&worker)));
+        assert_eq!(worker.load(), 1);
+        assert_eq!(
+            axum::body::to_bytes(body, usize::MAX)
+                .await
+                .unwrap()
+                .as_ref(),
+            b"done"
+        );
+        assert_eq!(worker.load(), 0);
+
+        let failed = futures_util::stream::iter(vec![Err::<bytes::Bytes, _>(
+            std::io::Error::other("body failed"),
+        )]);
+        let body = body_with_load(failed, DiscoveryLoadGuard::new(Arc::clone(&worker)));
+        assert!(axum::body::to_bytes(body, usize::MAX).await.is_err());
+        assert_eq!(worker.load(), 0);
+
+        let stalled = futures_util::stream::pending::<Result<bytes::Bytes, std::io::Error>>();
+        let body = body_with_load(stalled, DiscoveryLoadGuard::new(Arc::clone(&worker)));
+        assert_eq!(worker.load(), 1);
+        drop(body);
+        assert_eq!(worker.load(), 0);
+    }
 
     #[test]
     fn test_discovery_health_requires_prefill_and_decode_workers() {
