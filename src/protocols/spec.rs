@@ -3562,6 +3562,48 @@ mod tests {
         assert!(params.whitespace_pattern.is_none());
     }
 
+    /// Regression test for #186: `response_format.json_schema.schema` must be forwarded to
+    /// the worker with its properties in the same order the client sent them.
+    ///
+    /// `schema` is a `serde_json::Value`, whose `Object` variant sorts keys alphabetically
+    /// unless the `preserve_order` crate feature is enabled (Cargo.toml). Some backends use the
+    /// property order in the schema to decide the generation order for structured output, so
+    /// reordering it here silently changes what the model is asked to produce.
+    #[test]
+    fn test_response_format_json_schema_preserves_property_order() {
+        let input = r#"{"type":"json_schema","json_schema":{"name":"x","schema":{"zebra":1,"apple":2,"mango":3}}}"#;
+
+        let rf: ResponseFormat = serde_json::from_str(input).unwrap();
+        let ResponseFormat::JsonSchema { json_schema } = &rf else {
+            panic!("expected JsonSchema variant");
+        };
+        let schema_keys: Vec<&String> = json_schema.schema.as_object().unwrap().keys().collect();
+        assert_eq!(schema_keys, vec!["zebra", "apple", "mango"]);
+
+        // The round-tripped JSON sent to the worker must preserve the same order.
+        assert_eq!(serde_json::to_string(&rf).unwrap(), input);
+    }
+
+    /// Regression test for #186: a tool's `function.parameters` JSON Schema must also keep the
+    /// client's property order when forwarded to the worker (same root cause as the
+    /// `response_format.json_schema` case above).
+    #[test]
+    fn test_tool_function_parameters_preserves_property_order() {
+        let input = r#"{"type":"function","function":{"name":"f","parameters":{"zebra":1,"apple":2,"mango":3}}}"#;
+
+        let tool: Tool = serde_json::from_str(input).unwrap();
+        let param_keys: Vec<&String> = tool
+            .function
+            .parameters
+            .as_object()
+            .unwrap()
+            .keys()
+            .collect();
+        assert_eq!(param_keys, vec!["zebra", "apple", "mango"]);
+
+        assert_eq!(serde_json::to_string(&tool).unwrap(), input);
+    }
+
     #[test]
     fn test_structured_outputs_params_with_json_schema() {
         let schema = serde_json::json!({
