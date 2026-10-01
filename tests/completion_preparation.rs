@@ -173,8 +173,8 @@ fn unsupported_input_modifiers_fail_closed() {
     ] {
         let mut value_map = json!({"prompt": "hello"});
         value_map[field] = value;
-        let error = prepare_completion(&request(value_map), &tokenizer, MODEL_VOCAB_SIZE)
-            .unwrap_err();
+        let error =
+            prepare_completion(&request(value_map), &tokenizer, MODEL_VOCAB_SIZE).unwrap_err();
         assert!(error.contains(field), "{error}");
     }
 }
@@ -204,7 +204,12 @@ fn tokenizer_definition_rejects_padding_truncation_and_malformed_formats() {
             assert!(error.contains(field), "{error}");
         }
     }
-    for malformed in [Value::Null, json!([]), json!({}), json!({"model": {"type": "invalid"}})] {
+    for malformed in [
+        Value::Null,
+        json!([]),
+        json!({}),
+        json!({"model": {"type": "invalid"}}),
+    ] {
         assert!(validate_completion_tokenizer_definition(&malformed).is_err());
     }
 }
