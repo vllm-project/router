@@ -60,15 +60,16 @@ class BenchmarkRunner:
         quick_mode: bool = False,
         save_baseline: Optional[str] = None,
         compare_baseline: Optional[str] = None,
+        bench: str = "request_processing",
     ) -> str:
         """Run benchmarks with specified options."""
-        bench_args = ["cargo", "bench", "--bench", "request_processing"]
+        bench_args = ["cargo", "bench", "--bench", bench]
 
-        if quick_mode:
+        if quick_mode and bench == "request_processing":
             bench_args.append("benchmark_summary")
             print("Running quick benchmarks...")
         else:
-            print("Running full benchmark suite...")
+            print(f"Running full benchmark suite ({bench})...")
 
         # Note: Criterion baselines are handled via target directory structure
         # For now, we'll implement baseline functionality via file copying
@@ -92,6 +93,30 @@ class BenchmarkRunner:
             self._save_baseline(save_baseline, result.stdout)
 
         return result.stdout
+
+    def run_router_overhead(self) -> None:
+        """Run the end-to-end router overhead harness (ignored test, release).
+
+        See docs/benchmarks/router_overhead.md; environment variables
+        prefixed VLLM_ROUTER_BENCH_ control scenarios and durations.
+        """
+        cmd = [
+            "cargo",
+            "test",
+            "--release",
+            "--test",
+            "router_overhead_bench",
+            "--",
+            "--ignored",
+            "--nocapture",
+        ]
+        print(f"Executing: {' '.join(cmd)}")
+        result = self.run_command(cmd)
+        if result.returncode != 0:
+            print("Router overhead harness failed!")
+            sys.exit(1)
+        out_dir = os.environ.get("VLLM_ROUTER_BENCH_OUT_DIR", "target/router_overhead")
+        print(f"Results: {out_dir}/summary.md and {out_dir}/summary.json")
 
     def _save_baseline(self, filename: str, output: str):
         """Save benchmark results to a file as baseline."""
@@ -207,6 +232,17 @@ def main():
     parser.add_argument(
         "--save-results", action="store_true", help="Save results to file for CI"
     )
+    parser.add_argument(
+        "--bench",
+        choices=["request_processing", "routing_input"],
+        default="request_processing",
+        help="Criterion benchmark to run (default: request_processing)",
+    )
+    parser.add_argument(
+        "--router-overhead",
+        action="store_true",
+        help="Run the end-to-end router overhead harness instead of a criterion benchmark",
+    )
 
     args = parser.parse_args()
 
@@ -220,15 +256,41 @@ def main():
     # Build in release mode
     runner.build_release()
 
+    # --save-baseline writes the criterion output of whichever bench ran, so
+    # it still applies to a different --bench; the rest are request_processing
+    # only, and the harness takes none of them.
+    inapplicable = [
+        ("--quick", args.quick),
+        ("--compare-baseline", args.compare_baseline),
+        ("--validate-thresholds", args.validate_thresholds),
+        ("--save-results", args.save_results),
+    ]
+    if args.router_overhead:
+        inapplicable.append(("--save-baseline", args.save_baseline))
+    elif args.bench == "request_processing":
+        inapplicable = []
+    ignored = [name for name, used in inapplicable if used]
+    if ignored:
+        print("Note: ignoring " + ", ".join(ignored) + " for this run.")
+
+    if args.router_overhead:
+        runner.run_router_overhead()
+        return
+
     # Run benchmarks
     output = runner.run_benchmarks(
         quick_mode=args.quick,
         save_baseline=args.save_baseline,
         compare_baseline=args.compare_baseline,
+        bench=args.bench,
     )
 
     # Print the raw output
     print(output)
+
+    # Threshold parsing only understands the request_processing summary.
+    if args.bench != "request_processing":
+        return
 
     # Parse and validate results if requested
     if args.validate_thresholds or args.save_results:
