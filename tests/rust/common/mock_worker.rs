@@ -45,6 +45,8 @@ pub enum HealthStatus {
 /// Mock worker server for testing
 pub struct MockWorker {
     config: Arc<RwLock<MockWorkerConfig>>,
+    metrics: Arc<RwLock<Option<String>>>,
+    chat_response: Arc<RwLock<Option<serde_json::Value>>>,
     shutdown_handle: Option<tokio::task::JoinHandle<()>>,
     shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
 }
@@ -53,6 +55,8 @@ impl MockWorker {
     pub fn new(config: MockWorkerConfig) -> Self {
         Self {
             config: Arc::new(RwLock::new(config)),
+            metrics: Arc::new(RwLock::new(None)),
+            chat_response: Arc::new(RwLock::new(None)),
             shutdown_handle: None,
             shutdown_tx: None,
         }
@@ -69,14 +73,51 @@ impl MockWorker {
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", requested_port)).await?;
         let port = listener.local_addr()?.port();
         config.write().await.port = port;
+        let metrics = self.metrics.clone();
+        let chat_response = self.chat_response.clone();
 
         let app = Router::new()
             .route("/health", get(health_handler))
+            .route(
+                "/metrics",
+                get(move || {
+                    let metrics = metrics.clone();
+                    async move {
+                        match metrics.read().await.clone() {
+                            Some(body) => body.into_response(),
+                            None => StatusCode::NOT_FOUND.into_response(),
+                        }
+                    }
+                }),
+            )
             .route("/health_generate", get(health_generate_handler))
             .route("/get_server_info", get(server_info_handler))
             .route("/get_model_info", get(model_info_handler))
             .route("/generate", post(generate_handler))
-            .route("/v1/chat/completions", post(chat_completions_handler))
+            .route(
+                "/v1/chat/completions",
+                post(
+                    move |State(config): State<Arc<RwLock<MockWorkerConfig>>>,
+                          headers: axum::http::HeaderMap,
+                          Json(payload): Json<serde_json::Value>| {
+                        let chat_response = chat_response.clone();
+                        async move {
+                            if let Some(response) = chat_response.read().await.clone() {
+                                capture_request(
+                                    config.read().await.port,
+                                    "/v1/chat/completions",
+                                    &headers,
+                                    Some(&payload),
+                                );
+                                Json(response).into_response()
+                            } else {
+                                chat_completions_handler(State(config), headers, Json(payload))
+                                    .await
+                            }
+                        }
+                    },
+                ),
+            )
             .route("/v1/completions", post(completions_handler))
             .route("/v1/rerank", post(rerank_handler))
             .route("/v1/responses", post(responses_handler))
@@ -122,6 +163,18 @@ impl MockWorker {
             // Wait for the server to shut down
             let _ = tokio::time::timeout(tokio::time::Duration::from_secs(5), handle).await;
         }
+    }
+
+    pub async fn set_dp_metrics(&self, size: usize) {
+        *self.metrics.write().await = Some(
+            (0..size)
+                .map(|rank| format!("vllm:num_requests_running{{engine=\"{rank}\"}} 0\n"))
+                .collect(),
+        );
+    }
+
+    pub async fn set_chat_response(&self, response: serde_json::Value) {
+        *self.chat_response.write().await = Some(response);
     }
 }
 
@@ -282,7 +335,7 @@ async fn generate_handler(
     let config = config.read().await;
 
     // Capture request for test inspection
-    capture_request(config.port, "/generate", &headers);
+    capture_request(config.port, "/generate", &headers, Some(&payload));
 
     if should_fail(&config).await {
         return (
@@ -390,7 +443,12 @@ async fn chat_completions_handler(
     let config = config.read().await;
 
     // Capture request for test inspection
-    capture_request(config.port, "/v1/chat/completions", &headers);
+    capture_request(
+        config.port,
+        "/v1/chat/completions",
+        &headers,
+        Some(&payload),
+    );
 
     if should_fail(&config).await {
         return (
@@ -477,7 +535,7 @@ async fn completions_handler(
     let config = config.read().await;
 
     // Capture request for test inspection
-    capture_request(config.port, "/v1/completions", &headers);
+    capture_request(config.port, "/v1/completions", &headers, Some(&payload));
 
     if should_fail(&config).await {
         return (
@@ -691,7 +749,7 @@ async fn v1_models_handler(
     let config = config.read().await;
 
     // Capture request for test inspection (e.g. X-data-parallel-rank)
-    capture_request(config.port, "/v1/models", &headers);
+    capture_request(config.port, "/v1/models", &headers, None);
 
     if should_fail(&config).await {
         return (
@@ -877,7 +935,7 @@ impl Default for MockWorkerConfig {
 
 // --- Request header capture for verifying router behavior (e.g., X-data-parallel-rank) ---
 
-/// A captured request with headers and path
+/// A captured request with headers, path and parsed JSON body
 ///
 /// `headers` maps each header name to *all* values received for that name,
 /// so duplicate headers (e.g. a client-supplied and a router-injected
@@ -886,6 +944,7 @@ impl Default for MockWorkerConfig {
 pub struct CapturedRequest {
     pub path: String,
     pub headers: HashMap<String, Vec<String>>,
+    pub body: Option<serde_json::Value>,
 }
 
 static REQ_CAPTURE_STORE: OnceLock<Mutex<HashMap<u16, Vec<CapturedRequest>>>> = OnceLock::new();
@@ -895,7 +954,12 @@ fn get_capture_store() -> &'static Mutex<HashMap<u16, Vec<CapturedRequest>>> {
 }
 
 /// Record a request for a given worker port
-pub fn capture_request(port: u16, path: &str, headers: &axum::http::HeaderMap) {
+pub fn capture_request(
+    port: u16,
+    path: &str,
+    headers: &axum::http::HeaderMap,
+    body: Option<&serde_json::Value>,
+) {
     let mut captured_headers: HashMap<String, Vec<String>> = HashMap::new();
     for (name, value) in headers.iter() {
         if let Ok(v) = value.to_str() {
@@ -908,6 +972,7 @@ pub fn capture_request(port: u16, path: &str, headers: &axum::http::HeaderMap) {
     let captured = CapturedRequest {
         path: path.to_string(),
         headers: captured_headers,
+        body: body.cloned(),
     };
     let mut store = get_capture_store().lock().unwrap();
     store.entry(port).or_default().push(captured);

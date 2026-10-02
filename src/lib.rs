@@ -66,6 +66,8 @@ struct Router {
     wasm_middleware_sha256: Option<String>,
     wasm_middleware_routes: Vec<String>,
     intra_node_data_parallel_size: usize,
+    prefill_data_parallel_size: Option<usize>,
+    decode_data_parallel_size: Option<usize>,
     api_key: Option<String>,
     api_key_validation_urls: Vec<String>,
     log_dir: Option<String>,
@@ -238,6 +240,8 @@ impl Router {
             worker_startup_timeout_secs: self.worker_startup_timeout_secs,
             worker_startup_check_interval_secs: self.worker_startup_check_interval,
             intra_node_data_parallel_size: self.intra_node_data_parallel_size,
+            prefill_data_parallel_size: self.prefill_data_parallel_size,
+            decode_data_parallel_size: self.decode_data_parallel_size,
             api_key: self.api_key.clone(),
             api_key_validation_urls: self.api_key_validation_urls.clone(),
             discovery,
@@ -382,6 +386,8 @@ impl Router {
         kv_event_replay_source = vec![],
         kv_event_block_size = 16,
         kv_event_model = None,
+        prefill_data_parallel_size = None,
+        decode_data_parallel_size = None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -459,7 +465,19 @@ impl Router {
         kv_event_replay_source: Vec<String>,
         kv_event_block_size: u32,
         kv_event_model: Option<String>,
+        prefill_data_parallel_size: Option<usize>,
+        decode_data_parallel_size: Option<usize>,
     ) -> PyResult<Self> {
+        for (field, size) in [
+            ("prefill_data_parallel_size", prefill_data_parallel_size),
+            ("decode_data_parallel_size", decode_data_parallel_size),
+        ] {
+            if size == Some(0) {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "{field} must be > 0"
+                )));
+            }
+        }
         if wasm_middleware_sha256
             .as_deref()
             .map(str::trim)
@@ -503,6 +521,8 @@ impl Router {
             wasm_middleware_routes,
             enable_program_scheduling,
             intra_node_data_parallel_size,
+            prefill_data_parallel_size,
+            decode_data_parallel_size,
             api_key,
             api_key_validation_urls,
             log_dir,

@@ -7,6 +7,7 @@ use super::pd_types::{
     PdSelection, Stage, StageDecision,
 };
 use crate::backend::preprocess::{prepare_http_token_inputs, router_token_inputs, HttpTokenInput};
+use crate::config::RouterConfig;
 use crate::core::worker::WorkerMetadata;
 use crate::core::{
     BasicWorker, CircuitBreaker, CircuitBreakerConfig, ConnectionMode, DPAwareWorker, HealthConfig,
@@ -411,6 +412,7 @@ pub struct PdRouterBase {
     pub circuit_breaker_config: CircuitBreakerConfig,
     // Fallback DP size for servers that report no engine metrics
     pub dp_size: usize,
+    pub(super) config: Arc<RouterConfig>,
 }
 
 /// Build the workers backing one server URL, one per engine the server fronts.
@@ -624,6 +626,30 @@ impl PdRouterBase {
             );
         }
         admitted
+    }
+
+    /// An explicit role size takes precedence; otherwise keep per-server metrics discovery.
+    pub(super) async fn discover_worker_dp_size(
+        config: &RouterConfig,
+        client: &Client,
+        url: &str,
+        worker_type: &WorkerType,
+    ) -> usize {
+        let (configured, fallback) = match worker_type {
+            WorkerType::Prefill { .. } => (
+                config.prefill_data_parallel_size,
+                config.effective_prefill_data_parallel_size(),
+            ),
+            WorkerType::Decode => (
+                config.decode_data_parallel_size,
+                config.effective_decode_data_parallel_size(),
+            ),
+            _ => (None, config.intra_node_data_parallel_size),
+        };
+        match configured {
+            Some(size) => size,
+            None => dp_utils::discover_dp_size(client, url, fallback).await,
+        }
     }
 
     // Private helper method to perform health check on a new server
@@ -841,7 +867,8 @@ impl PdRouterBase {
         // Wait for the new server to be healthy
         self.wait_for_server_health(&url).await?;
 
-        let dp_size = dp_utils::discover_dp_size(&self.client, &url, self.dp_size).await;
+        let dp_size =
+            Self::discover_worker_dp_size(&self.config, &self.client, &url, &worker_type).await;
         let workers = build_dp_workers(
             &url,
             dp_size,
@@ -1070,7 +1097,9 @@ impl PdRouterBase {
         });
         let decode_workers = decode_urls.iter().map(|url| (url, WorkerType::Decode));
         for (url, worker_type) in prefill_workers.chain(decode_workers) {
-            let dp_size = dp_utils::discover_dp_size(&ctx.client, url, fallback_dp_size).await;
+            let dp_size =
+                Self::discover_worker_dp_size(&ctx.router_config, &ctx.client, url, &worker_type)
+                    .await;
             for worker in build_dp_workers(
                 url,
                 dp_size,
@@ -1163,6 +1192,7 @@ impl PdRouterBase {
             api_key: ctx.router_config.api_key.clone(),
             circuit_breaker_config: core_cb_config,
             dp_size: fallback_dp_size,
+            config: Arc::new(ctx.router_config.clone()),
         })
     }
 
@@ -1690,6 +1720,7 @@ mod tests {
             api_key: None,
             circuit_breaker_config: CircuitBreakerConfig::default(),
             dp_size: 1,
+            config: Arc::new(RouterConfig::default()),
         }
     }
 
@@ -1711,6 +1742,10 @@ mod tests {
             api_key: None,
             circuit_breaker_config: CircuitBreakerConfig::default(),
             dp_size,
+            config: Arc::new(RouterConfig {
+                intra_node_data_parallel_size: dp_size,
+                ..Default::default()
+            }),
         }
     }
 
