@@ -160,6 +160,7 @@ class RouterArgs:
                 "cache_aware",
                 "power_of_two",
                 "consistent_hash",
+                "sticky_round_robin",
             ],
             help="Load balancing policy to use. In PD mode, this is used for both prefill and decode unless overridden",
         )
@@ -173,6 +174,7 @@ class RouterArgs:
                 "cache_aware",
                 "power_of_two",
                 "consistent_hash",
+                "sticky_round_robin",
             ],
             help="Specific policy for prefill nodes in PD mode. If not specified, uses the main policy",
         )
@@ -186,6 +188,7 @@ class RouterArgs:
                 "cache_aware",
                 "power_of_two",
                 "consistent_hash",
+                "sticky_round_robin",
             ],
             help="Specific policy for decode nodes in PD mode. If not specified, uses the main policy",
         )

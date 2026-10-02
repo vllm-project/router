@@ -2,7 +2,7 @@
 
 use super::{
     CacheAwareConfig, CacheAwarePolicy, ConsistentHashPolicy, LoadBalancingPolicy,
-    PowerOfTwoPolicy, RandomPolicy, RendezvousHashPolicy, RoundRobinPolicy,
+    PowerOfTwoPolicy, RandomPolicy, RendezvousHashPolicy, RoundRobinPolicy, StickyRoundRobinPolicy,
 };
 use crate::config::PolicyConfig;
 use std::sync::Arc;
@@ -39,6 +39,7 @@ impl PolicyFactory {
                 Arc::new(ConsistentHashPolicy::new())
             }
             PolicyConfig::RendezvousHash => Arc::new(RendezvousHashPolicy::new()),
+            PolicyConfig::StickyRoundRobin => Arc::new(StickyRoundRobinPolicy::new()),
         }
     }
 
@@ -51,6 +52,9 @@ impl PolicyFactory {
             "cache_aware" | "cacheaware" => Some(Arc::new(CacheAwarePolicy::new())),
             "consistent_hash" | "consistenthash" => Some(Arc::new(ConsistentHashPolicy::new())),
             "rendezvous_hash" | "rendezvoushash" => Some(Arc::new(RendezvousHashPolicy::new())),
+            "sticky_round_robin" | "stickyroundrobin" => {
+                Some(Arc::new(StickyRoundRobinPolicy::new()))
+            }
             _ => None,
         }
     }
@@ -94,6 +98,10 @@ mod tests {
         // Test RendezvousHash
         let policy = PolicyFactory::create_from_config(&PolicyConfig::RendezvousHash);
         assert_eq!(policy.name(), "rendezvous_hash");
+
+        // Test StickyRoundRobin
+        let policy = PolicyFactory::create_from_config(&PolicyConfig::StickyRoundRobin);
+        assert_eq!(policy.name(), "sticky_round_robin");
     }
 
     #[test]
@@ -110,6 +118,8 @@ mod tests {
         assert!(PolicyFactory::create_by_name("ConsistentHash").is_some());
         assert!(PolicyFactory::create_by_name("rendezvous_hash").is_some());
         assert!(PolicyFactory::create_by_name("RendezvousHash").is_some());
+        assert!(PolicyFactory::create_by_name("sticky_round_robin").is_some());
+        assert!(PolicyFactory::create_by_name("StickyRoundRobin").is_some());
         assert!(PolicyFactory::create_by_name("unknown").is_none());
     }
 }
