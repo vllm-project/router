@@ -37,6 +37,7 @@ struct MooncakePrefillInfo {
 /// vLLM PD Router that extends PdRouterBase with vLLM-specific request handling
 #[derive(Debug)]
 pub struct VllmPDRouter {
+    epd: Option<super::epd::EncoderStage>,
     /// Underlying PD router for most functionality
     pd_router: PdRouterBase,
     /// Service discovery registry for dynamic ZMQ address resolution
@@ -1312,6 +1313,28 @@ impl VllmPDRouter {
             path
         );
 
+        let (original_request, mut ec_transfers) = if path == "/v1/chat/completions" {
+            if let Some(epd) = &self.epd {
+                match epd
+                    .prepare(
+                        &self.http_client,
+                        original_request,
+                        prefill_worker.base_url(),
+                        headers,
+                        std::env::var("OPENAI_API_KEY").ok().as_deref(),
+                    )
+                    .await
+                {
+                    Ok(prepared) => prepared,
+                    Err(error) => return Ok(error.into_response()),
+                }
+            } else {
+                (original_request, None)
+            }
+        } else {
+            (original_request, None)
+        };
+
         // Increment prefill load at the start of the prefill phase
         prefill_worker.increment_load();
 
@@ -1426,6 +1449,20 @@ impl VllmPDRouter {
             prefill_response.headers()
         );
 
+        if !prefill_response.status().is_success() {
+            prefill_worker.decrement_load();
+            let status = prefill_response.status();
+            let detail = prefill_response.text().await.unwrap_or_default();
+            self.stop_profiling(&prefill_base_url).await;
+            let duration = start_time.elapsed();
+            RouterMetrics::record_pd_prefill_error(&prefill_base_url);
+            RouterMetrics::record_pd_request(path);
+            RouterMetrics::record_pd_request_duration(path, duration);
+            return Err(PDRouterError::NetworkError {
+                message: format!("Prefill server {prefill_url} returned {status}: {detail}"),
+            });
+        }
+
         // Extract prefill response body to get kv_transfer_params
         let prefill_bytes = match prefill_response.bytes().await {
             Ok(bytes) => bytes,
@@ -1471,6 +1508,33 @@ impl VllmPDRouter {
             }
         };
 
+        if self.epd.is_some()
+            && !matches!(self.kv_connector, KvConnector::Mooncake)
+            && !matches!(self.moriio_transfer_mode(), Some(MoriIOTransferMode::Write))
+            && !prefill_response_json
+                .get("kv_transfer_params")
+                .is_some_and(Value::is_object)
+        {
+            prefill_worker.decrement_load();
+            self.stop_profiling(&prefill_base_url).await;
+            let duration = start_time.elapsed();
+            RouterMetrics::record_pd_prefill_error(&prefill_base_url);
+            RouterMetrics::record_pd_request(path);
+            RouterMetrics::record_pd_request_duration(path, duration);
+            return Err(PDRouterError::NetworkError {
+                message:
+                    "Prefill returned no KV transfer parameters; refusing metadata-only decode"
+                        .into(),
+            });
+        }
+
+        // Prefill succeeded and consumed the embeddings; the pending EC
+        // transfers are now owned by the decode phase, so disarm the
+        // cancel-on-abandon guard.
+        if let Some(transfers) = ec_transfers.as_mut() {
+            transfers.disarm();
+        }
+
         // Stop profiling on prefill server after its work is done
         self.stop_profiling(&prefill_base_url).await;
 
@@ -1482,6 +1546,13 @@ impl VllmPDRouter {
 
         // Stage 2: Prepare decode request with kv_transfer_params
         let mut decode_request = original_request.clone();
+        if self.epd.is_some() {
+            // D receives the prompt layout and KV, not P's EC reservations.
+            decode_request
+                .as_object_mut()
+                .unwrap()
+                .remove("ec_transfer_params");
+        }
         if let Some(params) = self
             .build_decode_kv_transfer_params(
                 &prefill_base_url,
@@ -1876,7 +1947,10 @@ impl VllmPDRouter {
         ctx: &Arc<crate::server::AppContext>,
     ) -> Result<Self, String> {
         let kv_connector = ctx.router_config.kv_connector;
-        let http_client = reqwest::Client::new();
+        // Carries the configured request/connect timeouts; a bare
+        // reqwest::Client::new() would let a stalled encoder hold the
+        // request and its concurrency permit indefinitely.
+        let http_client = ctx.client.clone();
 
         if let Some(ref addr) = discovery_address {
             // Discovery mode
@@ -1903,6 +1977,11 @@ impl VllmPDRouter {
             );
 
             Ok(Self {
+                epd: ctx
+                    .router_config
+                    .epd
+                    .clone()
+                    .map(super::epd::EncoderStage::new),
                 pd_router,
                 service_registry: Arc::new(service_registry),
                 http_client,
@@ -1993,6 +2072,11 @@ impl VllmPDRouter {
             }
 
             Ok(Self {
+                epd: ctx
+                    .router_config
+                    .epd
+                    .clone()
+                    .map(super::epd::EncoderStage::new),
                 pd_router,
                 service_registry: Arc::new(service_registry),
                 http_client,

@@ -23,6 +23,7 @@ impl ConfigValidator {
         if let Some(program_scheduling) = &config.program_scheduling {
             Self::validate_program_scheduling(program_scheduling)?;
         }
+        Self::validate_epd(config)?;
 
         if let Some(discovery) = &config.discovery {
             Self::validate_discovery(discovery, &config.mode)?;
@@ -179,6 +180,65 @@ impl ConfigValidator {
                     .to_string(),
             });
         }
+        Ok(())
+    }
+
+    fn validate_epd(config: &RouterConfig) -> ConfigResult<()> {
+        let Some(epd) = &config.epd else {
+            return Ok(());
+        };
+        let worker_urls: Vec<&String> = match &config.mode {
+            RoutingMode::Regular { worker_urls } => worker_urls.iter().collect(),
+            RoutingMode::VllmPrefillDecode {
+                prefill_urls,
+                discovery_address: None,
+                ..
+            } => prefill_urls.iter().map(|(url, _)| url).collect(),
+            _ => {
+                return Err(ConfigError::ValidationFailed {
+                    reason: "EPD requires regular E+PD or static vLLM E/P/D routing".into(),
+                })
+            }
+        };
+        if config.intra_node_data_parallel_size != 1 || config.enable_igw {
+            return Err(ConfigError::ValidationFailed {
+                reason: "EPD currently requires DP=1 and proxy mode".into(),
+            });
+        }
+        if epd.encoder_urls.is_empty() {
+            return Err(ConfigError::MissingRequired {
+                field: "epd.encoder_urls".into(),
+            });
+        }
+        Self::validate_urls(&epd.encoder_urls)?;
+        if !epd.consumer_zmq_addrs.is_empty() {
+            if worker_urls.is_empty()
+                || epd.consumer_zmq_addrs.len() != worker_urls.len()
+                || worker_urls
+                    .iter()
+                    .any(|url| !epd.consumer_zmq_addrs.contains_key(*url))
+            {
+                return Err(ConfigError::ValidationFailed {
+                    reason:
+                        "EPD consumer_zmq_addrs must map every embedding consumer URL exactly once"
+                            .into(),
+                });
+            }
+            for addr in epd.consumer_zmq_addrs.values() {
+                let parsed = url::Url::parse(addr).map_err(|e| ConfigError::ValidationFailed {
+                    reason: format!("Invalid EC address: {e}"),
+                })?;
+                if parsed.scheme() != "tcp"
+                    || parsed.host_str().is_none()
+                    || parsed.port().is_none()
+                {
+                    return Err(ConfigError::ValidationFailed {
+                        reason: "EC addresses must be tcp://host:port".into(),
+                    });
+                }
+            }
+        }
+
         Ok(())
     }
 
