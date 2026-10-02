@@ -47,6 +47,10 @@ class Router:
         max_payload_size: Maximum payload size in bytes. Default: 256MB
         max_tree_size: Maximum size of the approximation tree for cache-aware routing. Default: 2^24
         intra_node_data_parallel_size: Data parallel size for DP-aware routing (automatically enabled when > 1). Default: 1
+        prefill_data_parallel_size: Optional Prefill DP replicas per worker URL, overriding automatic discovery.
+            Defaults to the legacy DP size when metrics are unavailable.
+        decode_data_parallel_size: Optional Decode DP replicas per worker URL, overriding automatic discovery.
+            Defaults to the legacy DP size when metrics are unavailable. ZMQ discovery retains engine balancing.
         enable_igw: Enable IGW (Inference-Gateway) mode for multi-model support. When enabled,
             the router can manage multiple models simultaneously with per-model load balancing
             policies. Default: False

@@ -7,6 +7,37 @@ import requests
 
 
 @pytest.mark.integration
+def test_pd_asymmetric_sizes_through_python_launcher(router_manager, mock_workers):
+    _, [prefill_url], _ = mock_workers(n=1, args=["--capture-requests"])
+    _, [decode_url], _ = mock_workers(n=1, args=["--capture-requests"])
+    router = router_manager.start_router(
+        vllm_pd_disaggregation=True,
+        prefill_urls=[(prefill_url, None)],
+        decode_urls=[decode_url],
+        extra={"prefill_data_parallel_size": 4, "decode_data_parallel_size": 2},
+    )
+    with requests.Session() as session:
+        for _ in range(8):
+            response = session.post(
+                f"{router.url}/v1/completions",
+                json={"model": "mock", "prompt": "hello", "max_tokens": 7},
+                timeout=10,
+            )
+            assert response.status_code == 200, response.text
+        for url, size, max_tokens in [(prefill_url, 4, 1), (decode_url, 2, 7)]:
+            response = session.get(f"{url}/captured_requests", timeout=5)
+            response.raise_for_status()
+            captured = response.json()
+            assert len(captured) == 8
+            assert {
+                int(request["headers"]["x-data-parallel-rank"]) for request in captured
+            } == set(range(size))
+            assert all(
+                request["body"]["max_tokens"] == max_tokens for request in captured
+            )
+
+
+@pytest.mark.integration
 def test_pd_power_of_two_decode_attribution(router_manager, mock_workers):
     # Start two prefill and three decode mock workers via fixture
     _, prefill_urls_raw, prefill_ids = mock_workers(n=2)

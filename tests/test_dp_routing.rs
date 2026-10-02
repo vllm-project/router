@@ -244,6 +244,435 @@ mod dp_e2e_tests {
 
     use std::sync::Arc;
 
+    fn pd_mock(worker_type: WorkerType) -> MockWorker {
+        MockWorker::new(MockWorkerConfig {
+            port: 0,
+            worker_type,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 0.0,
+        })
+    }
+
+    fn worker_port(url: &str) -> u16 {
+        url.rsplit(':').next().unwrap().parse().unwrap()
+    }
+
+    async fn pd_chat_response(app: axum::Router) -> axum::response::Response {
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "model": "mock-model",
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "max_tokens": 7,
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        app.oneshot(request).await.unwrap()
+    }
+
+    async fn send_pd_chat(app: axum::Router) {
+        let response = pd_chat_response(app).await;
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(status.as_u16(), 200, "{}", String::from_utf8_lossy(&body));
+    }
+
+    fn captured_ranks(port: u16) -> std::collections::BTreeSet<usize> {
+        get_captured_requests(port)
+            .iter()
+            .filter_map(|request| request.headers.get("x-data-parallel-rank"))
+            .map(|values| {
+                assert_eq!(values.len(), 1);
+                values[0].parse().unwrap()
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn test_asymmetric_pd_static_requests_and_metrics() {
+        for (legacy, prefill, decode, metrics, expected) in [
+            (4, None, None, None, (4, 4)),
+            (1, Some(4), Some(2), None, (4, 2)),
+            (4, None, Some(2), None, (4, 2)),
+            (2, Some(4), None, None, (4, 2)),
+            (1, None, None, Some((4, 2)), (4, 2)),
+            (1, Some(4), Some(2), Some((2, 4)), (4, 2)),
+            (1, Some(4), Some(1), None, (4, 1)),
+            (1, Some(1), Some(2), None, (1, 2)),
+        ] {
+            let mut p = pd_mock(WorkerType::Prefill);
+            let mut d = pd_mock(WorkerType::Decode);
+            if let Some((p_size, d_size)) = metrics {
+                p.set_dp_metrics(p_size).await;
+                d.set_dp_metrics(d_size).await;
+            }
+            let p_url = p.start().await.unwrap();
+            let d_url = d.start().await.unwrap();
+            clear_captured_requests(worker_port(&p_url));
+            clear_captured_requests(worker_port(&d_url));
+            let mut config =
+                make_pd_config(vec![(p_url.clone(), None)], vec![d_url.clone()], legacy);
+            config.prefill_data_parallel_size = prefill;
+            config.decode_data_parallel_size = decode;
+            let ctx = common::create_test_context(config.clone());
+            let router = Arc::from(RouterFactory::create_router(&ctx).await.unwrap());
+            assert_eq!(ctx.worker_registry.get_prefill_workers().len(), expected.0);
+            assert_eq!(ctx.worker_registry.get_decode_workers().len(), expected.1);
+            let app = common::test_app::create_test_app(router, Client::new(), &config);
+            for _ in 0..8 {
+                send_pd_chat(app.clone()).await;
+            }
+            for (url, size) in [(&p_url, expected.0), (&d_url, expected.1)] {
+                let ranks = captured_ranks(worker_port(url));
+                let expected_ranks = if size > 1 {
+                    (0..size).collect()
+                } else {
+                    Default::default()
+                };
+                assert_eq!(
+                    ranks, expected_ranks,
+                    "{url}, legacy={legacy}, P={prefill:?}, D={decode:?}"
+                );
+            }
+            let p_requests = get_captured_requests(worker_port(&p_url));
+            let d_requests = get_captured_requests(worker_port(&d_url));
+            assert_eq!(p_requests.len(), 8);
+            assert_eq!(d_requests.len(), 8);
+            for request in p_requests {
+                assert_eq!(request.body.as_ref().unwrap()["max_tokens"], 1);
+                assert!(request.body.unwrap()["kv_transfer_params"]
+                    .get("remote_dp_size")
+                    .is_none());
+            }
+            for request in d_requests {
+                assert_eq!(request.body.unwrap()["max_tokens"], 7);
+            }
+            p.stop().await;
+            d.stop().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_asymmetric_pd_dynamic_add_remove_and_pinned_url() {
+        use vllm_router_rs::routers::http::vllm_pd_router::VllmPDRouter;
+        let mut p = pd_mock(WorkerType::Prefill);
+        let mut d = pd_mock(WorkerType::Decode);
+        let p_url = p.start().await.unwrap();
+        let d_url = d.start().await.unwrap();
+        let mut config = make_pd_config(vec![(format!("{p_url}@3"), None)], vec![d_url.clone()], 1);
+        config.prefill_data_parallel_size = Some(4);
+        config.decode_data_parallel_size = Some(2);
+        let ctx = common::create_test_context(config.clone());
+        let router = RouterFactory::create_router(&ctx).await.unwrap();
+        let pd = router.as_any().downcast_ref::<VllmPDRouter>().unwrap();
+        assert_eq!(ctx.worker_registry.get_prefill_workers().len(), 1);
+        assert_eq!(
+            ctx.worker_registry.get_prefill_workers()[0].dp_rank(),
+            Some(3)
+        );
+        let mut added_p = pd_mock(WorkerType::Prefill);
+        let mut added_d = pd_mock(WorkerType::Decode);
+        let added_p_url = added_p.start().await.unwrap();
+        let added_d_url = added_d.start().await.unwrap();
+        pd.add_prefill_server(added_p_url.clone(), None)
+            .await
+            .unwrap();
+        pd.add_decode_server(added_d_url.clone()).await.unwrap();
+        assert_eq!(ctx.worker_registry.get_prefill_workers().len(), 5);
+        assert_eq!(ctx.worker_registry.get_decode_workers().len(), 4);
+        pd.remove_prefill_server(&added_p_url).await.unwrap();
+        pd.remove_decode_server(&added_d_url).await.unwrap();
+        assert_eq!(ctx.worker_registry.get_prefill_workers().len(), 1);
+        assert_eq!(ctx.worker_registry.get_decode_workers().len(), 2);
+        for worker in [&mut p, &mut d, &mut added_p, &mut added_d] {
+            worker.stop().await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_asymmetric_pd_discovery_requests_and_peer_metadata() {
+        use vllm_router_rs::config::KvConnector;
+        for (connector, mode, prefill_size, reported_size, pinned_decode, role_overrides) in [
+            (KvConnector::Nixl, None, 4, None, None, true),
+            (KvConnector::MoriIO, Some("WRITE"), 4, Some(4), None, true),
+            (KvConnector::MoriIO, Some("READ"), 4, Some(4), None, true),
+            (KvConnector::MoriIO, Some("WRITE"), 1, Some(1), None, true),
+            (KvConnector::MoriIO, Some("READ"), 8, Some(16), None, false),
+            (KvConnector::MoriIO, Some("WRITE"), 8, Some(16), None, false),
+            (KvConnector::MoriIO, Some("WRITE"), 4, None, None, true),
+            (KvConnector::MoriIO, Some("WRITE"), 4, None, None, false),
+            (
+                KvConnector::MoriIO,
+                Some("WRITE"),
+                4,
+                Some(4),
+                Some(1),
+                true,
+            ),
+            (
+                KvConnector::MoriIO,
+                Some("WRITE"),
+                4,
+                Some(4),
+                Some(0),
+                true,
+            ),
+        ] {
+            let mut p = pd_mock(WorkerType::Prefill);
+            let mut d = pd_mock(WorkerType::Decode);
+            p.set_dp_metrics(prefill_size).await;
+            d.set_dp_metrics(2).await;
+            let producer_params = json!({
+                "do_remote_prefill": true,
+                "do_remote_decode": false,
+                "remote_engine_id": "producer",
+                "remote_block_ids": [1, 2],
+                "remote_dp_size": 8,
+                "remote_dp_size_local": 4,
+                "remote_dp_rank": 4,
+                "remote_dp_rank_override": true,
+            });
+            if mode == Some("READ") {
+                p.set_chat_response(json!({"kv_transfer_params": producer_params}))
+                    .await;
+            }
+            let p_url = p.start().await.unwrap();
+            let d_url = d.start().await.unwrap();
+            clear_captured_requests(worker_port(&p_url));
+            clear_captured_requests(worker_port(&d_url));
+            let reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let discovery_address = reservation.local_addr().unwrap().to_string();
+            let mut config = make_pd_config(vec![], vec![], 4);
+            if role_overrides {
+                config.prefill_data_parallel_size = Some(prefill_size);
+                config.decode_data_parallel_size = Some(2);
+            }
+            config.kv_connector = connector;
+            if let RoutingMode::VllmPrefillDecode {
+                discovery_address: address,
+                ..
+            } = &mut config.mode
+            {
+                *address = Some(discovery_address.clone());
+            }
+            let ctx = common::create_test_context(config.clone());
+            drop(reservation);
+            let router: Arc<dyn vllm_router_rs::routers::RouterTrait> =
+                Arc::from(RouterFactory::create_router(&ctx).await.unwrap());
+            let zmq_context = zmq::Context::new();
+            let sender = zmq_context.socket(zmq::DEALER).unwrap();
+            sender.set_linger(0).unwrap();
+            sender
+                .connect(&format!("tcp://{discovery_address}"))
+                .unwrap();
+            let registered_p_url = if pinned_decode.is_some() {
+                format!("{p_url}@3")
+            } else {
+                p_url.clone()
+            };
+            let registered_d_url = pinned_decode
+                .map(|rank| format!("{d_url}@{rank}"))
+                .unwrap_or_else(|| d_url.clone());
+            for (url, role, dp_size, tp_size) in [
+                (&registered_p_url, "P", reported_size, 2),
+                (&registered_d_url, "D", Some(2), 1),
+            ] {
+                let mut registration = json!({
+                    "type": role,
+                    "http_address": url.trim_start_matches("http://"),
+                    "zmq_address": "host:127.0.0.1,handshake:6301,notify:61005",
+                });
+                if let Some(mode) = mode {
+                    registration["transfer_mode"] = json!(mode);
+                    if let Some(size) = dp_size {
+                        registration["dp_size"] = json!(size);
+                    }
+                    registration["tp_size"] = json!(tp_size);
+                }
+                sender
+                    .send(rmp_serde::to_vec_named(&registration).unwrap(), 0)
+                    .unwrap();
+            }
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    let response = router.health(Request::new(Body::empty())).await;
+                    if response.status().is_success() {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            assert!(
+                ctx.worker_registry.get_all().is_empty(),
+                "ZMQ discovery must not expand Decode workers"
+            );
+            let app = common::test_app::create_test_app(router, Client::new(), &config);
+            let should_reject = mode == Some("WRITE")
+                && (reported_size.is_some_and(|size| size != prefill_size)
+                    || (reported_size.is_none() && role_overrides));
+            if should_reject {
+                let response = pd_chat_response(app).await;
+                assert_eq!(response.status().as_u16(), 500);
+                let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                let error = String::from_utf8_lossy(&body);
+                assert!(
+                    error.contains(if reported_size.is_some() {
+                        "global DP 16"
+                    } else {
+                        "must report its global DP size"
+                    }),
+                    "{error}"
+                );
+                assert!(get_captured_requests(worker_port(&p_url)).is_empty());
+                assert!(get_captured_requests(worker_port(&d_url)).is_empty());
+                p.stop().await;
+                d.stop().await;
+                continue;
+            }
+            let requests = prefill_size.max(4);
+            for _ in 0..requests {
+                send_pd_chat(app.clone()).await;
+            }
+            {
+                let expected = if pinned_decode.is_some() {
+                    [3].into_iter().collect()
+                } else if prefill_size > 1 {
+                    (0..prefill_size).collect()
+                } else {
+                    Default::default()
+                };
+                assert_eq!(captured_ranks(worker_port(&p_url)), expected);
+            }
+            assert_eq!(
+                captured_ranks(worker_port(&d_url)),
+                pinned_decode.into_iter().collect()
+            );
+            let p_requests = get_captured_requests(worker_port(&p_url));
+            let d_requests = get_captured_requests(worker_port(&d_url));
+            assert_eq!(p_requests.len(), requests);
+            assert_eq!(d_requests.len(), requests);
+            if connector == KvConnector::MoriIO {
+                for (p_request, d_request) in p_requests.iter().zip(d_requests.iter()) {
+                    let p_params = &p_request.body.as_ref().unwrap()["kv_transfer_params"];
+                    let d_params = &d_request.body.as_ref().unwrap()["kv_transfer_params"];
+                    assert_eq!(p_params["remote_dp_size"], 2);
+                    assert_eq!(
+                        p_params.get("remote_dp_rank"),
+                        pinned_decode.as_ref().map(|rank| json!(rank)).as_ref()
+                    );
+                    if mode == Some("WRITE") {
+                        assert_eq!(d_params["remote_dp_size"], prefill_size);
+                        assert_eq!(d_params["remote_tp_size"], 2);
+                        assert!(d_params.get("is_request_leader").is_none());
+                        if prefill_size > 1 {
+                            let p_rank: usize = p_request.headers["x-data-parallel-rank"][0]
+                                .parse()
+                                .unwrap();
+                            assert_eq!(d_params["remote_dp_rank"], p_rank);
+                        } else {
+                            assert_eq!(d_params["remote_dp_rank"], 0);
+                        }
+                        assert!(d_params.get("remote_dp_rank_override").is_none());
+                        assert_eq!(p_params["transfer_id"], d_params["transfer_id"]);
+                    } else {
+                        assert_eq!(d_params, &producer_params);
+                    }
+                }
+            }
+            p.stop().await;
+            d.stop().await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_discovery_rotates_prefill_ranks_per_endpoint() {
+        for prefill_override in [Some(4), None] {
+            let local_sizes = [4, if prefill_override.is_some() { 4 } else { 2 }];
+            let mut p1 = pd_mock(WorkerType::Prefill);
+            let mut p2 = pd_mock(WorkerType::Prefill);
+            let mut d = pd_mock(WorkerType::Decode);
+            p1.set_dp_metrics(local_sizes[0]).await;
+            p2.set_dp_metrics(local_sizes[1]).await;
+            let p1_url = p1.start().await.unwrap();
+            let p2_url = p2.start().await.unwrap();
+            let d_url = d.start().await.unwrap();
+            for url in [&p1_url, &p2_url, &d_url] {
+                clear_captured_requests(worker_port(url));
+            }
+            let reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let discovery_address = reservation.local_addr().unwrap().to_string();
+            let mut config = make_pd_config(vec![], vec![], 1);
+            config.prefill_data_parallel_size = prefill_override;
+            config.decode_data_parallel_size = Some(2);
+            if let RoutingMode::VllmPrefillDecode {
+                discovery_address: address,
+                ..
+            } = &mut config.mode
+            {
+                *address = Some(discovery_address.clone());
+            }
+            let ctx = common::create_test_context(config.clone());
+            drop(reservation);
+            let router: Arc<dyn vllm_router_rs::routers::RouterTrait> =
+                Arc::from(RouterFactory::create_router(&ctx).await.unwrap());
+            let zmq_context = zmq::Context::new();
+            let sender = zmq_context.socket(zmq::DEALER).unwrap();
+            sender.set_linger(0).unwrap();
+            sender
+                .connect(&format!("tcp://{discovery_address}"))
+                .unwrap();
+            // D registers last, so readiness implies both P registrations arrived.
+            for (url, role) in [(&p1_url, "P"), (&p2_url, "P"), (&d_url, "D")] {
+                let registration = json!({
+                    "type": role,
+                    "http_address": url.trim_start_matches("http://"),
+                    "zmq_address": "host:127.0.0.1,handshake:6301,notify:61005",
+                });
+                sender
+                    .send(rmp_serde::to_vec_named(&registration).unwrap(), 0)
+                    .unwrap();
+            }
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    if router
+                        .health(Request::new(Body::empty()))
+                        .await
+                        .status()
+                        .is_success()
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            let app = common::test_app::create_test_app(router, Client::new(), &config);
+            for _ in 0..16 {
+                send_pd_chat(app.clone()).await;
+            }
+            for (url, local_size) in [(&p1_url, local_sizes[0]), (&p2_url, local_sizes[1])] {
+                assert_eq!(get_captured_requests(worker_port(url)).len(), 8);
+                assert_eq!(captured_ranks(worker_port(url)), (0..local_size).collect());
+            }
+            assert!(captured_ranks(worker_port(&d_url)).is_empty());
+            for worker in [&mut p1, &mut p2, &mut d] {
+                worker.stop().await;
+            }
+        }
+    }
+
     /// Helper to create a RouterConfig with DP settings for Regular mode
     fn make_regular_config(worker_urls: Vec<String>, dp_size: usize) -> RouterConfig {
         RouterConfig {
@@ -256,6 +685,8 @@ mod dp_e2e_tests {
             worker_startup_timeout_secs: 5,
             worker_startup_check_interval_secs: 1,
             intra_node_data_parallel_size: dp_size,
+            prefill_data_parallel_size: None,
+            decode_data_parallel_size: None,
             api_key: None,
             api_key_validation_urls: vec![],
             discovery: None,
@@ -305,6 +736,8 @@ mod dp_e2e_tests {
             worker_startup_timeout_secs: 5,
             worker_startup_check_interval_secs: 1,
             intra_node_data_parallel_size: dp_size,
+            prefill_data_parallel_size: None,
+            decode_data_parallel_size: None,
             api_key: None,
             api_key_validation_urls: vec![],
             discovery: None,

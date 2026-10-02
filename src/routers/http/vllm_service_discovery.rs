@@ -80,11 +80,25 @@ pub struct ServiceInstance {
     pub dp_size: usize,
 }
 
+// Keep wire-field presence internal; the public registration/instance defaults stay DP1.
+#[derive(Debug, Clone)]
+struct RegisteredService {
+    instance: ServiceInstance,
+    reported_dp_size: Option<usize>,
+    // Each HTTP endpoint must cycle through all of its own engines independently.
+    prefill_dp_cursor: usize,
+}
+
+#[derive(Deserialize)]
+struct ReportedDpSize {
+    dp_size: Option<usize>,
+}
+
 /// Service registry maintaining prefill and decode instances
 #[derive(Debug)]
 pub struct ServiceRegistry {
-    prefill_instances: Arc<Mutex<HashMap<String, ServiceInstance>>>,
-    decode_instances: Arc<Mutex<HashMap<String, ServiceInstance>>>,
+    prefill_instances: Arc<Mutex<HashMap<String, RegisteredService>>>,
+    decode_instances: Arc<Mutex<HashMap<String, RegisteredService>>>,
     shutdown_tx: Option<broadcast::Sender<()>>,
     /// Set on first MoRI-IO registration; subsequent mismatches are rejected.
     pub moriio_transfer_mode: Arc<OnceLock<MoriIOTransferMode>>,
@@ -104,7 +118,7 @@ fn parse_registration(
     ServiceRegistration,
     Option<MoriIOTransferMode>,
     usize,
-    usize,
+    Option<usize>,
 )> {
     if matches!(kv_connector, KvConnector::MoriIO) {
         let reg: MoriIOServiceRegistration = match rmp_serde::from_slice(message_data) {
@@ -126,6 +140,10 @@ fn parse_registration(
             }
         };
         // Check for mismatch against already-committed mode without committing yet.
+        if reg.tp_size == 0 || reg.dp_size == 0 {
+            warn!("MoRI-IO registration TP and DP sizes must be > 0");
+            return None;
+        }
         if let Some(stored) = stored_transfer_mode {
             if stored != mode {
                 warn!(
@@ -137,10 +155,11 @@ fn parse_registration(
                 return None;
             }
         }
-        Some((reg.base, Some(mode), reg.tp_size, reg.dp_size))
+        let reported: ReportedDpSize = rmp_serde::from_slice(message_data).ok()?;
+        Some((reg.base, Some(mode), reg.tp_size, reported.dp_size))
     } else {
         match rmp_serde::from_slice(message_data) {
-            Ok(data) => Some((data, None, 1, 1)),
+            Ok(data) => Some((data, None, 1, None)),
             Err(e) => {
                 warn!("Failed to parse service registration: {}", e);
                 None
@@ -247,8 +266,8 @@ impl ServiceRegistry {
     async fn handle_registration_message(
         message_data: &[u8],
         remote_address: &[u8],
-        prefill_instances: &Arc<Mutex<HashMap<String, ServiceInstance>>>,
-        decode_instances: &Arc<Mutex<HashMap<String, ServiceInstance>>>,
+        prefill_instances: &Arc<Mutex<HashMap<String, RegisteredService>>>,
+        decode_instances: &Arc<Mutex<HashMap<String, RegisteredService>>>,
         kv_connector: KvConnector,
         moriio_transfer_mode: &Arc<OnceLock<MoriIOTransferMode>>,
     ) {
@@ -267,11 +286,15 @@ impl ServiceRegistry {
             .unwrap()
             .as_secs();
 
-        let instance = ServiceInstance {
-            zmq_address: data.zmq_address.clone(),
-            expires_at: current_time + DEFAULT_PING_SECONDS,
-            tp_size,
-            dp_size,
+        let mut instance = RegisteredService {
+            instance: ServiceInstance {
+                zmq_address: data.zmq_address.clone(),
+                expires_at: current_time + DEFAULT_PING_SECONDS,
+                tp_size,
+                dp_size: dp_size.unwrap_or(1),
+            },
+            reported_dp_size: dp_size,
+            prefill_dp_cursor: 0,
         };
 
         let remote_addr_str = String::from_utf8_lossy(remote_address);
@@ -292,6 +315,9 @@ impl ServiceRegistry {
             "P" => {
                 let mut prefill = prefill_instances.lock().unwrap();
                 let is_new = !prefill.contains_key(&data.http_address);
+                if let Some(previous) = prefill.get(&data.http_address) {
+                    instance.prefill_dp_cursor = previous.prefill_dp_cursor;
+                }
                 prefill.insert(data.http_address.clone(), instance);
 
                 if is_new {
@@ -334,8 +360,8 @@ impl ServiceRegistry {
 
     /// Clean up expired service instances
     async fn cleanup_expired_instances(
-        prefill_instances: &Arc<Mutex<HashMap<String, ServiceInstance>>>,
-        decode_instances: &Arc<Mutex<HashMap<String, ServiceInstance>>>,
+        prefill_instances: &Arc<Mutex<HashMap<String, RegisteredService>>>,
+        decode_instances: &Arc<Mutex<HashMap<String, RegisteredService>>>,
     ) {
         let current_time = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -347,7 +373,7 @@ impl ServiceRegistry {
             let mut prefill = prefill_instances.lock().unwrap();
             let expired_keys: Vec<_> = prefill
                 .iter()
-                .filter(|(_, instance)| instance.expires_at <= current_time)
+                .filter(|(_, instance)| instance.instance.expires_at <= current_time)
                 .map(|(key, _)| key.clone())
                 .collect();
 
@@ -355,7 +381,7 @@ impl ServiceRegistry {
                 if let Some(instance) = prefill.remove(&key) {
                     info!(
                         "🔴Remove Prefill [HTTP:{}, ZMQ:{}, expired]",
-                        key, instance.zmq_address
+                        key, instance.instance.zmq_address
                     );
                 }
             }
@@ -366,7 +392,7 @@ impl ServiceRegistry {
             let mut decode = decode_instances.lock().unwrap();
             let expired_keys: Vec<_> = decode
                 .iter()
-                .filter(|(_, instance)| instance.expires_at <= current_time)
+                .filter(|(_, instance)| instance.instance.expires_at <= current_time)
                 .map(|(key, _)| key.clone())
                 .collect();
 
@@ -374,7 +400,7 @@ impl ServiceRegistry {
                 if let Some(instance) = decode.remove(&key) {
                     info!(
                         "🔴Remove Decode [HTTP:{}, ZMQ:{}, expired]",
-                        key, instance.zmq_address
+                        key, instance.instance.zmq_address
                     );
                 }
             }
@@ -393,16 +419,23 @@ impl ServiceRegistry {
             .unwrap()
             .as_secs();
 
-        let instance = ServiceInstance {
-            zmq_address: zmq_address.clone(),
-            expires_at: current_time + DEFAULT_PING_SECONDS,
-            tp_size: 1,
-            dp_size: 1,
+        let mut instance = RegisteredService {
+            instance: ServiceInstance {
+                zmq_address: zmq_address.clone(),
+                expires_at: current_time + DEFAULT_PING_SECONDS,
+                tp_size: 1,
+                dp_size: 1,
+            },
+            reported_dp_size: None,
+            prefill_dp_cursor: 0,
         };
 
         match service_type {
             ServiceType::Prefill => {
                 let mut prefill = self.prefill_instances.lock().unwrap();
+                if let Some(previous) = prefill.get(&http_address) {
+                    instance.prefill_dp_cursor = previous.prefill_dp_cursor;
+                }
                 prefill.insert(http_address.clone(), instance);
                 info!(
                     "🔵Manual register Prefill [HTTP:{}, ZMQ:{}]",
@@ -420,8 +453,33 @@ impl ServiceRegistry {
         }
     }
 
+    /// Advance within the selected endpoint's local engines. Heartbeats preserve
+    /// this cursor; deleting an expired registration deletes the cursor with it.
+    pub(super) fn next_prefill_dp_rank(
+        &self,
+        http_address: &str,
+        local_dp_size: usize,
+    ) -> Option<usize> {
+        let mut instances = self.prefill_instances.lock().unwrap();
+        let entry = instances.get_mut(http_address)?;
+        let rank = entry.prefill_dp_cursor % local_dp_size;
+        entry.prefill_dp_cursor = entry.prefill_dp_cursor.wrapping_add(1);
+        Some(rank)
+    }
+
     /// Get tp_size and dp_size for a given HTTP address (from registration payload).
     pub fn get_tp_dp_size(&self, http_address: &str, service_type: ServiceType) -> (usize, usize) {
+        self.registered_peer_sizes(http_address, service_type)
+            .map(|(tp_size, dp_size)| (tp_size, dp_size.unwrap_or(1)))
+            .unwrap_or((1, 1))
+    }
+
+    /// Connector facts only: DP is the reported global world, never an HTTP rank limit.
+    pub(super) fn registered_peer_sizes(
+        &self,
+        http_address: &str,
+        service_type: ServiceType,
+    ) -> Option<(usize, Option<usize>)> {
         let instances = match service_type {
             ServiceType::Prefill => &self.prefill_instances,
             ServiceType::Decode => &self.decode_instances,
@@ -429,8 +487,7 @@ impl ServiceRegistry {
         let guard = instances.lock().unwrap();
         guard
             .get(http_address)
-            .map(|i| (i.tp_size, i.dp_size))
-            .unwrap_or((1, 1))
+            .map(|entry| (entry.instance.tp_size, entry.reported_dp_size))
     }
 
     /// Get ZMQ address for a given HTTP address
@@ -443,7 +500,7 @@ impl ServiceRegistry {
         let guard = instances.lock().unwrap();
         guard
             .get(http_address)
-            .map(|instance| instance.zmq_address.clone())
+            .map(|instance| instance.instance.zmq_address.clone())
     }
 
     /// Get all available prefill instances as `(http_address, zmq_address)`.
@@ -451,7 +508,7 @@ impl ServiceRegistry {
         let guard = self.prefill_instances.lock().unwrap();
         guard
             .iter()
-            .map(|(http, instance)| (http.clone(), instance.zmq_address.clone()))
+            .map(|(http, instance)| (http.clone(), instance.instance.zmq_address.clone()))
             .collect()
     }
 
@@ -460,7 +517,7 @@ impl ServiceRegistry {
         let guard = self.decode_instances.lock().unwrap();
         guard
             .iter()
-            .map(|(http, instance)| (http.clone(), instance.zmq_address.clone()))
+            .map(|(http, instance)| (http.clone(), instance.instance.zmq_address.clone()))
             .collect()
     }
 
@@ -488,6 +545,82 @@ impl Drop for ServiceRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn test_registered_dp_size_distinguishes_missing_and_one() {
+        for dp_size in [None, Some(1), Some(4)] {
+            let registry = ServiceRegistry::new();
+            let mut registration = serde_json::json!({
+                "type": "P",
+                "http_address": "prefill:8000",
+                "zmq_address": "host:prefill,handshake:6301,notify:61005",
+                "transfer_mode": "WRITE",
+                "tp_size": 2,
+            });
+            if let Some(size) = dp_size {
+                registration["dp_size"] = serde_json::json!(size);
+            }
+            let message = rmp_serde::to_vec_named(&registration).unwrap();
+            ServiceRegistry::handle_registration_message(
+                &message,
+                b"peer",
+                &registry.prefill_instances,
+                &registry.decode_instances,
+                KvConnector::MoriIO,
+                &registry.moriio_transfer_mode,
+            )
+            .await;
+            assert_eq!(
+                registry.registered_peer_sizes("prefill:8000", ServiceType::Prefill),
+                Some((2, dp_size))
+            );
+            assert_eq!(
+                registry.get_tp_dp_size("prefill:8000", ServiceType::Prefill),
+                (2, dp_size.unwrap_or(1))
+            );
+            assert_eq!(
+                registry.registered_peer_sizes("absent:8000", ServiceType::Prefill),
+                None
+            );
+            assert_eq!(registry.next_prefill_dp_rank("prefill:8000", 4), Some(0));
+            assert_eq!(registry.next_prefill_dp_rank("prefill:8000", 4), Some(1));
+            // A heartbeat updates registration facts without restarting local rotation.
+            ServiceRegistry::handle_registration_message(
+                &message,
+                b"peer",
+                &registry.prefill_instances,
+                &registry.decode_instances,
+                KvConnector::MoriIO,
+                &registry.moriio_transfer_mode,
+            )
+            .await;
+            assert_eq!(registry.next_prefill_dp_rank("prefill:8000", 4), Some(2));
+            registry
+                .prefill_instances
+                .lock()
+                .unwrap()
+                .get_mut("prefill:8000")
+                .unwrap()
+                .instance
+                .expires_at = 0;
+            ServiceRegistry::cleanup_expired_instances(
+                &registry.prefill_instances,
+                &registry.decode_instances,
+            )
+            .await;
+            assert_eq!(registry.next_prefill_dp_rank("prefill:8000", 4), None);
+            ServiceRegistry::handle_registration_message(
+                &message,
+                b"peer",
+                &registry.prefill_instances,
+                &registry.decode_instances,
+                KvConnector::MoriIO,
+                &registry.moriio_transfer_mode,
+            )
+            .await;
+            assert_eq!(registry.next_prefill_dp_rank("prefill:8000", 4), Some(0));
+        }
+    }
 
     fn make_moriio_msgpack(service_type: &str, transfer_mode: &str) -> Vec<u8> {
         // rmp_serde::to_vec_named produces msgpack — suitable for our deserializer.

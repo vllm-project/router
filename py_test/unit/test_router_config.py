@@ -9,12 +9,41 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from vllm_router.launch_router import RouterArgs, launch_router
-from vllm_router.router import policy_from_str
+from vllm_router.router import Router, policy_from_str
 from vllm_router_rs import PolicyType
 
 
 class TestRouterConfigValidation:
     """Test router configuration validation logic."""
+
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            {},
+            {"prefill_data_parallel_size": 4, "decode_data_parallel_size": 2},
+            {"decode_data_parallel_size": 2},
+            {"prefill_data_parallel_size": 4},
+        ],
+    )
+    def test_pd_sizes_reach_native_router(self, overrides):
+        args = RouterArgs(
+            vllm_pd_disaggregation=True,
+            prefill_urls=[("http://prefill:8000", None)],
+            decode_urls=["http://decode:8000"],
+            intra_node_data_parallel_size=4,
+            **overrides,
+        )
+        # Construct the real extension; do not start a server or patch the binding.
+        router = Router.from_args(args)
+        assert router._router is not None
+
+    @pytest.mark.parametrize(
+        "field", ["prefill_data_parallel_size", "decode_data_parallel_size"]
+    )
+    @pytest.mark.parametrize("value", [0, -1, 1.5])
+    def test_native_router_rejects_invalid_pd_size(self, field, value):
+        with pytest.raises((ValueError, OverflowError, TypeError)):
+            Router(worker_urls=[], **{field: value})
 
     def test_valid_basic_config(self):
         """Test that a valid basic configuration passes validation."""

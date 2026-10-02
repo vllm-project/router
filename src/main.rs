@@ -200,6 +200,14 @@ struct CliArgs {
     #[arg(long, default_value_t = 1)]
     intra_node_data_parallel_size: usize,
 
+    /// Prefill DP replicas per worker URL (overrides automatic discovery and the legacy fallback)
+    #[arg(long)]
+    prefill_data_parallel_size: Option<usize>,
+
+    /// Decode DP replicas per worker URL (overrides automatic discovery and the legacy fallback)
+    #[arg(long)]
+    decode_data_parallel_size: Option<usize>,
+
     /// API key for worker authorization
     #[arg(long)]
     api_key: Option<String>,
@@ -549,6 +557,8 @@ impl CliArgs {
             worker_startup_timeout_secs: self.worker_startup_timeout_secs,
             worker_startup_check_interval_secs: self.worker_startup_check_interval,
             intra_node_data_parallel_size: self.intra_node_data_parallel_size,
+            prefill_data_parallel_size: self.prefill_data_parallel_size,
+            decode_data_parallel_size: self.decode_data_parallel_size,
             api_key: self.api_key.clone(),
             api_key_validation_urls,
             discovery,
@@ -758,6 +768,39 @@ Provide --worker-urls or PD flags as usual.",
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_pd_data_parallel_sizes() {
+        let args = CliArgs::try_parse_from([
+            "vllm-router",
+            "--vllm-pd-disaggregation",
+            "--vllm-discovery-address",
+            "127.0.0.1:30001",
+            "--intra-node-data-parallel-size",
+            "4",
+            "--decode-data-parallel-size",
+            "2",
+        ])
+        .unwrap();
+        let config = args.to_router_config(vec![]).unwrap();
+        assert_eq!(config.effective_prefill_data_parallel_size(), 4);
+        assert_eq!(config.effective_decode_data_parallel_size(), 2);
+
+        let args = CliArgs::try_parse_from([
+            "vllm-router",
+            "--prefill-data-parallel-size",
+            "4",
+            "--decode-data-parallel-size",
+            "2",
+            "--vllm-pd-disaggregation",
+            "--vllm-discovery-address",
+            "127.0.0.1:30001",
+        ])
+        .unwrap();
+        let config = args.to_router_config(vec![]).unwrap();
+        assert_eq!(config.prefill_data_parallel_size, Some(4));
+        assert_eq!(config.decode_data_parallel_size, Some(2));
+    }
 
     #[test]
     fn parses_wasm_middleware_options() {
