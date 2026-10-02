@@ -5,6 +5,7 @@ These tests focus on testing the argument parsing logic in isolation,
 without starting actual router instances.
 """
 
+import argparse
 from types import SimpleNamespace
 
 import pytest
@@ -29,6 +30,8 @@ class TestRouterArgs:
         assert args.decode_urls == []
         assert args.enable_program_scheduling is False
         assert args.program_scheduling_config_json is None
+        assert args.prefill_data_parallel_size is None
+        assert args.decode_data_parallel_size is None
 
         # Test PD-specific defaults
         assert args.prefill_policy is None
@@ -420,6 +423,30 @@ class TestPolicyFromStr:
 
 class TestParseRouterArgs:
     """Test the parse_router_args function."""
+
+    @pytest.mark.parametrize("use_prefix", [False, True])
+    def test_parse_pd_data_parallel_sizes(self, use_prefix):
+        parser = argparse.ArgumentParser()
+        RouterArgs.add_cli_args(parser, use_router_prefix=use_prefix)
+        prefix = "router-" if use_prefix else ""
+        parsed = parser.parse_args(
+            [
+                f"--{prefix}intra-node-data-parallel-size",
+                "4",
+                f"--{prefix}decode-data-parallel-size",
+                "2",
+            ]
+        )
+        args = RouterArgs.from_cli_args(parsed, use_router_prefix=use_prefix)
+        assert args.intra_node_data_parallel_size == 4
+        assert args.prefill_data_parallel_size is None
+        assert args.decode_data_parallel_size == 2
+
+        args = parse_router_args(
+            ["--prefill-data-parallel-size", "4", "--decode-data-parallel-size", "2"]
+        )
+        assert args.prefill_data_parallel_size == 4
+        assert args.decode_data_parallel_size == 2
 
     def test_parse_basic_args(self):
         """Test parsing basic router arguments."""

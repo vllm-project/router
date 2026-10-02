@@ -96,6 +96,10 @@ class RouterArgs:
     cb_window_duration_secs: int = 120
     disable_circuit_breaker: bool = False
 
+    # Optional per-role DP replicas per worker URL; appended for positional compatibility.
+    prefill_data_parallel_size: Optional[int] = None
+    decode_data_parallel_size: Optional[int] = None
+
     @staticmethod
     def add_cli_args(
         parser: argparse.ArgumentParser,
@@ -294,6 +298,18 @@ class RouterArgs:
             type=int,
             default=RouterArgs.intra_node_data_parallel_size,
             help="Intra-node data parallel size for DP-aware routing (automatically enabled when > 1, default: 1)",
+        )
+        parser.add_argument(
+            f"--{prefix}prefill-data-parallel-size",
+            type=int,
+            default=None,
+            help="Prefill DP replicas per worker URL; overrides automatic discovery and the legacy DP fallback.",
+        )
+        parser.add_argument(
+            f"--{prefix}decode-data-parallel-size",
+            type=int,
+            default=None,
+            help="Decode DP replicas per worker URL; overrides automatic discovery and the legacy DP fallback.",
         )
         parser.add_argument(
             f"--{prefix}enable-igw",

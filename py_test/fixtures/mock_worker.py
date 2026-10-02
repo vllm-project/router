@@ -45,6 +45,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--max-payload-bytes", type=int, default=10 * 1024 * 1024)
     p.add_argument("--stream", action="store_true")
     p.add_argument("--dp-size", type=int, default=1)
+    p.add_argument("--capture-requests", action="store_true")
     p.add_argument("--crash-on-request", action="store_true")
     p.add_argument("--health-fail-after-ms", type=int, default=0)
     return p.parse_args()
@@ -62,6 +63,11 @@ def create_app(args: argparse.Namespace) -> FastAPI:
     worker_id = _extract_worker_id(args)
     start_ts = time.time()
     crashed = {"done": False}
+    captured_requests = []
+
+    @app.get("/captured_requests")
+    async def get_captured_requests():
+        return JSONResponse(captured_requests)
 
     async def maybe_delay():
         if args.latency_ms > 0:
@@ -180,6 +186,9 @@ def create_app(args: argparse.Namespace) -> FastAPI:
             data = await request.json()
         except (json.JSONDecodeError, ValueError):
             data = {}
+
+        if args.capture_requests:
+            captured_requests.append({"body": data, "headers": dict(request.headers)})
 
         now = time.time()
         ret = {
