@@ -125,6 +125,10 @@ fn parse_registration(
                 return None;
             }
         };
+        if reg.tp_size == 0 || reg.dp_size == Some(0) {
+            warn!("MoRI-IO registration TP and DP sizes must be > 0");
+            return None;
+        }
         // Check for mismatch against already-committed mode without committing yet.
         if let Some(stored) = stored_transfer_mode {
             if stored != mode {
@@ -431,6 +435,23 @@ impl ServiceRegistry {
             .get(http_address)
             .map(|i| (i.tp_size, i.dp_size.unwrap_or(1)))
             .unwrap_or((1, 1))
+    }
+
+    /// Reported connector topology, kept separate from HTTP engine counts.
+    pub(super) fn registered_peer_sizes(
+        &self,
+        http_address: &str,
+        service_type: ServiceType,
+    ) -> Option<(usize, Option<usize>)> {
+        let instances = match service_type {
+            ServiceType::Prefill => &self.prefill_instances,
+            ServiceType::Decode => &self.decode_instances,
+        };
+        instances
+            .lock()
+            .unwrap()
+            .get(http_address)
+            .map(|instance| (instance.tp_size, instance.dp_size))
     }
 
     /// Snapshot all registered endpoints and their optional DP sizes under a

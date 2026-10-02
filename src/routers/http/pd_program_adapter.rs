@@ -69,7 +69,7 @@ impl PdProgramRuntime {
         ));
         let observation_scheduler = scheduler.clone();
         let workers = ctx.worker_registry.clone();
-        let dp_size = ctx.router_config.intra_node_data_parallel_size;
+        let dp_size = ctx.router_config.effective_decode_data_parallel_size();
         let provider = VllmMetricsObservationProvider::new(
             ctx.client.clone(),
             ctx.router_config.api_key.clone(),
