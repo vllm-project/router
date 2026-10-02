@@ -519,22 +519,30 @@ impl RouterTrait for RouterManager {
     }
 
     /// Get available models - query from worker registry
+    // NOTE: serde_json::json!() sorts keys alphabetically,
+    // resulting in a different field order from the OpenAI API Spec.
+    // TODO: Preserve declaration order.
     async fn get_models(&self, _req: Request<Body>) -> Response {
-        // Get models from worker registry
         let models = self.worker_registry.get_models();
 
-        if models.is_empty() {
-            (StatusCode::SERVICE_UNAVAILABLE, "No models available").into_response()
-        } else {
-            (
-                StatusCode::OK,
+        let data: Vec<serde_json::Value> = models
+            .into_iter()
+            .map(|model_id| {
                 serde_json::json!({
-                    "models": models
+                    "id": model_id,
+                    "object": "model",
+                    "created": 0,
+                    "owned_by": "vllm",
                 })
-                .to_string(),
-            )
-                .into_response()
-        }
+            })
+            .collect();
+
+        let body = serde_json::json!({
+            "object": "list",
+            "data": data,
+        });
+
+        (StatusCode::OK, body.to_string()).into_response()
     }
 
     /// Get model information
