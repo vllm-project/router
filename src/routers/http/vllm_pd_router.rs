@@ -176,18 +176,17 @@ impl VllmPDRouter {
     }
 
     /// Generate a connector-specific transfer ID for correlating prefill and decode legs.
-    /// Returns `None` for connectors that do not use a transfer_id (e.g. NIXL).
     fn generate_transfer_id(&self) -> Option<String> {
         match self.kv_connector {
-            // Mooncake uses the "xfer-<uuid>" format.
-            KvConnector::Mooncake => Some(format!("xfer-{}", Uuid::new_v4())),
+            // NIXL only uses it in push mode, but the mode is unknown until the first
+            // prefill response, so it is always sent.
+            KvConnector::Mooncake | KvConnector::Nixl => Some(format!("xfer-{}", Uuid::new_v4())),
             // MoRI-IO uses the "tx-<uuid-no-dashes>" format to match MoRIIOConstants.TRANSFER_PREFIX.
             KvConnector::MoriIO => Some(format!(
                 "{}-{}",
                 MORIIO_TRANSFER_PREFIX,
                 Uuid::new_v4().simple()
             )),
-            KvConnector::Nixl => None,
         }
     }
 
@@ -254,7 +253,8 @@ impl VllmPDRouter {
                 "remote_engine_id": serde_json::Value::Null,
                 "remote_block_ids": serde_json::Value::Null,
                 "remote_host": serde_json::Value::Null,
-                "remote_port": serde_json::Value::Null
+                "remote_port": serde_json::Value::Null,
+                "transfer_id": transfer_id.unwrap_or(""),
             })),
         }
     }
@@ -330,7 +330,11 @@ impl VllmPDRouter {
                     prefill_dp_rank.map(|r| r as usize),
                     prefill_response_json,
                 )?;
-                Some(Self::build_nixl_push_decode_params(&identity, request_id?))
+                Some(Self::build_nixl_push_decode_params(
+                    &identity,
+                    request_id?,
+                    transfer_id.unwrap_or(""),
+                ))
             }
         }
     }
@@ -397,7 +401,11 @@ impl VllmPDRouter {
         }))
     }
 
-    fn build_nixl_push_decode_params(identity: &Value, request_id: &str) -> Value {
+    fn build_nixl_push_decode_params(
+        identity: &Value,
+        request_id: &str,
+        transfer_id: &str,
+    ) -> Value {
         json!({
             "do_remote_prefill": true,
             "do_remote_decode": false,
@@ -406,6 +414,7 @@ impl VllmPDRouter {
             "remote_port": identity.get("remote_port").cloned().unwrap_or(Value::Null),
             "tp_size": identity.get("tp_size").cloned().unwrap_or_else(|| json!(1)),
             "remote_request_id": request_id,
+            "transfer_id": transfer_id,
         })
     }
 
@@ -905,7 +914,7 @@ impl VllmPDRouter {
         // Prepare prefill request (max_tokens=1 to force prefill-only mode)
         let mut prefill_request = Self::prepare_prefill_request(request_json.clone(), path);
 
-        // Generate a connector-specific transfer_id (None for NIXL)
+        // Generate a connector-specific transfer_id
         let transfer_id = self.generate_transfer_id();
 
         let (prefill_base_http, mut prefill_dp_rank) = dp_utils::parse_worker_url(prefill_http);
@@ -1332,7 +1341,7 @@ impl VllmPDRouter {
         // Stage 1: Prepare prefill request with max_tokens=1 and kv_transfer_params
         let mut prefill_request = Self::prepare_prefill_request(original_request.clone(), path);
 
-        // Generate a connector-specific transfer_id (None for NIXL)
+        // Generate a connector-specific transfer_id
         let transfer_id = self.generate_transfer_id();
 
         // Add kv_transfer_params for KV connector support at top level
@@ -1696,16 +1705,24 @@ impl VllmPDRouter {
             self.get_zmq_address(prefill_worker.base_url(), ServiceType::Prefill);
         let decode_zmq_addr = self.get_zmq_address(decode_worker.base_url(), ServiceType::Decode);
         let request_id = Self::generate_vllm_request_id(&prefill_zmq_addr, &decode_zmq_addr);
+        let transfer_id = self.generate_transfer_id();
 
         let decode_base_url = decode_worker.base_url().to_string();
         let mut prefill_request = Self::prepare_prefill_request(original_request.clone(), path);
         prefill_request["kv_transfer_params"] = self
-            .build_prefill_kv_transfer_params(None, Some(&decode_base_url), decode_worker.dp_rank())
+            .build_prefill_kv_transfer_params(
+                transfer_id.as_deref(),
+                Some(&decode_base_url),
+                decode_worker.dp_rank(),
+            )
             .ok()?;
 
         let mut decode_request = original_request.clone();
-        decode_request["kv_transfer_params"] =
-            Self::build_nixl_push_decode_params(&identity, &request_id);
+        decode_request["kv_transfer_params"] = Self::build_nixl_push_decode_params(
+            &identity,
+            &request_id,
+            transfer_id.as_deref().unwrap_or(""),
+        );
 
         Some((prefill_request, decode_request, request_id))
     }
@@ -2901,13 +2918,129 @@ mod tests {
         assert_eq!(MORIIO_TRANSFER_PREFIX, "tx");
     }
 
-    #[test]
-    fn test_kv_transfer_params_nixl_has_no_transfer_id_or_remote_dp_size() {
-        // NIXL prefill params must not carry transfer_id or remote_dp_size.
-        use crate::config::KvConnector;
-        // Verify the KvConnector::Nixl variant exists and is the default.
-        let connector = KvConnector::default();
-        assert_eq!(connector, KvConnector::Nixl);
+    // --- NIXL transfer_id tests ---
+
+    async fn nixl_router() -> VllmPDRouter {
+        let config = crate::config::RouterConfig {
+            kv_connector: KvConnector::Nixl,
+            ..Default::default()
+        };
+        let ctx = Arc::new(
+            crate::server::AppContext::new(config, reqwest::Client::new(), 64, None, vec![])
+                .unwrap(),
+        );
+        VllmPDRouter::new(vec![], vec![], None, &ctx).await.unwrap()
+    }
+
+    fn nixl_push_prefill_response() -> Value {
+        json!({
+            "kv_transfer_params": {
+                "do_remote_prefill": true,
+                "do_remote_decode": false,
+                "remote_engine_id": "prefill-engine",
+                "remote_request_id": "cmpl-abc-0-1234abcd",
+                "remote_host": "10.0.0.1",
+                "remote_port": 5600,
+                "tp_size": 2,
+                "transfer_mode": "push",
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn test_nixl_push_kv_params_carry_given_transfer_id() {
+        let router = nixl_router().await;
+        let transfer_id = router.generate_transfer_id();
+
+        let prefill_params = router
+            .build_prefill_kv_transfer_params(transfer_id.as_deref(), None, None)
+            .unwrap();
+        let decode_params = router
+            .build_decode_kv_transfer_params(
+                "http://prefill:8000",
+                Some(&nixl_push_prefill_response()),
+                transfer_id.as_deref(),
+                None,
+                Some("router-request-id"),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(prefill_params["transfer_id"], transfer_id.unwrap());
+        assert_eq!(decode_params["transfer_id"], prefill_params["transfer_id"]);
+        assert_eq!(decode_params["remote_request_id"], "router-request-id");
+        assert_eq!(decode_params["remote_engine_id"], "prefill-engine");
+    }
+
+    #[tokio::test]
+    async fn test_nixl_concurrent_push_sends_same_transfer_id_to_prefill_and_decode() {
+        let router = nixl_router().await;
+        let prefill: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+            "http://prefill:8000".to_string(),
+            WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+        ));
+        let decode: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+            "http://decode:8000".to_string(),
+            WorkerType::Decode,
+        ));
+        router.maybe_cache_nixl_push_identity(
+            prefill.base_url(),
+            prefill.dp_rank(),
+            &nixl_push_prefill_response(),
+        );
+
+        let (prefill_a, decode_a, _) = router
+            .try_build_concurrent_requests(
+                &json!({"prompt": "hi"}),
+                &prefill,
+                &decode,
+                "/v1/completions",
+            )
+            .await
+            .unwrap();
+        let (prefill_b, _, _) = router
+            .try_build_concurrent_requests(
+                &json!({"prompt": "hi"}),
+                &prefill,
+                &decode,
+                "/v1/completions",
+            )
+            .await
+            .unwrap();
+
+        let transfer_id = &prefill_a["kv_transfer_params"]["transfer_id"];
+        assert!(transfer_id.as_str().is_some_and(|id| !id.is_empty()));
+        assert_eq!(&decode_a["kv_transfer_params"]["transfer_id"], transfer_id);
+        assert_ne!(&prefill_b["kv_transfer_params"]["transfer_id"], transfer_id);
+    }
+
+    #[tokio::test]
+    async fn test_nixl_pull_decode_params_are_forwarded_unchanged() {
+        let router = nixl_router().await;
+        let pull_kvt = json!({
+            "do_remote_prefill": true,
+            "do_remote_decode": false,
+            "remote_engine_id": "prefill-engine",
+            "remote_request_id": "cmpl-abc-0-1234abcd",
+            "remote_block_ids": [[1, 2]],
+            "remote_host": "10.0.0.1",
+            "remote_port": 5600,
+            "tp_size": 2,
+        });
+        let decode_params = router
+            .build_decode_kv_transfer_params(
+                "http://prefill:8000",
+                Some(&json!({ "kv_transfer_params": pull_kvt.clone() })),
+                Some("xfer-unused"),
+                None,
+                Some("router-request-id"),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(decode_params, pull_kvt);
     }
 
     // --- MoRI-IO WRITE mode parameter tests ---
