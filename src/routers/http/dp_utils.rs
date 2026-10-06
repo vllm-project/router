@@ -99,16 +99,32 @@ pub async fn get_dp_aware_workers(
             "Expanding worker {} to {} DP-aware URLs (ranks 0..{})",
             url,
             dp_size,
-            dp_size - 1
+            dp_size.saturating_sub(1)
         );
 
-        // Expand each worker URL to multiple DP-aware URLs
-        for rank in 0..dp_size {
-            dp_aware_workers.push(format!("{}@{}", url, rank));
-        }
+        // Expand each worker URL to multiple DP-aware URLs via the shared helper.
+        dp_aware_workers.extend(expand_dp_aware_url(url, dp_size));
     }
 
     Ok(dp_aware_workers)
+}
+
+/// Expand one worker URL into `host:port@rank` for each DP rank. Shared by all
+/// routers (the agg and direct-URL PD routers via [`get_dp_aware_workers`], and the
+/// discovery PD router). `dp_size <= 1` is a no-op and an already-`@rank` URL is
+/// returned unchanged rather than double-expanded.
+pub fn expand_dp_aware_url(worker_url: &str, dp_size: usize) -> Vec<String> {
+    // No-op for single-rank / DP-disabled setups.
+    if dp_size <= 1 {
+        return vec![worker_url.to_string()];
+    }
+    // Already DP-aware (parseable @rank): don't double-expand.
+    if extract_dp_rank(worker_url).is_ok() {
+        return vec![worker_url.to_string()];
+    }
+    (0..dp_size)
+        .map(|rank| format!("{}@{}", worker_url, rank))
+        .collect()
 }
 
 /// Extract dp_rank from a DP-aware worker URL
@@ -284,6 +300,41 @@ mod tests {
             "https://[2a03:83e4:5006:0090:5f5a:f8c5:0400:0000]:20009"
         );
         assert_eq!(rank, None);
+    }
+
+    #[test]
+    fn test_expand_dp_aware_url_noop_when_dp_size_is_1() {
+        assert_eq!(
+            expand_dp_aware_url("http://10.0.0.1:20005", 1),
+            vec!["http://10.0.0.1:20005".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_expand_dp_aware_url_one_entry_per_rank() {
+        let out = expand_dp_aware_url("http://10.0.0.1:20005", 4);
+        assert_eq!(
+            out,
+            vec![
+                "http://10.0.0.1:20005@0".to_string(),
+                "http://10.0.0.1:20005@1".to_string(),
+                "http://10.0.0.1:20005@2".to_string(),
+                "http://10.0.0.1:20005@3".to_string(),
+            ]
+        );
+        // Round-trip: each expanded URL parses back to (base, rank).
+        for (i, url) in out.iter().enumerate() {
+            assert_eq!(extract_dp_rank(url).unwrap(), ("http://10.0.0.1:20005", i));
+        }
+    }
+
+    #[test]
+    fn test_expand_dp_aware_url_keeps_already_ranked_address() {
+        // Discovery sources may already report host:port@rank; don't double-expand.
+        assert_eq!(
+            expand_dp_aware_url("http://10.0.0.1:20005@3", 8),
+            vec!["http://10.0.0.1:20005@3".to_string()]
+        );
     }
 
     #[tokio::test]

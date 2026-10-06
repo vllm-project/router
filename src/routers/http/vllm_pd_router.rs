@@ -634,6 +634,24 @@ impl VllmPDRouter {
             .collect()
     }
 
+    /// Expand each discovered prefill instance into one `host:port@rank` entry per DP
+    /// rank via the shared `dp_utils::expand_dp_aware_url`. Called on the prefill list
+    /// only (decode keeps the engine's own DP balancer); the instance's shared ZMQ
+    /// address is cloned onto each rank.
+    fn expand_dp_instances(
+        instances: Vec<(String, String)>,
+        intra_node_data_parallel_size: usize,
+    ) -> Vec<(String, String)> {
+        instances
+            .into_iter()
+            .flat_map(|(http, zmq)| {
+                dp_utils::expand_dp_aware_url(&http, intra_node_data_parallel_size)
+                    .into_iter()
+                    .map(move |ranked| (ranked, zmq.clone()))
+            })
+            .collect()
+    }
+
     /// Select worker using policy-based load balancing
     fn select_worker_with_policy(
         &self,
@@ -673,7 +691,10 @@ impl VllmPDRouter {
         );
 
         // Get available instances from service discovery
-        let prefill_instances = self.service_registry.get_prefill_instances();
+        let prefill_instances = Self::expand_dp_instances(
+            self.service_registry.get_prefill_instances(),
+            self.intra_node_data_parallel_size,
+        );
         let decode_instances = self.service_registry.get_decode_instances();
 
         debug!(
@@ -2988,5 +3009,63 @@ mod tests {
     fn test_moriio_write_decode_params_includes_remote_dp_rank_when_dp_size_gt_1() {
         let params = moriio_write_decode_params(Some("tx-abc"), 4, Some(2));
         assert_eq!(params["remote_dp_rank"], 2);
+    }
+
+    fn discovered(http: &str) -> Vec<(String, String)> {
+        vec![(http.to_string(), "host:10.0.0.1,handshake:8405".to_string())]
+    }
+
+    #[test]
+    fn test_expand_dp_instances_noop_when_dp_size_is_1() {
+        let out = VllmPDRouter::expand_dp_instances(discovered("10.0.0.1:20005"), 1);
+        assert_eq!(out, discovered("10.0.0.1:20005"));
+    }
+
+    #[test]
+    fn test_expand_dp_instances_one_entry_per_rank() {
+        let out = VllmPDRouter::expand_dp_instances(discovered("10.0.0.1:20005"), 4);
+        let https: Vec<&str> = out.iter().map(|(h, _)| h.as_str()).collect();
+        assert_eq!(
+            https,
+            vec![
+                "10.0.0.1:20005@0",
+                "10.0.0.1:20005@1",
+                "10.0.0.1:20005@2",
+                "10.0.0.1:20005@3"
+            ]
+        );
+        assert!(out.iter().all(|(_, z)| z == "host:10.0.0.1,handshake:8405"));
+        for (i, (http, _)) in out.iter().enumerate() {
+            assert_eq!(
+                dp_utils::extract_dp_rank(http).unwrap(),
+                ("10.0.0.1:20005", i)
+            );
+        }
+    }
+
+    #[test]
+    fn test_expand_dp_instances_keeps_already_ranked_address() {
+        let out = VllmPDRouter::expand_dp_instances(discovered("10.0.0.1:20005@3"), 8);
+        assert_eq!(out, discovered("10.0.0.1:20005@3"));
+    }
+
+    #[test]
+    fn test_discovered_dp_ranks_are_distinct_under_consistent_hash() {
+        use crate::policies::{ConsistentHashPolicy, LoadBalancingPolicy};
+
+        let instances = VllmPDRouter::expand_dp_instances(discovered("10.0.0.1:20005"), 8);
+        let workers = VllmPDRouter::instances_to_workers(&instances);
+        let policy = ConsistentHashPolicy::new();
+
+        // Distinct request bodies should spread across more than one expanded DP rank
+        // (i.e. the expansion produces independently-selectable per-rank workers).
+        let mut chosen = std::collections::HashSet::new();
+        for s in 0..64 {
+            let idx = policy
+                .select_worker(&workers, Some(&format!("{{\"prompt\":\"req-{}\"}}", s)))
+                .unwrap();
+            chosen.insert(idx);
+        }
+        assert!(chosen.len() > 1, "all requests hashed to one DP rank");
     }
 }
