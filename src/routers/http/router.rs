@@ -2519,8 +2519,15 @@ impl RouterTrait for Router {
             request_builder = request_builder.header("Authorization", format!("Bearer {}", key));
         }
 
+        let track_load = program_completion.is_some()
+            || self.policy_registry.get_default_policy().name() == "cache_aware";
+        if track_load {
+            worker.increment_load();
+            RouterMetrics::set_running_requests(worker.url(), worker.load());
+        }
+
         // Send request
-        match otel_http::send_client_request(
+        let response = match otel_http::send_client_request(
             request_builder,
             headers,
             ClientRequestOptions {
@@ -2644,6 +2651,11 @@ impl RouterTrait for Router {
                 )
                     .into_response()
             }
+        };
+        if track_load {
+            hold_load_until_body_done(response, worker)
+        } else {
+            response
         }
     }
 }
