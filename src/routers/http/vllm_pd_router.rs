@@ -390,7 +390,7 @@ impl VllmPDRouter {
                 })
             {
                 return Err(format!(
-                    "MoRI-IO WRITE {role} peer has an invalid handshake/notify address: {}",
+                    "MoRI-IO WRITE {role} peer has an invalid host/handshake/notify address: {}",
                     peer.zmq_address
                 ));
             }
