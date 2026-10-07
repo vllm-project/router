@@ -98,7 +98,7 @@ impl VllmPDRouter {
     async fn discovered_prefill_dp_size(&self, url: &str) -> usize {
         PdRouterBase::discover_worker_dp_size(
             &self.pd_router.config,
-            &self.http_client,
+            &self.pd_router.client,
             &format!("http://{url}"),
             &WorkerType::Prefill {
                 bootstrap_port: None,
@@ -152,7 +152,7 @@ impl VllmPDRouter {
                 })
             {
                 return Err(format!(
-                    "MoRI-IO WRITE {role} peer has an invalid handshake/notify address: {}",
+                    "MoRI-IO WRITE {role} peer has an invalid host/handshake/notify address: {}",
                     peer.zmq_address
                 ));
             }
@@ -1003,7 +1003,7 @@ impl VllmPDRouter {
         {
             let decode_dp_size = PdRouterBase::discover_worker_dp_size(
                 &self.pd_router.config,
-                &self.http_client,
+                &self.pd_router.client,
                 &format!("http://{decode_base_http}"),
                 &WorkerType::Decode,
             )
