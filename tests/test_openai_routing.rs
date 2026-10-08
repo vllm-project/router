@@ -198,6 +198,8 @@ async fn test_unsupported_endpoints() {
         return_logprob: false,
         lora_path: None,
         session_params: None,
+        session_id: None,
+        user_id: None,
         return_hidden_states: false,
         rid: None,
     };
