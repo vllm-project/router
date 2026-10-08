@@ -356,6 +356,17 @@ fn spec_messages_to_upstream(
                         "legacy function messages are not supported by vllm-chat"
                     ));
                 }
+                SpecChatMessage::Other(value) => {
+                    // HTTP backends can forward unknown roles verbatim, but vllm-chat
+                    // cannot represent them, so the gRPC frontend rejects them.
+                    let role = value
+                        .get("role")
+                        .and_then(serde_json::Value::as_str)
+                        .expect("ChatMessage::Other must contain a string `role`");
+                    return Err(anyhow!(
+                        "chat message role `{role}` is not supported by the router gRPC frontend"
+                    ));
+                }
             })
         })
         .collect()
@@ -558,6 +569,25 @@ mod tests {
                     && call.name == "weather"
                     && call.arguments == "{\"city\":\"Paris\"}"
         ));
+    }
+
+    #[test]
+    fn rejects_unknown_roles_on_grpc_path() {
+        for role in ["latest_reminder", "developer"] {
+            let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+                "messages": [{
+                    "role": role,
+                    "content": "Model-specific instructions."
+                }]
+            }))
+            .unwrap();
+
+            let error = spec_messages_to_upstream(&request.messages).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                format!("chat message role `{role}` is not supported by the router gRPC frontend")
+            );
+        }
     }
 
     #[test]
