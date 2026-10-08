@@ -637,6 +637,25 @@ impl RoutingMode {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
+pub struct SMetricConfig {
+    pub c_lin: f64,
+    pub c_att: f64,
+    pub prefill_rate: Option<f64>,
+    pub slack: f64,
+    pub hit_ratio: f64,
+    /// ttft_slo(req) = base + per_char * L, where L is the text character count.
+    pub ttft_slo_base: f64,
+    pub ttft_slo_per_char: f64,
+    #[serde(default = "default_smetric_tree_size")]
+    pub max_tree_size: usize,
+}
+
+fn default_smetric_tree_size() -> usize {
+    67_108_864
+}
+
 /// Policy configuration for routing
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -675,6 +694,9 @@ pub enum PolicyConfig {
 
     #[serde(rename = "rendezvous_hash")]
     RendezvousHash,
+
+    #[serde(rename = "smetric")]
+    SMetric { config: SMetricConfig },
 }
 
 impl PolicyConfig {
@@ -686,6 +708,7 @@ impl PolicyConfig {
             PolicyConfig::PowerOfTwo { .. } => "power_of_two",
             PolicyConfig::ConsistentHash { .. } => "consistent_hash",
             PolicyConfig::RendezvousHash => "rendezvous_hash",
+            PolicyConfig::SMetric { .. } => "smetric",
         }
     }
 }

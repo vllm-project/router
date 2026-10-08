@@ -560,7 +560,6 @@ impl Worker for DPAwareWorker {
     fn load(&self) -> usize {
         self.base_worker.load()
     }
-
     fn increment_load(&self) {
         self.base_worker.increment_load();
     }

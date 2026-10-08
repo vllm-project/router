@@ -4,9 +4,11 @@
 //! across both regular and prefill-decode (PD) routing modes.
 
 use crate::core::Worker;
+use crate::protocols::spec::RoutingPrompt;
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 mod cache_aware;
 mod consistent_hash;
@@ -17,6 +19,7 @@ mod random;
 mod registry;
 mod rendezvous_hash;
 mod round_robin;
+mod smetric;
 
 pub use cache_aware::{CacheAwareCandidate, CacheAwarePlacement, CacheAwarePolicy};
 pub use consistent_hash::ConsistentHashPolicy;
@@ -27,10 +30,60 @@ pub use random::RandomPolicy;
 pub use registry::PolicyRegistry;
 pub use rendezvous_hash::RendezvousHashPolicy;
 pub use round_robin::RoundRobinPolicy;
+pub use smetric::SMetricPolicy;
 
 /// HTTP headers passed to policies for routing decisions
 /// Key is lowercase header name, value is header value
 pub type RequestHeaders = HashMap<String, String>;
+
+/// Optional request metadata for affinity-aware selection.
+pub struct RoutingContext<'a> {
+    pub prompt: Option<&'a RoutingPrompt>,
+    pub allow_affinity: bool,
+    pub colocated: bool,
+    pub route: &'a str,
+}
+
+/// Shared per-worker state; trackers reuse its Arc rather than allocate callbacks.
+pub trait RequestObserver: Send + Sync {
+    fn charge(&self, work: u64);
+    /// Release charged work; elapsed is present only for a first-token observation.
+    fn finish(&self, work: u64, elapsed: Option<Duration>);
+}
+
+/// Own one work reservation, released exactly once on first token or Drop.
+pub struct RequestTracker {
+    observer: Option<Arc<dyn RequestObserver>>,
+    work: u64,
+    started: Instant,
+}
+
+impl RequestTracker {
+    pub fn new(observer: Arc<dyn RequestObserver>, work: u64) -> Self {
+        observer.charge(work);
+        Self {
+            observer: Some(observer),
+            work,
+            started: Instant::now(),
+        }
+    }
+
+    pub fn on_first_token(&mut self) {
+        self.finish(Some(self.started.elapsed()));
+    }
+
+    fn finish(&mut self, elapsed: Option<Duration>) {
+        if let Some(observer) = self.observer.take() {
+            observer.finish(self.work, elapsed);
+        }
+    }
+}
+
+impl Drop for RequestTracker {
+    fn drop(&mut self) {
+        self.finish(None);
+    }
+}
 
 /// Core trait for load balancing policies
 ///
@@ -60,6 +113,28 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
         request_text: Option<&str>,
         headers: Option<&RequestHeaders>,
     ) -> Option<usize>;
+
+    /// Select with optional affinity metadata and request-scoped tracking.
+    fn select_request(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        request_text: Option<&str>,
+        headers: Option<&RequestHeaders>,
+        _context: &RoutingContext<'_>,
+    ) -> Option<(usize, Option<RequestTracker>)> {
+        self.select_worker_with_headers(workers, request_text, headers)
+            .map(|idx| (idx, None))
+    }
+
+    /// Request typed affinity metadata only when the policy consumes it.
+    fn needs_affinity_prompt(&self) -> bool {
+        false
+    }
+
+    /// Opt in to router-owned request-lifecycle load accounting.
+    fn tracks_load(&self) -> bool {
+        false
+    }
 
     /// Select a pair of workers (prefill and decode) for PD routing
     ///

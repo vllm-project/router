@@ -294,6 +294,10 @@ impl CacheAwarePolicy {
 }
 
 impl LoadBalancingPolicy for CacheAwarePolicy {
+    fn tracks_load(&self) -> bool {
+        true
+    }
+
     fn select_worker_with_headers(
         &self,
         workers: &[Arc<dyn Worker>],

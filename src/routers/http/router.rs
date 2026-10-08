@@ -6,14 +6,15 @@ use crate::core::{
 };
 use crate::metrics::RouterMetrics;
 use crate::otel_http::{self, ClientRequestOptions};
-use crate::policies::{LoadBalancingPolicy, PolicyRegistry};
+use crate::policies::{LoadBalancingPolicy, PolicyRegistry, RequestTracker, RoutingContext};
 use crate::program_scheduling::{
     BackendObservationProvider, ProgramIdentity, ProgramScheduler, ProgramSchedulerConfig,
     ProgramTarget, ScheduleError, VllmMetricsObservationProvider,
 };
 use crate::protocols::spec::{
-    ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest, GenerationRequest,
-    InferenceGenerateRequest, RerankRequest, RerankResponse, RerankResult, ResponsesRequest,
+    affinity_prompt_from_json, ChatCompletionRequest, CompletionRequest, EmbeddingRequest,
+    GenerateRequest, GenerationRequest, InferenceGenerateRequest, RerankRequest, RerankResponse,
+    RerankResult, ResponsesRequest,
 };
 use crate::routers::header_utils;
 use crate::routers::http::dp_utils;
@@ -68,31 +69,51 @@ fn emit_http_first_sse<E>(
     let _ = tx.send(Ok(bytes::Bytes::from(comment)));
 }
 
-struct LoadTrackedBody {
-    inner: Pin<
-        Box<dyn futures_util::Stream<Item = Result<bytes::Bytes, axum::Error>> + Send + 'static>,
-    >,
-    worker: Option<Arc<dyn Worker>>,
-    producer_abort: Option<tokio::task::AbortHandle>,
+pub(super) struct RequestLoadGuard(Arc<dyn Worker>);
+
+impl RequestLoadGuard {
+    pub(super) fn new(worker: Arc<dyn Worker>) -> Self {
+        worker.increment_load();
+        RouterMetrics::set_running_requests(worker.url(), worker.load());
+        Self(worker)
+    }
 }
 
-impl LoadTrackedBody {
-    fn release(&mut self) {
-        if let Some(worker) = self.worker.take() {
-            worker.decrement_load();
-            RouterMetrics::set_running_requests(worker.url(), worker.load());
-        }
+impl Drop for RequestLoadGuard {
+    fn drop(&mut self) {
+        self.0.decrement_load();
+        RouterMetrics::set_running_requests(self.0.url(), self.0.load());
     }
+}
+
+struct LoadTrackedBody {
+    inner: axum::body::BodyDataStream,
+    load: Option<RequestLoadGuard>,
+    producer_abort: Option<tokio::task::AbortHandle>,
+    tracker: Option<RequestTracker>,
+    observe_first_token: bool,
 }
 
 impl futures_util::Stream for LoadTrackedBody {
     type Item = Result<bytes::Bytes, axum::Error>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let item = self.inner.as_mut().poll_next(cx);
-        if matches!(item, Poll::Ready(None)) {
-            self.release();
-            self.producer_abort.take();
+        let item = self.inner.poll_next_unpin(cx);
+        if self.observe_first_token
+            && matches!(&item, Poll::Ready(Some(Ok(bytes))) if !bytes.is_empty())
+        {
+            if let Some(mut tracker) = self.tracker.take() {
+                tracker.on_first_token();
+            }
+        }
+        if matches!(&item, Poll::Ready(None) | Poll::Ready(Some(Err(_)))) {
+            self.load.take();
+            self.tracker.take();
+            if let Some(abort) = self.producer_abort.take() {
+                if matches!(&item, Poll::Ready(Some(Err(_)))) {
+                    abort.abort();
+                }
+            }
         }
         item
     }
@@ -103,31 +124,36 @@ impl Drop for LoadTrackedBody {
         if let Some(abort) = self.producer_abort.take() {
             abort.abort();
         }
-        self.release();
     }
 }
 
-fn hold_load_until_body_done(mut response: Response, worker: Arc<dyn Worker>) -> Response {
+fn hold_load_until_body_done(
+    mut response: Response,
+    load: Option<RequestLoadGuard>,
+    tracker: Option<RequestTracker>,
+    observe_first_token: bool,
+) -> Response {
     let producer = response
         .extensions_mut()
         .remove::<crate::backend::grpc::GrpcStreamTask>()
         .and_then(|task| task.take());
     let producer_abort = producer.as_ref().map(tokio::task::JoinHandle::abort_handle);
-    let fallback_worker = if let Some(producer) = producer {
+    let load = if let Some(producer) = producer {
         tokio::spawn(async move {
             let _ = producer.await;
-            worker.decrement_load();
-            RouterMetrics::set_running_requests(worker.url(), worker.load());
+            drop(load);
         });
         None
     } else {
-        Some(worker)
+        load
     };
     let (parts, body) = response.into_parts();
     let stream = LoadTrackedBody {
-        inner: Box::pin(body.into_data_stream()),
-        worker: fallback_worker,
+        inner: body.into_data_stream(),
+        load,
         producer_abort,
+        tracker,
+        observe_first_token,
     };
     Response::from_parts(parts, Body::from_stream(stream))
 }
@@ -137,8 +163,9 @@ struct TypedDispatch<'a> {
     route: &'a str,
     worker_url: &'a str,
     is_stream: bool,
-    load_incremented: bool,
+    load: Option<RequestLoadGuard>,
     prepared: Option<crate::backend::PreparedChat>,
+    tracker: Option<RequestTracker>,
 }
 
 /// Regular router that uses injected load balancing policies
@@ -997,9 +1024,11 @@ impl Router {
     fn select_worker_for_model(
         &self,
         model_id: Option<&str>,
-        text: Option<&str>,
+        request_text: Option<&str>,
+        context: &RoutingContext<'_>,
         headers: Option<&HeaderMap>,
-    ) -> Option<Arc<dyn Worker>> {
+        policy: &dyn LoadBalancingPolicy,
+    ) -> Option<(Arc<dyn Worker>, Option<RequestTracker>)> {
         // Get workers for the specified model (O(1) lookup if model_id is provided)
         let workers = match model_id {
             Some(model) => self.worker_registry.get_by_model_fast(model),
@@ -1015,17 +1044,12 @@ impl Router {
             return None;
         }
 
-        // Get the appropriate policy for this model
-        let policy = match model_id {
-            Some(model) => self.policy_registry.get_policy_or_default(model),
-            None => self.policy_registry.get_default_policy(),
-        };
-
         // Convert headers for policies that need them (e.g., consistent_hash)
         let request_headers = Self::headers_to_request_headers(headers);
 
-        let idx = policy.select_worker_with_headers(&available, text, request_headers.as_ref())?;
-        Some(available[idx].clone())
+        let (idx, tracker) =
+            policy.select_request(&available, request_text, request_headers.as_ref(), context)?;
+        Some((available[idx].clone(), tracker))
     }
 
     pub async fn route_typed_request<T: GenerationRequest + serde::Serialize + Clone>(
@@ -1081,7 +1105,31 @@ impl Router {
             None
         };
 
-        let text = typed_req.extract_text_for_routing();
+        let policy = match model_id {
+            Some(model) => self.policy_registry.get_policy_or_default(model),
+            None => self.policy_registry.get_default_policy(),
+        };
+        let prompt = policy
+            .needs_affinity_prompt()
+            .then(|| typed_req.extract_affinity_prompt())
+            .flatten();
+        let turn_gate = typed_req.allows_cache_affinity()
+            && headers
+                .and_then(|headers| headers.get("x-session-turn"))
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<u32>().ok())
+                .is_none_or(|turn| turn > 1);
+        let text = if policy.needs_affinity_prompt() {
+            String::new()
+        } else {
+            typed_req.extract_text_for_routing()
+        };
+        let context = RoutingContext {
+            prompt: prompt.as_ref(),
+            allow_affinity: turn_gate,
+            colocated: true,
+            route,
+        };
 
         let response = RetryExecutor::execute_response_with_retry(
             &self.retry_config,
@@ -1100,7 +1148,7 @@ impl Router {
                 let forced_worker_url = program_completion
                     .as_ref()
                     .map(|completion| completion.dispatch().target_id.as_str());
-                let selected_worker = if let Some(target) = forced_worker_url {
+                let selected = if let Some(target) = forced_worker_url {
                     let worker = self
                         .worker_registry
                         .get_by_url(target)
@@ -1108,11 +1156,29 @@ impl Router {
                     let Some(worker) = worker else {
                         return Self::program_target_unavailable_response(route);
                     };
-                    Some(worker)
+                    if policy.needs_affinity_prompt() {
+                        let request_headers = Self::headers_to_request_headers(headers);
+                        policy
+                            .select_request(
+                                std::slice::from_ref(&worker),
+                                Some(&text),
+                                request_headers.as_ref(),
+                                &context,
+                            )
+                            .map(|(_, tracker)| (worker, tracker))
+                    } else {
+                        Some((worker, None))
+                    }
                 } else {
-                    self.select_worker_for_model(model_id, Some(&text), headers)
+                    self.select_worker_for_model(
+                        model_id,
+                        Some(&text),
+                        &context,
+                        headers,
+                        policy.as_ref(),
+                    )
                 };
-                let worker = match selected_worker {
+                let (worker, tracker) = match selected {
                     Some(w) => w,
                     None => {
                         RouterMetrics::record_request_error(route, "no_available_workers");
@@ -1124,28 +1190,8 @@ impl Router {
                     }
                 };
 
-                // Optional load tracking for cache-aware policy
-                // Get the policy for this model to check if it's cache-aware
-                let policy = match model_id {
-                    Some(model) => self.policy_registry.get_policy_or_default(model),
-                    None => self.policy_registry.get_default_policy(),
-                };
-
-                let load_incremented =
-                    if policy.name() == "cache_aware" || program_completion.is_some() {
-                        worker.increment_load();
-                        RouterMetrics::set_running_requests(worker.url(), worker.load());
-                        true
-                    } else {
-                        false
-                    };
-
-                // Keep a clone for potential cleanup on retry
-                let worker_for_cleanup = if load_incremented {
-                    Some(worker.clone())
-                } else {
-                    None
-                };
+                let load = (policy.tracks_load() || program_completion.is_some())
+                    .then(|| RequestLoadGuard::new(worker.clone()));
 
                 let response = self
                     .send_typed_request(
@@ -1155,8 +1201,9 @@ impl Router {
                             route,
                             worker_url: worker.url(),
                             is_stream,
-                            load_incremented,
+                            load,
                             prepared: prepared.clone(),
+                            tracker,
                         },
                         program_completion.clone(),
                     )
@@ -1169,18 +1216,6 @@ impl Router {
                 worker.record_outcome(status.is_success() || status.is_client_error());
                 if was_available != worker.is_available() {
                     self.worker_registry.notify_worker_state_change();
-                }
-
-                // For retryable failures, we need to decrement load since send_typed_request
-                // won't have done it (it only decrements on success or non-retryable failures)
-                if is_retryable_status(response.status()) && load_incremented {
-                    if let Some(cleanup_worker) = worker_for_cleanup {
-                        cleanup_worker.decrement_load();
-                        RouterMetrics::set_running_requests(
-                            cleanup_worker.url(),
-                            cleanup_worker.load(),
-                        );
-                    }
                 }
 
                 response
@@ -1345,8 +1380,9 @@ impl Router {
             route,
             worker_url,
             is_stream,
-            load_incremented,
+            load,
             prepared,
+            tracker,
         } = dispatch;
         if crate::backend::is_grpc_url(worker_url) {
             // gRPC workers are chat-only in this milestone. Reject unsupported
@@ -1367,17 +1403,9 @@ impl Router {
                     .into_response();
             };
             let mut response = self.frontend.dispatch(worker_url, prepared).await;
-            if load_incremented
-                && (response.status().is_success() || !is_retryable_status(response.status()))
+            if is_stream && response.status().is_success() && (load.is_some() || tracker.is_some())
             {
-                if let Some(worker) = self.worker_registry.get_by_url(worker_url) {
-                    if is_stream && response.status().is_success() {
-                        response = hold_load_until_body_done(response, worker);
-                    } else {
-                        worker.decrement_load();
-                        RouterMetrics::set_running_requests(worker_url, worker.load());
-                    }
-                }
+                response = hold_load_until_body_done(response, load, tracker, true);
             }
             if let Some(completion) = &program_completion {
                 completion.finish(response.status().is_success());
@@ -1473,14 +1501,6 @@ impl Router {
                     worker_url, route, e
                 );
 
-                // Decrement load on error if it was incremented
-                if load_incremented {
-                    if let Some(worker) = self.worker_registry.get_by_url(worker_url) {
-                        worker.decrement_load();
-                        RouterMetrics::set_running_requests(worker_url, worker.load());
-                    }
-                }
-
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     format!("Request failed: {}", e),
@@ -1514,36 +1534,17 @@ impl Router {
                     response
                 }
                 Err(e) => {
-                    // IMPORTANT: Decrement load on error before returning
-                    if load_incremented {
-                        if let Some(worker) = self.worker_registry.get_by_url(worker_url) {
-                            worker.decrement_load();
-                            RouterMetrics::set_running_requests(worker_url, worker.load());
-                        }
-                    }
-
                     let error_msg = format!("Failed to get response body: {}", e);
                     (StatusCode::INTERNAL_SERVER_ERROR, error_msg).into_response()
                 }
             };
-
-            // Decrement load counter for non-streaming requests if it was incremented
-            if load_incremented {
-                if let Some(worker) = self.worker_registry.get_by_url(worker_url) {
-                    worker.decrement_load();
-                    RouterMetrics::set_running_requests(worker_url, worker.load());
-                }
-            }
 
             if let Some(completion) = &program_completion {
                 completion.finish(response.status().is_success());
             }
 
             response
-        } else if load_incremented {
-            // For streaming with load tracking, we need to manually decrement when done
-            let registry = Arc::clone(&self.worker_registry);
-            let worker_url = worker_url.to_string();
+        } else {
             let completion = if status.is_success() {
                 program_completion
             } else {
@@ -1561,16 +1562,26 @@ impl Router {
 
             let stream = res.bytes_stream();
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            let tracker = if status.is_success() { tracker } else { None };
 
             // Spawn task to forward stream and detect completion
             tokio::spawn(async move {
+                let mut tracker = tracker;
                 let mut stream = stream;
-                let mut decremented = false;
+                let mut load = load;
                 let mut first_sse = true;
                 let mut stream_succeeded = true;
-                while let Some(chunk) = stream.next().await {
+                while let Some(chunk) = tokio::select! {
+                    _ = tx.closed() => { stream_succeeded = false; None },
+                    chunk = stream.next() => chunk,
+                } {
                     match chunk {
                         Ok(bytes) => {
+                            if !bytes.is_empty() {
+                                if let Some(mut tracker) = tracker.take() {
+                                    tracker.on_first_token();
+                                }
+                            }
                             if first_sse {
                                 first_sse = false;
                                 let first_ms = t_send.elapsed().as_secs_f64() * 1000.0;
@@ -1588,11 +1599,7 @@ impl Router {
                                 .windows(12)
                                 .any(|window| window == b"data: [DONE]")
                             {
-                                if let Some(worker) = registry.get_by_url(&worker_url) {
-                                    worker.decrement_load();
-                                    RouterMetrics::set_running_requests(&worker_url, worker.load());
-                                    decremented = true;
-                                }
+                                load.take();
                             }
                             if tx.send(Ok(bytes)).is_err() {
                                 stream_succeeded = false;
@@ -1606,74 +1613,7 @@ impl Router {
                         }
                     }
                 }
-                if !decremented {
-                    if let Some(worker) = registry.get_by_url(&worker_url) {
-                        worker.decrement_load();
-                        RouterMetrics::set_running_requests(&worker_url, worker.load());
-                    }
-                }
-                if let Some(completion) = &completion {
-                    completion.finish(stream_succeeded);
-                }
-            });
-
-            let stream = UnboundedReceiverStream::new(rx);
-            let body = Body::from_stream(stream);
-
-            let mut response = Response::new(body);
-            *response.status_mut() = status;
-            *response.headers_mut() = response_headers;
-            response
-        } else {
-            // For requests without load tracking, just stream
-            // Preserve headers for streaming response
-            let mut response_headers = header_utils::preserve_response_headers(res.headers());
-            // Ensure we set the correct content-type for SSE
-            response_headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
-            if stages_on {
-                let header_stages = http_stages_json(http_ttfb_ms, http_ttfb_ms);
-                insert_router_stages(&mut response_headers, &header_stages);
-            }
-
-            let stream = res.bytes_stream();
-            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-            let completion = if status.is_success() {
-                program_completion
-            } else {
-                None
-            };
-
-            // Spawn task to forward stream
-            tokio::spawn(async move {
-                let mut stream = stream;
-                let mut first_sse = true;
-                let mut stream_succeeded = true;
-                while let Some(chunk) = stream.next().await {
-                    match chunk {
-                        Ok(bytes) => {
-                            if first_sse {
-                                first_sse = false;
-                                let first_ms = t_send.elapsed().as_secs_f64() * 1000.0;
-                                if stages_on {
-                                    let stages = http_stages_json(http_ttfb_ms, first_ms);
-                                    emit_http_first_sse(&tx, &stages);
-                                }
-                            }
-                            if let Some(completion) = &completion {
-                                completion.observe_sse_chunk(&bytes);
-                            }
-                            if tx.send(Ok(bytes)).is_err() {
-                                stream_succeeded = false;
-                                break;
-                            }
-                        }
-                        Err(e) => {
-                            stream_succeeded = false;
-                            let _ = tx.send(Err(format!("Stream error: {}", e)));
-                            break;
-                        }
-                    }
-                }
+                drop(load);
                 if let Some(completion) = &completion {
                     completion.finish(stream_succeeded);
                 }
@@ -2460,22 +2400,53 @@ impl RouterTrait for Router {
         } else {
             None
         };
-        let worker = if let Some(completion) = &program_completion {
+        let policy = self.policy_registry.get_default_policy();
+        let affinity = policy
+            .needs_affinity_prompt()
+            .then(|| affinity_prompt_from_json(path, &body))
+            .flatten();
+        let context = RoutingContext {
+            prompt: affinity.as_ref().map(|(prompt, _)| prompt),
+            allow_affinity: affinity.as_ref().is_some_and(|(_, gate)| *gate)
+                && headers
+                    .and_then(|h| h.get("x-session-turn"))
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| v.parse::<u32>().ok())
+                    .is_none_or(|turn| turn > 1),
+            colocated: true,
+            route: path,
+        };
+        let selected = if let Some(completion) = &program_completion {
             self.worker_registry
                 .get_by_url(&completion.dispatch().target_id)
                 .filter(|worker| worker.is_available())
+                .and_then(|worker| {
+                    if policy.needs_affinity_prompt() {
+                        let headers = Self::headers_to_request_headers(headers);
+                        policy
+                            .select_request(
+                                std::slice::from_ref(&worker),
+                                request_text.as_deref(),
+                                headers.as_ref(),
+                                &context,
+                            )
+                            .map(|(_, tracker)| (worker, tracker))
+                    } else {
+                        Some((worker, None))
+                    }
+                })
         } else {
-            let policy = self.policy_registry.get_default_policy();
-            let request_headers = Self::headers_to_request_headers(headers);
+            let headers = Self::headers_to_request_headers(headers);
             policy
-                .select_worker_with_headers(
+                .select_request(
                     &workers,
                     request_text.as_deref(),
-                    request_headers.as_ref(),
+                    headers.as_ref(),
+                    &context,
                 )
-                .and_then(|index| workers.get(index).cloned())
+                .map(|(idx, tracker)| (workers[idx].clone(), tracker))
         };
-        let Some(worker) = worker else {
+        let Some((worker, tracker)) = selected else {
             if let Some(completion) = &program_completion {
                 completion.finish(false);
             }
@@ -2485,6 +2456,8 @@ impl RouterTrait for Router {
             )
                 .into_response();
         };
+        let load = (policy.tracks_load() || program_completion.is_some())
+            .then(|| RequestLoadGuard::new(worker.clone()));
         let url = worker.endpoint_url(path);
 
         debug!("Transparent proxy: forwarding to {}", url);
@@ -2520,7 +2493,7 @@ impl RouterTrait for Router {
         }
 
         // Send request
-        match otel_http::send_client_request(
+        let response = match otel_http::send_client_request(
             request_builder,
             headers,
             ClientRequestOptions {
@@ -2601,7 +2574,10 @@ impl RouterTrait for Router {
                     tokio::spawn(async move {
                         let mut stream = stream;
                         let mut stream_ok = true;
-                        while let Some(chunk) = stream.next().await {
+                        while let Some(chunk) = tokio::select! {
+                            _ = tx.closed() => { stream_ok = false; None },
+                            chunk = stream.next() => chunk,
+                        } {
                             match chunk {
                                 Ok(bytes) => {
                                     if let Some(completion) = &completion {
@@ -2644,6 +2620,16 @@ impl RouterTrait for Router {
                 )
                     .into_response()
             }
+        };
+        let tracker = if response.status().is_success() {
+            tracker
+        } else {
+            None
+        };
+        if load.is_some() || tracker.is_some() {
+            hold_load_until_body_done(response, load, tracker, is_stream)
+        } else {
+            response
         }
     }
 }
@@ -2865,16 +2851,22 @@ mod tests {
             WorkerType::Regular,
         ));
 
-        worker.increment_load();
-        let response =
-            hold_load_until_body_done(Response::new(Body::from("complete")), worker.clone());
+        let response = hold_load_until_body_done(
+            Response::new(Body::from("complete")),
+            Some(RequestLoadGuard::new(worker.clone())),
+            None,
+            false,
+        );
         assert_eq!(worker.load(), 1);
         let _ = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         assert_eq!(worker.load(), 0);
 
-        worker.increment_load();
-        let response =
-            hold_load_until_body_done(Response::new(Body::from("cancelled")), worker.clone());
+        let response = hold_load_until_body_done(
+            Response::new(Body::from("cancelled")),
+            Some(RequestLoadGuard::new(worker.clone())),
+            None,
+            false,
+        );
         assert_eq!(worker.load(), 1);
         drop(response);
         assert_eq!(worker.load(), 0);
@@ -2887,7 +2879,6 @@ mod tests {
             WorkerType::Regular,
         ));
 
-        worker.increment_load();
         let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
         let producer = tokio::spawn(async move {
             let _ = finish_rx.await;
@@ -2896,7 +2887,12 @@ mod tests {
         response
             .extensions_mut()
             .insert(crate::backend::grpc::GrpcStreamTask::new(producer));
-        let response = hold_load_until_body_done(response, worker.clone());
+        let response = hold_load_until_body_done(
+            response,
+            Some(RequestLoadGuard::new(worker.clone())),
+            None,
+            true,
+        );
         finish_tx.send(()).unwrap();
         tokio::time::timeout(Duration::from_secs(1), async {
             while worker.load() != 0 {
@@ -2909,13 +2905,17 @@ mod tests {
         assert_eq!(worker.load(), 0);
         drop(response);
 
-        worker.increment_load();
         let producer = tokio::spawn(std::future::pending::<()>());
         let mut response = Response::new(Body::from("buffered"));
         response
             .extensions_mut()
             .insert(crate::backend::grpc::GrpcStreamTask::new(producer));
-        let response = hold_load_until_body_done(response, worker.clone());
+        let response = hold_load_until_body_done(
+            response,
+            Some(RequestLoadGuard::new(worker.clone())),
+            None,
+            true,
+        );
         drop(response);
         tokio::time::timeout(Duration::from_secs(1), async {
             while worker.load() != 0 {
@@ -3026,35 +3026,6 @@ mod tests {
     }
 
     #[test]
-    fn test_select_worker_for_model_with_consistent_hash_uses_headers() {
-        // Verify that select_worker_for_model passes headers through to the policy,
-        // producing consistent routing for the same session ID
-        let router = create_test_consistent_hash_router();
-
-        let mut header_map = HeaderMap::new();
-        header_map.insert("x-session-id", HeaderValue::from_static("sticky-session-1"));
-
-        // Make multiple selections with the same headers - should all pick the same worker
-        let mut selected_urls: Vec<String> = Vec::new();
-        for _ in 0..10 {
-            let worker = router
-                .select_worker_for_model(None, Some(r#"{"prompt": "test"}"#), Some(&header_map))
-                .expect("Should select a worker");
-            selected_urls.push(worker.url().to_string());
-        }
-
-        // All selections should go to the same worker (sticky routing)
-        let first = &selected_urls[0];
-        for (i, url) in selected_urls.iter().enumerate() {
-            assert_eq!(
-                url, first,
-                "Request {} routed to {}, expected {} (session stickiness broken)",
-                i, url, first
-            );
-        }
-    }
-
-    #[test]
     fn test_select_worker_for_model_filters_unavailable_workers() {
         // Verify that select_worker_for_model skips unhealthy workers
         let router = create_test_consistent_hash_router();
@@ -3067,8 +3038,19 @@ mod tests {
             }
         }
 
-        let worker = router
-            .select_worker_for_model(None, Some(r#"{"prompt": "test"}"#), None)
+        let (worker, _) = router
+            .select_worker_for_model(
+                None,
+                Some(r#"{"prompt": "test"}"#),
+                &RoutingContext {
+                    prompt: None,
+                    allow_affinity: false,
+                    colocated: true,
+                    route: "/v1/completions",
+                },
+                None,
+                router.policy_registry.get_default_policy().as_ref(),
+            )
             .expect("Should select the remaining healthy worker");
 
         assert_eq!(
@@ -3089,7 +3071,18 @@ mod tests {
             w.set_healthy(false);
         }
 
-        let result = router.select_worker_for_model(None, Some(r#"{"prompt": "test"}"#), None);
+        let result = router.select_worker_for_model(
+            None,
+            Some(r#"{"prompt": "test"}"#),
+            &RoutingContext {
+                prompt: None,
+                allow_affinity: false,
+                colocated: true,
+                route: "/v1/completions",
+            },
+            None,
+            router.policy_registry.get_default_policy().as_ref(),
+        );
         assert!(
             result.is_none(),
             "Should return None when all workers are unavailable"
@@ -3107,10 +3100,17 @@ mod tests {
             let session_id = format!("session-{}", i);
             header_map.insert("x-session-id", HeaderValue::from_str(&session_id).unwrap());
 
-            if let Some(worker) = router.select_worker_for_model(
+            if let Some((worker, _)) = router.select_worker_for_model(
                 None,
                 Some(r#"{"prompt": "test"}"#),
+                &RoutingContext {
+                    prompt: None,
+                    allow_affinity: false,
+                    colocated: true,
+                    route: "/v1/completions",
+                },
                 Some(&header_map),
+                router.policy_registry.get_default_policy().as_ref(),
             ) {
                 worker_urls_seen.insert(worker.url().to_string());
             }

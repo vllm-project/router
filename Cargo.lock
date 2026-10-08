@@ -7449,6 +7449,7 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
+ "serde_yaml",
  "sha2",
  "strum 0.26.3",
  "tempfile",
