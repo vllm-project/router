@@ -95,6 +95,8 @@ class RouterArgs:
     cb_timeout_duration_secs: int = 60
     cb_window_duration_secs: int = 120
     disable_circuit_breaker: bool = False
+    # Additional typed inference-generate routes
+    extra_generate_paths: List[str] = dataclasses.field(default_factory=list)
 
     @staticmethod
     def add_cli_args(
@@ -133,6 +135,13 @@ class RouterArgs:
             nargs="*",
             default=[],
             help="List of worker URLs (e.g., http://worker1:8000 http://worker2:8000)",
+        )
+        parser.add_argument(
+            f"--{prefix}extra-generate-paths",
+            type=str,
+            nargs="*",
+            default=[],
+            help="Additional HTTP paths using the inference-generate request schema",
         )
 
         parser.add_argument(
@@ -563,6 +572,15 @@ class RouterArgs:
         return cls(**args_dict)
 
     def _validate_router_args(self):
+        if len(set(self.extra_generate_paths)) != len(self.extra_generate_paths):
+            raise ValueError("extra_generate_paths must not contain duplicates")
+        for path in self.extra_generate_paths:
+            if (
+                len(path) < 2
+                or not path.startswith("/")
+                or any(character in path for character in "?#{}*")
+            ):
+                raise ValueError(f"invalid extra generate path: {path}")
         if self.wasm_middleware_sha256 and not self.wasm_middleware:
             raise ValueError("wasm_middleware_sha256 requires wasm_middleware")
 
