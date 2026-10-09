@@ -62,12 +62,11 @@
 //! Hits, misses, evictions and oversized skips are counted under
 //! `vllm_tokenizer_cache_*_total`. `vllm_tokenizer_cache_entries` and
 //! `vllm_tokenizer_cache_bytes` are gauges holding the total occupancy of
-//! every live `CachedTokenizer` in the process. Each instance applies its
+//! every live tokenizer encoding cache in the process. Each instance applies its
 //! change to a process-wide aggregate and publishes the new totals while
 //! still holding its own lock, so after any `encode`, `clear` or drop the
 //! gauges equal the sum of the live instances' [`stats`](CachedTokenizer::stats).
-//! The series carry no labels; per-cache labels can be added when the cache
-//! is wired into the request path.
+//! The series carry no labels and include the gRPC frontend L0 cache.
 
 use super::traits::{
     Decoder, Encoder, Encoding, SpecialTokens, TokenIdType, Tokenizer as TokenizerTrait,
@@ -76,6 +75,8 @@ use crate::metrics::TokenizerMetrics;
 use anyhow::{bail, Result};
 use lru::LruCache;
 use parking_lot::Mutex;
+use std::borrow::Borrow;
+use std::hash::Hash;
 use std::mem::size_of;
 use std::num::NonZeroUsize;
 use std::ops::Range;
@@ -144,21 +145,24 @@ pub struct TokenizerCacheStats {
     pub bytes: usize,
 }
 
-struct CacheEntry {
-    encoding: Arc<Encoding>,
+struct CacheEntry<V> {
+    encoding: Arc<V>,
     bytes: usize,
 }
 
-struct CacheState {
-    lru: LruCache<String, CacheEntry>,
+struct CacheState<K, V> {
+    lru: LruCache<K, CacheEntry<V>>,
     /// Sum of `CacheEntry::bytes` over all entries in `lru`.
     bytes: usize,
 }
 
 /// Approximate fixed cost of one cache entry: the LRU node (key, value and two
 /// list links) and its hash-map slot (key reference and node pointer).
-const ENTRY_OVERHEAD_BYTES: usize =
-    size_of::<String>() + size_of::<CacheEntry>() + 4 * size_of::<usize>();
+const ENTRY_OVERHEAD_BYTES: usize = entry_overhead_bytes::<String, Encoding>();
+
+pub(crate) const fn entry_overhead_bytes<K, V>() -> usize {
+    size_of::<K>() + size_of::<CacheEntry<V>>() + 4 * size_of::<usize>()
+}
 
 /// Occupancy summed over every live cache in the process. Guarded by a lock
 /// so gauge publications are totally ordered and always carry the current
@@ -193,29 +197,64 @@ fn publish_occupancy_delta(entries_delta: isize, bytes_delta: isize) {
 /// See the [module documentation](self) for semantics and bounds.
 pub struct CachedTokenizer {
     inner: Arc<dyn TokenizerTrait>,
+    cache: EncodeCache<String, Encoding>,
+}
+
+impl CachedTokenizer {
+    /// Wrap a deterministic tokenizer with fixed configuration.
+    /// Returns an error for invalid budgets.
+    pub fn new(inner: Arc<dyn TokenizerTrait>, config: TokenizerCacheConfig) -> Result<Self> {
+        Ok(Self {
+            inner,
+            cache: EncodeCache::new(config)?,
+        })
+    }
+
+    /// The budgets this cache was built with.
+    pub fn config(&self) -> &TokenizerCacheConfig {
+        self.cache.config()
+    }
+
+    /// Number of entries currently retained.
+    pub fn len(&self) -> usize {
+        self.cache.len()
+    }
+
+    /// Whether the cache holds no entries.
+    pub fn is_empty(&self) -> bool {
+        self.cache.is_empty()
+    }
+
+    /// Snapshot of counters and occupancy.
+    pub fn stats(&self) -> TokenizerCacheStats {
+        self.cache.stats()
+    }
+
+    /// Drop every entry. Counters are kept.
+    pub fn clear(&self) {
+        self.cache.clear();
+    }
+}
+
+// Shared eviction, accounting and metrics for both tokenizer APIs.
+pub(crate) struct EncodeCache<K: Hash + Eq, V> {
     config: TokenizerCacheConfig,
-    state: Mutex<CacheState>,
+    state: Mutex<CacheState<K, V>>,
     hits: AtomicU64,
     misses: AtomicU64,
     evictions: AtomicU64,
     oversized: AtomicU64,
 }
 
-impl CachedTokenizer {
-    /// Wrap `inner` with a cache sized by `config`.
-    ///
-    /// Returns an error if `config` fails [`TokenizerCacheConfig::validate`].
-    pub fn new(inner: Arc<dyn TokenizerTrait>, config: TokenizerCacheConfig) -> Result<Self> {
+impl<K: Hash + Eq, V> EncodeCache<K, V> {
+    pub(crate) fn new(config: TokenizerCacheConfig) -> Result<Self> {
         config.validate()?;
         let capacity =
             NonZeroUsize::new(config.max_entries).expect("validate() guarantees max_entries >= 1");
         Ok(Self {
-            inner,
             config,
             state: Mutex::new(CacheState {
-                // `sparse` grows the map on demand instead of preallocating
-                // `max_entries` slots, which matters when the byte budget is
-                // the binding limit.
+                // Grow on demand; the byte budget may limit capacity first.
                 lru: LruCache::sparse(capacity),
                 bytes: 0,
             }),
@@ -226,22 +265,18 @@ impl CachedTokenizer {
         })
     }
 
-    /// The budgets this cache was built with.
     pub fn config(&self) -> &TokenizerCacheConfig {
         &self.config
     }
 
-    /// Number of entries currently retained.
     pub fn len(&self) -> usize {
         self.state.lock().lru.len()
     }
 
-    /// Whether the cache holds no entries.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
-    /// Snapshot of counters and occupancy.
     pub fn stats(&self) -> TokenizerCacheStats {
         let (entries, bytes) = {
             let state = self.state.lock();
@@ -257,7 +292,6 @@ impl CachedTokenizer {
         }
     }
 
-    /// Drop every entry. Counters are kept.
     pub fn clear(&self) {
         let removed = {
             let mut guard = self.state.lock();
@@ -270,11 +304,14 @@ impl CachedTokenizer {
             publish_occupancy_delta(-(entries as isize), -(bytes as isize));
             removed
         };
-        // Free the entries outside the lock; see the module documentation.
+        // Free entries outside the lock.
         drop(removed);
     }
 
-    fn lookup(&self, input: &str) -> Option<Arc<Encoding>> {
+    fn lookup<Q: Hash + Eq + ?Sized>(&self, input: &Q) -> Option<Arc<V>>
+    where
+        K: Borrow<Q>,
+    {
         let mut state = self.state.lock();
         state
             .lru
@@ -282,33 +319,30 @@ impl CachedTokenizer {
             .map(|entry| Arc::clone(&entry.encoding))
     }
 
-    fn insert(&self, input: &str, encoding: Arc<Encoding>, bytes: usize) {
+    fn insert(&self, input: K, encoding: Arc<V>, bytes: usize) {
         let mut evicted: u64 = 0;
-        // Entries removed under the lock are freed after it is released; see
-        // the module documentation. Allocates only when something is removed.
-        let mut removed: Vec<(String, CacheEntry)> = Vec::new();
+        // Defer deallocation until after unlocking.
+        let mut removed: Vec<(K, CacheEntry<V>)> = Vec::new();
         {
             let mut guard = self.state.lock();
             let state = &mut *guard;
             let entries_before = state.lru.len();
             let bytes_before = state.bytes;
 
-            if let Some((old_key, old_entry)) = state
-                .lru
-                .push(input.to_owned(), CacheEntry { encoding, bytes })
+            let replacing = state.lru.contains(&input);
+            if let Some((old_key, old_entry)) =
+                state.lru.push(input, CacheEntry { encoding, bytes })
             {
                 state.bytes -= old_entry.bytes;
-                // A concurrent miss may have inserted the same key.
-                // Replacing it does not count as an eviction.
-                if old_key != input {
+                // Concurrent replacements are not evictions.
+                if !replacing {
                     evicted += 1;
                 }
                 removed.push((old_key, old_entry));
             }
             state.bytes += bytes;
 
-            // `validate()` bounds every stored entry by `max_bytes`, so this
-            // loop never reaches the entry just inserted (the MRU).
+            // Each entry fits max_bytes, so the newest entry survives.
             while state.bytes > self.config.max_bytes {
                 match state.lru.pop_lru() {
                     Some(victim) => {
@@ -332,29 +366,29 @@ impl CachedTokenizer {
             TokenizerMetrics::record_cache_evictions(evicted);
         }
     }
-}
 
-impl Drop for CachedTokenizer {
-    fn drop(&mut self) {
-        let state = self.state.get_mut();
-        publish_occupancy_delta(-(state.lru.len() as isize), -(state.bytes as isize));
-    }
-}
-
-impl Encoder for CachedTokenizer {
-    fn encode(&self, input: &str) -> Result<Encoding> {
+    pub(crate) fn get_or_encode<Q, E>(
+        &self,
+        input: &Q,
+        encode: impl FnOnce() -> std::result::Result<V, E>,
+        estimate: impl FnOnce(&V) -> usize,
+    ) -> std::result::Result<V, E>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ToOwned<Owned = K> + ?Sized,
+        V: Clone,
+    {
         if let Some(encoding) = self.lookup(input) {
             self.hits.fetch_add(1, Ordering::Relaxed);
             TokenizerMetrics::record_cache_hit();
-            // Clone outside the lock so a large encoding does not stall
-            // other readers.
+            // Clone outside the lock.
             return Ok((*encoding).clone());
         }
         self.misses.fetch_add(1, Ordering::Relaxed);
         TokenizerMetrics::record_cache_miss();
 
-        let encoding = self.inner.encode(input)?;
-        let bytes = estimate_entry_bytes(input, &encoding);
+        let encoding = encode()?;
+        let bytes = estimate(&encoding);
         if bytes > self.config.max_entry_bytes {
             self.oversized.fetch_add(1, Ordering::Relaxed);
             TokenizerMetrics::record_cache_oversized();
@@ -363,8 +397,25 @@ impl Encoder for CachedTokenizer {
 
         let shared = Arc::new(encoding);
         let result = (*shared).clone();
-        self.insert(input, shared, bytes);
+        self.insert(input.to_owned(), shared, bytes);
         Ok(result)
+    }
+}
+
+impl<K: Hash + Eq, V> Drop for EncodeCache<K, V> {
+    fn drop(&mut self) {
+        let state = self.state.get_mut();
+        publish_occupancy_delta(-(state.lru.len() as isize), -(state.bytes as isize));
+    }
+}
+
+impl Encoder for CachedTokenizer {
+    fn encode(&self, input: &str) -> Result<Encoding> {
+        self.cache.get_or_encode(
+            input,
+            || self.inner.encode(input),
+            |encoding| estimate_entry_bytes(input, encoding),
+        )
     }
 
     fn encode_batch(&self, inputs: &[&str]) -> Result<Vec<Encoding>> {
@@ -446,7 +497,8 @@ fn estimate_hf_bytes(encoding: &tokenizers::tokenizer::Encoding) -> usize {
 impl CachedTokenizer {
     /// Recompute retained bytes from the entries, to check the running total.
     fn recomputed_bytes(&self) -> usize {
-        self.state
+        self.cache
+            .state
             .lock()
             .lru
             .iter()
@@ -779,8 +831,10 @@ mod tests {
         let bytes = mock_entry_bytes("Hello");
 
         // Models two threads that both missed on the same input.
-        cache.insert("Hello", encoding.clone(), bytes);
-        cache.insert("Hello", encoding, bytes);
+        cache
+            .cache
+            .insert("Hello".to_owned(), encoding.clone(), bytes);
+        cache.cache.insert("Hello".to_owned(), encoding, bytes);
 
         let stats = cache.stats();
         assert_eq!(stats.entries, 1);
@@ -932,7 +986,7 @@ mod tests {
         gate.wait_until_parked();
         // Release before asserting: a parked inserter holds the occupancy
         // lock, and a failed assertion here would leave it parked for good.
-        let locked = cache.state.try_lock().is_none();
+        let locked = cache.cache.state.try_lock().is_none();
         gate.release();
         inserter.join().unwrap();
         assert!(

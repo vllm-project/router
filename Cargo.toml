@@ -104,6 +104,7 @@ vllm-tokenizer = { git = "https://github.com/vllm-project/vllm", tag = "v0.29.0"
 vllm-text = { git = "https://github.com/vllm-project/vllm", tag = "v0.29.0" }
 
 [dev-dependencies]
+libc = "0.2"
 criterion = { version = "0.5", features = ["html_reports"] }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"

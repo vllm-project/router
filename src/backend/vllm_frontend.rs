@@ -1,6 +1,4 @@
-//! Adapter onto `vllm-chat` + `vllm-tokenizer` + `vllm-text` `Prompt`.
-//! Not a second renderer. `load_model_backends` is what
-//! `TokenizerCache` runs once per model key.
+//! Adapter for `vllm-chat`, `vllm-tokenizer`, and `vllm-text`.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -13,7 +11,9 @@ use vllm_chat::{
     ChatToolChoice, GenerationPromptMode, LoadModelBackendsOptions, LoadedModelBackends,
     ReasoningEffort, ResolvedToolContext, SamplingParams,
 };
-use vllm_text::{Prompt, TextDecodeOptions};
+use vllm_text::TextDecodeOptions;
+
+use super::l0::{deterministic_model, FrontendCache, PromptEncoder};
 use vllm_tokenizer::{IncrementalDecoder, Tokenizer};
 
 pub use vllm_chat::ChatMessage as UpstreamChatMessage;
@@ -23,12 +23,14 @@ pub use vllm_tokenizer::IncrementalDecoder as IncrementalDecoderTrait;
 #[derive(Clone)]
 pub struct VllmFrontend {
     backends: Arc<LoadedModelBackends>,
+    encoder: PromptEncoder,
 }
 
 impl VllmFrontend {
-    pub async fn load(
+    pub(crate) async fn load(
         model_id: &str,
         default_chat_template_kwargs: HashMap<String, Value>,
+        cache: Option<Arc<FrontendCache>>,
     ) -> vllm_chat::Result<Self> {
         let backends = load_model_backends(
             model_id,
@@ -39,8 +41,25 @@ impl VllmFrontend {
             },
         )
         .await?;
+        let cache = if cache.is_some() {
+            match deterministic_model(model_id).await {
+                Ok(true) => cache,
+                result => {
+                    tracing::warn!(
+                        model_id,
+                        ?result,
+                        "L0 disabled: tokenizer determinism is not established"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let encoder = PromptEncoder::new(model_id, backends.text_backend.tokenizer(), cache);
         Ok(Self {
             backends: Arc::new(backends),
+            encoder,
         })
     }
 
@@ -64,13 +83,14 @@ impl VllmFrontend {
         let rendered = self.backends.chat_backend.chat_renderer().render(request)?;
         let template_ms = t0.elapsed().as_secs_f64() * 1000.0;
         let t1 = Instant::now();
-        let ids = match rendered.prompt {
-            Prompt::Text(text) => self
-                .tokenizer()
-                .encode(&text, request.add_special_tokens)
-                .map_err(|error| vllm_chat::Error::ChatTemplate(error.to_string()))?,
-            Prompt::TokenIds(ids) => ids,
-        };
+        let ids = self
+            .encoder
+            .encode(
+                rendered.prompt,
+                request.add_special_tokens,
+                request.cache_salt.as_deref(),
+            )
+            .map_err(|error| vllm_chat::Error::ChatTemplate(error.to_string()))?;
         let encode_ms = t1.elapsed().as_secs_f64() * 1000.0;
         Ok((ids, template_ms, encode_ms))
     }

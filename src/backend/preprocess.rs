@@ -1,10 +1,5 @@
-//! Chat+tokenize for gRPC workers: **only** `vllm-chat` + `vllm-tokenizer`.
-//!
-//! There is no HuggingFace/minijinja fallback. If those crates are not
-//! linked, `grpc://` is unavailable.
-//!
-//! `TokenizerCache` caches loaded frontend objects (`load_model_backends`),
-//! not prior-request token ids or engine KV.
+//! gRPC chat rendering and tokenization via `vllm-chat` and `vllm-tokenizer`.
+//! Loaded models share an optional L0 encoding cache.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -13,6 +8,9 @@ use std::time::Instant;
 use anyhow::{anyhow, Result};
 use dashmap::DashMap;
 use parking_lot::RwLock;
+
+use super::l0::FrontendCache;
+use crate::tokenizer::{TokenizerCacheConfig, TokenizerCacheStats};
 
 use super::vllm_frontend::{
     chat_request_from_openai, system_text, tool_text, user_text, OpenAiChatRequest, VllmFrontend,
@@ -33,16 +31,13 @@ enum Frontend {
     TestIds(Vec<u32>),
 }
 
-/// In-process cache of loaded `vllm-chat` / `vllm-tokenizer` objects.
-///
-/// First request for a model key calls `load_model_backends`; later
-/// requests clone the `Arc`. This is **not** reuse of prior-request
-/// `token_ids` and **not** engine KV / prefix-cache routing.
+/// Loads each model once and optionally shares an L0 budget across models.
 #[derive(Clone)]
 pub struct TokenizerCache {
     pinned: Arc<RwLock<Option<Frontend>>>,
     by_model: Arc<DashMap<String, Arc<VllmFrontend>>>,
     load_lock: Arc<tokio::sync::Mutex<()>>,
+    encoding_cache: Option<Arc<FrontendCache>>,
 }
 
 impl std::fmt::Debug for TokenizerCache {
@@ -63,7 +58,21 @@ impl TokenizerCache {
             pinned: Arc::new(RwLock::new(None)),
             by_model: Arc::new(DashMap::new()),
             load_lock: Arc::new(tokio::sync::Mutex::new(())),
+            encoding_cache: None,
         }
+    }
+
+    /// Enable L0 with a shared budget across models.
+    pub fn with_encoding_cache(config: TokenizerCacheConfig) -> Result<Self> {
+        Ok(Self {
+            encoding_cache: Some(Arc::new(FrontendCache::new(config)?)),
+            ..Self::new()
+        })
+    }
+
+    /// L0 stats across models, or None when disabled.
+    pub fn encoding_cache_stats(&self) -> Option<TokenizerCacheStats> {
+        self.encoding_cache.as_ref().map(|cache| cache.stats())
     }
 
     /// Tests only: bypass model loading by returning these fake prompt ids.
@@ -86,7 +95,7 @@ impl TokenizerCache {
             return Ok(FrontendHandle(Frontend::Vllm(hit.clone())));
         }
         let frontend = Arc::new(
-            VllmFrontend::load(&source, Default::default())
+            VllmFrontend::load(&source, Default::default(), self.encoding_cache.clone())
                 .await
                 .map_err(|e| anyhow!("vllm-chat load {source} for key {key}: {e}"))?,
         );
@@ -515,7 +524,7 @@ mod tests {
     }
 
     async fn rust_vllm_chat_ids(model: &str, messages: serde_json::Value) -> Vec<u32> {
-        let frontend = VllmFrontend::load(model, Default::default())
+        let frontend = VllmFrontend::load(model, Default::default(), None)
             .await
             .expect("vllm-chat load_model_backends");
         let req: ChatCompletionRequest = serde_json::from_value(serde_json::json!({

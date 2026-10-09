@@ -191,7 +191,14 @@ impl Router {
         RouterMetrics::set_active_workers(worker_urls.len());
 
         // All-http or all-grpc. Mixed schemes fail here (not a silent fallback).
-        crate::backend::classify_worker_urls(&worker_urls)?;
+        let pool_kind = crate::backend::classify_worker_urls(&worker_urls)?;
+        let request_timeout = Duration::from_secs(ctx.router_config.request_timeout_secs);
+        let frontend = if pool_kind == Some(crate::backend::WorkerPoolKind::Http) {
+            crate::backend::EngineFrontend::with_request_timeout(request_timeout)
+        } else {
+            crate::backend::EngineFrontend::from_env(request_timeout)
+                .map_err(|error| format!("tokenizer cache: {error}"))?
+        };
 
         // Wait for workers to be healthy (skip if empty - for service discovery mode)
         if !worker_urls.is_empty() {
@@ -358,9 +365,7 @@ impl Router {
             retry_config: ctx.router_config.effective_retry_config(),
             circuit_breaker_config: core_cb_config,
             health_config,
-            frontend: crate::backend::EngineFrontend::with_request_timeout(Duration::from_secs(
-                ctx.router_config.request_timeout_secs,
-            )),
+            frontend,
             _worker_loads: worker_loads,
             _load_monitor_handle: load_monitor_handle,
             program_scheduler,
