@@ -6,7 +6,7 @@ use url::{Host, Url};
 pub fn parse_endpoint_mapping(value: &str) -> Result<(String, String), String> {
     let (worker, endpoint) = value
         .split_once('=')
-        .ok_or("KV endpoint mapping must be WORKER_HTTP_URL=tcp://HOST:PORT")?;
+        .ok_or("KV endpoint mapping must be WORKER_HTTP_URL=tcp://HOST:PORT; for example: http://worker:8000=tcp://publisher:5557")?;
     Ok((canonical_worker(worker)?, canonical_endpoint(endpoint)?))
 }
 
@@ -71,6 +71,7 @@ fn canonical_worker(value: &str) -> Result<String, String> {
     {
         return Err("KV workers must be plain HTTP(S) origins without credentials or paths".into());
     }
+    display_host(&parsed)?;
     Ok(parsed.to_string().trim_end_matches('/').to_string())
 }
 
