@@ -33,6 +33,12 @@ pub struct RouterConfig {
     /// Intra-node data parallel size (number of DP replicas per worker URL). When > 1, the router will create multiple worker instances per URL, one for each DP rank.
     #[serde(default = "default_intra_node_data_parallel_size")]
     pub intra_node_data_parallel_size: usize,
+    /// Prefill DP replicas per worker URL. None preserves automatic discovery and the legacy fallback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefill_data_parallel_size: Option<usize>,
+    /// Decode DP replicas per worker URL. None preserves automatic discovery and the legacy fallback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decode_data_parallel_size: Option<usize>,
     /// The api key used for the authorization with the worker
     pub api_key: Option<String>,
     /// API key validation URLs (if set, incoming requests must validate against them)
@@ -885,6 +891,8 @@ impl Default for RouterConfig {
             worker_startup_timeout_secs: 600,
             worker_startup_check_interval_secs: 30,
             intra_node_data_parallel_size: 1,
+            prefill_data_parallel_size: None,
+            decode_data_parallel_size: None,
             api_key: None,
             api_key_validation_urls: vec![],
             discovery: None,
@@ -914,6 +922,18 @@ impl Default for RouterConfig {
 }
 
 impl RouterConfig {
+    /// Prefill DP size when worker metadata is unavailable.
+    pub fn effective_prefill_data_parallel_size(&self) -> usize {
+        self.prefill_data_parallel_size
+            .unwrap_or(self.intra_node_data_parallel_size)
+    }
+
+    /// Decode DP size when worker metadata is unavailable.
+    pub fn effective_decode_data_parallel_size(&self) -> usize {
+        self.decode_data_parallel_size
+            .unwrap_or(self.intra_node_data_parallel_size)
+    }
+
     /// Create a new configuration with mode and policy
     pub fn new(mode: RoutingMode, policy: PolicyConfig) -> Self {
         Self {
@@ -1595,6 +1615,8 @@ mod tests {
             worker_startup_timeout_secs: 60,
             worker_startup_check_interval_secs: 5,
             intra_node_data_parallel_size: 1,
+            prefill_data_parallel_size: None,
+            decode_data_parallel_size: None,
             api_key: None,
             api_key_validation_urls: vec![],
             discovery: Some(DiscoveryConfig {
@@ -1662,6 +1684,8 @@ mod tests {
             worker_startup_timeout_secs: 180,
             worker_startup_check_interval_secs: 15,
             intra_node_data_parallel_size: 1,
+            prefill_data_parallel_size: None,
+            decode_data_parallel_size: None,
             api_key: None,
             api_key_validation_urls: vec![],
             discovery: Some(DiscoveryConfig {
@@ -1720,6 +1744,8 @@ mod tests {
             worker_startup_timeout_secs: 600,
             worker_startup_check_interval_secs: 20,
             intra_node_data_parallel_size: 1,
+            prefill_data_parallel_size: None,
+            decode_data_parallel_size: None,
             api_key: None,
             api_key_validation_urls: vec![],
             discovery: Some(DiscoveryConfig {
@@ -1926,6 +1952,58 @@ mod tests {
         match regular.get_decode_policy(&main_policy) {
             PolicyConfig::RoundRobin => {} // Success
             _ => panic!("Expected RoundRobin for regular mode"),
+        }
+    }
+
+    #[test]
+    fn test_pd_data_parallel_sizes_and_json_compatibility() {
+        for (legacy, prefill, decode, expected) in [
+            (4, None, None, (4, 4)),
+            (1, Some(4), Some(2), (4, 2)),
+            (4, None, Some(2), (4, 2)),
+            (2, Some(4), None, (4, 2)),
+        ] {
+            let config = RouterConfig {
+                intra_node_data_parallel_size: legacy,
+                prefill_data_parallel_size: prefill,
+                decode_data_parallel_size: decode,
+                ..Default::default()
+            };
+            let serialized = serde_json::to_value(&config).unwrap();
+            if prefill.is_none() && decode.is_none() {
+                assert!(serialized.get("prefill_data_parallel_size").is_none());
+                assert!(serialized.get("decode_data_parallel_size").is_none());
+            }
+            let restored: RouterConfig = serde_json::from_value(serialized).unwrap();
+            assert_eq!(
+                (
+                    restored.effective_prefill_data_parallel_size(),
+                    restored.effective_decode_data_parallel_size(),
+                ),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn test_pd_data_parallel_sizes_reject_zero() {
+        for (prefill, decode, field) in [
+            (Some(0), None, "prefill_data_parallel_size"),
+            (None, Some(0), "decode_data_parallel_size"),
+        ] {
+            let config = RouterConfig {
+                mode: RoutingMode::VllmPrefillDecode {
+                    prefill_urls: vec![("http://prefill:8000".into(), None)],
+                    decode_urls: vec!["http://decode:8000".into()],
+                    prefill_policy: None,
+                    decode_policy: None,
+                    discovery_address: None,
+                },
+                prefill_data_parallel_size: prefill,
+                decode_data_parallel_size: decode,
+                ..Default::default()
+            };
+            assert!(config.validate().unwrap_err().to_string().contains(field));
         }
     }
 }

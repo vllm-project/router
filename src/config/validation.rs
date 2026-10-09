@@ -349,6 +349,25 @@ impl ConfigValidator {
 
     /// Validate server configuration
     fn validate_server_settings(config: &RouterConfig) -> ConfigResult<()> {
+        for (field, size) in [
+            (
+                "prefill_data_parallel_size",
+                config.prefill_data_parallel_size,
+            ),
+            (
+                "decode_data_parallel_size",
+                config.decode_data_parallel_size,
+            ),
+        ] {
+            if size == Some(0) {
+                return Err(ConfigError::InvalidValue {
+                    field: field.to_string(),
+                    value: "0".to_string(),
+                    reason: "Must be > 0".to_string(),
+                });
+            }
+        }
+
         if config.port == 0 {
             return Err(ConfigError::InvalidValue {
                 field: "port".to_string(),
