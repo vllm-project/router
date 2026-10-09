@@ -99,6 +99,12 @@ fn display_host(parsed: &Url) -> Result<String, String> {
     // numeric IPv4 canonicalization, without resolving DNS aliases.
     let host = Host::parse(parsed.host_str().ok_or("missing endpoint host")?)
         .map_err(|error| format!("invalid endpoint host: {error}"))?;
+    let host = match host {
+        Host::Ipv6(address) => address
+            .to_ipv4_mapped()
+            .map_or(Host::Ipv6(address), Host::Ipv4),
+        host => host,
+    };
     match host {
         Host::Ipv6(address) if address.is_unspecified() => {
             Err("KV connect host cannot be unspecified".into())
@@ -116,6 +122,137 @@ fn display_host(parsed: &Url) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ipv4_mapped_explicit_publishers_cannot_hide_shared_endpoints() {
+        let workers: Vec<String> = vec!["http://worker:8000".into(), "http://worker:8001".into()];
+        for host in [
+            "[::ffff:127.0.0.1]",
+            "[::ffff:7f00:1]",
+            "[0:0:0:0:0:ffff:7f00:1]",
+        ] {
+            assert_eq!(
+                parse_endpoint_mapping(&format!("{}=tcp://{host}:5557", workers[0])).unwrap(),
+                (workers[0].clone(), "tcp://127.0.0.1:5557".into()),
+                "{host}"
+            );
+            let mappings = vec![
+                (workers[0].clone(), format!("tcp://{host}:5557")),
+                (workers[1].clone(), "tcp://127.0.0.1:5557".into()),
+            ];
+            assert_eq!(
+                resolve_endpoints(&workers, &mappings, 5558),
+                Err("workers cannot share KV endpoint tcp://127.0.0.1:5557; configure explicit per-worker endpoints".into()),
+                "{host}"
+            );
+        }
+    }
+
+    #[test]
+    fn ipv4_mapped_explicit_and_fallback_publishers_cannot_share_endpoints() {
+        for host in [
+            "[::ffff:127.0.0.1]",
+            "[::ffff:7f00:1]",
+            "[0:0:0:0:0:ffff:7f00:1]",
+        ] {
+            for (explicit_host, fallback_host) in [(host, "127.0.0.1"), ("127.0.0.1", host)] {
+                let workers = vec![
+                    "http://worker:8000".into(),
+                    format!("http://{fallback_host}:8001"),
+                ];
+                let mappings = vec![(workers[0].clone(), format!("tcp://{explicit_host}:5557"))];
+                assert_eq!(
+                    resolve_endpoints(&workers, &mappings, 5557),
+                    Err("workers cannot share KV endpoint tcp://127.0.0.1:5557; configure explicit per-worker endpoints".into()),
+                    "explicit: {explicit_host}, fallback: {fallback_host}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ipv4_mapped_unspecified_hosts_are_rejected_at_each_public_boundary() {
+        for host in ["[::ffff:0.0.0.0]", "[::ffff:0:0]"] {
+            assert_eq!(
+                parse_endpoint_mapping(&format!("http://worker:8000=tcp://{host}:5557")),
+                Err("KV connect host cannot be unspecified".into()),
+                "parse: {host}"
+            );
+            let mappings = vec![("http://worker:8000".into(), format!("tcp://{host}:5557"))];
+            assert_eq!(
+                resolve_endpoints(&["http://worker:8000".into()], &mappings, 5557),
+                Err("KV connect host cannot be unspecified".into()),
+                "raw mapping: {host}"
+            );
+            assert_eq!(
+                resolve_endpoints(&[format!("http://{host}:8000")], &[], 5557),
+                Err("KV connect host cannot be unspecified".into()),
+                "fallback: {host}"
+            );
+        }
+    }
+
+    #[test]
+    fn ipv4_mapped_distinct_publisher_ports_are_accepted() {
+        let workers: Vec<String> = vec![
+            "http://127.0.0.1:8000".into(),
+            "http://[::ffff:127.0.0.1]:8001".into(),
+        ];
+        let mappings = vec![
+            (workers[0].clone(), "tcp://[::ffff:7f00:1]:5557".into()),
+            (workers[1].clone(), "tcp://127.0.0.1:5558".into()),
+        ];
+        let expected = vec![
+            (workers[0].clone(), "tcp://127.0.0.1:5557".into()),
+            (workers[1].clone(), "tcp://127.0.0.1:5558".into()),
+        ];
+        assert_eq!(
+            resolve_endpoints(&workers, &mappings, 5559).unwrap(),
+            expected
+        );
+        assert_eq!(
+            resolve_endpoints(&workers, &mappings[..1], 5558).unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn ipv4_mapped_normalization_preserves_native_and_compatible_ipv6() {
+        let workers: Vec<String> = vec![
+            "http://127.0.0.1:8000".into(),
+            "http://[::1]:8001".into(),
+            "http://[::127.0.0.1]:8002".into(),
+        ];
+        let mappings = vec![
+            parse_endpoint_mapping("http://127.0.0.1:8000=tcp://127.0.0.1:5557").unwrap(),
+            parse_endpoint_mapping("http://[::1]:8001=tcp://[::1]:5557").unwrap(),
+            parse_endpoint_mapping("http://[::127.0.0.1]:8002=tcp://[::127.0.0.1]:5557").unwrap(),
+        ];
+        let expected = vec![
+            (workers[0].clone(), "tcp://127.0.0.1:5557".into()),
+            (workers[1].clone(), "tcp://[::1]:5557".into()),
+            (workers[2].clone(), "tcp://[::7f00:1]:5557".into()),
+        ];
+        assert_eq!(
+            resolve_endpoints(&workers, &mappings, 5558).unwrap(),
+            expected
+        );
+        assert_eq!(resolve_endpoints(&workers, &[], 5557).unwrap(), expected);
+    }
+
+    #[test]
+    fn ipv4_mapped_publishers_preserve_the_exact_registry_ownership_key() {
+        let workers = vec!["HTTP://[0:0:0:0:0:FFFF:7F00:1]:8000/".to_string()];
+        let mapping =
+            parse_endpoint_mapping("http://[::ffff:127.0.0.1]:8000=tcp://[::FFFF:127.0.0.1]:5557/")
+                .unwrap();
+        let expected = vec![(workers[0].clone(), "tcp://127.0.0.1:5557".into())];
+        assert_eq!(
+            resolve_endpoints(&workers, &[mapping], 5558).unwrap(),
+            expected
+        );
+        assert_eq!(resolve_endpoints(&workers, &[], 5557).unwrap(), expected);
+    }
 
     #[test]
     fn numeric_ipv4_aliases_cannot_hide_shared_publishers() {
