@@ -4,7 +4,7 @@ use vllm_router_rs::{
     kv_events::{decode_batch, validate_device_dp1_batch},
     kv_hash::BlockKeyGenerator,
     kv_index::{
-        subscriber::local_hashes,
+        local_hashes,
         wire::{ExternalBlockHash, KVEvent, KVEventBatch},
         ClearScope, KvBlockIndexer, MatchQuery, ResidencyOwner, StorageTier, TieredMatchProvider,
     },
