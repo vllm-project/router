@@ -432,11 +432,18 @@ fn user_content_text(content: &UserMessageContent) -> Result<String> {
         UserMessageContent::Parts(parts) => {
             let mut text = String::new();
             for part in parts {
-                match part {
-                    crate::protocols::spec::ContentPart::Text { text: part } => {
-                        text.push_str(part);
+                match part.get("type").and_then(serde_json::Value::as_str) {
+                    Some("text") => {
+                        let part_text = part
+                            .get("text")
+                            .and_then(serde_json::Value::as_str)
+                            .ok_or_else(|| {
+                                anyhow!("text content part is missing a string `text` field")
+                            })?;
+                        text.push_str(part_text);
                     }
-                    crate::protocols::spec::ContentPart::ImageUrl { .. } => {
+                    // The token_ids-only gRPC path cannot carry non-text parts.
+                    _ => {
                         return Err(anyhow!(
                             "multimodal chat is not supported by the token_ids-only gRPC path"
                         ));
@@ -675,6 +682,45 @@ mod tests {
         assert_eq!(
             rust_ids, py_ids,
             "vllm-chat+vllm-tokenizer must match Python vllm on system+user"
+        );
+    }
+
+    #[test]
+    fn test_user_content_text_rejects_non_text_parts() {
+        let parts = UserMessageContent::Parts(vec![
+            serde_json::json!({
+                "type": "audio_url",
+                "audio_url": {"url": "data:audio/wav;base64,AAAA"}
+            }),
+            serde_json::json!({"type": "text", "text": "hello"}),
+        ]);
+        let err = user_content_text(&parts).unwrap_err();
+        assert!(
+            err.to_string().contains("multimodal chat is not supported"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_user_content_text_concatenates_text_parts() {
+        let plain = UserMessageContent::Text("plain".to_string());
+        assert_eq!(user_content_text(&plain).unwrap(), "plain");
+
+        let parts = UserMessageContent::Parts(vec![
+            serde_json::json!({"type": "text", "text": "foo"}),
+            serde_json::json!({"type": "text", "text": "bar"}),
+        ]);
+        assert_eq!(user_content_text(&parts).unwrap(), "foobar");
+    }
+
+    #[test]
+    fn test_user_content_text_rejects_malformed_text_part() {
+        // `type == "text"` but no string `text` field.
+        let parts = UserMessageContent::Parts(vec![serde_json::json!({"type": "text"})]);
+        let err = user_content_text(&parts).unwrap_err();
+        assert!(
+            err.to_string().contains("missing a string `text` field"),
+            "unexpected error: {err}"
         );
     }
 }
