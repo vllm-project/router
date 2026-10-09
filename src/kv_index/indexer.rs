@@ -51,6 +51,9 @@ fn edge_common_prefix(edge: &[EdgeBlock], incoming: &[EdgeBlock]) -> usize {
 struct TreeNode {
     /// Edge blocks leading into this node; empty on the root sentinel.
     edge: Vec<EdgeBlock>,
+    /// Historical engine identities for each logical block, parallel to `edge`.
+    /// Topology and parent anchors survive removal of residency claims.
+    aliases: Vec<HashSet<Arc<str>>>,
     /// Per-block residency claims, parallel to `edge`; `claims[i]` owns
     /// `edge[i]`. Empty on the root sentinel.
     claims: Vec<Vec<OwnerTier>>,
@@ -62,14 +65,17 @@ impl TreeNode {
     fn root() -> Self {
         TreeNode {
             edge: Vec::new(),
+            aliases: Vec::new(),
             claims: Vec::new(),
             children: HashMap::new(),
         }
     }
     fn with_edge(edge: Vec<EdgeBlock>) -> Self {
         let claims = (0..edge.len()).map(|_| Vec::new()).collect();
+        let aliases = (0..edge.len()).map(|_| HashSet::new()).collect();
         TreeNode {
             edge,
+            aliases,
             claims,
             children: HashMap::new(),
         }
@@ -91,7 +97,8 @@ struct GroupShard {
     anchors: DashMap<Arc<str>, NodeRef>,
     /// Reverse lookup: (owner, tier) → seq hashes claimed.
     reverse: DashMap<OwnerTier, HashSet<Arc<str>>>,
-    /// Per-(owner, tier) resident block count, for capacity accounting.
+    /// Per-(owner, tier) count of distinct active engine sequence observations.
+    /// Multiple aliases of one logical block remain distinct observations.
     counts: DashMap<OwnerTier, usize>,
 }
 
@@ -121,84 +128,77 @@ impl GroupShard {
         parent_seq: Option<Arc<str>>,
         blocks: &[EdgeBlock],
     ) {
-        let key = (owner.clone(), tier);
-        let mut node: NodeRef = parent_seq
-            .as_ref()
-            .and_then(|s| self.anchors.get(s).map(|n| n.clone()))
-            .unwrap_or_else(|| self.root.clone());
+        let key = (owner, tier);
+        // Only the first unknown parent falls back to the root. Later cursors
+        // were recorded by this store and must follow their current anchor.
+        let mut cursor = parent_seq.filter(|seq| self.anchors.contains_key(seq));
         let mut bi = 0;
         while bi < blocks.len() {
-            let child = {
-                let n = node.read();
-                n.children.get(&blocks[bi].1).cloned()
-            };
+            let node = cursor
+                .as_ref()
+                .and_then(|seq| self.anchors.get(seq).map(|n| n.clone()))
+                .unwrap_or_else(|| self.root.clone());
+            let mut parent = node.write();
+            if let Some(seq) = &cursor {
+                let Some(pos) = parent
+                    .aliases
+                    .iter()
+                    .position(|aliases| aliases.contains(seq))
+                else {
+                    // A split moved the cursor after its anchor was cloned.
+                    continue;
+                };
+                if pos + 1 < parent.edge.len() {
+                    self.split_locked(&mut parent, pos + 1);
+                }
+            }
+            let child = parent.children.get(&blocks[bi].1).cloned();
             let Some(child) = child else {
-                // No child: append a new edge with all remaining blocks.
-                let edge = blocks[bi..].to_vec();
-                let new_node = Arc::new(RwLock::new(TreeNode::with_edge(edge)));
-                self.install_new_child(&node, &blocks[bi].1, &new_node);
-                let mut g = new_node.write();
-                self.record_locked(&mut g, &new_node, &key);
+                // Keep the parent locked from lookup through publication so
+                // another writer cannot replace a newly installed child.
+                let new_node = Arc::new(RwLock::new(TreeNode::with_edge(blocks[bi..].to_vec())));
+                let mut new = new_node.write();
+                self.record_locked(&mut new, &new_node, &key, &blocks[bi..]);
+                parent
+                    .children
+                    .insert(blocks[bi].1.clone(), new_node.clone());
                 return;
             };
-            // Match, split, and claim under one write lock: a concurrent split
-            // can't shorten this edge between the match and the split.
-            let descend = {
-                let mut c = child.write();
-                let matched = edge_common_prefix(&c.edge, &blocks[bi..]);
-                if matched >= c.edge.len() {
-                    self.record_locked(&mut c, &child, &key);
-                    bi += c.edge.len();
-                    true
-                } else {
-                    self.split_locked(&mut c, matched);
-                    self.record_locked(&mut c, &child, &key);
-                    bi += matched;
-                    false
-                }
-            };
-            if descend {
-                node = child;
-                continue;
+            drop(parent);
+            let mut c = child.write();
+            let matched = edge_common_prefix(&c.edge, &blocks[bi..]);
+            if matched < c.edge.len() {
+                self.split_locked(&mut c, matched);
             }
-            // Partial match ended the traversal; append remaining blocks as a sibling.
-            if bi < blocks.len() {
-                let edge = blocks[bi..].to_vec();
-                let new_node = Arc::new(RwLock::new(TreeNode::with_edge(edge)));
-                self.install_new_child(&child, &blocks[bi].1, &new_node);
-                let mut g = new_node.write();
-                self.record_locked(&mut g, &new_node, &key);
-            }
-            return;
+            self.record_locked(&mut c, &child, &key, &blocks[bi..bi + matched]);
+            bi += matched;
+            cursor = Some(blocks[bi - 1].0.clone());
         }
     }
 
-    /// Link a new child under its first local hash.
-    fn install_new_child(&self, parent: &NodeRef, first_local: &Arc<str>, child: &NodeRef) {
-        parent
-            .write()
-            .children
-            .insert(first_local.clone(), child.clone());
-    }
-
-    /// Record every block on `node`'s edge into anchors, reverse, counts, and
+    /// Record incoming identities into anchors, reverse, counts, and
     /// attach `(owner, tier)` as a per-block claim. Idempotent per
     /// (owner, tier, block). Caller holds `node`'s write lock.
-    fn record_locked(&self, n: &mut TreeNode, node: &NodeRef, key: &OwnerTier) {
-        for (seq, _) in &n.edge {
+    fn record_locked(
+        &self,
+        n: &mut TreeNode,
+        node: &NodeRef,
+        key: &OwnerTier,
+        incoming: &[EdgeBlock],
+    ) {
+        for (i, (seq, _)) in incoming.iter().enumerate() {
+            n.aliases[i].insert(seq.clone());
             self.anchors.insert(seq.clone(), node.clone());
-            let already = self.reverse.get(key).is_some_and(|c| c.contains(seq));
-            if !already {
-                self.reverse
-                    .entry(key.clone())
-                    .or_default()
-                    .insert(seq.clone());
+            if self
+                .reverse
+                .entry(key.clone())
+                .or_default()
+                .insert(seq.clone())
+            {
                 *self.counts.entry(key.clone()).or_insert(0) += 1;
             }
-        }
-        for claims in n.claims.iter_mut() {
-            if !claims.contains(key) {
-                claims.push(key.clone());
+            if !n.claims[i].contains(key) {
+                n.claims[i].push(key.clone());
             }
         }
     }
@@ -210,18 +210,20 @@ impl GroupShard {
     /// Called under the caller's write lock on `child`.
     fn split_locked(&self, c: &mut TreeNode, pos: usize) {
         let remainder: Vec<EdgeBlock> = c.edge.split_off(pos);
+        let rem_aliases = c.aliases.split_off(pos);
         let rem_claims: Vec<Vec<OwnerTier>> = c.claims.split_off(pos);
         let old_children = std::mem::take(&mut c.children);
         let rem_first = remainder[0].1.clone();
-        let rem_seqs: Vec<Arc<str>> = remainder.iter().map(|(s, _)| s.clone()).collect();
-        let rem_node = Arc::new(RwLock::new(TreeNode::with_edge(remainder)));
-        {
-            let mut r = rem_node.write();
-            r.claims = rem_claims;
-            r.children = old_children;
-        }
-        for seq in rem_seqs {
-            self.anchors.insert(seq, rem_node.clone());
+        let rem_node = Arc::new(RwLock::new(TreeNode {
+            edge: remainder,
+            aliases: rem_aliases,
+            claims: rem_claims,
+            children: old_children,
+        }));
+        for aliases in &rem_node.read().aliases {
+            for seq in aliases {
+                self.anchors.insert(seq.clone(), rem_node.clone());
+            }
         }
         c.children.insert(rem_first, rem_node);
     }
@@ -233,17 +235,13 @@ impl GroupShard {
     pub fn remove(&self, owner: &ResidencyOwner, tier: StorageTier, seq_hashes: &[Arc<str>]) {
         let key = (owner.clone(), tier);
         for seq in seq_hashes {
-            let node = match self.anchors.get(seq) {
-                Some(n) => n.clone(),
-                None => continue,
-            };
             let mut removed = false;
             if let Some(mut claims) = self.reverse.get_mut(&key) {
                 if claims.remove(seq) {
                     removed = true;
                 }
             }
-            self.remove_claim(&node, seq, &key);
+            self.remove_claim(seq, &key);
             if removed {
                 if let Some(mut c) = self.counts.get_mut(&key) {
                     if *c > 0 {
@@ -287,29 +285,37 @@ impl GroupShard {
             if !same {
                 continue;
             }
-            if let Some((_, seqs)) = self.reverse.remove(&key) {
-                for seq in &seqs {
-                    // Clone out of the anchors shard before the node write:
-                    // holding it across remove_claim's node.write() deadlocks store.
-                    let node = match self.anchors.get(seq) {
-                        Some(n) => n.clone(),
-                        None => continue,
-                    };
-                    self.remove_claim(&node, seq, &key);
-                }
-            }
-            self.counts.remove(&key);
+            let seqs: Vec<Arc<str>> = self
+                .reverse
+                .get(&key)
+                .map(|seqs| seqs.iter().cloned().collect())
+                .unwrap_or_default();
+            self.remove(&key.0, key.1, &seqs);
+            self.reverse.remove_if(&key, |_, seqs| seqs.is_empty());
+            self.counts.remove_if(&key, |_, count| *count == 0);
         }
     }
 
-    /// Drop `key` from the per-block claim set of the edge block whose seq is
-    /// `seq` on `node`.
-    fn remove_claim(&self, node: &NodeRef, seq: &Arc<str>, key: &OwnerTier) {
-        let mut n = node.write();
-        if let Some(idx) = n.edge.iter().position(|(s, _)| s == seq) {
-            if let Some(claims) = n.claims.get_mut(idx) {
-                claims.retain(|c| c != key);
+    /// Drop the logical block claim only after its last active alias is gone.
+    fn remove_claim(&self, seq: &Arc<str>, key: &OwnerTier) {
+        loop {
+            // Never hold an anchors map guard while taking the node lock.
+            let Some(node) = self.anchors.get(seq).map(|n| n.clone()) else {
+                return;
+            };
+            let mut n = node.write();
+            let Some(idx) = n.aliases.iter().position(|aliases| aliases.contains(seq)) else {
+                // A concurrent split moved this alias; resolve it again.
+                continue;
+            };
+            let active = self
+                .reverse
+                .get(key)
+                .is_some_and(|seqs| n.aliases[idx].iter().any(|alias| seqs.contains(alias)));
+            if !active {
+                n.claims[idx].retain(|claim| claim != key);
             }
+            return;
         }
     }
 
@@ -510,6 +516,217 @@ mod tests {
             .find(|m| &*m.target.instance_id == target_id && m.tier == tier)
             .map(|m| m.matched_depth)
             .unwrap_or(0)
+    }
+
+    fn assert_observations(shard: &GroupShard, key: &OwnerTier, expected: &[&str]) {
+        let actual = shard
+            .reverse
+            .get(key)
+            .map(|seqs| seqs.clone())
+            .unwrap_or_default();
+        assert_eq!(actual, expected.iter().map(|seq| h(seq)).collect());
+        assert_eq!(
+            shard.counts.get(key).map_or(0, |count| *count),
+            expected.len()
+        );
+        for seq in &actual {
+            let node = shard
+                .anchors
+                .get(seq)
+                .expect("active alias has an anchor")
+                .clone();
+            let node = node.read();
+            let pos = node
+                .aliases
+                .iter()
+                .position(|aliases| aliases.contains(seq))
+                .expect("anchor contains alias");
+            assert!(node.claims[pos].contains(key));
+        }
+    }
+
+    #[test]
+    fn alias_observation_counts_and_last_claim_are_idempotent() {
+        let idx = KvBlockIndexer::new();
+        let owner = worker("w0");
+        let key = (owner.clone(), StorageTier::Device);
+        for seq in ["i:900", "i:42", "i:42"] {
+            idx.store(
+                0,
+                owner.clone(),
+                StorageTier::Device,
+                None,
+                &[(h(seq), h("local"))],
+            );
+        }
+        let shard = idx.shard(0);
+        assert_observations(&shard, &key, &["i:900", "i:42"]);
+        let node = shard.anchors.get("i:900").unwrap().clone();
+        assert_eq!(node.read().edge[0].0, h("i:900"));
+
+        idx.remove(
+            0,
+            &owner,
+            StorageTier::Device,
+            &[h("i:42"), h("i:42"), h("i:404")],
+        );
+        assert_observations(&shard, &key, &["i:900"]);
+        assert_eq!(node.read().claims[0], vec![key.clone()]);
+        idx.remove(0, &owner, StorageTier::Device, &[h("i:900"), h("i:900")]);
+        assert_observations(&shard, &key, &[]);
+        assert!(node.read().claims[0].is_empty());
+        assert_eq!(node.read().aliases[0].len(), 2);
+        assert!(shard.counts.get(&key).is_none());
+    }
+
+    #[test]
+    fn split_reanchors_all_aliases_and_clear_keeps_other_counts() {
+        let idx = KvBlockIndexer::new();
+        let a = worker("a");
+        let b = worker("b");
+        let ka = (a.clone(), StorageTier::Device);
+        let kb = (b.clone(), StorageTier::Device);
+        let path_a = [
+            (h("i:100"), h("x")),
+            (h("i:101"), h("y")),
+            (h("i:102"), h("z")),
+        ];
+        let path_b = [
+            (h("i:200"), h("x")),
+            (h("i:201"), h("y")),
+            (h("i:202"), h("z")),
+        ];
+        idx.store(0, a.clone(), StorageTier::Device, None, &path_a);
+        idx.store(0, b.clone(), StorageTier::Device, None, &path_b);
+        idx.store(
+            0,
+            b.clone(),
+            StorageTier::Device,
+            None,
+            &[(h("b:0200"), h("x"))],
+        );
+        let shard = idx.shard(0);
+        assert_observations(&shard, &ka, &["i:100", "i:101", "i:102"]);
+        assert_observations(&shard, &kb, &["i:200", "i:201", "i:202", "b:0200"]);
+        idx.store(
+            0,
+            b.clone(),
+            StorageTier::Device,
+            Some(h("i:201")),
+            &[(h("i:203"), h("branch"))],
+        );
+        assert_observations(&shard, &ka, &["i:100", "i:101", "i:102"]);
+        assert_observations(&shard, &kb, &["i:200", "i:201", "i:202", "b:0200", "i:203"]);
+        idx.clear(&b, ClearScope::Worker);
+        idx.clear(&b, ClearScope::Worker);
+        assert_observations(&shard, &ka, &["i:100", "i:101", "i:102"]);
+        assert_observations(&shard, &kb, &[]);
+        assert!(shard.reverse.get(&kb).is_none());
+        assert!(shard.counts.get(&kb).is_none());
+        for seq in ["i:200", "i:201", "i:202", "b:0200", "i:203"] {
+            let node = shard.anchors.get(seq).unwrap().clone();
+            let node = node.read();
+            let pos = node
+                .aliases
+                .iter()
+                .position(|aliases| aliases.contains(seq))
+                .unwrap();
+            assert!(!node.claims[pos].contains(&kb));
+        }
+        assert_eq!(
+            depth_of(
+                &idx.find_matches(&query(&["x", "y", "z"], &[StorageTier::Device])),
+                "a",
+                StorageTier::Device
+            ),
+            3
+        );
+    }
+
+    #[test]
+    fn concurrent_distinct_owner_alias_writes_splits_and_removes() {
+        use std::sync::{mpsc, Barrier};
+        use std::time::Duration;
+
+        let idx = Arc::new(KvBlockIndexer::new());
+        idx.store(
+            0,
+            worker("seed"),
+            StorageTier::Device,
+            None,
+            &[(h("i:1"), h("x")), (h("i:2"), h("y")), (h("i:3"), h("z"))],
+        );
+        let barrier = Arc::new(Barrier::new(4));
+        let (done, completions) = mpsc::channel();
+        let mut threads = Vec::new();
+        for writer in 0..4 {
+            let idx = idx.clone();
+            let barrier = barrier.clone();
+            let done = done.clone();
+            threads.push(std::thread::spawn(move || {
+                let owner = worker(&format!("writer-{writer}"));
+                let seqs: Vec<Arc<str>> = (0..4)
+                    .map(|block| h(&format!("i:{}", 100 + writer * 10 + block)))
+                    .collect();
+                let path = [
+                    (seqs[0].clone(), h("x")),
+                    (seqs[1].clone(), h("y")),
+                    (seqs[2].clone(), h("z")),
+                ];
+                let branch = [(seqs[3].clone(), h(&format!("branch-{writer}")))];
+                barrier.wait();
+                for _ in 0..32 {
+                    idx.store(0, owner.clone(), StorageTier::Device, None, &path);
+                    idx.store(
+                        0,
+                        owner.clone(),
+                        StorageTier::Device,
+                        Some(seqs[1].clone()),
+                        &branch,
+                    );
+                    idx.remove(0, &owner, StorageTier::Device, &seqs[1..2]);
+                    idx.store(
+                        0,
+                        owner.clone(),
+                        StorageTier::Device,
+                        Some(seqs[0].clone()),
+                        &path[1..2],
+                    );
+                    assert_observations(
+                        &idx.shard(0),
+                        &(owner.clone(), StorageTier::Device),
+                        &seqs.iter().map(|seq| seq.as_ref()).collect::<Vec<_>>(),
+                    );
+                    idx.remove(0, &owner, StorageTier::Device, &seqs);
+                    assert_observations(&idx.shard(0), &(owner.clone(), StorageTier::Device), &[]);
+                }
+                done.send(()).unwrap();
+            }));
+        }
+        drop(done);
+        // The receiver is outside writer threads: a lock deadlock cannot starve
+        // its wall-clock deadline, and each owner has exactly one writer.
+        for _ in 0..4 {
+            completions
+                .recv_timeout(Duration::from_secs(30))
+                .expect("alias writer must complete without deadlock");
+        }
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        assert_observations(
+            &idx.shard(0),
+            &(worker("seed"), StorageTier::Device),
+            &["i:1", "i:2", "i:3"],
+        );
+        assert_eq!(
+            depth_of(
+                &idx.find_matches(&query(&["x", "y", "z"], &[StorageTier::Device])),
+                "seed",
+                StorageTier::Device
+            ),
+            3
+        );
     }
 
     #[test]
