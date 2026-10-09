@@ -2460,12 +2460,12 @@ impl RouterTrait for Router {
         } else {
             None
         };
+        let policy = self.policy_registry.get_default_policy();
         let worker = if let Some(completion) = &program_completion {
             self.worker_registry
                 .get_by_url(&completion.dispatch().target_id)
                 .filter(|worker| worker.is_available())
         } else {
-            let policy = self.policy_registry.get_default_policy();
             let request_headers = Self::headers_to_request_headers(headers);
             policy
                 .select_worker_with_headers(
@@ -2519,8 +2519,14 @@ impl RouterTrait for Router {
             request_builder = request_builder.header("Authorization", format!("Bearer {}", key));
         }
 
+        let track_load = program_completion.is_some() || policy.name() == "cache_aware";
+        if track_load {
+            worker.increment_load();
+            RouterMetrics::set_running_requests(worker.url(), worker.load());
+        }
+
         // Send request
-        match otel_http::send_client_request(
+        let response = match otel_http::send_client_request(
             request_builder,
             headers,
             ClientRequestOptions {
@@ -2644,6 +2650,11 @@ impl RouterTrait for Router {
                 )
                     .into_response()
             }
+        };
+        if track_load {
+            hold_load_until_body_done(response, worker)
+        } else {
+            response
         }
     }
 }
@@ -3332,5 +3343,64 @@ mod tests {
         assert!(registry.revision() > revision_before_recovery);
 
         health_checker.shutdown().await;
+    }
+
+    async fn assert_transparent_load(policy: crate::config::types::PolicyConfig, tracked: bool) {
+        use axum::{routing::post, Router as AxumRouter};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = AxumRouter::new().route(
+            "/v1/messages",
+            post(|| async { "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n" }),
+        );
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let mut router = create_test_regular_router();
+        router.worker_registry = Arc::new(WorkerRegistry::new());
+        router.worker_registry.register(Arc::new(BasicWorker::new(
+            format!("http://{addr}"),
+            WorkerType::Regular,
+        )));
+        router.policy_registry = Arc::new(PolicyRegistry::new(policy));
+        let worker = router.worker_registry.get_all()[0].clone();
+        let body = serde_json::json!({"model": "m", "stream": true, "messages": []});
+        let in_flight = usize::from(tracked);
+
+        let response = router
+            .route_transparent(None, "/v1/messages", &Method::POST, body.clone())
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(worker.load(), in_flight);
+        to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(worker.load(), 0);
+
+        let response = router
+            .route_transparent(None, "/v1/messages", &Method::POST, body)
+            .await;
+        assert_eq!(worker.load(), in_flight);
+        drop(response);
+        assert_eq!(worker.load(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_route_transparent_tracks_load_for_cache_aware() {
+        assert_transparent_load(
+            crate::config::types::PolicyConfig::CacheAware {
+                cache_threshold: 0.5,
+                balance_abs_threshold: 8,
+                balance_rel_threshold: 2.0,
+                eviction_interval_secs: 60,
+                max_tree_size: 1000,
+            },
+            true,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_route_transparent_skips_load_for_other_policies() {
+        assert_transparent_load(crate::config::types::PolicyConfig::RoundRobin, false).await;
     }
 }
