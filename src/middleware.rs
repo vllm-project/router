@@ -1,7 +1,8 @@
 use axum::{
-    extract::Request, extract::State, http::HeaderValue, http::StatusCode, middleware::Next,
-    response::IntoResponse, response::Response,
+    body::Body, extract::Request, extract::State, http::HeaderValue, http::StatusCode,
+    middleware::Next, response::IntoResponse, response::Response,
 };
+use http_body_util::BodyExt;
 use rand::Rng;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -490,6 +491,42 @@ impl ConcurrencyLimiter {
     }
 }
 
+/// Returns one concurrency token to the bucket when dropped.
+///
+/// `TokenBucket::return_tokens` is async, so the drop spawns it; that task only ever
+/// waits on the bucket's own mutex.
+struct ConcurrencyToken {
+    bucket: Arc<TokenBucket>,
+}
+
+impl Drop for ConcurrencyToken {
+    fn drop(&mut self) {
+        let bucket = Arc::clone(&self.bucket);
+        tokio::spawn(async move {
+            bucket.return_tokens(1.0).await;
+        });
+    }
+}
+
+/// Hold the concurrency slot until the response body has been fully sent.
+///
+/// `next.run()` returns as soon as the upstream response head is ready. On a streaming
+/// endpoint the body is still being forwarded at that point, so returning the token
+/// there frees the slot at the first token instead of at the end of generation, and
+/// `--max-concurrent-requests` ends up bounding time-to-first-token rather than
+/// concurrent generations. Moving the token into the body ties the slot to the whole
+/// response, including a client disconnect, which drops the body.
+fn hold_token_for_body(response: Response, bucket: Arc<TokenBucket>) -> Response {
+    let token = ConcurrencyToken { bucket };
+    let (parts, body) = response.into_parts();
+    let body = Body::new(body.map_frame(move |frame| {
+        // Captured by the closure so the token lives exactly as long as the body.
+        let _ = &token;
+        frame
+    }));
+    Response::from_parts(parts, body)
+}
+
 /// Middleware function for concurrency limiting with optional queuing
 pub async fn concurrency_limit_middleware(
     State(app_state): State<Arc<AppState>>,
@@ -508,10 +545,8 @@ pub async fn concurrency_limit_middleware(
         debug!("Acquired token immediately");
         let response = next.run(request).await;
 
-        // Return the token to the bucket
-        token_bucket.return_tokens(1.0).await;
-
-        response
+        // Release the slot when the body is done, not when the head is ready.
+        hold_token_for_body(response, token_bucket)
     } else {
         // No tokens available, try to queue if enabled
         if let Some(queue_tx) = &app_state.concurrency_queue_tx {
@@ -547,10 +582,8 @@ pub async fn concurrency_limit_middleware(
 
                             let response = next.run(request).await;
 
-                            // Return the token to the bucket
-                            token_bucket.return_tokens(1.0).await;
-
-                            response
+                            // Release the slot when the body is done, not when the head is ready.
+                            hold_token_for_body(response, token_bucket)
                         }
                         Ok(Err(status)) => {
                             warn!("Queue returned error status: {}", status);
