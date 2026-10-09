@@ -19,7 +19,7 @@ fn test_prompt_input_single_string() {
     assert_eq!(req.prompt.len(), 1);
     assert!(!req.prompt.is_empty());
     assert!(!req.prompt.is_token_based());
-    assert_eq!(req.prompt.extract_text_for_routing(), "Hello, world!");
+    assert_eq!(req.prompt.extract_text_for_routing(), "\u{1d}Hello, world!");
 }
 
 #[test]
@@ -43,7 +43,10 @@ fn test_prompt_input_string_array() {
     assert_eq!(req.prompt.len(), 3);
     assert!(!req.prompt.is_empty());
     assert!(!req.prompt.is_token_based());
-    assert_eq!(req.prompt.extract_text_for_routing(), "Hello world test");
+    assert_eq!(
+        req.prompt.extract_text_for_routing(),
+        "\u{1d}Hello world test"
+    );
 }
 
 #[test]
@@ -67,7 +70,10 @@ fn test_prompt_input_single_int_array() {
     assert_eq!(req.prompt.len(), 1);
     assert!(!req.prompt.is_empty());
     assert!(req.prompt.is_token_based());
-    assert_eq!(req.prompt.extract_text_for_routing(), "token_ids:5");
+    assert_eq!(
+        req.prompt.extract_text_for_routing(),
+        "\u{1e}128000\u{1f}9906\u{1f}11\u{1f}1917\u{1f}0\u{1f}"
+    );
     assert_eq!(req.prompt.estimated_token_count(), 5);
 }
 
@@ -98,7 +104,8 @@ fn test_prompt_input_int_batch() {
     assert!(req.prompt.is_token_based());
     assert_eq!(
         req.prompt.extract_text_for_routing(),
-        "token_ids_batch:2:10"
+        "\u{1e}128000\u{1f}9906\u{1f}11\u{1f}1917\u{1f}0\u{1f}\
+         \u{1e}128001\u{1f}9906\u{1f}11\u{1f}1917\u{1f}1\u{1f}"
     );
     assert_eq!(req.prompt.estimated_token_count(), 10);
 }
