@@ -2,6 +2,7 @@
 
 pub mod discovery;
 pub mod indexer;
+mod local_hash;
 pub mod subscriber;
 pub mod types;
 pub mod wire;
@@ -10,6 +11,7 @@ pub use discovery::{
     CacheKey, KvEventSourceEntry, KvEventSourcesResponse, KvIndexSupervisor, WorkerKvInfo,
 };
 pub use indexer::{KvBlockIndexer, MatchQuery, TierMatch};
+pub use local_hash::local_hashes;
 pub use types::{
     CacheOwnerId, ClearScope, HashMode, Locality, ResidencyOwner, RoutableTarget, SourceId,
     StorageTier,
