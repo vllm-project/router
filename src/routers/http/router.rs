@@ -1928,16 +1928,11 @@ impl Router {
             worker_url
         };
 
-        match self
-            .client
-            .get(format!("{}/get_load", worker_url))
-            .send()
-            .await
-        {
+        match self.client.get(format!("{}/load", worker_url)).send().await {
             Ok(res) if res.status().is_success() => match res.bytes().await {
                 Ok(bytes) => match serde_json::from_slice::<serde_json::Value>(&bytes) {
                     Ok(data) => data
-                        .get("load")
+                        .get("server_load")
                         .and_then(|v| v.as_i64())
                         .map(|v| v as isize),
                     Err(e) => {
@@ -2013,11 +2008,11 @@ impl Router {
             worker_url
         };
 
-        match client.get(format!("{}/get_load", worker_url)).send().await {
+        match client.get(format!("{}/load", worker_url)).send().await {
             Ok(res) if res.status().is_success() => match res.bytes().await {
                 Ok(bytes) => match serde_json::from_slice::<serde_json::Value>(&bytes) {
                     Ok(data) => data
-                        .get("load")
+                        .get("server_load")
                         .and_then(|v| v.as_i64())
                         .map(|v| v as isize),
                     Err(e) => {
