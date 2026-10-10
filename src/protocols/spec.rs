@@ -561,13 +561,33 @@ impl GenerationRequest for ChatCompletionRequest {
     }
 
     fn extract_text_for_routing(&self) -> String {
-        self.session_params
+        // consistent_hash / rendezvous_hash hash this text, so a session id keeps
+        // a session on one worker. Without one, return the conversation so
+        // cache_aware can match shared prefixes; an empty string here made every
+        // request miss the tree and fall back to min-load.
+        if let Some(session_id) = self
+            .session_params
             .as_ref()
             .and_then(|params| params.get("session_id"))
             .and_then(Value::as_str)
             .filter(|session_id| !session_id.trim().is_empty())
-            .unwrap_or_default()
-            .to_string()
+        {
+            return session_id.to_string();
+        }
+        self.messages
+            .iter()
+            .flat_map(|message| match message {
+                ChatMessage::System { content, .. } | ChatMessage::User { content, .. } => {
+                    content.routing_texts()
+                }
+                ChatMessage::Assistant {
+                    content: Some(content),
+                    ..
+                } => content.routing_texts(),
+                _ => Vec::new(),
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     fn extract_text_for_program_scheduling(&self) -> String {
@@ -3353,6 +3373,42 @@ mod tests {
         let de: EmbeddingRequest = serde_json::from_str(&serialized).unwrap();
         assert_eq!(de.model, req.model);
         assert_eq!(de.input, req.input);
+    }
+
+    #[test]
+    fn test_chat_routing_text_is_the_conversation() {
+        // cache_aware matches this text on a prefix tree: a later turn must
+        // extend the text of the turn before it.
+        let first: ChatCompletionRequest = serde_json::from_str(
+            r#"{"messages": [{"role": "system", "content": "be brief"},
+                             {"role": "user", "content": "hello"}]}"#,
+        )
+        .unwrap();
+        let second: ChatCompletionRequest = serde_json::from_str(
+            r#"{"messages": [{"role": "system", "content": "be brief"},
+                             {"role": "user", "content": "hello"},
+                             {"role": "assistant", "content": "hi"},
+                             {"role": "user", "content": "again"}]}"#,
+        )
+        .unwrap();
+
+        assert_eq!(first.extract_text_for_routing(), "be brief\nhello");
+        assert_eq!(
+            second.extract_text_for_routing(),
+            "be brief\nhello\nhi\nagain"
+        );
+    }
+
+    #[test]
+    fn test_chat_routing_text_prefers_session_id() {
+        // consistent_hash keys on this text; a session must stay on one worker.
+        let request: ChatCompletionRequest = serde_json::from_str(
+            r#"{"messages": [{"role": "user", "content": "hello"}],
+                "session_params": {"session_id": "abc"}}"#,
+        )
+        .unwrap();
+
+        assert_eq!(request.extract_text_for_routing(), "abc");
     }
 
     #[test]
