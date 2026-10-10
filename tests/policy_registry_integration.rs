@@ -154,3 +154,42 @@ fn test_policy_registry_multiple_models() {
 
     println!("✓ PolicyRegistry multiple models test passed");
 }
+
+#[tokio::test]
+async fn test_igw_cache_aware_routes_repeated_prompt_to_one_worker() {
+    // In IGW mode workers are added through RouterManager. cache_aware needs
+    // init_workers() to build the model's tree; without it every pick is random.
+    let worker_registry = Arc::new(WorkerRegistry::new());
+    let policy_registry = Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin));
+    let router_manager = RouterManager::new(
+        RouterConfig {
+            enable_igw: true,
+            ..Default::default()
+        },
+        reqwest::Client::new(),
+        worker_registry.clone(),
+        policy_registry.clone(),
+    );
+
+    for url in ["http://worker1:8000", "http://worker2:8000"] {
+        router_manager
+            .add_worker(WorkerConfigRequest {
+                url: url.to_string(),
+                model_id: Some("llama-3".to_string()),
+                worker_type: None,
+                priority: None,
+                cost: None,
+                labels: HashMap::from([("policy".to_string(), "cache_aware".to_string())]),
+                bootstrap_port: None,
+            })
+            .await
+            .unwrap();
+    }
+
+    let policy = policy_registry.get_policy("llama-3").unwrap();
+    let workers = worker_registry.get_by_model_fast("llama-3");
+    let picks: Vec<_> = (0..20)
+        .map(|_| policy.select_worker(&workers, Some("shared system prompt")))
+        .collect();
+    assert!(picks.iter().all(|pick| *pick == picks[0]), "{picks:?}");
+}
