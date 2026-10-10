@@ -302,6 +302,8 @@ steps:
   # Those agents run --no-plugins, while this lane needs the Docker plugin
   # to provide the pinned vLLM/MoRI userspace on a two-GPU xGMI host. Put the
   # condition on the group so fork builds cannot run plugin hooks.
+  # TODO: restore default-branch/non-fork-PR triggers once the MI300X host
+  # pre-pulls the pinned ROCm_VLLM_IMAGE digest (opt-in gate added in #362).
   # Opt-in only: the MI300X host's readiness gate deadlocks main-branch builds
   # whenever its pinned ROCm image is missing, so run this lane exclusively on
   # explicit UI/API-triggered builds with RUN_ROCM_XGMI=1 until pre-pulling is
