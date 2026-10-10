@@ -5,9 +5,376 @@ mod test_pd_routing {
     };
     use vllm_router_rs::routers::RouterFactory;
 
-    // ========================================================================
-    // Phase 1: Basic PD Components and Router Creation
-    // ========================================================================
+    #[tokio::test]
+    async fn test_epd_handoff_preserves_metadata_and_isolates_ec_handles() {
+        use axum::{
+            extract::State,
+            http::StatusCode,
+            response::IntoResponse,
+            routing::{get, post},
+            Json, Router,
+        };
+        use serde_json::{json, Value};
+        use std::sync::{Arc, Mutex};
+        use vllm_router_rs::config::{ConfigValidator, EpdConfig};
+
+        type Seen = Arc<Mutex<Vec<(String, Value)>>>;
+        async fn encode(
+            State(seen): State<Seen>,
+            Json(body): Json<Value>,
+        ) -> axum::response::Response {
+            seen.lock().unwrap().push(("E".into(), body.clone()));
+            if body["model"] == "encoder-fail" {
+                return (StatusCode::SERVICE_UNAVAILABLE, "injected encoder error").into_response();
+            }
+            let hash = body["messages"][0]["content"][0]["uuid"].as_str().unwrap();
+            Json(json!({
+                "ec_transfer_params": {
+                    (format!("engine-{hash}")): {
+                        "metadata": {"image_grid_thw": [[1, 2, 3]]},
+                        "peer_host": "encoder",
+                        "peer_port": 4321,
+                        "size_bytes": 128,
+                    },
+                },
+            }))
+            .into_response()
+        }
+        async fn prefill(
+            State(seen): State<Seen>,
+            Json(body): Json<Value>,
+        ) -> axum::response::Response {
+            seen.lock().unwrap().push(("P".into(), body.clone()));
+            if body["model"] == "fail" {
+                return (StatusCode::INTERNAL_SERVER_ERROR, "injected prefill error")
+                    .into_response();
+            }
+            if body["model"] == "missing-kv" {
+                return Json(json!({"choices":[]})).into_response();
+            }
+            Json(json!({
+                "kv_transfer_params": {
+                    "remote_engine_id": "P",
+                    "do_remote_prefill": true,
+                },
+            }))
+            .into_response()
+        }
+        async fn decode(
+            State(seen): State<Seen>,
+            Json(body): Json<Value>,
+        ) -> axum::response::Response {
+            seen.lock().unwrap().push(("D".into(), body.clone()));
+            if body["stream"] == true {
+                return ([("content-type", "text/event-stream")], "data: [DONE]\n\n")
+                    .into_response();
+            }
+            Json(json!({"choices":[{"message":{"content":"A"}}]})).into_response()
+        }
+        let seen: Seen = Arc::new(Mutex::new(Vec::new()));
+        let app = Router::new()
+            .route("/e/health", get(|| async { "ok" }))
+            .route("/p/health", get(|| async { "ok" }))
+            .route("/d/health", get(|| async { "ok" }))
+            .route("/e/v1/chat/completions", post(encode))
+            .route("/p/v1/chat/completions", post(prefill))
+            .route("/d/v1/chat/completions", post(decode))
+            .with_state(seen.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let mut config = RouterConfig {
+            mode: RoutingMode::VllmPrefillDecode {
+                prefill_urls: vec![(format!("{base}/p"), None)],
+                decode_urls: vec![format!("{base}/d")],
+                prefill_policy: None,
+                decode_policy: None,
+                discovery_address: None,
+            },
+            policy: PolicyConfig::Random,
+            epd: Some(EpdConfig {
+                encoder_urls: vec![format!("{base}/e")],
+                consumer_zmq_addrs: Default::default(),
+            }),
+            worker_startup_timeout_secs: 5,
+            ..RouterConfig::default()
+        };
+        // Mooncake EC reservations belong to P, not D.
+        config
+            .epd
+            .as_mut()
+            .unwrap()
+            .consumer_zmq_addrs
+            .insert(format!("{base}/d"), "tcp://localhost:1234".into());
+        assert!(ConfigValidator::validate(&config).is_err());
+        config.epd.as_mut().unwrap().consumer_zmq_addrs.clear();
+        ConfigValidator::validate(&config).unwrap();
+        let context = Arc::new(
+            vllm_router_rs::server::AppContext::new(
+                config,
+                reqwest::Client::new(),
+                64,
+                None,
+                vec![],
+            )
+            .unwrap(),
+        );
+        let router = RouterFactory::create_router(&context).await.unwrap();
+        for (model, stream, status) in [
+            ("test", false, StatusCode::OK),
+            ("test", true, StatusCode::OK),
+            ("fail", false, StatusCode::INTERNAL_SERVER_ERROR),
+            ("missing-kv", false, StatusCode::INTERNAL_SERVER_ERROR),
+            ("encoder-fail", false, StatusCode::SERVICE_UNAVAILABLE),
+            ("bad-input", false, StatusCode::BAD_REQUEST),
+        ] {
+            seen.lock().unwrap().clear();
+            let mut body = json!({
+                "model": model,
+                "stream": stream,
+                "max_tokens": 16,
+                "structured_outputs": {"choice": ["A", "B"]},
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}},
+                        {"type": "text", "text": "choose"},
+                    ],
+                }],
+            });
+            if model == "bad-input" {
+                body["messages"] = Value::Null;
+            }
+            let response = router
+                .route_transparent(
+                    None,
+                    "/v1/chat/completions",
+                    &axum::http::Method::POST,
+                    body,
+                )
+                .await;
+            assert_eq!(response.status(), status, "model={model}, stream={stream}");
+            let bytes = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+            if stream {
+                assert!(String::from_utf8_lossy(&bytes).contains("[DONE]"));
+            }
+            let seen = seen.lock().unwrap();
+            let phases: Vec<_> = seen.iter().map(|(phase, _)| phase.as_str()).collect();
+            assert_eq!(
+                phases,
+                match model {
+                    "bad-input" => vec![],
+                    "encoder-fail" => vec!["E"],
+                    "test" => vec!["E", "P", "D"],
+                    _ => vec!["E", "P"],
+                }
+            );
+            if seen.len() < 2 {
+                continue;
+            }
+            let p = &seen[1].1;
+            assert_eq!(p["max_tokens"], 1);
+            assert_eq!(p["stream"], false);
+            assert!(p["ec_transfer_params"]["ec_items"].is_array());
+            let uuid = p["messages"][0]["content"][0]["uuid"].as_str().unwrap();
+            let hash = format!("engine-{uuid}");
+            assert_eq!(p["ec_transfer_params"]["ec_items"][0]["mm_hash"], hash);
+            assert_eq!(p["ec_transfer_params"][&hash]["peer_port"], 4321);
+            assert!(p["ec_transfer_params"].get(uuid).is_none());
+            assert_eq!(
+                p["messages"][0]["content"][0]["image_embeds"]["image_grid_thw"],
+                json!([1, 2, 3])
+            );
+            if status.is_success() {
+                let d = &seen[2].1;
+                assert_eq!(d["max_tokens"], 16);
+                assert_eq!(d["messages"], p["messages"]);
+                assert_eq!(d["structured_outputs"], p["structured_outputs"]);
+                assert!(d.get("ec_transfer_params").is_none());
+                assert_eq!(d["kv_transfer_params"]["remote_engine_id"], "P");
+            }
+        }
+        server.abort();
+    }
+
+    /// With the NIXL connector, the first request caches the prefill push
+    /// identity and subsequent requests take the concurrent fast path. The
+    /// encoder stage must still run for those requests; otherwise raw media
+    /// reaches P/D without a published embedding.
+    #[tokio::test]
+    async fn test_epd_nixl_push_still_encodes_after_identity_cached() {
+        use axum::{
+            extract::State,
+            response::IntoResponse,
+            routing::{get, post},
+            Json, Router,
+        };
+        use serde_json::{json, Value};
+        use std::sync::{Arc, Mutex};
+        use vllm_router_rs::config::{EpdConfig, KvConnector};
+
+        type Seen = Arc<Mutex<Vec<(String, Value)>>>;
+        async fn encode(
+            State(seen): State<Seen>,
+            Json(body): Json<Value>,
+        ) -> axum::response::Response {
+            seen.lock().unwrap().push(("E".into(), body.clone()));
+            let uuid = body["messages"][0]["content"][0]["uuid"].as_str().unwrap();
+            Json(json!({
+                "ec_transfer_params": {
+                    (format!("engine-{uuid}")): {
+                        "metadata": {"image_grid_thw": [[1, 2, 3]]},
+                        "peer_host": "encoder",
+                        "peer_port": 4321,
+                        "size_bytes": 128,
+                    },
+                },
+            }))
+            .into_response()
+        }
+        async fn prefill(
+            State(seen): State<Seen>,
+            Json(body): Json<Value>,
+        ) -> axum::response::Response {
+            seen.lock().unwrap().push(("P".into(), body.clone()));
+            Json(json!({
+                "kv_transfer_params": {
+                    "remote_engine_id": "P",
+                    "remote_host": "127.0.0.1",
+                    "remote_port": 9100,
+                    "transfer_mode": "push",
+                },
+            }))
+            .into_response()
+        }
+        async fn decode(
+            State(seen): State<Seen>,
+            Json(body): Json<Value>,
+        ) -> axum::response::Response {
+            seen.lock().unwrap().push(("D".into(), body.clone()));
+            Json(json!({"choices":[{"message":{"content":"A"}}]})).into_response()
+        }
+        let seen: Seen = Arc::new(Mutex::new(Vec::new()));
+        let app = Router::new()
+            .route("/e/health", get(|| async { "ok" }))
+            .route("/p/health", get(|| async { "ok" }))
+            .route("/d/health", get(|| async { "ok" }))
+            .route("/e/v1/chat/completions", post(encode))
+            .route("/p/v1/chat/completions", post(prefill))
+            .route("/d/v1/chat/completions", post(decode))
+            .with_state(seen.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let config = RouterConfig {
+            mode: RoutingMode::VllmPrefillDecode {
+                prefill_urls: vec![(format!("{base}/p"), None)],
+                decode_urls: vec![format!("{base}/d")],
+                prefill_policy: None,
+                decode_policy: None,
+                discovery_address: None,
+            },
+            policy: PolicyConfig::Random,
+            epd: Some(EpdConfig {
+                encoder_urls: vec![format!("{base}/e")],
+                consumer_zmq_addrs: Default::default(),
+            }),
+            kv_connector: KvConnector::Nixl,
+            worker_startup_timeout_secs: 5,
+            ..RouterConfig::default()
+        };
+        let context = Arc::new(
+            vllm_router_rs::server::AppContext::new(
+                config,
+                reqwest::Client::new(),
+                64,
+                None,
+                vec![],
+            )
+            .unwrap(),
+        );
+        let router = RouterFactory::create_router(&context).await.unwrap();
+
+        let chat_body = || {
+            json!({
+                "model": "test",
+                "max_tokens": 16,
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}},
+                        {"type": "text", "text": "choose"},
+                    ],
+                }],
+            })
+        };
+
+        // First request: no cached push identity, sequential path.
+        let response = router
+            .route_transparent(
+                None,
+                "/v1/chat/completions",
+                &axum::http::Method::POST,
+                chat_body(),
+            )
+            .await;
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let _ = axum::body::to_bytes(response.into_body(), 4096).await;
+        let phases: Vec<_> = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(phase, _)| phase.clone())
+            .collect();
+        assert_eq!(phases, ["E", "P", "D"]);
+
+        // Second request: the push identity is now cached, so the concurrent
+        // fast path runs. The encoder must still be called and P/D must
+        // receive the rewritten embeds metadata, not raw media.
+        seen.lock().unwrap().clear();
+        let response = router
+            .route_transparent(
+                None,
+                "/v1/chat/completions",
+                &axum::http::Method::POST,
+                chat_body(),
+            )
+            .await;
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let _ = axum::body::to_bytes(response.into_body(), 4096).await;
+        let seen = seen.lock().unwrap();
+        let phases: Vec<_> = seen.iter().map(|(phase, _)| phase.as_str()).collect();
+        // P and D are dispatched concurrently, so only their set is stable.
+        assert_eq!(phases[0], "E");
+        let mut pd: Vec<_> = phases[1..].to_vec();
+        pd.sort_unstable();
+        assert_eq!(pd, ["D", "P"]);
+
+        let p = &seen[1..]
+            .iter()
+            .find(|(phase, _)| phase == "P")
+            .expect("prefill request")
+            .1;
+        let d = &seen[1..]
+            .iter()
+            .find(|(phase, _)| phase == "D")
+            .expect("decode request")
+            .1;
+        assert_eq!(
+            p["messages"][0]["content"][0]["image_embeds"]["image_grid_thw"],
+            json!([1, 2, 3])
+        );
+        assert!(d.get("ec_transfer_params").is_none());
+        assert_eq!(d["kv_transfer_params"]["do_remote_prefill"], true);
+        assert_eq!(d["kv_transfer_params"]["remote_engine_id"], "P");
+        server.abort();
+    }
 
     #[test]
     fn test_worker_types() {
@@ -130,6 +497,7 @@ mod test_pd_routing {
                 history_backend: vllm_router_rs::config::HistoryBackend::Memory,
                 enable_profiling: false,
                 profile_timeout_secs: 30,
+                epd: None,
                 kv_connector: vllm_router_rs::config::KvConnector::Nixl,
             };
 

@@ -31,6 +31,7 @@ use vllm_router_rs::routers::http::router::Router;
 
 fn test_config(worker_urls: Vec<String>) -> RouterConfig {
     RouterConfig {
+        epd: None,
         mode: RoutingMode::Regular { worker_urls },
         policy: PolicyConfig::RoundRobin,
         host: "127.0.0.1".to_string(),
