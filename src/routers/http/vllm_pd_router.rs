@@ -580,14 +580,8 @@ impl VllmPDRouter {
             // Generate API: max_tokens and min_tokens are in sampling_params
             if let Some(sampling_params) = request.get_mut("sampling_params") {
                 sampling_params["max_tokens"] = json!(1);
-                // Also adjust min_tokens to ensure min_tokens <= max_tokens
-                // This is required because vLLM validates that min_tokens <= max_tokens
-                if let Some(min_tokens) = sampling_params.get("min_tokens").and_then(|v| v.as_u64())
-                {
-                    if min_tokens > 1 {
-                        sampling_params["min_tokens"] = json!(1);
-                    }
-                }
+                // Prevent EOS/stop-token sampling on the only prefill output token.
+                sampling_params["min_tokens"] = json!(1);
             } else {
                 // Create sampling_params with prefill defaults when missing
                 request["sampling_params"] = json!({"max_tokens": 1, "min_tokens": 1});
@@ -601,13 +595,8 @@ impl VllmPDRouter {
             if request.get("max_completion_tokens").is_some() {
                 request["max_completion_tokens"] = json!(1);
             }
-            // Also adjust min_tokens to ensure min_tokens <= max_tokens
-            // This is required because vLLM validates that min_tokens <= max_tokens
-            if let Some(min_tokens) = request.get("min_tokens").and_then(|v| v.as_u64()) {
-                if min_tokens > 1 {
-                    request["min_tokens"] = json!(1);
-                }
-            }
+            // Prevent EOS/stop-token sampling on the only prefill output token.
+            request["min_tokens"] = json!(1);
         }
         // Force non-streaming for prefill to get JSON response with kv_transfer_params
         request["stream"] = json!(false);
@@ -2741,6 +2730,7 @@ mod tests {
         });
         let result = VllmPDRouter::prepare_prefill_request(request, "/v1/chat/completions");
         assert_eq!(result["max_tokens"], 1);
+        assert_eq!(result["min_tokens"], 1);
         assert_eq!(result["stream"], false);
     }
 
@@ -2770,7 +2760,7 @@ mod tests {
     }
 
     #[test]
-    fn test_prefill_chat_completion_leaves_small_min_tokens() {
+    fn test_prefill_chat_completion_raises_zero_min_tokens() {
         let request = json!({
             "model": "test",
             "max_tokens": 512,
@@ -2778,8 +2768,7 @@ mod tests {
         });
         let result = VllmPDRouter::prepare_prefill_request(request, "/v1/completions");
         assert_eq!(result["max_tokens"], 1);
-        // min_tokens <= 1, so it should be left as-is
-        assert_eq!(result["min_tokens"], 0);
+        assert_eq!(result["min_tokens"], 1);
     }
 
     #[test]
@@ -2841,6 +2830,8 @@ mod tests {
         let result = VllmPDRouter::prepare_prefill_request(request, "/inference/v1/generate");
         // sampling_params.max_tokens should be capped
         assert_eq!(result["sampling_params"]["max_tokens"], 1);
+        // Inject min_tokens when sampling_params is present but omits it.
+        assert_eq!(result["sampling_params"]["min_tokens"], 1);
         // temperature should be preserved
         assert_eq!(result["sampling_params"]["temperature"], 0.7);
         // top-level max_tokens should NOT be set
