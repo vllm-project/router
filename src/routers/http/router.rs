@@ -1252,7 +1252,8 @@ impl Router {
             };
 
             if let Some(hdrs) = headers {
-                for (name, value) in hdrs {
+                let forwarded = header_utils::sanitize_request_headers(hdrs);
+                for (name, value) in &forwarded {
                     let name_lc = name.as_str().to_lowercase();
                     if name_lc != "content-type"
                         && name_lc != "content-length"
@@ -1432,7 +1433,8 @@ impl Router {
         // Content-Type/Content-Length (.json() sets them) and trace headers
         // (propagate_trace_headers below injects fresh context).
         if let Some(headers) = headers {
-            for (name, value) in headers {
+            let forwarded = header_utils::sanitize_request_headers(headers);
+            for (name, value) in &forwarded {
                 if *name != CONTENT_TYPE
                     && *name != CONTENT_LENGTH
                     && !header_utils::TRACE_HEADER_NAMES
@@ -2534,7 +2536,7 @@ impl RouterTrait for Router {
         {
             Ok(response) => {
                 let status = response.status();
-                let headers = response.headers().clone();
+                let headers = header_utils::preserve_response_headers(response.headers());
                 let mut response_builder = Response::builder().status(status.as_u16());
 
                 for (name, value) in headers.iter() {
@@ -2652,6 +2654,120 @@ impl RouterTrait for Router {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[tokio::test]
+    async fn test_transparent_response_preserves_encoding_and_filters_connection() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = axum::Router::new().fallback(|| async {
+            Response::builder()
+                .header("content-encoding", "gzip")
+                .header("connection", "X-Internal")
+                .header("x-internal", "private")
+                .header("set-cookie", "a=1")
+                .header("set-cookie", "b=2")
+                .body(Body::from(vec![0x1f, 0x8b, 0x08, 0x00, 0xff]))
+                .unwrap()
+        });
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let mut router = create_test_regular_router();
+        router.worker_registry = Arc::new(WorkerRegistry::new());
+        router.worker_registry.register(Arc::new(BasicWorker::new(
+            format!("http://{address}"),
+            WorkerType::Regular,
+        )));
+        let response = router
+            .route_transparent(None, "/custom", &Method::GET, serde_json::Value::Null)
+            .await;
+        assert_eq!(response.headers().get("content-encoding").unwrap(), "gzip");
+        assert!(!response.headers().contains_key("connection"));
+        assert!(!response.headers().contains_key("x-internal"));
+        assert_eq!(response.headers().get_all("set-cookie").iter().count(), 2);
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(bytes.as_ref(), &[0x1f, 0x8b, 0x08, 0x00, 0xff]);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_inference_and_get_paths_strip_connection_headers() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let worker_url = format!("http://{address}");
+        let app = axum::Router::new().fallback(|headers: HeaderMap| async move {
+            let echoed: HashMap<String, String> = headers
+                .iter()
+                .map(|(name, value)| (name.to_string(), value.to_str().unwrap().to_string()))
+                .collect();
+            Json(echoed)
+        });
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let mut router = create_test_regular_router();
+        router.worker_registry = Arc::new(WorkerRegistry::new());
+        router.worker_registry.register(Arc::new(BasicWorker::new(
+            worker_url.clone(),
+            WorkerType::Regular,
+        )));
+        let mut headers = HeaderMap::new();
+        headers.append("connection", "X-Internal, traceparent".parse().unwrap());
+        headers.append("connection", " X-Second".parse().unwrap());
+        headers.insert("host", "client-controlled.example".parse().unwrap());
+        headers.insert("x-internal", "private".parse().unwrap());
+        headers.insert("x-second", "private".parse().unwrap());
+        headers.insert("trailer", "x-checksum".parse().unwrap());
+        headers.insert(
+            "traceparent",
+            "00-11111111111111111111111111111111-2222222222222222-01"
+                .parse()
+                .unwrap(),
+        );
+        headers.insert("x-public", "keep".parse().unwrap());
+        headers.insert("authorization", "Bearer token".parse().unwrap());
+        let request = Request::builder().body(Body::empty()).unwrap();
+        let (mut parts, body) = request.into_parts();
+        parts.headers = headers.clone();
+        let get_response = router
+            .proxy_get_request(Request::from_parts(parts, body), "v1/models")
+            .await;
+        let post_response = router
+            .send_typed_request(
+                &serde_json::json!({"model": "test", "messages": []}),
+                TypedDispatch {
+                    headers: Some(&headers),
+                    route: "/v1/chat/completions",
+                    worker_url: &worker_url,
+                    is_stream: false,
+                    load_incremented: false,
+                    prepared: None,
+                },
+                None,
+            )
+            .await;
+        for response in [get_response, post_response] {
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let echoed: HashMap<String, String> = serde_json::from_slice(&bytes).unwrap();
+            for name in [
+                "connection",
+                "x-internal",
+                "x-second",
+                "trailer",
+                "traceparent",
+            ] {
+                assert!(
+                    !echoed.contains_key(name),
+                    "{name} leaked to the worker: {echoed:?}"
+                );
+            }
+            assert_eq!(echoed["host"], address.to_string());
+            assert_eq!(echoed["x-public"], "keep");
+            assert_eq!(echoed["authorization"], "Bearer token");
+        }
+        server.abort();
+    }
 
     fn create_test_regular_router() -> Router {
         // Create registries
