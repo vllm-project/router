@@ -126,15 +126,7 @@ pub fn propagate_trace_headers(
         return request;
     }
 
-    if let Some(headers) = headers {
-        for &name in TRACE_HEADER_NAMES {
-            if let Some(value) = headers.get(name) {
-                request = request.header(name, value);
-            }
-        }
-    }
-
-    request
+    crate::routers::header_utils::propagate_headers(request, headers, TRACE_HEADER_NAMES)
 }
 
 fn record_server_address(span: &Span, url: &str) {
@@ -148,5 +140,35 @@ fn record_server_address(span: &Span, url: &str) {
 
     if let Some(port) = parsed.port_or_known_default() {
         span.record("server.port", port);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn passive_trace_propagation_honors_connection_options() {
+        assert!(!crate::otel_trace::is_otel_enabled());
+        let mut headers = HeaderMap::new();
+        headers.append("connection", "keep-alive".parse().unwrap());
+        headers.append("connection", " TraceParent , baggage".parse().unwrap());
+        headers.insert(
+            "traceparent",
+            "00-11111111111111111111111111111111-2222222222222222-01"
+                .parse()
+                .unwrap(),
+        );
+        headers.insert("baggage", "private=value".parse().unwrap());
+        headers.insert("tracestate", "vendor=value".parse().unwrap());
+        let request = propagate_trace_headers(
+            reqwest::Client::new().get("http://worker.example/"),
+            Some(&headers),
+        )
+        .build()
+        .unwrap();
+        assert!(!request.headers().contains_key("traceparent"));
+        assert!(!request.headers().contains_key("baggage"));
+        assert_eq!(request.headers()["tracestate"], "vendor=value");
     }
 }

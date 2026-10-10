@@ -17,26 +17,32 @@ pub fn copy_request_headers(req: &Request<Body>) -> Vec<(String, String)> {
 /// names. `content-encoding` is deliberately kept: the request body is relayed
 /// as-is, so dropping it would make the worker misread a compressed body.
 fn forwarded_request_headers(headers: &HeaderMap) -> Vec<(String, String)> {
-    let connection_fields = connection_named_fields(headers);
-
-    headers
+    sanitize_request_headers(headers)
         .iter()
         .filter_map(|(name, value)| {
-            let name_str = name.as_str();
-            if !should_forward_request_header(name_str)
-                || connection_fields
-                    .iter()
-                    .any(|field| field.eq_ignore_ascii_case(name_str))
-            {
-                return None;
-            }
-            // Convert header value to string, skipping non-UTF8 headers
             value
                 .to_str()
                 .ok()
                 .map(|v| (name.to_string(), v.to_string()))
         })
         .collect()
+}
+
+/// Remove connection-specific client headers while preserving repeated and
+/// opaque end-to-end values for callers that can forward a HeaderMap.
+pub fn sanitize_request_headers(headers: &HeaderMap) -> HeaderMap {
+    let connection_fields = connection_named_fields(headers);
+    let mut forwarded = HeaderMap::new();
+    for (name, value) in headers {
+        if should_forward_request_header(name.as_str())
+            && !connection_fields
+                .iter()
+                .any(|field| field.eq_ignore_ascii_case(name.as_str()))
+        {
+            forwarded.append(name.clone(), value.clone());
+        }
+    }
+    forwarded
 }
 
 /// Field names that a `Connection` header points at.
@@ -58,6 +64,9 @@ fn connection_named_fields(headers: &HeaderMap) -> Vec<&str> {
 
 /// Convert headers from reqwest Response to axum HeaderMap
 /// Filters out hop-by-hop headers that shouldn't be forwarded
+/// Retains Content-Encoding for unchanged encoded bytes. If reqwest decodes a
+/// response, it removes the encoding header itself; rewriting callers must do
+/// the same when they replace the body.
 pub fn preserve_response_headers(reqwest_headers: &HeaderMap) -> HeaderMap {
     let mut headers = HeaderMap::new();
 
@@ -90,6 +99,7 @@ fn is_hop_by_hop(name: &str) -> bool {
             | "proxy-authenticate"
             | "proxy-authorization"
             | "te"
+            | "trailer"
             | "trailers"
             | "transfer-encoding"
             | "upgrade"
@@ -98,9 +108,7 @@ fn is_hop_by_hop(name: &str) -> bool {
 
 /// Determine if a header should be forwarded from backend to client
 fn should_forward_response_header(name: &str) -> bool {
-    !is_hop_by_hop(name) &&
-        name != "content-encoding" && // Let axum/hyper handle encoding
-        name != "host" // Should not forward the backend's host header
+    !is_hop_by_hop(name) && name != "host"
 }
 
 /// Determine if a header should be forwarded from client to backend
@@ -144,8 +152,9 @@ pub fn propagate_headers(
     header_names: &[&str],
 ) -> reqwest::RequestBuilder {
     if let Some(h) = headers {
+        let h = sanitize_request_headers(h);
         for &name in header_names {
-            if let Some(value) = h.get(name) {
+            for value in h.get_all(name) {
                 request = request.header(name, value);
             }
         }
@@ -156,6 +165,21 @@ pub fn propagate_headers(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_standard_trailer_header_is_not_forwarded() {
+        let request = Request::builder()
+            .header("trailer", "x-checksum")
+            .header("x-public", "keep")
+            .body(Body::empty())
+            .unwrap();
+        assert!(!copy_request_headers(&request)
+            .iter()
+            .any(|(name, _)| name == "trailer"));
+        let response = preserve_response_headers(request.headers());
+        assert!(!response.contains_key("trailer"));
+        assert_eq!(response["x-public"], "keep");
+    }
 
     #[test]
     fn test_preserve_repeated_set_cookie_headers() {
