@@ -299,17 +299,18 @@ steps:
       - "/tmp/router.log"
 
   # This queue is intentionally separate from the shared amd_mi300_* queues.
-  # Those agents run with --no-plugins, while this lane needs the Docker plugin
+  # Those agents run --no-plugins, while this lane needs the Docker plugin
   # to provide the pinned vLLM/MoRI userspace on a two-GPU xGMI host. Put the
   # condition on the group so fork builds cannot run plugin hooks.
+  # Opt-in only: the MI300X host's readiness gate deadlocks main-branch builds
+  # whenever its pinned ROCm image is missing, so run this lane exclusively on
+  # explicit UI/API-triggered builds with RUN_ROCM_XGMI=1 until pre-pulling is
+  # fixed. Same pattern as pd-disagg-moriio-rdma-test below.
   - group: ":large_purple_circle: ROCm MoRI XGMI P/D"
     key: "pd-disagg-moriio-tests"
     if: |
-      build.branch == pipeline.default_branch ||
-      build.merge_queue.base_branch == pipeline.default_branch ||
-      (build.pull_request.id != null && build.pull_request.repository.fork == false) ||
-      ((build.source == "ui" || build.source == "api") &&
-       build.env("RUN_ROCM_XGMI") == "1")
+      (build.source == "ui" || build.source == "api") &&
+      build.env("RUN_ROCM_XGMI") == "1"
     steps:
       - label: "ROCm MoRI XGMI (read_mode={{matrix.read_mode}}, 2 GPUs)"
         key: "pd-disagg-moriio-test"
