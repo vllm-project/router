@@ -74,8 +74,10 @@ The dedicated `router_rocm_mi300_2` queue adds two MI300X matrices, each with
 - `run_moriio_rdma_accuracy_test.sh` uses one GPU on each of two hosts with the
   RDMA backend.
 
-The xGMI group runs for same-repository pull requests, the default branch, and
-merge-queue builds. Trusted manual/API builds can set `RUN_ROCM_XGMI=1`. The
+The xGMI group is opt-in only: it runs for trusted manual/API builds with
+`RUN_ROCM_XGMI=1` (the MI300X host readiness gate dead-ends automatic
+default-branch/PR/merge-queue builds while the pinned image is not
+re-pulled — see the TODO at the group definition in `pipeline.yml`). The
 RDMA matrix runs for scheduled builds with `NIGHTLY=1`, or trusted manual/API
 builds with `RUN_ROCM_RDMA=1`. Group-level filtering prevents Docker plugin
 hooks from running for untrusted fork pull requests.
