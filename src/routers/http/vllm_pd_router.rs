@@ -2,6 +2,7 @@
 // This module extends PdRouterBase to handle vLLM-specific two-stage processing
 use super::dp_utils;
 use super::logprobs_merge;
+use super::pd_cached_tokens;
 use super::pd_router::PdRouterBase;
 use super::pd_types::{error_chain, PDRouterError};
 use super::vllm_service_discovery::{MoriIOTransferMode, ServiceRegistry, ServiceType};
@@ -88,6 +89,122 @@ fn build_prefill_request_builder(
         .header("Content-Type", "application/json")
         .header("X-Request-Id", request_id);
     dp_utils::add_dp_rank_header(builder, dp_rank)
+}
+
+fn response_with_body(
+    status: StatusCode,
+    headers: &HeaderMap,
+    body: Body,
+) -> Result<Response, String> {
+    let mut builder = Response::builder().status(status);
+    for (name, value) in headers {
+        builder = builder.header(name, value);
+    }
+    builder
+        .body(body)
+        .map_err(|error| format!("Failed to build Decode response: {error}"))
+}
+
+/// Shared final response handling for direct/discovery and sequential/concurrent PD paths.
+async fn finalize_decode_response(
+    decode_response: reqwest::Response,
+    prefill_response_json: Option<&Value>,
+    path: &str,
+    is_streaming: bool,
+    needs_logprobs: bool,
+) -> Result<Response, String> {
+    let status = decode_response.status();
+    let mut headers = header_utils::preserve_response_headers(decode_response.headers());
+    headers.remove(axum::http::header::CONTENT_LENGTH);
+    // The filtered headers must still describe opaque bytes forwarded by PD.
+    // Reqwest removes Content-Encoding itself when it decodes a response.
+    headers.remove(axum::http::header::CONTENT_ENCODING);
+    for value in decode_response
+        .headers()
+        .get_all(axum::http::header::CONTENT_ENCODING)
+        .iter()
+    {
+        headers.append(axum::http::header::CONTENT_ENCODING, value.clone());
+    }
+    let is_encoded = headers
+        .get_all(axum::http::header::CONTENT_ENCODING)
+        .iter()
+        .any(|value| {
+            !value
+                .to_str()
+                .is_ok_and(|coding| coding.trim().eq_ignore_ascii_case("identity"))
+        });
+
+    // Only successful generation bodies can be enriched. Preserve worker error
+    // responses as opaque bodies; their status handling is a separate concern.
+    if !status.is_success() {
+        return response_with_body(
+            status,
+            &headers,
+            Body::from_stream(decode_response.bytes_stream()),
+        );
+    }
+
+    let reconcile_cache = pd_cached_tokens::is_supported_path(path);
+    let cached = if reconcile_cache {
+        pd_cached_tokens::prefill_cached_tokens(prefill_response_json)
+    } else {
+        None
+    };
+
+    if is_streaming {
+        let stream = decode_response.bytes_stream();
+        // Encoded bytes cannot be parsed as SSE frames without decoding them.
+        let body = if reconcile_cache && !is_encoded {
+            Body::from_stream(pd_cached_tokens::rewrite_sse_stream(stream, cached))
+        } else {
+            Body::from_stream(stream)
+        };
+        return response_with_body(status, &headers, body);
+    }
+
+    // Read successful non-streaming responses completely before committing the
+    // status, even when their bodies do not need enrichment.
+    let original = decode_response
+        .bytes()
+        .await
+        .map_err(|error| format!("Failed to read Decode response: {error}"))?;
+    if !reconcile_cache && !needs_logprobs {
+        return response_with_body(status, &headers, Body::from(original));
+    }
+
+    let mut json: Value = match serde_json::from_slice(&original) {
+        Ok(json) => json,
+        Err(error) if reconcile_cache => {
+            warn!("Cannot parse successful PD Decode response for cached-token reconciliation: {error}");
+            return response_with_body(status, &headers, Body::from(original));
+        }
+        Err(error) => return Err(format!("Failed to parse Decode response as JSON: {error}")),
+    };
+
+    let mut changed = false;
+    if needs_logprobs {
+        let empty_json = Value::Null;
+        changed |= logprobs_merge::merge_logprobs_in_json(
+            prefill_response_json.unwrap_or(&empty_json),
+            &mut json,
+        );
+    }
+    if reconcile_cache {
+        match pd_cached_tokens::reconcile_usage(&mut json, cached) {
+            Ok(rewritten) => changed |= rewritten,
+            Err(reason) => warn!("Cannot reconcile PD cached tokens: {reason}"),
+        }
+    }
+
+    if changed {
+        let encoded = serde_json::to_vec(&json)
+            .map_err(|error| format!("Failed to serialize Decode response: {error}"))?;
+        headers.remove(axum::http::header::CONTENT_ENCODING);
+        response_with_body(status, &headers, Body::from(encoded))
+    } else {
+        response_with_body(status, &headers, Body::from(original))
+    }
 }
 
 impl VllmPDRouter {
@@ -801,77 +918,14 @@ impl VllmPDRouter {
             RouterMetrics::record_pd_decode_error(decode_http);
         }
 
-        if needs_logprobs && !is_streaming {
-            debug!("Logprobs requested and non-streaming - merging prefill and decode logprobs");
-
-            let status = decode_response.status();
-            let resp_headers = decode_response.headers().clone();
-            let decode_body = decode_response
-                .bytes()
-                .await
-                .map_err(|e| format!("Failed to read decode response: {}", e))?;
-
-            let mut decode_json: Value = serde_json::from_slice(&decode_body)
-                .map_err(|e| format!("Failed to parse decode response as JSON: {}", e))?;
-
-            let empty_json = Value::Null;
-            let prefill_json_ref = prefill_response_json.unwrap_or(&empty_json);
-            let merged = logprobs_merge::merge_logprobs_in_json(prefill_json_ref, &mut decode_json);
-            if merged {
-                debug!("Successfully merged logprobs from prefill and decode responses");
-            } else {
-                warn!("No logprobs were merged (might be expected if logprobs not in response)");
-            }
-
-            let merged_body = serde_json::to_vec(&decode_json)
-                .map_err(|e| format!("Failed to serialize merged response: {}", e))?;
-
-            let mut response_builder = axum::http::Response::builder().status(status);
-            for (name, value) in resp_headers.iter() {
-                response_builder = response_builder.header(name, value);
-            }
-            return response_builder
-                .body(axum::body::Body::from(merged_body))
-                .map_err(|e| format!("Failed to build response: {}", e));
-        }
-
-        debug!(
-            "No logprobs merging needed (streaming={}, needs_logprobs={})",
-            is_streaming, needs_logprobs
-        );
-
-        let status = decode_response.status();
-
-        if is_streaming {
-            let mut response_builder = axum::http::Response::builder().status(status);
-            let mut decode_headers =
-                header_utils::preserve_response_headers(decode_response.headers());
-            decode_headers.remove(axum::http::header::CONTENT_LENGTH);
-            for (name, value) in decode_headers.iter() {
-                response_builder = response_builder.header(name, value);
-            }
-            let body = axum::body::Body::from_stream(decode_response.bytes_stream());
-            return response_builder.body(body).map_err(|e| {
-                format!(
-                    "Failed to build streaming response from {}: {}",
-                    decode_http, e
-                )
-            });
-        }
-
-        // Non-streaming, no logprobs: read entire body
-        let decode_headers = decode_response.headers().clone();
-        let body = decode_response
-            .bytes()
-            .await
-            .map_err(|e| format!("Failed to read decode response: {}", e))?;
-        let mut response_builder = axum::http::Response::builder().status(status);
-        for (name, value) in decode_headers.iter() {
-            response_builder = response_builder.header(name, value);
-        }
-        response_builder
-            .body(axum::body::Body::from(body))
-            .map_err(|e| format!("Failed to build response: {}", e))
+        finalize_decode_response(
+            decode_response,
+            prefill_response_json,
+            path,
+            is_streaming,
+            needs_logprobs,
+        )
+        .await
     }
 
     /// Two-stage request processing for vLLM disaggregated mode using discovered endpoints
@@ -1605,76 +1659,15 @@ impl VllmPDRouter {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
-        // If logprobs requested and non-streaming, merge prefill and decode logprobs
-        if needs_logprobs && !is_streaming {
-            debug!("Logprobs requested and non-streaming - merging prefill and decode logprobs");
-
-            // Read decode response body
-            let decode_body =
-                decode_response
-                    .bytes()
-                    .await
-                    .map_err(|e| PDRouterError::NetworkError {
-                        message: format!(
-                            "Failed to read decode response from {}: {}",
-                            decode_url, e
-                        ),
-                    })?;
-
-            // Parse decode response as JSON
-            let mut decode_json: Value =
-                serde_json::from_slice(&decode_body).map_err(|e| PDRouterError::NetworkError {
-                    message: format!("Failed to parse decode response as JSON: {}", e),
-                })?;
-
-            // Merge logprobs from prefill into decode response
-            let merged =
-                logprobs_merge::merge_logprobs_in_json(&prefill_response_json, &mut decode_json);
-            if merged {
-                debug!("Successfully merged logprobs from prefill and decode responses");
-            } else {
-                warn!("No logprobs were merged (might be expected if logprobs not in response)");
-            }
-
-            // Serialize merged response
-            let merged_body =
-                serde_json::to_vec(&decode_json).map_err(|e| PDRouterError::NetworkError {
-                    message: format!("Failed to serialize merged response: {}", e),
-                })?;
-
-            let mut response_builder = Response::builder().status(status);
-            for (key, value) in headers.iter() {
-                if key != "transfer-encoding" && key != "content-length" {
-                    response_builder = response_builder.header(key, value);
-                }
-            }
-
-            response_builder.body(Body::from(merged_body)).map_err(|e| {
-                PDRouterError::NetworkError {
-                    message: format!("Failed to build response from {}: {}", decode_url, e),
-                }
-            })
-        } else {
-            // No logprobs merging needed - return decode response as-is (streaming or no logprobs)
-            debug!(
-                "No logprobs merging needed (streaming={}, needs_logprobs={})",
-                is_streaming, needs_logprobs
-            );
-
-            let mut response_builder = Response::builder().status(status);
-            for (key, value) in headers.iter() {
-                if key != "transfer-encoding" && key != "content-length" {
-                    response_builder = response_builder.header(key, value);
-                }
-            }
-
-            let body = Body::from_stream(decode_response.bytes_stream());
-            response_builder
-                .body(body)
-                .map_err(|e| PDRouterError::NetworkError {
-                    message: format!("Failed to build response from {}: {}", decode_url, e),
-                })
-        }
+        finalize_decode_response(
+            decode_response,
+            Some(&prefill_response_json),
+            path,
+            is_streaming,
+            needs_logprobs,
+        )
+        .await
+        .map_err(|message| PDRouterError::NetworkError { message })
     }
 
     async fn try_build_concurrent_requests(
@@ -2719,6 +2712,381 @@ impl WorkerManagement for VllmPDRouter {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    async fn mock_decode_response(
+        status: StatusCode,
+        body: &'static str,
+    ) -> (reqwest::Response, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = axum::Router::new().route(
+            "/",
+            axum::routing::get(move || async move {
+                (status, [("content-type", "application/json")], body)
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let response = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .get(format!("http://{address}/"))
+            .send()
+            .await
+            .unwrap();
+        (response, server)
+    }
+
+    // Fixed gzip fixtures for a JSON usage body and an SSE usage/DONE stream.
+    const GZIP_JSON: &[u8] = b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x02\xff\xab\x56\x2a\x2d\x4e\x4c\x4f\x55\xb2\xaa\x56\x2a\x28\xca\xcf\x2d\x28\x89\x2f\xc9\xcf\x4e\xcd\x2b\x8e\x4f\x49\x2d\x49\xcc\xcc\x29\x06\x49\x24\x27\x26\x67\xa4\xa6\x40\x25\x94\xac\x2c\x2d\x6b\x6b\x75\x94\x92\x33\xf2\x33\x93\x53\x81\xdc\xe8\xd8\x5a\x00\xe1\x2d\x48\x6b\x45\x00\x00\x00";
+    const GZIP_SSE: &[u8] = b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x02\xff\x4b\x49\x2c\x49\xb4\x52\xa8\x56\x2a\x2d\x4e\x4c\x4f\x55\xb2\xaa\x56\x2a\x28\xca\xcf\x2d\x28\x89\x2f\xc9\xcf\x4e\xcd\x2b\x8e\x4f\x49\x2d\x49\xcc\xcc\x29\x06\x49\x24\x27\x26\x67\xa4\xa6\x40\x25\x94\xac\x2c\x2d\x6b\x6b\x75\x94\x92\x33\xf2\x33\x93\x53\x81\xdc\xe8\xd8\x5a\x2e\xae\x14\xb0\x61\xd1\x2e\xfe\x7e\xae\xb1\x5c\x5c\x00\x62\x9a\xfc\x7a\x5b\x00\x00\x00";
+
+    async fn mock_encoded_decode_response(
+        status: StatusCode,
+        body: &'static [u8],
+        content_type: &'static str,
+        content_encoding: &'static str,
+    ) -> (reqwest::Response, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = axum::Router::new().route(
+            "/",
+            axum::routing::get(move || async move {
+                (
+                    status,
+                    [
+                        ("content-type", content_type),
+                        ("content-encoding", content_encoding),
+                        ("retry-after", "7"),
+                        ("connection", "close"),
+                    ],
+                    body,
+                )
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let response = reqwest::Client::builder()
+            .no_proxy()
+            .no_gzip()
+            .build()
+            .unwrap()
+            .get(format!("http://{address}/"))
+            .send()
+            .await
+            .unwrap();
+        (response, server)
+    }
+
+    #[tokio::test]
+    async fn finalizer_preserves_gzip_passthrough_headers_and_body() {
+        let prefill = json!({"usage":{"prompt_tokens_details":{"cached_tokens":4}}});
+        for path in [
+            "/v1/chat/completions",
+            "/v1/completions",
+            "/v1/responses",
+            "/custom",
+        ] {
+            for status in [StatusCode::OK, StatusCode::TOO_MANY_REQUESTS] {
+                for is_streaming in [false, true] {
+                    for needs_logprobs in [false, true] {
+                        let streaming_success = is_streaming && status.is_success();
+                        let (raw, content_type) = if streaming_success {
+                            (GZIP_SSE, "text/event-stream")
+                        } else {
+                            (GZIP_JSON, "application/json")
+                        };
+                        let (decode, server) =
+                            mock_encoded_decode_response(status, raw, content_type, "gzip").await;
+                        let result = finalize_decode_response(
+                            decode,
+                            Some(&prefill),
+                            path,
+                            is_streaming,
+                            needs_logprobs,
+                        )
+                        .await;
+                        if status.is_success()
+                            && !is_streaming
+                            && needs_logprobs
+                            && !pd_cached_tokens::is_supported_path(path)
+                        {
+                            // Preserve the existing explicit logprobs parse-error path;
+                            // this fix does not add gzip decoding to JSON merging.
+                            assert!(result
+                                .unwrap_err()
+                                .contains("Failed to parse Decode response"));
+                        } else {
+                            let response = result.unwrap();
+                            assert_eq!(response.status(), status);
+                            assert_eq!(response.headers()["content-encoding"], "gzip");
+                            assert_eq!(response.headers()["content-type"], content_type);
+                            assert_eq!(response.headers()["retry-after"], "7");
+                            assert!(response.headers().get("connection").is_none());
+                            assert!(response.headers().get("content-length").is_none());
+                            let bytes = axum::body::to_bytes(response.into_body(), 1024)
+                                .await
+                                .unwrap();
+                            assert_eq!(bytes.as_ref(), raw, "path: {path}");
+                        }
+                        server.abort();
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn finalizer_preserves_encoded_sse_prefix_on_upstream_error() {
+        use futures_util::StreamExt;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            let bytes_read = socket.read(&mut request).await.unwrap();
+            assert!(bytes_read > 0, "client closed before sending request");
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Encoding: gzip\r\nContent-Encoding: identity\r\nContent-Length: {}\r\n\r\n",
+                GZIP_SSE.len() + 20
+            );
+            socket.write_all(headers.as_bytes()).await.unwrap();
+            socket.write_all(GZIP_SSE).await.unwrap();
+            socket.shutdown().await.unwrap();
+        });
+        let decode = reqwest::Client::builder()
+            .no_proxy()
+            .no_gzip()
+            .build()
+            .unwrap()
+            .get(format!("http://{address}/"))
+            .send()
+            .await
+            .unwrap();
+        let response = finalize_decode_response(decode, None, "/v1/completions", true, false)
+            .await
+            .unwrap();
+        let encodings: Vec<_> = response
+            .headers()
+            .get_all("content-encoding")
+            .iter()
+            .map(|value| value.to_str().unwrap())
+            .collect();
+        assert_eq!(encodings, ["gzip", "identity"]);
+        let mut stream = response.into_body().into_data_stream();
+        let mut received = Vec::new();
+        let mut read_failed = false;
+        while let Some(chunk) = stream.next().await {
+            match chunk {
+                Ok(bytes) => received.extend_from_slice(&bytes),
+                Err(_) => {
+                    read_failed = true;
+                    break;
+                }
+            }
+        }
+        assert!(read_failed);
+        assert_eq!(received, GZIP_SSE);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn finalizer_reconciles_identity_encoded_responses() {
+        let raw = b"data: {\"usage\":{\"prompt_tokens_details\":{\"cached_tokens\":99}},\"choices\":[]}\n\n";
+        let prefill = json!({"usage":{"prompt_tokens_details":{"cached_tokens":4}}});
+        let (decode, server) =
+            mock_encoded_decode_response(StatusCode::OK, raw, "text/event-stream", "identity")
+                .await;
+        let response =
+            finalize_decode_response(decode, Some(&prefill), "/v1/completions", true, false)
+                .await
+                .unwrap();
+        assert_eq!(response.headers()["content-encoding"], "identity");
+        let bytes = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        let result = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(result.contains("\"cached_tokens\":4"));
+        assert!(!result.contains("\"cached_tokens\":99"));
+        server.abort();
+
+        let (decode, server) = mock_encoded_decode_response(
+            StatusCode::OK,
+            br#"{"usage":{"prompt_tokens_details":{"cached_tokens":99}},"choices":[]}"#,
+            "application/json",
+            "identity",
+        )
+        .await;
+        let response =
+            finalize_decode_response(decode, Some(&prefill), "/v1/completions", false, false)
+                .await
+                .unwrap();
+        assert!(response.headers().get("content-encoding").is_none());
+        let bytes = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        let result: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(result["usage"]["prompt_tokens_details"]["cached_tokens"], 4);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn finalizer_reconciles_chat_and_completions_without_decode_details_flag() {
+        let prefill = json!({"usage": {"prompt_tokens_details": {"cached_tokens": 0}}});
+        for path in ["/v1/chat/completions", "/v1/completions"] {
+            let (decode, server) = mock_decode_response(
+                StatusCode::OK,
+                r#"{"usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12,"prompt_tokens_details":null},"metrics":{"x":1}}"#,
+            )
+            .await;
+            let response = finalize_decode_response(decode, Some(&prefill), path, false, false)
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert!(response.headers().get("content-length").is_none());
+            let bytes = axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap();
+            let result: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(result["usage"]["prompt_tokens_details"]["cached_tokens"], 0);
+            assert_eq!(result["usage"]["completion_tokens"], 2);
+            assert_eq!(result["metrics"], json!({"x": 1}));
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn finalizer_removes_decode_cache_when_prefill_did_not_report_it() {
+        let (decode, server) = mock_decode_response(
+            StatusCode::OK,
+            r#"{"usage":{"prompt_tokens_details":{"cached_tokens":10,"audio_tokens":1}}}"#,
+        )
+        .await;
+        let response =
+            finalize_decode_response(decode, Some(&json!({})), "/v1/completions", false, false)
+                .await
+                .unwrap();
+        let bytes = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        let result: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            result["usage"]["prompt_tokens_details"],
+            json!({"audio_tokens": 1})
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn finalizer_leaves_responses_api_and_unparseable_success_unchanged() {
+        let prefill = json!({"usage": {"prompt_tokens_details": {"cached_tokens": 5}}});
+        let response_body = r#"{"usage":{"input_tokens_details":{"cached_tokens":90}}}"#;
+        let (decode, server) = mock_decode_response(StatusCode::OK, response_body).await;
+        let response =
+            finalize_decode_response(decode, Some(&prefill), "/v1/responses", false, false)
+                .await
+                .unwrap();
+        let bytes = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        assert_eq!(bytes.as_ref(), response_body.as_bytes());
+        server.abort();
+
+        let (decode, server) = mock_decode_response(StatusCode::OK, "not-json").await;
+        let response =
+            finalize_decode_response(decode, Some(&prefill), "/v1/completions", false, false)
+                .await
+                .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        assert_eq!(bytes.as_ref(), b"not-json");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn finalizer_preserves_unenriched_non_streaming_body_verbatim() {
+        for path in [
+            "/v1/responses",
+            "/generate",
+            "/inference/v1/generate",
+            "/custom",
+        ] {
+            let raw = "  upstream plain text\n";
+            let (decode, server) = mock_decode_response(StatusCode::OK, raw).await;
+            let response = finalize_decode_response(decode, None, path, false, false)
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.headers()["content-type"], "application/json");
+            let bytes = axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap();
+            assert_eq!(bytes.as_ref(), raw.as_bytes(), "path: {path}");
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn finalizer_rejects_truncated_non_streaming_body_before_returning_response() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        for path in [
+            "/v1/chat/completions",
+            "/v1/completions",
+            "/v1/responses",
+            "/custom",
+        ] {
+            for needs_logprobs in [false, true] {
+                for is_streaming in [false, true] {
+                    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                    let address = listener.local_addr().unwrap();
+                    let server = tokio::spawn(async move {
+                        let (mut socket, _) = listener.accept().await.unwrap();
+                        let mut request = [0; 4096];
+                        let bytes_read = socket.read(&mut request).await.unwrap();
+                        assert!(bytes_read > 0, "client closed before sending request");
+                        // Send fewer bytes than Content-Length promises, then close.
+                        socket
+                            .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 20\r\n\r\n{")
+                            .await
+                            .unwrap();
+                        socket.shutdown().await.unwrap();
+                    });
+                    let decode = reqwest::Client::builder()
+                        .no_proxy()
+                        .timeout(std::time::Duration::from_secs(5))
+                        .build()
+                        .unwrap()
+                        .get(format!("http://{address}/"))
+                        .send()
+                        .await
+                        .unwrap();
+                    let result =
+                        finalize_decode_response(decode, None, path, is_streaming, needs_logprobs)
+                            .await;
+                    if is_streaming {
+                        let response = result.unwrap();
+                        assert_eq!(response.status(), StatusCode::OK);
+                        assert!(axum::body::to_bytes(response.into_body(), 1024)
+                            .await
+                            .is_err());
+                    } else {
+                        assert!(result
+                            .unwrap_err()
+                            .contains("Failed to read Decode response"));
+                    }
+                    server.await.unwrap();
+                }
+            }
+        }
+    }
 
     #[test]
     fn test_discovery_health_requires_prefill_and_decode_workers() {
