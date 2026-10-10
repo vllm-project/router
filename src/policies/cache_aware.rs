@@ -264,7 +264,7 @@ impl CacheAwarePolicy {
         // Use shortest queue when imbalanced
         let min_load_idx = healthy_indices
             .iter()
-            .min_by_key(|&&idx| workers[idx].load())
+            .min_by_key(|&&idx| (workers[idx].load(), workers[idx].processed_requests(), idx))
             .copied()?;
 
         // Even in imbalanced mode, update the tree to maintain cache state
@@ -390,7 +390,7 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
             // Low cache match: use worker with minimum load
             healthy_indices
                 .iter()
-                .min_by_key(|&&idx| workers[idx].load())
+                .min_by_key(|&&idx| (workers[idx].load(), workers[idx].processed_requests(), idx))
                 .copied()
         };
 
@@ -546,6 +546,67 @@ impl Drop for CacheAwarePolicy {
 mod tests {
     use super::*;
     use crate::core::{BasicWorker, WorkerType};
+
+    #[test]
+    fn unrelated_requests_rotate_when_loads_are_equal() {
+        let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+            eviction_interval_secs: 0,
+            ..Default::default()
+        });
+        let workers: Vec<Arc<dyn Worker>> = (0..2)
+            .map(|i| {
+                Arc::new(BasicWorker::new(
+                    format!("http://w{i}:8000"),
+                    WorkerType::Regular,
+                )) as Arc<dyn Worker>
+            })
+            .collect();
+        policy.init_workers(&workers);
+        assert_eq!(policy.select_worker(&workers, Some("alpha")), Some(0));
+        assert_eq!(
+            policy.select_worker(&workers, Some("unrelated beta")),
+            Some(1)
+        );
+        let reversed = vec![Arc::clone(&workers[1]), Arc::clone(&workers[0])];
+        assert_eq!(
+            policy.select_worker(&reversed, Some("third independent prompt")),
+            Some(0)
+        );
+        assert_eq!(
+            policy.select_worker(&reversed, Some("fourth independent prompt")),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn overloaded_cache_owner_yields_to_other_worker() {
+        let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+            balance_abs_threshold: 0,
+            eviction_interval_secs: 0,
+            ..Default::default()
+        });
+        let workers: Vec<Arc<dyn Worker>> = (0..2)
+            .map(|i| {
+                Arc::new(BasicWorker::new(
+                    format!("http://w{i}:8000"),
+                    WorkerType::Regular,
+                )) as Arc<dyn Worker>
+            })
+            .collect();
+        policy.add_worker(workers[0].as_ref());
+        policy.add_worker(workers[1].as_ref());
+        assert_eq!(
+            policy.select_worker(&workers, Some("repeated prompt")),
+            Some(0)
+        );
+        for _ in 0..10 {
+            workers[0].increment_load();
+        }
+        assert_eq!(
+            policy.select_worker(&workers, Some("repeated prompt")),
+            Some(1)
+        );
+    }
 
     #[test]
     fn test_cache_aware_with_balanced_load() {
