@@ -5,6 +5,7 @@
 //! consistently routed to the same worker for better cache locality.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 
 use tracing::debug;
@@ -30,6 +31,9 @@ pub struct ConsistentHashPolicy {
     hash_ring: RwLock<BTreeMap<u64, String>>,
     /// Current set of workers (for detecting changes)
     current_workers: RwLock<Vec<String>>,
+    /// Stateless requests have no affinity key. Spread them over healthy
+    /// workers instead of hashing the empty fallback to one worker forever.
+    stateless_counter: AtomicUsize,
 }
 
 impl ConsistentHashPolicy {
@@ -37,7 +41,22 @@ impl ConsistentHashPolicy {
         Self {
             hash_ring: RwLock::new(BTreeMap::new()),
             current_workers: RwLock::new(Vec::new()),
+            stateless_counter: AtomicUsize::new(0),
         }
+    }
+
+    fn select_stateless_worker(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        healthy_indices: &[usize],
+    ) -> usize {
+        let offset = self.stateless_counter.fetch_add(1, Ordering::Relaxed);
+        let selected_idx = healthy_indices[offset % healthy_indices.len()];
+        let worker_url = workers[selected_idx].url();
+        workers[selected_idx].increment_processed();
+        RouterMetrics::record_processed_request(worker_url);
+        RouterMetrics::record_policy_decision("consistent_hash_stateless_round_robin", worker_url);
+        selected_idx
     }
 
     /// MurmurHash64A implementation from Facebook's mcrouter/lib/fbi/hash.c
@@ -340,6 +359,24 @@ impl LoadBalancingPolicy for ConsistentHashPolicy {
             return None;
         }
 
+        // An explicitly supplied affinity key must never be silently treated
+        // as stateless. This catches callers that intended sticky routing but
+        // accidentally emitted an empty header.
+        if headers
+            .and_then(|values| values.get("x-session-id"))
+            .is_some_and(String::is_empty)
+        {
+            return None;
+        }
+
+        // Chat requests without session_params deliberately expose an empty
+        // routing string. Hashing it maps every stateless request to the same
+        // worker. Use bounded round-robin over the current healthy set.
+        let header_key = headers.and_then(hash_key::extract_hash_key_from_headers);
+        if request_text.map_or(true, str::is_empty) && header_key.is_none() {
+            return Some(self.select_stateless_worker(workers, &healthy_indices));
+        }
+
         // Update hash ring if needed
         self.update_hash_ring(workers);
 
@@ -477,6 +514,7 @@ impl LoadBalancingPolicy for ConsistentHashPolicy {
             let mut current = self.current_workers.write().unwrap();
             current.clear();
         }
+        self.stateless_counter.store(0, Ordering::Relaxed);
         info!("Consistent hash policy reset - hash ring cleared");
     }
 
