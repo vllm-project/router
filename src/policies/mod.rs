@@ -134,9 +134,15 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
         decode_workers: &[Arc<dyn Worker>],
         context: &PolicyRequestContext<'_>,
     ) -> Option<(usize, usize)> {
-        let prefill_idx = self.select_worker_with_context(prefill_workers, context)?;
-        let decode_idx = self.select_worker_with_context(decode_workers, context)?;
-        Some((prefill_idx, decode_idx))
+        // Preserve policy-specific pair selection (e.g. CacheAwarePolicy's
+        // least-load decode choice) even when prepared token IDs are available.
+        // A token-aware policy may override this method explicitly.
+        self.select_worker_pair_with_headers(
+            prefill_workers,
+            decode_workers,
+            context.request_text,
+            context.headers,
+        )
     }
 
     /// Update policy state after request completion
