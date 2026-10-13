@@ -44,10 +44,7 @@ pub struct PolicyRequestContext<'a> {
 }
 
 impl<'a> PolicyRequestContext<'a> {
-    pub fn new(
-        request_text: Option<&'a str>,
-        headers: Option<&'a RequestHeaders>,
-    ) -> Self {
+    pub fn new(request_text: Option<&'a str>, headers: Option<&'a RequestHeaders>) -> Self {
         Self {
             request_text,
             headers,
@@ -314,13 +311,16 @@ mod tests {
         let mut headers = RequestHeaders::new();
         headers.insert("x-session-id".to_string(), "session-123".to_string());
         let token_ids = [101_u32, 202];
-        let context = PolicyRequestContext::new(Some("hello"), Some(&headers))
-            .with_token_ids(&token_ids);
+        let context =
+            PolicyRequestContext::new(Some("hello"), Some(&headers)).with_token_ids(&token_ids);
         let policy = LegacyPolicy {
             seen: std::sync::Mutex::new(None),
         };
 
-        assert_eq!(policy.select_worker_with_context(&workers, &context), Some(0));
+        assert_eq!(
+            policy.select_worker_with_context(&workers, &context),
+            Some(0)
+        );
         assert_eq!(
             *policy.seen.lock().unwrap(),
             Some(("hello".to_string(), "session-123".to_string()))
@@ -330,8 +330,7 @@ mod tests {
     #[test]
     fn test_policy_request_context_borrows_prepared_token_ids() {
         let token_ids = vec![101_u32, 202, 303];
-        let context =
-            PolicyRequestContext::new(Some("hello"), None).with_token_ids(&token_ids);
+        let context = PolicyRequestContext::new(Some("hello"), None).with_token_ids(&token_ids);
         let borrowed = context.token_ids.expect("token ids should be attached");
 
         assert_eq!(context.request_text, Some("hello"));

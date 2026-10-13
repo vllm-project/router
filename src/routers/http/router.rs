@@ -3242,7 +3242,8 @@ mod tests {
 
     #[derive(Debug)]
     struct RecordingContextPolicy {
-        observations: std::sync::Mutex<Vec<(Option<String>, Option<String>, Option<usize>, Option<usize>)>>,
+        observations:
+            std::sync::Mutex<Vec<(Option<String>, Option<String>, Option<usize>, Option<usize>)>>,
     }
 
     impl RecordingContextPolicy {
@@ -3276,9 +3277,7 @@ mod tests {
         ) -> Option<usize> {
             self.observations.lock().unwrap().push((
                 context.request_text.map(str::to_owned),
-                context
-                    .headers
-                    .and_then(|h| h.get("x-session-id").cloned()),
+                context.headers.and_then(|h| h.get("x-session-id").cloned()),
                 context.token_ids.map(|ids| ids.len()),
                 context.token_ids.map(|ids| ids.as_ptr() as usize),
             ));
@@ -3305,6 +3304,7 @@ mod tests {
         Router {
             worker_registry,
             policy_registry,
+            epd: None,
             worker_startup_timeout_secs: 5,
             worker_startup_check_interval_secs: 1,
             intra_node_data_parallel_size: 1,
