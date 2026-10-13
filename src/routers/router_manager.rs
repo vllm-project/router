@@ -50,6 +50,10 @@ pub struct RouterManager {
     /// Policy registry for managing model-to-policy mappings
     policy_registry: Arc<crate::policies::PolicyRegistry>,
 
+    /// Keep management API topology changes and policy notifications in order.
+    /// Never held during backend discovery or across an await.
+    worker_mutation: parking_lot::Mutex<()>,
+
     /// All routers managed by this manager
     /// RouterId examples: "http-regular", "http-pd"
     routers: Arc<DashMap<RouterId, Arc<dyn RouterTrait>>>,
@@ -76,6 +80,7 @@ impl RouterManager {
         Self {
             worker_registry,
             policy_registry,
+            worker_mutation: parking_lot::Mutex::new(()),
             routers: Arc::new(DashMap::new()),
             default_router: Arc::new(std::sync::RwLock::new(None)),
             client,
@@ -203,14 +208,29 @@ impl RouterManager {
             ),
         };
 
-        // Register worker
+        // Serialize the registry update and its policy notification. Discovery
+        // above can await, but this critical section only updates local state.
+        let _mutation = self.worker_mutation.lock();
         let worker_arc: Arc<dyn Worker> = Arc::from(worker);
-        let worker_id = self.worker_registry.register(worker_arc.clone());
+        let registration = self
+            .worker_registry
+            .register_with_previous(worker_arc.clone());
+        let worker_id = registration.worker_id;
 
         // Notify PolicyRegistry about the new worker
         // Extract policy hint from labels if provided
         let policy_hint = labels.get("policy").map(|s| s.as_str());
-        let policy = self.policy_registry.on_worker_added(&model_id, policy_hint);
+        let policy = match registration.previous {
+            Some(previous) if previous.model_id() == model_id => {
+                self.policy_registry.get_policy_or_default(&model_id)
+            }
+            previous => {
+                if let Some(previous) = previous {
+                    self.policy_registry.on_worker_removed(previous.model_id());
+                }
+                self.policy_registry.on_worker_added(&model_id, policy_hint)
+            }
+        };
         if worker_arc.worker_type() == WorkerType::Regular {
             if let Some(kv) = kv_aware_ops(policy.as_ref()) {
                 kv.register_worker(worker_arc.as_ref(), None, None);
@@ -257,6 +277,7 @@ impl RouterManager {
         &self,
         url: &str,
     ) -> Result<WorkerApiResponse, WorkerErrorResponse> {
+        let _mutation = self.worker_mutation.lock();
         if let Some(worker) = self.worker_registry.remove_by_url(url) {
             if worker.worker_type() == WorkerType::Regular {
                 let policy = self
