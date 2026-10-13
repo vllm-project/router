@@ -91,6 +91,9 @@ impl ResponseStorage for MemoryResponseStorage {
             if let Some(ref user) = response.user {
                 if let Some(user_responses) = store.user_index.get_mut(user) {
                     user_responses.retain(|id| id != response_id);
+                    if user_responses.is_empty() {
+                        store.user_index.remove(user);
+                    }
                 }
             }
         }
@@ -304,6 +307,66 @@ mod tests {
         // User2's responses should still be there
         let user2_responses_after = store.list_user_responses("user2", None).await.unwrap();
         assert_eq!(user2_responses_after.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_delete_response_updates_user_count() {
+        let store = MemoryResponseStorage::new();
+        let mut ids = Vec::new();
+        for user in [Some("user1"), Some("user1"), Some("user2"), None] {
+            let mut response = StoredResponse::new("Input".to_string(), "Output".to_string(), None);
+            response.user = user.map(str::to_string);
+            ids.push(store.store_response(response).await.unwrap());
+        }
+
+        // Removing one of two responses must keep the user indexed.
+        store.delete_response(&ids[0]).await.unwrap();
+        assert_eq!(store.stats().response_count, 3);
+        assert_eq!(store.stats().user_count, 2);
+        let remaining = store.list_user_responses("user1", None).await.unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].id, ids[1]);
+
+        // Removing the last response must remove only that user's index.
+        store.delete_response(&ids[1]).await.unwrap();
+        assert_eq!(store.stats().response_count, 2);
+        assert_eq!(store.stats().user_count, 1);
+        assert!(store
+            .list_user_responses("user1", None)
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            store
+                .list_user_responses("user2", None)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // Repeated deletion and anonymous responses must not change user counts.
+        store.delete_response(&ids[1]).await.unwrap();
+        store.delete_response(&ids[3]).await.unwrap();
+        assert_eq!(store.stats().response_count, 1);
+        assert_eq!(store.stats().user_count, 1);
+        store.delete_response(&ids[2]).await.unwrap();
+        assert_eq!(store.stats().response_count, 0);
+        assert_eq!(store.stats().user_count, 0);
+
+        // A user whose index was removed can store responses again.
+        let mut response = StoredResponse::new("Again".to_string(), "Output".to_string(), None);
+        response.user = Some("user1".to_string());
+        store.store_response(response).await.unwrap();
+        assert_eq!(store.stats().user_count, 1);
+        assert_eq!(
+            store
+                .list_user_responses("user1", None)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]

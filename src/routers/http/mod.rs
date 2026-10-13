@@ -1,6 +1,7 @@
 //! HTTP router implementations
 
 pub mod dp_utils;
+mod epd;
 pub mod logprobs_merge;
 pub mod openai_router;
 pub mod pd_router;

@@ -99,6 +99,9 @@ pub enum ChatMessage {
         content: String,
         name: String,
     },
+    /// Unknown or model-specific message roles are preserved verbatim so the
+    /// downstream inference backend can validate and interpret them.
+    Other(Value),
 }
 
 impl<'de> Deserialize<'de> for ChatMessage {
@@ -111,8 +114,9 @@ impl<'de> Deserialize<'de> for ChatMessage {
         let value = Value::deserialize(deserializer)?;
         let role = value
             .get("role")
-            .and_then(|r| r.as_str())
-            .ok_or_else(|| D::Error::custom("missing role field"))?;
+            .ok_or_else(|| D::Error::custom("missing role field"))?
+            .as_str()
+            .ok_or_else(|| D::Error::custom("role field must be a string"))?;
 
         match role {
             "assistant" => Ok(ChatMessage::Assistant {
@@ -212,7 +216,7 @@ impl<'de> Deserialize<'de> for ChatMessage {
                     .unwrap_or("")
                     .to_string(),
             }),
-            _ => Err(D::Error::custom(format!("unknown role: {}", role))),
+            _ => Ok(ChatMessage::Other(value)),
         }
     }
 }
@@ -2489,15 +2493,20 @@ impl StringOrArray {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(untagged)]
 pub enum PromptInput {
+    /// Single string: str
+    ///
+    /// Kept first because a JSON string can only match this variant. With
+    /// `untagged`, serde tries variants in order and formats the whole prompt
+    /// into a discarded error for every failed sequence attempt, which dominated
+    /// parsing latency for long prompts (#310).
+    String(String),
     /// Batch of token ID sequences: list[list[int]]
-    /// This must come first due to serde untagged matching order
+    /// Must come before the other sequence variants due to serde untagged matching order
     IntBatch(Vec<Vec<i32>>),
     /// Array of strings: list[str]
     StringArray(Vec<String>),
     /// Single token ID sequence: list[int]
     IntArray(Vec<i32>),
-    /// Single string: str
-    String(String),
 }
 
 impl PromptInput {
@@ -3562,6 +3571,48 @@ mod tests {
         assert!(params.whitespace_pattern.is_none());
     }
 
+    /// Regression test for #186: `response_format.json_schema.schema` must be forwarded to
+    /// the worker with its properties in the same order the client sent them.
+    ///
+    /// `schema` is a `serde_json::Value`, whose `Object` variant sorts keys alphabetically
+    /// unless the `preserve_order` crate feature is enabled (Cargo.toml). Some backends use the
+    /// property order in the schema to decide the generation order for structured output, so
+    /// reordering it here silently changes what the model is asked to produce.
+    #[test]
+    fn test_response_format_json_schema_preserves_property_order() {
+        let input = r#"{"type":"json_schema","json_schema":{"name":"x","schema":{"zebra":1,"apple":2,"mango":3}}}"#;
+
+        let rf: ResponseFormat = serde_json::from_str(input).unwrap();
+        let ResponseFormat::JsonSchema { json_schema } = &rf else {
+            panic!("expected JsonSchema variant");
+        };
+        let schema_keys: Vec<&String> = json_schema.schema.as_object().unwrap().keys().collect();
+        assert_eq!(schema_keys, vec!["zebra", "apple", "mango"]);
+
+        // The round-tripped JSON sent to the worker must preserve the same order.
+        assert_eq!(serde_json::to_string(&rf).unwrap(), input);
+    }
+
+    /// Regression test for #186: a tool's `function.parameters` JSON Schema must also keep the
+    /// client's property order when forwarded to the worker (same root cause as the
+    /// `response_format.json_schema` case above).
+    #[test]
+    fn test_tool_function_parameters_preserves_property_order() {
+        let input = r#"{"type":"function","function":{"name":"f","parameters":{"zebra":1,"apple":2,"mango":3}}}"#;
+
+        let tool: Tool = serde_json::from_str(input).unwrap();
+        let param_keys: Vec<&String> = tool
+            .function
+            .parameters
+            .as_object()
+            .unwrap()
+            .keys()
+            .collect();
+        assert_eq!(param_keys, vec!["zebra", "apple", "mango"]);
+
+        assert_eq!(serde_json::to_string(&tool).unwrap(), input);
+    }
+
     #[test]
     fn test_structured_outputs_params_with_json_schema() {
         let schema = serde_json::json!({
@@ -4053,6 +4104,82 @@ mod tests {
             }
             _ => panic!("Expected Function message"),
         }
+    }
+
+    #[test]
+    fn test_chat_message_latest_reminder_roundtrip() {
+        let original = serde_json::json!({
+            "role": "latest_reminder",
+            "content": "Follow the latest instructions.",
+            "model_specific_field": {
+                "priority": 1,
+                "enabled": true
+            }
+        });
+
+        let message: ChatMessage = serde_json::from_value(original.clone()).unwrap();
+        match &message {
+            ChatMessage::Other(value) => assert_eq!(value, &original),
+            _ => panic!("Expected unknown role to use the Other variant"),
+        }
+
+        assert_eq!(serde_json::to_value(message).unwrap(), original);
+    }
+
+    #[test]
+    fn test_chat_message_arbitrary_role_roundtrip() {
+        let original = serde_json::json!({
+            "role": "developer",
+            "content": [
+                {"type": "text", "text": "Model-specific instructions"}
+            ],
+            "future_field": [1, 2, 3]
+        });
+
+        let message: ChatMessage = serde_json::from_value(original.clone()).unwrap();
+        assert!(matches!(message, ChatMessage::Other(_)));
+        assert_eq!(serde_json::to_value(message).unwrap(), original);
+    }
+
+    #[test]
+    fn test_chat_completion_request_preserves_unknown_role_message() {
+        let original = serde_json::json!({
+            "model": "deepseek-model",
+            "messages": [{
+                "role": "latest_reminder",
+                "content": "Remember the latest user request.",
+                "metadata": {"source": "deepseek"}
+            }],
+            "temperature": 0.25,
+            "max_tokens": 128,
+            "stream": true,
+            "model_specific_request_field": {
+                "priority": 1,
+                "enabled": true
+            }
+        });
+
+        let request: ChatCompletionRequest = serde_json::from_value(original.clone()).unwrap();
+        assert!(matches!(&request.messages[0], ChatMessage::Other(_)));
+
+        let serialized = serde_json::to_value(request).unwrap();
+        for (key, expected) in original.as_object().unwrap() {
+            assert_eq!(
+                &serialized[key], expected,
+                "request field `{key}` must survive the round trip"
+            );
+        }
+    }
+
+    #[test]
+    fn test_chat_message_rejects_missing_or_non_string_role() {
+        let missing_role = serde_json::json!({"content": "missing role"});
+        let error = serde_json::from_value::<ChatMessage>(missing_role).unwrap_err();
+        assert!(error.to_string().contains("missing role field"));
+
+        let non_string_role = serde_json::json!({"role": 42, "content": "invalid role"});
+        let error = serde_json::from_value::<ChatMessage>(non_string_role).unwrap_err();
+        assert!(error.to_string().contains("role field must be a string"));
     }
 
     #[test]

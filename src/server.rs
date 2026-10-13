@@ -24,18 +24,25 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{delete, get, post},
-    serve, Json, Router,
+    serve,
+    serve::{Listener, ListenerExt},
+    Json, Router,
 };
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::json;
 use std::{
     collections::HashMap,
+    net::SocketAddr,
     sync::atomic::{AtomicBool, Ordering},
     sync::Arc,
     time::Duration,
 };
-use tokio::{net::TcpListener, signal, spawn, sync::RwLock};
+use tokio::{
+    net::{TcpListener, TcpStream},
+    signal, spawn,
+    sync::RwLock,
+};
 use tracing::{error, info, warn, Level};
 
 #[derive(Clone)]
@@ -252,6 +259,25 @@ async fn v1_chat_completions(
     }
 
     state.router.route_chat(Some(&headers), &body, None).await
+}
+
+async fn epd_chat_completions(
+    State(state): State<Arc<AppState>>,
+    headers: http::HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    if let Err(response) = authorize_request(&state, &headers).await {
+        return response;
+    }
+    state
+        .router
+        .route_transparent(
+            Some(&headers),
+            "/v1/chat/completions",
+            &http::Method::POST,
+            body,
+        )
+        .await
 }
 
 async fn v1_completions(
@@ -695,6 +721,13 @@ async fn delete_worker(
     }
 }
 
+/// Default idle timeout for pooled backend connections, in seconds.
+/// Kept below vLLM's server-side keep-alive timeout
+/// (`VLLM_HTTP_TIMEOUT_KEEP_ALIVE`, 5s by default) so the router retires a
+/// pooled connection before the backend closes it; reusing a connection the
+/// backend already closed races and surfaces as sporadic transport-error 502s.
+pub const DEFAULT_POOL_IDLE_TIMEOUT_SECS: u64 = 2;
+
 pub struct ServerConfig {
     pub host: String,
     pub port: u16,
@@ -708,6 +741,9 @@ pub struct ServerConfig {
     pub service_discovery_config: Option<ServiceDiscoveryConfig>,
     pub prometheus_config: Option<PrometheusConfig>,
     pub request_timeout_secs: u64,
+    /// Idle timeout in seconds for pooled backend connections. A value of 0
+    /// disables connection reuse entirely.
+    pub pool_idle_timeout_secs: u64,
     pub request_id_headers: Option<Vec<String>>,
     pub trace_config: Option<TraceConfig>,
 }
@@ -767,7 +803,14 @@ pub fn build_app_with_wasm_middleware(
     let mut protected_routes = Router::new()
         .route("/generate", post(generate))
         .route("/inference/v1/generate", post(inference_generate))
-        .route("/v1/chat/completions", post(v1_chat_completions))
+        .route(
+            "/v1/chat/completions",
+            if app_state.context.router_config.epd.is_some() {
+                post(epd_chat_completions)
+            } else {
+                post(v1_chat_completions)
+            },
+        )
         .route("/v1/completions", post(v1_completions))
         .route("/rerank", post(rerank))
         .route("/v1/rerank", post(v1_rerank))
@@ -913,13 +956,19 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     );
 
     println!("DEBUG: Creating HTTP client");
-    let client = Client::builder()
-        .pool_idle_timeout(Some(Duration::from_secs(50)))
+    let mut client_builder = Client::builder()
         .pool_max_idle_per_host(500)
         .timeout(Duration::from_secs(config.request_timeout_secs))
         .connect_timeout(Duration::from_secs(10))
         .tcp_nodelay(true)
-        .tcp_keepalive(Some(Duration::from_secs(30)))
+        .tcp_keepalive(Some(Duration::from_secs(30)));
+    if config.pool_idle_timeout_secs == 0 {
+        client_builder = client_builder.pool_max_idle_per_host(0);
+    } else {
+        client_builder = client_builder
+            .pool_idle_timeout(Some(Duration::from_secs(config.pool_idle_timeout_secs)));
+    }
+    let client = client_builder
         .build()
         .expect("Failed to create HTTP client");
     println!("DEBUG: HTTP client created");
@@ -1140,7 +1189,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     );
 
     let addr = format!("{}:{}", config.host, config.port);
-    let listener = TcpListener::bind(&addr).await?;
+    let listener = bind_listener(&addr).await?;
     info!("Starting server on {}", addr);
     serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
@@ -1148,6 +1197,22 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
 
     Ok(())
+}
+
+/// Bind the client-facing listener with `TCP_NODELAY` on every accepted connection.
+///
+/// Without it, Nagle's algorithm holds small streamed chunks until the client's
+/// delayed ACK arrives (about 40 ms on Linux), which delays TTFT on keep-alive
+/// connections.
+async fn bind_listener(
+    addr: &str,
+) -> std::io::Result<impl Listener<Io = TcpStream, Addr = SocketAddr>> {
+    let listener = TcpListener::bind(addr).await?;
+    Ok(listener.tap_io(|tcp| {
+        if let Err(err) = tcp.set_nodelay(true) {
+            warn!("Failed to set TCP_NODELAY on incoming connection: {err}");
+        }
+    }))
 }
 
 // Graceful shutdown handler
@@ -1205,4 +1270,20 @@ fn create_cors_layer(allowed_origins: Vec<String>) -> tower_http::cors::CorsLaye
     };
 
     cors.max_age(Duration::from_secs(3600))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_bind_listener_sets_tcp_nodelay_on_accepted_connections() {
+        let mut listener = bind_listener("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let _client = TcpStream::connect(addr).await.unwrap();
+        let (accepted, _) = listener.accept().await;
+
+        assert!(accepted.nodelay().unwrap());
+    }
 }

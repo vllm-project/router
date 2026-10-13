@@ -258,3 +258,18 @@ fn test_prompt_input_deserialization_disambiguation() {
     let prompt4: PromptInput = serde_json::from_str(json4).unwrap();
     assert!(matches!(prompt4, PromptInput::String(_)));
 }
+
+#[test]
+fn test_prompt_input_empty_array_deserializes() {
+    // An empty JSON array matches the first sequence variant (IntBatch) under
+    // serde's untagged matching order. Pin this down so that reordering the enum
+    // cannot silently change how an empty prompt is interpreted.
+    let prompt: PromptInput = serde_json::from_str("[]").unwrap();
+    assert!(matches!(prompt, PromptInput::IntBatch(_)));
+    assert!(prompt.is_empty());
+
+    let req: CompletionRequest =
+        serde_json::from_str(r#"{"prompt": [], "max_tokens": 1}"#).unwrap();
+    assert!(matches!(req.prompt, PromptInput::IntBatch(_)));
+    assert!(req.prompt.is_empty());
+}

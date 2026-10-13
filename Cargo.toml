@@ -1,6 +1,6 @@
 [package]
 name = "vllm_router_rs"
-version = "0.1.15"
+version = "0.1.16"
 edition = "2021"
 
 [lib]
@@ -27,7 +27,8 @@ tower-http = { version = "0.6", features = [
     "util",
 ] }
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+serde_json = { version = "1.0", features = ["preserve_order"] }
+sha2 = "0.10"
 bytes = "1.8.0"
 rand = "0.9.2"
 reqwest = { version = "0.13", features = ["stream", "blocking", "json"] }
@@ -89,7 +90,6 @@ wasmtime = { version = "36", default-features = false, features = [
     "runtime",
 ] }
 wasmtime-wasi = "36"
-sha2 = "0.10"
 async-channel = "2"
 # Must match vllm-proto (tonic 0.14 / prost 0.14). otel-otlp keeps its own
 # tonic 0.12 copy for traces.
@@ -104,6 +104,7 @@ vllm-tokenizer = { git = "https://github.com/vllm-project/vllm", tag = "v0.29.0"
 vllm-text = { git = "https://github.com/vllm-project/vllm", tag = "v0.29.0" }
 
 [dev-dependencies]
+libc = "0.2"
 criterion = { version = "0.5", features = ["html_reports"] }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
@@ -111,6 +112,9 @@ portpicker = "0.1"
 tempfile = "3.8"
 lazy_static = "1.4"
 opentelemetry_sdk = { version = "0.27", features = ["testing"] }
+# Per-process CPU and RSS accounting for the router overhead harness.
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"
 
 [[bench]]
 name = "request_processing"
@@ -126,6 +130,11 @@ path = "benches/tokenizer_benchmark.rs"
 name = "tokenizer_cache_benchmark"
 harness = false
 path = "benches/tokenizer_cache_benchmark.rs"
+
+[[bench]]
+name = "routing_input"
+harness = false
+path = "benches/routing_input.rs"
 
 [[bench]]
 name = "otel_disabled_path"

@@ -41,6 +41,35 @@ vLLM 0.29 gRPC rewrites it to greedy `0.0`. When hidden stop strings/tokens are
 configured, the router requests worker text so exact character trimming is
 preserved.
 
+## Optional L0 encoding cache
+
+L0 is off by default. Enable it for gRPC chat requests:
+
+```bash
+VLLM_ROUTER_L0_CACHE=1 vllm-router --worker-urls grpc://127.0.0.1:50051
+```
+
+| Environment variable | Default | Meaning |
+|---|---:|---|
+| `VLLM_ROUTER_L0_CACHE` | `0` | Enable with `1` or `true`; disable with `0` or `false` |
+| `VLLM_ROUTER_L0_MAX_ENTRIES` | `10000` | Entry limit across models |
+| `VLLM_ROUTER_L0_MAX_BYTES` | `67108864` | Estimated byte limit across models |
+| `VLLM_ROUTER_L0_MAX_ENTRY_BYTES` | `1048576` | Per-entry byte limit |
+
+Settings are read at startup for gRPC and initially empty worker pools.
+Nonempty HTTP pools skip them. Limits must be positive, with the per-entry
+limit no larger than the total. Byte estimates are not RSS bounds.
+
+Keys include rendered text, tokenizer instance, `add_special_tokens` and
+`cache_salt`. Only successful deterministic encodings are cached; unknown
+configurations and `Prompt::TokenIds` bypass L0. Model assets must stay fixed
+during loading; restart the router to reload them. Rendering and validation
+still run per request, and retries reuse `PreparedChat`.
+
+L0 shares the existing LRU and `vllm_tokenizer_cache_*` metrics. Rust callers
+can use `EngineFrontend::with_tokenizer_cache(timeout, config)`. See the
+[benchmark guide](../benchmarks/grpc_frontend_l0.md) for measurement details.
+
 ## Capability Boundaries
 
 Reasoning/tool history, tool definitions, tool choice, template kwargs,
