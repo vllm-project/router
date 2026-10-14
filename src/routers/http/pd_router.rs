@@ -1029,18 +1029,8 @@ impl PdRouterBase {
         }
 
         // Exact URL match (with @rank or dp_size==1)
-        let model_id = match self.worker_registry.get_by_url(url) {
-            Some(worker) => worker.model_id().to_string(),
-            None => {
-                return Err(PDRouterError::WorkerNotFound {
-                    url: url.to_string(),
-                });
-            }
-        };
-
-        let removed = self.worker_registry.remove_by_url(url);
-
-        if removed.is_some() {
+        if let Some(removed) = self.worker_registry.remove_by_url(url) {
+            let model_id = removed.model_id().to_string();
             self.policy_registry.on_worker_removed(&model_id);
             if let Some(policy) = self.policy_registry.get_policy(&model_id) {
                 if policy.name() == "cache_aware" {
@@ -1052,9 +1042,6 @@ impl PdRouterBase {
                     }
                 }
             }
-        }
-
-        if removed.is_some() {
             info!("Removed prefill server: {}", url);
             Ok(format!("Successfully removed prefill server: {}", url))
         } else {
@@ -1069,18 +1056,8 @@ impl PdRouterBase {
             return self.remove_dp_expanded_workers(url, "decode");
         }
 
-        let model_id = match self.worker_registry.get_by_url(url) {
-            Some(worker) => worker.model_id().to_string(),
-            None => {
-                return Err(PDRouterError::WorkerNotFound {
-                    url: url.to_string(),
-                });
-            }
-        };
-
-        let removed = self.worker_registry.remove_by_url(url);
-
-        if removed.is_some() {
+        if let Some(removed) = self.worker_registry.remove_by_url(url) {
+            let model_id = removed.model_id().to_string();
             if let Some(kv) = kv_aware_ops(self.policy_registry.get_decode_policy().as_ref()) {
                 kv.unregister_worker(url);
             }
@@ -1098,9 +1075,6 @@ impl PdRouterBase {
                     }
                 }
             }
-        }
-
-        if removed.is_some() {
             info!("Removed decode server: {}", url);
             Ok(format!("Successfully removed decode server: {}", url))
         } else {
@@ -1119,8 +1093,8 @@ impl PdRouterBase {
         let mut removed_count = 0;
         for w in all_workers.iter() {
             if w.url().starts_with(&prefix) {
-                let model_id = w.model_id().to_string();
-                if self.worker_registry.remove_by_url(w.url()).is_some() {
+                if let Some(removed) = self.worker_registry.remove_by_url(w.url()) {
+                    let model_id = removed.model_id().to_string();
                     if role == "decode" {
                         if let Some(kv) =
                             kv_aware_ops(self.policy_registry.get_decode_policy().as_ref())
