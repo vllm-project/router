@@ -1,6 +1,6 @@
 use crate::{
     config::{HistoryBackend, RouterConfig, TraceConfig},
-    core::{WorkerRegistry, WorkerType},
+    core::{BasicWorker, CircuitBreakerConfig, HealthConfig, WorkerRegistry, WorkerType},
     data_connector::{MemoryResponseStorage, NoOpResponseStorage, SharedResponseStorage},
     logging::{self, LoggingConfig},
     metrics::{self, PrometheusConfig},
@@ -75,6 +75,10 @@ impl AppContext {
                 source.validate(worker).map_err(|error| error.to_string())?;
             }
         }
+        // Validate before touching the URL-keyed registry, including for Rust
+        // callers that create a context directly instead of using the CLI.
+        crate::config::ConfigValidator::validate_epd(&router_config)
+            .map_err(|error| error.to_string())?;
         let rate_limit_tokens = rate_limit_tokens_per_second.unwrap_or(max_concurrent_requests);
         let rate_limiter = Arc::new(TokenBucket::new(max_concurrent_requests, rate_limit_tokens));
 
@@ -85,6 +89,33 @@ impl AppContext {
                 .kv_aware_session_affinity_ttl_secs
                 .map(std::time::Duration::from_secs),
         ));
+
+        // Single registration point for the static E pool. Router construction
+        // only registers its consumers, and Encode does not affect their
+        // per-model policy counts. Cloned contexts share these worker objects.
+        if let Some(epd) = &router_config.epd {
+            let cb = router_config.effective_circuit_breaker_config();
+            let circuit_breaker = CircuitBreakerConfig {
+                failure_threshold: cb.failure_threshold,
+                success_threshold: cb.success_threshold,
+                timeout_duration: Duration::from_secs(cb.timeout_duration_secs),
+                window_duration: Duration::from_secs(cb.window_duration_secs),
+            };
+            let health = HealthConfig {
+                timeout_secs: router_config.health_check.timeout_secs,
+                check_interval_secs: router_config.health_check.check_interval_secs,
+                endpoint: router_config.health_check.endpoint.clone(),
+                failure_threshold: router_config.health_check.failure_threshold,
+                success_threshold: router_config.health_check.success_threshold,
+            };
+            for url in &epd.encoder_urls {
+                worker_registry.register(Arc::new(
+                    BasicWorker::new(url.clone(), WorkerType::Encode)
+                        .with_circuit_breaker_config(circuit_breaker.clone())
+                        .with_health_config(health.clone()),
+                ));
+            }
+        }
 
         let router_manager = None;
 
@@ -1348,6 +1379,51 @@ fn create_cors_layer(allowed_origins: Vec<String>) -> tower_http::cors::CorsLaye
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn static_encoders_register_once_and_context_clones_preserve_state() {
+        let config = RouterConfig {
+            mode: crate::config::RoutingMode::Regular {
+                worker_urls: vec!["http://consumer:8000".into()],
+            },
+            epd: Some(crate::config::EpdConfig {
+                encoder_urls: vec![
+                    "http://encoder-a:8000".into(),
+                    "https://encoder-b:8000".into(),
+                ],
+                consumer_zmq_addrs: Default::default(),
+            }),
+            ..RouterConfig::default()
+        };
+        let context = AppContext::new(config.clone(), Client::new(), 64, None, vec![]).unwrap();
+        let worker = context
+            .worker_registry
+            .get_by_url("http://encoder-a:8000")
+            .unwrap();
+        worker.increment_load();
+        worker.set_healthy(false);
+        let cloned = context.clone();
+        let reused = cloned.worker_registry.get_by_url(worker.url()).unwrap();
+        assert!(Arc::ptr_eq(&worker, &reused));
+        assert_eq!(context.worker_registry.stats().encode_workers, 2);
+        assert_eq!(
+            context.worker_registry.get_by_model_fast("unknown").len(),
+            2
+        );
+        assert_eq!(reused.load(), 1);
+        assert!(!reused.is_healthy());
+        assert!(context.policy_registry.get_worker_counts().is_empty());
+        for url in ["http://consumer:8000", "http://consumer:8000/"] {
+            let mut conflicting = config.clone();
+            conflicting.epd.as_mut().unwrap().encoder_urls = vec![url.into()];
+            assert!(
+                AppContext::new(conflicting, Client::new(), 64, None, vec![])
+                    .err()
+                    .unwrap()
+                    .contains("Encode and consumer")
+            );
+        }
+    }
 
     #[tokio::test]
     async fn completion_extractor_matches_locked_axum_json() {

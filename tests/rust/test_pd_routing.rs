@@ -388,7 +388,22 @@ mod test_pd_routing {
             )
             .unwrap(),
         );
+        let encoder = context
+            .worker_registry
+            .get_by_url(&format!("{base}/e"))
+            .unwrap();
+        encoder.increment_load();
         let router = RouterFactory::create_router(&context).await.unwrap();
+        let registered = context.worker_registry.get_by_url(encoder.url()).unwrap();
+        assert!(Arc::ptr_eq(&encoder, &registered));
+        assert_eq!(registered.load(), 1);
+        encoder.decrement_load();
+        assert_eq!(context.worker_registry.stats().encode_workers, 1);
+        assert_eq!(
+            context.worker_registry.get_by_model_fast("unknown").len(),
+            3
+        );
+        assert_eq!(router.get_worker_urls().len(), 2);
         for (model, stream, status) in [
             ("test", false, StatusCode::OK),
             ("test", true, StatusCode::OK),
@@ -476,6 +491,133 @@ mod test_pd_routing {
                 assert_eq!(d["kv_transfer_params"]["remote_engine_id"], "P");
             }
         }
+        server.abort();
+    }
+
+    /// Static Encode registration must leave Regular consumer selection intact:
+    /// text bypasses encoding, while media reaches Encode before the consumer.
+    #[tokio::test]
+    async fn test_epd_regular_registry_isolates_text_and_multimodal_consumers() {
+        use axum::{
+            extract::State,
+            http::{Method, StatusCode},
+            routing::{get, post},
+            Json, Router,
+        };
+        use serde_json::{json, Value};
+        use std::sync::{Arc, Mutex};
+        use vllm_router_rs::{config::EpdConfig, core::WorkerType};
+        type Seen = Arc<Mutex<Vec<(String, Value)>>>;
+        async fn encode(State(seen): State<Seen>, Json(body): Json<Value>) -> Json<Value> {
+            seen.lock().unwrap().push(("E".into(), body.clone()));
+            let hash = body["messages"][0]["content"][0]["uuid"].as_str().unwrap();
+            Json(json!({"ec_transfer_params": {(hash): {
+                "metadata": {"image_grid_thw": [[1, 2, 3]]}, "peer_host": "encoder", "peer_port": 4321,
+            }}}))
+        }
+        async fn consume(State(seen): State<Seen>, Json(body): Json<Value>) -> Json<Value> {
+            seen.lock().unwrap().push(("PD".into(), body));
+            Json(json!({"choices": [{"message": {"content": "ok"}}]}))
+        }
+        let seen: Seen = Arc::new(Mutex::new(Vec::new()));
+        let app = Router::new()
+            .route("/e/health", get(|| async { "ok" }))
+            .route("/pd/health", get(|| async { "ok" }))
+            .route("/e/v1/chat/completions", post(encode))
+            .route("/pd/v1/chat/completions", post(consume))
+            .with_state(seen.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let config = RouterConfig {
+            mode: RoutingMode::Regular {
+                worker_urls: vec![format!("{base}/pd")],
+            },
+            policy: PolicyConfig::RoundRobin,
+            epd: Some(EpdConfig {
+                encoder_urls: vec![format!("{base}/e")],
+                consumer_zmq_addrs: Default::default(),
+            }),
+            worker_startup_timeout_secs: 5,
+            ..RouterConfig::default()
+        };
+        let context = Arc::new(
+            vllm_router_rs::server::AppContext::new(
+                config,
+                reqwest::Client::new(),
+                64,
+                None,
+                vec![],
+            )
+            .unwrap(),
+        );
+        let encoder = context
+            .worker_registry
+            .get_by_url(&format!("{base}/e"))
+            .unwrap();
+        let router = RouterFactory::create_router(&context).await.unwrap();
+        assert!(Arc::ptr_eq(
+            &encoder,
+            &context.worker_registry.get_by_url(encoder.url()).unwrap()
+        ));
+        assert_eq!(
+            context
+                .worker_registry
+                .get_by_type(&WorkerType::Encode)
+                .len(),
+            1
+        );
+        assert_eq!(
+            context.policy_registry.get_worker_counts().get("unknown"),
+            Some(&1)
+        );
+        assert_eq!(router.get_worker_urls(), vec![format!("{base}/pd")]);
+        let text = json!({"model": "test", "messages": [{"role": "user", "content": "hello"}]});
+        let response = router
+            .route_transparent(None, "/v1/chat/completions", &Method::POST, text.clone())
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(*seen.lock().unwrap(), vec![("PD".into(), text)]);
+        seen.lock().unwrap().clear();
+        let response = router
+            .route_transparent(
+                None,
+                "/v1/chat/completions",
+                &Method::POST,
+                json!({"model": "test", "messages": [{"role": "user", "content": [
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}}
+                ]}]}),
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let requests = seen.lock().unwrap().clone();
+        assert_eq!(
+            requests
+                .iter()
+                .map(|(role, _)| role.as_str())
+                .collect::<Vec<_>>(),
+            vec!["E", "PD"]
+        );
+        assert_eq!(
+            requests[1].1["messages"][0]["content"][0]["type"],
+            "image_embeds"
+        );
+        assert_eq!(
+            context
+                .worker_registry
+                .get_by_url(&format!("{base}/pd"))
+                .unwrap()
+                .load(),
+            0
+        );
         server.abort();
     }
 

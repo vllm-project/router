@@ -317,6 +317,44 @@ impl WorkerRegistry {
         self.get_by_type(&WorkerType::Decode)
     }
 
+    /// Regular inference candidates. Encode-only models must not hide the
+    /// unlabeled consumer fallback used by program scheduling.
+    pub fn get_regular_workers(&self, model_id: Option<&str>) -> Vec<Arc<dyn Worker>> {
+        match model_id {
+            Some(model) => {
+                self.get_workers_filtered(Some(model), Some(WorkerType::Regular), None, false)
+            }
+            // The role index preserves registration order for static pools.
+            None => self.get_by_type(&WorkerType::Regular),
+        }
+    }
+
+    /// Inference consumers across routers; management views still use get_all.
+    pub fn get_consumer_workers(&self, model_id: Option<&str>) -> Vec<Arc<dyn Worker>> {
+        self.get_workers_filtered(model_id, None, None, false)
+            .into_iter()
+            .filter(|worker| {
+                matches!(
+                    worker.worker_type(),
+                    WorkerType::Regular | WorkerType::Prefill { .. } | WorkerType::Decode
+                )
+            })
+            .collect()
+    }
+
+    /// P/D candidates, including prefill workers with any bootstrap port.
+    pub fn get_pd_workers(&self) -> Vec<Arc<dyn Worker>> {
+        self.get_consumer_workers(None)
+            .into_iter()
+            .filter(|worker| {
+                matches!(
+                    worker.worker_type(),
+                    WorkerType::Prefill { .. } | WorkerType::Decode
+                )
+            })
+            .collect()
+    }
+
     /// Get all workers by connection mode
     pub fn get_by_connection(&self, connection_mode: &ConnectionMode) -> Vec<Arc<dyn Worker>> {
         let _topology = self.topology.read();

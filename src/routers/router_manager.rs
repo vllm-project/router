@@ -115,7 +115,7 @@ impl RouterManager {
     /// Get router for a specific model based on worker types
     pub fn get_router_for_model(&self, model_id: &str) -> Option<Arc<dyn RouterTrait>> {
         // Query workers for this model from registry
-        let workers = self.worker_registry.get_by_model(model_id);
+        let workers = self.worker_registry.get_consumer_workers(Some(model_id));
 
         if !workers.is_empty() {
             // Determine router based on worker types
@@ -149,11 +149,7 @@ impl RouterManager {
 
     /// Get workers for routing decision
     pub fn get_workers_for_request(&self, model_id: Option<&str>) -> Vec<Arc<dyn Worker>> {
-        if let Some(model) = model_id {
-            self.worker_registry.get_by_model(model)
-        } else {
-            self.worker_registry.get_all()
-        }
+        self.worker_registry.get_consumer_workers(model_id)
     }
 
     /// Add a worker to the registry
@@ -576,7 +572,14 @@ impl RouterTrait for RouterManager {
     /// Get available models - query from worker registry
     async fn get_models(&self, _req: Request<Body>) -> Response {
         // Get models from worker registry
-        let models = self.worker_registry.get_models();
+        let mut models: Vec<String> = self
+            .worker_registry
+            .get_consumer_workers(None)
+            .iter()
+            .map(|worker| worker.model_id().to_string())
+            .collect();
+        models.sort();
+        models.dedup();
 
         if models.is_empty() {
             (StatusCode::SERVICE_UNAVAILABLE, "No models available").into_response()
@@ -868,9 +871,18 @@ impl RouterTrait for RouterManager {
     fn readiness(&self) -> Response {
         if self.routers.is_empty() {
             (StatusCode::SERVICE_UNAVAILABLE, "No routers configured").into_response()
-        } else {
-            // TODO: Check readiness of all routers
+        } else if self
+            .routers
+            .iter()
+            .any(|router| router.readiness().status().is_success())
+        {
             (StatusCode::OK, "Ready").into_response()
+        } else {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "No router has healthy consumers",
+            )
+                .into_response()
         }
     }
 
@@ -914,6 +926,68 @@ impl std::fmt::Debug for RouterManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn inference_models_and_readiness_ignore_encode_only_workers() {
+        let config = RouterConfig::default();
+        let context = Arc::new(
+            crate::server::AppContext::new(
+                config.clone(),
+                reqwest::Client::new(),
+                64,
+                None,
+                vec![],
+            )
+            .unwrap(),
+        );
+        context.worker_registry.register(Arc::new(
+            crate::core::BasicWorker::new("http://encoder:8000".into(), WorkerType::Encode)
+                .with_labels(std::collections::HashMap::from([(
+                    "model_id".into(),
+                    "encode-only".into(),
+                )])),
+        ));
+        let manager = RouterManager::new(
+            config,
+            context.client.clone(),
+            context.worker_registry.clone(),
+            context.policy_registry.clone(),
+        );
+        let router = crate::routers::RouterFactory::create_regular_router(&[], &context)
+            .await
+            .unwrap();
+        manager.register_router(RouterId::new("http-regular".into()), Arc::from(router));
+        assert!(manager.get_workers_for_request(None).is_empty());
+        assert!(manager
+            .get_workers_for_request(Some("encode-only"))
+            .is_empty());
+        assert_eq!(
+            manager
+                .get_models(Request::new(Body::empty()))
+                .await
+                .status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            manager.readiness().status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        context.worker_registry.register(Arc::new(
+            crate::core::BasicWorker::new("http://consumer:8000".into(), WorkerType::Regular)
+                .with_labels(std::collections::HashMap::from([(
+                    "model_id".into(),
+                    "inference".into(),
+                )])),
+        ));
+        assert_eq!(manager.readiness().status(), StatusCode::OK);
+        let response = manager.get_models(Request::new(Body::empty())).await;
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let models: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(models["models"], serde_json::json!(["inference"]));
+        assert_eq!(manager.list_workers().total, 2);
+    }
 
     #[test]
     fn list_workers_reports_encode_role_and_count() {
