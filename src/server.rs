@@ -699,6 +699,7 @@ async fn list_workers_rest(
                         WorkerType::Regular => "regular",
                         WorkerType::Prefill { .. } => "prefill",
                         WorkerType::Decode => "decode",
+                        WorkerType::Encode => "encode",
                     },
                     "is_healthy": worker.is_healthy(),
                     "load": worker.load(),
@@ -719,6 +720,7 @@ async fn list_workers_rest(
                 "prefill_count": state.context.worker_registry.get_prefill_workers().len(),
                 "decode_count": state.context.worker_registry.get_decode_workers().len(),
                 "regular_count": state.context.worker_registry.get_by_type(&WorkerType::Regular).len(),
+                "encode_count": state.context.worker_registry.get_by_type(&WorkerType::Encode).len(),
             }
         });
         Json(response).into_response()

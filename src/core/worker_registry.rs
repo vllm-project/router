@@ -428,6 +428,7 @@ impl WorkerRegistry {
         let mut regular_count = 0;
         let mut prefill_count = 0;
         let mut decode_count = 0;
+        let mut encode_count = 0;
 
         for entry in self.workers.iter() {
             let worker = entry.value();
@@ -440,6 +441,7 @@ impl WorkerRegistry {
                 WorkerType::Regular => regular_count += 1,
                 WorkerType::Prefill { .. } => prefill_count += 1,
                 WorkerType::Decode => decode_count += 1,
+                WorkerType::Encode => encode_count += 1,
             }
         }
 
@@ -451,6 +453,7 @@ impl WorkerRegistry {
             regular_workers: regular_count,
             prefill_workers: prefill_count,
             decode_workers: decode_count,
+            encode_workers: encode_count,
         }
     }
 
@@ -519,6 +522,7 @@ pub struct WorkerRegistryStats {
     pub regular_workers: usize,
     pub prefill_workers: usize,
     pub decode_workers: usize,
+    pub encode_workers: usize,
 }
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
@@ -834,6 +838,51 @@ mod tests {
             .map(|worker| worker.url().to_string())
             .collect();
         assert_eq!(urls, ["http://z", "http://a"]);
+    }
+
+    #[test]
+    fn encode_registration_tracks_role_stats_and_removal() {
+        let registry = WorkerRegistry::new();
+        let regular_id = registry.register(Arc::from(WorkerFactory::create_regular(
+            "http://consumer:8080".to_string(),
+        )));
+        let prefill_id = registry.register(Arc::from(WorkerFactory::create_prefill(
+            "http://prefill:8080".to_string(),
+            Some(8998),
+        )));
+        let decode_id = registry.register(Arc::from(WorkerFactory::create_decode(
+            "http://decode:8080".to_string(),
+        )));
+        let encoder: Arc<dyn Worker> = Arc::from(WorkerFactory::create_encode(
+            "http://encoder:8080".to_string(),
+        ));
+        encoder.increment_load();
+        encoder.set_healthy(false);
+        let encode_id = registry.register(encoder);
+
+        let encoders = registry.get_by_type(&WorkerType::Encode);
+        assert_eq!(encoders.len(), 1);
+        assert_eq!(encoders[0].url(), "http://encoder:8080");
+        assert_eq!(registry.get_by_type(&WorkerType::Regular).len(), 1);
+        assert_eq!(registry.get_prefill_workers().len(), 1);
+        assert_eq!(registry.get_decode_workers().len(), 1);
+        let stats = registry.stats();
+        assert_eq!(stats.total_workers, 4);
+        assert_eq!(stats.healthy_workers, 3);
+        assert_eq!(stats.total_load, 1);
+        assert_eq!(stats.encode_workers, 1);
+        assert_eq!(stats.regular_workers, 1);
+        assert_eq!(stats.prefill_workers, 1);
+        assert_eq!(stats.decode_workers, 1);
+
+        registry.remove(&encode_id);
+        assert!(registry.get_by_type(&WorkerType::Encode).is_empty());
+        assert!(registry.get_by_url("http://encoder:8080").is_none());
+        assert_eq!(registry.stats().encode_workers, 0);
+        assert_eq!(registry.stats().total_workers, 3);
+        for id in [regular_id, prefill_id, decode_id] {
+            assert!(registry.get(&id).is_some());
+        }
     }
 
     #[test]

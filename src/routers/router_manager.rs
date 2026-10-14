@@ -336,6 +336,7 @@ impl RouterManager {
                 regular: registry_stats.regular_workers,
                 prefill: registry_stats.prefill_workers,
                 decode: registry_stats.decode_workers,
+                encode: registry_stats.encode_workers,
             },
         };
 
@@ -407,6 +408,7 @@ impl RouterManager {
                 WorkerType::Regular => "regular".to_string(),
                 WorkerType::Prefill { .. } => "prefill".to_string(),
                 WorkerType::Decode => "decode".to_string(),
+                WorkerType::Encode => "encode".to_string(),
             },
             is_healthy: worker.is_healthy(),
             load: worker.load(),
@@ -906,5 +908,40 @@ impl std::fmt::Debug for RouterManager {
             .field("workers_count", &self.worker_registry.get_all().len())
             .field("default_router", &*self.default_router.read().unwrap())
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn list_workers_reports_encode_role_and_count() {
+        let registry = Arc::new(WorkerRegistry::new());
+        registry.register(Arc::from(WorkerFactory::create_encode(
+            "http://encoder:8080".to_string(),
+        )));
+        registry.register(Arc::from(WorkerFactory::create_regular(
+            "http://consumer:8080".to_string(),
+        )));
+        let config = RouterConfig::default();
+        let manager = RouterManager::new(
+            config.clone(),
+            reqwest::Client::new(),
+            registry,
+            Arc::new(crate::policies::PolicyRegistry::new(config.policy)),
+        );
+        let response = serde_json::to_value(manager.list_workers()).unwrap();
+        assert_eq!(response["stats"]["by_type"]["encode"], 1);
+        assert_eq!(response["stats"]["by_type"]["regular"], 1);
+        assert_eq!(response["total"], 2);
+        let encoder = response["workers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|worker| worker["url"] == "http://encoder:8080")
+            .unwrap();
+        assert_eq!(encoder["worker_type"], "encode");
+        assert_eq!(encoder["connection_mode"], "Http");
     }
 }

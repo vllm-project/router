@@ -100,6 +100,7 @@ pub struct WorkerTypeStats {
     pub regular: usize,
     pub prefill: usize,
     pub decode: usize,
+    pub encode: usize,
 }
 
 /// Worker update request
