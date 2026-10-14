@@ -230,8 +230,9 @@ pub async fn start_service_discovery(
 
     // Create the task that will run in the background
     let handle = task::spawn(async move {
-        // We'll track pods we've already added to avoid duplicates
-        let tracked_pods = Arc::new(Mutex::new(HashSet::new()));
+        // We'll track pods by name and retain their registered type for accurate rank-aware removal
+        let tracked_pods: Arc<Mutex<HashMap<String, Option<PodType>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
 
         // Create a watcher for pods
         let pods: Api<Pod> = if let Some(namespace) = &config.namespace {
@@ -258,14 +259,21 @@ pub async fn start_service_discovery(
             let config_clone = Arc::clone(&config_arc);
             let tracked_pods_clone = Arc::clone(&tracked_pods);
 
-            // Simplified label selector filter using helper method
+            // Stream firewall: only allow pods that match the selector or are currently tracked
             let filtered_stream = watcher_stream.filter_map(move |obj_res| {
                 let config_inner = Arc::clone(&config_clone);
+                let tracked_pods_inner = Arc::clone(&tracked_pods_clone);
 
                 async move {
                     match obj_res {
                         Ok(pod) => {
-                            if PodInfo::should_include(&pod, &config_inner) {
+                            let is_tracked = pod.metadata.name.as_ref().map_or(false, |name| {
+                                tracked_pods_inner
+                                    .lock()
+                                    .map_or(false, |map| map.contains_key(name))
+                            });
+
+                            if PodInfo::should_include(&pod, &config_inner) || is_tracked {
                                 Some(Ok(pod))
                             } else {
                                 None
@@ -277,7 +285,7 @@ pub async fn start_service_discovery(
             });
 
             // Clone again for the next closure
-            let tracked_pods_clone2 = Arc::clone(&tracked_pods_clone);
+            let tracked_pods_clone2 = Arc::clone(&tracked_pods);
             let router_clone = Arc::clone(&router);
             let config_clone2 = Arc::clone(&config_arc);
 
@@ -291,6 +299,7 @@ pub async fn start_service_discovery(
                         let pod_info = PodInfo::from_pod(&pod, Some(&config_inner));
 
                         if let Some(pod_info) = pod_info {
+                            let should_include = PodInfo::should_include(&pod, &config_inner);
                             if pod.metadata.deletion_timestamp.is_some() {
                                 handle_pod_deletion(
                                     &pod_info,
@@ -307,6 +316,7 @@ pub async fn start_service_discovery(
                                     router_inner,
                                     port,
                                     config_inner.pd_mode,
+                                    should_include,
                                 )
                                 .await;
                             }
@@ -347,15 +357,16 @@ pub async fn start_service_discovery(
 
 async fn handle_pod_event(
     pod_info: &PodInfo,
-    tracked_pods: Arc<Mutex<HashSet<PodInfo>>>,
+    tracked_pods: Arc<Mutex<HashMap<String, Option<PodType>>>>,
     router: Arc<dyn RouterTrait>,
     port: u16,
     pd_mode: bool,
+    should_include: bool,
 ) {
     let worker_url = pod_info.worker_url(port);
 
-    // If pod is healthy, try to add it (with atomic check-and-insert)
-    if pod_info.is_healthy() {
+    // If pod is healthy and matches the selector, try to add it (with atomic check-and-insert)
+    if pod_info.is_healthy() && should_include {
         // Atomic check-and-insert to prevent race conditions
         let should_add = {
             let mut tracker = match tracked_pods.lock() {
@@ -366,11 +377,11 @@ async fn handle_pod_event(
                 }
             };
 
-            if tracker.contains(pod_info) {
+            if tracker.contains_key(&pod_info.name) {
                 false // Already tracked
             } else {
-                // Reserve the spot to prevent other threads from adding the same pod
-                tracker.insert(pod_info.clone());
+                // Reserve the spot and retain the registration-time pod type
+                tracker.insert(pod_info.name.clone(), pod_info.pod_type.clone());
                 true
             }
         };
@@ -417,47 +428,62 @@ async fn handle_pod_event(
                     error!("Failed to add worker {} to router: {}", worker_url, e);
                     // Remove from tracking since addition failed
                     if let Ok(mut tracker) = tracked_pods.lock() {
-                        tracker.remove(pod_info);
+                        tracker.remove(&pod_info.name);
                     }
                 }
             }
         }
+    } else {
+        // Pod is either unhealthy (e.g. Ready=False) or no longer matches selector.
+        // If it was previously tracked, remove it from the router and tracking set.
+        remove_tracked_pod(pod_info, tracked_pods, router, port, pd_mode, "ineligible").await;
     }
 }
 
 async fn handle_pod_deletion(
     pod_info: &PodInfo,
-    tracked_pods: Arc<Mutex<HashSet<PodInfo>>>,
+    tracked_pods: Arc<Mutex<HashMap<String, Option<PodType>>>>,
     router: Arc<dyn RouterTrait>,
     port: u16,
     pd_mode: bool,
 ) {
+    remove_tracked_pod(pod_info, tracked_pods, router, port, pd_mode, "deletion").await;
+}
+
+async fn remove_tracked_pod(
+    pod_info: &PodInfo,
+    tracked_pods: Arc<Mutex<HashMap<String, Option<PodType>>>>,
+    router: Arc<dyn RouterTrait>,
+    port: u16,
+    pd_mode: bool,
+    reason: &str,
+) {
     let worker_url = pod_info.worker_url(port);
 
-    let was_tracked = {
+    let registered_pod_type = {
         let mut tracked = match tracked_pods.lock() {
             Ok(tracked) => tracked,
             Err(e) => {
-                error!("Failed to acquire tracked_pods lock during deletion: {}", e);
+                error!("Failed to acquire tracked_pods lock during {}: {}", reason, e);
                 return;
             }
         };
-        tracked.remove(pod_info)
+        tracked.remove(&pod_info.name)
     };
 
-    if was_tracked {
+    if let Some(registered_type) = registered_pod_type {
         info!(
-            "Removing pod: {} | type: {:?} | url: {}",
-            pod_info.name, pod_info.pod_type, worker_url
+            "Removing pod ({}): {} | type: {:?} | url: {}",
+            reason, pod_info.name, registered_type, worker_url
         );
 
-        // Handle PD mode removal
-        if pd_mode && pod_info.pod_type.is_some() {
+        // Handle PD mode removal using the originally registered pod type
+        if pd_mode {
             use crate::routers::http::vllm_pd_router::VllmPDRouter;
 
             if let Some(vllm_pd_router) = router.as_any().downcast_ref::<VllmPDRouter>() {
                 // Support --vllm-pd-disaggregation mode with K8s service discovery
-                match &pod_info.pod_type {
+                match registered_type {
                     Some(PodType::Prefill) => {
                         if let Err(e) = vllm_pd_router.remove_prefill_server(&worker_url).await {
                             error!("Failed to remove vllm prefill server {}: {}", worker_url, e);
@@ -469,7 +495,6 @@ async fn handle_pod_deletion(
                         }
                     }
                     Some(PodType::Regular) | None => {
-                        // Fall back to regular remove_worker
                         router.remove_worker(&worker_url);
                     }
                 }
@@ -482,11 +507,9 @@ async fn handle_pod_deletion(
             router.remove_worker(&worker_url);
         }
     } else {
-        // This case might occur if a pod is deleted before it was ever marked healthy and added.
-        // Or if the event is duplicated. No action needed on the router if it wasn't tracked (and thus not added).
         debug!(
-            "Pod deletion event for untracked/already removed pod: {} (type: {:?}). Worker URL: {}",
-            pod_info.name, pod_info.pod_type, worker_url
+            "Pod {} event for untracked/already removed pod: {} (type: {:?}). Worker URL: {}",
+            reason, pod_info.name, pod_info.pod_type, worker_url
         );
     }
 }
@@ -926,7 +949,7 @@ mod tests {
     #[tokio::test]
     async fn test_handle_pod_event_add_unhealthy_pod() {
         let router = create_test_router().await;
-        let tracked_pods = Arc::new(Mutex::new(HashSet::new()));
+        let tracked_pods = Arc::new(Mutex::new(HashMap::new()));
         let pod_info = PodInfo {
             name: "pod1".into(),
             ip: "1.2.3.4".parse().unwrap(),
@@ -943,10 +966,11 @@ mod tests {
             Arc::clone(&router),
             port,
             false, // pd_mode = false
+            true,  // should_include = true
         )
         .await;
 
-        assert!(!tracked_pods.lock().unwrap().contains(&pod_info));
+        assert!(!tracked_pods.lock().unwrap().contains_key(&pod_info.name));
         assert!(!router
             .get_worker_urls()
             .contains(&pod_info.worker_url(port)));
@@ -955,7 +979,7 @@ mod tests {
     #[tokio::test]
     async fn test_handle_pod_deletion_non_existing_pod() {
         let router = create_test_router().await;
-        let tracked_pods = Arc::new(Mutex::new(HashSet::new()));
+        let tracked_pods = Arc::new(Mutex::new(HashMap::new()));
         let pod_info = PodInfo {
             name: "pod1".into(),
             ip: "1.2.3.4".parse().unwrap(),
@@ -982,7 +1006,7 @@ mod tests {
     #[tokio::test]
     async fn test_handle_pd_pod_event_prefill_pod() {
         let router = create_test_router().await;
-        let tracked_pods = Arc::new(Mutex::new(HashSet::new()));
+        let tracked_pods = Arc::new(Mutex::new(HashMap::new()));
         let pod_info = PodInfo {
             name: "prefill-pod".into(),
             ip: "1.2.3.4".parse().unwrap(),
@@ -1001,17 +1025,18 @@ mod tests {
             Arc::clone(&router),
             port,
             false, // pd_mode = false, so it should fallback to regular handling
+            true,  // should_include = true
         )
         .await;
 
         // Pod should not be tracked since router.add_worker will fail for non-running server
-        assert!(!tracked_pods.lock().unwrap().contains(&pod_info));
+        assert!(!tracked_pods.lock().unwrap().contains_key(&pod_info.name));
     }
 
     #[tokio::test]
     async fn test_handle_pd_pod_event_decode_pod() {
         let router = create_test_router().await;
-        let tracked_pods = Arc::new(Mutex::new(HashSet::new()));
+        let tracked_pods = Arc::new(Mutex::new(HashMap::new()));
         let pod_info = PodInfo {
             name: "decode-pod".into(),
             ip: "1.2.3.5".parse().unwrap(),
@@ -1028,17 +1053,18 @@ mod tests {
             Arc::clone(&router),
             port,
             false, // pd_mode = false, so it should fallback to regular handling
+            true,  // should_include = true
         )
         .await;
 
         // Pod should not be tracked since router.add_worker will fail for non-running server
-        assert!(!tracked_pods.lock().unwrap().contains(&pod_info));
+        assert!(!tracked_pods.lock().unwrap().contains_key(&pod_info.name));
     }
 
     #[tokio::test]
     async fn test_handle_pd_pod_deletion_tracked_pod() {
         let router = create_test_router().await;
-        let tracked_pods = Arc::new(Mutex::new(HashSet::new()));
+        let tracked_pods = Arc::new(Mutex::new(HashMap::new()));
         let pod_info = PodInfo {
             name: "test-pod".into(),
             ip: "1.2.3.4".parse().unwrap(),
@@ -1048,13 +1074,13 @@ mod tests {
             bootstrap_port: Some(8081),
         };
 
+        let port = 8080u16;
+
         // Add pod to tracked set first
         {
             let mut tracked = tracked_pods.lock().unwrap();
-            tracked.insert(pod_info.clone());
+            tracked.insert(pod_info.name.clone(), pod_info.pod_type.clone());
         }
-
-        let port = 8080u16;
 
         handle_pod_deletion(
             &pod_info,
@@ -1066,13 +1092,13 @@ mod tests {
         .await;
 
         // Pod should be removed from tracking
-        assert!(!tracked_pods.lock().unwrap().contains(&pod_info));
+        assert!(!tracked_pods.lock().unwrap().contains_key(&pod_info.name));
     }
 
     #[tokio::test]
     async fn test_handle_pd_pod_deletion_untracked_pod() {
         let router = create_test_router().await;
-        let tracked_pods = Arc::new(Mutex::new(HashSet::new()));
+        let tracked_pods = Arc::new(Mutex::new(HashMap::new()));
         let pod_info = PodInfo {
             name: "untracked-pod".into(),
             ip: "1.2.3.4".parse().unwrap(),
@@ -1101,7 +1127,7 @@ mod tests {
     #[tokio::test]
     async fn test_unified_handler_regular_mode() {
         let router = create_test_router().await;
-        let tracked_pods = Arc::new(Mutex::new(HashSet::new()));
+        let tracked_pods = Arc::new(Mutex::new(HashMap::new()));
         let pod_info = PodInfo {
             name: "regular-pod".into(),
             ip: "1.2.3.4".parse().unwrap(),
@@ -1119,17 +1145,18 @@ mod tests {
             Arc::clone(&router),
             port,
             false, // pd_mode = false
+            true,  // should_include = true
         )
         .await;
 
         // Pod should not be tracked since router.add_worker will fail for non-running server
-        assert!(!tracked_pods.lock().unwrap().contains(&pod_info));
+        assert!(!tracked_pods.lock().unwrap().contains_key(&pod_info.name));
     }
 
     #[tokio::test]
     async fn test_unified_handler_pd_mode_with_prefill() {
         let router = create_test_router().await;
-        let tracked_pods = Arc::new(Mutex::new(HashSet::new()));
+        let tracked_pods = Arc::new(Mutex::new(HashMap::new()));
         let pod_info = PodInfo {
             name: "prefill-pod".into(),
             ip: "1.2.3.4".parse().unwrap(),
@@ -1147,17 +1174,18 @@ mod tests {
             Arc::clone(&router),
             port,
             true, // pd_mode = true
+            true, // should_include = true
         )
         .await;
 
         // Pod should not be tracked since router.add_pd_worker will fail for regular router
-        assert!(!tracked_pods.lock().unwrap().contains(&pod_info));
+        assert!(!tracked_pods.lock().unwrap().contains_key(&pod_info.name));
     }
 
     #[tokio::test]
     async fn test_unified_handler_deletion_with_pd_mode() {
         let router = create_test_router().await;
-        let tracked_pods = Arc::new(Mutex::new(HashSet::new()));
+        let tracked_pods = Arc::new(Mutex::new(HashMap::new()));
         let pod_info = PodInfo {
             name: "decode-pod".into(),
             ip: "1.2.3.4".parse().unwrap(),
@@ -1167,13 +1195,13 @@ mod tests {
             bootstrap_port: None,
         };
 
+        let port = 8080u16;
+
         // Add pod to tracked set first
         {
             let mut tracked = tracked_pods.lock().unwrap();
-            tracked.insert(pod_info.clone());
+            tracked.insert(pod_info.name.clone(), pod_info.pod_type.clone());
         }
-
-        let port = 8080u16;
 
         // Test that unified handler works for deletion in PD mode
         handle_pod_deletion(
@@ -1186,6 +1214,208 @@ mod tests {
         .await;
 
         // Pod should be removed from tracking
-        assert!(!tracked_pods.lock().unwrap().contains(&pod_info));
+        assert!(!tracked_pods.lock().unwrap().contains_key(&pod_info.name));
+    }
+
+    #[tokio::test]
+    async fn test_handle_pod_event_removes_unready_pod() {
+        let router = create_test_router().await;
+        let tracked_pods = Arc::new(Mutex::new(HashMap::new()));
+        let pod_info = PodInfo {
+            name: "target-pod".into(),
+            ip: "10.0.0.1".parse().unwrap(),
+            status: "Running".into(),
+            is_ready: false, // Probe failed: Ready=False
+            pod_type: None,
+            bootstrap_port: None,
+        };
+        let port = 8000u16;
+
+        // Pre-track the pod as if it was previously healthy
+        tracked_pods
+            .lock()
+            .unwrap()
+            .insert(pod_info.name.clone(), pod_info.pod_type.clone());
+
+        handle_pod_event(
+            &pod_info,
+            Arc::clone(&tracked_pods),
+            Arc::clone(&router),
+            port,
+            false,
+            true, // Selector still matches, but Ready=False
+        )
+        .await;
+
+        // Pod must be removed from tracked set and router
+        assert!(!tracked_pods.lock().unwrap().contains_key(&pod_info.name));
+        assert!(!router.get_worker_urls().contains(&pod_info.worker_url(port)));
+    }
+
+    #[tokio::test]
+    async fn test_handle_pod_event_removes_selector_mismatched_pod() {
+        let router = create_test_router().await;
+        let tracked_pods = Arc::new(Mutex::new(HashMap::new()));
+        let pod_info = PodInfo {
+            name: "target-pod".into(),
+            ip: "10.0.0.2".parse().unwrap(),
+            status: "Running".into(),
+            is_ready: true, // Healthy, but label changed (role=canary)
+            pod_type: None,
+            bootstrap_port: None,
+        };
+        let port = 8000u16;
+
+        // Pre-track the pod
+        tracked_pods
+            .lock()
+            .unwrap()
+            .insert(pod_info.name.clone(), pod_info.pod_type.clone());
+
+        handle_pod_event(
+            &pod_info,
+            Arc::clone(&tracked_pods),
+            Arc::clone(&router),
+            port,
+            false,
+            false, // Selector no longer matches!
+        )
+        .await;
+
+        // Pod must be removed from tracked set and router
+        assert!(!tracked_pods.lock().unwrap().contains_key(&pod_info.name));
+        assert!(!router.get_worker_urls().contains(&pod_info.worker_url(port)));
+    }
+
+    #[tokio::test]
+    async fn test_handle_pod_event_untracked_unready_pod_is_noop() {
+        let router = create_test_router().await;
+        let tracked_pods = Arc::new(Mutex::new(HashMap::new()));
+        let pod_info = PodInfo {
+            name: "untracked".into(),
+            ip: "10.0.0.3".parse().unwrap(),
+            status: "Running".into(),
+            is_ready: false,
+            pod_type: None,
+            bootstrap_port: None,
+        };
+        let port = 8000u16;
+
+        handle_pod_event(
+            &pod_info,
+            Arc::clone(&tracked_pods),
+            Arc::clone(&router),
+            port,
+            false,
+            true,
+        )
+        .await;
+
+        assert!(tracked_pods.lock().unwrap().is_empty());
+        assert!(router.get_worker_urls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_handle_pod_event_hostnetwork_pod_isolation() {
+        let router = create_test_router().await;
+        let tracked_pods = Arc::new(Mutex::new(HashMap::new()));
+        let port = 8000u16;
+
+        // Pod A: Legitimate vLLM worker on node 10.0.0.50
+        let live_pod = PodInfo {
+            name: "vllm-worker-0".into(),
+            ip: "10.0.0.50".parse().unwrap(),
+            status: "Running".into(),
+            is_ready: true,
+            pod_type: None,
+            bootstrap_port: None,
+        };
+
+        // Pre-track the legitimate worker
+        tracked_pods
+            .lock()
+            .unwrap()
+            .insert(live_pod.name.clone(), live_pod.pod_type.clone());
+
+        // Pod B: Unrelated daemon/hostNetwork pod sharing the same node IP 10.0.0.50
+        let daemon_pod = PodInfo {
+            name: "node-exporter-abc".into(),
+            ip: "10.0.0.50".parse().unwrap(),
+            status: "Running".into(),
+            is_ready: true,
+            pod_type: None,
+            bootstrap_port: None,
+        };
+
+        // Event for daemon pod (does not match selector: should_include = false)
+        handle_pod_event(
+            &daemon_pod,
+            Arc::clone(&tracked_pods),
+            Arc::clone(&router),
+            port,
+            false,
+            false, // selector mismatch for daemon pod
+        )
+        .await;
+
+        // Legitimate worker MUST NOT be evicted
+        assert!(tracked_pods.lock().unwrap().contains_key(&live_pod.name));
+        assert!(!tracked_pods.lock().unwrap().contains_key(&daemon_pod.name));
+    }
+
+    #[tokio::test]
+    async fn test_filter_firewall_logic() {
+        let tracked_pods = Arc::new(Mutex::new(HashMap::new()));
+        tracked_pods
+            .lock()
+            .unwrap()
+            .insert("tracked-vllm-pod".to_string(), None);
+
+        let check_firewall = |pod_name: &str, should_include: bool| -> bool {
+            let is_tracked = tracked_pods.lock().unwrap().contains_key(pod_name);
+            should_include || is_tracked
+        };
+
+        // Case 1: Unrelated cluster pod (no match, not tracked) -> DROPPED
+        assert!(!check_firewall("unrelated-monitoring-pod", false));
+
+        // Case 2: New worker pod (matches selector, not yet tracked) -> PASSED
+        assert!(check_firewall("new-vllm-pod", true));
+
+        // Case 3: Tracked pod whose label changed (mismatched selector, but tracked) -> PASSED for cleanup!
+        assert!(check_firewall("tracked-vllm-pod", false));
+    }
+
+    #[tokio::test]
+    async fn test_handle_pod_event_pd_mode_preserves_registered_role_on_selector_mismatch() {
+        let router = create_test_router().await;
+        let tracked_pods = Arc::new(Mutex::new(HashMap::new()));
+        let port = 8000u16;
+
+        // Pre-track the pod as Prefill
+        tracked_pods.lock().unwrap().insert("prefill-1".to_string(), Some(PodType::Prefill));
+
+        // Event arrives with labels stripped (so from_pod classified it as Regular)
+        let pod_info_stripped = PodInfo {
+            name: "prefill-1".into(),
+            ip: "10.0.1.1".parse().unwrap(),
+            status: "Running".into(),
+            is_ready: true,
+            pod_type: Some(PodType::Regular), // Labels stripped!
+            bootstrap_port: None,
+        };
+
+        handle_pod_event(
+            &pod_info_stripped,
+            Arc::clone(&tracked_pods),
+            Arc::clone(&router),
+            port,
+            true, // pd_mode = true
+            false, // selector mismatch
+        )
+        .await;
+
+        // Pod should be cleanly removed from tracking
+        assert!(!tracked_pods.lock().unwrap().contains_key("prefill-1"));
     }
 }
