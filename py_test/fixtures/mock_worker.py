@@ -5,6 +5,7 @@ Implements minimal endpoints used by the router:
 - GET /health, /health_generate
 - POST /generate, /v1/completions, /v1/chat/completions
 - POST /flush_cache
+- GET /load (returns {"server_load": N} matching vLLM API)
 - GET /get_server_info, /get_model_info, /v1/models
 
 Behavior knobs are controlled via CLI flags to simulate failures, latency, and load.
@@ -138,9 +139,9 @@ def create_app(args: argparse.Namespace) -> FastAPI:
             }
         )
 
-    @app.get("/get_load")
-    async def get_load():
-        return JSONResponse({"load": _inflight})
+    @app.get("/load")
+    async def load():
+        return JSONResponse({"server_load": _inflight})
 
     def make_json_response(obj: dict, status_code: int = 200) -> JSONResponse:
         resp = JSONResponse(obj, status_code=status_code)
