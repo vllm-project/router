@@ -436,6 +436,115 @@ impl WorkerRegistry {
 
         crate::core::HealthChecker::new(handle, shutdown)
     }
+
+    /// Start the observational inference probe.
+    ///
+    /// Sends a real one-token generation to every registered worker on each
+    /// sweep and reports the outcome through metrics and logs.
+    ///
+    /// Unlike [`Self::start_health_checker`], this task **never** mutates worker
+    /// health: it does not call `set_healthy`, does not touch the circuit
+    /// breaker, and does not change routing. It is a diagnostic, so a defect
+    /// here cannot withdraw a healthy worker from rotation. See
+    /// [`crate::core::inference_probe`].
+    ///
+    /// `api_key` is the router's worker credential; when set, probes carry it
+    /// so that protected workers are not reported as failing on a 401.
+    pub fn start_inference_probe(
+        &self,
+        cfg: crate::config::InferenceProbeConfig,
+        api_key: Option<String>,
+    ) -> crate::core::InferenceProbeHandle {
+        let workers_ref = self.workers.clone();
+        let (shutdown, handle) = crate::core::inference_probe::probe_handle();
+        let interval_secs = cfg.interval_secs.max(1);
+        let timeout_secs = cfg.timeout_secs;
+        let concurrency = cfg.concurrency.max(1);
+
+        tokio::spawn(async move {
+            let mut interval =
+                tokio::time::interval(tokio::time::Duration::from_secs(interval_secs));
+            // A sweep that overruns its interval must not queue back-to-back
+            // catch-up sweeps. A missed interval is harmless for a diagnostic,
+            // whereas a burst of real generations is not.
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+            loop {
+                interval.tick().await;
+
+                if crate::core::inference_probe::should_stop(&shutdown) {
+                    tracing::debug!("Inference probe shutting down");
+                    break;
+                }
+
+                // The probe is HTTP-only (it POSTs to /v1/completions), so
+                // gRPC workers must be excluded: including them would send an
+                // HTTP request to a worker that only speaks gRPC, and every
+                // sweep would report `request_failed` + a 0 inference gauge
+                // on a perfectly healthy serving worker.
+                let workers: Vec<std::sync::Arc<dyn crate::core::Worker>> = workers_ref
+                    .iter()
+                    .filter_map(|entry| {
+                        let worker = entry.value();
+                        if worker.connection_mode() == ConnectionMode::Http {
+                            Some(std::sync::Arc::clone(worker))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+
+                // Probe with bounded concurrency: at most `concurrency` requests
+                // are in flight, so a sweep is capped at roughly
+                // `ceil(workers / concurrency) * timeout_secs`.
+                //
+                // Awaiting each worker in turn would instead take up to
+                // `workers * timeout_secs` -- 32 minutes for 64 stalled workers at
+                // the default timeout -- leaving later workers' gauges stale for
+                // far longer than the configured interval, precisely during the
+                // outage the probe exists to diagnose.
+                let credential = api_key.as_deref();
+                for chunk in workers.chunks(concurrency) {
+                    let probes = chunk.iter().map(|worker| async move {
+                        let outcome = crate::core::inference_probe::probe_inference(
+                            worker.as_ref(),
+                            timeout_secs,
+                            credential,
+                        )
+                        .await;
+                        (worker, outcome)
+                    });
+
+                    for (worker, outcome) in futures::future::join_all(probes).await {
+                        crate::metrics::RouterMetrics::record_inference_probe(
+                            worker.url(),
+                            outcome.ok,
+                            outcome.reason,
+                            outcome.latency_ms,
+                        );
+
+                        if outcome.ok {
+                            tracing::debug!(
+                                worker = %worker.url(),
+                                latency_ms = outcome.latency_ms,
+                                "Inference probe passed"
+                            );
+                        } else {
+                            tracing::warn!(
+                                worker = %worker.url(),
+                                reason = outcome.reason,
+                                detail = %outcome.detail,
+                                health_checker_healthy = worker.is_healthy(),
+                                "Inference probe failed: worker did not complete a one-token generation"
+                            );
+                        }
+                    }
+                }
+            }
+        });
+
+        handle
+    }
 }
 
 impl Default for WorkerRegistry {

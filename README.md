@@ -249,6 +249,8 @@ For detailed configuration options, hash key priorities, and usage examples, see
 
 For the optional agent metadata contract, scheduling enablement, request-scoped hints, and engine KV-control boundary, see [Program Scheduling](docs/program_scheduling.md).
 
+For worker health probe strategies — including the optional one-token inference probe that detects nodes which are up but cannot serve inference — see [Worker health checks](docs/health_checks.md).
+
 ## Advanced Features
 
 ### Kubernetes Service Discovery

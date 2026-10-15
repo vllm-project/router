@@ -772,6 +772,56 @@ fn default_retry_jitter_factor() -> f32 {
     0.2
 }
 
+/// Observational inference probe configuration.
+///
+/// When enabled, the router periodically sends a real one-token inference
+/// request (`POST /v1/completions` with `max_tokens: 1`) to every registered
+/// worker and **reports** the result. It detects the class of failure behind
+/// [#158](https://github.com/vllm-project/router/issues/158): a worker whose
+/// process is up — and whose `/health` therefore answers 200 — but which
+/// cannot complete a generation.
+///
+/// **This probe never changes routing state.** It does not mark a worker
+/// unhealthy, does not feed the circuit breaker, and does not remove a worker
+/// from rotation; it only emits metrics and log lines. Worker health continues
+/// to be decided exclusively by the health checker and its
+/// `failure_threshold` / `success_threshold` settings. Detection and
+/// enforcement are deliberately separated: a bug here can produce a wrong
+/// report, never an outage.
+///
+/// The probe is disabled by default because it costs one real generation per
+/// worker per interval. `timeout_secs` should be sized for inference latency
+/// rather than for a socket round trip.
+///
+/// Workers are probed with `concurrency`-bounded parallelism rather than one at
+/// a time, so a sweep takes about `ceil(workers / concurrency) * timeout_secs`
+/// in the worst case, when every probe has to time out. Probing serially would
+/// make a sweep of 64 stalled workers take 32 minutes at the default timeout,
+/// leaving later workers' gauges stale precisely during the outage the probe
+/// exists to diagnose.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InferenceProbeConfig {
+    /// Whether the observational inference probe runs at all
+    pub enabled: bool,
+    /// Interval between probe sweeps in seconds
+    pub interval_secs: u64,
+    /// Timeout for a single probe request in seconds
+    pub timeout_secs: u64,
+    /// Maximum number of probes in flight at once within a sweep
+    pub concurrency: usize,
+}
+
+impl Default for InferenceProbeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            interval_secs: 60,
+            timeout_secs: 30,
+            concurrency: 32,
+        }
+    }
+}
+
 /// Health check configuration for worker monitoring
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HealthCheckConfig {
@@ -783,8 +833,11 @@ pub struct HealthCheckConfig {
     pub timeout_secs: u64,
     /// Interval between health checks in seconds
     pub check_interval_secs: u64,
-    /// Health check endpoint path
+    /// Health check endpoint path, fetched with `GET`
     pub endpoint: String,
+    /// Observational inference probe: reports, never affects routing health
+    #[serde(default)]
+    pub inference_probe: InferenceProbeConfig,
 }
 
 impl Default for HealthCheckConfig {
@@ -795,6 +848,7 @@ impl Default for HealthCheckConfig {
             timeout_secs: 5,
             check_interval_secs: 60,
             endpoint: "/health".to_string(),
+            inference_probe: InferenceProbeConfig::default(),
         }
     }
 }

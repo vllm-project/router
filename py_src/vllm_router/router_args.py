@@ -89,6 +89,12 @@ class RouterArgs:
     health_check_timeout_secs: int = 5
     health_check_interval_secs: int = 60
     health_check_endpoint: str = "/health"
+    # Observational one-token inference probe. Reports only: it never marks
+    # workers unhealthy and never affects routing.
+    inference_probe: bool = False
+    inference_probe_interval_secs: int = 60
+    inference_probe_timeout_secs: int = 30
+    inference_probe_concurrency: int = 32
     # Circuit breaker configuration
     cb_failure_threshold: int = 10
     cb_success_threshold: int = 3
@@ -485,6 +491,43 @@ class RouterArgs:
             type=str,
             default=RouterArgs.health_check_endpoint,
             help="Health check endpoint path",
+        )
+        parser.add_argument(
+            f"--{prefix}inference-probe",
+            action="store_true",
+            default=RouterArgs.inference_probe,
+            help=(
+                "Enable the observational one-token inference probe: send a real "
+                "max_tokens=1 completion to every worker on each sweep and report "
+                "the result. It detects workers whose process is up but which "
+                "cannot actually serve inference. Reports only: it never marks "
+                "workers unhealthy and never affects routing."
+            ),
+        )
+        parser.add_argument(
+            f"--{prefix}inference-probe-interval-secs",
+            type=int,
+            default=RouterArgs.inference_probe_interval_secs,
+            help="Seconds between observational inference probe sweeps",
+        )
+        parser.add_argument(
+            f"--{prefix}inference-probe-timeout-secs",
+            type=int,
+            default=RouterArgs.inference_probe_timeout_secs,
+            help=(
+                "Timeout in seconds for a single inference probe request. Size it "
+                "for inference latency, not for a socket round trip"
+            ),
+        )
+        parser.add_argument(
+            f"--{prefix}inference-probe-concurrency",
+            type=int,
+            default=RouterArgs.inference_probe_concurrency,
+            help=(
+                "Maximum number of inference probes in flight at once. One sweep "
+                "takes about ceil(workers / concurrency) * timeout seconds in the "
+                "worst case, so raise this on large clusters"
+            ),
         )
         parser.add_argument(
             f"--{prefix}max-concurrent-requests",

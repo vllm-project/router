@@ -2,8 +2,8 @@ use clap::{ArgAction, Parser, ValueEnum};
 use std::collections::HashMap;
 use vllm_router_rs::config::{
     CircuitBreakerConfig, ConfigError, ConfigResult, ConnectionMode, DiscoveryConfig,
-    HealthCheckConfig, HistoryBackend, KvConnector, MetricsConfig, PolicyConfig,
-    ProgramSchedulingConfig, RetryConfig, RouterConfig, RoutingMode, TraceConfig,
+    HealthCheckConfig, HistoryBackend, InferenceProbeConfig, KvConnector, MetricsConfig,
+    PolicyConfig, ProgramSchedulingConfig, RetryConfig, RouterConfig, RoutingMode, TraceConfig,
 };
 use vllm_router_rs::metrics::PrometheusConfig;
 use vllm_router_rs::server::{self, ServerConfig};
@@ -364,6 +364,26 @@ struct CliArgs {
     #[arg(long, default_value = "/health")]
     health_check_endpoint: String,
 
+    /// Enable the observational one-token inference probe: periodically send a
+    /// real `max_tokens=1` completion to every worker and report the result.
+    /// The probe never marks workers unhealthy and never affects routing.
+    #[arg(long, default_value_t = false)]
+    inference_probe: bool,
+
+    /// Interval in seconds between observational inference probe sweeps
+    #[arg(long, default_value_t = 60)]
+    inference_probe_interval_secs: u64,
+
+    /// Timeout in seconds for a single observational inference probe request
+    /// (size for inference latency, not for a socket round trip)
+    #[arg(long, default_value_t = 30)]
+    inference_probe_timeout_secs: u64,
+
+    /// Maximum number of observational inference probes in flight at once.
+    /// Bounds one sweep at about ceil(workers / concurrency) * timeout seconds.
+    #[arg(long, default_value_t = 32)]
+    inference_probe_concurrency: usize,
+
     // IGW (Inference Gateway) configuration
     /// Enable Inference Gateway mode
     #[arg(long, default_value_t = false)]
@@ -602,6 +622,12 @@ impl CliArgs {
                 timeout_secs: self.health_check_timeout_secs,
                 check_interval_secs: self.health_check_interval_secs,
                 endpoint: self.health_check_endpoint.clone(),
+                inference_probe: InferenceProbeConfig {
+                    enabled: self.inference_probe,
+                    interval_secs: self.inference_probe_interval_secs,
+                    timeout_secs: self.inference_probe_timeout_secs,
+                    concurrency: self.inference_probe_concurrency,
+                },
             },
             enable_igw: self.enable_igw,
             rate_limit_tokens_per_second: None,

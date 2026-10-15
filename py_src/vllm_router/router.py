@@ -91,6 +91,18 @@ class Router:
         health_check_timeout_secs: Timeout in seconds for health check requests. Default: 5
         health_check_interval_secs: Interval in seconds between runtime health checks. Default: 60
         health_check_endpoint: Health check endpoint path. Default: '/health'
+        inference_probe: Enable the observational one-token inference probe:
+            send a real max_tokens=1 completion to every worker on each sweep
+            and report the result, so workers whose process is up but which
+            cannot actually serve inference are visible. Reports only: it never
+            marks workers unhealthy and never affects routing. Default: False
+        inference_probe_interval_secs: Seconds between probe sweeps. Default: 60
+        inference_probe_timeout_secs: Timeout for a single probe request in
+            seconds; size it for inference latency. Default: 30
+        inference_probe_concurrency: Maximum number of probes in flight at once
+            within a sweep, so one sweep takes about
+            ceil(workers / concurrency) * timeout seconds in the worst case.
+            Default: 32
         enable_program_scheduling: Enable Program-level scheduling. Default: False
         program_scheduling_config_json: Optional JSON object overriding Program-level scheduling defaults.
             Requires enable_program_scheduling. Default: None

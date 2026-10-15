@@ -70,6 +70,31 @@ pub fn init_metrics() {
     );
     describe_gauge!("vllm_router_worker_load", "Current load on each worker");
     describe_counter!(
+        "vllm_router_worker_inference_probe_total",
+        "Observational one-token inference probes by worker and result. \
+         These probes never affect routing health"
+    );
+    describe_gauge!(
+        "vllm_router_worker_inference_ok",
+        "Last observational inference probe result per worker (1=completed a generation, 0=failed)"
+    );
+    // Freshness signal for removed workers: the Prometheus side should alert
+    // on `vllm_router_worker_inference_ok == 0` qualified by a recency window
+    // on this gauge (e.g. `AND on(worker) vllm_router_worker_inference_last_probe_ts > time() - 5*interval`).
+    // A worker dropped from the registry (e.g. service discovery replaced a
+    // failed pod) stops being swept, so its last_probe_ts goes stale and the
+    // alert stops firing on the orphaned 0-value series.
+    describe_gauge!(
+        "vllm_router_worker_inference_last_probe_ts",
+        "Unix timestamp (seconds) of the last observational inference probe \
+         issued to each worker; used to tell active workers' gauges apart from \
+         those orphaned by removal"
+    );
+    describe_histogram!(
+        "vllm_router_worker_inference_probe_latency_ms",
+        "Latency of observational one-token inference probes in milliseconds"
+    );
+    describe_counter!(
         "vllm_router_processed_requests_total",
         "Total requests processed by each worker"
     );
@@ -566,6 +591,44 @@ impl RouterMetrics {
             "worker" => worker_url.to_string()
         )
         .set(load as f64);
+    }
+
+    /// Record the outcome of an observational inference probe.
+    ///
+    /// This is a report only: it deliberately does not touch
+    /// `vllm_router_worker_health` or any routing state. `reason` is a short
+    /// label-safe classifier, not the full error text.
+    pub fn record_inference_probe(worker_url: &str, ok: bool, reason: &str, latency_ms: u128) {
+        let result = if ok { "ok" } else { reason };
+        counter!("vllm_router_worker_inference_probe_total",
+            "worker" => worker_url.to_string(),
+            "result" => result.to_string()
+        )
+        .increment(1);
+        gauge!("vllm_router_worker_inference_ok",
+            "worker" => worker_url.to_string()
+        )
+        .set(if ok { 1.0 } else { 0.0 });
+        // Freshness signal: lets Prometheus distinguish a worker's live gauge
+        // from one orphaned by `WorkerRegistry::remove` (see the gauge's
+        // description). Removed workers stop being swept, so this ts stops
+        // advancing and their stale series can be filtered out by alert rules.
+        gauge!("vllm_router_worker_inference_last_probe_ts",
+            "worker" => worker_url.to_string()
+        )
+        .set({
+            let now_secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            now_secs as f64
+        });
+        if ok {
+            histogram!("vllm_router_worker_inference_probe_latency_ms",
+                "worker" => worker_url.to_string()
+            )
+            .record(latency_ms as f64);
+        }
     }
 
     pub fn record_processed_request(worker_url: &str) {

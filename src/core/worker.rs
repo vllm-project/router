@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock};
 
 // Shared HTTP client for worker operations (health checks, server info, etc.)
-static WORKER_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
+pub(crate) static WORKER_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
     reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30)) // Default timeout, overridden per request
         .build()
@@ -248,7 +248,7 @@ pub struct HealthConfig {
     pub timeout_secs: u64,
     /// Interval between health checks in seconds
     pub check_interval_secs: u64,
-    /// Health check endpoint path
+    /// Health check endpoint path, fetched with `GET`
     pub endpoint: String,
     /// Number of consecutive failures before marking unhealthy
     pub failure_threshold: u32,
@@ -350,6 +350,19 @@ impl BasicWorker {
         self
     }
 
+    /// Access the mutable metadata (used by tests to configure probes).
+    #[cfg(test)]
+    pub fn metadata_mut(&mut self) -> &mut WorkerMetadata {
+        &mut self.metadata
+    }
+
+    /// Test helper: start a worker in the given initial health state.
+    #[cfg(test)]
+    pub fn with_initial_health(self, healthy: bool) -> Self {
+        self.healthy.store(healthy, Ordering::Release);
+        self
+    }
+
     pub fn normalised_url(&self) -> WorkerResult<&str> {
         if self.url().contains("@") {
             // Need to extract the URL from "http://host:port@dp_rank"
@@ -369,6 +382,74 @@ impl BasicWorker {
         } else {
             Ok(self.url())
         }
+    }
+}
+
+/// Run one HTTP liveness probe against a worker URL.
+///
+/// Shared by [`BasicWorker`] (no DP rank) and [`DPAwareWorker`] (pinned rank),
+/// so a DP-rank probe pins `X-data-parallel-rank` the same way a proxied user
+/// request does; otherwise every logical rank worker would probe the same
+/// unpinned base server.
+///
+/// Probe requests never touch worker load counters (see PR #216).
+///
+/// This is the *health* path: its result drives `is_healthy` and therefore
+/// routing. The real-inference check that only reports lives in
+/// [`crate::core::inference_probe`] and must not be wired in here.
+async fn http_health_probe(url: &str, cfg: &HealthConfig, dp_rank: Option<usize>) -> bool {
+    use crate::routers::http::dp_utils::add_dp_rank_header;
+
+    let health_url = format!("{}{}", url, cfg.endpoint);
+    let mut req = WORKER_CLIENT
+        .get(&health_url)
+        .timeout(std::time::Duration::from_secs(cfg.timeout_secs));
+    if let Some(rank) = dp_rank {
+        req = add_dp_rank_header(req, Some(rank));
+    }
+    match req.send().await {
+        Ok(response) => response.status().is_success(),
+        Err(_) => false,
+    }
+}
+
+/// Apply a probe outcome to a worker's consecutive-failure / -success
+/// counters and flip health status at the configured thresholds.
+///
+/// Used by both [`BasicWorker`] and [`DPAwareWorker`] (which shares the
+/// underlying `Arc` counters with its `BasicWorker`) so the threshold
+/// logic is defined in one place.
+async fn apply_health_result(worker: &BasicWorker, ok: bool) -> WorkerResult<()> {
+    if ok {
+        // Health check succeeded
+        worker.consecutive_failures.store(0, Ordering::Release);
+        let successes = worker.consecutive_successes.fetch_add(1, Ordering::AcqRel) + 1;
+
+        // Mark healthy if we've reached the success threshold
+        if !worker.is_healthy()
+            && successes >= worker.metadata().health_config.success_threshold as usize
+        {
+            worker.set_healthy(true);
+            worker.consecutive_successes.store(0, Ordering::Release);
+        }
+        Ok(())
+    } else {
+        // Health check failed
+        worker.consecutive_successes.store(0, Ordering::Release);
+        let failures = worker.consecutive_failures.fetch_add(1, Ordering::AcqRel) + 1;
+
+        // Mark unhealthy if we've reached the failure threshold
+        if worker.is_healthy()
+            && failures >= worker.metadata().health_config.failure_threshold as usize
+        {
+            worker.set_healthy(false);
+            worker.consecutive_failures.store(0, Ordering::Release);
+        }
+
+        Err(WorkerError::HealthCheckFailed {
+            url: worker.url().to_string(),
+            reason: format!("Health check failed (consecutive failures: {})", failures),
+        })
     }
 }
 
@@ -402,14 +483,7 @@ impl Worker for BasicWorker {
             ConnectionMode::Http => {
                 // Perform HTTP health check
                 let url = self.normalised_url()?;
-                let health_url = format!("{}{}", url, self.metadata.health_config.endpoint);
-                let timeout = Duration::from_secs(self.metadata.health_config.timeout_secs);
-
-                // Use the shared client with a custom timeout for this request
-                match WORKER_CLIENT.get(&health_url).timeout(timeout).send().await {
-                    Ok(response) => response.status().is_success(),
-                    Err(_) => false,
-                }
+                http_health_probe(url, &self.metadata.health_config, None).await
             }
             ConnectionMode::Grpc => {
                 let timeout = Duration::from_secs(self.metadata.health_config.timeout_secs);
@@ -419,37 +493,7 @@ impl Worker for BasicWorker {
             }
         };
 
-        if health_result {
-            // Health check succeeded
-            self.consecutive_failures.store(0, Ordering::Release);
-            let successes = self.consecutive_successes.fetch_add(1, Ordering::AcqRel) + 1;
-
-            // Mark healthy if we've reached the success threshold
-            if !self.is_healthy()
-                && successes >= self.metadata.health_config.success_threshold as usize
-            {
-                self.set_healthy(true);
-                self.consecutive_successes.store(0, Ordering::Release);
-            }
-            Ok(())
-        } else {
-            // Health check failed
-            self.consecutive_successes.store(0, Ordering::Release);
-            let failures = self.consecutive_failures.fetch_add(1, Ordering::AcqRel) + 1;
-
-            // Mark unhealthy if we've reached the failure threshold
-            if self.is_healthy()
-                && failures >= self.metadata.health_config.failure_threshold as usize
-            {
-                self.set_healthy(false);
-                self.consecutive_failures.store(0, Ordering::Release);
-            }
-
-            Err(WorkerError::HealthCheckFailed {
-                url: self.metadata.url.clone(),
-                reason: format!("Health check failed (consecutive failures: {})", failures),
-            })
-        }
+        apply_health_result(self, health_result).await
     }
 
     fn load(&self) -> usize {
@@ -528,6 +572,15 @@ impl DPAwareWorker {
         self.base_worker = self.base_worker.with_health_config(config);
         self
     }
+
+    /// Test helper: start a worker in the given initial health state.
+    #[cfg(test)]
+    pub fn with_initial_health(self, healthy: bool) -> Self {
+        Self {
+            base_worker: self.base_worker.with_initial_health(healthy),
+            ..self
+        }
+    }
 }
 
 #[async_trait]
@@ -553,8 +606,30 @@ impl Worker for DPAwareWorker {
     }
 
     async fn check_health_async(&self) -> WorkerResult<()> {
-        // Delegate to the base worker's health check logic
-        self.base_worker.check_health_async().await
+        use std::time::Duration;
+
+        let health_result = match &self.base_worker.metadata().connection_mode {
+            ConnectionMode::Http => {
+                let url = self.base_worker.normalised_url()?;
+                http_health_probe(
+                    url,
+                    &self.base_worker.metadata().health_config,
+                    Some(self.dp_rank),
+                )
+                .await
+            }
+            ConnectionMode::Grpc => {
+                let timeout =
+                    Duration::from_secs(self.base_worker.metadata().health_config.timeout_secs);
+                crate::backend::check_grpc_health(self.url(), timeout)
+                    .await
+                    .is_ok()
+            }
+        };
+
+        // Share the threshold logic with BasicWorker; both drive the same
+        // underlying Arc counters on base_worker.
+        apply_health_result(&self.base_worker, health_result).await
     }
 
     fn load(&self) -> usize {

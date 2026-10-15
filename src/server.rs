@@ -1066,6 +1066,25 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         config.router_config.health_check.check_interval_secs
     );
 
+    // Start the observational inference probe when enabled. This probe reports
+    // only: it never marks workers unhealthy, never touches the circuit breaker,
+    // and never changes routing.
+    let _inference_probe = if config.router_config.health_check.inference_probe.enabled {
+        let inference_cfg = config.router_config.health_check.inference_probe.clone();
+        info!(
+            "Started observational inference probe ({}s interval, {}s timeout); \
+             it reports only and does not affect routing health",
+            inference_cfg.interval_secs, inference_cfg.timeout_secs
+        );
+        Some(
+            app_context
+                .worker_registry
+                .start_inference_probe(inference_cfg, config.router_config.api_key.clone()),
+        )
+    } else {
+        None
+    };
+
     // Set up concurrency limiter with queue if configured
     let (limiter, processor) = middleware::ConcurrencyLimiter::new(
         app_context.rate_limiter.clone(),
