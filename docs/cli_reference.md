@@ -71,7 +71,7 @@ while an earlier request is still running, even with `--max-concurrent-requests 
 | --- | --- | --- | --- | --- | --- |
 | `--worker-urls` | `string [0..] (repeatable)` | `[]` | `string [0..]` | `[]` | Worker URLs for regular routing, e.g. `http://worker:8000`; Rust also supports `grpc://` inference workers. |
 | `--worker-startup-timeout-secs` | `u64` | `600` | `integer` | `600` | Time in seconds to wait for workers to become ready. |
-| `--worker-startup-check-interval` | `u64` | `30` | `integer` | `30` | Seconds between worker startup checks. |
+| `--worker-startup-check-interval` | `u64` | `30` | `integer` | `30` | Seconds between worker startup checks; also controls regular-router `power_of_two` load polling. |
 | `--intra-node-data-parallel-size` | `usize` | `1` | `integer` | `1` | DP replicas per worker URL; values greater than 1 enable DP-aware routing. |
 | `--backend` | `vllm, trtllm, openai, anthropic` | `vllm` | — | — | Select the backend; `trtllm` and `anthropic` currently warn and fall back to regular routing. |
 | `--runtime` | `vllm, trtllm, openai, anthropic` | `vllm` | — | — | Alias for `--backend`, with the same choices and default. |
@@ -80,8 +80,10 @@ while an earlier request is still running, even with `--max-concurrent-requests 
 | `--history-backend` | `memory, none` | `memory` | — | — | Inference Gateway history storage: in-memory storage or no storage. |
 | `--profile` | `flag` | `false` | — | — | Enable profiling calls to vLLM workers; the Rust CLI uses a 10-second profiling timeout. |
 
-Regular mode requires worker URLs unless service discovery is enabled. Gateway
-mode and the Rust OpenAI backend use different configuration paths. See
+The Rust CLI requires worker URLs in regular mode unless service discovery is
+enabled. The Python launcher permits an empty worker list without service
+discovery; workers can be registered later through `/add_worker`. Gateway mode
+and the Rust OpenAI backend use different configuration paths. See
 [gRPC workers](backend/grpc.md) for supported gRPC worker capabilities.
 
 ## Routing policies
@@ -101,8 +103,11 @@ mode and the Rust OpenAI backend use different configuration paths. See
 Cache-aware tuning applies only to policies using `cache_aware`. Load balancing
 is triggered when both `(max_load - min_load) > balance_abs_threshold` and
 `max_load > min_load * balance_rel_threshold` hold. The CLI does not expose the
-power-of-two load-check interval or consistent-hash virtual-node count; they
-use `5` seconds and `160` virtual nodes. See [routing policies](load_balancing/README.md).
+consistent-hash virtual-node count, which is `160`. In the regular router,
+`power_of_two` load polling uses `--worker-startup-check-interval` (default
+`30` seconds) from either CLI. The internal policy configuration's
+`load_check_interval_secs` value is not used by this polling loop. See
+[routing policies](load_balancing/README.md).
 
 Without service discovery, `power_of_two` requires at least two workers. A
 PD stage using an explicit power-of-two policy needs two workers for that stage.
