@@ -55,7 +55,7 @@ The consistent hash policy extracts a routing key in the following priority orde
 | 8 | Request Body | `user` | `{"user": "..."}` (OpenAI format) |
 | 9 | Request Body | `session_id` | `{"session_id": "..."}` (legacy) |
 | 10 | Request Body | `user_id` | `{"user_id": "..."}` (legacy) |
-| 11 | Fallback | Request body hash | Hash of entire request body |
+| 11 | Fallback | Request text hash | Hash of the routing text; for chat without a session id this is the conversation, so a conversation sticks to one worker |
 
 ### Usage Examples
 

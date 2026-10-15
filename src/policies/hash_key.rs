@@ -25,7 +25,7 @@ pub(crate) const SESSION_HEADER_NAMES: &[&str] = &[
 /// 3. Body: user field (OpenAI format)
 /// 4. Body: session_id (legacy)
 /// 5. Body: user_id (legacy)
-/// 6. Fallback: hash of request body (long) or raw text (short)
+/// 6. Fallback: hash of the request text
 pub(crate) fn extract_hash_key(
     request_text: Option<&str>,
     headers: Option<&RequestHeaders>,
@@ -42,13 +42,10 @@ pub(crate) fn extract_hash_key(
         return key;
     }
 
-    // 3. Final fallback: hash of request body
+    // 3. Final fallback: hash of the request text. Always hash, never embed it:
+    // the key is logged at INFO, and for chat the text is the conversation.
     let text = request_text.unwrap_or("");
-    if text.len() > 100 {
-        format!("request_hash:{:016x}", ConsistentHashPolicy::fbi_hash(text))
-    } else {
-        format!("request:{}", text)
-    }
+    format!("request_hash:{:016x}", ConsistentHashPolicy::fbi_hash(text))
 }
 
 /// Extract hash key from HTTP headers
@@ -431,7 +428,8 @@ mod tests {
     #[test]
     fn test_hash_key_fallback_short_text() {
         let key = extract_hash_key(Some("short"), None);
-        assert_eq!(key, "request:short");
+        assert!(key.starts_with("request_hash:"));
+        assert!(!key.contains("short"));
     }
 
     #[test]
@@ -449,7 +447,7 @@ mod tests {
     #[test]
     fn test_hash_key_fallback_none() {
         let key = extract_hash_key(None, None);
-        assert_eq!(key, "request:");
+        assert!(key.starts_with("request_hash:"));
     }
 
     // === find_field_start tests ===

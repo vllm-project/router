@@ -1059,7 +1059,7 @@ impl Router {
         };
 
         // All-grpc chat: tokenize once, outside policy and retry.
-        // Policy still uses extract_text_for_routing (session / empty).
+        // Policy still uses extract_text_for_routing (session / conversation).
         // token_ids stay on PreparedChat for a later token-level policy —
         // do not dump 131k ids into the cache_aware tree.
         let prepared = if matches!(pool, Some(crate::backend::WorkerPoolKind::Grpc))
