@@ -10,6 +10,7 @@ use super::{
     BackendObservation, ProgramBindingCandidate, ProgramIdentity, ProgramRef,
     ProgramSchedulerConfig, ProgramState, ProgramStatus, ProgramTarget, ProgressTtlPolicyMath,
 };
+use crate::config::types::PredictionMode;
 use crate::metrics::RouterMetrics;
 use parking_lot::Mutex;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -29,7 +30,27 @@ impl ProgramScheduler {
     /// Construct an opt-in scheduler without changing native Router policy.
     pub fn new(config: ProgramSchedulerConfig) -> Self {
         let policy = ProgressTtlPolicyMath::new(config.progress_ttl.clone());
-        let state = ProgramSchedulerState::new(&config);
+        let mut state = ProgramSchedulerState::new(&config);
+        if config.prediction_profile.mode != PredictionMode::Off {
+            if let Some(path) = config.prediction_profile.profile_path.as_deref() {
+                if let Err(error) = state
+                    .prediction_profiles
+                    .load_path(std::path::Path::new(path))
+                {
+                    warn!(
+                        event = "prediction_profile_load_failed",
+                        path,
+                        %error,
+                        "Workflow prediction profile was not loaded"
+                    );
+                } else {
+                    info!(
+                        event = "prediction_profile_loaded",
+                        path, "Workflow prediction profile loaded"
+                    );
+                }
+            }
+        }
         Self {
             config,
             policy,
@@ -40,6 +61,38 @@ impl ProgramScheduler {
     /// Backend observation and periodic scheduling interval.
     pub fn metrics_interval(&self) -> Duration {
         self.config.metrics_interval
+    }
+
+    /// Take one bounded online-profile snapshot for lock-free serialization.
+    pub(crate) fn take_prediction_profile_snapshot(
+        &self,
+    ) -> Option<(
+        String,
+        u64,
+        super::prediction_profile::PredictionProfileFile,
+    )> {
+        let path = self.config.prediction_profile.snapshot_path.clone()?;
+        if self.config.prediction_profile.mode == PredictionMode::Off {
+            return None;
+        }
+        let now = Instant::now();
+        let mut state = self.state.lock();
+        if now < state.next_prediction_snapshot_at {
+            return None;
+        }
+        state.next_prediction_snapshot_at =
+            now + Duration::from_secs_f64(self.config.prediction_profile.snapshot_interval_seconds);
+        state
+            .prediction_profiles
+            .snapshot()
+            .map(|(revision, snapshot)| (path, revision, snapshot))
+    }
+
+    pub(crate) fn mark_prediction_profile_snapshotted(&self, revision: u64) {
+        self.state
+            .lock()
+            .prediction_profiles
+            .mark_snapshotted(revision);
     }
 
     /// Metadata source that opts one request into Program scheduling.
@@ -507,8 +560,11 @@ impl ProgramScheduler {
             decision.agent_id = identity.agent_id().map(str::to_string);
             decision.parent_program_id = identity.parent_program_id().map(str::to_string);
             decision.blocks_parent = identity.blocks_parent();
+            decision.expected_resume = identity.expected_resume();
             decision.agent_role = identity.agent_role().map(str::to_string);
             decision.spawn_reason = identity.spawn_reason().map(str::to_string);
+            decision.workflow_profile_id = identity.workflow_profile_id().map(str::to_string);
+            decision.profile_version = identity.profile_version().map(str::to_string);
             decision.output_token_reservation = identity.request_hints().expected_output_tokens;
             decision.step_id = identity
                 .step_id()
@@ -529,8 +585,11 @@ impl ProgramScheduler {
         decision.agent_id = identity.agent_id().map(str::to_string);
         decision.parent_program_id = identity.parent_program_id().map(str::to_string);
         decision.blocks_parent = identity.blocks_parent();
+        decision.expected_resume = identity.expected_resume();
         decision.agent_role = identity.agent_role().map(str::to_string);
         decision.spawn_reason = identity.spawn_reason().map(str::to_string);
+        decision.workflow_profile_id = identity.workflow_profile_id().map(str::to_string);
+        decision.profile_version = identity.profile_version().map(str::to_string);
         decision.output_token_reservation = identity.request_hints().expected_output_tokens;
         decision.step_id = identity.step_id().unwrap_or(0);
         state.decisions.insert(reference, decision);
