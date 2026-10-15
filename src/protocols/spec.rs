@@ -268,7 +268,10 @@ pub struct StructuredOutputsParams {
 #[serde(untagged)]
 pub enum UserMessageContent {
     Text(String),
-    Parts(Vec<ContentPart>),
+    // Parts are passed through verbatim as raw JSON so any part `type` vLLM supports
+    // (text, image_url, audio_url, input_audio, video_url, ...) survives untouched,
+    // instead of being dropped by a closed enum of known variants.
+    Parts(Vec<Value>),
 }
 
 impl UserMessageContent {
@@ -279,29 +282,11 @@ impl UserMessageContent {
             Self::Text(_) => Vec::new(),
             Self::Parts(parts) => parts
                 .iter()
-                .filter_map(|part| match part {
-                    ContentPart::Text { text } if !text.trim().is_empty() => Some(text.as_str()),
-                    _ => None,
-                })
+                .filter_map(|part| part.get("text").and_then(Value::as_str))
+                .filter(|text| !text.trim().is_empty())
                 .collect(),
         }
     }
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(tag = "type")]
-pub enum ContentPart {
-    #[serde(rename = "text")]
-    Text { text: String },
-    #[serde(rename = "image_url")]
-    ImageUrl { image_url: ImageUrl },
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct ImageUrl {
-    pub url: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub detail: Option<String>, // "auto", "low", or "high"
 }
 
 // ============= Response Format Types =============
@@ -4036,6 +4021,76 @@ mod tests {
             },
             _ => panic!("Expected User message"),
         }
+    }
+
+    #[test]
+    fn test_chat_message_user_parts_with_non_text_types_round_trip() {
+        // Regression test: user message parts with types other than `text`/`image_url`
+        // (e.g. vLLM's audio_url, input_audio, video_url) must survive untouched instead
+        // of being dropped, which previously collapsed the whole message to "".
+        for body in [
+            serde_json::json!({
+                "role": "user",
+                "content": [
+                    {"type": "audio_url", "audio_url": {"url": "data:audio/wav;base64,AAAA"}},
+                    {"type": "text", "text": "Return exactly W0_TANGERINE_4931 and nothing else."}
+                ]
+            }),
+            serde_json::json!({
+                "role": "user",
+                "content": [
+                    {"type": "input_audio", "input_audio": {"data": "AAAA", "format": "wav"}},
+                    {"type": "text", "text": "Return exactly W0_TANGERINE_4931 and nothing else."}
+                ]
+            }),
+            serde_json::json!({
+                "role": "user",
+                "content": [
+                    {"type": "video_url", "video_url": {"url": "https://example.com/clip.mp4"}},
+                    {"type": "text", "text": "Return exactly W0_TANGERINE_4931 and nothing else."}
+                ]
+            }),
+            serde_json::json!({
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": "https://example.com/img.png"}},
+                    {"type": "text", "text": "Return exactly W0_TANGERINE_4931 and nothing else."}
+                ]
+            }),
+        ] {
+            let message: ChatMessage = serde_json::from_value(body.clone()).unwrap();
+            let ChatMessage::User { content, .. } = message else {
+                panic!("Expected User message");
+            };
+            let UserMessageContent::Parts(parts) = content else {
+                panic!("Expected Parts content");
+            };
+            // Byte-exact round trip: the non-text part must be preserved verbatim.
+            let round_tripped =
+                serde_json::to_value(UserMessageContent::Parts(parts.clone())).unwrap();
+            assert_eq!(round_tripped, body["content"]);
+            assert_eq!(parts.len(), 2);
+        }
+    }
+
+    #[test]
+    fn test_chat_message_user_parts_routing_text_ignores_non_text_parts() {
+        let json = r#"{
+            "role": "user",
+            "content": [
+                {"type": "audio_url", "audio_url": {"url": "data:audio/wav;base64,AAAA"}},
+                {"type": "text", "text": "Return exactly W0_TANGERINE_4931 and nothing else."}
+            ]
+        }"#;
+
+        let message: ChatMessage = serde_json::from_str(json).unwrap();
+        let ChatMessage::User { content, .. } = message else {
+            panic!("Expected User message");
+        };
+        assert_eq!(
+            content.routing_texts(),
+            vec!["Return exactly W0_TANGERINE_4931 and nothing else."]
+        );
     }
 
     #[test]
