@@ -5811,6 +5811,7 @@ mod tests {
         router.epd = Some(super::super::epd::EncoderStage::new(
             crate::config::EpdConfig {
                 encoder_urls: vec!["http://unused".into()],
+                encode_policy: None,
                 consumer_zmq_addrs: Default::default(),
             },
         ));

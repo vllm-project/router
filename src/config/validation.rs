@@ -1318,6 +1318,7 @@ mod tests {
                 let mut config = RouterConfig::new(mode, PolicyConfig::Random);
                 config.epd = Some(EpdConfig {
                     encoder_urls: vec![format!("{encoder_scheme}://encoder:8000")],
+                    encode_policy: None,
                     consumer_zmq_addrs: Default::default(),
                 });
                 let result = ConfigValidator::validate(&config);
@@ -1349,6 +1350,7 @@ mod tests {
         );
         config.epd = Some(EpdConfig {
             encoder_urls: vec!["http://encoder:8000".into()],
+            encode_policy: None,
             consumer_zmq_addrs: Default::default(),
         });
         config

@@ -94,6 +94,7 @@ impl AppContext {
         // only registers its consumers, and Encode does not affect their
         // per-model policy counts. Cloned contexts share these worker objects.
         if let Some(epd) = &router_config.epd {
+            policy_registry.set_encode_policy(epd.effective_encode_policy());
             let cb = router_config.effective_circuit_breaker_config();
             let circuit_breaker = CircuitBreakerConfig {
                 failure_threshold: cb.failure_threshold,
@@ -1381,6 +1382,46 @@ mod tests {
     use super::*;
 
     #[test]
+    fn context_initializes_independent_encode_policy_from_rust_and_json_configs() {
+        use crate::config::{EncodePolicy, EpdConfig, PolicyConfig, RoutingMode};
+        for policy in [
+            None,
+            Some(EncodePolicy::RoundRobin),
+            Some(EncodePolicy::Random),
+        ] {
+            let config = RouterConfig {
+                mode: RoutingMode::Regular {
+                    worker_urls: vec!["http://consumer:8000".into()],
+                },
+                policy: PolicyConfig::RendezvousHash,
+                epd: Some(EpdConfig {
+                    encoder_urls: vec!["http://encoder:8000".into()],
+                    encode_policy: policy,
+                    consumer_zmq_addrs: Default::default(),
+                }),
+                ..RouterConfig::default()
+            };
+            let restored = serde_json::from_value(serde_json::to_value(&config).unwrap()).unwrap();
+            for config in [config, restored] {
+                let context = AppContext::new(config, Client::new(), 64, None, vec![]).unwrap();
+                let registry = &context.policy_registry;
+                let expected = if policy == Some(EncodePolicy::Random) {
+                    "random"
+                } else {
+                    "round_robin"
+                };
+                assert_eq!(registry.get_encode_policy().name(), expected);
+                assert_eq!(registry.get_default_policy().name(), "rendezvous_hash");
+                assert!(!Arc::ptr_eq(
+                    &registry.get_encode_policy(),
+                    &registry.get_default_policy()
+                ));
+                assert!(registry.get_worker_counts().is_empty());
+            }
+        }
+    }
+
+    #[test]
     fn static_encoders_register_once_and_context_clones_preserve_state() {
         let config = RouterConfig {
             mode: crate::config::RoutingMode::Regular {
@@ -1391,6 +1432,7 @@ mod tests {
                     "http://encoder-a:8000".into(),
                     "https://encoder-b:8000".into(),
                 ],
+                encode_policy: None,
                 consumer_zmq_addrs: Default::default(),
             }),
             ..RouterConfig::default()
