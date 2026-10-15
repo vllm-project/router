@@ -4,6 +4,14 @@ use axum::http::HeaderMap;
 
 pub use crate::otel_http::TRACE_HEADER_NAMES;
 
+pub(super) fn allows_affinity_for_turn(headers: Option<&HeaderMap>) -> bool {
+    headers
+        .and_then(|headers| headers.get("x-session-turn"))
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u32>().ok())
+        .is_none_or(|turn| turn > 1)
+}
+
 /// Copy request headers to a Vec of name-value string pairs
 /// Used for forwarding headers to backend workers
 pub fn copy_request_headers(req: &Request<Body>) -> Vec<(String, String)> {
@@ -97,6 +105,54 @@ pub fn propagate_headers(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_turn_affinity_defaults_to_allowed_without_a_header() {
+        assert!(allows_affinity_for_turn(None));
+        assert!(allows_affinity_for_turn(Some(&HeaderMap::new())));
+    }
+
+    #[test]
+    fn session_turn_affinity_preserves_parse_boundaries() {
+        for (value, expected) in [
+            ("0", false),
+            ("1", false),
+            ("01", false),
+            ("+1", false),
+            ("2", true),
+            ("4294967295", true),
+            ("", true),
+            ("invalid", true),
+            ("-1", true),
+            ("4294967296", true),
+            (" 0", true),
+            ("1 ", true),
+            ("\t1", true),
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert("x-session-turn", value.parse().unwrap());
+            assert_eq!(
+                allows_affinity_for_turn(Some(&headers)),
+                expected,
+                "unexpected affinity gate for {value:?}"
+            );
+        }
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-session-turn",
+            axum::http::HeaderValue::from_bytes(b"\xff").unwrap(),
+        );
+        assert!(allows_affinity_for_turn(Some(&headers)));
+    }
+
+    #[test]
+    fn session_turn_affinity_uses_the_first_header_value() {
+        let mut headers = HeaderMap::new();
+        headers.append("x-session-turn", "1".parse().unwrap());
+        headers.append("x-session-turn", "2".parse().unwrap());
+        assert!(!allows_affinity_for_turn(Some(&headers)));
+    }
 
     #[test]
     fn test_preserve_repeated_set_cookie_headers() {

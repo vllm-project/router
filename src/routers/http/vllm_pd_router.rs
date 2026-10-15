@@ -4,12 +4,15 @@ use super::dp_utils;
 use super::logprobs_merge;
 use super::pd_router::PdRouterBase;
 use super::pd_types::{error_chain, PDRouterError};
+use super::router::RequestLoadGuard;
 use super::vllm_service_discovery::{MoriIOTransferMode, ServiceRegistry, ServiceType};
 use crate::config::KvConnector;
 use crate::core::{BasicWorker, Worker, WorkerType};
 use crate::metrics::RouterMetrics;
 use crate::otel_http::{self, ClientRequestOptions};
-use crate::policies::PolicyRegistry;
+use crate::policies::{PolicyRegistry, RequestTracker, RoutingContext};
+use crate::protocols::spec::{affinity_prompt_from_json, GenerationRequest};
+use crate::routers::header_utils::allows_affinity_for_turn;
 use crate::routers::{header_utils, RouterTrait, WorkerManagement};
 use async_trait::async_trait;
 use axum::{
@@ -795,7 +798,10 @@ impl VllmPDRouter {
             debug!("Logprobs requested and non-streaming - merging prefill and decode logprobs");
 
             let status = decode_response.status();
-            let resp_headers = decode_response.headers().clone();
+            let mut resp_headers = decode_response.headers().clone();
+            // JSON re-encoding changes the body length and framing.
+            resp_headers.remove(axum::http::header::CONTENT_LENGTH);
+            resp_headers.remove(axum::http::header::TRANSFER_ENCODING);
             let decode_body = decode_response
                 .bytes()
                 .await
@@ -1261,15 +1267,11 @@ impl VllmPDRouter {
         .await
     }
 
-    /// Two-stage request processing for vLLM disaggregated mode
-    ///
-    /// This function handles fine-grained load tracking: the prefill worker's load is only
-    /// incremented during the prefill phase, and the decode worker's load is only incremented
-    /// during the decode phase. This accurately reflects the sequential nature of PD disaggregation.
     async fn process_vllm_two_stage_request(
         &self,
         original_request: Value,
         prefill_worker: Arc<dyn Worker>,
+        mut prefill_tracker: Option<RequestTracker>,
         decode_worker: Arc<dyn Worker>,
         path: &str,
         headers: Option<&HeaderMap>,
@@ -1319,6 +1321,7 @@ impl VllmPDRouter {
                     prefill_request,
                     decode_request,
                     prefill_worker,
+                    prefill_tracker,
                     decode_worker,
                     request_id,
                     path,
@@ -1335,9 +1338,7 @@ impl VllmPDRouter {
             decode_worker.url(),
             path
         );
-
-        // Increment prefill load at the start of the prefill phase
-        prefill_worker.increment_load();
+        let prefill_load = RequestLoadGuard::new(prefill_worker.clone());
 
         let prefill_zmq_addr =
             self.get_zmq_address(prefill_worker.base_url(), ServiceType::Prefill);
@@ -1432,7 +1433,6 @@ impl VllmPDRouter {
         {
             Ok(resp) => resp,
             Err(e) => {
-                prefill_worker.decrement_load();
                 let full_error = error_chain(&e);
                 let duration = start_time.elapsed();
                 RouterMetrics::record_pd_prefill_error(&prefill_base_url);
@@ -1449,9 +1449,9 @@ impl VllmPDRouter {
             "📥 Prefill response headers: {:?}",
             prefill_response.headers()
         );
+        let prefill_succeeded = prefill_response.status().is_success();
 
         if !prefill_response.status().is_success() {
-            prefill_worker.decrement_load();
             let status = prefill_response.status();
             let content_type = prefill_response
                 .headers()
@@ -1481,7 +1481,6 @@ impl VllmPDRouter {
         let prefill_bytes = match prefill_response.bytes().await {
             Ok(bytes) => bytes,
             Err(e) => {
-                prefill_worker.decrement_load();
                 let full_error = error_chain(&e);
                 let duration = start_time.elapsed();
                 RouterMetrics::record_pd_prefill_error(&prefill_base_url);
@@ -1511,7 +1510,6 @@ impl VllmPDRouter {
         let prefill_response_json: Value = match serde_json::from_slice(&prefill_bytes) {
             Ok(json) => json,
             Err(e) => {
-                prefill_worker.decrement_load();
                 let duration = start_time.elapsed();
                 RouterMetrics::record_pd_prefill_error(&prefill_base_url);
                 RouterMetrics::record_pd_request(path);
@@ -1529,7 +1527,6 @@ impl VllmPDRouter {
                 .get("kv_transfer_params")
                 .is_some_and(Value::is_object)
         {
-            prefill_worker.decrement_load();
             self.stop_profiling(&prefill_base_url).await;
             let duration = start_time.elapsed();
             RouterMetrics::record_pd_prefill_error(&prefill_base_url);
@@ -1553,7 +1550,13 @@ impl VllmPDRouter {
         self.stop_profiling(&prefill_base_url).await;
 
         // Prefill phase complete: decrement prefill load, increment decode load
-        prefill_worker.decrement_load();
+        if prefill_succeeded {
+            if let Some(tracker) = &mut prefill_tracker {
+                tracker.on_first_token();
+            }
+        }
+        drop(prefill_tracker);
+        drop(prefill_load);
         decode_worker.increment_load();
 
         debug!("✅ vLLM Stage 1 completed, starting Stage 2 - Decode");
@@ -1806,6 +1809,7 @@ impl VllmPDRouter {
         prefill_request: Value,
         decode_request: Value,
         prefill_worker: Arc<dyn Worker>,
+        prefill_tracker: Option<RequestTracker>,
         decode_worker: Arc<dyn Worker>,
         request_id: String,
         path: &str,
@@ -1835,13 +1839,14 @@ impl VllmPDRouter {
             )
         };
 
-        prefill_worker.increment_load();
+        let prefill_load = RequestLoadGuard::new(prefill_worker.clone());
         decode_worker.increment_load();
         self.start_profiling(&prefill_base_url).await;
         self.start_profiling(&decode_base_url).await;
 
-        let (prefill_result, decode_result) = tokio::join!(
-            otel_http::send_client_request(
+        let prefill_future = async {
+            let mut prefill_tracker = prefill_tracker;
+            let response = otel_http::send_client_request(
                 stage_builder(&prefill_url, prefill_dp_rank).json(&prefill_request),
                 headers,
                 ClientRequestOptions {
@@ -1850,7 +1855,26 @@ impl VllmPDRouter {
                     route: Some(path),
                     request_phase: Some("prefill"),
                 },
-            ),
+            )
+            .await;
+            let result = match response {
+                Ok(resp) if resp.status().is_success() => Ok(Ok(resp
+                    .bytes()
+                    .await
+                    .ok()
+                    .and_then(|b| serde_json::from_slice::<Value>(&b).ok()))),
+                Ok(resp) => Ok(Err(resp)),
+                Err(error) => Err(error),
+            };
+            if matches!(&result, Ok(Ok(Some(_)))) {
+                if let Some(tracker) = &mut prefill_tracker {
+                    tracker.on_first_token();
+                }
+            }
+            result
+        };
+        let (prefill_result, decode_result) = tokio::join!(
+            prefill_future,
             otel_http::send_client_request(
                 stage_builder(&decode_url, decode_dp_rank).json(&decode_request),
                 headers,
@@ -1862,17 +1886,14 @@ impl VllmPDRouter {
                 },
             ),
         );
+        drop(prefill_load);
 
-        prefill_worker.decrement_load();
         self.stop_profiling(&prefill_base_url).await;
 
         let prefill_response_json = match prefill_result {
-            Ok(resp) if resp.status().is_success() => resp
-                .bytes()
-                .await
-                .ok()
-                .and_then(|b| serde_json::from_slice::<Value>(&b).ok()),
-            Ok(resp) => {
+            Ok(Ok(json)) => json,
+            Ok(Err(resp)) => {
+                let status = resp.status();
                 decode_worker.decrement_load();
                 self.stop_profiling(&decode_base_url).await;
                 RouterMetrics::record_pd_prefill_error(&prefill_base_url);
@@ -1893,8 +1914,7 @@ impl VllmPDRouter {
                 return Err(PDRouterError::NetworkError {
                     message: format!(
                         "Prefill request failed to {} with status {}",
-                        prefill_url,
-                        resp.status()
+                        prefill_url, status
                     ),
                 });
             }
@@ -2356,10 +2376,21 @@ impl RouterTrait for VllmPDRouter {
             let prefill_policy = self.policy_registry.get_prefill_policy();
             let decode_policy = self.policy_registry.get_decode_policy();
 
-            let prefill_idx = match prefill_policy.select_worker_with_headers(
+            let prompt = prefill_policy
+                .needs_affinity_prompt()
+                .then(|| body.extract_affinity_prompt())
+                .flatten();
+            let context = RoutingContext {
+                prompt: prompt.as_ref(),
+                allow_affinity: body.allows_cache_affinity() && allows_affinity_for_turn(headers),
+                colocated: false,
+                route: "/v1/chat/completions",
+            };
+            let (prefill_idx, prefill_tracker) = match prefill_policy.select_request(
                 &prefill_workers,
                 request_str,
                 request_headers.as_ref(),
+                &context,
             ) {
                 Some(idx) => idx,
                 None => {
@@ -2406,6 +2437,7 @@ impl RouterTrait for VllmPDRouter {
                 .process_vllm_two_stage_request(
                     request_json,
                     prefill_worker.clone(),
+                    prefill_tracker,
                     decode_worker.clone(),
                     "/v1/chat/completions",
                     headers,
@@ -2527,10 +2559,21 @@ impl RouterTrait for VllmPDRouter {
             let prefill_policy = self.policy_registry.get_prefill_policy();
             let decode_policy = self.policy_registry.get_decode_policy();
 
-            let prefill_idx = match prefill_policy.select_worker_with_headers(
+            let prompt = prefill_policy
+                .needs_affinity_prompt()
+                .then(|| body.extract_affinity_prompt())
+                .flatten();
+            let context = RoutingContext {
+                prompt: prompt.as_ref(),
+                allow_affinity: body.allows_cache_affinity() && allows_affinity_for_turn(headers),
+                colocated: false,
+                route: "/v1/completions",
+            };
+            let (prefill_idx, prefill_tracker) = match prefill_policy.select_request(
                 &prefill_workers,
                 request_str,
                 request_headers.as_ref(),
+                &context,
             ) {
                 Some(idx) => idx,
                 None => {
@@ -2577,6 +2620,7 @@ impl RouterTrait for VllmPDRouter {
                 .process_vllm_two_stage_request(
                     request_json,
                     prefill_worker.clone(),
+                    prefill_tracker,
                     decode_worker.clone(),
                     "/v1/completions",
                     headers,
@@ -2749,10 +2793,22 @@ impl RouterTrait for VllmPDRouter {
             let prefill_policy = self.policy_registry.get_prefill_policy();
             let decode_policy = self.policy_registry.get_decode_policy();
 
-            let prefill_idx = match prefill_policy.select_worker_with_headers(
+            let affinity = prefill_policy
+                .needs_affinity_prompt()
+                .then(|| affinity_prompt_from_json(path, &request_json))
+                .flatten();
+            let context = RoutingContext {
+                prompt: affinity.as_ref().map(|(prompt, _)| prompt),
+                allow_affinity: affinity.as_ref().is_some_and(|(_, gate)| *gate)
+                    && allows_affinity_for_turn(headers),
+                colocated: false,
+                route: path,
+            };
+            let (prefill_idx, prefill_tracker) = match prefill_policy.select_request(
                 &prefill_workers,
                 request_str,
                 request_headers.as_ref(),
+                &context,
             ) {
                 Some(idx) => idx,
                 None => {
@@ -2795,6 +2851,7 @@ impl RouterTrait for VllmPDRouter {
                 .process_vllm_two_stage_request(
                     request_json,
                     prefill_worker.clone(),
+                    prefill_tracker,
                     decode_worker.clone(),
                     path,
                     headers,

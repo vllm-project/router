@@ -252,21 +252,13 @@ impl RouterManager {
         &self,
         url: &str,
     ) -> Result<WorkerApiResponse, WorkerErrorResponse> {
-        // Get worker to extract model_id before removing
-        let model_id = self
-            .worker_registry
-            .get_by_url(url)
-            .map(|worker| worker.model_id().to_string());
-
-        if let Some(_worker) = self.worker_registry.remove_by_url(url) {
-            // Notify PolicyRegistry about worker removal
-            if let Some(ref model_id) = model_id {
-                self.policy_registry.on_worker_removed(model_id);
-
-                info!("Removed worker with URL {} for model {}", url, model_id);
-            } else {
-                info!("Removed worker with URL {}", url);
-            }
+        if let Some(worker) = self.worker_registry.remove_by_url(url) {
+            self.policy_registry.notify_worker_removed(&worker);
+            info!(
+                "Removed worker with URL {} for model {}",
+                url,
+                worker.model_id()
+            );
 
             Ok(WorkerApiResponse {
                 success: true,
@@ -832,5 +824,71 @@ impl std::fmt::Debug for RouterManager {
             .field("workers_count", &self.worker_registry.get_all().len())
             .field("default_router", &*self.default_router.read().unwrap())
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::BasicWorker;
+    use crate::policies::{CacheAwareCandidate, CacheAwarePolicy, PolicyRegistry};
+
+    #[test]
+    fn worker_removal_clears_default_and_last_model_policy_state() {
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        let policy_registry = Arc::new(PolicyRegistry::new(
+            crate::config::PolicyConfig::CacheAware {
+                cache_threshold: 0.5,
+                balance_abs_threshold: 32,
+                balance_rel_threshold: 1.1,
+                eviction_interval_secs: 0,
+                max_tree_size: 1000,
+            },
+        ));
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+            "http://removed-manager".into(),
+            WorkerType::Regular,
+        ));
+        worker_registry.register(worker.clone());
+        let model_policy = policy_registry.on_worker_added(worker.model_id(), Some("cache_aware"));
+        let default_policy = policy_registry.get_default_policy();
+        for policy in [&default_policy, &model_policy] {
+            policy
+                .as_any()
+                .downcast_ref::<CacheAwarePolicy>()
+                .unwrap()
+                .commit_placement(worker.model_id(), "shared history", worker.url());
+        }
+        let manager = RouterManager::new(
+            RouterConfig::default(),
+            reqwest::Client::new(),
+            worker_registry,
+            policy_registry.clone(),
+        );
+
+        assert!(
+            manager
+                .remove_worker_from_registry(worker.url())
+                .unwrap()
+                .success
+        );
+
+        assert!(policy_registry.get_policy(worker.model_id()).is_none());
+        for policy in [default_policy, model_policy] {
+            let placement = policy
+                .as_any()
+                .downcast_ref::<CacheAwarePolicy>()
+                .unwrap()
+                .evaluate_initial_placement(
+                    worker.model_id(),
+                    "shared history",
+                    &[CacheAwareCandidate {
+                        target_id: worker.url(),
+                        kv_pressure: 0.0,
+                    }],
+                )
+                .unwrap();
+            assert_eq!(placement.match_rate, 0.0);
+        }
     }
 }

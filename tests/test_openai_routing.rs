@@ -361,32 +361,41 @@ async fn test_openai_router_chat_streaming_with_mock() {
 /// Test circuit breaker functionality
 #[tokio::test]
 async fn test_openai_router_circuit_breaker() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        while let Ok((connection, _)) = listener.accept().await {
+            drop(connection);
+        }
+    });
     // Create router with circuit breaker config
     let cb_config = vllm_router_rs::config::CircuitBreakerConfig {
         failure_threshold: 2,
         success_threshold: 1,
-        timeout_duration_secs: 1,
+        timeout_duration_secs: 60,
         window_duration_secs: 10,
     };
 
-    let router = OpenAIRouter::new(
-        "http://invalid-url-that-will-fail".to_string(),
-        Some(cb_config),
-    )
-    .await
-    .unwrap();
+    let router = OpenAIRouter::new(base_url, Some(cb_config)).await.unwrap();
 
     let chat_request = create_minimal_chat_request();
 
     // First few requests should fail and record failures
-    for _ in 0..3 {
+    for _ in 0..2 {
         let response = router.route_chat(None, &chat_request, None).await;
-        // Should get either an error or circuit breaker response
-        assert!(
-            response.status() == StatusCode::INTERNAL_SERVER_ERROR
-                || response.status() == StatusCode::SERVICE_UNAVAILABLE
-        );
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&body).starts_with("Failed to contact upstream:"));
     }
+    let response = router.route_chat(None, &chat_request, None).await;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = axum::body::to_bytes(response.into_body(), 4096)
+        .await
+        .unwrap();
+    assert_eq!(body, "Circuit breaker open");
+    server.abort();
 }
 
 /// Test that Authorization header is forwarded in /v1/models

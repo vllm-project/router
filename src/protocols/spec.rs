@@ -288,6 +288,48 @@ impl UserMessageContent {
     }
 }
 
+fn tool_content_is_text_only(content: &Value, is_content_part: bool) -> bool {
+    match content {
+        Value::Array(parts) => parts
+            .iter()
+            .all(|part| tool_content_is_text_only(part, is_content_part)),
+        Value::Object(object) => {
+            if let Some(kind) = object.get("type") {
+                if is_content_part
+                    && (kind.as_str() != Some("text")
+                        || !object.get("text").is_some_and(Value::is_string))
+                {
+                    return false;
+                }
+                if matches!(
+                    kind.as_str(),
+                    Some(
+                        "image_url"
+                            | "image_embeds"
+                            | "audio_embeds"
+                            | "video_embeds"
+                            | "input_image"
+                            | "input_audio"
+                            | "audio"
+                            | "image"
+                            | "video"
+                            | "video_url"
+                            | "input_video"
+                            | "file"
+                            | "input_file"
+                    )
+                ) {
+                    return false;
+                }
+            }
+            object
+                .iter()
+                .all(|(key, value)| tool_content_is_text_only(value, key == "content"))
+        }
+        _ => true,
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "type")]
 pub enum ContentPart {
@@ -295,6 +337,9 @@ pub enum ContentPart {
     Text { text: String },
     #[serde(rename = "image_url")]
     ImageUrl { image_url: ImageUrl },
+    // Preserve unsupported parts for native HTTP forwarding, not text affinity.
+    #[serde(untagged)]
+    Other(Value),
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -568,6 +613,60 @@ impl GenerationRequest for ChatCompletionRequest {
             .filter(|session_id| !session_id.trim().is_empty())
             .unwrap_or_default()
             .to_string()
+    }
+    fn extract_affinity_prompt(&self) -> Option<RoutingPrompt> {
+        let mut text = Vec::new();
+        // Stable static metadata precedes messages, so appending a turn preserves prefixes.
+        if let Some(tools) = &self.tools {
+            text.extend_from_slice(b"tools:");
+            serde_json::to_writer(&mut text, tools).ok()?;
+            text.push(b'\n');
+        }
+        if let Some(functions) = &self.functions {
+            text.extend_from_slice(b"functions:");
+            serde_json::to_writer(&mut text, functions).ok()?;
+            text.push(b'\n');
+        }
+        let mut chars = std::str::from_utf8(&text).ok()?.chars().count();
+        let mut est_hit_chars = 0;
+        for message in &self.messages {
+            let content = match message {
+                ChatMessage::System { content, .. } | ChatMessage::User { content, .. } => {
+                    Some(content)
+                }
+                ChatMessage::Assistant { content, .. } => content.as_ref(),
+                ChatMessage::Other(_) => return None,
+                ChatMessage::Tool { content, .. }
+                    if !tool_content_is_text_only(content, content.is_array()) =>
+                {
+                    return None;
+                }
+                _ => None,
+            };
+            if content.is_some_and(|content| {
+                matches!(content, UserMessageContent::Parts(parts)
+            if parts.iter().any(|part| !matches!(part, ContentPart::Text { .. })))
+            }) {
+                return None; // No text-only approximation for multimodal input.
+            }
+            let start = text.len();
+            serde_json::to_writer(&mut text, message).ok()?;
+            text.push(b'\n');
+            chars += std::str::from_utf8(&text[start..]).ok()?.chars().count();
+            if matches!(message, ChatMessage::Assistant { .. }) {
+                est_hit_chars = chars;
+            }
+        }
+        Some(RoutingPrompt {
+            text: String::from_utf8(text).ok()?,
+            est_hit_chars,
+        })
+    }
+
+    fn allows_cache_affinity(&self) -> bool {
+        self.messages
+            .iter()
+            .any(|m| matches!(m, ChatMessage::Assistant { .. }))
     }
 
     fn extract_text_for_program_scheduling(&self) -> String {
@@ -887,6 +986,20 @@ impl GenerationRequest for CompletionRequest {
 
     fn extract_text_for_routing(&self) -> String {
         self.prompt.extract_text_for_routing()
+    }
+    fn extract_affinity_prompt(&self) -> Option<RoutingPrompt> {
+        match &self.prompt {
+            PromptInput::String(text) => Some(RoutingPrompt {
+                text: text.clone(),
+                est_hit_chars: text.chars().count(),
+            }),
+            _ => None,
+        }
+    }
+
+    fn allows_cache_affinity(&self) -> bool {
+        // Completion lacks a structured turn boundary; still check cache and TTFT.
+        true
     }
 
     fn extract_program_identity_payload(&self) -> Option<serde_json::Value> {
@@ -2408,6 +2521,30 @@ pub fn default_true() -> bool {
     true
 }
 
+/// Text-only affinity input with the historical boundary at the last assistant turn.
+pub struct RoutingPrompt {
+    pub text: String,
+    pub est_hit_chars: usize,
+}
+
+/// Extract optional affinity metadata without cloning an intermediate JSON value.
+pub fn affinity_prompt_from_json(route: &str, body: &Value) -> Option<(RoutingPrompt, bool)> {
+    fn extract<T: GenerationRequest + for<'de> Deserialize<'de>>(
+        body: &Value,
+    ) -> Option<(RoutingPrompt, bool)> {
+        let request = T::deserialize(body).ok()?;
+        Some((
+            request.extract_affinity_prompt()?,
+            request.allows_cache_affinity(),
+        ))
+    }
+    match route {
+        "/v1/chat/completions" => extract::<ChatCompletionRequest>(body),
+        "/v1/completions" => extract::<CompletionRequest>(body),
+        _ => None,
+    }
+}
+
 /// Common trait for all generation requests across different APIs
 pub trait GenerationRequest: Send + Sync {
     /// Check if the request is for streaming
@@ -2418,6 +2555,14 @@ pub trait GenerationRequest: Send + Sync {
 
     /// Extract text content for routing decisions
     fn extract_text_for_routing(&self) -> String;
+    /// Return a text prompt and historical prefix length; multimodal and token-ID inputs are unsupported.
+    fn extract_affinity_prompt(&self) -> Option<RoutingPrompt> {
+        None
+    }
+
+    fn allows_cache_affinity(&self) -> bool {
+        false
+    }
 
     /// Extract prompt content used only by opted-in Program scheduling.
     fn extract_text_for_program_scheduling(&self) -> String {
@@ -2600,6 +2745,164 @@ mod tests {
         assert!(payload.get("prompt").is_none());
         assert!(payload.get("messages").is_none());
     }
+
+    #[test]
+    fn smetric_chat_history_is_an_append_only_prefix() {
+        let history: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "m", "messages": [
+                {"role": "user", "content": "你好"},
+                {"role": "assistant", "content": "hello"}
+            ]
+        }))
+        .unwrap();
+        let full: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "m", "messages": [
+                {"role": "user", "content": "你好"},
+                {"role": "assistant", "content": "hello"},
+                {"role": "user", "content": "next"}
+            ]
+        }))
+        .unwrap();
+        let history_text = history.extract_affinity_prompt().unwrap().text;
+        let prompt = full.extract_affinity_prompt().unwrap();
+        assert!(prompt.text.starts_with(&history_text));
+        assert_eq!(prompt.est_hit_chars, history_text.chars().count());
+        assert!(full.allows_cache_affinity());
+    }
+
+    #[test]
+    fn smetric_unknown_chat_parts_do_not_enable_affinity() {
+        let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "prefix"},
+                    {"type": "input_audio", "input_audio": {"data": "AQID", "format": "wav"}}
+                ]
+            }]
+        }))
+        .unwrap();
+        assert!(request.extract_affinity_prompt().is_none());
+    }
+
+    #[test]
+    fn smetric_unknown_roles_preserve_forwarding_without_affinity() {
+        for content in [
+            serde_json::json!("Model-specific instructions"),
+            serde_json::json!([
+                {"type": "text", "text": "prefix"},
+                {"type": "input_audio", "input_audio": {"data": "AQID", "format": "wav"}}
+            ]),
+        ] {
+            let body = serde_json::json!({
+                "messages": [
+                    {"role": "assistant", "content": "previous completion"},
+                    {"role": "developer", "content": content, "metadata": {"priority": 1}}
+                ]
+            });
+            assert!(affinity_prompt_from_json("/v1/chat/completions", &body).is_none());
+            let request: ChatCompletionRequest = serde_json::from_value(body.clone()).unwrap();
+            assert_eq!(
+                serde_json::to_value(request).unwrap()["messages"],
+                body["messages"]
+            );
+        }
+    }
+
+    #[test]
+    fn smetric_tool_media_parts_do_not_enable_affinity() {
+        for content in [
+            serde_json::json!([
+                {"type": "text", "text": "tool result"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AQID"}}
+            ]),
+            serde_json::json!([
+                {"type": "input_audio", "input_audio": {"data": "AQID", "format": "wav"}}
+            ]),
+            serde_json::json!([
+                {"type": "future_media", "payload": "AQID"}
+            ]),
+        ] {
+            let body = serde_json::json!({
+                "messages": [
+                    {"role": "assistant", "content": "previous completion"},
+                    {"role": "tool", "tool_call_id": "call_1", "content": content}
+                ]
+            });
+            assert!(
+                affinity_prompt_from_json("/v1/chat/completions", &body).is_none(),
+                "unexpected affinity for {}",
+                body["messages"][1]["content"]
+            );
+            let request: ChatCompletionRequest = serde_json::from_value(body.clone()).unwrap();
+            assert_eq!(
+                serde_json::to_value(request).unwrap()["messages"],
+                body["messages"]
+            );
+        }
+    }
+
+    #[test]
+    fn smetric_tool_nested_media_does_not_enable_affinity() {
+        for content in [
+            serde_json::json!({"type": "image_embeds", "image_embeds": {"image_grid_thw": [1, 2, 3]}}),
+            serde_json::json!({"type": "audio_embeds", "audio_embeds": {"length": 128}}),
+            serde_json::json!({"type": "video_embeds", "video_embeds": {"frames": 4}}),
+            serde_json::json!({
+                "type": "image_url", "image_url": {"url": "https://example.com/image.png"}
+            }),
+            serde_json::json!({
+                "result": {"content": [
+                    {"type": "text", "text": "tool result"},
+                    {"type": "input_audio", "input_audio": {"data": "AQID", "format": "wav"}}
+                ]}
+            }),
+            serde_json::json!({
+                "result": {"content": [{"type": "future_media", "payload": "AQID"}]}
+            }),
+            serde_json::json!([
+                [{"type": "image_url", "image_url": {"url": "https://example.com/image.png"}}]
+            ]),
+        ] {
+            let body = serde_json::json!({
+                "messages": [{"role": "tool", "tool_call_id": "call_1", "content": content}]
+            });
+            assert!(
+                affinity_prompt_from_json("/v1/chat/completions", &body).is_none(),
+                "unexpected affinity for {}",
+                body["messages"][0]["content"]
+            );
+        }
+    }
+
+    #[test]
+    fn smetric_tool_text_and_business_json_preserve_affinity() {
+        for content in [
+            serde_json::json!("tool result"),
+            serde_json::json!([{ "type": "text", "text": "tool result" }]),
+            serde_json::json!({
+                "type": "invoice", "total": 21,
+                "items": [{"type": "product", "name": "image_url"}],
+                "image_url": "https://example.com/product.png"
+            }),
+            serde_json::json!({"result": {"content": [{"type": "text", "text": "tool result"}]}}),
+        ] {
+            let body = serde_json::json!({
+                "messages": [
+                    {"role": "assistant", "content": "previous completion"},
+                    {"role": "tool", "tool_call_id": "call_1", "content": content}
+                ]
+            });
+            let (prompt, cache_affinity) =
+                affinity_prompt_from_json("/v1/chat/completions", &body).unwrap();
+            assert!(cache_affinity);
+            assert_eq!(prompt.est_hit_chars, 53);
+            let tool_message: Value =
+                serde_json::from_str(prompt.text.lines().nth(1).unwrap()).unwrap();
+            assert_eq!(tool_message["content"], body["messages"][1]["content"]);
+        }
+    }
+
     use serde_json;
 
     // ==================================================================

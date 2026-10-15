@@ -1,3 +1,4 @@
+use super::first_token::{FirstTokenObserver, Observation};
 use super::program_adapter::ProgramCompletion;
 use crate::config::types::RetryConfig;
 use crate::core::{
@@ -6,14 +7,15 @@ use crate::core::{
 };
 use crate::metrics::RouterMetrics;
 use crate::otel_http::{self, ClientRequestOptions};
-use crate::policies::{LoadBalancingPolicy, PolicyRegistry};
+use crate::policies::{LoadBalancingPolicy, PolicyRegistry, RequestTracker, RoutingContext};
 use crate::program_scheduling::{
     BackendObservationProvider, ProgramIdentity, ProgramScheduler, ProgramSchedulerConfig,
     ProgramTarget, ScheduleError, VllmMetricsObservationProvider,
 };
 use crate::protocols::spec::{
-    ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest, GenerationRequest,
-    InferenceGenerateRequest, RerankRequest, RerankResponse, RerankResult, ResponsesRequest,
+    affinity_prompt_from_json, ChatCompletionRequest, CompletionRequest, EmbeddingRequest,
+    GenerateRequest, GenerationRequest, InferenceGenerateRequest, RerankRequest, RerankResponse,
+    RerankResult, ResponsesRequest,
 };
 use crate::routers::header_utils;
 use crate::routers::http::dp_utils;
@@ -68,31 +70,60 @@ fn emit_http_first_sse<E>(
     let _ = tx.send(Ok(bytes::Bytes::from(comment)));
 }
 
-struct LoadTrackedBody {
-    inner: Pin<
-        Box<dyn futures_util::Stream<Item = Result<bytes::Bytes, axum::Error>> + Send + 'static>,
-    >,
-    worker: Option<Arc<dyn Worker>>,
-    producer_abort: Option<tokio::task::AbortHandle>,
+pub(super) struct RequestLoadGuard(Arc<dyn Worker>);
+
+impl RequestLoadGuard {
+    pub(super) fn new(worker: Arc<dyn Worker>) -> Self {
+        worker.increment_load();
+        RouterMetrics::set_running_requests(worker.url(), worker.load());
+        Self(worker)
+    }
 }
 
-impl LoadTrackedBody {
-    fn release(&mut self) {
-        if let Some(worker) = self.worker.take() {
-            worker.decrement_load();
-            RouterMetrics::set_running_requests(worker.url(), worker.load());
-        }
+impl Drop for RequestLoadGuard {
+    fn drop(&mut self) {
+        self.0.decrement_load();
+        RouterMetrics::set_running_requests(self.0.url(), self.0.load());
     }
+}
+
+struct LoadTrackedBody {
+    inner: axum::body::BodyDataStream,
+    load: Option<RequestLoadGuard>,
+    producer_abort: Option<tokio::task::AbortHandle>,
+    tracker: Option<RequestTracker>,
+    observe_first_token: bool,
+    first_token: FirstTokenObserver,
 }
 
 impl futures_util::Stream for LoadTrackedBody {
     type Item = Result<bytes::Bytes, axum::Error>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let item = self.inner.as_mut().poll_next(cx);
-        if matches!(item, Poll::Ready(None)) {
-            self.release();
-            self.producer_abort.take();
+        let item = self.inner.poll_next_unpin(cx);
+        if self.observe_first_token && self.tracker.is_some() {
+            if let Poll::Ready(Some(Ok(bytes))) = &item {
+                match self.first_token.observe(bytes) {
+                    Observation::Output => {
+                        if let Some(mut tracker) = self.tracker.take() {
+                            tracker.on_first_token();
+                        }
+                    }
+                    Observation::End => {
+                        self.tracker.take();
+                    }
+                    Observation::Pending => {}
+                }
+            }
+        }
+        if matches!(&item, Poll::Ready(None) | Poll::Ready(Some(Err(_)))) {
+            self.load.take();
+            self.tracker.take();
+            if let Some(abort) = self.producer_abort.take() {
+                if matches!(&item, Poll::Ready(Some(Err(_)))) {
+                    abort.abort();
+                }
+            }
         }
         item
     }
@@ -103,31 +134,37 @@ impl Drop for LoadTrackedBody {
         if let Some(abort) = self.producer_abort.take() {
             abort.abort();
         }
-        self.release();
     }
 }
 
-fn hold_load_until_body_done(mut response: Response, worker: Arc<dyn Worker>) -> Response {
+fn hold_load_until_body_done(
+    mut response: Response,
+    load: Option<RequestLoadGuard>,
+    tracker: Option<RequestTracker>,
+    observe_first_token: bool,
+) -> Response {
     let producer = response
         .extensions_mut()
         .remove::<crate::backend::grpc::GrpcStreamTask>()
         .and_then(|task| task.take());
     let producer_abort = producer.as_ref().map(tokio::task::JoinHandle::abort_handle);
-    let fallback_worker = if let Some(producer) = producer {
+    let load = if let Some(producer) = producer {
         tokio::spawn(async move {
             let _ = producer.await;
-            worker.decrement_load();
-            RouterMetrics::set_running_requests(worker.url(), worker.load());
+            drop(load);
         });
         None
     } else {
-        Some(worker)
+        load
     };
     let (parts, body) = response.into_parts();
     let stream = LoadTrackedBody {
-        inner: Box::pin(body.into_data_stream()),
-        worker: fallback_worker,
+        inner: body.into_data_stream(),
+        load,
         producer_abort,
+        tracker,
+        observe_first_token,
+        first_token: FirstTokenObserver::default(),
     };
     Response::from_parts(parts, Body::from_stream(stream))
 }
@@ -137,8 +174,9 @@ struct TypedDispatch<'a> {
     route: &'a str,
     worker_url: &'a str,
     is_stream: bool,
-    load_incremented: bool,
+    load: Option<RequestLoadGuard>,
     prepared: Option<crate::backend::PreparedChat>,
+    tracker: Option<RequestTracker>,
 }
 
 /// Regular router that uses injected load balancing policies
@@ -1008,9 +1046,11 @@ impl Router {
     fn select_worker_for_model(
         &self,
         model_id: Option<&str>,
-        text: Option<&str>,
+        request_text: Option<&str>,
+        context: &RoutingContext<'_>,
         headers: Option<&HeaderMap>,
-    ) -> Option<Arc<dyn Worker>> {
+        policy: &dyn LoadBalancingPolicy,
+    ) -> Option<(Arc<dyn Worker>, Option<RequestTracker>)> {
         // Get workers for the specified model (O(1) lookup if model_id is provided)
         let workers = match model_id {
             Some(model) => self.worker_registry.get_by_model_fast(model),
@@ -1026,17 +1066,12 @@ impl Router {
             return None;
         }
 
-        // Get the appropriate policy for this model
-        let policy = match model_id {
-            Some(model) => self.policy_registry.get_policy_or_default(model),
-            None => self.policy_registry.get_default_policy(),
-        };
-
         // Convert headers for policies that need them (e.g., consistent_hash)
         let request_headers = Self::headers_to_request_headers(headers);
 
-        let idx = policy.select_worker_with_headers(&available, text, request_headers.as_ref())?;
-        Some(available[idx].clone())
+        let (idx, tracker) =
+            policy.select_request(&available, request_text, request_headers.as_ref(), context)?;
+        Some((available[idx].clone(), tracker))
     }
 
     pub async fn route_typed_request<T: GenerationRequest + serde::Serialize + Clone>(
@@ -1092,7 +1127,27 @@ impl Router {
             None
         };
 
-        let text = typed_req.extract_text_for_routing();
+        let policy = match model_id {
+            Some(model) => self.policy_registry.get_policy_or_default(model),
+            None => self.policy_registry.get_default_policy(),
+        };
+        let prompt = policy
+            .needs_affinity_prompt()
+            .then(|| typed_req.extract_affinity_prompt())
+            .flatten();
+        let turn_gate =
+            typed_req.allows_cache_affinity() && header_utils::allows_affinity_for_turn(headers);
+        let text = if policy.needs_affinity_prompt() {
+            String::new()
+        } else {
+            typed_req.extract_text_for_routing()
+        };
+        let context = RoutingContext {
+            prompt: prompt.as_ref(),
+            allow_affinity: turn_gate,
+            colocated: true,
+            route,
+        };
 
         let response = RetryExecutor::execute_response_with_retry(
             &self.retry_config,
@@ -1111,7 +1166,7 @@ impl Router {
                 let forced_worker_url = program_completion
                     .as_ref()
                     .map(|completion| completion.dispatch().target_id.as_str());
-                let selected_worker = if let Some(target) = forced_worker_url {
+                let selected = if let Some(target) = forced_worker_url {
                     let worker = self
                         .worker_registry
                         .get_by_url(target)
@@ -1119,11 +1174,29 @@ impl Router {
                     let Some(worker) = worker else {
                         return Self::program_target_unavailable_response(route);
                     };
-                    Some(worker)
+                    if policy.needs_affinity_prompt() {
+                        let request_headers = Self::headers_to_request_headers(headers);
+                        policy
+                            .select_request(
+                                std::slice::from_ref(&worker),
+                                Some(&text),
+                                request_headers.as_ref(),
+                                &context,
+                            )
+                            .map(|(_, tracker)| (worker, tracker))
+                    } else {
+                        Some((worker, None))
+                    }
                 } else {
-                    self.select_worker_for_model(model_id, Some(&text), headers)
+                    self.select_worker_for_model(
+                        model_id,
+                        Some(&text),
+                        &context,
+                        headers,
+                        policy.as_ref(),
+                    )
                 };
-                let worker = match selected_worker {
+                let (worker, tracker) = match selected {
                     Some(w) => w,
                     None => {
                         RouterMetrics::record_request_error(route, "no_available_workers");
@@ -1135,28 +1208,8 @@ impl Router {
                     }
                 };
 
-                // Optional load tracking for cache-aware policy
-                // Get the policy for this model to check if it's cache-aware
-                let policy = match model_id {
-                    Some(model) => self.policy_registry.get_policy_or_default(model),
-                    None => self.policy_registry.get_default_policy(),
-                };
-
-                let load_incremented =
-                    if policy.name() == "cache_aware" || program_completion.is_some() {
-                        worker.increment_load();
-                        RouterMetrics::set_running_requests(worker.url(), worker.load());
-                        true
-                    } else {
-                        false
-                    };
-
-                // Keep a clone for potential cleanup on retry
-                let worker_for_cleanup = if load_incremented {
-                    Some(worker.clone())
-                } else {
-                    None
-                };
+                let load = (policy.tracks_load() || program_completion.is_some())
+                    .then(|| RequestLoadGuard::new(worker.clone()));
 
                 let response = self
                     .send_typed_request(
@@ -1166,8 +1219,9 @@ impl Router {
                             route,
                             worker_url: worker.url(),
                             is_stream,
-                            load_incremented,
+                            load,
                             prepared: prepared.clone(),
+                            tracker,
                         },
                         program_completion.clone(),
                     )
@@ -1180,18 +1234,6 @@ impl Router {
                 worker.record_outcome(status.is_success() || status.is_client_error());
                 if was_available != worker.is_available() {
                     self.worker_registry.notify_worker_state_change();
-                }
-
-                // For retryable failures, we need to decrement load since send_typed_request
-                // won't have done it (it only decrements on success or non-retryable failures)
-                if is_retryable_status(response.status()) && load_incremented {
-                    if let Some(cleanup_worker) = worker_for_cleanup {
-                        cleanup_worker.decrement_load();
-                        RouterMetrics::set_running_requests(
-                            cleanup_worker.url(),
-                            cleanup_worker.load(),
-                        );
-                    }
                 }
 
                 response
@@ -1356,8 +1398,9 @@ impl Router {
             route,
             worker_url,
             is_stream,
-            load_incremented,
+            load,
             prepared,
+            tracker,
         } = dispatch;
         if crate::backend::is_grpc_url(worker_url) {
             // gRPC workers are chat-only in this milestone. Reject unsupported
@@ -1378,17 +1421,9 @@ impl Router {
                     .into_response();
             };
             let mut response = self.frontend.dispatch(worker_url, prepared).await;
-            if load_incremented
-                && (response.status().is_success() || !is_retryable_status(response.status()))
+            if is_stream && response.status().is_success() && (load.is_some() || tracker.is_some())
             {
-                if let Some(worker) = self.worker_registry.get_by_url(worker_url) {
-                    if is_stream && response.status().is_success() {
-                        response = hold_load_until_body_done(response, worker);
-                    } else {
-                        worker.decrement_load();
-                        RouterMetrics::set_running_requests(worker_url, worker.load());
-                    }
-                }
+                response = hold_load_until_body_done(response, load, tracker, true);
             }
             if let Some(completion) = &program_completion {
                 completion.finish(response.status().is_success());
@@ -1484,14 +1519,6 @@ impl Router {
                     worker_url, route, e
                 );
 
-                // Decrement load on error if it was incremented
-                if load_incremented {
-                    if let Some(worker) = self.worker_registry.get_by_url(worker_url) {
-                        worker.decrement_load();
-                        RouterMetrics::set_running_requests(worker_url, worker.load());
-                    }
-                }
-
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     format!("Request failed: {}", e),
@@ -1525,36 +1552,17 @@ impl Router {
                     response
                 }
                 Err(e) => {
-                    // IMPORTANT: Decrement load on error before returning
-                    if load_incremented {
-                        if let Some(worker) = self.worker_registry.get_by_url(worker_url) {
-                            worker.decrement_load();
-                            RouterMetrics::set_running_requests(worker_url, worker.load());
-                        }
-                    }
-
                     let error_msg = format!("Failed to get response body: {}", e);
                     (StatusCode::INTERNAL_SERVER_ERROR, error_msg).into_response()
                 }
             };
-
-            // Decrement load counter for non-streaming requests if it was incremented
-            if load_incremented {
-                if let Some(worker) = self.worker_registry.get_by_url(worker_url) {
-                    worker.decrement_load();
-                    RouterMetrics::set_running_requests(worker_url, worker.load());
-                }
-            }
 
             if let Some(completion) = &program_completion {
                 completion.finish(response.status().is_success());
             }
 
             response
-        } else if load_incremented {
-            // For streaming with load tracking, we need to manually decrement when done
-            let registry = Arc::clone(&self.worker_registry);
-            let worker_url = worker_url.to_string();
+        } else {
             let completion = if status.is_success() {
                 program_completion
             } else {
@@ -1572,16 +1580,35 @@ impl Router {
 
             let stream = res.bytes_stream();
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            let tracker = if status.is_success() { tracker } else { None };
 
             // Spawn task to forward stream and detect completion
             tokio::spawn(async move {
+                let mut tracker = tracker;
+                let mut first_token = FirstTokenObserver::default();
                 let mut stream = stream;
-                let mut decremented = false;
+                let mut load = load;
                 let mut first_sse = true;
                 let mut stream_succeeded = true;
-                while let Some(chunk) = stream.next().await {
+                while let Some(chunk) = tokio::select! {
+                    _ = tx.closed() => { stream_succeeded = false; None },
+                    chunk = stream.next() => chunk,
+                } {
                     match chunk {
                         Ok(bytes) => {
+                            if tracker.is_some() {
+                                match first_token.observe(&bytes) {
+                                    Observation::Output => {
+                                        if let Some(mut tracker) = tracker.take() {
+                                            tracker.on_first_token();
+                                        }
+                                    }
+                                    Observation::End => {
+                                        tracker.take();
+                                    }
+                                    Observation::Pending => {}
+                                }
+                            }
                             if first_sse {
                                 first_sse = false;
                                 let first_ms = t_send.elapsed().as_secs_f64() * 1000.0;
@@ -1599,11 +1626,7 @@ impl Router {
                                 .windows(12)
                                 .any(|window| window == b"data: [DONE]")
                             {
-                                if let Some(worker) = registry.get_by_url(&worker_url) {
-                                    worker.decrement_load();
-                                    RouterMetrics::set_running_requests(&worker_url, worker.load());
-                                    decremented = true;
-                                }
+                                load.take();
                             }
                             if tx.send(Ok(bytes)).is_err() {
                                 stream_succeeded = false;
@@ -1617,74 +1640,7 @@ impl Router {
                         }
                     }
                 }
-                if !decremented {
-                    if let Some(worker) = registry.get_by_url(&worker_url) {
-                        worker.decrement_load();
-                        RouterMetrics::set_running_requests(&worker_url, worker.load());
-                    }
-                }
-                if let Some(completion) = &completion {
-                    completion.finish(stream_succeeded);
-                }
-            });
-
-            let stream = UnboundedReceiverStream::new(rx);
-            let body = Body::from_stream(stream);
-
-            let mut response = Response::new(body);
-            *response.status_mut() = status;
-            *response.headers_mut() = response_headers;
-            response
-        } else {
-            // For requests without load tracking, just stream
-            // Preserve headers for streaming response
-            let mut response_headers = header_utils::preserve_response_headers(res.headers());
-            // Ensure we set the correct content-type for SSE
-            response_headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
-            if stages_on {
-                let header_stages = http_stages_json(http_ttfb_ms, http_ttfb_ms);
-                insert_router_stages(&mut response_headers, &header_stages);
-            }
-
-            let stream = res.bytes_stream();
-            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-            let completion = if status.is_success() {
-                program_completion
-            } else {
-                None
-            };
-
-            // Spawn task to forward stream
-            tokio::spawn(async move {
-                let mut stream = stream;
-                let mut first_sse = true;
-                let mut stream_succeeded = true;
-                while let Some(chunk) = stream.next().await {
-                    match chunk {
-                        Ok(bytes) => {
-                            if first_sse {
-                                first_sse = false;
-                                let first_ms = t_send.elapsed().as_secs_f64() * 1000.0;
-                                if stages_on {
-                                    let stages = http_stages_json(http_ttfb_ms, first_ms);
-                                    emit_http_first_sse(&tx, &stages);
-                                }
-                            }
-                            if let Some(completion) = &completion {
-                                completion.observe_sse_chunk(&bytes);
-                            }
-                            if tx.send(Ok(bytes)).is_err() {
-                                stream_succeeded = false;
-                                break;
-                            }
-                        }
-                        Err(e) => {
-                            stream_succeeded = false;
-                            let _ = tx.send(Err(format!("Stream error: {}", e)));
-                            break;
-                        }
-                    }
-                }
+                drop(load);
                 if let Some(completion) = &completion {
                     completion.finish(stream_succeeded);
                 }
@@ -1847,81 +1803,31 @@ impl Router {
     }
 
     pub fn remove_worker(&self, worker_url: &str) {
-        if self.intra_node_data_parallel_size > 1 {
-            // remove dp-aware workers in a prefix-matching fashion
-            // without contacting the remote worker
-            let mut removed_workers: Vec<String> = Vec::new();
-            let worker_url_prefix = format!("{}@", worker_url);
-
-            // Find and remove all workers with matching prefix
-            let all_workers = self.worker_registry.get_all();
-            for w in all_workers.iter() {
-                if w.url().starts_with(&worker_url_prefix) {
-                    let removed_url = w.url().to_string();
-                    // Get model_id before removing
-                    let model_id = w.model_id().to_string();
-
-                    if self.worker_registry.remove_by_url(&removed_url).is_some() {
-                        self.frontend.remove_worker(&removed_url);
-                        info!("Removed worker: {}", removed_url);
-                        removed_workers.push(removed_url);
-
-                        // Notify PolicyRegistry about the removed worker
-                        self.policy_registry.on_worker_removed(&model_id);
-                    } else {
-                        warn!("Worker {} not found, skipping removal", w.url());
-                    }
-                }
-            }
-
-            RouterMetrics::set_active_workers(self.worker_registry.get_all().len());
-
-            // If any models are using cache aware policy, remove the workers from the tree
-            // Check each removed worker's model and get its policy
-            for dp_url in removed_workers.iter() {
-                if let Some(worker) = self.worker_registry.get_by_url(dp_url) {
-                    let model_id = worker.model_id();
-                    if let Some(policy) = self.policy_registry.get_policy(model_id) {
-                        if let Some(cache_aware) = policy
-                            .as_any()
-                            .downcast_ref::<crate::policies::CacheAwarePolicy>()
-                        {
-                            cache_aware.remove_worker_by_url(dp_url);
-                            info!("Removed worker from cache-aware tree: {}", dp_url);
-                        }
-                    }
-                }
-            }
+        let workers = if self.intra_node_data_parallel_size > 1 {
+            let prefix = format!("{}@", worker_url);
+            self.worker_registry
+                .get_all()
+                .into_iter()
+                .filter(|worker| worker.url() == worker_url || worker.url().starts_with(&prefix))
+                .collect::<Vec<_>>()
         } else {
-            // Get the worker first to extract model_id
-            let model_id = if let Some(worker) = self.worker_registry.get_by_url(worker_url) {
-                worker.model_id().to_string()
-            } else {
-                warn!("Worker {} not found, skipping removal", worker_url);
-                return;
-            };
-
-            if self.worker_registry.remove_by_url(worker_url).is_some() {
-                self.frontend.remove_worker(worker_url);
-                info!("Removed worker: {}", worker_url);
-
-                // Notify PolicyRegistry about the removed worker
-                self.policy_registry.on_worker_removed(&model_id);
-
-                RouterMetrics::set_active_workers(self.worker_registry.get_all().len());
-            }
-
-            // If the model is using cache aware policy, remove the worker from the tree
-            if let Some(policy) = self.policy_registry.get_policy(&model_id) {
-                if let Some(cache_aware) = policy
-                    .as_any()
-                    .downcast_ref::<crate::policies::CacheAwarePolicy>()
-                {
-                    cache_aware.remove_worker_by_url(worker_url);
-                    info!("Removed worker from cache-aware tree: {}", worker_url);
-                }
+            self.worker_registry
+                .get_by_url(worker_url)
+                .into_iter()
+                .collect()
+        };
+        if workers.is_empty() {
+            warn!("Worker {} not found, skipping removal", worker_url);
+            return;
+        }
+        for worker in workers {
+            if let Some(removed) = self.worker_registry.remove_by_url(worker.url()) {
+                self.policy_registry.notify_worker_removed(&removed);
+                self.frontend.remove_worker(removed.url());
+                info!("Removed worker: {}", removed.url());
             }
         }
+        RouterMetrics::set_active_workers(self.worker_registry.get_all().len());
     }
 
     async fn get_worker_load(&self, worker_url: &str) -> Option<isize> {
@@ -2483,21 +2389,48 @@ impl RouterTrait for Router {
         } else {
             None
         };
-        let worker = if let Some(completion) = &program_completion {
+        let affinity = policy
+            .needs_affinity_prompt()
+            .then(|| affinity_prompt_from_json(path, &body))
+            .flatten();
+        let context = RoutingContext {
+            prompt: affinity.as_ref().map(|(prompt, _)| prompt),
+            allow_affinity: affinity.as_ref().is_some_and(|(_, gate)| *gate)
+                && header_utils::allows_affinity_for_turn(headers),
+            colocated: true,
+            route: path,
+        };
+        let selected = if let Some(completion) = &program_completion {
             self.worker_registry
                 .get_by_url(&completion.dispatch().target_id)
                 .filter(|worker| worker.is_available())
+                .and_then(|worker| {
+                    if policy.needs_affinity_prompt() {
+                        let headers = Self::headers_to_request_headers(headers);
+                        policy
+                            .select_request(
+                                std::slice::from_ref(&worker),
+                                request_text.as_deref(),
+                                headers.as_ref(),
+                                &context,
+                            )
+                            .map(|(_, tracker)| (worker, tracker))
+                    } else {
+                        Some((worker, None))
+                    }
+                })
         } else {
             let request_headers = Self::headers_to_request_headers(headers);
             policy
-                .select_worker_with_headers(
+                .select_request(
                     &workers,
                     request_text.as_deref(),
                     request_headers.as_ref(),
+                    &context,
                 )
-                .and_then(|index| workers.get(index).cloned())
+                .map(|(idx, tracker)| (workers[idx].clone(), tracker))
         };
-        let Some(worker) = worker else {
+        let Some((worker, tracker)) = selected else {
             if let Some(completion) = &program_completion {
                 completion.finish(false);
             }
@@ -2508,15 +2441,9 @@ impl RouterTrait for Router {
             )
                 .into_response();
         };
+        let load = (policy.tracks_load() || program_completion.is_some())
+            .then(|| RequestLoadGuard::new(worker.clone()));
         let url = worker.endpoint_url(path);
-
-        // Match the typed path's load accounting so cache-aware imbalance
-        // detection also sees transparent (EPD) traffic.
-        let load_tracked = policy.name() == "cache_aware" || program_completion.is_some();
-        if load_tracked {
-            worker.increment_load();
-            RouterMetrics::set_running_requests(worker.url(), worker.load());
-        }
 
         let (body, mut transfers) = if let Some(epd) = &self.epd {
             if *method == Method::POST && path == "/v1/chat/completions" {
@@ -2533,10 +2460,6 @@ impl RouterTrait for Router {
                     Ok(value) => value,
                     Err(error) => {
                         RouterMetrics::record_request_error(path, "encoder_error");
-                        if load_tracked {
-                            worker.decrement_load();
-                            RouterMetrics::set_running_requests(worker.url(), worker.load());
-                        }
                         return error.into_response();
                     }
                 }
@@ -2558,10 +2481,6 @@ impl RouterTrait for Router {
             Method::PATCH => self.client.patch(&url),
             Method::HEAD => self.client.head(&url),
             _ => {
-                if load_tracked {
-                    worker.decrement_load();
-                    RouterMetrics::set_running_requests(worker.url(), worker.load());
-                }
                 RouterMetrics::record_request_error(path, "unsupported_method");
                 return (
                     StatusCode::METHOD_NOT_ALLOWED,
@@ -2701,7 +2620,10 @@ impl RouterTrait for Router {
                     tokio::spawn(async move {
                         let mut stream = stream;
                         let mut stream_ok = true;
-                        while let Some(chunk) = stream.next().await {
+                        while let Some(chunk) = tokio::select! {
+                            _ = tx.closed() => { stream_ok = false; None },
+                            chunk = stream.next() => chunk,
+                        } {
                             match chunk {
                                 Ok(bytes) => {
                                     if let Some(completion) = &completion {
@@ -2760,8 +2682,13 @@ impl RouterTrait for Router {
         } else {
             RouterMetrics::record_request_error(path, "backend_error");
         }
-        if load_tracked {
-            hold_load_until_body_done(response, worker)
+        let tracker = if response.status().is_success() {
+            tracker
+        } else {
+            None
+        };
+        if load.is_some() || tracker.is_some() {
+            hold_load_until_body_done(response, load, tracker, is_stream)
         } else {
             response
         }
@@ -2838,6 +2765,66 @@ mod tests {
             _program_observation_handle: None,
             program_targets_cache: Mutex::new(HashMap::new()),
             program_token_estimator: Arc::new(MomentumTokenEstimator::default()),
+        }
+    }
+
+    #[test]
+    fn worker_removal_clears_last_model_policy_for_regular_and_dp_workers() {
+        for dp_size in [1, 2] {
+            let mut router = create_test_regular_router();
+            router.worker_registry = Arc::new(WorkerRegistry::new());
+            router.intra_node_data_parallel_size = dp_size;
+            let base_url = "http://removed:8080";
+            let mut urls = Vec::new();
+            let mut model_policy = None;
+            for rank in 0..dp_size {
+                let url = if dp_size == 1 {
+                    base_url.to_string()
+                } else {
+                    format!("{base_url}@{rank}")
+                };
+                let worker: Arc<dyn Worker> = Arc::new(
+                    BasicWorker::new(url.clone(), WorkerType::Regular)
+                        .with_labels(HashMap::from([("model_id".into(), "removed-model".into())])),
+                );
+                router.worker_registry.register(worker);
+                let policy = router
+                    .policy_registry
+                    .on_worker_added("removed-model", Some("cache_aware"));
+                policy
+                    .as_any()
+                    .downcast_ref::<crate::policies::CacheAwarePolicy>()
+                    .unwrap()
+                    .commit_placement("removed-model", "shared history", &url);
+                model_policy = Some(policy);
+                urls.push(url);
+            }
+
+            router.remove_worker(base_url);
+
+            assert!(router.worker_registry.get_all().is_empty());
+            assert!(router.policy_registry.get_policy("removed-model").is_none());
+            let policy = model_policy.unwrap();
+            let cache_aware = policy
+                .as_any()
+                .downcast_ref::<crate::policies::CacheAwarePolicy>()
+                .unwrap();
+            for url in urls {
+                let placement = cache_aware
+                    .evaluate_initial_placement(
+                        "removed-model",
+                        "shared history",
+                        &[crate::policies::CacheAwareCandidate {
+                            target_id: &url,
+                            kv_pressure: 0.0,
+                        }],
+                    )
+                    .unwrap();
+                assert_eq!(
+                    placement.match_rate, 0.0,
+                    "stale cache entry after removing {url}"
+                );
+            }
         }
     }
 
@@ -3005,31 +2992,42 @@ mod tests {
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let mut router = create_test_regular_router();
         router.worker_registry = Arc::new(WorkerRegistry::new());
-        router
-            .worker_registry
-            .register(Arc::new(BasicWorker::new(url, WorkerType::Regular)));
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(url, WorkerType::Regular));
+        router.worker_registry.register(worker.clone());
+        router.policy_registry = Arc::new(PolicyRegistry::new(
+            crate::config::PolicyConfig::CacheAware {
+                cache_threshold: 0.5,
+                balance_abs_threshold: 32,
+                balance_rel_threshold: 1.1,
+                eviction_interval_secs: 0,
+                max_tree_size: 1000,
+            },
+        ));
         router.epd = Some(super::super::epd::EncoderStage::new(
             crate::config::EpdConfig {
                 encoder_urls: vec!["http://unused".into()],
                 consumer_zmq_addrs: Default::default(),
             },
         ));
-        for (body, status) in [
-            (json!({"messages": []}), StatusCode::OK),
-            (json!({"messages": [], "stream": true}), StatusCode::OK),
+        for (body, status, expected_load) in [
+            (json!({"messages": []}), StatusCode::OK, 1),
+            (json!({"messages": [], "stream": true}), StatusCode::OK, 1),
             (
                 json!({"messages": [], "fail": true}),
                 StatusCode::BAD_REQUEST,
+                1,
             ),
-            (json!({"messages": null}), StatusCode::BAD_REQUEST),
+            (json!({"messages": null}), StatusCode::BAD_REQUEST, 0),
         ] {
             let response = router
                 .route_transparent(None, "/v1/chat/completions", &Method::POST, body)
                 .await;
             assert_eq!(response.status(), status);
+            assert_eq!(worker.load(), expected_load);
             axum::body::to_bytes(response.into_body(), 4096)
                 .await
                 .unwrap();
+            assert_eq!(worker.load(), 0);
         }
         let exported = handle.render();
         assert!(exported.contains("vllm_router_requests_total{route=\"/v1/chat/completions\"} 2"));
@@ -3054,19 +3052,118 @@ mod tests {
             WorkerType::Regular,
         ));
 
-        worker.increment_load();
-        let response =
-            hold_load_until_body_done(Response::new(Body::from("complete")), worker.clone());
+        let response = hold_load_until_body_done(
+            Response::new(Body::from("complete")),
+            Some(RequestLoadGuard::new(worker.clone())),
+            None,
+            false,
+        );
         assert_eq!(worker.load(), 1);
         let _ = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         assert_eq!(worker.load(), 0);
 
-        worker.increment_load();
-        let response =
-            hold_load_until_body_done(Response::new(Body::from("cancelled")), worker.clone());
+        let response = hold_load_until_body_done(
+            Response::new(Body::from("cancelled")),
+            Some(RequestLoadGuard::new(worker.clone())),
+            None,
+            false,
+        );
         assert_eq!(worker.load(), 1);
         drop(response);
         assert_eq!(worker.load(), 0);
+    }
+
+    #[tokio::test]
+    async fn first_token_observation_ignores_error_and_metadata_frames() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct Observer {
+            pending: AtomicUsize,
+            samples: AtomicUsize,
+        }
+
+        impl crate::policies::RequestObserver for Observer {
+            fn charge(&self, work: u64) {
+                self.pending.fetch_add(work as usize, Ordering::SeqCst);
+            }
+
+            fn finish(&self, work: u64, elapsed: Option<Duration>) {
+                self.pending.fetch_sub(work as usize, Ordering::SeqCst);
+                if elapsed.is_some() {
+                    self.samples.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        }
+
+        for input in [
+            "data: {\"error\":\"backend failed\"}\n\n",
+            ": router-stages {}\n\ndata: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"\"}}]}\n\ndata: {\"choices\":[],\"usage\":{\"completion_tokens\":0}}\n\ndata: [DONE]\n\n",
+            "data: {\"error\":\"backend failed\"}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"ignored\"}}]}\n\n",
+        ] {
+            let observer = Arc::new(Observer {
+                pending: AtomicUsize::new(0),
+                samples: AtomicUsize::new(0),
+            });
+            let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+                "grpc://worker:50051".into(),
+                WorkerType::Regular,
+            ));
+            let response = hold_load_until_body_done(
+                Response::new(Body::from(input)),
+                Some(RequestLoadGuard::new(worker.clone())),
+                Some(RequestTracker::new(observer.clone(), 64)),
+                true,
+            );
+            let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            assert_eq!(bytes, input);
+            assert_eq!(observer.pending.load(Ordering::SeqCst), 0);
+            assert_eq!(observer.samples.load(Ordering::SeqCst), 0, "{input}");
+            assert_eq!(worker.load(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn first_token_observation_waits_for_complete_output_frame() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct Observer(AtomicUsize);
+
+        impl crate::policies::RequestObserver for Observer {
+            fn charge(&self, _: u64) {}
+
+            fn finish(&self, _: u64, elapsed: Option<Duration>) {
+                if elapsed.is_some() {
+                    self.0.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        }
+
+        let observer = Arc::new(Observer(AtomicUsize::new(0)));
+        let chunks = [
+            ": keepalive\r\n\r\n",
+            "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\r\n\r\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"he",
+            "llo\"}}]}\r\n\r\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\" again\"}}]}\n\ndata: [DONE]\n\n",
+        ];
+        let stream = futures_util::stream::iter(
+            chunks
+                .into_iter()
+                .map(|chunk| Ok::<_, std::io::Error>(bytes::Bytes::from_static(chunk.as_bytes()))),
+        );
+        let response = hold_load_until_body_done(
+            Response::new(Body::from_stream(stream)),
+            None,
+            Some(RequestTracker::new(observer.clone(), 64)),
+            true,
+        );
+        let mut body = response.into_body().into_data_stream();
+        for (index, chunk) in chunks.iter().enumerate() {
+            assert_eq!(body.next().await.unwrap().unwrap(), *chunk);
+            assert_eq!(observer.0.load(Ordering::SeqCst), usize::from(index >= 3));
+        }
+        assert!(body.next().await.is_none());
+        assert_eq!(observer.0.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -3076,7 +3173,6 @@ mod tests {
             WorkerType::Regular,
         ));
 
-        worker.increment_load();
         let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
         let producer = tokio::spawn(async move {
             let _ = finish_rx.await;
@@ -3085,7 +3181,12 @@ mod tests {
         response
             .extensions_mut()
             .insert(crate::backend::grpc::GrpcStreamTask::new(producer));
-        let response = hold_load_until_body_done(response, worker.clone());
+        let response = hold_load_until_body_done(
+            response,
+            Some(RequestLoadGuard::new(worker.clone())),
+            None,
+            true,
+        );
         finish_tx.send(()).unwrap();
         tokio::time::timeout(Duration::from_secs(1), async {
             while worker.load() != 0 {
@@ -3098,13 +3199,17 @@ mod tests {
         assert_eq!(worker.load(), 0);
         drop(response);
 
-        worker.increment_load();
         let producer = tokio::spawn(std::future::pending::<()>());
         let mut response = Response::new(Body::from("buffered"));
         response
             .extensions_mut()
             .insert(crate::backend::grpc::GrpcStreamTask::new(producer));
-        let response = hold_load_until_body_done(response, worker.clone());
+        let response = hold_load_until_body_done(
+            response,
+            Some(RequestLoadGuard::new(worker.clone())),
+            None,
+            true,
+        );
         drop(response);
         tokio::time::timeout(Duration::from_secs(1), async {
             while worker.load() != 0 {
@@ -3217,31 +3322,37 @@ mod tests {
 
     #[test]
     fn test_select_worker_for_model_with_consistent_hash_uses_headers() {
-        // Verify that select_worker_for_model passes headers through to the policy,
-        // producing consistent routing for the same session ID
         let router = create_test_consistent_hash_router();
-
-        let mut header_map = HeaderMap::new();
-        header_map.insert("x-session-id", HeaderValue::from_static("sticky-session-1"));
-
-        // Make multiple selections with the same headers - should all pick the same worker
-        let mut selected_urls: Vec<String> = Vec::new();
-        for _ in 0..10 {
-            let worker = router
-                .select_worker_for_model(None, Some(r#"{"prompt": "test"}"#), Some(&header_map))
-                .expect("Should select a worker");
-            selected_urls.push(worker.url().to_string());
+        let policy = router.policy_registry.get_default_policy();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-session-id", HeaderValue::from_static("shared-session"));
+        let context = RoutingContext {
+            prompt: None,
+            allow_affinity: false,
+            colocated: true,
+            route: "/v1/completions",
+        };
+        let mut sticky = std::collections::HashSet::new();
+        let mut without_header = std::collections::HashSet::new();
+        for i in 0..64 {
+            let text = format!("unique request content {i}");
+            let (worker, _) = router
+                .select_worker_for_model(
+                    None,
+                    Some(&text),
+                    &context,
+                    Some(&headers),
+                    policy.as_ref(),
+                )
+                .unwrap();
+            sticky.insert(worker.url().to_owned());
+            let (worker, _) = router
+                .select_worker_for_model(None, Some(&text), &context, None, policy.as_ref())
+                .unwrap();
+            without_header.insert(worker.url().to_owned());
         }
-
-        // All selections should go to the same worker (sticky routing)
-        let first = &selected_urls[0];
-        for (i, url) in selected_urls.iter().enumerate() {
-            assert_eq!(
-                url, first,
-                "Request {} routed to {}, expected {} (session stickiness broken)",
-                i, url, first
-            );
-        }
+        assert_eq!(sticky.len(), 1);
+        assert!(without_header.len() > 1);
     }
 
     #[test]
@@ -3257,8 +3368,19 @@ mod tests {
             }
         }
 
-        let worker = router
-            .select_worker_for_model(None, Some(r#"{"prompt": "test"}"#), None)
+        let (worker, _) = router
+            .select_worker_for_model(
+                None,
+                Some(r#"{"prompt": "test"}"#),
+                &RoutingContext {
+                    prompt: None,
+                    allow_affinity: false,
+                    colocated: true,
+                    route: "/v1/completions",
+                },
+                None,
+                router.policy_registry.get_default_policy().as_ref(),
+            )
             .expect("Should select the remaining healthy worker");
 
         assert_eq!(
@@ -3279,7 +3401,18 @@ mod tests {
             w.set_healthy(false);
         }
 
-        let result = router.select_worker_for_model(None, Some(r#"{"prompt": "test"}"#), None);
+        let result = router.select_worker_for_model(
+            None,
+            Some(r#"{"prompt": "test"}"#),
+            &RoutingContext {
+                prompt: None,
+                allow_affinity: false,
+                colocated: true,
+                route: "/v1/completions",
+            },
+            None,
+            router.policy_registry.get_default_policy().as_ref(),
+        );
         assert!(
             result.is_none(),
             "Should return None when all workers are unavailable"
@@ -3297,10 +3430,17 @@ mod tests {
             let session_id = format!("session-{}", i);
             header_map.insert("x-session-id", HeaderValue::from_str(&session_id).unwrap());
 
-            if let Some(worker) = router.select_worker_for_model(
+            if let Some((worker, _)) = router.select_worker_for_model(
                 None,
                 Some(r#"{"prompt": "test"}"#),
+                &RoutingContext {
+                    prompt: None,
+                    allow_affinity: false,
+                    colocated: true,
+                    route: "/v1/completions",
+                },
                 Some(&header_map),
+                router.policy_registry.get_default_policy().as_ref(),
             ) {
                 worker_urls_seen.insert(worker.url().to_string());
             }

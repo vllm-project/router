@@ -1,5 +1,6 @@
 //! Factory for creating load balancing policies
 
+use super::SMetricPolicy;
 use super::{
     CacheAwareConfig, CacheAwarePolicy, ConsistentHashPolicy, LoadBalancingPolicy,
     PowerOfTwoPolicy, RandomPolicy, RendezvousHashPolicy, RoundRobinPolicy,
@@ -39,6 +40,9 @@ impl PolicyFactory {
                 Arc::new(ConsistentHashPolicy::new())
             }
             PolicyConfig::RendezvousHash => Arc::new(RendezvousHashPolicy::new()),
+            PolicyConfig::SMetric { config } => {
+                Arc::new(SMetricPolicy::new(config.as_ref().clone()))
+            }
         }
     }
 
