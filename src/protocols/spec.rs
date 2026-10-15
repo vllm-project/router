@@ -2490,23 +2490,102 @@ impl StringOrArray {
 
 /// Prompt input type supporting both text and token IDs
 /// Compatible with vLLM's prompt field format
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(untagged)]
 pub enum PromptInput {
     /// Single string: str
-    ///
-    /// Kept first because a JSON string can only match this variant. With
-    /// `untagged`, serde tries variants in order and formats the whole prompt
-    /// into a discarded error for every failed sequence attempt, which dominated
-    /// parsing latency for long prompts (#310).
     String(String),
     /// Batch of token ID sequences: list[list[int]]
-    /// Must come before the other sequence variants due to serde untagged matching order
     IntBatch(Vec<Vec<i32>>),
     /// Array of strings: list[str]
     StringArray(Vec<String>),
     /// Single token ID sequence: list[int]
     IntArray(Vec<i32>),
+}
+
+// `PromptInput` is deserialized by hand rather than via `#[serde(untagged)]`.
+// Untagged deserialization buffers the whole input into `serde::__private::de::Content`
+// before trying each variant, which roughly doubles the cost of large array prompts
+// (`list[int]` / `list[str]` / `list[list[int]]`). Dispatching on the first element
+// instead parses the array once, in place. Serialization keeps the derived untagged
+// form, so the wire format is unchanged.
+impl<'de> Deserialize<'de> for PromptInput {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_any(PromptInputVisitor)
+    }
+}
+
+struct PromptInputVisitor;
+
+impl<'de> serde::de::Visitor<'de> for PromptInputVisitor {
+    type Value = PromptInput;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+        formatter.write_str(
+            "a string, a list of strings, a list of token ids, or a batch of token-id lists",
+        )
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(PromptInput::String(value.to_owned()))
+    }
+
+    fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(PromptInput::String(value))
+    }
+
+    fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+    where
+        A: serde::de::SeqAccess<'de>,
+    {
+        // Deserialize only the first element to pick the variant, then stream the
+        // remaining elements directly as that element type.
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum FirstElement {
+            Int(i32),
+            Str(String),
+            Seq(Vec<i32>),
+        }
+
+        match seq.next_element::<FirstElement>()? {
+            // An empty array keeps matching `IntBatch`, as it did before.
+            None => Ok(PromptInput::IntBatch(Vec::new())),
+            Some(FirstElement::Int(first)) => {
+                let mut ids = Vec::with_capacity(seq.size_hint().unwrap_or(0) + 1);
+                ids.push(first);
+                while let Some(id) = seq.next_element::<i32>()? {
+                    ids.push(id);
+                }
+                Ok(PromptInput::IntArray(ids))
+            }
+            Some(FirstElement::Str(first)) => {
+                let mut strings = Vec::with_capacity(seq.size_hint().unwrap_or(0) + 1);
+                strings.push(first);
+                while let Some(value) = seq.next_element::<String>()? {
+                    strings.push(value);
+                }
+                Ok(PromptInput::StringArray(strings))
+            }
+            Some(FirstElement::Seq(first)) => {
+                let mut batch = Vec::with_capacity(seq.size_hint().unwrap_or(0) + 1);
+                batch.push(first);
+                while let Some(ids) = seq.next_element::<Vec<i32>>()? {
+                    batch.push(ids);
+                }
+                Ok(PromptInput::IntBatch(batch))
+            }
+        }
+    }
 }
 
 impl PromptInput {
