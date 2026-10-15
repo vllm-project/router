@@ -23,6 +23,7 @@ pub mod frontend;
 pub mod grpc;
 pub mod health;
 pub mod openai;
+pub(crate) mod prefix_cache;
 pub mod preprocess;
 mod vllm_frontend;
 
@@ -45,6 +46,7 @@ pub use detect::{
 pub use frontend::{EngineFrontend, PreparedChat};
 pub use grpc::GrpcEngineBackend;
 pub use health::check_grpc_health;
+pub use prefix_cache::{PrefixCacheConfig, PrefixCacheHashStrategy, PrefixCacheStats};
 pub use preprocess::TokenizerCache;
 
 /// Prost/Tonic bindings for vLLM Inference + Control (`vllm-proto` on crates.io).

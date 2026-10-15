@@ -1,5 +1,5 @@
 //! gRPC chat rendering and tokenization via `vllm-chat` and `vllm-tokenizer`.
-//! Loaded models share an optional L0 encoding cache.
+//! Loaded models share optional L0 (exact) and L1 (prefix) encoding caches.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -10,6 +10,7 @@ use dashmap::DashMap;
 use parking_lot::RwLock;
 
 use super::encode_cache::FrontendCache;
+use super::prefix_cache::{PrefixCache, PrefixCacheConfig, PrefixCacheStats};
 use crate::tokenizer::{TokenizerCacheConfig, TokenizerCacheStats};
 
 use super::vllm_frontend::{
@@ -38,6 +39,7 @@ pub struct TokenizerCache {
     by_model: Arc<DashMap<String, Arc<VllmFrontend>>>,
     load_lock: Arc<tokio::sync::Mutex<()>>,
     encoding_cache: Option<Arc<FrontendCache>>,
+    prefix_cache: Option<Arc<PrefixCache>>,
 }
 
 impl std::fmt::Debug for TokenizerCache {
@@ -59,13 +61,23 @@ impl TokenizerCache {
             by_model: Arc::new(DashMap::new()),
             load_lock: Arc::new(tokio::sync::Mutex::new(())),
             encoding_cache: None,
+            prefix_cache: None,
         }
     }
 
     /// Enable L0 with a shared budget across models.
     pub fn with_encoding_cache(config: TokenizerCacheConfig) -> Result<Self> {
+        Self::with_caches(Some(config), None)
+    }
+
+    /// Enable L0 and/or L1, each with one budget shared across models.
+    pub fn with_caches(
+        l0: Option<TokenizerCacheConfig>,
+        l1: Option<PrefixCacheConfig>,
+    ) -> Result<Self> {
         Ok(Self {
-            encoding_cache: Some(Arc::new(FrontendCache::new(config)?)),
+            encoding_cache: l0.map(FrontendCache::new).transpose()?.map(Arc::new),
+            prefix_cache: l1.map(PrefixCache::new).transpose()?.map(Arc::new),
             ..Self::new()
         })
     }
@@ -73,6 +85,11 @@ impl TokenizerCache {
     /// L0 stats across models, or None when disabled.
     pub fn encoding_cache_stats(&self) -> Option<TokenizerCacheStats> {
         self.encoding_cache.as_ref().map(|cache| cache.stats())
+    }
+
+    /// L1 stats across models, or None when disabled.
+    pub fn prefix_cache_stats(&self) -> Option<PrefixCacheStats> {
+        self.prefix_cache.as_ref().map(|cache| cache.stats())
     }
 
     /// Tests only: bypass model loading by returning these fake prompt ids.
@@ -95,9 +112,14 @@ impl TokenizerCache {
             return Ok(FrontendHandle(Frontend::Vllm(hit.clone())));
         }
         let frontend = Arc::new(
-            VllmFrontend::load(&source, Default::default(), self.encoding_cache.clone())
-                .await
-                .map_err(|e| anyhow!("vllm-chat load {source} for key {key}: {e}"))?,
+            VllmFrontend::load(
+                &source,
+                Default::default(),
+                self.encoding_cache.clone(),
+                self.prefix_cache.clone(),
+            )
+            .await
+            .map_err(|e| anyhow!("vllm-chat load {source} for key {key}: {e}"))?,
         );
         self.by_model.insert(key, frontend.clone());
         Ok(FrontendHandle(Frontend::Vllm(frontend)))
@@ -170,6 +192,8 @@ pub struct TokenizeOut {
     pub template_ms: f64,
     pub encode_ms: f64,
     pub encode_backend: &'static str,
+    /// Prompt tokens served by L0 or L1 instead of the tokenizer.
+    pub cached_tokens: usize,
 }
 
 impl TokenizeOut {
@@ -193,6 +217,7 @@ pub fn tokenize_chat_request_timed(
                 template_ms: 0.0,
                 encode_ms: 0.0,
                 encode_backend: "test-pin",
+                cached_tokens: 0,
             })
         }
         Frontend::Vllm(vllm) => tokenize_vllm(request, vllm),
@@ -284,7 +309,7 @@ fn tokenize_vllm(request: &ChatCompletionRequest, frontend: &VllmFrontend) -> Re
         session_id,
     })?;
     let adapt_ms = t0.elapsed().as_secs_f64() * 1000.0;
-    let (token_ids, template_ms, encode_ms) = frontend
+    let (token_ids, cached_tokens, template_ms, encode_ms) = frontend
         .chat_tokenize_timed(&upstream)
         .map_err(|e| anyhow!("vllm-chat tokenize: {e}"))?;
     if token_ids.is_empty() {
@@ -296,6 +321,7 @@ fn tokenize_vllm(request: &ChatCompletionRequest, frontend: &VllmFrontend) -> Re
         template_ms,
         encode_ms,
         encode_backend: "vllm-tokenizer",
+        cached_tokens,
     })
 }
 
@@ -524,7 +550,7 @@ mod tests {
     }
 
     async fn rust_vllm_chat_ids(model: &str, messages: serde_json::Value) -> Vec<u32> {
-        let frontend = VllmFrontend::load(model, Default::default(), None)
+        let frontend = VllmFrontend::load(model, Default::default(), None, None)
             .await
             .expect("vllm-chat load_model_backends");
         let req: ChatCompletionRequest = serde_json::from_value(serde_json::json!({

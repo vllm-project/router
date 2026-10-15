@@ -134,6 +134,7 @@ impl GrpcEngineBackend {
         let encode_ms = tokenized.encode_ms;
         let frontend_ms = tokenized.frontend_ms();
         let encode_backend = tokenized.encode_backend;
+        let cached_tokens = tokenized.cached_tokens;
 
         let request_id = format!("chatcmpl-{}", Uuid::new_v4());
         let model = request.model.clone().unwrap_or_else(|| "unknown".into());
@@ -201,6 +202,7 @@ impl GrpcEngineBackend {
             "adapt_ms": adapt_ms,
             "template_ms": template_ms,
             "encode_ms": encode_ms,
+            "encode_cached_tokens": cached_tokens,
             "frontend_ms": frontend_ms,
             "xfer_ms": xfer_ms,
             "grpc_connect_ms": grpc_connect_ms,

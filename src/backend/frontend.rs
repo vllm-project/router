@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 use axum::response::Response;
 
 use super::grpc::GrpcEngineBackend;
+use super::prefix_cache::{PrefixCacheConfig, PrefixCacheStats};
 use super::preprocess::{tokenize_chat_request_timed, FrontendHandle, TokenizeOut, TokenizerCache};
 use crate::protocols::spec::ChatCompletionRequest;
 use crate::tokenizer::{TokenizerCacheConfig, TokenizerCacheStats};
@@ -57,22 +58,37 @@ impl EngineFrontend {
         request_timeout: Duration,
         config: TokenizerCacheConfig,
     ) -> anyhow::Result<Self> {
+        Self::with_encoding_caches(request_timeout, Some(config), None)
+    }
+
+    /// Enable L0 (exact) and/or L1 (prefix) encoding caches.
+    pub fn with_encoding_caches(
+        request_timeout: Duration,
+        l0: Option<TokenizerCacheConfig>,
+        l1: Option<PrefixCacheConfig>,
+    ) -> anyhow::Result<Self> {
         Ok(Self {
-            tokenizer: Arc::new(TokenizerCache::with_encoding_cache(config)?),
+            tokenizer: Arc::new(TokenizerCache::with_caches(l0, l1)?),
             ..Self::with_request_timeout(request_timeout)
         })
     }
 
     pub(crate) fn from_env(request_timeout: Duration) -> anyhow::Result<Self> {
-        match super::encode_cache::config_from_env()? {
-            Some(config) => Self::with_tokenizer_cache(request_timeout, config),
-            None => Ok(Self::with_request_timeout(request_timeout)),
-        }
+        Self::with_encoding_caches(
+            request_timeout,
+            super::encode_cache::config_from_env()?,
+            super::prefix_cache::config_from_env()?,
+        )
     }
 
     /// L0 stats across models, or None when disabled.
     pub fn tokenizer_cache_stats(&self) -> Option<TokenizerCacheStats> {
         self.tokenizer.encoding_cache_stats()
+    }
+
+    /// L1 stats across models, or None when disabled.
+    pub fn prefix_cache_stats(&self) -> Option<PrefixCacheStats> {
+        self.tokenizer.prefix_cache_stats()
     }
 
     /// Tests only: bypass model loading by returning these fake prompt ids.
