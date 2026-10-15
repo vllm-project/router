@@ -405,6 +405,7 @@ mod test_pd_routing {
             3
         );
         assert_eq!(router.get_worker_urls().len(), 2);
+        let mut completed_batches = 0;
         for (model, stream, status) in [
             ("test", false, StatusCode::OK),
             ("test", true, StatusCode::OK),
@@ -458,6 +459,9 @@ mod test_pd_routing {
             }
             let seen = seen.lock().unwrap();
             let phases: Vec<_> = seen.iter().map(|(phase, _)| phase.as_str()).collect();
+            completed_batches += usize::from(model != "bad-input");
+            assert_eq!(encoder.processed_requests(), completed_batches);
+            assert_eq!(encoder.load(), 0);
             assert_eq!(
                 phases,
                 match model {
@@ -492,6 +496,15 @@ mod test_pd_routing {
                 assert_eq!(d["kv_transfer_params"]["remote_engine_id"], "P");
             }
         }
+        encoder.set_healthy(false);
+        seen.lock().unwrap().clear();
+        let response = router.route_transparent(None, "/v1/chat/completions", &axum::http::Method::POST,
+            json!({"messages":[{"role":"user", "content":[{"type":"image_url", "image_url":{"url":"image"}}]}]})
+        ).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(seen.lock().unwrap().is_empty());
+        assert_eq!(encoder.processed_requests(), completed_batches);
+        assert_eq!(encoder.load(), 0);
         server.abort();
     }
 
@@ -560,6 +573,7 @@ mod test_pd_routing {
             .get_by_url(&format!("{base}/e"))
             .unwrap();
         let router = RouterFactory::create_router(&context).await.unwrap();
+        assert_eq!(context.policy_registry.get_encode_policy().name(), "random");
         assert!(Arc::ptr_eq(
             &encoder,
             &context.worker_registry.get_by_url(encoder.url()).unwrap()
@@ -620,6 +634,31 @@ mod test_pd_routing {
                 .load(),
             0
         );
+        assert_eq!(encoder.processed_requests(), 1);
+        assert_eq!(encoder.load(), 0);
+        assert_eq!(encoder.circuit_breaker().total_successes(), 1);
+        encoder.set_healthy(false);
+        seen.lock().unwrap().clear();
+        let response = router.route_transparent(None, "/v1/chat/completions", &Method::POST,
+            json!({"messages":[{"role":"user", "content":[{"type":"image_url", "image_url":{"url":"image"}}]}]})
+        ).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(seen.lock().unwrap().is_empty());
+        assert_eq!(encoder.processed_requests(), 1);
+        // No Encode availability is required for text-only requests.
+        let response = router
+            .route_transparent(
+                None,
+                "/v1/chat/completions",
+                &Method::POST,
+                json!({"messages":[{"role":"user", "content":"hello"}]}),
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(seen.lock().unwrap()[0].0, "PD");
         server.abort();
     }
 

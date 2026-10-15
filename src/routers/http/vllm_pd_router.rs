@@ -3000,11 +3000,13 @@ impl VllmPDRouter {
             let program_runtime = PdProgramRuntime::new(ctx, service_registry.clone(), true)?;
 
             Ok(Self {
-                epd: ctx
-                    .router_config
-                    .epd
-                    .clone()
-                    .map(super::epd::EncoderStage::new),
+                epd: ctx.router_config.epd.clone().map(|config| {
+                    super::epd::EncoderStage::new(
+                        config,
+                        ctx.worker_registry.clone(),
+                        ctx.policy_registry.clone(),
+                    )
+                }),
                 pd_router,
                 program_runtime,
                 service_registry,
@@ -3120,11 +3122,13 @@ impl VllmPDRouter {
             }
 
             Ok(Self {
-                epd: ctx
-                    .router_config
-                    .epd
-                    .clone()
-                    .map(super::epd::EncoderStage::new),
+                epd: ctx.router_config.epd.clone().map(|config| {
+                    super::epd::EncoderStage::new(
+                        config,
+                        ctx.worker_registry.clone(),
+                        ctx.policy_registry.clone(),
+                    )
+                }),
                 pd_router,
                 program_runtime,
                 service_registry,

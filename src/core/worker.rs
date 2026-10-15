@@ -652,17 +652,23 @@ impl WorkerFactory {
     /// Create an HTTP Encode worker. The caller validates the configured HTTP URL.
     /// Reuses the standard health checks and circuit breaker without DP expansion.
     pub fn create_encode(url: String) -> Box<dyn Worker> {
-        Self::create_encode_with_config(url, CircuitBreakerConfig::default())
+        Self::create_encode_with_config(
+            url,
+            CircuitBreakerConfig::default(),
+            HealthConfig::default(),
+        )
     }
 
-    /// Create an HTTP Encode worker with custom circuit breaker configuration.
+    /// Create an HTTP Encode worker with shared health and circuit configuration.
     pub fn create_encode_with_config(
         url: String,
         circuit_breaker_config: CircuitBreakerConfig,
+        health_config: HealthConfig,
     ) -> Box<dyn Worker> {
         Box::new(
             BasicWorker::with_connection_mode(url, WorkerType::Encode, ConnectionMode::Http)
-                .with_circuit_breaker_config(circuit_breaker_config),
+                .with_circuit_breaker_config(circuit_breaker_config)
+                .with_health_config(health_config),
         )
     }
 
@@ -1048,7 +1054,12 @@ mod tests {
                 failure_threshold: 1,
                 ..CircuitBreakerConfig::default()
             },
+            HealthConfig {
+                endpoint: "/encoder-health".into(),
+                ..HealthConfig::default()
+            },
         );
+        assert_eq!(worker.metadata().health_config.endpoint, "/encoder-health");
         assert!(worker.is_available());
         worker.set_healthy(false);
         assert!(!worker.is_available());

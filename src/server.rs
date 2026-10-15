@@ -1,6 +1,6 @@
 use crate::{
     config::{HistoryBackend, RouterConfig, TraceConfig},
-    core::{BasicWorker, CircuitBreakerConfig, HealthConfig, WorkerRegistry, WorkerType},
+    core::{CircuitBreakerConfig, HealthConfig, WorkerFactory, WorkerRegistry, WorkerType},
     data_connector::{MemoryResponseStorage, NoOpResponseStorage, SharedResponseStorage},
     logging::{self, LoggingConfig},
     metrics::{self, PrometheusConfig},
@@ -110,11 +110,11 @@ impl AppContext {
                 success_threshold: router_config.health_check.success_threshold,
             };
             for url in &epd.encoder_urls {
-                worker_registry.register(Arc::new(
-                    BasicWorker::new(url.clone(), WorkerType::Encode)
-                        .with_circuit_breaker_config(circuit_breaker.clone())
-                        .with_health_config(health.clone()),
-                ));
+                worker_registry.register(Arc::from(WorkerFactory::create_encode_with_config(
+                    url.clone(),
+                    circuit_breaker.clone(),
+                    health.clone(),
+                )));
             }
         }
 

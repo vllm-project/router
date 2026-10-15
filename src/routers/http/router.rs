@@ -606,11 +606,13 @@ impl Router {
         });
 
         Ok(Router {
-            epd: ctx
-                .router_config
-                .epd
-                .clone()
-                .map(super::epd::EncoderStage::new),
+            epd: ctx.router_config.epd.clone().map(|config| {
+                super::epd::EncoderStage::new(
+                    config,
+                    ctx.worker_registry.clone(),
+                    ctx.policy_registry.clone(),
+                )
+            }),
             worker_registry: ctx.worker_registry.clone(),
             policy_registry: ctx.policy_registry.clone(),
             client: ctx.client.clone(),
@@ -5814,6 +5816,8 @@ mod tests {
                 encode_policy: None,
                 consumer_zmq_addrs: Default::default(),
             },
+            router.worker_registry.clone(),
+            router.policy_registry.clone(),
         ));
         for (body, status) in [
             (json!({"messages": []}), StatusCode::OK),
