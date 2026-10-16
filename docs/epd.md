@@ -18,6 +18,7 @@ target/release/vllm-router \
   --policy random \
   --epd-config '{
     "encoder_urls": ["http://e0:8000", "http://e1:8000"],
+    "encode_policy": "round_robin",
     "consumer_zmq_addrs": {
       "http://pd0:8000": "tcp://pd0:14579",
       "http://pd1:8000": "tcp://pd1:14579"
@@ -28,9 +29,50 @@ target/release/vllm-router \
 `consumer_zmq_addrs` is for Mooncake PUSH and must map each configured PD HTTP URL
 to that worker's configured EC control address. For NIXL PULL or the shared-file
 example connector, omit this map. The PD worker is selected before encoding so
-the producer and the HTTP request use the same destination. Media items are
-assigned to encoders round-robin; images landing on the same encoder are
-batched into a single request, like the Python EPD proxy.
+the producer and the HTTP request use the same destination. The Encode policy
+assigns each media item to an available encoder; images landing on the same
+encoder are batched into a single request, like the Python EPD proxy.
+
+## Encode policy, health, and load
+
+`encode_policy` in `--epd-config` accepts `round_robin` (the default when omitted
+or null) or `random`. The native CLI can override the JSON setting with
+`--encode-policy random`; this flag requires `--epd-config`. Unsupported Encode
+policies are rejected at startup. Rust callers set `EpdConfig.encode_policy`
+to `Some(EncodePolicy::RoundRobin)` or `Some(EncodePolicy::Random)`;
+`None` uses round-robin.
+
+The Encode policy is shared across requests and independent of `--policy`,
+`--prefill-policy`, `--decode-policy`, and per-model consumer policies. For
+example, the command above uses random consumer selection and round-robin
+Encode selection. Round-robin reserves the media assignments for one request
+together, following the configured encoder order among available workers.
+Random assigns each media item uniformly among available workers. Both retain
+image batching by encoder; audio and video items remain singleton subrequests.
+
+Static encoders are registered at startup with the `Encode` role. They use the
+router's health-check endpoint (default `/health`), timeout, interval, and
+success/failure thresholds, together with its circuit-breaker configuration.
+Selection requires a healthy worker whose circuit breaker permits execution.
+If no encoder is available, a raw-media request returns `503` before consumer
+submission. Text-only and existing-embeds requests still bypass Encode.
+Encode workers appear in management listings but stay outside inference
+consumer pools and cannot satisfy consumer readiness on their own.
+
+Encode `load` counts in-flight encoder HTTP batches. A batch of several images
+adds one, and the count stays held until the response body/JSON is consumed or
+the attempt fails. Completion, failure, or dropping the encoder future releases
+that batch's load once; periodic load resets preserve active Encode batches.
+This counter measures router-side HTTP work, not media-item count or the
+engine's GPU queue. RR/random selection does not balance by this load.
+
+Encode `processed_requests` counts completed HTTP batch attempts, including
+HTTP, transport, and response-JSON failures. Dropping an unfinished future
+releases load without adding a completion or a circuit-breaker outcome.
+Successful JSON responses and HTTP 4xx count as reachable-worker outcomes;
+transport errors, HTTP 5xx, and unreadable JSON count as failed outcomes.
+
+## Request and metadata behavior
 
 Send ordinary OpenAI chat requests to `/v1/chat/completions`. Each raw media item
 is sent to an encoder. Published metadata replaces that item with an embeds
@@ -75,10 +117,11 @@ owns request completion/abort cleanup.
 - Regular E+PD or static vLLM E/P/D mode, including consumer DP>1, no IGW.
 - HTTP(S) backends only; gRPC encoder and consumer URLs are rejected at startup.
 - Encoder TP/PP constraints remain backend-specific and unchanged.
-- Static E URLs; E health-aware routing and dynamic consumer discovery are not added.
-  The service registry has no encoder role, and vLLM does not publish EC control
-  addresses, so Mooncake PUSH cannot resolve a newly registered consumer. Dynamic
-  discovery for NIXL PULL or the example connector is a smaller follow-up.
+- Static E URLs with health- and circuit-breaker-aware selection. Dynamic
+  Encode/consumer discovery is not supported. The discovery service registry
+  has no encoder role, and vLLM does not publish EC control addresses, so
+  Mooncake PUSH cannot resolve a newly registered consumer. Dynamic discovery
+  for NIXL PULL or the example connector is a smaller follow-up.
 - JSON metadata only, not legacy tensor-base64 metadata from old E servers.
 - No early metadata publication, encoder batching changes, or engine/scheduler changes.
 - Image E2E validation is performed separately; do not infer audio/video coverage
