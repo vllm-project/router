@@ -1,0 +1,25 @@
+name: rust-test
+
+on: [push, pull_request]
+
+jobs:
+  test:
+    name: Rust tests (Linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          components: rustfmt, clippy
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libssl-dev protobuf-compiler
+      - uses: Swatinem/rust-cache@v2
+      - name: Check formatting
+        run: cargo fmt --check
+      - name: Run locked test suite
+        run: cargo test --locked --all-targets --all-features
+      - name: Run locked clippy
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
