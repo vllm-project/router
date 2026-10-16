@@ -2587,7 +2587,8 @@ impl RouterTrait for Router {
                 // The same connection-aware filter the other forwarding paths
                 // use, so a field named by `Connection` or any other hop-by-hop
                 // field cannot reach the worker here either.
-                for (name, value) in header_utils::sanitize_request_headers(headers) {
+                let sanitized = header_utils::sanitize_request_headers(headers);
+                for (name, value) in &sanitized {
                     // When a backend api_key is configured it must win:
                     // RequestBuilder::header appends, and vLLM reads the
                     // first Authorization value.
@@ -3094,6 +3095,92 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.contains("mixed"), "{err}");
+    }
+
+    /// An axum backend that echoes the header names and values it received, so a
+    /// test can assert on what actually reached the worker.
+    async fn spawn_header_echo_backend() -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        use axum::Json;
+        let app = axum::Router::new().fallback(|headers: HeaderMap| async move {
+            let mut echoed: HashMap<String, Vec<String>> = HashMap::new();
+            for (name, value) in headers.iter() {
+                if let Ok(value) = value.to_str() {
+                    echoed
+                        .entry(name.to_string())
+                        .or_default()
+                        .push(value.to_string());
+                }
+            }
+            Json(echoed)
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (address, server)
+    }
+
+    fn router_pointing_at(address: std::net::SocketAddr) -> Router {
+        let mut router = create_test_regular_router();
+        router.worker_registry = Arc::new(WorkerRegistry::new());
+        router.worker_registry.register(Arc::new(BasicWorker::new(
+            format!("http://{address}"),
+            WorkerType::Regular,
+        )));
+        router
+    }
+
+    /// The transparent path with EPD enabled has to apply the same header policy
+    /// as every other forwarding path. Its own skip list only covered
+    /// host/content-length/content-type/connection/transfer-encoding, so
+    /// `keep-alive`, `te`, `upgrade`, `proxy-authorization` and whatever the
+    /// client's `Connection` named still went through to the worker.
+    #[tokio::test]
+    async fn transparent_epd_path_sanitizes_client_headers() {
+        let (address, server) = spawn_header_echo_backend().await;
+        let mut router = router_pointing_at(address);
+        router.epd = Some(super::super::epd::EncoderStage::new(
+            crate::config::EpdConfig {
+                encoder_urls: vec!["http://unused".into()],
+                consumer_zmq_addrs: Default::default(),
+            },
+        ));
+        let mut headers = HeaderMap::new();
+        headers.insert("keep-alive", "timeout=5".parse().unwrap());
+        headers.insert("te", "trailers".parse().unwrap());
+        headers.insert("upgrade", "websocket".parse().unwrap());
+        headers.insert("proxy-authorization", "Basic c2VjcmV0".parse().unwrap());
+        headers.insert("connection", "X-Internal".parse().unwrap());
+        headers.insert("x-internal", "must-not-leak".parse().unwrap());
+        headers.insert("x-session-id", "sticky-1".parse().unwrap());
+
+        // /v1/responses is not handed to the encoder, so this exercises the
+        // forwarding loop itself.
+        let response = router
+            .route_transparent(
+                Some(&headers),
+                "/v1/responses",
+                &Method::POST,
+                serde_json::json!({"model": "m"}),
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let echoed: HashMap<String, Vec<String>> = serde_json::from_slice(&bytes).unwrap();
+        for name in [
+            "keep-alive",
+            "te",
+            "upgrade",
+            "proxy-authorization",
+            "connection",
+            "x-internal",
+        ] {
+            assert!(
+                !echoed.contains_key(name),
+                "{name} reached the worker: {echoed:?}"
+            );
+        }
+        assert_eq!(echoed["x-session-id"], vec!["sticky-1"]);
+        server.abort();
     }
 
     #[tokio::test]
