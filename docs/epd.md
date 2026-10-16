@@ -39,6 +39,16 @@ its content-derived uuid pinned and its transfer is forwarded, so the consumer
 re-preprocesses into the same mm_hash and can still reuse the published
 embedding. Repeated images keep their original positions and independent
 transfer IDs.
+
+Encoder responses use the existing JSON metadata contract. When `item_indices`
+is present it must be a batch-local integer array with in-range, non-repeated
+positions; malformed indices or non-numeric metadata fail the request with
+`502` before the consumer is called. Three missing-data cases remain valid
+fallbacks: no EC report, no entry for an item, or an entry without non-empty
+placeholder metadata. In each case the router keeps the raw media with its
+content-derived UUID and forwards the reported transfer handle when one exists.
+Connector-specific fields under `ec_transfer_params` remain opaque and are
+passed through unchanged.
 Other request fields, including sampling options, pass through unchanged.
 Text-only and existing embeds inputs do not call the encoders. Mooncake consumers
 with rank-qualified URLs reject caller-provided nonempty `ec_transfer_params`

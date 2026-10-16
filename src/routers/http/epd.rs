@@ -307,26 +307,26 @@ impl EncoderStage {
             // uuids with processing options; the uuid key and the single-entry
             // shape are fallbacks for encoders without position metadata.
             let mut by_position: HashMap<usize, (&String, &Value)> = HashMap::new();
-            if indices.len() > 1 {
-                for (mm_hash, reported) in params.iter() {
-                    if let Some(item_indices) =
-                        reported.get("item_indices").and_then(Value::as_array)
-                    {
-                        for local in item_indices {
-                            let local = local
-                                .as_u64()
-                                .map(|v| v as usize)
-                                .filter(|&v| v < indices.len())
-                                .ok_or_else(|| {
-                                    (StatusCode::BAD_GATEWAY, "Invalid encoder item index".into())
-                                })?;
-                            if by_position.insert(local, (mm_hash, reported)).is_some() {
-                                return Err((
-                                    StatusCode::BAD_GATEWAY,
-                                    "Duplicate encoder item index".into(),
-                                ));
-                            }
-                        }
+            for (mm_hash, reported) in params.iter() {
+                let Some(item_indices) = reported.get("item_indices") else {
+                    continue;
+                };
+                let item_indices = item_indices.as_array().ok_or_else(|| {
+                    (StatusCode::BAD_GATEWAY, "Invalid encoder item index".into())
+                })?;
+                for local in item_indices {
+                    let local = local
+                        .as_u64()
+                        .and_then(|value| usize::try_from(value).ok())
+                        .filter(|&value| value < indices.len())
+                        .ok_or_else(|| {
+                            (StatusCode::BAD_GATEWAY, "Invalid encoder item index".into())
+                        })?;
+                    if by_position.insert(local, (mm_hash, reported)).is_some() {
+                        return Err((
+                            StatusCode::BAD_GATEWAY,
+                            "Duplicate encoder item index".into(),
+                        ));
                     }
                 }
             }
@@ -634,6 +634,15 @@ mod tests {
                 Json(json!({"error":"unavailable"})),
             );
         }
+        if state.mode == "no_report" {
+            return (StatusCode::OK, Json(json!({})));
+        }
+        if state.mode == "missing_entry" {
+            return (
+                StatusCode::OK,
+                Json(json!({"ec_transfer_params": {"opaque": {"backend_field": 42}}})),
+            );
+        }
         // Batched requests carry several media parts; dedupe identical media
         // into one entry and report positions via item_indices, like vLLM.
         let content = body["messages"][0]["content"].as_array().unwrap();
@@ -660,11 +669,18 @@ mod tests {
                 "invalid" => json!({"image_grid_thw": ["invalid"]}),
                 _ => json!({"image_grid_thw": [[1, 2, 3]]}),
             };
+            let item_indices = match state.mode {
+                "bad_indices_type" => json!("0"),
+                "bad_index_fractional" => json!([0.5]),
+                "bad_index_out_of_range" => json!([indices.len()]),
+                "duplicate_index" => json!([0, 0]),
+                _ => json!(indices),
+            };
             params.insert(
                 format!("engine-{uuid}"),
                 json!({
                     "metadata": metadata,
-                    "item_indices": indices,
+                    "item_indices": item_indices,
                     "peer_host": "encoder",
                     "peer_port": 4321,
                     "size_bytes": 128,
@@ -1281,6 +1297,55 @@ mod tests {
         assert_eq!(handle["metadata"], json!({}));
         assert_eq!(handle["peer_port"], 4321);
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn missing_report_and_missing_entry_keep_raw_media_with_uuid() {
+        for mode in ["no_report", "missing_entry"] {
+            let (stage, seen, server) = mock(mode).await;
+            let input = request();
+            let (body, pending) = stage
+                .prepare(&Client::new(), input.clone(), "pd", None, None)
+                .await
+                .unwrap();
+            assert!(pending.is_none());
+
+            let encoded = seen.lock().unwrap();
+            let uuid = encoded[0]["messages"][0]["content"][0]["uuid"]
+                .as_str()
+                .unwrap();
+            for index in [0, 2] {
+                let mut expected = input["messages"][0]["content"][index].clone();
+                expected["uuid"] = json!(uuid);
+                assert_eq!(body["messages"][0]["content"][index], expected);
+            }
+            assert_eq!(
+                body["messages"][0]["content"][1],
+                input["messages"][0]["content"][1]
+            );
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_encoder_item_indices_are_rejected() {
+        for mode in [
+            "bad_indices_type",
+            "bad_index_fractional",
+            "bad_index_out_of_range",
+            "duplicate_index",
+        ] {
+            let (stage, _, server) = mock(mode).await;
+            let mut input = request();
+            input["messages"][0]["content"] = json!([input["messages"][0]["content"][0].clone()]);
+            let error = stage
+                .prepare(&Client::new(), input, "pd", None, None)
+                .await
+                .err()
+                .unwrap();
+            assert_eq!(error.0, StatusCode::BAD_GATEWAY, "mode: {mode}");
+            server.abort();
+        }
     }
 
     #[tokio::test]
