@@ -2851,6 +2851,7 @@ mod tests {
     async fn test_decode_response_filters_headers_in_every_branch() {
         let policies = Arc::new(PolicyRegistry::new(crate::config::PolicyConfig::RoundRobin));
         let router = VllmPDRouter {
+            epd: None,
             pd_router: PdRouterBase {
                 worker_registry: Arc::new(crate::core::WorkerRegistry::new()),
                 policy_registry: policies.clone(),

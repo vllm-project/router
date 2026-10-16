@@ -149,6 +149,9 @@ mod tests {
 
     #[test]
     fn passive_trace_propagation_honors_connection_options() {
+        // The passive path only runs when OTel is off. The enabled flag latches
+        // on first use, so a developer with OTEL_* exported in their shell would
+        // otherwise see this fail confusingly instead of being skipped.
         assert!(!crate::otel_trace::is_otel_enabled());
         let mut headers = HeaderMap::new();
         headers.append("connection", "keep-alive".parse().unwrap());

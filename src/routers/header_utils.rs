@@ -152,8 +152,17 @@ pub fn propagate_headers(
     header_names: &[&str],
 ) -> reqwest::RequestBuilder {
     if let Some(h) = headers {
-        let h = sanitize_request_headers(h);
+        // Only the allowlisted names are copied out, so checking those names
+        // against the `Connection` list directly is enough and avoids
+        // rebuilding the whole map for every outbound request.
+        let connection_fields = connection_named_fields(h);
         for &name in header_names {
+            if connection_fields
+                .iter()
+                .any(|field| field.eq_ignore_ascii_case(name))
+            {
+                continue;
+            }
             for value in h.get_all(name) {
                 request = request.header(name, value);
             }

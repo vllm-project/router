@@ -2584,24 +2584,24 @@ impl RouterTrait for Router {
         // Add authorization if configured
         if self.epd.is_some() {
             if let Some(headers) = headers {
-                for (name, value) in headers {
+                // The same connection-aware filter the other forwarding paths
+                // use, so a field named by `Connection` or any other hop-by-hop
+                // field cannot reach the worker here either.
+                for (name, value) in header_utils::sanitize_request_headers(headers) {
                     // When a backend api_key is configured it must win:
                     // RequestBuilder::header appends, and vLLM reads the
                     // first Authorization value.
                     if self.api_key.is_some() && name == http::header::AUTHORIZATION {
                         continue;
                     }
-                    if !matches!(
-                        name.as_str(),
-                        "host"
-                            | "content-length"
-                            | "content-type"
-                            | "connection"
-                            | "transfer-encoding"
-                    ) && !header_utils::TRACE_HEADER_NAMES.contains(&name.as_str())
+                    // reqwest derives these from the body and URL it sends.
+                    if name == http::header::CONTENT_LENGTH
+                        || name == http::header::CONTENT_TYPE
+                        || header_utils::TRACE_HEADER_NAMES.contains(&name.as_str())
                     {
-                        request_builder = request_builder.header(name, value);
+                        continue;
                     }
+                    request_builder = request_builder.header(name, value);
                 }
             }
         }
