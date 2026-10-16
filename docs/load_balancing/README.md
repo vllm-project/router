@@ -14,7 +14,7 @@ the policy is the same for `grpc://host:port`.
 | `consistent_hash` | Multi-turn conversations, KV cache reuse | Yes | No |
 | `power_of_two` | Load-sensitive workloads | No | Yes |
 | `cache_aware` | Prefix caching optimization | Yes (cache-based) | Yes |
-| `kv_aware` | Tiered KV reuse and live-load scoring | No | Yes |
+| `kv_aware` | KV reuse and stage-aware load scoring | No | Yes |
 
 ---
 
@@ -242,7 +242,7 @@ vllm-router --policy cache_aware \
 
 ## KV Aware
 
-The `kv_aware` policy scores workers using the request's reusable KV blocks and current load. It is supported in regular, co-located routing mode only; it is not supported with PD disaggregation. In PD mode, the effective prefill and decode policies must use other policies. KV placement credit requires gRPC workers because the gRPC chat route supplies token IDs to the policy. With HTTP workers, the policy degrades to load-only scoring and does not use KV event placement.
+The `kv_aware` policy combines reusable KV placement with live load. Colocated routing uses a multiplicative cost; P/D routing uses separate prefill and decode costs. Unverified placement receives no KV credit.
 
 ```bash
 vllm-router --policy kv_aware \
@@ -256,6 +256,41 @@ vllm-router --policy kv_aware \
 For each candidate, the scorer computes `ptoken = new_prefill_tokens + active_prefill_tokens` and projects the request count as `max(slot_manager.active_requests, Worker::load) + 1`. It multiplies `ptoken` by that projected count, so the score estimates the load after admitting this request and includes its remaining prefill work even when the worker is currently idle. Zero-cost cases, such as a request with no prefill work, are resolved by the KV-work and current-load tie-breaks.
 
 `--router-temperature 0` selects a minimum-cost worker. A positive temperature samples among candidates by their relative costs. Device reuse has full credit; the host, external, and disk `--kv-penalty-*` flags configure transfer-credit ratios for those tiers. A higher credit means more reuse value and lower transfer cost.
+
+### KV Aware with P/D Disaggregation
+
+P/D workers use HTTP(S) endpoints. The router keeps the existing connector dispatch and non-KV policy paths.
+
+P uses the remaining prompt work after KV credit plus admitted P token work. D uses active plus pending decode occupancy:
+
+```text
+prefill_score = new_prefill_tokens + active_prefill_tokens
+decode_score  = active_decode_requests + pending_decode_requests + 1
+```
+
+For dense single-prompt completions and plain-text chat, the router reads P's KV events and prepares effective tokens before admission. Completion token-ID arrays are consumed directly; text and chat use each P server's `/tokenize` endpoint. Tokenizer/template inputs are never shared across P servers. `--router-temperature` controls P's token-cost picker; D uses deterministic minimum occupancy.
+
+Missing placement information charges full prompt token work. Unsupported inputs skip metadata/tokenization requests and use P request occupancy. Unavailable tokenization also uses occupancy. Any unknown in-flight P work also triggers occupancy selection across the pool. Equal scores prefer lower occupancy, then stable endpoint order.
+
+Set `kv_aware` as the common policy or override either stage. Stage-specific settings take precedence:
+
+```bash
+vllm-router --vllm-pd-disaggregation \
+  --prefill http://prefill:8000 --decode http://decode:8000 \
+  --prefill-policy kv_aware --decode-policy kv_aware
+```
+
+The router reserves P and pending D occupancy before dispatch. P occupancy is released after the prefill response body is consumed. D moves from pending to active at dispatch and remains active until its response body finishes or is cancelled/dropped. For non-streaming responses the body is buffered and D is released as soon as the backend has finished generating; a slow client does not extend decode occupancy. This prevents requests waiting for dispatch or streaming a response from appearing idle to later selections.
+
+The P and D endpoints form a request-scoped compatible pair; workers do not have a permanent one-to-one pairing. Existing connector configuration and transfer behavior are unchanged.
+
+P/D selection filters workers by the request's model only when they carry a `model_id` label; unlabeled workers remain eligible for every model.
+
+Prefill engines must enable prefix caching and ZMQ KV events, and expose `/tokenize`, `/v1/models`, `/kv_event_sources`, and block-size metadata through `/get_server_info` or `/server_info?config_format=json` (native Python vLLM requires `VLLM_SERVER_DEV_MODE=1`). The router must reach the advertised event endpoints. Configure the P/D KV connector as required by the engine.
+
+Prefix credit supports dense text completions, token-ID prompts, and plain chat messages with matching engine templates. Unsupported input features, unavailable metadata/tokenization, or unverified placement use conservative full-work or occupancy fallback. Model labels must match the request model exactly; aliases must be registered consistently.
+
+Compare identical repeated-prefix workloads against `round_robin` or `cache_aware` with the same P/D pools. Observe TTFT/JCT, `vllm_router_pd_prefill_decisions_total`, `vllm_router_pd_credited_prefix_tokens_total`, and P/D load gauges. Credited tokens are a scheduling estimate; backend execution metrics establish actual prefill savings.
 
 KV-aware session affinity is disabled by default. Set `--kv-aware-session-affinity-ttl-secs <seconds>` to enable it and expire idle bindings after the given TTL (1–31,536,000 seconds). For example, use `--kv-aware-session-affinity-ttl-secs 1800` for a 30-minute idle TTL. Omit the option to compare the original KV-aware routing behavior without affinity.
 

@@ -402,7 +402,7 @@ class TestRouterArgs:
         assert router_args.policy == "random"
         assert router_args.vllm_pd_disaggregation is False
 
-    def test_kv_aware_is_rejected_for_effective_pd_policies(self):
+    def test_kv_aware_is_allowed_for_effective_pd_policies(self):
         for kwargs in [
             {"policy": "kv_aware"},
             {"policy": "kv_aware", "enable_igw": True},
@@ -414,8 +414,7 @@ class TestRouterArgs:
                 service_discovery=True,
                 **kwargs,
             )
-            with pytest.raises(ValueError, match="only in regular mode"):
-                args._validate_router_args()
+            args._validate_router_args()
 
     def test_kv_aware_is_allowed_in_regular_mode(self):
         args = RouterArgs(policy="kv_aware")
@@ -508,9 +507,10 @@ class TestParseRouterArgs:
         assert captured["kv_penalty_external"] == 0.5
         assert captured["kv_penalty_disk"] == 0.2
 
-    def test_kv_aware_is_not_a_pd_stage_policy(self):
-        with pytest.raises(SystemExit):
-            parse_router_args(["--prefill-policy", "kv_aware"])
+    def test_kv_aware_is_a_pd_stage_policy(self):
+        for stage in ["prefill", "decode"]:
+            args = parse_router_args([f"--{stage}-policy", "kv_aware"])
+            assert getattr(args, f"{stage}_policy") == "kv_aware"
 
     def test_parse_program_scheduling_json(self):
         """Keep the opt-in scheduler configuration opaque until Rust validation."""

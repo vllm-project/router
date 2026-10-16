@@ -166,7 +166,7 @@ class RouterArgs:
                 "power_of_two",
                 "consistent_hash",
             ],
-            help="Load balancing policy to use. kv_aware is supported only in regular mode. In PD mode, this is used for both prefill and decode unless overridden",
+            help="Load balancing policy to use. kv_aware uses stage-specific load profiles in PD mode. In PD mode, this is used for both prefill and decode unless overridden",
         )
         parser.add_argument(
             f"--{prefix}prefill-policy",
@@ -176,10 +176,11 @@ class RouterArgs:
                 "random",
                 "round_robin",
                 "cache_aware",
+                "kv_aware",
                 "power_of_two",
                 "consistent_hash",
             ],
-            help="Specific policy for prefill nodes in PD mode. kv_aware is not supported in PD mode. If not specified, uses the main policy",
+            help="Specific policy for prefill nodes in PD mode. If not specified, uses the main policy",
         )
         parser.add_argument(
             f"--{prefix}decode-policy",
@@ -189,10 +190,11 @@ class RouterArgs:
                 "random",
                 "round_robin",
                 "cache_aware",
+                "kv_aware",
                 "power_of_two",
                 "consistent_hash",
             ],
-            help="Specific policy for decode nodes in PD mode. kv_aware is not supported in PD mode. If not specified, uses the main policy",
+            help="Specific policy for decode nodes in PD mode. If not specified, uses the main policy",
         )
 
         parser.add_argument(
@@ -219,7 +221,6 @@ class RouterArgs:
             default=RouterArgs.kv_penalty_disk,
             help="Disk-tier KV transfer credit for kv_aware (0.0-1.0)",
         )
-
         # PD-specific arguments
         parser.add_argument(
             f"--{prefix}mini-lb",
@@ -604,16 +605,6 @@ class RouterArgs:
                     raise ValueError("PD disaggregation mode requires --prefill")
                 if not self.decode_urls:
                     raise ValueError("PD disaggregation mode requires --decode")
-
-            effective_prefill_policy = self.prefill_policy or self.policy
-            effective_decode_policy = self.decode_policy or self.policy
-            if "kv_aware" in (
-                effective_prefill_policy,
-                effective_decode_policy,
-            ):
-                raise ValueError(
-                    "kv_aware is supported only in regular mode, not PD disaggregation"
-                )
 
             # Warn about policy usage in PD mode
             if self.prefill_policy and self.decode_policy and self.policy:

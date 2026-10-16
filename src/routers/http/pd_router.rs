@@ -1,13 +1,20 @@
 // PD (Prefill-Decode) Router Implementation
 // This module handles routing for disaggregated prefill-decode systems
 use super::dp_utils;
-use super::pd_types::PDRouterError;
-use crate::core::{
-    BasicWorker, CircuitBreakerConfig, DPAwareWorker, HealthConfig, Worker, WorkerRegistry,
-    WorkerType,
+use super::pd_types::{
+    Loads, PDRouterError, PdAttempt, PdEndpoint, PdLoadManager, PdPrefillInput, PdRequestContext,
+    PdSelection, Stage, StageDecision,
 };
-use crate::policies::{LoadBalancingPolicy, PolicyRegistry};
+use crate::core::worker::WorkerMetadata;
+use crate::core::{
+    BasicWorker, CircuitBreaker, CircuitBreakerConfig, ConnectionMode, DPAwareWorker, HealthConfig,
+    Worker, WorkerRegistry, WorkerResult, WorkerType,
+};
+use crate::kv_index::discovery::{query_pd_kv_event_sources, query_pd_server_info};
+use crate::kv_index::{HashMode, KvIndexSupervisor, WorkerKvInfo};
+use crate::policies::{kv_aware_ops, KvAwareOps, LoadBalancingPolicy, PolicyRegistry};
 use crate::routers::header_utils;
+use async_trait::async_trait;
 use axum::{
     body::Body,
     extract::Request,
@@ -15,16 +22,1026 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
+use futures_util::{stream, StreamExt};
 use reqwest::Client;
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
+
+/// Admission decision over the supplied load snapshot. Legacy policies
+/// retain their own selection semantics and text/header inputs.
+pub(super) fn select_pd_pair(
+    loads: &Loads,
+    prefill_workers: &[Arc<dyn Worker>],
+    decode_workers: &[Arc<dyn Worker>],
+    prefill_policy: &dyn LoadBalancingPolicy,
+    decode_policy: &dyn LoadBalancingPolicy,
+    context: &PdRequestContext<'_>,
+    compatible: impl Fn(&dyn Worker, &dyn Worker) -> bool,
+) -> Option<PdSelection> {
+    // Admission must not switch an endpoint between aggregate and per-rank
+    // accounting while requests are live. Index existing granularities once
+    // instead of rescanning every load key for every candidate.
+    let active_granularities: HashSet<(Stage, &str, bool)> = loads
+        .keys()
+        .map(|(stage, endpoint)| {
+            (
+                *stage,
+                endpoint.http_url.as_str(),
+                endpoint.dp_rank.is_some(),
+            )
+        })
+        .collect();
+    let eligible = |stage: Stage, worker: &dyn Worker, endpoint: &PdEndpoint| {
+        let granularity_matches = !active_granularities.contains(&(
+            stage,
+            endpoint.http_url.as_str(),
+            endpoint.dp_rank.is_none(),
+        ));
+        worker.is_available()
+            && granularity_matches
+            && context
+                .model_id
+                .is_none_or(|model| worker.model_id() == "unknown" || worker.model_id() == model)
+    };
+    let prefill_endpoints: Vec<_> = prefill_workers
+        .iter()
+        .map(|worker| PdEndpoint::for_worker(worker.as_ref()))
+        .collect();
+    let decode_endpoints: Vec<_> = decode_workers
+        .iter()
+        .map(|worker| PdEndpoint::for_worker(worker.as_ref()))
+        .collect();
+    let prefill_eligible: Vec<_> = prefill_workers
+        .iter()
+        .zip(&prefill_endpoints)
+        .map(|(worker, endpoint)| eligible(Stage::Prefill, worker.as_ref(), endpoint))
+        .collect();
+    let decode_eligible: Vec<_> = decode_workers
+        .iter()
+        .zip(&decode_endpoints)
+        .map(|(worker, endpoint)| eligible(Stage::Decode, worker.as_ref(), endpoint))
+        .collect();
+    let prefill_indices: Vec<_> = prefill_workers
+        .iter()
+        .enumerate()
+        .filter(|(index, p)| {
+            prefill_eligible[*index]
+                && decode_workers.iter().enumerate().any(|(decode_index, d)| {
+                    decode_eligible[decode_index] && compatible(p.as_ref(), d.as_ref())
+                })
+        })
+        .map(|(index, _)| index)
+        .collect();
+    let prefill = select_stage(
+        loads,
+        Stage::Prefill,
+        prefill_workers,
+        &prefill_endpoints,
+        &prefill_indices,
+        prefill_policy,
+        context,
+    )?;
+    let decode_indices: Vec<_> = decode_workers
+        .iter()
+        .enumerate()
+        .filter(|(index, d)| {
+            decode_eligible[*index]
+                && compatible(prefill_workers[prefill.worker_index].as_ref(), d.as_ref())
+        })
+        .map(|(index, _)| index)
+        .collect();
+    let Some(mut decode) = select_stage(
+        loads,
+        Stage::Decode,
+        decode_workers,
+        &decode_endpoints,
+        &decode_indices,
+        decode_policy,
+        context,
+    ) else {
+        // Nothing is charged on a failed selection; release the P binding
+        // reference this request acquired before bailing out.
+        if let Some(record) = &prefill.affinity {
+            record.release_ref();
+        }
+        return None;
+    };
+
+    decode.estimated_transfer_tokens = context
+        .prefill_inputs
+        .and_then(|inputs| inputs.get(prefill_workers[prefill.worker_index].base_url()))
+        .and_then(|input| input.token_ids.as_ref())
+        .map(|tokens| tokens.len() as u64);
+
+    Some(PdSelection { prefill, decode })
+}
+
+fn select_stage(
+    loads: &Loads,
+    stage: Stage,
+    workers: &[Arc<dyn Worker>],
+    endpoints: &[PdEndpoint],
+    indices: &[usize],
+    policy: &dyn LoadBalancingPolicy,
+    context: &PdRequestContext<'_>,
+) -> Option<StageDecision> {
+    let kv_aware = kv_aware_ops(policy).is_some();
+    let mut selected_indices = indices.to_vec();
+    let mut projected: Vec<Arc<dyn Worker>> = indices
+        .iter()
+        .map(|&index| {
+            let inner = workers[index].clone();
+            let endpoint = endpoints[index].clone();
+            let load = loads
+                .get(&(stage, endpoint))
+                .copied()
+                .unwrap_or_default()
+                .occupancy(stage);
+            Arc::new(PolicyWorker { inner, load }) as Arc<dyn Worker>
+        })
+        .collect();
+    // Discovery pools may originate in an unordered registry. Keep every
+    // policy's index-to-endpoint mapping stable, including stateful selectors.
+    let mut ordered: Vec<_> = projected.into_iter().zip(selected_indices).collect();
+    ordered.sort_by(|left, right| endpoints[left.1].cmp(&endpoints[right.1]));
+    let (workers, indices): (Vec<_>, Vec<_>) = ordered.into_iter().unzip();
+    projected = workers;
+    selected_indices = indices;
+    let unknown_backlog = stage == Stage::Prefill
+        && selected_indices.iter().any(|&index| {
+            loads
+                .get(&(stage, endpoints[index].clone()))
+                .is_some_and(|load| load.unknown_prefill_requests > 0)
+        });
+    if let (Stage::Prefill, Some(kv), false) = (stage, kv_aware_ops(policy), unknown_backlog) {
+        let inputs: Option<Vec<_>> = projected
+            .iter()
+            .map(|worker| {
+                let input = context.prefill_inputs?.get(worker.base_url())?;
+                Some((
+                    input,
+                    input.token_ids.as_deref()?,
+                    *input.work_by_rank.get(&worker.dp_rank())?,
+                ))
+            })
+            .collect();
+        // Token costs and request counts have different units. If any
+        // eligible P has unknown work, compare the whole pool by occupancy.
+        if let Some(inputs) = inputs {
+            let work: Vec<_> = inputs.iter().map(|(_, _, work)| *work).collect();
+            let costs: Vec<_> = selected_indices
+                .iter()
+                .zip(&work)
+                .map(|(&index, work)| {
+                    loads
+                        .get(&(stage, endpoints[index].clone()))
+                        .copied()
+                        .unwrap_or_default()
+                        .active_prefill_tokens
+                        .saturating_add(work.new_prefill_tokens) as f64
+                })
+                .collect();
+            let occupancy: Vec<_> = projected.iter().map(|worker| worker.load()).collect();
+            debug!(version = 1, stage = "prefill", endpoints = ?selected_indices.iter()
+                .map(|&index| &endpoints[index]).collect::<Vec<_>>(), ?costs, ?occupancy,
+                remaining_work = ?work, "P/D token-cost candidates");
+            let picked = kv.pick_with_binding(
+                "prefill",
+                context.affinity_key.as_ref(),
+                context.cache_salt,
+                &projected,
+                &|| kv.pick_prefill(&costs, &occupancy),
+            );
+            if let Some(pick) = picked {
+                let (input, tokens, _) = inputs[pick.index];
+                let estimate = work[pick.index];
+                let new_tokens = estimate.new_prefill_tokens;
+                return Some(StageDecision {
+                    worker_index: selected_indices[pick.index],
+                    endpoint: endpoints[selected_indices[pick.index]].clone(),
+                    score: Some(costs[pick.index]),
+                    new_prefill_tokens: Some(new_tokens),
+                    credited_prefix_tokens: Some((tokens.len() as u64).saturating_sub(new_tokens)),
+                    fallback_reason: input
+                        .fallback_reason
+                        .or((!estimate.placement_verified).then_some("unverified_placement")),
+                    estimated_transfer_tokens: None,
+                    affinity_outcome: context.affinity_key.is_some().then_some(pick.outcome),
+                    affinity: pick.binding,
+                });
+            }
+            // pick_prefill refused the candidates (non-finite or misaligned
+            // costs): degrade to policy selection, never fail the request.
+            debug!(
+                stage = "prefill",
+                "pick_prefill refused candidates; using policy selection"
+            );
+        }
+    }
+    let (picked, affinity_outcome, affinity_binding) = if stage == Stage::Decode && kv_aware {
+        // Decode never queries placement or applies the P temperature:
+        // deterministic minimum occupancy with rotating equal-load ties, and
+        // the optional per-stage session binding on top.
+        let kv = kv_aware_ops(policy)?;
+        let decode_loads: Vec<usize> = projected.iter().map(|worker| worker.load()).collect();
+        let pick = kv.pick_with_binding(
+            "decode",
+            context.affinity_key.as_ref(),
+            context.cache_salt,
+            &projected,
+            &|| kv.pick_decode(&decode_loads),
+        )?;
+        (
+            pick.index,
+            context.affinity_key.is_some().then_some(pick.outcome),
+            pick.binding,
+        )
+    } else if stage == Stage::Prefill && kv_aware {
+        // Occupancy fallback: unknown token work or refused costs select by
+        // the stage policy over the projected occupancy; the session binding
+        // still applies.
+        let kv = kv_aware_ops(policy)?;
+        let pick = kv.pick_with_binding(
+            "prefill",
+            context.affinity_key.as_ref(),
+            context.cache_salt,
+            &projected,
+            &|| {
+                policy.select_worker_with_headers(
+                    &projected,
+                    context.legacy_policy_input,
+                    context.headers,
+                )
+            },
+        )?;
+        (
+            pick.index,
+            context.affinity_key.is_some().then_some(pick.outcome),
+            pick.binding,
+        )
+    } else {
+        let picked = policy.select_worker_with_headers(
+            &projected,
+            context.legacy_policy_input,
+            context.headers,
+        )?;
+        (picked, None, None)
+    };
+    // A held binding reference must never leak on a late selection failure:
+    // release it before any bail-out below.
+    let worker = match projected.get(picked) {
+        Some(worker) => worker,
+        None => {
+            if let Some(record) = &affinity_binding {
+                record.release_ref();
+            }
+            return None;
+        }
+    };
+    let selected_tokens = (stage == Stage::Prefill)
+        .then(|| {
+            context
+                .prefill_inputs
+                .and_then(|inputs| inputs.get(worker.base_url()))
+                .and_then(|input| input.token_ids.as_ref())
+                .map(|tokens| tokens.len() as u64)
+        })
+        .flatten();
+    let Some(&worker_index) = selected_indices.get(picked) else {
+        if let Some(record) = &affinity_binding {
+            record.release_ref();
+        }
+        return None;
+    };
+    let Some(endpoint) = endpoints.get(worker_index) else {
+        if let Some(record) = &affinity_binding {
+            record.release_ref();
+        }
+        return None;
+    };
+    Some(StageDecision {
+        fallback_reason: if stage == Stage::Prefill && kv_aware {
+            Some(if unknown_backlog {
+                "unknown_prefill_backlog"
+            } else {
+                projected
+                    .iter()
+                    .find_map(|worker| {
+                        context
+                            .prefill_inputs
+                            .and_then(|inputs| inputs.get(worker.base_url()))
+                            .and_then(|input| input.fallback_reason)
+                    })
+                    .unwrap_or("unverified_effective_tokens")
+            })
+        } else {
+            None
+        },
+        credited_prefix_tokens: selected_tokens.map(|_| 0),
+        worker_index,
+        endpoint: endpoint.clone(),
+        // Unknown P token work falls back to occupancy; D includes the
+        // incoming request, which does not change candidate ranking.
+        score: kv_aware.then_some(match stage {
+            Stage::Prefill => worker.load() as f64,
+            Stage::Decode => (worker.load() + 1) as f64,
+        }),
+        new_prefill_tokens: selected_tokens,
+        estimated_transfer_tokens: None,
+        affinity_outcome,
+        affinity: affinity_binding,
+    })
+}
+
+/// Selection-only view: load is an immutable sample from the admission lock.
+/// Worker identity, availability, metadata and policy inputs are preserved.
+#[derive(Debug)]
+struct PolicyWorker {
+    inner: Arc<dyn Worker>,
+    load: usize,
+}
+
+#[async_trait]
+impl Worker for PolicyWorker {
+    fn url(&self) -> &str {
+        self.inner.url()
+    }
+    fn worker_type(&self) -> WorkerType {
+        self.inner.worker_type()
+    }
+    fn connection_mode(&self) -> ConnectionMode {
+        self.inner.connection_mode()
+    }
+    fn is_healthy(&self) -> bool {
+        self.inner.is_healthy()
+    }
+    fn set_healthy(&self, healthy: bool) {
+        self.inner.set_healthy(healthy);
+    }
+    async fn check_health_async(&self) -> WorkerResult<()> {
+        self.inner.check_health_async().await
+    }
+    fn load(&self) -> usize {
+        self.load
+    }
+    fn increment_load(&self) {
+        self.inner.increment_load();
+    }
+    fn decrement_load(&self) {
+        self.inner.decrement_load();
+    }
+    fn processed_requests(&self) -> usize {
+        self.inner.processed_requests()
+    }
+    fn increment_processed(&self) {
+        self.inner.increment_processed();
+    }
+    fn metadata(&self) -> &WorkerMetadata {
+        self.inner.metadata()
+    }
+    fn circuit_breaker(&self) -> &CircuitBreaker {
+        self.inner.circuit_breaker()
+    }
+    fn base_url(&self) -> &str {
+        self.inner.base_url()
+    }
+    fn dp_rank(&self) -> Option<usize> {
+        self.inner.dp_rank()
+    }
+    fn dp_size(&self) -> Option<usize> {
+        self.inner.dp_size()
+    }
+    fn is_dp_aware(&self) -> bool {
+        self.inner.is_dp_aware()
+    }
+}
+
+// HTTP prefill inputs and event bindings are prepared before admission.
+const CONTROL_TIMEOUT: Duration = Duration::from_secs(3);
+const REFRESH_INTERVAL: Duration = Duration::from_secs(30);
+/// Background reconcile cadence. bind() itself throttles per-base probes
+/// (REFRESH_INTERVAL when healthy, CONTROL_TIMEOUT while a binding is
+/// missing), so the tick only bounds how quickly pool changes and recovery
+/// are noticed.
+const REFRESH_TICK: Duration = Duration::from_secs(1);
+
+#[derive(Clone)]
+struct Binding {
+    signature: String,
+    checked: Instant,
+    info: Option<WorkerKvInfo>,
+    base_models: HashSet<String>,
+    probe_failures: u8,
+}
+
+/// A successful refresh probe: `(signature, base_models)`.
+type Discovery = (String, HashSet<String>);
+
+/// The most recent P pool and effective policy seen on the request path.
+/// The background refresh loop binds from it; recording it is a few Arc
+/// clones, so requests never wait for control-plane probes.
+#[derive(Clone, Default)]
+struct RefreshInputs {
+    workers: Arc<[Arc<dyn Worker>]>,
+    policy: Option<Arc<dyn LoadBalancingPolicy>>,
+}
+
+/// Consecutive failed probes before a previously healthy binding is treated as
+/// gone. One dropped control-plane round trip must not wipe a P engine's KV
+/// index; ~MAX_PROBE_FAILURES refresh intervals of unreachability may.
+const MAX_PROBE_FAILURES: u8 = 3;
+
+/// What bind() should do with a base after a refresh probe.
+#[derive(Debug, PartialEq, Eq)]
+enum ProbeOutcome {
+    /// Same healthy incarnation: only the check timestamp and models move.
+    Unchanged,
+    /// Probe failed: keep whatever binding exists (possibly none) and retry.
+    Keep,
+    /// New or changed incarnation: tear down and re-add the subscriber.
+    Rebuild,
+    /// Healthy binding unreachable for too long: drop it and the index.
+    Evict,
+}
+
+fn probe_outcome(existing: Option<&Binding>, signature: Option<&str>) -> ProbeOutcome {
+    match (existing, signature) {
+        (Some(binding), Some(signature))
+            if binding.info.is_some() && binding.signature == signature =>
+        {
+            ProbeOutcome::Unchanged
+        }
+        // A failed probe never evicts a healthy binding or wipes its index;
+        // retry after the normal refresh interval instead.
+        (Some(binding), None) => {
+            if binding.info.is_some() && binding.probe_failures + 1 >= MAX_PROBE_FAILURES {
+                ProbeOutcome::Evict
+            } else {
+                ProbeOutcome::Keep
+            }
+        }
+        // New or changed incarnation, and first success for an untracked base.
+        (_, Some(_)) => ProbeOutcome::Rebuild,
+        // Untracked base whose probe failed: record an empty binding so the
+        // short CONTROL_TIMEOUT retry cadence applies.
+        (None, None) => ProbeOutcome::Keep,
+    }
+}
+
+pub(super) struct PdKvState {
+    client: reqwest::Client,
+    supervisor: KvIndexSupervisor,
+    /// Static KV event sources per prefill URL.
+    static_sources: HashMap<String, crate::config::types::PdKvEventSources>,
+    bindings: Mutex<HashMap<String, Binding>>,
+    targets: Mutex<HashMap<String, String>>,
+    // Serializes bind() runs. Discovery and subscriber handshakes run outside
+    // the map locks, so a slow P engine can only delay its own refresh —
+    // never the request path's short binding reads.
+    bind_lock: Mutex<()>,
+    // The background refresh loop's latest view of the P pool and policy.
+    refresh_inputs: Mutex<RefreshInputs>,
+    signals: tokio::task::JoinHandle<()>,
+}
+
+impl std::fmt::Debug for PdKvState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PdKvState")
+            .field("supervisor", &self.supervisor)
+            .finish()
+    }
+}
+
+impl PdKvState {
+    /// Test-only constructor; production always passes the configured
+    /// `pd_kv_event_sources` via `new_with_statics`.
+    #[cfg(test)]
+    pub fn new(client: reqwest::Client) -> Self {
+        Self::new_with_statics(client, HashMap::new())
+    }
+
+    pub fn new_with_statics(
+        client: reqwest::Client,
+        static_sources: HashMap<String, crate::config::types::PdKvEventSources>,
+    ) -> Self {
+        let (supervisor, mut signals) =
+            KvIndexSupervisor::new_pd(client.clone(), HashMode::Sha256, static_sources.clone());
+        Self {
+            client,
+            supervisor,
+            static_sources,
+            bindings: Mutex::new(HashMap::new()),
+            targets: Mutex::new(HashMap::new()),
+            bind_lock: Mutex::new(()),
+            refresh_inputs: Mutex::new(RefreshInputs::default()),
+            // Subscribers enforce trust by suspending/clearing affected sources.
+            signals: tokio::spawn(async move { while signals.recv().await.is_some() {} }),
+        }
+    }
+
+    /// Reconcile bindings off the request path. Requests only record their
+    /// pool and policy; they never wait for control-plane probes, so one
+    /// hung P endpoint can no longer delay admission. Until the first
+    /// successful bind, requests see no binding and route with no KV credit.
+    pub(super) fn spawn_refresh(self: &Arc<Self>) {
+        let weak = Arc::downgrade(self);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(REFRESH_TICK).await;
+                let Some(state) = weak.upgrade() else { break };
+                let inputs = state.refresh_inputs.lock().await.clone();
+                let Some(policy) = inputs.policy else {
+                    continue;
+                };
+                let Some(kv) = kv_aware_ops(policy.as_ref()) else {
+                    continue;
+                };
+                if !inputs.workers.is_empty() {
+                    state.bind(&inputs.workers, kv).await;
+                }
+            }
+        });
+    }
+
+    /// Reconcile static/discovered P pools, including incarnation and publisher
+    /// changes. Binds serialize on `bind_lock`; refresh probes and subscriber
+    /// handshakes run outside every map lock so an unresponsive P engine can
+    /// only delay its own refresh, never the request path. Never hold the
+    /// admission load lock.
+    async fn bind(&self, workers: &[Arc<dyn Worker>], policy: &dyn KvAwareOps) {
+        let _bind_guard = self.bind_lock.lock().await;
+        let bases: HashSet<_> = workers
+            .iter()
+            .map(|worker| worker.base_url().to_owned())
+            .collect();
+        let refresh: Vec<String> = {
+            let mut bindings = self.bindings.lock().await;
+            let removed: Vec<_> = bindings
+                .keys()
+                .filter(|base| !bases.contains(*base))
+                .cloned()
+                .collect();
+            for base in removed {
+                self.supervisor.on_worker_removed(&base);
+                bindings.remove(&base);
+            }
+            bases
+                .iter()
+                .filter(|base| {
+                    bindings.get(*base).is_none_or(|binding| {
+                        binding.checked.elapsed()
+                            >= if binding.info.is_some() {
+                                REFRESH_INTERVAL
+                            } else {
+                                CONTROL_TIMEOUT
+                            }
+                    })
+                })
+                .cloned()
+                .collect()
+        };
+        {
+            let mut targets = self.targets.lock().await;
+            let current: HashSet<_> = workers
+                .iter()
+                .map(|worker| worker.url().to_owned())
+                .collect();
+            let removed: Vec<_> = targets
+                .keys()
+                .filter(|target| !current.contains(*target))
+                .cloned()
+                .collect();
+            for target in removed {
+                policy.unregister_worker(&target);
+                targets.remove(&target);
+            }
+        }
+        // Probe refresh candidates without holding any map lock.
+        let probes: Vec<(String, Option<Discovery>)> =
+            stream::iter(refresh.into_iter().map(|base| async move {
+                let discovery = tokio::time::timeout(CONTROL_TIMEOUT, self.probe_base(&base))
+                    .await
+                    .ok()
+                    .and_then(Result::ok);
+                (base, discovery)
+            }))
+            .buffer_unordered(8)
+            .collect()
+            .await;
+        for (base, discovery) in probes {
+            let signature = discovery.as_ref().map(|(signature, _)| signature.clone());
+            let existing = {
+                let bindings = self.bindings.lock().await;
+                bindings.get(&base).cloned()
+            };
+            match probe_outcome(existing.as_ref(), signature.as_deref()) {
+                ProbeOutcome::Unchanged => {
+                    let mut bindings = self.bindings.lock().await;
+                    if let Some(binding) = bindings.get_mut(&base) {
+                        binding.checked = Instant::now();
+                        binding.probe_failures = 0;
+                        binding.base_models =
+                            discovery.map(|(_, models)| models).unwrap_or_default();
+                    }
+                }
+                ProbeOutcome::Keep => {
+                    let mut bindings = self.bindings.lock().await;
+                    match bindings.get_mut(&base) {
+                        Some(binding) => {
+                            binding.checked = Instant::now();
+                            binding.probe_failures = binding.probe_failures.saturating_add(1);
+                        }
+                        None => {
+                            bindings.insert(
+                                base.clone(),
+                                Binding {
+                                    signature: String::new(),
+                                    checked: Instant::now(),
+                                    info: None,
+                                    base_models: HashSet::new(),
+                                    probe_failures: 0,
+                                },
+                            );
+                        }
+                    }
+                }
+                ProbeOutcome::Rebuild => {
+                    {
+                        let mut bindings = self.bindings.lock().await;
+                        bindings.remove(&base);
+                    }
+                    // The subscriber handshake runs without the map locks; a
+                    // concurrent prepare() sees no binding and denies credit
+                    // until the rebuild completes.
+                    self.supervisor.on_worker_removed(&base);
+                    let info = tokio::time::timeout(
+                        CONTROL_TIMEOUT,
+                        self.supervisor.on_worker_added(&base),
+                    )
+                    .await
+                    .ok()
+                    .and_then(Result::ok)
+                    .filter(|info| info.cache_key.is_some() && !info.ranks.is_empty());
+                    let mut bindings = self.bindings.lock().await;
+                    bindings.insert(
+                        base,
+                        Binding {
+                            signature: signature.unwrap_or_default(),
+                            checked: Instant::now(),
+                            info,
+                            base_models: discovery.map(|(_, models)| models).unwrap_or_default(),
+                            probe_failures: 0,
+                        },
+                    );
+                }
+                ProbeOutcome::Evict => {
+                    {
+                        let mut bindings = self.bindings.lock().await;
+                        // Replace with an empty binding so the short
+                        // CONTROL_TIMEOUT retry cadence keeps throttling
+                        // probes against the dead engine.
+                        bindings.insert(
+                            base.clone(),
+                            Binding {
+                                signature: String::new(),
+                                checked: Instant::now(),
+                                info: None,
+                                base_models: HashSet::new(),
+                                probe_failures: 0,
+                            },
+                        );
+                    }
+                    // Unreachable for several consecutive refresh intervals:
+                    // treat the engine as gone rather than trusting a possibly
+                    // restarted incarnation behind a stale signature.
+                    self.supervisor.on_worker_removed(&base);
+                }
+            }
+        }
+        let bindings = self.bindings.lock().await;
+        let mut targets = self.targets.lock().await;
+        for worker in workers {
+            let binding = bindings.get(worker.base_url());
+            let signature = binding
+                .map(|binding| format!("{}:{:?}", binding.signature, binding.info))
+                .unwrap_or_default();
+            if targets.get(worker.url()) == Some(&signature) {
+                continue;
+            }
+            policy.unregister_worker(worker.url());
+            let info = binding.and_then(|binding| binding.info.as_ref());
+            // Keep a load-only registration when discovery has no info: the
+            // occupancy fallback (affinity off, cache_salt/tools, health
+            // probes) shares this table, and KvAwarePolicy::prepare_selection
+            // drops every unregistered worker once any target is registered.
+            let matches = info.and_then(|info| {
+                let rank = worker.dp_rank().unwrap_or(0) as u32;
+                info.ranks
+                    .contains(&rank)
+                    .then(|| self.supervisor.match_provider_for_worker(worker.base_url()))
+                    .flatten()
+            });
+            policy.register_worker(worker.as_ref(), info, matches);
+            targets.insert(worker.url().to_owned(), signature);
+        }
+    }
+
+    /// One refresh probe: control-plane discovery plus the served base models.
+    /// `Ok` carries `(signature, base_models)`; any failure is an `Err`.
+    /// Statically configured workers skip the control-plane queries and
+    /// derive the signature from their configuration.
+    async fn probe_base(&self, base: &str) -> Result<Discovery, String> {
+        let signature = match self.static_sources.get(base) {
+            Some(config) => format!("static:{config:?}"),
+            None => {
+                let info = query_pd_server_info(&self.client, base).await?;
+                let sources = query_pd_kv_event_sources(&self.client, base).await?;
+                let mut sources: Vec<_> = sources.into_iter().collect();
+                sources.sort_by(|left, right| left.0.cmp(&right.0));
+                format!("{info:?}:{sources:?}")
+            }
+        };
+        let mut models_request = self
+            .client
+            .get(format!("{}/v1/models", base.trim_end_matches('/')));
+        if let Ok(key) = std::env::var("OPENAI_API_KEY") {
+            models_request = models_request.bearer_auth(key);
+        }
+        let models = match models_request.send().await {
+            Ok(response) if response.status().is_success() => response.json::<Value>().await.ok(),
+            _ => None,
+        };
+        let base_models: HashSet<String> = models
+            .as_ref()
+            .and_then(|models| models.get("data"))
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|model| model.get("parent").is_none_or(Value::is_null))
+            .filter_map(|model| model.get("id").and_then(Value::as_str).map(str::to_owned))
+            .collect();
+        Ok((signature, base_models))
+    }
+
+    pub async fn prepare(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        policy: &Arc<dyn LoadBalancingPolicy>,
+        request: &Value,
+        route: &str,
+        headers: Option<&HeaderMap>,
+    ) -> HashMap<String, PdPrefillInput> {
+        let started = Instant::now();
+        let input = tokenize_request(request, route);
+        if input.is_ok() {
+            // Record the pool for the background refresh loop; the request
+            // path never waits for control-plane probes.
+            *self.refresh_inputs.lock().await = RefreshInputs {
+                workers: workers.iter().cloned().collect(),
+                policy: Some(policy.clone()),
+            };
+        }
+        let bases: HashSet<_> = workers
+            .iter()
+            .map(|worker| worker.base_url().to_owned())
+            .collect();
+        let allow_credit: HashMap<_, _> = self
+            .bindings
+            .lock()
+            .await
+            .iter()
+            .map(|(base, binding)| {
+                let model = request.get("model").and_then(Value::as_str);
+                let allowed = model.is_some_and(|model| {
+                    binding.base_models.contains(model)
+                        || binding
+                            .info
+                            .as_ref()
+                            .and_then(|info| info.cache_key.as_ref())
+                            .is_some_and(|key| key.model.as_ref() == model)
+                });
+                (base.clone(), allowed)
+            })
+            .collect();
+        let mut prepared: HashMap<String, PdPrefillInput> =
+            stream::iter(bases.into_iter().map(|base| {
+                let input = input.clone();
+                let allow_credit = allow_credit.get(&base).copied().unwrap_or(false);
+                async move {
+                    let result = match input {
+                        Ok(TokenInput::Ids(tokens)) => Ok(tokens),
+                        Ok(TokenInput::Remote(body)) => self.tokenize(&base, body, headers).await,
+                        Err(reason) => Err(reason),
+                    };
+                    let input = match result {
+                        Ok(tokens) => PdPrefillInput {
+                            token_ids: Some(tokens.into()),
+                            work_by_rank: HashMap::new(),
+                            allow_credit,
+                            fallback_reason: (!allow_credit).then_some("unverified_model"),
+                        },
+                        Err(reason) => PdPrefillInput {
+                            token_ids: None,
+                            work_by_rank: HashMap::new(),
+                            allow_credit: false,
+                            fallback_reason: Some(reason),
+                        },
+                    };
+                    (base, input)
+                }
+            }))
+            .buffer_unordered(8)
+            .collect()
+            .await;
+        let kv = kv_aware_ops(policy.as_ref());
+        for worker in workers {
+            if let Some(input) = prepared.get_mut(worker.base_url()) {
+                if let (Some(tokens), Some(kv)) = (input.token_ids.as_deref(), kv) {
+                    let work =
+                        kv.estimate_prefill_work(worker.as_ref(), tokens, input.allow_credit);
+                    input.work_by_rank.insert(worker.dp_rank(), work);
+                }
+            }
+            tokio::task::yield_now().await;
+        }
+        metrics::histogram!("vllm_router_pd_kv_prepare_seconds")
+            .record(started.elapsed().as_secs_f64());
+        prepared
+    }
+
+    async fn tokenize(
+        &self,
+        base: &str,
+        body: Value,
+        headers: Option<&HeaderMap>,
+    ) -> Result<Vec<u32>, &'static str> {
+        let mut request = self
+            .client
+            .post(format!("{}/tokenize", base.trim_end_matches('/')))
+            .timeout(CONTROL_TIMEOUT)
+            .json(&body);
+        if let Ok(key) = std::env::var("OPENAI_API_KEY") {
+            request = request.bearer_auth(key);
+        } else if let Some(auth) =
+            headers.and_then(|headers| headers.get(axum::http::header::AUTHORIZATION))
+        {
+            request = request.header(axum::http::header::AUTHORIZATION, auth);
+        }
+        let response = request
+            .send()
+            .await
+            .map_err(|_| "tokenization_unavailable")?;
+        if !response.status().is_success() {
+            return Err("tokenization_unavailable");
+        }
+        let body: Value = response.json().await.map_err(|_| "invalid_tokenization")?;
+        let tokens = token_ids(body.get("tokens").ok_or("invalid_tokenization")?)
+            .map_err(|_| "invalid_tokenization")?;
+        if body.get("count").and_then(Value::as_u64) != Some(tokens.len() as u64)
+            || body
+                .get("max_model_len")
+                .and_then(Value::as_u64)
+                .is_some_and(|max| tokens.len() as u64 > max)
+        {
+            return Err("invalid_tokenization");
+        }
+        Ok(tokens)
+    }
+}
+
+impl Drop for PdKvState {
+    fn drop(&mut self) {
+        self.supervisor.shutdown();
+        self.signals.abort();
+    }
+}
+
+#[derive(Clone)]
+enum TokenInput {
+    Ids(Vec<u32>),
+    Remote(Value),
+}
+
+fn token_ids(value: &Value) -> Result<Vec<u32>, &'static str> {
+    let array = value
+        .as_array()
+        .filter(|array| !array.is_empty())
+        .ok_or("unsupported_prompt")?;
+    array
+        .iter()
+        .map(|id| {
+            id.as_u64()
+                .and_then(|id| u32::try_from(id).ok())
+                .ok_or("unsupported_prompt")
+        })
+        .collect()
+}
+
+/// Restrict parity to dense single-prompt requests. These fields alter rendering
+/// or cache identity beyond the shared tokenize/generation contract.
+fn tokenize_request(request: &Value, route: &str) -> Result<TokenInput, &'static str> {
+    for field in [
+        "lora_name",
+        "cache_salt",
+        "prompt_embeds",
+        "prompt_embeddings",
+        "multi_modal_data",
+        "mm_processor_kwargs",
+        "media_io_kwargs",
+        "truncate_prompt_tokens",
+        "truncation_side",
+        "tools",
+        "functions",
+        "documents",
+        "reasoning_effort",
+        "response_format",
+        "suffix",
+        "prompt_logprobs",
+    ] {
+        if request.get(field).is_some_and(|value| !value.is_null()) {
+            return Err("unsupported_input");
+        }
+    }
+    if request
+        .get("n")
+        .and_then(Value::as_u64)
+        .is_some_and(|n| n != 1)
+        || request
+            .get("best_of")
+            .and_then(Value::as_u64)
+            .is_some_and(|n| n != 1)
+        || request.get("use_beam_search").and_then(Value::as_bool) == Some(true)
+        || (request.get("echo").and_then(Value::as_bool) == Some(true)
+            && request
+                .get("logprobs")
+                .is_some_and(|value| !value.is_null()))
+    {
+        return Err("unsupported_input");
+    }
+    let mut body = json!({});
+    if let Some(model) = request.get("model") {
+        body["model"] = model.clone();
+    }
+    match route {
+        "/v1/completions" => {
+            let prompt = request.get("prompt").ok_or("unsupported_prompt")?;
+            if prompt.is_array() {
+                return token_ids(prompt).map(TokenInput::Ids);
+            }
+            if !prompt.is_string() {
+                return Err("unsupported_prompt");
+            }
+            body["prompt"] = prompt.clone();
+            body["add_special_tokens"] = request
+                .get("add_special_tokens")
+                .cloned()
+                .unwrap_or(json!(true));
+        }
+        "/v1/chat/completions" => {
+            let messages = request
+                .get("messages")
+                .and_then(Value::as_array)
+                .ok_or("unsupported_input")?;
+            if messages.is_empty()
+                || messages.iter().any(|message| {
+                    !message.get("content").is_some_and(Value::is_string)
+                        || message
+                            .get("tool_calls")
+                            .is_some_and(|value| !value.is_null())
+                        || message
+                            .get("function_call")
+                            .is_some_and(|value| !value.is_null())
+                })
+            {
+                return Err("unsupported_input");
+            }
+            body["messages"] = Value::Array(messages.clone());
+            for field in [
+                "add_generation_prompt",
+                "continue_final_message",
+                "add_special_tokens",
+                "chat_template",
+                "chat_template_kwargs",
+            ] {
+                if let Some(value) = request.get(field) {
+                    body[field] = value.clone();
+                }
+            }
+        }
+        _ => return Err("unsupported_route"),
+    }
+    Ok(TokenInput::Remote(body))
+}
 
 #[derive(Debug, Clone)]
 pub struct PdRouterBase {
+    pub(super) kv_state: Option<Arc<PdKvState>>,
     pub worker_registry: Arc<WorkerRegistry>,
+    pub(super) pd_load: Arc<PdLoadManager>,
     pub policy_registry: Arc<PolicyRegistry>,
     pub worker_startup_timeout_secs: u64,
     pub worker_startup_check_interval_secs: u64,
@@ -58,22 +1075,113 @@ fn build_dp_workers(
         Arc::new(worker)
     };
 
-    match pinned_rank {
-        Some(rank) => vec![dp_worker(rank)],
-        None if dp_size > 1 => (0..dp_size).map(dp_worker).collect(),
-        None => {
-            let worker = BasicWorker::new(url.to_string(), worker_type.clone())
-                .with_circuit_breaker_config(circuit_breaker_config.clone());
-            let worker = match health_config {
-                Some(config) => worker.with_health_config(config.clone()),
-                None => worker,
-            };
-            vec![Arc::new(worker) as Arc<dyn Worker>]
-        }
-    }
+    dp_utils::expand_dp_ranks(pinned_rank, dp_size)
+        .into_iter()
+        .map(|rank| match rank {
+            Some(rank) => dp_worker(rank),
+            None => {
+                let worker = BasicWorker::new(url.to_string(), worker_type.clone())
+                    .with_dp_size(dp_size)
+                    .with_circuit_breaker_config(circuit_breaker_config.clone());
+                let worker = match health_config {
+                    Some(config) => worker.with_health_config(config.clone()),
+                    None => worker,
+                };
+                Arc::new(worker) as Arc<dyn Worker>
+            }
+        })
+        .collect()
 }
 
 impl PdRouterBase {
+    pub(super) async fn prepare_prefill_inputs(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        request: &Value,
+        route: &str,
+        headers: Option<&HeaderMap>,
+    ) -> Option<HashMap<String, super::pd_types::PdPrefillInput>> {
+        let policy = self.policy_registry.get_prefill_policy();
+        kv_aware_ops(policy.as_ref())?;
+        Some(
+            self.kv_state
+                .as_ref()?
+                .prepare(workers, &policy, request, route, headers)
+                .await,
+        )
+    }
+
+    /// Shared entry point for static and discovered P/D pools. Selection and
+    /// reservation are synchronous; no network work runs under admission.
+    pub(super) fn select_and_admit(
+        &self,
+        prefill_workers: &[Arc<dyn Worker>],
+        decode_workers: &[Arc<dyn Worker>],
+        context: &PdRequestContext<'_>,
+        compatible: impl Fn(&dyn Worker, &dyn Worker) -> bool,
+    ) -> Option<(PdSelection, PdAttempt)> {
+        let prefill_policy = self.policy_registry.get_prefill_policy();
+        let decode_policy = self.policy_registry.get_decode_policy();
+        let admitted = self.pd_load.admit(|loads| {
+            select_pd_pair(
+                loads,
+                prefill_workers,
+                decode_workers,
+                prefill_policy.as_ref(),
+                decode_policy.as_ref(),
+                context,
+                compatible,
+            )
+        });
+        if let Some((selection, attempt)) = &admitted {
+            if kv_aware_ops(prefill_policy.as_ref()).is_some() {
+                crate::metrics::RouterMetrics::record_pd_kv_decision(
+                    selection.prefill.new_prefill_tokens,
+                    selection.prefill.credited_prefix_tokens,
+                    selection.prefill.fallback_reason,
+                );
+            }
+            for (stage, decision) in [
+                ("prefill", &selection.prefill),
+                ("decode", &selection.decode),
+            ] {
+                if let Some(outcome) = decision.affinity_outcome {
+                    crate::metrics::RouterMetrics::record_pd_affinity_decision(stage, outcome);
+                }
+            }
+            // Selection indices come from these same slices, so the lookups
+            // cannot fail today. If future filtering ever makes them fail,
+            // still return the admitted attempt: bailing out here would
+            // silently 503 a request whose occupancy was already reserved.
+            // The per-worker counters are best-effort (pd_load is the
+            // accounting of record); discovery pools rebuild their workers
+            // per request, so for them the counters are write-only until
+            // those workers are persisted.
+            if let (Some(prefill_worker), Some(decode_worker)) = (
+                prefill_workers.get(selection.prefill.worker_index),
+                decode_workers.get(selection.decode.worker_index),
+            ) {
+                attempt.attach_workers(prefill_worker.clone(), decode_worker.clone());
+            }
+            debug!(
+                version = 1,
+                route = context.route,
+                prefill_policy = prefill_policy.name(),
+                decode_policy = decode_policy.name(),
+                fallback = ?selection.prefill.fallback_reason,
+                new_prefill_tokens = ?selection.prefill.new_prefill_tokens,
+                credited_prefix_tokens = ?selection.prefill.credited_prefix_tokens,
+                prefill_score = ?selection.prefill.score,
+                decode_score = ?selection.decode.score,
+                decode_sticky = ?selection.decode.fallback_reason,
+                estimated_transfer_tokens = ?selection.decode.estimated_transfer_tokens,
+                ?selection,
+                "P/D admission"
+            );
+        }
+        admitted
+    }
+
     // Private helper method to perform health check on a new server
     async fn wait_for_server_health(&self, url: &str) -> Result<(), PDRouterError> {
         crate::routers::http::router::Router::wait_for_healthy_workers(
@@ -461,7 +1569,6 @@ impl PdRouterBase {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub async fn new(
         prefill_urls: Vec<(String, Option<u16>)>,
         decode_urls: Vec<String>,
@@ -568,6 +1675,15 @@ impl PdRouterBase {
         // Individual routers no longer need to manage health checkers
 
         Ok(PdRouterBase {
+            kv_state: kv_aware_ops(prefill_policy.as_ref()).is_some().then(|| {
+                let state = Arc::new(PdKvState::new_with_statics(
+                    ctx.client.clone(),
+                    ctx.router_config.pd_kv_event_sources.clone(),
+                ));
+                state.spawn_refresh();
+                state
+            }),
+            pd_load: Arc::new(PdLoadManager::default()),
             worker_registry: Arc::clone(&ctx.worker_registry),
             policy_registry: Arc::clone(&ctx.policy_registry),
             worker_startup_timeout_secs: ctx.router_config.worker_startup_timeout_secs,
@@ -580,101 +1696,6 @@ impl PdRouterBase {
             circuit_breaker_config: core_cb_config,
             dp_size: fallback_dp_size,
         })
-    }
-
-    // Select a pair of prefill and decode servers considering circuit breaker state
-    async fn select_pd_pair(
-        &self,
-        request_text: Option<&str>,
-        model_id: Option<&str>,
-    ) -> Result<(Arc<dyn Worker>, Arc<dyn Worker>), String> {
-        // Get workers from registry - filter by model if provided
-        let prefill_workers = if let Some(model) = model_id {
-            // Get model-specific workers and filter for prefill type
-            self.worker_registry
-                .get_by_model_fast(model)
-                .into_iter()
-                .filter(|w| matches!(w.worker_type(), WorkerType::Prefill { .. }))
-                .collect()
-        } else {
-            self.worker_registry.get_prefill_workers()
-        };
-
-        let decode_workers = if let Some(model) = model_id {
-            // Get model-specific workers and filter for decode type
-            self.worker_registry
-                .get_by_model_fast(model)
-                .into_iter()
-                .filter(|w| matches!(w.worker_type(), WorkerType::Decode))
-                .collect()
-        } else {
-            self.worker_registry.get_decode_workers()
-        };
-
-        // Select workers using helper function
-        // Use separate policies for prefill and decode to avoid counter conflicts
-        let prefill_policy = self.policy_registry.get_prefill_policy();
-        let decode_policy = self.policy_registry.get_decode_policy();
-
-        let prefill = Self::pick_worker_by_policy_arc(
-            &prefill_workers,
-            &*prefill_policy,
-            request_text,
-            "prefill",
-        )?;
-
-        let decode = Self::pick_worker_by_policy_arc(
-            &decode_workers,
-            &*decode_policy,
-            request_text,
-            "decode",
-        )?;
-
-        Ok((prefill, decode))
-    }
-
-    // Helper function to select a worker using the policy (Arc version)
-    fn pick_worker_by_policy_arc(
-        workers: &[Arc<dyn Worker>],
-        policy: &dyn LoadBalancingPolicy,
-        request_text: Option<&str>,
-        worker_type: &str,
-    ) -> Result<Arc<dyn Worker>, String> {
-        // Check if we have any workers
-        if workers.is_empty() {
-            return Err(format!(
-                "No {} workers available. Please check if {} servers are configured and healthy.",
-                worker_type, worker_type
-            ));
-        }
-
-        // Filter available workers (healthy + circuit breaker not open)
-        let available_workers: Vec<Arc<dyn Worker>> = workers
-            .iter()
-            .filter(|w| w.is_available())
-            .cloned()
-            .collect();
-
-        if available_workers.is_empty() {
-            return Err(format!(
-                "No available {} workers (all circuits open or unhealthy)",
-                worker_type
-            ));
-        }
-
-        // Let policy select from available workers (no conversion needed now!)
-        let selected_idx = policy
-            .select_worker(&available_workers, request_text)
-            .ok_or_else(|| {
-                format!(
-                    "Policy {} failed to select a {} worker",
-                    policy.name(),
-                    worker_type
-                )
-            })?;
-
-        // Return the selected Arc worker
-        Ok(available_workers[selected_idx].clone())
     }
 
     // Background task to monitor worker loads with shared client
@@ -824,18 +1845,42 @@ impl PdRouterBase {
     pub async fn health_generate(&self, _req: Request<Body>) -> Response {
         // Test model generation capability by selecting a random pair and testing them
         // Note: This endpoint actually causes the model to generate tokens, so we only test one pair
+        let prefill_workers = self.worker_registry.get_prefill_workers();
+        let decode_workers = self.worker_registry.get_decode_workers();
+        self.health_generate_for_workers(&prefill_workers, &decode_workers)
+            .await
+    }
 
-        // Select a random worker pair using the policy
-        let (prefill, decode) = match self.select_pd_pair(None, None).await {
-            Ok(pair) => pair,
-            Err(e) => {
-                return (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    format!("No healthy worker pair available: {}", e),
-                )
-                    .into_response();
-            }
+    /// Probe one P/D pair selected through the same admission path as real
+    /// traffic, so health checks and requests cannot drift apart. The
+    /// attempt is dropped (releasing its reservations) when the probe ends.
+    pub(super) async fn health_generate_for_workers(
+        &self,
+        prefill_workers: &[Arc<dyn Worker>],
+        decode_workers: &[Arc<dyn Worker>],
+    ) -> Response {
+        let context = PdRequestContext {
+            prefill_inputs: None,
+            model_id: None,
+            legacy_policy_input: None,
+            headers: None,
+            affinity_key: None,
+            cache_salt: None,
+            route: "/health_generate",
         };
+        let (selection, _attempt) =
+            match self.select_and_admit(prefill_workers, decode_workers, &context, |_, _| true) {
+                Some(admitted) => admitted,
+                None => {
+                    return (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "No healthy worker pair available".to_string(),
+                    )
+                        .into_response();
+                }
+            };
+        let prefill = &prefill_workers[selection.prefill.worker_index];
+        let decode = &decode_workers[selection.decode.worker_index];
 
         // Test prefill server's health_generate
         // Extract base URLs if DP-aware format (e.g., http://127.0.0.1:8081@0 → http://127.0.0.1:8081)
@@ -1107,6 +2152,8 @@ mod tests {
             Arc::new(PolicyRegistry::new(crate::config::PolicyConfig::RoundRobin));
 
         PdRouterBase {
+            kv_state: None,
+            pd_load: Arc::new(PdLoadManager::default()),
             worker_registry,
             policy_registry,
             worker_startup_timeout_secs: 5,
@@ -1125,6 +2172,8 @@ mod tests {
             Arc::new(PolicyRegistry::new(crate::config::PolicyConfig::RoundRobin));
 
         PdRouterBase {
+            kv_state: None,
+            pd_load: Arc::new(PdLoadManager::default()),
             worker_registry,
             policy_registry,
             worker_startup_timeout_secs: 5,
@@ -1289,24 +2338,49 @@ mod tests {
         router.worker_registry.register(Arc::from(healthy_worker));
         router.worker_registry.register(Arc::from(decode_worker));
 
-        let result = router.select_pd_pair(None, None).await;
-
-        assert!(result.is_ok());
-        let (prefill, _decode) = result.unwrap();
+        // Health-style selection goes through the same admission path as
+        // real traffic; availability filtering is part of that path.
+        let prefill_workers = router.worker_registry.get_prefill_workers();
+        let decode_workers = router.worker_registry.get_decode_workers();
+        let context = PdRequestContext {
+            prefill_inputs: None,
+            model_id: None,
+            legacy_policy_input: None,
+            headers: None,
+            affinity_key: None,
+            cache_salt: None,
+            route: "/health_generate",
+        };
+        let (selection, attempt) = router
+            .select_and_admit(&prefill_workers, &decode_workers, &context, |_, _| true)
+            .unwrap();
+        let prefill = &prefill_workers[selection.prefill.worker_index];
 
         // Should select the healthy worker
         assert_eq!(prefill.url(), "http://healthy");
         assert!(prefill.is_healthy());
+        drop(attempt);
+        assert!(router.pd_load.snapshot().is_empty());
     }
 
     #[tokio::test]
     async fn test_empty_worker_lists() {
         let router = create_test_pd_router();
 
-        let result = router.select_pd_pair(None, None).await;
-
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("No prefill workers available"));
+        let empty: Vec<Arc<dyn Worker>> = Vec::new();
+        let context = PdRequestContext {
+            prefill_inputs: None,
+            model_id: None,
+            legacy_policy_input: None,
+            headers: None,
+            affinity_key: None,
+            cache_salt: None,
+            route: "/health_generate",
+        };
+        assert!(router
+            .select_and_admit(&empty, &empty, &context, |_, _| true)
+            .is_none());
+        assert!(router.pd_load.snapshot().is_empty());
     }
 
     // ============= Health Endpoints Tests =============
@@ -1847,5 +2921,1264 @@ mod tests {
             4,
             "Only host 2's workers should remain"
         );
+    }
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::super::pd_types::PdLoadSample;
+    use super::*;
+    use crate::core::{BasicWorker, DPAwareWorker};
+    use crate::policies::{
+        AffinityKey, CostParams, KvAwarePolicy, RequestHeaders, RoundRobinPolicy,
+    };
+
+    fn prefix_policy_with_blocks(
+        p: &[Arc<dyn Worker>],
+        tokens: &[u32],
+        stored_blocks: usize,
+        params: CostParams,
+    ) -> KvAwarePolicy {
+        use crate::kv_index::{
+            CacheKey, HashMode, KvBlockIndexer, ResidencyOwner, RoutableTarget, StorageTier,
+        };
+        let policy = KvAwarePolicy::new(params);
+        let index = Arc::new(KvBlockIndexer::new());
+        let hashes = KvAwarePolicy::local_hashes(tokens, 16);
+        let blocks: Vec<_> = hashes
+            .into_iter()
+            .enumerate()
+            .take(stored_blocks)
+            .map(|(i, hash)| (Arc::<str>::from(format!("block-{i}")), hash))
+            .collect();
+        index.store(
+            0,
+            ResidencyOwner::Worker {
+                source: Arc::from(p[1].base_url()),
+                dp_rank: 0,
+                incarnation: 0,
+            },
+            StorageTier::Device,
+            None,
+            &blocks,
+        );
+        for worker in p {
+            policy.register_target_with_cache_identity(
+                worker.url(),
+                RoutableTarget {
+                    instance_id: Arc::from(worker.base_url()),
+                    dp_rank: 0,
+                },
+                CacheKey {
+                    model: Arc::from("model"),
+                    hash_mode: HashMode::Sha256,
+                    block_size: 16,
+                },
+                index.clone(),
+            );
+        }
+        policy
+    }
+
+    fn resident_prefix_policy(p: &[Arc<dyn Worker>], tokens: &[u32]) -> KvAwarePolicy {
+        prefix_policy_with_blocks(p, tokens, usize::MAX, CostParams::default())
+    }
+
+    fn token_inputs(
+        p: &[Arc<dyn Worker>],
+        tokens: &[u32],
+        policy: &KvAwarePolicy,
+    ) -> HashMap<String, super::super::pd_types::PdPrefillInput> {
+        p.iter()
+            .map(|worker| {
+                (
+                    worker.base_url().to_owned(),
+                    super::super::pd_types::PdPrefillInput {
+                        token_ids: Some(Arc::from(tokens)),
+                        work_by_rank: HashMap::from([(
+                            worker.dp_rank(),
+                            kv_aware_ops(policy).unwrap().estimate_prefill_work(
+                                worker.as_ref(),
+                                tokens,
+                                true,
+                            ),
+                        )]),
+                        allow_credit: true,
+                        fallback_reason: None,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn pd_prefix_credit_changes_placement_and_charges_exact_attempt_work() {
+        let manager = Arc::new(PdLoadManager::default());
+        let p = pool("p", 2);
+        let d = pool("d", 2);
+        let tokens: Vec<u32> = (0..33).collect();
+        let policy = resident_prefix_policy(&p, &tokens);
+        let colocated = policy
+            .select_worker_with_receipt(&p, Some(&tokens), None, None, None, &[])
+            .unwrap();
+        assert_eq!(colocated.worker_index, 1);
+        assert_eq!(colocated.new_prefill_tokens, 1);
+        let inputs = token_inputs(&p, &tokens, &policy);
+        let mut context = context();
+        context.prefill_inputs = Some(&inputs);
+        let (first, a) = manager
+            .admit(|loads| select_pd_pair(loads, &p, &d, &policy, &policy, &context, |_, _| true))
+            .unwrap();
+        assert_eq!(first.prefill.worker_index, 1); // Warm P wins over the first idle P.
+        assert_eq!(first.prefill.new_prefill_tokens, Some(1));
+        assert_eq!(first.prefill.credited_prefix_tokens, Some(32));
+        assert_eq!(first.prefill.fallback_reason, None);
+        assert_eq!(first.decode.estimated_transfer_tokens, Some(33));
+        let (second, b) = manager
+            .admit(|loads| select_pd_pair(loads, &p, &d, &policy, &policy, &context, |_, _| true))
+            .unwrap();
+        assert_eq!(second.prefill.worker_index, 1);
+        assert_eq!(second.prefill.score, Some(2.0));
+        assert_ne!(first.decode.endpoint, second.decode.endpoint);
+        assert_eq!(
+            sample(&manager, Stage::Prefill, &first.prefill.endpoint).active_prefill_tokens,
+            2
+        );
+        a.finish_prefill();
+        assert_eq!(
+            sample(&manager, Stage::Prefill, &first.prefill.endpoint).active_prefill_tokens,
+            1
+        );
+        drop((a, b));
+        assert!(manager.snapshot().is_empty());
+
+        let mut loads = Loads::new();
+        loads.insert(
+            (Stage::Prefill, first.prefill.endpoint),
+            PdLoadSample {
+                prefill_requests: 1,
+                active_prefill_tokens: 40,
+                ..Default::default()
+            },
+        );
+        let selection =
+            select_pd_pair(&loads, &p, &d, &policy, &policy, &context, |_, _| true).unwrap();
+        assert_eq!(selection.prefill.worker_index, 0); // Token backlog outweighs warm residency.
+        assert_eq!(selection.prefill.new_prefill_tokens, Some(33));
+    }
+
+    #[test]
+    fn prefill_backlog_shifts_to_idle_worker() {
+        let p = pool("p", 2);
+        let d = pool("d", 1);
+        // 400 tokens; p1 holds the first 12 blocks (192), so new_p1 = 208
+        // and new_p0 = 400. Placement is the only term favoring the holder:
+        // once its admitted backlog outweighs the recompute gap, the request
+        // shifts to the idle worker; session binding is the locality remedy.
+        let tokens: Vec<u32> = (0..400).collect();
+        let mut context = context();
+
+        let policy = prefix_policy_with_blocks(&p, &tokens, 12, CostParams::default());
+        let inputs = token_inputs(&p, &tokens, &policy);
+        context.prefill_inputs = Some(&inputs);
+        let manager = Arc::new(PdLoadManager::default());
+        let (first, a) = manager
+            .admit(|loads| select_pd_pair(loads, &p, &d, &policy, &policy, &context, |_, _| true))
+            .unwrap();
+        assert_eq!(first.prefill.worker_index, 1);
+        let (second, b) = manager
+            .admit(|loads| select_pd_pair(loads, &p, &d, &policy, &policy, &context, |_, _| true))
+            .unwrap();
+        assert_eq!(
+            second.prefill.worker_index, 0,
+            "the idle worker's backlog advantage beats the recompute gap"
+        );
+        drop((a, b));
+    }
+
+    #[test]
+    fn unknown_inflight_work_forces_one_unit_consistent_pool_fallback() {
+        let manager = Arc::new(PdLoadManager::default());
+        let p = pool("p", 2);
+        let d = pool("d", 2);
+        let tokens: Vec<u32> = (0..33).collect();
+        let policy = resident_prefix_policy(&p, &tokens);
+        let (_, unknown) = manager
+            .admit(|loads| select_pd_pair(loads, &p, &d, &policy, &policy, &context(), |_, _| true))
+            .unwrap();
+        let inputs = token_inputs(&p, &tokens, &policy);
+        let mut context = context();
+        context.prefill_inputs = Some(&inputs);
+        let (selection, known) = manager
+            .admit(|loads| select_pd_pair(loads, &p, &d, &policy, &policy, &context, |_, _| true))
+            .unwrap();
+        assert_eq!(
+            selection.prefill.fallback_reason,
+            Some("unknown_prefill_backlog")
+        );
+        assert_eq!(selection.prefill.new_prefill_tokens, Some(33));
+        assert_eq!(selection.prefill.credited_prefix_tokens, Some(0));
+        drop((unknown, known));
+        assert!(manager.snapshot().is_empty());
+    }
+
+    fn pool(prefix: &str, count: usize) -> Vec<Arc<dyn Worker>> {
+        (0..count)
+            .map(|i| {
+                Arc::new(BasicWorker::new(
+                    format!("http://{prefix}{i}"),
+                    WorkerType::Regular,
+                )) as Arc<dyn Worker>
+            })
+            .collect()
+    }
+
+    fn context() -> PdRequestContext<'static> {
+        PdRequestContext {
+            prefill_inputs: None,
+            model_id: None,
+            legacy_policy_input: Some("original request"),
+            headers: None,
+            affinity_key: None,
+            cache_salt: None,
+            route: "/v1/completions",
+        }
+    }
+
+    fn admit(
+        manager: &Arc<PdLoadManager>,
+        p: &[Arc<dyn Worker>],
+        d: &[Arc<dyn Worker>],
+    ) -> (PdSelection, PdAttempt) {
+        let policy = KvAwarePolicy::default();
+        manager
+            .admit(|loads| select_pd_pair(loads, p, d, &policy, &policy, &context(), |_, _| true))
+            .unwrap()
+    }
+
+    fn context_with_session(session: &str) -> PdRequestContext<'static> {
+        PdRequestContext {
+            prefill_inputs: None,
+            model_id: None,
+            legacy_policy_input: Some("original request"),
+            headers: None,
+            affinity_key: Some(affinity_key(session)),
+            cache_salt: None,
+            route: "/v1/completions",
+        }
+    }
+
+    fn affinity_key(session: &str) -> AffinityKey {
+        AffinityKey::from_request(
+            None,
+            Some(&serde_json::json!({ "session_id": session })),
+            "default",
+        )
+        .unwrap()
+    }
+
+    fn admit_with(
+        manager: &Arc<PdLoadManager>,
+        p: &[Arc<dyn Worker>],
+        d: &[Arc<dyn Worker>],
+        policy: &KvAwarePolicy,
+        context: &PdRequestContext<'_>,
+    ) -> (PdSelection, PdAttempt) {
+        manager
+            .admit(|loads| select_pd_pair(loads, p, d, policy, policy, context, |_, _| true))
+            .unwrap()
+    }
+
+    fn sample(manager: &PdLoadManager, stage: Stage, endpoint: &PdEndpoint) -> PdLoadSample {
+        manager
+            .snapshot()
+            .get(&(stage, endpoint.clone()))
+            .copied()
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn decode_session_binding_holds_regardless_of_load() {
+        let manager = Arc::new(PdLoadManager::default());
+        let p = pool("p", 1);
+        let d = pool("d", 2);
+        // The binding is honored regardless of load: the bound decoder keeps
+        // the session even as its occupancy grows past the pool minimum.
+        let policy = KvAwarePolicy::default();
+        let ctx = context_with_session("session-a");
+        let (first, attempt) = admit_with(&manager, &p, &d, &policy, &ctx);
+        assert_eq!(first.decode.affinity_outcome, Some("bind"));
+        let bound = first.decode.worker_index;
+        let mut attempts = vec![attempt];
+        for _ in 0..3 {
+            let (pick, attempt) = admit_with(&manager, &p, &d, &policy, &ctx);
+            assert_eq!(pick.decode.worker_index, bound, "binding must not migrate");
+            assert_eq!(pick.decode.affinity_outcome, Some("sticky_hit"));
+            attempts.push(attempt);
+        }
+        drop(attempts);
+        assert!(manager.snapshot().is_empty());
+    }
+
+    /// DP ranks on one HTTP server share a base URL; the binding target must
+    /// stay rank-qualified or every lookup would resolve to the first rank
+    /// and strand session KV there.
+    #[test]
+    fn decode_session_binds_by_rank_qualified_target() {
+        let manager = Arc::new(PdLoadManager::default());
+        let p = pool("p", 1);
+        let d: Vec<Arc<dyn Worker>> = (0..2)
+            .map(|rank| {
+                Arc::new(DPAwareWorker::new(
+                    "http://d".to_owned(),
+                    rank,
+                    2,
+                    WorkerType::Decode,
+                )) as Arc<dyn Worker>
+            })
+            .collect();
+        let policy = KvAwarePolicy::default();
+
+        // Session b binds and stays on rank 0, loading it above rank 1.
+        let ctx_b = context_with_session("session-b");
+        let mut attempts = Vec::new();
+        for _ in 0..2 {
+            let (pick, attempt) = admit_with(&manager, &p, &d, &policy, &ctx_b);
+            assert_eq!(pick.decode.worker_index, 0);
+            attempts.push(attempt);
+        }
+        // Session a must bind to the idle rank 1...
+        let ctx_a = context_with_session("session-a");
+        let (first, attempt) = admit_with(&manager, &p, &d, &policy, &ctx_a);
+        assert_eq!(first.decode.worker_index, 1);
+        assert_eq!(first.decode.affinity_outcome, Some("bind"));
+        attempts.push(attempt);
+        // ...and keep it even though rank 0 is idle again.
+        let (next, attempt) = admit_with(&manager, &p, &d, &policy, &ctx_a);
+        assert_eq!(next.decode.worker_index, 1);
+        assert_eq!(next.decode.affinity_outcome, Some("sticky_hit"));
+        attempts.push(attempt);
+        drop(attempts);
+        assert!(manager.snapshot().is_empty());
+    }
+
+    #[test]
+    fn pending_handoffs_balance_even_with_fresh_discovery_workers() {
+        let manager = Arc::new(PdLoadManager::default());
+        let (first, a) = admit(&manager, &pool("p", 1), &pool("d", 2));
+        a.finish_prefill();
+        let (second, b) = admit(&manager, &pool("p", 1), &pool("d", 2));
+        assert_ne!(first.decode.endpoint, second.decode.endpoint);
+        assert_eq!(
+            sample(&manager, Stage::Decode, &first.decode.endpoint).pending_decode_requests,
+            1
+        );
+        assert_eq!(first.prefill.new_prefill_tokens, None);
+        assert_eq!(first.prefill.estimated_transfer_tokens, None);
+        drop((a, b));
+        assert!(manager.snapshot().is_empty());
+    }
+
+    #[test]
+    fn stages_finish_independently_and_transitions_are_idempotent() {
+        let manager = Arc::new(PdLoadManager::default());
+        let (selection, attempt) = admit(&manager, &pool("same", 1), &pool("same", 1));
+        attempt.begin_decode();
+        attempt.begin_decode();
+        let d = sample(&manager, Stage::Decode, &selection.decode.endpoint);
+        assert_eq!(
+            (d.pending_decode_requests, d.active_decode_requests),
+            (0, 1)
+        );
+        attempt.finish_decode();
+        attempt.finish_decode();
+        assert_eq!(
+            sample(&manager, Stage::Prefill, &selection.prefill.endpoint).prefill_requests,
+            1
+        );
+        attempt.finish_prefill();
+        attempt.finish_prefill();
+        attempt.release();
+        attempt.begin_decode();
+        assert!(manager.snapshot().is_empty());
+    }
+
+    #[test]
+    fn finishing_prefill_retains_decode_and_drop_releases_pending() {
+        let manager = Arc::new(PdLoadManager::default());
+        let (selection, attempt) = admit(&manager, &pool("p", 1), &pool("d", 1));
+        attempt.finish_prefill();
+        assert_eq!(
+            sample(&manager, Stage::Decode, &selection.decode.endpoint).pending_decode_requests,
+            1
+        );
+        let clone = attempt.clone();
+        drop(attempt);
+        assert_eq!(manager.snapshot().len(), 1);
+        drop(clone);
+        assert!(manager.snapshot().is_empty());
+    }
+
+    #[test]
+    fn failed_pair_does_not_admit_and_p_without_compatible_d_is_excluded() {
+        let manager = Arc::new(PdLoadManager::default());
+        let p = pool("p", 2);
+        let d = pool("d", 1);
+        let policy = KvAwarePolicy::default();
+        assert!(manager
+            .admit(
+                |loads| select_pd_pair(loads, &p, &d, &policy, &policy, &context(), |_, _| false)
+            )
+            .is_none());
+        assert!(manager.snapshot().is_empty());
+        let (selection, attempt) = manager
+            .admit(|loads| {
+                select_pd_pair(loads, &p, &d, &policy, &policy, &context(), |p, _| {
+                    p.url().ends_with("p1")
+                })
+            })
+            .unwrap();
+        assert_eq!(selection.prefill.worker_index, 1);
+        drop(attempt);
+        assert!(manager.snapshot().is_empty());
+    }
+
+    #[test]
+    fn decode_policy_failure_after_prefill_selection_leaves_no_reservations() {
+        #[derive(Debug)]
+        struct RejectDecode;
+        impl LoadBalancingPolicy for RejectDecode {
+            fn select_worker_with_headers(
+                &self,
+                _: &[Arc<dyn Worker>],
+                _: Option<&str>,
+                _: Option<&RequestHeaders>,
+            ) -> Option<usize> {
+                None
+            }
+            fn name(&self) -> &'static str {
+                "reject-decode"
+            }
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+        }
+        let manager = Arc::new(PdLoadManager::default());
+        let p = pool("p", 1);
+        let d = pool("d", 1);
+        let policy = KvAwarePolicy::default();
+        assert!(manager
+            .admit(|loads| select_pd_pair(
+                loads,
+                &p,
+                &d,
+                &policy,
+                &RejectDecode,
+                &context(),
+                |_, _| true
+            ))
+            .is_none());
+        assert!(manager.snapshot().is_empty());
+    }
+
+    #[test]
+    fn equal_load_uses_endpoint_order_not_hashmap_enumeration() {
+        let manager = Arc::new(PdLoadManager::default());
+        let mut p = pool("p", 2);
+        let mut d = pool("d", 2);
+        p.reverse();
+        d.reverse();
+        let (selection, _) = admit(&manager, &p, &d);
+        assert_eq!(selection.prefill.worker_index, 1);
+        assert_eq!(selection.decode.worker_index, 1);
+    }
+
+    #[test]
+    fn dp_ranks_have_independent_occupancy_and_granularity_is_pinned() {
+        let manager = Arc::new(PdLoadManager::default());
+        let p = pool("p", 1);
+        let d: Vec<Arc<dyn Worker>> = (0..2)
+            .map(|rank| {
+                Arc::new(DPAwareWorker::new(
+                    "http://d0".into(),
+                    rank,
+                    2,
+                    WorkerType::Decode,
+                )) as Arc<dyn Worker>
+            })
+            .collect();
+        let (first, a) = admit(&manager, &p, &d);
+        let (second, b) = admit(&manager, &p, &d);
+        assert_eq!(first.decode.endpoint.dp_rank, Some(0));
+        assert_eq!(second.decode.endpoint.dp_rank, Some(1));
+        let policy = KvAwarePolicy::default();
+        assert!(manager
+            .admit(|loads| select_pd_pair(
+                loads,
+                &p,
+                &pool("d", 1),
+                &policy,
+                &policy,
+                &context(),
+                |_, _| true
+            ))
+            .is_none());
+        drop((a, b));
+        let (_, attempt) = admit(&manager, &p, &pool("d", 1));
+        drop(attempt);
+        assert!(manager.snapshot().is_empty());
+    }
+
+    #[test]
+    fn concurrent_admission_samples_and_reserves_atomically() {
+        let manager = Arc::new(PdLoadManager::default());
+        let handles: Vec<_> = (0..32)
+            .map(|_| {
+                let manager = manager.clone();
+                std::thread::spawn(move || admit(&manager, &pool("p", 2), &pool("d", 2)))
+            })
+            .collect();
+        let admitted: Vec<_> = handles
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect();
+        for load in manager.snapshot().values() {
+            assert_eq!(load.prefill_requests + load.pending_decode_requests, 16);
+        }
+        drop(admitted);
+        assert!(manager.snapshot().is_empty());
+    }
+
+    #[test]
+    fn racing_cleanup_never_releases_another_attempt() {
+        let manager = Arc::new(PdLoadManager::default());
+        let (_, a) = admit(&manager, &pool("p", 1), &pool("d", 1));
+        let (selection, b) = admit(&manager, &pool("p", 1), &pool("d", 1));
+        let threads: Vec<_> = (0..16)
+            .map(|i| {
+                let a = a.clone();
+                std::thread::spawn(move || {
+                    if i % 2 == 0 {
+                        a.begin_decode();
+                    }
+                    a.release();
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        assert_eq!(
+            sample(&manager, Stage::Prefill, &selection.prefill.endpoint).prefill_requests,
+            1
+        );
+        assert_eq!(
+            sample(&manager, Stage::Decode, &selection.decode.endpoint).pending_decode_requests,
+            1
+        );
+        drop((a, b));
+        assert!(manager.snapshot().is_empty());
+    }
+
+    #[test]
+    fn cleanup_uses_each_attempts_immutable_admitted_token_amount() {
+        let manager = Arc::new(PdLoadManager::default());
+        let p = pool("p", 1);
+        let d = pool("d", 1);
+        let policy = KvAwarePolicy::default();
+        let known = |tokens| {
+            manager
+                .admit(|loads| {
+                    let mut selection =
+                        select_pd_pair(loads, &p, &d, &policy, &policy, &context(), |_, _| true)?;
+                    selection.prefill.new_prefill_tokens = Some(tokens);
+                    Some(selection)
+                })
+                .unwrap()
+        };
+        let (selection, a) = known(17);
+        let (_, b) = known(31);
+        assert_eq!(
+            sample(&manager, Stage::Prefill, &selection.prefill.endpoint).active_prefill_tokens,
+            48
+        );
+        a.finish_prefill();
+        a.finish_prefill();
+        assert_eq!(
+            sample(&manager, Stage::Prefill, &selection.prefill.endpoint).active_prefill_tokens,
+            31
+        );
+        drop((a, b));
+        assert!(manager.snapshot().is_empty());
+    }
+
+    #[derive(Debug)]
+    struct LegacyPolicy;
+    impl LoadBalancingPolicy for LegacyPolicy {
+        fn select_worker_with_headers(
+            &self,
+            workers: &[Arc<dyn Worker>],
+            text: Option<&str>,
+            headers: Option<&RequestHeaders>,
+        ) -> Option<usize> {
+            assert_eq!(text, Some("original request"));
+            assert_eq!(
+                headers.unwrap().get("x-session-id").map(String::as_str),
+                Some("session")
+            );
+            workers
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, w)| w.load())
+                .map(|(i, _)| i)
+        }
+        fn name(&self) -> &'static str {
+            "legacy-test"
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    #[test]
+    fn mixed_legacy_policies_keep_inputs_and_read_shared_occupancy() {
+        let manager = Arc::new(PdLoadManager::default());
+        let p = pool("p", 2);
+        let d = pool("d", 2);
+        let (first, a) = admit(&manager, &p, &d);
+        let headers = HashMap::from([("x-session-id".into(), "session".into())]);
+        let mut context = context();
+        context.headers = Some(&headers);
+        let policy = LegacyPolicy;
+        let (second, b) = manager
+            .admit(|loads| select_pd_pair(loads, &p, &d, &policy, &policy, &context, |_, _| true))
+            .unwrap();
+        assert_ne!(first.prefill.endpoint, second.prefill.endpoint);
+        assert_ne!(first.decode.endpoint, second.decode.endpoint);
+        assert_eq!(second.prefill.score, None);
+        drop((a, b));
+        assert!(manager.snapshot().is_empty());
+    }
+
+    #[test]
+    fn stage_override_is_preserved() {
+        let manager = Arc::new(PdLoadManager::default());
+        let p = pool("p", 2);
+        let d = pool("d", 1);
+        let rr = RoundRobinPolicy::new();
+        let kv = KvAwarePolicy::default();
+        let (_, a) = manager
+            .admit(|loads| select_pd_pair(loads, &p, &d, &rr, &kv, &context(), |_, _| true))
+            .unwrap();
+        let (second, b) = manager
+            .admit(|loads| select_pd_pair(loads, &p, &d, &rr, &kv, &context(), |_, _| true))
+            .unwrap();
+        assert_eq!(second.prefill.score, None);
+        assert_eq!(second.decode.score, Some(2.0));
+        drop((a, b));
+    }
+
+    #[test]
+    fn model_labels_filter_eligible_pools() {
+        // PD workers register without labels today, so model filtering is
+        // inert until something populates model_id. Pin the behavior for the
+        // labeled future: a matching label or an unlabeled ("unknown")
+        // worker stays eligible, mismatched labels are excluded, and a model
+        // served by no labeled worker fails admission once every worker
+        // carries a label.
+        let manager = Arc::new(PdLoadManager::default());
+        let policy = KvAwarePolicy::default();
+        let d = pool("d", 1);
+        let labeled = |url: &str, model: &str| {
+            Arc::new(
+                BasicWorker::new(url.to_string(), WorkerType::Regular)
+                    .with_labels(HashMap::from([("model_id".to_string(), model.to_string())])),
+            ) as Arc<dyn Worker>
+        };
+        let unlabeled = |url: &str| {
+            Arc::new(BasicWorker::new(url.to_string(), WorkerType::Regular)) as Arc<dyn Worker>
+        };
+        fn ctx(model: &str) -> PdRequestContext<'_> {
+            PdRequestContext {
+                prefill_inputs: None,
+                model_id: Some(model),
+                legacy_policy_input: Some("original request"),
+                headers: None,
+                affinity_key: None,
+                cache_salt: None,
+                route: "/v1/completions",
+            }
+        }
+
+        // Request for model-b: p1 matches, p2 is unknown, p0 mismatches.
+        let p = vec![
+            labeled("http://p0", "model-a"),
+            labeled("http://p1", "model-b"),
+            unlabeled("http://p2"),
+        ];
+        let (selection, attempt) = manager
+            .admit(|loads| {
+                select_pd_pair(loads, &p, &d, &policy, &policy, &ctx("model-b"), |_, _| {
+                    true
+                })
+            })
+            .unwrap();
+        assert_eq!(selection.prefill.endpoint.http_url, "http://p1");
+        drop(attempt);
+
+        // Request for model-c: only the unlabeled worker keeps it routable.
+        let (selection, attempt) = manager
+            .admit(|loads| {
+                select_pd_pair(loads, &p, &d, &policy, &policy, &ctx("model-c"), |_, _| {
+                    true
+                })
+            })
+            .unwrap();
+        assert_eq!(selection.prefill.endpoint.http_url, "http://p2");
+        drop(attempt);
+
+        // Once every worker carries a label, an unserved model has no pair.
+        let only_labeled = vec![
+            labeled("http://p0", "model-a"),
+            labeled("http://p1", "model-b"),
+        ];
+        assert!(manager
+            .admit(|loads| {
+                select_pd_pair(
+                    loads,
+                    &only_labeled,
+                    &d,
+                    &policy,
+                    &policy,
+                    &ctx("model-c"),
+                    |_, _| true,
+                )
+            })
+            .is_none());
+        assert!(manager.snapshot().is_empty());
+    }
+
+    #[tokio::test]
+    async fn body_guard_holds_until_eof_and_handles_unpolled_drop() {
+        let manager = Arc::new(PdLoadManager::default());
+        let (_, attempt) = admit(&manager, &pool("p", 1), &pool("d", 1));
+        attempt.finish_prefill();
+        attempt.begin_decode();
+        let body = attempt.track_body(Body::from("chunk"));
+        assert_eq!(manager.snapshot().len(), 1);
+        let bytes = axum::body::to_bytes(body, 100).await.unwrap();
+        assert_eq!(&bytes[..], b"chunk");
+        assert!(manager.snapshot().is_empty());
+        let (_, attempt) = admit(&manager, &pool("p", 1), &pool("d", 1));
+        attempt.finish_prefill();
+        attempt.begin_decode();
+        let retained_producer_handle = attempt.clone();
+        let body = attempt.track_body(Body::from("never polled"));
+        drop(body);
+        assert!(manager.snapshot().is_empty());
+        drop(retained_producer_handle);
+    }
+
+    #[tokio::test]
+    async fn body_error_and_cancellation_release_occupancy() {
+        let manager = Arc::new(PdLoadManager::default());
+        let (_, attempt) = admit(&manager, &pool("p", 1), &pool("d", 1));
+        attempt.finish_prefill();
+        attempt.begin_decode();
+        let body = Body::from_stream(futures_util::stream::once(async {
+            Err::<bytes::Bytes, _>(std::io::Error::other("injected read failure"))
+        }));
+        assert!(axum::body::to_bytes(attempt.track_body(body), 100)
+            .await
+            .is_err());
+        assert!(manager.snapshot().is_empty());
+
+        let (_, attempt) = admit(&manager, &pool("p", 1), &pool("d", 1));
+        attempt.begin_decode();
+        let body = Body::from_stream(futures_util::stream::pending::<
+            Result<bytes::Bytes, std::io::Error>,
+        >());
+        let task =
+            tokio::spawn(async move { axum::body::to_bytes(attempt.track_body(body), 100).await });
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(manager.snapshot().is_empty());
+    }
+
+    #[test]
+    fn early_error_response_releases_both_stages_without_waiting_for_client() {
+        let manager = Arc::new(PdLoadManager::default());
+        let (_, attempt) = admit(&manager, &pool("p", 1), &pool("d", 1));
+        let response =
+            attempt.track_response(axum::response::Response::new(Body::from("prefill error")));
+        assert!(manager.snapshot().is_empty());
+        drop(response);
+    }
+}
+
+#[cfg(test)]
+mod kv_input_tests {
+    use super::*;
+    use crate::core::{BasicWorker, WorkerType};
+    use crate::policies::{kv_aware_ops, KvAwarePolicy};
+
+    #[test]
+    fn tokens_and_chat_render_options_follow_the_backend_contract() {
+        let request = json!({"model":"m", "prompt":[1,2,3], "max_tokens":30});
+        assert!(
+            matches!(tokenize_request(&request, "/v1/completions"), Ok(TokenInput::Ids(ids)) if ids == [1,2,3])
+        );
+        let chat = json!({"model":"m", "messages":[{"role":"user","content":"hi"}],
+            "add_generation_prompt":false, "continue_final_message":true,
+            "chat_template_kwargs":{"enable_thinking":false}, "temperature":0.7});
+        let Ok(TokenInput::Remote(body)) = tokenize_request(&chat, "/v1/chat/completions") else {
+            panic!("plain chat must be tokenizable")
+        };
+        assert_eq!(body["messages"], chat["messages"]);
+        assert_eq!(body["add_generation_prompt"], false);
+        assert_eq!(body["continue_final_message"], true);
+        assert_eq!(body["chat_template_kwargs"], chat["chat_template_kwargs"]);
+        assert!(body.get("temperature").is_none());
+        assert!(tokenize_request(
+            &json!({"model":"m","prompt":"x","cache_salt":"s"}),
+            "/v1/completions"
+        )
+        .is_err());
+        assert!(tokenize_request(
+            &json!({"model":"m","messages":[{"role":"user","content":[{"type":"image_url"}]}]}),
+            "/v1/chat/completions"
+        )
+        .is_err());
+        assert!(tokenize_request(&json!({"input":"x"}), "/v1/responses").is_err());
+    }
+
+    #[tokio::test]
+    async fn unsupported_inputs_fall_back_without_control_or_tokenization_requests() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        let app = axum::Router::new().fallback(move || {
+            let calls = observed.clone();
+            async move {
+                calls.fetch_add(1, Ordering::Relaxed);
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let state = PdKvState::new(Client::new());
+        let policy: Arc<dyn LoadBalancingPolicy> = Arc::new(KvAwarePolicy::default());
+        let workers: Vec<Arc<dyn Worker>> = vec![Arc::new(BasicWorker::new(
+            base.clone(),
+            WorkerType::Regular,
+        ))];
+        for (route, request) in [
+            (
+                "/v1/completions",
+                json!({"model":"m","prompt":"hello","cache_salt":"s"}),
+            ),
+            (
+                "/v1/chat/completions",
+                json!({"model":"m","messages":[{"role":"user","content":"hello"}],"tools":[]}),
+            ),
+            ("/v1/responses", json!({"model":"m","input":"hello"})),
+        ] {
+            let prepared = state
+                .prepare(&workers, &policy, &request, route, None)
+                .await;
+            let input = &prepared[&base];
+            assert!(input.token_ids.is_none());
+            assert!(input.work_by_rank.is_empty());
+            assert!(input.fallback_reason.is_some());
+        }
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn http_preparation_uses_backend_tokens_and_forwards_auth() {
+        use axum::{
+            routing::{get, post},
+            Json, Router,
+        };
+        let expected_auth = format!(
+            "Bearer {}",
+            std::env::var("OPENAI_API_KEY").unwrap_or_else(|_| "test".to_owned())
+        );
+        let app = Router::new()
+            .route(
+                "/get_server_info",
+                get(|| async { Json(json!({"model_id":"m","block_size":16,"instance_id":"p"})) }),
+            )
+            .route("/kv_event_sources", get(|| async { Json(json!({})) }))
+            .route(
+                "/v1/models",
+                get(|| async { Json(json!({"data":[{"id":"m","parent":null}]})) }),
+            )
+            .route(
+                "/tokenize",
+                post(move |headers: HeaderMap, Json(body): Json<Value>| {
+                    let expected_auth = expected_auth.clone();
+                    async move {
+                        assert!(headers
+                            .get("authorization")
+                            .is_some_and(|value| value.as_bytes() == expected_auth.as_bytes()));
+                        assert_eq!(body["prompt"], "hello");
+                        Json(json!({"tokens":[7,8,9],"count":3,"max_model_len":128}))
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let state = PdKvState::new(reqwest::Client::new());
+        let policy: Arc<dyn LoadBalancingPolicy> = Arc::new(KvAwarePolicy::default());
+        let workers: Vec<Arc<dyn Worker>> = vec![Arc::new(BasicWorker::new(
+            base.clone(),
+            WorkerType::Regular,
+        ))];
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer test".parse().unwrap());
+        state
+            .bind(&workers, kv_aware_ops(policy.as_ref()).unwrap())
+            .await;
+        let inputs = state
+            .prepare(
+                &workers,
+                &policy,
+                &json!({"model":"m","prompt":"hello"}),
+                "/v1/completions",
+                Some(&headers),
+            )
+            .await;
+        assert_eq!(
+            inputs[&base].token_ids.as_deref(),
+            Some([7, 8, 9].as_slice())
+        );
+        let work = kv_aware_ops(policy.as_ref())
+            .unwrap()
+            .estimate_prefill_work(workers[0].as_ref(), &[7, 8, 9], true);
+        assert_eq!(work.new_prefill_tokens, 3);
+        assert!(!work.placement_verified); // No event source: exact tokens, zero fabricated credit.
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn native_python_discovery_and_zmq_events_enable_real_prefix_credit() {
+        use axum::{routing::get, Json, Router};
+        let publisher_context = zmq::Context::new();
+        let publisher = publisher_context.socket(zmq::PUB).unwrap();
+        publisher.bind("tcp://127.0.0.1:*").unwrap();
+        let endpoint = publisher.get_last_endpoint().unwrap().unwrap();
+        let app = Router::new()
+            .route("/server_info", get(|| async {
+                Json(json!({"vllm_config":{"model_config":{"model":"m"},"cache_config":{"block_size":16}}}))
+            }))
+            .route("/v1/models", get(|| async {
+                Json(json!({"data":[{"id":"m", "parent":null}]}))
+            }))
+            .route("/kv_event_sources", get(move || {
+                let endpoint = endpoint.clone();
+                async move { Json(json!({"0":{"publisher":"zmq", "endpoint":endpoint, "enable_kv_cache_events":true}})) }
+            }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let state = PdKvState::new(reqwest::Client::new());
+        let policy: Arc<dyn LoadBalancingPolicy> = Arc::new(KvAwarePolicy::default());
+        let ops = kv_aware_ops(policy.as_ref()).unwrap();
+        let workers: Vec<Arc<dyn Worker>> = vec![Arc::new(BasicWorker::new(
+            base.clone(),
+            WorkerType::Regular,
+        ))];
+        let tokens: Vec<u32> = (0..33).collect();
+        let request = json!({"model":"m", "prompt":tokens});
+        state.bind(&workers, ops).await;
+        let initial = state
+            .prepare(&workers, &policy, &request, "/v1/completions", None)
+            .await;
+        assert_eq!(initial[&base].work_by_rank[&None].new_prefill_tokens, 33);
+        assert!(initial[&base].work_by_rank[&None].placement_verified);
+        let payload = rmp_serde::to_vec(&(
+            1.0,
+            vec![json!({
+                "type":"BlockStored", "block_hashes":[1,2], "parent_block_hash":null,
+                "token_ids":(0..32).collect::<Vec<u32>>(), "block_size":16,
+                "lora_id":null, "lora_name":null, "medium":"GPU"
+            })],
+            0_u32,
+        ))
+        .unwrap();
+        let seq = 0_u64.to_be_bytes();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                publisher
+                    .send_multipart([b"".as_slice(), seq.as_slice(), payload.as_slice()], 0)
+                    .unwrap();
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                let work = ops.estimate_prefill_work(workers[0].as_ref(), &tokens, true);
+                if work.new_prefill_tokens == 1 {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("subscriber should ingest the warm prefix");
+        let warm = state
+            .prepare(&workers, &policy, &request, "/v1/completions", None)
+            .await;
+        assert_eq!(warm[&base].work_by_rank[&None].new_prefill_tokens, 1);
+        assert!(warm[&base].work_by_rank[&None].placement_verified);
+        drop(state);
+        task.abort();
+    }
+
+    /// Regression for PD frontends whose control endpoints 404 over HTTP
+    /// (e.g. `vllm-rs serve`): with statically configured ZMQ endpoints, KV
+    /// credit must still flow. The mock deliberately serves only /v1/models.
+    #[tokio::test]
+    async fn static_pd_kv_event_sources_enable_real_prefix_credit_without_control_endpoints() {
+        use axum::{routing::get, Json, Router};
+        let publisher_context = zmq::Context::new();
+        let publisher = publisher_context.socket(zmq::PUB).unwrap();
+        publisher.bind("tcp://127.0.0.1:*").unwrap();
+        let endpoint = publisher.get_last_endpoint().unwrap().unwrap();
+        let app = Router::new().route(
+            "/v1/models",
+            get(|| async { Json(json!({"data":[{"id":"m", "parent":null}]})) }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let static_sources = std::iter::once((
+            base.clone(),
+            crate::config::types::PdKvEventSources {
+                endpoints: vec![endpoint],
+                replay_endpoints: None,
+                block_size: 16,
+                model: None,
+            },
+        ))
+        .collect();
+        let state = PdKvState::new_with_statics(reqwest::Client::new(), static_sources);
+        let policy: Arc<dyn LoadBalancingPolicy> = Arc::new(KvAwarePolicy::default());
+        let ops = kv_aware_ops(policy.as_ref()).unwrap();
+        let workers: Vec<Arc<dyn Worker>> = vec![Arc::new(BasicWorker::new(
+            base.clone(),
+            WorkerType::Regular,
+        ))];
+        let tokens: Vec<u32> = (0..33).collect();
+        let request = json!({"model":"m", "prompt":tokens});
+        state.bind(&workers, ops).await;
+        let initial = state
+            .prepare(&workers, &policy, &request, "/v1/completions", None)
+            .await;
+        assert_eq!(initial[&base].work_by_rank[&None].new_prefill_tokens, 33);
+        assert!(initial[&base].work_by_rank[&None].placement_verified);
+        let payload = rmp_serde::to_vec(&(
+            1.0,
+            vec![json!({
+                "type":"BlockStored", "block_hashes":[1,2], "parent_block_hash":null,
+                "token_ids":(0..32).collect::<Vec<u32>>(), "block_size":16,
+                "lora_id":null, "lora_name":null, "medium":"GPU"
+            })],
+            0_u32,
+        ))
+        .unwrap();
+        let seq = 0_u64.to_be_bytes();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                publisher
+                    .send_multipart([b"".as_slice(), seq.as_slice(), payload.as_slice()], 0)
+                    .unwrap();
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                let work = ops.estimate_prefill_work(workers[0].as_ref(), &tokens, true);
+                if work.new_prefill_tokens == 1 {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("static-source subscriber should ingest the warm prefix");
+        let warm = state
+            .prepare(&workers, &policy, &request, "/v1/completions", None)
+            .await;
+        assert_eq!(warm[&base].work_by_rank[&None].new_prefill_tokens, 1);
+        assert!(warm[&base].work_by_rank[&None].placement_verified);
+        drop(state);
+        task.abort();
+    }
+
+    fn healthy_binding(signature: &str, probe_failures: u8) -> Binding {
+        Binding {
+            signature: signature.to_owned(),
+            checked: Instant::now(),
+            info: Some(WorkerKvInfo::default()),
+            base_models: HashSet::new(),
+            probe_failures,
+        }
+    }
+
+    #[test]
+    fn probe_outcome_same_healthy_incarnation_is_unchanged() {
+        let binding = healthy_binding("sig", 2);
+        assert_eq!(
+            probe_outcome(Some(&binding), Some("sig")),
+            ProbeOutcome::Unchanged
+        );
+        // A changed signature rebuilds even when healthy.
+        assert_eq!(
+            probe_outcome(Some(&binding), Some("other")),
+            ProbeOutcome::Rebuild
+        );
+        // A binding that never produced info rebuilds on any success.
+        let mut never = healthy_binding("sig", 0);
+        never.info = None;
+        assert_eq!(
+            probe_outcome(Some(&never), Some("sig")),
+            ProbeOutcome::Rebuild
+        );
+    }
+
+    #[test]
+    fn probe_outcome_transient_failures_keep_healthy_binding_until_limit() {
+        for failures in 0..MAX_PROBE_FAILURES - 1 {
+            let binding = healthy_binding("sig", failures);
+            assert_eq!(
+                probe_outcome(Some(&binding), None),
+                ProbeOutcome::Keep,
+                "failures={failures}"
+            );
+        }
+        let binding = healthy_binding("sig", MAX_PROBE_FAILURES - 1);
+        assert_eq!(probe_outcome(Some(&binding), None), ProbeOutcome::Evict);
+        // Bindings without info never evict — there is nothing to lose.
+        let mut never = healthy_binding("sig", MAX_PROBE_FAILURES - 1);
+        never.info = None;
+        assert_eq!(probe_outcome(Some(&never), None), ProbeOutcome::Keep);
+    }
+
+    #[test]
+    fn probe_outcome_untracked_bases() {
+        assert_eq!(probe_outcome(None, Some("sig")), ProbeOutcome::Rebuild);
+        assert_eq!(probe_outcome(None, None), ProbeOutcome::Keep);
+    }
+
+    #[tokio::test]
+    async fn failed_refresh_probes_keep_healthy_binding_until_consecutive_limit() {
+        use axum::{routing::get, Json, Router};
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        // Rewind the binding's check timestamp so the next bind must re-probe.
+        async fn rewind(state: &PdKvState, base: &str) {
+            let mut bindings = state.bindings.lock().await;
+            if let Some(binding) = bindings.get_mut(base) {
+                binding.checked = Instant::now() - REFRESH_INTERVAL - CONTROL_TIMEOUT;
+            }
+        }
+
+        let healthy = Arc::new(AtomicBool::new(true));
+        let publisher_context = zmq::Context::new();
+        let publisher = publisher_context.socket(zmq::PUB).unwrap();
+        publisher.bind("tcp://127.0.0.1:*").unwrap();
+        let endpoint = publisher.get_last_endpoint().unwrap().unwrap();
+        let app = Router::new()
+            .route(
+                "/server_info",
+                get({
+                    let healthy = healthy.clone();
+                    move || {
+                        let healthy = healthy.clone();
+                        async move {
+                            if healthy.load(Ordering::Relaxed) {
+                                (
+                                    StatusCode::OK,
+                                    Json(json!({"vllm_config":{"model_config":{"model":"m"},"cache_config":{"block_size":16}}})),
+                                )
+                            } else {
+                                (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({})))
+                            }
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/v1/models",
+                get(|| async { Json(json!({"data":[{"id":"m","parent":null}]})) }),
+            )
+            .route("/kv_event_sources", get(move || {
+                let endpoint = endpoint.clone();
+                async move {
+                    Json(json!({"0":{"publisher":"zmq","endpoint":endpoint,"enable_kv_cache_events":true}}))
+                }
+            }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let state = PdKvState::new(reqwest::Client::new());
+        let policy: Arc<dyn LoadBalancingPolicy> = Arc::new(KvAwarePolicy::default());
+        let ops = kv_aware_ops(policy.as_ref()).unwrap();
+        let workers: Vec<Arc<dyn Worker>> = vec![Arc::new(BasicWorker::new(
+            base.clone(),
+            WorkerType::Regular,
+        ))];
+        let request = json!({"model":"m","prompt":(0..8).collect::<Vec<u32>>()});
+
+        // First bind: discovery succeeds and installs a binding with info.
+        state.bind(&workers, ops).await;
+        let inputs = state
+            .prepare(&workers, &policy, &request, "/v1/completions", None)
+            .await;
+        assert!(inputs[&base].allow_credit);
+        {
+            let bindings = state.bindings.lock().await;
+            let binding = bindings.get(&base).expect("binding after first discovery");
+            assert!(binding.info.is_some());
+            assert_eq!(binding.probe_failures, 0);
+        }
+
+        // Transient failures keep the healthy binding and its credit authority.
+        healthy.store(false, Ordering::Relaxed);
+        for expected_failures in 1..MAX_PROBE_FAILURES {
+            rewind(&state, &base).await;
+            state.bind(&workers, ops).await;
+            let inputs = state
+                .prepare(&workers, &policy, &request, "/v1/completions", None)
+                .await;
+            assert!(
+                inputs[&base].allow_credit,
+                "retained binding keeps credit authority"
+            );
+            let bindings = state.bindings.lock().await;
+            let binding = bindings
+                .get(&base)
+                .expect("binding retained after transient failure");
+            assert!(binding.info.is_some(), "index identity must survive");
+            assert_eq!(binding.probe_failures, expected_failures);
+        }
+
+        // The consecutive-failure limit replaces the binding with an empty one
+        // and tears the subscriber down.
+        rewind(&state, &base).await;
+        state.bind(&workers, ops).await;
+        let inputs = state
+            .prepare(&workers, &policy, &request, "/v1/completions", None)
+            .await;
+        assert!(!inputs[&base].allow_credit);
+        let bindings = state.bindings.lock().await;
+        let binding = bindings
+            .get(&base)
+            .expect("empty binding re-recorded for retry cadence");
+        assert!(binding.info.is_none());
+        assert_eq!(binding.probe_failures, 0);
+
+        task.abort();
     }
 }

@@ -203,6 +203,7 @@ impl Router {
         Ok(config::RouterConfig {
             epd: None,
             mode,
+            pd_kv_event_sources: Default::default(),
             policy,
             host: self.host.clone(),
             port: self.port,

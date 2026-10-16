@@ -159,6 +159,13 @@ impl PolicyRegistry {
         Arc::clone(&self.default_policy)
     }
 
+    /// The registry-owned KV affinity table. Its idle TTL carries the
+    /// router-level session-affinity setting; policies created outside this
+    /// registry must share this table or their affinity gate stays closed.
+    pub fn kv_affinity_table(&self) -> Arc<KvAffinityTable> {
+        Arc::clone(&self.kv_affinity_table)
+    }
+
     /// Get policy for a model, or default if not found
     pub fn get_policy_or_default(&self, model_id: &str) -> Arc<dyn LoadBalancingPolicy> {
         self.get_policy(model_id)
