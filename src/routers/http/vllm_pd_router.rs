@@ -6,7 +6,7 @@ use super::pd_router::PdRouterBase;
 use super::pd_types::{error_chain, PDRouterError};
 use super::vllm_service_discovery::{MoriIOTransferMode, ServiceRegistry, ServiceType};
 use crate::config::KvConnector;
-use crate::core::{BasicWorker, Worker, WorkerType};
+use crate::core::{BasicWorker, Worker, WorkerLoadGuard, WorkerType};
 use crate::metrics::RouterMetrics;
 use crate::otel_http::{self, ClientRequestOptions};
 use crate::policies::PolicyRegistry;
@@ -40,6 +40,8 @@ pub struct VllmPDRouter {
     epd: Option<super::epd::EncoderStage>,
     /// Underlying PD router for most functionality
     pd_router: PdRouterBase,
+    /// Serialize static decode selection and reservation; never held over I/O.
+    decode_selection: parking_lot::Mutex<()>,
     /// Service discovery registry for dynamic ZMQ address resolution
     service_registry: Arc<ServiceRegistry>,
     /// HTTP client for making requests to discovered services
@@ -92,6 +94,19 @@ fn build_prefill_request_builder(
 }
 
 impl VllmPDRouter {
+    /// Include assigned requests in local decode load while prefill is pending.
+    fn select_and_reserve_decode<'a>(
+        &self,
+        policy: &dyn crate::policies::LoadBalancingPolicy,
+        workers: &'a [Arc<dyn Worker>],
+        text: Option<&str>,
+        headers: Option<&crate::policies::RequestHeaders>,
+    ) -> Option<(usize, WorkerLoadGuard<'a>)> {
+        let _selection = self.decode_selection.lock();
+        let idx = policy.select_worker_with_headers(workers, text, headers)?;
+        Some((idx, WorkerLoadGuard::new(workers[idx].as_ref())))
+    }
+
     /// Query the Mooncake bootstrap server on a prefill node to get engine_id per dp_rank.
     /// Retries with backoff since the prefill server may not be ready at router startup.
     async fn query_mooncake_bootstrap(
@@ -1263,9 +1278,9 @@ impl VllmPDRouter {
 
     /// Two-stage request processing for vLLM disaggregated mode
     ///
-    /// This function handles fine-grained load tracking: the prefill worker's load is only
-    /// incremented during the prefill phase, and the decode worker's load is only incremented
-    /// during the decode phase. This accurately reflects the sequential nature of PD disaggregation.
+    /// Prefill load is tracked during the prefill phase. The static route caller
+    /// holds the selected decode reservation across this future, including prefill.
+    /// Streaming response-body load tracking is separate from this dispatch scope.
     async fn process_vllm_two_stage_request(
         &self,
         original_request: Value,
@@ -1552,9 +1567,8 @@ impl VllmPDRouter {
         // Stop profiling on prefill server after its work is done
         self.stop_profiling(&prefill_base_url).await;
 
-        // Prefill phase complete: decrement prefill load, increment decode load
+        // Prefill is complete; the caller still holds the decode reservation.
         prefill_worker.decrement_load();
-        decode_worker.increment_load();
 
         debug!("✅ vLLM Stage 1 completed, starting Stage 2 - Decode");
 
@@ -1642,7 +1656,6 @@ impl VllmPDRouter {
         {
             Ok(resp) => resp,
             Err(e) => {
-                decode_worker.decrement_load();
                 let full_error = error_chain(&e);
                 let duration = start_time.elapsed();
                 RouterMetrics::record_pd_decode_error(&decode_base_url);
@@ -1657,9 +1670,6 @@ impl VllmPDRouter {
 
         // Stop profiling on decode server after response received
         self.stop_profiling(&decode_base_url).await;
-
-        // Decode phase complete: decrement decode load
-        decode_worker.decrement_load();
 
         let status = decode_response.status();
         let headers = decode_response.headers().clone();
@@ -1836,7 +1846,6 @@ impl VllmPDRouter {
         };
 
         prefill_worker.increment_load();
-        decode_worker.increment_load();
         self.start_profiling(&prefill_base_url).await;
         self.start_profiling(&decode_base_url).await;
 
@@ -1873,7 +1882,6 @@ impl VllmPDRouter {
                 .ok()
                 .and_then(|b| serde_json::from_slice::<Value>(&b).ok()),
             Ok(resp) => {
-                decode_worker.decrement_load();
                 self.stop_profiling(&decode_base_url).await;
                 RouterMetrics::record_pd_prefill_error(&prefill_base_url);
                 RouterMetrics::record_pd_request(path);
@@ -1899,7 +1907,6 @@ impl VllmPDRouter {
                 });
             }
             Err(e) => {
-                decode_worker.decrement_load();
                 self.stop_profiling(&decode_base_url).await;
                 RouterMetrics::record_pd_prefill_error(&prefill_base_url);
                 RouterMetrics::record_pd_request(path);
@@ -1926,7 +1933,6 @@ impl VllmPDRouter {
         let decode_response = match decode_result {
             Ok(resp) => resp,
             Err(e) => {
-                decode_worker.decrement_load();
                 self.stop_profiling(&decode_base_url).await;
                 RouterMetrics::record_pd_decode_error(&decode_base_url);
                 RouterMetrics::record_pd_request(path);
@@ -1941,7 +1947,6 @@ impl VllmPDRouter {
                 });
             }
         };
-        decode_worker.decrement_load();
 
         let needs_logprobs = decode_request.get("logprobs").is_some()
             || decode_request
@@ -2021,6 +2026,7 @@ impl VllmPDRouter {
                     .clone()
                     .map(super::epd::EncoderStage::new),
                 pd_router,
+                decode_selection: parking_lot::Mutex::new(()),
                 service_registry: Arc::new(service_registry),
                 http_client,
                 policy_registry: ctx.policy_registry.clone(),
@@ -2116,6 +2122,7 @@ impl VllmPDRouter {
                     .clone()
                     .map(super::epd::EncoderStage::new),
                 pd_router,
+                decode_selection: parking_lot::Mutex::new(()),
                 service_registry: Arc::new(service_registry),
                 http_client,
                 policy_registry: ctx.policy_registry.clone(),
@@ -2372,7 +2379,8 @@ impl RouterTrait for VllmPDRouter {
                 }
             };
 
-            let decode_idx = match decode_policy.select_worker_with_headers(
+            let (decode_idx, _decode_load) = match self.select_and_reserve_decode(
+                decode_policy.as_ref(),
                 &decode_workers,
                 request_str,
                 request_headers.as_ref(),
@@ -2390,8 +2398,7 @@ impl RouterTrait for VllmPDRouter {
 
             let prefill_worker = &prefill_workers[prefill_idx];
             let decode_worker = &decode_workers[decode_idx];
-            // Load tracking is handled inside process_vllm_two_stage_request for fine-grained
-            // tracking: prefill load only during prefill phase, decode load only during decode phase.
+            // Keep the decode reservation through the two-stage dispatch, including prefill.
 
             info!(
                 "Chat: Selected prefill={} [policy:{}], decode={} [policy:{}]",
@@ -2543,7 +2550,8 @@ impl RouterTrait for VllmPDRouter {
                 }
             };
 
-            let decode_idx = match decode_policy.select_worker_with_headers(
+            let (decode_idx, _decode_load) = match self.select_and_reserve_decode(
+                decode_policy.as_ref(),
                 &decode_workers,
                 request_str,
                 request_headers.as_ref(),
@@ -2561,8 +2569,7 @@ impl RouterTrait for VllmPDRouter {
 
             let prefill_worker = &prefill_workers[prefill_idx];
             let decode_worker = &decode_workers[decode_idx];
-            // Load tracking is handled inside process_vllm_two_stage_request for fine-grained
-            // tracking: prefill load only during prefill phase, decode load only during decode phase.
+            // Keep the decode reservation through the two-stage dispatch, including prefill.
 
             info!(
                 "Completion: Selected prefill={} [policy:{}], decode={} [policy:{}]",
@@ -2765,7 +2772,8 @@ impl RouterTrait for VllmPDRouter {
                 }
             };
 
-            let decode_idx = match decode_policy.select_worker_with_headers(
+            let (decode_idx, _decode_load) = match self.select_and_reserve_decode(
+                decode_policy.as_ref(),
                 &decode_workers,
                 request_str,
                 request_headers.as_ref(),
@@ -2840,6 +2848,50 @@ impl WorkerManagement for VllmPDRouter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_vllm_pd_router() -> VllmPDRouter {
+        let worker_registry = Arc::new(crate::core::WorkerRegistry::new());
+        let policy_registry =
+            Arc::new(PolicyRegistry::new(crate::config::PolicyConfig::RoundRobin));
+        let pd_router = PdRouterBase {
+            worker_registry,
+            policy_registry: policy_registry.clone(),
+            worker_startup_timeout_secs: 5,
+            worker_startup_check_interval_secs: 1,
+            worker_loads: Arc::new(tokio::sync::watch::channel(HashMap::new()).1),
+            load_monitor_handle: None,
+            client: reqwest::Client::new(),
+            circuit_breaker_config: crate::core::CircuitBreakerConfig::default(),
+            dp_size: 1,
+        };
+        VllmPDRouter {
+            epd: None,
+            pd_router,
+            decode_selection: parking_lot::Mutex::new(()),
+            service_registry: Arc::new(ServiceRegistry::new()),
+            http_client: reqwest::Client::new(),
+            policy_registry,
+            use_discovery: false,
+            enable_profiling: false,
+            profile_timeout_secs: 0,
+            profiling_tasks: Arc::new(Mutex::new(HashMap::new())),
+            intra_node_data_parallel_size: 1,
+            prefill_dp_round_robin: Arc::new(AtomicUsize::new(0)),
+            kv_connector: KvConnector::Nixl,
+            mooncake_prefill_info: Arc::new(Mutex::new(HashMap::new())),
+            nixl_prefill_info: RwLock::new(HashMap::new()),
+        }
+    }
+
+    async fn spawn_test_server(app: axum::Router) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        url
+    }
+
     use serde_json::json;
 
     #[test]
@@ -3112,5 +3164,480 @@ mod tests {
     fn test_moriio_write_decode_params_includes_remote_dp_rank_when_dp_size_gt_1() {
         let params = moriio_write_decode_params(Some("tx-abc"), 4, Some(2));
         assert_eq!(params["remote_dp_rank"], 2);
+    }
+    async fn dispatch_reservation_test_request(router: &VllmPDRouter, path: &str) -> Response {
+        match path {
+            "/v1/chat/completions" => router.route_chat(None, &serde_json::from_value(json!({
+                "model": "test", "messages": [{"role": "user", "content": "hi"}], "stream": true,
+            })).unwrap(), None).await,
+            "/v1/completions" => router.route_completion(None, &serde_json::from_value(json!({
+                "model": "test", "prompt": "hi", "stream": true,
+            })).unwrap(), None).await,
+            _ => router.route_transparent(None, path, &Method::POST, json!({
+                "model": "test", "input": "hi", "stream": true,
+            })).await,
+        }
+    }
+
+    #[tokio::test]
+    async fn selected_decode_is_reserved_while_prefill_is_pending() {
+        for path in ["/v1/chat/completions", "/v1/completions", "/v1/responses"] {
+            let entered = Arc::new(tokio::sync::Notify::new());
+            let signal = entered.clone();
+            let prefill_url = spawn_test_server(axum::Router::new().fallback(move || {
+                let signal = signal.clone();
+                async move {
+                    signal.notify_one();
+                    std::future::pending::<StatusCode>().await
+                }
+            }))
+            .await;
+            let prefill: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+                prefill_url,
+                WorkerType::Prefill {
+                    bootstrap_port: None,
+                },
+            ));
+            let decode: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+                "http://127.0.0.1:1".to_string(),
+                WorkerType::Decode,
+            ));
+            let router = test_vllm_pd_router();
+            router.pd_router.worker_registry.register(prefill.clone());
+            router.pd_router.worker_registry.register(decode.clone());
+            let task =
+                tokio::spawn(async move { dispatch_reservation_test_request(&router, path).await });
+            tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
+                .await
+                .unwrap();
+            let pending_load = decode.load();
+            task.abort();
+            let _ = task.await;
+            assert_eq!(decode.load(), 0, "decode reservation cancellation: {path}");
+            assert_eq!(
+                pending_load, 1,
+                "selected decode must be visible before prefill completes: {path}"
+            );
+        }
+    }
+    #[test]
+    fn test_decode_reservation_serializes_concurrent_admission() {
+        let router = test_vllm_pd_router();
+        let workers: Vec<Arc<dyn Worker>> = (0..2)
+            .map(|i| {
+                Arc::new(BasicWorker::new(
+                    format!("http://decode-{i}"),
+                    WorkerType::Decode,
+                )) as Arc<dyn Worker>
+            })
+            .collect();
+        // With two candidates the existing power-of-two policy always compares
+        // both. No external load samples are installed in this test.
+        let policy = crate::policies::PowerOfTwoPolicy::new();
+        let barrier = std::sync::Barrier::new(32);
+        let guards = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..32)
+                .map(|_| {
+                    scope.spawn(|| {
+                        barrier.wait();
+                        router
+                            .select_and_reserve_decode(&policy, &workers, None, None)
+                            .unwrap()
+                            .1
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(workers[0].load(), 16);
+        assert_eq!(workers[1].load(), 16);
+        drop(guards);
+        assert!(workers.iter().all(|worker| worker.load() == 0));
+    }
+
+    #[test]
+    fn test_decode_reservation_unavailable_does_not_change_load() {
+        let router = test_vllm_pd_router();
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+            "http://decode".to_string(),
+            WorkerType::Decode,
+        ));
+        worker.set_healthy(false);
+        let policy = crate::policies::PowerOfTwoPolicy::new();
+        assert!(router
+            .select_and_reserve_decode(&policy, std::slice::from_ref(&worker), None, None)
+            .is_none());
+        assert_eq!(worker.load(), 0);
+        assert!(router
+            .select_and_reserve_decode(&policy, &[], None, None)
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn concurrent_nixl_keeps_one_reservation_until_cancelled() {
+        let p_entered = Arc::new(tokio::sync::Notify::new());
+        let d_entered = Arc::new(tokio::sync::Notify::new());
+        let mut urls = Vec::new();
+        for signal in [p_entered.clone(), d_entered.clone()] {
+            urls.push(
+                spawn_test_server(axum::Router::new().fallback(move || {
+                    let signal = signal.clone();
+                    async move {
+                        signal.notify_one();
+                        std::future::pending::<StatusCode>().await
+                    }
+                }))
+                .await,
+            );
+        }
+        let prefill: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+            urls[0].clone(),
+            WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+        ));
+        let decode: Arc<dyn Worker> =
+            Arc::new(BasicWorker::new(urls[1].clone(), WorkerType::Decode));
+        let router = test_vllm_pd_router();
+        router.store_nixl_info(
+            prefill.base_url(),
+            None,
+            json!({
+                "transfer_mode": "push", "remote_engine_id": "test-prefill",
+                "remote_host": "127.0.0.1", "remote_port": 1234, "tp_size": 1,
+            }),
+        );
+        router.pd_router.worker_registry.register(prefill.clone());
+        router.pd_router.worker_registry.register(decode.clone());
+        let task = tokio::spawn(async move {
+            dispatch_reservation_test_request(&router, "/v1/chat/completions").await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            p_entered.notified().await;
+            d_entered.notified().await;
+        })
+        .await
+        .expect("cached NIXL push identity must dispatch both stages concurrently");
+        let loads = (prefill.load(), decode.load());
+        task.abort();
+        let _ = task.await;
+        assert_eq!(
+            loads,
+            (1, 1),
+            "the NIXL fast path must reuse the reservation"
+        );
+        assert_eq!(decode.load(), 0);
+    }
+
+    #[tokio::test]
+    async fn prefill_parse_error_releases_decode_reservation() {
+        let prefill_url = spawn_test_server(
+            axum::Router::new().fallback(|| async { (StatusCode::OK, "not JSON") }),
+        )
+        .await;
+        let prefill: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+            prefill_url,
+            WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+        ));
+        let decode: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+            "http://127.0.0.1:1".to_string(),
+            WorkerType::Decode,
+        ));
+        let router = test_vllm_pd_router();
+        router.pd_router.worker_registry.register(prefill.clone());
+        router.pd_router.worker_registry.register(decode.clone());
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            dispatch_reservation_test_request(&router, "/v1/responses"),
+        )
+        .await
+        .unwrap();
+        assert!(response.status().is_server_error());
+        assert_eq!(decode.load(), 0);
+    }
+
+    #[tokio::test]
+    async fn buffered_logprobs_cancellation_releases_decode_reservation() {
+        use axum::{http::header::CONTENT_TYPE, routing::post};
+        use bytes::Bytes;
+        use std::{convert::Infallible, task::Poll};
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let signal = entered.clone();
+        let prefill_url = spawn_test_server(
+            axum::Router::new()
+                .fallback(|| async { axum::Json(json!({"kv_transfer_params": {}})) }),
+        )
+        .await;
+        let decode_url = spawn_test_server(axum::Router::new().route(
+            "/v1/chat/completions",
+            post(move || {
+                let signal = signal.clone();
+                async move {
+                    let stream = futures_util::stream::poll_fn(move |_| {
+                        signal.notify_one();
+                        Poll::Pending::<Option<Result<Bytes, Infallible>>>
+                    });
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(CONTENT_TYPE, "application/json")
+                        .body(Body::from_stream(stream))
+                        .unwrap()
+                }
+            }),
+        ))
+        .await;
+        let prefill: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+            prefill_url,
+            WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+        ));
+        let decode: Arc<dyn Worker> = Arc::new(BasicWorker::new(decode_url, WorkerType::Decode));
+        let router = test_vllm_pd_router();
+        router.pd_router.worker_registry.register(prefill.clone());
+        router.pd_router.worker_registry.register(decode.clone());
+        let task = tokio::spawn(async move {
+            router
+                .route_chat(
+                    None,
+                    &serde_json::from_value(json!({
+                        "model": "test", "messages": [{"role":"user","content":"hi"}],
+                        "stream": false, "logprobs": true,
+                    }))
+                    .unwrap(),
+                    None,
+                )
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
+            .await
+            .unwrap();
+        let decode_load = decode.load();
+        task.abort();
+        let _ = task.await;
+        assert_eq!(decode_load, 1);
+        assert_eq!(decode.load(), 0);
+    }
+    #[tokio::test]
+    async fn ordinary_decode_dispatch_reuses_reservation() {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let signal = entered.clone();
+        let resume = release.clone();
+        let prefill_url = spawn_test_server(
+            axum::Router::new()
+                .fallback(|| async { axum::Json(json!({"kv_transfer_params": {}})) }),
+        )
+        .await;
+        let decode_url = spawn_test_server(axum::Router::new().fallback(move || {
+            let signal = signal.clone();
+            let resume = resume.clone();
+            async move {
+                signal.notify_one();
+                resume.notified().await;
+                axum::Json(json!({"output": []}))
+            }
+        }))
+        .await;
+        let prefill: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+            prefill_url,
+            WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+        ));
+        let decode: Arc<dyn Worker> = Arc::new(BasicWorker::new(decode_url, WorkerType::Decode));
+        let router = test_vllm_pd_router();
+        router.pd_router.worker_registry.register(prefill.clone());
+        router.pd_router.worker_registry.register(decode.clone());
+        let task = tokio::spawn(async move {
+            dispatch_reservation_test_request(&router, "/v1/responses").await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
+            .await
+            .unwrap();
+        assert_eq!(prefill.load(), 0);
+        assert_eq!(
+            decode.load(),
+            1,
+            "dispatch must not increment the reservation twice"
+        );
+        release.notify_one();
+        let response = tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        drop(response);
+        assert_eq!(decode.load(), 0);
+    }
+    #[test]
+    fn review_default_cache_affinity_and_cold_mix() {
+        use crate::policies::{CacheAwareConfig, CacheAwarePolicy, LoadBalancingPolicy};
+        let router = test_vllm_pd_router();
+        let workers: Vec<Arc<dyn Worker>> = (0..8)
+            .map(|i| {
+                Arc::new(BasicWorker::new(
+                    format!("http://d-{i}"),
+                    WorkerType::Decode,
+                )) as Arc<dyn Worker>
+            })
+            .collect();
+        let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+            eviction_interval_secs: 0,
+            ..Default::default()
+        });
+        policy.init_workers(&workers);
+        let prefix = "shared conversation prefix ".repeat(100);
+        let (warm_idx, guard) = router
+            .select_and_reserve_decode(&policy, &workers, Some(&prefix), None)
+            .unwrap();
+        drop(guard);
+        // Sequential turns preserve affinity as the conversation grows.
+        for turn in 0..8 {
+            let text = format!("{prefix}turn {turn}");
+            let (idx, guard) = router
+                .select_and_reserve_decode(&policy, &workers, Some(&text), None)
+                .unwrap();
+            assert_eq!(idx, warm_idx);
+            drop(guard);
+        }
+        // A pending warm request does not force loss of affinity below the default threshold.
+        let (_, first) = router
+            .select_and_reserve_decode(&policy, &workers, Some(&prefix), None)
+            .unwrap();
+        let (idx, second) = router
+            .select_and_reserve_decode(&policy, &workers, Some(&prefix), None)
+            .unwrap();
+        assert_eq!(idx, warm_idx);
+        // A disjoint cold request can use an unoccupied D without erasing warm affinity.
+        let (cold_idx, cold) = router
+            .select_and_reserve_decode(&policy, &workers, Some("ZZZZ unrelated cold prompt"), None)
+            .unwrap();
+        assert_ne!(cold_idx, warm_idx);
+        drop((first, second, cold));
+        assert!(workers.iter().all(|w| w.load() == 0));
+        let (idx, guard) = router
+            .select_and_reserve_decode(&policy, &workers, Some(&prefix), None)
+            .unwrap();
+        assert_eq!(idx, warm_idx);
+        drop(guard);
+    }
+
+    #[test]
+    fn review_default_cold_burst_reservations_balance() {
+        use crate::policies::{CacheAwareConfig, CacheAwarePolicy, LoadBalancingPolicy};
+        let router = test_vllm_pd_router();
+        let workers: Vec<Arc<dyn Worker>> = (0..8)
+            .map(|i| {
+                Arc::new(BasicWorker::new(
+                    format!("http://d-{i}"),
+                    WorkerType::Decode,
+                )) as Arc<dyn Worker>
+            })
+            .collect();
+        let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+            eviction_interval_secs: 0,
+            ..Default::default()
+        });
+        policy.init_workers(&workers);
+        let mut guards = Vec::new();
+        for i in 0..24 {
+            let text = char::from_u32(0x400 + i).unwrap().to_string().repeat(100);
+            guards.push(
+                router
+                    .select_and_reserve_decode(&policy, &workers, Some(&text), None)
+                    .unwrap()
+                    .1,
+            );
+        }
+        assert!(workers.iter().all(|w| w.load() == 3));
+        drop(guards);
+        assert!(workers.iter().all(|w| w.load() == 0));
+    }
+
+    #[tokio::test]
+    async fn review_dispatch_failures_release_only_owned_reservation() {
+        for path in ["/v1/chat/completions", "/v1/completions", "/v1/responses"] {
+            for mode in [
+                "prefill_http",
+                "prefill_transport",
+                "decode_http",
+                "decode_transport",
+                "decode_timeout",
+            ] {
+                let prefill_url = if mode == "prefill_transport" {
+                    "http://127.0.0.1:1".to_string()
+                } else if mode == "prefill_http" {
+                    spawn_test_server(
+                        axum::Router::new()
+                            .fallback(|| async { StatusCode::INTERNAL_SERVER_ERROR }),
+                    )
+                    .await
+                } else {
+                    spawn_test_server(
+                        axum::Router::new()
+                            .fallback(|| async { axum::Json(json!({"kv_transfer_params": {}})) }),
+                    )
+                    .await
+                };
+                let decode_url = if mode == "decode_transport" {
+                    "http://127.0.0.1:1".to_string()
+                } else if mode == "decode_timeout" {
+                    spawn_test_server(
+                        axum::Router::new()
+                            .fallback(|| async { std::future::pending::<StatusCode>().await }),
+                    )
+                    .await
+                } else {
+                    spawn_test_server(
+                        axum::Router::new()
+                            .fallback(|| async { StatusCode::INTERNAL_SERVER_ERROR }),
+                    )
+                    .await
+                };
+                let prefill: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+                    prefill_url,
+                    WorkerType::Prefill {
+                        bootstrap_port: None,
+                    },
+                ));
+                let decode: Arc<dyn Worker> =
+                    Arc::new(BasicWorker::new(decode_url, WorkerType::Decode));
+                let mut router = test_vllm_pd_router();
+                router.http_client = reqwest::Client::builder()
+                    .timeout(std::time::Duration::from_millis(200))
+                    .build()
+                    .unwrap();
+                router.pd_router.client = router.http_client.clone();
+                router.pd_router.worker_registry.register(prefill);
+                router.pd_router.worker_registry.register(decode.clone());
+                // Sentinel load catches accidental double release hidden by saturating counters.
+                decode.increment_load();
+                let response = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    dispatch_reservation_test_request(&router, path),
+                )
+                .await
+                .unwrap();
+                assert!(
+                    response.status().is_server_error(),
+                    "{path} {mode}: {}",
+                    response.status()
+                );
+                assert_eq!(decode.load(), 1, "{path} {mode}");
+                drop(response);
+                assert_eq!(
+                    decode.load(),
+                    1,
+                    "response drop must not release again: {path} {mode}"
+                );
+                decode.decrement_load();
+            }
+        }
     }
 }
