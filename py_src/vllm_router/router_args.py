@@ -1,7 +1,7 @@
 import argparse
 import dataclasses
 import logging
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Union
 
 logger = logging.getLogger(__name__)
 
@@ -46,7 +46,7 @@ class RouterArgs:
     # Service discovery configuration
     service_discovery: bool = False
     selector: Dict[str, str] = dataclasses.field(default_factory=dict)
-    service_discovery_port: int = 80
+    service_discovery_port: Union[int, List[int]] = 80
     service_discovery_namespace: Optional[str] = None
     # PD service discovery configuration
     prefill_selector: Dict[str, str] = dataclasses.field(default_factory=dict)
@@ -334,8 +334,9 @@ class RouterArgs:
         parser.add_argument(
             f"--{prefix}service-discovery-port",
             type=int,
-            default=RouterArgs.service_discovery_port,
-            help="Port to use for discovered worker pods",
+            nargs="+",
+            action="extend",
+            help="Ports to use for discovered worker pods (default: 80)",
         )
         parser.add_argument(
             f"--{prefix}service-discovery-namespace",
@@ -556,6 +557,12 @@ class RouterArgs:
         args_dict["decode_selector"] = cls._parse_selector(
             cli_args_dict.get(f"{prefix}decode_selector", None)
         )
+
+        ports = args_dict.get("service_discovery_port")
+        if ports is None:
+            args_dict.pop("service_discovery_port", None)
+        elif isinstance(ports, list) and len(ports) == 1:
+            args_dict["service_discovery_port"] = ports[0]
 
         # Mooncake-specific annotation
         args_dict["bootstrap_port_annotation"] = "vllm.ai/bootstrap-port"

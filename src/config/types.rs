@@ -710,8 +710,11 @@ pub struct DiscoveryConfig {
     pub enabled: bool,
     /// Kubernetes namespace (None = all namespaces)
     pub namespace: Option<String>,
-    /// Service discovery port
+    /// Primary service discovery port
     pub port: u16,
+    /// Extra ports on each discovered pod
+    #[serde(default)]
+    pub additional_ports: Vec<u16>,
     /// Check interval for service discovery
     pub check_interval_secs: u64,
     /// Regular mode selector
@@ -730,6 +733,7 @@ impl Default for DiscoveryConfig {
             enabled: false,
             namespace: None,
             port: 8000,
+            additional_ports: Vec::new(),
             check_interval_secs: 120,
             selector: HashMap::new(),
             prefill_selector: HashMap::new(),
@@ -1401,6 +1405,7 @@ mod tests {
             enabled: true,
             namespace: Some("default".to_string()),
             port: 9000,
+            additional_ports: Vec::new(),
             check_interval_secs: 30,
             selector: selector.clone(),
             prefill_selector: selector.clone(),
@@ -1742,6 +1747,7 @@ mod tests {
                 enabled: true,
                 namespace: Some("production".to_string()),
                 port: 8443,
+                additional_ports: Vec::new(),
                 check_interval_secs: 120,
                 selector: selectors.clone(),
                 prefill_selector: selectors.clone(),
@@ -1944,5 +1950,13 @@ mod tests {
             PolicyConfig::RoundRobin => {} // Success
             _ => panic!("Expected RoundRobin for regular mode"),
         }
+    }
+    #[test]
+    fn test_discovery_config_accepts_legacy_port_field() {
+        let mut value = serde_json::to_value(DiscoveryConfig::default()).unwrap();
+        value.as_object_mut().unwrap().remove("additional_ports");
+        let decoded: DiscoveryConfig = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded.port, 8000);
+        assert!(decoded.additional_ports.is_empty());
     }
 }
