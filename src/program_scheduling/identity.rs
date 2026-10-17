@@ -444,7 +444,15 @@ fn canonical_identity(
     identity.spawn_reason =
         context_string(context, &["spawn_reason", "subagent_type", "agent_type"])?;
     identity.step_id = context_u64(context, &["step_id"])?;
-    identity.request_hints = ProgramRequestHints {
+    identity.request_hints = request_hints(context)?;
+    Ok(Some(identity))
+}
+
+/// Both supported body contracts use the same request-scoped hint semantics.
+fn request_hints(
+    context: &JsonMap<String, JsonValue>,
+) -> Result<ProgramRequestHints, ScheduleError> {
+    Ok(ProgramRequestHints {
         request_id: context_string(context, &["request_id"])?,
         priority: context_i64(context, &["priority"])?.unwrap_or_default(),
         deadline: context_duration(context, &["deadline", "deadline_seconds"])?,
@@ -456,8 +464,7 @@ fn canonical_identity(
             context,
             &["kv_retention_ttl", "kv_retention_ttl_seconds"],
         )?,
-    };
-    Ok(Some(identity))
+    })
 }
 
 fn related_program_id(
@@ -612,6 +619,9 @@ fn agent_hint_identity(
     identity.session_id = Some(session_id);
     identity.parent_program_id = parent_session_id;
     identity.blocks_parent = blocks_parent;
+    identity.agent_role = context_string(hint, &["agent_role"])?;
+    identity.step_id = context_u64(hint, &["step_id"])?;
+    identity.request_hints = request_hints(hint)?;
     Ok(Some(identity))
 }
 

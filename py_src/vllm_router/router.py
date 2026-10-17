@@ -10,6 +10,7 @@ def policy_from_str(policy_str: Optional[str]) -> PolicyType:
     if policy_str is None:
         return None
     policy_map = {
+        "kv_aware": PolicyType.KvAware,
         "random": PolicyType.Random,
         "round_robin": PolicyType.RoundRobin,
         "cache_aware": PolicyType.CacheAware,

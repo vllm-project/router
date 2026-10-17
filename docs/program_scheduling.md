@@ -156,6 +156,33 @@ The canonical contract is `vllm_xargs.agentic_context`. Identity semantics match
 
 For `agent_hint`, `session_id` becomes both Program ID and session ID, `task_id` remains absent, and `blocks_parent` defaults to true. A blocking hint requires `parent_session_id`. Explicit `expected_resume` always overrides the blocking-subagent default.
 
+When `program_scheduling_enable_key` is `auto`, `agent_hint` also accepts
+`agent_role`, `step_id`, and the same request-scoped hints as the canonical
+context: `request_id`, `priority`, `deadline_seconds` (alias `deadline`),
+`expected_output_length` (alias `expected_output_tokens`), and
+`kv_retention_ttl_seconds` (alias `kv_retention_ttl`). They are validated and
+consumed by the existing admission, resume, and completion paths; they are not
+silently ignored. All identity and feature-enable precedence remains unchanged.
+
+```json
+{
+  "agent_hint": {
+    "session_id": "research-task",
+    "blocks_parent": false,
+    "agent_role": "researcher",
+    "step_id": 2,
+    "priority": 5,
+    "deadline_seconds": 30,
+    "expected_output_tokens": 512,
+    "kv_retention_ttl_seconds": 5
+  }
+}
+```
+
+These hints affect Router scheduling. A retention hint does not establish that
+the engine retained or prefetched physical KV blocks; engine acceptance and
+actual reuse require separate validation.
+
 ## Resume ordering and capacity
 
 Resume first selects expired force-resume deadlines, then larger request priorities. Within each equal force/priority cohort, a Program paused because it reached `max_segment_rounds` ranks behind other candidates. Rank-local ordering defaults to MRU and can be changed to FCFS, while cross-Rank candidates always use FCFS. Successful resume clears the one-shot yield marker. Priority and yield ordering only change selection order and never grant a new capacity bypass; established force-resume admission behavior remains unchanged.

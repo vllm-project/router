@@ -168,6 +168,7 @@ impl PolicyRegistry {
     /// Create a policy from a type string
     fn create_policy_from_type(&self, policy_type: &str) -> Arc<dyn LoadBalancingPolicy> {
         match policy_type {
+            "kv_aware" => Arc::clone(&self.default_policy),
             "round_robin" => Arc::new(RoundRobinPolicy::new()),
             "random" => Arc::new(RandomPolicy::new()),
             "cache_aware" => Arc::new(CacheAwarePolicy::new()),
@@ -183,6 +184,9 @@ impl PolicyRegistry {
     /// Create a policy from a PolicyConfig
     fn create_policy_from_config(config: &PolicyConfig) -> Arc<dyn LoadBalancingPolicy> {
         match config {
+            PolicyConfig::KvAware { config } => {
+                Arc::new(super::KvAwarePolicy::with_config(config.clone()))
+            }
             PolicyConfig::RoundRobin => Arc::new(RoundRobinPolicy::new()),
             PolicyConfig::Random => Arc::new(RandomPolicy::new()),
             PolicyConfig::CacheAware {

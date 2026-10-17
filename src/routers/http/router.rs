@@ -132,6 +132,27 @@ fn hold_load_until_body_done(mut response: Response, worker: Arc<dyn Worker>) ->
     Response::from_parts(parts, Body::from_stream(stream))
 }
 
+// Own exactly one KV-policy load increment, including cancellation before headers.
+struct KvLoadGuard(Option<Arc<dyn Worker>>);
+impl KvLoadGuard {
+    fn new(worker: Arc<dyn Worker>) -> Self {
+        worker.increment_load();
+        RouterMetrics::set_running_requests(worker.url(), worker.load());
+        Self(Some(worker))
+    }
+    fn handoff(mut self) -> Arc<dyn Worker> {
+        self.0.take().expect("live load guard")
+    }
+}
+impl Drop for KvLoadGuard {
+    fn drop(&mut self) {
+        if let Some(worker) = self.0.take() {
+            worker.decrement_load();
+            RouterMetrics::set_running_requests(worker.url(), worker.load());
+        }
+    }
+}
+
 struct TypedDispatch<'a> {
     headers: Option<&'a HeaderMap>,
     route: &'a str,
@@ -139,6 +160,7 @@ struct TypedDispatch<'a> {
     is_stream: bool,
     load_incremented: bool,
     prepared: Option<crate::backend::PreparedChat>,
+    kv_rank: Option<u32>,
 }
 
 /// Regular router that uses injected load balancing policies
@@ -352,6 +374,28 @@ impl Router {
                 }
             }))
         });
+
+        if let Some(kv) = default_policy
+            .as_any()
+            .downcast_ref::<crate::policies::KvAwarePolicy>()
+        {
+            let mut bases = std::collections::HashSet::new();
+            for worker in ctx.worker_registry.get_all() {
+                if bases.insert(worker.base_url().to_string()) {
+                    if let Err(error) = kv
+                        .runtime
+                        .discover(
+                            &ctx.client,
+                            worker.base_url(),
+                            ctx.router_config.api_key.as_deref(),
+                        )
+                        .await
+                    {
+                        warn!(%error, "KV discovery unavailable; routing will fall back to load");
+                    }
+                }
+            }
+        }
 
         Ok(Router {
             epd: ctx
@@ -1093,6 +1137,35 @@ impl Router {
         };
 
         let text = typed_req.extract_text_for_routing();
+        let routing_policy = match model_id {
+            Some(model) => self.policy_registry.get_policy_or_default(model),
+            None => self.policy_registry.get_default_policy(),
+        };
+        let kv_policy = routing_policy
+            .as_any()
+            .downcast_ref::<crate::policies::KvAwarePolicy>();
+        let kv_body = kv_policy.and_then(|_| serde_json::to_value(typed_req).ok());
+        let kv_namespace_safe = kv_body
+            .as_ref()
+            .is_some_and(crate::policies::kv_aware::namespace_safe);
+        let completion_tokens: Option<Vec<u32>> = if route == "/v1/completions" {
+            kv_body
+                .as_ref()
+                .and_then(|body| body.get("prompt"))
+                .and_then(|prompt| prompt.as_array())
+                .and_then(|tokens| {
+                    tokens
+                        .iter()
+                        .map(|token| token.as_u64().and_then(|t| u32::try_from(t).ok()))
+                        .collect()
+                })
+        } else {
+            None
+        };
+        let kv_tokens = prepared
+            .as_ref()
+            .map(|p| p.tokenized.token_ids.as_ref())
+            .or(completion_tokens.as_deref());
 
         let response = RetryExecutor::execute_response_with_retry(
             &self.retry_config,
@@ -1111,6 +1184,7 @@ impl Router {
                 let forced_worker_url = program_completion
                     .as_ref()
                     .map(|completion| completion.dispatch().target_id.as_str());
+                let mut kv_decision = None;
                 let selected_worker = if let Some(target) = forced_worker_url {
                     let worker = self
                         .worker_registry
@@ -1120,6 +1194,12 @@ impl Router {
                         return Self::program_target_unavailable_response(route);
                     };
                     Some(worker)
+                } else if let Some(kv) = kv_policy {
+                    let workers = self.worker_registry.get_all();
+                    kv.select_with_tokens(&workers, model_id, kv_tokens, kv_namespace_safe).and_then(|(idx, decision)| {
+                        kv_decision = Some(decision);
+                        workers.get(idx).cloned()
+                    })
                 } else {
                     self.select_worker_for_model(model_id, Some(&text), headers)
                 };
@@ -1142,8 +1222,9 @@ impl Router {
                     None => self.policy_registry.get_default_policy(),
                 };
 
+                let kv_guard = kv_policy.map(|_| KvLoadGuard::new(worker.clone()));
                 let load_incremented =
-                    if policy.name() == "cache_aware" || program_completion.is_some() {
+                    if kv_policy.is_none() && (policy.name() == "cache_aware" || program_completion.is_some()) {
                         worker.increment_load();
                         RouterMetrics::set_running_requests(worker.url(), worker.load());
                         true
@@ -1158,7 +1239,7 @@ impl Router {
                     None
                 };
 
-                let response = self
+                let mut response = self
                     .send_typed_request(
                         typed_req,
                         TypedDispatch {
@@ -1168,10 +1249,28 @@ impl Router {
                             is_stream,
                             load_incremented,
                             prepared: prepared.clone(),
+                            kv_rank: kv_policy.map(|_| worker.dp_rank().unwrap_or(0) as u32),
                         },
                         program_completion.clone(),
                     )
                     .await;
+
+                if let Some(guard) = kv_guard {
+                    if is_stream && response.status().is_success() {
+                        response = hold_load_until_body_done(response, guard.handoff());
+                    }
+                }
+                if kv_policy.is_some() {
+                    let mode = kv_decision.as_ref().map_or("fallback", |d| match d.mode {
+                        crate::kv_index::routing::KvRoutingMode::Exact => "exact",
+                        crate::kv_index::routing::KvRoutingMode::Fallback => "fallback",
+                    });
+                    let reason = kv_decision.as_ref().and_then(|d| d.fallback_reason).unwrap_or(if forced_worker_url.is_some() { "program_binding" } else { "verified" });
+                    response.headers_mut().insert("x-router-kv-mode", HeaderValue::from_static(mode));
+                    response.headers_mut().insert("x-router-kv-reason", HeaderValue::from_static(reason));
+                    metrics::counter!("router_kv_decisions_total", "mode" => mode, "reason" => reason).increment(1);
+                    if let Some(decision) = &kv_decision { debug!(decision = %decision.to_json(), "KV routing decision"); }
+                }
 
                 // Client errors (4xx) are not worker failures - only server errors (5xx)
                 // should count against the circuit breaker.
@@ -1358,6 +1457,7 @@ impl Router {
             is_stream,
             load_incremented,
             prepared,
+            kv_rank,
         } = dispatch;
         if crate::backend::is_grpc_url(worker_url) {
             // gRPC workers are chat-only in this milestone. Reject unsupported
@@ -1446,6 +1546,7 @@ impl Router {
             for (name, value) in headers {
                 if *name != CONTENT_TYPE
                     && *name != CONTENT_LENGTH
+                    && !(kv_rank.is_some() && name.as_str() == "x-data-parallel-rank")
                     && !header_utils::TRACE_HEADER_NAMES
                         .iter()
                         .any(|&th| name.as_str().eq_ignore_ascii_case(th))
@@ -1456,7 +1557,7 @@ impl Router {
         }
 
         // Add X-data-parallel-rank header for DP-aware routing
-        if let Some(dp_rank) = extracted_dp_rank {
+        if let Some(dp_rank) = kv_rank.map(|rank| rank as usize).or(extracted_dp_rank) {
             request_builder = request_builder.header("X-data-parallel-rank", dp_rank.to_string());
         }
 
@@ -1503,6 +1604,67 @@ impl Router {
         let status = StatusCode::from_u16(res.status().as_u16())
             .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
         let http_ttfb_ms = t_send.elapsed().as_secs_f64() * 1000.0;
+
+        if is_stream && kv_rank.is_some() {
+            let mut response_headers = header_utils::preserve_response_headers(res.headers());
+            response_headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+            if stages_on {
+                insert_router_stages(
+                    &mut response_headers,
+                    &http_stages_json(http_ttfb_ms, http_ttfb_ms),
+                );
+            }
+            // Poll upstream with the client: no detached producer or unbounded
+            // queue. Dropping the response drops the upstream connection and
+            // ProgramCompletion; the outer load holder releases its one slot.
+            let stream = futures_util::stream::unfold(
+                (res.bytes_stream(), program_completion, true, false),
+                move |(mut stream, completion, first, finished)| async move {
+                    if finished {
+                        return None;
+                    }
+                    match stream.next().await {
+                        Some(Ok(bytes)) => {
+                            if let Some(completion) = &completion {
+                                completion.observe_sse_chunk(&bytes);
+                            }
+                            let bytes = if first && stages_on {
+                                let stages = http_stages_json(
+                                    http_ttfb_ms,
+                                    t_send.elapsed().as_secs_f64() * 1000.0,
+                                );
+                                let mut output =
+                                    format!(": router-stages {stages}\n\n").into_bytes();
+                                output.extend_from_slice(&bytes);
+                                bytes::Bytes::from(output)
+                            } else {
+                                bytes
+                            };
+                            Some((
+                                Ok::<_, reqwest::Error>(bytes),
+                                (stream, completion, false, false),
+                            ))
+                        }
+                        Some(Err(error)) => {
+                            if let Some(completion) = &completion {
+                                completion.finish(false);
+                            }
+                            Some((Err(error), (stream, completion, false, true)))
+                        }
+                        None => {
+                            if let Some(completion) = &completion {
+                                completion.finish(status.is_success());
+                            }
+                            None
+                        }
+                    }
+                },
+            );
+            let mut response = Response::new(Body::from_stream(stream));
+            *response.status_mut() = status;
+            *response.headers_mut() = response_headers;
+            return response;
+        }
 
         if !is_stream {
             // For non-streaming requests, preserve headers
@@ -1823,7 +1985,19 @@ impl Router {
                     }
 
                     RouterMetrics::set_active_workers(self.worker_registry.get_all().len());
-
+                    let policy = self.policy_registry.get_default_policy();
+                    if let Some(kv) = policy
+                        .as_any()
+                        .downcast_ref::<crate::policies::KvAwarePolicy>()
+                    {
+                        if let Err(error) = kv
+                            .runtime
+                            .discover(&self.client, worker_url, self.api_key.as_deref())
+                            .await
+                        {
+                            warn!(%error, "KV discovery unavailable after worker add");
+                        }
+                    }
                     return Ok(format!("Successfully added worker: {}", worker_url));
                 }
                 Err(e) => {
@@ -1847,6 +2021,14 @@ impl Router {
     }
 
     pub fn remove_worker(&self, worker_url: &str) {
+        let policy = self.policy_registry.get_default_policy();
+        if let Some(kv) = policy
+            .as_any()
+            .downcast_ref::<crate::policies::KvAwarePolicy>()
+        {
+            kv.runtime.remove_worker(worker_url);
+        }
+
         if self.intra_node_data_parallel_size > 1 {
             // remove dp-aware workers in a prefix-matching fashion
             // without contacting the remote worker

@@ -51,6 +51,21 @@ pub async fn get_grpc_server_info(
         .map(|response| response.into_inner())
 }
 
+pub async fn get_grpc_kv_event_sources(
+    worker_url: &str,
+    timeout: Duration,
+) -> Result<super::pb::GetKvEventSourcesResponse, String> {
+    let mut client = control_client(worker_url, timeout).await?;
+    tokio::time::timeout(
+        timeout,
+        client.get_kv_event_sources(super::pb::GetKvEventSourcesRequest {}),
+    )
+    .await
+    .map_err(|_| "gRPC KV source discovery timeout".to_string())?
+    .map_err(|e| e.to_string())
+    .map(|response| response.into_inner())
+}
+
 pub fn model_info_json(info: &ModelInfo) -> Value {
     json!({
         "model_id": info.model_id,

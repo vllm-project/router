@@ -32,6 +32,7 @@ pub enum PolicyType {
     CacheAware,
     PowerOfTwo,
     ConsistentHash,
+    KvAware,
 }
 
 #[pyclass]
@@ -121,6 +122,9 @@ impl Router {
         // Convert policy helper function
         let convert_policy = |policy: &PolicyType| -> ConfigPolicyConfig {
             match policy {
+                PolicyType::KvAware => ConfigPolicyConfig::KvAware {
+                    config: Default::default(),
+                },
                 PolicyType::Random => ConfigPolicyConfig::Random,
                 PolicyType::RoundRobin => ConfigPolicyConfig::RoundRobin,
                 PolicyType::CacheAware => ConfigPolicyConfig::CacheAware {

@@ -650,10 +650,48 @@ impl RoutingMode {
     }
 }
 
+/// Limits and scoring for the opt-in, normal-dense KV routing path.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct KvAwareConfig {
+    pub cache_weight: f64,
+    pub max_event_age_secs: u64,
+    pub max_sources: usize,
+    pub max_blocks: usize,
+}
+
+impl Default for KvAwareConfig {
+    fn default() -> Self {
+        Self {
+            cache_weight: 0.5,
+            max_event_age_secs: 30,
+            max_sources: 1024,
+            max_blocks: 65_536,
+        }
+    }
+}
+
+impl KvAwareConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        if !self.cache_weight.is_finite() || !(0.0..=1.0).contains(&self.cache_weight) {
+            return Err("KV cache_weight must be finite and in [0,1]".into());
+        }
+        if self.max_event_age_secs == 0 || self.max_sources == 0 || self.max_blocks == 0 {
+            return Err("KV freshness, source capacity and block budget must be positive".into());
+        }
+        Ok(())
+    }
+}
+
 /// Policy configuration for routing
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum PolicyConfig {
+    #[serde(rename = "kv_aware")]
+    KvAware {
+        #[serde(flatten)]
+        config: KvAwareConfig,
+    },
     #[serde(rename = "random")]
     Random,
 
@@ -693,6 +731,7 @@ pub enum PolicyConfig {
 impl PolicyConfig {
     pub fn name(&self) -> &'static str {
         match self {
+            PolicyConfig::KvAware { .. } => "kv_aware",
             PolicyConfig::Random => "random",
             PolicyConfig::RoundRobin => "round_robin",
             PolicyConfig::CacheAware { .. } => "cache_aware",

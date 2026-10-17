@@ -421,6 +421,14 @@ class TestPolicyFromStr:
 class TestParseRouterArgs:
     """Test the parse_router_args function."""
 
+    def test_kv_policy_reaches_the_native_binding(self):
+        from vllm_router_rs import PolicyType, Router
+
+        args = parse_router_args(["--policy", "kv_aware"])
+        assert args.policy == "kv_aware"
+        assert policy_from_str(args.policy) == PolicyType.KvAware
+        assert isinstance(Router(worker_urls=[], policy=PolicyType.KvAware), Router)
+
     def test_parse_basic_args(self):
         """Test parsing basic router arguments."""
         args = [
