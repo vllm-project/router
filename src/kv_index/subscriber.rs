@@ -4,7 +4,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use rmp_serde::from_slice;
-use sha2::{Digest, Sha256};
 use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, info, warn};
 
@@ -20,22 +19,7 @@ use crate::kv_index::IngestionSignal;
 // per-block extra_keys tuples (custom newtype or rmpv); add when cost model
 // scores cross-salt collisions. Until then lora_name alone distinguishes adapters.
 pub fn local_hashes(token_ids: &[u32], block_size: u32, lora_name: Option<&str>) -> Vec<[u8; 32]> {
-    let bs = block_size as usize;
-    if bs == 0 {
-        return Vec::new();
-    }
-    let mut out = Vec::with_capacity(token_ids.len().div_ceil(bs));
-    for chunk in token_ids.chunks(bs) {
-        let mut hasher = Sha256::new();
-        if let Some(l) = lora_name {
-            hasher.update(l.as_bytes());
-        }
-        for &tid in chunk {
-            hasher.update(tid.to_le_bytes());
-        }
-        out.push(hasher.finalize().into());
-    }
-    out
+    crate::kv_index::local_block_hashes(token_ids, block_size, lora_name)
 }
 
 /// The signed sentinel ending a replay stream: `seq = -1`.
@@ -107,6 +91,7 @@ pub fn spawn(
 
         let mut last_seq: i64 = -1;
         let mut incarnation: u64 = 0;
+        let mut suspended = false;
 
         loop {
             if is_shutdown(&mut shutdown_rx) {
@@ -115,7 +100,10 @@ pub fn spawn(
             }
             match sub.recv_multipart(zmq::DONTWAIT) {
                 Ok(frames) => {
-                    if frames.len() < 3 {
+                    if frames.len() < 3 || frames[1].len() != 8 {
+                        indexer.invalidate_source(&source_id, dp_rank);
+                        suspended = true;
+                        tokio::task::yield_now().await;
                         continue;
                     }
                     let seq = read_seq(&frames[1]);
@@ -128,10 +116,8 @@ pub fn spawn(
                             "kv_index {}: restart seq {} < {} → incarnation {}",
                             source_id, seq, last_seq, incarnation
                         );
-                        indexer.clear(
-                            &owner_for(&source_id, dp_rank, incarnation),
-                            ClearScope::Worker,
-                        );
+                        indexer.invalidate_source(&source_id, dp_rank);
+                        suspended = true;
                         last_seq = -1;
                         emit(
                             &signals,
@@ -141,10 +127,28 @@ pub fn spawn(
                             },
                         );
                     }
-                    if last_seq != -1 && seq > last_seq + 1 {
+                    if seq <= last_seq {
+                        tokio::task::yield_now().await;
+                        continue;
+                    }
+                    let batch = decode(&frames[2]).filter(|batch| {
+                        let correct_rank =
+                            batch.data_parallel_rank.is_none_or(|rank| rank == dp_rank);
+                        if !correct_rank {
+                            warn!(
+                                "kv_index {}: batch rank differs from subscriber rank {}",
+                                source_id, dp_rank
+                            );
+                        }
+                        correct_rank
+                    });
+                    // Include initial attachment to an already-running publisher.
+                    // A corrupt event is a one-event hole, not an applied seq.
+                    if seq > last_seq + 1 || batch.is_none() {
                         let from = last_seq + 1;
-                        let to = seq - 1;
-                        debug!("kv_index {}: gap {}..{}", source_id, from, to);
+                        let to = if batch.is_none() { seq } else { seq - 1 };
+                        indexer.suspend_source(&source_id, dp_rank);
+                        suspended = true;
                         emit(
                             &signals,
                             IngestionSignal::Gap {
@@ -154,9 +158,10 @@ pub fn spawn(
                             },
                         );
                         if let Some(ep) = replay_endpoint.as_deref() {
-                            let applied = replay(
+                            if let Some(last_replay) = replay(
                                 ep,
                                 last_seq,
+                                seq,
                                 &ctx,
                                 &indexer,
                                 &source_id,
@@ -164,9 +169,11 @@ pub fn spawn(
                                 incarnation,
                                 signals.clone(),
                             )
-                            .await;
-                            if let Some(last_replay) = applied {
+                            .await
+                            {
                                 last_seq = last_replay;
+                                indexer.resume_source(&source_id, dp_rank);
+                                suspended = false;
                                 emit(
                                     &signals,
                                     IngestionSignal::ReplayApplied {
@@ -174,14 +181,23 @@ pub fn spawn(
                                         replay_seq: last_replay,
                                     },
                                 );
+                                tokio::task::yield_now().await;
+                                continue;
                             }
                         }
+                        // Partial replay can include stores whose later
+                        // evictions were lost. Never expose that partial state.
+                        indexer.invalidate_source(&source_id, dp_rank);
                     }
-                    if seq > last_seq {
-                        if let Some(batch) = decode(&frames[2]) {
-                            apply_batch(&indexer, &source_id, dp_rank, incarnation, &batch);
-                        }
+                    if let Some(batch) = batch {
+                        // After unrecoverable loss, credit only fresh observations
+                        // on the now-clean source; absence is a conservative miss.
+                        apply_batch(&indexer, &source_id, dp_rank, incarnation, &batch);
                         last_seq = seq;
+                        if suspended {
+                            indexer.resume_source(&source_id, dp_rank);
+                            suspended = false;
+                        }
                         emit(
                             &signals,
                             IngestionSignal::Advance {
@@ -217,7 +233,7 @@ fn is_shutdown(rx: &mut broadcast::Receiver<()>) -> bool {
 }
 
 /// Advisory signal send: `try_send` so a slow arbiter never stalls the hot loop.
-/// A dropped signal under load is covered by the DEGRADED window.
+/// Source invalidation is synchronous in the indexer, independent of signals.
 fn emit(tx: &Option<mpsc::Sender<IngestionSignal>>, signal: IngestionSignal) {
     if let Some(tx) = tx {
         if let Err(e) = tx.try_send(signal) {
@@ -335,11 +351,14 @@ fn apply_batch(
 /// Backfill `(last_seq, ∞)` from the replay ROUTER via a DEALER socket.
 /// Frames with `seq <= last_seq` are skipped — deduped so an out-of-order
 /// re-send can't re-apply a stale `remove` over a freshly re-`store`d block.
-/// Returns the highest seq applied, for the `ReplayApplied` signal.
+/// Returns success only after every sequence through `through_seq` was decoded
+/// and applied. The caller suspends credit during replay and clears partial
+/// observations on failure.
 #[allow(clippy::too_many_arguments)]
 async fn replay(
     endpoint: &str,
     last_seq: i64,
+    through_seq: i64,
     ctx: &zmq::Context,
     indexer: &Arc<KvBlockIndexer>,
     source_id: &SourceId,
@@ -372,7 +391,6 @@ async fn replay(
     // guards against a silent router. Swap for backoff if replay grows large.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     let mut high = last_seq;
-    let mut last_applied: Option<i64> = None;
     loop {
         if tokio::time::Instant::now() >= deadline {
             warn!("kv_index replay {} timed out", source_id);
@@ -381,7 +399,7 @@ async fn replay(
         match dealer.recv_multipart(zmq::DONTWAIT) {
             Ok(frames) => {
                 // DEALER reply: [empty, topic, seq, payload]; seq is 2nd-from-last.
-                if frames.len() < 4 {
+                if frames.len() < 4 || frames[frames.len() - 2].len() != 8 {
                     break;
                 }
                 let seq = read_seq(&frames[frames.len() - 2]);
@@ -391,11 +409,25 @@ async fn replay(
                 if seq <= high {
                     continue;
                 }
-                if let Some(batch) = decode(&frames[frames.len() - 1]) {
-                    apply_batch(indexer, source_id, dp_rank, incarnation, &batch);
+                if seq != high + 1 {
+                    warn!(
+                        "kv_index replay {}: noncontiguous seq {}, expected {}",
+                        source_id,
+                        seq,
+                        high + 1
+                    );
+                    return None;
                 }
+                let batch = decode(&frames[frames.len() - 1])?;
+                if batch.data_parallel_rank.is_some_and(|rank| rank != dp_rank) {
+                    warn!(
+                        "kv_index replay {}: batch rank differs from subscriber rank {}",
+                        source_id, dp_rank
+                    );
+                    return None;
+                }
+                apply_batch(indexer, source_id, dp_rank, incarnation, &batch);
                 high = seq;
-                last_applied = Some(seq);
                 emit(
                     &signals,
                     IngestionSignal::Advance {
@@ -403,6 +435,9 @@ async fn replay(
                         last_seq: seq,
                     },
                 );
+                if high >= through_seq {
+                    return Some(high);
+                }
                 tokio::task::yield_now().await;
             }
             Err(zmq::Error::EAGAIN) => {
@@ -414,7 +449,7 @@ async fn replay(
             }
         }
     }
-    last_applied
+    None
 }
 
 fn hex(b: &[u8]) -> String {
@@ -729,5 +764,310 @@ mod tests {
                 Err(_) => continue,
             }
         }
+    }
+
+    struct Fixture {
+        _ctx: Arc<zmq::Context>,
+        publisher: zmq::Socket,
+        replay_server: Option<zmq::Socket>,
+        indexer: Arc<KvBlockIndexer>,
+        signals: mpsc::Receiver<IngestionSignal>,
+        _handle: SubscriberHandle,
+    }
+
+    fn fixture(with_replay: bool) -> Fixture {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static NEXT: AtomicU32 = AtomicU32::new(0);
+        let tag = NEXT.fetch_add(1, Ordering::Relaxed);
+        let ctx = Arc::new(zmq::Context::new());
+        let publisher = ctx.socket(zmq::PUB).unwrap();
+        let pub_endpoint = format!("inproc://kv-loss-pub-{tag}");
+        publisher.bind(&pub_endpoint).unwrap();
+        let replay_endpoint = format!("inproc://kv-loss-replay-{tag}");
+        let replay_server = with_replay.then(|| {
+            let socket = ctx.socket(zmq::ROUTER).unwrap();
+            socket.bind(&replay_endpoint).unwrap();
+            socket
+        });
+        let indexer = Arc::new(KvBlockIndexer::new());
+        let (tx, signals) = mpsc::channel(128);
+        let handle = spawn(
+            EventSource {
+                source: SourceId::from("w0"),
+                dp_rank: 0,
+                pub_endpoint,
+                replay_endpoint: with_replay.then_some(replay_endpoint),
+                topic: "kv".into(),
+                hwm: None,
+            },
+            indexer.clone(),
+            Some(tx),
+            ctx.clone(),
+        );
+        Fixture {
+            _ctx: ctx,
+            publisher,
+            replay_server,
+            indexer,
+            signals,
+            _handle: handle,
+        }
+    }
+
+    fn store_event(seq_hash: u64, tokens: &[u32]) -> KVEvent {
+        KVEvent::BlockStored(stored(
+            vec![ExternalBlockHash::Int(seq_hash)],
+            tokens.to_vec(),
+            Some("GPU"),
+            None,
+        ))
+    }
+
+    fn hits(index: &KvBlockIndexer, tokens: &[u32]) -> Vec<crate::kv_index::TierMatch> {
+        index.find_matches(&MatchQuery {
+            group_idx: 0,
+            local_hashes: local_hashes(tokens, 4, None)
+                .iter()
+                .map(|hash| Arc::from(hex(hash)))
+                .collect(),
+            tiers_of_interest: vec![StorageTier::Device],
+        })
+    }
+
+    #[tokio::test]
+    async fn unrecoverable_gap_discards_old_claims_but_preserves_other_source_and_rank() {
+        let mut f = fixture(false);
+        let tokens = [1, 2, 3, 4];
+        publish_until_advanced(
+            &f.publisher,
+            &mut f.signals,
+            b"kv",
+            0,
+            0.0,
+            &[store_event(100, &tokens)],
+            Some(0),
+        )
+        .await;
+        for (source, rank) in [("w0", 1), ("w1", 0)] {
+            apply_batch(
+                &f.indexer,
+                &SourceId::from(source),
+                rank,
+                0,
+                &KVEventBatch {
+                    ts: 0.0,
+                    events: vec![store_event(100, &tokens)],
+                    data_parallel_rank: Some(rank),
+                },
+            );
+        }
+        // Seq 1 was a lost eviction; seq 2 contains no replacement store.
+        publish_until_advanced(&f.publisher, &mut f.signals, b"kv", 2, 2.0, &[], Some(0)).await;
+        let remaining = hits(&f.indexer, &tokens);
+        assert_eq!(remaining.len(), 2);
+        assert!(remaining
+            .iter()
+            .all(|hit| &*hit.target.instance_id != "w0" || hit.target.dp_rank != 0));
+        publish_until_advanced(
+            &f.publisher,
+            &mut f.signals,
+            b"kv",
+            3,
+            3.0,
+            &[store_event(101, &tokens)],
+            Some(0),
+        )
+        .await;
+        assert_eq!(hits(&f.indexer, &tokens).len(), 3);
+    }
+
+    #[tokio::test]
+    async fn malformed_payload_does_not_advance_and_same_seq_can_be_retried() {
+        let mut f = fixture(false);
+        let tokens = [1, 2, 3, 4];
+        publish_until_advanced(
+            &f.publisher,
+            &mut f.signals,
+            b"kv",
+            0,
+            0.0,
+            &[store_event(100, &tokens)],
+            Some(0),
+        )
+        .await;
+        let seq = 1i64.to_be_bytes();
+        f.publisher
+            .send_multipart([b"kv".as_slice(), seq.as_slice(), &[0xc1]], 0)
+            .unwrap();
+        let signal = tokio::time::timeout(Duration::from_secs(5), f.signals.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            signal,
+            IngestionSignal::Gap {
+                from_seq: 1,
+                to_seq: 1,
+                ..
+            }
+        ));
+        assert!(hits(&f.indexer, &tokens).is_empty());
+        assert!(
+            f.signals.try_recv().is_err(),
+            "bad payload must not emit Advance"
+        );
+        publish_until_advanced(
+            &f.publisher,
+            &mut f.signals,
+            b"kv",
+            1,
+            1.0,
+            &[store_event(100, &tokens)],
+            Some(0),
+        )
+        .await;
+        assert_eq!(hits(&f.indexer, &tokens).len(), 1);
+    }
+
+    fn batch_payload(events: &[KVEvent], rank: u32) -> Vec<u8> {
+        rmp_serde::to_vec(&(1.0, events, Some(rank))).unwrap()
+    }
+
+    async fn serve_replay(
+        socket: &zmq::Socket,
+        replies: &[(i64, Vec<u8>)],
+        index: &KvBlockIndexer,
+    ) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let request = loop {
+            match socket.recv_multipart(zmq::DONTWAIT) {
+                Ok(request) => break request,
+                Err(zmq::Error::EAGAIN) => {
+                    assert!(tokio::time::Instant::now() < deadline, "no replay request");
+                    tokio::task::yield_now().await;
+                }
+                Err(e) => panic!("replay request failed: {e}"),
+            }
+        };
+        assert_eq!(read_seq(request.last().unwrap()), 1);
+        // No previously indexed credit may escape while backfill is incomplete.
+        assert!(hits(index, &[1, 2, 3, 4]).is_empty());
+        assert!(hits(index, &[5, 6, 7, 8]).is_empty());
+        for (seq, payload) in replies {
+            socket
+                .send_multipart(
+                    [
+                        request[0].clone(),
+                        vec![],
+                        b"kv".to_vec(),
+                        seq.to_be_bytes().to_vec(),
+                        payload.clone(),
+                    ],
+                    0,
+                )
+                .unwrap();
+        }
+    }
+
+    async fn check_replay_case(case: &str) {
+        let mut f = fixture(true);
+        let old = [1, 2, 3, 4];
+        let keep = [5, 6, 7, 8];
+        let partial = [9, 10, 11, 12];
+        let fresh = [13, 14, 15, 16];
+        publish_until_advanced(
+            &f.publisher,
+            &mut f.signals,
+            b"kv",
+            0,
+            0.0,
+            &[store_event(100, &old), store_event(101, &keep)],
+            Some(0),
+        )
+        .await;
+        let first = batch_payload(&[store_event(200, &partial)], 0);
+        let eviction = batch_payload(
+            &[KVEvent::BlockRemoved(BlockRemoved {
+                block_hashes: vec![ExternalBlockHash::Int(100)],
+                medium: Some("GPU".into()),
+                group_idx: Some(0),
+                locality: None,
+                ownership: None,
+            })],
+            0,
+        );
+        let third = batch_payload(&[store_event(400, &fresh)], 0);
+        let eof = (-1, vec![]);
+        let replies = match case {
+            "complete" => vec![(1, first), (2, eviction), (3, third)],
+            "missing_start" => vec![(2, eviction), eof],
+            "middle_gap" => vec![(1, first), (3, third), eof],
+            "corrupt" => vec![(1, first), (2, vec![0xc1]), eof],
+            "early_eof" => vec![(1, first), eof],
+            "wrong_rank" => vec![(1, first), (2, batch_payload(&[], 1)), eof],
+            _ => panic!("unknown replay case"),
+        };
+        let live_events = [store_event(400, &fresh)];
+        tokio::join!(
+            publish_until_advanced(
+                &f.publisher,
+                &mut f.signals,
+                b"kv",
+                3,
+                3.0,
+                &live_events,
+                Some(0)
+            ),
+            serve_replay(f.replay_server.as_ref().unwrap(), &replies, &f.indexer),
+        );
+        assert!(
+            hits(&f.indexer, &old).is_empty(),
+            "lost eviction must not leave old credit: {case}"
+        );
+        assert_eq!(
+            hits(&f.indexer, &keep).len(),
+            usize::from(case == "complete"),
+            "retain valid historical credit only on complete replay: {case}"
+        );
+        assert_eq!(
+            hits(&f.indexer, &partial).len(),
+            usize::from(case == "complete"),
+            "partial replay must not escape: {case}"
+        );
+        assert_eq!(
+            hits(&f.indexer, &fresh).len(),
+            1,
+            "fresh observations restore credit: {case}"
+        );
+    }
+
+    #[tokio::test]
+    async fn continuous_replay_preserves_valid_prefix_and_applies_lost_eviction() {
+        check_replay_case("complete").await;
+    }
+
+    #[tokio::test]
+    async fn replay_missing_start_clears_history() {
+        check_replay_case("missing_start").await;
+    }
+
+    #[tokio::test]
+    async fn replay_middle_gap_clears_partial_stores() {
+        check_replay_case("middle_gap").await;
+    }
+
+    #[tokio::test]
+    async fn replay_corrupt_payload_clears_partial_stores() {
+        check_replay_case("corrupt").await;
+    }
+
+    #[tokio::test]
+    async fn replay_early_eof_clears_partial_stores() {
+        check_replay_case("early_eof").await;
+    }
+
+    #[tokio::test]
+    async fn replay_wrong_rank_clears_partial_stores() {
+        check_replay_case("wrong_rank").await;
     }
 }

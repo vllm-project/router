@@ -5,8 +5,9 @@
 /// All subsequent workers of the same model use the established policy.
 /// When the last worker of a model is removed, the policy mapping is cleaned up.
 use super::{
-    CacheAwareConfig, CacheAwarePolicy, ConsistentHashPolicy, LoadBalancingPolicy,
-    PowerOfTwoPolicy, RandomPolicy, RendezvousHashPolicy, RoundRobinPolicy,
+    CacheAwareConfig, CacheAwarePolicy, ConsistentHashPolicy, CostParams, KvAwarePolicy,
+    LoadBalancingPolicy, PowerOfTwoPolicy, RandomPolicy, RendezvousHashPolicy, RoundRobinPolicy,
+    TransferCredits,
 };
 use crate::config::types::PolicyConfig;
 use std::collections::HashMap;
@@ -171,6 +172,7 @@ impl PolicyRegistry {
             "round_robin" => Arc::new(RoundRobinPolicy::new()),
             "random" => Arc::new(RandomPolicy::new()),
             "cache_aware" => Arc::new(CacheAwarePolicy::new()),
+            "kv_aware" => Arc::new(KvAwarePolicy::default()),
             "power_of_two" => Arc::new(PowerOfTwoPolicy::new()),
             "rendezvous_hash" => Arc::new(RendezvousHashPolicy::new()),
             _ => {
@@ -201,6 +203,21 @@ impl PolicyRegistry {
                 };
                 Arc::new(CacheAwarePolicy::with_config(cache_config))
             }
+            PolicyConfig::KvAware {
+                router_temperature,
+                kv_penalty_host,
+                kv_penalty_external,
+                kv_penalty_disk,
+            } => Arc::new(KvAwarePolicy::new(CostParams {
+                router_temperature: *router_temperature,
+                transfer_credits: TransferCredits {
+                    device: 1.0,
+                    host_pinned: *kv_penalty_host,
+                    external: *kv_penalty_external,
+                    disk: *kv_penalty_disk,
+                },
+                ..CostParams::default()
+            })),
             PolicyConfig::PowerOfTwo { .. } => Arc::new(PowerOfTwoPolicy::new()),
             PolicyConfig::ConsistentHash { .. } => Arc::new(ConsistentHashPolicy::new()),
             PolicyConfig::RendezvousHash => Arc::new(RendezvousHashPolicy::new()),

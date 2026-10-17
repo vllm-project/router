@@ -3,6 +3,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use dashmap::DashMap;
 use parking_lot::Mutex;
@@ -45,6 +46,10 @@ pub struct KvEventSourceEntry {
     #[serde(default)]
     pub publisher: Option<String>, // "zmq" | "null"
     #[serde(default)]
+    pub encoding: Option<String>, // "msgpack"
+    #[serde(default)]
+    pub schema_version: Option<u32>,
+    #[serde(default)]
     pub enable_kv_cache_events: Option<bool>,
 }
 
@@ -57,6 +62,17 @@ pub struct WorkerKvInfo {
     pub instance_id: String,
     pub block_size: Option<u32>,
     pub ranks: Vec<u32>,
+    /// Cache identity shared by every worker feeding the same placement index.
+    /// Absent when discovery cannot create an index for this worker.
+    pub cache_key: Option<CacheKey>,
+}
+
+struct WorkerDiscovery {
+    server_info: Result<ServerInfo, String>,
+    sources: Result<KvEventSourcesResponse, String>,
+    /// gRPC has a separate GetModelInfo RPC; preserve its failure instead of
+    /// silently turning the worker URL into a cache identity.
+    model_id: Result<Option<String>, String>,
 }
 
 /// Per-worker subscriber state retained for removal-time cleanup.
@@ -85,6 +101,17 @@ pub struct KvIndexSupervisor {
     workers: Mutex<HashMap<String, WorkerSubs>>,
     /// First-seen block_size, for cross-worker mismatch warning.
     first_block_size: Mutex<Option<u32>>,
+}
+
+impl std::fmt::Debug for KvIndexSupervisor {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("KvIndexSupervisor")
+            .field("hash_mode", &self.hash_mode)
+            .field("indexers", &self.indexers.len())
+            .field("workers", &self.workers.lock().len())
+            .finish()
+    }
 }
 
 impl KvIndexSupervisor {
@@ -126,43 +153,44 @@ impl KvIndexSupervisor {
             self.on_worker_removed(worker_url);
         }
 
-        let server_info = query_server_info(&self.client, worker_url)
-            .await
-            .unwrap_or_else(|e| {
-                warn!(
-                    "kv_index {}: {} — falling back to URL as instance/model id",
-                    worker_url, e
-                );
-                ServerInfo {
-                    model_id: Some(worker_url.to_string()),
-                    ..Default::default()
-                }
-            });
+        let discovery = discover_worker(&self.client, worker_url).await;
+        let server_info = discovery.server_info.unwrap_or_else(|e| {
+            warn!(
+                "kv_index {}: {} — falling back to URL as instance/model id",
+                worker_url, e
+            );
+            ServerInfo {
+                model_id: Some(worker_url.to_string()),
+                ..Default::default()
+            }
+        });
 
         let instance_id = server_info
             .instance_id
             .clone()
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| worker_url.to_string());
-        let model_id = server_info.model_id.clone().or_else(|| {
-            server_info
-                .model_path
-                .as_ref()
-                .and_then(|p| p.split('/').next_back().map(str::to_string))
-        });
-        let model_id = match model_id {
-            Some(m) => m,
-            None => {
-                warn!("kv_index {}: no model_id/model_path — using URL; cross-worker KV sharing disabled", worker_url);
-                worker_url.to_string()
+        let block_size = discovered_block_size(&server_info);
+        self.check_block_size(worker_url, block_size);
+        let model_id = match discovery.model_id {
+            Ok(Some(model_id)) if !model_id.trim().is_empty() => Some(model_id),
+            Ok(_) => {
+                warn!(
+                    "kv_index {}: GetModelInfo returned an empty model_id — cannot create cache identity",
+                    worker_url
+                );
+                None
+            }
+            Err(error) => {
+                warn!(
+                    "kv_index {}: GetModelInfo failed: {} — cannot create cache identity",
+                    worker_url, error
+                );
+                None
             }
         };
-        let block_size = server_info
-            .kv_block_size
-            .or(server_info.effective_attention_block_size);
-        self.check_block_size(worker_url, block_size);
 
-        let sources = match query_kv_event_sources(&self.client, worker_url).await {
+        let sources = match discovery.sources {
             Ok(s) => s,
             Err(e) => {
                 warn!(
@@ -173,6 +201,7 @@ impl KvIndexSupervisor {
                     instance_id,
                     block_size,
                     ranks: vec![],
+                    cache_key: None,
                 });
             }
         };
@@ -186,6 +215,15 @@ impl KvIndexSupervisor {
                 instance_id,
                 block_size: None,
                 ranks: vec![],
+                cache_key: None,
+            });
+        };
+        let Some(model_id) = model_id else {
+            return Ok(WorkerKvInfo {
+                instance_id,
+                block_size: Some(block_size),
+                ranks: vec![],
+                cache_key: None,
             });
         };
         let key = CacheKey {
@@ -244,7 +282,7 @@ impl KvIndexSupervisor {
         self.workers.lock().insert(
             worker_url.to_string(),
             WorkerSubs {
-                key,
+                key: key.clone(),
                 source_id,
                 ranks: ranks.clone(),
                 indexer,
@@ -255,6 +293,7 @@ impl KvIndexSupervisor {
             instance_id,
             block_size: Some(block_size),
             ranks,
+            cache_key: Some(key),
         })
     }
 
@@ -293,6 +332,17 @@ impl KvIndexSupervisor {
             self.release_identity(&key);
         }
         info!("kv_index supervisor shut down");
+    }
+
+    /// Expose the discovered worker's live index through the policy's read-only port.
+    pub fn match_provider_for_worker(
+        &self,
+        worker_url: &str,
+    ) -> Option<Arc<dyn crate::policies::TieredMatchProvider>> {
+        self.workers
+            .lock()
+            .get(worker_url)
+            .map(|worker| worker.indexer.clone() as Arc<dyn crate::policies::TieredMatchProvider>)
     }
 
     /// Ref-count an identity; on first acquisition create its indexer.
@@ -339,6 +389,103 @@ impl KvIndexSupervisor {
     }
 }
 
+async fn discover_worker(client: &reqwest::Client, worker_url: &str) -> WorkerDiscovery {
+    if crate::backend::is_grpc_url(worker_url) {
+        let timeout = Duration::from_secs(10);
+        let server = crate::backend::control::get_grpc_server_info(worker_url, timeout).await;
+        let model =
+            grpc_model_id(crate::backend::control::get_grpc_model_info(worker_url, timeout).await);
+        let sources = crate::backend::control::get_grpc_kv_event_sources(worker_url, timeout).await;
+        let server_info = server.map(|server| {
+            let model_id = model.as_ref().ok().and_then(|model| model.clone());
+            ServerInfo {
+                model_id,
+                instance_id: (!server.instance_id.is_empty()).then_some(server.instance_id),
+                kv_block_size: (server.kv_block_size != 0).then_some(server.kv_block_size),
+                effective_attention_block_size: server
+                    .effective_attention_block_size
+                    .and_then(|size| u32::try_from(size).ok()),
+                ..Default::default()
+            }
+        });
+        let sources =
+            sources.map(|response| grpc_kv_event_source_entries(worker_url, response.sources));
+        return WorkerDiscovery {
+            server_info,
+            sources,
+            model_id: model,
+        };
+    }
+    let server_info = query_server_info(client, worker_url).await;
+    let model_id = server_info
+        .as_ref()
+        .map(|info| Some(server_model_id(info).unwrap_or_else(|| worker_url.to_string())))
+        .map_err(|error| error.clone());
+    WorkerDiscovery {
+        server_info,
+        sources: query_kv_event_sources(client, worker_url).await,
+        model_id,
+    }
+}
+
+fn grpc_kv_event_source_entries(
+    worker_url: &str,
+    sources: Vec<crate::backend::pb::KvEventSource>,
+) -> KvEventSourcesResponse {
+    sources
+        .into_iter()
+        .filter_map(|source| {
+            let Some(rank) = source.data_parallel_rank else {
+                warn!(
+                    "kv_index {}: gRPC KV event source has no data_parallel_rank — skipping source",
+                    worker_url
+                );
+                return None;
+            };
+            Some((
+                rank.to_string(),
+                KvEventSourceEntry {
+                    endpoint: source.endpoint,
+                    replay_endpoint: (!source.replay_endpoint.is_empty())
+                        .then_some(source.replay_endpoint),
+                    topic: source.topic,
+                    hwm: i32::try_from(source.hwm).ok(),
+                    buffer_steps: Some(u64::from(source.buffer_steps)),
+                    publisher: Some(source.transport),
+                    encoding: Some(source.encoding),
+                    schema_version: Some(source.schema_version),
+                    // The Control RPC has no per-source enable flag; it only
+                    // returns sources when KV events are enabled.
+                    enable_kv_cache_events: Some(true),
+                },
+            ))
+        })
+        .collect()
+}
+
+fn server_model_id(server_info: &ServerInfo) -> Option<String> {
+    server_info
+        .model_id
+        .clone()
+        .filter(|id| !id.trim().is_empty())
+        .or_else(|| {
+            server_info
+                .model_path
+                .as_ref()
+                .and_then(|path| path.split('/').next_back().map(str::to_string))
+                .filter(|id| !id.trim().is_empty())
+        })
+}
+
+fn grpc_model_id(
+    model: Result<crate::backend::pb::ModelInfo, String>,
+) -> Result<Option<String>, String> {
+    model.map(|model| {
+        let model_id = model.model_id;
+        (!model_id.trim().is_empty()).then_some(model_id)
+    })
+}
+
 async fn query_server_info(
     client: &reqwest::Client,
     worker_url: &str,
@@ -376,9 +523,12 @@ async fn query_kv_event_sources(
         .map_err(|e| format!("kv_event_sources parse: {e}"))
 }
 
-/// A rank emits events iff publisher != "null" and events are enabled.
+/// A rank emits events only for the one wire format the subscriber decodes.
 fn events_enabled(entry: &KvEventSourceEntry) -> bool {
-    if matches!(entry.publisher.as_deref(), Some("null")) {
+    if entry.publisher.as_deref() != Some("zmq")
+        || entry.encoding.as_deref() != Some("msgpack")
+        || entry.schema_version != Some(1)
+    {
         return false;
     }
     if matches!(entry.enable_kv_cache_events, Some(false)) {
@@ -411,6 +561,17 @@ fn worker_host(worker_url: &str) -> Option<String> {
         .ok()?
         .host_str()
         .map(|h| h.to_string())
+}
+
+fn discovered_block_size(server_info: &ServerInfo) -> Option<u32> {
+    server_info
+        .kv_block_size
+        .filter(|size| *size > 0)
+        .or_else(|| {
+            server_info
+                .effective_attention_block_size
+                .filter(|size| *size > 0)
+        })
 }
 
 #[cfg(test)]
@@ -460,14 +621,49 @@ mod tests {
         let mut e = KvEventSourceEntry::default();
         assert!(!events_enabled(&e)); // empty endpoint
         e.endpoint = "tcp://*:5557".into();
+        e.publisher = Some("zmq".into());
+        assert!(!events_enabled(&e)); // encoding and schema are required
+        e.encoding = Some("msgpack".into());
+        e.schema_version = Some(1);
         assert!(events_enabled(&e));
         e.publisher = Some("null".into());
+        assert!(!events_enabled(&e));
+        e.publisher = Some("other".into());
         assert!(!events_enabled(&e));
         e.publisher = Some("zmq".into());
         e.enable_kv_cache_events = Some(false);
         assert!(!events_enabled(&e));
         e.enable_kv_cache_events = Some(true);
         assert!(events_enabled(&e));
+        e.encoding = Some("json".into());
+        assert!(!events_enabled(&e));
+        e.encoding = Some("msgpack".into());
+        e.schema_version = Some(2);
+        assert!(!events_enabled(&e));
+    }
+
+    #[test]
+    fn grpc_model_id_preserves_errors_and_rejects_empty_ids() {
+        let error = "GetModelInfo unavailable".to_string();
+        assert_eq!(grpc_model_id(Err(error.clone())), Err(error));
+        assert_eq!(
+            grpc_model_id(Ok(crate::backend::pb::ModelInfo::default())),
+            Ok(None)
+        );
+        assert_eq!(
+            grpc_model_id(Ok(crate::backend::pb::ModelInfo {
+                model_id: "   ".into(),
+                ..Default::default()
+            })),
+            Ok(None)
+        );
+        assert_eq!(
+            grpc_model_id(Ok(crate::backend::pb::ModelInfo {
+                model_id: "model-a".into(),
+                ..Default::default()
+            })),
+            Ok(Some("model-a".into()))
+        );
     }
 
     #[test]
@@ -489,14 +685,57 @@ mod tests {
     }
 
     #[test]
+    fn zero_block_size_is_treated_as_missing() {
+        let server_info = ServerInfo {
+            kv_block_size: Some(0),
+            effective_attention_block_size: Some(16),
+            ..Default::default()
+        };
+        assert_eq!(discovered_block_size(&server_info), Some(16));
+
+        let server_info = ServerInfo {
+            kv_block_size: Some(0),
+            effective_attention_block_size: Some(0),
+            ..Default::default()
+        };
+        assert_eq!(discovered_block_size(&server_info), None);
+    }
+
+    #[test]
     fn kv_event_sources_decodes_rank_map() {
         let body = r#"{
-            "0": {"endpoint":"tcp://*:5557","replay_endpoint":"tcp://*:5558","topic":"","hwm":100000,"publisher":"zmq","enable_kv_cache_events":true},
-            "1": {"endpoint":"tcp://*:5559","replay_endpoint":null,"topic":"","publisher":"zmq"}
+            "0": {"endpoint":"tcp://*:5557","replay_endpoint":"tcp://*:5558","topic":"","hwm":100000,"publisher":"zmq","encoding":"msgpack","schema_version":1,"enable_kv_cache_events":true},
+            "1": {"endpoint":"tcp://*:5559","replay_endpoint":null,"topic":"","publisher":"zmq","encoding":"msgpack","schema_version":1}
         }"#;
         let m: KvEventSourcesResponse = serde_json::from_str(body).unwrap();
         assert_eq!(m.len(), 2);
         assert_eq!(m["0"].hwm, Some(100_000));
+        assert_eq!(m["0"].encoding.as_deref(), Some("msgpack"));
+        assert_eq!(m["0"].schema_version, Some(1));
         assert!(m["1"].replay_endpoint.is_none());
+    }
+
+    #[test]
+    fn grpc_sources_without_rank_are_skipped_instead_of_positionally_assigned() {
+        let source = |rank| crate::backend::pb::KvEventSource {
+            transport: "zmq".to_string(),
+            endpoint: "tcp://worker:5557".to_string(),
+            topic: String::new(),
+            replay_endpoint: String::new(),
+            data_parallel_rank: rank,
+            encoding: "msgpack".to_string(),
+            schema_version: 1,
+            buffer_steps: 1,
+            hwm: 100,
+            max_queue_size: 0,
+        };
+
+        let entries =
+            grpc_kv_event_source_entries("grpc://worker:8000", vec![source(None), source(Some(3))]);
+
+        assert_eq!(entries.len(), 1);
+        assert!(entries.contains_key("3"));
+        assert_eq!(entries["3"].publisher.as_deref(), Some("zmq"));
+        assert_eq!(entries["3"].enable_kv_cache_events, Some(true));
     }
 }

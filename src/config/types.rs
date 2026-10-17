@@ -674,6 +674,21 @@ pub enum PolicyConfig {
         max_tree_size: usize,
     },
 
+    /// Event-driven, multi-tier KV placement plus live prefill/load scoring.
+    #[serde(rename = "kv_aware")]
+    KvAware {
+        /// Zero selects the minimum cost; positive values softmax-sample.
+        #[serde(default)]
+        router_temperature: f64,
+        /// Transfer credits in [0, 1]; lower means a costlier tier.
+        #[serde(default = "default_kv_penalty_host")]
+        kv_penalty_host: f64,
+        #[serde(default = "default_kv_penalty_external")]
+        kv_penalty_external: f64,
+        #[serde(default = "default_kv_penalty_disk")]
+        kv_penalty_disk: f64,
+    },
+
     #[serde(rename = "power_of_two")]
     PowerOfTwo {
         /// Interval for load monitoring (seconds)
@@ -696,11 +711,24 @@ impl PolicyConfig {
             PolicyConfig::Random => "random",
             PolicyConfig::RoundRobin => "round_robin",
             PolicyConfig::CacheAware { .. } => "cache_aware",
+            PolicyConfig::KvAware { .. } => "kv_aware",
             PolicyConfig::PowerOfTwo { .. } => "power_of_two",
             PolicyConfig::ConsistentHash { .. } => "consistent_hash",
             PolicyConfig::RendezvousHash => "rendezvous_hash",
         }
     }
+}
+
+fn default_kv_penalty_host() -> f64 {
+    0.8
+}
+
+fn default_kv_penalty_external() -> f64 {
+    0.6
+}
+
+fn default_kv_penalty_disk() -> f64 {
+    0.3
 }
 
 /// Service discovery configuration

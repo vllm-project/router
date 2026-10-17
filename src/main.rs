@@ -119,8 +119,8 @@ struct CliArgs {
     #[arg(long, num_args = 0..)]
     worker_urls: Vec<String>,
 
-    /// Load balancing policy to use
-    #[arg(long, default_value = "cache_aware", value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "consistent_hash", "rendezvous_hash"])]
+    /// Load balancing policy to use. kv_aware is supported only in regular mode, not PD disaggregation.
+    #[arg(long, default_value = "cache_aware", value_parser = ["random", "round_robin", "cache_aware", "kv_aware", "power_of_two", "consistent_hash", "rendezvous_hash"])]
     policy: String,
 
     /// Enable Program-level scheduling independently of the request-level
@@ -146,11 +146,11 @@ struct CliArgs {
     #[arg(long, action = ArgAction::Append)]
     decode: Vec<String>,
 
-    /// Specific policy for prefill nodes in PD mode
+    /// Specific policy for prefill nodes in PD mode. kv_aware is not supported in PD mode.
     #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "consistent_hash", "rendezvous_hash"])]
     prefill_policy: Option<String>,
 
-    /// Specific policy for decode nodes in PD mode
+    /// Specific policy for decode nodes in PD mode. kv_aware is not supported in PD mode.
     #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "consistent_hash", "rendezvous_hash"])]
     decode_policy: Option<String>,
 
@@ -181,6 +181,18 @@ struct CliArgs {
     /// Maximum size of the approximation tree for cache-aware routing
     #[arg(long, default_value_t = 67108864)] // 2^26
     max_tree_size: usize,
+
+    /// Softmax temperature for kv_aware (0 selects the minimum cost).
+    #[arg(long, default_value_t = 0.0)]
+    router_temperature: f64,
+
+    /// Per-tier transfer credits for kv_aware; lower means costlier transfer.
+    #[arg(long, default_value_t = 0.8)]
+    kv_penalty_host: f64,
+    #[arg(long, default_value_t = 0.6)]
+    kv_penalty_external: f64,
+    #[arg(long, default_value_t = 0.3)]
+    kv_penalty_disk: f64,
 
     /// Maximum payload size in bytes
     #[arg(long, default_value_t = 536870912)] // 512MB
@@ -407,6 +419,12 @@ impl CliArgs {
                 balance_rel_threshold: self.balance_rel_threshold,
                 eviction_interval_secs: self.eviction_interval,
                 max_tree_size: self.max_tree_size,
+            },
+            "kv_aware" => PolicyConfig::KvAware {
+                router_temperature: self.router_temperature,
+                kv_penalty_host: self.kv_penalty_host,
+                kv_penalty_external: self.kv_penalty_external,
+                kv_penalty_disk: self.kv_penalty_disk,
             },
             "power_of_two" => PolicyConfig::PowerOfTwo {
                 load_check_interval_secs: 5, // Default value

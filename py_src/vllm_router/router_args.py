@@ -25,6 +25,10 @@ class RouterArgs:
     policy: str = "cache_aware"
     prefill_policy: Optional[str] = None  # Specific policy for prefill nodes in PD mode
     decode_policy: Optional[str] = None  # Specific policy for decode nodes in PD mode
+    router_temperature: float = 0.0
+    kv_penalty_host: float = 0.8
+    kv_penalty_external: float = 0.6
+    kv_penalty_disk: float = 0.3
     worker_startup_timeout_secs: int = 600
     worker_startup_check_interval: int = 30
     cache_threshold: float = 0.3
@@ -158,10 +162,11 @@ class RouterArgs:
                 "random",
                 "round_robin",
                 "cache_aware",
+                "kv_aware",
                 "power_of_two",
                 "consistent_hash",
             ],
-            help="Load balancing policy to use. In PD mode, this is used for both prefill and decode unless overridden",
+            help="Load balancing policy to use. kv_aware is supported only in regular mode. In PD mode, this is used for both prefill and decode unless overridden",
         )
         parser.add_argument(
             f"--{prefix}prefill-policy",
@@ -174,7 +179,7 @@ class RouterArgs:
                 "power_of_two",
                 "consistent_hash",
             ],
-            help="Specific policy for prefill nodes in PD mode. If not specified, uses the main policy",
+            help="Specific policy for prefill nodes in PD mode. kv_aware is not supported in PD mode. If not specified, uses the main policy",
         )
         parser.add_argument(
             f"--{prefix}decode-policy",
@@ -187,7 +192,32 @@ class RouterArgs:
                 "power_of_two",
                 "consistent_hash",
             ],
-            help="Specific policy for decode nodes in PD mode. If not specified, uses the main policy",
+            help="Specific policy for decode nodes in PD mode. kv_aware is not supported in PD mode. If not specified, uses the main policy",
+        )
+
+        parser.add_argument(
+            f"--{prefix}router-temperature",
+            type=float,
+            default=RouterArgs.router_temperature,
+            help="Softmax temperature for kv_aware in regular mode (0 selects minimum cost)",
+        )
+        parser.add_argument(
+            f"--{prefix}kv-penalty-host",
+            type=float,
+            default=RouterArgs.kv_penalty_host,
+            help="Host-tier KV transfer credit for kv_aware (0.0-1.0)",
+        )
+        parser.add_argument(
+            f"--{prefix}kv-penalty-external",
+            type=float,
+            default=RouterArgs.kv_penalty_external,
+            help="External-tier KV transfer credit for kv_aware (0.0-1.0)",
+        )
+        parser.add_argument(
+            f"--{prefix}kv-penalty-disk",
+            type=float,
+            default=RouterArgs.kv_penalty_disk,
+            help="Disk-tier KV transfer credit for kv_aware (0.0-1.0)",
         )
 
         # PD-specific arguments
@@ -574,6 +604,16 @@ class RouterArgs:
                     raise ValueError("PD disaggregation mode requires --prefill")
                 if not self.decode_urls:
                     raise ValueError("PD disaggregation mode requires --decode")
+
+            effective_prefill_policy = self.prefill_policy or self.policy
+            effective_decode_policy = self.decode_policy or self.policy
+            if "kv_aware" in (
+                effective_prefill_policy,
+                effective_decode_policy,
+            ):
+                raise ValueError(
+                    "kv_aware is supported only in regular mode, not PD disaggregation"
+                )
 
             # Warn about policy usage in PD mode
             if self.prefill_policy and self.decode_policy and self.policy:

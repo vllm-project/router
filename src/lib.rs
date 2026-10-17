@@ -30,6 +30,7 @@ pub enum PolicyType {
     Random,
     RoundRobin,
     CacheAware,
+    KvAware,
     PowerOfTwo,
     ConsistentHash,
 }
@@ -41,6 +42,10 @@ struct Router {
     port: u16,
     worker_urls: Vec<String>,
     policy: PolicyType,
+    router_temperature: f64,
+    kv_penalty_host: f64,
+    kv_penalty_external: f64,
+    kv_penalty_disk: f64,
     worker_startup_timeout_secs: u64,
     worker_startup_check_interval: u64,
     cache_threshold: f32,
@@ -129,6 +134,12 @@ impl Router {
                     balance_rel_threshold: self.balance_rel_threshold,
                     eviction_interval_secs: self.eviction_interval_secs,
                     max_tree_size: self.max_tree_size,
+                },
+                PolicyType::KvAware => ConfigPolicyConfig::KvAware {
+                    router_temperature: self.router_temperature,
+                    kv_penalty_host: self.kv_penalty_host,
+                    kv_penalty_external: self.kv_penalty_external,
+                    kv_penalty_disk: self.kv_penalty_disk,
                 },
                 PolicyType::PowerOfTwo => ConfigPolicyConfig::PowerOfTwo {
                     load_check_interval_secs: 5, // Default value
@@ -332,6 +343,10 @@ impl Router {
         wasm_middleware_routes = vec![],
         enable_program_scheduling = false,
         program_scheduling_config_json = None,
+        router_temperature = 0.0,
+        kv_penalty_host = 0.8,
+        kv_penalty_external = 0.6,
+        kv_penalty_disk = 0.3,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -399,6 +414,10 @@ impl Router {
         wasm_middleware_routes: Vec<String>,
         enable_program_scheduling: bool,
         program_scheduling_config_json: Option<String>,
+        router_temperature: f64,
+        kv_penalty_host: f64,
+        kv_penalty_external: f64,
+        kv_penalty_disk: f64,
     ) -> PyResult<Self> {
         if wasm_middleware_sha256
             .as_deref()
@@ -420,6 +439,10 @@ impl Router {
             port,
             worker_urls,
             policy,
+            router_temperature,
+            kv_penalty_host,
+            kv_penalty_external,
+            kv_penalty_disk,
             worker_startup_timeout_secs,
             worker_startup_check_interval,
             cache_threshold,

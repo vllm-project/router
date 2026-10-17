@@ -389,6 +389,33 @@ impl ConfigValidator {
                     });
                 }
             }
+            PolicyConfig::KvAware {
+                router_temperature,
+                kv_penalty_host,
+                kv_penalty_external,
+                kv_penalty_disk,
+            } => {
+                if !router_temperature.is_finite() || *router_temperature < 0.0 {
+                    return Err(ConfigError::InvalidValue {
+                        field: "router_temperature".to_string(),
+                        value: router_temperature.to_string(),
+                        reason: "Must be finite and >= 0.0".to_string(),
+                    });
+                }
+                for (field, value) in [
+                    ("kv_penalty_host", kv_penalty_host),
+                    ("kv_penalty_external", kv_penalty_external),
+                    ("kv_penalty_disk", kv_penalty_disk),
+                ] {
+                    if !value.is_finite() || !(0.0..=1.0).contains(value) {
+                        return Err(ConfigError::InvalidValue {
+                            field: field.to_string(),
+                            value: value.to_string(),
+                            reason: "Must be finite and between 0.0 and 1.0".to_string(),
+                        });
+                    }
+                }
+            }
             PolicyConfig::PowerOfTwo {
                 load_check_interval_secs,
             } => {
@@ -620,8 +647,23 @@ impl ConfigValidator {
             return Ok(());
         }
 
-        // All policies are now supported for both router types thanks to the unified trait design
-        // No mode/policy restrictions needed anymore
+        if let RoutingMode::VllmPrefillDecode {
+            prefill_policy,
+            decode_policy,
+            ..
+        } = &config.mode
+        {
+            let effective_prefill = prefill_policy.as_ref().unwrap_or(&config.policy);
+            let effective_decode = decode_policy.as_ref().unwrap_or(&config.policy);
+            if matches!(effective_prefill, PolicyConfig::KvAware { .. })
+                || matches!(effective_decode, PolicyConfig::KvAware { .. })
+            {
+                return Err(ConfigError::IncompatibleConfig {
+                    reason: "kv_aware is supported only in regular mode, not PD disaggregation"
+                        .to_string(),
+                });
+            }
+        }
 
         // Check if service discovery is enabled for worker count validation.
         // This covers both K8s service discovery (config.discovery) and vLLM ZMQ
@@ -1133,6 +1175,28 @@ mod tests {
 
         let result = ConfigValidator::validate(&config);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_rejects_kv_aware_for_disaggregated_pd_mode() {
+        let config = RouterConfig::new(
+            RoutingMode::VllmPrefillDecode {
+                prefill_urls: vec![("http://prefill:8000".to_string(), None)],
+                decode_urls: vec!["http://decode:8000".to_string()],
+                prefill_policy: None,
+                decode_policy: None,
+                discovery_address: None,
+            },
+            PolicyConfig::KvAware {
+                router_temperature: 0.0,
+                kv_penalty_host: 0.8,
+                kv_penalty_external: 0.6,
+                kv_penalty_disk: 0.3,
+            },
+        );
+
+        let error = ConfigValidator::validate(&config).unwrap_err();
+        assert!(error.to_string().contains("not PD disaggregation"));
     }
 
     #[test]

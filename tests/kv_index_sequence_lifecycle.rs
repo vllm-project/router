@@ -419,7 +419,7 @@ fn no_parent_starts_at_root() {
 }
 
 #[test]
-fn unknown_initial_parent_keeps_root_fallback() {
+fn unknown_initial_parent_is_not_credited_until_ancestry_is_known() {
     let index = KvBlockIndexer::new();
     let owner = worker("a", 3);
     index.store(
@@ -436,10 +436,140 @@ fn unknown_initial_parent_keeps_root_fallback() {
         Some(Arc::from("i:999")),
         &blocks(&[("i:100", "x")]),
     );
-    assert_eq!(depth(&index, 0, &owner, StorageTier::Device, &["x"]), 1);
-    // Root attachment does not recover the missing ancestry of this suffix.
+    assert_eq!(depth(&index, 0, &owner, StorageTier::Device, &["x"]), 0);
     assert_eq!(
         depth(&index, 0, &owner, StorageTier::Device, &["prefix", "x"]),
         1
     );
+    index.store(
+        0,
+        owner.clone(),
+        StorageTier::Device,
+        None,
+        &blocks(&[("i:999", "actual-parent")]),
+    );
+    index.store(
+        0,
+        owner.clone(),
+        StorageTier::Device,
+        Some(Arc::from("i:999")),
+        &blocks(&[("i:100", "x")]),
+    );
+    assert_eq!(
+        depth(
+            &index,
+            0,
+            &owner,
+            StorageTier::Device,
+            &["actual-parent", "x"]
+        ),
+        2
+    );
+    assert_eq!(depth(&index, 0, &owner, StorageTier::Device, &["x"]), 0);
+}
+
+#[test]
+fn interior_parent_cpu_segment_and_evictions_preserve_gpu_truth() {
+    let index = KvBlockIndexer::new();
+    let a = worker("a", 0);
+    let b = worker("b", 0);
+    let chain = blocks(&[("s0", "x"), ("s1", "y"), ("s2", "z")]);
+    for owner in [&a, &b] {
+        index.store(0, owner.clone(), StorageTier::Device, None, &chain);
+    }
+    index.store(
+        0,
+        a.clone(),
+        StorageTier::HostPinned,
+        Some(Arc::from("s1")),
+        &chain[2..],
+    );
+    let query = MatchQuery {
+        group_idx: 0,
+        local_hashes: ["x", "y", "z"].iter().map(|s| Arc::from(*s)).collect(),
+        tiers_of_interest: vec![StorageTier::Device, StorageTier::HostPinned],
+    };
+    let hits = index.find_matches(&query);
+    let cpu = hits
+        .iter()
+        .find(|hit| hit.target == a.target() && hit.tier == StorageTier::HostPinned)
+        .unwrap();
+    assert_eq!(cpu.segments, vec![(2, 3)]);
+    index.remove(0, &a, StorageTier::Device, &[Arc::from("s2")]);
+    index.remove(0, &a, StorageTier::HostPinned, &[Arc::from("s2")]);
+    assert_eq!(
+        depth(&index, 0, &a, StorageTier::Device, &["x", "y", "z"]),
+        2
+    );
+    assert_eq!(
+        depth(&index, 0, &b, StorageTier::Device, &["x", "y", "z"]),
+        3
+    );
+    index.clear(&a, ClearScope::Worker);
+    assert!(index
+        .find_matches(&query)
+        .iter()
+        .all(|hit| hit.target != a.target()));
+}
+
+#[test]
+fn evicted_worker_does_not_beat_busy_worker_with_reusable_gpu_prefix() {
+    use vllm_router_rs::core::{BasicWorker, Worker, WorkerType};
+    use vllm_router_rs::policies::{
+        CostParams, InMemorySlotManager, KvAwarePolicy, MultiplicativeScorer, TemperaturePicker,
+    };
+    let index = Arc::new(KvBlockIndexer::new());
+    // 49 tokens leave one uncached tail token, matching the engine's logits
+    // requirement: B can reuse 48 tokens, while A can reuse only 32.
+    let ids: Vec<u32> = (0..49).collect();
+    let hashes = KvAwarePolicy::local_hashes(&ids, 16);
+    let chain: Vec<_> = hashes[..3]
+        .iter()
+        .enumerate()
+        .map(|(i, local)| (Arc::from(format!("s{i}")), local.clone()))
+        .collect();
+    for name in ["a", "b"] {
+        index.store(0, worker(name, 0), StorageTier::Device, None, &chain);
+    }
+    index.store(
+        0,
+        worker("a", 0),
+        StorageTier::HostPinned,
+        Some(Arc::from("s1")),
+        &chain[2..],
+    );
+    index.remove(0, &worker("a", 0), StorageTier::Device, &[Arc::from("s2")]);
+    index.remove(
+        0,
+        &worker("a", 0),
+        StorageTier::HostPinned,
+        &[Arc::from("s2")],
+    );
+    let policy = KvAwarePolicy::with_components(
+        index,
+        Arc::new(InMemorySlotManager::new()),
+        vec![Arc::new(MultiplicativeScorer)],
+        Arc::new(TemperaturePicker::new(0.0)),
+        CostParams::default(),
+    );
+    for name in ["a", "b"] {
+        policy.register_target(format!("http://{name}"), worker(name, 0).target());
+    }
+    let workers: Vec<Arc<dyn Worker>> = ["a", "b"]
+        .iter()
+        .map(|name| {
+            Arc::new(BasicWorker::new(
+                format!("http://{name}"),
+                WorkerType::Regular,
+            )) as Arc<dyn Worker>
+        })
+        .collect();
+    workers[0].increment_load();
+    workers[1].increment_load();
+    let selected = policy
+        .select_worker_with_receipt(&workers, Some(&ids), None, None)
+        .unwrap();
+    assert_eq!(selected.worker_index, 1);
+    assert_eq!(selected.new_prefill_tokens, 1);
+    assert_eq!(selected.decision.cost, 2.0);
 }

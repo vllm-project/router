@@ -9,7 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 from vllm_router.launch_router import RouterArgs, parse_router_args
-from vllm_router.router import policy_from_str
+from vllm_router.router import Router, policy_from_str
 
 
 class TestRouterArgs:
@@ -29,6 +29,10 @@ class TestRouterArgs:
         assert args.decode_urls == []
         assert args.enable_program_scheduling is False
         assert args.program_scheduling_config_json is None
+        assert args.router_temperature == 0.0
+        assert args.kv_penalty_host == 0.8
+        assert args.kv_penalty_external == 0.6
+        assert args.kv_penalty_disk == 0.3
 
         # Test PD-specific defaults
         assert args.prefill_policy is None
@@ -398,6 +402,35 @@ class TestRouterArgs:
         assert router_args.policy == "random"
         assert router_args.vllm_pd_disaggregation is False
 
+    def test_kv_aware_is_rejected_for_effective_pd_policies(self):
+        for kwargs in [
+            {"policy": "kv_aware"},
+            {"policy": "kv_aware", "enable_igw": True},
+            {"policy": "round_robin", "prefill_policy": "kv_aware"},
+            {"policy": "round_robin", "decode_policy": "kv_aware"},
+        ]:
+            args = RouterArgs(
+                vllm_pd_disaggregation=True,
+                service_discovery=True,
+                **kwargs,
+            )
+            with pytest.raises(ValueError, match="only in regular mode"):
+                args._validate_router_args()
+
+    def test_kv_aware_is_allowed_in_regular_mode(self):
+        args = RouterArgs(policy="kv_aware")
+        args._validate_router_args()
+
+    def test_kv_aware_is_allowed_when_pd_stages_override_main_policy(self):
+        args = RouterArgs(
+            vllm_pd_disaggregation=True,
+            service_discovery=True,
+            policy="kv_aware",
+            prefill_policy="round_robin",
+            decode_policy="consistent_hash",
+        )
+        args._validate_router_args()
+
 
 class TestPolicyFromStr:
     """Test policy string to enum conversion."""
@@ -409,6 +442,7 @@ class TestPolicyFromStr:
         assert policy_from_str("random") == PolicyType.Random
         assert policy_from_str("round_robin") == PolicyType.RoundRobin
         assert policy_from_str("cache_aware") == PolicyType.CacheAware
+        assert policy_from_str("kv_aware") == PolicyType.KvAware
         assert policy_from_str("power_of_two") == PolicyType.PowerOfTwo
         assert policy_from_str("consistent_hash") == PolicyType.ConsistentHash
 
@@ -441,6 +475,42 @@ class TestParseRouterArgs:
         assert router_args.port == 30001
         assert router_args.worker_urls == ["http://worker1:8000", "http://worker2:8000"]
         assert router_args.policy == "round_robin"
+
+    def test_kv_aware_cli_flags_reach_the_rust_router(self, monkeypatch):
+        from vllm_router_rs import PolicyType
+
+        args = parse_router_args(
+            [
+                "--policy",
+                "kv_aware",
+                "--router-temperature",
+                "0.25",
+                "--kv-penalty-host",
+                "0.7",
+                "--kv-penalty-external",
+                "0.5",
+                "--kv-penalty-disk",
+                "0.2",
+            ]
+        )
+        captured = {}
+
+        class FakeRustRouter:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+        monkeypatch.setattr("vllm_router.router._Router", FakeRustRouter)
+        Router.from_args(args)
+
+        assert captured["policy"] == PolicyType.KvAware
+        assert captured["router_temperature"] == 0.25
+        assert captured["kv_penalty_host"] == 0.7
+        assert captured["kv_penalty_external"] == 0.5
+        assert captured["kv_penalty_disk"] == 0.2
+
+    def test_kv_aware_is_not_a_pd_stage_policy(self):
+        with pytest.raises(SystemExit):
+            parse_router_args(["--prefill-policy", "kv_aware"])
 
     def test_parse_program_scheduling_json(self):
         """Keep the opt-in scheduler configuration opaque until Rust validation."""
