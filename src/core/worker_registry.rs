@@ -395,10 +395,6 @@ impl WorkerRegistry {
             let mut interval =
                 tokio::time::interval(tokio::time::Duration::from_secs(check_interval_secs));
 
-            // Counter for periodic load reset (every 10 health check cycles)
-            let mut check_count = 0u64;
-            const LOAD_RESET_INTERVAL: u64 = 10;
-
             loop {
                 interval.tick().await;
 
@@ -420,15 +416,6 @@ impl WorkerRegistry {
                     let _ = worker.check_health_async().await; // Use async version directly
                     if was_available != worker.is_available() {
                         revision.fetch_add(1, Ordering::AcqRel);
-                    }
-                }
-
-                // Reset loads periodically
-                check_count += 1;
-                if check_count.is_multiple_of(LOAD_RESET_INTERVAL) {
-                    tracing::debug!("Resetting worker loads (cycle {})", check_count);
-                    for worker in &workers {
-                        worker.reset_load();
                     }
                 }
             }
