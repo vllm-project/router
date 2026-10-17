@@ -21,7 +21,7 @@ pub trait Worker: Send + Sync + fmt::Debug {
     /// Get the worker's URL
     fn url(&self) -> &str;
 
-    /// Get the worker's type (Regular, Prefill, or Decode)
+    /// Get the worker's type (Regular, Prefill, Decode, or Encode)
     fn worker_type(&self) -> WorkerType;
 
     /// Get the worker's connection mode
@@ -49,7 +49,9 @@ pub trait Worker: Send + Sync + fmt::Debug {
             .block_on(self.check_health_async())
     }
 
-    /// Get the current load (number of active requests)
+    /// Get the current load (number of active requests).
+    /// For Encode workers, each request is an encoder HTTP batch, not a media item
+    /// or a measurement of the engine's queue.
     fn load(&self) -> usize;
 
     /// Increment the load counter
@@ -58,13 +60,14 @@ pub trait Worker: Send + Sync + fmt::Debug {
     /// Decrement the load counter
     fn decrement_load(&self);
 
-    /// Reset the load counter to 0 (for sync/recovery)
+    /// Reset the load counter for sync/recovery when supported.
+    /// Encode workers preserve their exact in-flight batch count instead.
     fn reset_load(&self) {
         // Default implementation - does nothing
         // Workers that track load should override this
     }
 
-    /// Get the number of processed requests
+    /// Get the number of processed requests (completed HTTP batches for Encode).
     fn processed_requests(&self) -> usize;
 
     /// Increment the processed requests counter
@@ -226,6 +229,9 @@ pub enum WorkerType {
     },
     /// Decode worker for PD disaggregated mode
     Decode,
+    /// HTTP encoder for EPD disaggregated mode. EC control addresses belong to
+    /// the selected prefill or combined prefill/decode consumer, not this worker.
+    Encode,
 }
 
 impl fmt::Display for WorkerType {
@@ -237,6 +243,7 @@ impl fmt::Display for WorkerType {
                 None => write!(f, "Prefill"),
             },
             WorkerType::Decode => write!(f, "Decode"),
+            WorkerType::Encode => write!(f, "Encode"),
         }
     }
 }
@@ -469,6 +476,11 @@ impl Worker for BasicWorker {
     }
 
     fn reset_load(&self) {
+        // Encode load is paired with the lifetime of each in-flight HTTP batch.
+        // Health check recovery must not erase batches still held by load guards.
+        if self.metadata.worker_type == WorkerType::Encode {
+            return;
+        }
         self.load_counter.store(0, Ordering::Relaxed);
     }
 
@@ -623,6 +635,29 @@ impl Worker for DPAwareWorker {
 pub struct WorkerFactory;
 
 impl WorkerFactory {
+    /// Create an HTTP Encode worker. The caller validates the configured HTTP URL.
+    /// Reuses the standard health checks and circuit breaker without DP expansion.
+    pub fn create_encode(url: String) -> Box<dyn Worker> {
+        Self::create_encode_with_config(
+            url,
+            CircuitBreakerConfig::default(),
+            HealthConfig::default(),
+        )
+    }
+
+    /// Create an HTTP Encode worker with shared health and circuit configuration.
+    pub fn create_encode_with_config(
+        url: String,
+        circuit_breaker_config: CircuitBreakerConfig,
+        health_config: HealthConfig,
+    ) -> Box<dyn Worker> {
+        Box::new(
+            BasicWorker::with_connection_mode(url, WorkerType::Encode, ConnectionMode::Http)
+                .with_circuit_breaker_config(circuit_breaker_config)
+                .with_health_config(health_config),
+        )
+    }
+
     /// Create a regular worker
     pub fn create_regular(url: String) -> Box<dyn Worker> {
         Box::new(BasicWorker::new(url, WorkerType::Regular))
@@ -972,6 +1007,80 @@ mod tests {
     use std::thread;
     use std::time::Duration;
 
+    #[test]
+    fn encode_batches_survive_load_reset_until_each_guard_drops() {
+        let worker = WorkerFactory::create_encode("http://encoder:8080".to_string());
+        assert_eq!(worker.worker_type(), WorkerType::Encode);
+        assert_eq!(worker.connection_mode(), ConnectionMode::Http);
+        assert!(!worker.is_dp_aware());
+
+        let first_batch = WorkerLoadGuard::new(worker.as_ref());
+        let second_batch = WorkerLoadGuard::new(worker.as_ref());
+        assert_eq!(worker.load(), 2);
+
+        worker.reset_load();
+        assert_eq!(worker.load(), 2);
+        drop(first_batch);
+        assert_eq!(worker.load(), 1);
+        worker.reset_load();
+        assert_eq!(worker.load(), 1);
+        drop(second_batch);
+        assert_eq!(worker.load(), 0);
+
+        // Preserve the recovery behavior for existing inference workers.
+        let regular = WorkerFactory::create_regular("http://consumer:8080".to_string());
+        regular.increment_load();
+        regular.reset_load();
+        assert_eq!(regular.load(), 0);
+    }
+
+    #[tokio::test]
+    async fn cancelled_encode_batch_releases_load() {
+        let worker: Arc<dyn Worker> = Arc::from(WorkerFactory::create_encode(
+            "http://encoder:8080".to_string(),
+        ));
+        let task_worker = worker.clone();
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _batch = WorkerLoadGuard::new(task_worker.as_ref());
+            started.send(()).unwrap();
+            std::future::pending::<()>().await;
+        });
+        ready.await.unwrap();
+        worker.reset_load();
+        assert_eq!(worker.load(), 1);
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert_eq!(worker.load(), 0);
+    }
+
+    #[test]
+    fn encode_worker_reuses_health_and_circuit_breaker() {
+        let worker = WorkerFactory::create_encode_with_config(
+            "http://encoder:8080".to_string(),
+            CircuitBreakerConfig {
+                failure_threshold: 1,
+                ..CircuitBreakerConfig::default()
+            },
+            HealthConfig {
+                endpoint: "/encoder-health".into(),
+                ..HealthConfig::default()
+            },
+        );
+        assert_eq!(worker.metadata().health_config.endpoint, "/encoder-health");
+        assert!(worker.is_available());
+        worker.set_healthy(false);
+        assert!(!worker.is_available());
+        worker.set_healthy(true);
+        assert!(worker.is_available());
+        worker.record_outcome(false);
+        assert_eq!(
+            worker.circuit_breaker().state(),
+            crate::core::CircuitState::Open
+        );
+        assert!(!worker.is_available());
+    }
+
     // Test WorkerType
     #[test]
     fn test_worker_type_display() {
@@ -991,6 +1100,7 @@ mod tests {
             "Prefill"
         );
         assert_eq!(WorkerType::Decode.to_string(), "Decode");
+        assert_eq!(WorkerType::Encode.to_string(), "Encode");
     }
 
     #[test]

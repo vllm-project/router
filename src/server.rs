@@ -1,6 +1,6 @@
 use crate::{
     config::{HistoryBackend, RouterConfig, TraceConfig},
-    core::{WorkerRegistry, WorkerType},
+    core::{CircuitBreakerConfig, HealthConfig, WorkerFactory, WorkerRegistry, WorkerType},
     data_connector::{MemoryResponseStorage, NoOpResponseStorage, SharedResponseStorage},
     logging::{self, LoggingConfig},
     metrics::{self, PrometheusConfig},
@@ -66,11 +66,43 @@ impl AppContext {
         rate_limit_tokens_per_second: Option<usize>,
         api_key_validation_urls: Vec<String>,
     ) -> Result<Self, String> {
+        // Validate before touching the URL-keyed registry, including for Rust
+        // callers that create a context directly instead of using the CLI.
+        crate::config::ConfigValidator::validate_epd(&router_config)
+            .map_err(|error| error.to_string())?;
         let rate_limit_tokens = rate_limit_tokens_per_second.unwrap_or(max_concurrent_requests);
         let rate_limiter = Arc::new(TokenBucket::new(max_concurrent_requests, rate_limit_tokens));
 
         let worker_registry = Arc::new(WorkerRegistry::new());
         let policy_registry = Arc::new(PolicyRegistry::new(router_config.policy.clone()));
+
+        // Single registration point for the static E pool. Router construction
+        // only registers its consumers, and Encode does not affect their
+        // per-model policy counts. Cloned contexts share these worker objects.
+        if let Some(epd) = &router_config.epd {
+            policy_registry.set_encode_policy(epd.effective_encode_policy());
+            let cb = router_config.effective_circuit_breaker_config();
+            let circuit_breaker = CircuitBreakerConfig {
+                failure_threshold: cb.failure_threshold,
+                success_threshold: cb.success_threshold,
+                timeout_duration: Duration::from_secs(cb.timeout_duration_secs),
+                window_duration: Duration::from_secs(cb.window_duration_secs),
+            };
+            let health = HealthConfig {
+                timeout_secs: router_config.health_check.timeout_secs,
+                check_interval_secs: router_config.health_check.check_interval_secs,
+                endpoint: router_config.health_check.endpoint.clone(),
+                failure_threshold: router_config.health_check.failure_threshold,
+                success_threshold: router_config.health_check.success_threshold,
+            };
+            for url in &epd.encoder_urls {
+                worker_registry.register(Arc::from(WorkerFactory::create_encode_with_config(
+                    url.clone(),
+                    circuit_breaker.clone(),
+                    health.clone(),
+                )));
+            }
+        }
 
         let router_manager = None;
 
@@ -629,6 +661,7 @@ async fn list_workers_rest(
                         WorkerType::Regular => "regular",
                         WorkerType::Prefill { .. } => "prefill",
                         WorkerType::Decode => "decode",
+                        WorkerType::Encode => "encode",
                     },
                     "is_healthy": worker.is_healthy(),
                     "load": worker.load(),
@@ -649,6 +682,7 @@ async fn list_workers_rest(
                 "prefill_count": state.context.worker_registry.get_prefill_workers().len(),
                 "decode_count": state.context.worker_registry.get_decode_workers().len(),
                 "regular_count": state.context.worker_registry.get_by_type(&WorkerType::Regular).len(),
+                "encode_count": state.context.worker_registry.get_by_type(&WorkerType::Encode).len(),
             }
         });
         Json(response).into_response()
@@ -1275,6 +1309,92 @@ fn create_cors_layer(allowed_origins: Vec<String>) -> tower_http::cors::CorsLaye
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn context_initializes_independent_encode_policy_from_rust_and_json_configs() {
+        use crate::config::{EncodePolicy, EpdConfig, PolicyConfig, RoutingMode};
+        for policy in [
+            None,
+            Some(EncodePolicy::RoundRobin),
+            Some(EncodePolicy::Random),
+        ] {
+            let config = RouterConfig {
+                mode: RoutingMode::Regular {
+                    worker_urls: vec!["http://consumer:8000".into()],
+                },
+                policy: PolicyConfig::RendezvousHash,
+                epd: Some(EpdConfig {
+                    encoder_urls: vec!["http://encoder:8000".into()],
+                    encode_policy: policy,
+                    consumer_zmq_addrs: Default::default(),
+                }),
+                ..RouterConfig::default()
+            };
+            let restored = serde_json::from_value(serde_json::to_value(&config).unwrap()).unwrap();
+            for config in [config, restored] {
+                let context = AppContext::new(config, Client::new(), 64, None, vec![]).unwrap();
+                let registry = &context.policy_registry;
+                let expected = if policy == Some(EncodePolicy::Random) {
+                    "random"
+                } else {
+                    "round_robin"
+                };
+                assert_eq!(registry.get_encode_policy().name(), expected);
+                assert_eq!(registry.get_default_policy().name(), "rendezvous_hash");
+                assert!(!Arc::ptr_eq(
+                    &registry.get_encode_policy(),
+                    &registry.get_default_policy()
+                ));
+                assert!(registry.get_worker_counts().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn static_encoders_register_once_and_context_clones_preserve_state() {
+        let config = RouterConfig {
+            mode: crate::config::RoutingMode::Regular {
+                worker_urls: vec!["http://consumer:8000".into()],
+            },
+            epd: Some(crate::config::EpdConfig {
+                encoder_urls: vec![
+                    "http://encoder-a:8000".into(),
+                    "https://encoder-b:8000".into(),
+                ],
+                encode_policy: None,
+                consumer_zmq_addrs: Default::default(),
+            }),
+            ..RouterConfig::default()
+        };
+        let context = AppContext::new(config.clone(), Client::new(), 64, None, vec![]).unwrap();
+        let worker = context
+            .worker_registry
+            .get_by_url("http://encoder-a:8000")
+            .unwrap();
+        worker.increment_load();
+        worker.set_healthy(false);
+        let cloned = context.clone();
+        let reused = cloned.worker_registry.get_by_url(worker.url()).unwrap();
+        assert!(Arc::ptr_eq(&worker, &reused));
+        assert_eq!(context.worker_registry.stats().encode_workers, 2);
+        assert_eq!(
+            context.worker_registry.get_by_model_fast("unknown").len(),
+            2
+        );
+        assert_eq!(reused.load(), 1);
+        assert!(!reused.is_healthy());
+        assert!(context.policy_registry.get_worker_counts().is_empty());
+        for url in ["http://consumer:8000", "http://consumer:8000/"] {
+            let mut conflicting = config.clone();
+            conflicting.epd.as_mut().unwrap().encoder_urls = vec![url.into()];
+            assert!(
+                AppContext::new(conflicting, Client::new(), 64, None, vec![])
+                    .err()
+                    .unwrap()
+                    .contains("Encode and consumer")
+            );
+        }
+    }
 
     #[tokio::test]
     async fn test_bind_listener_sets_tcp_nodelay_on_accepted_connections() {

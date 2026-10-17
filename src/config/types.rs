@@ -101,10 +101,42 @@ fn default_profile_timeout_secs() -> u64 {
 #[serde(deny_unknown_fields)]
 pub struct EpdConfig {
     pub encoder_urls: Vec<String>,
+    /// Independent Encode policy; omission uses round-robin, never the global policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encode_policy: Option<EncodePolicy>,
     /// Mooncake consumer control addresses, keyed by the P or combined PD HTTP URL.
     /// Omit for pull-based NIXL or the shared-file example connector.
     #[serde(default)]
     pub consumer_zmq_addrs: HashMap<String, String>,
+}
+
+impl EpdConfig {
+    pub fn effective_encode_policy(&self) -> EncodePolicy {
+        self.encode_policy.unwrap_or_default()
+    }
+}
+
+/// Policies with defined semantics for the static Encode pool.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EncodePolicy {
+    #[default]
+    RoundRobin,
+    Random,
+}
+
+impl std::str::FromStr for EncodePolicy {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "round_robin" => Ok(Self::RoundRobin),
+            "random" => Ok(Self::Random),
+            _ => Err(format!(
+                "Unsupported Encode policy '{value}': expected round_robin or random"
+            )),
+        }
+    }
 }
 
 fn default_history_backend() -> HistoryBackend {
@@ -988,6 +1020,77 @@ impl RouterConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn epd_policy_omission_and_null_use_independent_default() {
+        for json in [
+            r#"{"encoder_urls":["http://encoder:8000"]}"#,
+            r#"{"encoder_urls":["http://encoder:8000"],"encode_policy":null}"#,
+        ] {
+            let epd: EpdConfig = serde_json::from_str(json).unwrap();
+            assert_eq!(epd.encode_policy, None);
+            assert_eq!(epd.effective_encode_policy(), EncodePolicy::RoundRobin);
+            assert!(epd.consumer_zmq_addrs.is_empty());
+            assert!(serde_json::to_value(&epd)
+                .unwrap()
+                .get("encode_policy")
+                .is_none());
+
+            let mut config = serde_json::to_value(RouterConfig::default()).unwrap();
+            config["epd"] = serde_json::from_str(json).unwrap();
+            let config: RouterConfig = serde_json::from_value(config).unwrap();
+            assert!(matches!(config.policy, PolicyConfig::Random));
+            assert_eq!(
+                config.epd.unwrap().effective_encode_policy(),
+                EncodePolicy::RoundRobin
+            );
+        }
+    }
+
+    #[test]
+    fn epd_policy_serde_round_trip() {
+        for (name, expected) in [
+            ("round_robin", EncodePolicy::RoundRobin),
+            ("random", EncodePolicy::Random),
+        ] {
+            let json = serde_json::json!({
+                "encoder_urls": ["http://encoder:8000"],
+                "encode_policy": name,
+            });
+            let epd: EpdConfig = serde_json::from_value(json).unwrap();
+            assert_eq!(epd.effective_encode_policy(), expected);
+            let serialized = serde_json::to_value(&epd).unwrap();
+            assert_eq!(serialized["encode_policy"], name);
+            let restored: EpdConfig = serde_json::from_value(serialized).unwrap();
+            assert_eq!(restored.encode_policy, Some(expected));
+        }
+    }
+
+    #[test]
+    fn epd_policy_rejects_undefined_semantics() {
+        for name in [
+            "cache_aware",
+            "cache-aware",
+            "power_of_two",
+            "p2c",
+            "consistent_hash",
+            "rendezvous_hash",
+            "hash",
+            "program",
+            "unknown",
+        ] {
+            let error = serde_json::from_value::<EpdConfig>(serde_json::json!({
+                "encoder_urls": ["http://encoder:8000"],
+                "encode_policy": name,
+            }))
+            .unwrap_err()
+            .to_string();
+            assert!(
+                error.contains("round_robin") && error.contains("random"),
+                "{error}"
+            );
+        }
+    }
 
     // ============= RouterConfig Tests =============
 

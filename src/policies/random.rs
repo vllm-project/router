@@ -19,6 +19,26 @@ impl RandomPolicy {
 }
 
 impl LoadBalancingPolicy for RandomPolicy {
+    fn select_encode_batch(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        item_count: usize,
+    ) -> Option<Vec<usize>> {
+        if item_count == 0 {
+            return Some(Vec::new());
+        }
+        let healthy_indices = get_healthy_worker_indices(workers);
+        if healthy_indices.is_empty() {
+            return None;
+        }
+        let mut rng = rand::rng();
+        Some(
+            (0..item_count)
+                .map(|_| healthy_indices[rng.random_range(0..healthy_indices.len())])
+                .collect(),
+        )
+    }
+
     fn select_worker_with_headers(
         &self,
         workers: &[Arc<dyn Worker>],

@@ -8,91 +8,130 @@ use vllm_router_rs::policies::PolicyRegistry;
 use vllm_router_rs::protocols::worker_spec::WorkerConfigRequest;
 use vllm_router_rs::routers::router_manager::RouterManager;
 
-#[tokio::test]
-async fn test_policy_registry_with_router_manager() {
-    // Create RouterConfig
+fn manager_fixture() -> (Arc<RouterManager>, Arc<WorkerRegistry>, Arc<PolicyRegistry>) {
     let config = RouterConfig {
         enable_igw: true,
         policy: PolicyConfig::RoundRobin,
         ..Default::default()
     };
-
-    // Create HTTP client
-    let client = reqwest::Client::new();
-
-    // Create shared registries
-    let worker_registry = Arc::new(WorkerRegistry::new());
-    let policy_registry = Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin));
-
-    // Create RouterManager with shared registries
-    let _router_manager = RouterManager::new(
+    let workers = Arc::new(WorkerRegistry::new());
+    let policies = Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin));
+    let manager = Arc::new(RouterManager::new(
         config,
-        client,
-        worker_registry.clone(),
-        policy_registry.clone(),
+        reqwest::Client::new(),
+        workers.clone(),
+        policies.clone(),
+    ));
+    (manager, workers, policies)
+}
+
+fn worker_config(model: &str) -> WorkerConfigRequest {
+    WorkerConfigRequest {
+        url: "http://worker:8000".to_string(),
+        model_id: Some(model.to_string()),
+        worker_type: None,
+        priority: None,
+        cost: None,
+        labels: HashMap::new(),
+        bootstrap_port: None,
+    }
+}
+
+#[tokio::test]
+async fn test_policy_registry_with_router_manager() {
+    // An explicit model bypasses server-info discovery, so no backend is needed.
+    let (manager, workers, policies) = manager_fixture();
+    let first = manager
+        .add_worker(worker_config("model"))
+        .await
+        .unwrap()
+        .worker
+        .unwrap();
+    let policy = policies.get_policy("model").unwrap();
+    let second = manager
+        .add_worker(worker_config("model"))
+        .await
+        .unwrap()
+        .worker
+        .unwrap();
+    assert_eq!(first.id, second.id);
+    assert_eq!(workers.get_by_model_fast("model").len(), 1);
+    assert_eq!(policies.get_worker_counts().get("model"), Some(&1));
+    assert!(Arc::ptr_eq(&policy, &policies.get_policy("model").unwrap()));
+    manager
+        .remove_worker_from_registry("http://worker:8000")
+        .unwrap();
+    assert!(workers.get_all().is_empty());
+    assert!(policies.get_worker_counts().is_empty());
+    assert!(policies.get_policy("model").is_none());
+}
+
+#[tokio::test]
+async fn test_model_replacement_moves_policy_count() {
+    let (manager, workers, policies) = manager_fixture();
+    let first = manager
+        .add_worker(worker_config("old-model"))
+        .await
+        .unwrap()
+        .worker
+        .unwrap();
+    let second = manager
+        .add_worker(worker_config("new-model"))
+        .await
+        .unwrap()
+        .worker
+        .unwrap();
+    assert_eq!(first.id, second.id);
+    assert!(!workers.has_model("old-model"));
+    assert!(policies.get_policy("old-model").is_none());
+    assert_eq!(
+        policies.get_worker_counts(),
+        HashMap::from([("new-model".to_string(), 1)])
     );
+    manager
+        .remove_worker_from_registry("http://worker:8000")
+        .unwrap();
+    assert!(policies.get_worker_counts().is_empty());
+    assert!(policies.get_all_mappings().is_empty());
+}
 
-    // Test adding workers with different models and policies
-
-    // Add first worker for llama-3 with cache_aware policy hint
-    let mut labels1 = HashMap::new();
-    labels1.insert("policy".to_string(), "cache_aware".to_string());
-
-    let _worker1_config = WorkerConfigRequest {
-        url: "http://worker1:8000".to_string(),
-        model_id: Some("llama-3".to_string()),
-        worker_type: None,
-        priority: None,
-        cost: None,
-        labels: labels1,
-        bootstrap_port: None,
-    };
-
-    // This would normally connect to a real worker, but for testing we'll just verify the structure
-    // In a real test, we'd need to mock the worker or use a test server
-
-    // Verify PolicyRegistry has the correct policy for llama-3
-    let _llama_policy = policy_registry.get_policy("llama-3");
-    // After first worker is added, llama-3 should have a policy
-
-    // Add second worker for llama-3 with different policy hint (should be ignored)
-    let mut labels2 = HashMap::new();
-    labels2.insert("policy".to_string(), "random".to_string());
-
-    let _worker2_config = WorkerConfigRequest {
-        url: "http://worker2:8000".to_string(),
-        model_id: Some("llama-3".to_string()),
-        worker_type: None,
-        priority: None,
-        cost: None,
-        labels: labels2,
-        bootstrap_port: None,
-    };
-
-    // The second worker should use the same policy as the first (cache_aware)
-
-    // Add worker for different model (gpt-4) with random policy
-    let mut labels3 = HashMap::new();
-    labels3.insert("policy".to_string(), "random".to_string());
-
-    let _worker3_config = WorkerConfigRequest {
-        url: "http://worker3:8000".to_string(),
-        model_id: Some("gpt-4".to_string()),
-        worker_type: None,
-        priority: None,
-        cost: None,
-        labels: labels3,
-        bootstrap_port: None,
-    };
-
-    // Verify gpt-4 has random policy
-    let _gpt_policy = policy_registry.get_policy("gpt-4");
-
-    // Test removing workers
-    // When we remove both llama-3 workers, the policy should be cleaned up
-
-    println!("PolicyRegistry integration test structure created");
-    println!("Note: This test requires mocking or test servers to fully execute");
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_concurrent_management_add_remove_keeps_policy_count_consistent() {
+    let (manager, workers, policies) = manager_fixture();
+    let mut tasks = Vec::new();
+    for thread in 0..8 {
+        let manager = manager.clone();
+        tasks.push(tokio::spawn(async move {
+            for iteration in 0..20 {
+                let model = if (thread + iteration) % 2 == 0 {
+                    "model-a"
+                } else {
+                    "model-b"
+                };
+                manager.add_worker(worker_config(model)).await.unwrap();
+                let _ = manager.remove_worker_from_registry("http://worker:8000");
+                tokio::task::yield_now().await;
+            }
+        }));
+    }
+    for task in tasks {
+        task.await.unwrap();
+    }
+    manager
+        .add_worker(worker_config("final-model"))
+        .await
+        .unwrap();
+    assert_eq!(workers.get_all().len(), 1);
+    assert_eq!(
+        policies.get_worker_counts(),
+        HashMap::from([("final-model".to_string(), 1)])
+    );
+    manager
+        .remove_worker_from_registry("http://worker:8000")
+        .unwrap();
+    assert!(workers.get_all().is_empty());
+    assert!(policies.get_all_mappings().is_empty());
+    assert!(policies.get_worker_counts().is_empty());
 }
 
 #[test]

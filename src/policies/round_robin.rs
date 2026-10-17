@@ -23,6 +23,28 @@ impl RoundRobinPolicy {
 }
 
 impl LoadBalancingPolicy for RoundRobinPolicy {
+    fn select_encode_batch(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        item_count: usize,
+    ) -> Option<Vec<usize>> {
+        if item_count == 0 {
+            return Some(Vec::new());
+        }
+        let healthy_indices = get_healthy_worker_indices(workers);
+        if healthy_indices.is_empty() {
+            return None;
+        }
+        // Reserve the whole request's sequence atomically, preserving image
+        // grouping even when other requests select from the same E slot.
+        let start = self.counter.fetch_add(item_count, Ordering::Relaxed);
+        Some(
+            (0..item_count)
+                .map(|offset| healthy_indices[start.wrapping_add(offset) % healthy_indices.len()])
+                .collect(),
+        )
+    }
+
     fn select_worker_with_headers(
         &self,
         workers: &[Arc<dyn Worker>],

@@ -183,7 +183,7 @@ impl ConfigValidator {
         Ok(())
     }
 
-    fn validate_epd(config: &RouterConfig) -> ConfigResult<()> {
+    pub(crate) fn validate_epd(config: &RouterConfig) -> ConfigResult<()> {
         let Some(epd) = &config.epd else {
             return Ok(());
         };
@@ -200,6 +200,11 @@ impl ConfigValidator {
                 })
             }
         };
+        if config.discovery.as_ref().is_some_and(|d| d.enabled) {
+            return Err(ConfigError::ValidationFailed {
+                reason: "EPD currently requires static workers without service discovery".into(),
+            });
+        }
         if config.intra_node_data_parallel_size != 1 || config.enable_igw {
             return Err(ConfigError::ValidationFailed {
                 reason: "EPD currently requires DP=1 and proxy mode".into(),
@@ -210,13 +215,57 @@ impl ConfigValidator {
                 field: "epd.encoder_urls".into(),
             });
         }
-        Self::validate_urls(&epd.encoder_urls)?;
-        for url in epd.encoder_urls.iter().chain(worker_urls.iter().copied()) {
-            if !url.starts_with("http://") && !url.starts_with("https://") {
+        // Decode is not an embedding consumer, but it shares the same URL-keyed
+        // registry and must also be HTTP and distinct from every encoder.
+        let decode_urls = match &config.mode {
+            RoutingMode::VllmPrefillDecode { decode_urls, .. } => decode_urls.as_slice(),
+            _ => &[],
+        };
+        let mut endpoints = std::collections::HashMap::new();
+        for (role, url) in epd.encoder_urls.iter().map(|url| ("Encode", url)).chain(
+            worker_urls
+                .iter()
+                .copied()
+                .chain(decode_urls.iter())
+                .map(|url| ("consumer", url)),
+        ) {
+            let parsed = url::Url::parse(url).map_err(|e| ConfigError::InvalidValue {
+                field: "epd.worker_url".into(),
+                value: url.clone(),
+                reason: format!("Invalid EPD HTTP URL: {e}"),
+            })?;
+            if (!url.starts_with("http://") && !url.starts_with("https://"))
+                || !matches!(parsed.scheme(), "http" | "https")
+                || parsed.host_str().is_none()
+            {
                 return Err(ConfigError::InvalidValue {
                     field: "epd.worker_url".into(),
                     value: url.clone(),
                     reason: "EPD requires HTTP(S) encoder and consumer URLs".into(),
+                });
+            }
+            if url.trim() != url
+                || url.contains('@')
+                || !parsed.username().is_empty()
+                || parsed.password().is_some()
+                || parsed.query().is_some()
+                || parsed.fragment().is_some()
+            {
+                return Err(ConfigError::InvalidValue {
+                    field: "epd.worker_url".into(),
+                    value: url.clone(),
+                    reason: "EPD URLs must be HTTP base URLs without credentials, DP rank, query, fragment, or surrounding whitespace".into(),
+                });
+            }
+            // Canonical parsing also catches host case and default-port aliases.
+            let key = parsed.as_str().trim_end_matches('/').to_string();
+            if let Some(previous_role) = endpoints.insert(key, role) {
+                return Err(ConfigError::ValidationFailed {
+                    reason: if previous_role != role {
+                        "EPD Encode and consumer URLs must not conflict".into()
+                    } else {
+                        format!("EPD duplicate {role} URL")
+                    },
                 });
             }
         }
@@ -968,6 +1017,7 @@ mod tests {
                 let mut config = RouterConfig::new(mode, PolicyConfig::Random);
                 config.epd = Some(EpdConfig {
                     encoder_urls: vec![format!("{encoder_scheme}://encoder:8000")],
+                    encode_policy: None,
                     consumer_zmq_addrs: Default::default(),
                 });
                 let result = ConfigValidator::validate(&config);
@@ -984,6 +1034,164 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn static_epd_config() -> RouterConfig {
+        let mut config = RouterConfig::new(
+            RoutingMode::VllmPrefillDecode {
+                prefill_urls: vec![("http://prefill:8000".into(), Some(8081))],
+                decode_urls: vec!["http://decode:8000".into()],
+                prefill_policy: None,
+                decode_policy: None,
+                discovery_address: None,
+            },
+            PolicyConfig::RoundRobin,
+        );
+        config.epd = Some(EpdConfig {
+            encoder_urls: vec!["http://encoder:8000".into()],
+            encode_policy: None,
+            consumer_zmq_addrs: Default::default(),
+        });
+        config
+    }
+
+    #[test]
+    fn test_validate_epd_rejects_duplicate_and_conflicting_urls() {
+        for mode in [
+            RoutingMode::Regular {
+                worker_urls: vec!["http://consumer:8000".into()],
+            },
+            static_epd_config().mode,
+        ] {
+            let mut valid = static_epd_config();
+            valid.mode = mode;
+            ConfigValidator::validate(&valid).unwrap();
+            let consumers: Vec<String> = match &valid.mode {
+                RoutingMode::Regular { worker_urls } => worker_urls.clone(),
+                RoutingMode::VllmPrefillDecode {
+                    prefill_urls,
+                    decode_urls,
+                    ..
+                } => prefill_urls
+                    .iter()
+                    .map(|(url, _)| url.clone())
+                    .chain(decode_urls.iter().cloned())
+                    .collect(),
+                _ => unreachable!(),
+            };
+            for consumer in consumers {
+                let mut conflicting = valid.clone();
+                // Explicitly reject role conflicts, even though registry upsert is valid.
+                conflicting.epd.as_mut().unwrap().encoder_urls = vec![consumer.clone()];
+                assert!(ConfigValidator::validate(&conflicting)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("Encode and consumer"));
+                conflicting.epd.as_mut().unwrap().encoder_urls = vec![format!("{consumer}/")];
+                assert!(ConfigValidator::validate(&conflicting)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("Encode and consumer"));
+            }
+            let mut duplicate = valid.clone();
+            duplicate
+                .epd
+                .as_mut()
+                .unwrap()
+                .encoder_urls
+                .push("http://ENCODER:8000/".into());
+            assert!(ConfigValidator::validate(&duplicate)
+                .unwrap_err()
+                .to_string()
+                .contains("duplicate Encode"));
+            match &mut duplicate.mode {
+                RoutingMode::Regular { worker_urls } => worker_urls.push(worker_urls[0].clone()),
+                RoutingMode::VllmPrefillDecode {
+                    prefill_urls,
+                    decode_urls,
+                    ..
+                } => decode_urls.push(prefill_urls[0].0.clone()),
+                _ => unreachable!(),
+            }
+            duplicate.epd.as_mut().unwrap().encoder_urls.pop();
+            assert!(ConfigValidator::validate(&duplicate)
+                .unwrap_err()
+                .to_string()
+                .contains("duplicate consumer"));
+        }
+    }
+
+    #[test]
+    fn test_validate_epd_base_urls_and_static_support_boundaries() {
+        for invalid in [
+            "grpc://decode:8000",
+            "http://",
+            "http://decode:8000@0",
+            "http://user:password@decode:8000",
+            "http://decode:8000?q=1",
+            "http://decode:8000#frag",
+            " http://decode:8000",
+        ] {
+            for role in 0..3 {
+                let mut config = static_epd_config();
+                match role {
+                    0 => config.epd.as_mut().unwrap().encoder_urls[0] = invalid.into(),
+                    1 => {
+                        if let RoutingMode::VllmPrefillDecode { prefill_urls, .. } =
+                            &mut config.mode
+                        {
+                            prefill_urls[0].0 = invalid.into();
+                        }
+                    }
+                    _ => {
+                        if let RoutingMode::VllmPrefillDecode { decode_urls, .. } = &mut config.mode
+                        {
+                            decode_urls[0] = invalid.into();
+                        }
+                    }
+                }
+                assert!(
+                    ConfigValidator::validate_epd(&config).is_err(),
+                    "role={role}, url={invalid}"
+                );
+            }
+        }
+        let mut config = static_epd_config();
+        config.epd.as_mut().unwrap().encoder_urls =
+            vec!["http://ENCODER:80".into(), "http://encoder/".into()];
+        assert!(ConfigValidator::validate_epd(&config)
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate Encode"));
+        for unsupported in 0..4 {
+            let mut config = static_epd_config();
+            match unsupported {
+                0 => config.intra_node_data_parallel_size = 2,
+                1 => config.enable_igw = true,
+                2 => {
+                    config.discovery = Some(DiscoveryConfig {
+                        enabled: true,
+                        ..Default::default()
+                    })
+                }
+                _ => {
+                    if let RoutingMode::VllmPrefillDecode {
+                        discovery_address, ..
+                    } = &mut config.mode
+                    {
+                        *discovery_address = Some("tcp://discovery:1234".into());
+                    }
+                }
+            }
+            assert!(ConfigValidator::validate_epd(&config).is_err());
+        }
+        let ordinary = RouterConfig {
+            mode: RoutingMode::Regular {
+                worker_urls: vec!["grpc://consumer:8000".into()],
+            },
+            ..RouterConfig::default()
+        };
+        ConfigValidator::validate(&ordinary).unwrap();
     }
 
     #[test]

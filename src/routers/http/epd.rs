@@ -1,11 +1,13 @@
 use crate::config::EpdConfig;
+use crate::core::{Worker, WorkerLoadGuard, WorkerRegistry, WorkerType};
+use crate::policies::PolicyRegistry;
 use axum::http::{HeaderMap, StatusCode};
 use futures_util::future::join_all;
 use reqwest::{Client, RequestBuilder};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 use uuid::Uuid;
 
@@ -23,7 +25,8 @@ struct MediaItem {
 #[derive(Debug)]
 pub(super) struct EncoderStage {
     config: EpdConfig,
-    next_encoder: AtomicUsize,
+    worker_registry: Arc<WorkerRegistry>,
+    policy_registry: Arc<PolicyRegistry>,
 }
 
 /// Cancel abandoned Mooncake pushes when preparation or the P/PD request ends early.
@@ -108,11 +111,42 @@ fn cancel_ec_transfers(control_addr: &str, transfer_ids: &[String]) -> anyhow::R
 }
 
 impl EncoderStage {
-    pub(super) fn new(config: EpdConfig) -> Self {
+    pub(super) fn new(
+        config: EpdConfig,
+        worker_registry: Arc<WorkerRegistry>,
+        policy_registry: Arc<PolicyRegistry>,
+    ) -> Self {
         Self {
             config,
-            next_encoder: AtomicUsize::new(0),
+            worker_registry,
+            policy_registry,
         }
+    }
+
+    fn select_encoders(&self, item_count: usize) -> Result<Vec<Arc<dyn Worker>>, EpdError> {
+        // Query the live role pool once, then preserve static configuration order.
+        // Removed/replaced workers must not fall back to the configured raw URL.
+        let pool = self.worker_registry.get_by_type(&WorkerType::Encode);
+        let by_url: HashMap<_, _> = pool.iter().map(|worker| (worker.url(), worker)).collect();
+        let workers: Vec<_> = self
+            .config
+            .encoder_urls
+            .iter()
+            .filter_map(|url| by_url.get(url.as_str()).map(|worker| Arc::clone(worker)))
+            .collect();
+        let policy = self.policy_registry.get_encode_policy();
+        let assignments = policy
+            .select_encode_batch(&workers, item_count)
+            .ok_or_else(|| {
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "No available Encode workers".into(),
+                )
+            })?;
+        Ok(assignments
+            .into_iter()
+            .map(|index| workers[index].clone())
+            .collect())
     }
 
     pub(super) async fn prepare(
@@ -157,6 +191,7 @@ impl EncoderStage {
                 "Selected embedding consumer has no EC control address".into(),
             ));
         }
+        let encoders = self.select_encoders(items.len())?;
         let mut pending = consumer_addr.map(|control_addr| EcTransferGuard {
             control_addr: control_addr.clone(),
             transfer_ids: items.iter().map(|item| item.transfer_id.clone()).collect(),
@@ -166,19 +201,18 @@ impl EncoderStage {
             .and_then(|v| v.to_str().ok())
             .map(str::to_owned)
             .unwrap_or_else(|| Uuid::new_v4().to_string());
-        let start = self.next_encoder.fetch_add(items.len(), Ordering::Relaxed);
-        // Round-robin per item, then batch the images of one request that land
+        // Assign per item, then batch the images of one request that land
         // on the same encoder into a single call, like the Python EPD proxy.
         // Audio and video items stay singleton groups.
-        let mut groups: Vec<(usize, Vec<usize>)> = Vec::new();
-        let mut image_group_of: HashMap<usize, usize> = HashMap::new();
+        let mut groups: Vec<(&Arc<dyn Worker>, Vec<usize>)> = Vec::new();
+        let mut image_group_of: HashMap<&str, usize> = HashMap::new();
         for (index, item) in items.iter().enumerate() {
-            let encoder = start.wrapping_add(index) % self.config.encoder_urls.len();
+            let encoder = &encoders[index];
             if item.kind == "image_url" {
-                match image_group_of.get(&encoder) {
+                match image_group_of.get(encoder.url()) {
                     Some(&group) => groups[group].1.push(index),
                     None => {
-                        image_group_of.insert(encoder, groups.len());
+                        image_group_of.insert(encoder.url(), groups.len());
                         groups.push((encoder, vec![index]));
                     }
                 }
@@ -187,7 +221,7 @@ impl EncoderStage {
             }
         }
         let replies = join_all(groups.iter().map(|(encoder, indices)| {
-            let encoder_url = &self.config.encoder_urls[*encoder];
+            let encoder_url = encoder.url();
             let mut request = client
                 .post(format!(
                     "{}/v1/chat/completions",
@@ -211,6 +245,8 @@ impl EncoderStage {
                 indices,
                 &body,
                 consumer_addr.map(String::as_str),
+                encoder.as_ref(),
+                &self.worker_registry,
             )
         }))
         .await;
@@ -236,26 +272,26 @@ impl EncoderStage {
             // uuids with processing options; the uuid key and the single-entry
             // shape are fallbacks for encoders without position metadata.
             let mut by_position: HashMap<usize, (&String, &Value)> = HashMap::new();
-            if indices.len() > 1 {
-                for (mm_hash, reported) in params.iter() {
-                    if let Some(item_indices) =
-                        reported.get("item_indices").and_then(Value::as_array)
-                    {
-                        for local in item_indices {
-                            let local = local
-                                .as_u64()
-                                .map(|v| v as usize)
-                                .filter(|&v| v < indices.len())
-                                .ok_or_else(|| {
-                                    (StatusCode::BAD_GATEWAY, "Invalid encoder item index".into())
-                                })?;
-                            if by_position.insert(local, (mm_hash, reported)).is_some() {
-                                return Err((
-                                    StatusCode::BAD_GATEWAY,
-                                    "Duplicate encoder item index".into(),
-                                ));
-                            }
-                        }
+            for (mm_hash, reported) in params.iter() {
+                let Some(item_indices) = reported.get("item_indices") else {
+                    continue;
+                };
+                let item_indices = item_indices.as_array().ok_or_else(|| {
+                    (StatusCode::BAD_GATEWAY, "Invalid encoder item index".into())
+                })?;
+                for local in item_indices {
+                    let local = local
+                        .as_u64()
+                        .and_then(|value| usize::try_from(value).ok())
+                        .filter(|&value| value < indices.len())
+                        .ok_or_else(|| {
+                            (StatusCode::BAD_GATEWAY, "Invalid encoder item index".into())
+                        })?;
+                    if by_position.insert(local, (mm_hash, reported)).is_some() {
+                        return Err((
+                            StatusCode::BAD_GATEWAY,
+                            "Duplicate encoder item index".into(),
+                        ));
                     }
                 }
             }
@@ -423,7 +459,12 @@ async fn encode_group(
     indices: &[usize],
     body: &Value,
     consumer_addr: Option<&str>,
+    worker: &dyn Worker,
+    registry: &WorkerRegistry,
 ) -> Result<Value, EpdError> {
+    // A batch stays in flight until its response body/JSON has been consumed.
+    // Dropping the future releases load without inventing a completion/outcome.
+    let _load = WorkerLoadGuard::new(worker);
     let mut payload = json!({
         "model": body.get("model"),
         "stream": false,
@@ -454,21 +495,42 @@ async fn encode_group(
     }
     let request = request.json(&payload);
     drop(payload);
-    let response = request.send().await.map_err(|e| {
-        (
-            StatusCode::BAD_GATEWAY,
-            format!("Encoder request failed: {e}"),
-        )
-    })?;
-    if !response.status().is_success() {
-        return Err((response.status(), "Encoder request failed".into()));
+    let result = async {
+        let response = request.send().await.map_err(|e| {
+            (
+                StatusCode::BAD_GATEWAY,
+                format!("Encoder request failed: {e}"),
+            )
+        })?;
+        if !response.status().is_success() {
+            return Err((response.status(), "Encoder request failed".into()));
+        }
+        response.json::<Value>().await.map_err(|e| {
+            (
+                StatusCode::BAD_GATEWAY,
+                format!("Invalid encoder response: {e}"),
+            )
+        })
     }
-    response.json::<Value>().await.map_err(|e| {
-        (
-            StatusCode::BAD_GATEWAY,
-            format!("Invalid encoder response: {e}"),
-        )
-    })
+    .await;
+    worker.increment_processed();
+    // Match consumer circuit semantics: client errors are reachable workers;
+    // transport failures, 5xx and unreadable JSON are failed batch attempts.
+    let success = result
+        .as_ref()
+        .map_or_else(|(status, _)| status.is_client_error(), |_| true);
+    let was_available = worker.is_available();
+    worker.record_outcome(success);
+    if was_available != worker.is_available() {
+        registry.notify_worker_state_change();
+    }
+    tracing::debug!(
+        worker = worker.url(),
+        items = indices.len(),
+        success,
+        "EPD encoder batch complete"
+    );
+    result
 }
 
 fn flatten_metadata(metadata: &Map<String, Value>) -> Result<Map<String, Value>, EpdError> {
@@ -505,6 +567,18 @@ mod tests {
     use axum::{extract::State, routing::post, Json, Router};
     use std::sync::{Arc, Mutex};
 
+    fn test_stage(config: EpdConfig) -> EncoderStage {
+        let workers = Arc::new(WorkerRegistry::new());
+        for url in &config.encoder_urls {
+            workers.register(Arc::from(crate::core::WorkerFactory::create_encode(
+                url.clone(),
+            )));
+        }
+        let policies = Arc::new(PolicyRegistry::new(crate::config::PolicyConfig::RoundRobin));
+        policies.set_encode_policy(config.effective_encode_policy());
+        EncoderStage::new(config, workers, policies)
+    }
+
     #[derive(Clone)]
     struct MockEncoder {
         mode: &'static str,
@@ -523,6 +597,15 @@ mod tests {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(json!({"error":"unavailable"})),
+            );
+        }
+        if state.mode == "no_report" {
+            return (StatusCode::OK, Json(json!({})));
+        }
+        if state.mode == "missing_entry" {
+            return (
+                StatusCode::OK,
+                Json(json!({"ec_transfer_params": {"opaque": {"backend_field": 42}}})),
             );
         }
         // Batched requests carry several media parts; dedupe identical media
@@ -551,11 +634,18 @@ mod tests {
                 "invalid" => json!({"image_grid_thw": ["invalid"]}),
                 _ => json!({"image_grid_thw": [[1, 2, 3]]}),
             };
+            let item_indices = match state.mode {
+                "bad_indices_type" => json!("0"),
+                "bad_index_fractional" => json!([0.5]),
+                "bad_index_out_of_range" => json!([indices.len()]),
+                "duplicate_index" => json!([0, 0]),
+                _ => json!(indices),
+            };
             params.insert(
                 format!("engine-{uuid}"),
                 json!({
                     "metadata": metadata,
-                    "item_indices": indices,
+                    "item_indices": item_indices,
                     "peer_host": "encoder",
                     "peer_port": 4321,
                     "size_bytes": 128,
@@ -583,8 +673,9 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let stage = EncoderStage::new(EpdConfig {
+        let stage = test_stage(EpdConfig {
             encoder_urls: vec![url],
+            encode_policy: None,
             consumer_zmq_addrs: Default::default(),
         });
         (stage, seen, server)
@@ -606,6 +697,367 @@ mod tests {
                 ],
             }],
         })
+    }
+
+    #[test]
+    fn selection_uses_live_encode_pool_in_config_order_and_independent_slot() {
+        use crate::{config::EncodePolicy, core::BasicWorker};
+        let stage = test_stage(EpdConfig {
+            encoder_urls: vec!["http://e0".into(), "http://e1".into(), "http://e2".into()],
+            encode_policy: None,
+            consumer_zmq_addrs: Default::default(),
+        });
+        let urls = |count| {
+            stage
+                .select_encoders(count)
+                .unwrap()
+                .iter()
+                .map(|w| w.url().to_owned())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(urls(3), ["http://e0", "http://e1", "http://e2"]);
+        let second_stage = EncoderStage::new(
+            stage.config.clone(),
+            stage.worker_registry.clone(),
+            stage.policy_registry.clone(),
+        );
+        assert_eq!(urls(1), ["http://e0"]);
+        assert_eq!(
+            second_stage.select_encoders(1).unwrap()[0].url(),
+            "http://e1"
+        );
+        // Reinsert E0 last in the registry. Config order still determines RR.
+        stage.worker_registry.remove_by_url("http://e0");
+        let e0: Arc<dyn Worker> =
+            Arc::new(BasicWorker::new("http://e0".into(), WorkerType::Encode));
+        stage.worker_registry.register(e0.clone());
+        stage
+            .policy_registry
+            .set_encode_policy(EncodePolicy::RoundRobin);
+        assert_eq!(urls(3), ["http://e0", "http://e1", "http://e2"]);
+        let e1 = stage.worker_registry.get_by_url("http://e1").unwrap();
+        e1.set_healthy(false);
+        let e2 = stage.worker_registry.get_by_url("http://e2").unwrap();
+        for _ in 0..5 {
+            e2.record_outcome(false);
+        }
+        assert_eq!(urls(4), ["http://e0"; 4]);
+        // A healthy consumer is not an Encode fallback, even at a configured URL.
+        stage.worker_registry.register(Arc::new(BasicWorker::new(
+            "http://e2".into(),
+            WorkerType::Regular,
+        )));
+        assert_eq!(urls(4), ["http://e0"; 4]);
+        stage
+            .policy_registry
+            .set_encode_policy(EncodePolicy::Random);
+        assert_eq!(urls(8), ["http://e0"; 8]);
+        // The independent global consumer RR has not advanced at all.
+        assert_eq!(
+            stage
+                .policy_registry
+                .get_default_policy()
+                .select_worker(&[e0.clone(), e1], None),
+            Some(0)
+        );
+        stage.worker_registry.remove_by_url("http://e0");
+        assert_eq!(
+            stage.select_encoders(1).unwrap_err().0,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(e0.processed_requests(), 0);
+    }
+
+    #[tokio::test]
+    async fn text_and_existing_embeds_bypass_an_empty_encode_pool() {
+        let stage = test_stage(EpdConfig {
+            encoder_urls: vec![],
+            encode_policy: None,
+            consumer_zmq_addrs: Default::default(),
+        });
+        for content in [
+            json!("hello"),
+            json!([{"type":"image_embeds", "uuid":"existing", "image_embeds":[1,2]}]),
+        ] {
+            let body = json!({"messages":[{"role":"user", "content":content}]});
+            assert_eq!(
+                stage
+                    .prepare(&Client::new(), body.clone(), "pd", None, None)
+                    .await
+                    .unwrap()
+                    .0,
+                body
+            );
+        }
+        assert_eq!(
+            stage
+                .prepare(&Client::new(), request(), "pd", None, None)
+                .await
+                .err()
+                .unwrap()
+                .0,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
+    #[tokio::test]
+    async fn image_batches_and_audio_video_singletons_count_completed_attempts() {
+        let (stage, seen, server) = mock("normal").await;
+        let worker = stage.worker_registry.get_by_type(&WorkerType::Encode)[0].clone();
+        let mut input = request();
+        input["messages"][0]["content"]
+            .as_array_mut()
+            .unwrap()
+            .extend([
+                json!({"type":"audio_url", "audio_url":{"url":"audio-a"}}),
+                json!({"type":"audio_url", "audio_url":{"url":"audio-b"}}),
+                json!({"type":"video_url", "video_url":{"url":"video-a"}}),
+            ]);
+        stage
+            .prepare(&Client::new(), input, "pd", None, None)
+            .await
+            .unwrap();
+        let requests = seen.lock().unwrap();
+        let sizes: Vec<_> = requests
+            .iter()
+            .map(|b| b["messages"][0]["content"].as_array().unwrap().len())
+            .collect();
+        assert_eq!(sizes.len(), 4);
+        assert_eq!(sizes.iter().filter(|&&size| size == 2).count(), 1);
+        assert_eq!(sizes.iter().filter(|&&size| size == 1).count(), 3);
+        assert_eq!(worker.processed_requests(), 4);
+        assert_eq!(worker.load(), 0);
+        assert_eq!(worker.circuit_breaker().total_successes(), 4);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn batch_outcomes_cover_http_json_and_transport_failures() {
+        use axum::response::IntoResponse;
+        for (status, response_body, success) in [
+            (StatusCode::OK, "{}", true),
+            (StatusCode::BAD_REQUEST, "bad input", true),
+            (StatusCode::INTERNAL_SERVER_ERROR, "failed", false),
+            (StatusCode::OK, "invalid json", false),
+        ] {
+            let app = Router::new().route(
+                "/v1/chat/completions",
+                post(move || async move { (status, response_body).into_response() }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let stage = test_stage(EpdConfig {
+                encoder_urls: vec![url.clone()],
+                encode_policy: None,
+                consumer_zmq_addrs: Default::default(),
+            });
+            let worker: Arc<dyn Worker> =
+                Arc::from(crate::core::WorkerFactory::create_encode_with_config(
+                    url,
+                    crate::core::CircuitBreakerConfig {
+                        failure_threshold: 1,
+                        ..Default::default()
+                    },
+                    Default::default(),
+                ));
+            stage.worker_registry.register(worker.clone());
+            let revision = stage.worker_registry.revision();
+            let result = stage
+                .prepare(&Client::new(), request(), "pd", None, None)
+                .await;
+            assert_eq!(result.is_ok(), status.is_success() && success);
+            if let Err((actual, _)) = result {
+                assert_eq!(
+                    actual,
+                    if status.is_success() {
+                        StatusCode::BAD_GATEWAY
+                    } else {
+                        status
+                    }
+                );
+            }
+            assert_eq!(worker.load(), 0);
+            assert_eq!(worker.processed_requests(), 1);
+            assert_eq!(
+                worker.circuit_breaker().total_successes(),
+                u64::from(success)
+            );
+            assert_eq!(
+                worker.circuit_breaker().total_failures(),
+                u64::from(!success)
+            );
+            assert_eq!(stage.worker_registry.revision() > revision, !success);
+            if !success {
+                assert_eq!(
+                    stage.select_encoders(1).unwrap_err().0,
+                    StatusCode::SERVICE_UNAVAILABLE
+                );
+            }
+            server.abort();
+        }
+        // Bind without listening to keep a local refused port reserved.
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let url = format!("http://{}", socket.local_addr().unwrap());
+        let stage = test_stage(EpdConfig {
+            encoder_urls: vec![url],
+            encode_policy: None,
+            consumer_zmq_addrs: Default::default(),
+        });
+        let worker = stage.worker_registry.get_by_type(&WorkerType::Encode)[0].clone();
+        assert_eq!(
+            stage
+                .prepare(&Client::new(), request(), "pd", None, None)
+                .await
+                .err()
+                .unwrap()
+                .0,
+            StatusCode::BAD_GATEWAY
+        );
+        assert_eq!(worker.load(), 0);
+        assert_eq!(worker.processed_requests(), 1);
+        assert_eq!(worker.circuit_breaker().total_failures(), 1);
+    }
+
+    #[tokio::test]
+    async fn blocked_response_body_holds_load_until_completion_timeout_or_drop() {
+        use axum::{body::Body, response::Response};
+        use futures_util::stream;
+        use std::time::Duration;
+        use tokio::sync::{Notify, Semaphore};
+        for mode in ["complete", "timeout", "drop"] {
+            let entered = Arc::new(Notify::new());
+            let release = Arc::new(Semaphore::new(0));
+            let (entered_body, release_body) = (entered.clone(), release.clone());
+            let app = Router::new().route(
+                "/v1/chat/completions",
+                post(move || {
+                    let (entered, release) = (entered_body.clone(), release_body.clone());
+                    async move {
+                        let body = stream::once(async move {
+                            entered.notify_one();
+                            let _permit = release.acquire().await.unwrap();
+                            Ok::<_, std::io::Error>("{}")
+                        });
+                        Response::new(Body::from_stream(body))
+                    }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let stage = Arc::new(test_stage(EpdConfig {
+                encoder_urls: vec![url],
+                encode_policy: None,
+                consumer_zmq_addrs: Default::default(),
+            }));
+            let worker = stage.worker_registry.get_by_type(&WorkerType::Encode)[0].clone();
+            let client = if mode == "timeout" {
+                Client::builder()
+                    .timeout(Duration::from_millis(250))
+                    .build()
+                    .unwrap()
+            } else {
+                Client::new()
+            };
+            let task_stage = stage.clone();
+            let task = tokio::spawn(async move {
+                task_stage
+                    .prepare(&client, request(), "pd", None, None)
+                    .await
+                    .map(|(body, _)| body)
+            });
+            tokio::time::timeout(Duration::from_secs(5), entered.notified())
+                .await
+                .unwrap();
+            assert_eq!(worker.load(), 1, "{mode}");
+            assert_eq!(worker.processed_requests(), 0);
+            worker.reset_load();
+            assert_eq!(worker.load(), 1);
+            match mode {
+                "complete" => {
+                    release.add_permits(1);
+                    task.await.unwrap().unwrap();
+                }
+                "timeout" => {
+                    assert_eq!(task.await.unwrap().unwrap_err().0, StatusCode::BAD_GATEWAY);
+                }
+                _ => {
+                    task.abort();
+                    assert!(task.await.unwrap_err().is_cancelled());
+                }
+            }
+            assert_eq!(worker.load(), 0, "{mode}");
+            assert_eq!(worker.processed_requests(), usize::from(mode != "drop"));
+            assert_eq!(
+                worker.circuit_breaker().total_successes(),
+                u64::from(mode == "complete")
+            );
+            assert_eq!(
+                worker.circuit_breaker().total_failures(),
+                u64::from(mode == "timeout")
+            );
+            worker.reset_load();
+            assert_eq!(worker.load(), 0);
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_batch_still_joins_sibling_and_releases_each_load() {
+        use std::time::Duration;
+        use tokio::sync::{Notify, Semaphore};
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Semaphore::new(0));
+        let (notice, gate) = (entered.clone(), release.clone());
+        let app = Router::new()
+            .route(
+                "/e0/v1/chat/completions",
+                post(|| async { StatusCode::SERVICE_UNAVAILABLE }),
+            )
+            .route(
+                "/e1/v1/chat/completions",
+                post(move || {
+                    let (notice, gate) = (notice.clone(), gate.clone());
+                    async move {
+                        notice.notify_one();
+                        let _permit = gate.acquire().await.unwrap();
+                        Json(json!({}))
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let stage = Arc::new(test_stage(EpdConfig {
+            encoder_urls: vec![format!("{base}/e0"), format!("{base}/e1")],
+            encode_policy: None,
+            consumer_zmq_addrs: Default::default(),
+        }));
+        let workers = stage.worker_registry.get_by_type(&WorkerType::Encode);
+        let task_stage = stage.clone();
+        let task = tokio::spawn(async move {
+            task_stage
+                .prepare(&Client::new(), request(), "pd", None, None)
+                .await
+                .map(|(body, _)| body)
+        });
+        tokio::time::timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .unwrap();
+        assert!(!task.is_finished());
+        assert_eq!(workers[1].load(), 1);
+        release.add_permits(1);
+        assert_eq!(
+            task.await.unwrap().unwrap_err().0,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        for worker in workers {
+            assert_eq!(worker.load(), 0);
+            assert_eq!(worker.processed_requests(), 1);
+        }
+        server.abort();
     }
 
     #[tokio::test]
@@ -685,8 +1137,9 @@ mod tests {
         };
         let (url0, seen0, server0) = spawn().await;
         let (url1, seen1, server1) = spawn().await;
-        let stage = EncoderStage::new(EpdConfig {
+        let stage = test_stage(EpdConfig {
             encoder_urls: vec![url0, url1],
+            encode_policy: None,
             consumer_zmq_addrs: Default::default(),
         });
         let input = json!({
@@ -809,6 +1262,55 @@ mod tests {
         assert_eq!(handle["metadata"], json!({}));
         assert_eq!(handle["peer_port"], 4321);
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn missing_report_and_missing_entry_keep_raw_media_with_uuid() {
+        for mode in ["no_report", "missing_entry"] {
+            let (stage, seen, server) = mock(mode).await;
+            let input = request();
+            let (body, pending) = stage
+                .prepare(&Client::new(), input.clone(), "pd", None, None)
+                .await
+                .unwrap();
+            assert!(pending.is_none());
+
+            let encoded = seen.lock().unwrap();
+            let uuid = encoded[0]["messages"][0]["content"][0]["uuid"]
+                .as_str()
+                .unwrap();
+            for index in [0, 2] {
+                let mut expected = input["messages"][0]["content"][index].clone();
+                expected["uuid"] = json!(uuid);
+                assert_eq!(body["messages"][0]["content"][index], expected);
+            }
+            assert_eq!(
+                body["messages"][0]["content"][1],
+                input["messages"][0]["content"][1]
+            );
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_encoder_item_indices_are_rejected() {
+        for mode in [
+            "bad_indices_type",
+            "bad_index_fractional",
+            "bad_index_out_of_range",
+            "duplicate_index",
+        ] {
+            let (stage, _, server) = mock(mode).await;
+            let mut input = request();
+            input["messages"][0]["content"] = json!([input["messages"][0]["content"][0].clone()]);
+            let error = stage
+                .prepare(&Client::new(), input, "pd", None, None)
+                .await
+                .err()
+                .unwrap();
+            assert_eq!(error.0, StatusCode::BAD_GATEWAY, "mode: {mode}");
+            server.abort();
+        }
     }
 
     #[tokio::test]

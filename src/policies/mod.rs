@@ -61,6 +61,17 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
         headers: Option<&RequestHeaders>,
     ) -> Option<usize>;
 
+    /// Assign a request's Encode media items without emitting consumer metrics.
+    /// Only policies with defined Encode batching semantics support this method.
+    /// Returned indices refer to the supplied pool; None means no assignment.
+    fn select_encode_batch(
+        &self,
+        _workers: &[Arc<dyn Worker>],
+        _item_count: usize,
+    ) -> Option<Vec<usize>> {
+        None
+    }
+
     /// Select a pair of workers (prefill and decode) for PD routing
     ///
     /// Returns indices of (prefill_worker, decode_worker) from their respective arrays.

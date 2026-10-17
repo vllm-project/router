@@ -48,6 +48,10 @@ pub struct RouterManager {
     /// Policy registry for managing model-to-policy mappings
     policy_registry: Arc<crate::policies::PolicyRegistry>,
 
+    /// Keep management API topology changes and policy notifications in order.
+    /// Never held during backend discovery or across an await.
+    worker_mutation: parking_lot::Mutex<()>,
+
     /// All routers managed by this manager
     /// RouterId examples: "http-regular", "http-pd"
     routers: Arc<DashMap<RouterId, Arc<dyn RouterTrait>>>,
@@ -74,6 +78,7 @@ impl RouterManager {
         Self {
             worker_registry,
             policy_registry,
+            worker_mutation: parking_lot::Mutex::new(()),
             routers: Arc::new(DashMap::new()),
             default_router: Arc::new(std::sync::RwLock::new(None)),
             client,
@@ -108,7 +113,7 @@ impl RouterManager {
     /// Get router for a specific model based on worker types
     pub fn get_router_for_model(&self, model_id: &str) -> Option<Arc<dyn RouterTrait>> {
         // Query workers for this model from registry
-        let workers = self.worker_registry.get_by_model(model_id);
+        let workers = self.worker_registry.get_consumer_workers(Some(model_id));
 
         if !workers.is_empty() {
             // Determine router based on worker types
@@ -142,11 +147,7 @@ impl RouterManager {
 
     /// Get workers for routing decision
     pub fn get_workers_for_request(&self, model_id: Option<&str>) -> Vec<Arc<dyn Worker>> {
-        if let Some(model) = model_id {
-            self.worker_registry.get_by_model(model)
-        } else {
-            self.worker_registry.get_all()
-        }
+        self.worker_registry.get_consumer_workers(model_id)
     }
 
     /// Add a worker to the registry
@@ -209,14 +210,29 @@ impl RouterManager {
             ),
         };
 
-        // Register worker
+        // Serialize the registry update and its policy notification. Discovery
+        // above can await, but this critical section only updates local state.
+        let _mutation = self.worker_mutation.lock();
         let worker_arc: Arc<dyn Worker> = Arc::from(worker);
-        let worker_id = self.worker_registry.register(worker_arc.clone());
+        let registration = self
+            .worker_registry
+            .register_with_previous(worker_arc.clone());
+        let worker_id = registration.worker_id;
 
         // Notify PolicyRegistry about the new worker
         // Extract policy hint from labels if provided
         let policy_hint = labels.get("policy").map(|s| s.as_str());
-        let policy = self.policy_registry.on_worker_added(&model_id, policy_hint);
+        let policy = match registration.previous {
+            Some(previous) if previous.model_id() == model_id => {
+                self.policy_registry.get_policy_or_default(&model_id)
+            }
+            previous => {
+                if let Some(previous) = previous {
+                    self.policy_registry.on_worker_removed(previous.model_id());
+                }
+                self.policy_registry.on_worker_added(&model_id, policy_hint)
+            }
+        };
 
         // Log which type of router would handle this worker (for debugging)
         let expected_router = match config.worker_type.as_deref() {
@@ -252,21 +268,15 @@ impl RouterManager {
         &self,
         url: &str,
     ) -> Result<WorkerApiResponse, WorkerErrorResponse> {
-        // Get worker to extract model_id before removing
-        let model_id = self
-            .worker_registry
-            .get_by_url(url)
-            .map(|worker| worker.model_id().to_string());
-
-        if let Some(_worker) = self.worker_registry.remove_by_url(url) {
-            // Notify PolicyRegistry about worker removal
-            if let Some(ref model_id) = model_id {
-                self.policy_registry.on_worker_removed(model_id);
-
-                info!("Removed worker with URL {} for model {}", url, model_id);
-            } else {
-                info!("Removed worker with URL {}", url);
-            }
+        let _mutation = self.worker_mutation.lock();
+        if let Some(worker) = self.worker_registry.remove_by_url(url) {
+            // Notify for the object actually removed, not an earlier lookup.
+            self.policy_registry.on_worker_removed(worker.model_id());
+            info!(
+                "Removed worker with URL {} for model {}",
+                url,
+                worker.model_id()
+            );
 
             Ok(WorkerApiResponse {
                 success: true,
@@ -304,6 +314,7 @@ impl RouterManager {
                 regular: registry_stats.regular_workers,
                 prefill: registry_stats.prefill_workers,
                 decode: registry_stats.decode_workers,
+                encode: registry_stats.encode_workers,
             },
         };
 
@@ -354,6 +365,7 @@ impl RouterManager {
                 WorkerType::Regular => "regular".to_string(),
                 WorkerType::Prefill { .. } => "prefill".to_string(),
                 WorkerType::Decode => "decode".to_string(),
+                WorkerType::Encode => "encode".to_string(),
             },
             is_healthy: worker.is_healthy(),
             load: worker.load(),
@@ -521,7 +533,14 @@ impl RouterTrait for RouterManager {
     /// Get available models - query from worker registry
     async fn get_models(&self, _req: Request<Body>) -> Response {
         // Get models from worker registry
-        let models = self.worker_registry.get_models();
+        let mut models: Vec<String> = self
+            .worker_registry
+            .get_consumer_workers(None)
+            .iter()
+            .map(|worker| worker.model_id().to_string())
+            .collect();
+        models.sort();
+        models.dedup();
 
         if models.is_empty() {
             (StatusCode::SERVICE_UNAVAILABLE, "No models available").into_response()
@@ -792,9 +811,18 @@ impl RouterTrait for RouterManager {
     fn readiness(&self) -> Response {
         if self.routers.is_empty() {
             (StatusCode::SERVICE_UNAVAILABLE, "No routers configured").into_response()
-        } else {
-            // TODO: Check readiness of all routers
+        } else if self
+            .routers
+            .iter()
+            .any(|router| router.readiness().status().is_success())
+        {
             (StatusCode::OK, "Ready").into_response()
+        } else {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "No router has healthy consumers",
+            )
+                .into_response()
         }
     }
 
@@ -832,5 +860,102 @@ impl std::fmt::Debug for RouterManager {
             .field("workers_count", &self.worker_registry.get_all().len())
             .field("default_router", &*self.default_router.read().unwrap())
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn inference_models_and_readiness_ignore_encode_only_workers() {
+        let config = RouterConfig::default();
+        let context = Arc::new(
+            crate::server::AppContext::new(
+                config.clone(),
+                reqwest::Client::new(),
+                64,
+                None,
+                vec![],
+            )
+            .unwrap(),
+        );
+        context.worker_registry.register(Arc::new(
+            crate::core::BasicWorker::new("http://encoder:8000".into(), WorkerType::Encode)
+                .with_labels(std::collections::HashMap::from([(
+                    "model_id".into(),
+                    "encode-only".into(),
+                )])),
+        ));
+        let manager = RouterManager::new(
+            config,
+            context.client.clone(),
+            context.worker_registry.clone(),
+            context.policy_registry.clone(),
+        );
+        let router = crate::routers::RouterFactory::create_regular_router(&[], &context)
+            .await
+            .unwrap();
+        manager.register_router(RouterId::new("http-regular".into()), Arc::from(router));
+        assert!(manager.get_workers_for_request(None).is_empty());
+        assert!(manager
+            .get_workers_for_request(Some("encode-only"))
+            .is_empty());
+        assert_eq!(
+            manager
+                .get_models(Request::new(Body::empty()))
+                .await
+                .status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            manager.readiness().status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        context.worker_registry.register(Arc::new(
+            crate::core::BasicWorker::new("http://consumer:8000".into(), WorkerType::Regular)
+                .with_labels(std::collections::HashMap::from([(
+                    "model_id".into(),
+                    "inference".into(),
+                )])),
+        ));
+        assert_eq!(manager.readiness().status(), StatusCode::OK);
+        let response = manager.get_models(Request::new(Body::empty())).await;
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let models: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(models["models"], serde_json::json!(["inference"]));
+        assert_eq!(manager.list_workers().total, 2);
+    }
+
+    #[test]
+    fn list_workers_reports_encode_role_and_count() {
+        let registry = Arc::new(WorkerRegistry::new());
+        registry.register(Arc::from(WorkerFactory::create_encode(
+            "http://encoder:8080".to_string(),
+        )));
+        registry.register(Arc::from(WorkerFactory::create_regular(
+            "http://consumer:8080".to_string(),
+        )));
+        let config = RouterConfig::default();
+        let manager = RouterManager::new(
+            config.clone(),
+            reqwest::Client::new(),
+            registry,
+            Arc::new(crate::policies::PolicyRegistry::new(config.policy)),
+        );
+        let response = serde_json::to_value(manager.list_workers()).unwrap();
+        assert_eq!(response["stats"]["by_type"]["encode"], 1);
+        assert_eq!(response["stats"]["by_type"]["regular"], 1);
+        assert_eq!(response["total"], 2);
+        let encoder = response["workers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|worker| worker["url"] == "http://encoder:8080")
+            .unwrap();
+        assert_eq!(encoder["worker_type"], "encode");
+        assert_eq!(encoder["connection_mode"], "Http");
     }
 }

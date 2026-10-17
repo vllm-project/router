@@ -23,4 +23,4 @@ pub use worker::{
     start_health_checker, BasicWorker, ConnectionMode, DPAwareWorker, HealthChecker, HealthConfig,
     Worker, WorkerCollection, WorkerFactory, WorkerLoadGuard, WorkerType,
 };
-pub use worker_registry::{WorkerId, WorkerRegistry, WorkerRegistryStats};
+pub use worker_registry::{WorkerId, WorkerRegistration, WorkerRegistry, WorkerRegistryStats};
