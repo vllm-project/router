@@ -313,6 +313,13 @@ const PROGRAM_MODEL_POOL_FALLBACK: &str = "program:fallback:unlabeled";
 const PROGRAM_MODEL_POOL_NAMED_PREFIX: &str = "program:model:";
 const UNLABELED_WORKER_MODEL_ID: &str = "unknown";
 
+fn is_consumer_worker_type(worker_type: &WorkerType) -> bool {
+    matches!(
+        worker_type,
+        WorkerType::Regular | WorkerType::Prefill { .. } | WorkerType::Decode
+    )
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ResolvedProgramModelPool {
     scheduler_key: String,
@@ -2403,12 +2410,15 @@ impl Router {
 
                     if let Some(removed) = self.worker_registry.remove_by_url(&removed_url) {
                         let model_id = removed.model_id().to_string();
+                        let is_consumer = is_consumer_worker_type(&removed.worker_type());
                         self.frontend.remove_worker(&removed_url);
                         info!("Removed worker: {}", removed_url);
                         removed_workers.push(removed_url);
 
-                        // Notify PolicyRegistry about the removed worker
-                        self.policy_registry.on_worker_removed(&model_id);
+                        // PolicyRegistry tracks consumer workers, not Encode workers.
+                        if is_consumer {
+                            self.policy_registry.on_worker_removed(&model_id);
+                        }
                     } else {
                         warn!("Worker {} not found, skipping removal", w.url());
                     }
@@ -2439,11 +2449,14 @@ impl Router {
         } else {
             if let Some(removed) = self.worker_registry.remove_by_url(worker_url) {
                 let model_id = removed.model_id().to_string();
+                let is_consumer = is_consumer_worker_type(&removed.worker_type());
                 self.frontend.remove_worker(worker_url);
                 info!("Removed worker: {}", worker_url);
 
-                // Notify PolicyRegistry about the removed worker
-                self.policy_registry.on_worker_removed(&model_id);
+                // PolicyRegistry tracks consumer workers, not Encode workers.
+                if is_consumer {
+                    self.policy_registry.on_worker_removed(&model_id);
+                }
 
                 RouterMetrics::set_active_workers(self.worker_registry.get_regular_workers(None).len());
                 self.remove_kv_worker(worker_url, &[worker_url.to_string()]);
@@ -5395,6 +5408,46 @@ mod tests {
             program_targets_cache: Mutex::new(HashMap::new()),
             program_token_estimator: Arc::new(MomentumTokenEstimator::default()),
         }
+    }
+
+    #[test]
+    fn management_removal_of_encode_does_not_change_consumer_policy_lifecycle() {
+        let router = create_test_regular_router();
+        let consumer_url = "http://consumer:8000";
+        let encoder_url = "http://encoder:8000";
+
+        let consumer: Arc<dyn Worker> =
+            Arc::new(BasicWorker::new(consumer_url.into(), WorkerType::Regular));
+        let encoder: Arc<dyn Worker> =
+            Arc::new(BasicWorker::new(encoder_url.into(), WorkerType::Encode));
+
+        router.worker_registry.register(consumer.clone());
+        router.worker_registry.register(encoder);
+        router
+            .policy_registry
+            .on_worker_added(consumer.model_id(), None);
+
+        assert_eq!(
+            router.policy_registry.get_worker_counts().get("unknown"),
+            Some(&1)
+        );
+        assert!(router.policy_registry.get_policy("unknown").is_some());
+
+        WorkerManagement::remove_worker(&router, encoder_url);
+
+        assert!(router.worker_registry.get_by_url(encoder_url).is_none());
+        assert!(router.worker_registry.get_by_url(consumer_url).is_some());
+        assert_eq!(
+            router.policy_registry.get_worker_counts().get("unknown"),
+            Some(&1)
+        );
+        assert!(router.policy_registry.get_policy("unknown").is_some());
+
+        WorkerManagement::remove_worker(&router, consumer_url);
+
+        assert!(router.worker_registry.get_by_url(consumer_url).is_none());
+        assert!(router.policy_registry.get_worker_counts().is_empty());
+        assert!(router.policy_registry.get_policy("unknown").is_none());
     }
 
     #[tokio::test]
