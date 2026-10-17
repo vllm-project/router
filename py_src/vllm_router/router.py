@@ -26,6 +26,8 @@ class Router:
     Args:
         worker_urls: List of URLs for worker nodes that will handle requests. Each URL should include
             the protocol, host, and port (e.g., ['http://worker1:8000', 'http://worker2:8000'])
+        extra_generate_paths: Additional HTTP paths that use the inference-generate request schema.
+            Requests on these paths use typed routing, retries, circuit breaking, and load tracking.
         policy: Load balancing policy to use. Options:
             - PolicyType.Random: Randomly select workers
             - PolicyType.RoundRobin: Distribute requests in round-robin fashion

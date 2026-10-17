@@ -10,7 +10,7 @@ use axum::{
     http::{header::CONTENT_TYPE, StatusCode},
 };
 use common::mock_worker::{self, HealthStatus, MockWorker, MockWorkerConfig, WorkerType};
-use common::test_app::create_test_app_with_wasm;
+use common::test_app::create_test_app_with_wasm_and_generate_paths;
 use http_body_util::BodyExt;
 use reqwest::Client;
 use serde_json::json;
@@ -81,12 +81,13 @@ async fn wasm_middleware_modify_reject_and_path_isolation() {
         .expect("create router");
     tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
 
-    let app = create_test_app_with_wasm(
+    let app = create_test_app_with_wasm_and_generate_paths(
         Arc::from(router),
         Client::new(),
         &config,
         false,
         Some(wasm_runtime),
+        &["/custom/v1/generate".to_string()],
     );
 
     // Modify: chat should forward with the example header.
@@ -151,6 +152,7 @@ async fn wasm_middleware_modify_reject_and_path_isolation() {
     // Path isolation: completions is not attached by default.
     mock_worker::clear_captured_requests(worker_port);
     let completions = app
+        .clone()
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -179,6 +181,55 @@ async fn wasm_middleware_modify_reject_and_path_isolation() {
         header_values(completion_req, "x-wasm-middleware").is_none(),
         "default WASM attach point must not modify /v1/completions"
     );
+
+    // Extra generate routes retain typed forwarding alongside the WASM layer.
+    mock_worker::clear_captured_requests(worker_port);
+    let generate = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/custom/v1/generate")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "token_ids": [1, 2, 3],
+                        "sampling_params": {"max_tokens": 4},
+                        "custom_request_field": "__wasm_reject__"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(generate.status(), StatusCode::OK);
+    let generate_body = generate.into_body().collect().await.unwrap().to_bytes();
+    let generate_body: serde_json::Value = serde_json::from_slice(&generate_body).unwrap();
+    assert_eq!(generate_body["choices"][0]["token_ids"], json!([1, 2, 3]));
+    assert_eq!(generate_body["custom_request_field"], "__wasm_reject__");
+
+    let captured = mock_worker::get_captured_requests(worker_port);
+    let generate_req = captured
+        .iter()
+        .find(|r| r.path == "/custom/v1/generate")
+        .expect("mock worker should receive extra generate request");
+    assert!(header_values(generate_req, "x-wasm-middleware").is_none());
+
+    mock_worker::clear_captured_requests(worker_port);
+    let invalid_generate = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/custom/v1/generate")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"note":"missing token_ids"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(invalid_generate.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(mock_worker::get_captured_requests(worker_port).is_empty());
 
     worker.stop().await;
 }
