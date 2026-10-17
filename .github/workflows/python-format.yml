@@ -11,9 +11,11 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
+      - name: Check CLI reference
+        run: python scripts/check_cli_reference.py
       - name: Install black and ruff
         run: pip install black ruff==0.16.0
       - name: black
-        run: python -m black --check py_src/ py_test/
+        run: python -m black --check py_src/ py_test/ scripts/check_cli_reference.py
       - name: ruff
-        run: python -m ruff check py_src/ py_test/
+        run: python -m ruff check py_src/ py_test/ scripts/check_cli_reference.py
