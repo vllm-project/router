@@ -1,4 +1,5 @@
 import concurrent.futures
+import time
 
 import pytest
 import requests
@@ -89,6 +90,54 @@ def test_rate_limit_queue_and_timeout(router_manager, mock_workers):
     assert any(code == 408 for code in results), results
     non200 = [c for c in results if c != 200]
     assert len(non200) >= 2 and all(c in (408, 429) for c in non200), results
+
+
+@pytest.mark.integration
+def test_rate_limit_slot_held_for_streaming_response(router_manager, mock_workers):
+    """A streaming request must keep its concurrency slot until the stream ends.
+
+    The router hands back the response as soon as the upstream head arrives and
+    forwards the SSE body from a spawned task, so a slot released at that point
+    bounds time-to-first-token instead of the number of concurrent generations.
+
+    Wait beyond the rate bucket's one-second refill interval. The concurrency
+    slot must stay occupied while the worker streams for approximately six seconds.
+    """
+    _, urls, _ = mock_workers(n=1, args=["--stream", "--latency-ms", "3000"])
+    rh = router_manager.start_router(
+        worker_urls=urls,
+        policy="round_robin",
+        extra={
+            "max_concurrent_requests": 1,
+            "queue_size": 0,  # no queue -> immediate 429 while the slot is taken
+            "rate_limit_tokens_per_second": 1,
+        },
+    )
+
+    def post(prompt, stream):
+        r = requests.post(
+            f"{rh.url}/v1/chat/completions",
+            json={
+                "model": "test-model",
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": 4,
+                "stream": stream,
+            },
+            timeout=30,
+            stream=stream,
+        )
+        if stream and r.status_code == 200:
+            for _ in r.iter_lines():  # drain, so the slot is held until [DONE]
+                pass
+        return r.status_code
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
+        streaming = ex.submit(post, "long", True)
+        time.sleep(1.4)  # The rate bucket has refilled, but the stream is still active.
+        second = ex.submit(post, "short", False).result()
+
+    assert streaming.result() == 200
+    assert second == 429, f"slot was released mid-stream, got {second}"
 
 
 @pytest.mark.integration
