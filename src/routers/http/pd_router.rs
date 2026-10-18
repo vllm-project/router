@@ -1022,6 +1022,29 @@ impl PdRouterBase {
         }
     }
 
+    /// Only consumer roles were counted on registration. Use the actual
+    /// removed object for both policy accounting and cache-aware cleanup.
+    fn notify_consumer_removed(&self, removed: &dyn Worker) {
+        if !removed.worker_type().is_consumer() {
+            return;
+        }
+        if matches!(removed.worker_type(), WorkerType::Decode) {
+            if let Some(kv) = kv_aware_ops(self.policy_registry.get_decode_policy().as_ref()) {
+                kv.unregister_worker(removed.url());
+            }
+        }
+        let model_id = removed.model_id();
+        self.policy_registry.on_worker_removed(model_id);
+        if let Some(policy) = self.policy_registry.get_policy(model_id) {
+            if let Some(cache_aware) = policy
+                .as_any()
+                .downcast_ref::<crate::policies::CacheAwarePolicy>()
+            {
+                cache_aware.remove_worker_by_url(removed.url());
+            }
+        }
+    }
+
     pub async fn remove_prefill_server(&self, url: &str) -> Result<String, PDRouterError> {
         // A bare URL that is not registered as-is was expanded per DP rank.
         if !url.contains('@') && self.worker_registry.get_by_url(url).is_none() {
@@ -1030,18 +1053,7 @@ impl PdRouterBase {
 
         // Exact URL match (with @rank or dp_size==1)
         if let Some(removed) = self.worker_registry.remove_by_url(url) {
-            let model_id = removed.model_id().to_string();
-            self.policy_registry.on_worker_removed(&model_id);
-            if let Some(policy) = self.policy_registry.get_policy(&model_id) {
-                if policy.name() == "cache_aware" {
-                    if let Some(cache_aware) = policy
-                        .as_any()
-                        .downcast_ref::<crate::policies::CacheAwarePolicy>()
-                    {
-                        cache_aware.remove_worker_by_url(url);
-                    }
-                }
-            }
+            self.notify_consumer_removed(removed.as_ref());
             info!("Removed prefill server: {}", url);
             Ok(format!("Successfully removed prefill server: {}", url))
         } else {
@@ -1057,24 +1069,7 @@ impl PdRouterBase {
         }
 
         if let Some(removed) = self.worker_registry.remove_by_url(url) {
-            let model_id = removed.model_id().to_string();
-            if let Some(kv) = kv_aware_ops(self.policy_registry.get_decode_policy().as_ref()) {
-                kv.unregister_worker(url);
-            }
-            // Notify PolicyRegistry about the removed worker
-            self.policy_registry.on_worker_removed(&model_id);
-
-            // Get the policy for this model to update cache-aware if needed
-            if let Some(policy) = self.policy_registry.get_policy(&model_id) {
-                if policy.name() == "cache_aware" {
-                    if let Some(cache_aware) = policy
-                        .as_any()
-                        .downcast_ref::<crate::policies::CacheAwarePolicy>()
-                    {
-                        cache_aware.remove_worker_by_url(url);
-                    }
-                }
-            }
+            self.notify_consumer_removed(removed.as_ref());
             info!("Removed decode server: {}", url);
             Ok(format!("Successfully removed decode server: {}", url))
         } else {
@@ -1094,25 +1089,7 @@ impl PdRouterBase {
         for w in all_workers.iter() {
             if w.url().starts_with(&prefix) {
                 if let Some(removed) = self.worker_registry.remove_by_url(w.url()) {
-                    let model_id = removed.model_id().to_string();
-                    if role == "decode" {
-                        if let Some(kv) =
-                            kv_aware_ops(self.policy_registry.get_decode_policy().as_ref())
-                        {
-                            kv.unregister_worker(w.url());
-                        }
-                    }
-                    self.policy_registry.on_worker_removed(&model_id);
-                    if let Some(policy) = self.policy_registry.get_policy(&model_id) {
-                        if policy.name() == "cache_aware" {
-                            if let Some(cache_aware) = policy
-                                .as_any()
-                                .downcast_ref::<crate::policies::CacheAwarePolicy>(
-                            ) {
-                                cache_aware.remove_worker_by_url(w.url());
-                            }
-                        }
-                    }
+                    self.notify_consumer_removed(removed.as_ref());
                     removed_count += 1;
                 }
             }
@@ -1893,6 +1870,101 @@ mod tests {
     }
 
     // ============= Worker Management Tests =============
+
+    async fn check_role_specific_encode_removal(remove_prefill: bool) {
+        // These direct public-method calls do not enable EPD discovery support.
+        let router = create_test_pd_router();
+        let consumer: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+            "http://consumer:8000".into(),
+            WorkerType::Decode,
+        ));
+        router.register_and_notify(consumer);
+        let policy = router.policy_registry.get_policy("unknown").unwrap();
+        router
+            .worker_registry
+            .register(Arc::from(WorkerFactory::create_encode(
+                "http://encoder:8000".into(),
+            )));
+
+        if remove_prefill {
+            router
+                .remove_prefill_server("http://encoder:8000")
+                .await
+                .unwrap();
+        } else {
+            router
+                .remove_decode_server("http://encoder:8000")
+                .await
+                .unwrap();
+        }
+        assert!(router
+            .worker_registry
+            .get_by_url("http://encoder:8000")
+            .is_none());
+        assert!(router
+            .worker_registry
+            .get_by_url("http://consumer:8000")
+            .is_some());
+        assert_eq!(
+            router.policy_registry.get_worker_counts().get("unknown"),
+            Some(&1)
+        );
+        assert!(Arc::ptr_eq(
+            &policy,
+            &router.policy_registry.get_policy("unknown").unwrap()
+        ));
+
+        router
+            .remove_decode_server("http://consumer:8000")
+            .await
+            .unwrap();
+        assert!(router.policy_registry.get_worker_counts().is_empty());
+        assert!(router.policy_registry.get_policy("unknown").is_none());
+    }
+
+    #[tokio::test]
+    async fn prefill_encode_removal_preserves_consumer_policy() {
+        check_role_specific_encode_removal(true).await;
+    }
+
+    #[tokio::test]
+    async fn decode_encode_removal_preserves_consumer_policy() {
+        check_role_specific_encode_removal(false).await;
+    }
+
+    #[test]
+    fn dp_removal_counts_consumers_and_preserves_encoder() {
+        let router = create_test_pd_router_with_dp(2);
+        for rank in 0..2 {
+            router.register_and_notify(Arc::new(DPAwareWorker::new(
+                "http://prefill:8000".into(),
+                rank,
+                2,
+                WorkerType::Prefill {
+                    bootstrap_port: None,
+                },
+            )));
+        }
+        router
+            .worker_registry
+            .register(Arc::from(WorkerFactory::create_encode(
+                "http://encoder:8000".into(),
+            )));
+        assert_eq!(
+            router.policy_registry.get_worker_counts().get("unknown"),
+            Some(&2)
+        );
+        router
+            .remove_dp_expanded_workers("http://prefill:8000", "prefill")
+            .unwrap();
+        assert!(router.worker_registry.get_pd_workers().is_empty());
+        assert!(router
+            .worker_registry
+            .get_by_url("http://encoder:8000")
+            .is_some());
+        assert!(router.policy_registry.get_worker_counts().is_empty());
+        assert!(router.policy_registry.get_policy("unknown").is_none());
+    }
 
     #[tokio::test]
     async fn test_add_prefill_server_already_exists() {

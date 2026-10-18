@@ -333,12 +333,7 @@ impl WorkerRegistry {
     pub fn get_consumer_workers(&self, model_id: Option<&str>) -> Vec<Arc<dyn Worker>> {
         self.get_workers_filtered(model_id, None, None, false)
             .into_iter()
-            .filter(|worker| {
-                matches!(
-                    worker.worker_type(),
-                    WorkerType::Regular | WorkerType::Prefill { .. } | WorkerType::Decode
-                )
-            })
+            .filter(|worker| worker.worker_type().is_consumer())
             .collect()
     }
 

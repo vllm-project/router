@@ -235,6 +235,13 @@ pub enum WorkerType {
     Encode,
 }
 
+impl WorkerType {
+    /// Whether this role participates in inference consumer policy lifecycle.
+    pub fn is_consumer(&self) -> bool {
+        matches!(self, Self::Regular | Self::Prefill { .. } | Self::Decode)
+    }
+}
+
 impl fmt::Display for WorkerType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

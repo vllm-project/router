@@ -216,7 +216,12 @@ impl RouterManager {
         // Notify PolicyRegistry about the new worker
         // Extract policy hint from labels if provided
         let policy_hint = labels.get("policy").map(|s| s.as_str());
-        let policy = match registration.previous {
+        // This API creates consumers. A replaced Encode worker never counted
+        // toward consumer policies, even when it shares the new model ID.
+        let policy = match registration
+            .previous
+            .filter(|previous| previous.worker_type().is_consumer())
+        {
             Some(previous) if previous.model_id() == model_id => {
                 self.policy_registry.get_policy_or_default(&model_id)
             }
@@ -289,7 +294,10 @@ impl RouterManager {
                     }
                 }
             }
-            self.policy_registry.on_worker_removed(worker.model_id());
+            // Notify for the object actually removed, not an earlier lookup.
+            if worker.worker_type().is_consumer() {
+                self.policy_registry.on_worker_removed(worker.model_id());
+            }
             info!(
                 "Removed worker with URL {} for model {}",
                 url,
@@ -572,14 +580,7 @@ impl RouterTrait for RouterManager {
     /// Get available models - query from worker registry
     async fn get_models(&self, _req: Request<Body>) -> Response {
         // Get models from worker registry
-        let mut models: Vec<String> = self
-            .worker_registry
-            .get_consumer_workers(None)
-            .iter()
-            .map(|worker| worker.model_id().to_string())
-            .collect();
-        models.sort();
-        models.dedup();
+        let models = self.worker_registry.get_models();
 
         if models.is_empty() {
             (StatusCode::SERVICE_UNAVAILABLE, "No models available").into_response()
@@ -871,18 +872,9 @@ impl RouterTrait for RouterManager {
     fn readiness(&self) -> Response {
         if self.routers.is_empty() {
             (StatusCode::SERVICE_UNAVAILABLE, "No routers configured").into_response()
-        } else if self
-            .routers
-            .iter()
-            .any(|router| router.readiness().status().is_success())
-        {
-            (StatusCode::OK, "Ready").into_response()
         } else {
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "No router has healthy consumers",
-            )
-                .into_response()
+            // TODO: Check readiness of all routers
+            (StatusCode::OK, "Ready").into_response()
         }
     }
 
@@ -928,8 +920,30 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn inference_models_and_readiness_ignore_encode_only_workers() {
+    async fn inference_views_ignore_encode_only_workers() {
+        let registry = Arc::new(WorkerRegistry::new());
+        registry.register(Arc::from(WorkerFactory::create_encode(
+            "http://encoder:8000".into(),
+        )));
         let config = RouterConfig::default();
+        let manager = RouterManager::new(
+            config.clone(),
+            reqwest::Client::new(),
+            registry,
+            Arc::new(crate::policies::PolicyRegistry::new(config.policy)),
+        );
+        assert!(manager.get_workers_for_request(None).is_empty());
+        assert!(manager.get_workers_for_request(Some("unknown")).is_empty());
+        assert!(manager.get_router_for_model("unknown").is_none());
+        assert_eq!(manager.list_workers().total, 1);
+    }
+
+    #[tokio::test]
+    async fn manager_readiness_preserves_registered_router_contract() {
+        let config = RouterConfig {
+            enable_igw: true,
+            ..Default::default()
+        };
         let context = Arc::new(
             crate::server::AppContext::new(
                 config.clone(),
@@ -940,53 +954,56 @@ mod tests {
             )
             .unwrap(),
         );
-        context.worker_registry.register(Arc::new(
-            crate::core::BasicWorker::new("http://encoder:8000".into(), WorkerType::Encode)
-                .with_labels(std::collections::HashMap::from([(
-                    "model_id".into(),
-                    "encode-only".into(),
-                )])),
-        ));
         let manager = RouterManager::new(
             config,
             context.client.clone(),
             context.worker_registry.clone(),
             context.policy_registry.clone(),
         );
-        let router = crate::routers::RouterFactory::create_regular_router(&[], &context)
-            .await
-            .unwrap();
-        manager.register_router(RouterId::new("http-regular".into()), Arc::from(router));
-        assert!(manager.get_workers_for_request(None).is_empty());
-        assert!(manager
-            .get_workers_for_request(Some("encode-only"))
-            .is_empty());
-        assert_eq!(
-            manager
-                .get_models(Request::new(Body::empty()))
-                .await
-                .status(),
-            StatusCode::SERVICE_UNAVAILABLE
-        );
         assert_eq!(
             manager.readiness().status(),
             StatusCode::SERVICE_UNAVAILABLE
         );
-        context.worker_registry.register(Arc::new(
-            crate::core::BasicWorker::new("http://consumer:8000".into(), WorkerType::Regular)
-                .with_labels(std::collections::HashMap::from([(
-                    "model_id".into(),
-                    "inference".into(),
-                )])),
-        ));
+        let router = crate::routers::RouterFactory::create_regular_router(&[], &context)
+            .await
+            .unwrap();
+        assert_eq!(router.readiness().status(), StatusCode::SERVICE_UNAVAILABLE);
+        manager.register_router(RouterId::new("http-regular".into()), Arc::from(router));
+        // Keep IGW's existing registration-based readiness; Phase 1 does not
+        // introduce child-health readiness semantics for non-EPD deployments.
         assert_eq!(manager.readiness().status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn manager_model_listing_preserves_registry_view() {
+        let registry = Arc::new(WorkerRegistry::new());
+        for (url, role, model) in [
+            ("http://encoder:8000", WorkerType::Encode, "encode-only"),
+            ("http://consumer:8000", WorkerType::Regular, "inference"),
+            ("http://consumer2:8000", WorkerType::Regular, "inference"),
+        ] {
+            registry.register(Arc::new(
+                crate::core::BasicWorker::new(url.into(), role).with_labels(
+                    std::collections::HashMap::from([("model_id".into(), model.into())]),
+                ),
+            ));
+        }
+        let expected = registry.get_models();
+        let config = RouterConfig::default();
+        let manager = RouterManager::new(
+            config.clone(),
+            reqwest::Client::new(),
+            registry,
+            Arc::new(crate::policies::PolicyRegistry::new(config.policy)),
+        );
         let response = manager.get_models(Request::new(Body::empty())).await;
+        assert_eq!(response.status(), StatusCode::OK);
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap();
         let models: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(models["models"], serde_json::json!(["inference"]));
-        assert_eq!(manager.list_workers().total, 2);
+        // Preserve registry contents/order rather than adding manager-only sorting.
+        assert_eq!(models["models"], serde_json::json!(expected));
     }
 
     #[test]

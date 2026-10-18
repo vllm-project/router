@@ -313,13 +313,6 @@ const PROGRAM_MODEL_POOL_FALLBACK: &str = "program:fallback:unlabeled";
 const PROGRAM_MODEL_POOL_NAMED_PREFIX: &str = "program:model:";
 const UNLABELED_WORKER_MODEL_ID: &str = "unknown";
 
-fn is_consumer_worker_type(worker_type: &WorkerType) -> bool {
-    matches!(
-        worker_type,
-        WorkerType::Regular | WorkerType::Prefill { .. } | WorkerType::Decode
-    )
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ResolvedProgramModelPool {
     scheduler_key: String,
@@ -2410,7 +2403,7 @@ impl Router {
 
                     if let Some(removed) = self.worker_registry.remove_by_url(&removed_url) {
                         let model_id = removed.model_id().to_string();
-                        let is_consumer = is_consumer_worker_type(&removed.worker_type());
+                        let is_consumer = removed.worker_type().is_consumer();
                         self.frontend.remove_worker(&removed_url);
                         info!("Removed worker: {}", removed_url);
                         removed_workers.push(removed_url);
@@ -2449,7 +2442,7 @@ impl Router {
         } else {
             if let Some(removed) = self.worker_registry.remove_by_url(worker_url) {
                 let model_id = removed.model_id().to_string();
-                let is_consumer = is_consumer_worker_type(&removed.worker_type());
+                let is_consumer = removed.worker_type().is_consumer();
                 self.frontend.remove_worker(worker_url);
                 info!("Removed worker: {}", worker_url);
 

@@ -40,6 +40,91 @@ fn worker_config(model: &str) -> WorkerConfigRequest {
 }
 
 #[tokio::test]
+async fn test_manager_encode_removal_preserves_consumer_policy() {
+    use vllm_router_rs::core::{Worker, WorkerFactory};
+
+    let (manager, workers, policies) = manager_fixture();
+    manager.add_worker(worker_config("unknown")).await.unwrap();
+    let policy = policies.get_policy("unknown").unwrap();
+    let encoder: Arc<dyn Worker> =
+        Arc::from(WorkerFactory::create_encode("http://encoder:8000".into()));
+    workers.register(encoder);
+
+    manager
+        .remove_worker_from_registry("http://encoder:8000")
+        .unwrap();
+    assert!(workers.get_by_url("http://encoder:8000").is_none());
+    assert!(workers.get_by_url("http://worker:8000").is_some());
+    assert_eq!(policies.get_worker_counts().get("unknown"), Some(&1));
+    assert!(Arc::ptr_eq(
+        &policy,
+        &policies.get_policy("unknown").unwrap()
+    ));
+
+    manager
+        .remove_worker_from_registry("http://worker:8000")
+        .unwrap();
+    assert!(policies.get_worker_counts().is_empty());
+    assert!(policies.get_policy("unknown").is_none());
+}
+
+async fn check_manager_encode_replacement(replacement_model: &str) {
+    use vllm_router_rs::core::{Worker, WorkerFactory};
+
+    // Public-method contract only: EPD + IGW remains unsupported. Exercise
+    // both the same-model shortcut and the different-model replacement path.
+    let (manager, workers, policies) = manager_fixture();
+    let mut consumer = worker_config("unknown");
+    consumer.url = "http://consumer:8000".into();
+    manager.add_worker(consumer).await.unwrap();
+    let policy = policies.get_policy("unknown").unwrap();
+    let encoder: Arc<dyn Worker> =
+        Arc::from(WorkerFactory::create_encode("http://worker:8000".into()));
+    workers.register(encoder);
+
+    manager
+        .add_worker(worker_config(replacement_model))
+        .await
+        .unwrap();
+    let expected = if replacement_model == "unknown" {
+        HashMap::from([("unknown".to_string(), 2)])
+    } else {
+        HashMap::from([("unknown".to_string(), 1), ("new-model".to_string(), 1)])
+    };
+    assert_eq!(policies.get_worker_counts(), expected);
+    assert!(Arc::ptr_eq(
+        &policy,
+        &policies.get_policy("unknown").unwrap()
+    ));
+
+    manager
+        .remove_worker_from_registry("http://worker:8000")
+        .unwrap();
+    assert_eq!(
+        policies.get_worker_counts(),
+        HashMap::from([("unknown".to_string(), 1)])
+    );
+    assert!(Arc::ptr_eq(
+        &policy,
+        &policies.get_policy("unknown").unwrap()
+    ));
+    manager
+        .remove_worker_from_registry("http://consumer:8000")
+        .unwrap();
+    assert!(policies.get_worker_counts().is_empty());
+}
+
+#[tokio::test]
+async fn test_manager_encode_replacement_same_model_counts_consumer() {
+    check_manager_encode_replacement("unknown").await;
+}
+
+#[tokio::test]
+async fn test_manager_encode_replacement_different_model_preserves_old_consumers() {
+    check_manager_encode_replacement("new-model").await;
+}
+
+#[tokio::test]
 async fn test_policy_registry_with_router_manager() {
     // An explicit model bypasses server-info discovery, so no backend is needed.
     let (manager, workers, policies) = manager_fixture();
