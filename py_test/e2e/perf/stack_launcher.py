@@ -6,6 +6,8 @@ import logging
 import os
 import shutil
 import subprocess
+import sys
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -19,6 +21,23 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
+
+
+def _progress(msg: str) -> None:
+    print(f"[perf stack] {msg}", file=sys.stderr, flush=True)
+
+
+def _pipe_process_output(proc: subprocess.Popen, label: str) -> None:
+    """Avoid PIPE deadlock and surface worker/router logs under pytest -s."""
+
+    def _reader() -> None:
+        stream = proc.stdout
+        if stream is None:
+            return
+        for line in stream:
+            print(f"[{label}] {line}", end="", file=sys.stderr, flush=True)
+
+    threading.Thread(target=_reader, daemon=True).start()
 
 
 @dataclass
@@ -46,14 +65,24 @@ def _graceful_stop(proc: subprocess.Popen, timeout: float) -> None:
 def _wait_router_health(base_url: str, timeout: float) -> None:
     start = time.monotonic()
     url = base_url.rstrip("/") + "/health"
+    last_log = start
     with requests.Session() as session:
         while time.monotonic() - start < timeout:
             try:
                 r = session.get(url, timeout=5)
                 if r.status_code == 200:
+                    _progress(
+                        f"router healthy at {url} ({time.monotonic() - start:.0f}s)"
+                    )
                     return
             except requests.RequestException:
                 pass
+            now = time.monotonic()
+            if now - last_log >= 30:
+                _progress(
+                    f"waiting for {url} ({now - start:.0f}s / {timeout:.0f}s timeout)…"
+                )
+                last_log = now
             time.sleep(2)
     raise TimeoutError(f"router not healthy at {url} within {timeout}s")
 
@@ -147,7 +176,11 @@ def launch_stack(case: BackendCaseFile, model: str) -> PerfStack:
             str(gp),
             *cli,
         ]
+        _progress(
+            f"starting vllm-rs worker (model load may take 10–30+ min): {' '.join(worker_cmd)}"
+        )
         worker_proc = _popen(worker_cmd)
+        _pipe_process_output(worker_proc, "vllm-rs")
         time.sleep(sleep_s)
         worker_url = f"grpc://{host}:{gp}"
     elif backend == "rust_http":
@@ -161,7 +194,9 @@ def launch_stack(case: BackendCaseFile, model: str) -> PerfStack:
             str(wp),
             *cli,
         ]
+        _progress(f"starting rust-http worker: {' '.join(worker_cmd)}")
         worker_proc = _popen(worker_cmd, env={"VLLM_USE_RUST_FRONTEND": "1"})
+        _pipe_process_output(worker_proc, "vllm-rust-http")
         time.sleep(sleep_s)
         worker_url = f"http://{host}:{wp}"
     elif backend == "python_http":
@@ -175,7 +210,9 @@ def launch_stack(case: BackendCaseFile, model: str) -> PerfStack:
             str(wp),
             *cli,
         ]
+        _progress(f"starting python-http worker: {' '.join(worker_cmd)}")
         worker_proc = _popen(worker_cmd, env={"VLLM_USE_RUST_FRONTEND": "0"})
+        _pipe_process_output(worker_proc, "vllm-python-http")
         time.sleep(sleep_s)
         worker_url = f"http://{host}:{wp}"
     else:
@@ -199,7 +236,9 @@ def launch_stack(case: BackendCaseFile, model: str) -> PerfStack:
     if case.stack.prometheus_port is not None:
         router_cmd.extend(["--prometheus-port", str(case.stack.prometheus_port)])
 
+    _progress(f"starting vllm-router: {' '.join(router_cmd)}")
     router_proc = _popen(router_cmd, env=_router_env(model))
+    _pipe_process_output(router_proc, "vllm-router")
     router_url = f"http://{host}:{rp}"
     try:
         _wait_router_health(router_url, timeout)

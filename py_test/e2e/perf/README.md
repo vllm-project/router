@@ -32,6 +32,22 @@ pytest py_test/e2e/perf --perf-case=python_http -m perf
 
 Debug with an existing stack: `PERF_EXTERNAL=1` + `ROUTER_URL`.
 
+### No local stack / no pytest
+
+If workers and router already run on a GPU machine (Slurm, manual `serve_*.sh`, etc.),
+you do **not** need pytest or `stack_launcher.py` — only the bench CLI:
+
+```bash
+export ROUTER_URL=http://127.0.0.1:16002
+export MODEL=/path/to/model
+python benches/backend/bench_prefix_kvhit.py \
+  --hit-rate 0.99 --tokens 131072 --model-dir "$MODEL" \
+  --max-tokens 64 --warmup --concurrency 16 --requests 32 --timeout 1800
+```
+
+Optional pytest on that host: same env + `PERF_EXTERNAL=1` (skips launch, reuses bench
+functions loaded from `bench_prefix_kvhit.py`).
+
 ## Wave matrix (per `--perf-case`)
 
 | hit_rate | concurrency | requests |
@@ -46,6 +62,27 @@ Debug with an existing stack: `PERF_EXTERNAL=1` + `ROUTER_URL`.
 | 99% | 16 | 32 |
 
 Filter one wave: `-k hit99-c16-r32`.
+
+### Looks stuck after the test name?
+
+Pytest prints the node id, then runs **session fixtures** before the test body. With
+`-s`, stderr now shows `[perf stack]` / `[perf bench]` progress. Typical timeline for
+this case (27B-class, **131072** input tokens):
+
+1. **`perf_stack`** — `vllm-rs serve` + router `/health` (often **10–30+ minutes** on first load).
+2. **Tokenizer** — building the 131k-token prompt (minutes).
+3. **Warmup** — two serial full-prefix requests (each up to `bench.timeout`, default **1800s**).
+4. **Wave** — 32 requests at concurrency 16 (long; 99% hit still sends large bodies).
+
+Quick smoke (not comparable to acceptance matrix):
+
+```bash
+export PERF_TOKENS=4096
+export PERF_WARMUP=0
+pytest -sv py_test/e2e/perf --perf-case=rust_grpc -m perf -k hit99-c16-r32
+```
+
+Or attach to an existing stack: `PERF_EXTERNAL=1` + `ROUTER_URL=...` (skips launch).
 
 ## Acceptance (manual / downstream gate)
 
@@ -94,10 +131,10 @@ Serve/router flags come from `cases/*.json` (`stack`, `worker.cli` defaults).
 ```text
 cases/*.json
 case_loader.py
-stack_launcher.py
-prefix_kvhit_runner.py
+stack_launcher.py   # optional if PERF_EXTERNAL=1
 conftest.py
 test_prefix_kvhit_perf.py
+benches/backend/bench_prefix_kvhit.py   # HTTP bench + pytest helpers
 ```
 
 ## Related

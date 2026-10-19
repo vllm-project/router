@@ -10,19 +10,13 @@ import os
 
 import pytest
 
-from case_loader import perf_case_selected, use_external_router
-from prefix_kvhit_runner import (
-    assert_wave_summary,
-    maybe_write_result,
-    perf_env_ready,
-    run_prefix_kvhit_wave,
-)
+from case_loader import perf_case_selected, perf_model_ready, use_external_router
 
 pytestmark = pytest.mark.e2e
 
 
 def _case_ready() -> bool:
-    if not perf_env_ready() or not perf_case_selected():
+    if not perf_model_ready() or not perf_case_selected():
         return False
     if use_external_router():
         return bool(os.environ.get("ROUTER_URL", "").strip())
@@ -44,15 +38,14 @@ def test_prefix_kvhit_waves(
     concurrency: int,
     requests: int,
 ) -> None:
-    payload = run_prefix_kvhit_wave(
-        bench_mod,
+    payload = bench_mod.run_prefix_kvhit_wave(
         perf_settings,
         hit_rate=hit_rate,
         concurrency=concurrency,
         requests=requests,
     )
-    assert_wave_summary(payload["wave"], requests)
-    maybe_write_result(
+    bench_mod.assert_wave_summary(payload["wave"], requests)
+    bench_mod.maybe_write_result(
         perf_settings,
         run_idx=run_idx,
         hit_rate=hit_rate,

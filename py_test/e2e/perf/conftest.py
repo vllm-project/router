@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib.util
 import os
 import sys
 from pathlib import Path
@@ -21,12 +22,21 @@ from case_loader import (  # noqa: E402
     use_external_router,
     wave_case_id,
 )
-from prefix_kvhit_runner import (  # noqa: E402
-    default_output_dir,
-    load_bench_module,
-    read_perf_settings,
-)
 from stack_launcher import launch_stack  # noqa: E402
+
+BENCH_SCRIPT = _PERF_DIR.parents[2] / "benches" / "backend" / "bench_prefix_kvhit.py"
+
+
+def _progress(msg: str) -> None:
+    print(f"[perf] {msg}", file=sys.stderr, flush=True)
+
+
+def load_bench_module():
+    spec = importlib.util.spec_from_file_location("bench_prefix_kvhit", BENCH_SCRIPT)
+    assert spec and spec.loader
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
 
 
 def pytest_addoption(parser):
@@ -97,7 +107,12 @@ def perf_stack(perf_case):
         return
 
     model = os.environ["MODEL"].strip()
+    _progress(
+        f"session fixture perf_stack: launching {perf_case.backend} for model={model!r} "
+        "(first run: worker load + /health can take a long time; logs below)"
+    )
     stack = launch_stack(perf_case, model)
+    _progress(f"perf_stack ready: {stack.router_url}")
     os.environ["ROUTER_URL"] = stack.router_url
     try:
         yield stack
@@ -106,8 +121,8 @@ def perf_stack(perf_case):
 
 
 @pytest.fixture(scope="session")
-def perf_settings(perf_case, perf_stack):
-    settings = read_perf_settings(
+def perf_settings(perf_case, perf_stack, bench_mod):
+    settings = bench_mod.read_perf_settings(
         backend_label=perf_case.backend,
         bench_tokens=perf_case.bench_tokens,
         bench_max_tokens=perf_case.bench_max_tokens,
@@ -120,7 +135,9 @@ def perf_settings(perf_case, perf_stack):
         "true",
         "yes",
     ):
-        settings["output_dir"] = default_output_dir(settings)
+        settings["output_dir"] = bench_mod.default_output_dir(
+            settings, results_parent=_PERF_DIR / "results"
+        )
     return settings
 
 
