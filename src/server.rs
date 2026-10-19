@@ -1,5 +1,5 @@
 use crate::{
-    config::{HistoryBackend, RouterConfig, TraceConfig},
+    config::{HistoryBackend, RouterConfig, RoutingMode, TraceConfig},
     core::{CircuitBreakerConfig, HealthConfig, WorkerFactory, WorkerRegistry, WorkerType},
     data_connector::{MemoryResponseStorage, NoOpResponseStorage, SharedResponseStorage},
     logging::{self, LoggingConfig},
@@ -779,22 +779,29 @@ async fn get_worker(
             };
             (StatusCode::NOT_FOUND, Json(error)).into_response()
         }
+    } else if let Some(worker) = state.context.worker_registry.get_by_url(&url) {
+        Json(json!({
+            "url": worker.url(),
+            "model_id": worker.model_id(),
+            "is_healthy": worker.is_healthy()
+        }))
+        .into_response()
+    } else if matches!(state.context.router_config.mode, RoutingMode::OpenAI { .. })
+        && state.router.get_worker_urls().contains(&url)
+    {
+        // OpenAI routers expose their base URL without registering a worker.
+        Json(json!({
+            "url": url,
+            "model_id": "unknown",
+            "is_healthy": true
+        }))
+        .into_response()
     } else {
-        let workers = state.router.get_worker_urls();
-        if workers.contains(&url) {
-            Json(json!({
-                "url": url,
-                "model_id": "unknown",
-                "is_healthy": true
-            }))
-            .into_response()
-        } else {
-            let error = WorkerErrorResponse {
-                error: format!("Worker {url} not found"),
-                code: "WORKER_NOT_FOUND".to_string(),
-            };
-            (StatusCode::NOT_FOUND, Json(error)).into_response()
-        }
+        let error = WorkerErrorResponse {
+            error: format!("Worker {url} not found"),
+            code: "WORKER_NOT_FOUND".to_string(),
+        };
+        (StatusCode::NOT_FOUND, Json(error)).into_response()
     }
 }
 
