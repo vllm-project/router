@@ -8,7 +8,8 @@ use crate::core::{
 use crate::metrics::RouterMetrics;
 use crate::otel_http::{self, ClientRequestOptions};
 use crate::policies::{
-    kv_aware_ops, KvRequestSlot, KvSelectionReceipt, LoadBalancingPolicy, PolicyRegistry,
+    kv_aware_ops, AffinityKey, KvRequestSlot, KvSelectionReceipt, LoadBalancingPolicy,
+    PolicyRegistry,
 };
 use crate::program_scheduling::{
     BackendObservationProvider, ProgramIdentity, ProgramScheduler, ProgramSchedulerConfig,
@@ -16,7 +17,8 @@ use crate::program_scheduling::{
 };
 use crate::protocols::spec::{
     ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest, GenerationRequest,
-    InferenceGenerateRequest, RerankRequest, RerankResponse, RerankResult, ResponsesRequest,
+    InferenceGenerateRequest, PromptInput, RerankRequest, RerankResponse, RerankResult,
+    ResponsesRequest,
 };
 use crate::routers::header_utils;
 use crate::routers::http::dp_utils;
@@ -251,6 +253,7 @@ pub struct Router {
     api_key: Option<String>,
     retry_config: RetryConfig,
     circuit_breaker_config: CircuitBreakerConfig,
+    kv_aware_session_affinity_ttl_secs: Option<u64>,
     health_config: HealthConfig,
     frontend: crate::backend::EngineFrontend,
     _worker_loads: Arc<tokio::sync::watch::Receiver<HashMap<String, isize>>>,
@@ -398,12 +401,14 @@ impl Router {
             ctx.worker_registry.register(worker_arc.clone());
 
             if let Some(kv_aware) = kv_aware_ops(default_policy.as_ref()) {
-                if let Some(info) = kv_worker_info.get(worker_arc.base_url()) {
-                    let provider = kv_index_supervisor.as_ref().and_then(|supervisor| {
-                        supervisor.match_provider_for_worker(worker_arc.base_url())
-                    });
-                    kv_aware.register_worker(worker_arc.as_ref(), info, provider);
-                }
+                let provider = kv_index_supervisor.as_ref().and_then(|supervisor| {
+                    supervisor.match_provider_for_worker(worker_arc.base_url())
+                });
+                kv_aware.register_worker(
+                    worker_arc.as_ref(),
+                    kv_worker_info.get(worker_arc.base_url()),
+                    provider,
+                );
             }
 
             // Notify PolicyRegistry about the new worker
@@ -507,6 +512,9 @@ impl Router {
             api_key: ctx.router_config.api_key.clone(),
             retry_config: ctx.router_config.effective_retry_config(),
             circuit_breaker_config: core_cb_config,
+            kv_aware_session_affinity_ttl_secs: ctx
+                .router_config
+                .kv_aware_session_affinity_ttl_secs,
             health_config,
             frontend,
             _worker_loads: worker_loads,
@@ -547,7 +555,6 @@ impl Router {
         worker: &dyn Worker,
         info: Option<&crate::kv_index::WorkerKvInfo>,
     ) {
-        let Some(info) = info else { return };
         let policy = self.policy_registry.get_default_policy();
         let Some(kv_aware) = kv_aware_ops(policy.as_ref()) else {
             return;
@@ -1189,19 +1196,15 @@ impl Router {
         })
     }
 
-    fn prepared_cache_identity(
-        prepared: Option<&crate::backend::PreparedChat>,
-    ) -> (Option<&str>, Option<&str>) {
-        let field = |name| {
-            prepared
-                .and_then(|chat| chat.request.other.get(name))
-                .and_then(serde_json::Value::as_str)
-                .filter(|value| !value.is_empty())
-        };
-        (field("lora_name"), field("cache_salt"))
+    fn policy_for_model(&self, model_id: Option<&str>) -> Arc<dyn LoadBalancingPolicy> {
+        match model_id {
+            Some(model) => self.policy_registry.get_policy_or_default(model),
+            None => self.policy_registry.get_default_policy(),
+        }
     }
 
     /// Select worker for a specific model considering circuit breaker state
+    #[allow(clippy::too_many_arguments)]
     fn select_worker_for_model(
         &self,
         model_id: Option<&str>,
@@ -1210,6 +1213,8 @@ impl Router {
         token_ids: Option<&[u32]>,
         lora_name: Option<&str>,
         cache_salt: Option<&str>,
+        affinity_key: Option<&AffinityKey>,
+        excluded_workers: &[String],
     ) -> Option<SelectedWorker> {
         // Get workers for the specified model (O(1) lookup if model_id is provided)
         let workers = match model_id {
@@ -1226,28 +1231,32 @@ impl Router {
             return None;
         }
 
-        // Get the appropriate policy for this model
-        let policy = match model_id {
-            Some(model) => self.policy_registry.get_policy_or_default(model),
-            None => self.policy_registry.get_default_policy(),
-        };
+        let policy = self.policy_for_model(model_id);
 
         // Convert headers for policies that need them (e.g., consistent_hash)
         let request_headers = Self::headers_to_request_headers(headers);
 
-        let (idx, kv_receipt) = if let Some(kv_aware) = kv_aware_ops(policy.as_ref()) {
-            let receipt = kv_aware
-                .select_worker_with_receipt(&available, token_ids, lora_name, cache_salt)?;
-            (receipt.worker_index, Some(receipt))
-        } else {
-            (
-                policy.select_worker_with_headers(&available, text, request_headers.as_ref())?,
-                None,
-            )
-        };
+        if let Some(kv_aware) = kv_aware_ops(policy.as_ref()) {
+            // The policy sees the full list: a retry exclusion must not
+            // rewrite a still-valid binding.
+            let receipt = kv_aware.select_worker_with_receipt(
+                &available,
+                token_ids,
+                lora_name,
+                cache_salt,
+                affinity_key,
+                excluded_workers,
+            )?;
+            return Some(SelectedWorker {
+                worker: available.get(receipt.worker_index)?.clone(),
+                kv_receipt: Some(receipt),
+            });
+        }
+
+        let idx = policy.select_worker_with_headers(&available, text, request_headers.as_ref())?;
         Some(SelectedWorker {
             worker: available.get(idx)?.clone(),
-            kv_receipt,
+            kv_receipt: None,
         })
     }
 
@@ -1273,11 +1282,11 @@ impl Router {
         // Reject unsupported gRPC routes before admitting a request or
         // incrementing the selected worker's load.
         if matches!(pool, Some(crate::backend::WorkerPoolKind::Grpc))
-            && route != "/v1/chat/completions"
+            && !matches!(route, "/v1/chat/completions" | "/v1/completions")
         {
             return (
                 StatusCode::BAD_REQUEST,
-                format!("gRPC backend currently supports /v1/chat/completions, not {route}"),
+                format!("gRPC backend currently supports /v1/chat/completions and /v1/completions, not {route}"),
             )
                 .into_response();
         }
@@ -1286,37 +1295,89 @@ impl Router {
         // Policy still uses extract_text_for_routing (session / empty).
         // token_ids stay on PreparedChat for a later token-level policy —
         // do not dump 131k ids into the cache_aware tree.
-        let prepared = if matches!(pool, Some(crate::backend::WorkerPoolKind::Grpc))
-            && route == "/v1/chat/completions"
-        {
-            let chat: ChatCompletionRequest =
-                match serde_json::to_value(typed_req).and_then(serde_json::from_value) {
-                    Ok(req) => req,
-                    Err(e) => {
-                        return (
-                            StatusCode::BAD_REQUEST,
-                            format!("gRPC chat convert failed: {e}"),
-                        )
-                            .into_response();
-                    }
-                };
-            match self.frontend.prepare(chat).await {
-                Ok(p) => Some(p),
-                Err(e) => {
-                    let status =
-                        if e.starts_with("tokenizer:") || e.starts_with("sampling defaults:") {
-                            StatusCode::SERVICE_UNAVAILABLE
-                        } else {
-                            StatusCode::BAD_REQUEST
+        let prepared = if matches!(pool, Some(crate::backend::WorkerPoolKind::Grpc)) {
+            match route {
+                "/v1/chat/completions" => {
+                    let chat: ChatCompletionRequest =
+                        match serde_json::to_value(typed_req).and_then(serde_json::from_value) {
+                            Ok(req) => req,
+                            Err(e) => {
+                                return (
+                                    StatusCode::BAD_REQUEST,
+                                    format!("gRPC chat convert failed: {e}"),
+                                )
+                                    .into_response();
+                            }
                         };
-                    return (status, e).into_response();
+                    match self.frontend.prepare(chat).await {
+                        Ok(p) => Some(p),
+                        Err(e) => {
+                            let status = if e.starts_with("tokenizer:")
+                                || e.starts_with("sampling defaults:")
+                            {
+                                StatusCode::SERVICE_UNAVAILABLE
+                            } else {
+                                StatusCode::BAD_REQUEST
+                            };
+                            return (status, e).into_response();
+                        }
+                    }
                 }
+                "/v1/completions" => {
+                    let completion: CompletionRequest =
+                        match serde_json::to_value(typed_req).and_then(serde_json::from_value) {
+                            Ok(req) => req,
+                            Err(e) => {
+                                return (
+                                    StatusCode::BAD_REQUEST,
+                                    format!("gRPC completions convert failed: {e}"),
+                                )
+                                    .into_response();
+                            }
+                        };
+                    let token_ids = match &completion.prompt {
+                        PromptInput::IntArray(ids) => {
+                            ids.iter().map(|id| *id as u32).collect::<Vec<_>>()
+                        }
+                        _ => {
+                            return (
+                                StatusCode::BAD_REQUEST,
+                                "gRPC /v1/completions requires a single token-id prompt (list[int])"
+                                    .to_string(),
+                            )
+                                .into_response();
+                        }
+                    };
+                    let chat = match crate::backend::convert::completion_to_chat(&completion) {
+                        Ok(chat) => chat,
+                        Err(e) => {
+                            return (StatusCode::BAD_REQUEST, e).into_response();
+                        }
+                    };
+                    match self.frontend.prepare_token_ids(chat, token_ids).await {
+                        Ok(p) => Some(p),
+                        Err(e) => {
+                            let status = if e.starts_with("tokenizer:")
+                                || e.starts_with("sampling defaults:")
+                            {
+                                StatusCode::SERVICE_UNAVAILABLE
+                            } else {
+                                StatusCode::BAD_REQUEST
+                            };
+                            return (status, e).into_response();
+                        }
+                    }
+                }
+                _ => None,
             }
         } else {
             None
         };
 
         let text = typed_req.extract_text_for_routing();
+
+        // KV-aware retries may bypass a target without rewriting its binding.
+        let failed_workers = Mutex::new(Vec::new());
 
         let response = RetryExecutor::execute_response_with_retry(
             &self.retry_config,
@@ -1335,11 +1396,23 @@ impl Router {
                 let forced_worker_url = program_completion
                     .as_ref()
                     .map(|completion| completion.dispatch().target_id.as_str());
-                let (lora_name, cache_salt) = Self::prepared_cache_identity(prepared.as_ref());
-                let policy = match model_id {
-                    Some(model) => self.policy_registry.get_policy_or_default(model),
-                    None => self.policy_registry.get_default_policy(),
-                };
+                let (lora_name, cache_salt) = typed_req.cache_identity();
+                let policy = self.policy_for_model(model_id);
+                // Optional stable identity for kv_aware session affinity.
+                // Reuses the canonical Program identity parsing without
+                // Program scheduling lifecycles or constraints. Scoped by the
+                // request's actual model: HTTP entries pass model_id = None.
+                let affinity_scope = model_id.or_else(|| typed_req.get_model());
+                let affinity_key = self
+                    .kv_aware_session_affinity_ttl_secs
+                    .and_then(|_| kv_aware_ops(policy.as_ref()))
+                    .and_then(|_| {
+                        AffinityKey::from_request(
+                            headers,
+                            typed_req.extract_affinity_identity_payload().as_ref(),
+                            affinity_scope.unwrap_or("default"),
+                        )
+                    });
                 let selected_worker = if let Some(target) = forced_worker_url {
                     let worker = self
                         .worker_registry
@@ -1355,10 +1428,13 @@ impl Router {
                             Some(prepared.tokenized.token_ids.as_ref()),
                             lora_name,
                             cache_salt,
+                            affinity_key.as_ref(),
+                            &[],
                         )
                     });
                     Some(SelectedWorker { worker, kv_receipt })
                 } else {
+                    let excluded_workers = failed_workers.lock().clone();
                     self.select_worker_for_model(
                         model_id,
                         Some(&text),
@@ -1368,6 +1444,8 @@ impl Router {
                             .map(|prepared| prepared.tokenized.token_ids.as_ref()),
                         lora_name,
                         cache_salt,
+                        affinity_key.as_ref(),
+                        &excluded_workers,
                     )
                 };
                 let SelectedWorker { worker, kv_receipt } = match selected_worker {
@@ -1382,12 +1460,14 @@ impl Router {
                     }
                 };
 
-                let kv_slot = kv_aware_ops(policy.as_ref()).and_then(|kv_aware| {
-                    prepared.as_ref()?;
-                    kv_aware.begin_request(kv_receipt?)
-                });
-
-                let load_incremented = if matches!(policy.name(), "cache_aware" | "kv_aware")
+                // KV-aware selections reserved slot and worker load atomically
+                // with selection inside the policy; reuse their reservation and
+                // never double count.
+                let kv_slot = kv_receipt.as_ref().and_then(|receipt| receipt.slot.clone());
+                let load_incremented = if kv_receipt.is_some() {
+                    RouterMetrics::set_running_requests(worker.url(), worker.load());
+                    true
+                } else if matches!(policy.name(), "cache_aware" | "kv_aware")
                     || program_completion.is_some()
                 {
                     worker.increment_load();
@@ -1424,6 +1504,9 @@ impl Router {
                 worker.record_outcome(status.is_success() || status.is_client_error());
                 if was_available != worker.is_available() {
                     self.worker_registry.notify_worker_state_change();
+                }
+                if is_retryable_status(status) && kv_aware_ops(policy.as_ref()).is_some() {
+                    failed_workers.lock().push(worker.url().to_string());
                 }
 
                 response
@@ -1593,13 +1676,13 @@ impl Router {
         } = dispatch;
         let load_incremented = load.tracks_worker();
         if crate::backend::is_grpc_url(worker_url) {
-            // gRPC workers are chat-only in this milestone. Reject unsupported
-            // client routes as request errors so healthy workers are not
-            // penalized by circuit-breaker accounting.
-            if route != "/v1/chat/completions" {
+            // gRPC workers are chat/completions-only in this milestone. Reject
+            // unsupported client routes as request errors so healthy workers are
+            // not penalized by circuit-breaker accounting.
+            if !matches!(route, "/v1/chat/completions" | "/v1/completions") {
                 return (
                     StatusCode::BAD_REQUEST,
-                    format!("gRPC backend currently supports /v1/chat/completions, not {route}"),
+                    format!("gRPC backend currently supports /v1/chat/completions and /v1/completions, not {route}"),
                 )
                     .into_response();
             }
@@ -3016,6 +3099,7 @@ mod tests {
             _load_monitor_handle: None,
             kv_index_supervisor: None,
             _kv_signal_handle: None,
+            kv_aware_session_affinity_ttl_secs: None,
             program_scheduler: None,
             _program_observation_handle: None,
             program_targets_cache: Mutex::new(HashMap::new()),
@@ -3050,6 +3134,7 @@ mod tests {
             _load_monitor_handle: None,
             kv_index_supervisor: None,
             _kv_signal_handle: None,
+            kv_aware_session_affinity_ttl_secs: None,
             program_scheduler: None,
             _program_observation_handle: None,
             program_targets_cache: Mutex::new(HashMap::new()),
@@ -3378,7 +3463,10 @@ mod tests {
     ) -> RequestLoadGuard {
         crate::policies::SlotManager::begin_prefill(manager.as_ref(), &target, 64);
         worker.increment_load();
-        RequestLoadGuard::new(Some(worker), Some(KvRequestSlot::new(manager, target, 64)))
+        RequestLoadGuard::new(
+            Some(worker),
+            Some(KvRequestSlot::new(manager, target, 64, None)),
+        )
     }
 
     #[tokio::test]
@@ -3763,7 +3851,12 @@ mod tests {
         let response = hold_load_until_body_done(
             Response::new(Body::from("first token")),
             worker.clone(),
-            Some(KvRequestSlot::new(manager.clone(), target.clone(), 64)),
+            Some(KvRequestSlot::new(
+                manager.clone(),
+                target.clone(),
+                64,
+                None,
+            )),
         );
         assert_eq!(
             crate::policies::LoadProvider::sample(manager.as_ref(), &target),
@@ -3879,6 +3972,7 @@ mod tests {
             _load_monitor_handle: None,
             kv_index_supervisor: None,
             _kv_signal_handle: None,
+            kv_aware_session_affinity_ttl_secs: None,
             program_scheduler: None,
             _program_observation_handle: None,
             program_targets_cache: Mutex::new(HashMap::new()),
@@ -3948,6 +4042,8 @@ mod tests {
                     None,
                     None,
                     None,
+                    None,
+                    &[],
                 )
                 .expect("Should select a worker");
             selected_urls.push(worker.worker.url().to_string());
@@ -3978,7 +4074,16 @@ mod tests {
         }
 
         let worker = router
-            .select_worker_for_model(None, Some(r#"{"prompt": "test"}"#), None, None, None, None)
+            .select_worker_for_model(
+                None,
+                Some(r#"{"prompt": "test"}"#),
+                None,
+                None,
+                None,
+                None,
+                None,
+                &[],
+            )
             .expect("Should select the remaining healthy worker");
 
         assert_eq!(
@@ -4006,11 +4111,37 @@ mod tests {
             None,
             None,
             None,
+            None,
+            &[],
         );
         assert!(
             result.is_none(),
             "Should return None when all workers are unavailable"
         );
+    }
+
+    #[test]
+    fn test_retry_exclusion_does_not_change_other_policies() {
+        let router = create_test_consistent_hash_router();
+        let select = |excluded: &[String]| {
+            router
+                .select_worker_for_model(
+                    None,
+                    Some(r#"{"prompt": "test"}"#),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    excluded,
+                )
+                .expect("Should select a worker")
+                .worker
+                .url()
+                .to_string()
+        };
+        let first = select(&[]);
+        assert_eq!(select(std::slice::from_ref(&first)), first);
     }
 
     #[test]
@@ -4031,6 +4162,8 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                &[],
             ) {
                 worker_urls_seen.insert(worker.worker.url().to_string());
             }

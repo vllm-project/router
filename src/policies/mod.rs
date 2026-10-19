@@ -24,10 +24,10 @@ pub use consistent_hash::ConsistentHashPolicy;
 pub use consistent_hash::VIRTUAL_NODES_PER_WORKER;
 pub use factory::PolicyFactory;
 pub use kv_aware::{
-    cost_components, kv_aware_ops, CandidateView, CostComponents, CostDecision, CostParams,
-    InMemorySlotManager, KvAwareOps, KvAwarePolicy, KvRequestSlot, KvSelectionReceipt,
-    LoadProvider, LoadSample, MultiplicativeScorer, Picker, Scorer, SelectionError, SlotManager,
-    TemperaturePicker, TieredMatchProvider, TransferCredits,
+    cost_components, kv_aware_ops, AffinityKey, CandidateView, CostComponents, CostDecision,
+    CostParams, InMemorySlotManager, KvAffinityTable, KvAwareOps, KvAwarePolicy, KvRequestSlot,
+    KvSelectionReceipt, LoadProvider, LoadSample, MultiplicativeScorer, Picker, Scorer,
+    SelectionError, SlotManager, TemperaturePicker, TieredMatchProvider, TransferCredits,
 };
 pub use power_of_two::PowerOfTwoPolicy;
 pub use random::RandomPolicy;

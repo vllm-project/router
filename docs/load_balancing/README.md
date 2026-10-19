@@ -257,6 +257,8 @@ For each candidate, the scorer computes `ptoken = new_prefill_tokens + active_pr
 
 `--router-temperature 0` selects a minimum-cost worker. A positive temperature samples among candidates by their relative costs. Device reuse has full credit; the host, external, and disk `--kv-penalty-*` flags configure transfer-credit ratios for those tiers. A higher credit means more reuse value and lower transfer cost.
 
+KV-aware session affinity is disabled by default. Set `--kv-aware-session-affinity-ttl-secs <seconds>` to enable it and expire idle bindings after the given TTL (1–31,536,000 seconds). For example, use `--kv-aware-session-affinity-ttl-secs 1800` for a 30-minute idle TTL. Omit the option to compare the original KV-aware routing behavior without affinity.
+
 ---
 
 ## Choosing a Policy

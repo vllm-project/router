@@ -71,6 +71,10 @@ pub struct RouterConfig {
     /// Disable circuit breaker (overrides circuit_breaker.failure_threshold to u32::MAX when true)
     #[serde(default)]
     pub disable_circuit_breaker: bool,
+    /// Enable stable-identity affinity in `kv_aware` and expire idle bindings after this TTL.
+    /// `None` disables affinity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kv_aware_session_affinity_ttl_secs: Option<u64>,
     /// Health check configuration
     pub health_check: HealthCheckConfig,
     /// Enable Inference Gateway mode (false = proxy mode, true = IGW mode)
@@ -942,6 +946,7 @@ impl Default for RouterConfig {
             circuit_breaker: CircuitBreakerConfig::default(),
             disable_retries: false,
             disable_circuit_breaker: false,
+            kv_aware_session_affinity_ttl_secs: None,
             health_check: HealthCheckConfig::default(),
             enable_igw: false,
             connection_mode: ConnectionMode::Http,
@@ -1657,6 +1662,7 @@ mod tests {
             circuit_breaker: CircuitBreakerConfig::default(),
             disable_retries: false,
             disable_circuit_breaker: false,
+            kv_aware_session_affinity_ttl_secs: None,
             health_check: HealthCheckConfig::default(),
             enable_igw: false,
             queue_size: 100,
@@ -1725,6 +1731,7 @@ mod tests {
             circuit_breaker: CircuitBreakerConfig::default(),
             disable_retries: false,
             disable_circuit_breaker: false,
+            kv_aware_session_affinity_ttl_secs: None,
             health_check: HealthCheckConfig::default(),
             enable_igw: false,
             queue_size: 100,
@@ -1789,6 +1796,7 @@ mod tests {
             circuit_breaker: CircuitBreakerConfig::default(),
             disable_retries: false,
             disable_circuit_breaker: false,
+            kv_aware_session_affinity_ttl_secs: None,
             health_check: HealthCheckConfig::default(),
             enable_igw: false,
             queue_size: 100,

@@ -15,6 +15,7 @@ pub mod otel_trace;
 pub mod policies;
 pub mod program_scheduling;
 pub mod protocols;
+mod request_identity;
 pub mod routers;
 pub mod server;
 pub mod service_discovery;
@@ -46,6 +47,7 @@ struct Router {
     kv_penalty_host: f64,
     kv_penalty_external: f64,
     kv_penalty_disk: f64,
+    kv_aware_session_affinity_ttl_secs: Option<u64>,
     worker_startup_timeout_secs: u64,
     worker_startup_check_interval: u64,
     cache_threshold: f32,
@@ -237,6 +239,7 @@ impl Router {
             },
             disable_retries: self.disable_retries,
             disable_circuit_breaker: self.disable_circuit_breaker,
+            kv_aware_session_affinity_ttl_secs: self.kv_aware_session_affinity_ttl_secs,
             health_check: config::HealthCheckConfig {
                 failure_threshold: self.health_failure_threshold,
                 success_threshold: self.health_success_threshold,
@@ -347,6 +350,7 @@ impl Router {
         kv_penalty_host = 0.8,
         kv_penalty_external = 0.6,
         kv_penalty_disk = 0.3,
+        kv_aware_session_affinity_ttl_secs = None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -418,6 +422,7 @@ impl Router {
         kv_penalty_host: f64,
         kv_penalty_external: f64,
         kv_penalty_disk: f64,
+        kv_aware_session_affinity_ttl_secs: Option<u64>,
     ) -> PyResult<Self> {
         if wasm_middleware_sha256
             .as_deref()
@@ -443,6 +448,7 @@ impl Router {
             kv_penalty_host,
             kv_penalty_external,
             kv_penalty_disk,
+            kv_aware_session_affinity_ttl_secs,
             worker_startup_timeout_secs,
             worker_startup_check_interval,
             cache_threshold,
