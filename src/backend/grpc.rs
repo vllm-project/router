@@ -244,6 +244,7 @@ impl GrpcEngineBackend {
             "adapt_ms": adapt_ms,
             "template_ms": template_ms,
             "encode_ms": encode_ms,
+            "encode_cached_tokens": tokenized.cached_tokens,
             "frontend_ms": frontend_ms,
             "xfer_ms": xfer_ms,
             "grpc_connect_ms": grpc_connect_ms,

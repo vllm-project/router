@@ -7,6 +7,15 @@ pub struct ConfigValidator;
 impl ConfigValidator {
     /// Validate a complete router configuration
     pub fn validate(config: &RouterConfig) -> ConfigResult<()> {
+        if let Some(ttl_secs) = config.kv_aware_session_affinity_ttl_secs {
+            if !(1..=31_536_000).contains(&ttl_secs) {
+                return Err(ConfigError::InvalidValue {
+                    field: "kv_aware_session_affinity_ttl_secs".to_string(),
+                    value: ttl_secs.to_string(),
+                    reason: "Must be between 1 and 31536000 seconds".to_string(),
+                });
+            }
+        }
         // Check if service discovery is enabled (either via discovery config or vLLM mode)
         let has_service_discovery = config.discovery.as_ref().is_some_and(|d| d.enabled)
             || matches!(
@@ -810,6 +819,25 @@ impl ConfigValidator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_affinity_ttl_is_optional_and_bounded() {
+        let mut config = RouterConfig::new(
+            RoutingMode::Regular {
+                worker_urls: vec!["http://worker:8000".to_string()],
+            },
+            PolicyConfig::Random,
+        );
+        assert!(ConfigValidator::validate(&config).is_ok());
+
+        config.kv_aware_session_affinity_ttl_secs = Some(300);
+        assert!(ConfigValidator::validate(&config).is_ok());
+
+        for ttl in [0, 31_536_001] {
+            config.kv_aware_session_affinity_ttl_secs = Some(ttl);
+            assert!(ConfigValidator::validate(&config).is_err());
+        }
+    }
 
     #[test]
     fn test_validate_program_scheduling_boundaries() {

@@ -8,18 +8,22 @@ use super::ScheduleError;
 use crate::policies::{hash_key, RequestHeaders};
 use http::HeaderMap;
 use serde_json::{Map as JsonMap, Value as JsonValue};
-use std::io::{self, Write};
 use std::time::Duration;
 
-const MAX_IDENTITY_COMPONENT_BYTES: usize = 256;
+use crate::request_identity::{
+    canonical_context, context_string, framework_identity_headers, identity_from_parts,
+    normalized_agent_component, read_nonempty_header, scoped_program_id, IdentityError,
+    IdentitySource, StableIdentity, CLAUDE_SESSION_HEADER, CODEX_SESSION_HEADER,
+    GENERIC_SESSION_HEADER, MAX_IDENTITY_COMPONENT_BYTES,
+};
+
 const MAX_PLACEMENT_HASH_KEY_BYTES: usize = 512;
-const MAX_AGENTIC_CONTEXT_BYTES: usize = 16 * 1024;
-const CLAUDE_SESSION_HEADER: &str = "x-claude-code-session-id";
-const CLAUDE_AGENT_HEADER: &str = "x-claude-code-agent-id";
-const CLAUDE_PARENT_AGENT_HEADER: &str = "x-claude-code-parent-agent-id";
-const CODEX_SESSION_HEADER: &str = "session-id";
-const CODEX_THREAD_HEADER: &str = "thread-id";
-const GENERIC_SESSION_HEADER: &str = "x-session-id";
+
+impl From<IdentityError> for ScheduleError {
+    fn from(error: IdentityError) -> Self {
+        Self::InvalidIdentity(error.0)
+    }
+}
 
 /// Metadata source that opts one request into Program scheduling.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -126,87 +130,78 @@ impl ProgramIdentity {
         if enable_key == ProgramSchedulingEnableKey::AgenticContext && canonical.is_none() {
             return Ok(None);
         }
-        let identity = if let Some(context) = canonical {
-            canonical_identity(&context, headers, model_pool)?
-        } else if enable_key == ProgramSchedulingEnableKey::Auto {
-            if let Some(identity) = agent_hint_identity(request_object, model_pool)? {
-                Some(identity)
-            } else {
-                let (session_id, actor_id, parent_actor_id) = framework_identity_headers(headers)?;
-                match session_id {
-                    Some(session_id) => {
-                        let actor_id = normalized_agent_component(Some(&session_id), actor_id)?;
-                        let expected_resume = actor_id
-                            .as_deref()
-                            .is_none_or(|actor_id| actor_id == "lead");
-                        let program_id = scoped_program_id(&session_id, actor_id.as_deref());
-                        let mut identity = Self::build(
-                            program_id,
-                            session_id.clone(),
-                            expected_resume,
-                            model_pool,
-                        )?;
-                        identity.task_id = Some(session_id.clone());
-                        identity.session_id = Some(session_id.clone());
-                        identity.agent_id = actor_id.clone();
-                        identity.agent_role =
-                            Some(if actor_id.as_deref().is_none_or(|id| id == "lead") {
-                                "lead".to_string()
-                            } else {
-                                "subagent".to_string()
-                            });
-                        identity.parent_program_id =
-                            normalized_agent_component(Some(&session_id), parent_actor_id)?
-                                .map(|parent| scoped_program_id(&session_id, Some(&parent)))
-                                .or_else(|| {
-                                    (identity.agent_role.as_deref() == Some("subagent"))
-                                        .then(|| scoped_program_id(&session_id, Some("lead")))
-                                });
-                        identity.blocks_parent = identity.agent_role.as_deref() == Some("subagent");
-                        Some(identity)
-                    }
-                    None => None,
-                }
+        let Some(stable) = identity_from_parts(headers, request_object, canonical.as_ref())? else {
+            if let Some(context) = &canonical {
+                context_string(context, &["agent_role"])?;
             }
-        } else {
-            None
-        };
-        let Some(identity) = identity else {
             return Ok(None);
         };
+        let source = stable.source;
+        let mut identity = Self::from_stable(stable, model_pool)?;
+        if let Some(context) = &canonical {
+            apply_canonical_scheduling(&mut identity, context, headers)?;
+        } else if let Some(hint) = request_object
+            .and_then(|request| request.get("agent_hint"))
+            .and_then(JsonValue::as_object)
+        {
+            identity.parent_program_id = context_string(hint, &["parent_session_id"])?;
+            identity.blocks_parent = context_bool(hint, &["blocks_parent"])?.unwrap_or(true);
+            identity.expected_resume =
+                context_bool(hint, &["expected_resume"])?.unwrap_or(!identity.blocks_parent);
+        } else {
+            let (_, _, parent_actor_id) = framework_identity_headers(headers)?;
+            identity.expected_resume = identity.agent_id.as_deref().is_none_or(|id| id == "lead");
+            identity.agent_role = Some(
+                if identity.expected_resume {
+                    "lead"
+                } else {
+                    "subagent"
+                }
+                .to_string(),
+            );
+            identity.parent_program_id =
+                normalized_agent_component(identity.session_id.as_deref(), parent_actor_id)?
+                    .map(|parent| scoped_program_id(&identity.placement_key, Some(&parent)))
+                    .or_else(|| {
+                        (!identity.expected_resume)
+                            .then(|| scoped_program_id(&identity.placement_key, Some("lead")))
+                    });
+            identity.blocks_parent = !identity.expected_resume;
+        }
+        if identity.blocks_parent && identity.parent_program_id.is_none() {
+            return Err(ScheduleError::InvalidIdentity(match source {
+                IdentitySource::AgentHint => {
+                    "blocking agent_hint requires parent_session_id".to_string()
+                }
+                _ => "blocks_parent requires parent_program_id".to_string(),
+            }));
+        }
         let identity =
             identity.with_placement_hash_key(consistent_hash_request_key(headers, request))?;
         identity.validate_persisted_strings()?;
         Ok(Some(identity))
     }
 
-    fn build(
-        program_id: String,
-        placement_key: String,
-        expected_resume: bool,
+    fn from_stable(
+        stable: StableIdentity,
         model_pool: Option<&str>,
     ) -> Result<Self, ScheduleError> {
         let model_pool = model_pool.unwrap_or("default").to_string();
-        for (name, value) in [
-            ("program_id", program_id.as_str()),
-            ("placement key", placement_key.as_str()),
-            ("model pool", model_pool.as_str()),
-        ] {
-            if value.len() > MAX_IDENTITY_COMPONENT_BYTES {
-                return Err(ScheduleError::InvalidIdentity(format!(
-                    "{name} exceeds {MAX_IDENTITY_COMPONENT_BYTES} bytes"
-                )));
-            }
+        if model_pool.len() > MAX_IDENTITY_COMPONENT_BYTES {
+            return Err(ScheduleError::InvalidIdentity(format!(
+                "model pool exceeds {MAX_IDENTITY_COMPONENT_BYTES} bytes"
+            )));
         }
+        let placement_key = stable.placement_key().to_string();
         Ok(Self {
             model_pool,
-            program_id,
             placement_hash_key: placement_key.clone(),
             placement_key,
-            expected_resume,
-            task_id: None,
-            session_id: None,
-            agent_id: None,
+            program_id: stable.program_id,
+            task_id: stable.task_id,
+            session_id: stable.session_id,
+            agent_id: stable.agent_id,
+            expected_resume: true,
             parent_program_id: None,
             root_program_id: None,
             blocks_parent: false,
@@ -354,29 +349,15 @@ fn consistent_hash_request_key(headers: Option<&HeaderMap>, request: Option<&Jso
     hash_key::extract_hash_key(request_text.as_deref(), None)
 }
 
-fn canonical_identity(
+fn apply_canonical_scheduling(
+    identity: &mut ProgramIdentity,
     context: &JsonMap<String, JsonValue>,
     headers: Option<&HeaderMap>,
-    model_pool: Option<&str>,
-) -> Result<Option<ProgramIdentity>, ScheduleError> {
-    let (header_session_id, header_agent_id, header_parent_agent_id) =
-        framework_identity_headers(headers)?;
-    let explicit_program_id = context_string(context, &["program_id"])?;
-    let body_task_id = context_string(context, &["task_id"])?;
-    let session_id = context_string(context, &["session_id"])?.or(header_session_id);
-    let task_id = if body_task_id.is_some()
-        || (explicit_program_id.is_some() && context.contains_key("task_id"))
-    {
-        body_task_id
-    } else {
-        session_id.clone()
-    };
-
-    let mut agent_id = context_string(context, &["agent_id"])?.or(header_agent_id);
-    if agent_id.is_none() && task_id.is_some() {
-        agent_id = Some("lead".to_string());
-    }
-    agent_id = normalized_agent_component(task_id.as_deref(), agent_id)?;
+) -> Result<(), ScheduleError> {
+    let (_, _, header_parent_agent_id) = framework_identity_headers(headers)?;
+    let task_id = &identity.task_id;
+    let agent_id = &identity.agent_id;
+    let program_id = &identity.program_id;
     let agent_role = context_string(context, &["agent_role"])?.or_else(|| {
         agent_id.as_ref().map(|agent_id| {
             if agent_id == "lead" {
@@ -386,19 +367,6 @@ fn canonical_identity(
             }
         })
     });
-    let program_id =
-        explicit_program_id.or_else(|| match (task_id.as_deref(), agent_id.as_deref()) {
-            (Some(task_id), Some(agent_id)) => Some(scoped_program_id(task_id, Some(agent_id))),
-            _ => None,
-        });
-    let Some(program_id) = program_id else {
-        return Ok(None);
-    };
-    let placement_key = task_id
-        .clone()
-        .or(session_id.clone())
-        .unwrap_or_else(|| program_id.clone());
-
     let parent_program_id = context_string(context, &["parent_program_id", "parent_id"])?;
     let parent_agent_id = normalized_agent_component(
         task_id.as_deref(),
@@ -407,13 +375,13 @@ fn canonical_identity(
     let parent_program_id = parent_program_id
         .or_else(|| {
             parent_agent_id.as_deref().and_then(|parent| {
-                related_program_id(&program_id, agent_id.as_deref(), parent, task_id.as_deref())
+                related_program_id(program_id, agent_id.as_deref(), parent, task_id.as_deref())
             })
         })
         .or_else(|| {
             (agent_role.as_deref() == Some("subagent"))
                 .then(|| {
-                    related_program_id(&program_id, agent_id.as_deref(), "lead", task_id.as_deref())
+                    related_program_id(program_id, agent_id.as_deref(), "lead", task_id.as_deref())
                 })
                 .flatten()
         });
@@ -425,18 +393,8 @@ fn canonical_identity(
             "parent_program_id must differ from program_id".to_string(),
         ));
     }
-    if blocks_parent && parent_program_id.is_none() {
-        return Err(ScheduleError::InvalidIdentity(
-            "blocks_parent requires parent_program_id".to_string(),
-        ));
-    }
-    let expected_resume = context_bool(context, &["expected_resume"])?
+    identity.expected_resume = context_bool(context, &["expected_resume"])?
         .unwrap_or_else(|| !(blocks_parent && agent_role.as_deref() == Some("subagent")));
-    let mut identity =
-        ProgramIdentity::build(program_id, placement_key, expected_resume, model_pool)?;
-    identity.task_id = task_id;
-    identity.session_id = session_id;
-    identity.agent_id = agent_id;
     identity.parent_program_id = parent_program_id;
     identity.root_program_id = root_program_id;
     identity.blocks_parent = blocks_parent;
@@ -457,7 +415,7 @@ fn canonical_identity(
             &["kv_retention_ttl", "kv_retention_ttl_seconds"],
         )?,
     };
-    Ok(Some(identity))
+    Ok(())
 }
 
 fn related_program_id(
@@ -473,222 +431,6 @@ fn related_program_id(
         }
     }
     task_id.map(|task_id| scoped_program_id(task_id, Some(related_agent_id)))
-}
-
-fn normalized_agent_component(
-    task_id: Option<&str>,
-    agent_id: Option<String>,
-) -> Result<Option<String>, ScheduleError> {
-    let Some(agent_id) = agent_id else {
-        return Ok(None);
-    };
-    let Some(task_id) = task_id else {
-        return Ok(Some(agent_id));
-    };
-    let prefix = format!("{task_id}:");
-    let Some(component) = agent_id.strip_prefix(&prefix) else {
-        return Ok(Some(agent_id));
-    };
-    if component.is_empty() {
-        return Err(ScheduleError::InvalidIdentity(
-            "agent_id must include an agent component".to_string(),
-        ));
-    }
-    Ok(Some(component.to_string()))
-}
-
-fn canonical_context(
-    request: Option<&JsonMap<String, JsonValue>>,
-) -> Result<Option<JsonMap<String, JsonValue>>, ScheduleError> {
-    let Some(raw_xargs) = request.and_then(|request| request.get("vllm_xargs")) else {
-        return Ok(None);
-    };
-    if raw_xargs.is_null() {
-        return Ok(None);
-    }
-    let xargs = raw_xargs.as_object().ok_or_else(|| {
-        ScheduleError::InvalidIdentity("vllm_xargs must be an object".to_string())
-    })?;
-    let Some(raw_context) = xargs.get("agentic_context") else {
-        return Ok(None);
-    };
-    if raw_context.is_null() {
-        return Ok(None);
-    }
-    let context = match raw_context {
-        JsonValue::String(value) => {
-            if value.len() > MAX_AGENTIC_CONTEXT_BYTES {
-                return Err(bounded_agentic_context_error());
-            }
-            let decoded = serde_json::from_str::<JsonValue>(value)
-                .map_err(|_| bounded_agentic_context_error())?;
-            decoded
-                .as_object()
-                .cloned()
-                .ok_or_else(bounded_agentic_context_error)?
-        }
-        JsonValue::Object(context) => {
-            ensure_bounded_agentic_context(raw_context)?;
-            context.clone()
-        }
-        _ => {
-            return Err(ScheduleError::InvalidIdentity(
-                "vllm_xargs.agentic_context must be an object".to_string(),
-            ))
-        }
-    };
-    Ok(Some(context))
-}
-
-fn bounded_agentic_context_error() -> ScheduleError {
-    ScheduleError::InvalidIdentity(
-        "vllm_xargs.agentic_context must contain a bounded JSON object".to_string(),
-    )
-}
-
-fn ensure_bounded_agentic_context(context: &JsonValue) -> Result<(), ScheduleError> {
-    let mut writer = BoundedJsonWriter::default();
-    serde_json::to_writer(&mut writer, context).map_err(|_| bounded_agentic_context_error())
-}
-
-#[derive(Default)]
-struct BoundedJsonWriter {
-    written: usize,
-}
-
-impl Write for BoundedJsonWriter {
-    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
-        let Some(total) = self.written.checked_add(buffer.len()) else {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "agentic context size overflow",
-            ));
-        };
-        if total > MAX_AGENTIC_CONTEXT_BYTES {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "agentic context exceeds size limit",
-            ));
-        }
-        self.written = total;
-        Ok(buffer.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
-fn agent_hint_identity(
-    request: Option<&JsonMap<String, JsonValue>>,
-    model_pool: Option<&str>,
-) -> Result<Option<ProgramIdentity>, ScheduleError> {
-    let Some(raw_hint) = request.and_then(|request| request.get("agent_hint")) else {
-        return Ok(None);
-    };
-    if raw_hint.is_null() {
-        return Ok(None);
-    }
-    let hint = raw_hint.as_object().ok_or_else(|| {
-        ScheduleError::InvalidIdentity("agent_hint must be an object".to_string())
-    })?;
-    let session_id = context_string(hint, &["session_id"])?.ok_or_else(|| {
-        ScheduleError::InvalidIdentity("agent_hint.session_id is required".to_string())
-    })?;
-    let parent_session_id = context_string(hint, &["parent_session_id"])?;
-    let blocks_parent = context_bool(hint, &["blocks_parent"])?.unwrap_or(true);
-    if blocks_parent && parent_session_id.is_none() {
-        return Err(ScheduleError::InvalidIdentity(
-            "blocking agent_hint requires parent_session_id".to_string(),
-        ));
-    }
-    let expected_resume = context_bool(hint, &["expected_resume"])?.unwrap_or(!blocks_parent);
-    let mut identity = ProgramIdentity::build(
-        session_id.clone(),
-        session_id.clone(),
-        expected_resume,
-        model_pool,
-    )?;
-    identity.session_id = Some(session_id);
-    identity.parent_program_id = parent_session_id;
-    identity.blocks_parent = blocks_parent;
-    Ok(Some(identity))
-}
-
-type FrameworkIdentityHeaders = (Option<String>, Option<String>, Option<String>);
-
-fn framework_identity_headers(
-    headers: Option<&HeaderMap>,
-) -> Result<FrameworkIdentityHeaders, ScheduleError> {
-    let Some(headers) = headers else {
-        return Ok((None, None, None));
-    };
-    for (session_header, agent_header, parent_header) in [
-        (
-            CLAUDE_SESSION_HEADER,
-            Some(CLAUDE_AGENT_HEADER),
-            Some(CLAUDE_PARENT_AGENT_HEADER),
-        ),
-        (CODEX_SESSION_HEADER, Some(CODEX_THREAD_HEADER), None),
-        (GENERIC_SESSION_HEADER, None, None),
-    ] {
-        let Some(session_id) = read_nonempty_header(headers, session_header)? else {
-            continue;
-        };
-        let agent_id = match agent_header {
-            Some(name) => read_nonempty_header(headers, name)?,
-            None => None,
-        };
-        let parent_agent_id = match parent_header {
-            Some(name) => read_nonempty_header(headers, name)?,
-            None => None,
-        };
-        return Ok((Some(session_id), agent_id, parent_agent_id));
-    }
-    Ok((None, None, None))
-}
-
-fn read_nonempty_header(headers: &HeaderMap, name: &str) -> Result<Option<String>, ScheduleError> {
-    headers
-        .get(name)
-        .map(|value| {
-            value
-                .to_str()
-                .map(|value| value.trim().to_string())
-                .map_err(|_| ScheduleError::InvalidIdentity(format!("Invalid {name} header")))
-        })
-        .transpose()
-        .map(|value| value.filter(|value| !value.is_empty()))
-}
-
-fn context_string(
-    context: &JsonMap<String, JsonValue>,
-    keys: &[&str],
-) -> Result<Option<String>, ScheduleError> {
-    for key in keys {
-        let Some(value) = context.get(*key) else {
-            continue;
-        };
-        if value.is_null() {
-            continue;
-        }
-        let normalized = match value {
-            JsonValue::String(value) => value.trim().to_string(),
-            JsonValue::Number(value) if value.is_i64() || value.is_u64() => value.to_string(),
-            _ => {
-                return Err(ScheduleError::InvalidIdentity(format!(
-                    "{key} must be a string-compatible identifier"
-                )))
-            }
-        };
-        if normalized.is_empty() {
-            return Err(ScheduleError::InvalidIdentity(format!(
-                "{key} must not be empty"
-            )));
-        }
-        return Ok(Some(normalized));
-    }
-    Ok(None)
 }
 
 fn context_bool(
@@ -779,24 +521,20 @@ fn context_duration(
                 "{key} must be finite and non-negative"
             )));
         }
-        return Ok(Some(Duration::from_secs_f64(seconds)));
+        return Duration::try_from_secs_f64(seconds)
+            .map(Some)
+            .map_err(|_| ScheduleError::InvalidIdentity(format!("{key} overflows a duration")));
     }
     Ok(None)
-}
-
-fn scoped_program_id(session_id: &str, actor_id: Option<&str>) -> String {
-    let actor_id = actor_id.unwrap_or("lead");
-    let prefix = format!("{session_id}:");
-    if actor_id.starts_with(&prefix) {
-        actor_id.to_string()
-    } else {
-        format!("{prefix}{actor_id}")
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::request_identity::{
+        resolve_stable_identity, CLAUDE_AGENT_HEADER, CODEX_THREAD_HEADER,
+        MAX_AGENTIC_CONTEXT_BYTES,
+    };
 
     #[test]
     fn parses_existing_program_identity_contracts() {
@@ -1121,6 +859,20 @@ mod tests {
             ProgramIdentity::from_request(None, Some(&derived), Some("model")),
             Err(ScheduleError::InvalidIdentity(_))
         ));
+    }
+
+    #[test]
+    fn oversized_hint_durations_degrade_instead_of_panicking() {
+        let request = serde_json::json!({
+            "vllm_xargs": {"agentic_context": {"program_id": "p", "deadline": 1e300}}
+        });
+        assert!(matches!(
+            ProgramIdentity::from_request(None, Some(&request), Some("model")),
+            Err(ScheduleError::InvalidIdentity(_))
+        ));
+        assert!(resolve_stable_identity(None, Some(&request))
+            .unwrap()
+            .is_some());
     }
 
     #[test]

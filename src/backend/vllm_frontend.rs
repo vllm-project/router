@@ -78,21 +78,21 @@ impl VllmFrontend {
     pub fn chat_tokenize_timed(
         &self,
         request: &ChatRequest,
-    ) -> vllm_chat::Result<(Arc<[u32]>, f64, f64)> {
+    ) -> vllm_chat::Result<(Arc<[u32]>, f64, f64, usize)> {
         let t0 = Instant::now();
         let rendered = self.backends.chat_backend.chat_renderer().render(request)?;
         let template_ms = t0.elapsed().as_secs_f64() * 1000.0;
         let t1 = Instant::now();
-        let ids = self
+        let (ids, cached_tokens) = self
             .encoder
-            .encode(
+            .encode_with_stats(
                 rendered.prompt,
                 request.add_special_tokens,
                 request.cache_salt.as_deref(),
             )
             .map_err(|error| vllm_chat::Error::ChatTemplate(error.to_string()))?;
         let encode_ms = t1.elapsed().as_secs_f64() * 1000.0;
-        Ok((ids, template_ms, encode_ms))
+        Ok((ids, template_ms, encode_ms, cached_tokens))
     }
 }
 

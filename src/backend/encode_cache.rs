@@ -49,21 +49,32 @@ impl PromptEncoder {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn encode(
         &self,
         prompt: Prompt,
         add_special_tokens: bool,
         cache_salt: Option<&str>,
     ) -> vllm_tokenizer::Result<Arc<[u32]>> {
+        self.encode_with_stats(prompt, add_special_tokens, cache_salt)
+            .map(|(ids, _)| ids)
+    }
+
+    pub(crate) fn encode_with_stats(
+        &self,
+        prompt: Prompt,
+        add_special_tokens: bool,
+        cache_salt: Option<&str>,
+    ) -> vllm_tokenizer::Result<(Arc<[u32]>, usize)> {
         let text = match prompt {
-            Prompt::TokenIds(ids) => return Ok(Arc::from(ids)),
+            Prompt::TokenIds(ids) => return Ok((Arc::from(ids), 0)),
             Prompt::Text(text) => text,
         };
         let Some(cache) = &self.cache else {
             return self
                 .tokenizer
                 .encode(&text, add_special_tokens)
-                .map(Arc::from);
+                .map(|ids| (Arc::from(ids), 0));
         };
         let key = EncodingKey {
             instance: self.instance,
@@ -71,9 +82,11 @@ impl PromptEncoder {
             cache_salt: cache_salt.map(str::to_owned),
             text,
         };
-        cache.get_or_encode(
+        let encoded = std::cell::Cell::new(false);
+        let ids = cache.get_or_encode(
             &key,
             || {
+                encoded.set(true);
                 self.tokenizer
                     .encode(&key.text, add_special_tokens)
                     .map(Arc::from)
@@ -98,7 +111,9 @@ impl PromptEncoder {
                 }
                 bytes
             },
-        )
+        )?;
+        let cached_tokens = if encoded.get() { 0 } else { ids.len() };
+        Ok((ids, cached_tokens))
     }
 }
 
