@@ -14,7 +14,9 @@ if str(_PERF_DIR) not in sys.path:
 
 from case_loader import (  # noqa: E402
     WaveSpec,
+    apply_case_env,
     perf_case_selected,
+    perf_model_ready,
     resolve_perf_case,
     use_external_router,
     wave_case_id,
@@ -22,7 +24,6 @@ from case_loader import (  # noqa: E402
 from prefix_kvhit_runner import (  # noqa: E402
     default_output_dir,
     load_bench_module,
-    perf_env_ready,
     read_perf_settings,
 )
 from stack_launcher import launch_stack  # noqa: E402
@@ -44,10 +45,29 @@ def pytest_configure(config):
     opt = config.getoption("--perf-case", default=None)
     if opt:
         os.environ["PERF_CASE"] = str(opt).strip()
+    if perf_case_selected():
+        try:
+            apply_case_env(resolve_perf_case())
+        except (OSError, ValueError, RuntimeError, FileNotFoundError):
+            pass
 
 
 def _perf_ready() -> bool:
-    return perf_env_ready() and perf_case_selected()
+    return perf_model_ready() and perf_case_selected()
+
+
+def _perf_waves_for_collection() -> tuple[WaveSpec, ...] | None:
+    """Resolve wave matrix at collection time (does not require MODEL).
+
+    Parametrize before runtime env is complete so ``-k hit99-c16-r32`` works;
+    missing MODEL still skips at test time via ``test_prefix_kvhit_waves`` skipif.
+    """
+    if not perf_case_selected():
+        return None
+    try:
+        return resolve_perf_case().waves
+    except (OSError, ValueError, RuntimeError, FileNotFoundError):
+        return None
 
 
 @pytest.fixture(scope="session")
@@ -59,9 +79,11 @@ def bench_mod():
 def perf_case():
     if not perf_case_selected():
         pytest.skip("Set --perf-case (or PERF_CASE)")
+    case = resolve_perf_case()
+    apply_case_env(case)
     if not os.environ.get("MODEL", "").strip():
-        pytest.skip("Set MODEL to the served model path or HF id")
-    return resolve_perf_case()
+        pytest.skip("Set MODEL (env) or model in case JSON")
+    return case
 
 
 @pytest.fixture(scope="session")
@@ -117,15 +139,11 @@ def pytest_generate_tests(metafunc):
         return
     if metafunc.definition.name != "test_prefix_kvhit_waves":
         return
-    if not _perf_ready():
+    waves = _perf_waves_for_collection()
+    if not waves:
         return
 
-    try:
-        case = resolve_perf_case()
-    except (OSError, ValueError, RuntimeError, FileNotFoundError):
-        return
-
-    values, ids = _wave_params(case.waves)
+    values, ids = _wave_params(waves)
     if not values:
         return
     metafunc.parametrize(

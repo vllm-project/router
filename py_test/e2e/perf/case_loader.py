@@ -53,6 +53,8 @@ class BackendCaseFile:
     path: Path
     stack: StackConfig
     worker_cli: tuple[str, ...]
+    model: str | None = None
+    model_dir: str | None = None
     bench_tokens: int = 131072
     bench_max_tokens: int = 64
     bench_timeout: float = 1800.0
@@ -119,6 +121,43 @@ def _parse_worker_cli(worker: dict[str, Any]) -> tuple[str, ...]:
     return DEFAULT_WORKER_CLI
 
 
+def _optional_str(raw: Any) -> str | None:
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    return text or None
+
+
+def _parse_model_fields(
+    data: dict[str, Any], worker: dict[str, Any]
+) -> tuple[str | None, str | None]:
+    model = _optional_str(data.get("model")) or _optional_str(worker.get("model"))
+    model_dir = _optional_str(data.get("model_dir")) or _optional_str(
+        worker.get("model_dir")
+    )
+    return model, model_dir
+
+
+def apply_case_env(case: BackendCaseFile) -> None:
+    """Copy case ``model`` / ``model_dir`` into env when unset (env wins)."""
+    if case.model and not os.environ.get("MODEL", "").strip():
+        os.environ["MODEL"] = case.model
+    if case.model_dir and not os.environ.get("MODEL_DIR", "").strip():
+        os.environ["MODEL_DIR"] = case.model_dir
+
+
+def perf_model_ready() -> bool:
+    if os.environ.get("MODEL", "").strip():
+        return True
+    if not perf_case_selected():
+        return False
+    try:
+        case = resolve_perf_case()
+    except (OSError, ValueError, RuntimeError, FileNotFoundError):
+        return False
+    return bool(case.model)
+
+
 def load_case_file(path: Path) -> BackendCaseFile:
     data = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(data, dict):
@@ -128,12 +167,15 @@ def load_case_file(path: Path) -> BackendCaseFile:
         raise ValueError(f"{path}: backend must be a non-empty string")
     worker = data.get("worker") if isinstance(data.get("worker"), dict) else {}
     bench = data.get("bench") if isinstance(data.get("bench"), dict) else {}
+    model, model_dir = _parse_model_fields(data, worker)
     return BackendCaseFile(
         backend=backend,
         waves=_parse_waves(data, path),
         path=path,
         stack=_parse_stack(data, path, backend),
         worker_cli=_parse_worker_cli(worker),
+        model=model,
+        model_dir=model_dir,
         bench_tokens=int(bench.get("tokens", 131072)),
         bench_max_tokens=int(bench.get("max_tokens", 64)),
         bench_timeout=float(bench.get("timeout", 1800)),

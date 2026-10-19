@@ -31,7 +31,8 @@ def _case_ready() -> bool:
 
 @pytest.mark.perf
 @pytest.mark.skipif(
-    not _case_ready(), reason="Set MODEL, --perf-case; or PERF_EXTERNAL+ROUTER_URL"
+    not _case_ready(),
+    reason="Set --perf-case and MODEL (env or case JSON); or PERF_EXTERNAL+ROUTER_URL",
 )
 def test_prefix_kvhit_waves(
     bench_mod,

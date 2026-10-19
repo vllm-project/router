@@ -8,17 +8,19 @@ Reference workload: Qwen3.8-27B (`vllm-rs serve` / `vllm serve` + `vllm-router` 
 ## Flow
 
 ```text
-export MODEL=/path/to/Qwen3.8-27B/snapshot
 pytest py_test/e2e/perf --perf-case=rust_grpc -m perf
-  → vllm-rs serve (grpc) + vllm-router → 8 waves → teardown
+  → (model from case JSON or export MODEL=...) → vllm-rs + vllm-router → 8 waves
 ```
 
 Repeat with `--perf-case=rust_http` and `python_http` (**3 backends × 8 waves = 24** runs total).
 
 ## Run
 
+Model path or HF id: set `"model"` in `cases/<name>.json`, or `export MODEL=...`
+(**env overrides JSON**).
+
 ```bash
-export MODEL=/path/to/model
+export MODEL=/path/to/model   # optional if case JSON defines model
 export VLLM_RS=/path/to/vllm-rs          # rust_grpc
 export ROUTER_BIN=$PWD/target/release/vllm-router   # optional
 export PERF_SAVE_RESULTS=1               # optional, for cross-backend comparison

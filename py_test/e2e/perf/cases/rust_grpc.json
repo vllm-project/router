@@ -1,5 +1,6 @@
 {
   "backend": "rust_grpc",
+  "model": "/path/to/model/snapshot",
   "stack": {
     "host": "127.0.0.1",
     "router_port": 16002,

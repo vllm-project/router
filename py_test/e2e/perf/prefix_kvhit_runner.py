@@ -14,7 +14,9 @@ BENCH_SCRIPT = REPO_ROOT / "benches" / "backend" / "bench_prefix_kvhit.py"
 
 
 def perf_env_ready() -> bool:
-    return bool(os.environ.get("MODEL", "").strip())
+    from case_loader import perf_model_ready
+
+    return perf_model_ready()
 
 
 def load_bench_module():
