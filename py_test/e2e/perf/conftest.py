@@ -1,4 +1,4 @@
-"""Fixtures for py_test/e2e/perf (uses parent e2e conftest / vLLM test env)."""
+"""Fixtures for py_test/e2e/perf (uses parent e2e conftest; pip vLLM 0.29+ ok)."""
 
 from __future__ import annotations
 

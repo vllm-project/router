@@ -14,6 +14,14 @@ from urllib.parse import urlparse
 import pytest
 import requests
 
+from tools.e2e.vllm_test_compat import (
+    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+    DEFAULT_URL_FOR_TEST,
+    e2e_model_name,
+    vllm_worker_command,
+    vllm_worker_popen_env,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -95,25 +103,16 @@ def _popen_launch_worker(
     base_gpu_id: int | None = 0,
 ) -> subprocess.Popen:
     host, port = _parse_url(base_url)
-
-    cmd = [
-        "python3",
-        "-m",
-        "vllm.launch_server",
-        "--model-path",
+    cmd = vllm_worker_command(
         model,
-        "--host",
         host,
-        "--port",
         port,
-        "--base-gpu-id",
-        str(base_gpu_id or 0),
-    ]
-    if dp_size is not None:
-        cmd += ["--dp-size", str(dp_size)]
-    if api_key is not None:
-        cmd += ["--api-key", api_key]
-    return subprocess.Popen(cmd)
+        dp_size=dp_size,
+        api_key=api_key,
+        base_gpu_id=base_gpu_id,
+    )
+    env = vllm_worker_popen_env(base_gpu_id=base_gpu_id, dp_size=dp_size)
+    return subprocess.Popen(cmd, env=env)
 
 
 def _popen_launch_router_only(
@@ -677,18 +676,11 @@ def genai_bench_runner() -> Callable[..., None]:
 
 def pytest_configure(config):
     config.addinivalue_line("markers", "e2e: mark as end-to-end test")
-    config.addinivalue_line(
-        "markers",
-        "perf: GPU-backed prefix-KV performance (require ROUTER_URL and MODEL)",
-    )
 
 
 @pytest.fixture(scope="session")
 def e2e_model() -> str:
-    from vllm.test.test_utils import DEFAULT_MODEL_NAME_FOR_TEST
-
-    # Always use the default test model
-    return DEFAULT_MODEL_NAME_FOR_TEST
+    return e2e_model_name()
 
 
 @pytest.fixture
