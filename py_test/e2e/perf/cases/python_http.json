@@ -7,7 +7,26 @@
     "worker_http_port": 18002,
     "prometheus_port": 29003
   },
-  "worker": {},
+  "worker": {
+    "cli": [
+      "--tensor-parallel-size",
+      "2",
+      "--enable-auto-tool-choice",
+      "--tool-call-parser",
+      "qwen3_xml",
+      "--reasoning-parser",
+      "qwen3",
+      "--mm-encoder-tp-mode",
+      "data",
+      "--max-model-len",
+      "262144",
+      "--max-num-seqs",
+      "128",
+      "--gpu-memory-utilization",
+      "0.9",
+      "--enable-prefix-caching"
+    ]
+  },
   "bench": {
     "tokens": 131072,
     "max_tokens": 64,

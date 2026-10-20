@@ -10,25 +10,6 @@ from typing import Any
 
 CASES_DIR = Path(__file__).resolve().parent / "cases"
 
-DEFAULT_WORKER_CLI = (
-    "--tensor-parallel-size",
-    "2",
-    "--enable-auto-tool-choice",
-    "--tool-call-parser",
-    "qwen3_xml",
-    "--reasoning-parser",
-    "qwen3",
-    "--mm-encoder-tp-mode",
-    "data",
-    "--max-model-len",
-    "262144",
-    "--max-num-seqs",
-    "128",
-    "--gpu-memory-utilization",
-    "0.9",
-    "--enable-prefix-caching",
-)
-
 
 @dataclass(frozen=True)
 class StackConfig:
@@ -114,11 +95,15 @@ def _parse_stack(data: dict[str, Any], path: Path, backend: str) -> StackConfig:
     )
 
 
-def _parse_worker_cli(worker: dict[str, Any]) -> tuple[str, ...]:
+def _parse_worker_cli(worker: dict[str, Any], *, path: Path) -> tuple[str, ...]:
     cli = worker.get("cli")
     if isinstance(cli, list) and all(isinstance(x, str) for x in cli):
+        if not cli:
+            raise ValueError(f"{path}: worker.cli must be a non-empty string array")
         return tuple(cli)
-    return DEFAULT_WORKER_CLI
+    raise ValueError(
+        f"{path}: missing worker.cli (vllm-rs / vllm serve flags for this case)"
+    )
 
 
 def _optional_str(raw: Any) -> str | None:
@@ -173,7 +158,7 @@ def load_case_file(path: Path) -> BackendCaseFile:
         waves=_parse_waves(data, path),
         path=path,
         stack=_parse_stack(data, path, backend),
-        worker_cli=_parse_worker_cli(worker),
+        worker_cli=_parse_worker_cli(worker, path=path),
         model=model,
         model_dir=model_dir,
         bench_tokens=int(bench.get("tokens", 131072)),

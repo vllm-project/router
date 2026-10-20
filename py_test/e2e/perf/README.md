@@ -115,7 +115,7 @@ cross-backend SLOs.
 | Section | Content |
 |---------|---------|
 | `stack` | router **16002**, worker **18002**, gRPC **15002**, prom **29002/29001/29003** |
-| `worker.cli` | default Qwen3.8-27B flags, **`--max-num-seqs 128`**, TP=2, prefix caching, … |
+| `worker.cli` | **required** serve flags (Qwen3.8-27B example: TP=2, **`--max-num-seqs 128`**, prefix caching) |
 | `bench` | **tokens 131072**, **max_tokens 64**, **timeout 1800**, warmup via `PERF_WARMUP` |
 | `waves` | table above |
 
@@ -141,7 +141,7 @@ python benches/backend/bench_prefix_kvhit.py \
   --timeout 1800
 ```
 
-Serve/router flags come from `cases/*.json` (`stack`, `worker.cli` defaults).
+Serve/router flags come from `cases/*.json` (`stack`, `worker.cli`).
 
 ## Layout
 
