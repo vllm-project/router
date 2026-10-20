@@ -426,7 +426,11 @@ impl Worker for BasicWorker {
             ConnectionMode::Http => {
                 // Perform HTTP health check
                 let url = self.normalised_url()?;
-                let health_url = format!("{}{}", url, self.metadata.health_config.endpoint);
+                let health_url = format!(
+                    "{}/{}",
+                    url.trim_end_matches('/'),
+                    self.metadata.health_config.endpoint.trim_start_matches('/')
+                );
                 let timeout = Duration::from_secs(self.metadata.health_config.timeout_secs);
 
                 // Use the shared client with a custom timeout for this request

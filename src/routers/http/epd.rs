@@ -734,6 +734,91 @@ mod tests {
         })
     }
 
+    #[tokio::test]
+    async fn encoder_health_checks_preserve_trailing_slash_url_identity() {
+        use crate::core::{HealthConfig, WorkerFactory};
+        use axum::routing::get;
+
+        for (suffix, configured_endpoint, route_path) in [
+            ("", "/health", "/health"),
+            ("/", "/health", "/health"),
+            ("///", "/health", "/health"),
+            ("/", "/encoder-health", "/encoder-health"),
+            ("/", "health", "/health"),
+            ("", "health", "/health"),
+            ("///", "health", "/health"),
+            ("", "///health", "/health"),
+            ("/", "///health", "/health"),
+            ("///", "///health", "/health"),
+        ] {
+            let state = MockEncoder {
+                mode: "normal",
+                seen: Arc::new(Mutex::new(Vec::new())),
+            };
+            let app = Router::new()
+                .route(route_path, get(|| async { StatusCode::OK }))
+                .route("/v1/chat/completions", post(encode))
+                .with_state(state.clone());
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base_url = format!("http://{}", listener.local_addr().unwrap());
+            let url = format!("{base_url}{suffix}");
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let stage = test_stage(EpdConfig {
+                encoder_urls: vec![url.clone()],
+                encode_policy: None,
+                consumer_zmq_addrs: Default::default(),
+            });
+            let health_config = HealthConfig {
+                endpoint: configured_endpoint.into(),
+                ..Default::default()
+            };
+            let failure_threshold = health_config.failure_threshold;
+            let worker: Arc<dyn Worker> = Arc::from(WorkerFactory::create_encode_with_config(
+                url.clone(),
+                Default::default(),
+                health_config,
+            ));
+            stage.worker_registry.register(worker.clone());
+            let client = Client::new();
+
+            // Encoding already works before the first health check.
+            stage
+                .prepare(&client, request(), "pd", None, None)
+                .await
+                .unwrap();
+            let mut health_results = Vec::new();
+            for _ in 0..failure_threshold {
+                health_results.push(worker.check_health_async().await);
+            }
+            let next_request = stage.prepare(&client, request(), "pd", None, None).await;
+            assert!(
+                health_results.iter().all(Result::is_ok),
+                "Health checks failed for {url} with endpoint {configured_endpoint:?}: {health_results:?}; next request: {:?}",
+                next_request.as_ref().err()
+            );
+            assert!(worker.is_healthy());
+            assert!(worker.is_available());
+            next_request.unwrap();
+            assert_eq!(state.seen.lock().unwrap().len(), 2);
+
+            // Only the request URL is normalized; config and registry keys stay exact.
+            assert_eq!(stage.config.encoder_urls, vec![url.clone()]);
+            assert_eq!(worker.url(), url);
+            assert_eq!(
+                worker.metadata().health_config.endpoint,
+                configured_endpoint
+            );
+            assert!(Arc::ptr_eq(
+                &stage.worker_registry.get_by_url(&url).unwrap(),
+                &worker
+            ));
+            if !suffix.is_empty() {
+                assert!(stage.worker_registry.get_by_url(&base_url).is_none());
+            }
+            server.abort();
+        }
+    }
+
     #[test]
     fn selection_uses_live_encode_pool_in_config_order_and_independent_slot() {
         use crate::{config::EncodePolicy, core::BasicWorker};
