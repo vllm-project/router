@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib.util
 import os
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -97,8 +98,28 @@ def perf_case():
 
 
 @pytest.fixture(scope="session")
-def perf_stack(perf_case):
-    """Launch worker + router from case JSON, or use PERF_EXTERNAL + ROUTER_URL."""
+def perf_output_dir(perf_case, bench_mod) -> str:
+    """One results directory per pytest session when PERF_SAVE_RESULTS is set."""
+    existing = os.environ.get("PERF_OUTPUT_DIR", "").strip()
+    if existing:
+        return existing
+    if os.environ.get("PERF_SAVE_RESULTS", "").lower() not in (
+        "1",
+        "true",
+        "yes",
+    ):
+        return ""
+    path = bench_mod.default_output_dir(
+        {"backend_label": perf_case.backend},
+        results_parent=_PERF_DIR / "results",
+    )
+    os.environ["PERF_OUTPUT_DIR"] = path
+    return path
+
+
+@pytest.fixture(scope="function")
+def perf_stack(perf_case, request):
+    """Cold start: launch worker + router for each wave (teardown after the test)."""
     if use_external_router():
         url = os.environ.get("ROUTER_URL", "").strip()
         if not url:
@@ -107,9 +128,10 @@ def perf_stack(perf_case):
         return
 
     model = os.environ["MODEL"].strip()
+    wave_id = getattr(request, "node", None)
+    wave_label = wave_id.nodeid if wave_id is not None else "wave"
     _progress(
-        f"session fixture perf_stack: launching {perf_case.backend} for model={model!r} "
-        "(first run: worker load + /health can take a long time; logs below)"
+        f"perf_stack cold start [{wave_label}]: {perf_case.backend} model={model!r}"
     )
     stack = launch_stack(perf_case, model)
     _progress(f"perf_stack ready: {stack.router_url}")
@@ -117,27 +139,23 @@ def perf_stack(perf_case):
     try:
         yield stack
     finally:
+        _progress(f"perf_stack teardown [{wave_label}]")
         stack.stop()
+        stop_wait = float(os.environ.get("PERF_STACK_STOP_SLEEP", "3"))
+        if stop_wait > 0:
+            time.sleep(stop_wait)
 
 
-@pytest.fixture(scope="session")
-def perf_settings(perf_case, perf_stack, bench_mod):
+@pytest.fixture(scope="function")
+def perf_settings(perf_case, perf_stack, bench_mod, perf_output_dir):
     settings = bench_mod.read_perf_settings(
         backend_label=perf_case.backend,
         bench_tokens=perf_case.bench_tokens,
         bench_max_tokens=perf_case.bench_max_tokens,
         bench_timeout=perf_case.bench_timeout,
     )
-    if not settings["output_dir"] and os.environ.get(
-        "PERF_SAVE_RESULTS", ""
-    ).lower() in (
-        "1",
-        "true",
-        "yes",
-    ):
-        settings["output_dir"] = bench_mod.default_output_dir(
-            settings, results_parent=_PERF_DIR / "results"
-        )
+    if not settings["output_dir"] and perf_output_dir:
+        settings["output_dir"] = perf_output_dir
     return settings
 
 

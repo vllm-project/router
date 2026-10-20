@@ -9,10 +9,22 @@ Reference workload: Qwen3.8-27B (`vllm-rs serve` / `vllm serve` + `vllm-router` 
 
 ```text
 pytest py_test/e2e/perf --perf-case=rust_grpc -m perf
-  → (model from case JSON or export MODEL=...) → vllm-rs + vllm-router → 8 waves
+  → per wave: cold start vllm-rs + vllm-router → bench → teardown (×8)
 ```
 
-Repeat with `--perf-case=rust_http` and `python_http` (**3 backends × 8 waves = 24** runs total).
+Repeat with `--perf-case=rust_http` and `python_http` (**3 backends × 8 waves = 24** cold starts total).
+
+### Cold start (default)
+
+Each parametrized **wave** gets its own **`perf_stack`**: worker and router are
+**stopped after the test** and **launched again** before the next wave (fresh model
+load and empty prefix KV). Expect **much longer** total time than one shared stack.
+
+`PERF_STACK_STOP_SLEEP` (default `3`) seconds after teardown before the next launch.
+`PERF_EXTERNAL=1` skips pytest launch; cold start is then your responsibility.
+
+Wave-level **warmup** (`PERF_WARMUP=1`, default) still runs miss/hit requests after
+each cold stack is up, before the concurrent wave.
 
 ## Run
 
