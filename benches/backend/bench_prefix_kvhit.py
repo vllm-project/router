@@ -393,6 +393,54 @@ def assert_wave_summary(wave: dict[str, Any], expected_requests: int) -> dict[st
     return summary
 
 
+def _fmt_metric_block(block: dict[str, Any] | None) -> str:
+    if not isinstance(block, dict):
+        return "n/a"
+    parts = []
+    for stat in ("min", "avg", "max"):
+        val = block.get(stat)
+        if isinstance(val, (int, float)):
+            parts.append(f"{stat}={val:.2f}")
+    return " ".join(parts) if parts else "n/a"
+
+
+def print_wave_summary(
+    wave: dict[str, Any],
+    *,
+    backend: str | None = None,
+    hit_rate: float | None = None,
+    concurrency: int | None = None,
+    requests: int | None = None,
+    run_idx: int | None = None,
+) -> None:
+    """Human-readable wave summary for pytest -sv / bench CLI (stderr)."""
+    import sys
+
+    if os.environ.get("PERF_QUIET", "").lower() in ("1", "true", "yes"):
+        return
+    summary = wave.get("summary") or {}
+    tags: list[str] = []
+    if backend:
+        tags.append(backend)
+    if run_idx is not None:
+        tags.append(f"run{run_idx}")
+    if hit_rate is not None:
+        tags.append(f"hit={hit_rate:g}")
+    if concurrency is not None:
+        tags.append(f"c={concurrency}")
+    if requests is not None:
+        tags.append(f"r={requests}")
+    title = " | ".join(tags) if tags else "wave"
+    lines = [
+        "",
+        f"======== perf summary [{title}] count={summary.get('count', '?')} ========",
+    ]
+    for key in ("ttft_ms", "e2e_ms", "tpot_ms"):
+        lines.append(f"  {key}: {_fmt_metric_block(summary.get(key))}")
+    lines.append("=" * (len(lines[-2]) if len(lines) > 1 else 40))
+    print("\n".join(lines), file=sys.stderr, flush=True)
+
+
 def hit_rate_file_tag(hit_rate: float) -> str:
     if hit_rate >= 0.99:
         return "099"
@@ -538,6 +586,12 @@ def main() -> None:
         args.max_tokens,
         args.timeout,
         args.concurrency,
+    )
+    print_wave_summary(
+        result["wave"],
+        hit_rate=args.hit_rate,
+        concurrency=args.concurrency,
+        requests=wave_requests,
     )
     print(json.dumps(result, indent=2))
 

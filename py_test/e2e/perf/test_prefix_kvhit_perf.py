@@ -45,6 +45,14 @@ def test_prefix_kvhit_waves(
         requests=requests,
     )
     bench_mod.assert_wave_summary(payload["wave"], requests)
+    bench_mod.print_wave_summary(
+        payload["wave"],
+        backend=perf_case.backend,
+        hit_rate=hit_rate,
+        concurrency=concurrency,
+        requests=requests,
+        run_idx=run_idx,
+    )
     bench_mod.maybe_write_result(
         perf_settings,
         run_idx=run_idx,

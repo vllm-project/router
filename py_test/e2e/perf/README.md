@@ -120,6 +120,10 @@ cross-backend SLOs.
 
 Override bench via env: `PERF_TOKENS`, `PERF_MAX_TOKENS`, `PERF_TIMEOUT`.
 
+Each wave prints a **`perf summary`** block to stderr after the test (use `-sv`).
+Set `PERF_QUIET=1` to disable; full JSON still lands under `results/` when
+`PERF_SAVE_RESULTS=1`.
+
 One wave equals:
 
 ```bash
