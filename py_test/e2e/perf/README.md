@@ -35,7 +35,8 @@ Model path or HF id: set `"model"` in `cases/<name>.json`, or `export MODEL=...`
 export MODEL=/path/to/model   # optional if case JSON defines model
 export VLLM_RS=/path/to/vllm-rs          # rust_grpc
 export ROUTER_BIN=$PWD/target/release/vllm-router   # optional
-export PERF_SAVE_RESULTS=1               # optional, for cross-backend comparison
+# results JSON: default on → py_test/e2e/perf/results/<backend>_<ts>/
+# export PERF_SAVE_RESULTS=0   # disable file output
 
 pytest py_test/e2e/perf --perf-case=rust_grpc -m perf
 pytest py_test/e2e/perf --perf-case=rust_http -m perf
@@ -121,8 +122,8 @@ cross-backend SLOs.
 Override bench via env: `PERF_TOKENS`, `PERF_MAX_TOKENS`, `PERF_TIMEOUT`.
 
 Each wave prints a **`perf summary`** block to stderr after the test (use `-sv`).
-Set `PERF_QUIET=1` to disable; full JSON still lands under `results/` when
-`PERF_SAVE_RESULTS=1`.
+Set `PERF_QUIET=1` to disable terminal summary. Wave JSON is written under
+`py_test/e2e/perf/results/` **by default**; use `PERF_SAVE_RESULTS=0` to skip files.
 
 One wave equals:
 

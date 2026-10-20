@@ -67,6 +67,16 @@ def _perf_ready() -> bool:
     return perf_model_ready() and perf_case_selected()
 
 
+def _perf_save_results_enabled() -> bool:
+    """Default on; set PERF_SAVE_RESULTS=0 to skip writing results/*.json."""
+    raw = os.environ.get("PERF_SAVE_RESULTS", "").strip().lower()
+    if raw in ("0", "false", "no"):
+        return False
+    if raw in ("1", "true", "yes"):
+        return True
+    return True
+
+
 def _perf_waves_for_collection() -> tuple[WaveSpec, ...] | None:
     """Resolve wave matrix at collection time (does not require MODEL).
 
@@ -99,15 +109,11 @@ def perf_case():
 
 @pytest.fixture(scope="session")
 def perf_output_dir(perf_case, bench_mod) -> str:
-    """One results directory per pytest session when PERF_SAVE_RESULTS is set."""
+    """One results directory per pytest session (default: always save)."""
     existing = os.environ.get("PERF_OUTPUT_DIR", "").strip()
     if existing:
         return existing
-    if os.environ.get("PERF_SAVE_RESULTS", "").lower() not in (
-        "1",
-        "true",
-        "yes",
-    ):
+    if not _perf_save_results_enabled():
         return ""
     path = bench_mod.default_output_dir(
         {"backend_label": perf_case.backend},
