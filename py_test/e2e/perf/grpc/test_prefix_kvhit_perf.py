@@ -1,7 +1,7 @@
 """Live prefix-KV perf: launch stack from case JSON, then run bench waves.
 
   export MODEL=/path/to/model
-  pytest py_test/e2e/perf --perf-case=rust_grpc -m perf
+  pytest py_test/e2e/perf/grpc --perf-case=rust_grpc -m perf
 """
 
 from __future__ import annotations
