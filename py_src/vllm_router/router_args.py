@@ -165,6 +165,7 @@ class RouterArgs:
                 "kv_aware",
                 "power_of_two",
                 "consistent_hash",
+                "sticky_least_loaded",
             ],
             help="Load balancing policy to use. kv_aware is supported only in regular mode. In PD mode, this is used for both prefill and decode unless overridden",
         )
@@ -178,6 +179,7 @@ class RouterArgs:
                 "cache_aware",
                 "power_of_two",
                 "consistent_hash",
+                "sticky_least_loaded",
             ],
             help="Specific policy for prefill nodes in PD mode. kv_aware is not supported in PD mode. If not specified, uses the main policy",
         )
@@ -191,6 +193,7 @@ class RouterArgs:
                 "cache_aware",
                 "power_of_two",
                 "consistent_hash",
+                "sticky_least_loaded",
             ],
             help="Specific policy for decode nodes in PD mode. kv_aware is not supported in PD mode. If not specified, uses the main policy",
         )

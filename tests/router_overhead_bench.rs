@@ -146,7 +146,7 @@ struct Scenario {
     route: Route,
 }
 
-const SCENARIOS: [Scenario; 5] = [
+const SCENARIOS: [Scenario; 6] = [
     Scenario {
         name: "direct_completions",
         policy: None,
@@ -165,6 +165,11 @@ const SCENARIOS: [Scenario; 5] = [
     Scenario {
         name: "completions_rendezvous",
         policy: Some("rendezvous_hash"),
+        route: Route::Completions,
+    },
+    Scenario {
+        name: "completions_sticky_least_loaded",
+        policy: Some("sticky_least_loaded"),
         route: Route::Completions,
     },
     Scenario {
