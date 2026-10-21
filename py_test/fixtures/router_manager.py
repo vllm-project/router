@@ -1,4 +1,5 @@
 import subprocess
+import sys
 import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional
@@ -50,7 +51,7 @@ class RouterManager:
             ]
         else:
             cmd = [
-                "python3",
+                sys.executable,
                 "-m",
                 "vllm_router.launch_router",
                 "--host",

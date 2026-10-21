@@ -1,4 +1,5 @@
 import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Iterable, List, Optional, Tuple
@@ -29,7 +30,7 @@ def _spawn_mock_worker(args: List[str]) -> Tuple[subprocess.Popen, str, str]:
     port = find_free_port()
     worker_id = f"worker-{port}"
     base_cmd = [
-        "python3",
+        sys.executable,
         str(script),
         "--port",
         str(port),
