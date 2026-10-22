@@ -13,7 +13,7 @@ use rand::Rng;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore, TryAcquireError};
 use tower::{Layer, Service};
 use tower_http::classify::ServerErrorsFailureClass;
 use tower_http::trace::{MakeSpan, OnFailure, OnRequest, OnResponse, TraceLayer};
@@ -428,66 +428,79 @@ impl QueueProcessor {
         }
     }
 
-    pub async fn run(mut self) {
+    pub async fn run(self) {
+        let Self {
+            token_bucket,
+            concurrency_semaphore,
+            mut queue_rx,
+            queue_timeout,
+        } = self;
         info!("Starting concurrency queue processor");
 
-        // Let each queued request wait independently so one wait does not stall the queue.
-        while let Some(mut queued) = self.queue_rx.recv().await {
-            let deadline = queued.queued_at + self.queue_timeout;
-            let token_bucket = self.token_bucket.clone();
-            let concurrency_semaphore = self.concurrency_semaphore.clone();
+        // Process one queued request at a time. This keeps the bounded channel
+        // as the actual cap on waiting requests instead of spawning a detached
+        // task per dequeued request, which could grow without bound as senders
+        // refill the channel.
+        while let Some(mut queued) = queue_rx.recv().await {
+            let deadline = queued.queued_at + queue_timeout;
+            let acquisition = tokio::time::timeout_at(deadline, async {
+                let token_bucket = token_bucket.clone();
+                let concurrency_semaphore = concurrency_semaphore.clone();
 
-            tokio::spawn(async move {
-                let acquisition = tokio::time::timeout_at(deadline, async {
-                    if tokio::time::Instant::now() >= deadline {
-                        return Some(Err(StatusCode::REQUEST_TIMEOUT));
+                if tokio::time::Instant::now() >= deadline {
+                    return Some(Err(StatusCode::REQUEST_TIMEOUT));
+                }
+
+                let permit = tokio::select! {
+                    biased;
+                    _ = queued.permit_tx.closed() => return None,
+                    result = concurrency_semaphore.acquire_owned() => match result {
+                        Ok(permit) => permit,
+                        Err(_) => return Some(Err(StatusCode::SERVICE_UNAVAILABLE)),
+                    },
+                };
+
+                loop {
+                    if queued.permit_tx.is_closed() {
+                        return None;
                     }
 
-                    let permit = tokio::select! {
+                    tokio::select! {
                         biased;
                         _ = queued.permit_tx.closed() => return None,
-                        result = concurrency_semaphore.acquire_owned() => match result {
-                            Ok(permit) => permit,
-                            Err(_) => return Some(Err(StatusCode::SERVICE_UNAVAILABLE)),
-                        },
-                    };
-
-                    loop {
-                        if tokio::time::Instant::now() >= deadline {
-                            return Some(Err(StatusCode::REQUEST_TIMEOUT));
-                        }
-
-                        if token_bucket.try_acquire(1.0).await.is_ok() {
-                            return Some(Ok(permit));
-                        }
-
-                        tokio::select! {
-                            biased;
-                            _ = queued.permit_tx.closed() => return None,
-                            _ = tokio::time::sleep(Duration::from_millis(10)) => {}
-                        }
+                        _ = token_bucket.wait_until_available(1.0) => {}
                     }
-                })
-                .await;
 
-                match acquisition {
-                    Ok(Some(Ok(permit))) => {
-                        if queued.permit_tx.send(Ok(permit)).is_err() {
-                            debug!("Queued request was cancelled before permit delivery");
-                        }
+                    if queued.permit_tx.is_closed() {
+                        return None;
                     }
-                    Ok(Some(Err(status))) => {
-                        let _ = queued.permit_tx.send(Err(status));
-                    }
-                    Ok(None) => {
-                        debug!("Queued request was cancelled while waiting for a permit");
-                    }
-                    Err(_) => {
-                        warn!("Queue: request timed out waiting for a permit or rate token");
-                        let _ = queued.permit_tx.send(Err(StatusCode::REQUEST_TIMEOUT));
+
+                    if token_bucket.try_acquire(1.0).await.is_ok() {
+                        return Some(Ok(permit));
                     }
                 }
-            });
+            })
+            .await;
+
+            match acquisition {
+                Ok(Some(Ok(permit))) => {
+                    if queued.permit_tx.send(Ok(permit)).is_err() {
+                        debug!("Queued request was cancelled before permit delivery");
+                        token_bucket.return_tokens(1.0).await;
+                    }
+                }
+                Ok(Some(Err(status))) => {
+                    debug!("Queue: request rejected with {}", status);
+                    let _ = queued.permit_tx.send(Err(status));
+                }
+                Ok(None) => {
+                    debug!("Queued request was cancelled while waiting for a permit or rate token");
+                }
+                Err(_) => {
+                    warn!("Queue: request timed out waiting for a permit or rate token");
+                    let _ = queued.permit_tx.send(Err(StatusCode::REQUEST_TIMEOUT));
+                }
+            }
         }
 
         warn!("Concurrency queue processor shutting down");
@@ -534,13 +547,18 @@ impl ConcurrencyLimiter {
 /// response, including a client disconnect, which drops the body.
 fn hold_permit_for_body(response: Response, permit: OwnedSemaphorePermit) -> Response {
     let (parts, body) = response.into_parts();
-    let permit = if body.is_end_stream() {
+    if body.is_end_stream() {
         drop(permit);
-        None
+        Response::from_parts(parts, body)
     } else {
-        Some(permit)
-    };
-    Response::from_parts(parts, Body::new(ConcurrencyBody { body, permit }))
+        Response::from_parts(
+            parts,
+            Body::new(ConcurrencyBody {
+                body,
+                permit: Some(permit),
+            }),
+        )
+    }
 }
 
 struct ConcurrencyBody {
@@ -606,15 +624,24 @@ pub async fn concurrency_limit_middleware(
     let concurrency_semaphore = app_state.context.concurrency_semaphore.clone();
 
     // Acquire concurrency before consuming a rate token.
-    if let Ok(permit) = concurrency_semaphore.clone().try_acquire_owned() {
-        if token_bucket.try_acquire(1.0).await.is_ok() {
-            debug!("Acquired concurrency permit and rate token immediately");
-            let response = next.run(request).await;
-            return hold_permit_for_body(response, permit);
-        }
+    match concurrency_semaphore.clone().try_acquire_owned() {
+        Ok(permit) => {
+            if token_bucket.try_acquire(1.0).await.is_ok() {
+                debug!("Acquired concurrency permit and rate token immediately");
+                let response = next.run(request).await;
+                return hold_permit_for_body(response, permit);
+            }
 
-        drop(permit);
-        warn!("Rate limit exhausted, attempting to queue request");
+            drop(permit);
+            warn!("Rate limit exhausted, attempting to queue request");
+        }
+        Err(TryAcquireError::Closed) => {
+            warn!("Concurrency limiter closed; returning 503");
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+        Err(TryAcquireError::NoPermits) => {
+            debug!("Concurrency permits exhausted");
+        }
     }
 
     // No concurrency permit or rate token is available. Queue if enabled.
