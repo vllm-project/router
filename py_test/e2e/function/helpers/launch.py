@@ -2,13 +2,82 @@
 
 from __future__ import annotations
 
+import os
+import shutil
 import socket
 import subprocess
 import sys
 import time
+from pathlib import Path
 from urllib.parse import urlparse
 
 import requests
+
+
+def _validate_router_executable(path: str, *, env_key: str) -> str:
+    candidate = Path(path).expanduser()
+    if not candidate.is_file():
+        raise RuntimeError(f"{env_key}={path!r} is not a file (resolved {candidate})")
+    if not os.access(candidate, os.X_OK):
+        raise RuntimeError(f"{env_key}={path!r} is not executable")
+    return str(candidate.resolve())
+
+
+def _router_bin_from_env() -> str | None:
+    """``ROUTER_BIN`` matches scripts/backend; ``VLLM_ROUTER_BIN`` is an alias."""
+    for key in ("ROUTER_BIN", "VLLM_ROUTER_BIN"):
+        value = os.environ.get(key, "").strip()
+        if value:
+            return _validate_router_executable(value, env_key=key)
+    return None
+
+
+def _find_cargo_router_binary() -> str | None:
+    """Walk up from this file to a directory with ``Cargo.toml``, then ``target/*/vllm-router``."""
+    here = Path(__file__).resolve()
+    for parent in here.parents:
+        if not (parent / "Cargo.toml").is_file():
+            continue
+        for profile in ("release", "debug"):
+            candidate = parent / "target" / profile / "vllm-router"
+            if candidate.is_file() and os.access(candidate, os.X_OK):
+                return str(candidate)
+    return None
+
+
+def _python_router_launch_prefix() -> list[str] | None:
+    """Use only when ``vllm_router.launch_router`` imports (not bare ``find_spec``)."""
+    try:
+        import importlib
+
+        importlib.import_module("vllm_router.launch_router")
+    except ImportError:
+        return None
+    return [sys.executable, "-m", "vllm_router.launch_router"]
+
+
+def router_launch_prefix() -> list[str]:
+    """Command prefix to start the router (binary or ``python -m vllm_router.launch_router``)."""
+    env_bin = _router_bin_from_env()
+    if env_bin:
+        return [env_bin]
+
+    on_path = shutil.which("vllm-router")
+    if on_path:
+        return [on_path]
+
+    cargo_bin = _find_cargo_router_binary()
+    if cargo_bin:
+        return [cargo_bin]
+
+    py_prefix = _python_router_launch_prefix()
+    if py_prefix is not None:
+        return py_prefix
+
+    raise RuntimeError(
+        "Cannot start router: export ROUTER_BIN=/path/to/vllm-router (cargo build --release), "
+        "add vllm-router to PATH, build from this repo, or pip install -e ."
+    )
 
 
 def find_available_port() -> int:
@@ -83,9 +152,7 @@ def popen_launch_router_only(
     host, port = _parse_url(base_url)
     prom_port = find_available_port()
     cmd = [
-        sys.executable,
-        "-m",
-        "vllm_router.launch_router",
+        *router_launch_prefix(),
         "--host",
         host,
         "--port",
@@ -113,8 +180,21 @@ def popen_launch_router_only(
         "--prometheus-host",
         "127.0.0.1",
     ]
-    proc = subprocess.Popen(cmd)
-    wait_router_health(base_url, timeout)
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        wait_router_health(base_url, timeout)
+    except TimeoutError as exc:
+        detail = proc.stderr.read() if proc.stderr is not None else ""
+        if proc.poll() is None:
+            proc.kill()
+        raise TimeoutError(
+            f"{exc}\nrouter cmd: {cmd!r}\nrouter stderr:\n{detail}"
+        ) from exc
     return proc
 
 

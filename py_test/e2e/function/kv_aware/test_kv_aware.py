@@ -3,6 +3,10 @@
 Run (avoids importing ``py_test/e2e/conftest`` / ``vllm.test``)::
 
   pytest py_test/e2e/function/kv_aware --confcutdir=py_test/e2e/function/kv_aware -m e2e -v
+
+Router binary (pick one): auto-detect ``target/release/vllm-router`` after
+``cargo build --release``; or ``export ROUTER_BIN=/path/to/vllm-router``;
+or ``pip install -e .`` (``python -m vllm_router.launch_router``).
 """
 
 from __future__ import annotations
