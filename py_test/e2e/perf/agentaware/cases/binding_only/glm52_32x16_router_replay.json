@@ -1,0 +1,77 @@
+{
+  "test_name": "glm52_32x16_router_replay_binding_only",
+  "router_arm": "binding_only",
+  "description": "GLM-5.2 Ascend DP2xTP8 serve, Router binding-only program scheduling, 32 tasks x 16 concurrency replay",
+  "serve_env": {
+    "HCCL_OP_EXPANSION_MODE": "AIV",
+    "OMP_PROC_BIND": "false",
+    "OMP_NUM_THREADS": "1",
+    "HCCL_BUFFSIZE": "200",
+    "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
+    "VLLM_ASCEND_ENABLE_FLASHCOMM1": "1",
+    "VLLM_ASCEND_ENABLE_FUSED_MC2": "0"
+  },
+  "server_params": {
+    "model": "/path/to/models/GLM-5.2-w4a8c8",
+    "middleware": [],
+    "serve_args": {
+      "served-model-name": "glm-5",
+      "host": "0.0.0.0",
+      "port": 8077,
+      "api-server-count": 1,
+      "data-parallel-size": 2,
+      "enable-expert-parallel": true,
+      "tensor-parallel-size": 8,
+      "seed": 1024,
+      "tool-call-parser": "glm47",
+      "reasoning-parser": "glm45",
+      "enable-auto-tool-choice": true,
+      "max-num-seqs": 12,
+      "max-model-len": 180000,
+      "max-num-batched-tokens": 8192,
+      "trust-remote-code": true,
+      "gpu-memory-utilization": 0.92,
+      "quantization": "ascend",
+      "compilation-config": {"cudagraph_mode": "FULL_DECODE_ONLY"},
+      "additional-config": {
+        "enable_dsa_cp": true,
+        "enable_sparse_sfa_c8": false,
+        "enable_sparse_li_c8": true,
+        "enable_balance_scheduling": true,
+        "multistream_overlap_shared_expert": true
+      },
+      "speculative-config": {
+        "num_speculative_tokens": 3,
+        "method": "deepseek_mtp",
+        "enforce_eager": true
+      },
+      "enable-prefix-caching": true,
+      "async-scheduling": true,
+      "scheduler-cls": "vllm.v1.core.sched.async_scheduler.AsyncScheduler",
+      "enable-prompt-tokens-details": true
+    }
+  },
+  "router_params": {
+    "binary": "target/release/vllm-router",
+    "host": "0.0.0.0",
+    "port": 3001,
+    "metrics_port": 29000,
+    "worker_urls": ["http://127.0.0.1:8077"],
+    "intra_node_data_parallel_size": 2,
+    "program_scheduling_config": "results/agentaware/l1/program-scheduling-binding-only.json",
+    "ready_url": "http://127.0.0.1:3001/health",
+    "ready_timeout_seconds": 600
+  },
+  "result_root": "test-results/agentaware",
+  "wait_for_vllm_ready": true,
+  "benchmark_params": {
+    "workload": "router-replay",
+    "config": "py_test/e2e/perf/agentaware/configs/replay-full.yaml",
+    "model": "glm-5",
+    "task-num": 32,
+    "max-concurrency": 16,
+    "timeout": 3600,
+    "worker_metrics_url": "http://127.0.0.1:8077/metrics",
+    "worker_tokenizer_base_url": "http://127.0.0.1:8077"
+  }
+}

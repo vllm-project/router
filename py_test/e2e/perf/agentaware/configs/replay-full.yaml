@@ -1,0 +1,53 @@
+# Replay config for agent-aware router perf (run pytest from vllm-router repo root).
+# Paths below are relative to the repository root unless absolute.
+# CLI overrides (--task-num, --max-concurrency, --result-dir) take precedence when wired in case JSON.
+
+experiment:
+  task_num: 24
+  result_dir: test-results/agentaware/replay-placeholder
+  max_concurrency: 12
+  task_timeout_seconds: 3600
+  run_timeout_seconds: null
+
+backend:
+  type: vllm
+  base_url: http://127.0.0.1:3001
+  metrics_url: http://127.0.0.1:8077/metrics
+  tokenizer_base_url: http://127.0.0.1:8077
+  model: glm-5
+  endpoint: /v1/chat/completions
+  chat_template_kwargs: {}
+  api_key_env: null
+
+replay:
+  trace_type: agentinfer
+  trace_path: results/agentaware/traces/requests.jsonl
+  interval_mode: trace
+  trace_same_agent_gap_scale: 1.0
+  trace_same_agent_gap_offset_seconds: 0.0
+  sample_seed: 0
+
+  prompt_transport: completion_token_ids
+  tokenizer_max_concurrency: 16
+  prompt_calibration_tolerance_tokens: 0
+  request_timeout_seconds: 3600
+
+  context_adjustment_mode: adaptive
+  context_micro_trim_max_tokens: 64
+  context_micro_trim_max_ratio: 0.005
+
+  lead_1st_sys_shared_prefix: 18
+  lead_1st_sys_session_prefix: 0
+  lead_1st_tool_shared_prefix: 500
+  lead_1st_msg_shared_prefix: 74
+  lead_1st_trailing_system_prefix: 459
+
+  subagent_1st_sys_shared_prefix: 18
+  subagent_1st_sys_session_prefix: 732
+  subagent_tool_1st_shared_prefix: 6900
+  subagent_1st_msg_shared_prefix: 74
+
+  lead_continuation_extra_system_ratio: 0.2146
+  lead_continuation_system_tokens: 64
+  subagent_continuation_extra_system_ratio: 0.2344
+  subagent_continuation_system_tokens: 32

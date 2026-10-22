@@ -14,11 +14,18 @@ from urllib.parse import urlparse
 import pytest
 import requests
 
-from vllm.test.test_utils import (
-    DEFAULT_MODEL_NAME_FOR_TEST,
-    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-    DEFAULT_URL_FOR_TEST,
-)
+try:
+    from vllm.test.test_utils import (
+        DEFAULT_MODEL_NAME_FOR_TEST,
+        DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+        DEFAULT_URL_FOR_TEST,
+    )
+except ModuleNotFoundError:
+    # py_test/e2e/perf/agentaware does not use these fixtures; vLLM's test tree is optional
+    # (inference venvs often have vllm without vllm.test).
+    DEFAULT_MODEL_NAME_FOR_TEST = ""
+    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH = 600.0
+    DEFAULT_URL_FOR_TEST = "http://127.0.0.1:8000"
 
 logger = logging.getLogger(__name__)
 
@@ -687,12 +694,20 @@ def pytest_configure(config):
 
 @pytest.fixture(scope="session")
 def e2e_model() -> str:
-    # Always use the default test model
-    return DEFAULT_MODEL_NAME_FOR_TEST
+    pytest.importorskip("vllm.test")
+    from vllm.test.test_utils import DEFAULT_MODEL_NAME_FOR_TEST as model
+
+    return model
 
 
 @pytest.fixture
 def e2e_router(e2e_model: str):
+    pytest.importorskip("vllm.test")
+    from vllm.test.test_utils import (
+        DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+        DEFAULT_URL_FOR_TEST,
+    )
+
     # Keep this available but tests below use router-only to avoid GPU contention
     base_url = DEFAULT_URL_FOR_TEST
     proc = _popen_launch_router(
