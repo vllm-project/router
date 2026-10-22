@@ -25,7 +25,7 @@ from case_loader import (  # noqa: E402
 )
 from stack_launcher import launch_stack  # noqa: E402
 
-BENCH_SCRIPT = _PERF_DIR.parents[4] / "benches" / "backend" / "bench_prefix_kvhit.py"
+BENCH_SCRIPT = _PERF_DIR.parents[3] / "benches" / "backend" / "bench_prefix_kvhit.py"
 
 
 def _progress(msg: str) -> None:
