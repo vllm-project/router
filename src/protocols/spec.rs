@@ -676,7 +676,22 @@ impl GenerationRequest for ChatCompletionRequest {
     }
 
     fn extract_program_identity_payload(&self) -> Option<serde_json::Value> {
-        program_identity_payload(&self.other, self.user.as_deref())
+        program_identity_payload(Some(&self.other), None, self.user.as_deref())
+    }
+
+    fn extract_affinity_identity_payload(&self) -> Option<serde_json::Value> {
+        program_identity_payload(
+            Some(&self.other),
+            self.session_params.as_ref(),
+            self.user.as_deref(),
+        )
+    }
+
+    fn cache_identity(&self) -> (Option<&str>, Option<&str>) {
+        (
+            passthrough_string(&self.other, "lora_name"),
+            passthrough_string(&self.other, "cache_salt"),
+        )
     }
 }
 
@@ -732,6 +747,8 @@ pub struct ChatStreamChoice {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub logprobs: Option<ChatLogProbs>,
     pub finish_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_ids: Option<Vec<u32>>,
 }
 
 // ==================================================================
@@ -890,7 +907,22 @@ impl GenerationRequest for CompletionRequest {
     }
 
     fn extract_program_identity_payload(&self) -> Option<serde_json::Value> {
-        program_identity_payload(&self.other, self.user.as_deref())
+        program_identity_payload(Some(&self.other), None, self.user.as_deref())
+    }
+
+    fn extract_affinity_identity_payload(&self) -> Option<serde_json::Value> {
+        program_identity_payload(
+            Some(&self.other),
+            self.session_params.as_ref(),
+            self.user.as_deref(),
+        )
+    }
+
+    fn cache_identity(&self) -> (Option<&str>, Option<&str>) {
+        (
+            passthrough_string(&self.other, "lora_name"),
+            passthrough_string(&self.other, "cache_salt"),
+        )
     }
 }
 
@@ -933,6 +965,9 @@ pub struct CompletionStreamResponse {
     pub created: u64,
     pub choices: Vec<CompletionStreamChoice>,
     pub model: String,
+    /// Final usage chunk (`stream_options.include_usage`), vLLM-compatible.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<Usage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub system_fingerprint: Option<String>,
 }
@@ -944,6 +979,9 @@ pub struct CompletionStreamChoice {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub logprobs: Option<LogProbs>,
     pub finish_reason: Option<String>,
+    /// vLLM extension: emitted for `return_token_ids` requests.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_ids: Option<Vec<u32>>,
 }
 
 // ==================================================================
@@ -2100,6 +2138,11 @@ impl GenerationRequest for GenerateRequest {
         // No text input found
         String::new()
     }
+
+    fn extract_affinity_identity_payload(&self) -> Option<serde_json::Value> {
+        // No passthrough map; typed session_params is the only identity source.
+        program_identity_payload(None, self.session_params.as_ref(), None)
+    }
 }
 
 // ==================================================================
@@ -2138,7 +2181,14 @@ impl GenerationRequest for InferenceGenerateRequest {
     }
 
     fn extract_program_identity_payload(&self) -> Option<serde_json::Value> {
-        program_identity_payload(&self.other, None)
+        program_identity_payload(Some(&self.other), None, None)
+    }
+
+    fn cache_identity(&self) -> (Option<&str>, Option<&str>) {
+        (
+            passthrough_string(&self.other, "lora_name"),
+            passthrough_string(&self.other, "cache_salt"),
+        )
     }
 }
 
@@ -2428,23 +2478,61 @@ pub trait GenerationRequest: Send + Sync {
     fn extract_program_identity_payload(&self) -> Option<serde_json::Value> {
         None
     }
+
+    /// Identity payload for affinity routing: the Program identity payload
+    /// plus typed session fields the passthrough map cannot carry. Defaults
+    /// to the Program payload.
+    fn extract_affinity_identity_payload(&self) -> Option<serde_json::Value> {
+        self.extract_program_identity_payload()
+    }
+
+    /// LoRA adapter name and cache salt carried as passthrough body fields,
+    /// scoping KV-aware routing. Defaults to none.
+    fn cache_identity(&self) -> (Option<&str>, Option<&str>) {
+        (None, None)
+    }
+}
+
+fn passthrough_string<'a>(
+    other: &'a serde_json::Map<String, serde_json::Value>,
+    name: &str,
+) -> Option<&'a str> {
+    other
+        .get(name)
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty())
 }
 
 fn program_identity_payload(
-    other: &serde_json::Map<String, serde_json::Value>,
+    other: Option<&serde_json::Map<String, serde_json::Value>>,
+    session_params: Option<&HashMap<String, serde_json::Value>>,
     user: Option<&str>,
 ) -> Option<serde_json::Value> {
     let mut payload = serde_json::Map::new();
-    for field in [
-        "vllm_xargs",
-        "agent_hint",
-        "session_params",
-        "session_id",
-        "user_id",
-    ] {
-        if let Some(value) = other.get(field) {
-            payload.insert(field.to_string(), value.clone());
+    if let Some(other) = other {
+        for field in [
+            "vllm_xargs",
+            "agent_hint",
+            "session_params",
+            "session_id",
+            "user_id",
+        ] {
+            if let Some(value) = other.get(field) {
+                payload.insert(field.to_string(), value.clone());
+            }
         }
+    }
+    // Typed session_params is authoritative over any passthrough copy.
+    if let Some(session_params) = session_params {
+        payload.insert(
+            "session_params".to_string(),
+            serde_json::Value::Object(
+                session_params
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect(),
+            ),
+        );
     }
     if let Some(user) = user {
         payload.insert(
@@ -2592,13 +2680,81 @@ mod tests {
             "messages": ["must-not-be-copied"]
         }))
         .unwrap();
-        let payload = program_identity_payload(&other, Some("user-a")).unwrap();
+        let payload = program_identity_payload(Some(&other), None, Some("user-a")).unwrap();
         assert_eq!(payload.as_object().unwrap().len(), 3);
         assert!(payload.get("vllm_xargs").is_some());
         assert!(payload.get("agent_hint").is_some());
         assert_eq!(payload.get("user").unwrap(), "user-a");
         assert!(payload.get("prompt").is_none());
         assert!(payload.get("messages").is_none());
+    }
+
+    #[test]
+    fn affinity_payload_includes_typed_session_params() {
+        // session_params never reaches the passthrough map; only the
+        // affinity payload carries it.
+        let chat: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "session_params": {"session_id": "typed-session"}
+        }))
+        .unwrap();
+        assert!(chat.extract_program_identity_payload().is_none());
+        let payload = chat.extract_affinity_identity_payload().unwrap();
+        assert_eq!(
+            payload.get("session_params").unwrap(),
+            &serde_json::json!({"session_id": "typed-session"})
+        );
+
+        let completion: CompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "m",
+            "prompt": "hi",
+            "session_params": {"session_id": "typed-session"}
+        }))
+        .unwrap();
+        assert!(completion.extract_program_identity_payload().is_none());
+        let payload = completion.extract_affinity_identity_payload().unwrap();
+        assert_eq!(
+            payload.get("session_params").unwrap(),
+            &serde_json::json!({"session_id": "typed-session"})
+        );
+
+        let generate: GenerateRequest = serde_json::from_value(serde_json::json!({
+            "text": "hi",
+            "session_params": {"session_id": "typed-session"}
+        }))
+        .unwrap();
+        let payload = generate.extract_affinity_identity_payload().unwrap();
+        assert_eq!(
+            payload.get("session_params").unwrap(),
+            &serde_json::json!({"session_id": "typed-session"})
+        );
+    }
+
+    #[test]
+    fn cache_identity_reads_passthrough_fields() {
+        let chat: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "lora_name": "adapter",
+            "cache_salt": "tenant"
+        }))
+        .unwrap();
+        assert_eq!(chat.cache_identity(), (Some("adapter"), Some("tenant")));
+
+        // Empty strings are ignored, matching the prepared-path behavior.
+        let chat: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "lora_name": "",
+            "cache_salt": ""
+        }))
+        .unwrap();
+        assert_eq!(chat.cache_identity(), (None, None));
+
+        let generate: GenerateRequest =
+            serde_json::from_value(serde_json::json!({"text": "hi"})).unwrap();
+        assert_eq!(generate.cache_identity(), (None, None));
     }
     use serde_json;
 

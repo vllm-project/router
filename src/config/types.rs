@@ -16,6 +16,10 @@ pub struct RouterConfig {
     pub epd: Option<EpdConfig>,
     /// Routing mode configuration
     pub mode: RoutingMode,
+    /// Statically configured KV event sources, keyed by prefill base URL.
+    /// Workers listed here skip HTTP control-plane discovery and probing.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub pd_kv_event_sources: HashMap<String, PdKvEventSources>,
     /// Worker connection mode
     #[serde(default)]
     pub connection_mode: ConnectionMode,
@@ -71,6 +75,10 @@ pub struct RouterConfig {
     /// Disable circuit breaker (overrides circuit_breaker.failure_threshold to u32::MAX when true)
     #[serde(default)]
     pub disable_circuit_breaker: bool,
+    /// Enable stable-identity affinity in `kv_aware` and expire idle bindings after this TTL.
+    /// `None` disables affinity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kv_aware_session_affinity_ttl_secs: Option<u64>,
     /// Health check configuration
     pub health_check: HealthCheckConfig,
     /// Enable Inference Gateway mode (false = proxy mode, true = IGW mode)
@@ -573,6 +581,30 @@ pub enum ConnectionMode {
     Grpc,
 }
 
+/// Statically configured KV event sources for one prefill worker, used when
+/// the engine's HTTP control plane does not serve `/server_info` or
+/// `/kv_event_sources` (e.g. the `vllm-rs serve` frontend).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PdKvEventSources {
+    /// ZMQ PUB endpoints, one per data-parallel rank (index = rank).
+    pub endpoints: Vec<String>,
+    /// Optional ZMQ ROUTER (replay) endpoints, same ordering as `endpoints`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replay_endpoints: Option<Vec<String>>,
+    /// KV cache block size of the engine. Must match the engine's
+    /// `--block-size` (vLLM default: 16).
+    #[serde(default = "default_pd_kv_block_size")]
+    pub block_size: u32,
+    /// Model identity for the cache key. Defaults to the worker URL; the
+    /// served-model check then relies on `/v1/models`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+}
+
+fn default_pd_kv_block_size() -> u32 {
+    16
+}
+
 /// Routing mode configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -918,6 +950,7 @@ impl Default for RouterConfig {
             mode: RoutingMode::Regular {
                 worker_urls: vec![],
             },
+            pd_kv_event_sources: HashMap::new(),
             policy: PolicyConfig::Random,
             host: "127.0.0.1".to_string(),
             port: 3001,
@@ -942,6 +975,7 @@ impl Default for RouterConfig {
             circuit_breaker: CircuitBreakerConfig::default(),
             disable_retries: false,
             disable_circuit_breaker: false,
+            kv_aware_session_affinity_ttl_secs: None,
             health_check: HealthCheckConfig::default(),
             enable_igw: false,
             connection_mode: ConnectionMode::Http,
@@ -1061,6 +1095,62 @@ mod tests {
         // Other fields should be default
         assert_eq!(config.host, "127.0.0.1");
         assert_eq!(config.port, 3001);
+    }
+
+    #[test]
+    fn test_pd_kv_event_sources_serde_roundtrip_and_defaults() {
+        let mut config = RouterConfig::new(
+            RoutingMode::VllmPrefillDecode {
+                prefill_urls: vec![("http://prefill:8000".to_string(), None)],
+                decode_urls: vec!["http://decode:8000".to_string()],
+                prefill_policy: None,
+                decode_policy: None,
+                discovery_address: None,
+            },
+            PolicyConfig::KvAware {
+                router_temperature: 0.0,
+                kv_penalty_host: 0.8,
+                kv_penalty_external: 0.6,
+                kv_penalty_disk: 0.4,
+            },
+        );
+        config.pd_kv_event_sources.insert(
+            "http://prefill:8000".to_string(),
+            PdKvEventSources {
+                endpoints: vec!["tcp://prefill:5557".to_string()],
+                replay_endpoints: Some(vec!["tcp://prefill:5558".to_string()]),
+                block_size: 32,
+                model: Some("m".to_string()),
+            },
+        );
+        let json = serde_json::to_string(&config).unwrap();
+        let deserialized: RouterConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            deserialized.pd_kv_event_sources["http://prefill:8000"].endpoints,
+            vec!["tcp://prefill:5557".to_string()]
+        );
+        assert_eq!(
+            deserialized.pd_kv_event_sources["http://prefill:8000"].block_size,
+            32
+        );
+
+        // Omitted optional fields default: block_size 16, no replay, no model.
+        let sources: PdKvEventSources =
+            serde_json::from_str(r#"{"endpoints":["tcp://p:5557"]}"#).unwrap();
+        assert_eq!(sources.block_size, 16);
+        assert!(sources.replay_endpoints.is_none());
+        assert!(sources.model.is_none());
+
+        let bare = RouterConfig::new(
+            RoutingMode::Regular {
+                worker_urls: vec![],
+            },
+            PolicyConfig::RoundRobin,
+        );
+        let json = serde_json::to_string(&bare).unwrap();
+        assert!(!json.contains("pd_kv_event_sources"));
+        let empty: RouterConfig = serde_json::from_str(&json).unwrap();
+        assert!(empty.pd_kv_event_sources.is_empty());
     }
 
     #[test]
@@ -1627,6 +1717,7 @@ mod tests {
                 decode_policy: None,
                 discovery_address: None,
             },
+            pd_kv_event_sources: Default::default(),
             policy: PolicyConfig::PowerOfTwo {
                 load_check_interval_secs: 30,
             },
@@ -1657,6 +1748,7 @@ mod tests {
             circuit_breaker: CircuitBreakerConfig::default(),
             disable_retries: false,
             disable_circuit_breaker: false,
+            kv_aware_session_affinity_ttl_secs: None,
             health_check: HealthCheckConfig::default(),
             enable_igw: false,
             queue_size: 100,
@@ -1691,6 +1783,7 @@ mod tests {
                     "http://worker3:8000".to_string(),
                 ],
             },
+            pd_kv_event_sources: Default::default(),
             policy: PolicyConfig::CacheAware {
                 cache_threshold: 0.9,
                 balance_abs_threshold: 5,
@@ -1725,6 +1818,7 @@ mod tests {
             circuit_breaker: CircuitBreakerConfig::default(),
             disable_retries: false,
             disable_circuit_breaker: false,
+            kv_aware_session_affinity_ttl_secs: None,
             health_check: HealthCheckConfig::default(),
             enable_igw: false,
             queue_size: 100,
@@ -1756,6 +1850,7 @@ mod tests {
             mode: RoutingMode::Regular {
                 worker_urls: vec!["http://worker1".to_string()],
             },
+            pd_kv_event_sources: Default::default(),
             policy: PolicyConfig::RoundRobin,
             host: "::1".to_string(), // IPv6
             port: 8888,
@@ -1789,6 +1884,7 @@ mod tests {
             circuit_breaker: CircuitBreakerConfig::default(),
             disable_retries: false,
             disable_circuit_breaker: false,
+            kv_aware_session_affinity_ttl_secs: None,
             health_check: HealthCheckConfig::default(),
             enable_igw: false,
             queue_size: 100,

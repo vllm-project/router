@@ -33,6 +33,7 @@ fn test_config(worker_urls: Vec<String>) -> RouterConfig {
     RouterConfig {
         epd: None,
         mode: RoutingMode::Regular { worker_urls },
+        pd_kv_event_sources: Default::default(),
         policy: PolicyConfig::RoundRobin,
         host: "127.0.0.1".to_string(),
         port: 3002,
@@ -60,6 +61,7 @@ fn test_config(worker_urls: Vec<String>) -> RouterConfig {
         circuit_breaker: CircuitBreakerConfig::default(),
         disable_retries: true,
         disable_circuit_breaker: true,
+        kv_aware_session_affinity_ttl_secs: None,
         health_check: vllm_router_rs::config::HealthCheckConfig::default(),
         enable_igw: false,
         connection_mode: ConnectionMode::Http,
@@ -379,4 +381,168 @@ async fn grpc_stream_emits_openai_compatible_usage_chunk() {
             .is_some_and(|items| !items.is_empty()))
         .all(|chunk| chunk.get("usage").is_none() || chunk["usage"].is_null()));
     assert!(text.contains("data: [DONE]"));
+}
+
+const COMPLETION_BODY: &str = r#"{
+    "model": "test-model",
+    "prompt": [1, 2, 3],
+    "max_tokens": 8,
+    "stream": false
+}"#;
+
+/// `/v1/completions` on a gRPC pool must answer with `text_completion`, not
+/// the internal chat shape: Completion clients read `choices[].text`.
+#[tokio::test]
+async fn grpc_completions_reply_is_text_completion_shaped() {
+    let grpc = MockVllmRsServer::spawn().await;
+    let config = test_config(vec![grpc.grpc_url.clone()]);
+    let ctx = create_test_context(config.clone());
+    let router = Router::new(vec![grpc.grpc_url.clone()], &ctx)
+        .await
+        .expect("grpc worker should pass grpc.health.v1");
+    router.pin_test_token_ids(vec![1, 2, 3]);
+
+    let app = create_test_app(Arc::new(router), reqwest::Client::new(), &config);
+    let response = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/v1/completions")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(COMPLETION_BODY))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        response.status().is_success(),
+        "status {}",
+        response.status()
+    );
+    let json: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+
+    assert_eq!(json["object"], "text_completion");
+    assert_eq!(json["choices"][0]["text"], "hello from worker");
+    assert!(
+        json["choices"][0].get("message").is_none(),
+        "completion clients read choices[].text: {json}"
+    );
+    assert!(
+        json["id"].as_str().unwrap_or_default().starts_with("cmpl-"),
+        "unexpected id {}",
+        json["id"]
+    );
+
+    let captured = grpc.captured();
+    assert_eq!(captured.len(), 1);
+    assert_eq!(captured[0].token_ids, vec![1, 2, 3]);
+    assert!(!captured[0].had_text_prompt);
+}
+
+/// Streaming `/v1/completions` must emit `choices[].text` (plus the vLLM
+/// `token_ids` used for token-exact replay validation), never `delta`.
+#[tokio::test]
+async fn grpc_completions_stream_carries_text_and_token_ids() {
+    let grpc = MockVllmRsServer::spawn().await;
+    let config = test_config(vec![grpc.grpc_url.clone()]);
+    let ctx = create_test_context(config.clone());
+    let router = Router::new(vec![grpc.grpc_url.clone()], &ctx)
+        .await
+        .expect("grpc worker should pass grpc.health.v1");
+    router.pin_test_token_ids(vec![1, 2, 3]);
+
+    let app = create_test_app(Arc::new(router), reqwest::Client::new(), &config);
+    let body = json!({
+        "model": "test-model",
+        "prompt": [1, 2, 3],
+        "max_tokens": 8,
+        "return_token_ids": true,
+        "stream": true,
+        "stream_options": {"include_usage": true}
+    });
+    let response = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/v1/completions")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        response.status().is_success(),
+        "status {}",
+        response.status()
+    );
+    let text = String::from_utf8(
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(text.contains("data: [DONE]"), "{text}");
+
+    let chunks: Vec<serde_json::Value> = text
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .filter(|data| *data != "[DONE]")
+        .map(|data| serde_json::from_str(data).unwrap())
+        .collect();
+    let choice_chunks: Vec<&serde_json::Value> = chunks
+        .iter()
+        .filter(|chunk| {
+            chunk["choices"]
+                .as_array()
+                .is_some_and(|items| !items.is_empty())
+        })
+        .collect();
+    assert!(!choice_chunks.is_empty(), "{text}");
+
+    let streamed: String = choice_chunks
+        .iter()
+        .map(|chunk| chunk["choices"][0]["text"].as_str().unwrap_or_default())
+        .collect();
+    assert_eq!(streamed, "hello from worker");
+    let streamed_ids: Vec<u64> = choice_chunks
+        .iter()
+        .flat_map(|chunk| {
+            chunk["choices"][0]["token_ids"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+        })
+        .filter_map(|id| id.as_u64())
+        .collect();
+    assert_eq!(streamed_ids, vec![7, 8, 9]);
+    for chunk in &choice_chunks {
+        assert_eq!(chunk["object"], "text_completion");
+        assert!(
+            chunk["choices"][0].get("delta").is_none(),
+            "completion chunks must not use chat deltas: {chunk}"
+        );
+    }
+
+    let usage_chunks: Vec<&serde_json::Value> = chunks
+        .iter()
+        .filter(|chunk| chunk.get("usage").is_some_and(|usage| !usage.is_null()))
+        .collect();
+    assert_eq!(usage_chunks.len(), 1, "{text}");
+    assert_eq!(usage_chunks[0]["object"], "text_completion");
+    assert_eq!(usage_chunks[0]["choices"], json!([]));
+    assert_eq!(
+        usage_chunks[0]["usage"],
+        json!({
+            "prompt_tokens": 3,
+            "completion_tokens": 3,
+            "total_tokens": 6
+        })
+    );
 }

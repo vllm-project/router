@@ -5,7 +5,9 @@
 //! merge still lives in worker `vllm-text`; this only fills proto.
 
 use crate::backend::pb;
-use crate::protocols::spec::{ChatCompletionRequest, StringOrArray};
+use crate::protocols::spec::{
+    ChatCompletionRequest, CompletionRequest, PromptInput, StringOrArray,
+};
 
 pub fn requires_worker_output_text(request: &ChatCompletionRequest) -> bool {
     !request.no_stop_trim
@@ -293,6 +295,84 @@ fn other_i32(request: &ChatCompletionRequest, key: &str) -> Result<Option<i32>, 
                 .ok_or_else(|| format!("{key} must be a 32-bit integer"))
         })
         .transpose()
+}
+
+/// OpenAI completions request → chat-shaped request for the gRPC adapter.
+///
+/// The gRPC wire protocol is token_ids-only, so `/v1/completions` skips chat
+/// template + router-side tokenize and feeds the prompt ids straight through.
+/// Sampling fields map onto the chat shape that `chat_to_generate_request`
+/// understands. vLLM OpenAI-only extension fields (e.g. `return_token_ids`)
+/// are dropped: the gRPC response adapter streams detokenized text.
+pub fn completion_to_chat(request: &CompletionRequest) -> Result<ChatCompletionRequest, String> {
+    if !matches!(request.prompt, PromptInput::IntArray(_)) {
+        return Err(
+            "gRPC /v1/completions requires a single token-id prompt (list[int])".to_string(),
+        );
+    }
+    let supported_other = [
+        "add_special_tokens",
+        "cache_salt",
+        "documents",
+        "lora_name",
+        "priority",
+        "truncate_prompt_tokens",
+        "watermarking",
+    ];
+    let other = request
+        .other
+        .iter()
+        .filter(|(key, _)| supported_other.contains(&key.as_str()))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    Ok(ChatCompletionRequest {
+        model: request.model.clone(),
+        messages: Vec::new(),
+        temperature: request.temperature,
+        top_p: request.top_p,
+        n: request.n,
+        stream: request.stream,
+        stream_options: request.stream_options.clone(),
+        stop: request.stop.clone(),
+        max_tokens: request.max_tokens,
+        max_completion_tokens: None,
+        presence_penalty: request.presence_penalty,
+        frequency_penalty: request.frequency_penalty,
+        logit_bias: request.logit_bias.clone(),
+        user: request.user.clone(),
+        seed: request.seed,
+        logprobs: request.logprobs.is_some(),
+        top_logprobs: None,
+        response_format: None,
+        tools: None,
+        tool_choice: None,
+        parallel_tool_calls: None,
+        functions: None,
+        function_call: None,
+        top_k: request.top_k,
+        min_p: request.min_p,
+        min_tokens: request.min_tokens,
+        repetition_penalty: request.repetition_penalty,
+        regex: request.regex.clone(),
+        ebnf: request.ebnf.clone(),
+        stop_token_ids: request.stop_token_ids.clone(),
+        no_stop_trim: request.no_stop_trim,
+        ignore_eos: request.ignore_eos,
+        add_generation_prompt: None,
+        continue_final_message: false,
+        skip_special_tokens: request.skip_special_tokens,
+        lora_path: request.lora_path.clone(),
+        session_params: request.session_params.clone(),
+        separate_reasoning: true,
+        stream_reasoning: true,
+        chat_template_kwargs: None,
+        return_hidden_states: request.return_hidden_states,
+        echo: request.echo.then_some(true),
+        reasoning_effort: None,
+        include_reasoning: true,
+        structured_outputs: None,
+        other,
+    })
 }
 
 #[cfg(test)]

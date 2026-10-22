@@ -31,7 +31,7 @@ class Router:
             - PolicyType.Random: Randomly select workers
             - PolicyType.RoundRobin: Distribute requests in round-robin fashion
             - PolicyType.CacheAware: Distribute requests based on cache state and load balance
-            - PolicyType.KvAware: Select by held KV segments and live load (regular mode only)
+            - PolicyType.KvAware: KV/load selection, with stage-specific load profiles in PD mode
             - PolicyType.PowerOfTwo: Select best of two random workers based on load (PD mode only)
         host: Host address to bind the router server. Default: '127.0.0.1'
         port: Port number to bind the router server. Default: 3001

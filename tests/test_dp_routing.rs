@@ -248,6 +248,7 @@ mod dp_e2e_tests {
     fn make_regular_config(worker_urls: Vec<String>, dp_size: usize) -> RouterConfig {
         RouterConfig {
             mode: RoutingMode::Regular { worker_urls },
+            pd_kv_event_sources: Default::default(),
             policy: PolicyConfig::RoundRobin,
             host: "127.0.0.1".to_string(),
             port: 0,
@@ -272,6 +273,7 @@ mod dp_e2e_tests {
             circuit_breaker: CircuitBreakerConfig::default(),
             disable_retries: false,
             disable_circuit_breaker: false,
+            kv_aware_session_affinity_ttl_secs: None,
             health_check: vllm_router_rs::config::HealthCheckConfig::default(),
             enable_igw: false,
             connection_mode: ConnectionMode::Http,
@@ -298,6 +300,7 @@ mod dp_e2e_tests {
                 decode_policy: None,
                 discovery_address: None,
             },
+            pd_kv_event_sources: Default::default(),
             policy: PolicyConfig::RoundRobin,
             host: "127.0.0.1".to_string(),
             port: 0,
@@ -322,6 +325,7 @@ mod dp_e2e_tests {
             circuit_breaker: CircuitBreakerConfig::default(),
             disable_retries: false,
             disable_circuit_breaker: false,
+            kv_aware_session_affinity_ttl_secs: None,
             health_check: vllm_router_rs::config::HealthCheckConfig::default(),
             enable_igw: false,
             connection_mode: ConnectionMode::Http,

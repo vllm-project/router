@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 use axum::response::Response;
 
 use super::grpc::{FirstOutputCallback, GrpcEngineBackend};
+use super::openai::ResponseShape;
 use super::preprocess::{tokenize_chat_request_timed, FrontendHandle, TokenizeOut, TokenizerCache};
 use crate::protocols::spec::ChatCompletionRequest;
 use crate::tokenizer::{TokenizerCacheConfig, TokenizerCacheStats};
@@ -22,6 +23,9 @@ pub struct PreparedChat {
     pub handle: FrontendHandle,
     pub resolve_ms: f64,
     pub t_req: Instant,
+    /// Which client route produced this request; the gRPC adapter reshapes
+    /// the engine response to match.
+    pub shape: ResponseShape,
 }
 
 /// Load-once tokenizer + tonic client. One replica per router process.
@@ -108,6 +112,47 @@ impl EngineFrontend {
             handle,
             resolve_ms,
             t_req,
+            shape: ResponseShape::Chat,
+        })
+    }
+
+    /// Wire adapter path for `/v1/completions` on the gRPC pool: the client
+    /// already sent token ids, so there is no chat template / router tokenize.
+    /// Sampling defaults are resolved like `prepare`; encode fields report 0.
+    pub async fn prepare_token_ids(
+        &self,
+        mut request: ChatCompletionRequest,
+        token_ids: Vec<u32>,
+    ) -> Result<PreparedChat, String> {
+        let t_req = Instant::now();
+        let handle = self
+            .tokenizer
+            .resolve(request.model.as_deref())
+            .await
+            .map_err(|e| format!("tokenizer: {e}"))?;
+        if request.temperature.is_none() {
+            request.temperature = Some(
+                handle
+                    .default_temperature()
+                    .map_err(|e| format!("sampling defaults: {e}"))?
+                    .unwrap_or(1.0),
+            );
+        }
+        let resolve_ms = t_req.elapsed().as_secs_f64() * 1000.0;
+        let tokenized = TokenizeOut {
+            token_ids: Arc::from(token_ids),
+            adapt_ms: 0.0,
+            template_ms: 0.0,
+            encode_ms: 0.0,
+            encode_backend: "completions-token-ids",
+        };
+        Ok(PreparedChat {
+            request: Arc::new(request),
+            tokenized,
+            handle,
+            resolve_ms,
+            t_req,
+            shape: ResponseShape::Completion,
         })
     }
 

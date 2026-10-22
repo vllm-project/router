@@ -505,6 +505,27 @@ pub struct RouterMetrics;
 pub struct TokenizerMetrics;
 
 impl RouterMetrics {
+    pub fn record_pd_kv_decision(work: Option<u64>, credit: Option<u64>, fallback: Option<&str>) {
+        counter!("vllm_router_pd_prefill_decisions_total",
+            "fallback" => fallback.unwrap_or("none").to_owned())
+        .increment(1);
+        if let Some(work) = work {
+            histogram!("vllm_router_pd_new_prefill_tokens").record(work as f64);
+        }
+        if let Some(credit) = credit {
+            counter!("vllm_router_pd_credited_prefix_tokens_total").increment(credit);
+        }
+    }
+
+    /// Per-stage kv_aware session-affinity outcome: bind / sticky_hit /
+    /// no_session / capacity_bypass.
+    pub fn record_pd_affinity_decision(stage: &str, outcome: &str) {
+        counter!("vllm_router_pd_affinity_decisions_total",
+            "stage" => stage.to_owned(),
+            "outcome" => outcome.to_owned())
+        .increment(1);
+    }
+
     // Request metrics
     pub fn record_request(route: &str) {
         counter!("vllm_router_requests_total",
@@ -832,6 +853,15 @@ impl RouterMetrics {
     pub fn record_pd_decode_error(worker: &str) {
         counter!("vllm_router_pd_decode_errors_total",
             "worker" => worker.to_string()
+        )
+        .increment(1);
+    }
+
+    /// A router-buffered stage body exceeded the fixed buffer cap and the
+    /// request failed instead of buffering unbounded.
+    pub fn record_pd_body_over_limit(stage: &str) {
+        counter!("vllm_router_pd_body_over_limit_total",
+            "stage" => stage.to_string()
         )
         .increment(1);
     }
