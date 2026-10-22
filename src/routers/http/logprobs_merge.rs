@@ -193,7 +193,7 @@ pub fn merge_logprobs_in_json(prefill_json: &Value, decode_json: &mut Value) -> 
                                                 &prefill_tokens_arr[num_prompt_tokens - 1];
                                             let last_token_len = last_token
                                                 .as_str()
-                                                .map(|s| s.len() as i64)
+                                                .map(|s| s.chars().count() as i64)
                                                 .unwrap_or(0);
                                             last_prefill_offset + last_token_len
                                         } else {
@@ -335,6 +335,42 @@ mod tests {
         assert_eq!(merged_offsets[2].as_i64().unwrap(), 11); // Prompt token " test"
         assert_eq!(merged_offsets[3].as_i64().unwrap(), 16); // Decode token " output" (0 + 16)
         assert_eq!(merged_offsets[4].as_i64().unwrap(), 23); // Decode token " token" (7 + 16)
+    }
+
+    #[test]
+    fn test_merge_logprobs_uses_character_offsets() {
+        for (last_prompt_token, expected_decode_offset) in
+            [("ASCII", 5), ("é", 1), ("界", 1), ("🙂", 1)]
+        {
+            let prefill_json = json!({
+                "choices": [{
+                    "prompt_logprobs": [null],
+                    "logprobs": {
+                        "token_logprobs": [null, -1.0],
+                        "tokens": [last_prompt_token, "discarded"],
+                        "text_offset": [0, 999],
+                        "top_logprobs": [null, null]
+                    }
+                }]
+            });
+            let mut decode_json = json!({
+                "choices": [{
+                    "logprobs": {
+                        "token_logprobs": [-2.0],
+                        "tokens": ["decode"],
+                        "text_offset": [0],
+                        "top_logprobs": [null]
+                    }
+                }]
+            });
+
+            assert!(merge_logprobs_in_json(&prefill_json, &mut decode_json));
+            assert_eq!(
+                decode_json["choices"][0]["logprobs"]["text_offset"],
+                json!([0, expected_decode_offset]),
+                "last prompt token: {last_prompt_token}"
+            );
+        }
     }
 
     #[test]
