@@ -152,6 +152,9 @@ def _router_env(model: str) -> dict[str, str]:
 def launch_stack(case: BackendCaseFile, model: str) -> PerfStack:
     """Start worker then router; block until router /health is OK."""
     timeout = float(os.environ.get("PERF_STACK_TIMEOUT", "3600"))
+    worker_startup_timeout = int(
+        os.environ.get("PERF_WORKER_STARTUP_TIMEOUT", str(int(timeout)))
+    )
     sleep_s = float(os.environ.get("PERF_STACK_WORKER_SLEEP", "2"))
     host = case.stack.host
     rp = case.stack.router_port
@@ -232,6 +235,8 @@ def launch_stack(case: BackendCaseFile, model: str) -> PerfStack:
         str(rp),
         "--worker-urls",
         worker_url,
+        "--worker-startup-timeout-secs",
+        str(worker_startup_timeout),
     ]
     if case.stack.prometheus_port is not None:
         router_cmd.extend(["--prometheus-port", str(case.stack.prometheus_port)])

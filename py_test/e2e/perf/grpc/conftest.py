@@ -52,6 +52,10 @@ def pytest_addoption(parser):
     )
 
 
+def _perf_case_error(exc: BaseException) -> pytest.UsageError:
+    return pytest.UsageError(f"invalid --perf-case / PERF_CASE: {exc}")
+
+
 def pytest_configure(config):
     opt = config.getoption("--perf-case", default=None)
     if opt:
@@ -59,8 +63,8 @@ def pytest_configure(config):
     if perf_case_selected():
         try:
             apply_case_env(resolve_perf_case())
-        except (OSError, ValueError, RuntimeError, FileNotFoundError):
-            pass
+        except (OSError, ValueError, RuntimeError, FileNotFoundError) as exc:
+            raise _perf_case_error(exc) from exc
 
 
 def _perf_ready() -> bool:
@@ -87,8 +91,8 @@ def _perf_waves_for_collection() -> tuple[WaveSpec, ...] | None:
         return None
     try:
         return resolve_perf_case().waves
-    except (OSError, ValueError, RuntimeError, FileNotFoundError):
-        return None
+    except (OSError, ValueError, RuntimeError, FileNotFoundError) as exc:
+        raise _perf_case_error(exc) from exc
 
 
 @pytest.fixture(scope="session")
