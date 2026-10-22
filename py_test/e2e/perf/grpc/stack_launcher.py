@@ -20,7 +20,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-REPO_ROOT = Path(__file__).resolve().parents[3]
+REPO_ROOT = Path(__file__).resolve().parents[4]
 
 
 def _progress(msg: str) -> None:
@@ -62,12 +62,22 @@ def _graceful_stop(proc: subprocess.Popen, timeout: float) -> None:
         proc.kill()
 
 
-def _wait_router_health(base_url: str, timeout: float) -> None:
+def _proc_exit_error(proc: subprocess.Popen, label: str) -> RuntimeError:
+    out = proc.stdout.read() if proc.stdout else ""
+    return RuntimeError(f"{label} exited early (code={proc.returncode}): {out[-4000:]}")
+
+
+def _wait_router_health(
+    base_url: str, timeout: float, *, proc: subprocess.Popen | None = None
+) -> None:
     start = time.monotonic()
     url = base_url.rstrip("/") + "/health"
     last_log = start
     with requests.Session() as session:
         while time.monotonic() - start < timeout:
+            if proc is not None:
+                if proc.poll() is not None:
+                    raise _proc_exit_error(proc, "router")
             try:
                 r = session.get(url, timeout=5)
                 if r.status_code == 200:
@@ -161,6 +171,8 @@ def launch_stack(case: BackendCaseFile, model: str) -> PerfStack:
     wp = case.stack.worker_http_port
     cli = list(case.worker_cli)
 
+    router_bin = _router_bin()
+
     backend = case.backend
     if backend == "rust_grpc":
         gp = case.stack.worker_grpc_port
@@ -222,13 +234,10 @@ def launch_stack(case: BackendCaseFile, model: str) -> PerfStack:
         raise ValueError(f"unknown backend {backend!r} in {case.path}")
 
     if worker_proc.poll() is not None:
-        out = worker_proc.stdout.read() if worker_proc.stdout else ""
-        raise RuntimeError(
-            f"worker exited early (code={worker_proc.returncode}): {out[-4000:]}"
-        )
+        raise _proc_exit_error(worker_proc, "worker")
 
     router_cmd = [
-        _router_bin(),
+        router_bin,
         "--host",
         host,
         "--port",
@@ -241,22 +250,22 @@ def launch_stack(case: BackendCaseFile, model: str) -> PerfStack:
     if case.stack.prometheus_port is not None:
         router_cmd.extend(["--prometheus-port", str(case.stack.prometheus_port)])
 
-    _progress(f"starting vllm-router: {' '.join(router_cmd)}")
-    router_proc = _popen(router_cmd, env=_router_env(model))
-    _pipe_process_output(router_proc, "vllm-router")
     router_url = f"http://{host}:{rp}"
+    _progress(f"starting vllm-router: {' '.join(router_cmd)}")
     try:
-        _wait_router_health(router_url, timeout)
+        router_proc = _popen(router_cmd, env=_router_env(model))
     except Exception:
-        stop = PerfStack(router_url, worker_proc, router_proc)
-        stop.stop()
+        _graceful_stop(worker_proc, 120.0)
+        raise
+    _pipe_process_output(router_proc, "vllm-router")
+    try:
+        _wait_router_health(router_url, timeout, proc=router_proc)
+    except Exception:
+        PerfStack(router_url, worker_proc, router_proc).stop()
         raise
 
     if router_proc.poll() is not None:
-        out = router_proc.stdout.read() if router_proc.stdout else ""
-        worker_proc.terminate()
-        raise RuntimeError(
-            f"router exited early (code={router_proc.returncode}): {out[-4000:]}"
-        )
+        PerfStack(router_url, worker_proc, router_proc).stop()
+        raise _proc_exit_error(router_proc, "router")
 
     return PerfStack(router_url, worker_proc, router_proc)

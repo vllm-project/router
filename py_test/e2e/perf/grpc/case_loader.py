@@ -181,6 +181,8 @@ def _case_path_from_selector(raw: str) -> Path:
     if candidate.suffix == ".json":
         if candidate.is_file():
             return candidate.resolve()
+        if len(candidate.parts) > 1:
+            raise FileNotFoundError(f"{candidate} not found")
         under_cases = CASES_DIR / candidate.name
         if under_cases.is_file():
             return under_cases.resolve()
