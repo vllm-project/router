@@ -252,21 +252,18 @@ def popen_launch_router_only(
         "--prometheus-host",
         "127.0.0.1",
     ]
-    proc = subprocess.Popen(
-        cmd,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
-        text=True,
-        env=env,
-    )
+    env.setdefault("RUST_LOG", "vllm_router_rs=info")
+    # Inherit stdio so ``pytest -s`` shows router tracing (same as vllm-rs workers).
+    print(f"[e2e] starting router {base_url} policy={policy!r}", flush=True)
+    print(f"[e2e] router cmd: {cmd!r}", flush=True)
+    proc = subprocess.Popen(cmd, env=env)
     try:
         wait_router_health(base_url, timeout)
     except TimeoutError as exc:
-        detail = proc.stderr.read() if proc.stderr is not None else ""
         if proc.poll() is None:
             proc.kill()
         raise TimeoutError(
-            f"{exc}\nrouter cmd: {cmd!r}\nrouter stderr:\n{detail}"
+            f"{exc}\nrouter cmd: {cmd!r}\n(router logs were streamed to this terminal)"
         ) from exc
     return proc
 

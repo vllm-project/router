@@ -9,6 +9,8 @@ Optional environment (see also ``function/helpers/launch.py``):
 - ``VLLM_RS``: path to ``vllm-rs`` binary (else ``PATH`` or wheel under ``vllm``).
 - ``VLLM_RS_SERVE_EXTRA``: extra args to ``vllm-rs serve`` (shell-split), e.g.
   ``"--max-model-len 8192 --enable-prefix-caching"``.
+- Router logs: run pytest with ``-s``; default ``RUST_LOG=vllm_router_rs=info`` on
+  the router subprocess (override in the shell for more/less noise).
 """
 
 # HuggingFace id or local path for ``vllm-rs serve`` and ``VLLM_ROUTER_MODEL``.
