@@ -98,23 +98,49 @@ def _wait_router_health(
     raise TimeoutError(f"router not healthy at {url} within {timeout}s")
 
 
-def _router_bin() -> str:
+def _resolve_bin_path(raw: str) -> str | None:
+    """Resolve case JSON path (absolute, repo-relative, or PATH name)."""
+    text = raw.strip()
+    if not text:
+        return None
+    candidate = Path(text).expanduser()
+    if not candidate.is_absolute():
+        candidate = (REPO_ROOT / candidate).resolve()
+    if candidate.is_file():
+        return str(candidate)
+    found = shutil.which(text)
+    if found:
+        return found
+    return None
+
+
+def _router_bin(case: BackendCaseFile | None = None) -> str:
     if raw := os.environ.get("ROUTER_BIN", "").strip():
         return raw
+    if case and case.stack.router_bin:
+        if resolved := _resolve_bin_path(case.stack.router_bin):
+            return resolved
     hint = REPO_ROOT / "target" / "release" / "vllm-router"
     if hint.is_file():
         return str(hint)
     found = shutil.which("vllm-router")
     if found:
         return found
+    tried = [str(hint)]
+    if case and case.stack.router_bin:
+        tried.insert(0, case.stack.router_bin)
     raise FileNotFoundError(
-        "vllm-router not found; set ROUTER_BIN or build target/release/vllm-router"
+        f"vllm-router not found (repo root={REPO_ROOT}, tried {tried!r}); "
+        "set ROUTER_BIN, stack.router_bin in case JSON, or build target/release/vllm-router"
     )
 
 
-def _vllm_rs_bin() -> str:
+def _vllm_rs_bin(case: BackendCaseFile | None = None) -> str:
     if raw := os.environ.get("VLLM_RS", "").strip():
         return raw
+    if case and case.stack.vllm_rs_bin:
+        if resolved := _resolve_bin_path(case.stack.vllm_rs_bin):
+            return resolved
     found = shutil.which("vllm-rs")
     if found:
         return found
@@ -172,14 +198,14 @@ def launch_stack(case: BackendCaseFile, model: str) -> PerfStack:
     wp = case.stack.worker_http_port
     cli = list(case.worker_cli)
 
-    router_bin = _router_bin()
+    router_bin = _router_bin(case)
 
     backend = case.backend
     if backend == "rust_grpc":
         gp = case.stack.worker_grpc_port
         if gp is None:
             raise ValueError(f"{case.path}: rust_grpc requires stack.worker_grpc_port")
-        rs = _vllm_rs_bin()
+        rs = _vllm_rs_bin(case)
         worker_cmd = [
             rs,
             "serve",

@@ -7,6 +7,18 @@ Each `*.json` file drives one backend (`rust_grpc`, `rust_http`, `python_http`).
 Set **`model`** to a HuggingFace id or local snapshot directory (same as `export MODEL=...`).
 Bench token sizing and worker launch both use this path; **`export MODEL=...` overrides JSON**.
 
+## Binaries (`stack.router_bin`, `stack.vllm_rs_bin`)
+
+Optional paths to **`vllm-router`** and **`vllm-rs`**. Relative paths are resolved from the
+repository root (where `Cargo.toml` lives). **`ROUTER_BIN` / `VLLM_RS` env override JSON.**
+
+```json
+"stack": {
+  "router_bin": "target/release/vllm-router",
+  "vllm_rs_bin": "/path/to/vllm-rs"
+}
+```
+
 ## Worker (`worker.cli`)
 
 **Required.** Flat argv list appended to `vllm-rs serve` / `vllm serve` (TP, parsers,

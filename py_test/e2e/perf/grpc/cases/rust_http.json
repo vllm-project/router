@@ -1,7 +1,9 @@
 {
   "backend": "rust_http",
   "model": "/path/to/model/snapshot",
-  "stack": {    "host": "127.0.0.1",
+  "stack": {
+    "router_bin": "target/release/vllm-router",
+    "host": "127.0.0.1",
     "router_port": 16002,
     "worker_http_port": 18002,
     "prometheus_port": 29001

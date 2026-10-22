@@ -18,6 +18,8 @@ class StackConfig:
     worker_http_port: int
     worker_grpc_port: int | None
     prometheus_port: int | None
+    router_bin: str | None = None
+    vllm_rs_bin: str | None = None
 
 
 @dataclass(frozen=True)
@@ -92,6 +94,8 @@ def _parse_stack(data: dict[str, Any], path: Path, backend: str) -> StackConfig:
         worker_http_port=worker_http_port,
         worker_grpc_port=worker_grpc_port,
         prometheus_port=prometheus_port,
+        router_bin=_optional_str(stack.get("router_bin")),
+        vllm_rs_bin=_optional_str(stack.get("vllm_rs_bin")),
     )
 
 
