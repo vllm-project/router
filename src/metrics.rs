@@ -876,7 +876,7 @@ impl RouterMetrics {
         gauge!("vllm_router_embeddings_queue_size").set(size as f64);
     }
 
-    // Running requests for cache-aware policy
+    // Running requests for policies with request-lifecycle tracking
     pub fn set_running_requests(worker: &str, count: usize) {
         gauge!("vllm_router_running_requests",
             "worker" => worker.to_string()

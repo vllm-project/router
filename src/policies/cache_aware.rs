@@ -294,6 +294,14 @@ impl CacheAwarePolicy {
 }
 
 impl LoadBalancingPolicy for CacheAwarePolicy {
+    fn on_worker_removed(&self, worker: &Arc<dyn Worker>) {
+        self.remove_worker(worker.as_ref());
+    }
+
+    fn tracks_load(&self) -> bool {
+        true
+    }
+
     fn select_worker_with_headers(
         &self,
         workers: &[Arc<dyn Worker>],

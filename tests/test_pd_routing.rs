@@ -134,6 +134,8 @@ mod test_pd_routing {
             .unwrap(),
         );
         let router = RouterFactory::create_router(&context).await.unwrap();
+        let prefill_worker = context.worker_registry.get_prefill_workers()[0].clone();
+        prefill_worker.increment_load();
         for (model, stream, status) in [
             ("test", false, StatusCode::OK),
             ("test", true, StatusCode::OK),
@@ -176,6 +178,11 @@ mod test_pd_routing {
             let bytes = axum::body::to_bytes(response.into_body(), 4096)
                 .await
                 .unwrap();
+            assert_eq!(
+                prefill_worker.load(),
+                1,
+                "request changed another request's prefill load: model={model}, stream={stream}"
+            );
             if stream {
                 assert!(String::from_utf8_lossy(&bytes).contains("[DONE]"));
             }
@@ -221,6 +228,7 @@ mod test_pd_routing {
                 assert_eq!(d["kv_transfer_params"]["remote_engine_id"], "P");
             }
         }
+        prefill_worker.decrement_load();
         server.abort();
     }
 

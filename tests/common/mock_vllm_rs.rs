@@ -10,15 +10,15 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use tokio::sync::mpsc;
-use tokio_stream::wrappers::ReceiverStream;
-use tokio_stream::Stream;
-use tonic::{transport::Server, Request, Response, Status};
-use vllm_router_rs::backend::pb::{
+use super::router_library::backend::pb::{
     finish_info, generate_request,
     inference_server::{Inference, InferenceServer},
     FinishInfo, GenerateRequest, GenerateResponse, PromptInfo, SequenceOutput, TokenIds,
 };
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
+use tokio_stream::Stream;
+use tonic::{transport::Server, Request, Response, Status};
 
 #[derive(Clone, Default)]
 pub struct CapturedGrpcGenerate {

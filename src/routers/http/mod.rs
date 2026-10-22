@@ -2,6 +2,7 @@
 
 pub mod dp_utils;
 mod epd;
+mod first_token;
 pub mod logprobs_merge;
 pub mod openai_router;
 pub mod pd_router;

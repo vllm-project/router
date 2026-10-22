@@ -62,12 +62,14 @@ pub struct WorkerKvInfo {
     pub instance_id: String,
     pub block_size: Option<u32>,
     pub ranks: Vec<u32>,
+    pub default_rank: Option<u32>,
     /// Cache identity shared by every worker feeding the same placement index.
     /// Absent when discovery cannot create an index for this worker.
     pub cache_key: Option<CacheKey>,
 }
 
 struct WorkerDiscovery {
+    default_rank: Option<u32>,
     server_info: Result<ServerInfo, String>,
     sources: Result<KvEventSourcesResponse, String>,
     /// gRPC has a separate GetModelInfo RPC; preserve its failure instead of
@@ -154,6 +156,7 @@ impl KvIndexSupervisor {
         }
 
         let discovery = discover_worker(&self.client, worker_url).await;
+        let default_rank = discovery.default_rank;
         let server_info = discovery.server_info.unwrap_or_else(|e| {
             warn!(
                 "kv_index {}: {} — falling back to URL as instance/model id",
@@ -198,6 +201,7 @@ impl KvIndexSupervisor {
                     worker_url, e
                 );
                 return Ok(WorkerKvInfo {
+                    default_rank,
                     instance_id,
                     block_size,
                     ranks: vec![],
@@ -212,6 +216,7 @@ impl KvIndexSupervisor {
                 worker_url
             );
             return Ok(WorkerKvInfo {
+                default_rank,
                 instance_id,
                 block_size: None,
                 ranks: vec![],
@@ -220,6 +225,7 @@ impl KvIndexSupervisor {
         };
         let Some(model_id) = model_id else {
             return Ok(WorkerKvInfo {
+                default_rank,
                 instance_id,
                 block_size: Some(block_size),
                 ranks: vec![],
@@ -290,6 +296,7 @@ impl KvIndexSupervisor {
             },
         );
         Ok(WorkerKvInfo {
+            default_rank,
             instance_id,
             block_size: Some(block_size),
             ranks,
@@ -396,6 +403,12 @@ async fn discover_worker(client: &reqwest::Client, worker_url: &str) -> WorkerDi
         let model =
             grpc_model_id(crate::backend::control::get_grpc_model_info(worker_url, timeout).await);
         let sources = crate::backend::control::get_grpc_kv_event_sources(worker_url, timeout).await;
+        let default_rank = server
+            .as_ref()
+            .ok()
+            .and_then(|server| server.parallelism.as_ref())
+            .filter(|parallelism| parallelism.data_parallel_size == 1)
+            .map(|parallelism| parallelism.data_parallel_rank);
         let server_info = server.map(|server| {
             let model_id = model.as_ref().ok().and_then(|model| model.clone());
             ServerInfo {
@@ -411,6 +424,7 @@ async fn discover_worker(client: &reqwest::Client, worker_url: &str) -> WorkerDi
         let sources =
             sources.map(|response| grpc_kv_event_source_entries(worker_url, response.sources));
         return WorkerDiscovery {
+            default_rank,
             server_info,
             sources,
             model_id: model,
@@ -422,6 +436,7 @@ async fn discover_worker(client: &reqwest::Client, worker_url: &str) -> WorkerDi
         .map(|info| Some(server_model_id(info).unwrap_or_else(|| worker_url.to_string())))
         .map_err(|error| error.clone());
     WorkerDiscovery {
+        default_rank: None,
         server_info,
         sources: query_kv_event_sources(client, worker_url).await,
         model_id,

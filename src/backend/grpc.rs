@@ -328,7 +328,7 @@ async fn stream_openai(
         request_timeout,
         mut stages,
         t_req,
-        on_first_output: _,
+        on_first_output,
     } = reply;
     let header_stages = stages.clone();
     let stages_on = crate::backend::stages_enabled();
@@ -340,6 +340,7 @@ async fn stream_openai(
             .map(|t| decode_stream(&**t, prompt_ids.as_ref(), skip_special));
         let mut first = true;
         let mut first_token_logged = false;
+        let mut first_output_seen = false;
         let mut prompt_tokens = n_prompt_tokens as u32;
         let mut completion_tokens = 0u32;
         loop {
@@ -386,6 +387,12 @@ async fn stream_openai(
                             }
                         };
                     let generated_output = has_generated_output(&msg, &text);
+                    notify_first_output(
+                        &msg,
+                        &text,
+                        &mut first_output_seen,
+                        on_first_output.as_ref(),
+                    );
                     if !first_token_logged && !text.is_empty() {
                         stages["first_token_ms"] =
                             serde_json::json!(t_req.elapsed().as_secs_f64() * 1000.0);
@@ -726,5 +733,44 @@ mod tests {
             true,
         ));
         assert!(consumer.on_frame());
+    }
+
+    #[tokio::test]
+    async fn grpc_stream_reports_output_before_response_body_is_polled() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let worker = crate::test_mock_vllm_rs::MockVllmRsServer::spawn().await;
+        let frontend = crate::backend::EngineFrontend::new();
+        frontend.pin_test_token_ids(vec![1, 2, 3]);
+        let request = serde_json::from_value(serde_json::json!({
+            "messages":[{"role":"user","content":"hello"}], "stream":true
+        }))
+        .unwrap();
+        let prepared = frontend.prepare(request).await.unwrap();
+        let count = Arc::new(AtomicUsize::new(0));
+        let observed = count.clone();
+        let response = frontend
+            .dispatch_with_first_output(
+                &worker.grpc_url,
+                prepared,
+                Some(Arc::new(move || {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                })),
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while count.load(Ordering::SeqCst) == 0 && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            1,
+            "generated output must notify before body polling or producer cleanup"
+        );
+        let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        assert!(!bytes.is_empty());
+        assert_eq!(count.load(Ordering::SeqCst), 1);
     }
 }

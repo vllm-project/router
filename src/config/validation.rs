@@ -19,6 +19,38 @@ impl ConfigValidator {
 
         Self::validate_mode(&config.mode, has_service_discovery)?;
         Self::validate_policy(&config.policy)?;
+        if let RoutingMode::VllmPrefillDecode {
+            prefill_policy,
+            decode_policy,
+            discovery_address,
+            ..
+        } = &config.mode
+        {
+            if let Some(policy) = prefill_policy {
+                Self::validate_policy(policy)?;
+            }
+            if let Some(policy) = decode_policy {
+                Self::validate_policy(policy)?;
+            }
+            if matches!(
+                decode_policy.as_ref().unwrap_or(&config.policy),
+                PolicyConfig::SMetric { .. }
+            ) {
+                return Err(ConfigError::IncompatibleConfig {
+                    reason: "SMetric is a prefill policy; select another decode policy".into(),
+                });
+            }
+            if discovery_address.is_some()
+                && matches!(
+                    prefill_policy.as_ref().unwrap_or(&config.policy),
+                    PolicyConfig::SMetric { .. }
+                )
+            {
+                return Err(ConfigError::IncompatibleConfig {
+                    reason: "SMetric requires persistent workers; vLLM ZMQ discovery recreates workers per request".into(),
+                });
+            }
+        }
         Self::validate_server_settings(config)?;
         if let Some(program_scheduling) = &config.program_scheduling {
             Self::validate_program_scheduling(program_scheduling)?;
@@ -389,6 +421,44 @@ impl ConfigValidator {
                     });
                 }
             }
+            PolicyConfig::SMetric { config } => {
+                if config
+                    .prefill_rate
+                    .is_some_and(|rate| !rate.is_finite() || rate <= 0.0)
+                {
+                    return Err(ConfigError::InvalidValue {
+                        field: "PREFILL_RATE".into(),
+                        value: format!("{:?}", config.prefill_rate),
+                        reason: "Must be finite and positive when configured".into(),
+                    });
+                }
+                for (field, value, positive) in [
+                    ("C_LIN", config.c_lin, false),
+                    ("C_ATT", config.c_att, false),
+                    ("SLACK", config.slack, true),
+                    ("HIT_RATIO", config.hit_ratio, false),
+                    ("TTFT_SLO_BASE", config.ttft_slo_base, false),
+                    ("TTFT_SLO_PER_CHAR", config.ttft_slo_per_char, false),
+                ] {
+                    if !value.is_finite() || value < 0.0 || (positive && value == 0.0) {
+                        return Err(ConfigError::InvalidValue {
+                            field: field.into(),
+                            value: value.to_string(),
+                            reason: "Must be finite and nonnegative (positive for rates and slack)"
+                                .into(),
+                        });
+                    }
+                }
+                if config.c_lin == 0.0 && config.c_att == 0.0
+                    || config.ttft_slo_base == 0.0 && config.ttft_slo_per_char == 0.0
+                    || config.max_tree_size == 0
+                    || config.hit_ratio > 1.0
+                {
+                    return Err(ConfigError::ValidationFailed {
+                        reason: "SMetric requires nonzero cost/SLO models, MAX_TREE_SIZE > 0 and HIT_RATIO <= 1".into(),
+                    });
+                }
+            }
             PolicyConfig::KvAware {
                 router_temperature,
                 kv_penalty_host,
@@ -640,6 +710,14 @@ impl ConfigValidator {
             return Err(ConfigError::IncompatibleConfig {
                 reason: "Program scheduling currently requires regular HTTP routing mode"
                     .to_string(),
+            });
+        }
+        if matches!(config.policy, PolicyConfig::SMetric { .. })
+            && (config.enable_igw || matches!(config.mode, RoutingMode::OpenAI { .. }))
+        {
+            return Err(ConfigError::IncompatibleConfig {
+                reason: "SMetric supports regular routing or vLLM P/D prefill, not OpenAI/IGW"
+                    .into(),
             });
         }
         // IGW mode is independent - skip other compatibility checks when enabled

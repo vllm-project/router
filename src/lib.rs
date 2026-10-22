@@ -589,3 +589,9 @@ fn vllm_router_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Router>()?;
     Ok(())
 }
+
+#[cfg(test)]
+use crate as router_library;
+#[cfg(test)]
+#[path = "../tests/common/mock_vllm_rs.rs"]
+mod test_mock_vllm_rs;

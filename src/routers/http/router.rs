@@ -1,3 +1,4 @@
+use super::first_token::{FirstTokenObserver, Observation};
 use super::program_adapter::ProgramCompletion;
 use crate::backend::stream_output::OutputFrameConsumer;
 use crate::config::types::RetryConfig;
@@ -8,15 +9,17 @@ use crate::core::{
 use crate::metrics::RouterMetrics;
 use crate::otel_http::{self, ClientRequestOptions};
 use crate::policies::{
-    kv_aware_ops, KvRequestSlot, KvSelectionReceipt, LoadBalancingPolicy, PolicyRegistry,
+    kv_aware_ops, kv_event_consumer, KvRequestContext, KvRequestSlot, KvSelectionReceipt,
+    LoadBalancingPolicy, PolicyRegistry, RequestTracker, RoutingContext,
 };
 use crate::program_scheduling::{
     BackendObservationProvider, ProgramIdentity, ProgramScheduler, ProgramSchedulerConfig,
     ProgramTarget, ScheduleError, VllmMetricsObservationProvider,
 };
 use crate::protocols::spec::{
-    ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest, GenerationRequest,
-    InferenceGenerateRequest, RerankRequest, RerankResponse, RerankResult, ResponsesRequest,
+    affinity_prompt_from_json, ChatCompletionRequest, CompletionRequest, EmbeddingRequest,
+    GenerateRequest, GenerationRequest, InferenceGenerateRequest, RerankRequest, RerankResponse,
+    RerankResult, ResponsesRequest,
 };
 use crate::routers::header_utils;
 use crate::routers::http::dp_utils;
@@ -81,18 +84,20 @@ struct LoadTrackedBody {
     /// HTTP streams use their first frame.
     output_frame: Option<OutputFrameConsumer>,
     producer_abort: Option<tokio::task::AbortHandle>,
+    first_token: FirstTokenObserver,
 }
 
 struct RequestLoadState {
     worker: Option<Arc<dyn Worker>>,
     kv_slot: Option<KvRequestSlot>,
     released: AtomicBool,
+    tracker: Mutex<Option<RequestTracker>>,
 }
 
 /// Owns an admitted attempt across dispatch and response consumption. Any
 /// cancellation or completion releases the shared counters exactly once.
 #[derive(Clone)]
-struct RequestLoadGuard {
+pub(super) struct RequestLoadGuard {
     state: Arc<RequestLoadState>,
 }
 
@@ -103,7 +108,39 @@ impl RequestLoadGuard {
                 worker,
                 kv_slot,
                 released: AtomicBool::new(false),
+                tracker: Mutex::new(None),
             }),
+        }
+    }
+
+    pub(super) fn for_worker(worker: Arc<dyn Worker>) -> Self {
+        worker.increment_load();
+        RouterMetrics::set_running_requests(worker.url(), worker.load());
+        Self::new(Some(worker), None)
+    }
+
+    fn with_tracker(self, tracker: Option<RequestTracker>) -> Self {
+        *self.state.tracker.lock() = tracker;
+        self
+    }
+
+    fn has_tracker(&self) -> bool {
+        self.state.tracker.lock().is_some()
+    }
+
+    fn discard_tracker(&self) {
+        self.state.tracker.lock().take();
+    }
+
+    fn first_output_callback(
+        &self,
+        is_stream: bool,
+    ) -> Option<crate::backend::grpc::FirstOutputCallback> {
+        if is_stream && !self.has_tracker() {
+            None
+        } else {
+            let load = self.clone();
+            Some(Arc::new(move || load.begin_decode()))
         }
     }
 
@@ -112,6 +149,9 @@ impl RequestLoadGuard {
     }
 
     fn begin_decode(&self) {
+        if let Some(mut tracker) = self.state.tracker.lock().take() {
+            tracker.on_first_token();
+        }
         if let Some(slot) = &self.state.kv_slot {
             slot.begin_decode();
         }
@@ -121,6 +161,7 @@ impl RequestLoadGuard {
         if self.state.released.swap(true, Ordering::AcqRel) {
             return;
         }
+        self.discard_tracker();
         if let Some(slot) = &self.state.kv_slot {
             slot.release();
         }
@@ -148,18 +189,32 @@ impl futures_util::Stream for LoadTrackedBody {
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let item = self.inner.as_mut().poll_next(cx);
-        if matches!(&item, Poll::Ready(Some(Ok(_)))) {
-            let output_started = self
-                .output_frame
-                .as_mut()
-                .is_none_or(OutputFrameConsumer::on_frame);
+        if let Poll::Ready(Some(Ok(bytes))) = &item {
+            let output_started = if let Some(output) = self.output_frame.as_mut() {
+                output.on_frame()
+            } else if self.load.has_tracker() {
+                match self.first_token.observe(bytes) {
+                    Observation::Output => true,
+                    Observation::End => {
+                        self.load.discard_tracker();
+                        false
+                    }
+                    Observation::Pending => false,
+                }
+            } else {
+                true
+            };
             if output_started {
                 self.load.begin_decode();
             }
         }
-        if matches!(item, Poll::Ready(None)) {
+        if matches!(&item, Poll::Ready(None) | Poll::Ready(Some(Err(_)))) {
             self.release();
-            self.producer_abort.take();
+            if let Some(abort) = self.producer_abort.take() {
+                if matches!(&item, Poll::Ready(Some(Err(_)))) {
+                    abort.abort();
+                }
+            }
         }
         item
     }
@@ -220,6 +275,7 @@ fn hold_request_load_with_output_frame(
         load,
         output_frame,
         producer_abort,
+        first_token: FirstTokenObserver::default(),
     };
     Response::from_parts(parts, Body::from_stream(stream))
 }
@@ -236,6 +292,7 @@ struct TypedDispatch<'a> {
 struct SelectedWorker {
     worker: Arc<dyn Worker>,
     kv_receipt: Option<KvSelectionReceipt>,
+    tracker: Option<RequestTracker>,
 }
 
 /// Regular router that uses injected load balancing policies
@@ -347,32 +404,39 @@ impl Router {
         };
         let default_policy = ctx.policy_registry.get_default_policy();
         let mut kv_worker_info = HashMap::new();
-        let (kv_index_supervisor, kv_signal_handle) =
-            if kv_aware_ops(default_policy.as_ref()).is_some() {
-                let (supervisor, mut signals) = crate::kv_index::KvIndexSupervisor::new(
-                    ctx.client.clone(),
-                    crate::kv_index::HashMode::Sha256,
-                );
-                let supervisor = Arc::new(supervisor);
-                for worker_url in &kv_discovery_urls {
-                    match supervisor.on_worker_added(worker_url).await {
-                        Ok(info) => {
-                            kv_worker_info.insert(worker_url.clone(), info);
-                        }
-                        Err(error) => warn!(
-                            worker_url,
-                            %error,
-                            "kv_aware discovery failed; worker will use load-only scoring"
-                        ),
-                    }
+        let (kv_index_supervisor, kv_signal_handle) = if kv_event_consumer(default_policy.as_ref())
+            .is_some()
+        {
+            let (supervisor, mut signals) = crate::kv_index::KvIndexSupervisor::new(
+                ctx.client.clone(),
+                crate::kv_index::HashMode::Sha256,
+            );
+            let supervisor = Arc::new(supervisor);
+            for worker_url in &kv_discovery_urls {
+                if kv_aware_ops(default_policy.as_ref()).is_none()
+                    && !crate::backend::is_grpc_url(worker_url)
+                {
+                    continue;
                 }
-                let signal_handle = Arc::new(tokio::spawn(async move {
-                    while signals.recv().await.is_some() {}
-                }));
-                (Some(supervisor), Some(signal_handle))
-            } else {
-                (None, None)
-            };
+                match supervisor.on_worker_added(worker_url).await {
+                    Ok(info) => {
+                        kv_worker_info.insert(worker_url.clone(), info);
+                    }
+                    Err(error) => warn!(
+                        worker_url,
+                        policy = default_policy.name(),
+                        %error,
+                        "KV event discovery failed; worker will receive no event-derived cache credit"
+                    ),
+                }
+            }
+            let signal_handle = Arc::new(tokio::spawn(async move {
+                while signals.recv().await.is_some() {}
+            }));
+            (Some(supervisor), Some(signal_handle))
+        } else {
+            (None, None)
+        };
         for url in &worker_urls {
             // TODO: In IGW mode, fetch model_id from worker's /get_model_info endpoint
             // For now, create worker without model_id
@@ -397,12 +461,12 @@ impl Router {
             };
             ctx.worker_registry.register(worker_arc.clone());
 
-            if let Some(kv_aware) = kv_aware_ops(default_policy.as_ref()) {
+            if let Some(consumer) = kv_event_consumer(default_policy.as_ref()) {
                 if let Some(info) = kv_worker_info.get(worker_arc.base_url()) {
                     let provider = kv_index_supervisor.as_ref().and_then(|supervisor| {
                         supervisor.match_provider_for_worker(worker_arc.base_url())
                     });
-                    kv_aware.register_worker(worker_arc.as_ref(), info, provider);
+                    consumer.bind_worker(worker_arc.as_ref(), info, provider);
                 }
             }
 
@@ -528,14 +592,18 @@ impl Router {
     async fn discover_kv_worker(&self, worker_url: &str) -> Option<crate::kv_index::WorkerKvInfo> {
         let supervisor = self.kv_index_supervisor.as_ref()?;
         let policy = self.policy_registry.get_default_policy();
-        kv_aware_ops(policy.as_ref())?;
+        kv_event_consumer(policy.as_ref())?;
+        if kv_aware_ops(policy.as_ref()).is_none() && !crate::backend::is_grpc_url(worker_url) {
+            return None;
+        }
         match supervisor.on_worker_added(worker_url).await {
             Ok(info) => Some(info),
             Err(error) => {
                 warn!(
                     worker_url,
+                    policy = policy.name(),
                     %error,
-                    "kv_aware discovery failed; worker will use load-only scoring"
+                    "KV event discovery failed; worker will receive no event-derived cache credit"
                 );
                 None
             }
@@ -549,14 +617,14 @@ impl Router {
     ) {
         let Some(info) = info else { return };
         let policy = self.policy_registry.get_default_policy();
-        let Some(kv_aware) = kv_aware_ops(policy.as_ref()) else {
+        let Some(consumer) = kv_event_consumer(policy.as_ref()) else {
             return;
         };
         let provider = self
             .kv_index_supervisor
             .as_ref()
             .and_then(|supervisor| supervisor.match_provider_for_worker(worker.base_url()));
-        kv_aware.register_worker(worker, info, provider);
+        consumer.bind_worker(worker, info, provider);
     }
 
     fn remove_kv_worker(&self, worker_url: &str, target_urls: &[String]) {
@@ -1204,6 +1272,7 @@ impl Router {
     }
 
     /// Select worker for a specific model considering circuit breaker state
+    #[allow(clippy::too_many_arguments)]
     fn select_worker_for_model(
         &self,
         model_id: Option<&str>,
@@ -1212,6 +1281,7 @@ impl Router {
         token_ids: Option<&[u32]>,
         lora_name: Option<&str>,
         cache_salt: Option<&str>,
+        context: Option<&RoutingContext<'_>>,
     ) -> Option<SelectedWorker> {
         // Get workers for the specified model (O(1) lookup if model_id is provided)
         let workers = match model_id {
@@ -1237,19 +1307,20 @@ impl Router {
         // Convert headers for policies that need them (e.g., consistent_hash)
         let request_headers = Self::headers_to_request_headers(headers);
 
-        let (idx, kv_receipt) = if let Some(kv_aware) = kv_aware_ops(policy.as_ref()) {
+        let context = context.cloned().unwrap_or_default();
+        let (idx, kv_receipt, tracker) = if let Some(kv_aware) = kv_aware_ops(policy.as_ref()) {
             let receipt = kv_aware
                 .select_worker_with_receipt(&available, token_ids, lora_name, cache_salt)?;
-            (receipt.worker_index, Some(receipt))
+            (receipt.worker_index, Some(receipt), None)
         } else {
-            (
-                policy.select_worker_with_headers(&available, text, request_headers.as_ref())?,
-                None,
-            )
+            let (idx, tracker) =
+                policy.select_request(&available, text, request_headers.as_ref(), &context)?;
+            (idx, None, tracker)
         };
         Some(SelectedWorker {
             worker: available.get(idx)?.clone(),
             kv_receipt,
+            tracker,
         })
     }
 
@@ -1318,7 +1389,34 @@ impl Router {
             None
         };
 
-        let text = typed_req.extract_text_for_routing();
+        let policy = match model_id {
+            Some(model) => self.policy_registry.get_policy_or_default(model),
+            None => self.policy_registry.get_default_policy(),
+        };
+        let prompt = policy
+            .needs_affinity_prompt()
+            .then(|| typed_req.extract_affinity_prompt())
+            .flatten();
+        let context = RoutingContext {
+            prompt: prompt.as_ref(),
+            allow_affinity: typed_req.allows_cache_affinity()
+                && header_utils::allows_affinity_for_turn(headers),
+            colocated: true,
+            route,
+            kv: prepared.as_ref().map(|prepared| {
+                let (lora_name, cache_salt) = Self::prepared_cache_identity(Some(prepared));
+                KvRequestContext {
+                    token_ids: prepared.tokenized.token_ids.as_ref(),
+                    lora_name,
+                    cache_salt,
+                }
+            }),
+        };
+        let text = if policy.needs_affinity_prompt() {
+            String::new()
+        } else {
+            typed_req.extract_text_for_routing()
+        };
 
         let response = RetryExecutor::execute_response_with_retry(
             &self.retry_config,
@@ -1359,7 +1457,27 @@ impl Router {
                             cache_salt,
                         )
                     });
-                    Some(SelectedWorker { worker, kv_receipt })
+                    if kv_aware_ops(policy.as_ref()).is_some() {
+                        Some(SelectedWorker {
+                            worker,
+                            kv_receipt,
+                            tracker: None,
+                        })
+                    } else {
+                        let request_headers = Self::headers_to_request_headers(headers);
+                        policy
+                            .select_request(
+                                std::slice::from_ref(&worker),
+                                Some(&text),
+                                request_headers.as_ref(),
+                                &context,
+                            )
+                            .map(|(_, tracker)| SelectedWorker {
+                                worker,
+                                kv_receipt: None,
+                                tracker,
+                            })
+                    }
                 } else {
                     self.select_worker_for_model(
                         model_id,
@@ -1370,9 +1488,14 @@ impl Router {
                             .map(|prepared| prepared.tokenized.token_ids.as_ref()),
                         lora_name,
                         cache_salt,
+                        Some(&context),
                     )
                 };
-                let SelectedWorker { worker, kv_receipt } = match selected_worker {
+                let SelectedWorker {
+                    worker,
+                    kv_receipt,
+                    tracker,
+                } = match selected_worker {
                     Some(selection) => selection,
                     None => {
                         RouterMetrics::record_request_error(route, "no_available_workers");
@@ -1389,7 +1512,7 @@ impl Router {
                     kv_aware.begin_request(kv_receipt?)
                 });
 
-                let load_incremented = if matches!(policy.name(), "cache_aware" | "kv_aware")
+                let load_incremented = if (policy.tracks_load() || policy.name() == "kv_aware")
                     || program_completion.is_some()
                 {
                     worker.increment_load();
@@ -1402,7 +1525,8 @@ impl Router {
                 // The dispatch future owns cleanup even if it is cancelled
                 // before headers arrive. Successful streams transfer it to
                 // their response body and producer.
-                let load = RequestLoadGuard::new(load_incremented.then(|| worker.clone()), kv_slot);
+                let load = RequestLoadGuard::new(load_incremented.then(|| worker.clone()), kv_slot)
+                    .with_tracker(tracker);
 
                 let response = self
                     .send_typed_request(
@@ -1612,13 +1736,7 @@ impl Router {
                 )
                     .into_response();
             };
-            let on_first_output = if is_stream {
-                None
-            } else {
-                let load = load.clone();
-                Some(Arc::new(move || load.begin_decode())
-                    as crate::backend::grpc::FirstOutputCallback)
-            };
+            let on_first_output = load.first_output_callback(is_stream);
             let mut response = self
                 .frontend
                 .dispatch_with_first_output(worker_url, prepared, on_first_output)
@@ -1730,6 +1848,9 @@ impl Router {
 
         let status = StatusCode::from_u16(res.status().as_u16())
             .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        if !status.is_success() {
+            load.discard_tracker();
+        }
         let http_ttfb_ms = t_send.elapsed().as_secs_f64() * 1000.0;
 
         if !is_stream {
@@ -1786,13 +1907,22 @@ impl Router {
             // Spawn task to forward stream and detect completion
             let producer_load = load.clone();
             let producer = tokio::spawn(async move {
+                let mut first_token = FirstTokenObserver::default();
                 let mut stream = stream;
                 let mut first_sse = true;
                 let mut stream_succeeded = true;
                 while let Some(chunk) = stream.next().await {
                     match chunk {
                         Ok(bytes) => {
-                            producer_load.begin_decode();
+                            if producer_load.has_tracker() {
+                                match first_token.observe(&bytes) {
+                                    Observation::Output => producer_load.begin_decode(),
+                                    Observation::End => producer_load.discard_tracker(),
+                                    Observation::Pending => {}
+                                }
+                            } else {
+                                producer_load.begin_decode();
+                            }
                             if first_sse {
                                 first_sse = false;
                                 let first_ms = t_send.elapsed().as_secs_f64() * 1000.0;
@@ -2057,85 +2187,36 @@ impl Router {
     }
 
     pub fn remove_worker(&self, worker_url: &str) {
-        if self.intra_node_data_parallel_size > 1 {
-            // remove dp-aware workers in a prefix-matching fashion
-            // without contacting the remote worker
-            let mut removed_workers: Vec<String> = Vec::new();
-            let worker_url_prefix = format!("{}@", worker_url);
-
-            // Find and remove all workers with matching prefix
-            let all_workers = self.worker_registry.get_all();
-            for w in all_workers.iter() {
-                if w.url().starts_with(&worker_url_prefix) {
-                    let removed_url = w.url().to_string();
-                    // Get model_id before removing
-                    let model_id = w.model_id().to_string();
-
-                    if self.worker_registry.remove_by_url(&removed_url).is_some() {
-                        self.frontend.remove_worker(&removed_url);
-                        info!("Removed worker: {}", removed_url);
-                        removed_workers.push(removed_url);
-
-                        // Notify PolicyRegistry about the removed worker
-                        self.policy_registry.on_worker_removed(&model_id);
-                    } else {
-                        warn!("Worker {} not found, skipping removal", w.url());
-                    }
-                }
-            }
-
-            RouterMetrics::set_active_workers(self.worker_registry.get_all().len());
-            if !removed_workers.is_empty() {
-                self.remove_kv_worker(worker_url, &removed_workers);
-            }
-
-            // If any models are using cache aware policy, remove the workers from the tree
-            // Check each removed worker's model and get its policy
-            for dp_url in removed_workers.iter() {
-                if let Some(worker) = self.worker_registry.get_by_url(dp_url) {
-                    let model_id = worker.model_id();
-                    if let Some(policy) = self.policy_registry.get_policy(model_id) {
-                        if let Some(cache_aware) = policy
-                            .as_any()
-                            .downcast_ref::<crate::policies::CacheAwarePolicy>()
-                        {
-                            cache_aware.remove_worker_by_url(dp_url);
-                            info!("Removed worker from cache-aware tree: {}", dp_url);
-                        }
-                    }
-                }
-            }
+        let workers = if self.intra_node_data_parallel_size > 1 {
+            let prefix = format!("{}@", worker_url);
+            self.worker_registry
+                .get_all()
+                .into_iter()
+                .filter(|worker| worker.url() == worker_url || worker.url().starts_with(&prefix))
+                .collect::<Vec<_>>()
         } else {
-            // Get the worker first to extract model_id
-            let model_id = if let Some(worker) = self.worker_registry.get_by_url(worker_url) {
-                worker.model_id().to_string()
-            } else {
-                warn!("Worker {} not found, skipping removal", worker_url);
-                return;
-            };
-
-            if self.worker_registry.remove_by_url(worker_url).is_some() {
-                self.frontend.remove_worker(worker_url);
-                info!("Removed worker: {}", worker_url);
-
-                // Notify PolicyRegistry about the removed worker
-                self.policy_registry.on_worker_removed(&model_id);
-
-                RouterMetrics::set_active_workers(self.worker_registry.get_all().len());
-                self.remove_kv_worker(worker_url, &[worker_url.to_string()]);
-            }
-
-            // If the model is using cache aware policy, remove the worker from the tree
-            if let Some(policy) = self.policy_registry.get_policy(&model_id) {
-                if let Some(cache_aware) = policy
-                    .as_any()
-                    .downcast_ref::<crate::policies::CacheAwarePolicy>()
-                {
-                    cache_aware.remove_worker_by_url(worker_url);
-                    info!("Removed worker from cache-aware tree: {}", worker_url);
-                }
+            self.worker_registry
+                .get_by_url(worker_url)
+                .into_iter()
+                .collect()
+        };
+        if workers.is_empty() {
+            warn!("Worker {} not found, skipping removal", worker_url);
+            return;
+        }
+        let mut removed_urls = Vec::new();
+        for worker in workers {
+            if let Some(removed) = self.worker_registry.remove_by_url(worker.url()) {
+                self.policy_registry.notify_worker_removed(&removed);
+                self.frontend.remove_worker(removed.url());
+                removed_urls.push(removed.url().to_owned());
+                info!("Removed worker: {}", removed.url());
             }
         }
+        if !removed_urls.is_empty() {
+            self.remove_kv_worker(worker_url, &removed_urls);
+        }
+        RouterMetrics::set_active_workers(self.worker_registry.get_all().len());
     }
 
     async fn get_worker_load(&self, worker_url: &str) -> Option<isize> {
@@ -2697,21 +2778,49 @@ impl RouterTrait for Router {
         } else {
             None
         };
-        let worker = if let Some(completion) = &program_completion {
+        let affinity = policy
+            .needs_affinity_prompt()
+            .then(|| affinity_prompt_from_json(path, &body))
+            .flatten();
+        let context = RoutingContext {
+            prompt: affinity.as_ref().map(|(prompt, _)| prompt),
+            allow_affinity: affinity.as_ref().is_some_and(|(_, gate)| *gate)
+                && header_utils::allows_affinity_for_turn(headers),
+            colocated: true,
+            route: path,
+            kv: None,
+        };
+        let selected = if let Some(completion) = &program_completion {
             self.worker_registry
                 .get_by_url(&completion.dispatch().target_id)
                 .filter(|worker| worker.is_available())
+                .and_then(|worker| {
+                    if policy.needs_affinity_prompt() {
+                        let headers = Self::headers_to_request_headers(headers);
+                        policy
+                            .select_request(
+                                std::slice::from_ref(&worker),
+                                request_text.as_deref(),
+                                headers.as_ref(),
+                                &context,
+                            )
+                            .map(|(_, tracker)| (worker, tracker))
+                    } else {
+                        Some((worker, None))
+                    }
+                })
         } else {
             let request_headers = Self::headers_to_request_headers(headers);
             policy
-                .select_worker_with_headers(
+                .select_request(
                     &workers,
                     request_text.as_deref(),
                     request_headers.as_ref(),
+                    &context,
                 )
-                .and_then(|index| workers.get(index).cloned())
+                .map(|(idx, tracker)| (workers[idx].clone(), tracker))
         };
-        let Some(worker) = worker else {
+        let Some((worker, tracker)) = selected else {
             if let Some(completion) = &program_completion {
                 completion.finish(false);
             }
@@ -2727,7 +2836,7 @@ impl RouterTrait for Router {
         // Match the typed path's load accounting so tracked policies also
         // see transparent (EPD) traffic.
         let load_tracked =
-            matches!(policy.name(), "cache_aware" | "kv_aware") || program_completion.is_some();
+            (policy.tracks_load() || policy.name() == "kv_aware") || program_completion.is_some();
         if load_tracked {
             worker.increment_load();
             RouterMetrics::set_running_requests(worker.url(), worker.load());
@@ -2735,7 +2844,8 @@ impl RouterTrait for Router {
         // Own the admission increment before the first await. If EPD
         // preparation or waiting for backend headers is cancelled, Drop
         // releases the worker load just like the typed request path.
-        let load = load_tracked.then(|| RequestLoadGuard::new(Some(worker.clone()), None));
+        let load = load_tracked
+            .then(|| RequestLoadGuard::new(Some(worker.clone()), None).with_tracker(tracker));
 
         let (body, mut transfers) = if let Some(epd) = &self.epd {
             if *method == Method::POST && path == "/v1/chat/completions" {
@@ -2970,6 +3080,11 @@ impl RouterTrait for Router {
             RouterMetrics::record_generate_duration(start.elapsed());
         } else {
             RouterMetrics::record_request_error(path, "backend_error");
+        }
+        if let Some(load) = &load {
+            if !response.status().is_success() {
+                load.discard_tracker();
+            }
         }
         if load_tracked {
             hold_request_load_until_body_done(
@@ -3777,12 +3892,14 @@ mod tests {
             let response = router
                 .route_typed_request(None, &request, "/v1/chat/completions", None)
                 .await;
-            let expected_status = if fail_body {
-                StatusCode::INTERNAL_SERVER_ERROR
+            if fail_body {
+                assert!(matches!(
+                    response.status(),
+                    StatusCode::INTERNAL_SERVER_ERROR | StatusCode::BAD_GATEWAY
+                ));
             } else {
-                status
-            };
-            assert_eq!(response.status(), expected_status);
+                assert_eq!(response.status(), status);
+            }
             assert_eq!(worker.load(), 1, "status={status}, fail_body={fail_body}");
             to_bytes(response.into_body(), usize::MAX).await.unwrap();
             assert_eq!(worker.load(), 1);
@@ -3992,6 +4109,7 @@ mod tests {
                     None,
                     None,
                     None,
+                    None,
                 )
                 .expect("Should select a worker");
             selected_urls.push(worker.worker.url().to_string());
@@ -4022,7 +4140,15 @@ mod tests {
         }
 
         let worker = router
-            .select_worker_for_model(None, Some(r#"{"prompt": "test"}"#), None, None, None, None)
+            .select_worker_for_model(
+                None,
+                Some(r#"{"prompt": "test"}"#),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
             .expect("Should select the remaining healthy worker");
 
         assert_eq!(
@@ -4050,6 +4176,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         assert!(
             result.is_none(),
@@ -4072,6 +4199,7 @@ mod tests {
                 None,
                 Some(r#"{"prompt": "test"}"#),
                 Some(&header_map),
+                None,
                 None,
                 None,
                 None,
@@ -4296,5 +4424,236 @@ mod tests {
         assert!(registry.revision() > revision_before_recovery);
 
         health_checker.shutdown().await;
+    }
+    fn hold_smetric_load_until_body_done(
+        response: Response,
+        load: Option<RequestLoadGuard>,
+        tracker: Option<RequestTracker>,
+        _observe_first_token: bool,
+    ) -> Response {
+        let load = load
+            .unwrap_or_else(|| RequestLoadGuard::new(None, None))
+            .with_tracker(tracker);
+        hold_request_load_until_body_done(response, load)
+    }
+
+    #[test]
+    fn worker_removal_clears_last_model_policy_for_regular_and_dp_workers() {
+        for dp_size in [1, 2] {
+            let mut router = create_test_regular_router();
+            router.worker_registry = Arc::new(WorkerRegistry::new());
+            router.intra_node_data_parallel_size = dp_size;
+            let base_url = "http://removed:8080";
+            let mut urls = Vec::new();
+            let mut model_policy = None;
+            for rank in 0..dp_size {
+                let url = if dp_size == 1 {
+                    base_url.to_string()
+                } else {
+                    format!("{base_url}@{rank}")
+                };
+                let worker: Arc<dyn Worker> = Arc::new(
+                    BasicWorker::new(url.clone(), WorkerType::Regular)
+                        .with_labels(HashMap::from([("model_id".into(), "removed-model".into())])),
+                );
+                router.worker_registry.register(worker);
+                let policy = router
+                    .policy_registry
+                    .on_worker_added("removed-model", Some("cache_aware"));
+                policy
+                    .as_any()
+                    .downcast_ref::<crate::policies::CacheAwarePolicy>()
+                    .unwrap()
+                    .commit_placement("removed-model", "shared history", &url);
+                model_policy = Some(policy);
+                urls.push(url);
+            }
+
+            router.remove_worker(base_url);
+
+            assert!(router.worker_registry.get_all().is_empty());
+            assert!(router.policy_registry.get_policy("removed-model").is_none());
+            let policy = model_policy.unwrap();
+            let cache_aware = policy
+                .as_any()
+                .downcast_ref::<crate::policies::CacheAwarePolicy>()
+                .unwrap();
+            for url in urls {
+                let placement = cache_aware
+                    .evaluate_initial_placement(
+                        "removed-model",
+                        "shared history",
+                        &[crate::policies::CacheAwareCandidate {
+                            target_id: &url,
+                            kv_pressure: 0.0,
+                        }],
+                    )
+                    .unwrap();
+                assert_eq!(
+                    placement.match_rate, 0.0,
+                    "stale cache entry after removing {url}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn first_token_observation_ignores_error_and_metadata_frames() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct Observer {
+            pending: AtomicUsize,
+            samples: AtomicUsize,
+        }
+
+        impl crate::policies::RequestObserver for Observer {
+            fn charge(&self, work: u64) {
+                self.pending.fetch_add(work as usize, Ordering::SeqCst);
+            }
+
+            fn finish(&self, work: u64, elapsed: Option<Duration>) {
+                self.pending.fetch_sub(work as usize, Ordering::SeqCst);
+                if elapsed.is_some() {
+                    self.samples.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        }
+
+        for input in [
+            "data: {\"error\":\"backend failed\"}\n\n",
+            ": router-stages {}\n\ndata: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"\"}}]}\n\ndata: {\"choices\":[],\"usage\":{\"completion_tokens\":0}}\n\ndata: [DONE]\n\n",
+            "data: {\"error\":\"backend failed\"}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"ignored\"}}]}\n\n",
+        ] {
+            let observer = Arc::new(Observer {
+                pending: AtomicUsize::new(0),
+                samples: AtomicUsize::new(0),
+            });
+            let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+                "grpc://worker:50051".into(),
+                WorkerType::Regular,
+            ));
+            let response = hold_smetric_load_until_body_done(
+                Response::new(Body::from(input)),
+                Some(RequestLoadGuard::for_worker(worker.clone())),
+                Some(RequestTracker::new(observer.clone(), 64)),
+                true,
+            );
+            let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            assert_eq!(bytes, input);
+            assert_eq!(observer.pending.load(Ordering::SeqCst), 0);
+            assert_eq!(observer.samples.load(Ordering::SeqCst), 0, "{input}");
+            assert_eq!(worker.load(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn first_token_observation_waits_for_complete_output_frame() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct Observer(AtomicUsize);
+
+        impl crate::policies::RequestObserver for Observer {
+            fn charge(&self, _: u64) {}
+
+            fn finish(&self, _: u64, elapsed: Option<Duration>) {
+                if elapsed.is_some() {
+                    self.0.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        }
+
+        let observer = Arc::new(Observer(AtomicUsize::new(0)));
+        let chunks = [
+            ": keepalive\r\n\r\n",
+            "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\r\n\r\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"he",
+            "llo\"}}]}\r\n\r\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\" again\"}}]}\n\ndata: [DONE]\n\n",
+        ];
+        let stream = futures_util::stream::iter(
+            chunks
+                .into_iter()
+                .map(|chunk| Ok::<_, std::io::Error>(bytes::Bytes::from_static(chunk.as_bytes()))),
+        );
+        let response = hold_smetric_load_until_body_done(
+            Response::new(Body::from_stream(stream)),
+            None,
+            Some(RequestTracker::new(observer.clone(), 64)),
+            true,
+        );
+        let mut body = response.into_body().into_data_stream();
+        for (index, chunk) in chunks.iter().enumerate() {
+            assert_eq!(body.next().await.unwrap().unwrap(), *chunk);
+            assert_eq!(observer.0.load(Ordering::SeqCst), usize::from(index >= 3));
+        }
+        assert!(body.next().await.is_none());
+        assert_eq!(observer.0.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn response_body_error_releases_load_before_body_drop() {
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+            "http://body-error".into(),
+            WorkerType::Regular,
+        ));
+        worker.increment_load();
+        let response = Response::new(Body::from_stream(futures_util::stream::once(async {
+            Err::<bytes::Bytes, _>(std::io::Error::other("body failed"))
+        })));
+        let producer = tokio::spawn(std::future::pending::<()>());
+        let abort = producer.abort_handle();
+        let response = hold_request_load_with_producer(
+            response,
+            RequestLoadGuard::new(Some(worker.clone()), None),
+            Some(producer),
+        );
+        let mut body = response.into_body().into_data_stream();
+        assert!(body.next().await.unwrap().is_err());
+        assert_eq!(worker.load(), 0);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !abort.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        drop(body);
+        assert_eq!(worker.load(), 0);
+    }
+    #[test]
+    fn grpc_stream_keeps_smetric_observation_before_producer_cleanup() {
+        use std::sync::atomic::AtomicUsize;
+        struct Observer {
+            pending: AtomicUsize,
+            samples: AtomicUsize,
+        }
+        impl crate::policies::RequestObserver for Observer {
+            fn charge(&self, work: u64) {
+                self.pending.fetch_add(work as usize, Ordering::SeqCst);
+            }
+            fn finish(&self, work: u64, elapsed: Option<Duration>) {
+                self.pending.fetch_sub(work as usize, Ordering::SeqCst);
+                if elapsed.is_some() {
+                    self.samples.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        }
+        let observed = Arc::new(Observer {
+            pending: AtomicUsize::new(0),
+            samples: AtomicUsize::new(0),
+        });
+        let load = RequestLoadGuard::new(None, None)
+            .with_tracker(Some(RequestTracker::new(observed.clone(), 64)));
+        let callback = load
+            .first_output_callback(true)
+            .expect("streaming SMetric must observe native output before producer cleanup");
+        callback();
+        load.release();
+        callback();
+        assert_eq!(observed.pending.load(Ordering::SeqCst), 0);
+        assert_eq!(observed.samples.load(Ordering::SeqCst), 1);
+        assert!(RequestLoadGuard::new(None, None)
+            .first_output_callback(true)
+            .is_none());
     }
 }

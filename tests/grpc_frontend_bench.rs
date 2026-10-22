@@ -14,6 +14,7 @@ use fixture::{chat_request, model_fixture};
 use mock::{MockVllmRs, MockVllmRsServer};
 use serde_json::json;
 use tokio::sync::Barrier;
+use vllm_router_rs as router_library;
 use vllm_router_rs::backend::EngineFrontend;
 
 fn settings(name: &str, default: &str) -> Vec<usize> {

@@ -1,6 +1,8 @@
 // These modules are used by tests and benchmarks
 #![allow(dead_code)]
 
+use vllm_router_rs as router_library;
+
 // pub mod mock_mcp_server;
 pub mod bench_corpus;
 pub mod bench_mock;

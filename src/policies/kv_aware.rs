@@ -16,6 +16,25 @@ pub trait TieredMatchProvider: Send + Sync {
     fn find_tiered_matches(&self, query: &MatchQuery) -> Vec<TierMatch>;
 }
 
+pub trait KvEventConsumer: Send + Sync {
+    fn bind_worker(
+        &self,
+        worker: &dyn Worker,
+        info: &WorkerKvInfo,
+        matches: Option<Arc<dyn TieredMatchProvider>>,
+    );
+}
+
+pub fn kv_event_consumer(policy: &dyn LoadBalancingPolicy) -> Option<&dyn KvEventConsumer> {
+    if let Some(policy) = policy.as_any().downcast_ref::<KvAwarePolicy>() {
+        return Some(policy);
+    }
+    policy
+        .as_any()
+        .downcast_ref::<super::SMetricPolicy>()
+        .map(|policy| policy as &dyn KvEventConsumer)
+}
+
 /// Optional operations used by adapters with tokenized requests and KV discovery.
 pub trait KvAwareOps: Send + Sync {
     fn register_worker(
@@ -832,6 +851,17 @@ impl LoadBalancingPolicy for KvAwarePolicy {
 
     fn as_any(&self) -> &dyn std::any::Any {
         self
+    }
+}
+
+impl KvEventConsumer for KvAwarePolicy {
+    fn bind_worker(
+        &self,
+        worker: &dyn Worker,
+        info: &WorkerKvInfo,
+        matches: Option<Arc<dyn TieredMatchProvider>>,
+    ) {
+        KvAwareOps::register_worker(self, worker, info, matches);
     }
 }
 

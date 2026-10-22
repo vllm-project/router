@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use vllm_router_rs::config::{
     CircuitBreakerConfig, ConfigError, ConfigResult, ConnectionMode, DiscoveryConfig,
     HealthCheckConfig, HistoryBackend, KvConnector, MetricsConfig, PolicyConfig,
-    ProgramSchedulingConfig, RetryConfig, RouterConfig, RoutingMode, TraceConfig,
+    ProgramSchedulingConfig, RetryConfig, RouterConfig, RoutingMode, SMetricConfig, TraceConfig,
 };
 use vllm_router_rs::metrics::PrometheusConfig;
 use vllm_router_rs::server::{self, ServerConfig};
@@ -119,9 +119,12 @@ struct CliArgs {
     #[arg(long, num_args = 0..)]
     worker_urls: Vec<String>,
 
-    /// Load balancing policy to use. kv_aware is supported only in regular mode, not PD disaggregation.
-    #[arg(long, default_value = "cache_aware", value_parser = ["random", "round_robin", "cache_aware", "kv_aware", "power_of_two", "consistent_hash", "rendezvous_hash"])]
+    /// Load balancing policy to use
+    #[arg(long, default_value = "cache_aware", value_parser = ["random", "round_robin", "cache_aware", "kv_aware", "power_of_two", "consistent_hash", "rendezvous_hash", "smetric"])]
     policy: String,
+    /// YAML file of SMetric parameters (required when SMetric is selected)
+    #[arg(long)]
+    smetric_config: Option<std::path::PathBuf>,
 
     /// Enable Program-level scheduling independently of the request-level
     /// load-balancing policy.
@@ -146,8 +149,8 @@ struct CliArgs {
     #[arg(long, action = ArgAction::Append)]
     decode: Vec<String>,
 
-    /// Specific policy for prefill nodes in PD mode. kv_aware is not supported in PD mode.
-    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "consistent_hash", "rendezvous_hash"])]
+    /// Specific policy for prefill nodes in PD mode
+    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "consistent_hash", "rendezvous_hash", "smetric"])]
     prefill_policy: Option<String>,
 
     /// Specific policy for decode nodes in PD mode. kv_aware is not supported in PD mode.
@@ -409,8 +412,12 @@ impl CliArgs {
     }
 
     /// Convert policy string to PolicyConfig
-    fn parse_policy(&self, policy_str: &str) -> PolicyConfig {
-        match policy_str {
+    fn parse_policy(
+        &self,
+        policy_str: &str,
+        smetric: Option<&SMetricConfig>,
+    ) -> ConfigResult<PolicyConfig> {
+        Ok(match policy_str {
             "random" => PolicyConfig::Random,
             "round_robin" => PolicyConfig::RoundRobin,
             "cache_aware" => PolicyConfig::CacheAware {
@@ -433,8 +440,16 @@ impl CliArgs {
                 virtual_nodes: 160, // Default value
             },
             "rendezvous_hash" => PolicyConfig::RendezvousHash,
+            "smetric" => PolicyConfig::SMetric {
+                config: smetric
+                    .ok_or_else(|| ConfigError::MissingRequired {
+                        field: "--smetric-config".into(),
+                    })?
+                    .clone()
+                    .into(),
+            },
             _ => PolicyConfig::RoundRobin, // Fallback
-        }
+        })
     }
 
     /// Convert CLI arguments to RouterConfig
@@ -442,6 +457,37 @@ impl CliArgs {
         &self,
         prefill_urls: Vec<(String, Option<u16>)>,
     ) -> ConfigResult<RouterConfig> {
+        let smetric_selected =
+            self.policy == "smetric" || self.prefill_policy.as_deref() == Some("smetric");
+        let smetric = match (smetric_selected, &self.smetric_config) {
+            (true, Some(path)) => {
+                let yaml = std::fs::read_to_string(path).map_err(|error| {
+                    ConfigError::ValidationFailed {
+                        reason: format!("cannot read SMetric config {}: {error}", path.display()),
+                    }
+                })?;
+                let config = serde_yaml::from_str::<SMetricConfig>(&yaml).map_err(|error| {
+                    ConfigError::ValidationFailed {
+                        reason: format!("invalid SMetric config {}: {error}", path.display()),
+                    }
+                })?;
+                Some(config)
+            }
+            (true, None) => {
+                return Err(ConfigError::MissingRequired {
+                    field: "--smetric-config".into(),
+                })
+            }
+            (false, Some(_)) => {
+                return Err(ConfigError::ValidationFailed {
+                    reason:
+                        "--smetric-config requires --policy smetric or --prefill-policy smetric"
+                            .into(),
+                })
+            }
+            (false, None) => None,
+        };
+
         // Determine routing mode
         let mode = if self.enable_igw {
             // IGW mode - routing mode is not used in IGW, but we need to provide a placeholder
@@ -503,8 +549,16 @@ impl CliArgs {
             RoutingMode::VllmPrefillDecode {
                 prefill_urls: prefill_urls.clone(),
                 decode_urls: final_decode_urls,
-                prefill_policy: self.prefill_policy.as_ref().map(|p| self.parse_policy(p)),
-                decode_policy: self.decode_policy.as_ref().map(|p| self.parse_policy(p)),
+                prefill_policy: self
+                    .prefill_policy
+                    .as_ref()
+                    .map(|p| self.parse_policy(p, smetric.as_ref()))
+                    .transpose()?,
+                decode_policy: self
+                    .decode_policy
+                    .as_ref()
+                    .map(|p| self.parse_policy(p, smetric.as_ref()))
+                    .transpose()?,
                 discovery_address: self.vllm_discovery_address.clone(),
             }
         } else {
@@ -521,7 +575,7 @@ impl CliArgs {
         };
 
         // Main policy
-        let policy = self.parse_policy(&self.policy);
+        let policy = self.parse_policy(&self.policy, smetric.as_ref())?;
 
         // Service discovery configuration
         let discovery = if self.service_discovery {
@@ -794,6 +848,19 @@ Provide --worker-urls or PD flags as usual.",
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn smetric_policy_without_loaded_config_returns_error() {
+        let args = CliArgs::try_parse_from(["vllm-router"]).unwrap();
+
+        let result = std::panic::catch_unwind(|| args.parse_policy("smetric", None));
+
+        assert!(result.is_ok(), "missing SMetric config must not panic");
+        assert!(matches!(
+            result.unwrap(),
+            Err(ConfigError::MissingRequired { field }) if field == "--smetric-config"
+        ));
+    }
 
     #[test]
     fn parses_wasm_middleware_options() {
