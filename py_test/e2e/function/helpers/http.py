@@ -1,4 +1,4 @@
-"""HTTP helpers for router functional e2e (worker admin + OpenAI completions)."""
+"""HTTP helpers for router functional e2e (worker admin + OpenAI chat)."""
 
 from __future__ import annotations
 
@@ -13,22 +13,22 @@ def attach_workers(router_url: str, workers) -> None:
         r.raise_for_status()
 
 
-def post_completion(
+def post_chat_completion(
     session: requests.Session,
     router_url: str,
     *,
     model: str,
-    prompt: str,
+    content: str,
     stream: bool = False,
     max_tokens: int = 8,
     temperature: float = 0.0,
     timeout: float = 120.0,
 ) -> requests.Response:
     return session.post(
-        f"{router_url}/v1/completions",
+        f"{router_url}/v1/chat/completions",
         json={
             "model": model,
-            "prompt": prompt,
+            "messages": [{"role": "user", "content": content}],
             "max_tokens": max_tokens,
             "stream": stream,
             "temperature": temperature,
@@ -38,7 +38,7 @@ def post_completion(
     )
 
 
-def drain_completion_stream(response: requests.Response) -> None:
+def drain_sse_stream(response: requests.Response) -> None:
     for line in response.iter_lines(decode_unicode=True):
         if not line:
             continue

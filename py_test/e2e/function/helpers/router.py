@@ -9,6 +9,8 @@ from py_test.e2e.function.helpers import launch
 
 def spawn_kv_aware_router(
     worker_urls: list[str],
+    *,
+    router_model: str,
     timeout: float = 180.0,
 ) -> SimpleNamespace:
     port = launch.find_available_port()
@@ -19,6 +21,7 @@ def spawn_kv_aware_router(
         timeout=timeout,
         router_temperature=0.0,
         worker_urls=worker_urls,
+        router_model=router_model,
     )
     return SimpleNamespace(proc=proc, url=base_url)
 

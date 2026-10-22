@@ -1,19 +1,15 @@
 """Functional e2e: kv_aware routing policy (PR #371).
 
+Uses **vllm-rs serve** workers and ``grpc://`` worker URLs so the router
+tokenizes ``/v1/chat/completions`` and can exercise kv_aware discovery.
 Run (avoids importing ``py_test/e2e/conftest`` / ``vllm.test``)::
 
   pytest py_test/e2e/function/kv_aware --confcutdir=py_test/e2e/function/kv_aware -m e2e -v -s
 
-Use ``-s`` to see vLLM worker startup logs on the terminal.
-
-Workers need ``vllm`` on **the same interpreter as pytest** (see log line
-``platform linux -- Python ...``). Prefer::
+Prerequisites: ``vllm-rs`` (``export VLLM_RS=...`` or ``scripts/backend/check_vllm_rs.sh``),
+``ROUTER_BIN`` or ``cargo build --release``, two GPUs.
 
   .venv/bin/python -m pytest py_test/e2e/function/kv_aware/test_kv_aware.py -m e2e -v -s
-
-Router binary (pick one): auto-detect ``target/release/vllm-router`` after
-``cargo build --release``; or ``export ROUTER_BIN=/path/to/vllm-router``;
-or ``pip install -e .`` (``python -m vllm_router.launch_router``).
 """
 
 from __future__ import annotations
@@ -30,7 +26,7 @@ from py_test.e2e.function.kv_aware.config import (
 )
 
 
-def _prompt(suffix: str) -> str:
+def _user_message(suffix: str) -> str:
     return KV_AWARE_SHARED_PREFIX + suffix
 
 
@@ -40,11 +36,11 @@ def test_kv_aware_live_routing_and_streaming(
     kv_aware_two_workers,
 ):
     """
-    Smoke-test kv_aware on a regular HTTP router with two vLLM workers.
+    Smoke-test kv_aware with two gRPC (vllm-rs) workers.
 
-    HTTP completions do not supply token IDs, so placement credit falls back to
-    load-only scoring; this still validates discovery wiring, worker registration,
-    selection, and request lifecycle (including streaming slot release).
+    Exercises router tokenization on chat, worker registration, concurrent
+    routing, and streaming. Stronger KV placement assertions can be added once
+    observability (worker id / metrics) is wired in the test harness.
     Requires at least two GPUs (see ``kv_aware_two_workers``).
     """
     base = kv_aware_router.url
@@ -58,22 +54,24 @@ def test_kv_aware_live_routing_and_streaming(
     assert set(urls) == {w.url for w in workers}
 
     with requests.Session() as session:
-        warm = router_http.post_completion(
+        warm = router_http.post_chat_completion(
             session,
             base,
             model=model,
-            prompt=_prompt(" warm"),
+            content=_user_message(" warm"),
             stream=False,
         )
         warm.raise_for_status()
-        assert warm.json().get("choices")
+        choices = warm.json().get("choices") or []
+        assert choices
+        assert choices[0].get("message", {}).get("content") is not None
 
         def one_request(i: int) -> None:
-            r = router_http.post_completion(
+            r = router_http.post_chat_completion(
                 session,
                 base,
                 model=model,
-                prompt=_prompt(f" req-{i}"),
+                content=_user_message(f" req-{i}"),
                 stream=False,
             )
             r.raise_for_status()
@@ -83,13 +81,13 @@ def test_kv_aware_live_routing_and_streaming(
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
             list(pool.map(one_request, range(16)))
 
-        stream_resp = router_http.post_completion(
+        stream_resp = router_http.post_chat_completion(
             session,
             base,
             model=model,
-            prompt=_prompt(" stream"),
+            content=_user_message(" stream"),
             stream=True,
             max_tokens=4,
         )
         stream_resp.raise_for_status()
-        router_http.drain_completion_stream(stream_resp)
+        router_http.drain_sse_stream(stream_resp)

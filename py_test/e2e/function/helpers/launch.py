@@ -1,9 +1,10 @@
-"""Launch router/vLLM worker processes for py_test/e2e/function (no vllm.test import)."""
+"""Launch vllm-router and vllm-rs workers for py_test/e2e/function (no vllm.test import)."""
 
 from __future__ import annotations
 
 import importlib.util
 import os
+import shlex
 import shutil
 import socket
 import subprocess
@@ -135,59 +136,64 @@ def wait_router_health(base_url: str, timeout: float) -> None:
     raise TimeoutError("Router failed to become healthy in time")
 
 
-def _vllm_worker_mode() -> str:
-    """``serve`` (vLLM 0.3x CLI) or legacy ``launch_server`` module."""
-    override = os.environ.get("VLLM_E2E_WORKER_MODE", "").strip().lower()
-    if override in ("serve", "launch_server"):
-        return override
-    if importlib.util.find_spec("vllm.launch_server") is None:
-        return "serve"
-    return "launch_server"
+def resolve_vllm_rs_bin() -> str | None:
+    """``VLLM_RS``, then ``vllm-rs`` on PATH, then ``site-packages/vllm/vllm-rs``."""
+    override = os.environ.get("VLLM_RS", "").strip()
+    if override:
+        candidate = Path(override).expanduser()
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate.resolve())
+        return None
+    on_path = shutil.which("vllm-rs")
+    if on_path:
+        return on_path
+    if importlib.util.find_spec("vllm") is None:
+        return None
+    import vllm
+
+    bundled = Path(vllm.__file__).resolve().parent / "vllm-rs"
+    if bundled.is_file() and os.access(bundled, os.X_OK):
+        return str(bundled)
+    return None
 
 
-def popen_launch_worker(
+def vllm_rs_serve_extra_argv() -> list[str]:
+    raw = os.environ.get("VLLM_RS_SERVE_EXTRA", "").strip()
+    if not raw:
+        return ["--enable-prefix-caching"]
+    return shlex.split(raw)
+
+
+def popen_launch_vllm_rs_grpc_worker(
     model: str,
-    base_url: str,
     *,
-    dp_size: int | None = None,
-    api_key: str | None = None,
-    base_gpu_id: int | None = 0,
+    host: str = "127.0.0.1",
+    http_port: int,
+    grpc_port: int,
+    base_gpu_id: int = 0,
+    extra_argv: list[str] | None = None,
 ) -> subprocess.Popen:
-    host, port = _parse_url(base_url)
+    """``vllm-rs serve`` with OpenAI ``--port`` and Inference ``--grpc-port``."""
+    vllm_rs = resolve_vllm_rs_bin()
+    if not vllm_rs:
+        raise RuntimeError(
+            "vllm-rs not found: set VLLM_RS, put vllm-rs on PATH, or install a vllm wheel "
+            "that bundles site-packages/vllm/vllm-rs (see scripts/backend/check_vllm_rs.sh)"
+        )
     env = os.environ.copy()
-    env["CUDA_VISIBLE_DEVICES"] = str(base_gpu_id if base_gpu_id is not None else 0)
-
-    mode = _vllm_worker_mode()
-    if mode == "serve":
-        vllm_bin = shutil.which("vllm")
-        if not vllm_bin:
-            raise RuntimeError(
-                "vLLM 0.3x expects `vllm serve` on PATH; install vllm or set "
-                "VLLM_E2E_WORKER_MODE=launch_server for older layouts"
-            )
-        cmd = [vllm_bin, "serve", model, "--host", host, "--port", port]
-        if dp_size is not None:
-            cmd += ["--data-parallel-size", str(dp_size)]
-    else:
-        cmd = [
-            sys.executable,
-            "-m",
-            "vllm.launch_server",
-            "--model-path",
-            model,
-            "--host",
-            host,
-            "--port",
-            port,
-            "--base-gpu-id",
-            str(base_gpu_id or 0),
-        ]
-        if dp_size is not None:
-            cmd += ["--dp-size", str(dp_size)]
-
-    if api_key is not None:
-        cmd += ["--api-key", api_key]
-    # Inherit stdout/stderr so vLLM load logs appear when running pytest -s.
+    env["CUDA_VISIBLE_DEVICES"] = str(base_gpu_id)
+    cmd = [
+        vllm_rs,
+        "serve",
+        model,
+        "--host",
+        host,
+        "--port",
+        str(http_port),
+        "--grpc-port",
+        str(grpc_port),
+        *(extra_argv if extra_argv is not None else vllm_rs_serve_extra_argv()),
+    ]
     return subprocess.Popen(cmd, env=env)
 
 
@@ -204,9 +210,17 @@ def popen_launch_router_only(
     kv_penalty_external: float | None = None,
     kv_penalty_disk: float | None = None,
     worker_urls: list[str] | None = None,
+    router_model: str | None = None,
 ) -> subprocess.Popen:
     host, port = _parse_url(base_url)
     prom_port = find_available_port()
+    env = os.environ.copy()
+    if router_model:
+        env["VLLM_ROUTER_MODEL"] = router_model
+    elif worker_urls and any(u.startswith("grpc://") for u in worker_urls):
+        raise RuntimeError(
+            "grpc workers require router_model= (sets VLLM_ROUTER_MODEL for tokenization)"
+        )
     cmd = [
         *router_launch_prefix(),
         "--host",
@@ -243,6 +257,7 @@ def popen_launch_router_only(
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
         text=True,
+        env=env,
     )
     try:
         wait_router_health(base_url, timeout)
