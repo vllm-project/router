@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib.util
 import os
 import shutil
 import socket
@@ -93,12 +94,23 @@ def _parse_url(base_url: str) -> tuple[str, str]:
     )
 
 
-def wait_worker_health(base_url: str, timeout: float = 600.0) -> None:
+def wait_worker_health(
+    base_url: str,
+    timeout: float = 600.0,
+    proc: subprocess.Popen | None = None,
+) -> None:
     """Wait until a vLLM worker ``GET /health`` returns 200."""
     start = time.perf_counter()
     health_url = f"{base_url.rstrip('/')}/health"
     with requests.Session() as session:
         while time.perf_counter() - start < timeout:
+            if proc is not None:
+                code = proc.poll()
+                if code is not None:
+                    raise TimeoutError(
+                        f"Worker process exited with code {code} before "
+                        f"health OK: {health_url}"
+                    )
             try:
                 r = session.get(health_url, timeout=5)
                 if r.status_code == 200:
@@ -123,6 +135,16 @@ def wait_router_health(base_url: str, timeout: float) -> None:
     raise TimeoutError("Router failed to become healthy in time")
 
 
+def _vllm_worker_mode() -> str:
+    """``serve`` (vLLM 0.3x CLI) or legacy ``launch_server`` module."""
+    override = os.environ.get("VLLM_E2E_WORKER_MODE", "").strip().lower()
+    if override in ("serve", "launch_server"):
+        return override
+    if importlib.util.find_spec("vllm.launch_server") is None:
+        return "serve"
+    return "launch_server"
+
+
 def popen_launch_worker(
     model: str,
     base_url: str,
@@ -132,25 +154,41 @@ def popen_launch_worker(
     base_gpu_id: int | None = 0,
 ) -> subprocess.Popen:
     host, port = _parse_url(base_url)
-    cmd = [
-        sys.executable,
-        "-m",
-        "vllm.launch_server",
-        "--model-path",
-        model,
-        "--host",
-        host,
-        "--port",
-        port,
-        "--base-gpu-id",
-        str(base_gpu_id or 0),
-    ]
-    if dp_size is not None:
-        cmd += ["--dp-size", str(dp_size)]
+    env = os.environ.copy()
+    env["CUDA_VISIBLE_DEVICES"] = str(base_gpu_id if base_gpu_id is not None else 0)
+
+    mode = _vllm_worker_mode()
+    if mode == "serve":
+        vllm_bin = shutil.which("vllm")
+        if not vllm_bin:
+            raise RuntimeError(
+                "vLLM 0.3x expects `vllm serve` on PATH; install vllm or set "
+                "VLLM_E2E_WORKER_MODE=launch_server for older layouts"
+            )
+        cmd = [vllm_bin, "serve", model, "--host", host, "--port", port]
+        if dp_size is not None:
+            cmd += ["--data-parallel-size", str(dp_size)]
+    else:
+        cmd = [
+            sys.executable,
+            "-m",
+            "vllm.launch_server",
+            "--model-path",
+            model,
+            "--host",
+            host,
+            "--port",
+            port,
+            "--base-gpu-id",
+            str(base_gpu_id or 0),
+        ]
+        if dp_size is not None:
+            cmd += ["--dp-size", str(dp_size)]
+
     if api_key is not None:
         cmd += ["--api-key", api_key]
     # Inherit stdout/stderr so vLLM load logs appear when running pytest -s.
-    return subprocess.Popen(cmd)
+    return subprocess.Popen(cmd, env=env)
 
 
 def popen_launch_router_only(

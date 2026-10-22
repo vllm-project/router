@@ -6,6 +6,11 @@ Run (avoids importing ``py_test/e2e/conftest`` / ``vllm.test``)::
 
 Use ``-s`` to see vLLM worker startup logs on the terminal.
 
+Workers need ``vllm`` on **the same interpreter as pytest** (see log line
+``platform linux -- Python ...``). Prefer::
+
+  .venv/bin/python -m pytest py_test/e2e/function/kv_aware/test_kv_aware.py -m e2e -v -s
+
 Router binary (pick one): auto-detect ``target/release/vllm-router`` after
 ``cargo build --release``; or ``export ROUTER_BIN=/path/to/vllm-router``;
 or ``pip install -e .`` (``python -m vllm_router.launch_router``).
