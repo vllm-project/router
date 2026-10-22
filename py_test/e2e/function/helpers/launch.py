@@ -1,24 +1,130 @@
-"""Load shared worker/router launch helpers from py_test/e2e/conftest.py."""
+"""Launch router/vLLM worker processes for py_test/e2e/function (no vllm.test import)."""
 
 from __future__ import annotations
 
-import importlib.util
-from pathlib import Path
-from types import ModuleType
+import socket
+import subprocess
+import sys
+import time
+from urllib.parse import urlparse
 
-_E2E_CONFTEST: ModuleType | None = None
+import requests
 
 
-def get_e2e_conftest() -> ModuleType:
-    global _E2E_CONFTEST
-    if _E2E_CONFTEST is not None:
-        return _E2E_CONFTEST
+def find_available_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
 
-    path = Path(__file__).resolve().parents[2] / "conftest.py"
-    spec = importlib.util.spec_from_file_location("router_e2e_parent_conftest", path)
-    if spec is None or spec.loader is None:
-        raise ImportError(f"cannot load e2e helpers from {path}")
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    _E2E_CONFTEST = mod
-    return mod
+
+def _parse_url(base_url: str) -> tuple[str, str]:
+    parsed = urlparse(base_url)
+    return parsed.hostname or "127.0.0.1", (
+        str(parsed.port) if parsed.port is not None else ""
+    )
+
+
+def wait_router_health(base_url: str, timeout: float) -> None:
+    start = time.perf_counter()
+    with requests.Session() as session:
+        while time.perf_counter() - start < timeout:
+            try:
+                r = session.get(f"{base_url}/health", timeout=5)
+                if r.status_code == 200:
+                    return
+            except requests.RequestException:
+                pass
+            time.sleep(2)
+    raise TimeoutError("Router failed to become healthy in time")
+
+
+def popen_launch_worker(
+    model: str,
+    base_url: str,
+    *,
+    dp_size: int | None = None,
+    api_key: str | None = None,
+    base_gpu_id: int | None = 0,
+) -> subprocess.Popen:
+    host, port = _parse_url(base_url)
+    cmd = [
+        sys.executable,
+        "-m",
+        "vllm.launch_server",
+        "--model-path",
+        model,
+        "--host",
+        host,
+        "--port",
+        port,
+        "--base-gpu-id",
+        str(base_gpu_id or 0),
+    ]
+    if dp_size is not None:
+        cmd += ["--dp-size", str(dp_size)]
+    if api_key is not None:
+        cmd += ["--api-key", api_key]
+    return subprocess.Popen(cmd)
+
+
+def popen_launch_router_only(
+    base_url: str,
+    policy: str = "round_robin",
+    timeout: float = 120.0,
+    *,
+    intra_node_data_parallel_size: int = 1,
+    enable_igw: bool = False,
+    api_key: str | None = None,
+    router_temperature: float | None = None,
+    kv_penalty_host: float | None = None,
+    kv_penalty_external: float | None = None,
+    kv_penalty_disk: float | None = None,
+) -> subprocess.Popen:
+    host, port = _parse_url(base_url)
+    prom_port = find_available_port()
+    cmd = [
+        sys.executable,
+        "-m",
+        "vllm_router.launch_router",
+        "--host",
+        host,
+        "--port",
+        port,
+        "--policy",
+        policy,
+    ]
+    if intra_node_data_parallel_size > 1:
+        cmd += ["--intra-node-data-parallel-size", str(intra_node_data_parallel_size)]
+    if enable_igw:
+        cmd += ["--enable-igw"]
+    if api_key is not None:
+        cmd += ["--api-key", api_key]
+    if router_temperature is not None:
+        cmd += ["--router-temperature", str(router_temperature)]
+    if kv_penalty_host is not None:
+        cmd += ["--kv-penalty-host", str(kv_penalty_host)]
+    if kv_penalty_external is not None:
+        cmd += ["--kv-penalty-external", str(kv_penalty_external)]
+    if kv_penalty_disk is not None:
+        cmd += ["--kv-penalty-disk", str(kv_penalty_disk)]
+    cmd += [
+        "--prometheus-port",
+        str(prom_port),
+        "--prometheus-host",
+        "127.0.0.1",
+    ]
+    proc = subprocess.Popen(cmd)
+    wait_router_health(base_url, timeout)
+    return proc
+
+
+def terminate_process(proc: subprocess.Popen | None, timeout: float = 120) -> None:
+    if proc is None:
+        return
+    proc.terminate()
+    start = time.perf_counter()
+    while proc.poll() is None:
+        if time.perf_counter() - start > timeout:
+            proc.kill()
+            break
+        time.sleep(1)

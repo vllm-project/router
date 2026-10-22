@@ -1,8 +1,8 @@
 """Functional e2e: kv_aware routing policy (PR #371).
 
-Run::
+Run (avoids importing ``py_test/e2e/conftest`` / ``vllm.test``)::
 
-  pytest py_test/e2e/function/kv_aware/test_kv_aware.py -m e2e -v
+  pytest py_test/e2e/function/kv_aware --confcutdir=py_test/e2e/function/kv_aware -m e2e -v
 """
 
 from __future__ import annotations
@@ -25,7 +25,7 @@ def _prompt(suffix: str) -> str:
 
 @pytest.mark.e2e
 def test_kv_aware_live_routing_and_streaming(
-    e2e_router_only_kv_aware,
+    kv_aware_router,
     kv_aware_two_workers,
 ):
     """
@@ -36,7 +36,7 @@ def test_kv_aware_live_routing_and_streaming(
     selection, and request lifecycle (including streaming slot release).
     Requires at least two GPUs (see ``kv_aware_two_workers``).
     """
-    base = e2e_router_only_kv_aware.url
+    base = kv_aware_router.url
     workers = kv_aware_two_workers
     model = KV_AWARE_E2E_MODEL
 

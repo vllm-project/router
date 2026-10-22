@@ -14,11 +14,18 @@ from urllib.parse import urlparse
 import pytest
 import requests
 
-from vllm.test.test_utils import (
-    DEFAULT_MODEL_NAME_FOR_TEST,
-    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-    DEFAULT_URL_FOR_TEST,
-)
+try:
+    from vllm.test.test_utils import (
+        DEFAULT_MODEL_NAME_FOR_TEST,
+        DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+        DEFAULT_URL_FOR_TEST,
+    )
+except ImportError:
+    DEFAULT_MODEL_NAME_FOR_TEST = os.environ.get("E2E_MODEL", "Qwen/Qwen3-0.6B")
+    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH = int(
+        os.environ.get("E2E_SERVER_LAUNCH_TIMEOUT", "600")
+    )
+    DEFAULT_URL_FOR_TEST = os.environ.get("E2E_URL", "http://127.0.0.1:8000")
 
 logger = logging.getLogger(__name__)
 
