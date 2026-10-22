@@ -93,6 +93,22 @@ def _parse_url(base_url: str) -> tuple[str, str]:
     )
 
 
+def wait_worker_health(base_url: str, timeout: float = 600.0) -> None:
+    """Wait until a vLLM worker ``GET /health`` returns 200."""
+    start = time.perf_counter()
+    health_url = f"{base_url.rstrip('/')}/health"
+    with requests.Session() as session:
+        while time.perf_counter() - start < timeout:
+            try:
+                r = session.get(health_url, timeout=5)
+                if r.status_code == 200:
+                    return
+            except requests.RequestException:
+                pass
+            time.sleep(2)
+    raise TimeoutError(f"Worker failed to become healthy in time: {health_url}")
+
+
 def wait_router_health(base_url: str, timeout: float) -> None:
     start = time.perf_counter()
     with requests.Session() as session:
@@ -133,6 +149,7 @@ def popen_launch_worker(
         cmd += ["--dp-size", str(dp_size)]
     if api_key is not None:
         cmd += ["--api-key", api_key]
+    # Inherit stdout/stderr so vLLM load logs appear when running pytest -s.
     return subprocess.Popen(cmd)
 
 
@@ -148,6 +165,7 @@ def popen_launch_router_only(
     kv_penalty_host: float | None = None,
     kv_penalty_external: float | None = None,
     kv_penalty_disk: float | None = None,
+    worker_urls: list[str] | None = None,
 ) -> subprocess.Popen:
     host, port = _parse_url(base_url)
     prom_port = find_available_port()
@@ -160,6 +178,8 @@ def popen_launch_router_only(
         "--policy",
         policy,
     ]
+    if worker_urls:
+        cmd.extend(["--worker-urls", *worker_urls])
     if intra_node_data_parallel_size > 1:
         cmd += ["--intra-node-data-parallel-size", str(intra_node_data_parallel_size)]
     if enable_igw:
@@ -182,7 +202,7 @@ def popen_launch_router_only(
     ]
     proc = subprocess.Popen(
         cmd,
-        stdout=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
         text=True,
     )

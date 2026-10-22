@@ -2,7 +2,9 @@
 
 Run (avoids importing ``py_test/e2e/conftest`` / ``vllm.test``)::
 
-  pytest py_test/e2e/function/kv_aware --confcutdir=py_test/e2e/function/kv_aware -m e2e -v
+  pytest py_test/e2e/function/kv_aware --confcutdir=py_test/e2e/function/kv_aware -m e2e -v -s
+
+Use ``-s`` to see vLLM worker startup logs on the terminal.
 
 Router binary (pick one): auto-detect ``target/release/vllm-router`` after
 ``cargo build --release``; or ``export ROUTER_BIN=/path/to/vllm-router``;
@@ -43,8 +45,6 @@ def test_kv_aware_live_routing_and_streaming(
     base = kv_aware_router.url
     workers = kv_aware_two_workers
     model = KV_AWARE_E2E_MODEL
-
-    router_http.attach_workers(base, workers)
 
     listed = requests.get(f"{base}/list_workers", timeout=30)
     listed.raise_for_status()

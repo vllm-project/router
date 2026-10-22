@@ -7,7 +7,11 @@ from types import SimpleNamespace
 from py_test.e2e.function.helpers import launch
 
 
-def spawn_two_single_gpu_workers(model: str) -> list[SimpleNamespace]:
+def spawn_two_single_gpu_workers(
+    model: str,
+    *,
+    worker_health_timeout: float = 600.0,
+) -> list[SimpleNamespace]:
     workers: list[SimpleNamespace] = []
 
     port_a = launch.find_available_port()
@@ -19,6 +23,9 @@ def spawn_two_single_gpu_workers(model: str) -> list[SimpleNamespace]:
     url_b = f"http://127.0.0.1:{port_b}"
     proc_b = launch.popen_launch_worker(model, url_b, base_gpu_id=1)
     workers.append(SimpleNamespace(proc=proc_b, url=url_b))
+
+    for w in workers:
+        launch.wait_worker_health(w.url, worker_health_timeout)
 
     return workers
 
