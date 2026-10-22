@@ -1,3 +1,5 @@
+#![cfg(all(feature = "cpu", feature = "ready"))]
+
 use std::{sync::Arc, time::Duration};
 
 use axum::{
@@ -10,7 +12,7 @@ use axum::{
 };
 use bytes::Bytes;
 use http_body_util::BodyExt;
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::{mpsc, Notify, Semaphore};
 use tokio_stream::wrappers::ReceiverStream;
 use tower::ServiceExt;
 use vllm_router_rs::{
@@ -30,13 +32,33 @@ async fn app(
     mpsc::UnboundedReceiver<mpsc::Sender<Chunk>>,
     Arc<Notify>,
 ) {
+    let (app, started, entered, _) =
+        app_with_queue_processor(queue_size, rate, Duration::from_secs(3), true, None).await;
+    (app, started, entered)
+}
+
+async fn app_with_queue_processor(
+    queue_size: usize,
+    rate: usize,
+    queue_timeout: Duration,
+    start_processor: bool,
+    semaphore: Option<Arc<Semaphore>>,
+) -> (
+    Router,
+    mpsc::UnboundedReceiver<mpsc::Sender<Chunk>>,
+    Arc<Notify>,
+    Option<vllm_router_rs::middleware::QueueProcessor>,
+) {
     let config = RouterConfig {
         max_concurrent_requests: 1,
         rate_limit_tokens_per_second: Some(rate),
         ..Default::default()
     };
-    let context =
+    let mut context =
         Arc::new(AppContext::new(config, reqwest::Client::new(), 1, Some(rate), vec![]).unwrap());
+    if let Some(semaphore) = semaphore {
+        Arc::get_mut(&mut context).unwrap().concurrency_semaphore = semaphore;
+    }
     let router = Arc::from(
         RouterFactory::create_regular_router(&[], &context)
             .await
@@ -46,11 +68,16 @@ async fn app(
         context.rate_limiter.clone(),
         context.concurrency_semaphore.clone(),
         queue_size,
-        Duration::from_secs(3),
+        queue_timeout,
     );
-    if let Some(processor) = processor {
-        tokio::spawn(processor.run());
-    }
+    let processor = if start_processor {
+        if let Some(processor) = processor {
+            tokio::spawn(processor.run());
+        }
+        None
+    } else {
+        processor
+    };
     let state = Arc::new(AppState {
         router,
         context,
@@ -88,7 +115,7 @@ async fn app(
             state,
             concurrency_limit_middleware,
         ));
-    (app, started_rx, entered)
+    (app, started_rx, entered, processor)
 }
 
 async fn request(app: Router, path: &str) -> Response {
@@ -97,16 +124,42 @@ async fn request(app: Router, path: &str) -> Response {
         .unwrap()
 }
 
+async fn wait_for_short_ok(app: Router) {
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if request(app.clone(), "/short").await.status() == StatusCode::OK {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("short request was not accepted after permit release");
+}
+
+async fn wait_for_short_ok_client(client: &reqwest::Client, addr: &std::net::SocketAddr) {
+    let url = format!("http://{addr}/short");
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if client.get(&url).send().await.unwrap().status() == StatusCode::OK {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("short request was not accepted after permit release");
+}
+
 #[tokio::test]
 async fn disabled_queue_rejects_after_rate_refill_until_stream_eof() {
     let (app, mut started, _) = app(0, 1).await;
     let first = request(app.clone(), "/stream").await;
     let tx = started.recv().await.unwrap();
     tokio::time::sleep(Duration::from_millis(1100)).await;
-    assert_eq!(
-        request(app.clone(), "/short").await.status(),
-        StatusCode::TOO_MANY_REQUESTS
-    );
+    let rejected = request(app.clone(), "/short").await;
+    assert_eq!(rejected.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_retry_after(&rejected);
     drop(tx);
     first.into_body().collect().await.unwrap();
     assert_eq!(request(app, "/short").await.status(), StatusCode::OK);
@@ -142,15 +195,8 @@ async fn body_drop_releases_slot_with_and_without_queue() {
         let (app, mut started, _) = app(queue_size, 100).await;
         let first = request(app.clone(), "/stream").await;
         let _tx = started.recv().await.unwrap();
-        tokio::time::sleep(Duration::from_millis(20)).await;
         drop(first);
-        assert_eq!(
-            tokio::time::timeout(Duration::from_secs(1), request(app, "/short"))
-                .await
-                .unwrap()
-                .status(),
-            StatusCode::OK
-        );
+        wait_for_short_ok(app).await;
     }
 }
 
@@ -164,8 +210,7 @@ async fn body_error_releases_slot_before_body_drop() {
         .unwrap();
     let mut body = first.into_body();
     assert!(body.frame().await.unwrap().is_err());
-    tokio::time::sleep(Duration::from_millis(20)).await;
-    assert_eq!(request(app, "/short").await.status(), StatusCode::OK);
+    wait_for_short_ok(app).await;
     drop(body);
 }
 
@@ -176,8 +221,7 @@ async fn cancelling_handler_before_headers_releases_slot() {
     entered.notified().await;
     first.abort();
     assert!(first.await.unwrap_err().is_cancelled());
-    tokio::time::sleep(Duration::from_millis(20)).await;
-    assert_eq!(request(app, "/short").await.status(), StatusCode::OK);
+    wait_for_short_ok(app).await;
 }
 
 #[tokio::test]
@@ -224,8 +268,7 @@ async fn final_data_frame_releases_slot_before_body_drop() {
     let mut body = request(app.clone(), "/short").await.into_body();
     assert_eq!(body.size_hint().exact(), Some(2));
     assert!(body.frame().await.unwrap().unwrap().is_data());
-    tokio::time::sleep(Duration::from_millis(20)).await;
-    assert_eq!(request(app, "/short").await.status(), StatusCode::OK);
+    wait_for_short_ok(app).await;
     drop(body);
 }
 
@@ -235,8 +278,7 @@ async fn empty_body_keeps_end_stream_hint_and_releases_immediately() {
     let body = request(app.clone(), "/empty").await.into_body();
     assert!(body.is_end_stream());
     assert_eq!(body.size_hint().exact(), Some(0));
-    tokio::time::sleep(Duration::from_millis(20)).await;
-    assert_eq!(request(app, "/short").await.status(), StatusCode::OK);
+    wait_for_short_ok(app).await;
     drop(body);
 }
 
@@ -266,16 +308,7 @@ async fn http_client_disconnect_releases_stream_slot() {
         tokio::time::timeout(Duration::from_secs(1), tx.closed())
             .await
             .expect("disconnect must drop the server response body");
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        assert_eq!(
-            client
-                .get(format!("http://{addr}/short"))
-                .send()
-                .await
-                .unwrap()
-                .status(),
-            StatusCode::OK
-        );
+        wait_for_short_ok_client(&client, &addr).await;
         server.abort();
         assert!(server.await.unwrap_err().is_cancelled());
     }
@@ -313,4 +346,83 @@ async fn queued_request_times_out_while_stream_remains_active() {
             .status(),
         StatusCode::OK
     );
+}
+
+fn assert_retry_after(response: &Response) {
+    let seconds = response.headers()["retry-after"]
+        .to_str()
+        .unwrap()
+        .parse::<u64>()
+        .unwrap();
+    assert!(seconds >= 1);
+}
+
+#[tokio::test]
+async fn full_queue_returns_retry_after_without_starting_request() {
+    let (app, mut started, _, _processor) =
+        app_with_queue_processor(1, 100, Duration::from_secs(3), false, None).await;
+    let first = request(app.clone(), "/stream").await;
+    let _tx = started.recv().await.unwrap();
+    let mut queued = tokio::spawn(request(app.clone(), "/short"));
+    assert!(tokio::time::timeout(Duration::from_millis(50), &mut queued)
+        .await
+        .is_err());
+    let rejected = request(app, "/short").await;
+    assert_eq!(rejected.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_retry_after(&rejected);
+    queued.abort();
+    assert!(queued.await.unwrap_err().is_cancelled());
+    drop(first);
+}
+
+#[tokio::test]
+async fn queued_request_times_out_at_short_timeout() {
+    let (app, mut started, _, _) =
+        app_with_queue_processor(1, 100, Duration::from_millis(75), true, None).await;
+    let first = request(app.clone(), "/stream").await;
+    let _tx = started.recv().await.unwrap();
+    let response = tokio::time::timeout(Duration::from_secs(1), request(app.clone(), "/short"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+    drop(first);
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), request(app, "/short"))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn closed_semaphore_returns_503_with_or_without_queue() {
+    for queue_size in [0, 2] {
+        let semaphore = Arc::new(Semaphore::new(0));
+        semaphore.close();
+        let (app, _, _, _) = app_with_queue_processor(
+            queue_size,
+            100,
+            Duration::from_secs(3),
+            true,
+            Some(semaphore),
+        )
+        .await;
+        let response = request(app, "/short").await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+}
+
+#[tokio::test]
+async fn exhausted_rate_bucket_returns_retry_after() {
+    let (app, _, _) = app(0, 1).await;
+    request(app.clone(), "/short")
+        .await
+        .into_body()
+        .collect()
+        .await
+        .unwrap();
+    let rejected = request(app, "/short").await;
+    assert_eq!(rejected.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_retry_after(&rejected);
 }
