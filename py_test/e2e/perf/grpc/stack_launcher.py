@@ -20,6 +20,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# ``py_test/e2e/perf/grpc`` → repo root (run pytest from repository root).
 REPO_ROOT = Path(__file__).resolve().parents[3]
 
 
