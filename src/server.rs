@@ -441,7 +441,7 @@ async fn v1_messages(
     body: Result<Json<MessagesRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
     if let Err(response) = authorize_request(&state, &headers).await {
-        return anthropic_error_response(response).await;
+        return response;
     }
     let body = match body {
         Ok(Json(body)) => body,
@@ -461,11 +461,26 @@ async fn v1_messages(
             return out;
         }
     };
-    let response = state
+    state
         .router
         .route_messages(Some(&headers), &body, None)
-        .await;
-    anthropic_error_response(response).await
+        .await
+}
+
+/// Outermost layer on the protected routes: rewrites router generated
+/// errors on `/v1/messages` (including concurrency limit and wasm rejects)
+/// into the anthropic error shape. Other routes pass through untouched.
+async fn anthropic_error_layer(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let is_messages = req.uri().path() == "/v1/messages";
+    let response = next.run(req).await;
+    if is_messages {
+        anthropic_error_response(response).await
+    } else {
+        response
+    }
 }
 
 async fn v1_responses_get(
@@ -984,6 +999,8 @@ pub fn build_app_with_wasm_middleware(
         app_state.clone(),
         middleware::concurrency_limit_middleware,
     ));
+    let protected_routes =
+        protected_routes.route_layer(axum::middleware::from_fn(anthropic_error_layer));
 
     let public_routes = Router::new()
         .route("/liveness", get(liveness))

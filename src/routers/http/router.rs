@@ -2084,7 +2084,10 @@ impl Router {
             .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
         let http_ttfb_ms = t_send.elapsed().as_secs_f64() * 1000.0;
 
-        if !is_stream {
+        // A worker can reject a streaming request with a plain json error
+        // before any sse is sent; pass that through with its own status,
+        // body and content type instead of proxying it as an event stream.
+        if !is_stream || !status.is_success() {
             // For non-streaming requests, preserve headers
             let mut response_headers = header_utils::preserve_response_headers(res.headers());
             let first_ms = t_send.elapsed().as_secs_f64() * 1000.0;

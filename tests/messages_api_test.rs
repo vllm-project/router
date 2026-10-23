@@ -258,3 +258,49 @@ async fn messages_metadata_user_id_drives_affinity_after_headers() {
         .all(|c| !c.headers.contains_key("x-user-id")));
     ctx.shutdown().await;
 }
+
+#[tokio::test]
+async fn messages_concurrency_reject_uses_anthropic_error_shape() {
+    // no tokens and no queue: the concurrency layer rejects with 429 before
+    // the handler runs, and the body must still be an anthropic error.
+    let ctx = Ctx::new(PolicyConfig::RoundRobin, vec![worker(0.0)], |c| {
+        c.max_concurrent_requests = 0;
+        c.rate_limit_tokens_per_second = Some(0);
+    })
+    .await;
+    let (status, resp) = ctx.post(&agent_body(None, "hi").to_string(), &[]).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(resp["type"], "error", "body: {resp}");
+    assert_eq!(resp["error"]["type"], "rate_limit_error");
+    ctx.shutdown().await;
+}
+
+#[tokio::test]
+async fn messages_stream_worker_json_error_keeps_status_and_content_type() {
+    let ctx = Ctx::new(PolicyConfig::RoundRobin, vec![worker(1.0)], |c| {
+        c.disable_retries = true;
+        c.disable_circuit_breaker = true;
+    })
+    .await;
+    let mut body = agent_body(None, "hi");
+    body["stream"] = json!(true);
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/messages")
+        .header(CONTENT_TYPE, "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let resp = ctx.app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let ct = resp.headers()[CONTENT_TYPE].to_str().unwrap().to_string();
+    assert!(ct.contains("application/json"), "content-type: {ct}");
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let value: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(
+        value,
+        json!({"type": "error", "error": {"type": "api_error", "message": "mock worker failure"}})
+    );
+    ctx.shutdown().await;
+}
