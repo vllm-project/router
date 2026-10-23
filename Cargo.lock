@@ -7412,6 +7412,7 @@ version = "0.1.16"
 dependencies = [
  "anyhow",
  "async-channel 2.5.0",
+ "async-stream",
  "async-trait",
  "axum 0.8.9",
  "backoff",

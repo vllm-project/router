@@ -10,3 +10,5 @@ mod program_adapter;
 pub mod router;
 pub mod vllm_pd_router;
 pub mod vllm_service_discovery;
+
+mod recompute_guard;
