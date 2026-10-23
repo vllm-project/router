@@ -9,6 +9,7 @@ use axum::{
 };
 use std::fmt::Debug;
 
+use crate::protocols::anthropic::MessagesRequest;
 use crate::protocols::spec::{
     ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest,
     InferenceGenerateRequest, RerankRequest, ResponsesRequest,
@@ -164,6 +165,30 @@ pub trait RouterTrait: Send + Sync + Debug + WorkerManagement {
         body: &RerankRequest,
         model_id: Option<&str>,
     ) -> Response;
+
+    /// Route an anthropic messages request (`POST /v1/messages`).
+    ///
+    /// Routers without a typed implementation keep today's behavior and pass
+    /// the request to `route_transparent`, which returns 404 when the
+    /// transparent proxy is not supported.
+    async fn route_messages(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &MessagesRequest,
+        _model_id: Option<&str>,
+    ) -> Response {
+        match serde_json::to_value(body) {
+            Ok(value) => {
+                self.route_transparent(headers, "/v1/messages", &Method::POST, value)
+                    .await
+            }
+            Err(e) => (
+                StatusCode::BAD_REQUEST,
+                format!("Invalid request body: {e}"),
+            )
+                .into_response(),
+        }
+    }
 
     /// Flush cache on all workers
     async fn flush_cache(&self) -> Response;

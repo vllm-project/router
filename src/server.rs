@@ -7,6 +7,7 @@ use crate::{
     middleware::{self, QueuedRequest, TokenBucket},
     policies::PolicyRegistry,
     protocols::{
+        anthropic::{anthropic_error_body, MessagesRequest},
         spec::{
             ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest,
             InferenceGenerateRequest, RerankRequest, V1RerankReqInput,
@@ -394,6 +395,77 @@ async fn v1_embeddings(
         .router
         .route_embeddings(Some(&headers), &body, None)
         .await
+}
+
+/// Max size of a router generated error body rewritten for `/v1/messages`.
+const MESSAGES_ERROR_BODY_LIMIT: usize = 64 * 1024;
+
+/// Rewrite router generated errors on `/v1/messages` into the anthropic
+/// error shape. Router errors are plain text; worker errors come back as
+/// json and pass through unchanged, as do successful responses.
+async fn anthropic_error_response(response: Response) -> Response {
+    let status = response.status();
+    if status.is_success() {
+        return response;
+    }
+    let is_json = response
+        .headers()
+        .get(http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.contains("json") || v.contains("event-stream"));
+    if is_json {
+        return response;
+    }
+    let (mut parts, body) = response.into_parts();
+    let message = match axum::body::to_bytes(body, MESSAGES_ERROR_BODY_LIMIT).await {
+        Ok(bytes) if !bytes.is_empty() => String::from_utf8_lossy(&bytes).into_owned(),
+        _ => status
+            .canonical_reason()
+            .unwrap_or("request failed")
+            .to_string(),
+    };
+    parts.headers.remove(http::header::CONTENT_LENGTH);
+    let mut out = Json(anthropic_error_body(status.as_u16(), &message)).into_response();
+    *out.status_mut() = status;
+    for (name, value) in parts.headers.iter() {
+        if name != http::header::CONTENT_TYPE {
+            out.headers_mut().insert(name.clone(), value.clone());
+        }
+    }
+    out
+}
+
+async fn v1_messages(
+    State(state): State<Arc<AppState>>,
+    headers: http::HeaderMap,
+    body: Result<Json<MessagesRequest>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    if let Err(response) = authorize_request(&state, &headers).await {
+        return anthropic_error_response(response).await;
+    }
+    let body = match body {
+        Ok(Json(body)) => body,
+        Err(rejection) => {
+            // Size limits keep their own status; every other body problem
+            // is an invalid request.
+            let status = match rejection.status() {
+                StatusCode::PAYLOAD_TOO_LARGE => StatusCode::PAYLOAD_TOO_LARGE,
+                _ => StatusCode::BAD_REQUEST,
+            };
+            let mut out = Json(anthropic_error_body(
+                status.as_u16(),
+                &rejection.body_text(),
+            ))
+            .into_response();
+            *out.status_mut() = status;
+            return out;
+        }
+    };
+    let response = state
+        .router
+        .route_messages(Some(&headers), &body, None)
+        .await;
+    anthropic_error_response(response).await
 }
 
 async fn v1_responses_get(
@@ -886,6 +958,7 @@ pub fn build_app_with_wasm_middleware(
         .route("/v1/rerank", post(v1_rerank))
         .route("/v1/responses", post(v1_responses))
         .route("/v1/embeddings", post(v1_embeddings))
+        .route("/v1/messages", post(v1_messages))
         .route("/v1/responses/{response_id}", get(v1_responses_get))
         .route(
             "/v1/responses/{response_id}/cancel",

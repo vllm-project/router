@@ -23,6 +23,7 @@ use crate::program_scheduling::{
     BackendObservationProvider, ProgramIdentity, ProgramScheduler, ProgramSchedulerConfig,
     ProgramTarget, ScheduleError, VllmMetricsObservationProvider,
 };
+use crate::protocols::anthropic::MessagesRequest;
 use crate::protocols::spec::{
     ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest, GenerationRequest,
     GrpcRequestRef, InferenceGenerateRequest, RerankRequest, RerankResponse, RerankResult,
@@ -1315,6 +1316,24 @@ impl Router {
         }
     }
 
+    /// Add a body level affinity key (for example anthropic
+    /// `metadata.user_id`) to the policy view of the headers, only when no
+    /// session header is present. Headers always win, and nothing is added
+    /// to the headers forwarded to the worker.
+    pub(crate) fn apply_affinity_key(
+        request_headers: Option<crate::policies::RequestHeaders>,
+        affinity_key: Option<&str>,
+    ) -> Option<crate::policies::RequestHeaders> {
+        let Some(key) = affinity_key else {
+            return request_headers;
+        };
+        let mut map = request_headers.unwrap_or_default();
+        if crate::policies::hash_key::extract_hash_key_from_headers(&map).is_none() {
+            map.insert("x-user-id".to_string(), key.to_string());
+        }
+        Some(map)
+    }
+
     fn available_workers(&self, model_id: Option<&str>) -> Vec<Arc<dyn Worker>> {
         let workers = match model_id {
             Some(model) => self.worker_registry.get_by_model_fast(model),
@@ -1327,6 +1346,7 @@ impl Router {
     }
 
     /// Select worker for a specific model considering circuit breaker state
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     fn select_worker_for_model(
         &self,
@@ -1341,6 +1361,38 @@ impl Router {
         affinity_key: Option<&AffinityKey>,
         excluded_workers: &[String],
     ) -> Option<SelectedWorker> {
+        self.select_worker_for_model_with_affinity(
+            model_id,
+            available,
+            text,
+            headers,
+            token_ids,
+            eligibility,
+            lora_name,
+            cache_salt,
+            affinity_key,
+            excluded_workers,
+            None,
+        )
+    }
+
+    /// Like `select_worker_for_model`, plus a body level affinity key (for
+    /// example anthropic `metadata.user_id`) for header based policies.
+    #[allow(clippy::too_many_arguments)]
+    fn select_worker_for_model_with_affinity(
+        &self,
+        model_id: Option<&str>,
+        available: &[Arc<dyn Worker>],
+        text: Option<&str>,
+        headers: Option<&HeaderMap>,
+        token_ids: KvRequestTokens<'_>,
+        eligibility: Option<&[bool]>,
+        lora_name: Option<&str>,
+        cache_salt: Option<&str>,
+        affinity_key: Option<&AffinityKey>,
+        excluded_workers: &[String],
+        body_affinity_key: Option<&str>,
+    ) -> Option<SelectedWorker> {
         if available.is_empty() {
             return None;
         }
@@ -1348,7 +1400,8 @@ impl Router {
         let policy = self.policy_for_model(model_id);
 
         // Convert headers for policies that need them (e.g., consistent_hash)
-        let request_headers = Self::headers_to_request_headers(headers);
+        let request_headers =
+            Self::apply_affinity_key(Self::headers_to_request_headers(headers), body_affinity_key);
 
         if let Some(kv_aware) = kv_aware_ops(policy.as_ref()) {
             // The policy sees the full list: a retry exclusion must not
@@ -1648,7 +1701,7 @@ impl Router {
                     });
                     Some(SelectedWorker { worker, kv_receipt })
                 } else {
-                    self.select_worker_for_model(
+                    self.select_worker_for_model_with_affinity(
                         model_id,
                         &workers,
                         Some(if policy.needs_cache_routing_key() {
@@ -1663,6 +1716,7 @@ impl Router {
                         cache_salt,
                         affinity_key.as_ref(),
                         &excluded_workers,
+                        typed_req.affinity_user_key(),
                     )
                 };
                 let SelectedWorker { worker, kv_receipt } = match selected_worker {
@@ -2833,6 +2887,16 @@ impl RouterTrait for Router {
     async fn cancel_response(&self, headers: Option<&HeaderMap>, response_id: &str) -> Response {
         let endpoint = format!("v1/responses/{}/cancel", response_id);
         self.route_post_empty_request(headers, &endpoint).await
+    }
+
+    async fn route_messages(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &MessagesRequest,
+        model_id: Option<&str>,
+    ) -> Response {
+        self.route_typed_request(headers, body, "/v1/messages", model_id)
+            .await
     }
 
     async fn route_embeddings(

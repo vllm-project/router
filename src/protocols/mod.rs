@@ -1,6 +1,8 @@
 // Protocol definitions and validation for various LLM APIs
 // This module provides a structured approach to handling different API protocols
 
+pub mod anthropic;
+
 pub(crate) mod prometheus_text {
     //! Minimal Prometheus text-format parsing.
     //!
@@ -119,6 +121,7 @@ pub(crate) mod prometheus_text {
         }
     }
 }
+
 pub mod spec;
 pub mod validation;
 pub mod worker_spec;

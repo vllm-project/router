@@ -2617,6 +2617,12 @@ pub trait GenerationRequest: Send + Sync {
     fn cache_identity(&self) -> (Option<&str>, Option<&str>) {
         (None, None)
     }
+
+    /// Body level session affinity key, used only when no session header is
+    /// present (for example anthropic `metadata.user_id`).
+    fn affinity_user_key(&self) -> Option<&str> {
+        None
+    }
 }
 
 fn passthrough_string<'a>(
