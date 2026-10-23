@@ -12,6 +12,8 @@ Prerequisites: ``vllm-rs`` (``export VLLM_RS=...`` or ``scripts/backend/check_vl
   .venv/bin/python -m pytest py_test/e2e/function/kv_aware/test_kv_aware.py -m e2e -v -s
 
 Use ``-s`` so vllm-rs worker and vllm-router logs appear on the terminal.
+
+Stronger prefix / cache checks: ``test_kv_aware_prefix_cache.py``.
 """
 
 from __future__ import annotations
