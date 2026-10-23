@@ -122,6 +122,8 @@ def test_kv_aware_dual_lane_prime_and_reuse(kv_aware_router, kv_aware_two_worker
       after the first index update; if both primes land on the same worker, the
       test fails (see env above).
     - Each lane's reuse(s) must match that lane's ``prime_worker``.
+    - Reuses are **interleaved B then A** each round so lane B is not sent only
+      after many lane-A hits on one worker (load/KV index timing).
     """
     workers = kv_aware_two_workers
     worker_urls = {w.url for w in workers}
@@ -184,8 +186,8 @@ def test_kv_aware_dual_lane_prime_and_reuse(kv_aware_router, kv_aware_two_worker
 
     reuse_by_lane: dict[str, list[str]] = {"A": [], "B": []}
     with requests.Session() as session:
-        for lane in ("A", "B"):
-            for r in range(1, n_reuse + 1):
+        for r in range(1, n_reuse + 1):
+            for lane in ("B", "A"):
                 w = _chat_worker(
                     session,
                     base=base,
