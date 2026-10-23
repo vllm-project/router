@@ -33,6 +33,7 @@ impl ConfigValidator {
             Self::validate_program_scheduling(program_scheduling)?;
         }
         Self::validate_epd(config)?;
+        Self::validate_moriio_multi_pod(config)?;
 
         if let Some(discovery) = &config.discovery {
             Self::validate_discovery(discovery, &config.mode)?;
@@ -245,6 +246,32 @@ impl ConfigValidator {
                 })?;
             }
         }
+        Ok(())
+    }
+
+    fn validate_moriio_multi_pod(config: &RouterConfig) -> ConfigResult<()> {
+        let Some(mp) = &config.moriio_multi_pod else {
+            return Ok(());
+        };
+        let invalid = |reason: String| ConfigError::ValidationFailed {
+            reason: format!("MoRI-IO multi-pod: {reason}"),
+        };
+        if config.kv_connector != KvConnector::MoriIO
+            || !matches!(config.mode, RoutingMode::VllmPrefillDecode { .. })
+        {
+            return Err(invalid(
+                "requires --vllm-pd-disaggregation with --kv-connector moriio".into(),
+            ));
+        }
+        if mp.dp_size_local == 0 || mp.prefill_hosts.is_empty() || mp.decode_hosts.is_empty() {
+            return Err(invalid(
+                "set all of --moriio-dp-size-local (>0), --moriio-prefill-hosts and \
+                 --moriio-decode-hosts"
+                    .into(),
+            ));
+        }
+        // A role's DP size is only known once its master registers; whether every
+        // rank lands on a listed pod is checked there (VllmPDRouter::discovery_candidates).
         Ok(())
     }
 
@@ -1750,6 +1777,29 @@ mod tests {
         }
     }
 
+    fn moriio_multi_pod_config(mp: MoriIOMultiPodConfig) -> RouterConfig {
+        RouterConfig {
+            mode: RoutingMode::VllmPrefillDecode {
+                prefill_urls: vec![],
+                decode_urls: vec![],
+                prefill_policy: None,
+                decode_policy: None,
+                discovery_address: Some("0.0.0.0:36367".to_string()),
+            },
+            kv_connector: KvConnector::MoriIO,
+            moriio_multi_pod: Some(mp),
+            ..Default::default()
+        }
+    }
+
+    fn two_pods() -> MoriIOMultiPodConfig {
+        MoriIOMultiPodConfig {
+            dp_size_local: 8,
+            prefill_hosts: vec!["10.0.0.1".into(), "10.0.0.2".into()],
+            decode_hosts: vec!["10.0.0.3".into(), "10.0.0.4".into()],
+        }
+    }
+
     #[test]
     fn test_pd_kv_event_sources_validates_replay_and_accepts_ipc_and_ipv6() {
         let mut config = pd_config_with_static_kv_sources();
@@ -1792,5 +1842,28 @@ mod tests {
         };
         let err = ConfigValidator::validate(&config).unwrap_err().to_string();
         assert!(err.contains("requires a kv_aware prefill policy"), "{err}");
+    }
+
+    #[test]
+    fn test_validate_moriio_multi_pod() {
+        let ok =
+            |mp| ConfigValidator::validate_moriio_multi_pod(&moriio_multi_pod_config(mp)).is_ok();
+        assert!(ok(two_pods()));
+        assert!(ConfigValidator::validate_moriio_multi_pod(&RouterConfig::default()).is_ok());
+
+        let mut config = moriio_multi_pod_config(two_pods());
+        config.kv_connector = KvConnector::Nixl;
+        assert!(ConfigValidator::validate_moriio_multi_pod(&config).is_err());
+
+        let mut mp = two_pods();
+        mp.dp_size_local = 0;
+        assert!(!ok(mp));
+        let mut mp = two_pods();
+        mp.decode_hosts.clear();
+        assert!(!ok(mp));
+        // Whether the pods cover a role's ranks is a registration-time check.
+        let mut mp = two_pods();
+        mp.prefill_hosts.truncate(1);
+        assert!(ok(mp));
     }
 }
