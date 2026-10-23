@@ -133,6 +133,16 @@ async fn messages_invalid_json_uses_anthropic_error_shape() {
     let (status, resp) = ctx.post(r#"{"model":"m"}"#, &[]).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(resp["error"]["type"], "invalid_request_error");
+
+    // required by the Messages API: model and max_tokens
+    for body in [
+        r#"{"max_tokens":8,"messages":[{"role":"user","content":"hi"}]}"#,
+        r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#,
+    ] {
+        let (status, resp) = ctx.post(body, &[]).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(resp["error"]["type"], "invalid_request_error");
+    }
     ctx.shutdown().await;
 }
 

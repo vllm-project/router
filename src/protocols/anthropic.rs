@@ -2,8 +2,9 @@
 //!
 //! The router only types the fields it reads for routing (`model`, `stream`,
 //! `system`, `messages`, `max_tokens`, `tools`, `metadata`). Every other field
-//! is kept in a flattened map, so the body forwarded to the worker carries the
-//! same json as the client sent. The router never translates this request to
+//! is kept in a flattened map, and optional typed fields keep an explicit
+//! `null`, so the body forwarded to the worker carries the same json as the
+//! client sent. `model`, `max_tokens` and `messages` are required. The router never translates this request to
 //! chat completions; engines that speak `/v1/messages` natively get it as is.
 
 use serde::{Deserialize, Serialize};
@@ -11,29 +12,62 @@ use serde_json::{Map, Value};
 
 use super::spec::GenerationRequest;
 
+/// Optional typed field that keeps an explicit `null`. Outer `None` means the
+/// key was absent, `Some(None)` means the client sent `null`, so the
+/// forwarded body round trips exactly.
+pub type Nullable<T> = Option<Option<T>>;
+
+fn nullable<'de, D, T>(deserializer: D) -> Result<Nullable<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(Some)
+}
+
+fn present<T>(field: &Nullable<T>) -> Option<&T> {
+    field.as_ref().and_then(Option::as_ref)
+}
+
 /// `POST /v1/messages` request body.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct MessagesRequest {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub model: Option<String>,
+    /// Required by the Messages API; a missing field is a 400 from the router.
+    pub model: String,
 
     pub messages: Vec<AnthropicMessage>,
 
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_tokens: Option<u64>,
+    /// Required by the Messages API; a missing field is a 400 from the router.
+    pub max_tokens: u64,
 
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub stream: Option<bool>,
+    #[serde(
+        default,
+        deserialize_with = "nullable",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub stream: Nullable<bool>,
 
     /// Top level system prompt, a string or a list of text blocks.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub system: Option<MessageContent>,
+    #[serde(
+        default,
+        deserialize_with = "nullable",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub system: Nullable<MessageContent>,
 
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tools: Option<Vec<AnthropicTool>>,
+    #[serde(
+        default,
+        deserialize_with = "nullable",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub tools: Nullable<Vec<AnthropicTool>>,
 
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub metadata: Option<MessagesMetadata>,
+    #[serde(
+        default,
+        deserialize_with = "nullable",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub metadata: Nullable<MessagesMetadata>,
 
     /// Fields the router does not read, forwarded unchanged.
     #[serde(flatten)]
@@ -62,28 +96,48 @@ pub enum MessageContent {
 pub struct ContentBlock {
     #[serde(rename = "type")]
     pub block_type: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub text: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "nullable",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub text: Nullable<String>,
+    #[serde(
+        default,
+        deserialize_with = "nullable",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub name: Nullable<String>,
     #[serde(flatten)]
     pub other: Map<String, Value>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AnthropicTool {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "nullable",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub name: Nullable<String>,
+    #[serde(
+        default,
+        deserialize_with = "nullable",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub description: Nullable<String>,
     #[serde(flatten)]
     pub other: Map<String, Value>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct MessagesMetadata {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub user_id: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "nullable",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub user_id: Nullable<String>,
     #[serde(flatten)]
     pub other: Map<String, Value>,
 }
@@ -108,13 +162,13 @@ impl ContentBlock {
     fn push_routing_text(&self, out: &mut Vec<String>) {
         match self.block_type.as_str() {
             "text" => {
-                if let Some(text) = &self.text {
+                if let Some(text) = present(&self.text) {
                     out.push(text.clone());
                 }
             }
             "tool_use" => out.push(format!(
                 "[tool_use:{}]",
-                self.name.as_deref().unwrap_or_default()
+                present(&self.name).map(String::as_str).unwrap_or_default()
             )),
             other => out.push(format!("[{other}]")),
         }
@@ -124,9 +178,9 @@ impl ContentBlock {
 impl MessagesRequest {
     /// `metadata.user_id`, read from the nested field only.
     pub fn metadata_user_id(&self) -> Option<&str> {
-        self.metadata
-            .as_ref()
-            .and_then(|m| m.user_id.as_deref())
+        present(&self.metadata)
+            .and_then(|m| present(&m.user_id))
+            .map(String::as_str)
             .map(str::trim)
             .filter(|id| !id.is_empty())
     }
@@ -134,11 +188,11 @@ impl MessagesRequest {
 
 impl GenerationRequest for MessagesRequest {
     fn is_stream(&self) -> bool {
-        self.stream.unwrap_or(false)
+        present(&self.stream).copied().unwrap_or(false)
     }
 
     fn get_model(&self) -> Option<&str> {
-        self.model.as_deref()
+        Some(&self.model)
     }
 
     /// System prompt first, then tool names and descriptions, then message
@@ -146,14 +200,14 @@ impl GenerationRequest for MessagesRequest {
     /// share a prefix for cache aware routing.
     fn extract_text_for_routing(&self) -> String {
         let mut parts = Vec::new();
-        if let Some(system) = &self.system {
+        if let Some(system) = present(&self.system) {
             system.push_routing_text(&mut parts);
         }
-        for tool in self.tools.iter().flatten() {
-            if let Some(name) = &tool.name {
+        for tool in present(&self.tools).into_iter().flatten() {
+            if let Some(name) = present(&tool.name) {
                 parts.push(name.clone());
             }
-            if let Some(description) = &tool.description {
+            if let Some(description) = present(&tool.description) {
                 parts.push(description.clone());
             }
         }
@@ -202,6 +256,15 @@ mod tests {
         serde_json::from_value(v.clone()).unwrap()
     }
 
+    /// Parse with the required fields filled in, for tests about other fields.
+    fn parse_with_required(v: &Value) -> MessagesRequest {
+        let mut v = v.clone();
+        let obj = v.as_object_mut().unwrap();
+        obj.entry("model").or_insert(json!("m"));
+        obj.entry("max_tokens").or_insert(json!(16));
+        parse(&v)
+    }
+
     #[test]
     fn round_trip_keeps_unknown_fields() {
         let body = json!({
@@ -240,17 +303,18 @@ mod tests {
 
     #[test]
     fn stream_and_model() {
-        let req = parse(&json!({"model": "m", "stream": true, "messages": []}));
+        let req = parse_with_required(&json!({"stream": true, "messages": []}));
         assert!(req.is_stream());
         assert_eq!(req.get_model(), Some("m"));
-        let req = parse(&json!({"messages": []}));
+        let req = parse_with_required(&json!({"messages": []}));
         assert!(!req.is_stream());
-        assert_eq!(req.get_model(), None);
+        let req = parse_with_required(&json!({"stream": null, "messages": []}));
+        assert!(!req.is_stream());
     }
 
     #[test]
     fn routing_text_order_and_markers() {
-        let req = parse(&json!({
+        let req = parse_with_required(&json!({
             "system": "sys prompt",
             "tools": [{"name": "search", "description": "web search", "input_schema": {"type": "object"}}],
             "messages": [
@@ -271,7 +335,7 @@ mod tests {
 
     #[test]
     fn routing_text_system_blocks() {
-        let req = parse(&json!({
+        let req = parse_with_required(&json!({
             "system": [{"type": "text", "text": "a"}, {"type": "text", "text": "b"}],
             "messages": [{"role": "user", "content": "c"}]
         }));
@@ -280,8 +344,10 @@ mod tests {
 
     #[test]
     fn routing_prefix_stable_across_turns() {
-        let turn1 = parse(&json!({"system": "s", "messages": [{"role": "user", "content": "q1"}]}));
-        let turn2 = parse(&json!({"system": "s", "messages": [
+        let turn1 = parse_with_required(
+            &json!({"system": "s", "messages": [{"role": "user", "content": "q1"}]}),
+        );
+        let turn2 = parse_with_required(&json!({"system": "s", "messages": [
             {"role": "user", "content": "q1"},
             {"role": "assistant", "content": "a1"},
             {"role": "user", "content": "q2"}
@@ -293,15 +359,47 @@ mod tests {
 
     #[test]
     fn metadata_user_id_is_nested_only() {
-        let req = parse(&json!({
+        let req = parse_with_required(&json!({
             "tools": [{"name": "t", "input_schema": {"properties": {"user_id": "schema"}}}],
             "messages": []
         }));
         assert_eq!(req.affinity_user_key(), None);
-        let req = parse(&json!({"metadata": {"user_id": " u1 "}, "messages": []}));
+        let req = parse_with_required(&json!({"metadata": {"user_id": " u1 "}, "messages": []}));
         assert_eq!(req.affinity_user_key(), Some("u1"));
-        let req = parse(&json!({"metadata": {"user_id": ""}, "messages": []}));
+        let req = parse_with_required(&json!({"metadata": {"user_id": ""}, "messages": []}));
         assert_eq!(req.affinity_user_key(), None);
+    }
+
+    #[test]
+    fn required_fields_are_enforced() {
+        let ok = json!({"model": "m", "max_tokens": 1, "messages": []});
+        assert!(serde_json::from_value::<MessagesRequest>(ok.clone()).is_ok());
+        for field in ["model", "max_tokens", "messages"] {
+            let mut body = ok.clone();
+            body.as_object_mut().unwrap().remove(field);
+            let err = serde_json::from_value::<MessagesRequest>(body).unwrap_err();
+            assert!(err.to_string().contains(field), "{field}: {err}");
+        }
+    }
+
+    #[test]
+    fn round_trip_keeps_explicit_nulls() {
+        let body = json!({
+            "model": "m",
+            "max_tokens": 8,
+            "stream": null,
+            "system": null,
+            "tools": [{"name": "t", "description": null, "input_schema": {"type": "object"}}],
+            "metadata": {"user_id": null},
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "hi", "name": null}]}]
+        });
+        let req = parse(&body);
+        assert!(!req.is_stream());
+        assert_eq!(req.affinity_user_key(), None);
+        assert_eq!(serde_json::to_value(&req).unwrap(), body);
+        let body =
+            json!({"model": "m", "max_tokens": 8, "metadata": null, "tools": null, "messages": []});
+        assert_eq!(serde_json::to_value(parse(&body)).unwrap(), body);
     }
 
     #[test]
