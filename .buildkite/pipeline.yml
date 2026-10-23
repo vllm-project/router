@@ -93,7 +93,7 @@ steps:
       queue: "medium_cpu_queue_premerge"
 
   # Uploads wait for the build group, not for image-build, and not for each other.
-  # NVIDIA P/D jobs depend on image-build.
+  # Uploaded jobs depend on their upload step. NVIDIA P/D jobs also wait for image-build.
   # L1: same gate as Omni READY_LABEL_IF. ROCM_ONLY stays on the smoke job.
   - label: ":pipeline: Upload L1 ready"
     key: "upload-ready-pipeline"
@@ -129,7 +129,7 @@ steps:
 
   # L3: default-branch NIGHTLY=1, or any other branch labeled nightly-test.
   # Job-only gates stay in test-nightly.yml: ready overlap, ROCM_ONLY,
-  # RUN_ROCM_XGMI, and the RDMA schedule/manual gate.
+  # RUN_ROCM_XGMI, and the RDMA schedule/label/manual gate.
   - label: ":pipeline: Upload L3 nightly"
     key: "upload-nightly-pipeline"
     depends_on: "build"

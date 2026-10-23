@@ -13,7 +13,7 @@ pip install pre-commit && pre-commit install
 ## Pipeline Files
 
 `pipeline.yml` builds the release binary and wheel, pushes the NVIDIA CI image, then uploads L1, L2, and L3.
-Those uploads depend on the build step, not on each other. The L1 and L3 NVIDIA P/D jobs also wait for `image-build`. `NIGHTLY=1` on this test pipeline selects tests. `NIGHTLY=1`
+Those uploads depend on the build step, not on each other. Jobs in each uploaded file depend on that upload step. The L1 and L3 NVIDIA P/D jobs also wait for `image-build`. `NIGHTLY=1` on this test pipeline selects tests. `NIGHTLY=1`
 on `release-pipeline.yml` (the `router-release` pipeline) publishes images.
 
 | File | Level | When it is uploaded | What runs |
@@ -101,7 +101,8 @@ are the L2/L3 triggers, not the old "every trusted PR" condition.
 
 L2 RDMA (`test-merge.yml`) sets `SMOKE_ONLY=true` and `read_mode=true`. Both
 L2 jobs run whenever that file is uploaded. L3 RDMA runs both directions for
-scheduled `NIGHTLY=1`, or a manual/API build with `RUN_ROCM_RDMA=1`.
+scheduled `NIGHTLY=1`, a pull request labeled `nightly-test`, or a manual/API
+build with `RUN_ROCM_RDMA=1`.
 
 ROCm-only scheduled builds should set both `NIGHTLY=1` and `ROCM_ONLY=1`.
 `ROCM_ONLY=1` skips the NVIDIA four-GPU step while retaining the CPU build

@@ -22,6 +22,7 @@ steps:
   # ============================================================================
   - group: ":test_tube: Tests"
     key: "tests"
+    depends_on: "upload-ready-pipeline"
     steps:
       - label: ":rust: Rust Unit Tests"
         plugins:
@@ -82,7 +83,6 @@ steps:
           - "coverage.xml"
         agents:
           queue: "medium_cpu_queue_premerge"
-        depends_on: "build"
 
   # ============================================================================
   # L1 P/D smoke — one /v1/completions on EKS l4-k8s (4x L4).
@@ -118,6 +118,8 @@ steps:
       export NUM_SANITY_REQUESTS=1
       bash ./run_accuracy_test.sh
       BASH
-    depends_on: "image-build"
+    depends_on:
+      - "upload-ready-pipeline"
+      - "image-build"
     artifact_paths:
       - "/tmp/router.log"
