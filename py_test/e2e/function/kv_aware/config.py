@@ -28,6 +28,10 @@ Routing scenario (``test_kv_aware_*`` under ``kv_aware/``):
 - ``KV_AWARE_REUSE_ROUNDS``: reuse rounds per lane in the dual-lane test (default 3).
 - ``KV_AWARE_DUAL_PRIME_CONCURRENT``: ``1`` (default) fire lane A/B primes together;
   ``0`` serial primes (more reliable one-worker-per-lane on cold start).
+
+Prompt metrics (token counts, block estimates for issue #331)::
+
+  python -m py_test.e2e.function.kv_aware.measure_prompt_metrics --model-dir /path/to/model
 """
 
 from __future__ import annotations
