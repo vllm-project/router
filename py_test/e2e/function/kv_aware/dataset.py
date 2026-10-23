@@ -37,3 +37,17 @@ def default_prefix_reuse_scenario() -> PrefixReuseScenario:
         reuse_user=KV_AWARE_SHARED_PREFIX + " Follow-up with the same prefix block.",
         control_user=control_filler,
     )
+
+
+def reuse_user_message(suffix: str) -> str:
+    """Same shared token prefix as prime; only the trailing text differs."""
+    return KV_AWARE_SHARED_PREFIX + suffix
+
+
+def control_user_message(index: int) -> str:
+    """Unrelated prompt (no ``KV_AWARE_SHARED_PREFIX``); unique per index."""
+    stamp = time.time_ns()
+    return (
+        f"Unrelated control #{index} {stamp}. "
+        "Discuss weather and hiking trails in one short sentence. " + ("misc-" * 48)
+    )

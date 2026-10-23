@@ -21,10 +21,12 @@ Worker GPUs (two ``vllm-rs serve`` processes):
 - If unset, query the machine via ``nvidia-smi`` and use physical ``0`` and ``1``
   (requires at least two GPUs on the host).
 
-Routing scenario (``test_kv_aware_reuse_routes_to_prime_worker``):
+Routing scenario (``test_kv_aware_*`` under ``kv_aware/``):
 
 - ``KV_AWARE_INDEX_SETTLE_SEC``: wait after prime for KV events / index (default 5).
 - ``KV_AWARE_REQUEST_LOG_POLL_SEC``: max wait for ``request_id`` in worker logs (default 60).
+- ``KV_AWARE_REUSE_ROUNDS`` / ``KV_AWARE_CONTROL_ROUNDS``: counts for the multi-round
+  routing probe (default 5 each).
 """
 
 from __future__ import annotations
@@ -54,6 +56,22 @@ def kv_aware_request_log_poll_sec() -> float:
 def kv_aware_worker_logs_quiet() -> bool:
     raw = os.environ.get("KV_AWARE_WORKER_LOG_QUIET", "").strip().lower()
     return raw in ("1", "true", "yes")
+
+
+def kv_aware_reuse_rounds() -> int:
+    raw = os.environ.get("KV_AWARE_REUSE_ROUNDS", "5").strip()
+    value = int(raw)
+    if value < 1:
+        raise ValueError("KV_AWARE_REUSE_ROUNDS must be >= 1")
+    return value
+
+
+def kv_aware_control_rounds() -> int:
+    raw = os.environ.get("KV_AWARE_CONTROL_ROUNDS", "5").strip()
+    value = int(raw)
+    if value < 1:
+        raise ValueError("KV_AWARE_CONTROL_ROUNDS must be >= 1")
+    return value
 
 
 def _parse_cuda_visible_device_list(raw: str) -> list[int]:
