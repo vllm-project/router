@@ -1253,7 +1253,7 @@ impl Router {
         })
     }
 
-    pub async fn route_typed_request<T: GenerationRequest + serde::Serialize + Clone>(
+    pub async fn route_typed_request<T: GenerationRequest + serde::Serialize + Clone + 'static>(
         &self,
         headers: Option<&HeaderMap>,
         typed_req: &T,
@@ -1291,17 +1291,21 @@ impl Router {
         let prepared = if matches!(pool, Some(crate::backend::WorkerPoolKind::Grpc))
             && route == "/v1/chat/completions"
         {
-            let chat: ChatCompletionRequest =
-                match serde_json::to_value(typed_req).and_then(serde_json::from_value) {
-                    Ok(req) => req,
-                    Err(e) => {
-                        return (
-                            StatusCode::BAD_REQUEST,
-                            format!("gRPC chat convert failed: {e}"),
-                        )
-                            .into_response();
-                    }
+            let chat =
+                match (typed_req as &dyn std::any::Any).downcast_ref::<ChatCompletionRequest>() {
+                    Some(chat) => Ok(chat.clone()),
+                    None => serde_json::to_value(typed_req).and_then(serde_json::from_value),
                 };
+            let chat: ChatCompletionRequest = match chat {
+                Ok(req) => req,
+                Err(e) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        format!("gRPC chat convert failed: {e}"),
+                    )
+                        .into_response();
+                }
+            };
             match self.frontend.prepare(chat).await {
                 Ok(p) => Some(p),
                 Err(e) => {
