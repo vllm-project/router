@@ -274,6 +274,7 @@ def popen_launch_router_only(
         "127.0.0.1",
     ]
     env.setdefault("RUST_LOG", "vllm_router_rs=info")
+    env.setdefault("VLLM_ROUTER_STAGES", "1")
     # Inherit stdio so ``pytest -s`` shows router tracing (same as vllm-rs workers).
     print(f"[e2e] starting router {base_url} policy={policy!r}", flush=True)
     print(f"[e2e] router cmd: {cmd!r}", flush=True)

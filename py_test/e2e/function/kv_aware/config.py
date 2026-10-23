@@ -22,7 +22,9 @@ Worker GPUs (two ``vllm-rs serve`` processes):
 Prefix-cache scenario (``test_kv_aware_prefix_cache_reuse``):
 
 - ``KV_AWARE_INDEX_SETTLE_SEC``: wait after prime for KV events / index (default 5).
-- ``KV_AWARE_MIN_CACHED_ON_REUSE``: minimum ``cached_tokens`` on reuse request.
+- ``KV_AWARE_MIN_TTFT_GAP_MS``: reuse TTFT must beat control by at least this many ms
+  (default 5). gRPC router ``usage`` often omits ``cached_tokens``; the prefix test
+  uses client TTFT + optional ``x-router-stages`` instead.
 """
 
 from __future__ import annotations
@@ -44,9 +46,9 @@ def kv_aware_index_settle_sec() -> float:
     return float(raw)
 
 
-def kv_aware_min_cached_on_reuse() -> int:
-    raw = os.environ.get("KV_AWARE_MIN_CACHED_ON_REUSE", "16").strip()
-    return int(raw)
+def kv_aware_min_ttft_gap_ms() -> float:
+    raw = os.environ.get("KV_AWARE_MIN_TTFT_GAP_MS", "5").strip()
+    return float(raw)
 
 
 def _parse_cuda_visible_device_list(raw: str) -> list[int]:

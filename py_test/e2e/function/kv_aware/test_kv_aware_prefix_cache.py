@@ -1,4 +1,4 @@
-"""kv_aware prefix reuse: observable cache signal via chat ``usage``."""
+"""kv_aware prefix reuse: TTFT / optional cached_tokens after a priming request."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from py_test.e2e.function.helpers import http as router_http
 from py_test.e2e.function.kv_aware.config import (
     KV_AWARE_E2E_MODEL,
     kv_aware_index_settle_sec,
-    kv_aware_min_cached_on_reuse,
+    kv_aware_min_ttft_gap_ms,
 )
 from py_test.e2e.function.kv_aware.dataset import default_prefix_reuse_scenario
 
@@ -19,29 +19,28 @@ from py_test.e2e.function.kv_aware.dataset import default_prefix_reuse_scenario
 @pytest.mark.e2e
 def test_kv_aware_prefix_cache_reuse(kv_aware_router, kv_aware_two_workers):
     """
-    Dataset-driven check that a **reuse** prompt hits prefix KV harder than a
-    **control** prompt after a serial **prime**.
+    After **prime** (shared long prefix), **reuse** should beat **control** on an
+    observable signal:
 
-    Interpreting ``cached_tokens`` (worker ``usage``):
-    - High reuse vs low control ⇒ likely same worker family + prefix cache
-      (router kv_aware placement + engine prefix caching, end-to-end).
-    - Does **not** assert gRPC worker URL directly (no response header today).
-    - ``ptoken`` / internal ``cost`` components ⇒ ``cargo test`` on ``KvAwarePolicy``
-      (see ``tests/kv_index_sequence_lifecycle.rs``).
+    - Primary: client **TTFT** (reuse faster than control with unique prefix lead-in).
+    - Bonus: ``usage.cached_tokens`` when the gRPC router path forwards it (often 0 today).
+
+    Router enables ``VLLM_ROUTER_STAGES=1`` in e2e fixtures for ``x-router-stages``.
+    Does not assert which ``grpc://`` worker was picked.
     """
     _ = kv_aware_two_workers
     base = kv_aware_router.url
     model = KV_AWARE_E2E_MODEL
     scenario = default_prefix_reuse_scenario()
     settle = kv_aware_index_settle_sec()
-    min_cached = kv_aware_min_cached_on_reuse()
+    min_gap = kv_aware_min_ttft_gap_ms()
 
     listed = requests.get(f"{base}/list_workers", timeout=30)
     listed.raise_for_status()
     assert len(listed.json().get("urls", [])) == 2
 
     with requests.Session() as session:
-        prime_usage = router_http.post_chat_stream_collect_usage(
+        prime = router_http.post_chat_stream_timed(
             session,
             base,
             model=model,
@@ -49,14 +48,14 @@ def test_kv_aware_prefix_cache_reuse(kv_aware_router, kv_aware_two_workers):
             max_tokens=8,
         )
         time.sleep(settle)
-        reuse_usage = router_http.post_chat_stream_collect_usage(
+        reuse = router_http.post_chat_stream_timed(
             session,
             base,
             model=model,
             content=scenario.reuse_user,
             max_tokens=8,
         )
-        control_usage = router_http.post_chat_stream_collect_usage(
+        control = router_http.post_chat_stream_timed(
             session,
             base,
             model=model,
@@ -64,15 +63,18 @@ def test_kv_aware_prefix_cache_reuse(kv_aware_router, kv_aware_two_workers):
             max_tokens=8,
         )
 
-    prime_cached = router_http.cached_tokens_from_usage(prime_usage)
-    reuse_cached = router_http.cached_tokens_from_usage(reuse_usage)
-    control_cached = router_http.cached_tokens_from_usage(control_usage)
+    reuse_ttft = float(reuse["ttft_ms"])
+    control_ttft = float(control["ttft_ms"])
+    gap = control_ttft - reuse_ttft
 
-    assert reuse_cached >= min_cached, (
-        f"reuse cached_tokens={reuse_cached} expected >={min_cached} "
-        f"(prime={prime_cached}, control={control_cached}, scenario={scenario.name})"
-    )
-    assert reuse_cached > control_cached, (
-        f"reuse should beat control: reuse={reuse_cached} control={control_cached} "
-        f"prime={prime_cached}"
-    )
+    if reuse["cached_tokens"] > 0 or control["cached_tokens"] > 0:
+        assert (
+            reuse["cached_tokens"] >= control["cached_tokens"]
+        ), f"cached_tokens reuse={reuse['cached_tokens']} control={control['cached_tokens']}"
+    else:
+        assert gap >= min_gap, (
+            f"reuse TTFT should beat control by >={min_gap}ms (gap={gap:.1f}ms): "
+            f"reuse={reuse_ttft:.1f} control={control_ttft:.1f} prime={float(prime['ttft_ms']):.1f} "
+            f"scenario={scenario.name!r}. "
+            "Sync latest test (TTFT not cached_tokens); workers need --enable-prefix-caching."
+        )

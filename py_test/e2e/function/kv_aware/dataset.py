@@ -24,15 +24,16 @@ class PrefixReuseScenario:
 
 
 def default_prefix_reuse_scenario() -> PrefixReuseScenario:
-    """Shared long prefix; reuse vs unique leading tag for control."""
+    """Shared long prefix on prime/reuse; control is unrelated text (true miss)."""
     stamp = time.time_ns()
+    # Control must not repeat KV_AWARE_SHARED_PREFIX or it also prefix-hits after prime.
+    control_filler = (
+        f"Unrelated control request {stamp}. "
+        "Discuss weather and hiking trails in one short sentence. " + ("misc-" * 48)
+    )
     return PrefixReuseScenario(
         name="shared-prefix-reuse",
         prime_user=KV_AWARE_SHARED_PREFIX + " Prime this prefix on one worker.",
         reuse_user=KV_AWARE_SHARED_PREFIX + " Follow-up with the same prefix block.",
-        control_user=(
-            f"UNIQUE-CONTROL-{stamp} "
-            + KV_AWARE_SHARED_PREFIX
-            + " Control: prefix not aligned with prior requests."
-        ),
+        control_user=control_filler,
     )
