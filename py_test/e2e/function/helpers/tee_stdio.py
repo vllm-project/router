@@ -24,6 +24,17 @@ class TeeTextIO:
         self._log_file.flush()
         self._stream.flush()
 
+    def fileno(self) -> int:
+        # subprocess / stdio checks call fileno on the stdout= sink (Windows).
+        return self._log_file.fileno()
+
+    def isatty(self) -> bool:
+        return False
+
+    @property
+    def encoding(self) -> str | None:
+        return getattr(self._log_file, "encoding", None)
+
     def close(self) -> None:
         self.flush()
         self._log_file.close()
