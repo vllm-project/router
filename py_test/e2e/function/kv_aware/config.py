@@ -25,8 +25,9 @@ Routing scenario (``test_kv_aware_*`` under ``kv_aware/``):
 
 - ``KV_AWARE_INDEX_SETTLE_SEC``: wait after prime for KV events / index (default 5).
 - ``KV_AWARE_REQUEST_LOG_POLL_SEC``: max wait for ``request_id`` in worker logs (default 60).
-- ``KV_AWARE_REUSE_ROUNDS`` / ``KV_AWARE_CONTROL_ROUNDS``: counts for the multi-round
-  routing probe (default 5 each).
+- ``KV_AWARE_REUSE_ROUNDS``: reuse rounds per lane in the dual-lane test (default 3).
+- ``KV_AWARE_DUAL_PRIME_CONCURRENT``: ``1`` (default) fire lane A/B primes together;
+  ``0`` serial primes (more reliable one-worker-per-lane on cold start).
 """
 
 from __future__ import annotations
@@ -40,6 +41,14 @@ KV_AWARE_E2E_MODEL = "Qwen/Qwen3-0.6B"
 KV_AWARE_SHARED_PREFIX = (
     "You are a concise assistant. Answer in one short sentence. Context block: "
     + ("token-" * 48)
+)
+
+# Independent long prefixes so two lanes do not share KV block hashes.
+KV_AWARE_LANE_A_PREFIX = "Lane A assistant. One short sentence. Context block A: " + (
+    "alpha-" * 48
+)
+KV_AWARE_LANE_B_PREFIX = "Lane B assistant. One short sentence. Context block B: " + (
+    "beta-" * 48
 )
 
 
@@ -59,19 +68,16 @@ def kv_aware_worker_logs_quiet() -> bool:
 
 
 def kv_aware_reuse_rounds() -> int:
-    raw = os.environ.get("KV_AWARE_REUSE_ROUNDS", "5").strip()
+    raw = os.environ.get("KV_AWARE_REUSE_ROUNDS", "3").strip()
     value = int(raw)
     if value < 1:
         raise ValueError("KV_AWARE_REUSE_ROUNDS must be >= 1")
     return value
 
 
-def kv_aware_control_rounds() -> int:
-    raw = os.environ.get("KV_AWARE_CONTROL_ROUNDS", "5").strip()
-    value = int(raw)
-    if value < 1:
-        raise ValueError("KV_AWARE_CONTROL_ROUNDS must be >= 1")
-    return value
+def kv_aware_dual_prime_concurrent() -> bool:
+    raw = os.environ.get("KV_AWARE_DUAL_PRIME_CONCURRENT", "1").strip().lower()
+    return raw not in ("0", "false", "no")
 
 
 def _parse_cuda_visible_device_list(raw: str) -> list[int]:

@@ -10,7 +10,11 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass
 
-from py_test.e2e.function.kv_aware.config import KV_AWARE_SHARED_PREFIX
+from py_test.e2e.function.kv_aware.config import (
+    KV_AWARE_LANE_A_PREFIX,
+    KV_AWARE_LANE_B_PREFIX,
+    KV_AWARE_SHARED_PREFIX,
+)
 
 
 @dataclass(frozen=True)
@@ -42,6 +46,24 @@ def default_prefix_reuse_scenario() -> PrefixReuseScenario:
 def reuse_user_message(suffix: str) -> str:
     """Same shared token prefix as prime; only the trailing text differs."""
     return KV_AWARE_SHARED_PREFIX + suffix
+
+
+def lane_prefix(lane: str) -> str:
+    if lane == "A":
+        return KV_AWARE_LANE_A_PREFIX
+    if lane == "B":
+        return KV_AWARE_LANE_B_PREFIX
+    raise ValueError(f"unknown lane {lane!r}")
+
+
+def lane_prime_user(lane: str) -> str:
+    return lane_prefix(lane) + f" Prime lane {lane} on one worker."
+
+
+def lane_reuse_user(lane: str, *, round_index: int = 1) -> str:
+    return lane_prefix(lane) + (
+        f" Follow-up lane {lane} round {round_index} same prefix block."
+    )
 
 
 def control_user_message(index: int) -> str:
