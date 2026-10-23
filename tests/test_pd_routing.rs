@@ -5,6 +5,244 @@ mod test_pd_routing {
     };
     use vllm_router_rs::routers::RouterFactory;
 
+    async fn mock_pd_router(
+        decode: axum::routing::MethodRouter,
+    ) -> (
+        Box<dyn vllm_router_rs::routers::RouterTrait>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        mock_pd_router_with_mode(decode, false).await
+    }
+
+    async fn mock_pd_router_with_mode(
+        decode: axum::routing::MethodRouter,
+        push: bool,
+    ) -> (
+        Box<dyn vllm_router_rs::routers::RouterTrait>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use axum::{extract::State, http::Uri, routing::get, routing::post, Json, Router};
+        use serde_json::json;
+        use std::sync::Arc;
+
+        async fn prefill(State(push): State<bool>, uri: Uri) -> Json<serde_json::Value> {
+            let usage = if uri.path().ends_with("/responses") {
+                json!({"input_tokens": 70, "output_tokens": 1, "total_tokens": 71, "input_tokens_details": {"cached_tokens": 4}})
+            } else {
+                json!({"prompt_tokens": 70, "completion_tokens": 1, "total_tokens": 71, "prompt_tokens_details": {"cached_tokens": 4}})
+            };
+            let mut response = json!({
+                "kv_transfer_params": {
+                    "remote_engine_id": "P",
+                    "do_remote_prefill": true,
+                },
+                "usage": usage,
+            });
+            if push {
+                response["kv_transfer_params"]["remote_host"] = json!("127.0.0.1");
+                response["kv_transfer_params"]["remote_port"] = json!(9100);
+                response["kv_transfer_params"]["transfer_mode"] = json!("push");
+            }
+            Json(response)
+        }
+        let app = Router::new()
+            .route("/p/health", get(|| async { "ok" }))
+            .route("/d/health", get(|| async { "ok" }))
+            .route("/p/v1/chat/completions", post(prefill))
+            .route("/p/v1/completions", post(prefill))
+            .route("/p/v1/responses", post(prefill))
+            .with_state(push)
+            .route("/d/v1/chat/completions", decode.clone())
+            .route("/d/v1/responses", decode.clone())
+            .route("/d/v1/completions", decode);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let config = RouterConfig {
+            mode: RoutingMode::VllmPrefillDecode {
+                prefill_urls: vec![(format!("{base}/p"), None)],
+                decode_urls: vec![format!("{base}/d")],
+                prefill_policy: None,
+                decode_policy: None,
+                discovery_address: None,
+            },
+            policy: PolicyConfig::Random,
+            kv_connector: vllm_router_rs::config::KvConnector::Nixl,
+            disable_retries: true,
+            disable_circuit_breaker: true,
+            worker_startup_timeout_secs: 5,
+            ..RouterConfig::default()
+        };
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let context = Arc::new(
+            vllm_router_rs::server::AppContext::new(config, client, 64, None, vec![]).unwrap(),
+        );
+        let router = RouterFactory::create_router(&context).await.unwrap();
+        (router, server)
+    }
+
+    #[tokio::test]
+    async fn test_pd_usage_through_sequential_and_nixl_push_router() {
+        use axum::{
+            http::{Method, StatusCode, Uri},
+            response::IntoResponse,
+            routing::post,
+            Json,
+        };
+        use serde_json::{json, Value};
+
+        async fn decode(uri: Uri, Json(body): Json<Value>) -> axum::response::Response {
+            let responses = uri.path().ends_with("/responses");
+            let usage = if responses {
+                json!({"input_tokens": 999, "output_tokens": 8, "total_tokens": 1007,
+                       "output_tokens_details": {"reasoning_tokens": 2}})
+            } else {
+                json!({"prompt_tokens": 999, "completion_tokens": 8, "total_tokens": 1007,
+                       "prompt_tokens_details": {"cached_tokens": 99, "audio_tokens": 2}})
+            };
+            if body["stream"] == true {
+                let delta = if responses {
+                    json!({"type": "response.output_text.delta", "delta": "answer"})
+                } else {
+                    json!({"choices": [{"index": 0, "text": "answer"}], "usage": null})
+                };
+                let final_usage = if responses {
+                    json!({"type": "response.completed", "response": {"usage": usage}})
+                } else {
+                    json!({"choices": [], "usage": usage})
+                };
+                return (
+                    [("content-type", "text/event-stream")],
+                    format!("data: {delta}\n\ndata: {final_usage}\n\ndata: [DONE]\n\n"),
+                )
+                    .into_response();
+            }
+            Json(json!({"choices": [{"text": "answer"}], "usage": usage})).into_response()
+        }
+
+        for push in [false, true] {
+            let (router, server) = mock_pd_router_with_mode(post(decode), push).await;
+            // The first NIXL push request learns the identity. The second and
+            // all subsequent requests exercise concurrent P/D dispatch.
+            for _ in 0..2 {
+                for path in ["/v1/chat/completions", "/v1/completions", "/v1/responses"] {
+                    for streaming in [false, true] {
+                        let mut request =
+                            json!({"model": "test", "stream": streaming, "max_tokens": 8});
+                        match path {
+                            "/v1/chat/completions" => {
+                                request["messages"] = json!([{"role": "user", "content": "hello"}])
+                            }
+                            "/v1/responses" => {
+                                request["input"] = json!("hello");
+                                request["max_output_tokens"] = json!(8);
+                            }
+                            _ => request["prompt"] = json!("hello"),
+                        }
+                        if streaming && path != "/v1/responses" {
+                            request["stream_options"] = json!({"include_usage": true});
+                        }
+                        let response = router
+                            .route_transparent(None, path, &Method::POST, request)
+                            .await;
+                        assert_eq!(response.status(), StatusCode::OK);
+                        let bytes = axum::body::to_bytes(response.into_body(), 4096)
+                            .await
+                            .unwrap();
+                        let result: Value = if streaming {
+                            let text = std::str::from_utf8(&bytes).unwrap();
+                            assert!(text.ends_with("data: [DONE]\n\n"));
+                            let frames: Vec<Value> = text
+                                .split("\n\n")
+                                .filter_map(|frame| frame.strip_prefix("data: "))
+                                .filter(|data| *data != "[DONE]")
+                                .map(|data| serde_json::from_str(data).unwrap())
+                                .collect();
+                            assert_eq!(frames.len(), 2);
+                            assert!(frames[0].get("usage").is_none_or(Value::is_null));
+                            frames.into_iter().last().unwrap()
+                        } else {
+                            serde_json::from_slice(&bytes).unwrap()
+                        };
+                        let usage = if streaming && path == "/v1/responses" {
+                            assert!(result.get("usage").is_none());
+                            &result["response"]["usage"]
+                        } else {
+                            &result["usage"]
+                        };
+                        let expected = if path == "/v1/responses" {
+                            json!({"input_tokens": 70, "output_tokens": 8, "total_tokens": 78,
+                                   "output_tokens_details": {"reasoning_tokens": 2},
+                                   "input_tokens_details": {"cached_tokens": 4}})
+                        } else {
+                            json!({"prompt_tokens": 70, "completion_tokens": 8, "total_tokens": 78,
+                                   "prompt_tokens_details": {"cached_tokens": 4, "audio_tokens": 2}})
+                        };
+                        assert_eq!(
+                            usage, &expected,
+                            "path={path}, streaming={streaming}, push={push}"
+                        );
+                    }
+                }
+            }
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn test_pd_decode_429_passthrough_through_router() {
+        use axum::{http::Method, http::StatusCode, routing::post};
+        use serde_json::json;
+
+        let (router, server) = mock_pd_router(post(|| async {
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                [("retry-after", "7"), ("content-type", "text/plain")],
+                "decode is overloaded\n",
+            )
+        }))
+        .await;
+        for path in ["/v1/chat/completions", "/v1/completions", "/v1/responses"] {
+            for streaming in [false, true] {
+                // A text error must bypass successful-response JSON/logprobs handling.
+                let mut request = json!({
+                    "model": "test",
+                    "stream": streaming,
+                    "max_tokens": 1,
+                    "logprobs": if path == "/v1/chat/completions" { json!(true) } else { json!(1) },
+                });
+                if path == "/v1/chat/completions" {
+                    request["messages"] = json!([{"role": "user", "content": "hello"}]);
+                } else if path == "/v1/responses" {
+                    request["input"] = json!("hello");
+                } else {
+                    request["prompt"] = json!("hello");
+                }
+                let response = router
+                    .route_transparent(None, path, &Method::POST, request)
+                    .await;
+                assert_eq!(
+                    response.status(),
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "path={path}, streaming={streaming}",
+                );
+                assert_eq!(response.headers()["retry-after"], "7");
+                assert_eq!(response.headers()["content-type"], "text/plain");
+                let bytes = axum::body::to_bytes(response.into_body(), 4096)
+                    .await
+                    .unwrap();
+                assert_eq!(bytes.as_ref(), b"decode is overloaded\n");
+            }
+        }
+        server.abort();
+    }
+
     #[tokio::test]
     async fn test_epd_handoff_preserves_metadata_and_isolates_ec_handles() {
         use axum::{
