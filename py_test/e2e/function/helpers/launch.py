@@ -83,9 +83,30 @@ def router_launch_prefix() -> list[str]:
 
 
 def find_available_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
+    return find_distinct_available_ports(1)[0]
+
+
+def find_distinct_available_ports(count: int) -> list[int]:
+    """Return ``count`` unique ephemeral ports on 127.0.0.1 (hold until allocated)."""
+    if count < 1:
+        raise ValueError("count must be >= 1")
+    ports: list[int] = []
+    sockets: list[socket.socket] = []
+    try:
+        while len(ports) < count:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+            if port not in ports:
+                ports.append(port)
+                sockets.append(s)
+            else:
+                s.close()
+        return ports
+    finally:
+        for s in sockets:
+            s.close()
 
 
 def _parse_url(base_url: str) -> tuple[str, str]:
