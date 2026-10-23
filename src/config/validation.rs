@@ -304,6 +304,18 @@ impl ConfigValidator {
                     all.extend(decode_urls.iter().cloned());
                     Self::reject_mixed_worker_urls(&all)?;
                 }
+                // Discovered P/D workers register as http://, so a grpc://
+                // static pool would end up mixed at runtime.
+                let has_grpc_url = prefill_urls
+                    .iter()
+                    .map(|(url, _)| url.as_str())
+                    .chain(decode_urls.iter().map(String::as_str))
+                    .any(crate::backend::is_grpc_url);
+                if has_service_discovery && has_grpc_url {
+                    return Err(ConfigError::ValidationFailed {
+                        reason: "grpc:// P/D workers cannot be combined with service discovery, which registers http:// workers".to_string(),
+                    });
+                }
 
                 // Validate bootstrap ports
                 for (_url, port) in prefill_urls {
@@ -1261,5 +1273,36 @@ mod tests {
 
         let result = ConfigValidator::validate(&config);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_grpc_pd_workers_reject_service_discovery() {
+        let pd_mode = |discovery_address: Option<String>| RoutingMode::VllmPrefillDecode {
+            prefill_urls: vec![("grpc://prefill:50051".to_string(), None)],
+            decode_urls: vec!["grpc://decode:50052".to_string()],
+            prefill_policy: None,
+            decode_policy: None,
+            discovery_address,
+        };
+
+        let zmq = RouterConfig::new(
+            pd_mode(Some("0.0.0.0:36367".to_string())),
+            PolicyConfig::Random,
+        );
+        let mut k8s = RouterConfig::new(pd_mode(None), PolicyConfig::Random);
+        k8s.discovery = Some(DiscoveryConfig {
+            enabled: true,
+            prefill_selector: vec![("role".to_string(), "prefill".to_string())]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        });
+        for config in [zmq, k8s] {
+            let err = ConfigValidator::validate(&config).unwrap_err();
+            assert!(err.to_string().contains("service discovery"), "{err}");
+        }
+
+        let static_only = RouterConfig::new(pd_mode(None), PolicyConfig::Random);
+        assert!(ConfigValidator::validate(&static_only).is_ok());
     }
 }

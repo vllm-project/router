@@ -543,7 +543,13 @@ impl PdRouterBase {
 
         let load_monitor_handle =
             if prefill_policy.name() == "power_of_two" || decode_policy.name() == "power_of_two" {
-                let monitor_urls = all_urls.clone();
+                // grpc:// workers serve no HTTP /get_load. A failed probe would
+                // cache load 0 and hide their local in-flight count.
+                let monitor_urls: Vec<String> = all_urls
+                    .iter()
+                    .filter(|url| !crate::backend::is_grpc_url(url))
+                    .cloned()
+                    .collect();
                 let monitor_interval = ctx.router_config.worker_startup_check_interval_secs;
                 let monitor_client = ctx.client.clone();
                 let prefill_policy_clone = Arc::clone(&prefill_policy);
