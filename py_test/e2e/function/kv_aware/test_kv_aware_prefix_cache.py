@@ -13,12 +13,15 @@ from py_test.e2e.function.helpers import http as router_http
 from py_test.e2e.function.helpers.worker_logs import worker_url_for_request_id
 from py_test.e2e.function.kv_aware.config import (
     KV_AWARE_E2E_MODEL,
+    KV_AWARE_SHARED_PREFIX,
     kv_aware_dual_prime_concurrent,
     kv_aware_index_settle_sec,
     kv_aware_request_log_poll_sec,
     kv_aware_reuse_rounds,
 )
 from py_test.e2e.function.kv_aware.dataset import (
+    assert_dual_lane_prefixes_distinct,
+    assert_lane_reuse_shares_prefix,
     default_prefix_reuse_scenario,
     lane_prime_user,
     lane_reuse_user,
@@ -79,6 +82,9 @@ def test_kv_aware_reuse_routes_to_prime_worker(kv_aware_router, kv_aware_two_wor
     scenario = default_prefix_reuse_scenario()
     settle = kv_aware_index_settle_sec()
     log_poll = kv_aware_request_log_poll_sec()
+    assert scenario.prime_user.startswith(KV_AWARE_SHARED_PREFIX)
+    assert scenario.reuse_user.startswith(KV_AWARE_SHARED_PREFIX)
+    print("[e2e] checkpoint: single-lane reuse shares prefix with prime", flush=True)
 
     listed = requests.get(f"{base}/list_workers", timeout=30)
     listed.raise_for_status()
@@ -93,6 +99,7 @@ def test_kv_aware_reuse_routes_to_prime_worker(kv_aware_router, kv_aware_two_wor
             content=scenario.prime_user,
             log_poll=log_poll,
         )
+        print(f"[e2e] checkpoint: index settle {settle}s after prime", flush=True)
         time.sleep(settle)
         reuse_worker = _chat_worker(
             session,
@@ -124,6 +131,13 @@ def test_kv_aware_dual_lane_prime_and_reuse(kv_aware_router, kv_aware_two_worker
     - Each lane's reuse(s) must match that lane's ``prime_worker``.
     - Reuses are **interleaved B then A** each round so lane B is not sent only
       after many lane-A hits on one worker (load/KV index timing).
+
+    **Checkpoints (preconditions before sticky assert):**
+
+    1. Prompt contract — reuse shares lane prefix; A/B prefixes differ.
+    2. Dual prime — two distinct ``grpc://`` workers.
+    3. Index settle — ``KV_AWARE_INDEX_SETTLE_SEC`` sleep after prime.
+    4. First B reuse — one B reuse **before any A reuse**, must match ``prime_B``.
     """
     workers = kv_aware_two_workers
     worker_urls = {w.url for w in workers}
@@ -133,6 +147,14 @@ def test_kv_aware_dual_lane_prime_and_reuse(kv_aware_router, kv_aware_two_worker
     log_poll = kv_aware_request_log_poll_sec()
     n_reuse = kv_aware_reuse_rounds()
     concurrent_prime = kv_aware_dual_prime_concurrent()
+
+    assert_dual_lane_prefixes_distinct()
+    for lane in ("A", "B"):
+        assert_lane_reuse_shares_prefix(lane, round_index=1)
+    print(
+        "[e2e] checkpoint: lane prompt contract OK (reuse shares prime prefix)",
+        flush=True,
+    )
 
     if concurrent_prime:
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
@@ -181,13 +203,38 @@ def test_kv_aware_dual_lane_prime_and_reuse(kv_aware_router, kv_aware_two_worker
         "Cold concurrent primes often tie on one worker — retry with "
         "KV_AWARE_DUAL_PRIME_CONCURRENT=0 (serial primes)."
     )
+    print("[e2e] checkpoint: dual prime on two workers OK", flush=True)
 
+    print(f"[e2e] checkpoint: index settle {settle}s after prime", flush=True)
     time.sleep(settle)
 
     reuse_by_lane: dict[str, list[str]] = {"A": [], "B": []}
     with requests.Session() as session:
+        w_b_first = _chat_worker(
+            session,
+            base=base,
+            model=model,
+            workers=workers,
+            content=lane_reuse_user("B", round_index=1),
+            log_poll=log_poll,
+        )
+        reuse_by_lane["B"].append(w_b_first)
+        print(
+            f"[e2e] checkpoint: first B reuse (no A reuse yet) worker={w_b_first} "
+            f"prime_B={prime_by_lane['B']}",
+            flush=True,
+        )
+        assert w_b_first == prime_by_lane["B"], (
+            "checkpoint: first B reuse must hit B prime worker before any A reuse; "
+            f"got reuse={w_b_first!r} prime_B={prime_by_lane['B']!r} "
+            f"(prime_by_lane={prime_by_lane})"
+        )
+
         for r in range(1, n_reuse + 1):
             for lane in ("B", "A"):
+                if lane == "B" and r == 1:
+                    continue
+                assert_lane_reuse_shares_prefix(lane, round_index=r)
                 w = _chat_worker(
                     session,
                     base=base,

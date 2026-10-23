@@ -29,6 +29,9 @@ Routing scenario (``test_kv_aware_*`` under ``kv_aware/``):
 - ``KV_AWARE_DUAL_PRIME_CONCURRENT``: ``1`` (default) fire lane A/B primes together;
   ``0`` serial primes (more reliable one-worker-per-lane on cold start).
 
+Dual-lane test **checkpoints** (terminal ``[e2e] checkpoint: ...``): prompt contract,
+two-worker prime, index settle, then **first B reuse before any A reuse**.
+
 Prompt metrics (token counts, block estimates for issue #331)::
 
   python -m py_test.e2e.function.kv_aware.measure_prompt_metrics --model-dir /path/to/model
