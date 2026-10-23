@@ -11,6 +11,8 @@ Optional environment (see also ``function/helpers/launch.py``):
   ``"--max-model-len 8192 --enable-prefix-caching"``.
 - Router logs: run pytest with ``-s``; default ``RUST_LOG=vllm_router_rs=info`` on
   the router subprocess (override in the shell for more/less noise).
+- Worker logs: duplicated to the terminal (tee) when ``pytest -s`` unless
+  ``KV_AWARE_WORKER_LOG_QUIET=1`` (file-only under ``[e2e] worker logs: ...``).
 
 Worker GPUs (two ``vllm-rs serve`` processes):
 
@@ -47,6 +49,11 @@ def kv_aware_index_settle_sec() -> float:
 def kv_aware_request_log_poll_sec() -> float:
     raw = os.environ.get("KV_AWARE_REQUEST_LOG_POLL_SEC", "60").strip()
     return float(raw)
+
+
+def kv_aware_worker_logs_quiet() -> bool:
+    raw = os.environ.get("KV_AWARE_WORKER_LOG_QUIET", "").strip().lower()
+    return raw in ("1", "true", "yes")
 
 
 def _parse_cuda_visible_device_list(raw: str) -> list[int]:
