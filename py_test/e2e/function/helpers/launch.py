@@ -11,7 +11,6 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import TextIO
 from urllib.parse import urlparse
 
 import requests
@@ -194,9 +193,13 @@ def popen_launch_vllm_rs_grpc_worker(
     grpc_port: int,
     base_gpu_id: int = 0,
     extra_argv: list[str] | None = None,
-    log_file: TextIO | None = None,
+    capture_output: bool = False,
 ) -> subprocess.Popen:
-    """``vllm-rs serve`` with OpenAI ``--port`` and Inference ``--grpc-port``."""
+    """``vllm-rs serve`` with OpenAI ``--port`` and Inference ``--grpc-port``.
+
+    When ``capture_output`` is true, stdout/stderr are merged into a PIPE for
+    ``SubprocessLogPump`` (do not pass a custom stdout object).
+    """
     vllm_rs = resolve_vllm_rs_bin()
     if not vllm_rs:
         raise RuntimeError(
@@ -218,9 +221,13 @@ def popen_launch_vllm_rs_grpc_worker(
         *(extra_argv if extra_argv is not None else vllm_rs_serve_extra_argv()),
     ]
     popen_kw: dict = {"env": env}
-    if log_file is not None:
-        popen_kw["stdout"] = log_file
+    if capture_output:
+        popen_kw["stdout"] = subprocess.PIPE
         popen_kw["stderr"] = subprocess.STDOUT
+        popen_kw["text"] = True
+        popen_kw["encoding"] = "utf-8"
+        popen_kw["errors"] = "replace"
+        popen_kw["bufsize"] = 1
     return subprocess.Popen(cmd, **popen_kw)
 
 

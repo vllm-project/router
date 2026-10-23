@@ -11,7 +11,7 @@ Optional environment (see also ``function/helpers/launch.py``):
   ``"--max-model-len 8192 --enable-prefix-caching"``.
 - Router logs: run pytest with ``-s``; default ``RUST_LOG=vllm_router_rs=info`` on
   the router subprocess (override in the shell for more/less noise).
-- Worker logs: duplicated to the terminal (tee) when ``pytest -s`` unless
+- Worker logs: subprocess PIPE → log file + stderr echo when ``pytest -s`` unless
   ``KV_AWARE_WORKER_LOG_QUIET=1`` (file-only under ``[e2e] worker logs: ...``).
 
 Worker GPUs (two ``vllm-rs serve`` processes):
