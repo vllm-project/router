@@ -13,7 +13,7 @@ Prerequisites: ``vllm-rs`` (``export VLLM_RS=...`` or ``scripts/backend/check_vl
 
 Use ``-s`` so vllm-rs worker and vllm-router logs appear on the terminal.
 
-Stronger prefix / cache checks: ``test_kv_aware_prefix_cache.py``.
+kv_aware worker stickiness: ``test_kv_aware_prefix_cache.py`` (reuse → same worker as prime).
 """
 
 from __future__ import annotations

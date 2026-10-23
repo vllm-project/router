@@ -19,12 +19,10 @@ Worker GPUs (two ``vllm-rs serve`` processes):
 - If unset, query the machine via ``nvidia-smi`` and use physical ``0`` and ``1``
   (requires at least two GPUs on the host).
 
-Prefix-cache scenario (``test_kv_aware_prefix_cache_reuse``):
+Routing scenario (``test_kv_aware_reuse_routes_to_prime_worker``):
 
 - ``KV_AWARE_INDEX_SETTLE_SEC``: wait after prime for KV events / index (default 5).
-- ``KV_AWARE_MIN_TTFT_GAP_MS``: reuse TTFT must beat control by at least this many ms
-  (default 5). gRPC router ``usage`` often omits ``cached_tokens``; the prefix test
-  uses client TTFT + optional ``x-router-stages`` instead.
+- ``KV_AWARE_REQUEST_LOG_POLL_SEC``: max wait for ``request_id`` in worker logs (default 60).
 """
 
 from __future__ import annotations
@@ -46,8 +44,8 @@ def kv_aware_index_settle_sec() -> float:
     return float(raw)
 
 
-def kv_aware_min_ttft_gap_ms() -> float:
-    raw = os.environ.get("KV_AWARE_MIN_TTFT_GAP_MS", "5").strip()
+def kv_aware_request_log_poll_sec() -> float:
+    raw = os.environ.get("KV_AWARE_REQUEST_LOG_POLL_SEC", "60").strip()
     return float(raw)
 
 

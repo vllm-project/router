@@ -83,6 +83,7 @@ def post_chat_stream_timed(
     t0 = time.perf_counter()
     ttft_ms: float | None = None
     usage: dict[str, Any] = {}
+    request_id: str | None = None
     saw_done = False
     for line in response.iter_lines(decode_unicode=True):
         if not line:
@@ -100,6 +101,9 @@ def post_chat_stream_timed(
             obj = json.loads(payload)
         except json.JSONDecodeError:
             continue
+        chunk_id = obj.get("id")
+        if isinstance(chunk_id, str) and chunk_id:
+            request_id = chunk_id
         if obj.get("usage"):
             usage = obj["usage"]
         choices = obj.get("choices") or []
@@ -118,6 +122,8 @@ def post_chat_stream_timed(
         raise RuntimeError("incomplete SSE stream (no [DONE])")
     if ttft_ms is None:
         raise RuntimeError("no streamed output (ttft unavailable)")
+    if not request_id:
+        raise RuntimeError("stream ended without OpenAI completion id")
     stages: dict[str, Any] | None = None
     if stages_raw:
         try:
@@ -127,11 +133,22 @@ def post_chat_stream_timed(
         except json.JSONDecodeError:
             stages = None
     return {
+        "request_id": request_id,
         "ttft_ms": ttft_ms,
         "usage": usage,
         "cached_tokens": cached_tokens_from_usage(usage),
         "stages": stages,
     }
+
+
+def first_token_ms_from_timed(row: dict[str, Any]) -> float:
+    """Prefer router ``x-router-stages`` ``first_token_ms`` over client TTFT."""
+    stages = row.get("stages")
+    if isinstance(stages, dict):
+        ft = stages.get("first_token_ms")
+        if isinstance(ft, (int, float)):
+            return float(ft)
+    return float(row["ttft_ms"])
 
 
 def post_chat_stream_collect_usage(

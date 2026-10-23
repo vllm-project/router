@@ -1,4 +1,4 @@
-"""Prompt scenarios for kv_aware prefix / cache reuse checks.
+"""Prompt scenarios for kv_aware routing (shared token prefix on prime/reuse).
 
 These are not a static file on disk — they are structured cases built from
 ``KV_AWARE_SHARED_PREFIX`` so the router and workers see a long shared leading

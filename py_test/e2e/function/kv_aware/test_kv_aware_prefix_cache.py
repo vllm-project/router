@@ -1,4 +1,4 @@
-"""kv_aware prefix reuse: TTFT / optional cached_tokens after a priming request."""
+"""kv_aware: reuse request should route to the same worker as prime."""
 
 from __future__ import annotations
 
@@ -8,32 +8,33 @@ import pytest
 import requests
 
 from py_test.e2e.function.helpers import http as router_http
+from py_test.e2e.function.helpers.worker_logs import worker_url_for_request_id
 from py_test.e2e.function.kv_aware.config import (
     KV_AWARE_E2E_MODEL,
     kv_aware_index_settle_sec,
-    kv_aware_min_ttft_gap_ms,
+    kv_aware_request_log_poll_sec,
 )
 from py_test.e2e.function.kv_aware.dataset import default_prefix_reuse_scenario
 
 
 @pytest.mark.e2e
-def test_kv_aware_prefix_cache_reuse(kv_aware_router, kv_aware_two_workers):
+def test_kv_aware_reuse_routes_to_prime_worker(kv_aware_router, kv_aware_two_workers):
     """
-    After **prime** (shared long prefix), **reuse** should beat **control** on an
-    observable signal:
+    Serial shared token-prefix scenario under **kv_aware**:
 
-    - Primary: client **TTFT** (reuse faster than control with unique prefix lead-in).
-    - Bonus: ``usage.cached_tokens`` when the gRPC router path forwards it (often 0 today).
+    1. **prime** — long shared prefix on one worker (KV events + index).
+    2. **reuse** — same prefix; Router should select the same ``grpc://`` worker.
+    3. **control** — unrelated text (logged for debugging; not asserted).
 
-    Router enables ``VLLM_ROUTER_STAGES=1`` in e2e fixtures for ``x-router-stages``.
-    Does not assert which ``grpc://`` worker was picked.
+    Worker choice is resolved from per-worker vllm-rs logs using the OpenAI
+    ``request_id`` on each streamed completion (see ``[e2e] worker logs: ...``).
     """
-    _ = kv_aware_two_workers
+    workers = kv_aware_two_workers
     base = kv_aware_router.url
     model = KV_AWARE_E2E_MODEL
     scenario = default_prefix_reuse_scenario()
     settle = kv_aware_index_settle_sec()
-    min_gap = kv_aware_min_ttft_gap_ms()
+    log_poll = kv_aware_request_log_poll_sec()
 
     listed = requests.get(f"{base}/list_workers", timeout=30)
     listed.raise_for_status()
@@ -47,6 +48,9 @@ def test_kv_aware_prefix_cache_reuse(kv_aware_router, kv_aware_two_workers):
             content=scenario.prime_user,
             max_tokens=8,
         )
+        prime_worker = worker_url_for_request_id(
+            workers, prime["request_id"], poll_timeout_sec=log_poll
+        )
         time.sleep(settle)
         reuse = router_http.post_chat_stream_timed(
             session,
@@ -55,6 +59,9 @@ def test_kv_aware_prefix_cache_reuse(kv_aware_router, kv_aware_two_workers):
             content=scenario.reuse_user,
             max_tokens=8,
         )
+        reuse_worker = worker_url_for_request_id(
+            workers, reuse["request_id"], poll_timeout_sec=log_poll
+        )
         control = router_http.post_chat_stream_timed(
             session,
             base,
@@ -62,19 +69,13 @@ def test_kv_aware_prefix_cache_reuse(kv_aware_router, kv_aware_two_workers):
             content=scenario.control_user,
             max_tokens=8,
         )
-
-    reuse_ttft = float(reuse["ttft_ms"])
-    control_ttft = float(control["ttft_ms"])
-    gap = control_ttft - reuse_ttft
-
-    if reuse["cached_tokens"] > 0 or control["cached_tokens"] > 0:
-        assert (
-            reuse["cached_tokens"] >= control["cached_tokens"]
-        ), f"cached_tokens reuse={reuse['cached_tokens']} control={control['cached_tokens']}"
-    else:
-        assert gap >= min_gap, (
-            f"reuse TTFT should beat control by >={min_gap}ms (gap={gap:.1f}ms): "
-            f"reuse={reuse_ttft:.1f} control={control_ttft:.1f} prime={float(prime['ttft_ms']):.1f} "
-            f"scenario={scenario.name!r}. "
-            "Sync latest test (TTFT not cached_tokens); workers need --enable-prefix-caching."
+        control_worker = worker_url_for_request_id(
+            workers, control["request_id"], poll_timeout_sec=log_poll
         )
+
+    assert reuse_worker == prime_worker, (
+        f"kv_aware should send reuse to prime worker: "
+        f"prime={prime_worker} reuse={reuse_worker} "
+        f"(control={control_worker}, scenario={scenario.name!r}, "
+        f"prime_id={prime['request_id']!r}, reuse_id={reuse['request_id']!r})"
+    )

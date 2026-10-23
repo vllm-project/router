@@ -11,6 +11,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import TextIO
 from urllib.parse import urlparse
 
 import requests
@@ -193,6 +194,7 @@ def popen_launch_vllm_rs_grpc_worker(
     grpc_port: int,
     base_gpu_id: int = 0,
     extra_argv: list[str] | None = None,
+    log_file: TextIO | None = None,
 ) -> subprocess.Popen:
     """``vllm-rs serve`` with OpenAI ``--port`` and Inference ``--grpc-port``."""
     vllm_rs = resolve_vllm_rs_bin()
@@ -215,7 +217,11 @@ def popen_launch_vllm_rs_grpc_worker(
         str(grpc_port),
         *(extra_argv if extra_argv is not None else vllm_rs_serve_extra_argv()),
     ]
-    return subprocess.Popen(cmd, env=env)
+    popen_kw: dict = {"env": env}
+    if log_file is not None:
+        popen_kw["stdout"] = log_file
+        popen_kw["stderr"] = subprocess.STDOUT
+    return subprocess.Popen(cmd, **popen_kw)
 
 
 def popen_launch_router_only(
