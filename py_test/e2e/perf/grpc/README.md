@@ -28,14 +28,14 @@ each cold stack is up, before the concurrent wave.
 
 ## Run
 
-Model path or HF id: set `"model"` in `cases/<name>.json`, or `export MODEL=...`
+Model path or HF id: set `"model"` in `cases/<name>.json`, or `export GRPC_MODEL=...`
 (**env overrides JSON**).
 
 ```bash
-export MODEL=/path/to/model   # optional if case JSON defines model
+export GRPC_MODEL=/path/to/model   # required unless case JSON defines model
 export VLLM_RS=/path/to/vllm-rs          # rust_grpc
 export ROUTER_BIN=$PWD/target/release/vllm-router   # optional
-# results JSON: default on → py_test/e2e/perf/grpc/results/<backend>_<ts>/
+# results JSON (default on, dir created at run time): py_test/e2e/perf/grpc/results/<backend>_<ts>/
 # export PERF_SAVE_RESULTS=0   # disable file output
 
 pytest py_test/e2e/perf/grpc --perf-case=rust_grpc -m perf
@@ -52,9 +52,9 @@ you do **not** need pytest or `stack_launcher.py` — only the bench CLI:
 
 ```bash
 export ROUTER_URL=http://127.0.0.1:16002
-export MODEL=/path/to/model
+export GRPC_MODEL=/path/to/model
 python benches/backend/bench_prefix_kvhit.py \
-  --hit-rate 0.99 --tokens 131072 --model-dir "$MODEL" \
+  --hit-rate 0.99 --tokens 131072 --model-dir "$GRPC_MODEL" \
   --max-tokens 64 --warmup --concurrency 16 --requests 32 --timeout 1800
 ```
 
@@ -130,10 +130,10 @@ One wave equals:
 ```bash
 python benches/backend/bench_prefix_kvhit.py \
   --router-url http://127.0.0.1:16002 \
-  --model "$MODEL" \
+  --model "$GRPC_MODEL" \
   --hit-rate <0.00|0.99> \
   --tokens 131072 \
-  --model-dir "$MODEL" \
+  --model-dir "$GRPC_MODEL" \
   --max-tokens 64 \
   --warmup \
   --concurrency C \

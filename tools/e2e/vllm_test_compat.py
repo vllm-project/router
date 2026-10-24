@@ -93,6 +93,23 @@ def vllm_worker_command(
     return cmd
 
 
+def vllm_worker_popen_env(
+    *,
+    base_gpu_id: int | None = 0,
+    dp_size: int | None = None,
+) -> dict[str, str]:
+    """Environment for ``Popen`` when ``vllm serve`` has no ``--base-gpu-id``."""
+    env = os.environ.copy()
+    if _has_launch_server_module():
+        return env
+    start = int(base_gpu_id or 0)
+    width = max(1, int(dp_size) if dp_size is not None and dp_size > 0 else 1)
+    if start == 0 and width == 1:
+        return env
+    env["CUDA_VISIBLE_DEVICES"] = ",".join(str(start + i) for i in range(width))
+    return env
+
+
 def import_run_eval() -> Callable:
     """Return ``run_eval`` from vLLM/SGLang test tree, or raise with a clear message."""
     for module in ("vllm.test.run_eval", "sglang.test.run_eval"):

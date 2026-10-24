@@ -1,6 +1,5 @@
 {
   "backend": "python_http",
-  "model": "/path/to/model/snapshot",
   "stack": {
     "router_bin": "target/release/vllm-router",
     "host": "127.0.0.1",

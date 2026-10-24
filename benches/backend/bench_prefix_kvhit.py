@@ -7,7 +7,7 @@ router, or a worker). Pair with one of the serve_*.sh scripts under
 scripts/backend.
 
   export ROUTER_URL=http://127.0.0.1:30000
-  export MODEL=my-served-model
+  export GRPC_MODEL=my-served-model
   python benches/backend/bench_prefix_kvhit.py
 
 By default the script writes a short synthetic chat body into a temp
@@ -305,7 +305,7 @@ def read_perf_settings(
     bench_timeout: float | None = None,
 ) -> dict[str, Any]:
     """Merge case JSON bench fields with PERF_* / ROUTER_URL env (pytest perf)."""
-    model = os.environ["MODEL"]
+    model = os.environ["GRPC_MODEL"]
     if os.environ.get("PERF_TOKENS", "").strip():
         tokens = int(os.environ["PERF_TOKENS"].strip())
     elif bench_tokens is not None:
@@ -318,7 +318,7 @@ def read_perf_settings(
     return {
         "router_url": os.environ["ROUTER_URL"],
         "model": model,
-        "model_dir": os.environ.get("MODEL_DIR", model),
+        "model_dir": os.environ.get("GRPC_MODEL_DIR", model),
         "tokens": tokens,
         "chars": int(os.environ.get("KVHIT_CHARS", "8000")),
         "max_tokens": int(os.environ.get("PERF_MAX_TOKENS", str(default_max))),

@@ -10,6 +10,7 @@ GPU-backed performance scenarios live in subdirectories (each with its own
 Run a suite:
 
 ```bash
+export GRPC_MODEL=/path/to/model
 python -m pytest -sv py_test/e2e/perf/grpc --perf-case=rust_grpc -m perf
 ```
 

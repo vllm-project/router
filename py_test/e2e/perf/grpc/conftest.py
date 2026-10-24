@@ -15,8 +15,10 @@ if str(_PERF_DIR) not in sys.path:
     sys.path.insert(0, str(_PERF_DIR))
 
 from case_loader import (  # noqa: E402
+    PERF_MODEL_ENV,
     WaveSpec,
     apply_case_env,
+    grpc_model,
     perf_case_selected,
     perf_model_ready,
     resolve_perf_case,
@@ -82,10 +84,10 @@ def _perf_save_results_enabled() -> bool:
 
 
 def _perf_waves_for_collection() -> tuple[WaveSpec, ...] | None:
-    """Resolve wave matrix at collection time (does not require MODEL).
+    """Resolve wave matrix at collection time (does not require GRPC_MODEL).
 
     Parametrize before runtime env is complete so ``-k hit99-c16-r32`` works;
-    missing MODEL still skips at test time via ``test_prefix_kvhit_waves`` skipif.
+    missing GRPC_MODEL still skips at test time via ``test_prefix_kvhit_waves`` skipif.
     """
     if not perf_case_selected():
         return None
@@ -106,8 +108,8 @@ def perf_case():
         pytest.skip("Set --perf-case (or PERF_CASE)")
     case = resolve_perf_case()
     apply_case_env(case)
-    if not os.environ.get("MODEL", "").strip():
-        pytest.skip("Set MODEL (env) or model in case JSON")
+    if not grpc_model():
+        pytest.skip(f"Set {PERF_MODEL_ENV} (env) or model in case JSON")
     return case
 
 
@@ -137,7 +139,7 @@ def perf_stack(perf_case, request):
         yield None
         return
 
-    model = os.environ["MODEL"].strip()
+    model = grpc_model()
     wave_id = getattr(request, "node", None)
     wave_label = wave_id.nodeid if wave_id is not None else "wave"
     _progress(
@@ -184,6 +186,21 @@ def pytest_generate_tests(metafunc):
         return
     if metafunc.definition.name != "test_prefix_kvhit_waves":
         return
+    if not perf_case_selected():
+        metafunc.parametrize(
+            "hit_rate,concurrency,requests",
+            [
+                pytest.param(
+                    0.0,
+                    1,
+                    1,
+                    marks=pytest.mark.skip(reason="Set --perf-case (or PERF_CASE)"),
+                )
+            ],
+            ids=["no-perf-case"],
+        )
+        return
+
     waves = _perf_waves_for_collection()
     if not waves:
         return

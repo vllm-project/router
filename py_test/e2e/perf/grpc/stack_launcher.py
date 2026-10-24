@@ -20,8 +20,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# ``py_test/e2e/perf/grpc`` → repo root (run pytest from repository root).
-REPO_ROOT = Path(__file__).resolve().parents[3]
+# File is ``py_test/e2e/perf/grpc/stack_launcher.py`` → repo root is parents[4].
+REPO_ROOT = Path(__file__).resolve().parents[4]
 
 
 def _progress(msg: str) -> None:

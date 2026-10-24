@@ -10,6 +10,17 @@ from typing import Any
 
 CASES_DIR = Path(__file__).resolve().parent / "cases"
 
+PERF_MODEL_ENV = "GRPC_MODEL"
+PERF_MODEL_DIR_ENV = "GRPC_MODEL_DIR"
+
+
+def grpc_model() -> str:
+    return os.environ.get(PERF_MODEL_ENV, "").strip()
+
+
+def grpc_model_dir() -> str:
+    return os.environ.get(PERF_MODEL_DIR_ENV, "").strip() or grpc_model()
+
 
 @dataclass(frozen=True)
 class StackConfig:
@@ -129,14 +140,14 @@ def _parse_model_fields(
 
 def apply_case_env(case: BackendCaseFile) -> None:
     """Copy case ``model`` / ``model_dir`` into env when unset (env wins)."""
-    if case.model and not os.environ.get("MODEL", "").strip():
-        os.environ["MODEL"] = case.model
-    if case.model_dir and not os.environ.get("MODEL_DIR", "").strip():
-        os.environ["MODEL_DIR"] = case.model_dir
+    if case.model and not grpc_model():
+        os.environ[PERF_MODEL_ENV] = case.model
+    if case.model_dir and not os.environ.get(PERF_MODEL_DIR_ENV, "").strip():
+        os.environ[PERF_MODEL_DIR_ENV] = case.model_dir
 
 
 def perf_model_ready() -> bool:
-    if os.environ.get("MODEL", "").strip():
+    if grpc_model():
         return True
     if not perf_case_selected():
         return False
