@@ -41,7 +41,7 @@ use std::{
 use tokio::{
     net::{TcpListener, TcpStream},
     signal, spawn,
-    sync::RwLock,
+    sync::{RwLock, Semaphore},
 };
 use tracing::{error, info, warn, Level};
 
@@ -50,6 +50,7 @@ pub struct AppContext {
     pub client: Client,
     pub router_config: RouterConfig,
     pub rate_limiter: Arc<TokenBucket>,
+    pub concurrency_semaphore: Arc<Semaphore>,
     pub worker_registry: Arc<WorkerRegistry>,
     pub policy_registry: Arc<PolicyRegistry>,
     pub router_manager: Option<Arc<RouterManager>>,
@@ -68,6 +69,7 @@ impl AppContext {
     ) -> Result<Self, String> {
         let rate_limit_tokens = rate_limit_tokens_per_second.unwrap_or(max_concurrent_requests);
         let rate_limiter = Arc::new(TokenBucket::new(max_concurrent_requests, rate_limit_tokens));
+        let concurrency_semaphore = Arc::new(Semaphore::new(max_concurrent_requests));
 
         let worker_registry = Arc::new(WorkerRegistry::new());
         let policy_registry = Arc::new(PolicyRegistry::new(router_config.policy.clone()));
@@ -84,6 +86,7 @@ impl AppContext {
             client,
             router_config,
             rate_limiter,
+            concurrency_semaphore,
             worker_registry,
             policy_registry,
             router_manager,
@@ -1069,6 +1072,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     // Set up concurrency limiter with queue if configured
     let (limiter, processor) = middleware::ConcurrencyLimiter::new(
         app_context.rate_limiter.clone(),
+        app_context.concurrency_semaphore.clone(),
         config.router_config.queue_size,
         Duration::from_secs(config.router_config.queue_timeout_secs),
     );

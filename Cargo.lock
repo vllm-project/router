@@ -7426,6 +7426,7 @@ dependencies = [
  "futures-util",
  "hf-hub 0.4.3",
  "http",
+ "http-body",
  "http-body-util",
  "k8s-openapi",
  "kube",

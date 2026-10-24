@@ -213,6 +213,9 @@ def create_app(args: argparse.Namespace) -> FastAPI:
             # minimal 2-chunk stream then [DONE]
             for i in range(2):
                 await asyncio.sleep(0.01)
+                # --latency-ms applies per chunk here, so a test can keep a stream
+                # open long enough to observe router behaviour mid-generation.
+                await maybe_delay()
                 chunk = {
                     "choices": [{"delta": {"content": "x"}}],
                     "worker_id": worker_id,

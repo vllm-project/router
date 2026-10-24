@@ -81,38 +81,46 @@ impl TokenBucket {
         }
     }
 
-    /// Acquire tokens, waiting if necessary
+    /// Wait until `tokens` are expected to be available without consuming them.
+    ///
+    /// The caller can cancel this future while it waits without leaking a token,
+    /// because this method does not mutate the bucket.
+    pub async fn wait_until_available(&self, tokens: f64) {
+        loop {
+            if self.available_tokens().await >= tokens {
+                return;
+            }
+
+            let wait_time = {
+                let inner = self.inner.lock();
+                let tokens_needed = (tokens - inner.tokens).max(0.0);
+                Duration::from_secs_f64((tokens_needed / self.refill_rate).max(0.0))
+            };
+
+            tokio::select! {
+                _ = self.notify.notified() => {},
+                _ = tokio::time::sleep(wait_time) => {},
+            }
+        }
+    }
+
+    /// Acquire tokens, waiting if necessary.
     pub async fn acquire(&self, tokens: f64) -> Result<(), tokio::time::error::Elapsed> {
-        // First try to acquire immediately
         if self.try_acquire(tokens).await.is_ok() {
             return Ok(());
         }
 
-        // Calculate wait time
         let wait_time = {
             let inner = self.inner.lock();
             let tokens_needed = (tokens - inner.tokens).max(0.0);
-            let wait_secs = (tokens_needed / self.refill_rate).max(0.0);
-            Duration::from_secs_f64(wait_secs)
+            Duration::from_secs_f64((tokens_needed / self.refill_rate).max(0.0))
         };
 
-        debug!(
-            "Token bucket: waiting {:?} for {} tokens",
-            wait_time, tokens
-        );
-
-        // Wait for tokens to be available
         tokio::time::timeout(wait_time, async {
             loop {
-                // Check if we can acquire now
+                self.wait_until_available(tokens).await;
                 if self.try_acquire(tokens).await.is_ok() {
                     return;
-                }
-
-                // Wait for notification or small interval
-                tokio::select! {
-                    _ = self.notify.notified() => {},
-                    _ = tokio::time::sleep(Duration::from_millis(10)) => {},
                 }
             }
         })
@@ -203,5 +211,35 @@ mod tests {
         // Should have ~5 tokens
         let available = bucket.available_tokens().await;
         assert!((4.0..=6.0).contains(&available));
+    }
+
+    #[tokio::test]
+    async fn test_token_bucket_acquire_waits_for_refill() {
+        let bucket = TokenBucket::new(1, 10); // 1 capacity, 10 per second
+        assert!(bucket.try_acquire(1.0).await.is_ok());
+
+        let start = Instant::now();
+        bucket.acquire(1.0).await.unwrap();
+        let elapsed = start.elapsed();
+        assert!(elapsed >= Duration::from_millis(80));
+        assert!(elapsed < Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn test_token_bucket_acquire_wakes_on_return() {
+        let bucket = TokenBucket::new(1, 1); // 1 per second, so refill alone is slow
+        assert!(bucket.try_acquire(1.0).await.is_ok());
+
+        let waiter = {
+            let bucket = bucket.clone();
+            tokio::spawn(async move { bucket.acquire(1.0).await.unwrap() })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        bucket.return_tokens(1.0).await;
+
+        tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("token return did not wake the waiter")
+            .unwrap();
     }
 }
