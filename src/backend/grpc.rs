@@ -682,7 +682,7 @@ fn output_text_and_finish(
                 .flush(None)
                 .map_err(|error| format!("detokenization flush failed: {error}"))?;
             if let Some(last) = last {
-                decoded.push_str(&last);
+                decoded.push_str(&last.text);
             }
         }
     }

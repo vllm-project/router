@@ -21,7 +21,7 @@ use crate::protocols::spec::{
 };
 use vllm_chat::{
     AssistantContentBlock, AssistantToolCall, ChatTool, ChatToolChoice,
-    ReasoningEffort as VllmReasoningEffort,
+    EffortValue as VllmReasoningEffort,
 };
 
 #[derive(Clone)]
@@ -200,19 +200,6 @@ pub fn tokenize_chat_request_timed(
 }
 
 fn tokenize_vllm(request: &ChatCompletionRequest, frontend: &VllmFrontend) -> Result<TokenizeOut> {
-    if request
-        .tools
-        .as_ref()
-        .is_some_and(|tools| !tools.is_empty())
-        && !matches!(
-            request.tool_choice,
-            Some(SpecToolChoice::Value(ToolChoiceValue::None))
-        )
-    {
-        return Err(anyhow!(
-            "active tool calling requires vllm-chat output parsing, which the gRPC response adapter does not yet expose; tool history and tool_choice=none are supported"
-        ));
-    }
     if request.reasoning_effort.is_some() {
         return Err(anyhow!(
             "reasoning_effort requires vllm-chat output parsing, which the gRPC response adapter does not yet expose"
@@ -283,6 +270,11 @@ fn tokenize_vllm(request: &ChatCompletionRequest, frontend: &VllmFrontend) -> Re
         data_parallel_rank,
         session_id,
     })?;
+    if upstream.tool_context.parsing_enabled() {
+        return Err(anyhow!(
+            "active tool calling requires vllm-chat output parsing, which the gRPC response adapter does not yet expose; tool history and tool_choice=none are supported"
+        ));
+    }
     let adapt_ms = t0.elapsed().as_secs_f64() * 1000.0;
     let (token_ids, template_ms, encode_ms) = frontend
         .chat_tokenize_timed(&upstream)
@@ -366,15 +358,40 @@ fn spec_messages_to_upstream(
                     ));
                 }
                 SpecChatMessage::Other(value) => {
-                    // HTTP backends can forward unknown roles verbatim, but vllm-chat
-                    // cannot represent them, so the gRPC frontend rejects them.
                     let role = value
                         .get("role")
                         .and_then(serde_json::Value::as_str)
-                        .expect("ChatMessage::Other must contain a string `role`");
-                    return Err(anyhow!(
-                        "chat message role `{role}` is not supported by the router gRPC frontend"
-                    ));
+                        .ok_or_else(|| anyhow!("chat message role must be a string"))?;
+                    let content = value.get("content").ok_or_else(|| {
+                        anyhow!("chat message role `{role}` requires content on the gRPC path")
+                    })?;
+                    let content: UserMessageContent = serde_json::from_value(content.clone())
+                        .map_err(|error| {
+                            anyhow!("chat message role `{role}` has invalid content: {error}")
+                        })?;
+                    let text = user_content_text(&content)?;
+                    if role == "developer" {
+                        let tools = value
+                            .get("tools")
+                            .filter(|tools| !tools.is_null())
+                            .map(tool_declarations_to_upstream)
+                            .transpose()
+                            .map_err(|error| anyhow!("invalid developer tools: {error}"))?
+                            .filter(|tools| !tools.is_empty());
+                        super::vllm_frontend::UpstreamChatMessage::developer(text, tools)
+                    } else {
+                        let mut extra_fields = value
+                            .as_object()
+                            .ok_or_else(|| anyhow!("custom chat message must be an object"))?
+                            .clone();
+                        extra_fields.remove("role");
+                        extra_fields.remove("content");
+                        super::vllm_frontend::UpstreamChatMessage::custom_with_extra_fields(
+                            role,
+                            text,
+                            extra_fields,
+                        )?
+                    }
                 }
             })
         })
@@ -382,21 +399,41 @@ fn spec_messages_to_upstream(
 }
 
 fn spec_tools_to_upstream(request: &ChatCompletionRequest) -> Result<Vec<ChatTool>> {
-    request
-        .tools
-        .as_deref()
-        .unwrap_or_default()
+    tool_declarations_to_upstream(&serde_json::to_value(
+        request.tools.as_deref().unwrap_or_default(),
+    )?)
+}
+
+fn tool_declarations_to_upstream(value: &serde_json::Value) -> Result<Vec<ChatTool>> {
+    value
+        .as_array()
+        .ok_or_else(|| anyhow!("tools must be an array"))?
         .iter()
         .map(|tool| {
-            if tool.tool_type != "function" {
+            if tool
+                .get("type")
+                .is_some_and(|kind| kind.as_str() != Some("function"))
+            {
                 return Err(anyhow!("only function tools are supported"));
             }
-            Ok(ChatTool {
-                name: tool.function.name.clone(),
-                description: tool.function.description.clone(),
-                parameters: tool.function.parameters.clone(),
-                strict: None,
-            })
+            let mut function = tool
+                .get("function")
+                .and_then(serde_json::Value::as_object)
+                .cloned()
+                .ok_or_else(|| anyhow!("function tool must contain a function object"))?;
+            function
+                .entry("parameters")
+                .or_insert(serde_json::Value::Null);
+            let deferred: Option<bool> = serde_json::from_value(
+                tool.get("defer_loading")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
+            )
+            .map_err(|error| anyhow!("invalid tool defer_loading: {error}"))?;
+            let mut function: ChatTool = serde_json::from_value(function.into())
+                .map_err(|error| anyhow!("invalid function tool: {error}"))?;
+            function.defer_loading = function.defer_loading.or(deferred);
+            Ok(function)
         })
         .collect()
 }
@@ -581,8 +618,8 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unknown_roles_on_grpc_path() {
-        for role in ["latest_reminder", "developer"] {
+    fn preserves_custom_and_developer_roles_on_grpc_path() {
+        for role in ["latest_reminder", "developer", "checkpoint"] {
             let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
                 "messages": [{
                     "role": role,
@@ -591,11 +628,89 @@ mod tests {
             }))
             .unwrap();
 
-            let error = spec_messages_to_upstream(&request.messages).unwrap_err();
+            let messages = spec_messages_to_upstream(&request.messages).unwrap();
+            assert_eq!(messages[0].role().as_str(), role);
             assert_eq!(
-                error.to_string(),
-                format!("chat message role `{role}` is not supported by the router gRPC frontend")
+                messages[0].text_content().unwrap(),
+                "Model-specific instructions."
             );
+        }
+    }
+
+    #[test]
+    fn developer_tools_preserve_schema_and_loading_metadata() {
+        let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "messages": [{"role":"developer", "content":"policy", "tools":[{
+                "type":"function", "defer_loading":true,
+                "function":{"name":"weather", "description":"lookup", "parameters":{"type":"object"},
+                    "strict":true, "defer_loading":false}
+            }]}]
+        }))
+        .unwrap();
+        let messages = spec_messages_to_upstream(&request.messages).unwrap();
+        let vllm_chat::ChatMessage::Developer {
+            tools: Some(tools), ..
+        } = &messages[0]
+        else {
+            panic!("developer tools must survive conversion");
+        };
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, "weather");
+        assert_eq!(tools[0].description.as_deref(), Some("lookup"));
+        assert_eq!(tools[0].parameters, serde_json::json!({"type":"object"}));
+        assert_eq!(tools[0].strict, Some(true));
+        assert_eq!(tools[0].defer_loading, Some(false));
+        for declaration in [
+            serde_json::json!({"function":{"name":"minimal"}}),
+            serde_json::json!({"type":"function", "defer_loading":true, "function":{"name":"minimal"}}),
+        ] {
+            let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+                "messages":[{"role":"developer", "content":"policy", "tools":[declaration.clone()]}]
+            }))
+            .unwrap();
+            let messages = spec_messages_to_upstream(&request.messages).unwrap();
+            let vllm_chat::ChatMessage::Developer {
+                tools: Some(tools), ..
+            } = &messages[0]
+            else {
+                panic!("developer tools must survive conversion");
+            };
+            assert_eq!(tools[0].name, "minimal");
+            assert_eq!(tools[0].parameters, serde_json::Value::Null);
+            assert_eq!(tools[0].strict, None);
+            assert_eq!(
+                tools[0].defer_loading,
+                declaration.get("defer_loading").map(|_| true)
+            );
+        }
+        for tools in [serde_json::Value::Null, serde_json::json!([])] {
+            let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+                "messages": [{"role":"developer", "content":"policy", "tools":tools}]
+            }))
+            .unwrap();
+            let messages = spec_messages_to_upstream(&request.messages).unwrap();
+            assert_eq!(messages[0].text_content().unwrap(), "policy");
+        }
+    }
+
+    #[test]
+    fn developer_tools_reject_malformed_declarations() {
+        for tools in [
+            serde_json::json!({}),
+            serde_json::json!("invalid"),
+            serde_json::json!(false),
+            serde_json::json!([{"type":"custom", "function":{"name":"weather"}}]),
+            serde_json::json!([{"type":null, "function":{"name":"weather"}}]),
+            serde_json::json!([{"type":"function", "function":{}}]),
+            serde_json::json!([{"type":"function", "function":{"name":"weather", "strict":"yes"}}]),
+            serde_json::json!([{"defer_loading":"yes", "function":{"name":"weather", "defer_loading":true}}]),
+        ] {
+            let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+                "messages": [{"role":"developer", "content":"policy", "tools":tools}]
+            }))
+            .unwrap();
+            let error = spec_messages_to_upstream(&request.messages).unwrap_err();
+            assert!(error.to_string().contains("developer"));
         }
     }
 
