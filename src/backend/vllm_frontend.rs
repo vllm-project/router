@@ -14,6 +14,7 @@ use vllm_chat::{
 use vllm_text::TextDecodeOptions;
 
 use super::encode_cache::{deterministic_model, FrontendCache, PromptEncoder};
+use super::l1_cache::{load_boundary_matcher, L1Cache, L1Encoder};
 use vllm_tokenizer::{IncrementalDecoder, Tokenizer};
 
 pub use vllm_chat::ChatMessage as UpstreamChatMessage;
@@ -31,6 +32,7 @@ impl VllmFrontend {
         model_id: &str,
         default_chat_template_kwargs: HashMap<String, Value>,
         cache: Option<Arc<FrontendCache>>,
+        l1_cache: Option<Arc<L1Cache>>,
     ) -> vllm_chat::Result<Self> {
         let backends = load_model_backends(
             model_id,
@@ -56,7 +58,26 @@ impl VllmFrontend {
         } else {
             None
         };
-        let encoder = PromptEncoder::new(model_id, backends.text_backend.tokenizer(), cache);
+        let tokenizer = backends.text_backend.tokenizer();
+        let l1 = match l1_cache {
+            Some(l1_cache) => {
+                let matcher = load_boundary_matcher(model_id)
+                    .await
+                    .and_then(|matcher| matcher.probed(tokenizer.as_ref()));
+                match matcher {
+                    Ok(matcher) => {
+                        tracing::info!(model_id, boundaries = ?matcher.tokens(), "L1 enabled");
+                        Some(L1Encoder::new(model_id, l1_cache, matcher))
+                    }
+                    Err(error) => {
+                        tracing::warn!(model_id, %error, "L1 disabled for this model");
+                        None
+                    }
+                }
+            }
+            None => None,
+        };
+        let encoder = PromptEncoder::new(model_id, tokenizer, cache).with_l1_cache(l1);
         Ok(Self {
             backends: Arc::new(backends),
             encoder,
@@ -75,24 +96,25 @@ impl VllmFrontend {
             .default_temperature)
     }
 
+    /// Returns IDs, cached token count, template ms and encode ms.
     pub fn chat_tokenize_timed(
         &self,
         request: &ChatRequest,
-    ) -> vllm_chat::Result<(Arc<[u32]>, f64, f64)> {
+    ) -> vllm_chat::Result<(Arc<[u32]>, usize, f64, f64)> {
         let t0 = Instant::now();
         let rendered = self.backends.chat_backend.chat_renderer().render(request)?;
         let template_ms = t0.elapsed().as_secs_f64() * 1000.0;
         let t1 = Instant::now();
-        let ids = self
+        let encoded = self
             .encoder
-            .encode(
+            .encode_detailed(
                 rendered.prompt,
                 request.add_special_tokens,
                 request.cache_salt.as_deref(),
             )
             .map_err(|error| vllm_chat::Error::ChatTemplate(error.to_string()))?;
         let encode_ms = t1.elapsed().as_secs_f64() * 1000.0;
-        Ok((ids, template_ms, encode_ms))
+        Ok((encoded.ids, encoded.cached_tokens, template_ms, encode_ms))
     }
 }
 

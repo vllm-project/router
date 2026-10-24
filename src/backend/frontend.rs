@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 use axum::response::Response;
 
 use super::grpc::{FirstOutputCallback, GrpcEngineBackend};
+use super::l1_cache::{L1CacheConfig, L1CacheStats};
 use super::preprocess::{tokenize_chat_request_timed, FrontendHandle, TokenizeOut, TokenizerCache};
 use crate::protocols::spec::ChatCompletionRequest;
 use crate::tokenizer::{TokenizerCacheConfig, TokenizerCacheStats};
@@ -88,22 +89,37 @@ impl EngineFrontend {
         request_timeout: Duration,
         config: TokenizerCacheConfig,
     ) -> anyhow::Result<Self> {
+        Self::with_encoding_caches(request_timeout, Some(config), None)
+    }
+
+    /// Enable L0 (exact) and/or L1 (prefix) encoding caches.
+    pub fn with_encoding_caches(
+        request_timeout: Duration,
+        l0: Option<TokenizerCacheConfig>,
+        l1: Option<L1CacheConfig>,
+    ) -> anyhow::Result<Self> {
         Ok(Self {
-            tokenizer: Arc::new(TokenizerCache::with_encoding_cache(config)?),
+            tokenizer: Arc::new(TokenizerCache::with_caches(l0, l1)?),
             ..Self::with_request_timeout(request_timeout)
         })
     }
 
     pub(crate) fn from_env(request_timeout: Duration) -> anyhow::Result<Self> {
-        match super::encode_cache::config_from_env()? {
-            Some(config) => Self::with_tokenizer_cache(request_timeout, config),
-            None => Ok(Self::with_request_timeout(request_timeout)),
-        }
+        Self::with_encoding_caches(
+            request_timeout,
+            super::encode_cache::config_from_env()?,
+            super::l1_cache::config_from_env()?,
+        )
     }
 
     /// L0 stats across models, or None when disabled.
     pub fn tokenizer_cache_stats(&self) -> Option<TokenizerCacheStats> {
         self.tokenizer.encoding_cache_stats()
+    }
+
+    /// L1 stats across models, or None when disabled.
+    pub fn l1_cache_stats(&self) -> Option<L1CacheStats> {
+        self.tokenizer.l1_cache_stats()
     }
 
     /// Tests only: bypass model loading by returning these fake prompt ids.
@@ -201,5 +217,46 @@ impl EngineFrontend {
 
     pub fn remove_worker(&self, worker_url: &str) {
         self.grpc.remove_client(worker_url);
+    }
+}
+
+/// HTTP pools proxy the request body, so the router never tokenizes and the
+/// L0/L1 switches have no effect. Say so instead of ignoring them silently.
+pub(crate) fn warn_ignored_encoding_caches() {
+    for name in ignored_cache_switches(|name| std::env::var(name).ok()) {
+        tracing::warn!("{name} is ignored: HTTP worker pools do not tokenize in the router");
+    }
+}
+
+fn ignored_cache_switches(read: impl Fn(&str) -> Option<String>) -> Vec<&'static str> {
+    ["VLLM_ROUTER_L0_CACHE", "VLLM_ROUTER_L1_CACHE"]
+        .into_iter()
+        .filter(|name| !matches!(read(name).as_deref(), None | Some("" | "0" | "false")))
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ignored_cache_switches;
+
+    #[test]
+    fn http_pools_report_requested_cache_switches() {
+        let read = |values: &'static [(&'static str, &'static str)]| {
+            move |name: &str| {
+                values
+                    .iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| value.to_string())
+            }
+        };
+        assert!(ignored_cache_switches(read(&[])).is_empty());
+        assert!(ignored_cache_switches(read(&[("VLLM_ROUTER_L1_CACHE", "0")])).is_empty());
+        assert_eq!(
+            ignored_cache_switches(read(&[
+                ("VLLM_ROUTER_L0_CACHE", "1"),
+                ("VLLM_ROUTER_L1_CACHE", "true"),
+            ])),
+            ["VLLM_ROUTER_L0_CACHE", "VLLM_ROUTER_L1_CACHE"]
+        );
     }
 }

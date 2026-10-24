@@ -1,4 +1,5 @@
-//! Shared prompt encoding cache.
+//! Shared prompt encoding caches: exact-match L0, then prefix L1.
+use std::cell::Cell;
 use std::mem::size_of;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Once};
@@ -8,6 +9,7 @@ use vllm_text::backend::hf::{ResolvedModelFiles, TokenizerSource};
 use vllm_text::Prompt;
 use vllm_tokenizer::DynTokenizer;
 
+use super::l1_cache::{L1Bypass, L1Encoder};
 use crate::tokenizer::cache::{entry_overhead_bytes, EncodeCache};
 use crate::tokenizer::TokenizerCacheConfig;
 
@@ -26,9 +28,17 @@ pub(crate) type FrontendCache = EncodeCache<EncodingKey, Arc<[u32]>>;
 pub(crate) struct PromptEncoder {
     tokenizer: DynTokenizer,
     cache: Option<Arc<FrontendCache>>,
+    l1: Option<L1Encoder>,
     instance: u64,
     model_id: Arc<str>,
     oversized_warning: Arc<Once>,
+}
+
+/// Prompt IDs and how many of them came from L0 or L1.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Encoded {
+    pub ids: Arc<[u32]>,
+    pub cached_tokens: usize,
 }
 
 impl PromptEncoder {
@@ -42,6 +52,7 @@ impl PromptEncoder {
         Self {
             tokenizer,
             cache,
+            l1: None,
             // Clones share an ID; new instances get distinct IDs.
             instance: NEXT_INSTANCE.fetch_add(1, Ordering::Relaxed),
             model_id: Arc::from(model_id),
@@ -49,21 +60,44 @@ impl PromptEncoder {
         }
     }
 
+    pub(crate) fn with_l1_cache(mut self, l1: Option<L1Encoder>) -> Self {
+        self.l1 = l1;
+        self
+    }
+
+    #[cfg(test)]
     pub(crate) fn encode(
         &self,
         prompt: Prompt,
         add_special_tokens: bool,
         cache_salt: Option<&str>,
     ) -> vllm_tokenizer::Result<Arc<[u32]>> {
+        self.encode_detailed(prompt, add_special_tokens, cache_salt)
+            .map(|encoded| encoded.ids)
+    }
+
+    /// L0 exact match first, then L1 prefix reuse, then the tokenizer.
+    /// An L0 hit returns the cached `Arc` directly.
+    pub(crate) fn encode_detailed(
+        &self,
+        prompt: Prompt,
+        add_special_tokens: bool,
+        cache_salt: Option<&str>,
+    ) -> vllm_tokenizer::Result<Encoded> {
         let text = match prompt {
-            Prompt::TokenIds(ids) => return Ok(Arc::from(ids)),
+            Prompt::TokenIds(ids) => {
+                if let Some(l1) = &self.l1 {
+                    l1.record_bypass(L1Bypass::TokenIds);
+                }
+                return Ok(Encoded {
+                    ids: Arc::from(ids),
+                    cached_tokens: 0,
+                });
+            }
             Prompt::Text(text) => text,
         };
         let Some(cache) = &self.cache else {
-            return self
-                .tokenizer
-                .encode(&text, add_special_tokens)
-                .map(Arc::from);
+            return self.encode_text(&text, add_special_tokens, cache_salt);
         };
         let key = EncodingKey {
             instance: self.instance,
@@ -71,12 +105,13 @@ impl PromptEncoder {
             cache_salt: cache_salt.map(str::to_owned),
             text,
         };
-        cache.get_or_encode(
+        let l1_cached = Cell::new(None);
+        let ids = cache.get_or_encode(
             &key,
             || {
-                self.tokenizer
-                    .encode(&key.text, add_special_tokens)
-                    .map(Arc::from)
+                let encoded = self.encode_text(&key.text, add_special_tokens, cache_salt)?;
+                l1_cached.set(Some(encoded.cached_tokens));
+                Ok(encoded.ids)
             },
             |ids| {
                 let bytes = entry_overhead_bytes::<EncodingKey, Arc<[u32]>>()
@@ -98,7 +133,35 @@ impl PromptEncoder {
                 }
                 bytes
             },
-        )
+        )?;
+        // The closure only runs on an L0 miss.
+        let cached_tokens = l1_cached.get().unwrap_or(ids.len());
+        Ok(Encoded { ids, cached_tokens })
+    }
+
+    fn encode_text(
+        &self,
+        text: &str,
+        add_special_tokens: bool,
+        cache_salt: Option<&str>,
+    ) -> vllm_tokenizer::Result<Encoded> {
+        if let Some(l1) = &self.l1 {
+            // BOS/EOS post-processing is not prefix-stable, so L1 skips it.
+            if add_special_tokens {
+                l1.record_bypass(L1Bypass::AddSpecialTokens);
+            } else if let Some((ids, cached_tokens)) =
+                l1.encode(self.tokenizer.as_ref(), self.instance, text, cache_salt)?
+            {
+                return Ok(Encoded {
+                    ids: Arc::from(ids),
+                    cached_tokens,
+                });
+            }
+        }
+        Ok(Encoded {
+            ids: Arc::from(self.tokenizer.encode(text, add_special_tokens)?),
+            cached_tokens: 0,
+        })
     }
 }
 
@@ -114,7 +177,7 @@ pub(crate) async fn deterministic_model(model: &str) -> Result<bool> {
     }
 }
 
-fn deterministic_hf_model(model: &serde_json::Value) -> bool {
+pub(crate) fn deterministic_hf_model(model: &serde_json::Value) -> bool {
     match model["type"].as_str() {
         Some("BPE") => model["dropout"].is_null() || model["dropout"].as_f64() == Some(0.0),
         // Normal encode does not sample.

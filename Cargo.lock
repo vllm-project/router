@@ -7410,6 +7410,7 @@ dependencies = [
 name = "vllm_router_rs"
 version = "0.1.16"
 dependencies = [
+ "aho-corasick",
  "anyhow",
  "async-channel 2.5.0",
  "async-trait",
