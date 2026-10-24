@@ -83,6 +83,7 @@ pub struct ProgramTarget {
 /// Immutable proof that one retained request was admitted to a target.
 #[derive(Debug, Clone)]
 pub struct ProgramDispatch {
+    attempt_id: u64,
     program: ProgramRef,
     /// Target selected by the accepted admission or resume transition.
     pub target_id: String,
@@ -99,6 +100,7 @@ impl ProgramDispatch {
     /// Construct a dispatch after admission has atomically committed.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
+        attempt_id: u64,
         program: ProgramRef,
         target_id: String,
         placement_epoch: u64,
@@ -110,6 +112,7 @@ impl ProgramDispatch {
         request_hints: ProgramRequestHints,
     ) -> Self {
         Self {
+            attempt_id,
             program,
             target_id,
             placement_epoch,
@@ -120,6 +123,11 @@ impl ProgramDispatch {
             routing_text,
             request_hints,
         }
+    }
+
+    /// Unique Router-owned attempt, fencing duplicate completion within a placement.
+    pub fn attempt_id(&self) -> u64 {
+        self.attempt_id
     }
 
     /// Exact Program generation associated with this request attempt.

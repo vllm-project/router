@@ -120,8 +120,49 @@ fn default_intra_node_data_parallel_size() -> usize {
 /// This is intentionally separate from request-level `PolicyConfig`. The
 /// binding policy is evaluated once for a new Program generation; admission
 /// and resume remain ProgramScheduler decisions.
+/// First rollout of RFC-PD-PROGRAM-SCHEDULING: one-way remote execution.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct PdProgramSchedulingConfig {
+    pub enabled: bool,
+    /// Event residency is advisory and never authorizes a warm transfer.
+    pub kv_events: bool,
+    pub kv_hash_mode: String,
+    pub max_prefill_requests_per_target: usize,
+    /// Only bounded explicit TTL is supported; otherwise Acting TTL is zero.
+    pub explicit_ttl: bool,
+    /// Treat native D occupancy and Program reservations as overlapping
+    /// observations of the same KV instead of adding them. Enabled by default
+    /// so a Program's KV is not charged twice.
+    pub exclusive_capacity_accounting: bool,
+    /// P KV-cache usage watermark at or above which the Program-count cap
+    /// tightens back to the configured P prefill permit count. This keeps the
+    /// exclusive accounting from over-admitting into a pressured P cache.
+    /// Zero disables the guard.
+    pub prefill_kv_high_watermark: f64,
+    /// P KV-cache sampling window in seconds for the guard above.
+    pub prefill_kv_window_seconds: f64,
+}
+
+impl Default for PdProgramSchedulingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            kv_events: false,
+            kv_hash_mode: "sha256".to_string(),
+            max_prefill_requests_per_target: 1,
+            explicit_ttl: false,
+            exclusive_capacity_accounting: true,
+            prefill_kv_high_watermark: 0.85,
+            prefill_kv_window_seconds: 10.0,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct ProgramSchedulingConfig {
+    #[serde(default)]
+    pub pd: PdProgramSchedulingConfig,
     /// Metadata source that opts an individual request into Program scheduling.
     #[serde(
         default,
@@ -264,6 +305,7 @@ impl ProgramSchedulingConfig {
 impl Default for ProgramSchedulingConfig {
     fn default() -> Self {
         Self {
+            pd: PdProgramSchedulingConfig::default(),
             enable_key: ProgramSchedulingEnableKey::default(),
             binding_only: false,
             global_queue: false,
@@ -299,6 +341,8 @@ impl Default for ProgramSchedulingConfig {
 
 #[derive(Deserialize)]
 struct ProgramSchedulingConfigInput {
+    #[serde(default)]
+    pd: PdProgramSchedulingConfig,
     #[serde(
         default,
         rename = "program_scheduling_enable_key",
@@ -435,6 +479,7 @@ impl<'de> Deserialize<'de> for ProgramSchedulingConfig {
         };
 
         Ok(Self {
+            pd: input.pd,
             enable_key: input.enable_key,
             binding_only: input.binding_only,
             global_queue: input.global_queue,
@@ -474,7 +519,9 @@ fn default_program_hash_virtual_nodes() -> u32 {
 }
 
 fn default_program_max_active_programs_per_target() -> usize {
-    64
+    // Zero means auto: two Programs per configured P prefill permit (the
+    // configured proxy for decode slots), clamped to [4, 64].
+    0
 }
 
 fn default_program_metrics_interval_seconds() -> f64 {
@@ -482,7 +529,11 @@ fn default_program_metrics_interval_seconds() -> f64 {
 }
 
 fn default_program_admission_waiting_request_threshold() -> usize {
-    1
+    // Zero means auto: `2 * max_prefill_requests_per_target`, clamped to
+    // [4, 64]. Gating admission on an empty D engine queue moves the queue
+    // from the engine into the Router; admit while the engine queue still has
+    // headroom instead.
+    0
 }
 
 fn default_program_queue_timeout_seconds() -> f64 {
@@ -1037,6 +1088,20 @@ mod tests {
         assert!(config.metrics.is_none());
         assert!(config.log_dir.is_none());
         assert!(config.log_level.is_none());
+    }
+
+    #[test]
+    fn test_pd_exclusive_capacity_accounting_defaults_and_parses() {
+        let default = ProgramSchedulingConfig::default();
+        assert!(default.pd.exclusive_capacity_accounting);
+        assert_eq!(default.pd.prefill_kv_high_watermark, 0.85);
+        assert_eq!(default.pd.prefill_kv_window_seconds, 10.0);
+
+        let parsed: ProgramSchedulingConfig =
+            serde_json::from_str(r#"{"pd":{"enabled":true,"exclusive_capacity_accounting":true}}"#)
+                .unwrap();
+        assert!(parsed.pd.enabled);
+        assert!(parsed.pd.exclusive_capacity_accounting);
     }
 
     #[test]

@@ -96,10 +96,21 @@ impl ProgramScheduler {
                     .fitted_acting_ttl(factors, cache_miss_impact_seconds)
             })
             .unwrap_or_default();
-        let acting_ttl = dispatch
+        let mut acting_ttl = dispatch
             .request_hints()
             .kv_retention_ttl
             .unwrap_or(policy_acting_ttl);
+        if self.config.pd_mode {
+            acting_ttl = if self.config.pd_explicit_ttl {
+                dispatch
+                    .request_hints()
+                    .kv_retention_ttl
+                    .unwrap_or_default()
+                    .min(self.config.progress_ttl.max_acting_ttl)
+            } else {
+                std::time::Duration::ZERO
+            };
+        }
         let ttl_window_samples = state
             .rank_factors
             .get(&target_id)
@@ -115,6 +126,10 @@ impl ProgramScheduler {
             return;
         }
         let runtime_after = state.runtime.view(dispatch.program());
+        let next_output_reservation = state
+            .runtime
+            .front_request_hints(dispatch.program())
+            .and_then(|h| h.expected_output_tokens);
 
         // A retained successor continues the same reasoning placement. Match
         // the historical Router behavior by cancelling a deferred capacity
@@ -190,7 +205,11 @@ impl ProgramScheduler {
                     decision.ttl_pause_sampled_segment_rounds = 0;
                     decision.segment_started_at = Some(dispatch.dispatched_at());
                     if freshness_due {
-                        decision.shared_prefix_tokens = explicitly_observed_cache_tokens;
+                        decision.shared_prefix_tokens = if self.config.pd_mode {
+                            0
+                        } else {
+                            explicitly_observed_cache_tokens
+                        };
                         decision.shared_prefix_observed = true;
                         decision.shared_prefix_fresh_until =
                             Some(decision.shared_prefix_freshness_anchor_at + freshness);
@@ -305,7 +324,11 @@ impl ProgramScheduler {
                     "Program scheduling diagnostic"
                 );
             }
-            decision.output_token_reservation = None;
+            decision.output_token_reservation = if self.config.pd_mode {
+                next_output_reservation
+            } else {
+                None
+            };
         }
         if state
             .runtime
@@ -320,6 +343,18 @@ impl ProgramScheduler {
                 accounted_tokens_after - accounted_tokens_before,
             );
         }
+        // The retained successor is now the Program's front turn. Promote its
+        // request-scoped context before the next admission or capacity check,
+        // so an over-capacity successor is re-admitted (or paused/requeued)
+        // instead of dispatching on the finished turn's smaller estimate.
+        if let Some(context_tokens) = state.runtime.front_request_context(dispatch.program()) {
+            if let Some(decision) = state.decisions.get_mut(dispatch.program()) {
+                if context_tokens > decision.estimated_context_tokens {
+                    decision.estimated_context_tokens = context_tokens;
+                    decision.context_shrink_observations = 0;
+                }
+            }
+        }
         if let Some(sample) = request_sample {
             state
                 .rank_factors
@@ -332,6 +367,9 @@ impl ProgramScheduler {
         }
         if !self.config.binding_only {
             self.yield_completed_segment(&mut state, dispatch.program(), now);
+        }
+        if self.config.pd_mode {
+            state.runtime.notify_front(dispatch.program());
         }
         self.run_periodic_decisions(&mut state, now);
     }

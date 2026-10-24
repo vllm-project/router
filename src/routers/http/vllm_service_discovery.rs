@@ -53,8 +53,11 @@ pub struct MoriIOServiceRegistration {
     pub transfer_mode: String, // "READ" or "WRITE"
     #[serde(default = "default_one")]
     pub tp_size: usize,
-    #[serde(default = "default_one")]
-    pub dp_size: usize,
+    /// `None` when the registration did not report a DP size. Preserve that
+    /// distinction so discovery can fall back to the configured size only when
+    /// the engine did not provide one.
+    #[serde(default)]
+    pub dp_size: Option<usize>,
 }
 
 fn default_one() -> usize {
@@ -78,6 +81,8 @@ pub struct ServiceInstance {
     pub expires_at: u64, // Unix timestamp
     pub tp_size: usize,
     pub dp_size: usize,
+    /// DP size explicitly reported by the registration, if it supplied one.
+    pub reported_dp_size: Option<usize>,
 }
 
 /// Service registry maintaining prefill and decode instances
@@ -92,6 +97,14 @@ pub struct ServiceRegistry {
 
 /// Deserialize a registration message according to the active KV connector.
 /// Returns the parsed `ServiceRegistration` and, for MoRI-IO, the validated transfer mode.
+type ParsedRegistration = (
+    ServiceRegistration,
+    Option<MoriIOTransferMode>,
+    usize,
+    usize,
+    Option<usize>,
+);
+
 /// Returns `None` if the message should be dropped (parse error, unknown mode, or
 /// transfer-mode mismatch). The caller is responsible for committing the transfer mode
 /// to the `OnceLock` only after the service type has been validated.
@@ -100,12 +113,7 @@ fn parse_registration(
     remote_address: &[u8],
     kv_connector: KvConnector,
     stored_transfer_mode: Option<MoriIOTransferMode>,
-) -> Option<(
-    ServiceRegistration,
-    Option<MoriIOTransferMode>,
-    usize,
-    usize,
-)> {
+) -> Option<ParsedRegistration> {
     if matches!(kv_connector, KvConnector::MoriIO) {
         let reg: MoriIOServiceRegistration = match rmp_serde::from_slice(message_data) {
             Ok(r) => r,
@@ -137,10 +145,16 @@ fn parse_registration(
                 return None;
             }
         }
-        Some((reg.base, Some(mode), reg.tp_size, reg.dp_size))
+        Some((
+            reg.base,
+            Some(mode),
+            reg.tp_size,
+            reg.dp_size.unwrap_or(1),
+            reg.dp_size,
+        ))
     } else {
         match rmp_serde::from_slice(message_data) {
-            Ok(data) => Some((data, None, 1, 1)),
+            Ok(data) => Some((data, None, 1, 1, None)),
             Err(e) => {
                 warn!("Failed to parse service registration: {}", e);
                 None
@@ -252,7 +266,7 @@ impl ServiceRegistry {
         kv_connector: KvConnector,
         moriio_transfer_mode: &Arc<OnceLock<MoriIOTransferMode>>,
     ) {
-        let (data, parsed_mode, tp_size, dp_size) = match parse_registration(
+        let (data, parsed_mode, tp_size, dp_size, reported_dp_size) = match parse_registration(
             message_data,
             remote_address,
             kv_connector,
@@ -272,6 +286,7 @@ impl ServiceRegistry {
             expires_at: current_time + DEFAULT_PING_SECONDS,
             tp_size,
             dp_size,
+            reported_dp_size,
         };
 
         let remote_addr_str = String::from_utf8_lossy(remote_address);
@@ -398,6 +413,7 @@ impl ServiceRegistry {
             expires_at: current_time + DEFAULT_PING_SECONDS,
             tp_size: 1,
             dp_size: 1,
+            reported_dp_size: None,
         };
 
         match service_type {
@@ -420,6 +436,39 @@ impl ServiceRegistry {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn register_test_instance(
+        &self,
+        http_address: String,
+        zmq_address: String,
+        service_type: ServiceType,
+        tp_size: usize,
+        dp_size: usize,
+        reported_dp_size: Option<usize>,
+    ) {
+        let instance = ServiceInstance {
+            zmq_address,
+            expires_at: u64::MAX,
+            tp_size,
+            dp_size,
+            reported_dp_size,
+        };
+        match service_type {
+            ServiceType::Prefill => {
+                self.prefill_instances
+                    .lock()
+                    .unwrap()
+                    .insert(http_address, instance);
+            }
+            ServiceType::Decode => {
+                self.decode_instances
+                    .lock()
+                    .unwrap()
+                    .insert(http_address, instance);
+            }
+        }
+    }
+
     /// Get tp_size and dp_size for a given HTTP address (from registration payload).
     pub fn get_tp_dp_size(&self, http_address: &str, service_type: ServiceType) -> (usize, usize) {
         let instances = match service_type {
@@ -431,6 +480,22 @@ impl ServiceRegistry {
             .get(http_address)
             .map(|i| (i.tp_size, i.dp_size))
             .unwrap_or((1, 1))
+    }
+
+    /// Get the DP size explicitly supplied by the registration, if any.
+    /// This distinguishes an explicit `dp_size=1` from an unreported size so
+    /// callers can apply the configured fallback only when it is unknown.
+    pub fn get_reported_dp_size(
+        &self,
+        http_address: &str,
+        service_type: ServiceType,
+    ) -> Option<usize> {
+        let instances = match service_type {
+            ServiceType::Prefill => &self.prefill_instances,
+            ServiceType::Decode => &self.decode_instances,
+        };
+        let guard = instances.lock().unwrap();
+        guard.get(http_address).and_then(|i| i.reported_dp_size)
     }
 
     /// Get ZMQ address for a given HTTP address
@@ -490,14 +555,25 @@ mod tests {
     use super::*;
 
     fn make_moriio_msgpack(service_type: &str, transfer_mode: &str) -> Vec<u8> {
+        make_moriio_msgpack_with_dp(service_type, transfer_mode, None)
+    }
+
+    fn make_moriio_msgpack_with_dp(
+        service_type: &str,
+        transfer_mode: &str,
+        dp_size: Option<usize>,
+    ) -> Vec<u8> {
         // rmp_serde::to_vec_named produces msgpack — suitable for our deserializer.
-        rmp_serde::to_vec_named(&serde_json::json!({
+        let mut registration = serde_json::json!({
             "type": service_type,
             "http_address": "1.2.3.4:8000",
             "zmq_address": "host:1.2.3.4,handshake:6301,notify:61005",
             "transfer_mode": transfer_mode,
-        }))
-        .unwrap()
+        });
+        if let Some(dp_size) = dp_size {
+            registration["dp_size"] = serde_json::json!(dp_size);
+        }
+        rmp_serde::to_vec_named(&registration).unwrap()
     }
 
     #[test]
@@ -541,7 +617,58 @@ mod tests {
             Some(MoriIOTransferMode::Write),
         );
         assert!(result.is_some());
-        let (_, mode, _, _) = result.unwrap();
+        let (_, mode, _, _, _) = result.unwrap();
         assert_eq!(mode, Some(MoriIOTransferMode::Write));
+    }
+
+    #[test]
+    fn test_moriio_explicit_dp_size_is_reported() {
+        let bytes = make_moriio_msgpack_with_dp("D", "READ", Some(2));
+        let (_, _, _, dp_size, reported_dp_size) =
+            parse_registration(&bytes, b"peer", KvConnector::MoriIO, None).unwrap();
+        assert_eq!(dp_size, 2);
+        assert_eq!(reported_dp_size, Some(2));
+    }
+
+    #[test]
+    fn test_moriio_missing_dp_size_is_unreported() {
+        let bytes = make_moriio_msgpack_with_dp("D", "READ", None);
+        let (_, _, _, dp_size, reported_dp_size) =
+            parse_registration(&bytes, b"peer", KvConnector::MoriIO, None).unwrap();
+        assert_eq!(dp_size, 1);
+        assert_eq!(reported_dp_size, None);
+    }
+
+    #[test]
+    fn test_registry_preserves_explicit_dp_size() {
+        let registry = ServiceRegistry::new();
+        registry.decode_instances.lock().unwrap().insert(
+            "d".into(),
+            ServiceInstance {
+                zmq_address: "d-zmq".into(),
+                expires_at: u64::MAX,
+                tp_size: 1,
+                dp_size: 2,
+                reported_dp_size: Some(2),
+            },
+        );
+        assert_eq!(
+            registry.get_reported_dp_size("d", ServiceType::Decode),
+            Some(2)
+        );
+        registry.decode_instances.lock().unwrap().insert(
+            "unknown".into(),
+            ServiceInstance {
+                zmq_address: "u-zmq".into(),
+                expires_at: u64::MAX,
+                tp_size: 1,
+                dp_size: 1,
+                reported_dp_size: None,
+            },
+        );
+        assert_eq!(
+            registry.get_reported_dp_size("unknown", ServiceType::Decode),
+            None
+        );
     }
 }

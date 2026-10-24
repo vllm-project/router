@@ -71,6 +71,16 @@ pub struct ProgramIdentity {
 }
 
 impl ProgramIdentity {
+    /// Reserve at least the wire output limit, regardless of a smaller hint.
+    pub(crate) fn reserve_pd_output(&mut self, wire_limit: usize) {
+        self.request_hints.expected_output_tokens = Some(
+            self.request_hints
+                .expected_output_tokens
+                .unwrap_or(0)
+                .max(wire_limit),
+        );
+    }
+
     pub(crate) fn for_rebinding(
         reference: &super::ProgramRef,
         placement_hash_key: String,
