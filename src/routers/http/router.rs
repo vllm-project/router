@@ -36,7 +36,7 @@ use axum::{
 use futures_util::StreamExt;
 use parking_lot::Mutex;
 use reqwest::Client;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -44,6 +44,33 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, error, info, warn};
+
+/// Hop-by-hop request headers (RFC 9110 §7.6.1): they describe the client's
+/// connection to the router and must not be forwarded to the worker.
+const HOP_BY_HOP_REQUEST_HEADERS: &[&str] = &[
+    "connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+];
+
+/// Lowercased field names listed in the request's Connection headers, which
+/// are hop-by-hop for this request as well. A set keeps matching linear in
+/// the number of headers even when Connection lists many options.
+fn connection_listed_headers(headers: &HeaderMap) -> HashSet<String> {
+    headers
+        .get_all(http::header::CONNECTION)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .map(|token| token.trim().to_ascii_lowercase())
+        .filter(|token| !token.is_empty())
+        .collect()
+}
 
 fn prepare_error_status(error: &PrepareError) -> StatusCode {
     match error {
@@ -2818,27 +2845,34 @@ impl RouterTrait for Router {
             request_builder = request_builder.json(&body);
         }
 
-        // Add authorization if configured
-        if self.epd.is_some() {
-            if let Some(headers) = headers {
-                for (name, value) in headers {
-                    // When a backend api_key is configured it must win:
-                    // RequestBuilder::header appends, and vLLM reads the
-                    // first Authorization value.
-                    if self.api_key.is_some() && name == http::header::AUTHORIZATION {
-                        continue;
-                    }
-                    if !matches!(
-                        name.as_str(),
-                        "host"
-                            | "content-length"
-                            | "content-type"
-                            | "connection"
-                            | "transfer-encoding"
-                    ) && !header_utils::TRACE_HEADER_NAMES.contains(&name.as_str())
-                    {
-                        request_builder = request_builder.header(name, value);
-                    }
+        // Forward the client's headers (e.g. Authorization, anthropic-version)
+        // like the typed routes do, in every mode rather than only EPD.
+        if let Some(headers) = headers {
+            let connection_listed = connection_listed_headers(headers);
+            for (name, value) in headers {
+                // Hop-by-hop headers, including any the client named in
+                // Connection, end at the router.
+                if HOP_BY_HOP_REQUEST_HEADERS.contains(&name.as_str())
+                    || connection_listed.contains(name.as_str())
+                {
+                    continue;
+                }
+                // When a backend api_key is configured it must win:
+                // RequestBuilder::header appends, and vLLM reads the
+                // first Authorization value.
+                if self.api_key.is_some() && name == http::header::AUTHORIZATION {
+                    continue;
+                }
+                // When the router selects a DP rank, it owns the
+                // X-data-parallel-rank header: skip any client-supplied
+                // value so the worker sees exactly one rank (ours).
+                if worker.dp_rank().is_some() && name.as_str() == "x-data-parallel-rank" {
+                    continue;
+                }
+                if !matches!(name.as_str(), "host" | "content-length" | "content-type")
+                    && !header_utils::TRACE_HEADER_NAMES.contains(&name.as_str())
+                {
+                    request_builder = request_builder.header(name, value);
                 }
             }
         }
@@ -3014,6 +3048,269 @@ impl RouterTrait for Router {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    /// Start a worker that echoes every request header value it receives and
+    /// return a router whose only worker is that echo server.
+    async fn header_echo_router(
+        api_key: Option<&str>,
+        epd: bool,
+        dp_rank: Option<usize>,
+    ) -> (Router, tokio::task::JoinHandle<()>) {
+        let app = axum::Router::new().fallback(|headers: HeaderMap| async move {
+            let echoed: Vec<(String, String)> = headers
+                .iter()
+                .map(|(name, value)| (name.to_string(), value.to_str().unwrap().to_string()))
+                .collect();
+            Json(echoed)
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut router = create_test_regular_router();
+        router.worker_registry = Arc::new(WorkerRegistry::new());
+        let worker: Arc<dyn Worker> = match dp_rank {
+            Some(rank) => Arc::new(DPAwareWorker::new(url, rank, 2, WorkerType::Regular)),
+            None => Arc::new(BasicWorker::new(url, WorkerType::Regular)),
+        };
+        router.worker_registry.register(worker);
+        router.api_key = api_key.map(str::to_string);
+        if epd {
+            router.epd = Some(super::super::epd::EncoderStage::new(
+                crate::config::EpdConfig {
+                    encoder_urls: vec!["http://unused".into()],
+                    consumer_zmq_addrs: Default::default(),
+                },
+            ));
+        }
+        (router, server)
+    }
+
+    fn client_request_headers() -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer client-key".parse().unwrap());
+        headers.insert("anthropic-version", "2023-06-01".parse().unwrap());
+        headers.insert("x-custom-tenant", "tenant-a".parse().unwrap());
+        headers.insert("x-data-parallel-rank", "0".parse().unwrap());
+        headers.insert("host", "client.example".parse().unwrap());
+        headers.insert("content-length", "999".parse().unwrap());
+        headers.insert("content-type", "text/plain".parse().unwrap());
+        headers.insert(
+            "traceparent",
+            "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"
+                .parse()
+                .unwrap(),
+        );
+        headers
+    }
+
+    async fn transparent_echoed_headers(
+        router: &Router,
+        path: &str,
+    ) -> HashMap<String, Vec<String>> {
+        transparent_echoed_headers_for(router, path, &client_request_headers()).await
+    }
+
+    async fn transparent_echoed_headers_for(
+        router: &Router,
+        path: &str,
+        headers: &HeaderMap,
+    ) -> HashMap<String, Vec<String>> {
+        let response = router
+            .route_transparent(
+                Some(headers),
+                path,
+                &Method::POST,
+                serde_json::json!({"model": "m", "messages": [], "input": "hi"}),
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::OK, "{path}");
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let pairs: Vec<(String, String)> = serde_json::from_slice(&bytes).unwrap();
+        let mut echoed: HashMap<String, Vec<String>> = HashMap::new();
+        for (name, value) in pairs {
+            echoed.entry(name).or_default().push(value);
+        }
+        echoed
+    }
+
+    fn header_values<'a>(echoed: &'a HashMap<String, Vec<String>>, name: &str) -> Vec<&'a str> {
+        echoed
+            .get(name)
+            .map(|values| values.iter().map(String::as_str).collect())
+            .unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn test_route_transparent_forwards_client_headers_in_all_modes() {
+        for epd in [false, true] {
+            let (router, server) = header_echo_router(None, epd, None).await;
+            let paths: &[&str] = if epd {
+                &["/v1/chat/completions"]
+            } else {
+                &["/v1/responses", "/v1/messages", "/custom"]
+            };
+            for path in paths {
+                let echoed = transparent_echoed_headers(&router, path).await;
+                let context = format!("epd={epd} {path}: {echoed:?}");
+                assert_eq!(
+                    header_values(&echoed, "authorization"),
+                    ["Bearer client-key"],
+                    "{context}"
+                );
+                assert_eq!(
+                    header_values(&echoed, "anthropic-version"),
+                    ["2023-06-01"],
+                    "{context}"
+                );
+                assert_eq!(
+                    header_values(&echoed, "x-custom-tenant"),
+                    ["tenant-a"],
+                    "{context}"
+                );
+                // Still filtered: the router sets its own Host, body framing
+                // and JSON content type, and propagates trace context once.
+                assert_ne!(
+                    header_values(&echoed, "host"),
+                    ["client.example"],
+                    "{context}"
+                );
+                assert_eq!(
+                    header_values(&echoed, "content-type"),
+                    ["application/json"],
+                    "{context}"
+                );
+                assert_ne!(
+                    header_values(&echoed, "content-length"),
+                    ["999"],
+                    "{context}"
+                );
+                assert_eq!(header_values(&echoed, "traceparent").len(), 1, "{context}");
+            }
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn test_route_transparent_router_api_key_overrides_client_authorization() {
+        for epd in [false, true] {
+            let (router, server) = header_echo_router(Some("router-key"), epd, None).await;
+            let path = if epd {
+                "/v1/chat/completions"
+            } else {
+                "/v1/messages"
+            };
+            let echoed = transparent_echoed_headers(&router, path).await;
+            let context = format!("epd={epd} {path}: {echoed:?}");
+            assert_eq!(
+                header_values(&echoed, "authorization"),
+                ["Bearer router-key"],
+                "{context}"
+            );
+            assert_eq!(
+                header_values(&echoed, "anthropic-version"),
+                ["2023-06-01"],
+                "{context}"
+            );
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn test_route_transparent_drops_hop_by_hop_request_headers() {
+        let mut headers = client_request_headers();
+        headers.insert(
+            "proxy-authorization",
+            "Basic cHJveHk6c2VjcmV0".parse().unwrap(),
+        );
+        headers.insert("keep-alive", "timeout=5".parse().unwrap());
+        headers.insert("te", "trailers".parse().unwrap());
+        headers.insert("trailer", "x-checksum".parse().unwrap());
+        headers.insert("upgrade", "h2c".parse().unwrap());
+        // Two Connection headers; the listed names differ in case and
+        // spacing from the actual header names.
+        headers.append("connection", "keep-alive, X-Private-Hop".parse().unwrap());
+        headers.append("connection", " Upgrade ,x-other-hop".parse().unwrap());
+        headers.insert("x-private-hop", "private".parse().unwrap());
+        headers.insert("x-other-hop", "other".parse().unwrap());
+        for router_configured in [false, true] {
+            for epd in [false, true] {
+                let (router, server) =
+                    header_echo_router(router_configured.then_some("router-key"), epd, None).await;
+                let paths: &[&str] = if epd {
+                    &["/v1/chat/completions"]
+                } else {
+                    &["/v1/messages", "/custom"]
+                };
+                for path in paths {
+                    let echoed = transparent_echoed_headers_for(&router, path, &headers).await;
+                    let context = format!(
+                        "router_configured={router_configured} epd={epd} {path}: {echoed:?}"
+                    );
+                    for dropped in [
+                        "proxy-authorization",
+                        "connection",
+                        "keep-alive",
+                        "te",
+                        "trailer",
+                        "upgrade",
+                        "x-private-hop",
+                        "x-other-hop",
+                    ] {
+                        assert!(
+                            header_values(&echoed, dropped).is_empty(),
+                            "{dropped} forwarded; {context}"
+                        );
+                    }
+                    let expected_bearer = if router_configured {
+                        "Bearer router-key"
+                    } else {
+                        "Bearer client-key"
+                    };
+                    assert_eq!(
+                        header_values(&echoed, "authorization"),
+                        [expected_bearer],
+                        "{context}"
+                    );
+                    assert_eq!(
+                        header_values(&echoed, "anthropic-version"),
+                        ["2023-06-01"],
+                        "{context}"
+                    );
+                    assert_eq!(
+                        header_values(&echoed, "x-custom-tenant"),
+                        ["tenant-a"],
+                        "{context}"
+                    );
+                }
+                server.abort();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_route_transparent_router_dp_rank_overrides_client_dp_rank() {
+        for epd in [false, true] {
+            let (router, server) = header_echo_router(None, epd, Some(1)).await;
+            let path = if epd {
+                "/v1/chat/completions"
+            } else {
+                "/v1/responses"
+            };
+            let echoed = transparent_echoed_headers(&router, path).await;
+            let context = format!("epd={epd} {path}: {echoed:?}");
+            assert_eq!(
+                header_values(&echoed, "x-data-parallel-rank"),
+                ["1"],
+                "{context}"
+            );
+            assert_eq!(
+                header_values(&echoed, "authorization"),
+                ["Bearer client-key"],
+                "{context}"
+            );
+            server.abort();
+        }
+    }
 
     fn create_test_regular_router() -> Router {
         // Create registries
