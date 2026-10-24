@@ -1,3 +1,5 @@
+#![cfg(all(feature = "cpu", feature = "ready"))]
+
 // Integration test to ensure benchmarks compile and basic functionality works
 // This prevents benchmarks from breaking in CI
 //

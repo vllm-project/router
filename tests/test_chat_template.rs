@@ -1,4 +1,6 @@
-#[cfg(test)]
+#![cfg(all(feature = "cpu", feature = "ready"))]
+
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use vllm_router_rs::tokenizer::chat_template::{ChatMessage, ChatTemplateProcessor};
 

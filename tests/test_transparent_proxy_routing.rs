@@ -1,3 +1,5 @@
+#![cfg(all(feature = "cpu", feature = "ready"))]
+
 //! Tests for transparent proxy routing with headers and availability filtering.
 //!
 //! These tests verify the fixes to route_transparent() across router
@@ -7,7 +9,7 @@
 //!   3. The inline header conversion pattern (used in vllm_pd_router) matches
 //!      the Router::headers_to_request_headers() output
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod transparent_proxy_routing_tests {
     use std::collections::HashMap;
     use std::collections::HashSet;

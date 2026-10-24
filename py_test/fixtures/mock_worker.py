@@ -183,7 +183,7 @@ def create_app(args: argparse.Namespace) -> FastAPI:
 
         now = time.time()
         ret = {
-            "id": f"cmpl-{int(now*1000)}",
+            "id": f"cmpl-{int(now * 1000)}",
             "object": "text_completion",
             "created": int(now),
             "model": "mock",

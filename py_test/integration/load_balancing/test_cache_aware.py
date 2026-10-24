@@ -5,6 +5,8 @@ import uuid
 import pytest
 import requests
 
+pytestmark = [pytest.mark.ready, pytest.mark.cpu]
+
 
 @pytest.mark.integration
 def test_cache_aware_affinity(mock_workers, router_manager):

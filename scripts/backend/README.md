@@ -238,12 +238,12 @@ are not a forever ban on a gRPC text prompt.
 
 ```bash
 # always-on, in-process mock (no GPU, no vllm-rs)
-cargo test --test grpc_vs_http_e2e
-cargo test --lib backend::
+cargo test --features cpu,ready --test grpc_vs_http_e2e
+cargo test --features cpu,ready --lib backend::
 
 # optional: rust vllm-chat ids vs Python vLLM (skips if unset)
 export VLLM_ROUTER_MODEL=/path/to/hf-model   # tokenizer.json required
-cargo test --lib vllm_chat_tokenize_matches_python_vllm -- --nocapture
+cargo test --features cpu,ready --lib vllm_chat_tokenize_matches_python_vllm -- --nocapture
 ```
 
 `tests/python_vllm_chat_ids.py` is a helper spawned by the preprocess

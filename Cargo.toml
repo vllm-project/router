@@ -104,6 +104,12 @@ vllm-chat = { git = "https://github.com/vllm-project/vllm", tag = "v0.29.0" }
 vllm-tokenizer = { git = "https://github.com/vllm-project/vllm", tag = "v0.29.0" }
 vllm-text = { git = "https://github.com/vllm-project/vllm", tag = "v0.29.0" }
 
+[features]
+# Every Rust test file is gated on these. `cargo test` compiles a group
+# only when its features are passed, for example `--features cpu,ready`.
+cpu = []
+ready = []
+
 [dev-dependencies]
 libc = "0.2"
 criterion = { version = "0.5", features = ["html_reports"] }

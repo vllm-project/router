@@ -493,7 +493,7 @@ fn estimate_hf_bytes(encoding: &tokenizers::tokenizer::Encoding) -> usize {
     tokens + token_text + overflowing + sequence_ranges
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
 impl CachedTokenizer {
     /// Recompute retained bytes from the entries, to check the running total.
     fn recomputed_bytes(&self) -> usize {
@@ -507,7 +507,7 @@ impl CachedTokenizer {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use super::*;
     use crate::tokenizer::mock::MockTokenizer;

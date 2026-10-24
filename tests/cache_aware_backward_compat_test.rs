@@ -1,3 +1,5 @@
+#![cfg(all(feature = "cpu", feature = "ready"))]
+
 use std::collections::HashMap;
 use std::sync::Arc;
 use vllm_router_rs::core::{BasicWorker, Worker, WorkerType};

@@ -412,7 +412,7 @@ struct RuntimeProgram {
     in_flight_requests: usize,
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use super::*;
     use serde_json::json;

@@ -1,3 +1,5 @@
+#![cfg(all(feature = "cpu", feature = "ready"))]
+
 use vllm_router_rs::kv_index::{parse_endpoint_mapping, resolve_endpoints};
 
 #[test]

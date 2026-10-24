@@ -25,26 +25,37 @@ repos:
         name: cargo clippy
         args: ['--all-targets', '--all-features', '--', '-D', 'warnings']
 
-  # Python formatting with black
-  - repo: https://github.com/psf/black
-    rev: 24.2.0
-    hooks:
-      - id: black
-        language_version: python3.12
-        files: ^(py_src|py_test)/.*\.py$
-
-  # Python linting with ruff
+  # Ruff lint + format. Same shape as vllm-omni: a py3 wheel, no
+  # language_version pin. Rev matches CI's ruff==0.16.0.
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.3.0
+    rev: v0.16.0
     hooks:
-      - id: ruff
+      - id: ruff-check
         args: ['--fix', '--exit-non-zero-on-fix']
         files: ^(py_src|py_test)/.*\.py$
+      - id: ruff-format
+        files: ^(py_src|py_test)/.*\.py$
 
-  # Python type checking
-  - repo: https://github.com/pre-commit/mirrors-mypy
-    rev: v1.9.0
+  # Test marks: Python level + machine marks, Rust level + machine features.
+  - repo: local
     hooks:
+      - id: check-mark
+        name: Ensure tests have CI level and machine marks
+        entry: python tools/pre_commit/check_test_marks.py
+        language: system
+        types_or: [python, rust]
+        files: ^(py_test/|src/|tests/).*\.(py|rs)$
+
+      # Install the universal mypy wheel into this hook's env. Do not use
+      # mirrors-mypy: that builds from source and needs a pinned interpreter.
       - id: mypy
+        name: Run mypy
+        entry: mypy
+        language: python
+        types_or: [python, pyi]
         files: ^py_src/.*\.py$
-        additional_dependencies: ['types-requests']
+        args: ['--ignore-missing-imports', '--scripts-are-modules']
+        require_serial: true
+        additional_dependencies:
+          - mypy==1.11.1
+          - types-requests

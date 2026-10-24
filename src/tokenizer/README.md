@@ -944,7 +944,7 @@ The `Encoding` enum must:
 - Byte-budget eviction and oversized bypass with real encodings
 - Decode and streaming through the `Tokenizer` wrapper
 - Concurrent access with eviction
-- `#[ignore]` TinyLlama repeat of the comparison plus the hash fixtures (`cargo test --test tokenizer_cache_integration -- --ignored`)
+- `#[ignore]` TinyLlama repeat of the comparison plus the hash fixtures (`cargo test --features cpu,ready --test tokenizer_cache_integration -- --ignored`)
 
 **Cache Metrics Tests (5 tests in tokenizer_cache_metrics.rs):**
 - Capturing `metrics::Recorder` checks the occupancy gauges sum over live instances, follow eviction, `clear()` and `Drop`, and stay consistent under concurrent inserts and clears, including a stalled publication that must not be overtaken by a later clear or by another instance's publication

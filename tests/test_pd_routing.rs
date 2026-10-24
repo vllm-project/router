@@ -1,4 +1,6 @@
-#[cfg(test)]
+#![cfg(all(feature = "cpu", feature = "ready"))]
+
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod test_pd_routing {
     use vllm_router_rs::config::{
         CircuitBreakerConfig, ConnectionMode, PolicyConfig, RetryConfig, RouterConfig, RoutingMode,

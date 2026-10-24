@@ -1,3 +1,5 @@
+#![cfg(all(feature = "cpu", feature = "ready"))]
+
 //! Synthetic event consumer using the shared index and read contract.
 use std::sync::Arc;
 use vllm_router_rs::{

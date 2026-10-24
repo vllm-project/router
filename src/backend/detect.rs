@@ -96,7 +96,7 @@ pub fn grpc_socket_addr(url: &str) -> Result<String, String> {
         .ok_or_else(|| format!("failed to parse grpc address from {url}"))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use super::*;
 

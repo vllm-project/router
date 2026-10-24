@@ -1,3 +1,5 @@
+#![cfg(all(feature = "cpu", feature = "ready"))]
+
 //! Integration tests for PolicyRegistry with RouterManager
 
 use std::collections::HashMap;

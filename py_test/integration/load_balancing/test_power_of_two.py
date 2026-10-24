@@ -5,6 +5,8 @@ import time
 import pytest
 import requests
 
+pytestmark = [pytest.mark.ready, pytest.mark.cpu]
+
 
 @pytest.mark.integration
 def test_power_of_two_prefers_less_loaded(mock_workers, router_manager):
