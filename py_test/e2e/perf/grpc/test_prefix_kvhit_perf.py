@@ -1,12 +1,13 @@
 """Live prefix-KV perf: launch stack from case JSON, then run bench waves.
 
   export GRPC_MODEL=/path/to/model
-  pytest py_test/e2e/perf/grpc --perf-case=rust_grpc -m perf
+  pytest py_test/e2e/perf/grpc --perf-case=rust_grpc
 """
 
 from __future__ import annotations
 
 import os
+import sys
 
 import pytest
 
@@ -23,7 +24,6 @@ def _case_ready() -> bool:
     return True
 
 
-@pytest.mark.perf
 @pytest.mark.skipif(
     not _case_ready(),
     reason="Set --perf-case and GRPC_MODEL (env or case JSON); or PERF_EXTERNAL+ROUTER_URL",
@@ -53,7 +53,7 @@ def test_prefix_kvhit_waves(
         requests=requests,
         run_idx=run_idx,
     )
-    bench_mod.maybe_write_result(
+    result_path = bench_mod.maybe_write_result(
         perf_settings,
         run_idx=run_idx,
         hit_rate=hit_rate,
@@ -61,3 +61,9 @@ def test_prefix_kvhit_waves(
         requests=requests,
         payload={**payload, "backend": perf_case.backend},
     )
+    if result_path is not None:
+        print(
+            f"[perf] wrote result: {result_path.resolve()}",
+            file=sys.stderr,
+            flush=True,
+        )

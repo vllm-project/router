@@ -11,7 +11,7 @@ Run a suite:
 
 ```bash
 export GRPC_MODEL=/path/to/model
-python -m pytest -sv py_test/e2e/perf/grpc --perf-case=rust_grpc -m perf
+python -m pytest -sv py_test/e2e/perf/grpc --perf-case=rust_grpc
 ```
 
 Additional perf suites can be added as siblings of `grpc/` without sharing fixtures.

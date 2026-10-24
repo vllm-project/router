@@ -8,7 +8,7 @@ Reference workload: Qwen3.8-27B (`vllm-rs serve` / `vllm serve` + `vllm-router` 
 ## Flow
 
 ```text
-pytest py_test/e2e/perf/grpc --perf-case=rust_grpc -m perf
+pytest py_test/e2e/perf/grpc --perf-case=rust_grpc
   → per wave: cold start vllm-rs + vllm-router → bench → teardown (×8)
 ```
 
@@ -38,9 +38,9 @@ export ROUTER_BIN=$PWD/target/release/vllm-router   # optional
 # results JSON (default on, dir created at run time): py_test/e2e/perf/grpc/results/<backend>_<ts>/
 # export PERF_SAVE_RESULTS=0   # disable file output
 
-pytest py_test/e2e/perf/grpc --perf-case=rust_grpc -m perf
-pytest py_test/e2e/perf/grpc --perf-case=rust_http -m perf
-pytest py_test/e2e/perf/grpc --perf-case=python_http -m perf
+pytest py_test/e2e/perf/grpc --perf-case=rust_grpc
+pytest py_test/e2e/perf/grpc --perf-case=rust_http
+pytest py_test/e2e/perf/grpc --perf-case=python_http
 ```
 
 Debug with an existing stack: `PERF_EXTERNAL=1` + `ROUTER_URL`.
@@ -92,7 +92,7 @@ Quick smoke (not comparable to acceptance matrix):
 ```bash
 export PERF_TOKENS=4096
 export PERF_WARMUP=0
-pytest -sv py_test/e2e/perf/grpc --perf-case=rust_grpc -m perf -k hit99-c16-r32
+pytest -sv py_test/e2e/perf/grpc --perf-case=rust_grpc -k hit99-c16-r32
 ```
 
 Or attach to an existing stack: `PERF_EXTERNAL=1` + `ROUTER_URL=...` (skips launch).

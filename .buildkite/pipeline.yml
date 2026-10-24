@@ -298,6 +298,138 @@ steps:
     artifact_paths:
       - "/tmp/router.log"
 
+  # ============================================================================
+  # gRPC perf e2e — concurrency-16 waves for rust_grpc / rust_http / python_http
+  # ============================================================================
+  - label: ":python: grpc perf test case"
+    key: "grpc-perf-e2e"
+    if: build.env("ROCM_ONLY") != "1"
+    timeout_in_minutes: 720
+    retry:
+      automatic:
+        - exit_status: "*"
+          limit: 1
+      manual:
+        allowed: true
+        reason: "GPU perf cold starts can be flaky — retry after checking logs"
+    plugins:
+      - kubernetes:
+          metadata:
+            annotations:
+              cluster-autoscaler.kubernetes.io/safe-to-evict: "false"
+              karpenter.sh/do-not-disrupt: "true"
+          podSpec:
+            priorityClassName: ci
+            serviceAccountName: buildkite-gpu-jobs
+            tolerations:
+              - key: nvidia.com/gpu
+                operator: Exists
+                effect: NoSchedule
+            nodeSelector:
+              vllm.ci/gpu-pool: l4x4
+            containers:
+              - image: nvidia/cuda:13.0.2-devel-ubuntu22.04
+                resources:
+                  limits:
+                    nvidia.com/gpu: 4
+                  requests:
+                    nvidia.com/gpu: 4
+                    cpu: "40"
+                    memory: 160Gi
+                volumeMounts:
+                  - name: devshm
+                    mountPath: /dev/shm
+                  - name: hf-cache
+                    mountPath: /fsx/hf_cache
+                env:
+                  - name: HF_HOME
+                    value: /fsx/hf_cache
+                  - name: HF_HUB_ENABLE_HF_TRANSFER
+                    value: "1"
+                  - name: NCCL_CUMEM_HOST_ENABLE
+                    value: "0"
+                  - name: VLLM_USE_V1
+                    value: "1"
+                  - name: VLLM_LOGGING_LEVEL
+                    value: INFO
+                  - name: HF_TOKEN
+                    valueFrom:
+                      secretKeyRef:
+                        name: hf-token-secret
+                        key: token
+                  - name: BUILDKITE_SHELL
+                    value: "/bin/bash -e -c"
+            volumes:
+              - name: devshm
+                emptyDir:
+                  medium: Memory
+                  sizeLimit: 96Gi
+              - name: hf-cache
+                hostPath:
+                  path: /fsx/hf_cache
+                  type: DirectoryOrCreate
+    command: |
+      bash <<'BASH'
+      set -euo pipefail
+
+      if [ -z "$${HF_TOKEN:-}" ]; then
+        echo "ERROR: HF_TOKEN is not set (required to pull the perf model from Hugging Face)."
+        exit 1
+      fi
+      export GRPC_MODEL="Qwen/Qwen3.8-27B"
+      echo "HF_TOKEN is configured; GRPC_MODEL=$${GRPC_MODEL}"
+
+      apt-get update && apt-get install -y \
+        curl \
+        python3 \
+        python3-pip \
+        pkg-config \
+        libssl-dev \
+        protobuf-compiler \
+        git
+
+      curl -LsSf https://astral.sh/uv/install.sh | sh
+      source /root/.local/bin/env
+
+      uv venv --python 3.12 --seed
+      source .venv/bin/activate
+
+      uv pip install vllm --torch-backend=cu130
+      uv pip install requests pytest
+
+      python - <<'PY'
+      import torch
+      import vllm
+      assert torch.version.cuda and torch.version.cuda.startswith("13."), torch.version.cuda
+      print(f"vLLM {vllm.__version__}, torch CUDA {torch.version.cuda}")
+      PY
+
+      curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+      source /root/.cargo/env
+      cargo build --release
+
+      export ROUTER_BIN="$$PWD/target/release/vllm-router"
+      export PATH="$$PWD/target/release:$$PATH"
+
+      PERF_PYTEST=(
+        python -m pytest -sv py_test/e2e/perf/grpc
+        -k c16-r32
+      )
+
+      for case in rust_grpc rust_http python_http; do
+        echo "=== perf grpc: --perf-case=$${case} (concurrency 16 waves) ==="
+        "$${PERF_PYTEST[@]}" --perf-case="$${case}"
+      done
+
+      echo "=== perf result artifacts ==="
+      find py_test/e2e/perf/grpc/results -type f -name '*.json' 2>/dev/null || true
+      BASH
+    agents:
+      queue: "l4-k8s"
+    depends_on: "build"
+    artifact_paths:
+      - "py_test/e2e/perf/grpc/results/**/*.json"
+
   # This queue is intentionally separate from the shared amd_mi300_* queues.
   # Those agents run --no-plugins, while this lane needs the Docker plugin
   # to provide the pinned vLLM/MoRI userspace on a two-GPU xGMI host. Put the

@@ -126,6 +126,7 @@ def perf_output_dir(perf_case, bench_mod) -> str:
         results_parent=_PERF_DIR / "results",
     )
     os.environ["PERF_OUTPUT_DIR"] = path
+    _progress(f"results directory: {Path(path).resolve()}")
     return path
 
 
