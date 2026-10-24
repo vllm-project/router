@@ -494,6 +494,55 @@ impl Router {
                     }
                     scheduler.apply_observations(epoch, observations);
                     scheduler.tick();
+                    if let Some((path, revision, snapshot)) =
+                        scheduler.take_prediction_profile_snapshot()
+                    {
+                        match serde_json::to_vec_pretty(&snapshot) {
+                            Ok(bytes) => {
+                                let destination = std::path::PathBuf::from(&path);
+                                let temporary = destination.with_extension("tmp");
+                                if let Some(parent) = destination
+                                    .parent()
+                                    .filter(|parent| !parent.as_os_str().is_empty())
+                                {
+                                    if let Err(error) = tokio::fs::create_dir_all(parent).await {
+                                        warn!(
+                                            event = "prediction_profile_snapshot_failed",
+                                            path,
+                                            %error,
+                                            "Failed to create prediction snapshot directory"
+                                        );
+                                        continue;
+                                    }
+                                }
+                                if let Err(error) = tokio::fs::write(&temporary, bytes).await {
+                                    warn!(
+                                        event = "prediction_profile_snapshot_failed",
+                                        path,
+                                        %error,
+                                        "Failed to write prediction profile snapshot"
+                                    );
+                                } else if let Err(error) =
+                                    tokio::fs::rename(&temporary, &destination).await
+                                {
+                                    warn!(
+                                        event = "prediction_profile_snapshot_failed",
+                                        path,
+                                        %error,
+                                        "Failed to atomically replace prediction profile snapshot"
+                                    );
+                                } else {
+                                    scheduler.mark_prediction_profile_snapshotted(revision);
+                                }
+                            }
+                            Err(error) => warn!(
+                                event = "prediction_profile_snapshot_failed",
+                                path,
+                                %error,
+                                "Failed to serialize prediction profile snapshot"
+                            ),
+                        }
+                    }
                 }
             }))
         });

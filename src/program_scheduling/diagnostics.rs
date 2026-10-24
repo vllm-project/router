@@ -6,6 +6,7 @@
 use super::scheduler::ProgramScheduler;
 use super::scheduler_state::ProgramSchedulerState;
 use super::{ProgramState, ProgramStatus};
+use crate::config::types::PredictionMode;
 use crate::metrics::RouterMetrics;
 use serde::Serialize;
 use std::time::Instant;
@@ -26,6 +27,8 @@ pub struct ProgramDiagnostic {
     pub blocks_parent: bool,
     pub agent_role: Option<String>,
     pub spawn_reason: Option<String>,
+    pub workflow_profile_id: Option<String>,
+    pub profile_version: Option<String>,
     pub step_id: u64,
     pub request_id: Option<String>,
     pub request_priority: i64,
@@ -55,6 +58,23 @@ pub struct ProgramDiagnostic {
     pub force_resume_active_remaining_rounds: f64,
     pub force_resume_pool_remaining_rounds: f64,
     pub force_resume_request_throughput_per_second: f64,
+    pub predicted_return_probability: Option<f64>,
+    pub predicted_ttl_seconds: Option<f64>,
+    pub return_prediction_support: Option<usize>,
+    pub return_prediction_online_support: Option<usize>,
+    pub return_prediction_backoff_level: Option<usize>,
+    pub return_prediction_source: Option<&'static str>,
+    pub last_return_actual_seconds: Option<f64>,
+    pub predicted_output_tokens: Option<usize>,
+    pub predicted_output_p50: Option<usize>,
+    pub predicted_output_p95: Option<usize>,
+    pub predicted_output_p99: Option<usize>,
+    pub output_prediction_support: Option<usize>,
+    pub output_prediction_online_support: Option<usize>,
+    pub output_prediction_backoff_level: Option<usize>,
+    pub output_prediction_source: Option<&'static str>,
+    pub output_prediction_mature: Option<bool>,
+    pub last_output_actual_tokens: Option<usize>,
 }
 
 /// Bounded rank-local workload measurements used by Progress-TTL.
@@ -124,6 +144,9 @@ pub struct ProgramSchedulerDiagnostic {
     pub resume_order: super::ProgramResumeOrder,
     pub cross_rank_headroom_ratio: f64,
     pub retained_requests: usize,
+    pub prediction_mode: PredictionMode,
+    pub return_time_profile_keys: usize,
+    pub output_length_profile_keys: usize,
     pub ranks: Vec<RankDiagnostic>,
 }
 
@@ -131,6 +154,10 @@ impl ProgramScheduler {
     /// Refresh bounded-cardinality gauges only from the periodic tick path.
     pub(crate) fn publish_metrics(&self, state: &ProgramSchedulerState) {
         let now = Instant::now();
+        RouterMetrics::set_workflow_prediction_profile_keys(
+            state.prediction_profiles.return_key_count(),
+            state.prediction_profiles.output_key_count(),
+        );
         let mut rank_counts = state
             .targets
             .keys()
@@ -230,6 +257,8 @@ impl ProgramScheduler {
                     blocks_parent: decision.blocks_parent,
                     agent_role: decision.agent_role.clone(),
                     spawn_reason: decision.spawn_reason.clone(),
+                    workflow_profile_id: decision.workflow_profile_id.clone(),
+                    profile_version: decision.profile_version.clone(),
                     step_id: decision.step_id,
                     request_id: request_hints.and_then(|hints| hints.request_id.clone()),
                     request_priority: request_hints.map_or(0, |hints| hints.priority),
@@ -283,6 +312,83 @@ impl ProgramScheduler {
                     force_resume_pool_remaining_rounds: decision.force_resume_pool_remaining_rounds,
                     force_resume_request_throughput_per_second: decision
                         .force_resume_request_throughput_per_second,
+                    predicted_return_probability: decision
+                        .pending_return_prediction
+                        .as_ref()
+                        .and_then(|pending| pending.prediction.as_ref())
+                        .map(|prediction| prediction.probability),
+                    predicted_ttl_seconds: decision
+                        .pending_return_prediction
+                        .as_ref()
+                        .and_then(|pending| pending.prediction.as_ref())
+                        .map(|prediction| prediction.suggested_ttl_seconds),
+                    return_prediction_support: decision
+                        .pending_return_prediction
+                        .as_ref()
+                        .and_then(|pending| pending.prediction.as_ref())
+                        .map(|prediction| prediction.support),
+                    return_prediction_online_support: decision
+                        .pending_return_prediction
+                        .as_ref()
+                        .and_then(|pending| pending.prediction.as_ref())
+                        .map(|prediction| prediction.online_support),
+                    return_prediction_backoff_level: decision
+                        .pending_return_prediction
+                        .as_ref()
+                        .and_then(|pending| pending.prediction.as_ref())
+                        .map(|prediction| prediction.backoff_level),
+                    return_prediction_source: decision
+                        .pending_return_prediction
+                        .as_ref()
+                        .and_then(|pending| pending.prediction.as_ref())
+                        .map(|prediction| prediction.source.as_str()),
+                    last_return_actual_seconds: decision.last_return_actual_seconds,
+                    predicted_output_tokens: decision
+                        .pending_output_prediction
+                        .as_ref()
+                        .and_then(|pending| pending.prediction.as_ref())
+                        .map(|prediction| prediction.tokens),
+                    predicted_output_p50: decision
+                        .pending_output_prediction
+                        .as_ref()
+                        .and_then(|pending| pending.prediction.as_ref())
+                        .map(|prediction| prediction.p50),
+                    predicted_output_p95: decision
+                        .pending_output_prediction
+                        .as_ref()
+                        .and_then(|pending| pending.prediction.as_ref())
+                        .map(|prediction| prediction.p95),
+                    predicted_output_p99: decision
+                        .pending_output_prediction
+                        .as_ref()
+                        .and_then(|pending| pending.prediction.as_ref())
+                        .map(|prediction| prediction.p99),
+                    output_prediction_support: decision
+                        .pending_output_prediction
+                        .as_ref()
+                        .and_then(|pending| pending.prediction.as_ref())
+                        .map(|prediction| prediction.support),
+                    output_prediction_online_support: decision
+                        .pending_output_prediction
+                        .as_ref()
+                        .and_then(|pending| pending.prediction.as_ref())
+                        .map(|prediction| prediction.online_support),
+                    output_prediction_backoff_level: decision
+                        .pending_output_prediction
+                        .as_ref()
+                        .and_then(|pending| pending.prediction.as_ref())
+                        .map(|prediction| prediction.backoff_level),
+                    output_prediction_source: decision
+                        .pending_output_prediction
+                        .as_ref()
+                        .and_then(|pending| pending.prediction.as_ref())
+                        .map(|prediction| prediction.source.as_str()),
+                    output_prediction_mature: decision
+                        .pending_output_prediction
+                        .as_ref()
+                        .and_then(|pending| pending.prediction.as_ref())
+                        .map(|prediction| prediction.mature),
+                    last_output_actual_tokens: decision.last_output_actual_tokens,
                 });
         }
         let mut ranks = Vec::with_capacity(state.targets.len());
@@ -438,6 +544,9 @@ impl ProgramScheduler {
             resume_order: self.config.resume_order,
             cross_rank_headroom_ratio: self.config.cross_rank_headroom_ratio,
             retained_requests: state.runtime.retained_request_count(),
+            prediction_mode: self.config.prediction_profile.mode,
+            return_time_profile_keys: state.prediction_profiles.return_key_count(),
+            output_length_profile_keys: state.prediction_profiles.output_key_count(),
             ranks,
         }
     }
