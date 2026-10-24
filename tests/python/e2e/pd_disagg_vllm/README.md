@@ -71,7 +71,7 @@ MORIIO_READ_MODE=false bash ./run_moriio_rdma_accuracy_test.sh
 
 Run all tests with default configuration:
 ```bash
-cd py_test/e2e/pd_disagg_vllm
+cd tests/python/e2e/pd_disagg_vllm
 ./tp_config_sweep_test.sh
 ```
 

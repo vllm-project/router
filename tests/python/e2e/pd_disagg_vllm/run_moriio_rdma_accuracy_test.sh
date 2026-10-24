@@ -5,7 +5,7 @@
 set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../../../.." && pwd)"
 
 MODEL_NAMES=${MODEL_NAMES:-"Qwen/Qwen3-0.6B"}
 ROCM_VLLM_IMAGE=${ROCM_VLLM_IMAGE:-"vllm/vllm-openai-rocm:nightly@sha256:d22922d540810d90c5a3eafe91d3b4a62c2b881f3e990d0b7180b2875a5d176d"}
@@ -312,7 +312,7 @@ python3 -m pip install --disable-pip-version-check --quiet requests
 if [[ ${SKIP_LM_EVAL} != true ]]; then
   python3 -m pip install --disable-pip-version-check --quiet openai 'lm-eval[api]==0.4.12'
 fi
-python3 py_test/e2e/pd_disagg_vllm/test_pd_accuracy.py \\
+python3 tests/python/e2e/pd_disagg_vllm/test_pd_accuracy.py \\
   --router-url http://127.0.0.1:${ROUTER_PORT} \\
   --model ${MODEL_NAMES} \\
   --num-requests ${NUM_SANITY_REQUESTS} \\
@@ -328,7 +328,7 @@ args=(
   --disable-thinking
 )
 if [[ ${LM_EVAL_LOG_SAMPLES} == true ]]; then args+=(--log-samples); fi
-python3 py_test/e2e/pd_disagg_vllm/test_lm_eval_accuracy.py "\${args[@]}"
+python3 tests/python/e2e/pd_disagg_vllm/test_lm_eval_accuracy.py "\${args[@]}"
 EOF
 )
 

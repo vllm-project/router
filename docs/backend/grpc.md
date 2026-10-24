@@ -193,7 +193,7 @@ Always-on tests:
 ```bash
 cargo test --test grpc_vs_http_e2e
 cargo test --lib backend::
-python3 -m unittest tests/test_bench_prefix_kvhit.py
+python3 -m unittest tests/python/test_bench_prefix_kvhit.py
 ```
 
 Optional tokenizer parity check, skipped unless the model dir and Python vLLM

@@ -31,7 +31,7 @@ use vllm_router_rs::protocols::spec::{
 };
 use vllm_router_rs::tree::Tree;
 
-#[path = "../tests/common/mod.rs"]
+#[path = "../tests/rust/common/mod.rs"]
 mod common;
 use common::bench_corpus::{
     chat, completion_ids, completion_text, seeded_ids, seeded_text, seeded_utf8_text,

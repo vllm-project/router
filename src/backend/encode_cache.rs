@@ -170,7 +170,7 @@ mod tests {
             Arc::new(Self {
                 inner: HuggingFaceTokenizer::new_hf(std::path::Path::new(concat!(
                     env!("CARGO_MANIFEST_DIR"),
-                    "/tests/fixtures/tokenizer/byte_level_bpe.json"
+                    "/tests/rust/fixtures/tokenizer/byte_level_bpe.json"
                 )))
                 .unwrap(),
                 calls: AtomicUsize::new(0),

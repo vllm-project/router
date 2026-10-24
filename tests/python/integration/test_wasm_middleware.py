@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 import requests
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+REPO_ROOT = Path(__file__).resolve().parents[3]
 EXAMPLE_DIR = REPO_ROOT / "examples" / "wasm_middleware"
 WASM_COMPONENT = EXAMPLE_DIR / "wasm_middleware_example.component.wasm"
 

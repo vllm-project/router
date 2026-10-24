@@ -1,7 +1,7 @@
 //! In-process vLLM 0.29 `Inference` gRPC worker for router tests.
 //!
 //! Also serves `grpc.health.v1` as `SERVING` so `Router::new` startup
-//! probes pass. Used by `tests/grpc_vs_http_e2e.rs`. Records `token_ids`
+//! probes pass. Used by `tests/rust/grpc_vs_http_e2e.rs`. Records `token_ids`
 //! vs text prompt on each `GenerateStream`. Not Python EngineCore.
 
 #![allow(dead_code)]

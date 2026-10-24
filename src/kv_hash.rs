@@ -164,9 +164,10 @@ mod tests {
         // (sha256_cbor) and vllm/v1/core/kv_cache_utils.py
         // (init_none_hash / hash_block_tokens). No engine run is implied.
         // Canonical-CBOR inputs are retained for representation review.
-        let oracle: Oracle =
-            serde_json::from_str(include_str!("../tests/fixtures/kv_cbor/python_oracle.json"))
-                .unwrap();
+        let oracle: Oracle = serde_json::from_str(include_str!(
+            "../tests/rust/fixtures/kv_cbor/python_oracle.json"
+        ))
+        .unwrap();
         assert_eq!(oracle.algorithm, "sha256_cbor");
         assert_eq!(oracle.cbor2_version, "5.6.5");
         assert_eq!(oracle.block_size, 16);

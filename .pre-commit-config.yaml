@@ -31,7 +31,7 @@ repos:
     hooks:
       - id: black
         language_version: python3.12
-        files: ^(py_src|py_test)/.*\.py$
+        files: ^(py_src|tests/python)/.*\.py$
 
   # Python linting with ruff
   - repo: https://github.com/astral-sh/ruff-pre-commit
@@ -39,7 +39,7 @@ repos:
     hooks:
       - id: ruff
         args: ['--fix', '--exit-non-zero-on-fix']
-        files: ^(py_src|py_test)/.*\.py$
+        files: ^(py_src|tests/python)/.*\.py$
 
   # Python type checking
   - repo: https://github.com/pre-commit/mirrors-mypy
@@ -48,3 +48,13 @@ repos:
       - id: mypy
         files: ^py_src/.*\.py$
         additional_dependencies: ['types-requests']
+
+  # Cargo only auto-discovers tests/*.rs. Nested tests/rust/*.rs need [[test]].
+  - repo: local
+    hooks:
+      - id: check-rust-tests
+        name: check rust [[test]] registration
+        language: python
+        entry: python tools/pre_commit/check_rust_tests.py
+        files: ^(Cargo\.toml|tests/rust/[^/]+\.rs)$
+        pass_filenames: false

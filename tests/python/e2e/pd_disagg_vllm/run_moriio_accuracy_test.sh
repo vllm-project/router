@@ -5,7 +5,7 @@
 set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../../../.." && pwd)"
 
 MODEL_NAMES=${MODEL_NAMES:-"Qwen/Qwen3-0.6B"}
 MORIIO_READ_MODE=${MORIIO_READ_MODE:-"true"}

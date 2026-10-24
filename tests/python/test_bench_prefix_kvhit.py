@@ -15,8 +15,7 @@ from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-
-SCRIPT = Path(__file__).parents[1] / "benches" / "backend" / "bench_prefix_kvhit.py"
+SCRIPT = Path(__file__).parents[2] / "benches" / "backend" / "bench_prefix_kvhit.py"
 SPEC = importlib.util.spec_from_file_location("bench_prefix_kvhit", SCRIPT)
 assert SPEC and SPEC.loader
 BENCH_PREFIX_KVHIT = importlib.util.module_from_spec(SPEC)
@@ -87,7 +86,9 @@ class PrefixKvhitSseTests(unittest.TestCase):
         self.assertGreater(result["total_duration_ms"], 100)
 
     def test_top_level_sse_error_fails_measurement(self):
-        with sse_server([(0, chunk("partial")), (0, '{"error":"worker failed"}')]) as url:
+        with sse_server(
+            [(0, chunk("partial")), (0, '{"error":"worker failed"}')]
+        ) as url:
             with self.assertRaises(SystemExit):
                 BENCH_PREFIX_KVHIT.post_chat(url, "model", "hello", 2, 2)
 
@@ -132,7 +133,9 @@ class PrefixKvhitSseTests(unittest.TestCase):
         ]
         with sse_server(events) as url:
             start = time.perf_counter()
-            result = BENCH_PREFIX_KVHIT.post_hit_wave(url, "model", ["hello"] * 4, 1, 2, 4)
+            result = BENCH_PREFIX_KVHIT.post_hit_wave(
+                url, "model", ["hello"] * 4, 1, 2, 4
+            )
             elapsed = time.perf_counter() - start
         self.assertEqual(result["concurrency"], 4)
         self.assertEqual(result["requests"], 4)

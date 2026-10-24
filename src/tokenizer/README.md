@@ -937,7 +937,7 @@ The `Encoding` enum must:
 - Thread safety validation
 
 **Cache Integration Tests (8 tests + 1 ignored in tokenizer_cache_integration.rs):**
-- Use `tests/fixtures/tokenizer/byte_level_bpe.json`, a checked-in byte-level BPE tokenizer (256 byte symbols, 34 merges, `<s>`/`</s>`/`<unk>`); no network needed
+- Use `tests/rust/fixtures/tokenizer/byte_level_bpe.json`, a checked-in byte-level BPE tokenizer (256 byte symbols, 34 merges, `<s>`/`</s>`/`<unk>`); no network needed
 - Fixture pinned by vocab size, special tokens and token IDs
 - Cached vs uncached HuggingFace encodings compared field by field, including overflowing encodings from truncation
 - Byte accounting against `estimate_entry_bytes`

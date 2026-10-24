@@ -6,7 +6,7 @@
 //! prompt. That locks **this PR's default contract**, not a forever ban
 //! on a gRPC text fallback or HTTP token-id input.
 //!
-//! Uses `tests/common/mock_vllm_rs.rs`. Pin fake ids via
+//! Uses `tests/rust/common/mock_vllm_rs.rs`. Pin fake ids via
 //! `Router::pin_test_token_ids` so CI does not load a real tokenizer.
 //!
 //!   cargo test --test grpc_vs_http_e2e
