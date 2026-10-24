@@ -5,7 +5,9 @@ from types import SimpleNamespace
 import pytest
 import requests
 
-from vllm.test.run_eval import run_eval
+from tools.e2e.vllm_test_compat import import_run_eval
+
+run_eval = import_run_eval()
 
 
 @pytest.mark.e2e

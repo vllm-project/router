@@ -7,7 +7,7 @@ router, or a worker). Pair with one of the serve_*.sh scripts under
 scripts/backend.
 
   export ROUTER_URL=http://127.0.0.1:30000
-  export MODEL=my-served-model
+  export GRPC_MODEL=my-served-model
   python benches/backend/bench_prefix_kvhit.py
 
 By default the script writes a short synthetic chat body into a temp
@@ -41,7 +41,9 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 
 def _env(name: str, default: str | None = None) -> str:
@@ -292,6 +294,200 @@ def post_hit_wave(
     }
 
 
+# --- Pytest perf (py_test/e2e/perf/grpc) and remote bench reuse ---------------
+
+
+def read_perf_settings(
+    *,
+    backend_label: str | None = None,
+    bench_tokens: int | None = None,
+    bench_max_tokens: int | None = None,
+    bench_timeout: float | None = None,
+) -> dict[str, Any]:
+    """Merge case JSON bench fields with PERF_* / ROUTER_URL env (pytest perf)."""
+    model = os.environ["GRPC_MODEL"]
+    if os.environ.get("PERF_TOKENS", "").strip():
+        tokens = int(os.environ["PERF_TOKENS"].strip())
+    elif bench_tokens is not None:
+        tokens = bench_tokens
+    else:
+        tokens = 0
+    label = os.environ.get("BACKEND_LABEL") or backend_label or "backend"
+    default_max = bench_max_tokens if bench_max_tokens is not None else 64
+    default_timeout = bench_timeout if bench_timeout is not None else 1800.0
+    return {
+        "router_url": os.environ["ROUTER_URL"],
+        "model": model,
+        "model_dir": os.environ.get("GRPC_MODEL_DIR", model),
+        "tokens": tokens,
+        "chars": int(os.environ.get("KVHIT_CHARS", "8000")),
+        "max_tokens": int(os.environ.get("PERF_MAX_TOKENS", str(default_max))),
+        "timeout": float(os.environ.get("PERF_TIMEOUT", str(default_timeout))),
+        "warmup": os.environ.get("PERF_WARMUP", "1").lower() in ("1", "true", "yes"),
+        "backend_label": label,
+        "output_dir": os.environ.get("PERF_OUTPUT_DIR", "").strip(),
+        "runs": max(1, int(os.environ.get("RUNS", "1"))),
+    }
+
+
+def _resolve_user_text(settings: dict[str, Any]) -> str:
+    if settings["tokens"] > 0:
+        return make_user_text_exact_tokens(settings["model_dir"], settings["tokens"])
+    return make_user_text(settings["chars"])
+
+
+def run_prefix_kvhit_wave(
+    settings: dict[str, Any],
+    *,
+    hit_rate: float,
+    concurrency: int,
+    requests: int,
+    warmup: bool | None = None,
+) -> dict[str, Any]:
+    """One warmup (optional) + concurrent wave; used by pytest perf and callable from tests."""
+    user = _resolve_user_text(settings)
+    do_warmup = settings["warmup"] if warmup is None else warmup
+    miss_user, hit_user = make_bodies(hit_rate, user)
+    result: dict[str, Any] = {
+        "router": settings["router_url"],
+        "model": settings["model"],
+        "hit_rate": hit_rate,
+        "concurrency": concurrency,
+        "requests": requests,
+    }
+    if do_warmup:
+        result["warmup"] = {
+            "miss": post_chat(
+                settings["router_url"],
+                settings["model"],
+                miss_user,
+                settings["max_tokens"],
+                settings["timeout"],
+            ),
+            "hit": post_chat(
+                settings["router_url"],
+                settings["model"],
+                hit_user,
+                settings["max_tokens"],
+                settings["timeout"],
+            ),
+        }
+    result["wave"] = post_hit_wave(
+        settings["router_url"],
+        settings["model"],
+        make_wave_bodies(hit_rate, user, requests),
+        settings["max_tokens"],
+        settings["timeout"],
+        concurrency,
+    )
+    return result
+
+
+def assert_wave_summary(wave: dict[str, Any], expected_requests: int) -> dict[str, Any]:
+    summary = wave.get("summary") or {}
+    assert summary.get("count") == expected_requests
+    for key in ("ttft_ms", "e2e_ms"):
+        block = summary.get(key)
+        assert isinstance(block, dict), f"missing {key} in {json.dumps(summary)}"
+        assert block.get("avg", 0) > 0
+    return summary
+
+
+def _fmt_metric_block(block: dict[str, Any] | None) -> str:
+    if not isinstance(block, dict):
+        return "n/a"
+    parts = []
+    for stat in ("min", "avg", "max"):
+        val = block.get(stat)
+        if isinstance(val, (int, float)):
+            parts.append(f"{stat}={val:.2f}")
+    return " ".join(parts) if parts else "n/a"
+
+
+def print_wave_summary(
+    wave: dict[str, Any],
+    *,
+    backend: str | None = None,
+    hit_rate: float | None = None,
+    concurrency: int | None = None,
+    requests: int | None = None,
+    run_idx: int | None = None,
+) -> None:
+    """Human-readable wave summary for pytest -sv / bench CLI (stderr)."""
+    import sys
+
+    if os.environ.get("PERF_QUIET", "").lower() in ("1", "true", "yes"):
+        return
+    summary = wave.get("summary") or {}
+    tags: list[str] = []
+    if backend:
+        tags.append(backend)
+    if run_idx is not None:
+        tags.append(f"run{run_idx}")
+    if hit_rate is not None:
+        tags.append(f"hit={hit_rate:g}")
+    if concurrency is not None:
+        tags.append(f"c={concurrency}")
+    if requests is not None:
+        tags.append(f"r={requests}")
+    title = " | ".join(tags) if tags else "wave"
+    lines = [
+        "",
+        f"======== perf summary [{title}] count={summary.get('count', '?')} ========",
+    ]
+    for key in ("ttft_ms", "e2e_ms", "tpot_ms"):
+        lines.append(f"  {key}: {_fmt_metric_block(summary.get(key))}")
+    lines.append("=" * (len(lines[-2]) if len(lines) > 1 else 40))
+    print("\n".join(lines), file=sys.stderr, flush=True)
+
+
+def hit_rate_file_tag(hit_rate: float) -> str:
+    if hit_rate >= 0.99:
+        return "099"
+    if hit_rate <= 0.0:
+        return "000"
+    return str(hit_rate).replace(".", "")
+
+
+def maybe_write_result(
+    settings: dict[str, Any],
+    *,
+    run_idx: int,
+    hit_rate: float,
+    concurrency: int,
+    requests: int,
+    payload: dict[str, Any],
+) -> Path | None:
+    base = settings.get("output_dir") or ""
+    if not base:
+        return None
+    out_dir = Path(base)
+    if not out_dir.is_absolute():
+        out_dir = Path.cwd() / out_dir
+    out_dir.mkdir(parents=True, exist_ok=True)
+    name = (
+        f"run{run_idx}_hit{hit_rate_file_tag(hit_rate)}"
+        f"_c{concurrency}_r{requests}.json"
+    )
+    path = out_dir / name
+    envelope = {
+        "backend_label": settings["backend_label"],
+        "run_idx": run_idx,
+        "hit_rate": hit_rate,
+        "concurrency": concurrency,
+        "requests": requests,
+        **payload,
+    }
+    path.write_text(json.dumps(envelope, indent=2), encoding="utf-8")
+    return path
+
+
+def default_output_dir(settings: dict[str, Any], *, results_parent: Path) -> str:
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    label = settings["backend_label"]
+    return str(results_parent / f"{label}_{stamp}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--router-url", default=_env("ROUTER_URL", "http://127.0.0.1:30000"))
@@ -390,6 +586,12 @@ def main() -> None:
         args.max_tokens,
         args.timeout,
         args.concurrency,
+    )
+    print_wave_summary(
+        result["wave"],
+        hit_rate=args.hit_rate,
+        concurrency=args.concurrency,
+        requests=wave_requests,
     )
     print(json.dumps(result, indent=2))
 
