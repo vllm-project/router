@@ -357,10 +357,26 @@ impl Router {
         let mut kv_worker_info = HashMap::new();
         let (kv_index_supervisor, kv_signal_handle) =
             if kv_aware_ops(default_policy.as_ref()).is_some() {
-                let (supervisor, mut signals) = crate::kv_index::KvIndexSupervisor::new(
-                    ctx.client.clone(),
-                    crate::kv_index::HashMode::Sha256,
-                );
+                let (supervisor, mut signals) =
+                    if pool_kind == Some(crate::backend::WorkerPoolKind::Http)
+                        && std::env::var_os("VLLM_ROUTER_KV_EVENT_SOURCES").is_some()
+                    {
+                        if dp_size != 1 {
+                            return Err(
+                        "static HTTP KV sources require independently addressed DP1 workers".into(),
+                    );
+                        }
+                        crate::kv_index::KvIndexSupervisor::new_http_dense(
+                            ctx.client.clone(),
+                            crate::kv_index::HashMode::Sha256,
+                            &kv_discovery_urls,
+                        )?
+                    } else {
+                        crate::kv_index::KvIndexSupervisor::new(
+                            ctx.client.clone(),
+                            crate::kv_index::HashMode::Sha256,
+                        )
+                    };
                 let supervisor = Arc::new(supervisor);
                 for worker_url in &kv_discovery_urls {
                     match supervisor.on_worker_added(worker_url).await {
