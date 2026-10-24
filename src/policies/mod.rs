@@ -3,7 +3,7 @@
 //! This module provides a unified abstraction for routing policies that work
 //! across both regular and prefill-decode (PD) routing modes.
 
-use crate::core::Worker;
+use crate::core::{Worker, WorkerLoadGuard};
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::sync::Arc;
@@ -39,6 +39,15 @@ pub use round_robin::RoundRobinPolicy;
 /// Key is lowercase header name, value is header value
 pub type RequestHeaders = HashMap<String, String>;
 
+/// Coordinates selection and reservation for one worker pool.
+///
+/// Reuse the same context for admissions to the same pool. It belongs to the
+/// caller, not the policy: one policy may be shared by separate P and D pools.
+#[derive(Debug, Default)]
+pub struct SelectionContext {
+    lock: parking_lot::Mutex<()>,
+}
+
 /// Core trait for load balancing policies
 ///
 /// This trait provides a unified interface for implementing routing algorithms
@@ -67,6 +76,25 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
         request_text: Option<&str>,
         headers: Option<&RequestHeaders>,
     ) -> Option<usize>;
+
+    /// Select a worker and reserve its local load before another admission
+    /// through this context can make a load-based decision.
+    ///
+    /// The caller owns the returned guard's lifetime. Policies with expensive
+    /// preparation can override this hook, keeping only the final decision and
+    /// reservation under the context lock. The default preserves existing policy
+    /// behavior, including policies which maintain their own selection state.
+    fn select_and_reserve<'a>(
+        &self,
+        context: &SelectionContext,
+        workers: &'a [Arc<dyn Worker>],
+        request_text: Option<&str>,
+        headers: Option<&RequestHeaders>,
+    ) -> Option<(usize, WorkerLoadGuard<'a>)> {
+        let _selection = context.lock.lock();
+        let idx = self.select_worker_with_headers(workers, request_text, headers)?;
+        Some((idx, WorkerLoadGuard::new(workers[idx].as_ref())))
+    }
 
     /// Select a pair of workers (prefill and decode) for PD routing
     ///
