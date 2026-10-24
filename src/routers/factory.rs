@@ -66,11 +66,12 @@ impl RouterFactory {
         main_policy_config: &PolicyConfig,
         ctx: &Arc<AppContext>,
     ) -> Result<Box<dyn RouterTrait>, String> {
-        // Initialize policies in PolicyRegistry - use specific policies if provided, otherwise fall back to main policy
+        // Prefill inherits the main policy; decode defaults to load balancing.
         let prefill_policy =
             PolicyFactory::create_from_config(prefill_policy_config.unwrap_or(main_policy_config));
-        let decode_policy =
-            PolicyFactory::create_from_config(decode_policy_config.unwrap_or(main_policy_config));
+        let decode_policy = PolicyFactory::create_from_config(
+            decode_policy_config.unwrap_or(&PolicyConfig::DEFAULT_DECODE),
+        );
 
         // Set the prefill and decode policies in the registry
         ctx.policy_registry.set_prefill_policy(prefill_policy);

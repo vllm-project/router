@@ -226,7 +226,7 @@ vllm-router --policy cache_aware \
 1. **Balanced mode** (when load is even):
    - Find worker with highest prefix match for the request
    - If match rate > `cache_threshold`: route to that worker (cache hit)
-   - Otherwise: route to worker with smallest tree (most cache capacity)
+   - Otherwise: route to worker with lowest load
 
 2. **Imbalanced mode** (when load is skewed):
    - Route to worker with lowest load (shortest queue)
@@ -242,7 +242,7 @@ vllm-router --policy cache_aware \
 
 ## KV Aware
 
-The `kv_aware` policy scores workers using the request's reusable KV blocks and current load. It is supported in regular, co-located routing mode only; it is not supported with PD disaggregation. In PD mode, the effective prefill and decode policies must use other policies. KV placement credit requires gRPC workers because the gRPC chat route supplies token IDs to the policy. With HTTP workers, the policy degrades to load-only scoring and does not use KV event placement.
+The `kv_aware` policy scores workers using the request's reusable KV blocks and current load. It supports regular, co-located HTTP and gRPC workers with KV event discovery enabled. HTTP workers must expose the corresponding render endpoint for text, chat, and Responses requests; simple text and chat can also use `/tokenize`. Token-array completion prompts need no rendering. Requests without verified tokens or cache identity fall back to load scoring. PD disaggregation remains unsupported.
 
 ```bash
 vllm-router --policy kv_aware \
@@ -256,6 +256,12 @@ vllm-router --policy kv_aware \
 For each candidate, the scorer computes `ptoken = new_prefill_tokens + active_prefill_tokens` and projects the request count as `max(slot_manager.active_requests, Worker::load) + 1`. It multiplies `ptoken` by that projected count, so the score estimates the load after admitting this request and includes its remaining prefill work even when the worker is currently idle. Zero-cost cases, such as a request with no prefill work, are resolved by the KV-work and current-load tie-breaks.
 
 `--router-temperature 0` selects a minimum-cost worker. A positive temperature samples among candidates by their relative costs. Device reuse has full credit; the host, external, and disk `--kv-penalty-*` flags configure transfer-credit ratios for those tiers. A higher credit means more reuse value and lower transfer cost.
+
+KV-aware session affinity is disabled by default. Set `--kv-aware-session-affinity-ttl-secs <seconds>` to enable it and expire idle bindings after the given TTL (1–31,536,000 seconds). For example, use `--kv-aware-session-affinity-ttl-secs 1800` for a 30-minute idle TTL. Omit the option to compare the original KV-aware routing behavior without affinity.
+
+A retry excludes a worker that returned a retryable status, including 408/429, for that request's next selection when another candidate is available. This does not replace a healthy session binding: later requests retain their affinity. If every candidate has been excluded, selection allows them again.
+
+The gRPC `/v1/completions` route accepts one nonempty list of non-negative token IDs, which bypasses chat templating and frontend encoding caches. Replies use `text_completion` and `choices[].text`. Set `return_token_ids: true` to include generated `choices[].token_ids` and, in non-streaming replies, `choices[].prompt_token_ids`. Routing identity metadata stays at the router; LoRA and cache salt are forwarded to the worker. Unsupported generation options, including string or batched prompts, `suffix`, `best_of`, and `json_schema`, are rejected before dispatch; use `regex` or `ebnf` for output constraints.
 
 ---
 
@@ -315,4 +321,4 @@ vllm-router \
 
 This allows optimizing each stage independently:
 - **Prefill**: Use `consistent_hash` for cache locality
-- **Decode**: Use `round_robin` or `power_of_two` for load distribution
+- **Decode**: Defaults to lowest load; override with `--decode-policy`

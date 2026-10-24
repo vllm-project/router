@@ -13,6 +13,7 @@ mod consistent_hash;
 mod factory;
 pub(crate) mod hash_key;
 mod kv_aware;
+mod least_load;
 mod power_of_two;
 mod random;
 mod registry;
@@ -23,12 +24,15 @@ pub use cache_aware::{CacheAwareCandidate, CacheAwarePlacement, CacheAwarePolicy
 pub use consistent_hash::ConsistentHashPolicy;
 pub use consistent_hash::VIRTUAL_NODES_PER_WORKER;
 pub use factory::PolicyFactory;
+pub(crate) use kv_aware::KvAffinityTable;
 pub use kv_aware::{
-    cost_components, kv_aware_ops, CandidateView, CostComponents, CostDecision, CostParams,
-    InMemorySlotManager, KvAwareOps, KvAwarePolicy, KvRequestSlot, KvSelectionReceipt,
-    LoadProvider, LoadSample, MultiplicativeScorer, Picker, Scorer, SelectionError, SlotManager,
-    TemperaturePicker, TieredMatchProvider, TransferCredits,
+    cost_components, kv_aware_ops, AffinityKey, CandidateView, CostComponents, CostDecision,
+    CostParams, InMemorySlotManager, KvAwareOps, KvAwarePolicy, KvRequestSlot, KvRequestTokens,
+    KvSelectionReceipt, LoadProvider, LoadSample, MultiplicativeScorer, Picker, Scorer,
+    SelectionError, SlotManager, TemperaturePicker, TieredMatchProvider, TransferCredits,
+    WorkerTokenInputs,
 };
+pub use least_load::LeastLoadPolicy;
 pub use power_of_two::PowerOfTwoPolicy;
 pub use random::RandomPolicy;
 pub use registry::PolicyRegistry;

@@ -24,6 +24,202 @@ use vllm_chat::{
     ReasoningEffort as VllmReasoningEffort,
 };
 
+/// HTTP routing uses the worker's own render contract, not the gRPC model
+/// frontend: HTTP workers can have different templates and tokenizer settings.
+pub(crate) enum HttpKvInput {
+    Direct(Arc<[Vec<u32>]>),
+    Render {
+        path: &'static str,
+        tokenize_fallback: Option<Vec<serde_json::Value>>,
+    },
+}
+
+pub(crate) fn dense_token_ids(value: &serde_json::Value) -> Result<Vec<u32>, &'static str> {
+    let ids = value.as_array().ok_or("invalid_token_ids")?;
+    if ids.is_empty() {
+        return Err("empty_input");
+    }
+    ids.iter()
+        .map(|id| {
+            id.as_u64()
+                .and_then(|id| u32::try_from(id).ok())
+                .ok_or("invalid_token_ids")
+        })
+        .collect()
+}
+
+pub(crate) fn http_kv_input(
+    body: &serde_json::Value,
+    route: &str,
+) -> Result<HttpKvInput, &'static str> {
+    // The event index cannot identify multimodal/embedding or prompt-adapter
+    // cache keys from token IDs alone. HTTP adapter names also need an explicit
+    // mapping to the names carried by KV events before they can earn credit.
+    for field in [
+        "features",
+        "prompt_embeds",
+        "input_embeds",
+        "input_embeddings",
+        "multi_modal_data",
+        "lora_path",
+        "lora_name",
+        "prompt_adapter_request",
+    ] {
+        if body.get(field).is_some_and(|value| !value.is_null()) {
+            return Err("unsupported_cache_identity");
+        }
+    }
+    if let Some(messages) = body.get("messages").and_then(serde_json::Value::as_array) {
+        for message in messages {
+            if let Some(parts) = message.get("content").and_then(serde_json::Value::as_array) {
+                if parts.iter().any(|part| {
+                    part.get("type").and_then(serde_json::Value::as_str) != Some("text")
+                }) {
+                    return Err("multimodal_input");
+                }
+            }
+        }
+    }
+    let path = match route {
+        "/v1/completions" => {
+            if body
+                .get("truncate_prompt_tokens")
+                .is_none_or(serde_json::Value::is_null)
+                && body.get("suffix").is_none_or(serde_json::Value::is_null)
+            {
+                if let Some(items) = body.get("prompt").and_then(serde_json::Value::as_array) {
+                    if items.is_empty() {
+                        return Err("empty_input");
+                    }
+                    if items[0].is_number() {
+                        return Ok(HttpKvInput::Direct(Arc::from(vec![dense_token_ids(
+                            &body["prompt"],
+                        )?])));
+                    }
+                    if items[0].is_array() {
+                        let prompts = items
+                            .iter()
+                            .map(dense_token_ids)
+                            .collect::<Result<Vec<_>, _>>()?;
+                        return Ok(HttpKvInput::Direct(Arc::from(prompts)));
+                    }
+                }
+            }
+            "/v1/completions/render"
+        }
+        "/v1/chat/completions" => "/v1/chat/completions/render",
+        "/v1/responses" => {
+            if body
+                .get("previous_response_id")
+                .is_some_and(|value| !value.is_null())
+            {
+                return Err("stateful_input");
+            }
+            "/v1/responses/render"
+        }
+        "/inference/v1/generate" => {
+            return Ok(HttpKvInput::Direct(Arc::from(vec![dense_token_ids(
+                &body["token_ids"],
+            )?])))
+        }
+        _ => return Err("unsupported_route"),
+    };
+    Ok(HttpKvInput::Render {
+        path,
+        tokenize_fallback: http_tokenize_fallback(body, route),
+    })
+}
+
+fn http_tokenize_fallback(body: &serde_json::Value, route: &str) -> Option<Vec<serde_json::Value>> {
+    // /tokenize has fewer fields than generation in vLLM 0.30. Complex chat
+    // must use /render; silently dropping tool/template options is not exact.
+    for field in [
+        "truncate_prompt_tokens",
+        "suffix",
+        "tools",
+        "tool_choice",
+        "functions",
+        "function_call",
+        "response_format",
+        "reasoning_effort",
+        "documents",
+    ] {
+        if body.get(field).is_some_and(|value| !value.is_null()) {
+            return None;
+        }
+    }
+    let mut payload = serde_json::Map::new();
+    for field in [
+        "model",
+        "add_special_tokens",
+        "chat_template",
+        "chat_template_kwargs",
+        "add_generation_prompt",
+        "continue_final_message",
+    ] {
+        if let Some(value) = body.get(field).filter(|value| !value.is_null()) {
+            payload.insert(field.into(), value.clone());
+        }
+    }
+    match route {
+        "/v1/completions" => {
+            let prompts = match body.get("prompt")? {
+                serde_json::Value::String(text) => vec![text.as_str()],
+                serde_json::Value::Array(items) => items
+                    .iter()
+                    .map(serde_json::Value::as_str)
+                    .collect::<Option<Vec<_>>>()?,
+                _ => return None,
+            };
+            Some(
+                prompts
+                    .into_iter()
+                    .map(|prompt| {
+                        let mut payload = payload.clone();
+                        payload.insert("prompt".into(), prompt.into());
+                        serde_json::Value::Object(payload)
+                    })
+                    .collect(),
+            )
+        }
+        "/v1/chat/completions" => {
+            let messages = body.get("messages")?.as_array()?;
+            if messages.iter().any(|message| {
+                ["tool_calls", "function_call"]
+                    .iter()
+                    .any(|field| message.get(field).is_some_and(|value| !value.is_null()))
+            }) {
+                return None;
+            }
+            payload.insert("messages".into(), body["messages"].clone());
+            Some(vec![serde_json::Value::Object(payload)])
+        }
+        _ => None,
+    }
+}
+
+pub(crate) fn http_rendered_tokens(
+    body: &serde_json::Value,
+) -> Result<Arc<[Vec<u32>]>, &'static str> {
+    let items = match body {
+        serde_json::Value::Array(items) => items.iter().collect::<Vec<_>>(),
+        item => vec![item],
+    };
+    if items.is_empty() {
+        return Err("empty_input");
+    }
+    let prompts = items
+        .into_iter()
+        .map(|item| {
+            if item.get("features").is_some_and(|value| !value.is_null()) {
+                return Err("multimodal_input");
+            }
+            dense_token_ids(&item["token_ids"])
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Arc::from(prompts))
+}
+
 #[derive(Clone)]
 enum Frontend {
     Vllm(Arc<VllmFrontend>),
@@ -170,6 +366,8 @@ pub struct TokenizeOut {
     pub template_ms: f64,
     pub encode_ms: f64,
     pub encode_backend: &'static str,
+    /// Tokens reused by the frontend encoding cache (pre-tokenized input is zero).
+    pub cached_tokens: usize,
 }
 
 impl TokenizeOut {
@@ -193,6 +391,7 @@ pub fn tokenize_chat_request_timed(
                 template_ms: 0.0,
                 encode_ms: 0.0,
                 encode_backend: "test-pin",
+                cached_tokens: 0,
             })
         }
         Frontend::Vllm(vllm) => tokenize_vllm(request, vllm),
@@ -284,7 +483,7 @@ fn tokenize_vllm(request: &ChatCompletionRequest, frontend: &VllmFrontend) -> Re
         session_id,
     })?;
     let adapt_ms = t0.elapsed().as_secs_f64() * 1000.0;
-    let (token_ids, template_ms, encode_ms) = frontend
+    let (token_ids, template_ms, encode_ms, cached_tokens) = frontend
         .chat_tokenize_timed(&upstream)
         .map_err(|e| anyhow!("vllm-chat tokenize: {e}"))?;
     if token_ids.is_empty() {
@@ -296,6 +495,7 @@ fn tokenize_vllm(request: &ChatCompletionRequest, frontend: &VllmFrontend) -> Re
         template_ms,
         encode_ms,
         encode_backend: "vllm-tokenizer",
+        cached_tokens,
     })
 }
 
@@ -459,6 +659,41 @@ fn user_content_text(content: &UserMessageContent) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn http_inputs_keep_prompt_boundaries_and_require_exact_render_for_options() {
+        use super::{http_kv_input, http_rendered_tokens, HttpKvInput};
+        use serde_json::json;
+        let HttpKvInput::Direct(prompts) =
+            http_kv_input(&json!({"prompt":[[1,2],[3,4]]}), "/v1/completions").unwrap()
+        else {
+            panic!("direct ids")
+        };
+        assert_eq!(prompts.as_ref(), &[vec![1, 2], vec![3, 4]]);
+        assert!(http_kv_input(&json!({"prompt":[-1,2]}), "/v1/completions").is_err());
+        for body in [
+            json!({"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}],"tools":[{"type":"function","function":{"name":"f"}}],"tool_choice":"auto"}),
+            json!({"messages":[{"role":"assistant","tool_calls":[]}],"response_format":{"type":"json_object"}}),
+            json!({"prompt":[1,2,3],"truncate_prompt_tokens":2}),
+        ] {
+            let route = if body.get("prompt").is_some() {
+                "/v1/completions"
+            } else {
+                "/v1/chat/completions"
+            };
+            let HttpKvInput::Render {
+                tokenize_fallback, ..
+            } = http_kv_input(&body, route).unwrap()
+            else {
+                panic!("render options")
+            };
+            assert!(tokenize_fallback.is_none());
+        }
+        assert!(http_kv_input(&json!({"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"image"}}]}]}),"/v1/chat/completions").is_err());
+        assert!(http_rendered_tokens(
+            &json!({"token_ids":[1,2],"features":{"mm_hashes":{"image":["x"]}}})
+        )
+        .is_err());
+    }
     use super::*;
     use std::path::{Path, PathBuf};
     use std::process::Command;

@@ -71,6 +71,10 @@ pub struct RouterConfig {
     /// Disable circuit breaker (overrides circuit_breaker.failure_threshold to u32::MAX when true)
     #[serde(default)]
     pub disable_circuit_breaker: bool,
+    /// Enable stable-identity affinity in `kv_aware` and expire idle bindings after this TTL.
+    /// `None` disables affinity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kv_aware_session_affinity_ttl_secs: Option<u64>,
     /// Health check configuration
     pub health_check: HealthCheckConfig,
     /// Enable Inference Gateway mode (false = proxy mode, true = IGW mode)
@@ -596,7 +600,7 @@ pub enum RoutingMode {
         /// Optional separate policy for prefill workers
         #[serde(skip_serializing_if = "Option::is_none")]
         prefill_policy: Option<PolicyConfig>,
-        /// Optional separate policy for decode workers
+        /// Optional separate policy for decode workers (defaults to least_load)
         #[serde(skip_serializing_if = "Option::is_none")]
         decode_policy: Option<PolicyConfig>,
         /// ZMQ service discovery address (e.g., "0.0.0.0:30001")
@@ -639,12 +643,12 @@ impl RoutingMode {
     }
 
     /// Get the effective decode policy for PD mode
-    /// Falls back to the main policy if no specific decode policy is set
+    /// Decode balances load by default: its KV is transferred from prefill.
     pub fn get_decode_policy<'a>(&'a self, main_policy: &'a PolicyConfig) -> &'a PolicyConfig {
         match self {
-            RoutingMode::VllmPrefillDecode { decode_policy, .. } => {
-                decode_policy.as_ref().unwrap_or(main_policy)
-            }
+            RoutingMode::VllmPrefillDecode { decode_policy, .. } => decode_policy
+                .as_ref()
+                .unwrap_or(&PolicyConfig::DEFAULT_DECODE),
             _ => main_policy,
         }
     }
@@ -654,6 +658,9 @@ impl RoutingMode {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum PolicyConfig {
+    #[serde(rename = "least_load")]
+    LeastLoad,
+
     #[serde(rename = "random")]
     Random,
 
@@ -706,8 +713,11 @@ pub enum PolicyConfig {
 }
 
 impl PolicyConfig {
+    pub const DEFAULT_DECODE: Self = Self::LeastLoad;
+
     pub fn name(&self) -> &'static str {
         match self {
+            PolicyConfig::LeastLoad => "least_load",
             PolicyConfig::Random => "random",
             PolicyConfig::RoundRobin => "round_robin",
             PolicyConfig::CacheAware { .. } => "cache_aware",
@@ -942,6 +952,7 @@ impl Default for RouterConfig {
             circuit_breaker: CircuitBreakerConfig::default(),
             disable_retries: false,
             disable_circuit_breaker: false,
+            kv_aware_session_affinity_ttl_secs: None,
             health_check: HealthCheckConfig::default(),
             enable_igw: false,
             connection_mode: ConnectionMode::Http,
@@ -1657,6 +1668,7 @@ mod tests {
             circuit_breaker: CircuitBreakerConfig::default(),
             disable_retries: false,
             disable_circuit_breaker: false,
+            kv_aware_session_affinity_ttl_secs: None,
             health_check: HealthCheckConfig::default(),
             enable_igw: false,
             queue_size: 100,
@@ -1725,6 +1737,7 @@ mod tests {
             circuit_breaker: CircuitBreakerConfig::default(),
             disable_retries: false,
             disable_circuit_breaker: false,
+            kv_aware_session_affinity_ttl_secs: None,
             health_check: HealthCheckConfig::default(),
             enable_igw: false,
             queue_size: 100,
@@ -1789,6 +1802,7 @@ mod tests {
             circuit_breaker: CircuitBreakerConfig::default(),
             disable_retries: false,
             disable_circuit_breaker: false,
+            kv_aware_session_affinity_ttl_secs: None,
             health_check: HealthCheckConfig::default(),
             enable_igw: false,
             queue_size: 100,
@@ -1856,7 +1870,7 @@ mod tests {
 
     #[test]
     fn test_pd_policy_fallback_only_prefill() {
-        // When only prefill policy is specified, decode should use main policy
+        // When only prefill policy is specified, decode should balance load.
         let pd = RoutingMode::VllmPrefillDecode {
             prefill_urls: vec![("http://prefill1".to_string(), None)],
             decode_urls: vec!["http://decode1".to_string()],
@@ -1879,10 +1893,10 @@ mod tests {
             _ => panic!("Expected CacheAware for prefill"),
         }
 
-        // Decode should fall back to main policy
+        // Decode defaults independently of the main policy.
         match pd.get_decode_policy(&main_policy) {
-            PolicyConfig::RoundRobin => {} // Success
-            _ => panic!("Expected RoundRobin for decode"),
+            PolicyConfig::LeastLoad => {}
+            _ => panic!("Expected LeastLoad for decode"),
         }
     }
 
@@ -1933,7 +1947,7 @@ mod tests {
             max_tree_size: 2000,
         };
 
-        // Both should fall back to main policy
+        // Prefill inherits the main policy; decode balances load.
         match pd.get_prefill_policy(&main_policy) {
             PolicyConfig::CacheAware {
                 cache_threshold, ..
@@ -1944,12 +1958,8 @@ mod tests {
         }
 
         match pd.get_decode_policy(&main_policy) {
-            PolicyConfig::CacheAware {
-                cache_threshold, ..
-            } => {
-                assert!((cache_threshold - 0.7).abs() < 0.0001);
-            }
-            _ => panic!("Expected CacheAware for decode"),
+            PolicyConfig::LeastLoad => {}
+            _ => panic!("Expected LeastLoad for decode"),
         }
     }
 

@@ -76,6 +76,18 @@ pub fn init_metrics() {
 
     // Policy metrics
     describe_counter!(
+        "vllm_router_cache_routing_keys_total",
+        "Cache-aware decisions by input key kind"
+    );
+    describe_counter!(
+        "vllm_router_kv_routing_inputs_total",
+        "KV-aware token preparation by transport and result"
+    );
+    describe_counter!(
+        "vllm_router_kv_placement_lookups_total",
+        "KV-aware placement lookups and reasons for skipping them"
+    );
+    describe_counter!(
         "vllm_router_policy_decisions_total",
         "Total routing policy decisions by policy and worker"
     );
@@ -505,6 +517,12 @@ pub struct RouterMetrics;
 pub struct TokenizerMetrics;
 
 impl RouterMetrics {
+    pub fn record_kv_placement_lookup(result: &'static str) {
+        counter!("vllm_router_kv_placement_lookups_total", "result" => result).increment(1);
+    }
+    pub fn record_kv_routing_input(transport: &'static str, result: &'static str) {
+        counter!("vllm_router_kv_routing_inputs_total", "transport" => transport, "result" => result).increment(1);
+    }
     // Request metrics
     pub fn record_request(route: &str) {
         counter!("vllm_router_requests_total",
@@ -582,6 +600,10 @@ impl RouterMetrics {
             "worker" => worker.to_string()
         )
         .increment(1);
+    }
+
+    pub fn record_cache_routing_key(kind: &'static str) {
+        counter!("vllm_router_cache_routing_keys_total", "kind" => kind).increment(1);
     }
 
     pub fn record_cache_hit() {

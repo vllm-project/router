@@ -6,6 +6,7 @@
 
 use crate::config::RouterConfig;
 use crate::core::{CircuitBreakerConfig, Worker, WorkerFactory, WorkerRegistry, WorkerType};
+use crate::policies::kv_aware_ops;
 use crate::protocols::spec::{
     ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest,
     InferenceGenerateRequest, RerankRequest, ResponsesRequest,
@@ -217,6 +218,17 @@ impl RouterManager {
         // Extract policy hint from labels if provided
         let policy_hint = labels.get("policy").map(|s| s.as_str());
         let policy = self.policy_registry.on_worker_added(&model_id, policy_hint);
+        if worker_arc.worker_type() == WorkerType::Regular {
+            if let Some(kv) = kv_aware_ops(policy.as_ref()) {
+                kv.register_worker(worker_arc.as_ref(), None, None);
+            }
+            let default = self.policy_registry.get_default_policy();
+            if !Arc::ptr_eq(&policy, &default) {
+                if let Some(kv) = kv_aware_ops(default.as_ref()) {
+                    kv.register_worker(worker_arc.as_ref(), None, None);
+                }
+            }
+        }
 
         // Log which type of router would handle this worker (for debugging)
         let expected_router = match config.worker_type.as_deref() {
@@ -252,21 +264,27 @@ impl RouterManager {
         &self,
         url: &str,
     ) -> Result<WorkerApiResponse, WorkerErrorResponse> {
-        // Get worker to extract model_id before removing
-        let model_id = self
-            .worker_registry
-            .get_by_url(url)
-            .map(|worker| worker.model_id().to_string());
-
-        if let Some(_worker) = self.worker_registry.remove_by_url(url) {
-            // Notify PolicyRegistry about worker removal
-            if let Some(ref model_id) = model_id {
-                self.policy_registry.on_worker_removed(model_id);
-
-                info!("Removed worker with URL {} for model {}", url, model_id);
-            } else {
-                info!("Removed worker with URL {}", url);
+        if let Some(worker) = self.worker_registry.remove_by_url(url) {
+            if worker.worker_type() == WorkerType::Regular {
+                let policy = self
+                    .policy_registry
+                    .get_policy_or_default(worker.model_id());
+                if let Some(kv) = kv_aware_ops(policy.as_ref()) {
+                    kv.unregister_worker(url);
+                }
+                let default = self.policy_registry.get_default_policy();
+                if !Arc::ptr_eq(&policy, &default) {
+                    if let Some(kv) = kv_aware_ops(default.as_ref()) {
+                        kv.unregister_worker(url);
+                    }
+                }
             }
+            self.policy_registry.on_worker_removed(worker.model_id());
+            info!(
+                "Removed worker with URL {} for model {}",
+                url,
+                worker.model_id()
+            );
 
             Ok(WorkerApiResponse {
                 success: true,

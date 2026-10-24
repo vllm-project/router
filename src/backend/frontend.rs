@@ -141,8 +141,9 @@ impl EngineFrontend {
         mut request: ChatCompletionRequest,
     ) -> Result<PreparedRequest, PrepareError> {
         let (handle, t_req, resolve_ms) = self.resolve_with_defaults(&mut request).await?;
-        let tokenized = tokenize_chat_request_timed(&request, &handle)
+        let mut tokenized = tokenize_chat_request_timed(&request, &handle)
             .map_err(|e| PrepareError::Invalid(format!("preprocess: {e}")))?;
+        truncate_grpc_prompt(&request, &mut tokenized)?;
         Ok(PreparedRequest {
             request: Arc::new(request),
             tokenized,
@@ -164,13 +165,15 @@ impl EngineFrontend {
         emit_token_ids: bool,
     ) -> Result<PreparedRequest, PrepareError> {
         let (handle, t_req, resolve_ms) = self.resolve_with_defaults(&mut request).await?;
-        let tokenized = TokenizeOut {
+        let mut tokenized = TokenizeOut {
             token_ids: Arc::from(token_ids),
             adapt_ms: 0.0,
             template_ms: 0.0,
             encode_ms: 0.0,
             encode_backend: "completions-token-ids",
+            cached_tokens: 0,
         };
+        truncate_grpc_prompt(&request, &mut tokenized)?;
         Ok(PreparedRequest {
             request: Arc::new(request),
             tokenized,
@@ -202,4 +205,33 @@ impl EngineFrontend {
     pub fn remove_worker(&self, worker_url: &str) {
         self.grpc.remove_client(worker_url);
     }
+}
+
+fn truncate_grpc_prompt(
+    request: &ChatCompletionRequest,
+    tokenized: &mut TokenizeOut,
+) -> Result<(), PrepareError> {
+    if let Some(value) = request
+        .other
+        .get("truncate_prompt_tokens")
+        .filter(|value| !value.is_null())
+    {
+        let limit = value
+            .as_u64()
+            .and_then(|value| u32::try_from(value).ok())
+            .ok_or_else(|| {
+                PrepareError::Invalid(
+                    "truncate_prompt_tokens must be a non-negative 32-bit integer on gRPC".into(),
+                )
+            })? as usize;
+        // The gRPC protocol's zero means no truncation; positive limits keep
+        // the suffix. Sending the already-truncated IDs makes placement and
+        // dispatch agree, even when the worker applies the same limit again.
+        if limit > 0 && tokenized.token_ids.len() > limit {
+            tokenized.token_ids =
+                Arc::from(&tokenized.token_ids[tokenized.token_ids.len() - limit..]);
+            tokenized.cached_tokens = tokenized.cached_tokens.min(limit);
+        }
+    }
+    Ok(())
 }

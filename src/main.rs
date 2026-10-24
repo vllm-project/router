@@ -120,7 +120,7 @@ struct CliArgs {
     worker_urls: Vec<String>,
 
     /// Load balancing policy to use. kv_aware is supported only in regular mode, not PD disaggregation.
-    #[arg(long, default_value = "cache_aware", value_parser = ["random", "round_robin", "cache_aware", "kv_aware", "power_of_two", "consistent_hash", "rendezvous_hash"])]
+    #[arg(long, default_value = "cache_aware", value_parser = ["least_load", "random", "round_robin", "cache_aware", "kv_aware", "power_of_two", "consistent_hash", "rendezvous_hash"])]
     policy: String,
 
     /// Enable Program-level scheduling independently of the request-level
@@ -147,11 +147,11 @@ struct CliArgs {
     decode: Vec<String>,
 
     /// Specific policy for prefill nodes in PD mode. kv_aware is not supported in PD mode.
-    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "consistent_hash", "rendezvous_hash"])]
+    #[arg(long, value_parser = ["least_load", "random", "round_robin", "cache_aware", "power_of_two", "consistent_hash", "rendezvous_hash"])]
     prefill_policy: Option<String>,
 
-    /// Specific policy for decode nodes in PD mode. kv_aware is not supported in PD mode.
-    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "consistent_hash", "rendezvous_hash"])]
+    /// Specific policy for decode nodes in PD mode (default: least_load). kv_aware is not supported.
+    #[arg(long, value_parser = ["least_load", "random", "round_robin", "cache_aware", "power_of_two", "consistent_hash", "rendezvous_hash"])]
     decode_policy: Option<String>,
 
     /// Timeout in seconds for worker startup
@@ -186,7 +186,11 @@ struct CliArgs {
     #[arg(long, default_value_t = 0.0)]
     router_temperature: f64,
 
-    /// Per-tier transfer credits for kv_aware; lower means costlier transfer.
+    /// Enable kv_aware session affinity and set its idle TTL in seconds.
+    /// Omit to disable session affinity while keeping KV-aware routing enabled.
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..=31_536_000))]
+    kv_aware_session_affinity_ttl_secs: Option<u64>,
+    /// Transfer credit for host-resident KV blocks.
     #[arg(long, default_value_t = 0.8)]
     kv_penalty_host: f64,
     #[arg(long, default_value_t = 0.6)]
@@ -411,6 +415,7 @@ impl CliArgs {
     /// Convert policy string to PolicyConfig
     fn parse_policy(&self, policy_str: &str) -> PolicyConfig {
         match policy_str {
+            "least_load" => PolicyConfig::LeastLoad,
             "random" => PolicyConfig::Random,
             "round_robin" => PolicyConfig::RoundRobin,
             "cache_aware" => PolicyConfig::CacheAware {
@@ -614,6 +619,7 @@ impl CliArgs {
             },
             disable_retries: self.disable_retries,
             disable_circuit_breaker: self.disable_circuit_breaker,
+            kv_aware_session_affinity_ttl_secs: self.kv_aware_session_affinity_ttl_secs,
             health_check: HealthCheckConfig {
                 failure_threshold: self.health_failure_threshold,
                 success_threshold: self.health_success_threshold,
