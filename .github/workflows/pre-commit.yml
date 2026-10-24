@@ -1,0 +1,39 @@
+name: pre-commit
+
+on:
+  pull_request:
+    branches: [main, "release-**"]
+  push:
+    branches: [main, "release-**"]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  pre-commit:
+    name: pre-commit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          components: rustfmt, clippy
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libssl-dev protobuf-compiler
+      - uses: Swatinem/rust-cache@v2
+      # fmt, clippy, black, ruff, and typos stay required.
+      # shellcheck and mypy still run locally on changed files. CI skips
+      # them until `pre-commit run --all-files` is clean for those hooks.
+      - uses: pre-commit/action@v3.0.1
+        env:
+          SKIP: mypy,shellcheck

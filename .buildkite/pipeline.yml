@@ -11,6 +11,9 @@ env:
   RUST_BACKTRACE: "1"
 
 steps:
+  # Formatting, Clippy, Ruff, and spelling run in GitHub Actions from
+  # .pre-commit-config.yaml. They are not Buildkite jobs.
+
   # ============================================================================
   # Build - Create release artifacts
   # ============================================================================

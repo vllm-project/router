@@ -1,0 +1,19 @@
+# Intentional tokens. codespell previously ignored aks, te, hel, wit, wast.
+[default.extend-words]
+aks = "aks"
+AKS = "AKS"
+te = "te"
+hel = "hel"
+Hel = "Hel"
+wit = "wit"
+wast = "wast"
+# AMD ROCm runtime variable HSA_NO_SCRATCH_RECLAIM.
+HSA = "HSA"
+# vLLM multimodal field image_grid_thw (temporal, height, width).
+thw = "thw"
+
+[files]
+extend-exclude = [
+    "scripts/deepseek/*-oom-logs.txt",
+    "tests/fixtures/tokenizer/byte_level_bpe.json",
+]

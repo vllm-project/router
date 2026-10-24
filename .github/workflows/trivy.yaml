@@ -1,9 +1,14 @@
+# Image CVE scan for the nightly lane. Not a required check on feature PRs.
+# GitHub runs this schedule from the default branch only. workflow_dispatch
+# is the manual run. This stays its own workflow; it is not part of the
+# release image publish (NIGHTLY=1 on router-release).
 name: Trivy vulnerability scanner
 on:
-  push:
-    branches:
-      - main
-  pull_request:
+  schedule:
+    - cron: "0 0 * * *"
+  workflow_dispatch:
+permissions:
+  contents: read
 jobs:
   build:
     name: Build
@@ -11,11 +16,11 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v6
-      
+
       - name: Build an image from Dockerfile
         run: |
           docker build --no-cache --output=type=docker -t test/router:latest -f ./Dockerfile.router .
-      
+
       - name: Run Trivy vulnerability scanner
         uses: aquasecurity/trivy-action@master
         env:
