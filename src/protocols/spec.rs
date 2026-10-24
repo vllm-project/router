@@ -2485,6 +2485,12 @@ pub trait GenerationRequest: Send + Sync {
         None
     }
 
+    /// Body level session affinity key, used only when no session header is
+    /// present (for example anthropic `metadata.user_id`).
+    fn affinity_user_key(&self) -> Option<&str> {
+        None
+    }
+
     /// Concretely-typed view of this request for the gRPC prepare path.
     ///
     /// The gRPC pool serves only `/v1/chat/completions` and `/v1/completions`;
@@ -2495,7 +2501,7 @@ pub trait GenerationRequest: Send + Sync {
     }
 }
 
-fn program_identity_payload(
+pub(crate) fn program_identity_payload(
     other: &serde_json::Map<String, serde_json::Value>,
     user: Option<&str>,
 ) -> Option<serde_json::Value> {

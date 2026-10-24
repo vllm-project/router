@@ -7,6 +7,7 @@ use crate::{
     middleware::{self, QueuedRequest, TokenBucket},
     policies::PolicyRegistry,
     protocols::{
+        anthropic::{anthropic_error_body, MessagesRequest},
         spec::{
             ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest,
             InferenceGenerateRequest, RerankRequest, V1RerankReqInput,
@@ -15,7 +16,7 @@ use crate::{
     },
     routers::{
         router_manager::{RouterId, RouterManager},
-        RouterFactory, RouterTrait,
+        RouterFactory, RouterTrait, UpstreamResponse,
     },
     service_discovery::{start_service_discovery, ServiceDiscoveryConfig},
 };
@@ -350,6 +351,102 @@ async fn v1_embeddings(
         .router
         .route_embeddings(Some(&headers), &body, None)
         .await
+}
+
+/// Max size of a router generated error body rewritten for `/v1/messages`.
+/// Router errors are short; worker responses never reach the rewrite.
+const MESSAGES_ERROR_BODY_LIMIT: usize = 64 * 1024;
+
+/// Message text of a router generated error body. Some router errors are
+/// already json (`{"error": {"message": ...}}` or `{"message": ...}`); use
+/// their message instead of nesting the json text. Plain text is used as is.
+fn router_error_message(bytes: &[u8]) -> String {
+    if let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) {
+        let message = value
+            .pointer("/error/message")
+            .or_else(|| value.get("message"))
+            .or_else(|| value.get("error"))
+            .and_then(serde_json::Value::as_str);
+        if let Some(message) = message {
+            return message.to_string();
+        }
+    }
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
+/// Rewrite router generated errors on `/v1/messages` into the anthropic
+/// error shape. Worker responses carry [`UpstreamResponse`] and pass through
+/// unchanged whatever their content type, as do successful responses.
+async fn anthropic_error_response(response: Response) -> Response {
+    let status = response.status();
+    if status.is_success() || response.extensions().get::<UpstreamResponse>().is_some() {
+        return response;
+    }
+    let (mut parts, body) = response.into_parts();
+    let message = match axum::body::to_bytes(body, MESSAGES_ERROR_BODY_LIMIT).await {
+        Ok(bytes) if !bytes.is_empty() => router_error_message(&bytes),
+        _ => status
+            .canonical_reason()
+            .unwrap_or("request failed")
+            .to_string(),
+    };
+    parts.headers.remove(http::header::CONTENT_LENGTH);
+    let mut out = Json(anthropic_error_body(status.as_u16(), &message)).into_response();
+    *out.status_mut() = status;
+    for (name, value) in parts.headers.iter() {
+        if name != http::header::CONTENT_TYPE {
+            out.headers_mut().insert(name.clone(), value.clone());
+        }
+    }
+    out
+}
+
+async fn v1_messages(
+    State(state): State<Arc<AppState>>,
+    headers: http::HeaderMap,
+    body: Result<Json<MessagesRequest>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    if let Err(response) = authorize_request(&state, &headers).await {
+        return response;
+    }
+    let body = match body {
+        Ok(Json(body)) => body,
+        Err(rejection) => {
+            // Size limits keep their own status; every other body problem
+            // is an invalid request.
+            let status = match rejection.status() {
+                StatusCode::PAYLOAD_TOO_LARGE => StatusCode::PAYLOAD_TOO_LARGE,
+                _ => StatusCode::BAD_REQUEST,
+            };
+            let mut out = Json(anthropic_error_body(
+                status.as_u16(),
+                &rejection.body_text(),
+            ))
+            .into_response();
+            *out.status_mut() = status;
+            return out;
+        }
+    };
+    state
+        .router
+        .route_messages(Some(&headers), &body, None)
+        .await
+}
+
+/// Outermost layer on the protected routes: rewrites router generated
+/// errors on `/v1/messages` (including concurrency limit and wasm rejects)
+/// into the anthropic error shape. Other routes pass through untouched.
+async fn anthropic_error_layer(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let is_messages = req.uri().path() == "/v1/messages";
+    let response = next.run(req).await;
+    if is_messages {
+        anthropic_error_response(response).await
+    } else {
+        response
+    }
 }
 
 async fn v1_responses_get(
@@ -816,6 +913,7 @@ pub fn build_app_with_wasm_middleware(
         .route("/v1/rerank", post(v1_rerank))
         .route("/v1/responses", post(v1_responses))
         .route("/v1/embeddings", post(v1_embeddings))
+        .route("/v1/messages", post(v1_messages))
         .route("/v1/responses/{response_id}", get(v1_responses_get))
         .route(
             "/v1/responses/{response_id}/cancel",
@@ -841,6 +939,8 @@ pub fn build_app_with_wasm_middleware(
         app_state.clone(),
         middleware::concurrency_limit_middleware,
     ));
+    let protected_routes =
+        protected_routes.route_layer(axum::middleware::from_fn(anthropic_error_layer));
 
     let public_routes = Router::new()
         .route("/liveness", get(liveness))
