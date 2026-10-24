@@ -84,6 +84,13 @@ impl TokenizerCache {
         if let Some(pinned) = self.pinned.read().clone() {
             return Ok(FrontendHandle(pinned));
         }
+        if let Some(hit) = model
+            .map(str::trim)
+            .filter(|model| !model.is_empty())
+            .and_then(|model| self.by_model.get(model))
+        {
+            return Ok(FrontendHandle(Frontend::Vllm(hit.clone())));
+        }
         let (key, source) = model_resolution(model)?;
         if let Some(hit) = self.by_model.get(&key) {
             return Ok(FrontendHandle(Frontend::Vllm(hit.clone())));
@@ -148,6 +155,13 @@ fn model_resolution(request_model: Option<&str>) -> Result<(String, String)> {
 pub struct FrontendHandle(Frontend);
 
 impl FrontendHandle {
+    pub(crate) fn asset_source(&self) -> Option<&str> {
+        match &self.0 {
+            Frontend::Vllm(frontend) => Some(frontend.asset_source()),
+            Frontend::TestIds(_) => None,
+        }
+    }
+
     pub fn tokenizer(&self) -> Option<super::vllm_frontend::DynTokenizer> {
         match &self.0 {
             Frontend::Vllm(frontend) => Some(frontend.tokenizer()),
@@ -462,6 +476,63 @@ mod tests {
     use super::*;
     use std::path::{Path, PathBuf};
     use std::process::Command;
+
+    #[tokio::test]
+    async fn completion_contract_uses_cached_frontend_source_and_separate_model_vocab() {
+        let model = tempfile::tempdir().unwrap();
+        let assets = tempfile::tempdir().unwrap();
+        std::fs::write(model.path().join("config.json"), r#"{"vocab_size":512}"#).unwrap();
+        std::fs::write(
+            assets.path().join("config.json"),
+            r#"{"model_type":"llama","vocab_size":293}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            assets.path().join("tokenizer.json"),
+            include_str!("../../tests/fixtures/tokenizer/byte_level_bpe.json"),
+        )
+        .unwrap();
+        std::fs::write(
+            assets.path().join("tokenizer_config.json"),
+            r#"{"bos_token":"<s>","eos_token":"</s>","chat_template":"{{ messages[0]['content'] }}"}"#,
+        )
+        .unwrap();
+        let loaded = Arc::new(
+            VllmFrontend::load(assets.path().to_str().unwrap(), Default::default(), None)
+                .await
+                .unwrap(),
+        );
+        let cache = TokenizerCache::new();
+        // The alias deliberately is neither a directory nor its basename.
+        // A hit must be returned before environment-based asset resolution.
+        cache.by_model.insert("public-alias".into(), loaded.clone());
+        let handle = cache.resolve(Some("public-alias")).await.unwrap();
+        assert_eq!(handle.asset_source(), assets.path().to_str());
+        let input = super::super::completion_input::CompletionInput::load(
+            "public-alias",
+            "engine-cache-identity",
+            model.path(),
+            async { Ok(handle) },
+        )
+        .await
+        .unwrap();
+        assert_eq!(input.model, "public-alias");
+        assert_eq!(input.cache_model, "engine-cache-identity");
+        assert_eq!(input.vocab_size, 512);
+        assert!(Arc::ptr_eq(&input.tokenizer, &loaded.tokenizer()));
+
+        // Validate the actual cached source, never a convenient model sibling.
+        std::fs::write(assets.path().join("tokenizer.json"), "{}").unwrap();
+        let handle = cache.resolve(Some("public-alias")).await.unwrap();
+        assert!(super::super::completion_input::CompletionInput::load(
+            "public-alias",
+            "engine-cache-identity",
+            model.path(),
+            async { Ok(handle) },
+        )
+        .await
+        .is_err());
+    }
 
     fn model_dir() -> Option<String> {
         let dir = std::env::var("VLLM_ROUTER_MODEL")

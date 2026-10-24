@@ -79,7 +79,7 @@ fn canonical_worker(value: &str) -> Result<(String, String), String> {
     Ok((parsed.to_string().trim_end_matches('/').to_string(), host))
 }
 
-fn canonical_endpoint(value: &str) -> Result<String, String> {
+pub(crate) fn canonical_endpoint(value: &str) -> Result<String, String> {
     let parsed = Url::parse(value).map_err(|error| format!("invalid KV endpoint: {error}"))?;
     if parsed.scheme() != "tcp"
         || parsed.host().is_none()

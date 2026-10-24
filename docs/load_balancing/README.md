@@ -242,7 +242,7 @@ vllm-router --policy cache_aware \
 
 ## KV Aware
 
-The `kv_aware` policy scores workers using the request's reusable KV blocks and current load. It is supported in regular, co-located routing mode only; it is not supported with PD disaggregation. In PD mode, the effective prefill and decode policies must use other policies. KV placement credit requires gRPC workers because the gRPC chat route supplies token IDs to the policy. With HTTP workers, the policy degrades to load-only scoring and does not use KV event placement.
+The `kv_aware` policy scores workers using the request's reusable KV blocks and current load. It is supported in regular, co-located routing mode only; it is not supported with PD disaggregation. In PD mode, the effective prefill and decode policies must use other policies. KV placement credit requires prepared tokens: gRPC Chat supplies these by default; static HTTP Completion has an [opt-in input contract](http_completion_kv.md). Other HTTP requests use load-only scoring.
 
 ```bash
 vllm-router --policy kv_aware \

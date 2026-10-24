@@ -3,8 +3,9 @@
 //! Worker pool is all-`http(s)://` or all-`grpc://`. Mixed schemes fail
 //! at init / `add_worker` (gRPC is `token_ids` only).
 //!
-//! - All-HTTP: policy selects, then `router.rs` reverse-proxies OpenAI JSON
-//!   (no chat/tokenizer frontend on the critical path).
+//! - All-HTTP: policy selects, then `router.rs` reverse-proxies OpenAI JSON.
+//!   Opt-in static Completion inputs share the tokenizer loader for KV selection;
+//!   the original validated request bytes still go to the Worker.
 //! - All-gRPC: `EngineFrontend::prepare(chat)` → `token_ids`, then policy
 //!   selects, then `EngineFrontend::dispatch` (`convert` + GenerateStream +
 //!   detok).
@@ -13,8 +14,10 @@
 //! `vllm-chat` + `vllm-tokenizer` only (Cargo git, not `pip install`).
 //!
 //! `VLLM_ROUTER_STAGES=1` emits stage clocks. gRPC always tokenizes; HTTP
-//! remains a transparent proxy and reports worker header/first-byte timings.
+//! retains the Worker serving path and reports worker header/first-byte timings.
 
+pub mod completion;
+pub(crate) mod completion_input;
 pub mod control;
 pub mod convert;
 pub mod detect;
@@ -34,6 +37,10 @@ pub fn stages_enabled() -> bool {
     )
 }
 
+pub use completion::{
+    prepare_completion, prepare_completion_classified, validate_completion_tokenizer_definition,
+    CompletionPreparationError,
+};
 pub use control::{
     get_grpc_model_info, get_grpc_server_info, model_info_json, openai_models_json,
     server_info_json,

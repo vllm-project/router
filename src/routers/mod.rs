@@ -100,6 +100,19 @@ pub trait RouterTrait: Send + Sync + Debug + WorkerManagement {
         model_id: Option<&str>,
     ) -> Response;
 
+    /// Preserve validated ingress bytes where a router supports transparent
+    /// Completion forwarding. Other backends retain their typed behavior.
+    async fn route_completion_raw(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &CompletionRequest,
+        raw: &axum::body::Bytes,
+        model_id: Option<&str>,
+    ) -> Response {
+        let _ = raw;
+        self.route_completion(headers, body, model_id).await
+    }
+
     /// Route a responses request
     async fn route_responses(
         &self,

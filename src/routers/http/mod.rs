@@ -1,5 +1,6 @@
 //! HTTP router implementations
 
+mod completion_output;
 pub mod dp_utils;
 mod epd;
 pub mod logprobs_merge;

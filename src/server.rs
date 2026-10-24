@@ -20,7 +20,7 @@ use crate::{
     service_discovery::{start_service_discovery, ServiceDiscoveryConfig},
 };
 use axum::{
-    extract::{DefaultBodyLimit, Path, Query, Request, State},
+    extract::{DefaultBodyLimit, FromRequest, Path, Query, Request, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{delete, get, post},
@@ -283,7 +283,7 @@ async fn epd_chat_completions(
 async fn v1_completions(
     State(state): State<Arc<AppState>>,
     headers: http::HeaderMap,
-    Json(body): Json<CompletionRequest>,
+    JsonWithRaw { value: body, raw }: JsonWithRaw<CompletionRequest>,
 ) -> Response {
     if let Err(response) = authorize_request(&state, &headers).await {
         return response;
@@ -291,8 +291,44 @@ async fn v1_completions(
 
     state
         .router
-        .route_completion(Some(&headers), &body, None)
+        .route_completion_raw(Some(&headers), &body, &raw, None)
         .await
+}
+
+struct JsonWithRaw<T> {
+    value: T,
+    raw: axum::body::Bytes,
+}
+
+impl<T, S> FromRequest<S> for JsonWithRaw<T>
+where
+    T: serde::de::DeserializeOwned,
+    S: Send + Sync,
+{
+    type Rejection = Response;
+
+    async fn from_request(request: Request, state: &S) -> Result<Self, Self::Rejection> {
+        // Axum's MIME predicate is private. Keep this compatibility check at
+        // the same boundary and compare it against the locked Json extractor.
+        let json_content_type = request
+            .headers()
+            .get(http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<mime::Mime>().ok())
+            .is_some_and(|value| {
+                value.type_() == "application"
+                    && (value.subtype() == "json"
+                        || value.suffix().is_some_and(|suffix| suffix == "json"))
+            });
+        if !json_content_type {
+            return Err(axum::extract::rejection::MissingJsonContentType::default().into_response());
+        }
+        let raw = axum::body::Bytes::from_request(request, state)
+            .await
+            .map_err(IntoResponse::into_response)?;
+        let Json(value) = Json::<T>::from_bytes(&raw).map_err(IntoResponse::into_response)?;
+        Ok(Self { value, raw })
+    }
 }
 
 async fn rerank(
@@ -1275,6 +1311,240 @@ fn create_cors_layer(allowed_origins: Vec<String>) -> tower_http::cors::CorsLaye
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn completion_extractor_matches_locked_axum_json() {
+        use axum::body::{to_bytes, Body, Bytes};
+
+        for content_type in [
+            None,
+            Some(http::HeaderValue::from_static("application/json")),
+            Some(http::HeaderValue::from_static(
+                "application/json; charset=utf-8",
+            )),
+            Some(http::HeaderValue::from_static(
+                "application/problem+json; charset=utf-8",
+            )),
+            Some(http::HeaderValue::from_static("text/json")),
+            Some(http::HeaderValue::from_static("application/json; broken")),
+            Some(http::HeaderValue::from_bytes(b"\xff").unwrap()),
+        ] {
+            for raw in [
+                r#" { "max_tokens":1, "prompt":"\u4f60好\n\"" } "#,
+                r#"{"prompt":[1,2]}"#,
+                r#"{"prompt":[1],"prompt":[2]}"#,
+                r#"{"prompt":{}}"#,
+                r#"{"prompt":"#,
+                "",
+            ] {
+                let request = || {
+                    let mut request = Request::new(Body::from(raw));
+                    if let Some(value) = &content_type {
+                        request
+                            .headers_mut()
+                            .insert(http::header::CONTENT_TYPE, value.clone());
+                    }
+                    request
+                };
+                match (
+                    JsonWithRaw::<CompletionRequest>::from_request(request(), &()).await,
+                    Json::<CompletionRequest>::from_request(request(), &()).await,
+                ) {
+                    (Ok(actual), Ok(Json(expected))) => {
+                        assert_eq!(
+                            serde_json::to_value(actual.value).unwrap(),
+                            serde_json::to_value(expected).unwrap()
+                        );
+                        assert_eq!(actual.raw, Bytes::copy_from_slice(raw.as_bytes()));
+                    }
+                    (Err(actual), Err(expected)) => {
+                        let expected = expected.into_response();
+                        assert_eq!(
+                            actual.status(),
+                            expected.status(),
+                            "{content_type:?}: {raw}"
+                        );
+                        assert_eq!(actual.headers(), expected.headers());
+                        assert_eq!(
+                            to_bytes(actual.into_body(), 4096).await.unwrap(),
+                            to_bytes(expected.into_body(), 4096).await.unwrap()
+                        );
+                    }
+                    _ => panic!("extractors disagreed for {content_type:?}: {raw}"),
+                }
+            }
+        }
+
+        let failed_body = || {
+            Request::builder()
+                .header(http::header::CONTENT_TYPE, "application/json")
+                .body(Body::from_stream(futures_util::stream::once(async {
+                    Err::<Bytes, _>(std::io::Error::other("injected body read failure"))
+                })))
+                .unwrap()
+        };
+        let actual = JsonWithRaw::<CompletionRequest>::from_request(failed_body(), &())
+            .await
+            .err()
+            .unwrap();
+        let expected = Json::<CompletionRequest>::from_request(failed_body(), &())
+            .await
+            .unwrap_err()
+            .into_response();
+        assert_eq!(actual.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(actual.status(), expected.status());
+        assert_eq!(actual.headers(), expected.headers());
+        assert_eq!(
+            to_bytes(actual.into_body(), 4096).await.unwrap(),
+            to_bytes(expected.into_body(), 4096).await.unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn completion_handler_preserves_extraction_auth_limits_and_raw_body() {
+        use axum::body::{to_bytes, Body, Bytes};
+        use std::sync::atomic::AtomicUsize;
+        use tower::ServiceExt;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let worker_url = format!("http://{}", listener.local_addr().unwrap());
+        let backend = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route("/v1/completions", post(|raw: Bytes| async { raw })),
+            )
+            .await
+            .unwrap();
+        });
+        let config = RouterConfig {
+            policy: crate::config::PolicyConfig::KvAware {
+                router_temperature: 0.0,
+                kv_penalty_host: 0.3,
+                kv_penalty_external: 0.05,
+                kv_penalty_disk: 0.01,
+            },
+            ..Default::default()
+        };
+        let context = Arc::new(
+            AppContext::new(
+                config,
+                Client::new(),
+                32,
+                None,
+                vec!["http://unused.invalid".into()],
+            )
+            .unwrap(),
+        );
+        context
+            .api_key_cache
+            .write()
+            .await
+            .insert("valid".into(), true);
+        let router = crate::routers::http::router::Router::new(Vec::new(), &context)
+            .await
+            .unwrap();
+        context
+            .worker_registry
+            .register(Arc::new(crate::core::BasicWorker::new(
+                worker_url,
+                WorkerType::Regular,
+            )));
+        let app = build_app_with_request_tracing(
+            Arc::new(AppState {
+                router: Arc::new(router),
+                context,
+                concurrency_queue_tx: None,
+                router_manager: None,
+            }),
+            128,
+            Vec::new(),
+            Vec::new(),
+            false,
+            false,
+        );
+        let raw = r#" { "max_tokens":1, "prompt":"\u4f60好\n\"" } "#;
+        for (body, status, authorized) in [
+            (raw, StatusCode::OK, true),
+            (raw, StatusCode::UNAUTHORIZED, false),
+            (r#"{"prompt":"#, StatusCode::BAD_REQUEST, false),
+            (
+                r#"{"prompt":[1],"prompt":[2]}"#,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                false,
+            ),
+        ] {
+            let mut request = Request::builder()
+                .method("POST")
+                .uri("/v1/completions")
+                .header(http::header::CONTENT_TYPE, "application/json");
+            if authorized {
+                request = request.header(http::header::AUTHORIZATION, "Bearer valid");
+            }
+            let response = app
+                .clone()
+                .oneshot(request.body(Body::from(body)).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), status);
+            if status == StatusCode::OK {
+                assert_eq!(
+                    to_bytes(response.into_body(), 4096).await.unwrap(),
+                    raw.as_bytes()
+                );
+            }
+        }
+        for content_type in [
+            None,
+            Some(http::HeaderValue::from_static("text/plain")),
+            Some(http::HeaderValue::from_static("application/json; broken")),
+            Some(http::HeaderValue::from_bytes(b"\xff").unwrap()),
+        ] {
+            let polls = Arc::new(AtomicUsize::new(0));
+            let observed = polls.clone();
+            let body = Body::from_stream(futures_util::stream::poll_fn(move |_| {
+                observed.fetch_add(1, Ordering::Relaxed);
+                std::task::Poll::Pending::<Option<Result<Bytes, std::io::Error>>>
+            }));
+            let mut request = Request::builder().method("POST").uri("/v1/completions");
+            if let Some(content_type) = content_type {
+                request = request.header(http::header::CONTENT_TYPE, content_type);
+            }
+            let response = tokio::time::timeout(
+                Duration::from_secs(1),
+                app.clone().oneshot(request.body(body).unwrap()),
+            )
+            .await
+            .expect("invalid header must not wait for an unfinished body")
+            .unwrap();
+            assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+            assert_eq!(polls.load(Ordering::Relaxed), 0);
+        }
+        for (body, status) in [
+            (Body::from(" ".repeat(129)), StatusCode::PAYLOAD_TOO_LARGE),
+            (
+                Body::from_stream(futures_util::stream::once(async {
+                    Err::<Bytes, _>(std::io::Error::other("injected body read failure"))
+                })),
+                StatusCode::BAD_REQUEST,
+            ),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v1/completions")
+                        .header(http::header::CONTENT_TYPE, "application/json")
+                        .body(body)
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), status);
+        }
+        backend.abort();
+        let _ = backend.await;
+    }
 
     #[tokio::test]
     async fn test_bind_listener_sets_tcp_nodelay_on_accepted_connections() {

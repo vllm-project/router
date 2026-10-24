@@ -24,6 +24,7 @@ pub use vllm_tokenizer::IncrementalDecoder as IncrementalDecoderTrait;
 pub struct VllmFrontend {
     backends: Arc<LoadedModelBackends>,
     encoder: PromptEncoder,
+    asset_source: String,
 }
 
 impl VllmFrontend {
@@ -60,7 +61,12 @@ impl VllmFrontend {
         Ok(Self {
             backends: Arc::new(backends),
             encoder,
+            asset_source: model_id.to_owned(),
         })
+    }
+
+    pub(crate) fn asset_source(&self) -> &str {
+        &self.asset_source
     }
 
     pub fn tokenizer(&self) -> DynTokenizer {

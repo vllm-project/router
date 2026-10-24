@@ -1,5 +1,8 @@
+use super::completion_output::CompletionOutputObserver;
 use super::program_adapter::ProgramCompletion;
-use crate::backend::stream_output::OutputFrameConsumer;
+use crate::backend::stream_output::{
+    output_frame_tracking, OutputFrameConsumer, OutputFrameProducer,
+};
 use crate::config::types::RetryConfig;
 use crate::core::{
     is_retryable_status, BasicWorker, CircuitBreakerConfig, DPAwareWorker, HealthConfig,
@@ -66,10 +69,14 @@ fn http_stages_json(http_ttfb_ms: f64, first_sse_ms: f64) -> serde_json::Value {
 fn emit_http_first_sse<E>(
     tx: &tokio::sync::mpsc::UnboundedSender<Result<bytes::Bytes, E>>,
     stages: &serde_json::Value,
-) {
-    let comment = format!(": router-stages {stages}\n\n");
+    output_frame: Option<&mut OutputFrameProducer>,
+) -> bool {
+    let comment = bytes::Bytes::from(format!(": router-stages {stages}\n\n"));
     info!(%stages, "http proxy stages");
-    let _ = tx.send(Ok(bytes::Bytes::from(comment)));
+    match output_frame {
+        Some(output_frame) => output_frame.send(tx, comment, false),
+        None => tx.send(Ok(comment)).is_ok(),
+    }
 }
 
 struct LoadTrackedBody {
@@ -77,8 +84,8 @@ struct LoadTrackedBody {
         Box<dyn futures_util::Stream<Item = Result<bytes::Bytes, axum::Error>> + Send + 'static>,
     >,
     load: RequestLoadGuard,
-    /// gRPC streams report the body frame containing their first model output.
-    /// HTTP streams use their first frame.
+    /// gRPC and Completion streams report the frame containing model output.
+    /// Other HTTP streams retain their first-frame behavior.
     output_frame: Option<OutputFrameConsumer>,
     producer_abort: Option<tokio::task::AbortHandle>,
 }
@@ -192,14 +199,6 @@ fn hold_request_load_until_body_done(mut response: Response, load: RequestLoadGu
     hold_request_load_with_output_frame(response, load, producer, output_frame)
 }
 
-fn hold_request_load_with_producer(
-    response: Response,
-    load: RequestLoadGuard,
-    producer: Option<tokio::task::JoinHandle<()>>,
-) -> Response {
-    hold_request_load_with_output_frame(response, load, producer, None)
-}
-
 fn hold_request_load_with_output_frame(
     response: Response,
     load: RequestLoadGuard,
@@ -224,11 +223,18 @@ fn hold_request_load_with_output_frame(
     Response::from_parts(parts, Body::from_stream(stream))
 }
 
+struct CompletionRoute<'a> {
+    tokens: Option<Vec<u32>>,
+    raw_body: Option<&'a axum::body::Bytes>,
+    echo: bool,
+}
+
 struct TypedDispatch<'a> {
     headers: Option<&'a HeaderMap>,
     route: &'a str,
     worker_url: &'a str,
     is_stream: bool,
+    completion: Option<&'a CompletionRoute<'a>>,
     load: RequestLoadGuard,
     prepared: Option<crate::backend::PreparedChat>,
 }
@@ -236,6 +242,7 @@ struct TypedDispatch<'a> {
 struct SelectedWorker {
     worker: Arc<dyn Worker>,
     kv_receipt: Option<KvSelectionReceipt>,
+    input_tokens: Option<usize>,
 }
 
 /// Regular router that uses injected load balancing policies
@@ -253,6 +260,7 @@ pub struct Router {
     circuit_breaker_config: CircuitBreakerConfig,
     health_config: HealthConfig,
     frontend: crate::backend::EngineFrontend,
+    completion_input: Option<crate::backend::completion_input::CompletionInput>,
     _worker_loads: Arc<tokio::sync::watch::Receiver<HashMap<String, isize>>>,
     _load_monitor_handle: Option<Arc<tokio::task::JoinHandle<()>>>,
     kv_index_supervisor: Option<Arc<crate::kv_index::KvIndexSupervisor>>,
@@ -293,11 +301,26 @@ impl Router {
         // All-http or all-grpc. Mixed schemes fail here (not a silent fallback).
         let pool_kind = crate::backend::classify_worker_urls(&worker_urls)?;
         let request_timeout = Duration::from_secs(ctx.router_config.request_timeout_secs);
-        let frontend = if pool_kind == Some(crate::backend::WorkerPoolKind::Http) {
-            crate::backend::EngineFrontend::with_request_timeout(request_timeout)
+        let completion_enabled = std::env::var_os("VLLM_ROUTER_COMPLETION_MODEL_ALIAS").is_some();
+        let frontend =
+            if pool_kind == Some(crate::backend::WorkerPoolKind::Http) && !completion_enabled {
+                crate::backend::EngineFrontend::with_request_timeout(request_timeout)
+            } else {
+                crate::backend::EngineFrontend::from_env(request_timeout)
+                    .map_err(|error| format!("tokenizer cache: {error}"))?
+            };
+        let completion_input = if completion_enabled {
+            if pool_kind != Some(crate::backend::WorkerPoolKind::Http)
+                || ctx.router_config.intra_node_data_parallel_size != 1
+                || kv_aware_ops(ctx.policy_registry.get_default_policy().as_ref()).is_none()
+            {
+                return Err("Completion input binding requires static HTTP Regular kv_aware with independent DP1 Workers".into());
+            }
+            crate::backend::completion_input::CompletionInput::from_env(&frontend)
+                .await
+                .map_err(|error| format!("Completion input: {error:#}"))?
         } else {
-            crate::backend::EngineFrontend::from_env(request_timeout)
-                .map_err(|error| format!("tokenizer cache: {error}"))?
+            None
         };
 
         // Wait for workers to be healthy (skip if empty - for service discovery mode)
@@ -347,32 +370,49 @@ impl Router {
         };
         let default_policy = ctx.policy_registry.get_default_policy();
         let mut kv_worker_info = HashMap::new();
-        let (kv_index_supervisor, kv_signal_handle) =
-            if kv_aware_ops(default_policy.as_ref()).is_some() {
-                let (supervisor, mut signals) = crate::kv_index::KvIndexSupervisor::new(
+        let (kv_index_supervisor, kv_signal_handle) = if kv_aware_ops(default_policy.as_ref())
+            .is_some()
+        {
+            let (supervisor, mut signals) = if completion_input.is_some()
+                || (pool_kind == Some(crate::backend::WorkerPoolKind::Http)
+                    && std::env::var_os("VLLM_ROUTER_KV_EVENT_SOURCES").is_some())
+            {
+                if dp_size != 1 {
+                    return Err(
+                        "static HTTP KV sources require independently addressed DP1 workers".into(),
+                    );
+                }
+                crate::kv_index::KvIndexSupervisor::new_http_dense(
                     ctx.client.clone(),
                     crate::kv_index::HashMode::Sha256,
-                );
-                let supervisor = Arc::new(supervisor);
-                for worker_url in &kv_discovery_urls {
-                    match supervisor.on_worker_added(worker_url).await {
-                        Ok(info) => {
-                            kv_worker_info.insert(worker_url.clone(), info);
-                        }
-                        Err(error) => warn!(
-                            worker_url,
-                            %error,
-                            "kv_aware discovery failed; worker will use load-only scoring"
-                        ),
-                    }
-                }
-                let signal_handle = Arc::new(tokio::spawn(async move {
-                    while signals.recv().await.is_some() {}
-                }));
-                (Some(supervisor), Some(signal_handle))
+                    &kv_discovery_urls,
+                )?
             } else {
-                (None, None)
+                crate::kv_index::KvIndexSupervisor::new(
+                    ctx.client.clone(),
+                    crate::kv_index::HashMode::Sha256,
+                )
             };
+            let supervisor = Arc::new(supervisor);
+            for worker_url in &kv_discovery_urls {
+                match supervisor.on_worker_added(worker_url).await {
+                    Ok(info) => {
+                        kv_worker_info.insert(worker_url.clone(), info);
+                    }
+                    Err(error) => warn!(
+                        worker_url,
+                        %error,
+                        "kv_aware discovery failed; worker will use load-only scoring"
+                    ),
+                }
+            }
+            let signal_handle = Arc::new(tokio::spawn(async move {
+                while signals.recv().await.is_some() {}
+            }));
+            (Some(supervisor), Some(signal_handle))
+        } else {
+            (None, None)
+        };
         for url in &worker_urls {
             // TODO: In IGW mode, fetch model_id from worker's /get_model_info endpoint
             // For now, create worker without model_id
@@ -509,6 +549,7 @@ impl Router {
             circuit_breaker_config: core_cb_config,
             health_config,
             frontend,
+            completion_input,
             _worker_loads: worker_loads,
             _load_monitor_handle: load_monitor_handle,
             kv_index_supervisor,
@@ -1203,6 +1244,23 @@ impl Router {
         (field("lora_name"), field("cache_salt"))
     }
 
+    fn completion_placement_eligibility(&self, workers: &[Arc<dyn Worker>]) -> Option<Vec<bool>> {
+        let input = self.completion_input.as_ref()?;
+        // Qualification is per target, not an all-workers grant. Unknown
+        // sources retain ordinary routing and the full known input cost.
+        Some(
+            workers
+                .iter()
+                .map(|worker| {
+                    worker.dp_rank().unwrap_or(0) == 0
+                        && self.kv_index_supervisor.as_ref().is_some_and(|supervisor| {
+                            supervisor.worker_has_dense_model(worker.base_url(), &input.cache_model)
+                        })
+                })
+                .collect(),
+        )
+    }
+
     /// Select worker for a specific model considering circuit breaker state
     fn select_worker_for_model(
         &self,
@@ -1237,9 +1295,15 @@ impl Router {
         // Convert headers for policies that need them (e.g., consistent_hash)
         let request_headers = Self::headers_to_request_headers(headers);
 
+        let eligibility = self.completion_placement_eligibility(&available);
         let (idx, kv_receipt) = if let Some(kv_aware) = kv_aware_ops(policy.as_ref()) {
-            let receipt = kv_aware
-                .select_worker_with_receipt(&available, token_ids, lora_name, cache_salt)?;
+            let receipt = kv_aware.select_worker_with_receipt_and_eligibility(
+                &available,
+                token_ids,
+                lora_name,
+                cache_salt,
+                eligibility.as_deref(),
+            )?;
             (receipt.worker_index, Some(receipt))
         } else {
             (
@@ -1250,6 +1314,7 @@ impl Router {
         Some(SelectedWorker {
             worker: available.get(idx)?.clone(),
             kv_receipt,
+            input_tokens: token_ids.map(<[u32]>::len),
         })
     }
 
@@ -1259,6 +1324,69 @@ impl Router {
         typed_req: &T,
         route: &str,
         model_id: Option<&str>,
+    ) -> Response {
+        self.route_prepared_request(headers, typed_req, route, model_id, None, None)
+            .await
+    }
+
+    fn prepare_completion_route<'a>(
+        &self,
+        request: &CompletionRequest,
+        raw_body: Option<&'a axum::body::Bytes>,
+        model_id: Option<&str>,
+    ) -> Result<CompletionRoute<'a>, (StatusCode, String)> {
+        let policy = match model_id {
+            Some(model) => self.policy_registry.get_policy_or_default(model),
+            None => self.policy_registry.get_default_policy(),
+        };
+        let tokens = match self.completion_input.as_ref() {
+            Some(input)
+                if kv_aware_ops(policy.as_ref()).is_some()
+                    && request
+                        .model
+                        .as_deref()
+                        .is_none_or(|model| model == input.model) =>
+            {
+                match crate::backend::prepare_completion_classified(
+                    request,
+                    input.tokenizer.as_ref(),
+                    input.vocab_size,
+                ) {
+                    Ok(tokens) => {
+                        debug!(token_count = tokens.len(), "Completion input prepared once");
+                        Some(tokens)
+                    }
+                    Err(crate::backend::CompletionPreparationError::Unsupported(_)) => {
+                        debug!("Completion input uses ordinary fallback");
+                        None
+                    }
+                    Err(crate::backend::CompletionPreparationError::InvalidRequest(error)) => {
+                        return Err((StatusCode::BAD_REQUEST, error));
+                    }
+                    Err(crate::backend::CompletionPreparationError::ServiceFailure(error)) => {
+                        return Err((StatusCode::SERVICE_UNAVAILABLE, error));
+                    }
+                }
+            }
+            _ => None,
+        };
+        // Fallback drops only input credit, not the original body or output contract.
+        Ok(CompletionRoute {
+            tokens,
+            raw_body,
+            echo: request.echo,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn route_prepared_request<T: GenerationRequest + serde::Serialize + Clone>(
+        &self,
+        headers: Option<&HeaderMap>,
+        typed_req: &T,
+        route: &str,
+        model_id: Option<&str>,
+        completion: Option<&CompletionRequest>,
+        raw_body: Option<&axum::body::Bytes>,
     ) -> Response {
         let start = Instant::now();
         let is_stream = typed_req.is_stream();
@@ -1318,12 +1446,30 @@ impl Router {
             None
         };
 
+        let completion = match completion
+            .map(|request| self.prepare_completion_route(request, raw_body, model_id))
+            .transpose()
+        {
+            Ok(completion) => completion,
+            Err(error) => return error.into_response(),
+        };
+        let token_ids = prepared
+            .as_ref()
+            .map(|prepared| prepared.tokenized.token_ids.as_ref())
+            .or_else(|| {
+                completion
+                    .as_ref()
+                    .and_then(|input| input.tokens.as_deref())
+            });
         let text = typed_req.extract_text_for_routing();
+        let text = &text;
+        let prepared = &prepared;
+        let completion = completion.as_ref();
 
         let response = RetryExecutor::execute_response_with_retry(
             &self.retry_config,
             // operation per attempt
-            |_: u32| async {
+            |attempt: u32| async move {
                 // Each backend attempt is a fresh scheduling arrival. The
                 // previous ProgramCompletion finishes exactly once before a
                 // retry invokes this closure again.
@@ -1350,29 +1496,33 @@ impl Router {
                     let Some(worker) = worker else {
                         return Self::program_target_unavailable_response(route);
                     };
-                    let kv_receipt = prepared.as_ref().and_then(|prepared| {
-                        let kv_aware = kv_aware_ops(policy.as_ref())?;
-                        kv_aware.select_worker_with_receipt(
+                    if model_id.is_some_and(|model| {
+                        worker.model_id() != model && worker.model_id() != UNLABELED_WORKER_MODEL_ID
+                    }) {
+                        return Self::program_target_unavailable_response(route);
+                    }
+                    let eligibility = self.completion_placement_eligibility(std::slice::from_ref(&worker));
+                    let kv_receipt = kv_aware_ops(policy.as_ref()).and_then(|kv_aware| {
+                        kv_aware.select_worker_with_receipt_and_eligibility(
                             std::slice::from_ref(&worker),
-                            Some(prepared.tokenized.token_ids.as_ref()),
+                            token_ids,
                             lora_name,
                             cache_salt,
+                            eligibility.as_deref(),
                         )
                     });
-                    Some(SelectedWorker { worker, kv_receipt })
+                    Some(SelectedWorker { worker, kv_receipt, input_tokens: token_ids.map(<[u32]>::len) })
                 } else {
                     self.select_worker_for_model(
                         model_id,
-                        Some(&text),
+                        Some(text),
                         headers,
-                        prepared
-                            .as_ref()
-                            .map(|prepared| prepared.tokenized.token_ids.as_ref()),
+                        token_ids,
                         lora_name,
                         cache_salt,
                     )
                 };
-                let SelectedWorker { worker, kv_receipt } = match selected_worker {
+                let SelectedWorker { worker, kv_receipt, input_tokens } = match selected_worker {
                     Some(selection) => selection,
                     None => {
                         RouterMetrics::record_request_error(route, "no_available_workers");
@@ -1384,10 +1534,11 @@ impl Router {
                     }
                 };
 
-                let kv_slot = kv_aware_ops(policy.as_ref()).and_then(|kv_aware| {
-                    prepared.as_ref()?;
-                    kv_aware.begin_request(kv_receipt?)
-                });
+                if let Some(receipt) = &kv_receipt {
+                    debug!(attempt, worker_url = worker.url(), target = %receipt.decision.target.instance_id, rank = receipt.decision.target.dp_rank, new_prefill_tokens = receipt.new_prefill_tokens, input_known = input_tokens.is_some(), input_tokens, "KV request selected");
+                }
+                let kv_slot = kv_aware_ops(policy.as_ref())
+                    .and_then(|kv_aware| kv_aware.begin_request(kv_receipt?));
 
                 let load_incremented = if matches!(policy.name(), "cache_aware" | "kv_aware")
                     || program_completion.is_some()
@@ -1412,8 +1563,9 @@ impl Router {
                             route,
                             worker_url: worker.url(),
                             is_stream,
+                            completion,
                             load,
-                            prepared: prepared.clone(),
+                            prepared: (*prepared).clone(),
                         },
                         program_completion.clone(),
                     )
@@ -1590,9 +1742,12 @@ impl Router {
             route,
             worker_url,
             is_stream,
+            completion,
             load,
             prepared,
         } = dispatch;
+        let completion_echo = completion.map(|input| input.echo);
+        let raw_body = completion.and_then(|input| input.raw_body);
         let load_incremented = load.tracks_worker();
         if crate::backend::is_grpc_url(worker_url) {
             // gRPC workers are chat-only in this milestone. Reject unsupported
@@ -1632,48 +1787,63 @@ impl Router {
             return response;
         }
 
-        let (mut request_builder, extracted_dp_rank, request_url) =
-            if self.intra_node_data_parallel_size > 1 {
-                let (worker_url_prefix, dp_rank) = match dp_utils::extract_dp_rank(worker_url) {
-                    Ok(tup) => tup,
-                    Err(e) => {
-                        error!("Failed to extract dp_rank: {}", e);
-                        return (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            format!("Failed to extract dp_rank: {}", e),
-                        )
-                            .into_response();
-                    }
-                };
-
-                // Parse the request body
-                let json_val = match serde_json::to_value(typed_req) {
-                    Ok(j) => j,
-                    Err(e) => {
-                        return (
-                            StatusCode::BAD_REQUEST,
-                            format!("Convert into serde_json::Value failed: {}", e),
-                        )
-                            .into_response();
-                    }
-                };
-
-                // Use the original json_val without modification
-
-                let request_url = format!("{}{}", worker_url_prefix, route);
-                (
-                    self.client.post(&request_url).json(&json_val),
-                    Some(dp_rank),
-                    request_url,
-                )
-            } else {
-                let request_url = format!("{}{}", worker_url, route);
-                (
-                    self.client.post(&request_url).json(typed_req),
-                    None,
-                    request_url,
-                )
+        let (mut request_builder, extracted_dp_rank, request_url) = if self
+            .intra_node_data_parallel_size
+            > 1
+        {
+            let (worker_url_prefix, dp_rank) = match dp_utils::extract_dp_rank(worker_url) {
+                Ok(tup) => tup,
+                Err(e) => {
+                    error!("Failed to extract dp_rank: {}", e);
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Failed to extract dp_rank: {}", e),
+                    )
+                        .into_response();
+                }
             };
+
+            // Parse the request body
+            let json_val = match serde_json::to_value(typed_req) {
+                Ok(j) => j,
+                Err(e) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        format!("Convert into serde_json::Value failed: {}", e),
+                    )
+                        .into_response();
+                }
+            };
+
+            // Use the original json_val without modification
+
+            let request_url = format!("{}{}", worker_url_prefix, route);
+            (
+                self.client.post(&request_url).json(&json_val),
+                Some(dp_rank),
+                request_url,
+            )
+        } else {
+            let request_url = format!("{}{}", worker_url, route);
+            (
+                if let Some(raw) = raw_body {
+                    self.client
+                        .post(&request_url)
+                        .header(
+                            CONTENT_TYPE,
+                            headers
+                                .and_then(|headers| headers.get(CONTENT_TYPE))
+                                .cloned()
+                                .unwrap_or_else(|| HeaderValue::from_static("application/json")),
+                        )
+                        .body(raw.clone())
+                } else {
+                    self.client.post(&request_url).json(typed_req)
+                },
+                None,
+                request_url,
+            )
+        };
 
         // Copy all headers from original request if provided, skipping
         // Content-Type/Content-Length (.json() sets them) and trace headers
@@ -1782,6 +1952,16 @@ impl Router {
 
             let stream = res.bytes_stream();
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            // Echo text cannot distinguish prompt from generated output.
+            // Keep it (and unsuccessful responses) in prefill until cleanup.
+            let mut completion_output = completion_echo
+                .map(|echo| CompletionOutputObserver::new(echo || !status.is_success()));
+            let (mut producer_output_frame, output_frame) = if completion_echo.is_some() {
+                let (producer, consumer) = output_frame_tracking();
+                (Some(producer), Some(consumer))
+            } else {
+                (None, None)
+            };
 
             // Spawn task to forward stream and detect completion
             let producer_load = load.clone();
@@ -1792,29 +1972,50 @@ impl Router {
                 while let Some(chunk) = stream.next().await {
                     match chunk {
                         Ok(bytes) => {
-                            producer_load.begin_decode();
+                            if completion_echo.is_none() {
+                                producer_load.begin_decode();
+                            }
                             if first_sse {
                                 first_sse = false;
                                 let first_ms = t_send.elapsed().as_secs_f64() * 1000.0;
                                 if stages_on {
                                     let stages = http_stages_json(http_ttfb_ms, first_ms);
-                                    emit_http_first_sse(&tx, &stages);
+                                    if !emit_http_first_sse(
+                                        &tx,
+                                        &stages,
+                                        producer_output_frame.as_mut(),
+                                    ) && completion_echo.is_some()
+                                    {
+                                        stream_succeeded = false;
+                                        break;
+                                    }
                                 }
                             }
                             if let Some(completion) = &completion {
                                 completion.observe_sse_chunk(&bytes);
                             }
                             // Check for stream end marker
-                            if bytes
-                                .as_ref()
-                                .windows(12)
-                                .any(|window| window == b"data: [DONE]")
+                            if completion_echo.is_none()
+                                && bytes
+                                    .as_ref()
+                                    .windows(12)
+                                    .any(|window| window == b"data: [DONE]")
                             {
                                 producer_load.release();
                             }
-                            if tx.send(Ok(bytes)).is_err() {
+                            let has_output = completion_output
+                                .as_mut()
+                                .is_some_and(|observer| observer.observe(&bytes));
+                            let sent = match producer_output_frame.as_mut() {
+                                Some(output_frame) => output_frame.send(&tx, bytes, has_output),
+                                None => tx.send(Ok(bytes)).is_ok(),
+                            };
+                            if !sent {
                                 stream_succeeded = false;
                                 break;
+                            }
+                            if has_output {
+                                producer_load.begin_decode();
                             }
                         }
                         Err(e) => {
@@ -1835,7 +2036,7 @@ impl Router {
             let mut response = Response::new(body);
             *response.status_mut() = status;
             *response.headers_mut() = response_headers;
-            hold_request_load_with_producer(response, load, Some(producer))
+            hold_request_load_with_output_frame(response, load, Some(producer), output_frame)
         } else {
             // For requests without load tracking, just stream
             // Preserve headers for streaming response
@@ -1868,7 +2069,7 @@ impl Router {
                                 let first_ms = t_send.elapsed().as_secs_f64() * 1000.0;
                                 if stages_on {
                                     let stages = http_stages_json(http_ttfb_ms, first_ms);
-                                    emit_http_first_sse(&tx, &stages);
+                                    emit_http_first_sse(&tx, &stages, None);
                                 }
                             }
                             if let Some(completion) = &completion {
@@ -2461,8 +2662,33 @@ impl RouterTrait for Router {
         body: &CompletionRequest,
         model_id: Option<&str>,
     ) -> Response {
-        self.route_typed_request(headers, body, "/v1/completions", model_id)
+        self.route_prepared_request(headers, body, "/v1/completions", model_id, Some(body), None)
             .await
+    }
+
+    async fn route_completion_raw(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &CompletionRequest,
+        raw: &axum::body::Bytes,
+        model_id: Option<&str>,
+    ) -> Response {
+        // DP rewrites and non-KV routes preserve their pre-existing typed wire.
+        let policy = match model_id {
+            Some(model) => self.policy_registry.get_policy_or_default(model),
+            None => self.policy_registry.get_default_policy(),
+        };
+        let preserve_raw =
+            self.intra_node_data_parallel_size == 1 && kv_aware_ops(policy.as_ref()).is_some();
+        self.route_prepared_request(
+            headers,
+            body,
+            "/v1/completions",
+            model_id,
+            Some(body),
+            preserve_raw.then_some(raw),
+        )
+        .await
     }
 
     async fn route_responses(
@@ -2987,6 +3213,532 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
+    struct CompletionCountingTokenizer {
+        inner: vllm_tokenizer::HuggingFaceTokenizer,
+        encodes: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl vllm_tokenizer::Tokenizer for CompletionCountingTokenizer {
+        fn encode(&self, text: &str, special: bool) -> vllm_tokenizer::Result<Vec<u32>> {
+            self.encodes.fetch_add(1, Ordering::Relaxed);
+            self.inner.encode(text, special)
+        }
+        fn encode_ordinary(&self, _text: &str) -> vllm_tokenizer::Result<Vec<u32>> {
+            panic!("Completion preparation must call encode directly")
+        }
+        fn decode(&self, ids: &[u32], special: bool) -> vllm_tokenizer::Result<String> {
+            self.inner.decode(ids, special)
+        }
+        fn token_to_id(&self, text: &str) -> Option<u32> {
+            self.inner.token_to_id(text)
+        }
+        fn id_to_token(&self, id: u32) -> Option<String> {
+            self.inner.id_to_token(id)
+        }
+    }
+
+    #[tokio::test]
+    async fn completion_classification_controls_actual_dispatch() {
+        for (raw, vocab_size, fixture, status, encodes_expected, dispatched, error) in [
+            (
+                bytes::Bytes::from_static(b" { \"model\":\"qwen3\", \"prompt\":\"hello world\", \"cache_salt\":\"tenant\" }\n"),
+                16,
+                "completion_word_level.json",
+                StatusCode::OK,
+                0,
+                true,
+                "",
+            ),
+            (
+                bytes::Bytes::from_static(b"{\"model\":\"qwen3\",\"prompt\":[-1],\"cache_salt\":\"tenant\"}"),
+                16,
+                "completion_word_level.json",
+                StatusCode::BAD_REQUEST,
+                0,
+                false,
+                "completion prompt contains negative token ID -1",
+            ),
+            (
+                bytes::Bytes::from_static(b"{\"model\":\"qwen3\",\"prompt\":[16],\"cache_salt\":\"tenant\"}"),
+                16,
+                "completion_word_level.json",
+                StatusCode::BAD_REQUEST,
+                0,
+                false,
+                "completion token ID 16 is outside model vocabulary size 16",
+            ),
+            (
+                bytes::Bytes::from_static(b"{\"model\":\"qwen3\",\"prompt\":\"hello world\"}"),
+                0,
+                "completion_word_level.json",
+                StatusCode::SERVICE_UNAVAILABLE,
+                0,
+                false,
+                "completion model vocabulary must be nonzero",
+            ),
+            (
+                bytes::Bytes::from_static(b"{\"model\":\"qwen3\",\"prompt\":\"unknown\"}"),
+                16,
+                "completion_missing_unk.json",
+                StatusCode::SERVICE_UNAVAILABLE,
+                1,
+                false,
+                "completion tokenization failed:",
+            ),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+                format!("http://{}", listener.local_addr().unwrap()),
+                WorkerType::Regular,
+            ));
+            let mut router = create_test_regular_router();
+            router.worker_registry = Arc::new(WorkerRegistry::new());
+            router.worker_registry.register(worker.clone());
+            router.policy_registry =
+                Arc::new(PolicyRegistry::new(crate::config::PolicyConfig::KvAware {
+                    router_temperature: 0.0,
+                    kv_penalty_host: 0.8,
+                    kv_penalty_external: 0.6,
+                    kv_penalty_disk: 0.3,
+                }));
+            router.retry_config = RetryConfig {
+                max_retries: 2,
+                initial_backoff_ms: 0,
+                max_backoff_ms: 0,
+                jitter_factor: 0.0,
+                ..Default::default()
+            };
+            let encodes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            router.completion_input = Some(crate::backend::completion_input::CompletionInput {
+                model: "qwen3".into(),
+                cache_model: "qwen3".into(),
+                vocab_size,
+                tokenizer: Arc::new(CompletionCountingTokenizer {
+                    inner: vllm_tokenizer::HuggingFaceTokenizer::new_hf(
+                        &std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                            .join("tests/fixtures/tokenizer")
+                            .join(fixture),
+                    )
+                    .unwrap(),
+                    encodes: encodes.clone(),
+                }),
+            });
+            let policy = router.policy_registry.get_default_policy();
+            let kv = policy
+                .as_any()
+                .downcast_ref::<crate::policies::KvAwarePolicy>()
+                .unwrap();
+            let manager = kv.slot_manager().unwrap();
+            let target = kv.target_for_worker(worker.as_ref());
+            let captured = Arc::new(Mutex::new(Vec::new()));
+            let (bodies, inflight_manager, inflight_target, inflight_worker) =
+                (captured.clone(), manager.clone(), target.clone(), worker.clone());
+            let app = axum::Router::new().route(
+                "/v1/completions",
+                axum::routing::post(move |body: axum::body::Bytes| {
+                    let (bodies, manager, target, worker) = (
+                        bodies.clone(),
+                        inflight_manager.clone(),
+                        inflight_target.clone(),
+                        inflight_worker.clone(),
+                    );
+                    async move {
+                        assert_eq!(
+                            manager.sample(&target),
+                            crate::policies::LoadSample {
+                                active_prefill_tokens: 0,
+                                active_requests: 1,
+                            },
+                            "Unsupported dispatch must not receive prepared-input credit"
+                        );
+                        assert_eq!(worker.load(), 1);
+                        bodies.lock().push(body);
+                        Json(serde_json::json!({"choices":[{"text":"ok"}]}))
+                    }
+                }),
+            );
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let request: CompletionRequest = serde_json::from_slice(&raw).unwrap();
+            let original_request = serde_json::to_value(&request).unwrap();
+            let response = tokio::time::timeout(
+                Duration::from_secs(5),
+                router.route_completion_raw(None, &request, &raw, None),
+            )
+            .await
+            .unwrap();
+            let actual_status = response.status();
+            let response_body = tokio::time::timeout(
+                Duration::from_secs(5),
+                to_bytes(response.into_body(), usize::MAX),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            server.abort();
+            assert_eq!(actual_status, status, "{raw:?}: {response_body:?}");
+            if !dispatched {
+                assert!(
+                    std::str::from_utf8(&response_body).unwrap().contains(error),
+                    "{response_body:?}"
+                );
+            }
+            assert_eq!(serde_json::to_value(&request).unwrap(), original_request);
+            assert_eq!(encodes.load(Ordering::Relaxed), encodes_expected);
+            assert_eq!(captured.lock().len(), usize::from(dispatched));
+            if dispatched {
+                assert_eq!(captured.lock()[0], raw);
+            }
+            assert_eq!(worker.load(), 0);
+            assert_eq!(manager.sample(&target), crate::policies::LoadSample::default());
+        }
+    }
+
+    #[tokio::test]
+    async fn completion_placement_qualifies_each_exact_model_and_dp1_target() {
+        let context = zmq::Context::new();
+        let publisher = context.socket(zmq::XPUB).unwrap();
+        publisher.bind("tcp://127.0.0.1:*").unwrap();
+        let endpoint = publisher.get_last_endpoint().unwrap().unwrap();
+        let mut servers = Vec::new();
+        let mut workers: Vec<Arc<dyn Worker>> = Vec::new();
+        for (model, rank) in [
+            ("engine-cache-identity", Some(0)),
+            ("engine-cache-identity", None),
+            ("wrong-cache-identity", Some(0)),
+            ("engine-cache-identity", Some(1)),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            workers.push(Arc::new(BasicWorker::new(url, WorkerType::Regular)));
+            let endpoint = endpoint.clone();
+            let app = axum::Router::new()
+                .route(
+                    "/get_server_info",
+                    axum::routing::get(move || async move {
+                        Json(serde_json::json!({"model_id":model,"kv_block_size":4}))
+                    }),
+                )
+                .route(
+                    "/kv_event_sources",
+                    axum::routing::get(move || {
+                        let endpoint = endpoint.clone();
+                        async move {
+                            match rank {
+                                Some(rank) => Json(serde_json::json!({rank.to_string(): {
+                                    "endpoint":endpoint,"publisher":"zmq","encoding":"msgpack",
+                                    "schema_version":1,"enable_kv_cache_events":true
+                                }}))
+                                .into_response(),
+                                None => StatusCode::NOT_FOUND.into_response(),
+                            }
+                        }
+                    }),
+                );
+            servers.push(tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap()
+            }));
+        }
+        let (supervisor, _signals) = crate::kv_index::KvIndexSupervisor::new_http_dense(
+            Client::new(),
+            crate::kv_index::HashMode::Sha256,
+            &workers
+                .iter()
+                .map(|worker| worker.url().to_owned())
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        for worker in &workers {
+            supervisor.on_worker_added(worker.url()).await.unwrap();
+        }
+        let mut router = create_test_regular_router();
+        router.completion_input = Some(crate::backend::completion_input::CompletionInput {
+            model: "public-alias".into(),
+            cache_model: "engine-cache-identity".into(),
+            vocab_size: 16,
+            tokenizer: Arc::new(
+                vllm_tokenizer::HuggingFaceTokenizer::new_hf(std::path::Path::new(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/tests/fixtures/tokenizer/completion_word_level.json"
+                )))
+                .unwrap(),
+            ),
+        });
+        router.kv_index_supervisor = Some(Arc::new(supervisor));
+        assert_eq!(
+            router.completion_placement_eligibility(&workers),
+            Some(vec![true, false, false, false])
+        );
+        let wrong_rank: Arc<dyn Worker> = Arc::new(crate::core::DPAwareWorker::new(
+            workers[0].base_url().to_owned(),
+            1,
+            2,
+            WorkerType::Regular,
+        ));
+        assert_eq!(
+            router.completion_placement_eligibility(&[wrong_rank]),
+            Some(vec![false])
+        );
+        router.kv_index_supervisor.as_ref().unwrap().shutdown();
+        for server in servers {
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn completion_retry_prepares_once_preserves_raw_and_releases_only_own_load() {
+        use crate::kv_index::wire::ExternalBlockHash;
+        use crate::kv_index::{BlockStored, IngestionSignal, KVEvent};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+            format!("http://{}", listener.local_addr().unwrap()),
+            WorkerType::Regular,
+        ));
+        let mut router = create_test_regular_router();
+        router.worker_registry = Arc::new(WorkerRegistry::new());
+        router.worker_registry.register(worker.clone());
+        router.policy_registry =
+            Arc::new(PolicyRegistry::new(crate::config::PolicyConfig::KvAware {
+                router_temperature: 0.0,
+                kv_penalty_host: 0.8,
+                kv_penalty_external: 0.6,
+                kv_penalty_disk: 0.3,
+            }));
+        router.retry_config = RetryConfig {
+            max_retries: 2,
+            initial_backoff_ms: 0,
+            max_backoff_ms: 0,
+            jitter_factor: 0.0,
+            ..Default::default()
+        };
+        let encodes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        router.completion_input = Some(crate::backend::completion_input::CompletionInput {
+            model: "qwen3".into(),
+            cache_model: "qwen3".into(),
+            vocab_size: 16,
+            tokenizer: Arc::new(CompletionCountingTokenizer {
+                inner: vllm_tokenizer::HuggingFaceTokenizer::new_hf(std::path::Path::new(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/tests/fixtures/tokenizer/completion_word_level.json"
+                )))
+                .unwrap(),
+                encodes: encodes.clone(),
+            }),
+        });
+        let policy = router.policy_registry.get_default_policy();
+        let kv = policy
+            .as_any()
+            .downcast_ref::<crate::policies::KvAwarePolicy>()
+            .unwrap();
+        let manager = kv.slot_manager().unwrap();
+        let target = kv.target_for_worker(worker.as_ref());
+        let context = zmq::Context::new();
+        let publisher = context.socket(zmq::XPUB).unwrap();
+        publisher.bind("tcp://127.0.0.1:*").unwrap();
+        let endpoint = publisher.get_last_endpoint().unwrap().unwrap();
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let (seen, bodies) = (attempts.clone(), captured.clone());
+        let (inflight_manager, inflight_target, inflight_worker) =
+            (manager.clone(), target.clone(), worker.clone());
+        let source_url = worker.url().to_owned();
+        let app = axum::Router::new()
+            .route("/get_server_info", axum::routing::get(move || {
+                let source_url = source_url.clone();
+                async move { Json(serde_json::json!({"model_id":"qwen3","instance_id":source_url,"kv_block_size":4})) }
+            }))
+            .route("/kv_event_sources", axum::routing::get(move || {
+                let endpoint = endpoint.clone();
+                async move { Json(serde_json::json!({"0":{"endpoint":endpoint,"publisher":"zmq","encoding":"msgpack","schema_version":1,"enable_kv_cache_events":true}})) }
+            }))
+            .route("/v1/completions", axum::routing::post(move |body: axum::body::Bytes| {
+                let (seen, bodies, manager, target, worker) = (seen.clone(), bodies.clone(), inflight_manager.clone(), inflight_target.clone(), inflight_worker.clone());
+                async move {
+                    let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                    let prepared = request["model"] == "qwen3";
+                    assert_eq!(manager.sample(&target), crate::policies::LoadSample {active_prefill_tokens:7 + u64::from(prepared),active_requests:2}, "only the configured alias has prepared input and placement credit");
+                    assert_eq!(worker.load(), 2);
+                    bodies.lock().push(body);
+                    if seen.fetch_add(1, Ordering::Relaxed) % 2 == 0 {
+                        StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                    } else {
+                        Json(serde_json::json!({"choices":[{"text":"ok","finish_reason":"stop"}]})).into_response()
+                    }
+                }
+            }));
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let (supervisor, mut signals) = crate::kv_index::KvIndexSupervisor::new_http_dense(
+            Client::new(),
+            crate::kv_index::HashMode::Sha256,
+            &[worker.url().to_owned()],
+        )
+        .unwrap();
+        let supervisor = Arc::new(supervisor);
+        let info = supervisor.on_worker_added(worker.url()).await.unwrap();
+        kv_aware_ops(policy.as_ref()).unwrap().register_worker(
+            worker.as_ref(),
+            &info,
+            supervisor.match_provider_for_worker(worker.url()),
+        );
+        router.kv_index_supervisor = Some(supervisor.clone());
+        assert!(supervisor.worker_has_dense_model(worker.url(), "qwen3"));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match publisher.recv_bytes(zmq::DONTWAIT) {
+                    Ok(subscription) => {
+                        assert_eq!(subscription, [1]);
+                        break;
+                    }
+                    Err(zmq::Error::EAGAIN) => tokio::task::yield_now().await,
+                    Err(error) => panic!("subscription handshake: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("subscriber handshake");
+        let event = KVEvent::BlockStored(BlockStored {
+            extra_keys: None,
+            block_hashes: vec![ExternalBlockHash::Int(1), ExternalBlockHash::Int(2)],
+            parent_block_hash: None,
+            token_ids: vec![1, 3, 4, 3, 4, 3, 4, 3],
+            block_size: 4,
+            lora_id: None,
+            medium: Some("GPU".into()),
+            lora_name: None,
+            group_idx: Some(0),
+            kv_cache_spec_kind: Some("full_attention".into()),
+            kv_cache_spec_sliding_window: None,
+            locality: Some("LOCAL".into()),
+            ownership: None,
+            session_id: None,
+        });
+        let payload = rmp_serde::to_vec_named(&(0.0, vec![event], Some(0u32))).unwrap();
+        publisher
+            .send_multipart(
+                [
+                    b"".as_slice(),
+                    0i64.to_be_bytes().as_slice(),
+                    payload.as_slice(),
+                ],
+                0,
+            )
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match signals.recv().await {
+                    Some(IngestionSignal::Advance { last_seq: 0, .. }) => break,
+                    Some(_) => {}
+                    None => panic!("source signal channel closed"),
+                }
+            }
+        })
+        .await
+        .expect("stored prefix applied");
+        let receipt = kv
+            .select_worker_with_receipt(
+                std::slice::from_ref(&worker),
+                Some(&[1, 3, 4, 3, 4, 3, 4, 3, 4]),
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(receipt.new_prefill_tokens, 1);
+        manager.begin_prefill(&target, 7);
+        worker.increment_load();
+        for raw in [
+            bytes::Bytes::from_static(b" { \"prompt\": \"hello world hello world hello world hello world\", \"model\":\"qwen3\", \"priority\":0 } "),
+            bytes::Bytes::from_static(b"{\"model\":\"qwen3\", \"prompt\":[1,3,4,3,4,3,4,3,15]}\n"),
+            bytes::Bytes::from_static(b"{\"model\":\"other-alias\",\"prompt\":\"hello world\"}"),
+        ] {
+            let request: CompletionRequest = serde_json::from_slice(&raw).unwrap();
+            let response = tokio::time::timeout(Duration::from_secs(5), router.route_completion_raw(None, &request, &raw, None)).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let bodies = captured.lock();
+            assert_eq!(bodies[bodies.len()-2], raw); assert_eq!(bodies[bodies.len()-1], raw);
+            drop(bodies);
+            assert_eq!(encodes.load(Ordering::Relaxed), 1, "text prepared once across retries; IDs never encoded");
+            assert_eq!(worker.load(), 1);
+            assert_eq!(manager.sample(&target), crate::policies::LoadSample {active_prefill_tokens:7,active_requests:1});
+        }
+        assert_eq!(attempts.load(Ordering::Relaxed), 6);
+        supervisor.shutdown();
+        server.abort();
+    }
+    #[tokio::test]
+    async fn completion_raw_forwarding_uses_effective_model_policy() {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let bodies = captured.clone();
+        let app = axum::Router::new().route(
+            "/v1/completions",
+            axum::routing::post(move |headers: HeaderMap, body: axum::body::Bytes| {
+                let bodies = bodies.clone();
+                async move {
+                    bodies.lock().push((headers, body));
+                    Json(serde_json::json!({"choices":[]}))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorker::new(
+                format!("http://{}", listener.local_addr().unwrap()),
+                WorkerType::Regular,
+            )
+            .with_labels(HashMap::from([("model_id".into(), "qwen3".into())])),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let raw = bytes::Bytes::from_static(
+            b" { \"model\":\"qwen3\", \"prompt\":[3], \"custom\":null } ",
+        );
+        let request: CompletionRequest = serde_json::from_slice(&raw).unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            CONTENT_TYPE,
+            HeaderValue::from_static("application/problem+json; charset=utf-8"),
+        );
+        for model_kv in [false, true] {
+            let mut router = create_test_regular_router();
+            router.worker_registry = Arc::new(WorkerRegistry::new());
+            router.worker_registry.register(worker.clone());
+            router.policy_registry = Arc::new(PolicyRegistry::new(if model_kv {
+                crate::config::PolicyConfig::RoundRobin
+            } else {
+                crate::config::PolicyConfig::KvAware {
+                    router_temperature: 0.0,
+                    kv_penalty_host: 0.8,
+                    kv_penalty_external: 0.6,
+                    kv_penalty_disk: 0.3,
+                }
+            }));
+            router.policy_registry.on_worker_added(
+                "qwen3",
+                Some(if model_kv { "kv_aware" } else { "round_robin" }),
+            );
+            let response = router
+                .route_completion_raw(Some(&headers), &request, &raw, Some("qwen3"))
+                .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let bodies = captured.lock();
+            let (sent_headers, sent) = bodies.last().unwrap();
+            let expected = if model_kv {
+                raw.clone()
+            } else {
+                bytes::Bytes::from(serde_json::to_vec(&request).unwrap())
+            };
+            assert_eq!(sent, &expected);
+            assert_eq!(
+                sent_headers[CONTENT_TYPE],
+                if model_kv {
+                    "application/problem+json; charset=utf-8"
+                } else {
+                    "application/json"
+                }
+            );
+        }
+        server.abort();
+    }
+
     fn create_test_regular_router() -> Router {
         // Create registries
         let worker_registry = Arc::new(WorkerRegistry::new());
@@ -3014,6 +3766,7 @@ mod tests {
             circuit_breaker_config: CircuitBreakerConfig::default(),
             health_config: HealthConfig::default(),
             frontend: crate::backend::EngineFrontend::new(),
+            completion_input: None,
             _worker_loads: Arc::new(rx),
             _load_monitor_handle: None,
             kv_index_supervisor: None,
@@ -3047,6 +3800,7 @@ mod tests {
             circuit_breaker_config: CircuitBreakerConfig::default(),
             health_config: HealthConfig::default(),
             frontend: crate::backend::EngineFrontend::new(),
+            completion_input: None,
             epd: None,
             _worker_loads: Arc::new(rx),
             _load_monitor_handle: None,
@@ -3426,6 +4180,484 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unsupported_completion_stream_keeps_raw_body_and_output_lifecycle() {
+        for echo in [false, true] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+                format!("http://{}", listener.local_addr().unwrap()),
+                WorkerType::Regular,
+            ));
+            let mut router = create_test_regular_router();
+            router.worker_registry = Arc::new(WorkerRegistry::new());
+            router.worker_registry.register(worker.clone());
+            router.policy_registry =
+                Arc::new(PolicyRegistry::new(crate::config::PolicyConfig::KvAware {
+                    router_temperature: 0.0,
+                    kv_penalty_host: 0.8,
+                    kv_penalty_external: 0.6,
+                    kv_penalty_disk: 0.3,
+                }));
+            router.completion_input = Some(crate::backend::completion_input::CompletionInput {
+                model: "qwen3".into(),
+                cache_model: "qwen3".into(),
+                vocab_size: 16,
+                tokenizer: Arc::new(
+                    vllm_tokenizer::HuggingFaceTokenizer::new_hf(
+                        &std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                            .join("tests/fixtures/tokenizer/completion_word_level.json"),
+                    )
+                    .unwrap(),
+                ),
+            });
+            let policy = router.policy_registry.get_default_policy();
+            let kv = policy
+                .as_any()
+                .downcast_ref::<crate::policies::KvAwarePolicy>()
+                .unwrap();
+            let manager = kv.slot_manager().unwrap();
+            let target = kv.target_for_worker(worker.as_ref());
+            let raw = bytes::Bytes::from(format!(
+                " {{ \"prompt\": \"hello world\", \"cache_salt\": \"tenant\", \"stream\": true, \"echo\": {echo} }}\n"
+            ));
+            let request: CompletionRequest = serde_json::from_slice(&raw).unwrap();
+            let (tx, rx) =
+                tokio::sync::mpsc::unbounded_channel::<Result<bytes::Bytes, std::io::Error>>();
+            let receiver = Arc::new(Mutex::new(Some(rx)));
+            let expected = raw.clone();
+            let app = axum::Router::new().route(
+                "/v1/completions",
+                axum::routing::post(move |body: axum::body::Bytes| {
+                    assert_eq!(body, expected);
+                    let rx = receiver.lock().take().unwrap();
+                    async move { Response::new(Body::from_stream(UnboundedReceiverStream::new(rx))) }
+                }),
+            );
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let response = tokio::time::timeout(
+                Duration::from_secs(5),
+                router.route_completion_raw(None, &request, &raw, None),
+            )
+            .await
+            .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let mut body = response.into_body().into_data_stream();
+            for chunk in [
+                b": comment containing data: [DONE]\n\n".as_slice(),
+                b"data: {\"choices\":[{\"text\":\"output or echo\"}]}\n\n".as_slice(),
+            ] {
+                tx.send(Ok(bytes::Bytes::from_static(chunk))).unwrap();
+                let received = tokio::time::timeout(Duration::from_secs(5), body.next())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+                assert!(received.ends_with(chunk));
+                assert_eq!(
+                    worker.load(),
+                    1,
+                    "fallback must retain Completion observation"
+                );
+                assert_eq!(
+                    manager.sample(&target),
+                    crate::policies::LoadSample {
+                        active_prefill_tokens: 0,
+                        active_requests: 1,
+                    },
+                    "Unsupported has no token credit, but its request remains active"
+                );
+            }
+            drop(body);
+            assert_eq!(worker.load(), 0);
+            assert_eq!(
+                manager.sample(&target),
+                crate::policies::LoadSample::default()
+            );
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn http_completion_stream_requires_complete_model_output() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+            format!("http://{}", listener.local_addr().unwrap()),
+            WorkerType::Regular,
+        ));
+        let (tx, rx) =
+            tokio::sync::mpsc::unbounded_channel::<Result<bytes::Bytes, std::io::Error>>();
+        let receiver = Arc::new(Mutex::new(Some(rx)));
+        let app = axum::Router::new().route(
+            "/v1/completions",
+            axum::routing::post(move || {
+                let rx = receiver.lock().take().unwrap();
+                async move { Response::new(Body::from_stream(UnboundedReceiverStream::new(rx))) }
+            }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let manager = Arc::new(crate::policies::InMemorySlotManager::new());
+        let target = crate::kv_index::RoutableTarget {
+            instance_id: Arc::from(worker.url()),
+            dp_rank: 0,
+        };
+        crate::policies::SlotManager::begin_prefill(manager.as_ref(), &target, 7);
+        worker.increment_load();
+        let unrelated = RequestLoadGuard::new(
+            Some(worker.clone()),
+            Some(KvRequestSlot::new(manager.clone(), target.clone(), 7)),
+        );
+        let load = admitted_kv_load(worker.clone(), manager.clone(), target.clone());
+        let request: CompletionRequest = serde_json::from_value(serde_json::json!({
+            "prompt": [1], "stream": true, "echo": false,
+        }))
+        .unwrap();
+        let completion = CompletionRoute {
+            tokens: None,
+            raw_body: None,
+            echo: request.echo,
+        };
+        let router = create_test_regular_router();
+        let response = router
+            .send_typed_request(
+                &request,
+                TypedDispatch {
+                    headers: None,
+                    route: "/v1/completions",
+                    worker_url: worker.url(),
+                    is_stream: true,
+                    completion: Some(&completion),
+                    load,
+                    prepared: None,
+                },
+                None,
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut body = response.into_body().into_data_stream();
+        for chunk in [
+            ": heartbeat\r\n\r\n",
+            "\n\n",
+            "data: {\"choices\":[{\"text\":\"\"}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"completion_tokens\":0}}\n\n",
+            "data: {\"choices\":[{\"text\":\"generated",
+        ] {
+            tx.send(Ok(bytes::Bytes::from_static(chunk.as_bytes())))
+                .unwrap();
+            let bytes = tokio::time::timeout(Duration::from_secs(5), body.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert!(
+                bytes.ends_with(chunk.as_bytes()),
+                "raw backend bytes must be forwarded"
+            );
+            assert_eq!(
+                crate::policies::LoadProvider::sample(manager.as_ref(), &target),
+                crate::policies::LoadSample {
+                    active_prefill_tokens: 71,
+                    active_requests: 2
+                },
+                "non-output chunk must retain prefill: {chunk:?}",
+            );
+            assert_eq!(worker.load(), 2);
+        }
+        tx.send(Ok(bytes::Bytes::from_static(b"\"}]}\r\n\r\n")))
+            .unwrap();
+        body.next().await.unwrap().unwrap();
+        assert_eq!(
+            crate::policies::LoadProvider::sample(manager.as_ref(), &target),
+            crate::policies::LoadSample {
+                active_prefill_tokens: 7,
+                active_requests: 2
+            },
+        );
+        for chunk in [
+            "data: {\"choices\":[{\"text\":\"again\"}]}\n\n",
+            ": keepalive containing data: [DONE]\n\n",
+            "data: [DONE]\n\n",
+        ] {
+            tx.send(Ok(bytes::Bytes::from_static(chunk.as_bytes())))
+                .unwrap();
+            body.next().await.unwrap().unwrap();
+            assert_eq!(worker.load(), 2, "only EOF/drop releases the request");
+            assert_eq!(
+                crate::policies::LoadProvider::sample(manager.as_ref(), &target),
+                crate::policies::LoadSample {
+                    active_prefill_tokens: 7,
+                    active_requests: 2
+                },
+            );
+        }
+        drop(tx);
+        assert!(tokio::time::timeout(Duration::from_secs(5), body.next())
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(worker.load(), 1);
+        assert_eq!(
+            crate::policies::LoadProvider::sample(manager.as_ref(), &target),
+            crate::policies::LoadSample {
+                active_prefill_tokens: 7,
+                active_requests: 1
+            },
+        );
+        drop(unrelated);
+        assert_eq!(worker.load(), 0);
+        assert_eq!(
+            crate::policies::LoadProvider::sample(manager.as_ref(), &target),
+            crate::policies::LoadSample::default()
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn http_completion_output_frame_marker_prevents_first_byte_decode() {
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+            "http://completion-marker".into(),
+            WorkerType::Regular,
+        ));
+        let manager = Arc::new(crate::policies::InMemorySlotManager::new());
+        let target = crate::kv_index::RoutableTarget {
+            instance_id: Arc::from(worker.url()),
+            dp_rank: 0,
+        };
+        let load = admitted_kv_load(worker.clone(), manager.clone(), target.clone());
+        let (mut producer, consumer) = crate::backend::stream_output::output_frame_tracking();
+        let (tx, rx) =
+            tokio::sync::mpsc::unbounded_channel::<Result<bytes::Bytes, std::io::Error>>();
+        assert!(emit_http_first_sse(
+            &tx,
+            &serde_json::json!({}),
+            Some(&mut producer)
+        ));
+        assert!(producer.send(
+            &tx,
+            bytes::Bytes::from_static(b"data: {\"choices\":[{\"text\":\"output\"}]}\n\n"),
+            true
+        ));
+        let response = hold_request_load_with_output_frame(
+            Response::new(Body::from_stream(UnboundedReceiverStream::new(rx))),
+            load,
+            None,
+            Some(consumer),
+        );
+        let mut body = response.into_body().into_data_stream();
+        body.next().await.unwrap().unwrap();
+        assert_eq!(
+            crate::policies::LoadProvider::sample(manager.as_ref(), &target),
+            crate::policies::LoadSample {
+                active_prefill_tokens: 64,
+                active_requests: 1
+            }
+        );
+        body.next().await.unwrap().unwrap();
+        assert_eq!(
+            crate::policies::LoadProvider::sample(manager.as_ref(), &target),
+            crate::policies::LoadSample {
+                active_prefill_tokens: 0,
+                active_requests: 1
+            }
+        );
+        assert_eq!(worker.load(), 1);
+        drop(body);
+        assert_eq!(worker.load(), 0);
+    }
+
+    #[tokio::test]
+    async fn http_completion_nonoutput_cancel_and_error_isolate_admitted_load() {
+        for (echo, fail_body, status) in [
+            (false, false, StatusCode::OK),
+            (false, true, StatusCode::OK),
+            (true, false, StatusCode::OK),
+            (false, false, StatusCode::BAD_REQUEST),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+                format!("http://{}", listener.local_addr().unwrap()),
+                WorkerType::Regular,
+            ));
+            let (tx, rx) =
+                tokio::sync::mpsc::unbounded_channel::<Result<bytes::Bytes, std::io::Error>>();
+            let receiver = Arc::new(Mutex::new(Some(rx)));
+            let app = axum::Router::new().route(
+                "/v1/completions",
+                axum::routing::post(move || {
+                    let rx = receiver.lock().take().unwrap();
+                    async move {
+                        let mut response =
+                            Response::new(Body::from_stream(UnboundedReceiverStream::new(rx)));
+                        *response.status_mut() = status;
+                        response
+                    }
+                }),
+            );
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let manager = Arc::new(crate::policies::InMemorySlotManager::new());
+            let target = crate::kv_index::RoutableTarget {
+                instance_id: Arc::from(worker.url()),
+                dp_rank: 0,
+            };
+            crate::policies::SlotManager::begin_prefill(manager.as_ref(), &target, 7);
+            worker.increment_load();
+            let unrelated = RequestLoadGuard::new(
+                Some(worker.clone()),
+                Some(KvRequestSlot::new(manager.clone(), target.clone(), 7)),
+            );
+            let load = admitted_kv_load(worker.clone(), manager.clone(), target.clone());
+            let request: CompletionRequest = serde_json::from_value(
+                serde_json::json!({ "prompt": [1], "stream": true, "echo": echo }),
+            )
+            .unwrap();
+            let completion = CompletionRoute {
+                tokens: None,
+                raw_body: None,
+                echo,
+            };
+            let response = create_test_regular_router()
+                .send_typed_request(
+                    &request,
+                    TypedDispatch {
+                        headers: None,
+                        route: "/v1/completions",
+                        worker_url: worker.url(),
+                        is_stream: true,
+                        completion: Some(&completion),
+                        load,
+                        prepared: None,
+                    },
+                    None,
+                )
+                .await;
+            let mut body = response.into_body().into_data_stream();
+            let chunk = if echo || !status.is_success() {
+                b"data: {\"choices\":[{\"text\":\"not proven generated output\"}]}\n\n".as_slice()
+            } else {
+                b": comment containing data: [DONE]\n\n".as_slice()
+            };
+            tx.send(Ok(bytes::Bytes::from_static(chunk))).unwrap();
+            tokio::time::timeout(Duration::from_secs(5), body.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert_eq!(worker.load(), 2);
+            assert_eq!(
+                crate::policies::LoadProvider::sample(manager.as_ref(), &target),
+                crate::policies::LoadSample {
+                    active_prefill_tokens: 71,
+                    active_requests: 2
+                }
+            );
+            if fail_body {
+                tx.send(Err(std::io::Error::other("broken backend body")))
+                    .unwrap();
+                assert!(tokio::time::timeout(Duration::from_secs(5), body.next())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .is_err());
+            }
+            drop(body);
+            assert_eq!(worker.load(), 1);
+            assert_eq!(
+                crate::policies::LoadProvider::sample(manager.as_ref(), &target),
+                crate::policies::LoadSample {
+                    active_prefill_tokens: 7,
+                    active_requests: 1
+                }
+            );
+            drop(unrelated);
+            assert_eq!(worker.load(), 0);
+            server.abort();
+        }
+    }
+
+    async fn check_health_preserves_guarded_load(registry_checker: bool) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+            format!("http://{}", listener.local_addr().unwrap()),
+            WorkerType::Regular,
+        ));
+        let checks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let checked = Arc::new(tokio::sync::Notify::new());
+        let handler_checks = checks.clone();
+        let handler_checked = checked.clone();
+        let app = axum::Router::new().route(
+            "/health",
+            axum::routing::get(move || {
+                let checks = handler_checks.clone();
+                let checked = handler_checked.clone();
+                async move {
+                    checks.fetch_add(1, Ordering::Release);
+                    checked.notify_one();
+                    StatusCode::OK
+                }
+            }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let manager = Arc::new(crate::policies::InMemorySlotManager::new());
+        let target = crate::kv_index::RoutableTarget {
+            instance_id: Arc::from(worker.url()),
+            dp_rank: 0,
+        };
+        let old_request = admitted_kv_load(worker.clone(), manager.clone(), target.clone());
+        let health_checker = if registry_checker {
+            let registry = WorkerRegistry::new();
+            registry.register(worker.clone());
+            registry.start_health_checker(1)
+        } else {
+            crate::core::start_health_checker(
+                Arc::new(std::sync::RwLock::new(vec![worker.clone()])),
+                1,
+            )
+        };
+
+        // The next completed health check is after the old tenth-cycle reset,
+        // without invoking reset_load directly or relying on a guessed sleep.
+        let completed = tokio::time::timeout(Duration::from_secs(14), async {
+            while checks.load(Ordering::Acquire) < 11 {
+                checked.notified().await;
+            }
+        })
+        .await;
+        let load_after_checks = worker.load();
+        let new_request = admitted_kv_load(worker.clone(), manager.clone(), target.clone());
+        drop(old_request);
+        let load_after_old_release = worker.load();
+        let remaining = crate::policies::LoadProvider::sample(manager.as_ref(), &target);
+        drop(new_request);
+        health_checker.shutdown().await;
+        server.abort();
+
+        completed.expect("health checker must execute more than ten cycles");
+        assert_eq!(
+            load_after_checks, 1,
+            "health checks cannot erase active load"
+        );
+        assert_eq!(
+            load_after_old_release, 1,
+            "an older request cannot release a newer request's load"
+        );
+        assert_eq!(remaining.active_requests, 1);
+        assert_eq!(remaining.active_prefill_tokens, 64);
+        assert_eq!(worker.load(), 0);
+        assert_eq!(
+            crate::policies::LoadProvider::sample(manager.as_ref(), &target).active_requests,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn registry_health_checker_preserves_guarded_load() {
+        check_health_preserves_guarded_load(true).await;
+    }
+
+    #[tokio::test]
+    async fn collection_health_checker_preserves_guarded_load() {
+        check_health_preserves_guarded_load(false).await;
+    }
+
+    #[tokio::test]
     async fn cancelled_dispatch_releases_only_its_prefill_and_worker_load() {
         let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(
             "grpc://cancel:50051".into(),
@@ -3626,10 +4858,11 @@ mod tests {
             let producer = tokio::spawn(async move {
                 let _ = finish_rx.await;
             });
-            let response = hold_request_load_with_producer(
+            let response = hold_request_load_with_output_frame(
                 Response::new(Body::from("buffered")),
                 load,
                 Some(producer),
+                None,
             );
             if cancel {
                 drop(response);
@@ -3919,6 +5152,7 @@ mod tests {
             circuit_breaker_config: CircuitBreakerConfig::default(),
             health_config: HealthConfig::default(),
             frontend: crate::backend::EngineFrontend::new(),
+            completion_input: None,
             _worker_loads: Arc::new(rx),
             _load_monitor_handle: None,
             kv_index_supervisor: None,

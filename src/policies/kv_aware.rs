@@ -32,6 +32,24 @@ pub trait KvAwareOps: Send + Sync {
         lora_name: Option<&str>,
         cache_salt: Option<&str>,
     ) -> Option<KvSelectionReceipt>;
+    /// Optional placement qualification aligned with the original `workers`
+    /// slice, before health filtering. `None` retains the legacy contract.
+    /// Unknown targets remain candidates but must receive no placement credit.
+    fn select_worker_with_receipt_and_eligibility(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        token_ids: Option<&[u32]>,
+        lora_name: Option<&str>,
+        cache_salt: Option<&str>,
+        eligibility: Option<&[bool]>,
+    ) -> Option<KvSelectionReceipt> {
+        // Existing implementers have no per-target qualification capability.
+        // Preserve their API while conservatively withholding all token credit.
+        let token_ids = token_ids.filter(|_| {
+            eligibility.is_none_or(|mask| mask.len() == workers.len() && mask.iter().all(|v| *v))
+        });
+        self.select_worker_with_receipt(workers, token_ids, lora_name, cache_salt)
+    }
     fn begin_request(&self, receipt: KvSelectionReceipt) -> Option<KvRequestSlot>;
 }
 
@@ -659,6 +677,19 @@ impl KvAwarePolicy {
         lora_name: Option<&str>,
         cache_salt: Option<&str>,
     ) -> Option<KvSelectionReceipt> {
+        self.select_worker_with_receipt_and_eligibility(
+            workers, token_ids, lora_name, cache_salt, None,
+        )
+    }
+
+    pub fn select_worker_with_receipt_and_eligibility(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        token_ids: Option<&[u32]>,
+        lora_name: Option<&str>,
+        cache_salt: Option<&str>,
+        eligibility: Option<&[bool]>,
+    ) -> Option<KvSelectionReceipt> {
         let healthy = get_healthy_worker_indices(workers);
         if healthy.is_empty() {
             return None;
@@ -673,8 +704,16 @@ impl KvAwarePolicy {
         // same way as ingestion; for salted requests, skip placement credit
         // instead of claiming an incompatible unsalted cache entry.
         let placement_enabled = cache_salt.is_none_or(|salt| salt.is_empty());
+        let eligible = |worker_index| {
+            eligibility.is_none_or(|mask| {
+                mask.len() == workers.len() && mask.get(worker_index) == Some(&true)
+            })
+        };
         let mut matches_by_identity: HashMap<Option<CacheKey>, Vec<TierMatch>> = HashMap::new();
-        for binding in &bindings {
+        for (binding, &worker_index) in bindings.iter().zip(&healthy) {
+            if !eligible(worker_index) {
+                continue;
+            }
             let identity = binding.cache_key.clone();
             if matches_by_identity.contains_key(&identity) {
                 continue;
@@ -700,12 +739,13 @@ impl KvAwarePolicy {
 
         let grouped: Vec<Vec<TierMatch>> = bindings
             .iter()
-            .map(|binding| {
+            .zip(&healthy)
+            .map(|(binding, &worker_index)| {
                 matches_by_identity
                     .get(&binding.cache_key)
                     .into_iter()
                     .flatten()
-                    .filter(|hit| hit.target == binding.target)
+                    .filter(|hit| eligible(worker_index) && hit.target == binding.target)
                     .cloned()
                     .collect()
             })
@@ -868,6 +908,24 @@ impl KvAwareOps for KvAwarePolicy {
         KvAwarePolicy::select_worker_with_receipt(self, workers, token_ids, lora_name, cache_salt)
     }
 
+    fn select_worker_with_receipt_and_eligibility(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        token_ids: Option<&[u32]>,
+        lora_name: Option<&str>,
+        cache_salt: Option<&str>,
+        eligibility: Option<&[bool]>,
+    ) -> Option<KvSelectionReceipt> {
+        KvAwarePolicy::select_worker_with_receipt_and_eligibility(
+            self,
+            workers,
+            token_ids,
+            lora_name,
+            cache_salt,
+            eligibility,
+        )
+    }
+
     fn begin_request(&self, receipt: KvSelectionReceipt) -> Option<KvRequestSlot> {
         let manager = self.slot_manager()?;
         manager.begin_prefill(&receipt.decision.target, receipt.new_prefill_tokens);
@@ -917,6 +975,136 @@ mod tests {
             Arc::new(TemperaturePicker::new(params.router_temperature)),
             params,
         )
+    }
+
+    #[test]
+    fn placement_eligibility_keeps_unknown_targets_selectable_without_shared_identity_credit() {
+        struct Matches {
+            queries: AtomicUsize,
+            blocks: AtomicUsize,
+            hits: Vec<TierMatch>,
+        }
+        impl TieredMatchProvider for Matches {
+            fn find_tiered_matches(&self, query: &MatchQuery) -> Vec<TierMatch> {
+                self.queries.fetch_add(1, Ordering::Relaxed);
+                self.blocks
+                    .store(query.local_hashes.len(), Ordering::Relaxed);
+                self.hits.clone()
+            }
+        }
+        for count in 1..=3 {
+            for block_size in [2, 4] {
+                let policy = KvAwarePolicy::new(CostParams {
+                    router_temperature: 0.0,
+                    ..CostParams::default()
+                });
+                let workers: Vec<Arc<dyn Worker>> = (0..count)
+                    .map(|index| {
+                        Arc::new(BasicWorker::new(
+                            format!("http://worker-{index}"),
+                            WorkerType::Regular,
+                        )) as Arc<dyn Worker>
+                    })
+                    .collect();
+                let provider = Arc::new(Matches {
+                    queries: AtomicUsize::new(0),
+                    blocks: AtomicUsize::new(0),
+                    hits: workers
+                        .iter()
+                        .map(|worker| {
+                            tier_match(&target(worker.url(), 0), StorageTier::Device, &[(0, 2)])
+                        })
+                        .collect(),
+                });
+                let key = CacheKey {
+                    model: Arc::from("engine-cache-identity"),
+                    hash_mode: crate::kv_index::HashMode::Sha256,
+                    block_size,
+                };
+                for worker in &workers {
+                    policy.register_target_with_cache_identity(
+                        worker.url(),
+                        target(worker.url(), 0),
+                        key.clone(),
+                        provider.clone(),
+                    );
+                }
+                let ids: Vec<u32> = (0..2 * block_size + 1).collect();
+                let mut mask = vec![true; count];
+                if count > 1 {
+                    mask[count - 1] = false;
+                }
+                let receipt = kv_aware_ops(&policy)
+                    .unwrap()
+                    .select_worker_with_receipt_and_eligibility(
+                        &workers,
+                        Some(&ids),
+                        None,
+                        None,
+                        Some(&mask),
+                    )
+                    .unwrap();
+                assert_eq!(receipt.worker_index, 0);
+                assert_eq!(receipt.new_prefill_tokens, 1);
+                assert_eq!(provider.queries.load(Ordering::Relaxed), 1);
+                assert_eq!(provider.blocks.load(Ordering::Relaxed), 3);
+
+                // A provider query for one qualified target returns hits for
+                // every target in this identity. None may leak to an unproved
+                // candidate, even though it remains in the common cost model.
+                for worker in &workers[..count.saturating_sub(1)] {
+                    for _ in 0..ids.len() {
+                        worker.increment_load();
+                    }
+                }
+                if count > 1 {
+                    let receipt = policy
+                        .select_worker_with_receipt_and_eligibility(
+                            &workers,
+                            Some(&ids),
+                            None,
+                            None,
+                            Some(&mask),
+                        )
+                        .unwrap();
+                    assert_eq!(receipt.worker_index, count - 1);
+                    assert_eq!(receipt.new_prefill_tokens, ids.len() as u64);
+                    assert_eq!(receipt.decision.cost, ids.len() as f64);
+                }
+
+                for mask in [vec![false; count], vec![true; count + 1], vec![]] {
+                    provider.queries.store(0, Ordering::Relaxed);
+                    let receipt = policy
+                        .select_worker_with_receipt_and_eligibility(
+                            &workers,
+                            Some(&ids),
+                            None,
+                            None,
+                            Some(&mask),
+                        )
+                        .unwrap();
+                    assert_eq!(provider.queries.load(Ordering::Relaxed), 0);
+                    assert_eq!(receipt.new_prefill_tokens, ids.len() as u64);
+                }
+
+                if count > 1 {
+                    workers[0].set_healthy(false);
+                    let mut mask = vec![false; count];
+                    mask[count - 1] = true;
+                    let receipt = policy
+                        .select_worker_with_receipt_and_eligibility(
+                            &workers,
+                            Some(&ids),
+                            None,
+                            None,
+                            Some(&mask),
+                        )
+                        .unwrap();
+                    assert_eq!(receipt.worker_index, count - 1);
+                    assert_eq!(receipt.new_prefill_tokens, 1);
+                }
+            }
+        }
     }
 
     #[test]

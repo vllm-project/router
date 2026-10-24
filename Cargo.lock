@@ -7434,6 +7434,7 @@ dependencies = [
  "lru",
  "metrics",
  "metrics-exporter-prometheus",
+ "mime",
  "minijinja",
  "once_cell",
  "opentelemetry",
