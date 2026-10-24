@@ -45,6 +45,15 @@ impl Ctx {
             urls.push(w.start().await.unwrap());
             started.push(w);
         }
+        Self::with_urls(policy, started, urls, tweak).await
+    }
+
+    async fn with_urls(
+        policy: PolicyConfig,
+        started: Vec<MockWorker>,
+        urls: Vec<String>,
+        tweak: impl FnOnce(&mut RouterConfig),
+    ) -> Self {
         let mut config = RouterConfig {
             mode: RoutingMode::Regular { worker_urls: urls },
             policy,
@@ -312,5 +321,62 @@ async fn messages_stream_worker_json_error_keeps_status_and_content_type() {
         value,
         json!({"type": "error", "error": {"type": "api_error", "message": "mock worker failure"}})
     );
+    ctx.shutdown().await;
+}
+
+/// A worker (or a reverse proxy in front of it) that rejects
+/// `/v1/messages` with a large non-json body. Every other path is healthy.
+async fn start_plain_text_error_worker(body: String) -> String {
+    use axum::response::IntoResponse;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = Router::new().fallback(move |req: Request| {
+        let body = body.clone();
+        async move {
+            if req.uri().path() == "/v1/messages" {
+                (StatusCode::BAD_GATEWAY, [(CONTENT_TYPE, "text/html")], body).into_response()
+            } else {
+                (StatusCode::OK, [(CONTENT_TYPE, "application/json")], "{}").into_response()
+            }
+        }
+    });
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    format!("http://{addr}")
+}
+
+#[tokio::test]
+async fn messages_worker_non_json_error_passes_through_unchanged() {
+    // Larger than the router error rewrite limit, so a rewrite would also
+    // have dropped the body.
+    let html = format!("<html><body>{}</body></html>", "x".repeat(100 * 1024));
+    let url = start_plain_text_error_worker(html.clone()).await;
+    let ctx = Ctx::with_urls(PolicyConfig::RoundRobin, Vec::new(), vec![url], |c| {
+        c.disable_retries = true;
+        c.disable_circuit_breaker = true;
+    })
+    .await;
+    for stream in [false, true] {
+        let mut body = agent_body(None, "hi");
+        body["stream"] = json!(stream);
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/messages")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = ctx.app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY, "stream={stream}");
+        let ct = resp.headers()[CONTENT_TYPE].to_str().unwrap().to_string();
+        assert!(
+            ct.contains("text/html"),
+            "stream={stream} content-type: {ct}"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(bytes, html.as_bytes(), "stream={stream}");
+    }
     ctx.shutdown().await;
 }

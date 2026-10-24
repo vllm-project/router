@@ -220,6 +220,13 @@ impl GenerationRequest for MessagesRequest {
     fn affinity_user_key(&self) -> Option<&str> {
         self.metadata_user_id()
     }
+
+    /// Program identity fields (`vllm_xargs`, `agent_hint`, `session_params`,
+    /// `session_id`, `user_id`) live in the forwarded `other` fields, so a
+    /// body level Program opt-in keeps working on the typed route.
+    fn extract_program_identity_payload(&self) -> Option<Value> {
+        crate::protocols::spec::program_identity_payload(Some(&self.other), None)
+    }
 }
 
 /// Anthropic error `type` for a router generated status code.
@@ -412,5 +419,29 @@ mod tests {
         assert_eq!(anthropic_error_type(401), "authentication_error");
         assert_eq!(anthropic_error_type(404), "not_found_error");
         assert_eq!(anthropic_error_type(500), "api_error");
+    }
+
+    #[test]
+    fn program_identity_payload_keeps_body_level_opt_in() {
+        let req = parse_with_required(&json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "vllm_xargs": {"agentic_context": {"program_id": "program-a"}},
+            "agent_hint": {"session_id": "session-a"},
+            "metadata": {"user_id": "u-1"}
+        }));
+        let payload = req.extract_program_identity_payload().unwrap();
+        assert_eq!(
+            payload["vllm_xargs"]["agentic_context"]["program_id"],
+            "program-a"
+        );
+        assert_eq!(payload["agent_hint"]["session_id"], "session-a");
+        // Generation content never enters the identity payload.
+        assert!(payload.get("messages").is_none());
+        assert!(payload.get("metadata").is_none());
+
+        let plain = parse_with_required(&json!({
+            "messages": [{"role": "user", "content": "hi"}]
+        }));
+        assert!(plain.extract_program_identity_payload().is_none());
     }
 }

@@ -16,7 +16,7 @@ use crate::{
     },
     routers::{
         router_manager::{RouterId, RouterManager},
-        RouterFactory, RouterTrait,
+        RouterFactory, RouterTrait, UpstreamResponse,
     },
     service_discovery::{start_service_discovery, ServiceDiscoveryConfig},
 };
@@ -398,27 +398,37 @@ async fn v1_embeddings(
 }
 
 /// Max size of a router generated error body rewritten for `/v1/messages`.
+/// Router errors are short; worker responses never reach the rewrite.
 const MESSAGES_ERROR_BODY_LIMIT: usize = 64 * 1024;
 
+/// Message text of a router generated error body. Some router errors are
+/// already json (`{"error": {"message": ...}}` or `{"message": ...}`); use
+/// their message instead of nesting the json text. Plain text is used as is.
+fn router_error_message(bytes: &[u8]) -> String {
+    if let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) {
+        let message = value
+            .pointer("/error/message")
+            .or_else(|| value.get("message"))
+            .or_else(|| value.get("error"))
+            .and_then(serde_json::Value::as_str);
+        if let Some(message) = message {
+            return message.to_string();
+        }
+    }
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
 /// Rewrite router generated errors on `/v1/messages` into the anthropic
-/// error shape. Router errors are plain text; worker errors come back as
-/// json and pass through unchanged, as do successful responses.
+/// error shape. Worker responses carry [`UpstreamResponse`] and pass through
+/// unchanged whatever their content type, as do successful responses.
 async fn anthropic_error_response(response: Response) -> Response {
     let status = response.status();
-    if status.is_success() {
-        return response;
-    }
-    let is_json = response
-        .headers()
-        .get(http::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| v.contains("json") || v.contains("event-stream"));
-    if is_json {
+    if status.is_success() || response.extensions().get::<UpstreamResponse>().is_some() {
         return response;
     }
     let (mut parts, body) = response.into_parts();
     let message = match axum::body::to_bytes(body, MESSAGES_ERROR_BODY_LIMIT).await {
-        Ok(bytes) if !bytes.is_empty() => String::from_utf8_lossy(&bytes).into_owned(),
+        Ok(bytes) if !bytes.is_empty() => router_error_message(&bytes),
         _ => status
             .canonical_reason()
             .unwrap_or("request failed")

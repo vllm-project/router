@@ -2106,6 +2106,9 @@ impl Router {
                     *response.status_mut() = status;
                     *response.headers_mut() = response_headers;
                     response
+                        .extensions_mut()
+                        .insert(crate::routers::UpstreamResponse);
+                    response
                 }
                 Err(e) => {
                     let error_msg = format!("Failed to get response body: {}", e);

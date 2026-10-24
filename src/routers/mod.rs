@@ -28,6 +28,13 @@ pub use http::{openai_router, pd_router, pd_types, router};
 ///
 /// This trait is separate from RouterTrait to allow Send futures
 /// for use in service discovery and other background tasks
+/// Response extension set on responses that came from a worker (or from a
+/// transparent proxy path). `/v1/messages` rewrites only responses without it
+/// into the anthropic error shape, so worker errors always pass through as
+/// sent, whatever their content type or size.
+#[derive(Debug, Clone, Copy)]
+pub struct UpstreamResponse;
+
 #[async_trait]
 pub trait WorkerManagement: Send + Sync {
     /// Add a worker to the router
@@ -179,8 +186,13 @@ pub trait RouterTrait: Send + Sync + Debug + WorkerManagement {
     ) -> Response {
         match serde_json::to_value(body) {
             Ok(value) => {
-                self.route_transparent(headers, "/v1/messages", &Method::POST, value)
-                    .await
+                // The transparent path does not separate its own errors from
+                // worker responses, so keep its responses untouched as before.
+                let mut response = self
+                    .route_transparent(headers, "/v1/messages", &Method::POST, value)
+                    .await;
+                response.extensions_mut().insert(UpstreamResponse);
+                response
             }
             Err(e) => (
                 StatusCode::BAD_REQUEST,

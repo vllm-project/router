@@ -2635,7 +2635,7 @@ fn passthrough_string<'a>(
         .filter(|value| !value.is_empty())
 }
 
-fn program_identity_payload(
+pub(crate) fn program_identity_payload(
     other: Option<&serde_json::Map<String, serde_json::Value>>,
     user: Option<&str>,
 ) -> Option<serde_json::Value> {
