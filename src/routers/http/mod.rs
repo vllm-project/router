@@ -4,6 +4,8 @@ pub mod dp_utils;
 mod epd;
 pub mod logprobs_merge;
 pub mod openai_router;
+mod pd_dispatch;
+mod pd_request_error;
 pub mod pd_router;
 pub mod pd_types;
 mod program_adapter;
