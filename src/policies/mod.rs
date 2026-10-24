@@ -13,6 +13,7 @@ mod consistent_hash;
 mod factory;
 pub(crate) mod hash_key;
 mod kv_aware;
+mod least_load;
 mod power_of_two;
 mod random;
 mod registry;
@@ -29,6 +30,7 @@ pub use kv_aware::{
     LoadProvider, LoadSample, MultiplicativeScorer, Picker, Scorer, SelectionError, SlotManager,
     TemperaturePicker, TieredMatchProvider, TransferCredits,
 };
+pub use least_load::LeastLoadPolicy;
 pub use power_of_two::PowerOfTwoPolicy;
 pub use random::RandomPolicy;
 pub use registry::PolicyRegistry;

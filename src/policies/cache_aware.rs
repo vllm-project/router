@@ -63,6 +63,7 @@ use super::{get_healthy_worker_indices, CacheAwareConfig, LoadBalancingPolicy, R
 use crate::core::Worker;
 use crate::metrics::RouterMetrics;
 use crate::policies::normalize_model_key;
+use crate::protocols::spec::cache_routing;
 use crate::tree::Tree;
 use dashmap::DashMap;
 use rand::Rng;
@@ -152,11 +153,8 @@ impl CacheAwarePolicy {
                 let matched_chars = tree.as_ref().map_or(0, |tree| {
                     tree.prefix_match_tenant_char_count(request_text, candidate.target_id)
                 });
-                let affinity = if input_chars == 0 {
-                    0.0
-                } else {
-                    matched_chars as f64 / input_chars as f64
-                };
+                let affinity =
+                    cache_routing::match_rate(request_text, matched_chars, input_chars) as f64;
                 let headroom = 1.0 - candidate.kv_pressure.clamp(0.0, 1.0);
                 (candidate, affinity, headroom, (1.0 + affinity) * headroom)
             })
@@ -305,6 +303,14 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         if healthy_indices.is_empty() {
             return None;
         }
+        let text = request_text.unwrap_or("");
+        let key_kind = cache_routing::kind(text);
+        RouterMetrics::record_cache_routing_key(key_kind);
+        debug!(
+            key_kind,
+            prefix_information = matches!(key_kind, "tokens" | "text" | "legacy_text"),
+            "Cache-aware routing input"
+        );
 
         // Determine the model for this set of workers (router pre-filters by model)
         // All workers should be from the same model
@@ -342,8 +348,6 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         }
 
         // Use cache-aware routing when balanced
-        let text = request_text.unwrap_or("");
-
         // Get the tree reference without locking the entire HashMap
         // DashMap only locks the specific shard containing this key
         let tree = self.trees.get(model_id).map(|entry| entry.value().clone());
@@ -372,11 +376,8 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         // Now we work with the tree without holding the HashMap lock
         // Use prefix_match_with_counts to avoid redundant chars().count() calls
         let result = tree.prefix_match_with_counts(text);
-        let match_rate = if result.input_char_count == 0 {
-            0.0
-        } else {
-            result.matched_char_count as f32 / result.input_char_count as f32
-        };
+        let match_rate =
+            cache_routing::match_rate(text, result.matched_char_count, result.input_char_count);
 
         debug!(
             "Cache match for model '{}': matched_chars={}, input_chars={}, match_rate={:.2}",
@@ -550,6 +551,79 @@ impl Drop for CacheAwarePolicy {
 mod tests {
     use super::*;
     use crate::core::{BasicWorker, WorkerType};
+    use crate::protocols::spec::{CompletionRequest, GenerationRequest};
+
+    #[test]
+    fn bounded_keys_do_not_turn_unrelated_tokens_or_sessions_into_hits() {
+        let key = |value| {
+            serde_json::from_value::<CompletionRequest>(value)
+                .unwrap()
+                .extract_cache_routing_key()
+        };
+        let pairs = [
+            (
+                serde_json::json!({"prompt": [1,2,3,4]}),
+                serde_json::json!({"prompt": [2,3,4,5]}),
+            ),
+            (
+                serde_json::json!({"prompt": [1]}),
+                serde_json::json!({"prompt": [2]}),
+            ),
+            (
+                serde_json::json!({"prompt": [1,2,3,4]}),
+                serde_json::json!({"prompt": [1,2,9,8]}),
+            ),
+            (
+                serde_json::json!({"prompt": "a", "session_params": {"session_id": "sess-0001"}}),
+                serde_json::json!({"prompt": "a", "session_params": {"session_id": "sess-0002"}}),
+            ),
+        ];
+        for (seed, query) in pairs {
+            let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+                eviction_interval_secs: 0,
+                ..Default::default()
+            });
+            let workers: Vec<Arc<dyn Worker>> = (0..2)
+                .map(|i| {
+                    Arc::new(BasicWorker::new(
+                        format!("http://w{i}:8000"),
+                        WorkerType::Regular,
+                    )) as Arc<dyn Worker>
+                })
+                .collect();
+            policy.init_workers(&workers);
+            let seed = key(seed);
+            policy.commit_placement(workers[0].model_id(), &seed, workers[0].url());
+            workers[0].increment_load();
+            // The absolute imbalance guard does not fire at (1,0).
+            // Equal-length unrelated tokens and similar session IDs must miss.
+            assert_eq!(policy.select_worker(&workers, Some(&key(query))), Some(1));
+            // The original complete key still has affinity to worker 0.
+            assert_eq!(policy.select_worker(&workers, Some(&seed)), Some(0));
+        }
+    }
+
+    #[test]
+    fn bounded_token_keys_keep_real_prefix_affinity() {
+        let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+            eviction_interval_secs: 0,
+            ..Default::default()
+        });
+        let workers: Vec<Arc<dyn Worker>> = (0..2)
+            .map(|i| {
+                Arc::new(BasicWorker::new(
+                    format!("http://w{i}:8000"),
+                    WorkerType::Regular,
+                )) as Arc<dyn Worker>
+            })
+            .collect();
+        policy.init_workers(&workers);
+        let seed = cache_routing::from_value(&serde_json::json!({"prompt": [1,2,3,4]}));
+        let query = cache_routing::from_value(&serde_json::json!({"prompt": [1,2,3,5]}));
+        policy.commit_placement(workers[0].model_id(), &seed, workers[0].url());
+        workers[0].increment_load();
+        assert_eq!(policy.select_worker(&workers, Some(&query)), Some(0));
+    }
 
     #[test]
     fn unhealthy_worker_load_does_not_disable_cache_affinity() {

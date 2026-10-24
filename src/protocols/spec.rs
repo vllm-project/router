@@ -552,6 +552,16 @@ pub struct ChatCompletionRequest {
 }
 
 impl GenerationRequest for ChatCompletionRequest {
+    fn extract_cache_routing_key(&self) -> String {
+        cache_routing::session(
+            self.session_params
+                .as_ref()
+                .and_then(|p| p.get("session_id"))
+                .and_then(Value::as_str),
+        )
+        .unwrap_or_else(|| cache_routing::text(&self.extract_text_for_program_scheduling()))
+    }
+
     fn is_stream(&self) -> bool {
         self.stream
     }
@@ -881,6 +891,16 @@ pub struct CompletionRequest {
 }
 
 impl GenerationRequest for CompletionRequest {
+    fn extract_cache_routing_key(&self) -> String {
+        cache_routing::session(
+            self.session_params
+                .as_ref()
+                .and_then(|p| p.get("session_id"))
+                .and_then(Value::as_str),
+        )
+        .unwrap_or_else(|| cache_routing::prompt(&self.prompt))
+    }
+
     fn is_stream(&self) -> bool {
         self.stream
     }
@@ -906,10 +926,8 @@ impl GenerationRequest for CompletionRequest {
 }
 
 impl CompletionRequest {
-    /// Routing key for typed gRPC completions. Session affinity is only used
-    /// on this path; token-array prompts without a session have no useful
-    /// prefix key because the generic prompt representation contains only
-    /// their length.
+    /// Legacy routing text for non-cache-aware typed gRPC policies.
+    /// Cache-aware placement uses `extract_cache_routing_key` on both transports.
     pub fn extract_text_for_grpc_routing(&self) -> String {
         if let Some(session_id) = self
             .session_params
@@ -2106,6 +2124,35 @@ pub struct GenerateRequest {
 }
 
 impl GenerationRequest for GenerateRequest {
+    fn extract_cache_routing_key(&self) -> String {
+        if let Some(key) = cache_routing::session(
+            self.session_params
+                .as_ref()
+                .and_then(|p| p.get("session_id"))
+                .and_then(Value::as_str),
+        ) {
+            return key;
+        }
+        if let Some(text) = &self.text {
+            return cache_routing::text(text);
+        }
+        if let Some(prompt) = &self.prompt {
+            return match prompt {
+                StringOrArray::String(text) => cache_routing::text(text),
+                StringOrArray::Array(values) => values
+                    .first()
+                    .map_or_else(String::new, |v| cache_routing::text(v)),
+            };
+        }
+        match &self.input_ids {
+            Some(InputIds::Single(ids)) => cache_routing::tokens(ids),
+            Some(InputIds::Batch(batch)) => batch
+                .first()
+                .map_or_else(String::new, |ids| cache_routing::tokens(ids)),
+            None => String::new(),
+        }
+    }
+
     fn is_stream(&self) -> bool {
         self.stream
     }
@@ -2167,6 +2214,10 @@ pub struct InferenceGenerateRequest {
 }
 
 impl GenerationRequest for InferenceGenerateRequest {
+    fn extract_cache_routing_key(&self) -> String {
+        cache_routing::tokens(&self.token_ids)
+    }
+
     fn is_stream(&self) -> bool {
         self.stream
     }
@@ -2466,6 +2517,12 @@ pub enum GrpcRequestRef<'a> {
 
 /// Common trait for all generation requests across different APIs
 pub trait GenerationRequest: Send + Sync {
+    /// Bounded prefix/session hint for cache-aware placement. Separate from
+    /// legacy routing text and Program token estimation.
+    fn extract_cache_routing_key(&self) -> String {
+        cache_routing::text(&self.extract_text_for_routing())
+    }
+
     /// Check if the request is for streaming
     fn is_stream(&self) -> bool;
 
@@ -2595,8 +2652,8 @@ impl PromptInput {
         }
     }
 
-    /// Extract text representation for routing decisions
-    /// For token IDs, converts to a string representation
+    /// Legacy text representation for routing and Program estimation.
+    /// Cache-aware placement uses content keys through `extract_cache_routing_key`.
     pub fn extract_text_for_routing(&self) -> String {
         match self {
             PromptInput::String(s) => s.clone(),
@@ -2642,6 +2699,295 @@ impl PromptInput {
 pub enum LoRAPath {
     Single(Option<String>),
     Batch(Vec<Option<String>>),
+}
+
+pub(crate) mod cache_routing {
+    //! Bounded, transport-independent keys used only by the cache-aware policy.
+    //!
+    //! Namespace bytes never count as cached content. Token matches count complete
+    //! fixed-width IDs; session affinity requires equality, not a shared prefix.
+
+    use super::{
+        ChatCompletionRequest, CompletionRequest, GenerateRequest, GenerationRequest,
+        InferenceGenerateRequest, PromptInput, ResponsesRequest,
+    };
+    use serde_json::Value;
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write;
+
+    const TEXT: &str = "\0ca:t:";
+    const TOKENS: &str = "\0ca:i:";
+    const SESSION: &str = "\0ca:s:";
+    pub const TOKEN_PREFIX_LIMIT: usize = 2048;
+    pub const TEXT_PREFIX_LIMIT: usize = 16_384;
+    const TOKEN_WIDTH: usize = 8;
+
+    pub fn text(value: &str) -> String {
+        if value.is_empty() {
+            return String::new();
+        }
+        let mut key = String::from(TEXT);
+        key.extend(value.chars().take(TEXT_PREFIX_LIMIT));
+        key
+    }
+
+    pub fn session(id: Option<&str>) -> Option<String> {
+        let id = id.filter(|id| !id.trim().is_empty())?;
+        // Bound arbitrary client IDs and keep them out of the content namespace.
+        Some(format!("{SESSION}{:x}", Sha256::digest(id.as_bytes())))
+    }
+
+    pub fn prompt(prompt: &PromptInput) -> String {
+        match prompt {
+            PromptInput::String(value) => text(value),
+            PromptInput::StringArray(values) => {
+                values.first().map_or_else(String::new, |v| text(v))
+            }
+            PromptInput::IntArray(ids) => tokens(ids),
+            // A batch has one placement; use its first prompt as the affinity hint.
+            PromptInput::IntBatch(batch) => {
+                batch.first().map_or_else(String::new, |ids| tokens(ids))
+            }
+        }
+    }
+
+    pub fn tokens(ids: &[i32]) -> String {
+        if ids.is_empty() {
+            return String::new();
+        }
+        let mut key =
+            String::with_capacity(TOKENS.len() + ids.len().min(TOKEN_PREFIX_LIMIT) * TOKEN_WIDTH);
+        key.push_str(TOKENS);
+        for id in ids.iter().take(TOKEN_PREFIX_LIMIT) {
+            // Preserve all 32 bits, including signed IDs accepted by PromptInput.
+            write!(key, "{:08x}", *id as u32).expect("writing to String");
+        }
+        key
+    }
+
+    /// Use the route's protocol semantics even when extra fields resemble
+    /// another API (for example a chat request with a `prompt` extension).
+    pub fn for_route(body: &Value, route: &str) -> String {
+        match route {
+            "/v1/chat/completions" => serde_json::from_value::<ChatCompletionRequest>(body.clone())
+                .map(|request| request.extract_cache_routing_key())
+                .unwrap_or_default(),
+            "/v1/completions" => serde_json::from_value::<CompletionRequest>(body.clone())
+                .map(|request| request.extract_cache_routing_key())
+                .unwrap_or_default(),
+            "/generate" => serde_json::from_value::<GenerateRequest>(body.clone())
+                .map(|request| request.extract_cache_routing_key())
+                .unwrap_or_default(),
+            "/inference/v1/generate" => {
+                serde_json::from_value::<InferenceGenerateRequest>(body.clone())
+                    .map(|request| request.extract_cache_routing_key())
+                    .unwrap_or_default()
+            }
+            "/v1/responses" => serde_json::from_value::<ResponsesRequest>(body.clone())
+                .map(|request| request.extract_cache_routing_key())
+                .unwrap_or_default(),
+            _ => from_value(body),
+        }
+    }
+
+    /// Extract content from an untyped HTTP/PD body, ignoring generation settings
+    /// and JSON field order. Unsupported shapes deliberately have no prefix hint.
+    pub fn from_value(body: &Value) -> String {
+        if let Some(key) = session(
+            body.get("session_params")
+                .and_then(|p| p.get("session_id"))
+                .and_then(Value::as_str),
+        ) {
+            return key;
+        }
+        if let Some(value) = body.get("prompt") {
+            return serde_json::from_value::<PromptInput>(value.clone())
+                .map(|value| prompt(&value))
+                .unwrap_or_default();
+        }
+        if body.get("messages").is_some() {
+            return serde_json::from_value::<ChatCompletionRequest>(body.clone())
+                .map(|request| request.extract_cache_routing_key())
+                .unwrap_or_default();
+        }
+        if let Some(value) = body.get("text").and_then(Value::as_str) {
+            return text(value);
+        }
+        if let Some(value) = body.get("input_ids").or_else(|| body.get("token_ids")) {
+            return serde_json::from_value::<PromptInput>(value.clone())
+                .map(|value| prompt(&value))
+                .unwrap_or_default();
+        }
+        if body.get("input").is_some() {
+            return serde_json::from_value::<ResponsesRequest>(body.clone())
+                .map(|request| request.extract_cache_routing_key())
+                .unwrap_or_default();
+        }
+        String::new()
+    }
+
+    pub fn kind(key: &str) -> &'static str {
+        if key.is_empty() {
+            "none"
+        } else if key.starts_with(SESSION) {
+            "session"
+        } else if key.starts_with(TOKENS) {
+            "tokens"
+        } else if key.starts_with(TEXT) {
+            "text"
+        } else {
+            "legacy_text"
+        }
+    }
+
+    pub fn match_rate(key: &str, matched: usize, input: usize) -> f32 {
+        let (matched, input) = match kind(key) {
+            "session" => {
+                return if matched == input && input > SESSION.len() {
+                    1.0
+                } else {
+                    0.0
+                }
+            }
+            "tokens" => (
+                matched.saturating_sub(TOKENS.len()) / TOKEN_WIDTH,
+                input.saturating_sub(TOKENS.len()) / TOKEN_WIDTH,
+            ),
+            "text" => (
+                matched.saturating_sub(TEXT.len()),
+                input.saturating_sub(TEXT.len()),
+            ),
+            _ => (matched, input),
+        };
+        if input == 0 {
+            0.0
+        } else {
+            matched as f32 / input as f32
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use serde_json::json;
+
+        fn affinity(left: &str, right: &str) -> f32 {
+            let matched = left
+                .chars()
+                .zip(right.chars())
+                .take_while(|(a, b)| a == b)
+                .count();
+            match_rate(right, matched, right.chars().count())
+        }
+
+        #[test]
+        fn token_keys_preserve_complete_token_prefixes() {
+            let key = prompt(&PromptInput::IntArray(vec![1, 2, 3, 4]));
+            assert_eq!(
+                affinity(&key, &prompt(&PromptInput::IntArray(vec![1, 2, 9, 8]))),
+                0.5
+            );
+            assert_eq!(
+                affinity(&key, &prompt(&PromptInput::IntArray(vec![2, 3, 4, 5]))),
+                0.0
+            );
+            assert_eq!(affinity(&key, &text(&key)), 0.0);
+            assert_eq!(prompt(&PromptInput::IntArray(vec![])), "");
+            assert!(
+                prompt(&PromptInput::IntArray(vec![1; 131_072])).len()
+                    <= TOKENS.len() + 8 * TOKEN_PREFIX_LIMIT
+            );
+        }
+
+        #[test]
+        fn sessions_require_equality_and_have_bounded_keys() {
+            let a = session(Some("sess-0001")).unwrap();
+            let b = session(Some("sess-0002")).unwrap();
+            assert_eq!(affinity(&a, &b), 0.0);
+            assert_eq!(affinity(&a, &a), 1.0);
+            assert_eq!(affinity(&a, &text(&a)), 0.0);
+            assert!(session(Some("  ")).is_none());
+            assert_eq!(session(Some(&"x".repeat(100_000))).unwrap().len(), a.len());
+        }
+
+        #[test]
+        fn typed_and_untyped_keys_ignore_transport_and_generation_fields() {
+            let a: super::super::CompletionRequest =
+                serde_json::from_value(json!({"prompt": [1,2,3]})).unwrap();
+            assert_eq!(
+                a.extract_cache_routing_key(),
+                from_value(&json!({"seed": 999, "max_tokens": 20, "prompt": [1,2,3]}))
+            );
+            let chat =
+                json!({"messages": [{"role": "user", "content": "hello"}], "temperature": 0.7});
+            let request: ChatCompletionRequest = serde_json::from_value(chat.clone()).unwrap();
+            assert_eq!(request.extract_cache_routing_key(), from_value(&chat));
+            assert!(!from_value(&chat).is_empty());
+            assert_eq!(from_value(&json!({"messages": []})), "");
+            assert_eq!(from_value(&json!({"unsupported": "shape"})), "");
+            let reordered: Value =
+                serde_json::from_str(r#"{"prompt":[1,2,3],"max_tokens":1,"seed":2}"#).unwrap();
+            assert_eq!(a.extract_cache_routing_key(), from_value(&reordered));
+        }
+
+        #[test]
+        fn session_has_priority_for_chat_and_completions() {
+            let session_chat = json!({"messages": [{"role": "user", "content": "hello"}], "session_params": {"session_id": "sess-1"}});
+            let session_completion =
+                json!({"prompt": [42], "session_params": {"session_id": "sess-1"}});
+            let chat: ChatCompletionRequest = serde_json::from_value(session_chat.clone()).unwrap();
+            let completion: super::super::CompletionRequest =
+                serde_json::from_value(session_completion.clone()).unwrap();
+            assert_eq!(
+                chat.extract_cache_routing_key(),
+                completion.extract_cache_routing_key()
+            );
+            assert_eq!(from_value(&session_chat), from_value(&session_completion));
+            assert_eq!(chat.extract_cache_routing_key(), from_value(&session_chat));
+        }
+
+        #[test]
+        fn route_preserves_typed_field_precedence() {
+            let generate = json!({"text": "native text", "prompt": "other prompt"});
+            let typed: GenerateRequest = serde_json::from_value(generate.clone()).unwrap();
+            assert_eq!(
+                typed.extract_cache_routing_key(),
+                for_route(&generate, "/generate")
+            );
+            let completion = json!({"prompt": [1,2,3], "text": "extension"});
+            let typed: CompletionRequest = serde_json::from_value(completion.clone()).unwrap();
+            assert_eq!(
+                typed.extract_cache_routing_key(),
+                for_route(&completion, "/v1/completions")
+            );
+            let chat =
+                json!({"messages": [{"role": "user", "content": "hello"}], "prompt": "extension"});
+            let typed: ChatCompletionRequest = serde_json::from_value(chat.clone()).unwrap();
+            assert_eq!(
+                typed.extract_cache_routing_key(),
+                for_route(&chat, "/v1/chat/completions")
+            );
+        }
+
+        #[test]
+        fn batches_and_unicode_text_are_bounded() {
+            assert_eq!(
+                prompt(&PromptInput::IntBatch(vec![vec![1, 2], vec![3]])),
+                tokens(&[1, 2])
+            );
+            assert_eq!(
+                prompt(&PromptInput::StringArray(vec![
+                    "hello".into(),
+                    "world".into()
+                ])),
+                text("hello")
+            );
+            let key = text(&"界".repeat(100_000));
+            assert_eq!(key.chars().count(), TEXT.len() + TEXT_PREFIX_LIMIT);
+            assert_eq!(affinity(&text("hello"), &text("world")), 0.0);
+            assert_ne!(tokens(&[-1]), tokens(&[i32::MAX]));
+        }
+    }
 }
 
 #[cfg(test)]
