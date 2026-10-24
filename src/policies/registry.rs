@@ -6,8 +6,8 @@
 /// When the last worker of a model is removed, the policy mapping is cleaned up.
 use super::{
     CacheAwareConfig, CacheAwarePolicy, ConsistentHashPolicy, CostParams, KvAwarePolicy,
-    LoadBalancingPolicy, PowerOfTwoPolicy, RandomPolicy, RendezvousHashPolicy, RoundRobinPolicy,
-    TransferCredits,
+    LeastLoadPolicy, LoadBalancingPolicy, PowerOfTwoPolicy, RandomPolicy, RendezvousHashPolicy,
+    RoundRobinPolicy, TransferCredits,
 };
 use crate::config::types::PolicyConfig;
 use std::collections::HashMap;
@@ -43,7 +43,9 @@ impl PolicyRegistry {
             model_worker_counts: Arc::new(RwLock::new(HashMap::new())),
             default_policy,
             prefill_policy: Arc::new(RwLock::new(None)),
-            decode_policy: Arc::new(RwLock::new(None)),
+            decode_policy: Arc::new(RwLock::new(Some(Self::create_policy_from_config(
+                &PolicyConfig::DEFAULT_DECODE,
+            )))),
         }
     }
 
@@ -169,6 +171,7 @@ impl PolicyRegistry {
     /// Create a policy from a type string
     fn create_policy_from_type(&self, policy_type: &str) -> Arc<dyn LoadBalancingPolicy> {
         match policy_type {
+            "least_load" => Arc::new(LeastLoadPolicy),
             "round_robin" => Arc::new(RoundRobinPolicy::new()),
             "random" => Arc::new(RandomPolicy::new()),
             "cache_aware" => Arc::new(CacheAwarePolicy::new()),
@@ -185,6 +188,7 @@ impl PolicyRegistry {
     /// Create a policy from a PolicyConfig
     fn create_policy_from_config(config: &PolicyConfig) -> Arc<dyn LoadBalancingPolicy> {
         match config {
+            PolicyConfig::LeastLoad => Arc::new(LeastLoadPolicy),
             PolicyConfig::RoundRobin => Arc::new(RoundRobinPolicy::new()),
             PolicyConfig::Random => Arc::new(RandomPolicy::new()),
             PolicyConfig::CacheAware {
@@ -267,7 +271,7 @@ impl PolicyRegistry {
             .unwrap_or_else(|| self.get_default_policy())
     }
 
-    /// Get the decode policy for PD mode, or default if not set
+    /// Get the decode policy for PD mode (power-of-two unless overridden).
     pub fn get_decode_policy(&self) -> Arc<dyn LoadBalancingPolicy> {
         let decode_policy = self.decode_policy.read().unwrap();
         decode_policy

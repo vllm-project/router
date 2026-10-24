@@ -10,6 +10,7 @@ use crate::core::{BasicWorker, Worker, WorkerType};
 use crate::metrics::RouterMetrics;
 use crate::otel_http::{self, ClientRequestOptions};
 use crate::policies::PolicyRegistry;
+use crate::protocols::spec::GenerationRequest;
 use crate::routers::{header_utils, RouterTrait, WorkerManagement};
 use async_trait::async_trait;
 use axum::{
@@ -630,6 +631,7 @@ impl VllmPDRouter {
         instances: &[(String, String)],
         is_prefill: bool,
         request_text: Option<&str>,
+        cache_key: &str,
     ) -> Option<usize> {
         if instances.is_empty() {
             return None;
@@ -646,7 +648,14 @@ impl VllmPDRouter {
         };
 
         // Use policy to select worker
-        policy.select_worker(&workers, request_text)
+        policy.select_worker(
+            &workers,
+            if policy.name() == "cache_aware" {
+                Some(cache_key)
+            } else {
+                request_text
+            },
+        )
     }
 
     /// Process vLLM request using pure service discovery
@@ -688,9 +697,11 @@ impl VllmPDRouter {
         // Use policy-based load balancing to select prefill and decode workers
         let request_text = serde_json::to_string(&request_json).ok();
         let request_str = request_text.as_deref();
+        let cache_key = crate::protocols::spec::cache_routing::for_route(&request_json, path);
 
         let prefill_idx =
-            match self.select_worker_with_policy(&prefill_instances, true, request_str) {
+            match self.select_worker_with_policy(&prefill_instances, true, request_str, &cache_key)
+            {
                 Some(idx) => idx,
                 None => {
                     RouterMetrics::record_pd_error("server_selection");
@@ -702,18 +713,19 @@ impl VllmPDRouter {
                 }
             };
 
-        let decode_idx = match self.select_worker_with_policy(&decode_instances, false, request_str)
-        {
-            Some(idx) => idx,
-            None => {
-                RouterMetrics::record_pd_error("server_selection");
-                return (
-                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                    "Decode policy failed to select a worker".to_string(),
-                )
-                    .into_response();
-            }
-        };
+        let decode_idx =
+            match self.select_worker_with_policy(&decode_instances, false, request_str, &cache_key)
+            {
+                Some(idx) => idx,
+                None => {
+                    RouterMetrics::record_pd_error("server_selection");
+                    return (
+                        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                        "Decode policy failed to select a worker".to_string(),
+                    )
+                        .into_response();
+                }
+            };
 
         let (prefill_http, prefill_zmq) = &prefill_instances[prefill_idx];
         let (decode_http, decode_zmq) = &decode_instances[decode_idx];
@@ -2342,6 +2354,7 @@ impl RouterTrait for VllmPDRouter {
             // Select workers using policy with headers for consistent hash
             let request_text = serde_json::to_string(&request_json).ok();
             let request_str = request_text.as_deref();
+            let cache_key = body.extract_cache_routing_key();
             let request_headers: Option<HashMap<String, String>> = headers.map(|h| {
                 h.iter()
                     .filter_map(|(name, value)| {
@@ -2358,7 +2371,11 @@ impl RouterTrait for VllmPDRouter {
 
             let prefill_idx = match prefill_policy.select_worker_with_headers(
                 &prefill_workers,
-                request_str,
+                if prefill_policy.name() == "cache_aware" {
+                    Some(cache_key.as_str())
+                } else {
+                    request_str
+                },
                 request_headers.as_ref(),
             ) {
                 Some(idx) => idx,
@@ -2374,7 +2391,11 @@ impl RouterTrait for VllmPDRouter {
 
             let decode_idx = match decode_policy.select_worker_with_headers(
                 &decode_workers,
-                request_str,
+                if decode_policy.name() == "cache_aware" {
+                    Some(cache_key.as_str())
+                } else {
+                    request_str
+                },
                 request_headers.as_ref(),
             ) {
                 Some(idx) => idx,
@@ -2513,6 +2534,7 @@ impl RouterTrait for VllmPDRouter {
             // Select workers using policy with headers for consistent hash
             let request_text = serde_json::to_string(&request_json).ok();
             let request_str = request_text.as_deref();
+            let cache_key = body.extract_cache_routing_key();
             let request_headers: Option<HashMap<String, String>> = headers.map(|h| {
                 h.iter()
                     .filter_map(|(name, value)| {
@@ -2529,7 +2551,11 @@ impl RouterTrait for VllmPDRouter {
 
             let prefill_idx = match prefill_policy.select_worker_with_headers(
                 &prefill_workers,
-                request_str,
+                if prefill_policy.name() == "cache_aware" {
+                    Some(cache_key.as_str())
+                } else {
+                    request_str
+                },
                 request_headers.as_ref(),
             ) {
                 Some(idx) => idx,
@@ -2545,7 +2571,11 @@ impl RouterTrait for VllmPDRouter {
 
             let decode_idx = match decode_policy.select_worker_with_headers(
                 &decode_workers,
-                request_str,
+                if decode_policy.name() == "cache_aware" {
+                    Some(cache_key.as_str())
+                } else {
+                    request_str
+                },
                 request_headers.as_ref(),
             ) {
                 Some(idx) => idx,
@@ -2735,6 +2765,7 @@ impl RouterTrait for VllmPDRouter {
             // Select workers using policy with headers for consistent hash
             let request_text = serde_json::to_string(&request_json).ok();
             let request_str = request_text.as_deref();
+            let cache_key = crate::protocols::spec::cache_routing::for_route(&request_json, path);
             let request_headers: Option<HashMap<String, String>> = headers.map(|h| {
                 h.iter()
                     .filter_map(|(name, value)| {
@@ -2751,7 +2782,11 @@ impl RouterTrait for VllmPDRouter {
 
             let prefill_idx = match prefill_policy.select_worker_with_headers(
                 &prefill_workers,
-                request_str,
+                if prefill_policy.name() == "cache_aware" {
+                    Some(cache_key.as_str())
+                } else {
+                    request_str
+                },
                 request_headers.as_ref(),
             ) {
                 Some(idx) => idx,
@@ -2767,7 +2802,11 @@ impl RouterTrait for VllmPDRouter {
 
             let decode_idx = match decode_policy.select_worker_with_headers(
                 &decode_workers,
-                request_str,
+                if decode_policy.name() == "cache_aware" {
+                    Some(cache_key.as_str())
+                } else {
+                    request_str
+                },
                 request_headers.as_ref(),
             ) {
                 Some(idx) => idx,

@@ -27,6 +27,7 @@ use crate::metrics::PrometheusConfig;
 #[pyclass(eq)]
 #[derive(Clone, PartialEq, Debug)]
 pub enum PolicyType {
+    LeastLoad,
     Random,
     RoundRobin,
     CacheAware,
@@ -126,6 +127,7 @@ impl Router {
         // Convert policy helper function
         let convert_policy = |policy: &PolicyType| -> ConfigPolicyConfig {
             match policy {
+                PolicyType::LeastLoad => ConfigPolicyConfig::LeastLoad,
                 PolicyType::Random => ConfigPolicyConfig::Random,
                 PolicyType::RoundRobin => ConfigPolicyConfig::RoundRobin,
                 PolicyType::CacheAware => ConfigPolicyConfig::CacheAware {
