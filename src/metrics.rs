@@ -76,6 +76,10 @@ pub fn init_metrics() {
 
     // Policy metrics
     describe_counter!(
+        "vllm_router_cache_routing_keys_total",
+        "Cache-aware decisions by input key kind"
+    );
+    describe_counter!(
         "vllm_router_policy_decisions_total",
         "Total routing policy decisions by policy and worker"
     );
@@ -582,6 +586,10 @@ impl RouterMetrics {
             "worker" => worker.to_string()
         )
         .increment(1);
+    }
+
+    pub fn record_cache_routing_key(kind: &'static str) {
+        counter!("vllm_router_cache_routing_keys_total", "kind" => kind).increment(1);
     }
 
     pub fn record_cache_hit() {

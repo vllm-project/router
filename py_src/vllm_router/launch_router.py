@@ -90,7 +90,7 @@ Examples:
   vllm-router --vllm-pd-disaggregation \\
     --prefill http://prefill1:8000 --prefill http://prefill2:8000 \\
     --decode http://decode1:8001 --decode http://decode2:8001 \\
-    --prefill-policy cache_aware --decode-policy power_of_two
+    --prefill-policy cache_aware --decode-policy least_load
 
     """,
         formatter_class=CustomHelpFormatter,

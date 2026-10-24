@@ -159,6 +159,7 @@ class RouterArgs:
             type=str,
             default=RouterArgs.policy,
             choices=[
+                "least_load",
                 "random",
                 "round_robin",
                 "cache_aware",
@@ -173,6 +174,7 @@ class RouterArgs:
             type=str,
             default=None,
             choices=[
+                "least_load",
                 "random",
                 "round_robin",
                 "cache_aware",
@@ -186,13 +188,14 @@ class RouterArgs:
             type=str,
             default=None,
             choices=[
+                "least_load",
                 "random",
                 "round_robin",
                 "cache_aware",
                 "power_of_two",
                 "consistent_hash",
             ],
-            help="Specific policy for decode nodes in PD mode. kv_aware is not supported in PD mode. If not specified, uses the main policy",
+            help="Specific policy for decode nodes in PD mode. kv_aware is not supported in PD mode. Defaults to least_load",
         )
 
         parser.add_argument(
@@ -286,7 +289,7 @@ class RouterArgs:
             f"--{prefix}max-tree-size",
             type=int,
             default=RouterArgs.max_tree_size,
-            help="Maximum size of the approximation tree for cache-aware routing",
+            help="Per-worker character budget in each model tree (enforced at cache eviction)",
         )
         parser.add_argument(
             f"--{prefix}max-payload-size",
@@ -606,7 +609,7 @@ class RouterArgs:
                     raise ValueError("PD disaggregation mode requires --decode")
 
             effective_prefill_policy = self.prefill_policy or self.policy
-            effective_decode_policy = self.decode_policy or self.policy
+            effective_decode_policy = self.decode_policy or "least_load"
             if "kv_aware" in (
                 effective_prefill_policy,
                 effective_decode_policy,
@@ -624,7 +627,7 @@ class RouterArgs:
             elif self.prefill_policy and not self.decode_policy and self.policy:
                 logger.info(
                     f"Using --prefill-policy '{self.prefill_policy}' for prefill nodes "
-                    f"and --policy '{self.policy}' for decode nodes."
+                    "and default least_load for decode nodes."
                 )
             elif self.decode_policy and not self.prefill_policy and self.policy:
                 logger.info(

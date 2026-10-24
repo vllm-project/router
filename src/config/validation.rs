@@ -347,7 +347,7 @@ impl ConfigValidator {
     /// Validate policy configuration
     fn validate_policy(policy: &PolicyConfig) -> ConfigResult<()> {
         match policy {
-            PolicyConfig::Random | PolicyConfig::RoundRobin => {
+            PolicyConfig::LeastLoad | PolicyConfig::Random | PolicyConfig::RoundRobin => {
                 // No specific validation needed
             }
             PolicyConfig::CacheAware {
@@ -654,7 +654,9 @@ impl ConfigValidator {
         } = &config.mode
         {
             let effective_prefill = prefill_policy.as_ref().unwrap_or(&config.policy);
-            let effective_decode = decode_policy.as_ref().unwrap_or(&config.policy);
+            let effective_decode = decode_policy
+                .as_ref()
+                .unwrap_or(&PolicyConfig::DEFAULT_DECODE);
             if matches!(effective_prefill, PolicyConfig::KvAware { .. })
                 || matches!(effective_decode, PolicyConfig::KvAware { .. })
             {
