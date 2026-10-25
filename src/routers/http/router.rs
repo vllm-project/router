@@ -2029,6 +2029,15 @@ impl Router {
         // Copy all headers from original request if provided, skipping
         // Content-Type/Content-Length (.json() sets them) and trace headers
         // (propagate_trace_headers below injects fresh context).
+        // sanitize_request_headers drops host and hop-by-hop headers. On
+        // `/v1/messages` a configured worker api_key also wins over the
+        // client's Authorization, matching route_transparent.
+        let is_messages = route == "/v1/messages";
+        let worker_key = if is_messages {
+            self.api_key.as_deref()
+        } else {
+            None
+        };
         if let Some(headers) = headers {
             let forwarded = header_utils::sanitize_request_headers(headers);
             for (name, value) in &forwarded {
@@ -2037,10 +2046,14 @@ impl Router {
                     && !header_utils::TRACE_HEADER_NAMES
                         .iter()
                         .any(|&th| name.as_str().eq_ignore_ascii_case(th))
+                    && !(worker_key.is_some() && *name == http::header::AUTHORIZATION)
                 {
                     request_builder = request_builder.header(name, value);
                 }
             }
+        }
+        if let Some(key) = worker_key {
+            request_builder = request_builder.header("Authorization", format!("Bearer {}", key));
         }
 
         // Add X-data-parallel-rank header for DP-aware routing

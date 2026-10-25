@@ -396,3 +396,83 @@ async fn messages_oversized_content_length_uses_anthropic_error_shape() {
     assert!(!resp["error"]["message"].as_str().unwrap().is_empty());
     ctx.shutdown().await;
 }
+
+fn captured_messages(port: u16) -> Vec<common::mock_worker::CapturedRequest> {
+    common::mock_worker::get_captured_requests(port)
+        .into_iter()
+        .filter(|c| c.path == "/v1/messages")
+        .collect()
+}
+
+#[tokio::test]
+async fn messages_configured_worker_api_key_wins_over_client_key() {
+    let ctx = Ctx::new(PolicyConfig::RoundRobin, vec![worker(0.0)], |c| {
+        c.api_key = Some("worker-secret".to_string());
+    })
+    .await;
+    let (status, resp) = ctx
+        .post(
+            &agent_body(None, "hi").to_string(),
+            &[("authorization", "Bearer client-secret")],
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let port = resp["worker_port"].as_u64().unwrap() as u16;
+    let captured = captured_messages(port);
+    assert!(!captured.is_empty());
+    for c in &captured {
+        assert_eq!(
+            c.headers.get("authorization"),
+            Some(&vec!["Bearer worker-secret".to_string()])
+        );
+    }
+    ctx.shutdown().await;
+}
+
+#[tokio::test]
+async fn messages_strips_hop_by_hop_headers() {
+    let ctx = Ctx::new(PolicyConfig::RoundRobin, vec![worker(0.0)], |_| {}).await;
+    let (status, resp) = ctx
+        .post(
+            &agent_body(None, "hi").to_string(),
+            &[
+                ("connection", "x-private-hop"),
+                ("x-private-hop", "1"),
+                ("proxy-authorization", "Basic cHJveHk6c2VjcmV0"),
+                ("proxy-authenticate", "Basic"),
+                ("keep-alive", "timeout=5"),
+                ("te", "trailers"),
+                ("trailer", "x-checksum"),
+                ("upgrade", "h2c"),
+                ("x-end-to-end", "kept"),
+            ],
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let port = resp["worker_port"].as_u64().unwrap() as u16;
+    let captured = captured_messages(port);
+    assert!(!captured.is_empty());
+    for c in &captured {
+        for hop in [
+            "connection",
+            "x-private-hop",
+            "proxy-authorization",
+            "proxy-authenticate",
+            "keep-alive",
+            "te",
+            "trailer",
+            "upgrade",
+        ] {
+            let leaked = c.headers.get(hop).is_some_and(|vals| {
+                vals.iter()
+                    .any(|v| !(hop == "connection" && v.eq_ignore_ascii_case("keep-alive")))
+            });
+            assert!(!leaked, "{hop} leaked to worker: {:?}", c.headers.get(hop));
+        }
+        assert_eq!(
+            c.headers.get("x-end-to-end"),
+            Some(&vec!["kept".to_string()])
+        );
+    }
+    ctx.shutdown().await;
+}
