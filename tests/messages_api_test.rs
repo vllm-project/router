@@ -380,3 +380,19 @@ async fn messages_worker_non_json_error_passes_through_unchanged() {
     }
     ctx.shutdown().await;
 }
+
+#[tokio::test]
+async fn messages_oversized_content_length_uses_anthropic_error_shape() {
+    let ctx = Ctx::new(PolicyConfig::RoundRobin, vec![worker(0.0)], |c| {
+        c.max_payload_size = 1024;
+    })
+    .await;
+    let body = agent_body(None, &"x".repeat(4096)).to_string();
+    let len = body.len().to_string();
+    let (status, resp) = ctx.post(&body, &[("content-length", &len)]).await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(resp["type"], "error", "body: {resp}");
+    assert_eq!(resp["error"]["type"], "request_too_large");
+    assert!(!resp["error"]["message"].as_str().unwrap().is_empty());
+    ctx.shutdown().await;
+}

@@ -477,8 +477,8 @@ async fn v1_messages(
         .await
 }
 
-/// Outermost layer on the protected routes: rewrites router generated
-/// errors on `/v1/messages` (including concurrency limit and wasm rejects)
+/// Sits outside the body limit layer: rewrites router generated
+/// errors on `/v1/messages` (including body limit, concurrency limit and wasm rejects)
 /// into the anthropic error shape. Other routes pass through untouched.
 async fn anthropic_error_layer(
     req: axum::extract::Request,
@@ -1009,8 +1009,6 @@ pub fn build_app_with_wasm_middleware(
         app_state.clone(),
         middleware::concurrency_limit_middleware,
     ));
-    let protected_routes =
-        protected_routes.route_layer(axum::middleware::from_fn(anthropic_error_layer));
 
     let public_routes = Router::new()
         .route("/liveness", get(liveness))
@@ -1055,7 +1053,10 @@ pub fn build_app_with_wasm_middleware(
         .layer(DefaultBodyLimit::max(max_payload_size))
         .layer(tower_http::limit::RequestBodyLimitLayer::new(
             max_payload_size,
-        ));
+        ))
+        // Wraps the body limit so oversized `/v1/messages` requests still get
+        // the anthropic error shape. Other paths pass through untouched.
+        .layer(axum::middleware::from_fn(anthropic_error_layer));
 
     let base_app = if enable_request_tracing {
         base_app.layer(middleware::create_logging_layer())
