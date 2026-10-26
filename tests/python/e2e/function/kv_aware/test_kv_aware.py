@@ -25,8 +25,8 @@ import requests
 
 from tests.python.e2e.function.helpers import http as router_http
 from tests.python.e2e.function.kv_aware.config import (
-    KV_AWARE_E2E_MODEL,
     KV_AWARE_SHARED_PREFIX,
+    kv_aware_e2e_model,
 )
 
 
@@ -49,7 +49,7 @@ def test_kv_aware_live_routing_and_streaming(
     """
     base = kv_aware_router.url
     workers = kv_aware_two_workers
-    model = KV_AWARE_E2E_MODEL
+    model = kv_aware_e2e_model()
 
     listed = requests.get(f"{base}/list_workers", timeout=30)
     listed.raise_for_status()

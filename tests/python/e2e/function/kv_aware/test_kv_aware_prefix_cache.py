@@ -12,8 +12,8 @@ import requests
 from tests.python.e2e.function.helpers import http as router_http
 from tests.python.e2e.function.helpers.worker_logs import worker_url_for_request_id
 from tests.python.e2e.function.kv_aware.config import (
-    KV_AWARE_E2E_MODEL,
     KV_AWARE_SHARED_PREFIX,
+    kv_aware_e2e_model,
     kv_aware_dual_prime_concurrent,
     kv_aware_index_settle_sec,
     kv_aware_request_log_poll_sec,
@@ -78,7 +78,7 @@ def test_kv_aware_reuse_routes_to_prime_worker(kv_aware_router, kv_aware_two_wor
     """
     workers = kv_aware_two_workers
     base = kv_aware_router.url
-    model = KV_AWARE_E2E_MODEL
+    model = kv_aware_e2e_model()
     scenario = default_prefix_reuse_scenario()
     settle = kv_aware_index_settle_sec()
     log_poll = kv_aware_request_log_poll_sec()
@@ -142,7 +142,7 @@ def test_kv_aware_dual_lane_prime_and_reuse(kv_aware_router, kv_aware_two_worker
     workers = kv_aware_two_workers
     worker_urls = {w.url for w in workers}
     base = kv_aware_router.url
-    model = KV_AWARE_E2E_MODEL
+    model = kv_aware_e2e_model()
     settle = kv_aware_index_settle_sec()
     log_poll = kv_aware_request_log_poll_sec()
     n_reuse = kv_aware_reuse_rounds()
@@ -274,7 +274,7 @@ def test_kv_aware_multi_reuse_after_single_prime(kv_aware_router, kv_aware_two_w
     """One prime, many reuse rounds on the same shared prefix (no control)."""
     workers = kv_aware_two_workers
     base = kv_aware_router.url
-    model = KV_AWARE_E2E_MODEL
+    model = kv_aware_e2e_model()
     settle = kv_aware_index_settle_sec()
     log_poll = kv_aware_request_log_poll_sec()
     n_reuse = kv_aware_reuse_rounds()

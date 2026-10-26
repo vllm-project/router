@@ -23,9 +23,9 @@ def kv_aware_two_workers():
         spawn_two_vllm_rs_grpc_workers,
         terminate_workers,
     )
-    from tests.python.e2e.function.kv_aware.config import KV_AWARE_E2E_MODEL
+    from tests.python.e2e.function.kv_aware.config import kv_aware_e2e_model
 
-    workers = spawn_two_vllm_rs_grpc_workers(KV_AWARE_E2E_MODEL)
+    workers = spawn_two_vllm_rs_grpc_workers(kv_aware_e2e_model())
     try:
         yield workers
     finally:
@@ -39,12 +39,12 @@ def kv_aware_router(kv_aware_two_workers):
         spawn_kv_aware_router,
         terminate_router,
     )
-    from tests.python.e2e.function.kv_aware.config import KV_AWARE_E2E_MODEL
+    from tests.python.e2e.function.kv_aware.config import kv_aware_e2e_model
 
     urls = [w.url for w in kv_aware_two_workers]
     handle = spawn_kv_aware_router(
         worker_urls=urls,
-        router_model=KV_AWARE_E2E_MODEL,
+        router_model=kv_aware_e2e_model(),
     )
     try:
         yield handle

@@ -7,6 +7,9 @@ Optional environment (see also ``function/helpers/launch.py``):
 - ``ROUTER_BIN``: path to ``vllm-router`` after ``cargo build --release``
   (same as ``scripts/backend`` / Buildkite). Alias: ``VLLM_ROUTER_BIN``.
 - ``VLLM_RS``: path to ``vllm-rs`` binary (else ``PATH`` or wheel under ``vllm``).
+- Model for workers + router (HF id or local dir), first match wins:
+  ``KV_AWARE_E2E_MODEL``, ``MODEL``, ``VLLM_ROUTER_MODEL``, ``MODEL_DIR``;
+  default ``Qwen/Qwen3-0.6B`` (see ``kv_aware_e2e_model()``).
 - ``VLLM_RS_SERVE_EXTRA``: extra args to ``vllm-rs serve`` (shell-split), e.g.
   ``"--max-model-len 8192 --enable-prefix-caching"``. When unset, workers also get
   per-process ``--kv-events-config`` (ZMQ) unless ``KV_AWARE_KV_EVENTS=0``.
@@ -45,8 +48,21 @@ from __future__ import annotations
 import os
 import subprocess
 
-# HuggingFace id or local path for ``vllm-rs serve`` and ``VLLM_ROUTER_MODEL``.
-KV_AWARE_E2E_MODEL = "Qwen/Qwen3-0.6B"
+# Default when no model env is set (see ``kv_aware_e2e_model()``).
+KV_AWARE_E2E_MODEL_DEFAULT = "Qwen/Qwen3-0.6B"
+
+# Backward-compatible name for the default id (not live env resolution).
+KV_AWARE_E2E_MODEL = KV_AWARE_E2E_MODEL_DEFAULT
+
+
+def kv_aware_e2e_model() -> str:
+    """HF model id or local path for ``vllm-rs serve`` and ``VLLM_ROUTER_MODEL``."""
+    for key in ("KV_AWARE_E2E_MODEL", "MODEL", "VLLM_ROUTER_MODEL", "MODEL_DIR"):
+        raw = os.environ.get(key, "").strip()
+        if raw:
+            return raw
+    return KV_AWARE_E2E_MODEL_DEFAULT
+
 
 KV_AWARE_SHARED_PREFIX = (
     "You are a concise assistant. Answer in one short sentence. Context block: "

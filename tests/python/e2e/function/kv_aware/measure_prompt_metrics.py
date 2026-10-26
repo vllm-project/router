@@ -16,7 +16,8 @@ Examples (from repo root)::
     --model-dir /path/to/model --router-url http://127.0.0.1:8000 \\
     --worker-http http://127.0.0.1:9000
 
-Environment: ``MODEL_DIR`` or ``KV_AWARE_E2E_MODEL`` as default model path/id.
+Environment: ``kv_aware_e2e_model()`` — ``KV_AWARE_E2E_MODEL``, ``MODEL``,
+``VLLM_ROUTER_MODEL``, ``MODEL_DIR`` (same order as e2e fixtures).
 """
 
 from __future__ import annotations
@@ -30,7 +31,7 @@ import urllib.request
 from typing import Any
 
 from tests.python.e2e.function.kv_aware.config import (
-    KV_AWARE_E2E_MODEL,
+    kv_aware_e2e_model,
     kv_aware_index_settle_sec,
 )
 from tests.python.e2e.function.kv_aware.dataset import (
@@ -257,7 +258,7 @@ def build_report(
         "block_size_source": block_source,
         "e2e_env": {
             "KV_AWARE_INDEX_SETTLE_SEC": kv_aware_index_settle_sec(),
-            "KV_AWARE_E2E_MODEL": KV_AWARE_E2E_MODEL,
+            "kv_aware_e2e_model": kv_aware_e2e_model(),
         },
         "scenarios": {
             "single_lane": single,
@@ -295,7 +296,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--model-dir",
-        default=os.environ.get("MODEL_DIR", "").strip() or KV_AWARE_E2E_MODEL,
+        default=kv_aware_e2e_model(),
         help="HF model id or local snapshot (tokenizer for offline counts)",
     )
     parser.add_argument(
@@ -316,7 +317,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--router-model",
-        default=os.environ.get("VLLM_ROUTER_MODEL", KV_AWARE_E2E_MODEL),
+        default=kv_aware_e2e_model(),
         help="Model field when probing router chat",
     )
     parser.add_argument(
@@ -332,7 +333,9 @@ def main() -> None:
     )
     args = parser.parse_args()
     if not args.model_dir:
-        parser.error("set --model-dir or MODEL_DIR or KV_AWARE_E2E_MODEL")
+        parser.error(
+            "set --model-dir or MODEL / MODEL_DIR / VLLM_ROUTER_MODEL / KV_AWARE_E2E_MODEL"
+        )
 
     block = args.block_size if args.block_size > 0 else None
     report = build_report(
