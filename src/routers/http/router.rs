@@ -277,6 +277,9 @@ struct SelectedWorker {
     kv_receipt: Option<KvSelectionReceipt>,
 }
 
+/// Lowercase name of the header that carries the router-selected DP rank.
+const DP_RANK_HEADER: &str = "x-data-parallel-rank";
+
 /// Regular router that uses injected load balancing policies
 #[derive(Debug)]
 pub struct Router {
@@ -1241,7 +1244,7 @@ impl Router {
                     // value so the worker sees exactly one rank (ours).
                     if name_lc != "content-type"
                         && name_lc != "content-length"
-                        && !(dp_rank.is_some() && name_lc == "x-data-parallel-rank")
+                        && !(dp_rank.is_some() && name_lc == DP_RANK_HEADER)
                         && !header_utils::TRACE_HEADER_NAMES.contains(&name_lc.as_str())
                     {
                         request_builder = request_builder.header(name, value);
@@ -2047,6 +2050,10 @@ impl Router {
                         .iter()
                         .any(|&th| name.as_str().eq_ignore_ascii_case(th))
                     && !(worker_key.is_some() && *name == http::header::AUTHORIZATION)
+                    // The router owns X-data-parallel-rank when it picked a
+                    // rank: reqwest appends and vLLM reads the first value,
+                    // so a client copy would override our choice.
+                    && !(extracted_dp_rank.is_some() && name.as_str() == DP_RANK_HEADER)
                 {
                     request_builder = request_builder.header(name, value);
                 }
@@ -3317,6 +3324,10 @@ impl RouterTrait for Router {
                     // RequestBuilder::header appends, and vLLM reads the
                     // first Authorization value.
                     if self.api_key.is_some() && name == http::header::AUTHORIZATION {
+                        continue;
+                    }
+                    // Same for the DP rank the router selected for this worker.
+                    if worker.dp_rank().is_some() && name.as_str() == DP_RANK_HEADER {
                         continue;
                     }
                     // reqwest derives these from the body and URL it sends.
@@ -5779,6 +5790,77 @@ mod tests {
             );
         }
         assert_eq!(echoed["x-session-id"], vec!["sticky-1"]);
+        server.abort();
+    }
+
+    fn dp_router_pointing_at(address: std::net::SocketAddr, dp_rank: usize) -> Router {
+        let mut router = create_test_regular_router();
+        router.intra_node_data_parallel_size = 2;
+        router.worker_registry = Arc::new(WorkerRegistry::new());
+        router
+            .worker_registry
+            .register(Arc::new(crate::core::DPAwareWorker::new(
+                format!("http://{address}"),
+                dp_rank,
+                2,
+                WorkerType::Regular,
+            )));
+        router
+    }
+
+    /// With DP size > 1 the router owns X-data-parallel-rank. reqwest appends
+    /// headers and vLLM reads the first value, so a client copy must not be
+    /// forwarded on the Messages typed-dispatch path.
+    #[tokio::test]
+    async fn messages_dp_rank_header_is_router_owned() {
+        let (address, server) = spawn_header_echo_backend().await;
+        let router = dp_router_pointing_at(address, 1);
+        let mut headers = HeaderMap::new();
+        headers.insert("x-data-parallel-rank", "7".parse().unwrap());
+        headers.insert("x-session-id", "sticky-1".parse().unwrap());
+        let body: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "m",
+            "max_tokens": 8,
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .unwrap();
+
+        let response = router.route_messages(Some(&headers), &body, None).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let echoed: HashMap<String, Vec<String>> = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(echoed["x-data-parallel-rank"], vec!["1"], "{echoed:?}");
+        assert_eq!(echoed["x-session-id"], vec!["sticky-1"]);
+        server.abort();
+    }
+
+    /// The transparent EPD path forwards client headers too, so it applies the
+    /// same rule for the worker's DP rank.
+    #[tokio::test]
+    async fn transparent_epd_dp_rank_header_is_router_owned() {
+        let (address, server) = spawn_header_echo_backend().await;
+        let mut router = dp_router_pointing_at(address, 1);
+        router.epd = Some(super::super::epd::EncoderStage::new(
+            crate::config::EpdConfig {
+                encoder_urls: vec!["http://unused".into()],
+                consumer_zmq_addrs: Default::default(),
+            },
+        ));
+        let mut headers = HeaderMap::new();
+        headers.insert("x-data-parallel-rank", "7".parse().unwrap());
+
+        let response = router
+            .route_transparent(
+                Some(&headers),
+                "/v1/responses",
+                &Method::POST,
+                serde_json::json!({"model": "m"}),
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let echoed: HashMap<String, Vec<String>> = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(echoed["x-data-parallel-rank"], vec!["1"], "{echoed:?}");
         server.abort();
     }
 
