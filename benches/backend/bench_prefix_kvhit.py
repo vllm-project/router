@@ -7,7 +7,7 @@ router, or a worker). Pair with one of the serve_*.sh scripts under
 scripts/backend.
 
   export ROUTER_URL=http://127.0.0.1:30000
-  export GRPC_MODEL=my-served-model
+  export MODEL=my-served-model
   python benches/backend/bench_prefix_kvhit.py
 
 By default the script writes a short synthetic chat body into a temp
@@ -53,6 +53,28 @@ def _env(name: str, default: str | None = None) -> str:
     if default is not None:
         return default
     raise SystemExit(f"set {name}")
+
+
+def _default_cli_model() -> str:
+    """``--model`` default from ``MODEL``, else ``default``."""
+    raw = (os.environ.get("MODEL") or "").strip()
+    return raw or "default"
+
+
+def _tokenizer_dir_for_tokens(*, model: str, model_dir: str) -> str:
+    """Local HF path for ``--tokens`` when ``--model-dir`` is omitted."""
+    explicit = (model_dir or "").strip()
+    if explicit:
+        return explicit
+    override = (os.environ.get("MODEL_DIR") or "").strip()
+    if override:
+        return override
+    if model != "default":
+        return model
+    raise SystemExit(
+        "--tokens needs a tokenizer path: pass --model-dir, set MODEL_DIR, "
+        "or set MODEL / --model to the HF id or local snapshot"
+    )
 
 
 def make_bodies(hit_rate: float, text: str) -> tuple[str, str]:
@@ -305,7 +327,7 @@ def read_perf_settings(
     bench_timeout: float | None = None,
 ) -> dict[str, Any]:
     """Merge case JSON bench fields with PERF_* / ROUTER_URL env (pytest perf)."""
-    model = os.environ["GRPC_MODEL"]
+    model = os.environ["MODEL"]
     if os.environ.get("PERF_TOKENS", "").strip():
         tokens = int(os.environ["PERF_TOKENS"].strip())
     elif bench_tokens is not None:
@@ -318,7 +340,7 @@ def read_perf_settings(
     return {
         "router_url": os.environ["ROUTER_URL"],
         "model": model,
-        "model_dir": os.environ.get("GRPC_MODEL_DIR", model),
+        "model_dir": os.environ.get("MODEL_DIR", model),
         "tokens": tokens,
         "chars": int(os.environ.get("KVHIT_CHARS", "8000")),
         "max_tokens": int(os.environ.get("PERF_MAX_TOKENS", str(default_max))),
@@ -491,11 +513,20 @@ def default_output_dir(settings: dict[str, Any], *, results_parent: Path) -> str
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--router-url", default=_env("ROUTER_URL", "http://127.0.0.1:30000"))
-    parser.add_argument("--model", default=_env("MODEL", "default"))
+    parser.add_argument("--model", default=_default_cli_model())
     parser.add_argument("--hit-rate", type=float, default=float(os.environ.get("HIT_RATE", "0.99")))
     parser.add_argument("--chars", type=int, default=int(os.environ.get("KVHIT_CHARS", "8000")))
-    parser.add_argument("--tokens", type=int, default=0, help="exact ISL via --model-dir")
-    parser.add_argument("--model-dir", default=os.environ.get("MODEL_DIR", ""))
+    parser.add_argument(
+        "--tokens",
+        type=int,
+        default=0,
+        help="exact ISL via tokenizer (--model-dir, or same as --model / MODEL)",
+    )
+    parser.add_argument(
+        "--model-dir",
+        default="",
+        help="HF snapshot for --tokens (optional if --model / MODEL is a local path or id)",
+    )
     parser.add_argument("--max-tokens", type=int, default=16)
     parser.add_argument("--timeout", type=float, default=300.0)
     parser.add_argument(
@@ -529,9 +560,8 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.tokens:
-        if not args.model_dir:
-            raise SystemExit("--tokens requires --model-dir (or MODEL_DIR)")
-        user = make_user_text_exact_tokens(args.model_dir, args.tokens)
+        tok_dir = _tokenizer_dir_for_tokens(model=args.model, model_dir=args.model_dir)
+        user = make_user_text_exact_tokens(tok_dir, args.tokens)
     else:
         user = make_user_text(args.chars)
     miss_user, hit_user = make_bodies(args.hit_rate, user)

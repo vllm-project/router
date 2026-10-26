@@ -376,8 +376,8 @@ steps:
         echo "ERROR: HF_TOKEN is not set (required to pull the perf model from Hugging Face)."
         exit 1
       fi
-      export GRPC_MODEL="Qwen/Qwen3.8-27B"
-      echo "HF_TOKEN is configured; GRPC_MODEL=$${GRPC_MODEL}"
+      export MODEL="Qwen/Qwen3.8-27B"
+      echo "HF_TOKEN is configured; MODEL=$${MODEL}"
 
       apt-get update && apt-get install -y \
         curl \

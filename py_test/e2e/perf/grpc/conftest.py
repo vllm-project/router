@@ -18,7 +18,7 @@ from case_loader import (  # noqa: E402
     PERF_MODEL_ENV,
     WaveSpec,
     apply_case_env,
-    grpc_model,
+    perf_model,
     perf_case_selected,
     perf_model_ready,
     resolve_perf_case,
@@ -84,10 +84,10 @@ def _perf_save_results_enabled() -> bool:
 
 
 def _perf_waves_for_collection() -> tuple[WaveSpec, ...] | None:
-    """Resolve wave matrix at collection time (does not require GRPC_MODEL).
+    """Resolve wave matrix at collection time (does not require MODEL).
 
     Parametrize before runtime env is complete so ``-k hit99-c16-r32`` works;
-    missing GRPC_MODEL still skips at test time via ``test_prefix_kvhit_waves`` skipif.
+    missing MODEL still skips at test time via ``test_prefix_kvhit_waves`` skipif.
     """
     if not perf_case_selected():
         return None
@@ -108,7 +108,7 @@ def perf_case():
         pytest.skip("Set --perf-case (or PERF_CASE)")
     case = resolve_perf_case()
     apply_case_env(case)
-    if not grpc_model():
+    if not perf_model():
         pytest.skip(f"Set {PERF_MODEL_ENV} (env) or model in case JSON")
     return case
 
@@ -140,7 +140,7 @@ def perf_stack(perf_case, request):
         yield None
         return
 
-    model = grpc_model()
+    model = perf_model()
     wave_id = getattr(request, "node", None)
     wave_label = wave_id.nodeid if wave_id is not None else "wave"
     _progress(

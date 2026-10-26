@@ -4,8 +4,8 @@ Each `*.json` file drives one backend (`rust_grpc`, `rust_http`, `python_http`).
 
 ## Model
 
-Optional **`model`** in JSON (HF id or local path). For perf runs, set **`export GRPC_MODEL=...`**
-(**env overrides JSON**). Do not commit placeholder paths; with no `GRPC_MODEL`, tests skip until
+Optional **`model`** in JSON (HF id or local path). For perf runs, set **`export MODEL=...`**
+(**env overrides JSON**). Do not commit placeholder paths; with no `MODEL`, tests skip until
 you set the env var or add a real `model` in your local case file.
 
 ## Binaries (`stack.router_bin`, `stack.vllm_rs_bin`)

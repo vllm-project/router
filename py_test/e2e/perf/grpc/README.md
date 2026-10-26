@@ -28,11 +28,11 @@ each cold stack is up, before the concurrent wave.
 
 ## Run
 
-Model path or HF id: set `"model"` in `cases/<name>.json`, or `export GRPC_MODEL=...`
+Model path or HF id: set `"model"` in `cases/<name>.json`, or `export MODEL=...`
 (**env overrides JSON**).
 
 ```bash
-export GRPC_MODEL=/path/to/model   # required unless case JSON defines model
+export MODEL=/path/to/model   # required unless case JSON defines model
 export VLLM_RS=/path/to/vllm-rs          # rust_grpc
 export ROUTER_BIN=$PWD/target/release/vllm-router   # optional
 # results JSON (default on, dir created at run time): py_test/e2e/perf/grpc/results/<backend>_<ts>/
@@ -52,9 +52,9 @@ you do **not** need pytest or `stack_launcher.py` — only the bench CLI:
 
 ```bash
 export ROUTER_URL=http://127.0.0.1:16002
-export GRPC_MODEL=/path/to/model
+export MODEL=/path/to/model
 python benches/backend/bench_prefix_kvhit.py \
-  --hit-rate 0.99 --tokens 131072 --model-dir "$GRPC_MODEL" \
+  --hit-rate 0.99 --tokens 131072 \
   --max-tokens 64 --warmup --concurrency 16 --requests 32 --timeout 1800
 ```
 
@@ -130,10 +130,9 @@ One wave equals:
 ```bash
 python benches/backend/bench_prefix_kvhit.py \
   --router-url http://127.0.0.1:16002 \
-  --model "$GRPC_MODEL" \
+  --model "$MODEL" \
   --hit-rate <0.00|0.99> \
   --tokens 131072 \
-  --model-dir "$GRPC_MODEL" \
   --max-tokens 64 \
   --warmup \
   --concurrency C \
@@ -153,6 +152,17 @@ conftest.py
 test_prefix_kvhit_perf.py
 benches/backend/bench_prefix_kvhit.py   # HTTP bench + pytest helpers
 ```
+
+## CI
+
+Buildkite step **`:python: grpc perf test case`** (`key: grpc-perf-e2e` in
+`.buildkite/pipeline.yml`): NVIDIA **l4x4** pool, `HF_TOKEN`, model
+`MODEL=Qwen/Qwen3.8-27B`, `cargo build --release`, then for each of
+`rust_grpc`, `rust_http`, `python_http`:
+
+`python -m pytest -sv py_test/e2e/perf/grpc -k c16-r32 --perf-case=<case>`
+
+Wave JSON under `results/` is collected as build artifacts.
 
 ## Related
 

@@ -1,6 +1,6 @@
 """Live prefix-KV perf: launch stack from case JSON, then run bench waves.
 
-  export GRPC_MODEL=/path/to/model
+  export MODEL=/path/to/model
   pytest py_test/e2e/perf/grpc --perf-case=rust_grpc
 """
 
@@ -26,7 +26,7 @@ def _case_ready() -> bool:
 
 @pytest.mark.skipif(
     not _case_ready(),
-    reason="Set --perf-case and GRPC_MODEL (env or case JSON); or PERF_EXTERNAL+ROUTER_URL",
+    reason="Set --perf-case and MODEL (env or case JSON); or PERF_EXTERNAL+ROUTER_URL",
 )
 def test_prefix_kvhit_waves(
     bench_mod,
