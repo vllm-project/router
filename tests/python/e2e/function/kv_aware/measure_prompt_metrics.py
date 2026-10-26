@@ -8,11 +8,11 @@ grpc chat when the same tokenizer/model is configured.
 Examples (from repo root)::
 
   pip install transformers  # if not already available
-  python -m py_test.e2e.function.kv_aware.measure_prompt_metrics \\
+  python -m tests.python.e2e.function.kv_aware.measure_prompt_metrics \\
     --model-dir /path/to/Qwen3-0.6B
 
   # Optional live checks (router / worker already running):
-  python -m py_test.e2e.function.kv_aware.measure_prompt_metrics \\
+  python -m tests.python.e2e.function.kv_aware.measure_prompt_metrics \\
     --model-dir /path/to/model --router-url http://127.0.0.1:8000 \\
     --worker-http http://127.0.0.1:9000
 
@@ -29,11 +29,11 @@ import urllib.error
 import urllib.request
 from typing import Any
 
-from py_test.e2e.function.kv_aware.config import (
+from tests.python.e2e.function.kv_aware.config import (
     KV_AWARE_E2E_MODEL,
     kv_aware_index_settle_sec,
 )
-from py_test.e2e.function.kv_aware.dataset import (
+from tests.python.e2e.function.kv_aware.dataset import (
     default_prefix_reuse_scenario,
     lane_prime_user,
     lane_reuse_user,

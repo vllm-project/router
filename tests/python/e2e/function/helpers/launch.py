@@ -1,4 +1,4 @@
-"""Launch vllm-router and vllm-rs workers for py_test/e2e/function (no vllm.test import)."""
+"""Launch vllm-router and vllm-rs workers for tests/python/e2e/function (no vllm.test import)."""
 
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ from urllib.parse import urlparse
 
 import requests
 
-from py_test.e2e.function.kv_aware.config import kv_aware_kv_events_enabled
+from tests.python.e2e.function.kv_aware.config import kv_aware_kv_events_enabled
 
 
 def _validate_router_executable(path: str, *, env_key: str) -> str:

@@ -2,14 +2,14 @@
 
 Uses **vllm-rs serve** workers and ``grpc://`` worker URLs so the router
 tokenizes ``/v1/chat/completions`` and can exercise kv_aware discovery.
-Run (avoids importing ``py_test/e2e/conftest`` / ``vllm.test``)::
+Run (avoids importing ``tests/python/e2e/conftest`` / ``vllm.test``)::
 
-  pytest py_test/e2e/function/kv_aware --confcutdir=py_test/e2e/function/kv_aware -m e2e -v -s
+  pytest tests/python/e2e/function/kv_aware --confcutdir=tests/python/e2e/function/kv_aware -m e2e -v -s
 
 Prerequisites: ``vllm-rs`` (``export VLLM_RS=...`` or ``scripts/backend/check_vllm_rs.sh``),
 ``ROUTER_BIN`` or ``cargo build --release``, two GPUs.
 
-  .venv/bin/python -m pytest py_test/e2e/function/kv_aware/test_kv_aware.py -m e2e -v -s
+  .venv/bin/python -m pytest tests/python/e2e/function/kv_aware/test_kv_aware.py -m e2e -v -s
 
 Use ``-s`` so vllm-rs worker and vllm-router logs appear on the terminal.
 
@@ -23,8 +23,8 @@ import concurrent.futures
 import pytest
 import requests
 
-from py_test.e2e.function.helpers import http as router_http
-from py_test.e2e.function.kv_aware.config import (
+from tests.python.e2e.function.helpers import http as router_http
+from tests.python.e2e.function.kv_aware.config import (
     KV_AWARE_E2E_MODEL,
     KV_AWARE_SHARED_PREFIX,
 )

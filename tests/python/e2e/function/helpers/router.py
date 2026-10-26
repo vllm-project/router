@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from py_test.e2e.function.helpers import launch
+from tests.python.e2e.function.helpers import launch
 
 
 def spawn_kv_aware_router(

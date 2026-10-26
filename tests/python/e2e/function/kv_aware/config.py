@@ -37,7 +37,7 @@ two-worker prime, index settle, then **first B reuse before any A reuse**.
 
 Prompt metrics (token counts, block estimates for issue #331)::
 
-  python -m py_test.e2e.function.kv_aware.measure_prompt_metrics --model-dir /path/to/model
+  python -m tests.python.e2e.function.kv_aware.measure_prompt_metrics --model-dir /path/to/model
 """
 
 from __future__ import annotations

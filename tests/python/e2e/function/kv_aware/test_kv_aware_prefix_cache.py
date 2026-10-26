@@ -9,9 +9,9 @@ from collections import Counter
 import pytest
 import requests
 
-from py_test.e2e.function.helpers import http as router_http
-from py_test.e2e.function.helpers.worker_logs import worker_url_for_request_id
-from py_test.e2e.function.kv_aware.config import (
+from tests.python.e2e.function.helpers import http as router_http
+from tests.python.e2e.function.helpers.worker_logs import worker_url_for_request_id
+from tests.python.e2e.function.kv_aware.config import (
     KV_AWARE_E2E_MODEL,
     KV_AWARE_SHARED_PREFIX,
     kv_aware_dual_prime_concurrent,
@@ -19,7 +19,7 @@ from py_test.e2e.function.kv_aware.config import (
     kv_aware_request_log_poll_sec,
     kv_aware_reuse_rounds,
 )
-from py_test.e2e.function.kv_aware.dataset import (
+from tests.python.e2e.function.kv_aware.dataset import (
     assert_dual_lane_prefixes_distinct,
     assert_lane_reuse_shares_prefix,
     default_prefix_reuse_scenario,

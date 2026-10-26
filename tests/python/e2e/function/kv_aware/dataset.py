@@ -10,7 +10,7 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass
 
-from py_test.e2e.function.kv_aware.config import (
+from tests.python.e2e.function.kv_aware.config import (
     KV_AWARE_LANE_A_PREFIX,
     KV_AWARE_LANE_B_PREFIX,
     KV_AWARE_SHARED_PREFIX,

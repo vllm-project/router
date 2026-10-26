@@ -8,9 +8,9 @@ from types import SimpleNamespace
 
 import pytest
 
-from py_test.e2e.function.helpers import launch
-from py_test.e2e.function.helpers.worker_log_pump import SubprocessLogPump
-from py_test.e2e.function.kv_aware.config import (
+from tests.python.e2e.function.helpers import launch
+from tests.python.e2e.function.helpers.worker_log_pump import SubprocessLogPump
+from tests.python.e2e.function.kv_aware.config import (
     kv_aware_kv_events_enabled,
     kv_aware_worker_gpu_ids,
     kv_aware_worker_logs_quiet,
