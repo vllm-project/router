@@ -94,6 +94,9 @@ All fields below belong to `program_scheduling`. Values omitted from the JSON ob
 | `binding_strategy` | `consistent_hash` | Selects the initial home Rank for each new Program generation. Supported values are `consistent_hash`, `program_round_robin`, `least_program_count`, `reasoning_token_balance`, and `cache_aware`; it does not replace admission or resume decisions. |
 | `hash_virtual_nodes` | `160` | Sets the number of virtual nodes used by `consistent_hash` initial binding. It has no effect on the other binding strategies. |
 | `token_capacity_per_dp_rank` | `null` | Supplies the logical KV-token capacity of each concrete DP Rank. A value enables token-based admission, growth reserve, capacity repair, and cross-Rank headroom checks; `null` falls back to the Program-count guard. `reasoning_token_balance` requires this value. The deprecated input alias `token_capacity_per_target` is accepted but is never emitted when the configuration is serialized. |
+| `token_count_mode` | `estimated` | Selects the input-token fact source. `estimated` keeps the byte estimator and changes nothing. `shadow` keeps the estimator for decisions but records what a prepared count would decide. `exact_when_verified` applies a prepared count after its fingerprint is allowlisted and has not been revoked by an Engine disagreement. |
+| `token_count_model_pools` | `[]` | Model pools allowed to apply prepared exact counts. Empty allows every pool; listing pools limits exact mode to them. |
+| `exact_text_endpoints` | `[]` | Text endpoints allowed to use a Router-tokenized exact count (for example `["/v1/chat/completions"]`). Only consulted when `token_count_mode` is not `estimated`. Enable it only after the Router renderer and tokenizer are verified equal to the Engine's; set `VLLM_ROUTER_TOKENIZER` to the deployed model directory, and watch `vllm_router_agent_aware_context_token_observation_delta_ratio` plus revocations for drift. |
 | `max_active_programs_per_target` | `64` | Limits active Programs on one Rank as a coarse concurrency guard. It is the primary capacity guard when token capacity is absent and remains a count guard when token capacity is configured; forced resume may override it. |
 | `metrics_interval_seconds` | `1.0` | Sets the backend metrics polling and periodic scheduling interval. It also defines observation freshness and the minimum residence used by parts of cross-Rank resume. |
 | `admission_waiting_request_threshold` | `1` | Blocks ordinary admission or resume to a Rank when its native vLLM waiting-request count reaches this threshold. `0` disables this waiting gate. |
@@ -149,6 +152,34 @@ The canonical contract is `vllm_xargs.agentic_context`. Identity semantics match
 `program_id` is stable for one Program generation. `parent_program_id` and `root_program_id` form a model-scoped parent forest that supports multi-level agent trees but does not grant scheduling privilege. An omitted first `step_id` becomes zero; a later omitted value becomes the previous observed value plus one.
 
 `request_id`, `priority`, `deadline_seconds`, `expected_output_length`, and `kv_retention_ttl_seconds` are request-scoped. They are retained with exactly one RequestPool entry; dispatch transfers them only to that exact in-flight request, and completion or cancellation drops them. Priority affects resume ordering, deadline overrides the force-resume wait, expected output length replaces the default output allowance in capacity demand, and KV-retention TTL replaces the automatic acting TTL after that request completes.
+
+## Input-token facts
+
+Program admission, context-growth accounting, and Progress-TTL cost all consume one number: how many input tokens a request adds to a Program's context. Historically that number came from a byte estimator whose only input is the request text.
+
+`token_count_mode` makes the source explicit:
+
+| Mode | Applied count | Operator visibility |
+|---|---|---|
+| `estimated` | Byte estimator with usage feedback | `context_token_source="estimated"` |
+| `shadow` | Byte estimator (identical decisions) | Prepared counterfactual in diagnostics; `vllm_router_agent_aware_context_token_shadow_total` counts agreement |
+| `exact_when_verified` | Prepared count | `context_token_source` records `client_token_ids` or `prepared_token_ids` |
+
+A prepared count exists for three request shapes:
+
+- **Token-ID prompts** (`/v1/completions` with one integer `prompt` array) when the request sets `add_special_tokens: false`. The array *is* the Engine input, so its length is exact and no tokenizer runs. This applies on both the typed and the transparent HTTP path.
+- **gRPC chat/completions** where `EngineFrontend::prepare` already rendered and encoded the request. The same IDs are sent to the Engine, so admission reuses `tokenized.token_ids.len()` and no attempt re-encodes.
+- **HTTP chat** when the deployment lists the endpoint in `exact_text_endpoints` and `token_count_mode` is not `estimated`. The Router runs the same render + encode once per request before admission and includes the result as a prepared fact. This is a second tokenization that the Engine repeats, so it costs Router CPU (`vllm_router_agent_aware_token_prepare_seconds`, with `vllm_router_agent_aware_token_prepare_failures_total` for the fallback path) and it is only safe after the renderer/tokenizer equivalence below is verified. Preparation is skipped for model pools excluded by `token_count_model_pools`. Because the HTTP pool passes the Engine response through, a request with active tool calling (or `reasoning_effort`) can still be counted exactly: only the rendered prompt is needed here, while gRPC dispatch keeps its response-adapter checks.
+
+Before enabling `exact_text_endpoints`, verify that the Router's rendering and tokenization equal the Engine's for the deployed model, template and chat options. `examples/render_count.rs` performs that check on CPU against a fixture of conversations with Engine-side counts (no GPU required); a mismatch is also visible at runtime as a non-zero `vllm_router_agent_aware_context_token_observation_delta_ratio` and as fingerprint revocations (`vllm_router_agent_aware_context_token_revocations_total`).
+
+Every prepared count carries a fingerprint of the token-equivalence inputs (model pool, request model, Router frontend asset overrides, template options, encode backend). At completion the Router compares the prepared count with Engine `prompt_tokens`:
+
+- equal counts keep the fingerprint verified;
+- any difference records `vllm_router_agent_aware_context_token_observation_delta_ratio`, revokes that fingerprint once, and returns its later requests to estimation;
+- an Engine-observed count may replace a trusted prepared context immediately when the Program has no other in-flight or retained attempt; estimated inputs and overlapping attempts keep the two-observation shrink confirmation.
+
+Exactness covers only the input IDs sent to the Engine. Future output length, the next tool-return time, physical KV occupancy, and future KV hits remain unknown, and an L0/L1 encoding-cache hit is never counted as an Engine KV hit or used to fill the logical shared-prefix deduction.
 
 ## Compatibility identity inputs
 

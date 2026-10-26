@@ -61,9 +61,18 @@ impl ProgramScheduler {
             return;
         }
         let target_id = dispatch.target_id.clone();
-        let observed_prompt_tokens = usage
-            .prompt_tokens
-            .unwrap_or(dispatch.estimated_context_tokens());
+        let observed_prompt_tokens = usage.prompt_tokens.unwrap_or(dispatch.context_tokens());
+        self.reconcile_observed_prompt_tokens(
+            &mut state,
+            dispatch.program().model_pool(),
+            dispatch.context_token_source(),
+            dispatch.context_token_fingerprint(),
+            dispatch
+                .context_token_source()
+                .is_prepared()
+                .then(|| dispatch.context_tokens()),
+            usage.prompt_tokens,
+        );
         let fallback_cached_tokens = state
             .rank_factors
             .get(&target_id)
@@ -174,10 +183,18 @@ impl ProgramScheduler {
                     || decision
                         .shared_prefix_fresh_until
                         .is_none_or(|deadline| now >= deadline));
+            let context_is_quiescent = runtime_after.as_ref().is_some_and(|runtime| {
+                runtime.in_flight_requests == 0 && runtime.waiting_requests == 0
+            });
+            let trusted_prepared = dispatch.context_token_source().is_prepared();
             if usage.prompt_tokens.is_some() {
-                decision.observe_completed_context(observed_prompt_tokens);
-            } else if observed_prompt_tokens >= decision.estimated_context_tokens {
-                decision.estimated_context_tokens = observed_prompt_tokens;
+                decision.observe_completed_context(
+                    observed_prompt_tokens,
+                    trusted_prepared,
+                    context_is_quiescent,
+                );
+            } else if observed_prompt_tokens >= decision.context_tokens {
+                decision.context_tokens = observed_prompt_tokens;
                 decision.context_shrink_observations = 0;
             }
             if success {
@@ -566,9 +583,9 @@ impl ProgramScheduler {
                         let input = if program.status == ProgramStatus::Acting {
                             decision
                                 .last_context_tokens
-                                .unwrap_or(decision.estimated_context_tokens)
+                                .unwrap_or(decision.context_tokens)
                         } else {
-                            decision.estimated_context_tokens
+                            decision.context_tokens
                         };
                         let score = elapsed
                             * (1.0 / (input as f64 / average_prompt).max(1e-6).sqrt()).max(0.5);
@@ -685,7 +702,12 @@ mod tests {
             dp_rank: Some(0),
         };
         let dispatch = scheduler
-            .acquire(identity("p"), 100, &[target], None)
+            .acquire(
+                identity("p"),
+                crate::program_scheduling::ContextTokens::estimated(100),
+                &[target],
+                None,
+            )
             .await
             .unwrap();
         scheduler.complete(
@@ -730,7 +752,12 @@ mod tests {
             .unwrap()
             .unwrap();
         let dispatch = scheduler
-            .acquire(identity, 100, &[target], None)
+            .acquire(
+                identity,
+                crate::program_scheduling::ContextTokens::estimated(100),
+                &[target],
+                None,
+            )
             .await
             .unwrap();
         scheduler.complete(&dispatch, true, false, Some(100), Some(0.1));
@@ -750,11 +777,21 @@ mod tests {
             dp_rank: Some(0),
         };
         let first = scheduler
-            .acquire(identity("first"), 100, std::slice::from_ref(&target), None)
+            .acquire(
+                identity("first"),
+                crate::program_scheduling::ContextTokens::estimated(100),
+                std::slice::from_ref(&target),
+                None,
+            )
             .await
             .unwrap();
         let second = scheduler
-            .acquire(identity("second"), 100, &[target], None)
+            .acquire(
+                identity("second"),
+                crate::program_scheduling::ContextTokens::estimated(100),
+                &[target],
+                None,
+            )
             .await
             .unwrap();
         let now = Instant::now();
@@ -769,12 +806,12 @@ mod tests {
                 .decisions
                 .get_mut(first.program())
                 .unwrap()
-                .estimated_context_tokens = 140;
+                .context_tokens = 140;
             state
                 .decisions
                 .get_mut(second.program())
                 .unwrap()
-                .estimated_context_tokens = 140;
+                .context_tokens = 140;
             assert!(!scheduler.repair_capacity(&mut state, now));
             assert!(state.decisions[first.program()].pause_when_idle);
             assert!(!state.decisions[second.program()].pause_when_idle);
@@ -794,14 +831,19 @@ mod tests {
         let first = scheduler
             .acquire(
                 identity("segment"),
-                100,
+                crate::program_scheduling::ContextTokens::estimated(100),
                 std::slice::from_ref(&target),
                 None,
             )
             .await
             .unwrap();
         let second = scheduler
-            .acquire(identity("segment"), 130, &[target], None)
+            .acquire(
+                identity("segment"),
+                crate::program_scheduling::ContextTokens::estimated(130),
+                &[target],
+                None,
+            )
             .await
             .unwrap();
         assert!(first.placement_start_request());
@@ -843,7 +885,12 @@ mod tests {
             dp_rank: Some(0),
         };
         let dispatch = scheduler
-            .acquire(identity("missing-cache"), 100, &[target], None)
+            .acquire(
+                identity("missing-cache"),
+                crate::program_scheduling::ContextTokens::estimated(100),
+                &[target],
+                None,
+            )
             .await
             .unwrap();
         scheduler.complete(
@@ -870,7 +917,12 @@ mod tests {
             dp_rank: Some(0),
         };
         let dispatch = scheduler
-            .acquire(identity("terminal"), 100, &[target], None)
+            .acquire(
+                identity("terminal"),
+                crate::program_scheduling::ContextTokens::estimated(100),
+                &[target],
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(

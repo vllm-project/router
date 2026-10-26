@@ -265,7 +265,12 @@ mod tests {
         let estimator = Arc::new(MomentumTokenEstimator::default());
 
         let first_dispatch = scheduler
-            .acquire(identity.clone(), 100, std::slice::from_ref(&target), None)
+            .acquire(
+                identity.clone(),
+                crate::program_scheduling::ContextTokens::estimated(100),
+                std::slice::from_ref(&target),
+                None,
+            )
             .await
             .unwrap();
         let (_, first_calibration) = estimator.estimate(
@@ -283,7 +288,12 @@ mod tests {
         drop(first);
 
         let second_dispatch = scheduler
-            .acquire(identity, 100, std::slice::from_ref(&target), None)
+            .acquire(
+                identity,
+                crate::program_scheduling::ContextTokens::estimated(100),
+                std::slice::from_ref(&target),
+                None,
+            )
             .await
             .unwrap();
         let (_, second_calibration) = estimator.estimate(

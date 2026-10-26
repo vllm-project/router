@@ -273,7 +273,7 @@ impl ProgramScheduler {
         let source_headroom = (limit - self.target_usage(state, source, now)).max(0.0);
         destination_headroom
             >= source_headroom
-                + self.config.cross_rank_headroom_ratio * decision.estimated_context_tokens as f64
+                + self.config.cross_rank_headroom_ratio * decision.context_tokens as f64
     }
 
     fn active_program_count(&self, state: &ProgramSchedulerState, target_id: &str) -> usize {
@@ -332,12 +332,17 @@ mod tests {
         let now = Instant::now();
         let mut state = scheduler.state.lock();
         let identity = identity("p");
-        let handle = state.runtime.retain_request(&identity, 100, None, now);
+        let handle = state.runtime.retain_request(
+            &identity,
+            crate::program_scheduling::ContextTokens::estimated(100),
+            None,
+            now,
+        );
         scheduler.ensure_decision_state(
             &mut state,
             &identity,
             handle.program().clone(),
-            100,
+            crate::program_scheduling::ContextTokens::estimated(100),
             now,
             None,
         );
@@ -380,12 +385,17 @@ mod tests {
             ("old", now - Duration::from_secs(10), now),
         ] {
             let identity = identity(name);
-            let handle = state.runtime.retain_request(&identity, 100, None, now);
+            let handle = state.runtime.retain_request(
+                &identity,
+                crate::program_scheduling::ContextTokens::estimated(100),
+                None,
+                now,
+            );
             scheduler.ensure_decision_state(
                 &mut state,
                 &identity,
                 handle.program().clone(),
-                100,
+                crate::program_scheduling::ContextTokens::estimated(100),
                 now,
                 None,
             );
@@ -432,12 +442,17 @@ mod tests {
         let mut programs = Vec::new();
         for (index, name) in ["first", "second"].into_iter().enumerate() {
             let identity = identity(name);
-            let handle = state.runtime.retain_request(&identity, 100, None, now);
+            let handle = state.runtime.retain_request(
+                &identity,
+                crate::program_scheduling::ContextTokens::estimated(100),
+                None,
+                now,
+            );
             scheduler.ensure_decision_state(
                 &mut state,
                 &identity,
                 handle.program().clone(),
-                100,
+                crate::program_scheduling::ContextTokens::estimated(100),
                 now,
                 None,
             );

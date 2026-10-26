@@ -193,6 +193,43 @@ pub fn init_metrics() {
         describe_histogram!(name, description);
     }
 
+    describe_counter!(
+        "vllm_router_agent_aware_context_token_facts_total",
+        "Applied Program context-token fact sources by model pool and endpoint"
+    );
+    describe_histogram!(
+        "vllm_router_agent_aware_context_token_fact_tokens",
+        "Applied Program context-token counts by fact source"
+    );
+    describe_counter!(
+        "vllm_router_agent_aware_context_token_fallbacks_total",
+        "Prepared context-token facts not applied, by fallback reason"
+    );
+    describe_counter!(
+        "vllm_router_agent_aware_context_token_shadow_total",
+        "Admission counterfactuals recorded by shadow token-count mode"
+    );
+    describe_histogram!(
+        "vllm_router_agent_aware_context_token_observation_delta_ratio",
+        "Relative difference between prepared and Engine-observed prompt tokens"
+    );
+    describe_counter!(
+        "vllm_router_agent_aware_context_token_revocations_total",
+        "Tokenizer fingerprints revoked after an Engine disagreement"
+    );
+    describe_gauge!(
+        "vllm_router_agent_aware_context_token_mode",
+        "Active Program context-token count mode (1 for the selected mode)"
+    );
+    describe_histogram!(
+        "vllm_router_agent_aware_token_prepare_seconds",
+        "Router-side text tokenization time for prepared exact facts"
+    );
+    describe_counter!(
+        "vllm_router_agent_aware_token_prepare_failures_total",
+        "Prepared exact facts skipped because Router-side text preparation failed"
+    );
+
     // PD-specific metrics
     describe_counter!(
         "vllm_router_pd_requests_total",
@@ -731,6 +768,90 @@ impl RouterMetrics {
             "target" => target.to_string()
         )
         .record(tokens as f64);
+    }
+
+    pub fn record_agent_aware_context_token_fact(
+        model_pool: &str,
+        endpoint: &str,
+        source: &'static str,
+        tokens: usize,
+        fallback: Option<&'static str>,
+    ) {
+        counter!(
+            "vllm_router_agent_aware_context_token_facts_total",
+            "model_pool" => model_pool.to_string(),
+            "endpoint" => endpoint.to_string(),
+            "source" => source
+        )
+        .increment(1);
+        histogram!(
+            "vllm_router_agent_aware_context_token_fact_tokens",
+            "model_pool" => model_pool.to_string(),
+            "source" => source
+        )
+        .record(tokens as f64);
+        if let Some(fallback) = fallback {
+            counter!(
+                "vllm_router_agent_aware_context_token_fallbacks_total",
+                "model_pool" => model_pool.to_string(),
+                "reason" => fallback
+            )
+            .increment(1);
+        }
+    }
+
+    pub fn record_agent_aware_context_token_shadow(target: &str, outcome: &'static str) {
+        counter!(
+            "vllm_router_agent_aware_context_token_shadow_total",
+            "target" => target.to_string(),
+            "outcome" => outcome
+        )
+        .increment(1);
+    }
+
+    pub fn record_agent_aware_context_token_observation_delta(
+        model_pool: &str,
+        source: &'static str,
+        delta_tokens: i64,
+        observed_tokens: usize,
+    ) {
+        let ratio = if observed_tokens == 0 {
+            0.0
+        } else {
+            delta_tokens as f64 / observed_tokens as f64
+        };
+        histogram!(
+            "vllm_router_agent_aware_context_token_observation_delta_ratio",
+            "model_pool" => model_pool.to_string(),
+            "source" => source
+        )
+        .record(ratio);
+    }
+
+    pub fn record_agent_aware_context_token_revocation(reason: &'static str) {
+        counter!(
+            "vllm_router_agent_aware_context_token_revocations_total",
+            "reason" => reason
+        )
+        .increment(1);
+    }
+
+    pub fn record_agent_aware_token_prepare(seconds: f64) {
+        histogram!("vllm_router_agent_aware_token_prepare_seconds").record(seconds);
+    }
+
+    pub fn record_agent_aware_token_prepare_failure() {
+        counter!("vllm_router_agent_aware_token_prepare_failures_total").increment(1);
+    }
+
+    pub fn set_agent_aware_context_token_mode(mode: &'static str) {
+        for candidate in ["estimated", "shadow", "exact_when_verified"] {
+            gauge!(
+                "vllm_router_agent_aware_context_token_mode",
+                "mode" => candidate
+            )
+            .set(if candidate == mode { 1.0 } else { 0.0 });
+        }
     }
 
     pub(crate) fn record_agent_aware_admission(target: &str, sample: AgentAwareAdmissionMetrics) {

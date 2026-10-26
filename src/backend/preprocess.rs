@@ -178,28 +178,13 @@ impl TokenizeOut {
     }
 }
 
-pub fn tokenize_chat_request_timed(
-    request: &ChatCompletionRequest,
-    frontend: &FrontendHandle,
-) -> Result<TokenizeOut> {
-    match &frontend.0 {
-        Frontend::TestIds(ids) => {
-            if ids.is_empty() {
-                return Err(anyhow!("pinned test token_ids are empty"));
-            }
-            Ok(TokenizeOut {
-                token_ids: Arc::from(ids.clone()),
-                adapt_ms: 0.0,
-                template_ms: 0.0,
-                encode_ms: 0.0,
-                encode_backend: "test-pin",
-            })
-        }
-        Frontend::Vllm(vllm) => tokenize_vllm(request, vllm),
-    }
-}
-
-fn tokenize_vllm(request: &ChatCompletionRequest, frontend: &VllmFrontend) -> Result<TokenizeOut> {
+/// Reject request shapes whose output the gRPC response adapter cannot parse.
+///
+/// This governs *dispatch* for a `grpc://` pool, where the Router has to parse
+/// the Engine stream into the client response. It does not affect rendering or
+/// tokenization: `tokenize_chat_request_for_count_timed` deliberately skips it,
+/// because an exact input-token count only needs the rendered prompt.
+pub(crate) fn check_output_adapter_support(request: &ChatCompletionRequest) -> Result<()> {
     if request
         .tools
         .as_ref()
@@ -218,6 +203,61 @@ fn tokenize_vllm(request: &ChatCompletionRequest, frontend: &VllmFrontend) -> Re
             "reasoning_effort requires vllm-chat output parsing, which the gRPC response adapter does not yet expose"
         ));
     }
+    Ok(())
+}
+
+fn pinned_test_tokenize(frontend: &FrontendHandle) -> Option<Result<TokenizeOut>> {
+    match &frontend.0 {
+        Frontend::TestIds(ids) => Some(if ids.is_empty() {
+            Err(anyhow!("pinned test token_ids are empty"))
+        } else {
+            Ok(TokenizeOut {
+                token_ids: Arc::from(ids.clone()),
+                adapt_ms: 0.0,
+                template_ms: 0.0,
+                encode_ms: 0.0,
+                encode_backend: "test-pin",
+            })
+        }),
+        Frontend::Vllm(_) => None,
+    }
+}
+
+/// Tokenize for gRPC dispatch: output-adapter support is a precondition.
+pub fn tokenize_chat_request_timed(
+    request: &ChatCompletionRequest,
+    frontend: &FrontendHandle,
+) -> Result<TokenizeOut> {
+    if let Some(pinned) = pinned_test_tokenize(frontend) {
+        return pinned;
+    }
+    check_output_adapter_support(request)?;
+    match &frontend.0 {
+        Frontend::TestIds(_) => unreachable!("pinned frontend handled above"),
+        Frontend::Vllm(vllm) => tokenize_vllm(request, vllm),
+    }
+}
+
+/// Tokenize only, for an exact input-token count.
+///
+/// The HTTP passthrough path never parses the Engine output in the Router, so a
+/// request with active tool calling (or `reasoning_effort`) can still be counted
+/// exactly; only the rendered prompt matters here. Dispatch paths that do parse
+/// the output must use `tokenize_chat_request_timed`.
+pub fn tokenize_chat_request_for_count_timed(
+    request: &ChatCompletionRequest,
+    frontend: &FrontendHandle,
+) -> Result<TokenizeOut> {
+    if let Some(pinned) = pinned_test_tokenize(frontend) {
+        return pinned;
+    }
+    match &frontend.0 {
+        Frontend::TestIds(_) => unreachable!("pinned frontend handled above"),
+        Frontend::Vllm(vllm) => tokenize_vllm(request, vllm),
+    }
+}
+
+fn tokenize_vllm(request: &ChatCompletionRequest, frontend: &VllmFrontend) -> Result<TokenizeOut> {
     let t0 = Instant::now();
     let kwargs = request.chat_template_kwargs.clone().unwrap_or_default();
     if request.other.contains_key("chat_template") {
@@ -731,5 +771,63 @@ mod tests {
             err.to_string().contains("missing a string `text` field"),
             "unexpected error: {err}"
         );
+    }
+    #[test]
+    fn output_adapter_checks_reject_shapes_the_count_path_can_still_render() {
+        let request = |value: serde_json::Value| -> ChatCompletionRequest {
+            serde_json::from_value(value).expect("chat request")
+        };
+        let tools = serde_json::json!([{
+            "type": "function",
+            "function": {"name": "shell", "parameters": {"type": "object"}}
+        }]);
+
+        // Active tool calling needs output parsing, so dispatch rejects it.
+        let active = request(serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": tools,
+        }));
+        assert!(check_output_adapter_support(&active).is_err());
+
+        // The same request is renderable, which is all the count path needs.
+        assert!(
+            crate::backend::preprocess::tokenize_chat_request_for_count_timed(
+                &active,
+                &FrontendHandle(Frontend::TestIds(vec![7, 8, 9])),
+            )
+            .is_ok()
+        );
+
+        let tool_choice_none = request(serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": tools,
+            "tool_choice": "none",
+        }));
+        assert!(check_output_adapter_support(&tool_choice_none).is_ok());
+
+        // Tool history without active tools is supported on both paths.
+        let history = request(serde_json::json!({
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "", "tool_calls": [{
+                    "id": "c1",
+                    "type": "function",
+                    "function": {"name": "shell", "arguments": "{\"cmd\":\"ls\"}"}
+                }]},
+                {"role": "tool", "tool_call_id": "c1", "content": "a"},
+                {"role": "user", "content": "go on"}
+            ],
+        }));
+        assert!(check_output_adapter_support(&history).is_ok());
+
+        let reasoning = request(serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "reasoning_effort": "high",
+        }));
+        assert!(check_output_adapter_support(&reasoning).is_err());
     }
 }

@@ -11,8 +11,9 @@ use crate::policies::{
     kv_aware_ops, KvRequestSlot, KvSelectionReceipt, LoadBalancingPolicy, PolicyRegistry,
 };
 use crate::program_scheduling::{
-    BackendObservationProvider, ProgramIdentity, ProgramScheduler, ProgramSchedulerConfig,
-    ProgramTarget, ScheduleError, VllmMetricsObservationProvider,
+    ArrivalTokenFacts, BackendObservationProvider, ProgramIdentity, ProgramScheduler,
+    ProgramSchedulerConfig, ProgramTarget, ScheduleError, TokenFacts, TokenizerFingerprint,
+    VllmMetricsObservationProvider,
 };
 use crate::protocols::spec::{
     ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest, GenerationRequest,
@@ -50,6 +51,124 @@ fn prepare_error_status(error: &PrepareError) -> StatusCode {
         PrepareError::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
         PrepareError::Invalid(_) => StatusCode::BAD_REQUEST,
     }
+}
+
+/// Identity of a tokenizer/prompt-preparation equivalence class.
+///
+/// The Engine must tokenize the same model with the same template options and
+/// the same frontend assets for a prepared count to describe Engine input. The
+/// fingerprint covers every input that changes that mapping, so a mismatch
+/// revokes exactly one class instead of disabling a whole deployment.
+/// Canonical JSON for a fingerprint: object keys sorted at every level.
+///
+/// `chat_template_kwargs` is a `HashMap`, so plain serialization would make the
+/// fingerprint depend on iteration order and silently split one equivalence
+/// class into many.
+fn canonical_json(value: &serde_json::Value) -> String {
+    fn write(value: &serde_json::Value, out: &mut String) {
+        match value {
+            serde_json::Value::Object(map) => {
+                let mut keys = map.keys().collect::<Vec<_>>();
+                keys.sort();
+                out.push('{');
+                for (index, key) in keys.into_iter().enumerate() {
+                    if index > 0 {
+                        out.push(',');
+                    }
+                    out.push_str(&serde_json::to_string(key).unwrap_or_default());
+                    out.push(':');
+                    write(&map[key], out);
+                }
+                out.push('}');
+            }
+            serde_json::Value::Array(items) => {
+                out.push('[');
+                for (index, item) in items.iter().enumerate() {
+                    if index > 0 {
+                        out.push(',');
+                    }
+                    write(item, out);
+                }
+                out.push(']');
+            }
+            other => out.push_str(&serde_json::to_string(other).unwrap_or_default()),
+        }
+    }
+    let mut out = String::new();
+    write(value, &mut out);
+    out
+}
+
+fn prepared_chat_fingerprint(
+    request: &ChatCompletionRequest,
+    encode_backend: &str,
+) -> TokenizerFingerprint {
+    let env_model = std::env::var("VLLM_ROUTER_MODEL").unwrap_or_default();
+    let env_tokenizer = std::env::var("VLLM_ROUTER_TOKENIZER").unwrap_or_default();
+    // Only inputs that change the rendered token IDs belong in the fingerprint.
+    // Per-request identity (`vllm_xargs`, `agent_hint`, session params),
+    // sampling knobs and credentials must not split one equivalence class into
+    // thousands of fingerprints.
+    let options = canonical_json(&serde_json::json!({
+        "chat_template_kwargs": request.chat_template_kwargs,
+        "add_generation_prompt": request.add_generation_prompt,
+        "continue_final_message": request.continue_final_message,
+        "add_special_tokens": request.other.get("add_special_tokens"),
+        "chat_template": request.other.get("chat_template"),
+        "tools": request.tools,
+        "functions": request.functions,
+        "tool_choice": request.tool_choice,
+        "parallel_tool_calls": request.parallel_tool_calls,
+    }));
+    TokenizerFingerprint::from_parts(&[
+        "prepared_token_ids",
+        request.model.as_deref().unwrap_or_default(),
+        &env_model,
+        &env_tokenizer,
+        &options,
+        encode_backend,
+    ])
+}
+
+/// Fingerprint for a client-supplied token-ID prompt.
+///
+/// Those IDs are forwarded verbatim, so the only way the Engine count can differ
+/// is per-request options (for example an implicit special token) or a model
+/// mix-up; both are covered here.
+fn client_token_ids_fingerprint(
+    model_id: Option<&str>,
+    model_pool: &str,
+    endpoint: &str,
+) -> TokenizerFingerprint {
+    TokenizerFingerprint::from_parts(&[
+        "client_token_ids",
+        model_pool,
+        endpoint,
+        model_id.unwrap_or_default(),
+    ])
+}
+
+/// Exact input-token count of a transparent JSON body, when its prompt is one
+/// token-ID array.
+fn exact_prompt_tokens_from_json(request: Option<&serde_json::Value>) -> Option<usize> {
+    let request = request?;
+    // The Engine must not prepend special tokens for `len(prompt)` to be the
+    // exact Engine input count.
+    if request
+        .get("add_special_tokens")
+        .and_then(serde_json::Value::as_bool)
+        != Some(false)
+    {
+        return None;
+    }
+    let array = request.get("prompt")?.as_array()?;
+    if array.is_empty() {
+        return None;
+    }
+    array
+        .iter()
+        .all(|value| value.as_u64().is_some())
+        .then_some(array.len())
 }
 
 fn insert_router_stages(headers: &mut HeaderMap, stages: &serde_json::Value) {
@@ -299,14 +418,14 @@ impl Router {
         RouterMetrics::set_active_workers(worker_urls.len());
 
         // All-http or all-grpc. Mixed schemes fail here (not a silent fallback).
-        let pool_kind = crate::backend::classify_worker_urls(&worker_urls)?;
+        // Reject mixed schemes up front; both pool kinds now share the same
+        // tokenizer frontend construction below.
+        let _pool_kind = crate::backend::classify_worker_urls(&worker_urls)?;
         let request_timeout = Duration::from_secs(ctx.router_config.request_timeout_secs);
-        let frontend = if pool_kind == Some(crate::backend::WorkerPoolKind::Http) {
-            crate::backend::EngineFrontend::with_request_timeout(request_timeout)
-        } else {
-            crate::backend::EngineFrontend::from_env(request_timeout)
-                .map_err(|error| format!("tokenizer cache: {error}"))?
-        };
+        // Both pool kinds may need the tokenizer: gRPC always prepares, and an
+        // HTTP pool prepares only when exact-text counting is opted in.
+        let frontend = crate::backend::EngineFrontend::from_env(request_timeout)
+            .map_err(|error| format!("tokenizer cache: {error}"))?;
 
         // Wait for workers to be healthy (skip if empty - for service discovery mode)
         if !worker_urls.is_empty() {
@@ -465,6 +584,24 @@ impl Router {
             .as_ref()
             .map(ProgramSchedulerConfig::from)
             .map(ProgramScheduler::new)
+            .map(|scheduler| {
+                scheduler.publish_token_count_mode();
+                if scheduler.exact_text_enabled() {
+                    let tokenizer_override = std::env::var("VLLM_ROUTER_TOKENIZER").unwrap_or_default();
+                    let model_override = std::env::var("VLLM_ROUTER_MODEL").unwrap_or_default();
+                    if tokenizer_override.is_empty() && model_override.is_empty() {
+                        warn!(
+                            event = "exact_text_tokenizer_unset",
+                            "Program scheduling will tokenize HTTP text for exact facts, but neither \
+                             VLLM_ROUTER_TOKENIZER nor VLLM_ROUTER_MODEL is set; request-model \
+                             resolution may download from Hugging Face. Point \
+                             VLLM_ROUTER_TOKENIZER at the deployed model directory so the Router \
+                             count matches the Engine's chat template."
+                        );
+                    }
+                }
+                scheduler
+            })
             .map(Arc::new);
         let program_observation_handle = program_scheduler.as_ref().map(|scheduler| {
             let scheduler = scheduler.clone();
@@ -771,6 +908,7 @@ impl Router {
         typed_req: &T,
         model_id: Option<&str>,
         endpoint: &str,
+        prepared: Option<&crate::backend::PreparedRequest>,
     ) -> Result<Option<ProgramCompletion>, ScheduleError> {
         let Some(scheduler) = &self.program_scheduler else {
             return Ok(None);
@@ -787,12 +925,20 @@ impl Router {
             return Ok(None);
         };
         let input_text = typed_req.extract_text_for_program_scheduling();
+        let prepared_facts = self.prepared_token_facts(
+            typed_req.exact_input_token_count(),
+            prepared,
+            model_id,
+            &model_pool.scheduler_key,
+            endpoint,
+        );
         self.acquire_program_completion_for_identity(
             scheduler,
             identity,
             &model_pool,
             endpoint,
             &input_text,
+            prepared_facts,
         )
         .await
     }
@@ -818,16 +964,56 @@ impl Router {
         else {
             return Ok(None);
         };
+        let prepared_facts = self.prepared_token_facts(
+            exact_prompt_tokens_from_json(request),
+            None,
+            model_id,
+            &model_pool.scheduler_key,
+            endpoint,
+        );
         self.acquire_program_completion_for_identity(
             scheduler,
             identity,
             &model_pool,
             endpoint,
             input_text,
+            prepared_facts,
         )
         .await
     }
 
+    /// Build the pre-dispatch input-token fact for one attempt.
+    ///
+    /// A prepared chat carries the exact IDs the Engine will receive. A
+    /// token-ID prompt already *is* the Engine input, so the client array
+    /// length is the exact fact even on the transparent HTTP path. Every other
+    /// shape returns `None` and keeps the byte estimator.
+    fn prepared_token_facts(
+        &self,
+        typed_exact_tokens: Option<usize>,
+        prepared: Option<&crate::backend::PreparedRequest>,
+        model_id: Option<&str>,
+        model_pool: &str,
+        endpoint: &str,
+    ) -> Option<TokenFacts> {
+        if let Some(prepared) = prepared {
+            let tokens = prepared.tokenized.token_ids.len();
+            if tokens > 0 {
+                let fingerprint = prepared_chat_fingerprint(
+                    prepared.request.as_ref(),
+                    prepared.tokenized.encode_backend,
+                );
+                return Some(TokenFacts::prepared_token_ids(tokens, fingerprint));
+            }
+        }
+        let tokens = typed_exact_tokens?;
+        Some(TokenFacts::client_token_ids(
+            tokens,
+            client_token_ids_fingerprint(model_id, model_pool, endpoint),
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
     async fn acquire_program_completion_for_identity(
         &self,
         scheduler: &Arc<ProgramScheduler>,
@@ -835,17 +1021,27 @@ impl Router {
         model_pool: &ResolvedProgramModelPool,
         endpoint: &str,
         input_text: &str,
+        prepared_facts: Option<TokenFacts>,
     ) -> Result<Option<ProgramCompletion>, ScheduleError> {
         let (estimated_context_tokens, calibration) = self.program_token_estimator.estimate(
             TokenEstimateScope::new(&model_pool.scheduler_key, endpoint),
             input_text,
+        );
+        let arrival = ArrivalTokenFacts::new(estimated_context_tokens, prepared_facts);
+        let context = scheduler.resolve_arrival_tokens(&model_pool.scheduler_key, arrival);
+        RouterMetrics::record_agent_aware_context_token_fact(
+            &model_pool.scheduler_key,
+            endpoint,
+            context.source().as_str(),
+            context.tokens(),
+            context.fallback().map(|reason| reason.as_str()),
         );
         let targets = self.program_targets_for_model(model_pool);
         let routing_text = scheduler
             .uses_cache_aware_binding()
             .then(|| input_text.to_string());
         let dispatch = scheduler
-            .acquire_from_snapshot(identity, estimated_context_tokens, targets, routing_text)
+            .acquire_from_snapshot(identity, context, targets, routing_text)
             .await?;
         Ok(Some(ProgramCompletion::new(
             scheduler.clone(),
@@ -1296,10 +1492,21 @@ impl Router {
         // Policy still uses extract_text_for_routing (session / empty).
         // token_ids stay on PreparedRequest for a later token-level policy —
         // do not dump 131k ids into the cache_aware tree.
-        //
-        // The concrete request comes from `GenerationRequest::grpc_request`
-        // rather than a `serde_json::Value` roundtrip: the only two routes a
-        // gRPC pool admits are exactly the two concrete request types.
+        // All-grpc chat/completions prepare once, outside policy and retry.
+        // An HTTP chat pool prepares only when the deployment opted the
+        // endpoint into exact text counting; a preparation failure there falls
+        // back to the estimator instead of failing the request.
+        // Router-side preparation is a second tokenization, so skip it when the
+        // scheduler would discard the fact: the endpoint must be opted in and
+        // the model pool must be allowed by `token_count_model_pools`.
+        let exact_text_chat = matches!(pool, Some(crate::backend::WorkerPoolKind::Http))
+            && route == "/v1/chat/completions"
+            && self.program_scheduler.as_ref().is_some_and(|scheduler| {
+                scheduler.exact_text_endpoint_enabled(route)
+                    && scheduler.prepared_token_pool_allowed(
+                        &self.resolved_program_model_pool(model_id).scheduler_key,
+                    )
+            });
         let prepared = match (pool, typed_req.grpc_request()) {
             (Some(crate::backend::WorkerPoolKind::Grpc), Some(GrpcRequestRef::Chat(chat)))
                 if route == "/v1/chat/completions" =>
@@ -1337,6 +1544,29 @@ impl Router {
                 )
                     .into_response();
             }
+            (Some(crate::backend::WorkerPoolKind::Http), Some(GrpcRequestRef::Chat(chat)))
+                if exact_text_chat =>
+            {
+                let started = Instant::now();
+                match self.frontend.prepare_for_token_count(chat.clone()).await {
+                    Ok(prepared) => {
+                        RouterMetrics::record_agent_aware_token_prepare(
+                            started.elapsed().as_secs_f64(),
+                        );
+                        Some(prepared)
+                    }
+                    Err(error) => {
+                        RouterMetrics::record_agent_aware_token_prepare_failure();
+                        debug!(
+                            event = "exact_text_prepare_failed",
+                            endpoint = route,
+                            error = %error,
+                            "falling back to the byte estimator for Program context tokens"
+                        );
+                        None
+                    }
+                }
+            }
             _ => None,
         };
 
@@ -1356,7 +1586,13 @@ impl Router {
                 // previous ProgramCompletion finishes exactly once before a
                 // retry invokes this closure again.
                 let program_completion = match self
-                    .acquire_program_completion(headers, typed_req, model_id, route)
+                    .acquire_program_completion(
+                        headers,
+                        typed_req,
+                        model_id,
+                        route,
+                        prepared.as_ref(),
+                    )
                     .await
                 {
                     Ok(completion) => completion,
@@ -3133,6 +3369,97 @@ mod tests {
             assert_eq!(echoed["authorization"], "Bearer token");
         }
         server.abort();
+    }
+
+    fn chat_request_with_identity(program: &str) -> ChatCompletionRequest {
+        serde_json::from_value(serde_json::json!({
+            "model": "pd-model",
+            "messages": [{"role": "user", "content": "hello"}],
+            "chat_template_kwargs": {"enable_thinking": false},
+            "vllm_xargs": {"agentic_context": format!("{{\"program_id\":\"{program}\"}}")},
+            "metadata": {"trace": "abc"}
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn prepared_fingerprint_ignores_per_request_identity() {
+        let first = prepared_chat_fingerprint(&chat_request_with_identity("p1"), "vllm-tokenizer");
+        let second = prepared_chat_fingerprint(&chat_request_with_identity("p2"), "vllm-tokenizer");
+        assert_eq!(first, second, "identity fields must not split the class");
+    }
+
+    #[test]
+    fn prepared_fingerprint_tracks_template_and_tool_options() {
+        let base = chat_request_with_identity("p1");
+        let base_fp = prepared_chat_fingerprint(&base, "vllm-tokenizer");
+        let mut kwargs_changed = chat_request_with_identity("p1");
+        kwargs_changed.chat_template_kwargs = Some(HashMap::from([(
+            "enable_thinking".to_string(),
+            serde_json::json!(true),
+        )]));
+        assert_ne!(
+            base_fp,
+            prepared_chat_fingerprint(&kwargs_changed, "vllm-tokenizer")
+        );
+
+        let mut tools_changed = chat_request_with_identity("p1");
+        tools_changed.tools = Some(vec![serde_json::from_value(serde_json::json!({
+            "type": "function",
+            "function": {"name": "shell", "parameters": {"type": "object"}}
+        }))
+        .unwrap()]);
+        assert_ne!(
+            base_fp,
+            prepared_chat_fingerprint(&tools_changed, "vllm-tokenizer")
+        );
+
+        let mut special_changed = chat_request_with_identity("p1");
+        special_changed
+            .other
+            .insert("add_special_tokens".to_string(), serde_json::json!(true));
+        assert_ne!(
+            base_fp,
+            prepared_chat_fingerprint(&special_changed, "vllm-tokenizer")
+        );
+    }
+
+    #[test]
+    fn exact_prompt_tokens_requires_disabled_special_tokens() {
+        let ids = serde_json::json!({
+            "prompt": [1, 2, 3],
+            "add_special_tokens": false
+        });
+        assert_eq!(exact_prompt_tokens_from_json(Some(&ids)), Some(3));
+        let defaulted = serde_json::json!({"prompt": [1, 2, 3]});
+        assert_eq!(exact_prompt_tokens_from_json(Some(&defaulted)), None);
+        let text = serde_json::json!({
+            "prompt": "hello",
+            "add_special_tokens": false
+        });
+        assert_eq!(exact_prompt_tokens_from_json(Some(&text)), None);
+        let batched = serde_json::json!({
+            "prompt": [[1, 2], [3]],
+            "add_special_tokens": false
+        });
+        assert_eq!(exact_prompt_tokens_from_json(Some(&batched)), None);
+    }
+
+    #[test]
+    fn client_token_ids_fingerprint_changes_with_pool_and_model() {
+        let base = client_token_ids_fingerprint(Some("model-a"), "model-a", "/v1/completions");
+        assert_eq!(
+            base,
+            client_token_ids_fingerprint(Some("model-a"), "model-a", "/v1/completions")
+        );
+        assert_ne!(
+            base,
+            client_token_ids_fingerprint(Some("model-b"), "model-a", "/v1/completions")
+        );
+        assert_ne!(
+            base,
+            client_token_ids_fingerprint(Some("model-a"), "model-a", "/v1/chat/completions")
+        );
     }
 
     fn create_test_regular_router() -> Router {

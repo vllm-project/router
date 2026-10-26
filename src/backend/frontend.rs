@@ -154,6 +154,32 @@ impl EngineFrontend {
         })
     }
 
+    /// Render + encode for an exact input-token count on a passthrough path.
+    ///
+    /// The HTTP pool never parses the Engine output in the Router, so an exact
+    /// count does not require the gRPC response-adapter capabilities: a request
+    /// with active tool calling or `reasoning_effort` is still counted from its
+    /// rendered prompt. Dispatch paths that parse the output must keep using
+    /// [`EngineFrontend::prepare`], which validates those capabilities.
+    pub async fn prepare_for_token_count(
+        &self,
+        mut request: ChatCompletionRequest,
+    ) -> Result<PreparedRequest, PrepareError> {
+        let (handle, t_req, resolve_ms) = self.resolve_with_defaults(&mut request).await?;
+        let tokenized =
+            crate::backend::preprocess::tokenize_chat_request_for_count_timed(&request, &handle)
+                .map_err(|e| PrepareError::Invalid(format!("preprocess: {e}")))?;
+        Ok(PreparedRequest {
+            request: Arc::new(request),
+            tokenized,
+            handle,
+            resolve_ms,
+            t_req,
+            shape: ResponseShape::Chat,
+            emit_token_ids: false,
+        })
+    }
+
     /// Wire adapter path for `/v1/completions` on the gRPC pool: the client
     /// already sent token ids, so there is no chat template / router tokenize.
     /// Sampling defaults are resolved like `prepare`; encode fields report 0.

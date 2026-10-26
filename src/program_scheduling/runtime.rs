@@ -5,8 +5,8 @@
 
 use super::request_pool::RequestPool;
 use super::{
-    ProgramDispatch, ProgramIdentity, ProgramRef, ProgramRequestHandle, ProgramRequestHints,
-    ProgramState, ProgramStatus, ProgramUsageObservation,
+    ContextTokens, ProgramDispatch, ProgramIdentity, ProgramRef, ProgramRequestHandle,
+    ProgramRequestHints, ProgramState, ProgramStatus, ProgramUsageObservation,
 };
 use std::collections::HashMap;
 use std::time::Instant;
@@ -26,7 +26,7 @@ impl ProgramRuntime {
     pub fn retain_request(
         &mut self,
         identity: &ProgramIdentity,
-        estimated_context_tokens: usize,
+        context: ContextTokens,
         routing_text: Option<&str>,
         arrived_at: Instant,
     ) -> ProgramRequestHandle {
@@ -34,9 +34,7 @@ impl ProgramRuntime {
         self.released_generations_at.remove(&key);
         let program_ref = if let Some(program) = self.programs.get_mut(&key) {
             program.expected_resume = identity.expected_resume();
-            program.estimated_context_tokens = program
-                .estimated_context_tokens
-                .max(estimated_context_tokens);
+            program.context = program.context.max_with(context);
             program.reference.clone()
         } else {
             let generation = self
@@ -60,7 +58,7 @@ impl ProgramRuntime {
                     placement: None,
                     placement_epoch: 0,
                     placement_start_request_pending: false,
-                    estimated_context_tokens,
+                    context,
                     in_flight_requests: 0,
                 },
             );
@@ -72,7 +70,7 @@ impl ProgramRuntime {
         self.request_pool.retain(
             program_ref,
             arrived_at,
-            estimated_context_tokens,
+            context,
             routing_text,
             identity.request_hints().clone(),
         )
@@ -119,7 +117,7 @@ impl ProgramRuntime {
             program.placement_epoch,
             request.arrived_at,
             dispatched_at,
-            request.estimated_context_tokens,
+            request.context,
             starts_placement,
             request.routing_text,
             request.hints,
@@ -142,10 +140,10 @@ impl ProgramRuntime {
         {
             return false;
         }
-        let prompt_tokens = usage
-            .prompt_tokens
-            .unwrap_or(dispatch.estimated_context_tokens());
-        program.estimated_context_tokens = program.estimated_context_tokens.max(prompt_tokens);
+        let prompt_tokens = usage.prompt_tokens.unwrap_or(dispatch.context_tokens());
+        program.context = program
+            .context
+            .max_with(ContextTokens::estimated(prompt_tokens));
         program.in_flight_requests -= 1;
         if program.in_flight_requests == 0 && self.request_pool.program_len(&program.reference) == 0
         {
@@ -340,7 +338,7 @@ impl ProgramRuntime {
             status: program.status,
             expected_resume: program.expected_resume,
             placement: program.placement.as_deref(),
-            estimated_context_tokens: program.estimated_context_tokens,
+            estimated_context_tokens: program.context.tokens(),
             in_flight_requests: program.in_flight_requests,
             waiting_requests: self.request_pool.program_len(&program.reference),
         })
@@ -408,13 +406,14 @@ struct RuntimeProgram {
     placement: Option<String>,
     placement_epoch: u64,
     placement_start_request_pending: bool,
-    estimated_context_tokens: usize,
+    context: ContextTokens,
     in_flight_requests: usize,
 }
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use super::*;
+    use crate::program_scheduling::ContextTokens as CT;
     use serde_json::json;
 
     fn identity(program_id: &str) -> ProgramIdentity {
@@ -436,7 +435,8 @@ mod tests {
     #[test]
     fn retain_admit_complete_pause_and_release() {
         let mut runtime = ProgramRuntime::default();
-        let handle = runtime.retain_request(&identity("p"), 100, None, Instant::now());
+        let handle =
+            runtime.retain_request(&identity("p"), CT::estimated(100), None, Instant::now());
         assert_eq!(runtime.retained_request_count(), 1);
         let dispatch = runtime
             .admit_front(&handle, "rank-0".into(), Instant::now())
@@ -463,7 +463,8 @@ mod tests {
     #[test]
     fn stale_generation_cannot_mutate_replacement() {
         let mut runtime = ProgramRuntime::default();
-        let old_handle = runtime.retain_request(&identity("p"), 100, None, Instant::now());
+        let old_handle =
+            runtime.retain_request(&identity("p"), CT::estimated(100), None, Instant::now());
         let old_dispatch = runtime
             .admit_front(&old_handle, "rank-0".into(), Instant::now())
             .unwrap();
@@ -471,7 +472,8 @@ mod tests {
         assert!(runtime.pause_idle(old_dispatch.program()));
         assert!(runtime.release_idle(old_dispatch.program(), Instant::now()));
 
-        let new_handle = runtime.retain_request(&identity("p"), 200, None, Instant::now());
+        let new_handle =
+            runtime.retain_request(&identity("p"), CT::estimated(200), None, Instant::now());
         let new_dispatch = runtime
             .admit_front(&new_handle, "rank-1".into(), Instant::now())
             .unwrap();
@@ -486,7 +488,7 @@ mod tests {
         let now = Instant::now();
         let mut runtime = ProgramRuntime::default();
         let identity = identity("bounded");
-        let handle = runtime.retain_request(&identity, 10, None, now);
+        let handle = runtime.retain_request(&identity, CT::estimated(10), None, now);
         let dispatch = runtime.admit_front(&handle, "rank-0".into(), now).unwrap();
         assert!(runtime.complete_request(&dispatch, Some(10).into()));
         assert!(runtime.pause_idle(dispatch.program()));
@@ -503,11 +505,11 @@ mod tests {
     fn active_consecutive_request_keeps_placement_epoch() {
         let mut runtime = ProgramRuntime::default();
         let program = identity("p");
-        let first = runtime.retain_request(&program, 100, None, Instant::now());
+        let first = runtime.retain_request(&program, CT::estimated(100), None, Instant::now());
         let first_dispatch = runtime
             .admit_front(&first, "rank-0".into(), Instant::now())
             .unwrap();
-        let second = runtime.retain_request(&program, 110, None, Instant::now());
+        let second = runtime.retain_request(&program, CT::estimated(110), None, Instant::now());
         let second_dispatch = runtime
             .admit_front(&second, "rank-0".into(), Instant::now())
             .unwrap();
@@ -524,12 +526,12 @@ mod tests {
     fn cancelling_only_waiter_releases_active_reasoning_placement() {
         let mut runtime = ProgramRuntime::default();
         let program = identity("p");
-        let first = runtime.retain_request(&program, 100, None, Instant::now());
+        let first = runtime.retain_request(&program, CT::estimated(100), None, Instant::now());
         let dispatch = runtime
             .admit_front(&first, "rank-0".into(), Instant::now())
             .unwrap();
         assert!(runtime.complete_request(&dispatch, None.into()));
-        let waiting = runtime.retain_request(&program, 110, None, Instant::now());
+        let waiting = runtime.retain_request(&program, CT::estimated(110), None, Instant::now());
         assert!(runtime.cancel_request(&waiting));
         assert_eq!(runtime.placement(dispatch.program()), None);
         assert_eq!(

@@ -888,6 +888,23 @@ impl GenerationRequest for CompletionRequest {
         Some(GrpcRequestRef::Completion(self))
     }
 
+    fn exact_input_token_count(&self) -> Option<usize> {
+        // A token-ID prompt counts as the exact Engine input only when the
+        // client also disabled special-token rewriting. With the default
+        // option the Engine may prepend BOS, so `len(prompt)` would be an
+        // estimate rather than the Engine's own count.
+        let rewrites_disabled = self
+            .other
+            .get("add_special_tokens")
+            .and_then(serde_json::Value::as_bool)
+            == Some(false);
+        if rewrites_disabled {
+            self.prompt.token_array_len()
+        } else {
+            None
+        }
+    }
+
     fn extract_program_identity_payload(&self) -> Option<serde_json::Value> {
         program_identity_payload(&self.other, self.user.as_deref())
     }
@@ -2468,6 +2485,16 @@ pub trait GenerationRequest: Send + Sync {
         self.extract_text_for_routing()
     }
 
+    /// Exact input-token count when the request itself carries the token IDs
+    /// that will be forwarded to the Engine.
+    ///
+    /// Only request shapes whose prompt *is* the token ID array qualify: the
+    /// count then needs no tokenizer and no estimator, and the Engine observes
+    /// exactly those IDs (plus any explicitly configured special tokens).
+    fn exact_input_token_count(&self) -> Option<usize> {
+        None
+    }
+
     /// Extract only the small body subset used for Program identity parsing.
     fn extract_program_identity_payload(&self) -> Option<serde_json::Value> {
         None
@@ -2607,6 +2634,17 @@ impl PromptInput {
         matches!(self, PromptInput::IntArray(_) | PromptInput::IntBatch(_))
     }
 
+    /// Exact token count when the prompt is one token-ID array.
+    ///
+    /// Batched token IDs describe several independent prompts in one request,
+    /// so they have no single Program context length and return `None`.
+    pub fn token_array_len(&self) -> Option<usize> {
+        match self {
+            PromptInput::IntArray(ids) if !ids.is_empty() => Some(ids.len()),
+            _ => None,
+        }
+    }
+
     /// Get the total token count if token-based, otherwise estimate from text
     pub fn estimated_token_count(&self) -> usize {
         match self {
@@ -2635,6 +2673,42 @@ pub enum LoRAPath {
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn token_id_prompt_is_exact_only_when_special_tokens_are_disabled() {
+        let base = serde_json::json!({
+            "model": "model-a",
+            "prompt": [11, 12, 13, 14],
+            "max_tokens": 4
+        });
+        let without_option: CompletionRequest = serde_json::from_value(base.clone()).unwrap();
+        assert_eq!(without_option.exact_input_token_count(), None);
+
+        let with_option: CompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "model-a",
+            "prompt": [11, 12, 13, 14],
+            "add_special_tokens": false,
+            "max_tokens": 4
+        }))
+        .unwrap();
+        assert_eq!(with_option.exact_input_token_count(), Some(4));
+
+        let text_prompt: CompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "model-a",
+            "prompt": "hello",
+            "add_special_tokens": false
+        }))
+        .unwrap();
+        assert_eq!(text_prompt.exact_input_token_count(), None);
+
+        let batch_prompt: CompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "model-a",
+            "prompt": [[1, 2], [3, 4, 5]],
+            "add_special_tokens": false
+        }))
+        .unwrap();
+        assert_eq!(batch_prompt.exact_input_token_count(), None);
+    }
 
     #[test]
     fn program_identity_payload_excludes_generation_content() {

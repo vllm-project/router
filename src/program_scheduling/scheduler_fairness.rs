@@ -319,12 +319,17 @@ mod tests {
         scheduler.sync_targets("model", &[target]);
         let now = Instant::now();
         let mut state = scheduler.state.lock();
-        let handle = state.runtime.retain_request(&identity, 100, None, now);
+        let handle = state.runtime.retain_request(
+            &identity,
+            crate::program_scheduling::ContextTokens::estimated(100),
+            None,
+            now,
+        );
         scheduler.ensure_decision_state(
             &mut state,
             &identity,
             handle.program().clone(),
-            100,
+            crate::program_scheduling::ContextTokens::estimated(100),
             now,
             None,
         );

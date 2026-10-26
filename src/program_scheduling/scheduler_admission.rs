@@ -5,6 +5,7 @@
 
 use super::scheduler::ProgramScheduler;
 use super::scheduler_state::{ProgramPauseReason, ProgramResumeOrder, ProgramSchedulerState};
+use super::ContextTokens;
 use super::{
     BatchGainInputs, ContinuitySample, ProgramDispatch, ProgramIdentity, ProgramRef,
     ProgramRequestHandle, ProgramState, ProgramStatus, ProgramTarget, ScheduleError,
@@ -30,12 +31,12 @@ impl ProgramScheduler {
     pub async fn acquire(
         &self,
         identity: ProgramIdentity,
-        estimated_context_tokens: usize,
+        context: ContextTokens,
         targets: &[ProgramTarget],
         routing_text: Option<String>,
     ) -> Result<ProgramDispatch, ScheduleError> {
         self.sync_targets(identity.model_pool(), targets);
-        self.acquire_synced(identity, estimated_context_tokens, targets, routing_text)
+        self.acquire_synced(identity, context, targets, routing_text)
             .await
     }
 
@@ -43,24 +44,19 @@ impl ProgramScheduler {
     pub async fn acquire_from_snapshot(
         &self,
         identity: ProgramIdentity,
-        estimated_context_tokens: usize,
+        context: ContextTokens,
         targets: Arc<[ProgramTarget]>,
         routing_text: Option<String>,
     ) -> Result<ProgramDispatch, ScheduleError> {
         self.sync_target_snapshot(identity.model_pool(), targets.clone());
-        self.acquire_synced(
-            identity,
-            estimated_context_tokens,
-            targets.as_ref(),
-            routing_text,
-        )
-        .await
+        self.acquire_synced(identity, context, targets.as_ref(), routing_text)
+            .await
     }
 
     async fn acquire_synced(
         &self,
         identity: ProgramIdentity,
-        estimated_context_tokens: usize,
+        context: ContextTokens,
         targets: &[ProgramTarget],
         routing_text: Option<String>,
     ) -> Result<ProgramDispatch, ScheduleError> {
@@ -72,7 +68,7 @@ impl ProgramScheduler {
             let mut state = self.state.lock();
             let handle = state.runtime.retain_request(
                 &identity,
-                estimated_context_tokens,
+                context,
                 routing_text.as_deref(),
                 arrived_at,
             );
@@ -126,10 +122,19 @@ impl ProgramScheduler {
                 &mut state,
                 &identity,
                 reference.clone(),
-                estimated_context_tokens,
+                context,
                 arrived_at,
                 routing_text.as_deref(),
             );
+            if context.shadow_tokens().is_some() {
+                if let Some(target_id) = state
+                    .decisions
+                    .get(&reference)
+                    .and_then(|decision| decision.last_target.clone())
+                {
+                    self.record_shadow_admission(&state, &reference, &target_id, arrived_at);
+                }
+            }
             let current_tokens = state.decisions[&reference]
                 .private_tokens(self.config.progress_ttl.decode_buffer_tokens);
             if let Some(placement) = state
@@ -259,7 +264,7 @@ impl ProgramScheduler {
                 .dispatched_at()
                 .saturating_duration_since(dispatch.request_arrived_at())
                 .as_secs_f64(),
-            estimated_context_tokens = dispatch.estimated_context_tokens(),
+            context_tokens = dispatch.context_tokens(),
             placement_epoch = dispatch.placement_epoch(),
             placement_start_request = dispatch.placement_start_request(),
             "Program scheduling diagnostic"
@@ -604,17 +609,17 @@ impl ProgramScheduler {
                     state
                         .decisions
                         .get(active.reference)
-                        .map(|decision| decision.estimated_context_tokens)
+                        .map(|decision| decision.context_tokens)
                 })
                 .sum(),
-            candidate_context_tokens: decision.estimated_context_tokens,
+            candidate_context_tokens: decision.context_tokens,
             used_tokens,
             required_tokens,
             protected_remaining_rounds: &protected_rounds,
             protected_recovery_cost_seconds: &protected_costs,
             candidate_recovery_cost_seconds: self.policy.cache_miss_impact_seconds(
                 decision
-                    .estimated_context_tokens
+                    .context_tokens
                     .saturating_sub(decision.shared_prefix_tokens),
             ),
         });
@@ -871,7 +876,12 @@ mod tests {
     async fn first_program_is_admitted_and_dispatched() {
         let scheduler = ProgramScheduler::new(ProgramSchedulerConfig::default());
         let dispatch = scheduler
-            .acquire(identity("p"), 100, &[target()], None)
+            .acquire(
+                identity("p"),
+                crate::program_scheduling::ContextTokens::estimated(100),
+                &[target()],
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(dispatch.target_id, "rank-0");
@@ -887,7 +897,12 @@ mod tests {
         let scheduler = ProgramScheduler::new(config);
         let target = target();
         let first = scheduler
-            .acquire(identity("first"), 100, std::slice::from_ref(&target), None)
+            .acquire(
+                identity("first"),
+                crate::program_scheduling::ContextTokens::estimated(100),
+                std::slice::from_ref(&target),
+                None,
+            )
             .await
             .unwrap();
         {
@@ -896,7 +911,12 @@ mod tests {
         }
         let second = tokio::time::timeout(
             std::time::Duration::from_millis(10),
-            scheduler.acquire(identity("second"), 100, &[target], None),
+            scheduler.acquire(
+                identity("second"),
+                crate::program_scheduling::ContextTokens::estimated(100),
+                &[target],
+                None,
+            ),
         )
         .await;
         assert!(second.is_err());
@@ -914,7 +934,7 @@ mod tests {
         let first = scheduler
             .acquire(
                 identity("program"),
-                100,
+                crate::program_scheduling::ContextTokens::estimated(100),
                 std::slice::from_ref(&target),
                 None,
             )
@@ -922,7 +942,12 @@ mod tests {
             .unwrap();
         scheduler.complete(&first, true, false, Some(100), Some(0.1));
         let second = scheduler
-            .acquire(identity("program"), 110, &[target], None)
+            .acquire(
+                identity("program"),
+                crate::program_scheduling::ContextTokens::estimated(110),
+                &[target],
+                None,
+            )
             .await
             .unwrap();
         let state = scheduler.state.lock();
@@ -945,13 +970,18 @@ mod tests {
         let mut refs = Vec::new();
         for name in ["old", "new", "forced"] {
             let identity = identity(name);
-            let handle = state.runtime.retain_request(&identity, 100, None, now);
+            let handle = state.runtime.retain_request(
+                &identity,
+                crate::program_scheduling::ContextTokens::estimated(100),
+                None,
+                now,
+            );
             let reference = handle.program().clone();
             scheduler.ensure_decision_state(
                 &mut state,
                 &identity,
                 reference.clone(),
-                100,
+                crate::program_scheduling::ContextTokens::estimated(100),
                 now,
                 None,
             );
@@ -996,13 +1026,18 @@ mod tests {
         let mut refs = Vec::new();
         for (index, name) in ["first", "second"].into_iter().enumerate() {
             let identity = identity(name);
-            let handle = state.runtime.retain_request(&identity, 100, None, now);
+            let handle = state.runtime.retain_request(
+                &identity,
+                crate::program_scheduling::ContextTokens::estimated(100),
+                None,
+                now,
+            );
             let reference = handle.program().clone();
             scheduler.ensure_decision_state(
                 &mut state,
                 &identity,
                 reference.clone(),
-                100,
+                crate::program_scheduling::ContextTokens::estimated(100),
                 now,
                 None,
             );
@@ -1030,13 +1065,18 @@ mod tests {
         let mut queued = Vec::new();
         for (name, priority, yielded) in specifications {
             let identity = identity_with_priority(name, priority);
-            let handle = state.runtime.retain_request(&identity, 100, None, now);
+            let handle = state.runtime.retain_request(
+                &identity,
+                crate::program_scheduling::ContextTokens::estimated(100),
+                None,
+                now,
+            );
             let reference = handle.program().clone();
             scheduler.ensure_decision_state(
                 &mut state,
                 &identity,
                 reference.clone(),
-                100,
+                crate::program_scheduling::ContextTokens::estimated(100),
                 now,
                 None,
             );
@@ -1060,12 +1100,17 @@ mod tests {
         let now = Instant::now();
         let identity = identity("yielded");
         let mut state = scheduler.state.lock();
-        let handle = state.runtime.retain_request(&identity, 100, None, now);
+        let handle = state.runtime.retain_request(
+            &identity,
+            crate::program_scheduling::ContextTokens::estimated(100),
+            None,
+            now,
+        );
         scheduler.ensure_decision_state(
             &mut state,
             &identity,
             handle.program().clone(),
-            100,
+            crate::program_scheduling::ContextTokens::estimated(100),
             now,
             None,
         );
@@ -1091,12 +1136,17 @@ mod tests {
         let now = Instant::now();
         let identity = identity_with_expected_output("program", 200);
         let mut state = scheduler.state.lock();
-        let handle = state.runtime.retain_request(&identity, 100, None, now);
+        let handle = state.runtime.retain_request(
+            &identity,
+            crate::program_scheduling::ContextTokens::estimated(100),
+            None,
+            now,
+        );
         scheduler.ensure_decision_state(
             &mut state,
             &identity,
             handle.program().clone(),
-            100,
+            crate::program_scheduling::ContextTokens::estimated(100),
             now,
             None,
         );
@@ -1115,12 +1165,17 @@ mod tests {
         let now = Instant::now();
         let handle = {
             let mut state = scheduler.state.lock();
-            let handle = state.runtime.retain_request(&identity, 100, None, now);
+            let handle = state.runtime.retain_request(
+                &identity,
+                crate::program_scheduling::ContextTokens::estimated(100),
+                None,
+                now,
+            );
             scheduler.ensure_decision_state(
                 &mut state,
                 &identity,
                 handle.program().clone(),
-                100,
+                crate::program_scheduling::ContextTokens::estimated(100),
                 now,
                 None,
             );
@@ -1149,12 +1204,17 @@ mod tests {
         let now = Instant::now();
         let identity = identity("forced");
         let mut state = scheduler.state.lock();
-        let handle = state.runtime.retain_request(&identity, 100, None, now);
+        let handle = state.runtime.retain_request(
+            &identity,
+            crate::program_scheduling::ContextTokens::estimated(100),
+            None,
+            now,
+        );
         scheduler.ensure_decision_state(
             &mut state,
             &identity,
             handle.program().clone(),
-            100,
+            crate::program_scheduling::ContextTokens::estimated(100),
             now,
             None,
         );
@@ -1181,7 +1241,12 @@ mod tests {
         let scheduler = ProgramScheduler::new(ProgramSchedulerConfig::default());
         let target = target();
         let first = scheduler
-            .acquire(identity("marked"), 100, std::slice::from_ref(&target), None)
+            .acquire(
+                identity("marked"),
+                crate::program_scheduling::ContextTokens::estimated(100),
+                std::slice::from_ref(&target),
+                None,
+            )
             .await
             .unwrap();
         {
@@ -1198,7 +1263,12 @@ mod tests {
                 .active_program_token_delta = 100.0;
         }
         let second = scheduler
-            .acquire(identity("marked"), 200, &[target], None)
+            .acquire(
+                identity("marked"),
+                crate::program_scheduling::ContextTokens::estimated(200),
+                &[target],
+                None,
+            )
             .await
             .unwrap();
         let state = scheduler.state.lock();

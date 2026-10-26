@@ -35,7 +35,14 @@ pub struct ProgramDiagnostic {
     pub home_target: Option<String>,
     pub last_target: Option<String>,
     pub placement: Option<String>,
-    pub estimated_context_tokens: usize,
+    /// Input-token demand currently reserved in the rank ledger.
+    pub context_tokens: usize,
+    /// Provenance of `context_tokens`.
+    pub context_token_source: &'static str,
+    /// Prepared counterfactual recorded by shadow mode, if any.
+    pub shadow_context_tokens: Option<usize>,
+    /// Fingerprint of the prepared count behind `context_tokens`, if any.
+    pub context_token_fingerprint: Option<String>,
     pub shared_prefix_tokens: usize,
     pub shared_prefix_freshness_remaining_seconds: Option<f64>,
     pub logical_tokens: usize,
@@ -245,13 +252,18 @@ impl ProgramScheduler {
                     home_target: decision.home_target.clone(),
                     last_target: decision.last_target.clone(),
                     placement: runtime.placement.map(str::to_string),
-                    estimated_context_tokens: decision.estimated_context_tokens,
+                    context_tokens: decision.context_tokens,
+                    context_token_source: decision.context_token_source.as_str(),
+                    shadow_context_tokens: decision.shadow_context_tokens,
+                    context_token_fingerprint: decision
+                        .context_token_fingerprint
+                        .map(|fingerprint| fingerprint.as_hex()),
                     shared_prefix_tokens: decision.shared_prefix_tokens,
                     shared_prefix_freshness_remaining_seconds: decision
                         .shared_prefix_fresh_until
                         .map(|deadline| deadline.saturating_duration_since(now).as_secs_f64()),
                     logical_tokens: decision
-                        .estimated_context_tokens
+                        .context_tokens
                         .saturating_add(self.config.progress_ttl.decode_buffer_tokens),
                     private_tokens: decision
                         .private_tokens(self.config.progress_ttl.decode_buffer_tokens)
@@ -469,7 +481,12 @@ mod tests {
         .unwrap()
         .unwrap();
         let _dispatch = scheduler
-            .acquire(identity, 123, std::slice::from_ref(&target), None)
+            .acquire(
+                identity,
+                crate::program_scheduling::ContextTokens::estimated(123),
+                std::slice::from_ref(&target),
+                None,
+            )
             .await
             .unwrap();
 
@@ -477,7 +494,11 @@ mod tests {
         assert_eq!(snapshot.ranks.len(), 1);
         assert_eq!(snapshot.ranks[0].target_id, "rank-0");
         assert_eq!(snapshot.ranks[0].router_active_reasoning_programs, 1);
-        assert_eq!(snapshot.ranks[0].programs[0].estimated_context_tokens, 123);
+        assert_eq!(snapshot.ranks[0].programs[0].context_tokens, 123);
+        assert_eq!(
+            snapshot.ranks[0].programs[0].context_token_source,
+            "estimated"
+        );
         assert!(snapshot.ranks[0].programs[0].expected_resume);
         assert!(!snapshot.ranks[0].observation_fresh);
         assert_eq!(

@@ -5,7 +5,7 @@ use std::hash::{BuildHasher, Hash};
 use std::sync::OnceLock;
 use std::time::Instant;
 
-use super::ProgramRequestHints;
+use super::{ContextTokens, ProgramRequestHints};
 
 /// Whether a Program currently owns logical admission capacity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,7 +89,7 @@ pub struct ProgramDispatch {
     placement_epoch: u64,
     request_arrived_at: Instant,
     dispatched_at: Instant,
-    estimated_context_tokens: usize,
+    context: ContextTokens,
     placement_start_request: bool,
     routing_text: Option<String>,
     request_hints: ProgramRequestHints,
@@ -104,7 +104,7 @@ impl ProgramDispatch {
         placement_epoch: u64,
         request_arrived_at: Instant,
         dispatched_at: Instant,
-        estimated_context_tokens: usize,
+        context: ContextTokens,
         placement_start_request: bool,
         routing_text: Option<String>,
         request_hints: ProgramRequestHints,
@@ -115,7 +115,7 @@ impl ProgramDispatch {
             placement_epoch,
             request_arrived_at,
             dispatched_at,
-            estimated_context_tokens,
+            context,
             placement_start_request,
             routing_text,
             request_hints,
@@ -142,9 +142,24 @@ impl ProgramDispatch {
         self.dispatched_at
     }
 
-    /// Arrival-time context estimate for completion fallback.
-    pub fn estimated_context_tokens(&self) -> usize {
-        self.estimated_context_tokens
+    /// Applied arrival-time context demand for completion fallback.
+    pub fn context_tokens(&self) -> usize {
+        self.context.tokens()
+    }
+
+    /// Provenance of the applied context demand.
+    pub fn context_token_source(&self) -> super::TokenFactSource {
+        self.context.source()
+    }
+
+    /// Fingerprint of a prepared count, when this attempt carried one.
+    pub fn context_token_fingerprint(&self) -> Option<super::TokenizerFingerprint> {
+        self.context.fingerprint()
+    }
+
+    /// Shadow counterfactual recorded at arrival, when shadow mode was active.
+    pub fn shadow_context_tokens(&self) -> Option<usize> {
+        self.context.shadow_tokens()
     }
 
     /// Whether this is the first request after admission or resume.

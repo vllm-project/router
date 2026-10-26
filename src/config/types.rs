@@ -5,7 +5,7 @@ use std::collections::HashMap;
 
 use crate::program_scheduling::{
     DecodeThroughputModel, PrefillCostModel, ProgramBindingStrategy, ProgramResumeOrder,
-    ProgramSchedulingEnableKey,
+    ProgramSchedulingEnableKey, TokenCountMode,
 };
 
 /// Main router configuration
@@ -143,6 +143,20 @@ pub struct ProgramSchedulingConfig {
     pub hash_virtual_nodes: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_capacity_per_dp_rank: Option<usize>,
+    /// Input-token fact source used for admission, growth, and TTL cost.
+    #[serde(default)]
+    pub token_count_mode: TokenCountMode,
+    /// Model pools allowed to apply prepared exact counts. Empty means all.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub token_count_model_pools: Vec<String>,
+    /// Text endpoints allowed to apply Router-tokenized exact counts.
+    ///
+    /// Exactness for HTTP text requires verified tokenizer/template
+    /// equivalence; deployments opt in per endpoint (for example
+    /// `/v1/chat/completions`) and the Router revokes a fingerprint whose
+    /// prepared count disagrees with Engine usage.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exact_text_endpoints: Vec<String>,
     #[serde(default = "default_program_max_active_programs_per_target")]
     pub max_active_programs_per_target: usize,
     #[serde(default = "default_program_metrics_interval_seconds")]
@@ -272,6 +286,9 @@ impl Default for ProgramSchedulingConfig {
             binding_strategy: ProgramBindingStrategy::default(),
             hash_virtual_nodes: default_program_hash_virtual_nodes(),
             token_capacity_per_dp_rank: None,
+            token_count_mode: TokenCountMode::default(),
+            token_count_model_pools: Vec::new(),
+            exact_text_endpoints: Vec::new(),
             max_active_programs_per_target: default_program_max_active_programs_per_target(),
             metrics_interval_seconds: default_program_metrics_interval_seconds(),
             admission_waiting_request_threshold:
@@ -319,6 +336,12 @@ struct ProgramSchedulingConfigInput {
     hash_virtual_nodes: u32,
     #[serde(default, alias = "token_capacity_per_target")]
     token_capacity_per_dp_rank: Option<usize>,
+    #[serde(default)]
+    token_count_mode: TokenCountMode,
+    #[serde(default)]
+    token_count_model_pools: Vec<String>,
+    #[serde(default)]
+    exact_text_endpoints: Vec<String>,
     #[serde(default = "default_program_max_active_programs_per_target")]
     max_active_programs_per_target: usize,
     #[serde(default = "default_program_metrics_interval_seconds")]
@@ -443,6 +466,9 @@ impl<'de> Deserialize<'de> for ProgramSchedulingConfig {
             binding_strategy: input.binding_strategy,
             hash_virtual_nodes: input.hash_virtual_nodes,
             token_capacity_per_dp_rank: input.token_capacity_per_dp_rank,
+            token_count_mode: input.token_count_mode,
+            token_count_model_pools: input.token_count_model_pools,
+            exact_text_endpoints: input.exact_text_endpoints,
             max_active_programs_per_target: input.max_active_programs_per_target,
             metrics_interval_seconds: input.metrics_interval_seconds,
             admission_waiting_request_threshold: input.admission_waiting_request_threshold,
@@ -1018,6 +1044,38 @@ mod tests {
     use super::*;
 
     // ============= RouterConfig Tests =============
+
+    #[test]
+    fn program_token_count_mode_parses_and_defaults_to_estimated() {
+        let default = ProgramSchedulingConfig::resolve(true, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(default.token_count_mode, TokenCountMode::Estimated);
+        assert!(default.token_count_model_pools.is_empty());
+
+        let configured = ProgramSchedulingConfig::resolve(
+            true,
+            Some(r#"{"token_count_mode":"exact_when_verified","token_count_model_pools":["model-a"]}"#),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            configured.token_count_mode,
+            TokenCountMode::ExactWhenVerified
+        );
+        assert_eq!(configured.token_count_model_pools, vec!["model-a"]);
+
+        let shadow =
+            ProgramSchedulingConfig::resolve(true, Some(r#"{"token_count_mode":"shadow"}"#))
+                .unwrap()
+                .unwrap();
+        assert_eq!(shadow.token_count_mode, TokenCountMode::Shadow);
+
+        assert!(
+            ProgramSchedulingConfig::resolve(true, Some(r#"{"token_count_mode":"bogus"}"#))
+                .is_err()
+        );
+    }
 
     #[test]
     fn test_router_config_default() {

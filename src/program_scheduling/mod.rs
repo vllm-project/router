@@ -20,6 +20,8 @@ mod scheduler_fairness;
 mod scheduler_global;
 mod scheduler_lifecycle;
 mod scheduler_state;
+mod scheduler_tokens;
+mod token_facts;
 
 pub use binding::{
     ProgramBindingCandidate, ProgramBindingPolicy, ProgramBindingStrategy, ProgramBindings,
@@ -46,3 +48,7 @@ pub use request_pool::ProgramRequestHandle;
 pub use runtime::ProgramRuntime;
 pub use scheduler::{BackendObservationEpoch, ProgramScheduler};
 pub use scheduler_state::{ProgramResumeOrder, ProgramSchedulerConfig};
+pub use token_facts::{
+    resolve_context_tokens, ArrivalTokenFacts, ContextTokens, TokenCountMode, TokenFactFallback,
+    TokenFactSource, TokenFacts, TokenizerFingerprint,
+};

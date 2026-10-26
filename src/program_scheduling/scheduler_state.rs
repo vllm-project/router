@@ -5,8 +5,9 @@
 
 use super::lineage::ProgramLineage;
 use super::{
-    ProgramBindingStrategy, ProgramBindings, ProgramRef, ProgramRuntime,
+    ContextTokens, ProgramBindingStrategy, ProgramBindings, ProgramRef, ProgramRuntime,
     ProgramSchedulingEnableKey, ProgramTarget, ProgressTtlConfig, ProgressTtlFactors,
+    TokenCountMode, TokenFactSource, TokenizerFingerprint,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::Arc;
@@ -42,6 +43,12 @@ pub struct ProgramSchedulerConfig {
     pub hash_virtual_nodes: u32,
     /// Coarse Program-count guard when explicit token capacity is unavailable.
     pub max_active_programs_per_target: usize,
+    /// Input-token fact source used for admission, growth, and TTL cost.
+    pub token_count_mode: TokenCountMode,
+    /// Model pools allowed to apply prepared exact counts. Empty means all.
+    pub token_count_model_pools: Vec<String>,
+    /// Text endpoints allowed to apply Router-tokenized exact counts.
+    pub exact_text_endpoints: Vec<String>,
     /// Backend observation and periodic scheduling interval.
     pub metrics_interval: Duration,
     /// Block admission at or above this native waiting-request count.
@@ -71,6 +78,9 @@ impl Default for ProgramSchedulerConfig {
             binding_strategy: ProgramBindingStrategy::ConsistentHash,
             hash_virtual_nodes: 160,
             max_active_programs_per_target: 64,
+            token_count_mode: TokenCountMode::default(),
+            token_count_model_pools: Vec::new(),
+            exact_text_endpoints: Vec::new(),
             metrics_interval: Duration::from_secs(1),
             admission_waiting_request_threshold: 1,
             queue_timeout: Duration::from_secs(600),
@@ -94,6 +104,9 @@ impl From<&crate::config::types::ProgramSchedulingConfig> for ProgramSchedulerCo
             binding_strategy: config.binding_strategy,
             hash_virtual_nodes: config.hash_virtual_nodes,
             max_active_programs_per_target: config.max_active_programs_per_target,
+            token_count_mode: config.token_count_mode,
+            token_count_model_pools: config.token_count_model_pools.clone(),
+            exact_text_endpoints: config.exact_text_endpoints.clone(),
             metrics_interval: Duration::from_secs_f64(config.metrics_interval_seconds),
             admission_waiting_request_threshold: config.admission_waiting_request_threshold,
             queue_timeout: Duration::from_secs_f64(config.queue_timeout_seconds),
@@ -156,7 +169,14 @@ pub(crate) struct ProgramDecisionState {
     pub(crate) step_id: u64,
     pub(crate) home_target: Option<String>,
     pub(crate) last_target: Option<String>,
-    pub(crate) estimated_context_tokens: usize,
+    /// Input-token demand currently reserved in the rank ledger.
+    pub(crate) context_tokens: usize,
+    /// Provenance of `context_tokens`.
+    pub(crate) context_token_source: TokenFactSource,
+    /// Prepared counterfactual recorded by shadow mode, if any.
+    pub(crate) shadow_context_tokens: Option<usize>,
+    /// Fingerprint of the prepared count that established `context_tokens`.
+    pub(crate) context_token_fingerprint: Option<TokenizerFingerprint>,
     pub(crate) output_token_reservation: Option<usize>,
     pub(crate) context_shrink_observations: u8,
     pub(crate) completed_requests: usize,
@@ -193,7 +213,7 @@ impl ProgramDecisionState {
         placement_key: String,
         placement_hash_key: String,
         home_target: Option<String>,
-        estimated_context_tokens: usize,
+        context: ContextTokens,
         now: Instant,
     ) -> Self {
         Self {
@@ -209,7 +229,10 @@ impl ProgramDecisionState {
             step_id: 0,
             last_target: home_target.clone(),
             home_target,
-            estimated_context_tokens,
+            context_tokens: context.tokens(),
+            context_token_source: context.source(),
+            shadow_context_tokens: context.shadow_tokens(),
+            context_token_fingerprint: context.fingerprint(),
             output_token_reservation: None,
             context_shrink_observations: 0,
             completed_requests: 0,
@@ -251,7 +274,7 @@ impl ProgramDecisionState {
         decode_buffer_tokens: usize,
         expected_output_tokens: Option<usize>,
     ) -> f64 {
-        self.estimated_context_tokens
+        self.context_tokens
             .saturating_sub(self.shared_prefix_tokens)
             .saturating_add(
                 expected_output_tokens
@@ -260,16 +283,50 @@ impl ProgramDecisionState {
             ) as f64
     }
 
-    pub(crate) fn observe_completed_context(&mut self, observed_context_tokens: usize) {
+    /// Demand implied by the prepared counterfactual, used only for shadow
+    /// decisions. Never feeds admission or accounting.
+    pub(crate) fn shadow_private_tokens_with_output(
+        &self,
+        decode_buffer_tokens: usize,
+        expected_output_tokens: Option<usize>,
+    ) -> Option<f64> {
+        self.shadow_context_tokens.map(|tokens| {
+            tokens
+                .saturating_sub(self.shared_prefix_tokens)
+                .saturating_add(
+                    expected_output_tokens
+                        .or(self.output_token_reservation)
+                        .unwrap_or(decode_buffer_tokens),
+                ) as f64
+        })
+    }
+
+    /// Reconcile an Engine-observed context with the current ledger demand.
+    ///
+    /// Trusted prepared counts may replace an older estimate immediately when
+    /// no other attempt of this Program can still grow the context. Estimated
+    /// inputs and overlapping attempts keep the two-shrink-confirmation rule so
+    /// a smaller observed count cannot undercount concurrent requests.
+    pub(crate) fn observe_completed_context(
+        &mut self,
+        observed_context_tokens: usize,
+        trusted_prepared: bool,
+        context_is_quiescent: bool,
+    ) {
         const SHRINK_CONFIRMATIONS: u8 = 2;
-        if observed_context_tokens >= self.estimated_context_tokens {
-            self.estimated_context_tokens = observed_context_tokens;
+        if observed_context_tokens >= self.context_tokens {
+            self.context_tokens = observed_context_tokens;
+            self.context_shrink_observations = 0;
+            return;
+        }
+        if trusted_prepared && context_is_quiescent {
+            self.context_tokens = observed_context_tokens;
             self.context_shrink_observations = 0;
             return;
         }
         self.context_shrink_observations = self.context_shrink_observations.saturating_add(1);
         if self.context_shrink_observations >= SHRINK_CONFIRMATIONS {
-            self.estimated_context_tokens = observed_context_tokens;
+            self.context_tokens = observed_context_tokens;
             self.context_shrink_observations = 0;
         }
     }
@@ -325,6 +382,13 @@ pub(crate) struct ProgramSchedulerState {
     pub(crate) observations: HashMap<String, RankObservationState>,
     pub(crate) rank_factors: HashMap<String, ProgressTtlFactors>,
     pub(crate) lineage: ProgramLineage,
+    /// Fingerprints whose prepared counts disagreed with Engine usage.
+    ///
+    /// Ordered by revocation time and bounded so a pathological workload cannot
+    /// grow scheduler memory without limit.
+    pub(crate) revoked_token_fingerprints: BTreeMap<TokenizerFingerprint, Instant>,
+    /// Total revocations, including entries evicted from the bounded map.
+    pub(crate) token_fingerprint_revocations: u64,
 }
 
 impl ProgramSchedulerState {
@@ -342,6 +406,8 @@ impl ProgramSchedulerState {
             observations: HashMap::new(),
             rank_factors: HashMap::new(),
             lineage: ProgramLineage::default(),
+            revoked_token_fingerprints: BTreeMap::new(),
+            token_fingerprint_revocations: 0,
         }
     }
 }
@@ -372,14 +438,44 @@ mod tests {
             "task".into(),
             "hash".into(),
             Some("rank-0".into()),
-            100,
+            ContextTokens::estimated(100),
             now,
         );
-        state.observe_completed_context(80);
-        assert_eq!(state.estimated_context_tokens, 100);
-        state.observe_completed_context(80);
-        assert_eq!(state.estimated_context_tokens, 80);
-        state.observe_completed_context(120);
-        assert_eq!(state.estimated_context_tokens, 120);
+        state.observe_completed_context(80, false, true);
+        assert_eq!(state.context_tokens, 100);
+        state.observe_completed_context(80, false, true);
+        assert_eq!(state.context_tokens, 80);
+        state.observe_completed_context(120, false, true);
+        assert_eq!(state.context_tokens, 120);
+    }
+
+    #[test]
+    fn trusted_prepared_context_may_shrink_immediately() {
+        let now = Instant::now();
+        let mut state = ProgramDecisionState::new(
+            "task".into(),
+            "hash".into(),
+            Some("rank-0".into()),
+            ContextTokens::estimated(100_000),
+            now,
+        );
+        state.observe_completed_context(80_000, true, true);
+        assert_eq!(state.context_tokens, 80_000);
+    }
+
+    #[test]
+    fn trusted_prepared_context_keeps_overlap_confirmation() {
+        let now = Instant::now();
+        let mut state = ProgramDecisionState::new(
+            "task".into(),
+            "hash".into(),
+            Some("rank-0".into()),
+            ContextTokens::estimated(100_000),
+            now,
+        );
+        state.observe_completed_context(80_000, true, false);
+        assert_eq!(state.context_tokens, 100_000);
+        state.observe_completed_context(80_000, true, false);
+        assert_eq!(state.context_tokens, 80_000);
     }
 }
