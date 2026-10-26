@@ -50,6 +50,11 @@ def _has_launch_server_module() -> bool:
     return importlib.util.find_spec("vllm.launch_server") is not None
 
 
+def _legacy_pd_cli_flags(extra: list[str]) -> list[str]:
+    """Flags only meant for ``vllm.launch_server`` / legacy PD worker launches."""
+    return [a for a in extra if a.startswith("--disaggregation")]
+
+
 def vllm_worker_command(
     model: str,
     host: str,
@@ -83,6 +88,14 @@ def vllm_worker_command(
         cmd.extend(tail)
         return cmd
 
+    pd_flags = _legacy_pd_cli_flags(tail)
+    if pd_flags:
+        raise RuntimeError(
+            "vllm serve (pip vLLM >= 0.29) does not accept legacy disaggregation "
+            f"worker flags {pd_flags!r}. Use a vLLM install with vllm.launch_server "
+            "for test_pd_router PD workers, or run pd_disagg_vllm shell scripts."
+        )
+
     vllm_bin = shutil.which("vllm") or "vllm"
     cmd = [vllm_bin, "serve", model, "--host", host, "--port", str(port)]
     if dp_size is not None and dp_size > 1:
@@ -104,8 +117,6 @@ def vllm_worker_popen_env(
         return env
     start = int(base_gpu_id or 0)
     width = max(1, int(dp_size) if dp_size is not None and dp_size > 0 else 1)
-    if start == 0 and width == 1:
-        return env
     env["CUDA_VISIBLE_DEVICES"] = ",".join(str(start + i) for i in range(width))
     return env
 
