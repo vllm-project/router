@@ -38,7 +38,7 @@ See `scripts/llama3.1/` for example setup scripts showing the proper configurati
 
 ### Test Script
 
-Location: `py_test/e2e/pd_disagg_vllm/run_accuracy_test.sh`
+Location: `tests/python/e2e/pd_disagg_vllm/run_accuracy_test.sh`
 
 The test script:
 - Launches prefill and decode vLLM instances in Docker containers
@@ -120,7 +120,7 @@ On test completion (success or failure), artifacts are collected:
 To run the test locally:
 
 ```bash
-cd py_test/e2e/pd_disagg_vllm
+cd tests/python/e2e/pd_disagg_vllm
 
 # Run with defaults
 bash ./run_accuracy_test.sh

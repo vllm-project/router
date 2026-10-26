@@ -265,7 +265,7 @@ if ! command -v vllm-router &> /dev/null; then
   fi
 
   # Build router from repository root
-  REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
+  REPO_ROOT="$(cd "${SCRIPT_DIR}/../../../.." && pwd)"
   pushd "$REPO_ROOT" > /dev/null
   cargo build --release
   export PATH="${REPO_ROOT}/target/release:$PATH"

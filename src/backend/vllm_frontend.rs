@@ -78,7 +78,7 @@ impl VllmFrontend {
     pub fn chat_tokenize_timed(
         &self,
         request: &ChatRequest,
-    ) -> vllm_chat::Result<(Vec<u32>, f64, f64)> {
+    ) -> vllm_chat::Result<(Arc<[u32]>, f64, f64)> {
         let t0 = Instant::now();
         let rendered = self.backends.chat_backend.chat_renderer().render(request)?;
         let template_ms = t0.elapsed().as_secs_f64() * 1000.0;

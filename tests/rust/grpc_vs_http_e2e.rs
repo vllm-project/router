@@ -6,7 +6,7 @@
 //! prompt. That locks **this PR's default contract**, not a forever ban
 //! on a gRPC text fallback or HTTP token-id input.
 //!
-//! Uses `tests/common/mock_vllm_rs.rs`. Pin fake ids via
+//! Uses `tests/rust/common/mock_vllm_rs.rs`. Pin fake ids via
 //! `Router::pin_test_token_ids` so CI does not load a real tokenizer.
 //!
 //!   cargo test --test grpc_vs_http_e2e
@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex};
 
 use axum::{extract::Json, routing::get, routing::post, Router as AxumRouter};
 use common::create_test_context;
-use common::mock_vllm_rs::MockVllmRsServer;
+use common::mock_vllm_rs::{MockVllmRs, MockVllmRsServer};
 use common::test_app::create_test_app;
 use serde_json::json;
 use tokio::net::TcpListener;
@@ -379,4 +379,297 @@ async fn grpc_stream_emits_openai_compatible_usage_chunk() {
             .is_some_and(|items| !items.is_empty()))
         .all(|chunk| chunk.get("usage").is_none() || chunk["usage"].is_null()));
     assert!(text.contains("data: [DONE]"));
+}
+
+/// Non-streaming `/v1/completions` body shared by several tests.
+fn completion_body() -> serde_json::Value {
+    json!({"model": "test-model", "prompt": [1, 2, 3], "max_tokens": 8, "stream": false})
+}
+
+/// Router pinned to one in-process worker, plus that worker.
+async fn completion_app(state: MockVllmRs) -> (MockVllmRsServer, AxumRouter) {
+    let grpc = MockVllmRsServer::spawn_with_state(state).await;
+    let config = test_config(vec![grpc.grpc_url.clone()]);
+    let ctx = create_test_context(config.clone());
+    let router = Router::new(vec![grpc.grpc_url.clone()], &ctx)
+        .await
+        .expect("grpc worker should pass grpc.health.v1");
+    // Pinned ids differ from the client prompt ids below, so an assertion on
+    // captured [1, 2, 3] proves the client ids reached the worker unchanged.
+    router.pin_test_token_ids(vec![9, 9, 9]);
+    (
+        grpc,
+        create_test_app(Arc::new(router), reqwest::Client::new(), &config),
+    )
+}
+
+async fn post_completion(app: AxumRouter, body: serde_json::Value) -> axum::response::Response {
+    app.oneshot(
+        axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/completions")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(body.to_string()))
+            .unwrap(),
+    )
+    .await
+    .unwrap()
+}
+
+async fn body_text(response: axum::response::Response) -> String {
+    String::from_utf8(
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap()
+}
+
+async fn body_json(response: axum::response::Response) -> serde_json::Value {
+    serde_json::from_slice(
+        &axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap()
+}
+
+/// SSE `data:` payloads in order, `[DONE]` dropped.
+fn sse_events(body: &str) -> Vec<serde_json::Value> {
+    body.lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .filter(|data| *data != "[DONE]")
+        .map(|data| serde_json::from_str(data).unwrap())
+        .collect()
+}
+
+/// What a completion client reads across chunks: joined `text` and every id.
+fn streamed(chunks: &[serde_json::Value]) -> (String, Vec<u64>) {
+    let text = chunks
+        .iter()
+        .map(|chunk| chunk["choices"][0]["text"].as_str().unwrap_or_default())
+        .collect();
+    let token_ids = chunks
+        .iter()
+        .flat_map(|chunk| {
+            chunk["choices"][0]["token_ids"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+        })
+        .filter_map(|id| id.as_u64())
+        .collect();
+    (text, token_ids)
+}
+
+/// `/v1/completions` on a gRPC pool must answer with `text_completion`, not
+/// the internal chat shape: Completion clients read `choices[].text`.
+#[tokio::test]
+async fn grpc_completions_reply_is_text_completion_shaped() {
+    let (grpc, app) = completion_app(MockVllmRs::default()).await;
+
+    let response = post_completion(app, completion_body()).await;
+    assert!(
+        response.status().is_success(),
+        "status {}",
+        response.status()
+    );
+    let json = body_json(response).await;
+    assert_eq!(json["object"], "text_completion");
+    assert_eq!(json["choices"][0]["text"], "hello from worker");
+    assert!(
+        json["choices"][0].get("message").is_none(),
+        "completion clients read choices[].text: {json}"
+    );
+    assert!(
+        json["choices"][0].get("prompt_token_ids").is_none(),
+        "prompt_token_ids must follow return_token_ids: {json}"
+    );
+    assert!(
+        json["id"].as_str().unwrap_or_default().starts_with("cmpl-"),
+        "unexpected id {}",
+        json["id"]
+    );
+
+    let captured = grpc.captured();
+    assert_eq!(captured.len(), 1);
+    assert_eq!(captured[0].token_ids, vec![1, 2, 3]);
+    assert!(!captured[0].had_text_prompt);
+}
+
+/// Streaming `/v1/completions` must emit `choices[].text` (plus the vLLM
+/// `token_ids` used for token-exact replay validation), never `delta`.
+#[tokio::test]
+async fn grpc_completions_stream_carries_text_and_token_ids() {
+    let (_grpc, app) = completion_app(MockVllmRs::default()).await;
+
+    let response = post_completion(
+        app,
+        json!({
+            "model": "test-model",
+            "prompt": [1, 2, 3],
+            "max_tokens": 8,
+            "return_token_ids": true,
+            "stream": true,
+            "stream_options": {"include_usage": true}
+        }),
+    )
+    .await;
+    assert!(
+        response.status().is_success(),
+        "status {}",
+        response.status()
+    );
+    let text = body_text(response).await;
+    assert!(text.contains("data: [DONE]"), "{text}");
+
+    let chunks = sse_events(&text);
+    let choice_chunks: Vec<serde_json::Value> = chunks
+        .iter()
+        .filter(|chunk| {
+            chunk["choices"]
+                .as_array()
+                .is_some_and(|items| !items.is_empty())
+        })
+        .cloned()
+        .collect();
+    assert!(!choice_chunks.is_empty(), "{text}");
+    assert!(
+        !choice_chunks[0]["choices"][0]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .is_empty(),
+        "the first choice chunk must carry text, not a priming placeholder: {text}"
+    );
+
+    let (streamed_text, streamed_ids) = streamed(&choice_chunks);
+    assert_eq!(streamed_text, "hello from worker");
+    assert_eq!(streamed_ids, vec![7, 8, 9]);
+    for chunk in &choice_chunks {
+        assert_eq!(chunk["object"], "text_completion");
+        assert!(
+            chunk["choices"][0].get("delta").is_none(),
+            "completion chunks must not use chat deltas: {chunk}"
+        );
+    }
+
+    let usage_chunks: Vec<&serde_json::Value> = chunks
+        .iter()
+        .filter(|chunk| chunk.get("usage").is_some_and(|usage| !usage.is_null()))
+        .collect();
+    assert_eq!(usage_chunks.len(), 1, "{text}");
+    assert_eq!(usage_chunks[0]["object"], "text_completion");
+    assert_eq!(usage_chunks[0]["choices"], json!([]));
+    assert_eq!(
+        usage_chunks[0]["usage"],
+        json!({
+            "prompt_tokens": 3,
+            "completion_tokens": 3,
+            "total_tokens": 6
+        })
+    );
+}
+
+/// The decoder buffers byte-fallback fragments, so a frame can carry ids while
+/// its text is empty. `return_token_ids` clients must still receive every id.
+#[tokio::test]
+async fn grpc_completions_stream_keeps_ids_from_textless_frames() {
+    let (_grpc, app) = completion_app(MockVllmRs {
+        frames: Some(vec![
+            ("hello ".to_string(), vec![7]),
+            (String::new(), vec![8]),
+            ("from worker".to_string(), vec![9]),
+        ]),
+        ..Default::default()
+    })
+    .await;
+
+    let response = post_completion(
+        app,
+        json!({
+            "model": "test-model",
+            "prompt": [1, 2, 3],
+            "max_tokens": 8,
+            "return_token_ids": true,
+            "stream": true
+        }),
+    )
+    .await;
+    assert!(response.status().is_success());
+    let text = body_text(response).await;
+
+    let (streamed_text, streamed_ids) = streamed(&sse_events(&text));
+    assert_eq!(streamed_text, "hello from worker", "{text}");
+    assert_eq!(streamed_ids, vec![7, 8, 9], "{text}");
+}
+
+/// `token_ids` is opt-in, exactly as in the OpenAI schema.
+#[tokio::test]
+async fn grpc_completions_hides_token_ids_unless_requested() {
+    let (_grpc, app) = completion_app(MockVllmRs::default()).await;
+
+    let response = post_completion(
+        app.clone(),
+        json!({
+            "model": "test-model",
+            "prompt": [1, 2, 3],
+            "max_tokens": 8,
+            "stream": true
+        }),
+    )
+    .await;
+    let text = body_text(response).await;
+    assert!(!text.contains("token_ids"), "{text}");
+
+    let response = post_completion(app, completion_body()).await;
+    let json = body_json(response).await;
+    assert!(json["choices"][0].get("token_ids").is_none(), "{json}");
+}
+
+/// The non-streaming reply honors `return_token_ids` too.
+#[tokio::test]
+async fn grpc_completions_reply_carries_token_ids_when_requested() {
+    let (_grpc, app) = completion_app(MockVllmRs::default()).await;
+
+    let response = post_completion(
+        app,
+        json!({
+            "model": "test-model",
+            "prompt": [1, 2, 3],
+            "max_tokens": 8,
+            "return_token_ids": true
+        }),
+    )
+    .await;
+    assert!(response.status().is_success());
+    let json = body_json(response).await;
+    assert_eq!(json["choices"][0]["token_ids"], json!([7, 8, 9]));
+    assert_eq!(json["choices"][0]["prompt_token_ids"], json!([1, 2, 3]));
+    assert_eq!(json["choices"][0]["text"], "hello from worker");
+}
+
+#[tokio::test]
+async fn grpc_completions_rejects_unsupported_requests() {
+    let (grpc, app) = completion_app(MockVllmRs::default()).await;
+
+    for body in [
+        json!({"model": "test-model", "prompt": [1, -2, 3], "max_tokens": 8}),
+        json!({"model": "test-model", "prompt": "hello", "max_tokens": 8}),
+        json!({"model": "test-model", "prompt": [[1, 2]], "max_tokens": 8}),
+        json!({"model": "test-model", "prompt": [1, 2, 3], "suffix": "tail"}),
+        json!({"model": "test-model", "prompt": [1, 2, 3], "documents": [{"content": "x"}]}),
+        json!({"model": "test-model", "prompt": [1, 2, 3], "guided_decoding_backend": "xgrammar"}),
+    ] {
+        let response = post_completion(app.clone(), body.clone()).await;
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::BAD_REQUEST,
+            "{body}"
+        );
+    }
+    assert!(
+        grpc.captured().is_empty(),
+        "an unusable request must not reach a worker"
+    );
 }

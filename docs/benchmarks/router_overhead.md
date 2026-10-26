@@ -24,7 +24,7 @@ are also available through `scripts/run_benchmarks.py` with
 
 ## Inputs
 
-`tests/common/bench_corpus.rs` generates the same requests from seed `0x244`,
+`tests/rust/common/bench_corpus.rs` generates the same requests from seed `0x244`,
 input size and request index.
 
 | Corpus | Prompts |
@@ -74,7 +74,7 @@ cargo bench --bench routing_input -- --baseline main       # changed commit
 
 ### Edge fixtures
 
-`tests/common/routing_edge.rs` supplies both CI tests and Criterion. Each
+`tests/rust/common/routing_edge.rs` supplies both CI tests and Criterion. Each
 cache-aware benchmark asserts its expected worker before timing. CI also
 checks exact character counts and selection after a fixture reset.
 

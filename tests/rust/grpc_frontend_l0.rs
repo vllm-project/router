@@ -45,6 +45,10 @@ async fn grpc_frontend_cache_parity_metrics_streaming_and_retries() {
     let second = on.prepare(request.clone()).await.unwrap();
     assert_eq!(first.tokenized.token_ids, expected.tokenized.token_ids);
     assert_eq!(second.tokenized.token_ids, expected.tokenized.token_ids);
+    assert!(Arc::ptr_eq(
+        &first.tokenized.token_ids,
+        &second.tokenized.token_ids
+    ));
     let stats = on.tokenizer_cache_stats().unwrap();
     assert_eq!((stats.misses, stats.hits, stats.entries), (1, 1, 1));
     assert_eq!(
@@ -237,6 +241,30 @@ async fn grpc_frontend_cache_parity_metrics_streaming_and_retries() {
     assert_eq!(
         metric(&metrics, "vllm_tokenizer_cache_oversized_total") - oversized,
         1.0
+    );
+
+    // In-flight requests keep their prompt ids after eviction.
+    let single = EngineFrontend::with_tokenizer_cache(
+        Duration::from_secs(30),
+        TokenizerCacheConfig {
+            max_entries: 1,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let held = single.prepare(request.clone()).await.unwrap();
+    single
+        .prepare(chat_request(&model, "evict", false))
+        .await
+        .unwrap();
+    assert_eq!(single.tokenizer_cache_stats().unwrap().evictions, 1);
+    assert_eq!(Arc::strong_count(&held.tokenized.token_ids), 1);
+    let response = single.dispatch(&worker.grpc_url, held).await;
+    assert_eq!(response.status(), 200);
+    to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(
+        worker.captured().last().unwrap().token_ids,
+        expected.tokenized.token_ids.as_ref()
     );
 }
 

@@ -25,8 +25,8 @@ def router_manager() -> Iterable[RouterManager]:
 
 
 def _spawn_mock_worker(args: List[str]) -> Tuple[subprocess.Popen, str, str]:
-    repo_root = Path(__file__).resolve().parents[2]
-    script = repo_root / "py_test" / "fixtures" / "mock_worker.py"
+    repo_root = Path(__file__).resolve().parents[3]
+    script = repo_root / "tests" / "python" / "fixtures" / "mock_worker.py"
     port = find_free_port()
     worker_id = f"worker-{port}"
     base_cmd = [

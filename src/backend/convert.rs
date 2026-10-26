@@ -5,7 +5,39 @@
 //! merge still lives in worker `vllm-text`; this only fills proto.
 
 use crate::backend::pb;
-use crate::protocols::spec::{ChatCompletionRequest, StringOrArray};
+use crate::protocols::spec::{
+    ChatCompletionRequest, CompletionRequest, PromptInput, StringOrArray,
+};
+
+/// Passthrough keys the gRPC pipeline forwards to the worker. Anything else is
+/// rejected: a field the adapter cannot express must not be dropped silently.
+const SUPPORTED_OTHER: [&str; 7] = [
+    "add_special_tokens",
+    "cache_salt",
+    "documents",
+    "lora_name",
+    "priority",
+    "truncate_prompt_tokens",
+    "watermarking",
+];
+
+/// Completions-only response option; never part of the chat shape.
+const RETURN_TOKEN_IDS: &str = "return_token_ids";
+
+fn ensure_supported_other<'a>(
+    keys: impl Iterator<Item = &'a str>,
+    endpoint: &str,
+) -> Result<(), String> {
+    let unsupported: Vec<&str> = keys.filter(|key| !SUPPORTED_OTHER.contains(key)).collect();
+    if unsupported.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "unsupported gRPC {endpoint} fields: {}",
+            unsupported.join(", ")
+        ))
+    }
+}
 
 pub fn requires_worker_output_text(request: &ChatCompletionRequest) -> bool {
     !request.no_stop_trim
@@ -49,27 +81,7 @@ pub fn chat_to_generate_request(
                 .to_string(),
         );
     }
-    let supported_other = [
-        "add_special_tokens",
-        "cache_salt",
-        "documents",
-        "lora_name",
-        "priority",
-        "truncate_prompt_tokens",
-        "watermarking",
-    ];
-    let unsupported: Vec<_> = request
-        .other
-        .keys()
-        .filter(|key| !supported_other.contains(&key.as_str()))
-        .cloned()
-        .collect();
-    if !unsupported.is_empty() {
-        return Err(format!(
-            "unsupported gRPC chat fields: {}",
-            unsupported.join(", ")
-        ));
-    }
+    ensure_supported_other(request.other.keys().map(String::as_str), "chat")?;
     other_bool(request, "add_special_tokens")?;
     let max_new_tokens = request
         .max_completion_tokens
@@ -295,6 +307,130 @@ fn other_i32(request: &ChatCompletionRequest, key: &str) -> Result<Option<i32>, 
         .transpose()
 }
 
+/// A `/v1/completions` request lowered onto the gRPC pipeline.
+#[derive(Debug)]
+pub struct PreparedCompletion {
+    pub chat: ChatCompletionRequest,
+    pub token_ids: Vec<u32>,
+    pub emit_token_ids: bool,
+}
+
+/// Completions → chat shape, prompt ids, and response options for a gRPC pool.
+///
+/// The gRPC wire protocol is token_ids-only, so the client's ids go straight
+/// through: no chat template and no router-side tokenize. Fields without a
+/// chat-shape equivalent are rejected — dropping them would answer a different
+/// request than the client sent.
+pub fn prepare_grpc_completion(request: &CompletionRequest) -> Result<PreparedCompletion, String> {
+    let PromptInput::IntArray(ids) = &request.prompt else {
+        return Err(
+            "gRPC /v1/completions requires a single token-id prompt (list[int])".to_string(),
+        );
+    };
+    let token_ids = ids
+        .iter()
+        .map(|id| {
+            u32::try_from(*id)
+                .map_err(|_| format!("prompt token ids must be non-negative 32-bit integers: {id}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let rejected: [(&str, bool, Option<&str>); 7] = [
+        ("suffix", request.suffix.is_some(), None),
+        ("best_of", request.best_of.is_some(), None),
+        (
+            "json_schema",
+            request.json_schema.is_some(),
+            Some("use regex or ebnf"),
+        ),
+        ("logprobs", request.logprobs.is_some(), None),
+        ("echo", request.echo, None),
+        ("return_hidden_states", request.return_hidden_states, None),
+        ("n > 1", request.n.unwrap_or(1) > 1, Some("use n=1")),
+    ];
+    if let Some((field, _, hint)) = rejected.iter().find(|(_, present, _)| *present) {
+        let hint = hint.map(|hint| format!("; {hint}")).unwrap_or_default();
+        return Err(format!(
+            "{field} is not supported by the gRPC /v1/completions path{hint}"
+        ));
+    }
+    if request.other.contains_key("documents") {
+        return Err("documents is not supported by the gRPC /v1/completions path".to_string());
+    }
+    // Router-side only: the adapter asks the worker for ids unconditionally, so
+    // this gates what the reply writes back rather than the wire request.
+    let emit_token_ids = match request.other.get(RETURN_TOKEN_IDS) {
+        None => false,
+        Some(value) => value
+            .as_bool()
+            .ok_or_else(|| "return_token_ids must be a boolean".to_string())?,
+    };
+    ensure_supported_other(
+        request
+            .other
+            .keys()
+            .map(String::as_str)
+            .filter(|key| *key != RETURN_TOKEN_IDS),
+        "/v1/completions",
+    )?;
+    let other = request
+        .other
+        .iter()
+        .filter(|(key, _)| key.as_str() != RETURN_TOKEN_IDS)
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    let chat = ChatCompletionRequest {
+        model: request.model.clone(),
+        messages: Vec::new(),
+        temperature: request.temperature,
+        top_p: request.top_p,
+        n: request.n,
+        stream: request.stream,
+        stream_options: request.stream_options.clone(),
+        stop: request.stop.clone(),
+        max_tokens: request.max_tokens,
+        max_completion_tokens: None,
+        presence_penalty: request.presence_penalty,
+        frequency_penalty: request.frequency_penalty,
+        logit_bias: request.logit_bias.clone(),
+        user: request.user.clone(),
+        seed: request.seed,
+        logprobs: false,
+        top_logprobs: None,
+        response_format: None,
+        tools: None,
+        tool_choice: None,
+        parallel_tool_calls: None,
+        functions: None,
+        function_call: None,
+        top_k: request.top_k,
+        min_p: request.min_p,
+        min_tokens: request.min_tokens,
+        repetition_penalty: request.repetition_penalty,
+        regex: request.regex.clone(),
+        ebnf: request.ebnf.clone(),
+        stop_token_ids: request.stop_token_ids.clone(),
+        no_stop_trim: request.no_stop_trim,
+        ignore_eos: request.ignore_eos,
+        add_generation_prompt: None,
+        continue_final_message: false,
+        skip_special_tokens: request.skip_special_tokens,
+        lora_path: request.lora_path.clone(),
+        session_params: request.session_params.clone(),
+        chat_template_kwargs: None,
+        return_hidden_states: false,
+        echo: None,
+        reasoning_effort: None,
+        structured_outputs: None,
+        other,
+        ..Default::default()
+    };
+    Ok(PreparedCompletion {
+        chat,
+        token_ids,
+        emit_token_ids,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -430,5 +566,121 @@ mod tests {
         }));
         let proto = chat_to_generate_request(&visible, vec![1], "r".into()).unwrap();
         assert_eq!(proto.response.unwrap().output_text, Some(false));
+    }
+
+    fn completion(json: serde_json::Value) -> CompletionRequest {
+        serde_json::from_value(json).unwrap()
+    }
+
+    #[test]
+    fn lowers_completion_onto_chat_shape() {
+        let req = completion(serde_json::json!({
+            "model": "qwen",
+            "prompt": [1, 2, 3],
+            "max_tokens": 16,
+            "temperature": 0.3,
+            "top_k": 10,
+            "stop": ["END"],
+            "return_token_ids": true
+        }));
+        let prepared = prepare_grpc_completion(&req).unwrap();
+        assert_eq!(prepared.token_ids, vec![1, 2, 3]);
+        assert!(prepared.emit_token_ids);
+        assert_eq!(prepared.chat.max_tokens, Some(16));
+        assert_eq!(prepared.chat.top_k, Some(10));
+        assert!(prepared.chat.messages.is_empty());
+        assert!(prepared.chat.stop.is_some());
+    }
+
+    #[test]
+    fn token_ids_are_withheld_unless_requested() {
+        let default =
+            prepare_grpc_completion(&completion(serde_json::json!({"prompt": [1]}))).unwrap();
+        assert!(!default.emit_token_ids);
+
+        let explicit_false = prepare_grpc_completion(&completion(serde_json::json!({
+            "prompt": [1],
+            "return_token_ids": false
+        })))
+        .unwrap();
+        assert!(!explicit_false.emit_token_ids);
+
+        let wrong_type = prepare_grpc_completion(&completion(serde_json::json!({
+            "prompt": [1],
+            "return_token_ids": "yes"
+        })))
+        .unwrap_err();
+        assert!(wrong_type.contains("boolean"), "{wrong_type}");
+    }
+
+    #[test]
+    fn rejects_fields_the_grpc_adapter_cannot_express() {
+        for (body, field) in [
+            (
+                serde_json::json!({"prompt": [1], "suffix": "tail"}),
+                "suffix",
+            ),
+            (serde_json::json!({"prompt": [1], "best_of": 3}), "best_of"),
+            (serde_json::json!({"prompt": [1], "n": 2}), "n > 1"),
+            (
+                serde_json::json!({"prompt": [1], "json_schema": "{\"type\":\"object\"}"}),
+                "json_schema",
+            ),
+            (
+                serde_json::json!({"prompt": [1], "logprobs": 3}),
+                "logprobs",
+            ),
+            (serde_json::json!({"prompt": [1], "echo": true}), "echo"),
+            (
+                serde_json::json!({"prompt": [1], "return_hidden_states": true}),
+                "return_hidden_states",
+            ),
+            (
+                serde_json::json!({"prompt": [1], "documents": [{"content": "x"}]}),
+                "documents",
+            ),
+        ] {
+            let err = prepare_grpc_completion(&completion(body)).unwrap_err();
+            assert!(err.contains(field), "{err}");
+        }
+
+        let off = completion(serde_json::json!({"prompt": [1], "echo": false}));
+        assert!(!prepare_grpc_completion(&off)
+            .unwrap()
+            .chat
+            .echo
+            .unwrap_or(false));
+    }
+
+    #[test]
+    fn rejects_unknown_passthrough_fields_instead_of_dropping_them() {
+        let err = prepare_grpc_completion(&completion(serde_json::json!({
+            "prompt": [1],
+            "guided_decoding_backend": "xgrammar"
+        })))
+        .unwrap_err();
+        assert!(err.contains("guided_decoding_backend"), "{err}");
+
+        let chat_err = chat_to_generate_request(
+            &chat(serde_json::json!({
+                "messages": [{"role": "user", "content": "hi"}],
+                "guided_decoding_backend": "xgrammar"
+            })),
+            vec![1],
+            "r".into(),
+        )
+        .unwrap_err();
+        assert!(chat_err.contains("guided_decoding_backend"), "{chat_err}");
+    }
+
+    #[test]
+    fn rejects_prompts_without_usable_token_ids() {
+        let text = prepare_grpc_completion(&completion(serde_json::json!({"prompt": "hello"})))
+            .unwrap_err();
+        assert!(text.contains("list[int]"), "{text}");
+
+        let negative = prepare_grpc_completion(&completion(serde_json::json!({"prompt": [1, -2]})))
+            .unwrap_err();
+        assert!(negative.contains("non-negative"), "{negative}");
     }
 }

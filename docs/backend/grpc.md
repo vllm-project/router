@@ -15,6 +15,41 @@ The current gRPC wire sends router-produced `token_ids`:
 This is the current backend contract, not a policy that gRPC can never support
 text prompts or richer payloads.
 
+## API Compatibility
+
+Support status of the OpenAI HTTP surface when the worker pool is `grpc://`:
+
+| API | Status | Behavior |
+|---|---|---|
+| `/v1/chat/completions` | Supported | The router renders the chat template and tokenizes, then sends `TokenIds`. |
+| `/v1/completions` | Supported, token-id prompts only | `prompt` must be `list[int]`; ids go straight to the wire. Text prompts and fields the chat shape cannot express (`suffix`, `best_of`, `n > 1`, `json_schema`, `logprobs`, `echo`, `return_hidden_states`, `documents`) are rejected with `400`. |
+| `/v1/responses`, `/v1/embeddings`, `/v1/rerank`, `/generate`, `/inference/v1/generate` | Not supported | Rejected with `400` before dispatch, so they are client errors and never reach a worker. |
+| `/v1/models`, `/health` | Supported | Answered through the gRPC control/health services. |
+| `/health_generate` | Not supported | Returns `501`; use `/health` for gRPC readiness. |
+
+Chat-level gaps (tool calling, `reasoning_effort`, multimodal content) are
+listed under [Capability Boundaries](#capability-boundaries).
+
+### `/v1/completions` on a gRPC pool
+
+A gRPC pool also serves `/v1/completions` with token-id prompts only:
+`prompt: [int]` skips the chat template (step 2 above) and the client's ids go
+straight to the worker. Text and nested prompts return 400. Routing honors
+`session_params.session_id` like chat; without one, token-id prompts create no
+prefix-cache affinity (cache_aware balances them on load alone).
+
+The reply is shaped for completion clients — `text_completion` chunks and body
+with `choices[].text`, `cmpl-` ids — while reusing the chat pipeline internally.
+`return_token_ids` gates whether the reply writes `choices[].token_ids`; chat
+responses never carry them. Streaming emits every id even from frames whose
+text is empty. The non-streaming choice also carries `prompt_token_ids` (the
+client's ids) under the same flag; streaming never echoes prompt ids, matching
+vLLM HTTP where that happens only under `echo`.
+
+`suffix`, `best_of`, `n > 1`, `json_schema`, `logprobs`, `echo`,
+`return_hidden_states`, `documents`, negative prompt ids, and unknown
+passthrough keys return 400 instead of being dropped.
+
 ## Pool Behavior
 
 A worker pool is all HTTP or all gRPC. Mixed schemes fail during startup or
@@ -64,7 +99,7 @@ Keys include rendered text, tokenizer instance, `add_special_tokens` and
 `cache_salt`. Only successful deterministic encodings are cached; unknown
 configurations and `Prompt::TokenIds` bypass L0. Model assets must stay fixed
 during loading; restart the router to reload them. Rendering and validation
-still run per request, and retries reuse `PreparedChat`.
+still run per request, and retries reuse `PreparedRequest`.
 
 L0 shares the existing LRU and `vllm_tokenizer_cache_*` metrics. Rust callers
 can use `EngineFrontend::with_tokenizer_cache(timeout, config)`. See the
@@ -94,11 +129,11 @@ proto media fields and adding parity tests against vLLM HTTP behavior.
 |---|---|
 | `src/backend/mod.rs` | Shared backend exports and `pb` aliases for `vllm-proto` |
 | `src/backend/detect.rs` | Scheme detection, pool-kind locking, DP rank stripping, tonic URI conversion |
-| `src/backend/frontend.rs` | `EngineFrontend`: `prepare(chat)` and `dispatch(ids, url)` |
+| `src/backend/frontend.rs` | `EngineFrontend`: `prepare(chat)`, `prepare_token_ids(chat, ids)`, and `dispatch` |
 | `src/backend/health.rs` | gRPC health checks for startup and worker probes |
 | `src/backend/preprocess.rs` | Tokenizer/model cache and chat render/encode |
 | `src/backend/vllm_frontend.rs` | Adapter around `vllm-chat`, `vllm-tokenizer`, and `vllm-text` |
-| `src/backend/convert.rs` | OpenAI request fields to `GenerateRequest` |
+| `src/backend/convert.rs` | OpenAI request fields to `GenerateRequest`; `prepare_grpc_completion` lowers `/v1/completions` onto the chat shape |
 | `src/backend/grpc.rs` | Cached tonic `InferenceClient` and `GenerateStream` |
 | `src/backend/openai.rs` | Proto chunks to OpenAI JSON/SSE for clients |
 
@@ -158,7 +193,7 @@ Always-on tests:
 ```bash
 cargo test --test grpc_vs_http_e2e
 cargo test --lib backend::
-python3 -m unittest tests/test_bench_prefix_kvhit.py
+python3 -m unittest tests/python/test_bench_prefix_kvhit.py
 ```
 
 Optional tokenizer parity check, skipped unless the model dir and Python vLLM

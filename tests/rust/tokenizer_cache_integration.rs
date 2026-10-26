@@ -1,6 +1,6 @@
 //! Integration tests for `CachedTokenizer` with real HuggingFace encodings.
 //!
-//! The default tests load `tests/fixtures/tokenizer/byte_level_bpe.json`, a
+//! The default tests load `tests/rust/fixtures/tokenizer/byte_level_bpe.json`, a
 //! small byte-level BPE tokenizer checked into the repository (256 byte
 //! symbols, a few merges, `<s>`/`</s>`/`<unk>` as special tokens). It handles
 //! arbitrary UTF-8 and yields `Encoding::Hf` values with tokens, offsets and
@@ -20,7 +20,7 @@ use vllm_router_rs::tokenizer::{
 
 const FIXTURE: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/tests/fixtures/tokenizer/byte_level_bpe.json"
+    "/tests/rust/fixtures/tokenizer/byte_level_bpe.json"
 );
 
 const PROMPTS: &[&str] = &[

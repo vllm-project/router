@@ -21,10 +21,10 @@ use uuid::Uuid;
 
 use super::convert::{chat_to_generate_request, requires_worker_output_text};
 use super::detect::{grpc_connect_uri, parse_dp_rank};
-use super::frontend::PreparedChat;
+use super::frontend::{PreparedRequest, ResponseShape};
 use super::openai::{
-    final_response, finish_reason_name, format_sse, now_secs, stream_chunk, stream_usage_chunk,
-    SSE_DONE,
+    completion_final_response, final_response, finish_reason_name, now_secs, sse_chunk,
+    sse_usage_chunk, SSE_DONE,
 };
 use super::pb::inference_client::InferenceClient;
 use super::stream_output::{output_frame_tracking, OutputFrameConsumer, OutputFrameProducer};
@@ -155,15 +155,17 @@ impl GrpcEngineBackend {
     pub(crate) async fn dispatch_prepared(
         &self,
         worker_url: &str,
-        prepared: PreparedChat,
+        prepared: PreparedRequest,
         on_first_output: Option<FirstOutputCallback>,
     ) -> Response {
-        let PreparedChat {
+        let PreparedRequest {
             request,
             tokenized,
             handle,
             resolve_ms,
             t_req,
+            shape,
+            emit_token_ids,
         } = prepared;
         let request = request.as_ref();
         let n_prompt_tokens = tokenized.token_ids.len();
@@ -173,7 +175,10 @@ impl GrpcEngineBackend {
         let frontend_ms = tokenized.frontend_ms();
         let encode_backend = tokenized.encode_backend;
 
-        let request_id = format!("chatcmpl-{}", Uuid::new_v4());
+        let request_id = match shape {
+            ResponseShape::Chat => format!("chatcmpl-{}", Uuid::new_v4()),
+            ResponseShape::Completion => format!("cmpl-{}", Uuid::new_v4()),
+        };
         let model = request.model.clone().unwrap_or_else(|| "unknown".into());
         let created = now_secs();
         let skip_special = request.skip_special_tokens;
@@ -258,6 +263,8 @@ impl GrpcEngineBackend {
                 .as_ref()
                 .and_then(|options| options.include_usage)
                 .unwrap_or(false),
+            shape,
+            emit_token_ids,
             request_timeout: self.request_timeout,
             stages,
             t_req,
@@ -284,6 +291,8 @@ struct ChatReply {
     skip_special: bool,
     prefer_worker_text: bool,
     include_usage: bool,
+    shape: ResponseShape,
+    emit_token_ids: bool,
     request_timeout: Duration,
     stages: serde_json::Value,
     t_req: Instant,
@@ -325,6 +334,8 @@ async fn stream_openai(
         skip_special,
         prefer_worker_text,
         include_usage,
+        shape,
+        emit_token_ids,
         request_timeout,
         mut stages,
         t_req,
@@ -402,20 +413,36 @@ async fn stream_openai(
                         }
                         first_token_logged = true;
                     }
-                    if !text.is_empty() || finish.is_some() || first {
-                        let chunk = stream_chunk(
+                    // Ids alone qualify: the decoder buffers byte-fallback
+                    // fragments, so text can be empty while the frame holds
+                    // tokens a token-exact client still needs.
+                    let output_token_ids = if emit_token_ids {
+                        msg.outputs
+                            .as_ref()
+                            .map(|outputs| outputs.token_ids.clone())
+                            .filter(|ids| !ids.is_empty())
+                    } else {
+                        None
+                    };
+                    if !text.is_empty()
+                        || output_token_ids.is_some()
+                        || finish.is_some()
+                        || (first && shape == ResponseShape::Chat)
+                    {
+                        let line = sse_chunk(
+                            shape,
                             &request_id,
                             &model,
                             created,
                             &text,
                             first,
                             finish.clone(),
-                            None,
+                            output_token_ids,
                         );
                         if !send_stream_chunk(
                             &tx,
                             &mut producer_output_frame,
-                            format_sse(&chunk),
+                            line,
                             generated_output,
                         ) {
                             break;
@@ -430,13 +457,8 @@ async fn stream_openai(
                                 total_tokens: prompt_tokens + completion_tokens,
                                 completion_tokens_details: None,
                             };
-                            let chunk = stream_usage_chunk(&request_id, &model, created, usage);
-                            let _ = send_stream_chunk(
-                                &tx,
-                                &mut producer_output_frame,
-                                format_sse(&chunk),
-                                false,
-                            );
+                            let line = sse_usage_chunk(shape, &request_id, &model, created, usage);
+                            let _ = send_stream_chunk(&tx, &mut producer_output_frame, line, false);
                         }
                         let _ = send_stream_chunk(
                             &tx,
@@ -499,6 +521,8 @@ async fn collect_openai(
         skip_special,
         prefer_worker_text,
         include_usage: _,
+        shape,
+        emit_token_ids,
         request_timeout,
         mut stages,
         t_req,
@@ -508,6 +532,7 @@ async fn collect_openai(
         .as_ref()
         .map(|t| decode_stream(&**t, prompt_ids.as_ref(), skip_special));
     let mut text = String::new();
+    let mut token_ids: Vec<u32> = Vec::new();
     let mut finish = None;
     let mut prompt_tokens = prompt_ids.len() as u32;
     let mut completion_tokens = 0u32;
@@ -555,6 +580,9 @@ async fn collect_openai(
                 text.push_str(&delta);
                 if let Some(outputs) = &msg.outputs {
                     completion_tokens = completion_tokens.saturating_add(outputs.num_tokens);
+                    if emit_token_ids {
+                        token_ids.extend_from_slice(&outputs.token_ids);
+                    }
                 }
                 if reason.is_some() {
                     finish = reason;
@@ -576,16 +604,30 @@ async fn collect_openai(
         )
             .into_response();
     }
-    let body = final_response(
-        &request_id,
-        &model,
-        created,
-        text,
-        finish,
-        prompt_tokens,
-        completion_tokens,
-    );
-    let mut resp = (StatusCode::OK, axum::Json(body)).into_response();
+    let mut resp = match shape {
+        ResponseShape::Chat => axum::Json(final_response(
+            &request_id,
+            &model,
+            created,
+            text,
+            finish,
+            prompt_tokens,
+            completion_tokens,
+        ))
+        .into_response(),
+        ResponseShape::Completion => axum::Json(completion_final_response(
+            &request_id,
+            &model,
+            created,
+            text,
+            finish,
+            prompt_tokens,
+            completion_tokens,
+            emit_token_ids.then_some(token_ids),
+            emit_token_ids.then(|| prompt_ids.to_vec()),
+        ))
+        .into_response(),
+    };
     if crate::backend::stages_enabled() {
         resp.headers_mut()
             .insert("x-router-stages", stages_header(&stages));

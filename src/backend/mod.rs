@@ -38,11 +38,12 @@ pub use control::{
     get_grpc_model_info, get_grpc_server_info, model_info_json, openai_models_json,
     server_info_json,
 };
+pub use convert::prepare_grpc_completion;
 pub use detect::{
     classify_worker_urls, connection_mode_from_url, grpc_connect_uri, is_grpc_url, parse_dp_rank,
     strip_dp_suffix, WorkerPoolKind,
 };
-pub use frontend::{EngineFrontend, PreparedChat};
+pub use frontend::{EngineFrontend, PrepareError, PreparedRequest};
 pub use grpc::GrpcEngineBackend;
 pub use health::check_grpc_health;
 pub use preprocess::TokenizerCache;

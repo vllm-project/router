@@ -1,5 +1,5 @@
 use super::program_adapter::ProgramCompletion;
-use crate::backend::stream_output::OutputFrameConsumer;
+use crate::backend::{stream_output::OutputFrameConsumer, PrepareError};
 use crate::config::types::RetryConfig;
 use crate::core::{
     is_retryable_status, BasicWorker, CircuitBreakerConfig, DPAwareWorker, HealthConfig,
@@ -16,7 +16,8 @@ use crate::program_scheduling::{
 };
 use crate::protocols::spec::{
     ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest, GenerationRequest,
-    InferenceGenerateRequest, RerankRequest, RerankResponse, RerankResult, ResponsesRequest,
+    GrpcRequestRef, InferenceGenerateRequest, RerankRequest, RerankResponse, RerankResult,
+    ResponsesRequest,
 };
 use crate::routers::header_utils;
 use crate::routers::http::dp_utils;
@@ -43,6 +44,13 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, error, info, warn};
+
+fn prepare_error_status(error: &PrepareError) -> StatusCode {
+    match error {
+        PrepareError::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
+        PrepareError::Invalid(_) => StatusCode::BAD_REQUEST,
+    }
+}
 
 fn insert_router_stages(headers: &mut HeaderMap, stages: &serde_json::Value) {
     if let Ok(value) = HeaderValue::from_str(&stages.to_string()) {
@@ -230,7 +238,7 @@ struct TypedDispatch<'a> {
     worker_url: &'a str,
     is_stream: bool,
     load: RequestLoadGuard,
-    prepared: Option<crate::backend::PreparedChat>,
+    prepared: Option<crate::backend::PreparedRequest>,
 }
 
 struct SelectedWorker {
@@ -1192,7 +1200,7 @@ impl Router {
     }
 
     fn prepared_cache_identity(
-        prepared: Option<&crate::backend::PreparedChat>,
+        prepared: Option<&crate::backend::PreparedRequest>,
     ) -> (Option<&str>, Option<&str>) {
         let field = |name| {
             prepared
@@ -1275,50 +1283,70 @@ impl Router {
         // Reject unsupported gRPC routes before admitting a request or
         // incrementing the selected worker's load.
         if matches!(pool, Some(crate::backend::WorkerPoolKind::Grpc))
-            && route != "/v1/chat/completions"
+            && !matches!(route, "/v1/chat/completions" | "/v1/completions")
         {
             return (
                 StatusCode::BAD_REQUEST,
-                format!("gRPC backend currently supports /v1/chat/completions, not {route}"),
+                format!("gRPC backend currently supports /v1/chat/completions and /v1/completions, not {route}"),
             )
                 .into_response();
         }
 
         // All-grpc chat: tokenize once, outside policy and retry.
         // Policy still uses extract_text_for_routing (session / empty).
-        // token_ids stay on PreparedChat for a later token-level policy —
+        // token_ids stay on PreparedRequest for a later token-level policy —
         // do not dump 131k ids into the cache_aware tree.
-        let prepared = if matches!(pool, Some(crate::backend::WorkerPoolKind::Grpc))
-            && route == "/v1/chat/completions"
-        {
-            let chat: ChatCompletionRequest =
-                match serde_json::to_value(typed_req).and_then(serde_json::from_value) {
-                    Ok(req) => req,
-                    Err(e) => {
-                        return (
-                            StatusCode::BAD_REQUEST,
-                            format!("gRPC chat convert failed: {e}"),
-                        )
-                            .into_response();
+        //
+        // The concrete request comes from `GenerationRequest::grpc_request`
+        // rather than a `serde_json::Value` roundtrip: the only two routes a
+        // gRPC pool admits are exactly the two concrete request types.
+        let prepared = match (pool, typed_req.grpc_request()) {
+            (Some(crate::backend::WorkerPoolKind::Grpc), Some(GrpcRequestRef::Chat(chat)))
+                if route == "/v1/chat/completions" =>
+            {
+                match self.frontend.prepare(chat.clone()).await {
+                    Ok(prepared) => Some(prepared),
+                    Err(error) => {
+                        return (prepare_error_status(&error), error.to_string()).into_response();
                     }
-                };
-            match self.frontend.prepare(chat).await {
-                Ok(p) => Some(p),
-                Err(e) => {
-                    let status =
-                        if e.starts_with("tokenizer:") || e.starts_with("sampling defaults:") {
-                            StatusCode::SERVICE_UNAVAILABLE
-                        } else {
-                            StatusCode::BAD_REQUEST
-                        };
-                    return (status, e).into_response();
                 }
             }
-        } else {
-            None
+            (
+                Some(crate::backend::WorkerPoolKind::Grpc),
+                Some(GrpcRequestRef::Completion(completion)),
+            ) if route == "/v1/completions" => {
+                let lowered = match crate::backend::prepare_grpc_completion(completion) {
+                    Ok(lowered) => lowered,
+                    Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
+                };
+                match self
+                    .frontend
+                    .prepare_token_ids(lowered.chat, lowered.token_ids, lowered.emit_token_ids)
+                    .await
+                {
+                    Ok(prepared) => Some(prepared),
+                    Err(error) => {
+                        return (prepare_error_status(&error), error.to_string()).into_response();
+                    }
+                }
+            }
+            (Some(crate::backend::WorkerPoolKind::Grpc), _) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    format!("gRPC backend received a request body that does not match {route}"),
+                )
+                    .into_response();
+            }
+            _ => None,
         };
 
-        let text = typed_req.extract_text_for_routing();
+        let text = match (pool, typed_req.grpc_request()) {
+            (
+                Some(crate::backend::WorkerPoolKind::Grpc),
+                Some(GrpcRequestRef::Completion(completion)),
+            ) if route == "/v1/completions" => completion.extract_text_for_grpc_routing(),
+            _ => typed_req.extract_text_for_routing(),
+        };
 
         let response = RetryExecutor::execute_response_with_retry(
             &self.retry_config,
@@ -1497,7 +1525,8 @@ impl Router {
             };
 
             if let Some(hdrs) = headers {
-                for (name, value) in hdrs {
+                let forwarded = header_utils::sanitize_request_headers(hdrs);
+                for (name, value) in &forwarded {
                     let name_lc = name.as_str().to_lowercase();
                     if name_lc != "content-type"
                         && name_lc != "content-length"
@@ -1595,13 +1624,13 @@ impl Router {
         } = dispatch;
         let load_incremented = load.tracks_worker();
         if crate::backend::is_grpc_url(worker_url) {
-            // gRPC workers are chat-only in this milestone. Reject unsupported
-            // client routes as request errors so healthy workers are not
-            // penalized by circuit-breaker accounting.
-            if route != "/v1/chat/completions" {
+            // gRPC workers currently support only the chat and completions
+            // endpoints. Treat all other routes as client errors so they do not
+            // count against healthy workers in circuit-breaker accounting.
+            if !matches!(route, "/v1/chat/completions" | "/v1/completions") {
                 return (
                     StatusCode::BAD_REQUEST,
-                    format!("gRPC backend currently supports /v1/chat/completions, not {route}"),
+                    format!("gRPC backend currently supports /v1/chat/completions and /v1/completions, not {route}"),
                 )
                     .into_response();
             }
@@ -1679,7 +1708,8 @@ impl Router {
         // Content-Type/Content-Length (.json() sets them) and trace headers
         // (propagate_trace_headers below injects fresh context).
         if let Some(headers) = headers {
-            for (name, value) in headers {
+            let forwarded = header_utils::sanitize_request_headers(headers);
+            for (name, value) in &forwarded {
                 if *name != CONTENT_TYPE
                     && *name != CONTENT_LENGTH
                     && !header_utils::TRACE_HEADER_NAMES
@@ -2793,24 +2823,25 @@ impl RouterTrait for Router {
         // Add authorization if configured
         if self.epd.is_some() {
             if let Some(headers) = headers {
-                for (name, value) in headers {
+                // The same connection-aware filter the other forwarding paths
+                // use, so a field named by `Connection` or any other hop-by-hop
+                // field cannot reach the worker here either.
+                let sanitized = header_utils::sanitize_request_headers(headers);
+                for (name, value) in &sanitized {
                     // When a backend api_key is configured it must win:
                     // RequestBuilder::header appends, and vLLM reads the
                     // first Authorization value.
                     if self.api_key.is_some() && name == http::header::AUTHORIZATION {
                         continue;
                     }
-                    if !matches!(
-                        name.as_str(),
-                        "host"
-                            | "content-length"
-                            | "content-type"
-                            | "connection"
-                            | "transfer-encoding"
-                    ) && !header_utils::TRACE_HEADER_NAMES.contains(&name.as_str())
+                    // reqwest derives these from the body and URL it sends.
+                    if name == http::header::CONTENT_LENGTH
+                        || name == http::header::CONTENT_TYPE
+                        || header_utils::TRACE_HEADER_NAMES.contains(&name.as_str())
                     {
-                        request_builder = request_builder.header(name, value);
+                        continue;
                     }
+                    request_builder = request_builder.header(name, value);
                 }
             }
         }
@@ -2845,7 +2876,7 @@ impl RouterTrait for Router {
                         transfers.disarm();
                     }
                 }
-                let headers = response.headers().clone();
+                let headers = header_utils::preserve_response_headers(response.headers());
                 let mut response_builder = Response::builder().status(status.as_u16());
 
                 for (name, value) in headers.iter() {
@@ -2986,6 +3017,123 @@ impl RouterTrait for Router {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[tokio::test]
+    async fn test_transparent_response_preserves_encoding_and_filters_connection() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = axum::Router::new().fallback(|| async {
+            Response::builder()
+                .header("content-encoding", "gzip")
+                .header("connection", "X-Internal")
+                .header("x-internal", "private")
+                .header("set-cookie", "a=1")
+                .header("set-cookie", "b=2")
+                .body(Body::from(vec![0x1f, 0x8b, 0x08, 0x00, 0xff]))
+                .unwrap()
+        });
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let mut router = create_test_regular_router();
+        router.worker_registry = Arc::new(WorkerRegistry::new());
+        router.worker_registry.register(Arc::new(BasicWorker::new(
+            format!("http://{address}"),
+            WorkerType::Regular,
+        )));
+        let response = router
+            .route_transparent(None, "/custom", &Method::GET, serde_json::Value::Null)
+            .await;
+        assert_eq!(response.headers().get("content-encoding").unwrap(), "gzip");
+        assert!(!response.headers().contains_key("connection"));
+        assert!(!response.headers().contains_key("x-internal"));
+        assert_eq!(response.headers().get_all("set-cookie").iter().count(), 2);
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(bytes.as_ref(), &[0x1f, 0x8b, 0x08, 0x00, 0xff]);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_inference_and_get_paths_strip_connection_headers() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let worker_url = format!("http://{address}");
+        let app = axum::Router::new().fallback(|headers: HeaderMap| async move {
+            let echoed: HashMap<String, String> = headers
+                .iter()
+                .map(|(name, value)| (name.to_string(), value.to_str().unwrap().to_string()))
+                .collect();
+            Json(echoed)
+        });
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let mut router = create_test_regular_router();
+        router.worker_registry = Arc::new(WorkerRegistry::new());
+        router.worker_registry.register(Arc::new(BasicWorker::new(
+            worker_url.clone(),
+            WorkerType::Regular,
+        )));
+        let mut headers = HeaderMap::new();
+        headers.append("connection", "X-Internal, traceparent".parse().unwrap());
+        headers.append("connection", " X-Second".parse().unwrap());
+        headers.insert("host", "client-controlled.example".parse().unwrap());
+        headers.insert("x-internal", "private".parse().unwrap());
+        headers.insert("x-second", "private".parse().unwrap());
+        headers.insert("trailer", "x-checksum".parse().unwrap());
+        headers.insert(
+            "traceparent",
+            "00-11111111111111111111111111111111-2222222222222222-01"
+                .parse()
+                .unwrap(),
+        );
+        headers.insert("x-public", "keep".parse().unwrap());
+        headers.insert("authorization", "Bearer token".parse().unwrap());
+        let request = Request::builder().body(Body::empty()).unwrap();
+        let (mut parts, body) = request.into_parts();
+        parts.headers = headers.clone();
+        let get_response = router
+            .proxy_get_request(Request::from_parts(parts, body), "v1/models")
+            .await;
+        let post_response = router
+            .send_typed_request(
+                &serde_json::json!({"model": "test", "messages": []}),
+                TypedDispatch {
+                    headers: Some(&headers),
+                    route: "/v1/chat/completions",
+                    worker_url: &worker_url,
+                    is_stream: false,
+                    // No worker is tracked, so this dispatch does not count against
+                    // a worker's load — the same state the old `load_incremented:
+                    // false` expressed before the field became a guard.
+                    load: RequestLoadGuard::new(None, None),
+                    prepared: None,
+                },
+                None,
+            )
+            .await;
+        for response in [get_response, post_response] {
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let echoed: HashMap<String, String> = serde_json::from_slice(&bytes).unwrap();
+            for name in [
+                "connection",
+                "x-internal",
+                "x-second",
+                "trailer",
+                "traceparent",
+            ] {
+                assert!(
+                    !echoed.contains_key(name),
+                    "{name} leaked to the worker: {echoed:?}"
+                );
+            }
+            assert_eq!(echoed["host"], address.to_string());
+            assert_eq!(echoed["x-public"], "keep");
+            assert_eq!(echoed["authorization"], "Bearer token");
+        }
+        server.abort();
+    }
 
     fn create_test_regular_router() -> Router {
         // Create registries
@@ -3238,6 +3386,92 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.contains("mixed"), "{err}");
+    }
+
+    /// An axum backend that echoes the header names and values it received, so a
+    /// test can assert on what actually reached the worker.
+    async fn spawn_header_echo_backend() -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        use axum::Json;
+        let app = axum::Router::new().fallback(|headers: HeaderMap| async move {
+            let mut echoed: HashMap<String, Vec<String>> = HashMap::new();
+            for (name, value) in headers.iter() {
+                if let Ok(value) = value.to_str() {
+                    echoed
+                        .entry(name.to_string())
+                        .or_default()
+                        .push(value.to_string());
+                }
+            }
+            Json(echoed)
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (address, server)
+    }
+
+    fn router_pointing_at(address: std::net::SocketAddr) -> Router {
+        let mut router = create_test_regular_router();
+        router.worker_registry = Arc::new(WorkerRegistry::new());
+        router.worker_registry.register(Arc::new(BasicWorker::new(
+            format!("http://{address}"),
+            WorkerType::Regular,
+        )));
+        router
+    }
+
+    /// The transparent path with EPD enabled has to apply the same header policy
+    /// as every other forwarding path. Its own skip list only covered
+    /// host/content-length/content-type/connection/transfer-encoding, so
+    /// `keep-alive`, `te`, `upgrade`, `proxy-authorization` and whatever the
+    /// client's `Connection` named still went through to the worker.
+    #[tokio::test]
+    async fn transparent_epd_path_sanitizes_client_headers() {
+        let (address, server) = spawn_header_echo_backend().await;
+        let mut router = router_pointing_at(address);
+        router.epd = Some(super::super::epd::EncoderStage::new(
+            crate::config::EpdConfig {
+                encoder_urls: vec!["http://unused".into()],
+                consumer_zmq_addrs: Default::default(),
+            },
+        ));
+        let mut headers = HeaderMap::new();
+        headers.insert("keep-alive", "timeout=5".parse().unwrap());
+        headers.insert("te", "trailers".parse().unwrap());
+        headers.insert("upgrade", "websocket".parse().unwrap());
+        headers.insert("proxy-authorization", "Basic c2VjcmV0".parse().unwrap());
+        headers.insert("connection", "X-Internal".parse().unwrap());
+        headers.insert("x-internal", "must-not-leak".parse().unwrap());
+        headers.insert("x-session-id", "sticky-1".parse().unwrap());
+
+        // /v1/responses is not handed to the encoder, so this exercises the
+        // forwarding loop itself.
+        let response = router
+            .route_transparent(
+                Some(&headers),
+                "/v1/responses",
+                &Method::POST,
+                serde_json::json!({"model": "m"}),
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let echoed: HashMap<String, Vec<String>> = serde_json::from_slice(&bytes).unwrap();
+        for name in [
+            "keep-alive",
+            "te",
+            "upgrade",
+            "proxy-authorization",
+            "connection",
+            "x-internal",
+        ] {
+            assert!(
+                !echoed.contains_key(name),
+                "{name} reached the worker: {echoed:?}"
+            );
+        }
+        assert_eq!(echoed["x-session-id"], vec!["sticky-1"]);
+        server.abort();
     }
 
     #[tokio::test]

@@ -620,6 +620,34 @@ mod tests {
     }
 
     #[test]
+    fn literal_token_ids_prefix_keeps_cache_affinity() {
+        let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+            eviction_interval_secs: 0,
+            ..Default::default()
+        });
+        let workers: Vec<Arc<dyn Worker>> = vec![
+            Arc::new(BasicWorker::new(
+                "http://w1:8000".to_string(),
+                WorkerType::Regular,
+            )),
+            Arc::new(BasicWorker::new(
+                "http://w2:8000".to_string(),
+                WorkerType::Regular,
+            )),
+        ];
+        policy.init_workers(&workers);
+        let key = "token_ids: explain this field";
+        let model_id = normalize_model_key(workers[0].model_id());
+        policy
+            .trees
+            .get(model_id)
+            .expect("initialized model cache")
+            .insert(key, workers[1].url());
+
+        assert_eq!(policy.select_worker(&workers, Some(key)), Some(1));
+    }
+
+    #[test]
     fn test_cache_aware_with_imbalanced_load() {
         let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
             cache_threshold: 0.5,
