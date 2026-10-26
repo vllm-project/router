@@ -90,11 +90,13 @@ pub fn preserve_response_headers(reqwest_headers: &HeaderMap) -> HeaderMap {
 }
 
 /// Hop-by-hop fields, which belong to a single connection and must never be
-/// relayed (RFC 9110 §7.6.1).
+/// relayed (RFC 9110 §7.6.1). `proxy-connection` is a non-standard but widely
+/// sent alias of `connection`, so it is treated the same way.
 fn is_hop_by_hop(name: &str) -> bool {
     matches!(
         name,
         "connection"
+            | "proxy-connection"
             | "keep-alive"
             | "proxy-authenticate"
             | "proxy-authorization"
@@ -171,9 +173,24 @@ pub fn propagate_headers(
     request
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_proxy_connection_is_not_forwarded() {
+        let mut headers = HeaderMap::new();
+        headers.insert("proxy-connection", "keep-alive".parse().unwrap());
+        headers.insert("x-request-id", "abc".parse().unwrap());
+
+        let request = sanitize_request_headers(&headers);
+        assert!(request.get("proxy-connection").is_none());
+        assert_eq!(request.get("x-request-id").unwrap(), "abc");
+
+        let response = preserve_response_headers(&headers);
+        assert!(response.get("proxy-connection").is_none());
+        assert_eq!(response.get("x-request-id").unwrap(), "abc");
+    }
 
     #[test]
     fn test_standard_trailer_header_is_not_forwarded() {

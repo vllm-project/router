@@ -90,7 +90,7 @@ steps:
                   apt-get update && apt-get install -y pkg-config libssl-dev protobuf-compiler
                   # wasm_middleware unit tests load the example component artifact
                   bash examples/wasm_middleware/build.sh
-                  cargo test --lib --bins
+                  cargo test --features cpu,ready --lib --bins
         agents:
           queue: "cpu_queue_premerge"
 
@@ -109,7 +109,7 @@ steps:
                 - -c
                 - |
                   apt-get update && apt-get install -y pkg-config libssl-dev protobuf-compiler
-                  cargo test --test '*'
+                  cargo test --features cpu,ready --test '*'
         agents:
           queue: "cpu_queue_premerge"
 
@@ -136,7 +136,7 @@ steps:
                   pip install -U pip setuptools wheel setuptools-rust
                   pip install -e .[dev]
                   pip install pytest pytest-cov pytest-asyncio
-                  pytest tests/python/ -v --ignore=tests/python/e2e --cov=vllm_router --cov-report=xml --cov-report=term
+                  pytest tests/python/ -v --ignore=tests/python/e2e -m "ready and cpu" --cov=vllm_router --cov-report=xml --cov-report=term
         artifact_paths:
           - "coverage.xml"
         agents:

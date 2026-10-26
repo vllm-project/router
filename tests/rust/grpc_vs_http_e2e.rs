@@ -1,3 +1,5 @@
+#![cfg(all(feature = "cpu", feature = "ready"))]
+
 //! This-version wire: HTTP forwards `messages`, gRPC forwards `token_ids`.
 //!
 //! In-process mocks (no GPU, no live `vllm-rs`). HTTP worker body must

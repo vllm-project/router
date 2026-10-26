@@ -1,3 +1,5 @@
+#![cfg(all(feature = "cpu", feature = "ready"))]
+
 /// Regression tests for #322: user message content parts other than
 /// `text`/`image_url` (vLLM's `audio_url`, `input_audio`, `video_url`) must be
 /// forwarded verbatim instead of being silently replaced with `""`.

@@ -192,7 +192,7 @@ pub(crate) fn normalize_model_key(model_id: &str) -> &str {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use super::*;
     use crate::core::{BasicWorker, WorkerType};

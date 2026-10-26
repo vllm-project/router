@@ -4,7 +4,7 @@ Uses a local BPE fixture and mock gRPC worker to compare L0 off/on through
 `EngineFrontend::prepare` and `dispatch`. No model download or GPU is needed.
 
 ```bash
-cargo test --release --test grpc_frontend_bench -- --ignored --nocapture
+cargo test --features cpu,ready --release --test grpc_frontend_bench -- --ignored --nocapture
 ```
 
 Settings use the `VLLM_ROUTER_BENCH_` prefix, as in #290:

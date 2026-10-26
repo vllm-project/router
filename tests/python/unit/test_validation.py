@@ -10,6 +10,8 @@ from unittest.mock import MagicMock, patch
 import pytest
 from vllm_router.launch_router import RouterArgs, launch_router
 
+pytestmark = [pytest.mark.ready, pytest.mark.cpu]
+
 
 class TestURLValidation:
     """Test URL validation logic."""

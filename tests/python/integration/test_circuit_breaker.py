@@ -3,6 +3,8 @@ import time
 import pytest
 import requests
 
+pytestmark = [pytest.mark.ready, pytest.mark.cpu]
+
 
 @pytest.mark.integration
 def test_circuit_breaker_opens_and_recovers(router_manager, mock_workers):
@@ -232,6 +234,6 @@ def test_circuit_breaker_ignores_4xx_client_errors(router_manager, mock_workers)
         r = post_once()
         # Should get 400 from worker, NOT 503 from circuit breaker
         assert r.status_code == 400, (
-            f"Request {i+1}: Expected 400 (client error passthrough), "
+            f"Request {i + 1}: Expected 400 (client error passthrough), "
             f"got {r.status_code}. Circuit breaker incorrectly opened on 4xx errors."
         )

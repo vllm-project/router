@@ -42,7 +42,7 @@ pub struct GrpcStreamTask {
 }
 
 impl GrpcStreamTask {
-    #[cfg(test)]
+    #[cfg(all(test, feature = "cpu", feature = "ready"))]
     pub(crate) fn new(handle: tokio::task::JoinHandle<()>) -> Self {
         Self {
             handle: Arc::new(std::sync::Mutex::new(Some(handle))),
@@ -700,7 +700,7 @@ fn has_generated_output(msg: &super::pb::GenerateResponse, text: &str) -> bool {
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use super::*;
     use crate::backend::pb::{GenerateResponse, PromptInfo, SequenceOutput};

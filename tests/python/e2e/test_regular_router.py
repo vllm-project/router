@@ -5,8 +5,6 @@ from types import SimpleNamespace
 import pytest
 import requests
 
-from vllm.test.run_eval import run_eval
-
 
 @pytest.mark.e2e
 def test_mmlu(e2e_router_only_rr, e2e_two_workers_dp2, e2e_model):
@@ -24,6 +22,8 @@ def test_mmlu(e2e_router_only_rr, e2e_two_workers_dp2, e2e_model):
         num_threads=32,
         temperature=0.1,
     )
+    from vllm.test.run_eval import run_eval
+
     metrics = run_eval(args)
     assert metrics["score"] >= 0.65
 
@@ -107,6 +107,8 @@ def test_lazy_fault_tolerance_live(e2e_router_only_rr, e2e_primary_worker, e2e_m
         num_threads=16,
         temperature=0.0,
     )
+    from vllm.test.run_eval import run_eval
+
     metrics = run_eval(args)
     assert 0.0 <= metrics["score"] <= 1.0
 
@@ -167,5 +169,7 @@ def test_dp_aware_worker_expansion_and_api_key(
         num_threads=32,
         temperature=0.1,
     )
+    from vllm.test.run_eval import run_eval
+
     metrics = run_eval(args)
     assert metrics["score"] >= 0.65

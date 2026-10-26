@@ -1,3 +1,5 @@
+#![cfg(all(feature = "cpu", feature = "ready"))]
+
 //! End-to-end router overhead against instant mock workers.
 //!
 //! Each routed cell starts a router process and measures latency, throughput, load

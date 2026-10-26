@@ -12,10 +12,10 @@ cargo bench --bench routing_input
 cargo bench --bench routing_input -- edge/
 
 # End-to-end harness (ignored by default)
-cargo test --release --test router_overhead_bench -- --ignored --nocapture
+cargo test --features cpu,ready --release --test router_overhead_bench -- --ignored --nocapture
 
 # CI checks for shared fixtures, corpus and mock workers
-cargo test --test routing_edge_cases_test --test bench_corpus_test --test router_overhead_bench
+cargo test --features cpu,ready --test routing_edge_cases_test --test bench_corpus_test --test router_overhead_bench
 ```
 
 CI builds both benchmarks but runs only the non-ignored tests. The tools
@@ -166,7 +166,7 @@ Quick smoke test:
 VLLM_ROUTER_BENCH_SCENARIOS=direct_completions,completions_off \
 VLLM_ROUTER_BENCH_SIZES=2048 VLLM_ROUTER_BENCH_CONCURRENCY=4 \
 VLLM_ROUTER_BENCH_WARMUP_SECS=1 VLLM_ROUTER_BENCH_MEASURE_SECS=3 \
-cargo test --release --test router_overhead_bench -- --ignored --nocapture
+cargo test --features cpu,ready --release --test router_overhead_bench -- --ignored --nocapture
 ```
 
 For long inputs, name the corpora explicitly. The harness rejects `cold`,
@@ -178,7 +178,7 @@ VLLM_ROUTER_BENCH_SIZES=131072,524288,1048576 \
 VLLM_ROUTER_BENCH_CORPORA=hot64,utf8_hot64,long_shared_prefix \
 VLLM_ROUTER_BENCH_PROMPT_IDS=131072 \
 VLLM_ROUTER_BENCH_CONCURRENCY=1,16 \
-cargo test --release --test router_overhead_bench -- --ignored --nocapture
+cargo test --features cpu,ready --release --test router_overhead_bench -- --ignored --nocapture
 ```
 
 ### Read the results
