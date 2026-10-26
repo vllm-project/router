@@ -136,7 +136,7 @@ pub fn openai_models_json(info: &ModelInfo) -> Value {
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use super::*;
     use crate::backend::pb::{ParallelismInfo, RlCapabilities};

@@ -11,6 +11,8 @@ import pytest
 from vllm_router.launch_router import RouterArgs, parse_router_args
 from vllm_router.router import Router, policy_from_str
 
+pytestmark = [pytest.mark.ready, pytest.mark.cpu]
+
 
 class TestRouterArgs:
     """Test RouterArgs dataclass and its methods."""

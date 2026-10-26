@@ -6,7 +6,8 @@ dnf install -y openssl-devel protobuf-compiler protobuf-devel
 
 # Install Rust toolchain (explicitly use nightly to match previous pipeline)
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain nightly
-source $HOME/.cargo/env
+# shellcheck disable=SC1091
+source "${HOME}/.cargo/env"
 
 # Build Rust binary for release
 cargo build --release

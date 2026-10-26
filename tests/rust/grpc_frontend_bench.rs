@@ -1,3 +1,5 @@
+#![cfg(all(feature = "cpu", feature = "ready"))]
+
 //! Offline gRPC frontend benchmark.
 //! cargo test --release --test grpc_frontend_bench -- --ignored --nocapture
 #![cfg(unix)]

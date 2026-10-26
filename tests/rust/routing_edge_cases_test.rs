@@ -1,3 +1,5 @@
+#![cfg(all(feature = "cpu", feature = "ready"))]
+
 //! CI checks for the fixtures timed by `benches/routing_input.rs`, plus
 //! stale-tenant cleanup and the HTTP request-body limit.
 

@@ -1,3 +1,5 @@
+#![cfg(all(feature = "cpu", feature = "ready"))]
+
 //! Integration tests for WASM OnRequest middleware with mock HTTP workers.
 //!
 //! Builds the example component via `examples/wasm_middleware/build.sh` on demand.

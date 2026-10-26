@@ -1,3 +1,5 @@
+#![cfg(all(feature = "cpu", feature = "ready"))]
+
 //! Compile-and-run guard for the benchmark corpus and the bench mock worker.
 //!
 //! The criterion benchmark and the `#[ignore]` overhead harness are not run

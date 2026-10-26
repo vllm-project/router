@@ -59,7 +59,7 @@ impl BlockKeyGenerator {
             .collect()
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "cpu", feature = "ready"))]
     pub(crate) fn none_hash(&self) -> SequenceHash {
         self.none_hash
     }
@@ -109,7 +109,7 @@ fn digest(bytes: &[u8]) -> SequenceHash {
     Sha256::digest(bytes).into()
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use super::*;
 

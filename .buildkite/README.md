@@ -2,6 +2,14 @@
 
 This directory contains the Buildkite pipeline configurations for the vLLM Router project.
 
+Formatting, Clippy, Black, Ruff, and spelling are not Buildkite jobs. They run
+from [`.pre-commit-config.yaml`](../.pre-commit-config.yaml) locally and in the
+GitHub Actions `pre-commit` workflow:
+
+```bash
+pip install pre-commit && pre-commit install
+```
+
 ## Pipeline Files
 
 `pipeline.yml` builds the release binary and wheel, pushes the NVIDIA CI image, then uploads L1, L2, and L3.

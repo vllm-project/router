@@ -763,7 +763,7 @@ impl ValidatableRequest for ChatCompletionRequest {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use super::constants::*;
     use super::utils::*;
@@ -876,7 +876,7 @@ mod tests {
     }
 
     // Chat completion specific tests
-    #[cfg(test)]
+    #[cfg(all(test, feature = "cpu", feature = "ready"))]
     mod chat_tests {
         use super::*;
         use crate::protocols::spec::ReasoningEffort;

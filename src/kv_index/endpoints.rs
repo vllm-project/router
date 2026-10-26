@@ -124,7 +124,7 @@ fn display_host(parsed: &Url) -> Result<String, String> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use super::*;
 

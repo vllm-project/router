@@ -1,6 +1,8 @@
 import pytest
 import requests
 
+pytestmark = [pytest.mark.ready, pytest.mark.cpu]
+
 
 @pytest.mark.integration
 def test_retry_reroutes_to_healthy_worker(router_manager, mock_workers):

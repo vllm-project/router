@@ -1,6 +1,8 @@
 import pytest
 import requests
 
+pytestmark = [pytest.mark.ready, pytest.mark.cpu]
+
 
 @pytest.mark.integration
 def test_discovery_shim_add_remove(router_manager, mock_workers):

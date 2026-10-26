@@ -1,6 +1,8 @@
 import pytest
 import requests
 
+pytestmark = [pytest.mark.ready, pytest.mark.cpu]
+
 
 @pytest.mark.integration
 def test_add_and_remove_worker(mock_worker, router_manager, mock_workers):

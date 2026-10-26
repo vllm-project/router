@@ -1,3 +1,5 @@
+#![cfg(all(feature = "cpu", feature = "ready"))]
+
 use std::sync::Arc;
 
 use vllm_router_rs::kv_index::{

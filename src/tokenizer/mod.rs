@@ -19,7 +19,7 @@ pub mod huggingface;
 
 pub mod tiktoken;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests;
 
 // Re-exports

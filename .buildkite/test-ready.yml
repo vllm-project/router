@@ -37,7 +37,7 @@ steps:
                 - -c
                 - |
                   bash .buildkite/scripts/install_packages.sh rust
-                  cargo test --lib --bins
+                  cargo test --features cpu,ready --lib --bins
         agents:
           queue: "medium_cpu_queue_premerge"
 
@@ -56,7 +56,7 @@ steps:
                 - -c
                 - |
                   bash .buildkite/scripts/install_packages.sh rust
-                  cargo test --test '*'
+                  cargo test --features cpu,ready --test '*'
         agents:
           queue: "medium_cpu_queue_premerge"
 
@@ -76,7 +76,7 @@ steps:
                 - -c
                 - |
                   source .buildkite/scripts/install_packages.sh python
-                  pytest tests/python/ -v --ignore=tests/python/e2e --cov=vllm_router --cov-report=xml --cov-report=term
+                  pytest tests/python/ -v --ignore=tests/python/e2e -m "ready and cpu" --cov=vllm_router --cov-report=xml --cov-report=term
         artifact_paths:
           - "coverage.xml"
         agents:
