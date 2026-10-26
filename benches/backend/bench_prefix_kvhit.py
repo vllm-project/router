@@ -316,7 +316,7 @@ def post_hit_wave(
     }
 
 
-# --- Pytest perf (py_test/e2e/perf/grpc) and remote bench reuse ---------------
+# --- Pytest perf (tests/python/e2e/perf/grpc) and remote bench reuse ----------
 
 
 def read_perf_settings(

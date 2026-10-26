@@ -20,8 +20,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# File is ``py_test/e2e/perf/grpc/stack_launcher.py`` → repo root is parents[4].
-REPO_ROOT = Path(__file__).resolve().parents[4]
+# File is ``tests/python/e2e/perf/grpc/stack_launcher.py`` → repo root is parents[5].
+REPO_ROOT = Path(__file__).resolve().parents[5]
 
 
 def _progress(msg: str) -> None:

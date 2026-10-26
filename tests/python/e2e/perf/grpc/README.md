@@ -8,7 +8,7 @@ Reference workload: Qwen3.8-27B (`vllm-rs serve` / `vllm serve` + `vllm-router` 
 ## Flow
 
 ```text
-pytest py_test/e2e/perf/grpc --perf-case=rust_grpc
+pytest tests/python/e2e/perf/grpc --perf-case=rust_grpc
   → per wave: cold start vllm-rs + vllm-router → bench → teardown (×8)
 ```
 
@@ -35,12 +35,12 @@ Model path or HF id: set `"model"` in `cases/<name>.json`, or `export MODEL=...`
 export MODEL=/path/to/model   # required unless case JSON defines model
 export VLLM_RS=/path/to/vllm-rs          # rust_grpc
 export ROUTER_BIN=$PWD/target/release/vllm-router   # optional
-# results JSON (default on, dir created at run time): py_test/e2e/perf/grpc/results/<backend>_<ts>/
+# results JSON (default on, dir created at run time): tests/python/e2e/perf/grpc/results/<backend>_<ts>/
 # export PERF_SAVE_RESULTS=0   # disable file output
 
-pytest py_test/e2e/perf/grpc --perf-case=rust_grpc
-pytest py_test/e2e/perf/grpc --perf-case=rust_http
-pytest py_test/e2e/perf/grpc --perf-case=python_http
+pytest tests/python/e2e/perf/grpc --perf-case=rust_grpc
+pytest tests/python/e2e/perf/grpc --perf-case=rust_http
+pytest tests/python/e2e/perf/grpc --perf-case=python_http
 ```
 
 Debug with an existing stack: `PERF_EXTERNAL=1` + `ROUTER_URL`.
@@ -92,7 +92,7 @@ Quick smoke (not comparable to acceptance matrix):
 ```bash
 export PERF_TOKENS=4096
 export PERF_WARMUP=0
-pytest -sv py_test/e2e/perf/grpc --perf-case=rust_grpc -k hit99-c16-r32
+pytest -sv tests/python/e2e/perf/grpc --perf-case=rust_grpc -k hit99-c16-r32
 ```
 
 Or attach to an existing stack: `PERF_EXTERNAL=1` + `ROUTER_URL=...` (skips launch).
@@ -123,7 +123,7 @@ Override bench via env: `PERF_TOKENS`, `PERF_MAX_TOKENS`, `PERF_TIMEOUT`.
 
 Each wave prints a **`perf summary`** block to stderr after the test (use `-sv`).
 Set `PERF_QUIET=1` to disable terminal summary. Wave JSON is written under
-`py_test/e2e/perf/grpc/results/` **by default**; use `PERF_SAVE_RESULTS=0` to skip files.
+`tests/python/e2e/perf/grpc/results/` **by default**; use `PERF_SAVE_RESULTS=0` to skip files.
 
 One wave equals:
 
@@ -160,7 +160,7 @@ Buildkite step **`:python: grpc perf test case`** (`key: grpc-perf-e2e` in
 `MODEL=Qwen/Qwen3.8-27B`, `cargo build --release`, then for each of
 `rust_grpc`, `rust_http`, `python_http`:
 
-`python -m pytest -sv py_test/e2e/perf/grpc -k c16-r32 --perf-case=<case>`
+`python -m pytest -sv tests/python/e2e/perf/grpc -k c16-r32 --perf-case=<case>`
 
 Wave JSON under `results/` is collected as build artifacts.
 

@@ -1,4 +1,4 @@
-"""Fixtures for py_test/e2e/perf/grpc (uses parent e2e conftest; pip vLLM 0.29+ ok)."""
+"""Fixtures for tests/python/e2e/perf/grpc (uses parent e2e conftest; pip vLLM 0.29+ ok)."""
 
 from __future__ import annotations
 
@@ -27,7 +27,7 @@ from case_loader import (  # noqa: E402
 )
 from stack_launcher import launch_stack  # noqa: E402
 
-BENCH_SCRIPT = _PERF_DIR.parents[3] / "benches" / "backend" / "bench_prefix_kvhit.py"
+BENCH_SCRIPT = _PERF_DIR.parents[4] / "benches" / "backend" / "bench_prefix_kvhit.py"
 
 
 def _progress(msg: str) -> None:
@@ -49,7 +49,7 @@ def pytest_addoption(parser):
         default=None,
         help=(
             "Perf scenario JSON: cases/<name>.json stem (rust_grpc), "
-            "or path (py_test/e2e/perf/grpc/cases/rust_grpc.json)"
+            "or path (tests/python/e2e/perf/grpc/cases/rust_grpc.json)"
         ),
     )
 

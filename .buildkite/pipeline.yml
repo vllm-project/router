@@ -412,7 +412,7 @@ steps:
       export PATH="$$PWD/target/release:$$PATH"
 
       PERF_PYTEST=(
-        python -m pytest -sv py_test/e2e/perf/grpc
+        python -m pytest -sv tests/python/e2e/perf/grpc
         -k c16-r32
       )
 
@@ -422,13 +422,13 @@ steps:
       done
 
       echo "=== perf result artifacts ==="
-      find py_test/e2e/perf/grpc/results -type f -name '*.json' 2>/dev/null || true
+      find tests/python/e2e/perf/grpc/results -type f -name '*.json' 2>/dev/null || true
       BASH
     agents:
       queue: "l4-k8s"
     depends_on: "build"
     artifact_paths:
-      - "py_test/e2e/perf/grpc/results/**/*.json"
+      - "tests/python/e2e/perf/grpc/results/**/*.json"
 
   # This queue is intentionally separate from the shared amd_mi300_* queues.
   # Those agents run --no-plugins, while this lane needs the Docker plugin
