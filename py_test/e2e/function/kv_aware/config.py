@@ -8,7 +8,10 @@ Optional environment (see also ``function/helpers/launch.py``):
   (same as ``scripts/backend`` / Buildkite). Alias: ``VLLM_ROUTER_BIN``.
 - ``VLLM_RS``: path to ``vllm-rs`` binary (else ``PATH`` or wheel under ``vllm``).
 - ``VLLM_RS_SERVE_EXTRA``: extra args to ``vllm-rs serve`` (shell-split), e.g.
-  ``"--max-model-len 8192 --enable-prefix-caching"``.
+  ``"--max-model-len 8192 --enable-prefix-caching"``. When unset, workers also get
+  per-process ``--kv-events-config`` (ZMQ) unless ``KV_AWARE_KV_EVENTS=0``.
+- ``KV_AWARE_KV_EVENTS``: ``1`` (default) append ZMQ kv-events per worker; ``0`` to disable.
+- ``KV_AWARE_KV_EVENTS_HOST``: bind/publish host in kv-events JSON (default ``127.0.0.1``).
 - Router logs: run pytest with ``-s``; default ``RUST_LOG=vllm_router_rs=info`` on
   the router subprocess (override in the shell for more/less noise).
 - Worker logs: subprocess PIPE → log file + stderr echo when ``pytest -s`` unless
@@ -84,6 +87,11 @@ def kv_aware_reuse_rounds() -> int:
 
 def kv_aware_dual_prime_concurrent() -> bool:
     raw = os.environ.get("KV_AWARE_DUAL_PRIME_CONCURRENT", "1").strip().lower()
+    return raw not in ("0", "false", "no")
+
+
+def kv_aware_kv_events_enabled() -> bool:
+    raw = os.environ.get("KV_AWARE_KV_EVENTS", "1").strip().lower()
     return raw not in ("0", "false", "no")
 
 

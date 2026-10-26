@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import shlex
 import shutil
@@ -14,6 +15,8 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 import requests
+
+from py_test.e2e.function.kv_aware.config import kv_aware_kv_events_enabled
 
 
 def _validate_router_executable(path: str, *, env_key: str) -> str:
@@ -178,11 +181,33 @@ def resolve_vllm_rs_bin() -> str | None:
     return None
 
 
-def vllm_rs_serve_extra_argv() -> list[str]:
+def vllm_rs_kv_events_config_argv(host: str, zmq_port: int) -> list[str]:
+    """``--kv-events-config`` for router ``GetKvEventSources`` / ZMQ KV index."""
+    payload = json.dumps(
+        {
+            "enable_kv_cache_events": True,
+            "publisher": "zmq",
+            "endpoint": f"tcp://{host}:{zmq_port}",
+        },
+        separators=(",", ":"),
+    )
+    return ["--kv-events-config", payload]
+
+
+def vllm_rs_serve_extra_argv(*, kv_events_zmq_port: int | None = None) -> list[str]:
     raw = os.environ.get("VLLM_RS_SERVE_EXTRA", "").strip()
-    if not raw:
-        return ["--enable-prefix-caching"]
-    return shlex.split(raw)
+    argv = shlex.split(raw) if raw else ["--enable-prefix-caching"]
+    if (
+        kv_events_zmq_port is not None
+        and kv_aware_kv_events_enabled()
+        and "--kv-events-config" not in argv
+    ):
+        host = (
+            os.environ.get("KV_AWARE_KV_EVENTS_HOST", "127.0.0.1").strip()
+            or "127.0.0.1"
+        )
+        argv = [*argv, *vllm_rs_kv_events_config_argv(host, kv_events_zmq_port)]
+    return argv
 
 
 def popen_launch_vllm_rs_grpc_worker(
@@ -192,6 +217,7 @@ def popen_launch_vllm_rs_grpc_worker(
     http_port: int,
     grpc_port: int,
     base_gpu_id: int = 0,
+    kv_events_zmq_port: int | None = None,
     extra_argv: list[str] | None = None,
     capture_output: bool = False,
 ) -> subprocess.Popen:
@@ -218,7 +244,11 @@ def popen_launch_vllm_rs_grpc_worker(
         str(http_port),
         "--grpc-port",
         str(grpc_port),
-        *(extra_argv if extra_argv is not None else vllm_rs_serve_extra_argv()),
+        *(
+            extra_argv
+            if extra_argv is not None
+            else vllm_rs_serve_extra_argv(kv_events_zmq_port=kv_events_zmq_port)
+        ),
     ]
     popen_kw: dict = {"env": env}
     if capture_output:

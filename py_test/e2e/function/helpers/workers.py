@@ -11,6 +11,7 @@ import pytest
 from py_test.e2e.function.helpers import launch
 from py_test.e2e.function.helpers.worker_log_pump import SubprocessLogPump
 from py_test.e2e.function.kv_aware.config import (
+    kv_aware_kv_events_enabled,
     kv_aware_worker_gpu_ids,
     kv_aware_worker_logs_quiet,
 )
@@ -53,9 +54,14 @@ def spawn_two_vllm_rs_grpc_workers(
         flush=True,
     )
 
-    http_a, grpc_a, http_b, grpc_b = launch.find_distinct_available_ports(4)
+    port_count = 6 if kv_aware_kv_events_enabled() else 4
+    ports = launch.find_distinct_available_ports(port_count)
+    http_a, grpc_a, http_b, grpc_b = ports[:4]
+    zmq_a = ports[4] if port_count == 6 else None
+    zmq_b = ports[5] if port_count == 6 else None
     print(
-        f"[e2e] worker A gpu={gpu_a} http={http_a} grpc={grpc_a}",
+        f"[e2e] worker A gpu={gpu_a} http={http_a} grpc={grpc_a}"
+        + (f" kv_events_zmq={zmq_a}" if zmq_a is not None else ""),
         flush=True,
     )
     log_a_path = log_dir / f"worker_a_grpc_{grpc_a}.log"
@@ -65,6 +71,7 @@ def spawn_two_vllm_rs_grpc_workers(
         http_port=http_a,
         grpc_port=grpc_a,
         base_gpu_id=gpu_a,
+        kv_events_zmq_port=zmq_a,
         capture_output=True,
     )
     pump_a = SubprocessLogPump(
@@ -87,7 +94,8 @@ def spawn_two_vllm_rs_grpc_workers(
     workers.append(worker_a)
 
     print(
-        f"[e2e] worker B gpu={gpu_b} http={http_b} grpc={grpc_b}",
+        f"[e2e] worker B gpu={gpu_b} http={http_b} grpc={grpc_b}"
+        + (f" kv_events_zmq={zmq_b}" if zmq_b is not None else ""),
         flush=True,
     )
     log_b_path = log_dir / f"worker_b_grpc_{grpc_b}.log"
@@ -97,6 +105,7 @@ def spawn_two_vllm_rs_grpc_workers(
         http_port=http_b,
         grpc_port=grpc_b,
         base_gpu_id=gpu_b,
+        kv_events_zmq_port=zmq_b,
         capture_output=True,
     )
     pump_b = SubprocessLogPump(
