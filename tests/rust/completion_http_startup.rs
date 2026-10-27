@@ -75,7 +75,7 @@ fn completion_public_startup_loads_assets_and_routes_owned_request() {
         let url = format!("http://{}", listener.local_addr().unwrap());
         let config = RouterConfig {
             mode: RoutingMode::Regular { worker_urls: vec![url.clone()] },
-            policy: PolicyConfig::KvAware { router_temperature: 0.0, kv_penalty_host: 0.8, kv_penalty_external: 0.6, kv_penalty_disk: 0.3 },
+            policy: PolicyConfig::KvAware { router_temperature: 0.0, kv_penalty_host: 0.8, kv_penalty_external: 0.6, kv_penalty_disk: 0.3, static_kv_event_sources: Default::default() },
             worker_startup_timeout_secs: 5,
             worker_startup_check_interval_secs: 1,
             disable_retries: true,

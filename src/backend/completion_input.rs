@@ -16,7 +16,9 @@ use vllm_tokenizer::DynTokenizer;
 
 use crate::protocols::spec::{CompletionRequest, PromptInput};
 
-use super::completion::{encode_completion_text, preflight_completion, CompletionPreflight};
+use super::completion::{
+    encode_completion_text, preflight_completion, CompletionPreflight, CompletionPreparationFailure,
+};
 use super::preprocess::FrontendHandle;
 use super::{validate_completion_tokenizer_definition, EngineFrontend};
 
@@ -195,28 +197,24 @@ impl CompletionPreparation {
 }
 
 fn completion_preparation_result(
-    prepared: Result<Vec<u32>, super::CompletionPreparationError>,
+    prepared: Result<Vec<u32>, CompletionPreparationFailure>,
 ) -> Result<Option<Vec<u32>>, (StatusCode, String)> {
     match prepared {
         Ok(tokens) => {
             tracing::debug!(token_count = tokens.len(), "Completion input prepared once");
             Ok(Some(tokens))
         }
-        Err(super::CompletionPreparationError::Unsupported(reason)) => {
-            let reason = match reason.as_str() {
-                "completion preparation does not support lora_path" => "lora_path",
-                "completion preparation does not support session_params" => "session_params",
-                "completion preparation does not support suffix" => "suffix",
-                "completion preparation does not support batched prompts" => "batched_prompts",
-                _ => "extension_field",
-            };
-            tracing::debug!(reason, "Completion input uses ordinary fallback");
+        Err(CompletionPreparationFailure::Unsupported { reason, .. }) => {
+            tracing::debug!(
+                reason = reason.as_str(),
+                "Completion input uses ordinary fallback"
+            );
             Ok(None)
         }
-        Err(super::CompletionPreparationError::InvalidRequest(error)) => {
+        Err(CompletionPreparationFailure::InvalidRequest(error)) => {
             Err((StatusCode::BAD_REQUEST, error))
         }
-        Err(super::CompletionPreparationError::ServiceFailure(error)) => {
+        Err(CompletionPreparationFailure::ServiceFailure(error)) => {
             Err((StatusCode::SERVICE_UNAVAILABLE, error))
         }
     }
@@ -324,6 +322,104 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
+
+    #[test]
+    fn completion_fallback_reason_is_independent_of_diagnostic_and_extension_name() {
+        use super::super::completion::CompletionUnsupportedReason;
+        use serde_json::json;
+
+        #[derive(Clone)]
+        struct LogWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+
+        impl std::io::Write for LogWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let output = LogWriter(Arc::default());
+        let writer = output.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(move || writer.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        for (value, expected, label) in [
+            (
+                json!({"prompt": [1], "lora_path": "adapter"}),
+                CompletionUnsupportedReason::LoraPath,
+                "lora_path",
+            ),
+            (
+                json!({"prompt": [1], "session_params": {}}),
+                CompletionUnsupportedReason::SessionParams,
+                "session_params",
+            ),
+            (
+                json!({"prompt": [1], "suffix": "tail"}),
+                CompletionUnsupportedReason::Suffix,
+                "suffix",
+            ),
+            (
+                json!({"prompt": ["first", "second"]}),
+                CompletionUnsupportedReason::BatchedPrompts,
+                "batched_prompts",
+            ),
+            (
+                json!({"prompt": [[1], [2]]}),
+                CompletionUnsupportedReason::BatchedPrompts,
+                "batched_prompts",
+            ),
+            (
+                json!({"prompt": [1], "private_extension_a": "secret"}),
+                CompletionUnsupportedReason::ExtensionField,
+                "extension_field",
+            ),
+            (
+                json!({"prompt": [1], "private_extension_b": "secret"}),
+                CompletionUnsupportedReason::ExtensionField,
+                "extension_field",
+            ),
+        ] {
+            let request: CompletionRequest = serde_json::from_value(value).unwrap();
+            let Err(CompletionPreparationFailure::Unsupported { reason, diagnostic }) =
+                preflight_completion(&request, 16)
+            else {
+                panic!("expected unsupported input");
+            };
+            assert_eq!(reason, expected);
+            assert_eq!(reason.as_str(), label);
+            // Both the existing and reworded diagnostic must yield the same
+            // fixed log label, never diagnostic or dynamic extension contents.
+            for diagnostic in [diagnostic, "reworded private diagnostic".into()] {
+                output.0.lock().unwrap().clear();
+                assert_eq!(
+                    completion_preparation_result(Err(CompletionPreparationFailure::Unsupported {
+                        reason,
+                        diagnostic,
+                    })),
+                    Ok(None)
+                );
+                let log = String::from_utf8(output.0.lock().unwrap().clone()).unwrap();
+                assert!(log.contains(&format!("reason=\"{label}\"")), "{log}");
+                for private in [
+                    "private_extension",
+                    "secret",
+                    "diagnostic",
+                    "does not support",
+                ] {
+                    assert!(!log.contains(private), "{log}");
+                }
+            }
+        }
+    }
 
     struct ControlledTokenizer {
         started: tokio::sync::mpsc::UnboundedSender<()>,

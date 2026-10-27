@@ -17,6 +17,7 @@ use crate::protocols::spec::CompletionRequest;
 
 pub(super) struct CompletionRoute<'a> {
     pub(super) tokens: Option<Vec<u32>>,
+    pub(super) input_active: bool,
     pub(super) raw_body: Option<&'a Bytes>,
     pub(super) echo: bool,
 }
@@ -60,21 +61,21 @@ pub(super) async fn prepare_completion_route<'a>(
     raw_body: Option<&'a Bytes>,
 ) -> Result<CompletionRoute<'a>, (StatusCode, String)> {
     let echo = request.echo;
+    let input = input.filter(|input| {
+        kv_aware_ops(policy).is_some()
+            && request
+                .model
+                .as_deref()
+                .is_none_or(|model| model == input.model)
+    });
     let tokens = match input {
-        Some(input)
-            if kv_aware_ops(policy).is_some()
-                && request
-                    .model
-                    .as_deref()
-                    .is_none_or(|model| model == input.model) =>
-        {
-            preparation.prepare(request, input.clone()).await?
-        }
+        Some(input) => preparation.prepare(request, input.clone()).await?,
         _ => None,
     };
     // Fallback drops only input credit, not the original body or output contract.
     Ok(CompletionRoute {
         tokens,
+        input_active: input.is_some(),
         raw_body,
         echo,
     })

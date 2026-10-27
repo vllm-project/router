@@ -3,7 +3,7 @@
 //! This module provides a unified abstraction for routing policies that work
 //! across both regular and prefill-decode (PD) routing modes.
 
-use crate::core::Worker;
+use crate::core::{Worker, WorkerLoadGuard};
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::sync::Arc;
@@ -24,11 +24,13 @@ pub use consistent_hash::ConsistentHashPolicy;
 pub use consistent_hash::VIRTUAL_NODES_PER_WORKER;
 pub use factory::PolicyFactory;
 pub use kv_aware::{
-    cost_components, kv_aware_ops, CandidateView, CostComponents, CostDecision, CostParams,
-    InMemorySlotManager, KvAwareOps, KvAwarePolicy, KvRequestSlot, KvSelectionReceipt,
-    LoadProvider, LoadSample, MultiplicativeScorer, Picker, Scorer, SelectionError, SlotManager,
-    TemperaturePicker, TieredMatchProvider, TransferCredits,
+    cost_components, kv_aware_ops, AffinityKey, CandidateView, CostComponents, CostDecision,
+    CostParams, InMemorySlotManager, KvAwareOps, KvAwarePolicy, KvRequestSlot, KvRequestTokens,
+    KvSelectionReceipt, LoadProvider, LoadSample, MultiplicativeScorer, Picker, Scorer,
+    SelectionError, SlotManager, TemperaturePicker, TieredMatchProvider, TransferCredits,
+    WorkerTokenInputs,
 };
+pub(crate) use kv_aware::{kv_aware_policy, KvAffinityTable, QualifiedKvInput};
 pub use power_of_two::PowerOfTwoPolicy;
 pub use random::RandomPolicy;
 pub use registry::PolicyRegistry;
@@ -38,6 +40,15 @@ pub use round_robin::RoundRobinPolicy;
 /// HTTP headers passed to policies for routing decisions
 /// Key is lowercase header name, value is header value
 pub type RequestHeaders = HashMap<String, String>;
+
+/// Coordinates selection and reservation for one worker pool.
+///
+/// Reuse the same context for admissions to the same pool. It belongs to the
+/// caller, not the policy: one policy may be shared by separate P and D pools.
+#[derive(Debug, Default)]
+pub struct SelectionContext {
+    lock: parking_lot::Mutex<()>,
+}
 
 /// Core trait for load balancing policies
 ///
@@ -67,6 +78,25 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
         request_text: Option<&str>,
         headers: Option<&RequestHeaders>,
     ) -> Option<usize>;
+
+    /// Select a worker and reserve its local load before another admission
+    /// through this context can make a load-based decision.
+    ///
+    /// The caller owns the returned guard's lifetime. Policies with expensive
+    /// preparation can override this hook, keeping only the final decision and
+    /// reservation under the context lock. The default preserves existing policy
+    /// behavior, including policies which maintain their own selection state.
+    fn select_and_reserve<'a>(
+        &self,
+        context: &SelectionContext,
+        workers: &'a [Arc<dyn Worker>],
+        request_text: Option<&str>,
+        headers: Option<&RequestHeaders>,
+    ) -> Option<(usize, WorkerLoadGuard<'a>)> {
+        let _selection = context.lock.lock();
+        let idx = self.select_worker_with_headers(workers, request_text, headers)?;
+        Some((idx, WorkerLoadGuard::new(workers[idx].as_ref())))
+    }
 
     /// Select a pair of workers (prefill and decode) for PD routing
     ///
@@ -110,6 +140,16 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
     /// Check if this policy needs request text for routing decisions
     fn needs_request_text(&self) -> bool {
         false // Default: most policies don't need request text
+    }
+
+    /// Whether request text must use the content-preserving cache routing key.
+    fn needs_cache_routing_key(&self) -> bool {
+        false
+    }
+
+    /// Whether the router must track requests in flight for this policy.
+    fn tracks_request_load(&self) -> bool {
+        false
     }
 
     /// Check if this policy needs HTTP headers for routing decisions

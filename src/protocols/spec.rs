@@ -1,3 +1,4 @@
+use crate::request_identity::IdentityFields;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -707,7 +708,21 @@ impl GenerationRequest for ChatCompletionRequest {
     }
 
     fn extract_program_identity_payload(&self) -> Option<serde_json::Value> {
-        program_identity_payload(&self.other, self.user.as_deref())
+        program_identity_payload(Some(&self.other), self.user.as_deref())
+    }
+
+    fn affinity_identity(&self) -> IdentityFields<'_> {
+        IdentityFields {
+            other: Some(&self.other),
+            session_params: self.session_params.as_ref(),
+        }
+    }
+
+    fn cache_identity(&self) -> (Option<&str>, Option<&str>) {
+        (
+            passthrough_string(&self.other, "lora_name"),
+            passthrough_string(&self.other, "cache_salt"),
+        )
     }
 }
 
@@ -938,7 +953,21 @@ impl GenerationRequest for CompletionRequest {
     }
 
     fn extract_program_identity_payload(&self) -> Option<serde_json::Value> {
-        program_identity_payload(&self.other, self.user.as_deref())
+        program_identity_payload(Some(&self.other), self.user.as_deref())
+    }
+
+    fn affinity_identity(&self) -> IdentityFields<'_> {
+        IdentityFields {
+            other: Some(&self.other),
+            session_params: self.session_params.as_ref(),
+        }
+    }
+
+    fn cache_identity(&self) -> (Option<&str>, Option<&str>) {
+        (
+            passthrough_string(&self.other, "lora_name"),
+            passthrough_string(&self.other, "cache_salt"),
+        )
     }
 }
 
@@ -2210,6 +2239,13 @@ impl GenerationRequest for GenerateRequest {
         // No text input found
         String::new()
     }
+
+    fn affinity_identity(&self) -> IdentityFields<'_> {
+        IdentityFields {
+            other: None,
+            session_params: self.session_params.as_ref(),
+        }
+    }
 }
 
 // ==================================================================
@@ -2252,7 +2288,21 @@ impl GenerationRequest for InferenceGenerateRequest {
     }
 
     fn extract_program_identity_payload(&self) -> Option<serde_json::Value> {
-        program_identity_payload(&self.other, None)
+        program_identity_payload(Some(&self.other), None)
+    }
+
+    fn affinity_identity(&self) -> IdentityFields<'_> {
+        IdentityFields {
+            other: Some(&self.other),
+            session_params: None,
+        }
+    }
+
+    fn cache_identity(&self) -> (Option<&str>, Option<&str>) {
+        (
+            passthrough_string(&self.other, "lora_name"),
+            passthrough_string(&self.other, "cache_salt"),
+        )
     }
 }
 
@@ -2567,22 +2617,44 @@ pub trait GenerationRequest: Send + Sync {
     fn grpc_request(&self) -> Option<GrpcRequestRef<'_>> {
         None
     }
+    /// Borrow identity fields without serializing a separate payload.
+    fn affinity_identity(&self) -> IdentityFields<'_> {
+        IdentityFields::default()
+    }
+
+    /// LoRA adapter name and cache salt carried as passthrough body fields,
+    /// scoping KV-aware routing. Defaults to none.
+    fn cache_identity(&self) -> (Option<&str>, Option<&str>) {
+        (None, None)
+    }
+}
+
+fn passthrough_string<'a>(
+    other: &'a serde_json::Map<String, serde_json::Value>,
+    name: &str,
+) -> Option<&'a str> {
+    other
+        .get(name)
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty())
 }
 
 fn program_identity_payload(
-    other: &serde_json::Map<String, serde_json::Value>,
+    other: Option<&serde_json::Map<String, serde_json::Value>>,
     user: Option<&str>,
 ) -> Option<serde_json::Value> {
     let mut payload = serde_json::Map::new();
-    for field in [
-        "vllm_xargs",
-        "agent_hint",
-        "session_params",
-        "session_id",
-        "user_id",
-    ] {
-        if let Some(value) = other.get(field) {
-            payload.insert(field.to_string(), value.clone());
+    if let Some(other) = other {
+        for field in [
+            "vllm_xargs",
+            "agent_hint",
+            "session_params",
+            "session_id",
+            "user_id",
+        ] {
+            if let Some(value) = other.get(field) {
+                payload.insert(field.to_string(), value.clone());
+            }
         }
     }
     if let Some(user) = user {
@@ -3172,13 +3244,97 @@ mod tests {
             "messages": ["must-not-be-copied"]
         }))
         .unwrap();
-        let payload = program_identity_payload(&other, Some("user-a")).unwrap();
+        let payload = program_identity_payload(Some(&other), Some("user-a")).unwrap();
         assert_eq!(payload.as_object().unwrap().len(), 3);
         assert!(payload.get("vllm_xargs").is_some());
         assert!(payload.get("agent_hint").is_some());
         assert_eq!(payload.get("user").unwrap(), "user-a");
         assert!(payload.get("prompt").is_none());
         assert!(payload.get("messages").is_none());
+    }
+
+    #[test]
+    fn affinity_identity_borrows_typed_session_params() {
+        // session_params never reaches the passthrough map; only the
+        // borrowed affinity fields carry it.
+        let mut chat: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "session_params": {"session_id": "typed-session"}
+        }))
+        .unwrap();
+        assert!(chat.extract_program_identity_payload().is_none());
+        chat.other.insert(
+            "session_params".into(),
+            serde_json::json!({"session_id":"shadow"}),
+        );
+        let fields = chat.affinity_identity();
+        assert!(std::ptr::eq(
+            fields.session_params.unwrap(),
+            chat.session_params.as_ref().unwrap()
+        ));
+        let identity = crate::request_identity::resolve_affinity_identity(None, fields)
+            .unwrap()
+            .unwrap();
+        assert_eq!(identity.program_id, "typed-session");
+
+        let completion: CompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "m",
+            "prompt": "hi",
+            "session_params": {"session_id": "typed-session"}
+        }))
+        .unwrap();
+        assert!(completion.extract_program_identity_payload().is_none());
+        let fields = completion.affinity_identity();
+        assert!(std::ptr::eq(
+            fields.session_params.unwrap(),
+            completion.session_params.as_ref().unwrap()
+        ));
+        let identity = crate::request_identity::resolve_affinity_identity(None, fields)
+            .unwrap()
+            .unwrap();
+        assert_eq!(identity.program_id, "typed-session");
+
+        let generate: GenerateRequest = serde_json::from_value(serde_json::json!({
+            "text": "hi",
+            "session_params": {"session_id": "typed-session"}
+        }))
+        .unwrap();
+        let fields = generate.affinity_identity();
+        assert!(std::ptr::eq(
+            fields.session_params.unwrap(),
+            generate.session_params.as_ref().unwrap()
+        ));
+        let identity = crate::request_identity::resolve_affinity_identity(None, fields)
+            .unwrap()
+            .unwrap();
+        assert_eq!(identity.program_id, "typed-session");
+    }
+
+    #[test]
+    fn cache_identity_reads_passthrough_fields() {
+        let chat: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "lora_name": "adapter",
+            "cache_salt": "tenant"
+        }))
+        .unwrap();
+        assert_eq!(chat.cache_identity(), (Some("adapter"), Some("tenant")));
+
+        // Empty strings are ignored, matching the prepared-path behavior.
+        let chat: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "lora_name": "",
+            "cache_salt": ""
+        }))
+        .unwrap();
+        assert_eq!(chat.cache_identity(), (None, None));
+
+        let generate: GenerateRequest =
+            serde_json::from_value(serde_json::json!({"text": "hi"})).unwrap();
+        assert_eq!(generate.cache_identity(), (None, None));
     }
     use serde_json;
 

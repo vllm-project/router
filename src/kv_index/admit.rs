@@ -191,3 +191,56 @@ fn dense_residency_supported(
             )
         })
 }
+
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dense_block_size_matrix_preserves_rejection_reason_and_event_index() {
+        for expected in [8, 16, 32] {
+            for actual in [0, 8, 16, 32] {
+                let stored = serde_json::from_value(serde_json::json!({
+                    "type": "BlockStored", "block_hashes": [1, 2],
+                    "parent_block_hash": null, "token_ids": vec![1u32; actual * 2],
+                    "block_size": actual, "medium": "CPU",
+                    "lora_id": null, "lora_name": null
+                }))
+                .unwrap();
+                let mut batch = KVEventBatch {
+                    ts: 1.0,
+                    events: vec![KVEvent::AllBlocksCleared(Default::default()), stored],
+                    data_parallel_rank: Some(3),
+                };
+                let reason = if actual == 0 {
+                    Some(DenseRejectionReason::ZeroBlockSize)
+                } else if actual as u32 != expected {
+                    Some(DenseRejectionReason::BlockSizeMismatch)
+                } else {
+                    None
+                };
+                assert_eq!(
+                    validate_dense_batch(&batch, expected),
+                    reason.map_or(Ok(()), |reason| Err(DenseBatchRejection {
+                        reason,
+                        event_index: 1,
+                    })),
+                    "source={expected}, event={actual}"
+                );
+                if reason.is_none() {
+                    let KVEvent::BlockStored(stored) = &mut batch.events[1] else {
+                        unreachable!()
+                    };
+                    stored.token_ids.pop();
+                    assert_eq!(
+                        validate_dense_batch(&batch, expected),
+                        Err(DenseBatchRejection {
+                            reason: DenseRejectionReason::TokenCountMismatch,
+                            event_index: 1,
+                        })
+                    );
+                }
+            }
+        }
+    }
+}

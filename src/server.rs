@@ -60,17 +60,33 @@ pub struct AppContext {
 
 impl AppContext {
     pub fn new(
-        router_config: RouterConfig,
+        mut router_config: RouterConfig,
         client: Client,
         max_concurrent_requests: usize,
         rate_limit_tokens_per_second: Option<usize>,
         api_key_validation_urls: Vec<String>,
     ) -> Result<Self, String> {
+        if matches!(
+            &router_config.policy,
+            crate::config::PolicyConfig::KvAware { .. }
+        ) {
+            let legacy_sources = std::env::var("VLLM_ROUTER_KV_EVENT_SOURCES").ok();
+            crate::config::normalize_static_kv_event_sources(
+                &mut router_config.policy,
+                legacy_sources.as_deref(),
+            )
+            .map_err(|error| error.to_string())?;
+        }
         let rate_limit_tokens = rate_limit_tokens_per_second.unwrap_or(max_concurrent_requests);
         let rate_limiter = Arc::new(TokenBucket::new(max_concurrent_requests, rate_limit_tokens));
 
         let worker_registry = Arc::new(WorkerRegistry::new());
-        let policy_registry = Arc::new(PolicyRegistry::new(router_config.policy.clone()));
+        let policy_registry = Arc::new(PolicyRegistry::new_with_affinity_ttl(
+            router_config.policy.clone(),
+            router_config
+                .kv_aware_session_affinity_ttl_secs
+                .map(std::time::Duration::from_secs),
+        ));
 
         let router_manager = None;
 
@@ -1316,6 +1332,44 @@ mod tests {
     async fn completion_extractor_matches_locked_axum_json() {
         use axum::body::{to_bytes, Body, Bytes};
 
+        async fn assert_parity(content_type: Option<http::HeaderValue>, raw: &'static str) {
+            let request = || {
+                let mut request = Request::new(Body::from(raw));
+                if let Some(value) = &content_type {
+                    request
+                        .headers_mut()
+                        .insert(http::header::CONTENT_TYPE, value.clone());
+                }
+                request
+            };
+            match (
+                JsonWithRaw::<CompletionRequest>::from_request(request(), &()).await,
+                Json::<CompletionRequest>::from_request(request(), &()).await,
+            ) {
+                (Ok(actual), Ok(Json(expected))) => {
+                    assert_eq!(
+                        serde_json::to_value(actual.value).unwrap(),
+                        serde_json::to_value(expected).unwrap()
+                    );
+                    assert_eq!(actual.raw, Bytes::copy_from_slice(raw.as_bytes()));
+                }
+                (Err(actual), Err(expected)) => {
+                    let expected = expected.into_response();
+                    assert_eq!(
+                        actual.status(),
+                        expected.status(),
+                        "{content_type:?}: {raw}"
+                    );
+                    assert_eq!(actual.headers(), expected.headers());
+                    assert_eq!(
+                        to_bytes(actual.into_body(), 4096).await.unwrap(),
+                        to_bytes(expected.into_body(), 4096).await.unwrap()
+                    );
+                }
+                _ => panic!("extractors disagreed for {content_type:?}: {raw}"),
+            }
+        }
+
         for content_type in [
             None,
             Some(http::HeaderValue::from_static("application/json")),
@@ -1329,51 +1383,31 @@ mod tests {
             Some(http::HeaderValue::from_static("application/json; broken")),
             Some(http::HeaderValue::from_bytes(b"\xff").unwrap()),
         ] {
-            for raw in [
+            assert_parity(
+                content_type,
                 r#" { "max_tokens":1, "prompt":"\u4f60好\n\"" } "#,
-                r#"{"prompt":[1,2]}"#,
-                r#"{"prompt":[1],"prompt":[2]}"#,
-                r#"{"prompt":{}}"#,
-                r#"{"prompt":"#,
-                "",
-            ] {
-                let request = || {
-                    let mut request = Request::new(Body::from(raw));
-                    if let Some(value) = &content_type {
-                        request
-                            .headers_mut()
-                            .insert(http::header::CONTENT_TYPE, value.clone());
-                    }
-                    request
-                };
-                match (
-                    JsonWithRaw::<CompletionRequest>::from_request(request(), &()).await,
-                    Json::<CompletionRequest>::from_request(request(), &()).await,
-                ) {
-                    (Ok(actual), Ok(Json(expected))) => {
-                        assert_eq!(
-                            serde_json::to_value(actual.value).unwrap(),
-                            serde_json::to_value(expected).unwrap()
-                        );
-                        assert_eq!(actual.raw, Bytes::copy_from_slice(raw.as_bytes()));
-                    }
-                    (Err(actual), Err(expected)) => {
-                        let expected = expected.into_response();
-                        assert_eq!(
-                            actual.status(),
-                            expected.status(),
-                            "{content_type:?}: {raw}"
-                        );
-                        assert_eq!(actual.headers(), expected.headers());
-                        assert_eq!(
-                            to_bytes(actual.into_body(), 4096).await.unwrap(),
-                            to_bytes(expected.into_body(), 4096).await.unwrap()
-                        );
-                    }
-                    _ => panic!("extractors disagreed for {content_type:?}: {raw}"),
-                }
-            }
+            )
+            .await;
         }
+        for raw in [
+            r#"{"prompt":[1,2]}"#,
+            r#"{"prompt":[1],"prompt":[2]}"#,
+            r#"{"prompt":{}}"#,
+            r#"{"prompt":"#,
+            "",
+        ] {
+            assert_parity(
+                Some(http::HeaderValue::from_static("application/json")),
+                raw,
+            )
+            .await;
+        }
+        // Invalid MIME takes precedence even when the body is also malformed.
+        assert_parity(
+            Some(http::HeaderValue::from_static("text/json")),
+            r#"{"prompt":"#,
+        )
+        .await;
 
         let failed_body = || {
             Request::builder()
@@ -1422,6 +1456,7 @@ mod tests {
                 kv_penalty_host: 0.3,
                 kv_penalty_external: 0.05,
                 kv_penalty_disk: 0.01,
+                static_kv_event_sources: Default::default(),
             },
             ..Default::default()
         };
