@@ -1,3 +1,5 @@
+#![cfg(all(feature = "cpu", feature = "ready"))]
+
 //! Integration tests for OpenTelemetry distributed tracing.
 //!
 //! These tests verify that:

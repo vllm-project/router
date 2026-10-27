@@ -1,3 +1,5 @@
+#![cfg(all(feature = "cpu", feature = "ready"))]
+
 //! Integration tests for `CachedTokenizer` with real HuggingFace encodings.
 //!
 //! The default tests load `tests/rust/fixtures/tokenizer/byte_level_bpe.json`, a

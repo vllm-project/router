@@ -1,6 +1,8 @@
 import pytest
 import requests
 
+pytestmark = [pytest.mark.ready, pytest.mark.cpu]
+
 
 @pytest.mark.integration
 def test_worker_crash_reroute_with_retries(router_manager, mock_workers):

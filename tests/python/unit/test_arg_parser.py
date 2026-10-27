@@ -11,6 +11,8 @@ import pytest
 from vllm_router.launch_router import RouterArgs, parse_router_args
 from vllm_router.router import Router, policy_from_str
 
+pytestmark = [pytest.mark.ready, pytest.mark.cpu]
+
 
 class TestRouterArgs:
     """Test RouterArgs dataclass and its methods."""
@@ -22,6 +24,7 @@ class TestRouterArgs:
         # Test basic defaults
         assert args.host == "127.0.0.1"
         assert args.port == 30000
+        assert args.max_tree_size == 2**25
         assert args.policy == "cache_aware"
         assert args.worker_urls == []
         assert args.vllm_pd_disaggregation is False

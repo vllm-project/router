@@ -1,3 +1,5 @@
+#![cfg(all(feature = "cpu", feature = "ready"))]
+
 mod common;
 
 use common::mock_worker::{HealthStatus, MockWorker, MockWorkerConfig, WorkerType};
@@ -97,7 +99,7 @@ impl TestContext {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod request_format_tests {
     use super::*;
 

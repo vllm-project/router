@@ -1,6 +1,8 @@
 import pytest
 import requests
 
+pytestmark = [pytest.mark.ready, pytest.mark.cpu]
+
 
 @pytest.mark.integration
 def test_payload_size_limit(router_manager, mock_workers):

@@ -12,9 +12,6 @@ import argparse
 import os
 import sys
 
-import lm_eval
-import openai
-
 # Test configuration
 TASK = "gsm8k"
 DEFAULT_FILTER = "exact_match,strict-match"
@@ -80,6 +77,8 @@ def run_simple_prompt(
     print_info("Running connectivity test with simple prompt...")
 
     try:
+        import openai
+
         # Use a very long timeout (10 minutes) for connectivity test
         client = openai.OpenAI(api_key="EMPTY", base_url=base_url, timeout=600.0)
         # Use chat completions for Instruct models
@@ -164,6 +163,8 @@ def run_accuracy_evaluation(
             # vLLM's top-k/top-p sampling kernel for every dynamic batch shape.
             gen_kwargs["temperature"] = 0.0
 
+        import lm_eval
+
         results = lm_eval.simple_evaluate(
             model="local-chat-completions",
             model_args={
@@ -216,7 +217,7 @@ def validate_accuracy(
 
     if expected_value is None:
         print_warning(
-            f"No expected baseline found for {model_name}. " "Cannot validate accuracy."
+            f"No expected baseline found for {model_name}. Cannot validate accuracy."
         )
         print_info(
             "If this is the first time testing this model, "

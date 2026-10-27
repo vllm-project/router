@@ -2,6 +2,9 @@ import multiprocessing
 import time
 import unittest
 from types import SimpleNamespace
+import pytest
+
+pytestmark = [pytest.mark.ready, pytest.mark.cpu]
 
 
 def terminate_process(process: multiprocessing.Process, timeout: float = 1.0) -> None:
