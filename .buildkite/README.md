@@ -18,13 +18,13 @@ on `release-pipeline.yml` (the `router-release` pipeline) publishes images.
 
 | File | Level | When it is uploaded | What runs |
 | --- | --- | --- | --- |
-| `test-ready.yml` | L1 ready | non-default branch labeled `ready` | Rust and Python unit/integration tests, product image build, one NVIDIA P/D completion |
-| `test-merge.yml` | L2 merge | default branch (except `NIGHTLY=1`), or any other branch labeled `merge-test` | one-mode xGMI smoke and RDMA `SMOKE_ONLY` |
-| `test-nightly.yml` | L3 nightly | default branch with `NIGHTLY=1`, or any other branch labeled `nightly-test` | Rust and Python unit/integration tests (skipped when the PR also has `ready`), full NVIDIA GSM8K, full xGMI matrix, full RDMA |
+| `test-ready.yml` | L1 ready | non-default branch labeled `ready` | Rust and Python unit/integration tests, product image build, one NVIDIA P/D completion (`ROCM_ONLY != 1` on that job) |
+| `test-merge.yml` | L2 merge | default branch (except `NIGHTLY=1`), its merge queue, or any other branch labeled `merge-test` | one-mode xGMI smoke and RDMA `SMOKE_ONLY` |
+| `test-nightly.yml` | L3 nightly | default branch with `NIGHTLY=1`, or any other branch labeled `nightly-test` | Rust and Python unit/integration tests (skipped when the PR also has `ready`), full NVIDIA GSM8K (`ROCM_ONLY != 1`), full xGMI matrix, full RDMA |
 | `release-pipeline.yml` | release | tag / release pipeline | wheels and images only |
 
-A pull request labeled `ready` uploads every job in `test-ready.yml`, including
-forks. There is no per-job fork skip inside that file.
+A pull request labeled `ready` uploads `test-ready.yml`, including forks.
+`test-merge.yml` has no per-job `if`. In `test-ready.yml` and `test-nightly.yml`, a job whose gate is narrower than the upload keeps its own `if`.
 
 GPU machine presets are in [`ci_mirror_hardwares.yml`](ci_mirror_hardwares.yml).
 A step names one with `mirror_hardwares`. `scripts/upload_pipeline.py` expands
@@ -73,9 +73,9 @@ The test script:
 
 ### CI Configuration
 
-Trusted builds run one completion from `test-ready.yml`
-(`SKIP_LM_EVAL=true`, `NUM_SANITY_REQUESTS=1`). Full GSM8K stays in
-`test-nightly.yml`. Forks do not run either GPU job.
+A `ready` label runs one completion from `test-ready.yml`
+(`SKIP_LM_EVAL=true`, `NUM_SANITY_REQUESTS=1`) when `ROCM_ONLY != 1`.
+Full GSM8K stays in `test-nightly.yml`. Both include forks.
 
 **Key features:**
 - Requires 4 GPUs (runs on `l4-k8s`)
@@ -94,16 +94,14 @@ The dedicated `router_rocm_mi300_2` queue covers two MoRI lanes:
 The hosts restore the digest-pinned ROCm image before each job
 (https://github.com/vllm-project/router/issues/363). L2 xGMI is one
 `read_mode` plus `LM_EVAL_LIMIT=20`, and runs for a default-branch push, the
-default-branch merge queue, or a same-repository pull request labeled
-`merge-test`. L3 xGMI is the read+write matrix and 500-example GSM8K. It runs
-for `NIGHTLY=1`, a same-repository pull request labeled `nightly-test`, or a
-manual/API build with `RUN_ROCM_XGMI=1`. These are the L2/L3 triggers, not the
-old "every trusted PR" condition.
+default-branch merge queue, or any pull request labeled `merge-test`. L3
+xGMI is the read+write matrix. It runs for `NIGHTLY=1`, any pull request
+labeled `nightly-test`, or a manual/API build with `RUN_ROCM_XGMI=1`. These
+are the L2/L3 triggers, not the old "every trusted PR" condition.
 
-L2 RDMA (`test-merge.yml`) sets `SMOKE_ONLY=true` and `read_mode=true`. L3
-RDMA runs both directions for scheduled `NIGHTLY=1`, or a manual/API build
-with `RUN_ROCM_RDMA=1`. Group-level filtering keeps the xGMI Docker plugin
-off untrusted fork pull requests.
+L2 RDMA (`test-merge.yml`) sets `SMOKE_ONLY=true` and `read_mode=true`. Both
+L2 jobs run whenever that file is uploaded. L3 RDMA runs both directions for
+scheduled `NIGHTLY=1`, or a manual/API build with `RUN_ROCM_RDMA=1`.
 
 ROCm-only scheduled builds should set both `NIGHTLY=1` and `ROCM_ONLY=1`.
 `ROCM_ONLY=1` skips the NVIDIA four-GPU step while retaining the CPU build

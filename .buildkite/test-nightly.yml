@@ -1,21 +1,14 @@
 # L3 nightly (https://github.com/vllm-project/router/issues/273).
-# Uploaded for a default-branch push with NIGHTLY=1, or any other branch
-# labeled nightly-test. RUN_ROCM_* is decided on the ROCm jobs below.
-# Also runs the Rust and Python unit/integration jobs from test-ready.yml,
-# unless that PR already has the ready label (those jobs run in L1).
-# Full NVIDIA GSM8K, the full xGMI read+write matrix, and full RDMA.
-# NIGHTLY=1 on this test pipeline does not publish images. That stays on
-# release-pipeline.yml (router-release).
+# pipeline.yml uploads this file for NIGHTLY=1 or nightly-test, including forks.
+# Jobs whose gate is narrower than that upload keep their own if.
+# NIGHTLY=1 on this test pipeline does not publish images.
 
 env:
   RUST_IMAGE: "rust:1.95.0-bookworm"
   # Pin the ROCm nightly used by the MoRI lane so dependency changes are explicit.
   ROCM_VLLM_IMAGE: "vllm/vllm-openai-rocm:nightly@sha256:d22922d540810d90c5a3eafe91d3b4a62c2b881f3e990d0b7180b2875a5d176d"
-  # Disable incremental compilation for consistent CI builds
   CARGO_INCREMENTAL: "0"
-  # Enable full Rust backtraces for debugging
   RUST_BACKTRACE: "1"
-
 
 steps:
   - group: ":test_tube: Tests"
@@ -91,10 +84,8 @@ steps:
   # ============================================================================
   - label: ":satellite: P/D Disaggregation Test (4 GPUs)"
     key: "pd-disagg-test"
-    # This file is already uploaded only for NIGHTLY=1 or the nightly-test
-    # label, including fork PRs. ROCm-only builds set ROCM_ONLY=1 and must
-    # not wait for an L4 node. Full GSM8K; the one-completion smoke is
-    # test-ready.yml.
+    # image-build is skipped when ROCM_ONLY=1. A skipped dependency is treated
+    # as satisfied, so this job must use the same condition.
     if: build.env("ROCM_ONLY") != "1"
     timeout_in_minutes: 60
     retry:
@@ -113,18 +104,16 @@ steps:
 
   # This queue is intentionally separate from the shared amd_mi300_* queues.
   # Those agents run --no-plugins, while this lane needs the Docker plugin
-  # to provide the pinned vLLM/MoRI userspace on a two-GPU xGMI host. Put the
-  # condition on the group so fork builds cannot run plugin hooks.
+  # to provide the pinned vLLM/MoRI userspace on a two-GPU xGMI host.
   # Hosts restore the digest-pinned image before the job (#363). This is the
   # L3 matrix, not the old "every trusted PR" condition. The one-mode smoke
-  # lives in test-merge.yml. Fork pull requests stay off this plugin group.
+  # lives in test-merge.yml. nightly-test includes forks.
   - group: ":large_purple_circle: ROCm MoRI XGMI P/D"
     key: "pd-disagg-moriio-tests"
     if: |
       build.env("NIGHTLY") == "1" ||
       (
         build.pull_request.id != null &&
-        build.pull_request.repository.fork == false &&
         build.pull_request.labels includes "nightly-test"
       ) ||
       ((build.source == "ui" || build.source == "api") &&

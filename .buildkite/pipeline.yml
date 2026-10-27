@@ -94,7 +94,7 @@ steps:
 
   # Uploads wait for the build group, not for image-build, and not for each other.
   # NVIDIA P/D jobs depend on image-build.
-  # L1: same gate as Omni READY_LABEL_IF. The file has no per-job fork check.
+  # L1: same gate as Omni READY_LABEL_IF. ROCM_ONLY stays on the smoke job.
   - label: ":pipeline: Upload L1 ready"
     key: "upload-ready-pipeline"
     depends_on: "build"
@@ -106,8 +106,9 @@ steps:
     agents:
       queue: "medium_cpu_queue_premerge"
 
-  # L2: default-branch push, or any other branch labeled merge-test.
-  # Scheduled main + NIGHTLY=1 stays on L3 (same split as Omni MERGE_MAIN_IF).
+  # L2: default-branch push, its merge queue, or any other branch labeled
+  # merge-test. test-merge.yml has no per-job gate. Scheduled main +
+  # NIGHTLY=1 stays on L3 (same split as Omni MERGE_MAIN_IF).
   - label: ":pipeline: Upload L2 merge"
     key: "upload-merge-pipeline"
     depends_on: "build"
@@ -116,6 +117,7 @@ steps:
         build.branch == pipeline.default_branch &&
         build.env("NIGHTLY") != "1"
       ) ||
+      build.merge_queue.base_branch == pipeline.default_branch ||
       (
         build.branch != pipeline.default_branch &&
         build.pull_request.labels includes "merge-test"
@@ -126,7 +128,8 @@ steps:
       queue: "medium_cpu_queue_premerge"
 
   # L3: default-branch NIGHTLY=1, or any other branch labeled nightly-test.
-  # RUN_ROCM_* stays on the jobs in test-nightly.yml, not on this upload.
+  # Job-only gates stay in test-nightly.yml: ready overlap, ROCM_ONLY,
+  # RUN_ROCM_XGMI, and the RDMA schedule/manual gate.
   - label: ":pipeline: Upload L3 nightly"
     key: "upload-nightly-pipeline"
     depends_on: "build"

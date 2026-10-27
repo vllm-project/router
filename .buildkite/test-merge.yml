@@ -1,8 +1,6 @@
 # L2 merge (https://github.com/vllm-project/router/issues/273).
-# Uploaded for a default-branch push (except NIGHTLY=1) or a non-default
-# branch labeled merge-test.
-# xGMI smoke is one read mode plus a short limit. It runs automatically for
-# this file's L2 upload, except fork pull requests.
+# pipeline.yml decides when this file is uploaded. Jobs here have no if.
+# xGMI smoke is one read mode plus a short limit.
 # RDMA smoke is SMOKE_ONLY in one direction.
 
 env:
@@ -19,21 +17,11 @@ steps:
   # L2 smoke: one read_mode and LM_EVAL_LIMIT=20. Full read+write is test-nightly.yml.
   # This queue is intentionally separate from the shared amd_mi300_* queues.
   # Those agents run --no-plugins, while this lane needs the Docker plugin
-  # to provide the pinned vLLM/MoRI userspace on a two-GPU xGMI host. Put the
-  # condition on the group so fork builds cannot run plugin hooks.
-  # Hosts restore the digest-pinned image before the job (#363). Keep the
-  # plugin hooks off fork pull requests. Full read+write stays on
-  # test-nightly.yml.
+  # to provide the pinned vLLM/MoRI userspace on a two-GPU xGMI host.
+  # Hosts restore the digest-pinned image before the job (#363). Full
+  # read+write stays on test-nightly.yml.
   - group: ":large_purple_circle: ROCm MoRI XGMI smoke"
     key: "pd-disagg-moriio-smoke"
-    if: |
-      build.branch == pipeline.default_branch ||
-      build.merge_queue.base_branch == pipeline.default_branch ||
-      (
-        build.pull_request.id != null &&
-        build.pull_request.repository.fork == false &&
-        build.pull_request.labels includes "merge-test"
-      )
     steps:
       - label: "ROCm MoRI XGMI smoke (read_mode=true, short limit, 2 GPUs)"
         key: "pd-disagg-moriio-smoke-job"
@@ -66,10 +54,8 @@ steps:
           - "target/ci-logs/moriio-smoke/*.log"
 
   # L2: one cross-node completion (SMOKE_ONLY). Full read+write is test-nightly.yml.
-  # Uploaded only for merge-test, main, or the merge queue — not for NIGHTLY=1.
   - label: ":large_purple_circle: ROCm MoRI RDMA smoke (read_mode=true, 2 nodes)"
     key: "pd-disagg-moriio-rdma-smoke"
-    if: build.pull_request.id == null || build.pull_request.repository.fork == false
     timeout_in_minutes: 75
     retry:
       automatic:

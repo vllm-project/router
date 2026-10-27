@@ -1,7 +1,8 @@
 # L1 ready (https://github.com/vllm-project/router/issues/273).
-# Uploaded when a non-default branch has the ready label (Omni READY_LABEL_IF).
-# CPU unit and integration tests, a non-publishing image build, and one
-# NVIDIA P/D completion. Full GSM8K is test-nightly.yml.
+# pipeline.yml uploads this file when a non-default branch has the ready label.
+# CPU tests and the product image have no extra if. The NVIDIA smoke skips
+# when ROCM_ONLY=1, because a skipped image-build is treated as satisfied.
+# Full GSM8K is test-nightly.yml.
 # tests/python/e2e stays ignored here; regular-router, embeddings, and
 # test_pd_router.py are not wired to a GPU lane in this split.
 
@@ -86,7 +87,7 @@ steps:
   # ============================================================================
   # L1 P/D smoke — one /v1/completions on EKS l4-k8s (4x L4).
   # /health and /v1/models run inside test_pd_accuracy.py.
-  # Full GSM8K is test-nightly.yml. This file is only uploaded for ready.
+  # Full GSM8K is test-nightly.yml.
   # ============================================================================
   - label: ":satellite: P/D Disaggregation Smoke (4 GPUs)"
     key: "pd-disagg-smoke"
