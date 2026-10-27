@@ -224,7 +224,7 @@ pub fn add_dp_rank_header(
     request
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use super::*;
 

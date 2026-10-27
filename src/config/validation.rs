@@ -23,6 +23,7 @@ impl ConfigValidator {
         if let Some(program_scheduling) = &config.program_scheduling {
             Self::validate_program_scheduling(program_scheduling)?;
         }
+        Self::validate_epd(config)?;
 
         if let Some(discovery) = &config.discovery {
             Self::validate_discovery(discovery, &config.mode)?;
@@ -182,6 +183,74 @@ impl ConfigValidator {
         Ok(())
     }
 
+    fn validate_epd(config: &RouterConfig) -> ConfigResult<()> {
+        let Some(epd) = &config.epd else {
+            return Ok(());
+        };
+        let worker_urls: Vec<&String> = match &config.mode {
+            RoutingMode::Regular { worker_urls } => worker_urls.iter().collect(),
+            RoutingMode::VllmPrefillDecode {
+                prefill_urls,
+                discovery_address: None,
+                ..
+            } => prefill_urls.iter().map(|(url, _)| url).collect(),
+            _ => {
+                return Err(ConfigError::ValidationFailed {
+                    reason: "EPD requires regular E+PD or static vLLM E/P/D routing".into(),
+                })
+            }
+        };
+        if config.intra_node_data_parallel_size != 1 || config.enable_igw {
+            return Err(ConfigError::ValidationFailed {
+                reason: "EPD currently requires DP=1 and proxy mode".into(),
+            });
+        }
+        if epd.encoder_urls.is_empty() {
+            return Err(ConfigError::MissingRequired {
+                field: "epd.encoder_urls".into(),
+            });
+        }
+        Self::validate_urls(&epd.encoder_urls)?;
+        for url in epd.encoder_urls.iter().chain(worker_urls.iter().copied()) {
+            if !url.starts_with("http://") && !url.starts_with("https://") {
+                return Err(ConfigError::InvalidValue {
+                    field: "epd.worker_url".into(),
+                    value: url.clone(),
+                    reason: "EPD requires HTTP(S) encoder and consumer URLs".into(),
+                });
+            }
+        }
+        if !epd.consumer_zmq_addrs.is_empty() {
+            if worker_urls.is_empty()
+                || epd.consumer_zmq_addrs.len() != worker_urls.len()
+                || worker_urls
+                    .iter()
+                    .any(|url| !epd.consumer_zmq_addrs.contains_key(*url))
+            {
+                return Err(ConfigError::ValidationFailed {
+                    reason:
+                        "EPD consumer_zmq_addrs must map every embedding consumer URL exactly once"
+                            .into(),
+                });
+            }
+            for addr in epd.consumer_zmq_addrs.values() {
+                let parsed = url::Url::parse(addr).map_err(|e| ConfigError::ValidationFailed {
+                    reason: format!("Invalid EC address: {e}"),
+                })?;
+                if parsed.scheme() != "tcp"
+                    || parsed.host_str().is_none()
+                    || parsed.port().is_none()
+                {
+                    return Err(ConfigError::ValidationFailed {
+                        reason: "EC addresses must be tcp://host:port".into(),
+                    });
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     /// Validate routing mode configuration
     fn validate_mode(mode: &RoutingMode, has_service_discovery: bool) -> ConfigResult<()> {
         match mode {
@@ -318,6 +387,33 @@ impl ConfigValidator {
                         value: max_tree_size.to_string(),
                         reason: "Must be > 0".to_string(),
                     });
+                }
+            }
+            PolicyConfig::KvAware {
+                router_temperature,
+                kv_penalty_host,
+                kv_penalty_external,
+                kv_penalty_disk,
+            } => {
+                if !router_temperature.is_finite() || *router_temperature < 0.0 {
+                    return Err(ConfigError::InvalidValue {
+                        field: "router_temperature".to_string(),
+                        value: router_temperature.to_string(),
+                        reason: "Must be finite and >= 0.0".to_string(),
+                    });
+                }
+                for (field, value) in [
+                    ("kv_penalty_host", kv_penalty_host),
+                    ("kv_penalty_external", kv_penalty_external),
+                    ("kv_penalty_disk", kv_penalty_disk),
+                ] {
+                    if !value.is_finite() || !(0.0..=1.0).contains(value) {
+                        return Err(ConfigError::InvalidValue {
+                            field: field.to_string(),
+                            value: value.to_string(),
+                            reason: "Must be finite and between 0.0 and 1.0".to_string(),
+                        });
+                    }
                 }
             }
             PolicyConfig::PowerOfTwo {
@@ -551,8 +647,23 @@ impl ConfigValidator {
             return Ok(());
         }
 
-        // All policies are now supported for both router types thanks to the unified trait design
-        // No mode/policy restrictions needed anymore
+        if let RoutingMode::VllmPrefillDecode {
+            prefill_policy,
+            decode_policy,
+            ..
+        } = &config.mode
+        {
+            let effective_prefill = prefill_policy.as_ref().unwrap_or(&config.policy);
+            let effective_decode = decode_policy.as_ref().unwrap_or(&config.policy);
+            if matches!(effective_prefill, PolicyConfig::KvAware { .. })
+                || matches!(effective_decode, PolicyConfig::KvAware { .. })
+            {
+                return Err(ConfigError::IncompatibleConfig {
+                    reason: "kv_aware is supported only in regular mode, not PD disaggregation"
+                        .to_string(),
+                });
+            }
+        }
 
         // Check if service discovery is enabled for worker count validation.
         // This covers both K8s service discovery (config.discovery) and vLLM ZMQ
@@ -694,7 +805,7 @@ impl ConfigValidator {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use super::*;
 
@@ -876,6 +987,48 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_epd_requires_http_workers() {
+        for (encoder_scheme, consumer_scheme, supported) in [
+            ("http", "http", true),
+            ("https", "https", true),
+            ("grpc", "http", false),
+            ("http", "grpc", false),
+        ] {
+            let consumer = format!("{consumer_scheme}://consumer:8000");
+            for mode in [
+                RoutingMode::Regular {
+                    worker_urls: vec![consumer.clone()],
+                },
+                RoutingMode::VllmPrefillDecode {
+                    prefill_urls: vec![(consumer.clone(), None)],
+                    decode_urls: vec![format!("{consumer_scheme}://decode:8000")],
+                    prefill_policy: None,
+                    decode_policy: None,
+                    discovery_address: None,
+                },
+            ] {
+                let mut config = RouterConfig::new(mode, PolicyConfig::Random);
+                config.epd = Some(EpdConfig {
+                    encoder_urls: vec![format!("{encoder_scheme}://encoder:8000")],
+                    consumer_zmq_addrs: Default::default(),
+                });
+                let result = ConfigValidator::validate(&config);
+                if supported {
+                    result.unwrap();
+                } else {
+                    assert!(
+                        result
+                            .unwrap_err()
+                            .to_string()
+                            .contains("EPD requires HTTP(S)"),
+                        "encoder={encoder_scheme}, consumer={consumer_scheme}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn test_validate_cache_aware_thresholds() {
         let config = RouterConfig::new(
             RoutingMode::Regular {
@@ -1022,6 +1175,28 @@ mod tests {
 
         let result = ConfigValidator::validate(&config);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_rejects_kv_aware_for_disaggregated_pd_mode() {
+        let config = RouterConfig::new(
+            RoutingMode::VllmPrefillDecode {
+                prefill_urls: vec![("http://prefill:8000".to_string(), None)],
+                decode_urls: vec!["http://decode:8000".to_string()],
+                prefill_policy: None,
+                decode_policy: None,
+                discovery_address: None,
+            },
+            PolicyConfig::KvAware {
+                router_temperature: 0.0,
+                kv_penalty_host: 0.8,
+                kv_penalty_external: 0.6,
+                kv_penalty_disk: 0.3,
+            },
+        );
+
+        let error = ConfigValidator::validate(&config).unwrap_err();
+        assert!(error.to_string().contains("not PD disaggregation"));
     }
 
     #[test]

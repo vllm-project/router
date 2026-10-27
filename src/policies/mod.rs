@@ -12,6 +12,7 @@ mod cache_aware;
 mod consistent_hash;
 mod factory;
 pub(crate) mod hash_key;
+mod kv_aware;
 mod power_of_two;
 mod random;
 mod registry;
@@ -22,6 +23,12 @@ pub use cache_aware::{CacheAwareCandidate, CacheAwarePlacement, CacheAwarePolicy
 pub use consistent_hash::ConsistentHashPolicy;
 pub use consistent_hash::VIRTUAL_NODES_PER_WORKER;
 pub use factory::PolicyFactory;
+pub use kv_aware::{
+    cost_components, kv_aware_ops, CandidateView, CostComponents, CostDecision, CostParams,
+    InMemorySlotManager, KvAwareOps, KvAwarePolicy, KvRequestSlot, KvSelectionReceipt,
+    LoadProvider, LoadSample, MultiplicativeScorer, Picker, Scorer, SelectionError, SlotManager,
+    TemperaturePicker, TieredMatchProvider, TransferCredits,
+};
 pub use power_of_two::PowerOfTwoPolicy;
 pub use random::RandomPolicy;
 pub use registry::PolicyRegistry;
@@ -148,6 +155,7 @@ pub struct CacheAwareConfig {
     pub balance_abs_threshold: usize,
     pub balance_rel_threshold: f32,
     pub eviction_interval_secs: u64,
+    /// Per-worker character budget in each model tree, enforced by periodic eviction.
     pub max_tree_size: usize,
 }
 
@@ -158,7 +166,7 @@ impl Default for CacheAwareConfig {
             balance_abs_threshold: 32,
             balance_rel_threshold: 1.1,
             eviction_interval_secs: 30,
-            max_tree_size: 10000,
+            max_tree_size: 1 << 25,
         }
     }
 }
@@ -185,7 +193,7 @@ pub(crate) fn normalize_model_key(model_id: &str) -> &str {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use super::*;
     use crate::core::{BasicWorker, WorkerType};

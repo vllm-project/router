@@ -2,6 +2,14 @@
 
 This directory contains the Buildkite pipeline configurations for the vLLM Router project.
 
+Formatting, Clippy, Black, Ruff, and spelling are not Buildkite jobs. They run
+from [`.pre-commit-config.yaml`](../.pre-commit-config.yaml) locally and in the
+GitHub Actions `pre-commit` workflow:
+
+```bash
+pip install pre-commit && pre-commit install
+```
+
 ## Pipeline Files
 
 ### `pipeline.yml`
@@ -38,7 +46,7 @@ See `scripts/llama3.1/` for example setup scripts showing the proper configurati
 
 ### Test Script
 
-Location: `py_test/e2e/pd_disagg_vllm/run_accuracy_test.sh`
+Location: `tests/python/e2e/pd_disagg_vllm/run_accuracy_test.sh`
 
 The test script:
 - Launches prefill and decode vLLM instances in Docker containers
@@ -74,11 +82,11 @@ The dedicated `router_rocm_mi300_2` queue adds two MI300X matrices, each with
 - `run_moriio_rdma_accuracy_test.sh` uses one GPU on each of two hosts with the
   RDMA backend.
 
-The xGMI group runs for same-repository pull requests, the default branch, and
-merge-queue builds. Trusted manual/API builds can set `RUN_ROCM_XGMI=1`. The
-RDMA matrix runs for scheduled builds with `NIGHTLY=1`, or trusted manual/API
-builds with `RUN_ROCM_RDMA=1`. Group-level filtering prevents Docker plugin
-hooks from running for untrusted fork pull requests.
+The xGMI group runs on the default branch, the default-branch merge queue,
+trusted same-repository pull requests, or trusted manual/API builds with
+`RUN_ROCM_XGMI=1`. The RDMA matrix runs for scheduled builds with `NIGHTLY=1`,
+or trusted manual/API builds with `RUN_ROCM_RDMA=1`. Group-level filtering
+prevents Docker plugin hooks from running for untrusted fork pull requests.
 
 ROCm-only scheduled builds should set both `NIGHTLY=1` and `ROCM_ONLY=1`.
 `ROCM_ONLY=1` skips the unrelated NVIDIA four-GPU P/D step while retaining the
@@ -115,7 +123,7 @@ On test completion (success or failure), artifacts are collected:
 To run the test locally:
 
 ```bash
-cd py_test/e2e/pd_disagg_vllm
+cd tests/python/e2e/pd_disagg_vllm
 
 # Run with defaults
 bash ./run_accuracy_test.sh
@@ -154,7 +162,9 @@ Comprehensive test suite:
 - Python tests with coverage
 
 ### Benchmarks
-Optional manual trigger for performance benchmarks.
+Not part of the pipeline. Run them locally with `scripts/run_benchmarks.py`
+(criterion) or the router overhead harness; see
+`docs/benchmarks/router_overhead.md`.
 
 ### Docker Build
 Builds Docker image for the router.

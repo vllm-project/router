@@ -2367,6 +2367,8 @@ version = "0.16.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "841d1cc9bed7f9236f321df977030373f4a4163ae1a7dbfe1a51a2c1a51d9100"
 dependencies = [
+ "allocator-api2",
+ "equivalent",
  "foldhash 0.2.0",
 ]
 
@@ -7408,8 +7410,9 @@ dependencies = [
 
 [[package]]
 name = "vllm_router_rs"
-version = "0.1.15"
+version = "0.1.16"
 dependencies = [
+ "aho-corasick",
  "anyhow",
  "async-channel 2.5.0",
  "async-trait",
@@ -7422,14 +7425,17 @@ dependencies = [
  "dashmap",
  "deadpool",
  "dotenvy",
+ "foldhash 0.2.0",
  "futures",
  "futures-util",
+ "hashbrown 0.16.1",
  "hf-hub 0.4.3",
  "http",
  "http-body-util",
  "k8s-openapi",
  "kube",
  "lazy_static",
+ "libc",
  "lru",
  "metrics",
  "metrics-exporter-prometheus",
@@ -7446,6 +7452,7 @@ dependencies = [
  "regex",
  "reqwest 0.13.5",
  "rmp-serde",
+ "rmpv",
  "rustls",
  "serde",
  "serde_json",

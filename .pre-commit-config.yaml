@@ -1,5 +1,7 @@
-# Pre-commit hooks for vLLM Router
-# Install with: pip install pre-commit && pre-commit install
+# Pre-commit hooks for vLLM Router.
+# This file is the only static-quality list. GitHub Actions runs it via
+# .github/workflows/pre-commit.yml. Install with:
+#   pip install pre-commit && pre-commit install
 
 repos:
   # General file checks
@@ -9,11 +11,14 @@ repos:
       - id: trailing-whitespace
       - id: end-of-file-fixer
       - id: check-yaml
+        # Kubernetes manifests in scripts/ are multi-document streams.
+        args: ['--allow-multiple-documents']
       - id: check-added-large-files
         args: ['--maxkb=1000']
       - id: check-merge-conflict
       - id: check-toml
       - id: mixed-line-ending
+      - id: debug-statements
 
   # Rust formatting and linting
   - repo: https://github.com/doublify/pre-commit-rust
@@ -25,26 +30,76 @@ repos:
         name: cargo clippy
         args: ['--all-targets', '--all-features', '--', '-D', 'warnings']
 
-  # Python formatting with black
-  - repo: https://github.com/psf/black
-    rev: 24.2.0
-    hooks:
-      - id: black
-        language_version: python3.12
-        files: ^(py_src|py_test)/.*\.py$
-
-  # Python linting with ruff
+  # Ruff lint + format. Rev matches CI's ruff==0.16.0.
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.3.0
+    rev: v0.16.0
     hooks:
-      - id: ruff
+      - id: ruff-check
         args: ['--fix', '--exit-non-zero-on-fix']
-        files: ^(py_src|py_test)/.*\.py$
+        files: ^(py_src|tests/python)/.*\.py$
+      - id: ruff-format
+        files: ^(py_src|tests/python)/.*\.py$
 
-  # Python type checking
-  - repo: https://github.com/pre-commit/mirrors-mypy
-    rev: v1.9.0
+  # Test marks: Python level + machine marks, Rust level + machine features.
+  # mypy uses the universal wheel. mirrors-mypy builds from source and needs
+  # a pinned interpreter.
+  - repo: local
     hooks:
+      - id: check-mark
+        name: Ensure tests have CI level and machine marks
+        entry: python tools/pre_commit/check_test_marks.py
+        language: system
+        types_or: [python, rust]
+        files: '^(tests/python/.*\.py|tests/rust/.*\.rs|src/.*\.rs|tests/[^/]+\.rs)$'
+
       - id: mypy
+        name: Run mypy
+        entry: mypy
+        language: python
+        types_or: [python, pyi]
         files: ^py_src/.*\.py$
-        additional_dependencies: ['types-requests']
+        args: ['--ignore-missing-imports', '--scripts-are-modules']
+        require_serial: true
+        additional_dependencies:
+          - mypy==1.11.1
+          - types-requests
+
+      - id: shellcheck
+        name: Lint shell scripts
+        # language: script breaks on Windows (shebang paths lose slashes).
+        # Invoke bash so Linux CI and Git Bash both work.
+        entry: bash
+        args: [tools/pre_commit/shellcheck.sh]
+        language: system
+        types: [shell]
+
+      # Same schema check as vllm-omni. Router pipelines have no Omni-only
+      # keys, so the hook validates the YAML directly.
+      - id: check-buildkite
+        name: Validate Buildkite Pipelines
+        entry: python tools/pre_commit/check_buildkite.py
+        language: python
+        files: ^\.buildkite/.*\.ya?ml$
+        additional_dependencies: [pyyaml, check-jsonschema==0.38.0]
+
+      # Cargo only auto-discovers tests/*.rs. Nested tests/rust/*.rs need [[test]].
+      - id: check-rust-tests
+        name: check rust [[test]] registration
+        language: python
+        entry: python tools/pre_commit/check_rust_tests.py
+        files: ^(Cargo\.toml|tests/rust/[^/]+\.rs)$
+        pass_filenames: false
+
+  # One spelling engine. Do not add codespell beside this hook.
+  - repo: https://github.com/crate-ci/typos
+    rev: v1.49.0
+    hooks:
+      - id: typos
+
+  # v1.7.8+ sets `go 1.24.0` in go.mod, which older Go toolchains (and most
+  # current CI images) cannot parse. Pin to v1.7.7 until that is fixed.
+  - repo: https://github.com/rhysd/actionlint
+    rev: v1.7.7
+    hooks:
+      - id: actionlint
+        files: ^\.github/workflows/.*\.ya?ml$

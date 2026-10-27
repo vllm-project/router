@@ -13,6 +13,7 @@ def policy_from_str(policy_str: Optional[str]) -> PolicyType:
         "random": PolicyType.Random,
         "round_robin": PolicyType.RoundRobin,
         "cache_aware": PolicyType.CacheAware,
+        "kv_aware": PolicyType.KvAware,
         "power_of_two": PolicyType.PowerOfTwo,
         "consistent_hash": PolicyType.ConsistentHash,
     }
@@ -30,6 +31,7 @@ class Router:
             - PolicyType.Random: Randomly select workers
             - PolicyType.RoundRobin: Distribute requests in round-robin fashion
             - PolicyType.CacheAware: Distribute requests based on cache state and load balance
+            - PolicyType.KvAware: Select by held KV segments and live load (regular mode only)
             - PolicyType.PowerOfTwo: Select best of two random workers based on load (PD mode only)
         host: Host address to bind the router server. Default: '127.0.0.1'
         port: Port number to bind the router server. Default: 3001
@@ -45,7 +47,7 @@ class Router:
         eviction_interval_secs: Interval in seconds between cache eviction operations in cache-aware
             routing. Default: 60
         max_payload_size: Maximum payload size in bytes. Default: 256MB
-        max_tree_size: Maximum size of the approximation tree for cache-aware routing. Default: 2^24
+        max_tree_size: Character budget per worker per model for cache-aware routing. Default: 2^25
         intra_node_data_parallel_size: Data parallel size for DP-aware routing (automatically enabled when > 1). Default: 1
         enable_igw: Enable IGW (Inference-Gateway) mode for multi-model support. When enabled,
             the router can manage multiple models simultaneously with per-model load balancing
@@ -75,6 +77,10 @@ class Router:
             If not specified, uses the main policy. Default: None
         decode_policy: Specific load balancing policy for decode nodes (PD mode only).
             If not specified, uses the main policy. Default: None
+        router_temperature: Softmax temperature for kv_aware. Default: 0.0
+        kv_penalty_host: Host-tier transfer credit for kv_aware. Default: 0.8
+        kv_penalty_external: External-tier transfer credit for kv_aware. Default: 0.6
+        kv_penalty_disk: Disk-tier transfer credit for kv_aware. Default: 0.3
         request_id_headers: List of HTTP headers to check for request IDs. If not specified,
             uses common defaults: ['x-request-id', 'x-correlation-id', 'x-trace-id', 'request-id'].
             Example: ['x-my-request-id', 'x-custom-trace-id']. Default: None

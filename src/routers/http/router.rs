@@ -1,4 +1,5 @@
 use super::program_adapter::ProgramCompletion;
+use crate::backend::{stream_output::OutputFrameConsumer, PrepareError};
 use crate::config::types::RetryConfig;
 use crate::core::{
     is_retryable_status, BasicWorker, CircuitBreakerConfig, DPAwareWorker, HealthConfig,
@@ -6,14 +7,17 @@ use crate::core::{
 };
 use crate::metrics::RouterMetrics;
 use crate::otel_http::{self, ClientRequestOptions};
-use crate::policies::{LoadBalancingPolicy, PolicyRegistry};
+use crate::policies::{
+    kv_aware_ops, KvRequestSlot, KvSelectionReceipt, LoadBalancingPolicy, PolicyRegistry,
+};
 use crate::program_scheduling::{
     BackendObservationProvider, ProgramIdentity, ProgramScheduler, ProgramSchedulerConfig,
     ProgramTarget, ScheduleError, VllmMetricsObservationProvider,
 };
 use crate::protocols::spec::{
     ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest, GenerationRequest,
-    InferenceGenerateRequest, RerankRequest, RerankResponse, RerankResult, ResponsesRequest,
+    GrpcRequestRef, InferenceGenerateRequest, RerankRequest, RerankResponse, RerankResult,
+    ResponsesRequest,
 };
 use crate::routers::header_utils;
 use crate::routers::http::dp_utils;
@@ -34,11 +38,19 @@ use parking_lot::Mutex;
 use reqwest::Client;
 use std::collections::HashMap;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, error, info, warn};
+
+fn prepare_error_status(error: &PrepareError) -> StatusCode {
+    match error {
+        PrepareError::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
+        PrepareError::Invalid(_) => StatusCode::BAD_REQUEST,
+    }
+}
 
 fn insert_router_stages(headers: &mut HeaderMap, stages: &serde_json::Value) {
     if let Ok(value) = HeaderValue::from_str(&stages.to_string()) {
@@ -72,16 +84,70 @@ struct LoadTrackedBody {
     inner: Pin<
         Box<dyn futures_util::Stream<Item = Result<bytes::Bytes, axum::Error>> + Send + 'static>,
     >,
-    worker: Option<Arc<dyn Worker>>,
+    load: RequestLoadGuard,
+    /// gRPC streams report the body frame containing their first model output.
+    /// HTTP streams use their first frame.
+    output_frame: Option<OutputFrameConsumer>,
     producer_abort: Option<tokio::task::AbortHandle>,
+}
+
+struct RequestLoadState {
+    worker: Option<Arc<dyn Worker>>,
+    kv_slot: Option<KvRequestSlot>,
+    released: AtomicBool,
+}
+
+/// Owns an admitted attempt across dispatch and response consumption. Any
+/// cancellation or completion releases the shared counters exactly once.
+#[derive(Clone)]
+struct RequestLoadGuard {
+    state: Arc<RequestLoadState>,
+}
+
+impl RequestLoadGuard {
+    fn new(worker: Option<Arc<dyn Worker>>, kv_slot: Option<KvRequestSlot>) -> Self {
+        Self {
+            state: Arc::new(RequestLoadState {
+                worker,
+                kv_slot,
+                released: AtomicBool::new(false),
+            }),
+        }
+    }
+
+    fn tracks_worker(&self) -> bool {
+        self.state.worker.is_some()
+    }
+
+    fn begin_decode(&self) {
+        if let Some(slot) = &self.state.kv_slot {
+            slot.begin_decode();
+        }
+    }
+
+    fn release(&self) {
+        if self.state.released.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        if let Some(slot) = &self.state.kv_slot {
+            slot.release();
+        }
+        if let Some(worker) = &self.state.worker {
+            worker.decrement_load();
+            RouterMetrics::set_running_requests(worker.url(), worker.load());
+        }
+    }
+}
+
+impl Drop for RequestLoadGuard {
+    fn drop(&mut self) {
+        self.release();
+    }
 }
 
 impl LoadTrackedBody {
     fn release(&mut self) {
-        if let Some(worker) = self.worker.take() {
-            worker.decrement_load();
-            RouterMetrics::set_running_requests(worker.url(), worker.load());
-        }
+        self.load.release();
     }
 }
 
@@ -90,6 +156,15 @@ impl futures_util::Stream for LoadTrackedBody {
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let item = self.inner.as_mut().poll_next(cx);
+        if matches!(&item, Poll::Ready(Some(Ok(_)))) {
+            let output_started = self
+                .output_frame
+                .as_mut()
+                .is_none_or(OutputFrameConsumer::on_frame);
+            if output_started {
+                self.load.begin_decode();
+            }
+        }
         if matches!(item, Poll::Ready(None)) {
             self.release();
             self.producer_abort.take();
@@ -107,26 +182,51 @@ impl Drop for LoadTrackedBody {
     }
 }
 
-fn hold_load_until_body_done(mut response: Response, worker: Arc<dyn Worker>) -> Response {
-    let producer = response
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
+fn hold_load_until_body_done(
+    response: Response,
+    worker: Arc<dyn Worker>,
+    kv_slot: Option<KvRequestSlot>,
+) -> Response {
+    hold_request_load_until_body_done(response, RequestLoadGuard::new(Some(worker), kv_slot))
+}
+
+fn hold_request_load_until_body_done(mut response: Response, load: RequestLoadGuard) -> Response {
+    let task = response
         .extensions_mut()
-        .remove::<crate::backend::grpc::GrpcStreamTask>()
-        .and_then(|task| task.take());
+        .remove::<crate::backend::grpc::GrpcStreamTask>();
+    let output_frame = task.as_ref().and_then(|task| task.output_frame());
+    let producer = task.and_then(|task| task.take());
+    hold_request_load_with_output_frame(response, load, producer, output_frame)
+}
+
+fn hold_request_load_with_producer(
+    response: Response,
+    load: RequestLoadGuard,
+    producer: Option<tokio::task::JoinHandle<()>>,
+) -> Response {
+    hold_request_load_with_output_frame(response, load, producer, None)
+}
+
+fn hold_request_load_with_output_frame(
+    response: Response,
+    load: RequestLoadGuard,
+    producer: Option<tokio::task::JoinHandle<()>>,
+    output_frame: Option<OutputFrameConsumer>,
+) -> Response {
     let producer_abort = producer.as_ref().map(tokio::task::JoinHandle::abort_handle);
-    let fallback_worker = if let Some(producer) = producer {
+    if let Some(producer) = producer {
+        let producer_load = load.clone();
         tokio::spawn(async move {
             let _ = producer.await;
-            worker.decrement_load();
-            RouterMetrics::set_running_requests(worker.url(), worker.load());
+            producer_load.release();
         });
-        None
-    } else {
-        Some(worker)
-    };
+    }
     let (parts, body) = response.into_parts();
     let stream = LoadTrackedBody {
         inner: Box::pin(body.into_data_stream()),
-        worker: fallback_worker,
+        load,
+        output_frame,
         producer_abort,
     };
     Response::from_parts(parts, Body::from_stream(stream))
@@ -137,13 +237,19 @@ struct TypedDispatch<'a> {
     route: &'a str,
     worker_url: &'a str,
     is_stream: bool,
-    load_incremented: bool,
-    prepared: Option<crate::backend::PreparedChat>,
+    load: RequestLoadGuard,
+    prepared: Option<crate::backend::PreparedRequest>,
+}
+
+struct SelectedWorker {
+    worker: Arc<dyn Worker>,
+    kv_receipt: Option<KvSelectionReceipt>,
 }
 
 /// Regular router that uses injected load balancing policies
 #[derive(Debug)]
 pub struct Router {
+    epd: Option<super::epd::EncoderStage>,
     worker_registry: Arc<WorkerRegistry>,
     policy_registry: Arc<PolicyRegistry>,
     client: Client,
@@ -157,6 +263,8 @@ pub struct Router {
     frontend: crate::backend::EngineFrontend,
     _worker_loads: Arc<tokio::sync::watch::Receiver<HashMap<String, isize>>>,
     _load_monitor_handle: Option<Arc<tokio::task::JoinHandle<()>>>,
+    kv_index_supervisor: Option<Arc<crate::kv_index::KvIndexSupervisor>>,
+    _kv_signal_handle: Option<Arc<tokio::task::JoinHandle<()>>>,
     program_scheduler: Option<Arc<ProgramScheduler>>,
     _program_observation_handle: Option<Arc<tokio::task::JoinHandle<()>>>,
     program_targets_cache: Mutex<HashMap<String, ProgramTargetCacheEntry>>,
@@ -191,7 +299,15 @@ impl Router {
         RouterMetrics::set_active_workers(worker_urls.len());
 
         // All-http or all-grpc. Mixed schemes fail here (not a silent fallback).
-        crate::backend::classify_worker_urls(&worker_urls)?;
+        let pool_kind = crate::backend::classify_worker_urls(&worker_urls)?;
+        let request_timeout = Duration::from_secs(ctx.router_config.request_timeout_secs);
+        let frontend = if pool_kind == Some(crate::backend::WorkerPoolKind::Http) {
+            crate::backend::frontend::warn_ignored_encoding_caches();
+            crate::backend::EngineFrontend::with_request_timeout(request_timeout)
+        } else {
+            crate::backend::EngineFrontend::from_env(request_timeout)
+                .map_err(|error| format!("tokenizer cache: {error}"))?
+        };
 
         // Wait for workers to be healthy (skip if empty - for service discovery mode)
         if !worker_urls.is_empty() {
@@ -202,6 +318,8 @@ impl Router {
             )
             .await?;
         }
+
+        let kv_discovery_urls = worker_urls.clone();
 
         // Automatically expand to DP-aware workers when intra_node_data_parallel_size > 1
         let worker_urls = if ctx.router_config.intra_node_data_parallel_size > 1 {
@@ -236,6 +354,34 @@ impl Router {
             failure_threshold: ctx.router_config.health_check.failure_threshold,
             success_threshold: ctx.router_config.health_check.success_threshold,
         };
+        let default_policy = ctx.policy_registry.get_default_policy();
+        let mut kv_worker_info = HashMap::new();
+        let (kv_index_supervisor, kv_signal_handle) =
+            if kv_aware_ops(default_policy.as_ref()).is_some() {
+                let (supervisor, mut signals) = crate::kv_index::KvIndexSupervisor::new(
+                    ctx.client.clone(),
+                    crate::kv_index::HashMode::Sha256,
+                );
+                let supervisor = Arc::new(supervisor);
+                for worker_url in &kv_discovery_urls {
+                    match supervisor.on_worker_added(worker_url).await {
+                        Ok(info) => {
+                            kv_worker_info.insert(worker_url.clone(), info);
+                        }
+                        Err(error) => warn!(
+                            worker_url,
+                            %error,
+                            "kv_aware discovery failed; worker will use load-only scoring"
+                        ),
+                    }
+                }
+                let signal_handle = Arc::new(tokio::spawn(async move {
+                    while signals.recv().await.is_some() {}
+                }));
+                (Some(supervisor), Some(signal_handle))
+            } else {
+                (None, None)
+            };
         for url in &worker_urls {
             // TODO: In IGW mode, fetch model_id from worker's /get_model_info endpoint
             // For now, create worker without model_id
@@ -260,6 +406,15 @@ impl Router {
             };
             ctx.worker_registry.register(worker_arc.clone());
 
+            if let Some(kv_aware) = kv_aware_ops(default_policy.as_ref()) {
+                if let Some(info) = kv_worker_info.get(worker_arc.base_url()) {
+                    let provider = kv_index_supervisor.as_ref().and_then(|supervisor| {
+                        supervisor.match_provider_for_worker(worker_arc.base_url())
+                    });
+                    kv_aware.register_worker(worker_arc.as_ref(), info, provider);
+                }
+            }
+
             // Notify PolicyRegistry about the new worker
             let model_id = worker_arc.model_id();
             let policy = ctx.policy_registry.on_worker_added(model_id, None);
@@ -282,7 +437,6 @@ impl Router {
         let worker_loads = Arc::new(rx);
 
         // Check if default policy is power_of_two for load monitoring
-        let default_policy = ctx.policy_registry.get_default_policy();
         let load_monitor_handle = if default_policy.name() == "power_of_two" {
             let monitor_urls = worker_urls.clone();
             let monitor_interval = ctx.router_config.worker_startup_check_interval_secs;
@@ -346,6 +500,11 @@ impl Router {
         });
 
         Ok(Router {
+            epd: ctx
+                .router_config
+                .epd
+                .clone()
+                .map(super::epd::EncoderStage::new),
             worker_registry: ctx.worker_registry.clone(),
             policy_registry: ctx.policy_registry.clone(),
             client: ctx.client.clone(),
@@ -358,11 +517,11 @@ impl Router {
             retry_config: ctx.router_config.effective_retry_config(),
             circuit_breaker_config: core_cb_config,
             health_config,
-            frontend: crate::backend::EngineFrontend::with_request_timeout(Duration::from_secs(
-                ctx.router_config.request_timeout_secs,
-            )),
+            frontend,
             _worker_loads: worker_loads,
             _load_monitor_handle: load_monitor_handle,
+            kv_index_supervisor,
+            _kv_signal_handle: kv_signal_handle,
             program_scheduler,
             _program_observation_handle: program_observation_handle,
             program_targets_cache: Mutex::new(HashMap::new()),
@@ -373,6 +532,52 @@ impl Router {
     /// Test hook: pin token ids so gRPC e2e does not load a model.
     pub fn pin_test_token_ids(&self, token_ids: Vec<u32>) {
         self.frontend.pin_test_token_ids(token_ids);
+    }
+
+    async fn discover_kv_worker(&self, worker_url: &str) -> Option<crate::kv_index::WorkerKvInfo> {
+        let supervisor = self.kv_index_supervisor.as_ref()?;
+        let policy = self.policy_registry.get_default_policy();
+        kv_aware_ops(policy.as_ref())?;
+        match supervisor.on_worker_added(worker_url).await {
+            Ok(info) => Some(info),
+            Err(error) => {
+                warn!(
+                    worker_url,
+                    %error,
+                    "kv_aware discovery failed; worker will use load-only scoring"
+                );
+                None
+            }
+        }
+    }
+
+    fn register_kv_target(
+        &self,
+        worker: &dyn Worker,
+        info: Option<&crate::kv_index::WorkerKvInfo>,
+    ) {
+        let Some(info) = info else { return };
+        let policy = self.policy_registry.get_default_policy();
+        let Some(kv_aware) = kv_aware_ops(policy.as_ref()) else {
+            return;
+        };
+        let provider = self
+            .kv_index_supervisor
+            .as_ref()
+            .and_then(|supervisor| supervisor.match_provider_for_worker(worker.base_url()));
+        kv_aware.register_worker(worker, info, provider);
+    }
+
+    fn remove_kv_worker(&self, worker_url: &str, target_urls: &[String]) {
+        if let Some(supervisor) = &self.kv_index_supervisor {
+            supervisor.on_worker_removed(worker_url);
+        }
+        let policy = self.policy_registry.get_default_policy();
+        if let Some(kv_aware) = kv_aware_ops(policy.as_ref()) {
+            for target_url in target_urls {
+                kv_aware.unregister_worker(target_url);
+            }
+        }
     }
 
     fn warn_on_default_program_calibration(config: &crate::config::types::ProgramSchedulingConfig) {
@@ -814,11 +1019,13 @@ impl Router {
     }
 
     fn select_first_worker(&self) -> Result<String, String> {
+        // Prefer an available worker so proxy GETs (e.g. /v1/models) don't 500
+        // when an arbitrary registered worker is temporarily down or its
+        // circuit breaker is open.
         let workers = self.worker_registry.get_all();
-        if workers.is_empty() {
-            Err("No workers are available".to_string())
-        } else {
-            Ok(workers[0].url().to_string())
+        match workers.into_iter().find(|w| w.is_available()) {
+            Some(worker) => Ok(worker.url().to_string()),
+            None => Err("No workers are currently available".to_string()),
         }
     }
 
@@ -993,13 +1200,28 @@ impl Router {
         })
     }
 
+    fn prepared_cache_identity(
+        prepared: Option<&crate::backend::PreparedRequest>,
+    ) -> (Option<&str>, Option<&str>) {
+        let field = |name| {
+            prepared
+                .and_then(|chat| chat.request.other.get(name))
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| !value.is_empty())
+        };
+        (field("lora_name"), field("cache_salt"))
+    }
+
     /// Select worker for a specific model considering circuit breaker state
     fn select_worker_for_model(
         &self,
         model_id: Option<&str>,
         text: Option<&str>,
         headers: Option<&HeaderMap>,
-    ) -> Option<Arc<dyn Worker>> {
+        token_ids: Option<&[u32]>,
+        lora_name: Option<&str>,
+        cache_salt: Option<&str>,
+    ) -> Option<SelectedWorker> {
         // Get workers for the specified model (O(1) lookup if model_id is provided)
         let workers = match model_id {
             Some(model) => self.worker_registry.get_by_model_fast(model),
@@ -1024,8 +1246,20 @@ impl Router {
         // Convert headers for policies that need them (e.g., consistent_hash)
         let request_headers = Self::headers_to_request_headers(headers);
 
-        let idx = policy.select_worker_with_headers(&available, text, request_headers.as_ref())?;
-        Some(available[idx].clone())
+        let (idx, kv_receipt) = if let Some(kv_aware) = kv_aware_ops(policy.as_ref()) {
+            let receipt = kv_aware
+                .select_worker_with_receipt(&available, token_ids, lora_name, cache_salt)?;
+            (receipt.worker_index, Some(receipt))
+        } else {
+            (
+                policy.select_worker_with_headers(&available, text, request_headers.as_ref())?,
+                None,
+            )
+        };
+        Some(SelectedWorker {
+            worker: available.get(idx)?.clone(),
+            kv_receipt,
+        })
     }
 
     pub async fn route_typed_request<T: GenerationRequest + serde::Serialize + Clone>(
@@ -1047,41 +1281,73 @@ impl Router {
             }
         };
 
-        // All-grpc chat: tokenize once, outside policy and retry.
-        // Policy still uses extract_text_for_routing (session / empty).
-        // token_ids stay on PreparedChat for a later token-level policy —
-        // do not dump 131k ids into the cache_aware tree.
-        let prepared = if matches!(pool, Some(crate::backend::WorkerPoolKind::Grpc))
-            && route == "/v1/chat/completions"
+        // Reject unsupported gRPC routes before admitting a request or
+        // incrementing the selected worker's load.
+        if matches!(pool, Some(crate::backend::WorkerPoolKind::Grpc))
+            && !matches!(route, "/v1/chat/completions" | "/v1/completions")
         {
-            let chat: ChatCompletionRequest =
-                match serde_json::to_value(typed_req).and_then(serde_json::from_value) {
-                    Ok(req) => req,
-                    Err(e) => {
-                        return (
-                            StatusCode::BAD_REQUEST,
-                            format!("gRPC chat convert failed: {e}"),
-                        )
-                            .into_response();
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("gRPC backend currently supports /v1/chat/completions and /v1/completions, not {route}"),
+            )
+                .into_response();
+        }
+
+        // All-grpc chat: tokenize once, outside policy and retry.
+        // Cache-aware placement uses the same full content/session key as
+        // HTTP. PreparedRequest retains full token IDs for backend dispatch.
+        //
+        // The concrete request comes from `GenerationRequest::grpc_request`
+        // rather than a `serde_json::Value` roundtrip: the only two routes a
+        // gRPC pool admits are exactly the two concrete request types.
+        let prepared = match (pool, typed_req.grpc_request()) {
+            (Some(crate::backend::WorkerPoolKind::Grpc), Some(GrpcRequestRef::Chat(chat)))
+                if route == "/v1/chat/completions" =>
+            {
+                match self.frontend.prepare(chat.clone()).await {
+                    Ok(prepared) => Some(prepared),
+                    Err(error) => {
+                        return (prepare_error_status(&error), error.to_string()).into_response();
                     }
-                };
-            match self.frontend.prepare(chat).await {
-                Ok(p) => Some(p),
-                Err(e) => {
-                    let status =
-                        if e.starts_with("tokenizer:") || e.starts_with("sampling defaults:") {
-                            StatusCode::SERVICE_UNAVAILABLE
-                        } else {
-                            StatusCode::BAD_REQUEST
-                        };
-                    return (status, e).into_response();
                 }
             }
-        } else {
-            None
+            (
+                Some(crate::backend::WorkerPoolKind::Grpc),
+                Some(GrpcRequestRef::Completion(completion)),
+            ) if route == "/v1/completions" => {
+                let lowered = match crate::backend::prepare_grpc_completion(completion) {
+                    Ok(lowered) => lowered,
+                    Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
+                };
+                match self
+                    .frontend
+                    .prepare_token_ids(lowered.chat, lowered.token_ids, lowered.emit_token_ids)
+                    .await
+                {
+                    Ok(prepared) => Some(prepared),
+                    Err(error) => {
+                        return (prepare_error_status(&error), error.to_string()).into_response();
+                    }
+                }
+            }
+            (Some(crate::backend::WorkerPoolKind::Grpc), _) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    format!("gRPC backend received a request body that does not match {route}"),
+                )
+                    .into_response();
+            }
+            _ => None,
         };
 
-        let text = typed_req.extract_text_for_routing();
+        let text = match (pool, typed_req.grpc_request()) {
+            (
+                Some(crate::backend::WorkerPoolKind::Grpc),
+                Some(GrpcRequestRef::Completion(completion)),
+            ) if route == "/v1/completions" => completion.extract_text_for_grpc_routing(),
+            _ => typed_req.extract_text_for_routing(),
+        };
+        let cache_key = std::sync::OnceLock::new();
 
         let response = RetryExecutor::execute_response_with_retry(
             &self.retry_config,
@@ -1100,6 +1366,11 @@ impl Router {
                 let forced_worker_url = program_completion
                     .as_ref()
                     .map(|completion| completion.dispatch().target_id.as_str());
+                let (lora_name, cache_salt) = Self::prepared_cache_identity(prepared.as_ref());
+                let policy = match model_id {
+                    Some(model) => self.policy_registry.get_policy_or_default(model),
+                    None => self.policy_registry.get_default_policy(),
+                };
                 let selected_worker = if let Some(target) = forced_worker_url {
                     let worker = self
                         .worker_registry
@@ -1108,12 +1379,34 @@ impl Router {
                     let Some(worker) = worker else {
                         return Self::program_target_unavailable_response(route);
                     };
-                    Some(worker)
+                    let kv_receipt = prepared.as_ref().and_then(|prepared| {
+                        let kv_aware = kv_aware_ops(policy.as_ref())?;
+                        kv_aware.select_worker_with_receipt(
+                            std::slice::from_ref(&worker),
+                            Some(prepared.tokenized.token_ids.as_ref()),
+                            lora_name,
+                            cache_salt,
+                        )
+                    });
+                    Some(SelectedWorker { worker, kv_receipt })
                 } else {
-                    self.select_worker_for_model(model_id, Some(&text), headers)
+                    self.select_worker_for_model(
+                        model_id,
+                        Some(if policy.name() == "cache_aware" {
+                            cache_key.get_or_init(|| typed_req.extract_cache_routing_key())
+                        } else {
+                            &text
+                        }),
+                        headers,
+                        prepared
+                            .as_ref()
+                            .map(|prepared| prepared.tokenized.token_ids.as_ref()),
+                        lora_name,
+                        cache_salt,
+                    )
                 };
-                let worker = match selected_worker {
-                    Some(w) => w,
+                let SelectedWorker { worker, kv_receipt } = match selected_worker {
+                    Some(selection) => selection,
                     None => {
                         RouterMetrics::record_request_error(route, "no_available_workers");
                         return (
@@ -1124,28 +1417,25 @@ impl Router {
                     }
                 };
 
-                // Optional load tracking for cache-aware policy
-                // Get the policy for this model to check if it's cache-aware
-                let policy = match model_id {
-                    Some(model) => self.policy_registry.get_policy_or_default(model),
-                    None => self.policy_registry.get_default_policy(),
-                };
+                let kv_slot = kv_aware_ops(policy.as_ref()).and_then(|kv_aware| {
+                    prepared.as_ref()?;
+                    kv_aware.begin_request(kv_receipt?)
+                });
 
-                let load_incremented =
-                    if policy.name() == "cache_aware" || program_completion.is_some() {
-                        worker.increment_load();
-                        RouterMetrics::set_running_requests(worker.url(), worker.load());
-                        true
-                    } else {
-                        false
-                    };
-
-                // Keep a clone for potential cleanup on retry
-                let worker_for_cleanup = if load_incremented {
-                    Some(worker.clone())
+                let load_incremented = if matches!(policy.name(), "cache_aware" | "kv_aware")
+                    || program_completion.is_some()
+                {
+                    worker.increment_load();
+                    RouterMetrics::set_running_requests(worker.url(), worker.load());
+                    true
                 } else {
-                    None
+                    false
                 };
+
+                // The dispatch future owns cleanup even if it is cancelled
+                // before headers arrive. Successful streams transfer it to
+                // their response body and producer.
+                let load = RequestLoadGuard::new(load_incremented.then(|| worker.clone()), kv_slot);
 
                 let response = self
                     .send_typed_request(
@@ -1155,7 +1445,7 @@ impl Router {
                             route,
                             worker_url: worker.url(),
                             is_stream,
-                            load_incremented,
+                            load,
                             prepared: prepared.clone(),
                         },
                         program_completion.clone(),
@@ -1169,18 +1459,6 @@ impl Router {
                 worker.record_outcome(status.is_success() || status.is_client_error());
                 if was_available != worker.is_available() {
                     self.worker_registry.notify_worker_state_change();
-                }
-
-                // For retryable failures, we need to decrement load since send_typed_request
-                // won't have done it (it only decrements on success or non-retryable failures)
-                if is_retryable_status(response.status()) && load_incremented {
-                    if let Some(cleanup_worker) = worker_for_cleanup {
-                        cleanup_worker.decrement_load();
-                        RouterMetrics::set_running_requests(
-                            cleanup_worker.url(),
-                            cleanup_worker.load(),
-                        );
-                    }
                 }
 
                 response
@@ -1252,7 +1530,8 @@ impl Router {
             };
 
             if let Some(hdrs) = headers {
-                for (name, value) in hdrs {
+                let forwarded = header_utils::sanitize_request_headers(hdrs);
+                for (name, value) in &forwarded {
                     let name_lc = name.as_str().to_lowercase();
                     if name_lc != "content-type"
                         && name_lc != "content-length"
@@ -1345,17 +1624,18 @@ impl Router {
             route,
             worker_url,
             is_stream,
-            load_incremented,
+            load,
             prepared,
         } = dispatch;
+        let load_incremented = load.tracks_worker();
         if crate::backend::is_grpc_url(worker_url) {
-            // gRPC workers are chat-only in this milestone. Reject unsupported
-            // client routes as request errors so healthy workers are not
-            // penalized by circuit-breaker accounting.
-            if route != "/v1/chat/completions" {
+            // gRPC workers currently support only the chat and completions
+            // endpoints. Treat all other routes as client errors so they do not
+            // count against healthy workers in circuit-breaker accounting.
+            if !matches!(route, "/v1/chat/completions" | "/v1/completions") {
                 return (
                     StatusCode::BAD_REQUEST,
-                    format!("gRPC backend currently supports /v1/chat/completions, not {route}"),
+                    format!("gRPC backend currently supports /v1/chat/completions and /v1/completions, not {route}"),
                 )
                     .into_response();
             }
@@ -1366,18 +1646,19 @@ impl Router {
                 )
                     .into_response();
             };
-            let mut response = self.frontend.dispatch(worker_url, prepared).await;
-            if load_incremented
-                && (response.status().is_success() || !is_retryable_status(response.status()))
-            {
-                if let Some(worker) = self.worker_registry.get_by_url(worker_url) {
-                    if is_stream && response.status().is_success() {
-                        response = hold_load_until_body_done(response, worker);
-                    } else {
-                        worker.decrement_load();
-                        RouterMetrics::set_running_requests(worker_url, worker.load());
-                    }
-                }
+            let on_first_output = if is_stream {
+                None
+            } else {
+                let load = load.clone();
+                Some(Arc::new(move || load.begin_decode())
+                    as crate::backend::grpc::FirstOutputCallback)
+            };
+            let mut response = self
+                .frontend
+                .dispatch_with_first_output(worker_url, prepared, on_first_output)
+                .await;
+            if is_stream && response.status().is_success() {
+                response = hold_request_load_until_body_done(response, load);
             }
             if let Some(completion) = &program_completion {
                 completion.finish(response.status().is_success());
@@ -1432,7 +1713,8 @@ impl Router {
         // Content-Type/Content-Length (.json() sets them) and trace headers
         // (propagate_trace_headers below injects fresh context).
         if let Some(headers) = headers {
-            for (name, value) in headers {
+            let forwarded = header_utils::sanitize_request_headers(headers);
+            for (name, value) in &forwarded {
                 if *name != CONTENT_TYPE
                     && *name != CONTENT_LENGTH
                     && !header_utils::TRACE_HEADER_NAMES
@@ -1473,14 +1755,6 @@ impl Router {
                     worker_url, route, e
                 );
 
-                // Decrement load on error if it was incremented
-                if load_incremented {
-                    if let Some(worker) = self.worker_registry.get_by_url(worker_url) {
-                        worker.decrement_load();
-                        RouterMetrics::set_running_requests(worker_url, worker.load());
-                    }
-                }
-
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     format!("Request failed: {}", e),
@@ -1514,26 +1788,10 @@ impl Router {
                     response
                 }
                 Err(e) => {
-                    // IMPORTANT: Decrement load on error before returning
-                    if load_incremented {
-                        if let Some(worker) = self.worker_registry.get_by_url(worker_url) {
-                            worker.decrement_load();
-                            RouterMetrics::set_running_requests(worker_url, worker.load());
-                        }
-                    }
-
                     let error_msg = format!("Failed to get response body: {}", e);
                     (StatusCode::INTERNAL_SERVER_ERROR, error_msg).into_response()
                 }
             };
-
-            // Decrement load counter for non-streaming requests if it was incremented
-            if load_incremented {
-                if let Some(worker) = self.worker_registry.get_by_url(worker_url) {
-                    worker.decrement_load();
-                    RouterMetrics::set_running_requests(worker_url, worker.load());
-                }
-            }
 
             if let Some(completion) = &program_completion {
                 completion.finish(response.status().is_success());
@@ -1541,9 +1799,7 @@ impl Router {
 
             response
         } else if load_incremented {
-            // For streaming with load tracking, we need to manually decrement when done
-            let registry = Arc::clone(&self.worker_registry);
-            let worker_url = worker_url.to_string();
+            // The forwarding task and response body share one cleanup receipt.
             let completion = if status.is_success() {
                 program_completion
             } else {
@@ -1563,14 +1819,15 @@ impl Router {
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
 
             // Spawn task to forward stream and detect completion
-            tokio::spawn(async move {
+            let producer_load = load.clone();
+            let producer = tokio::spawn(async move {
                 let mut stream = stream;
-                let mut decremented = false;
                 let mut first_sse = true;
                 let mut stream_succeeded = true;
                 while let Some(chunk) = stream.next().await {
                     match chunk {
                         Ok(bytes) => {
+                            producer_load.begin_decode();
                             if first_sse {
                                 first_sse = false;
                                 let first_ms = t_send.elapsed().as_secs_f64() * 1000.0;
@@ -1588,11 +1845,7 @@ impl Router {
                                 .windows(12)
                                 .any(|window| window == b"data: [DONE]")
                             {
-                                if let Some(worker) = registry.get_by_url(&worker_url) {
-                                    worker.decrement_load();
-                                    RouterMetrics::set_running_requests(&worker_url, worker.load());
-                                    decremented = true;
-                                }
+                                producer_load.release();
                             }
                             if tx.send(Ok(bytes)).is_err() {
                                 stream_succeeded = false;
@@ -1606,12 +1859,6 @@ impl Router {
                         }
                     }
                 }
-                if !decremented {
-                    if let Some(worker) = registry.get_by_url(&worker_url) {
-                        worker.decrement_load();
-                        RouterMetrics::set_running_requests(&worker_url, worker.load());
-                    }
-                }
                 if let Some(completion) = &completion {
                     completion.finish(stream_succeeded);
                 }
@@ -1623,7 +1870,7 @@ impl Router {
             let mut response = Response::new(body);
             *response.status_mut() = status;
             *response.headers_mut() = response_headers;
-            response
+            hold_request_load_with_producer(response, load, Some(producer))
         } else {
             // For requests without load tracking, just stream
             // Preserve headers for streaming response
@@ -1737,10 +1984,16 @@ impl Router {
                         .await
                         .map_err(|e| format!("Failed to get dp-aware workers: {}", e))?;
                         let mut worker_added: bool = false;
+                        let mut kv_discovery_attempted = false;
+                        let mut kv_info = None;
                         for dp_url in &dp_url_vec {
                             if self.worker_registry.get_by_url(dp_url).is_some() {
                                 warn!("Worker {} already exists", dp_url);
                                 continue;
+                            }
+                            if !kv_discovery_attempted {
+                                kv_info = self.discover_kv_worker(worker_url).await;
+                                kv_discovery_attempted = true;
                             }
                             info!("Added worker: {}", dp_url);
                             // TODO: In IGW mode, fetch model_id from worker's /get_model_info endpoint
@@ -1756,6 +2009,7 @@ impl Router {
 
                             let worker_arc: Arc<dyn Worker> = Arc::new(new_worker);
                             self.worker_registry.register(worker_arc.clone());
+                            self.register_kv_target(worker_arc.as_ref(), kv_info.as_ref());
 
                             // Notify PolicyRegistry about the new worker
                             let model_id = worker_arc.model_id();
@@ -1782,6 +2036,7 @@ impl Router {
                         if self.worker_registry.get_by_url(worker_url).is_some() {
                             return Err(format!("Worker {} already exists", worker_url));
                         }
+                        let kv_info = self.discover_kv_worker(worker_url).await;
                         info!("Added worker: {}", worker_url);
 
                         // TODO: In IGW mode, fetch model_id from worker's /get_model_info endpoint
@@ -1792,6 +2047,7 @@ impl Router {
 
                         let worker_arc = Arc::new(new_worker);
                         self.worker_registry.register(worker_arc.clone());
+                        self.register_kv_target(worker_arc.as_ref(), kv_info.as_ref());
 
                         // Notify PolicyRegistry about the new worker
                         let model_id = worker_arc.model_id();
@@ -1864,6 +2120,9 @@ impl Router {
             }
 
             RouterMetrics::set_active_workers(self.worker_registry.get_all().len());
+            if !removed_workers.is_empty() {
+                self.remove_kv_worker(worker_url, &removed_workers);
+            }
 
             // If any models are using cache aware policy, remove the workers from the tree
             // Check each removed worker's model and get its policy
@@ -1898,6 +2157,7 @@ impl Router {
                 self.policy_registry.on_worker_removed(&model_id);
 
                 RouterMetrics::set_active_workers(self.worker_registry.get_all().len());
+                self.remove_kv_worker(worker_url, &[worker_url.to_string()]);
             }
 
             // If the model is using cache aware policy, remove the worker from the tree
@@ -2421,6 +2681,7 @@ impl RouterTrait for Router {
         body: serde_json::Value,
     ) -> Response {
         debug!("Transparent proxy: routing {} {} to backend", method, path);
+        let start = Instant::now();
 
         // Select a worker (filter by availability like select_worker_for_model)
         let all_workers = self.worker_registry.get_all();
@@ -2430,6 +2691,7 @@ impl RouterTrait for Router {
             .cloned()
             .collect();
         if workers.is_empty() {
+            RouterMetrics::record_request_error(path, "no_available_workers");
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 "No available workers".to_string(),
@@ -2437,7 +2699,16 @@ impl RouterTrait for Router {
                 .into_response();
         }
 
-        let request_text = serde_json::to_string(&body).ok();
+        let policy = self.policy_registry.get_default_policy();
+        // Serializing the whole body is expensive when it carries base64
+        // media; only consumers that actually read the text pay for it.
+        let request_text = if (policy.needs_request_text() && policy.name() != "cache_aware")
+            || self.program_scheduler.is_some()
+        {
+            serde_json::to_string(&body).ok()
+        } else {
+            None
+        };
         let model_id = body.get("model").and_then(serde_json::Value::as_str);
         let is_stream = body
             .get("stream")
@@ -2455,7 +2726,10 @@ impl RouterTrait for Router {
                 .await
             {
                 Ok(completion) => completion,
-                Err(error) => return Self::schedule_error_response(error),
+                Err(error) => {
+                    RouterMetrics::record_request_error(path, "program_scheduling_error");
+                    return Self::schedule_error_response(error);
+                }
             }
         } else {
             None
@@ -2465,12 +2739,13 @@ impl RouterTrait for Router {
                 .get_by_url(&completion.dispatch().target_id)
                 .filter(|worker| worker.is_available())
         } else {
-            let policy = self.policy_registry.get_default_policy();
+            let cache_key = (policy.name() == "cache_aware")
+                .then(|| crate::protocols::spec::cache_routing::for_route(&body, path));
             let request_headers = Self::headers_to_request_headers(headers);
             policy
                 .select_worker_with_headers(
                     &workers,
-                    request_text.as_deref(),
+                    cache_key.as_deref().or(request_text.as_deref()),
                     request_headers.as_ref(),
                 )
                 .and_then(|index| workers.get(index).cloned())
@@ -2479,6 +2754,7 @@ impl RouterTrait for Router {
             if let Some(completion) = &program_completion {
                 completion.finish(false);
             }
+            RouterMetrics::record_request_error(path, "no_available_workers");
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 "Failed to select the Program target".to_string(),
@@ -2486,6 +2762,44 @@ impl RouterTrait for Router {
                 .into_response();
         };
         let url = worker.endpoint_url(path);
+
+        // Match the typed path's load accounting so tracked policies also
+        // see transparent (EPD) traffic.
+        let load_tracked =
+            matches!(policy.name(), "cache_aware" | "kv_aware") || program_completion.is_some();
+        if load_tracked {
+            worker.increment_load();
+            RouterMetrics::set_running_requests(worker.url(), worker.load());
+        }
+        // Own the admission increment before the first await. If EPD
+        // preparation or waiting for backend headers is cancelled, Drop
+        // releases the worker load just like the typed request path.
+        let load = load_tracked.then(|| RequestLoadGuard::new(Some(worker.clone()), None));
+
+        let (body, mut transfers) = if let Some(epd) = &self.epd {
+            if *method == Method::POST && path == "/v1/chat/completions" {
+                match epd
+                    .prepare(
+                        &self.client,
+                        body,
+                        worker.url(),
+                        headers,
+                        self.api_key.as_deref(),
+                    )
+                    .await
+                {
+                    Ok(value) => value,
+                    Err(error) => {
+                        RouterMetrics::record_request_error(path, "encoder_error");
+                        return error.into_response();
+                    }
+                }
+            } else {
+                (body, None)
+            }
+        } else {
+            (body, None)
+        };
 
         debug!("Transparent proxy: forwarding to {}", url);
 
@@ -2498,6 +2812,7 @@ impl RouterTrait for Router {
             Method::PATCH => self.client.patch(&url),
             Method::HEAD => self.client.head(&url),
             _ => {
+                RouterMetrics::record_request_error(path, "unsupported_method");
                 return (
                     StatusCode::METHOD_NOT_ALLOWED,
                     format!("Method {} not supported", method),
@@ -2515,12 +2830,36 @@ impl RouterTrait for Router {
         }
 
         // Add authorization if configured
+        if self.epd.is_some() {
+            if let Some(headers) = headers {
+                // The same connection-aware filter the other forwarding paths
+                // use, so a field named by `Connection` or any other hop-by-hop
+                // field cannot reach the worker here either.
+                let sanitized = header_utils::sanitize_request_headers(headers);
+                for (name, value) in &sanitized {
+                    // When a backend api_key is configured it must win:
+                    // RequestBuilder::header appends, and vLLM reads the
+                    // first Authorization value.
+                    if self.api_key.is_some() && name == http::header::AUTHORIZATION {
+                        continue;
+                    }
+                    // reqwest derives these from the body and URL it sends.
+                    if name == http::header::CONTENT_LENGTH
+                        || name == http::header::CONTENT_TYPE
+                        || header_utils::TRACE_HEADER_NAMES.contains(&name.as_str())
+                    {
+                        continue;
+                    }
+                    request_builder = request_builder.header(name, value);
+                }
+            }
+        }
         if let Some(ref key) = self.api_key {
             request_builder = request_builder.header("Authorization", format!("Bearer {}", key));
         }
 
         // Send request
-        match otel_http::send_client_request(
+        let response = match otel_http::send_client_request(
             request_builder,
             headers,
             ClientRequestOptions {
@@ -2534,7 +2873,19 @@ impl RouterTrait for Router {
         {
             Ok(response) => {
                 let status = response.status();
-                let headers = response.headers().clone();
+                // Keep the circuit breaker informed, as the typed path does:
+                // 2xx/4xx count as success, 5xx as worker failure.
+                let was_available = worker.is_available();
+                worker.record_outcome(status.is_success() || status.is_client_error());
+                if was_available != worker.is_available() {
+                    self.worker_registry.notify_worker_state_change();
+                }
+                if status.is_success() {
+                    if let Some(transfers) = transfers.as_mut() {
+                        transfers.disarm();
+                    }
+                }
+                let headers = header_utils::preserve_response_headers(response.headers());
                 let mut response_builder = Response::builder().status(status.as_u16());
 
                 for (name, value) in headers.iter() {
@@ -2635,8 +2986,17 @@ impl RouterTrait for Router {
                 }
             }
             Err(error) => {
+                // The 502 response below still flows through
+                // hold_load_until_body_done, which releases the load once
+                // its body finishes or is dropped — do not decrement here.
                 if let Some(completion) = &program_completion {
                     completion.finish(false);
+                }
+                // Transport failure: the worker never produced a response.
+                let was_available = worker.is_available();
+                worker.record_outcome(false);
+                if was_available != worker.is_available() {
+                    self.worker_registry.notify_worker_state_change();
                 }
                 (
                     StatusCode::BAD_GATEWAY,
@@ -2644,14 +3004,145 @@ impl RouterTrait for Router {
                 )
                     .into_response()
             }
+        };
+        if response.status().is_success() {
+            RouterMetrics::record_request(path);
+            RouterMetrics::record_generate_duration(start.elapsed());
+        } else {
+            RouterMetrics::record_request_error(path, "backend_error");
+        }
+        if load_tracked {
+            hold_request_load_until_body_done(
+                response,
+                load.expect("tracked requests must own a load guard"),
+            )
+        } else {
+            response
         }
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[tokio::test]
+    async fn test_transparent_response_preserves_encoding_and_filters_connection() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = axum::Router::new().fallback(|| async {
+            Response::builder()
+                .header("content-encoding", "gzip")
+                .header("connection", "X-Internal")
+                .header("x-internal", "private")
+                .header("set-cookie", "a=1")
+                .header("set-cookie", "b=2")
+                .body(Body::from(vec![0x1f, 0x8b, 0x08, 0x00, 0xff]))
+                .unwrap()
+        });
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let mut router = create_test_regular_router();
+        router.worker_registry = Arc::new(WorkerRegistry::new());
+        router.worker_registry.register(Arc::new(BasicWorker::new(
+            format!("http://{address}"),
+            WorkerType::Regular,
+        )));
+        let response = router
+            .route_transparent(None, "/custom", &Method::GET, serde_json::Value::Null)
+            .await;
+        assert_eq!(response.headers().get("content-encoding").unwrap(), "gzip");
+        assert!(!response.headers().contains_key("connection"));
+        assert!(!response.headers().contains_key("x-internal"));
+        assert_eq!(response.headers().get_all("set-cookie").iter().count(), 2);
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(bytes.as_ref(), &[0x1f, 0x8b, 0x08, 0x00, 0xff]);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_inference_and_get_paths_strip_connection_headers() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let worker_url = format!("http://{address}");
+        let app = axum::Router::new().fallback(|headers: HeaderMap| async move {
+            let echoed: HashMap<String, String> = headers
+                .iter()
+                .map(|(name, value)| (name.to_string(), value.to_str().unwrap().to_string()))
+                .collect();
+            Json(echoed)
+        });
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let mut router = create_test_regular_router();
+        router.worker_registry = Arc::new(WorkerRegistry::new());
+        router.worker_registry.register(Arc::new(BasicWorker::new(
+            worker_url.clone(),
+            WorkerType::Regular,
+        )));
+        let mut headers = HeaderMap::new();
+        headers.append("connection", "X-Internal, traceparent".parse().unwrap());
+        headers.append("connection", " X-Second".parse().unwrap());
+        headers.insert("host", "client-controlled.example".parse().unwrap());
+        headers.insert("x-internal", "private".parse().unwrap());
+        headers.insert("x-second", "private".parse().unwrap());
+        headers.insert("trailer", "x-checksum".parse().unwrap());
+        headers.insert(
+            "traceparent",
+            "00-11111111111111111111111111111111-2222222222222222-01"
+                .parse()
+                .unwrap(),
+        );
+        headers.insert("x-public", "keep".parse().unwrap());
+        headers.insert("authorization", "Bearer token".parse().unwrap());
+        let request = Request::builder().body(Body::empty()).unwrap();
+        let (mut parts, body) = request.into_parts();
+        parts.headers = headers.clone();
+        let get_response = router
+            .proxy_get_request(Request::from_parts(parts, body), "v1/models")
+            .await;
+        let post_response = router
+            .send_typed_request(
+                &serde_json::json!({"model": "test", "messages": []}),
+                TypedDispatch {
+                    headers: Some(&headers),
+                    route: "/v1/chat/completions",
+                    worker_url: &worker_url,
+                    is_stream: false,
+                    // No worker is tracked, so this dispatch does not count against
+                    // a worker's load — the same state the old `load_incremented:
+                    // false` expressed before the field became a guard.
+                    load: RequestLoadGuard::new(None, None),
+                    prepared: None,
+                },
+                None,
+            )
+            .await;
+        for response in [get_response, post_response] {
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let echoed: HashMap<String, String> = serde_json::from_slice(&bytes).unwrap();
+            for name in [
+                "connection",
+                "x-internal",
+                "x-second",
+                "trailer",
+                "traceparent",
+            ] {
+                assert!(
+                    !echoed.contains_key(name),
+                    "{name} leaked to the worker: {echoed:?}"
+                );
+            }
+            assert_eq!(echoed["host"], address.to_string());
+            assert_eq!(echoed["x-public"], "keep");
+            assert_eq!(echoed["authorization"], "Bearer token");
+        }
+        server.abort();
+    }
 
     fn create_test_regular_router() -> Router {
         // Create registries
@@ -2668,6 +3159,7 @@ mod tests {
 
         let (_, rx) = tokio::sync::watch::channel(HashMap::new());
         Router {
+            epd: None,
             worker_registry,
             policy_registry,
             worker_startup_timeout_secs: 5,
@@ -2681,6 +3173,8 @@ mod tests {
             frontend: crate::backend::EngineFrontend::new(),
             _worker_loads: Arc::new(rx),
             _load_monitor_handle: None,
+            kv_index_supervisor: None,
+            _kv_signal_handle: None,
             program_scheduler: None,
             _program_observation_handle: None,
             program_targets_cache: Mutex::new(HashMap::new()),
@@ -2710,8 +3204,11 @@ mod tests {
             circuit_breaker_config: CircuitBreakerConfig::default(),
             health_config: HealthConfig::default(),
             frontend: crate::backend::EngineFrontend::new(),
+            epd: None,
             _worker_loads: Arc::new(rx),
             _load_monitor_handle: None,
+            kv_index_supervisor: None,
+            _kv_signal_handle: None,
             program_scheduler: None,
             _program_observation_handle: None,
             program_targets_cache: Mutex::new(HashMap::new()),
@@ -2838,6 +3335,48 @@ mod tests {
         assert!(url == "http://worker1:8080" || url == "http://worker2:8080");
     }
 
+    #[test]
+    fn test_select_first_worker_skips_unhealthy() {
+        let router = create_test_regular_router();
+        // Mark worker1 unhealthy; select_first_worker must not return it.
+        for w in router.worker_registry.get_all() {
+            if w.url() == "http://worker1:8080" {
+                w.set_healthy(false);
+            }
+        }
+        let result = router.select_first_worker();
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "http://worker2:8080");
+    }
+
+    #[test]
+    fn test_select_first_worker_skips_circuit_open() {
+        let router = create_test_regular_router();
+        // Worker1 stays healthy but its circuit is forced open.
+        for w in router.worker_registry.get_all() {
+            if w.url() == "http://worker1:8080" {
+                for _ in 0..5 {
+                    w.record_outcome(false);
+                }
+                assert!(w.is_healthy()); // Still healthy
+                assert!(!w.is_available()); // But circuit is open
+            }
+        }
+        let result = router.select_first_worker();
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "http://worker2:8080");
+    }
+
+    #[test]
+    fn test_select_first_worker_all_unhealthy() {
+        let router = create_test_regular_router();
+        for w in router.worker_registry.get_all() {
+            w.set_healthy(false);
+        }
+        let result = router.select_first_worker();
+        assert!(result.is_err());
+    }
+
     #[tokio::test]
     async fn test_grpc_health_generate_is_explicitly_not_implemented() {
         let router = create_test_grpc_router();
@@ -2858,6 +3397,245 @@ mod tests {
         assert!(err.contains("mixed"), "{err}");
     }
 
+    /// An axum backend that echoes the header names and values it received, so a
+    /// test can assert on what actually reached the worker.
+    async fn spawn_header_echo_backend() -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        use axum::Json;
+        let app = axum::Router::new().fallback(|headers: HeaderMap| async move {
+            let mut echoed: HashMap<String, Vec<String>> = HashMap::new();
+            for (name, value) in headers.iter() {
+                if let Ok(value) = value.to_str() {
+                    echoed
+                        .entry(name.to_string())
+                        .or_default()
+                        .push(value.to_string());
+                }
+            }
+            Json(echoed)
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (address, server)
+    }
+
+    fn router_pointing_at(address: std::net::SocketAddr) -> Router {
+        let mut router = create_test_regular_router();
+        router.worker_registry = Arc::new(WorkerRegistry::new());
+        router.worker_registry.register(Arc::new(BasicWorker::new(
+            format!("http://{address}"),
+            WorkerType::Regular,
+        )));
+        router
+    }
+
+    /// The transparent path with EPD enabled has to apply the same header policy
+    /// as every other forwarding path. Its own skip list only covered
+    /// host/content-length/content-type/connection/transfer-encoding, so
+    /// `keep-alive`, `te`, `upgrade`, `proxy-authorization` and whatever the
+    /// client's `Connection` named still went through to the worker.
+    #[tokio::test]
+    async fn transparent_epd_path_sanitizes_client_headers() {
+        let (address, server) = spawn_header_echo_backend().await;
+        let mut router = router_pointing_at(address);
+        router.epd = Some(super::super::epd::EncoderStage::new(
+            crate::config::EpdConfig {
+                encoder_urls: vec!["http://unused".into()],
+                consumer_zmq_addrs: Default::default(),
+            },
+        ));
+        let mut headers = HeaderMap::new();
+        headers.insert("keep-alive", "timeout=5".parse().unwrap());
+        headers.insert("te", "trailers".parse().unwrap());
+        headers.insert("upgrade", "websocket".parse().unwrap());
+        headers.insert("proxy-authorization", "Basic c2VjcmV0".parse().unwrap());
+        headers.insert("connection", "X-Internal".parse().unwrap());
+        headers.insert("x-internal", "must-not-leak".parse().unwrap());
+        headers.insert("x-session-id", "sticky-1".parse().unwrap());
+
+        // /v1/responses is not handed to the encoder, so this exercises the
+        // forwarding loop itself.
+        let response = router
+            .route_transparent(
+                Some(&headers),
+                "/v1/responses",
+                &Method::POST,
+                serde_json::json!({"model": "m"}),
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let echoed: HashMap<String, Vec<String>> = serde_json::from_slice(&bytes).unwrap();
+        for name in [
+            "keep-alive",
+            "te",
+            "upgrade",
+            "proxy-authorization",
+            "connection",
+            "x-internal",
+        ] {
+            assert!(
+                !echoed.contains_key(name),
+                "{name} reached the worker: {echoed:?}"
+            );
+        }
+        assert_eq!(echoed["x-session-id"], vec!["sticky-1"]);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn transparent_epd_records_request_metrics() {
+        use axum::{routing::post, Json};
+        use serde_json::{json, Value};
+
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _metrics = metrics::set_default_local_recorder(&recorder);
+        let app = axum::Router::new().route(
+            "/v1/chat/completions",
+            post(|Json(body): Json<Value>| async move {
+                if body["fail"] == true {
+                    (StatusCode::BAD_REQUEST, "invalid request").into_response()
+                } else if body["stream"] == true {
+                    ([("content-type", "text/event-stream")], "data: [DONE]\n\n").into_response()
+                } else {
+                    Json(json!({"choices": []})).into_response()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut router = create_test_regular_router();
+        router.worker_registry = Arc::new(WorkerRegistry::new());
+        router
+            .worker_registry
+            .register(Arc::new(BasicWorker::new(url, WorkerType::Regular)));
+        router.epd = Some(super::super::epd::EncoderStage::new(
+            crate::config::EpdConfig {
+                encoder_urls: vec!["http://unused".into()],
+                consumer_zmq_addrs: Default::default(),
+            },
+        ));
+        for (body, status) in [
+            (json!({"messages": []}), StatusCode::OK),
+            (json!({"messages": [], "stream": true}), StatusCode::OK),
+            (
+                json!({"messages": [], "fail": true}),
+                StatusCode::BAD_REQUEST,
+            ),
+            (json!({"messages": null}), StatusCode::BAD_REQUEST),
+        ] {
+            let response = router
+                .route_transparent(None, "/v1/chat/completions", &Method::POST, body)
+                .await;
+            assert_eq!(response.status(), status);
+            axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+        }
+        let exported = handle.render();
+        assert!(exported.contains("vllm_router_requests_total{route=\"/v1/chat/completions\"} 2"));
+        assert!(exported.contains("vllm_router_generate_duration_seconds_count 2"));
+        for error in ["encoder_error", "backend_error"] {
+            assert!(
+                exported
+                    .lines()
+                    .any(|line| line.starts_with("vllm_router_request_errors_total{")
+                        && line.contains(&format!("error_type=\"{error}\""))
+                        && line.ends_with(" 1")),
+                "{exported}"
+            );
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn unsupported_grpc_route_does_not_leak_tracked_load() {
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+            "grpc://127.0.0.1:1".into(),
+            WorkerType::Regular,
+        ));
+        let mut router = create_test_regular_router();
+        router.worker_registry = Arc::new(WorkerRegistry::new());
+        router.worker_registry.register(worker.clone());
+        router.policy_registry =
+            Arc::new(PolicyRegistry::new(crate::config::PolicyConfig::KvAware {
+                router_temperature: 0.0,
+                kv_penalty_host: 0.8,
+                kv_penalty_external: 0.6,
+                kv_penalty_disk: 0.3,
+            }));
+        let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "messages": [{"role": "user", "content": "hello"}]
+        }))
+        .unwrap();
+        for _ in 0..3 {
+            let response = router
+                .route_typed_request(None, &request, "/v1/completions", None)
+                .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(worker.load(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_transparent_backend_header_wait_releases_worker_load() {
+        use axum::routing::post;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+            format!("http://{}", listener.local_addr().unwrap()),
+            WorkerType::Regular,
+        ));
+        let request_started = Arc::new(tokio::sync::Notify::new());
+        let handler_started = request_started.clone();
+        let app = axum::Router::new().route(
+            "/v1/chat/completions",
+            post(move || {
+                let request_started = handler_started.clone();
+                async move {
+                    request_started.notify_one();
+                    std::future::pending::<Response>().await
+                }
+            }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let mut router = create_test_regular_router();
+        router.worker_registry = Arc::new(WorkerRegistry::new());
+        router.worker_registry.register(worker.clone());
+        router.policy_registry =
+            Arc::new(PolicyRegistry::new(crate::config::PolicyConfig::KvAware {
+                router_temperature: 0.0,
+                kv_penalty_host: 0.8,
+                kv_penalty_external: 0.6,
+                kv_penalty_disk: 0.3,
+            }));
+
+        let request = serde_json::json!({"messages": []});
+        let dispatch = tokio::spawn(async move {
+            router
+                .route_transparent(None, "/v1/chat/completions", &Method::POST, request)
+                .await
+        });
+        request_started.notified().await;
+        assert_eq!(
+            worker.load(),
+            1,
+            "admitted request must count while awaiting headers"
+        );
+
+        dispatch.abort();
+        assert!(dispatch.await.unwrap_err().is_cancelled());
+        assert_eq!(
+            worker.load(),
+            0,
+            "cancellation must release the admission load"
+        );
+        server.abort();
+    }
+
     #[tokio::test]
     async fn streaming_body_holds_load_until_consumed_or_dropped() {
         let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(
@@ -2867,16 +3645,425 @@ mod tests {
 
         worker.increment_load();
         let response =
-            hold_load_until_body_done(Response::new(Body::from("complete")), worker.clone());
+            hold_load_until_body_done(Response::new(Body::from("complete")), worker.clone(), None);
         assert_eq!(worker.load(), 1);
         let _ = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         assert_eq!(worker.load(), 0);
 
         worker.increment_load();
         let response =
-            hold_load_until_body_done(Response::new(Body::from("cancelled")), worker.clone());
+            hold_load_until_body_done(Response::new(Body::from("cancelled")), worker.clone(), None);
         assert_eq!(worker.load(), 1);
         drop(response);
+        assert_eq!(worker.load(), 0);
+    }
+
+    fn admitted_kv_load(
+        worker: Arc<dyn Worker>,
+        manager: Arc<crate::policies::InMemorySlotManager>,
+        target: crate::kv_index::RoutableTarget,
+    ) -> RequestLoadGuard {
+        crate::policies::SlotManager::begin_prefill(manager.as_ref(), &target, 64);
+        worker.increment_load();
+        RequestLoadGuard::new(Some(worker), Some(KvRequestSlot::new(manager, target, 64)))
+    }
+
+    #[tokio::test]
+    async fn cancelled_dispatch_releases_only_its_prefill_and_worker_load() {
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+            "grpc://cancel:50051".into(),
+            WorkerType::Regular,
+        ));
+        let manager = Arc::new(crate::policies::InMemorySlotManager::new());
+        let target = crate::kv_index::RoutableTarget {
+            instance_id: Arc::from("cancel"),
+            dp_rank: 0,
+        };
+        // An unrelated in-flight request makes duplicate decrement visible.
+        crate::policies::SlotManager::begin_prefill(manager.as_ref(), &target, 7);
+        worker.increment_load();
+        let load = admitted_kv_load(worker.clone(), manager.clone(), target.clone());
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let dispatch = tokio::spawn(async move {
+            let _load = load;
+            started_tx.send(()).unwrap();
+            std::future::pending::<Response>().await
+        });
+        started_rx.await.unwrap();
+        assert_eq!(worker.load(), 2);
+        dispatch.abort();
+        assert!(dispatch.await.unwrap_err().is_cancelled());
+        assert_eq!(worker.load(), 1);
+        assert_eq!(
+            crate::policies::LoadProvider::sample(manager.as_ref(), &target),
+            crate::policies::LoadSample {
+                active_prefill_tokens: 7,
+                active_requests: 1,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_nonstream_body_read_releases_prefill_and_worker_load() {
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+            "grpc://body:50051".into(),
+            WorkerType::Regular,
+        ));
+        let manager = Arc::new(crate::policies::InMemorySlotManager::new());
+        let target = crate::kv_index::RoutableTarget {
+            instance_id: Arc::from("body"),
+            dp_rank: 0,
+        };
+        let load = admitted_kv_load(worker.clone(), manager.clone(), target.clone());
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let dispatch = tokio::spawn(async move {
+            let _load = load;
+            let body = Body::from_stream(futures_util::stream::once(async move {
+                started_tx.send(()).unwrap();
+                std::future::pending::<Result<bytes::Bytes, std::io::Error>>().await
+            }));
+            to_bytes(body, usize::MAX).await
+        });
+        started_rx.await.unwrap();
+        dispatch.abort();
+        assert!(dispatch.await.unwrap_err().is_cancelled());
+        assert_eq!(worker.load(), 0);
+        assert_eq!(
+            crate::policies::LoadProvider::sample(manager.as_ref(), &target),
+            crate::policies::LoadSample::default()
+        );
+    }
+
+    #[tokio::test]
+    async fn response_transfer_keeps_load_through_decode_and_releases_on_drop() {
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+            "grpc://transfer:50051".into(),
+            WorkerType::Regular,
+        ));
+        let manager = Arc::new(crate::policies::InMemorySlotManager::new());
+        let target = crate::kv_index::RoutableTarget {
+            instance_id: Arc::from("transfer"),
+            dp_rank: 0,
+        };
+        let load = admitted_kv_load(worker.clone(), manager.clone(), target.clone());
+        let stream = futures_util::stream::once(async {
+            Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"first token"))
+        })
+        .chain(futures_util::stream::pending());
+        let response =
+            hold_request_load_until_body_done(Response::new(Body::from_stream(stream)), load);
+        assert_eq!(worker.load(), 1);
+        let mut body = response.into_body().into_data_stream();
+        body.next().await.unwrap().unwrap();
+        assert_eq!(
+            crate::policies::LoadProvider::sample(manager.as_ref(), &target),
+            crate::policies::LoadSample {
+                active_prefill_tokens: 0,
+                active_requests: 1,
+            }
+        );
+        assert_eq!(worker.load(), 1);
+        drop(body);
+        assert_eq!(worker.load(), 0);
+        assert_eq!(
+            crate::policies::LoadProvider::sample(manager.as_ref(), &target),
+            crate::policies::LoadSample::default()
+        );
+    }
+
+    #[tokio::test]
+    async fn grpc_prompt_info_chunk_keeps_kv_load_in_prefill_until_model_output() {
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+            "grpc://prompt-info:50051".into(),
+            WorkerType::Regular,
+        ));
+        let manager = Arc::new(crate::policies::InMemorySlotManager::new());
+        let target = crate::kv_index::RoutableTarget {
+            instance_id: Arc::from("prompt-info"),
+            dp_rank: 0,
+        };
+        let load = admitted_kv_load(worker.clone(), manager.clone(), target.clone());
+        let (mut producer_output_frame, output_frame) =
+            crate::backend::stream_output::output_frame_tracking();
+        let (body_tx, body_rx) =
+            tokio::sync::mpsc::unbounded_channel::<Result<bytes::Bytes, std::io::Error>>();
+        let (queued_tx, queued_rx) = tokio::sync::oneshot::channel();
+        let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
+        let producer = tokio::spawn(async move {
+            assert!(producer_output_frame.send(
+                &body_tx,
+                bytes::Bytes::from_static(b"data: prompt_info_only\n\n"),
+                false,
+            ));
+            // Model the gRPC producer getting ahead of the client: by the
+            // time the first body frame is polled, it has already queued the
+            // generated-output frame too.
+            assert!(producer_output_frame.send(
+                &body_tx,
+                bytes::Bytes::from_static(b"data: generated_token\n\n"),
+                true,
+            ));
+            queued_tx.send(()).unwrap();
+            let _ = finish_rx.await;
+        });
+        queued_rx.await.unwrap();
+        let mut response = Response::new(Body::from_stream(UnboundedReceiverStream::new(body_rx)));
+        response
+            .extensions_mut()
+            .insert(crate::backend::grpc::GrpcStreamTask::with_output_frame(
+                producer,
+                output_frame,
+            ));
+        let response = hold_request_load_until_body_done(response, load);
+        let mut body = response.into_body().into_data_stream();
+
+        assert_eq!(
+            body.next().await.unwrap().unwrap(),
+            bytes::Bytes::from_static(b"data: prompt_info_only\n\n")
+        );
+        assert_eq!(
+            crate::policies::LoadProvider::sample(manager.as_ref(), &target),
+            crate::policies::LoadSample {
+                active_prefill_tokens: 64,
+                active_requests: 1,
+            }
+        );
+
+        assert_eq!(
+            body.next().await.unwrap().unwrap(),
+            bytes::Bytes::from_static(b"data: generated_token\n\n")
+        );
+        assert_eq!(
+            crate::policies::LoadProvider::sample(manager.as_ref(), &target),
+            crate::policies::LoadSample {
+                active_prefill_tokens: 0,
+                active_requests: 1,
+            }
+        );
+
+        finish_tx.send(()).unwrap();
+        assert!(body.next().await.is_none());
+        assert_eq!(worker.load(), 0);
+        assert_eq!(
+            crate::policies::LoadProvider::sample(manager.as_ref(), &target),
+            crate::policies::LoadSample::default()
+        );
+    }
+
+    #[tokio::test]
+    async fn producer_completion_and_body_drop_release_shared_load_once() {
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+            "grpc://producer:50051".into(),
+            WorkerType::Regular,
+        ));
+        let manager = Arc::new(crate::policies::InMemorySlotManager::new());
+        let target = crate::kv_index::RoutableTarget {
+            instance_id: Arc::from("producer"),
+            dp_rank: 0,
+        };
+        crate::policies::SlotManager::begin_prefill(manager.as_ref(), &target, 7);
+        worker.increment_load();
+        for cancel in [false, true] {
+            let load = admitted_kv_load(worker.clone(), manager.clone(), target.clone());
+            let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
+            let producer = tokio::spawn(async move {
+                let _ = finish_rx.await;
+            });
+            let response = hold_request_load_with_producer(
+                Response::new(Body::from("buffered")),
+                load,
+                Some(producer),
+            );
+            if cancel {
+                drop(response);
+                assert_eq!(worker.load(), 1, "body cancellation releases synchronously");
+                drop(finish_tx);
+            } else {
+                finish_tx.send(()).unwrap();
+                tokio::time::timeout(Duration::from_secs(1), async {
+                    while worker.load() != 1 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+                drop(response);
+            }
+            assert_eq!(worker.load(), 1);
+            assert_eq!(
+                crate::policies::LoadProvider::sample(manager.as_ref(), &target),
+                crate::policies::LoadSample {
+                    active_prefill_tokens: 7,
+                    active_requests: 1,
+                }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn typed_request_cancellation_before_headers_or_during_body_releases_load() {
+        use axum::routing::post;
+        for (headers_ready, streaming) in [(false, false), (false, true), (true, false)] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+                format!("http://{}", listener.local_addr().unwrap()),
+                WorkerType::Regular,
+            ));
+            let started = Arc::new(tokio::sync::Notify::new());
+            let handler_started = started.clone();
+            let app = axum::Router::new().route(
+                "/v1/chat/completions",
+                post(move || {
+                    let started = handler_started.clone();
+                    async move {
+                        if headers_ready {
+                            let stream = futures_util::stream::once(async move {
+                                started.notify_one();
+                                std::future::pending::<Result<bytes::Bytes, std::io::Error>>().await
+                            });
+                            Response::new(Body::from_stream(stream))
+                        } else {
+                            started.notify_one();
+                            std::future::pending::<Response>().await
+                        }
+                    }
+                }),
+            );
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let mut router = create_test_regular_router();
+            router.worker_registry = Arc::new(WorkerRegistry::new());
+            router.worker_registry.register(worker.clone());
+            router.policy_registry =
+                Arc::new(PolicyRegistry::new(crate::config::PolicyConfig::KvAware {
+                    router_temperature: 0.0,
+                    kv_penalty_host: 0.8,
+                    kv_penalty_external: 0.6,
+                    kv_penalty_disk: 0.3,
+                }));
+            let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+                "messages": [{"role": "user", "content": "hello"}], "stream": streaming,
+            }))
+            .unwrap();
+            let mut future =
+                Box::pin(router.route_typed_request(None, &request, "/v1/chat/completions", None));
+            tokio::time::timeout(Duration::from_secs(5), async {
+                tokio::select! {
+                    _ = started.notified() => {},
+                    _ = &mut future => panic!("request completed before cancellation"),
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(worker.load(), 1);
+            drop(future);
+            assert_eq!(
+                worker.load(),
+                0,
+                "headers_ready={headers_ready}, streaming={streaming}"
+            );
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn typed_request_success_and_errors_release_only_the_current_attempt() {
+        use axum::routing::post;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+            format!("http://{}", listener.local_addr().unwrap()),
+            WorkerType::Regular,
+        ));
+        let mode = Arc::new(Mutex::new((StatusCode::OK, false)));
+        let handler_mode = mode.clone();
+        let app = axum::Router::new().route(
+            "/v1/chat/completions",
+            post(move || {
+                let (status, fail_body) = *handler_mode.lock();
+                async move {
+                    let body = if fail_body {
+                        Body::from_stream(futures_util::stream::once(async {
+                            Err::<bytes::Bytes, _>(std::io::Error::other("broken backend body"))
+                        }))
+                    } else {
+                        Body::from("{}")
+                    };
+                    let mut response = Response::new(body);
+                    *response.status_mut() = status;
+                    response
+                }
+            }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut router = create_test_regular_router();
+        router.worker_registry = Arc::new(WorkerRegistry::new());
+        router.worker_registry.register(worker.clone());
+        router.policy_registry =
+            Arc::new(PolicyRegistry::new(crate::config::PolicyConfig::KvAware {
+                router_temperature: 0.0,
+                kv_penalty_host: 0.8,
+                kv_penalty_external: 0.6,
+                kv_penalty_disk: 0.3,
+            }));
+        router.retry_config.max_retries = 0;
+        let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "messages": [{"role": "user", "content": "hello"}],
+        }))
+        .unwrap();
+        worker.increment_load(); // An unrelated request must remain counted.
+        for (status, fail_body) in [
+            (StatusCode::OK, false),
+            (StatusCode::BAD_REQUEST, false),
+            (StatusCode::INTERNAL_SERVER_ERROR, false),
+            (StatusCode::OK, true),
+        ] {
+            *mode.lock() = (status, fail_body);
+            let response = router
+                .route_typed_request(None, &request, "/v1/chat/completions", None)
+                .await;
+            let expected_status = if fail_body {
+                StatusCode::INTERNAL_SERVER_ERROR
+            } else {
+                status
+            };
+            assert_eq!(response.status(), expected_status);
+            assert_eq!(worker.load(), 1, "status={status}, fail_body={fail_body}");
+            to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            assert_eq!(worker.load(), 1);
+        }
+        worker.decrement_load();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn streaming_body_releases_kv_slot_lifecycle() {
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+            "grpc://worker:50051".to_string(),
+            WorkerType::Regular,
+        ));
+        let manager = Arc::new(crate::policies::InMemorySlotManager::new());
+        let target = crate::kv_index::RoutableTarget {
+            instance_id: Arc::from("worker"),
+            dp_rank: 0,
+        };
+        crate::policies::SlotManager::begin_prefill(manager.as_ref(), &target, 64);
+        worker.increment_load();
+        let response = hold_load_until_body_done(
+            Response::new(Body::from("first token")),
+            worker.clone(),
+            Some(KvRequestSlot::new(manager.clone(), target.clone(), 64)),
+        );
+        assert_eq!(
+            crate::policies::LoadProvider::sample(manager.as_ref(), &target),
+            crate::policies::LoadSample {
+                active_prefill_tokens: 64,
+                active_requests: 1,
+            }
+        );
+        let _ = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(
+            crate::policies::LoadProvider::sample(manager.as_ref(), &target),
+            crate::policies::LoadSample::default()
+        );
         assert_eq!(worker.load(), 0);
     }
 
@@ -2896,7 +4083,7 @@ mod tests {
         response
             .extensions_mut()
             .insert(crate::backend::grpc::GrpcStreamTask::new(producer));
-        let response = hold_load_until_body_done(response, worker.clone());
+        let response = hold_load_until_body_done(response, worker.clone(), None);
         finish_tx.send(()).unwrap();
         tokio::time::timeout(Duration::from_secs(1), async {
             while worker.load() != 0 {
@@ -2915,7 +4102,7 @@ mod tests {
         response
             .extensions_mut()
             .insert(crate::backend::grpc::GrpcStreamTask::new(producer));
-        let response = hold_load_until_body_done(response, worker.clone());
+        let response = hold_load_until_body_done(response, worker.clone(), None);
         drop(response);
         tokio::time::timeout(Duration::from_secs(1), async {
             while worker.load() != 0 {
@@ -2965,6 +4152,7 @@ mod tests {
         Router {
             worker_registry,
             policy_registry,
+            epd: None,
             worker_startup_timeout_secs: 5,
             worker_startup_check_interval_secs: 1,
             intra_node_data_parallel_size: 1,
@@ -2976,6 +4164,8 @@ mod tests {
             frontend: crate::backend::EngineFrontend::new(),
             _worker_loads: Arc::new(rx),
             _load_monitor_handle: None,
+            kv_index_supervisor: None,
+            _kv_signal_handle: None,
             program_scheduler: None,
             _program_observation_handle: None,
             program_targets_cache: Mutex::new(HashMap::new()),
@@ -3038,9 +4228,16 @@ mod tests {
         let mut selected_urls: Vec<String> = Vec::new();
         for _ in 0..10 {
             let worker = router
-                .select_worker_for_model(None, Some(r#"{"prompt": "test"}"#), Some(&header_map))
+                .select_worker_for_model(
+                    None,
+                    Some(r#"{"prompt": "test"}"#),
+                    Some(&header_map),
+                    None,
+                    None,
+                    None,
+                )
                 .expect("Should select a worker");
-            selected_urls.push(worker.url().to_string());
+            selected_urls.push(worker.worker.url().to_string());
         }
 
         // All selections should go to the same worker (sticky routing)
@@ -3068,11 +4265,11 @@ mod tests {
         }
 
         let worker = router
-            .select_worker_for_model(None, Some(r#"{"prompt": "test"}"#), None)
+            .select_worker_for_model(None, Some(r#"{"prompt": "test"}"#), None, None, None, None)
             .expect("Should select the remaining healthy worker");
 
         assert_eq!(
-            worker.url(),
+            worker.worker.url(),
             "http://worker3:8080",
             "Should only select the healthy worker"
         );
@@ -3089,7 +4286,14 @@ mod tests {
             w.set_healthy(false);
         }
 
-        let result = router.select_worker_for_model(None, Some(r#"{"prompt": "test"}"#), None);
+        let result = router.select_worker_for_model(
+            None,
+            Some(r#"{"prompt": "test"}"#),
+            None,
+            None,
+            None,
+            None,
+        );
         assert!(
             result.is_none(),
             "Should return None when all workers are unavailable"
@@ -3111,8 +4315,11 @@ mod tests {
                 None,
                 Some(r#"{"prompt": "test"}"#),
                 Some(&header_map),
+                None,
+                None,
+                None,
             ) {
-                worker_urls_seen.insert(worker.url().to_string());
+                worker_urls_seen.insert(worker.worker.url().to_string());
             }
         }
 

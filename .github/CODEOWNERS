@@ -1,0 +1,9 @@
+# CODEOWNERS is used to automatically request PR reviews.
+# Format: path pattern @username or @team
+# More info: https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+#
+# Last-match-wins: more specific rules must come AFTER broader ones.
+# Add path-specific rules only when the relevant ownership is agreed.
+
+# Default owners (fallback reviewers for all files)
+* @hsliuustc0106 @wuhang2014

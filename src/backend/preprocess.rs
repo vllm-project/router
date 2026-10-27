@@ -1,10 +1,5 @@
-//! Chat+tokenize for gRPC workers: **only** `vllm-chat` + `vllm-tokenizer`.
-//!
-//! There is no HuggingFace/minijinja fallback. If those crates are not
-//! linked, `grpc://` is unavailable.
-//!
-//! `TokenizerCache` caches loaded frontend objects (`load_model_backends`),
-//! not prior-request token ids or engine KV.
+//! gRPC chat rendering and tokenization via `vllm-chat` and `vllm-tokenizer`.
+//! Loaded models share optional L0 (exact) and L1 (prefix) encoding caches.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -13,6 +8,10 @@ use std::time::Instant;
 use anyhow::{anyhow, Result};
 use dashmap::DashMap;
 use parking_lot::RwLock;
+
+use super::encode_cache::FrontendCache;
+use super::l1_encode_cache::{L1Cache, L1CacheConfig, L1CacheStats};
+use crate::tokenizer::{TokenizerCacheConfig, TokenizerCacheStats};
 
 use super::vllm_frontend::{
     chat_request_from_openai, system_text, tool_text, user_text, OpenAiChatRequest, VllmFrontend,
@@ -33,16 +32,14 @@ enum Frontend {
     TestIds(Vec<u32>),
 }
 
-/// In-process cache of loaded `vllm-chat` / `vllm-tokenizer` objects.
-///
-/// First request for a model key calls `load_model_backends`; later
-/// requests clone the `Arc`. This is **not** reuse of prior-request
-/// `token_ids` and **not** engine KV / prefix-cache routing.
+/// Loads each model once and optionally shares an L0 budget across models.
 #[derive(Clone)]
 pub struct TokenizerCache {
     pinned: Arc<RwLock<Option<Frontend>>>,
     by_model: Arc<DashMap<String, Arc<VllmFrontend>>>,
     load_lock: Arc<tokio::sync::Mutex<()>>,
+    encoding_cache: Option<Arc<FrontendCache>>,
+    l1_cache: Option<Arc<L1Cache>>,
 }
 
 impl std::fmt::Debug for TokenizerCache {
@@ -63,7 +60,36 @@ impl TokenizerCache {
             pinned: Arc::new(RwLock::new(None)),
             by_model: Arc::new(DashMap::new()),
             load_lock: Arc::new(tokio::sync::Mutex::new(())),
+            encoding_cache: None,
+            l1_cache: None,
         }
+    }
+
+    /// Enable L0 with a shared budget across models.
+    pub fn with_encoding_cache(config: TokenizerCacheConfig) -> Result<Self> {
+        Self::with_caches(Some(config), None)
+    }
+
+    /// Enable L0 and/or L1, each with one budget shared across models.
+    pub fn with_caches(
+        l0: Option<TokenizerCacheConfig>,
+        l1: Option<L1CacheConfig>,
+    ) -> Result<Self> {
+        Ok(Self {
+            encoding_cache: l0.map(FrontendCache::new).transpose()?.map(Arc::new),
+            l1_cache: l1.map(L1Cache::new).transpose()?.map(Arc::new),
+            ..Self::new()
+        })
+    }
+
+    /// L0 stats across models, or None when disabled.
+    pub fn encoding_cache_stats(&self) -> Option<TokenizerCacheStats> {
+        self.encoding_cache.as_ref().map(|cache| cache.stats())
+    }
+
+    /// L1 stats across models, or None when disabled.
+    pub fn l1_cache_stats(&self) -> Option<L1CacheStats> {
+        self.l1_cache.as_ref().map(|cache| cache.stats())
     }
 
     /// Tests only: bypass model loading by returning these fake prompt ids.
@@ -86,9 +112,14 @@ impl TokenizerCache {
             return Ok(FrontendHandle(Frontend::Vllm(hit.clone())));
         }
         let frontend = Arc::new(
-            VllmFrontend::load(&source, Default::default())
-                .await
-                .map_err(|e| anyhow!("vllm-chat load {source} for key {key}: {e}"))?,
+            VllmFrontend::load(
+                &source,
+                Default::default(),
+                self.encoding_cache.clone(),
+                self.l1_cache.clone(),
+            )
+            .await
+            .map_err(|e| anyhow!("vllm-chat load {source} for key {key}: {e}"))?,
         );
         self.by_model.insert(key, frontend.clone());
         Ok(FrontendHandle(Frontend::Vllm(frontend)))
@@ -161,6 +192,8 @@ pub struct TokenizeOut {
     pub template_ms: f64,
     pub encode_ms: f64,
     pub encode_backend: &'static str,
+    /// Prompt tokens served by L0 or L1 instead of the tokenizer.
+    pub cached_tokens: usize,
 }
 
 impl TokenizeOut {
@@ -184,6 +217,7 @@ pub fn tokenize_chat_request_timed(
                 template_ms: 0.0,
                 encode_ms: 0.0,
                 encode_backend: "test-pin",
+                cached_tokens: 0,
             })
         }
         Frontend::Vllm(vllm) => tokenize_vllm(request, vllm),
@@ -275,18 +309,19 @@ fn tokenize_vllm(request: &ChatCompletionRequest, frontend: &VllmFrontend) -> Re
         session_id,
     })?;
     let adapt_ms = t0.elapsed().as_secs_f64() * 1000.0;
-    let (token_ids, template_ms, encode_ms) = frontend
+    let (token_ids, cached_tokens, template_ms, encode_ms) = frontend
         .chat_tokenize_timed(&upstream)
         .map_err(|e| anyhow!("vllm-chat tokenize: {e}"))?;
     if token_ids.is_empty() {
         return Err(anyhow!("vllm-chat produced empty token_ids"));
     }
     Ok(TokenizeOut {
-        token_ids: Arc::from(token_ids),
+        token_ids,
         adapt_ms,
         template_ms,
         encode_ms,
         encode_backend: "vllm-tokenizer",
+        cached_tokens,
     })
 }
 
@@ -356,6 +391,17 @@ fn spec_messages_to_upstream(
                         "legacy function messages are not supported by vllm-chat"
                     ));
                 }
+                SpecChatMessage::Other(value) => {
+                    // HTTP backends can forward unknown roles verbatim, but vllm-chat
+                    // cannot represent them, so the gRPC frontend rejects them.
+                    let role = value
+                        .get("role")
+                        .and_then(serde_json::Value::as_str)
+                        .expect("ChatMessage::Other must contain a string `role`");
+                    return Err(anyhow!(
+                        "chat message role `{role}` is not supported by the router gRPC frontend"
+                    ));
+                }
             })
         })
         .collect()
@@ -421,11 +467,18 @@ fn user_content_text(content: &UserMessageContent) -> Result<String> {
         UserMessageContent::Parts(parts) => {
             let mut text = String::new();
             for part in parts {
-                match part {
-                    crate::protocols::spec::ContentPart::Text { text: part } => {
-                        text.push_str(part);
+                match part.get("type").and_then(serde_json::Value::as_str) {
+                    Some("text") => {
+                        let part_text = part
+                            .get("text")
+                            .and_then(serde_json::Value::as_str)
+                            .ok_or_else(|| {
+                                anyhow!("text content part is missing a string `text` field")
+                            })?;
+                        text.push_str(part_text);
                     }
-                    crate::protocols::spec::ContentPart::ImageUrl { .. } => {
+                    // The token_ids-only gRPC path cannot carry non-text parts.
+                    _ => {
                         return Err(anyhow!(
                             "multimodal chat is not supported by the token_ids-only gRPC path"
                         ));
@@ -437,7 +490,7 @@ fn user_content_text(content: &UserMessageContent) -> Result<String> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use super::*;
     use std::path::{Path, PathBuf};
@@ -504,7 +557,7 @@ mod tests {
     }
 
     async fn rust_vllm_chat_ids(model: &str, messages: serde_json::Value) -> Vec<u32> {
-        let frontend = VllmFrontend::load(model, Default::default())
+        let frontend = VllmFrontend::load(model, Default::default(), None, None)
             .await
             .expect("vllm-chat load_model_backends");
         let req: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
@@ -558,6 +611,25 @@ mod tests {
                     && call.name == "weather"
                     && call.arguments == "{\"city\":\"Paris\"}"
         ));
+    }
+
+    #[test]
+    fn rejects_unknown_roles_on_grpc_path() {
+        for role in ["latest_reminder", "developer"] {
+            let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+                "messages": [{
+                    "role": role,
+                    "content": "Model-specific instructions."
+                }]
+            }))
+            .unwrap();
+
+            let error = spec_messages_to_upstream(&request.messages).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                format!("chat message role `{role}` is not supported by the router gRPC frontend")
+            );
+        }
     }
 
     #[test]
@@ -645,6 +717,45 @@ mod tests {
         assert_eq!(
             rust_ids, py_ids,
             "vllm-chat+vllm-tokenizer must match Python vllm on system+user"
+        );
+    }
+
+    #[test]
+    fn test_user_content_text_rejects_non_text_parts() {
+        let parts = UserMessageContent::Parts(vec![
+            serde_json::json!({
+                "type": "audio_url",
+                "audio_url": {"url": "data:audio/wav;base64,AAAA"}
+            }),
+            serde_json::json!({"type": "text", "text": "hello"}),
+        ]);
+        let err = user_content_text(&parts).unwrap_err();
+        assert!(
+            err.to_string().contains("multimodal chat is not supported"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_user_content_text_concatenates_text_parts() {
+        let plain = UserMessageContent::Text("plain".to_string());
+        assert_eq!(user_content_text(&plain).unwrap(), "plain");
+
+        let parts = UserMessageContent::Parts(vec![
+            serde_json::json!({"type": "text", "text": "foo"}),
+            serde_json::json!({"type": "text", "text": "bar"}),
+        ]);
+        assert_eq!(user_content_text(&parts).unwrap(), "foobar");
+    }
+
+    #[test]
+    fn test_user_content_text_rejects_malformed_text_part() {
+        // `type == "text"` but no string `text` field.
+        let parts = UserMessageContent::Parts(vec![serde_json::json!({"type": "text"})]);
+        let err = user_content_text(&parts).unwrap_err();
+        assert!(
+            err.to_string().contains("missing a string `text` field"),
+            "unexpected error: {err}"
         );
     }
 }

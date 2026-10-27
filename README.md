@@ -274,6 +274,9 @@ vllm-router \
 
 ## Development
 
+For contributor intent and pre-submit self-review, start with
+[Contributing](CONTRIBUTING.md).
+
 ### gRPC worker backend
 
 `grpc://` workers speak vLLM’s Rust `Inference` API. HTTP workers remain

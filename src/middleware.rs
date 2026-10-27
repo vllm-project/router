@@ -1,6 +1,6 @@
 use axum::{
-    extract::Request, extract::State, http::HeaderValue, http::StatusCode, middleware::Next,
-    response::IntoResponse, response::Response,
+    extract::Request, extract::State, http::header, http::HeaderValue, http::StatusCode,
+    middleware::Next, response::IntoResponse, response::Response,
 };
 use rand::Rng;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -490,6 +490,21 @@ impl ConcurrencyLimiter {
     }
 }
 
+/// A 429 carrying a `Retry-After` hint.
+///
+/// Without the header OpenAI-compatible SDKs treat the 429 as non-retryable and
+/// surface it to the caller instead of backing off, so a bare 429 turns a transient
+/// queue-full into a hard failure. The hint comes from the token bucket rather than a
+/// new knob; it is a lower bound, since a finishing request can free a slot sooner.
+async fn too_many_requests(token_bucket: &TokenBucket) -> Response {
+    let seconds = token_bucket.seconds_until_available(1.0).await.ceil() as u64;
+    let mut response = StatusCode::TOO_MANY_REQUESTS.into_response();
+    response
+        .headers_mut()
+        .insert(header::RETRY_AFTER, HeaderValue::from(seconds.max(1)));
+    response
+}
+
 /// Middleware function for concurrency limiting with optional queuing
 pub async fn concurrency_limit_middleware(
     State(app_state): State<Arc<AppState>>,
@@ -576,12 +591,12 @@ pub async fn concurrency_limit_middleware(
                 }
                 Err(_) => {
                     warn!("Request queue is full, returning 429");
-                    StatusCode::TOO_MANY_REQUESTS.into_response()
+                    too_many_requests(&token_bucket).await
                 }
             }
         } else {
             warn!("No tokens available and queuing is disabled, returning 429");
-            StatusCode::TOO_MANY_REQUESTS.into_response()
+            too_many_requests(&token_bucket).await
         }
     }
 }

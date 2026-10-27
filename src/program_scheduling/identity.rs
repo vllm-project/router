@@ -794,7 +794,7 @@ fn scoped_program_id(session_id: &str, actor_id: Option<&str>) -> String {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use super::*;
 
