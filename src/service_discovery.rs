@@ -121,17 +121,21 @@ impl PodInfo {
         }
     }
 
+    /// Format a namespace-qualified pod identity key of the form `namespace/name`.
+    fn pod_key_from_meta(ns: Option<&str>, name: Option<&str>) -> String {
+        format!("{}/{}", ns.unwrap_or(""), name.unwrap_or(""))
+    }
+
     /// Check if a pod event should be allowed through the watcher stream firewall.
     /// Returns true if the pod matches the selector or is currently in the tracked set.
-    pub fn should_allow_event(
+    fn should_allow_event(
         pod: &Pod,
         config: &ServiceDiscoveryConfig,
         tracked_pods: &HashMap<String, TrackedPod>,
     ) -> bool {
-        let pod_key = format!(
-            "{}/{}",
-            pod.metadata.namespace.as_deref().unwrap_or(""),
-            pod.metadata.name.as_deref().unwrap_or("")
+        let pod_key = Self::pod_key_from_meta(
+            pod.metadata.namespace.as_deref(),
+            pod.metadata.name.as_deref(),
         );
         Self::should_include(pod, config) || tracked_pods.contains_key(&pod_key)
     }
@@ -215,7 +219,7 @@ impl PodInfo {
     /// Stable across IP, label, and status changes; unique across namespaces for
     /// cluster-wide (`Api::all`) watches.
     pub fn pod_key(&self) -> String {
-        format!("{}/{}", self.namespace, self.name)
+        Self::pod_key_from_meta(Some(&self.namespace), Some(&self.name))
     }
 }
 
@@ -1848,12 +1852,26 @@ mod tests {
         let info = PodInfo::from_pod(&k8s_pod, None).unwrap();
         assert_eq!(info.namespace, "prod-ns");
         assert_eq!(info.pod_key(), "prod-ns/my-worker");
+        assert_eq!(
+            PodInfo::pod_key_from_meta(
+                k8s_pod.metadata.namespace.as_deref(),
+                k8s_pod.metadata.name.as_deref()
+            ),
+            info.pod_key()
+        );
 
         // Pod with None namespace (cluster-wide)
         k8s_pod.metadata.namespace = None;
         let info_no_ns = PodInfo::from_pod(&k8s_pod, None).unwrap();
         assert_eq!(info_no_ns.namespace, "");
         assert_eq!(info_no_ns.pod_key(), "/my-worker");
+        assert_eq!(
+            PodInfo::pod_key_from_meta(
+                k8s_pod.metadata.namespace.as_deref(),
+                k8s_pod.metadata.name.as_deref()
+            ),
+            info_no_ns.pod_key()
+        );
     }
 
     #[test]
