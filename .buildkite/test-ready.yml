@@ -1,6 +1,6 @@
 # L1 ready (https://github.com/vllm-project/router/issues/273).
 # pipeline.yml uploads this file when a non-default branch has the ready label.
-# CPU tests and the product image have no extra if. The NVIDIA smoke skips
+# CPU tests have no extra if. The NVIDIA smoke skips
 # when ROCM_ONLY=1, because a skipped image-build is treated as satisfied.
 # Full GSM8K is test-nightly.yml.
 # tests/python/e2e stays ignored here; regular-router, embeddings, and
@@ -121,14 +121,3 @@ steps:
     depends_on: "image-build"
     artifact_paths:
       - "/tmp/router.log"
-
-  # ============================================================================
-  # Docker Build - Parallel with tests
-  # ============================================================================
-  - label: ":docker: Build Docker Image"
-    command: |
-      docker build -f Dockerfile.router -t vllm-router:${BUILDKITE_COMMIT} .
-      docker tag vllm-router:${BUILDKITE_COMMIT} vllm-router:latest
-    agents:
-      queue: "medium_cpu_queue_premerge"
-    depends_on: "build"
