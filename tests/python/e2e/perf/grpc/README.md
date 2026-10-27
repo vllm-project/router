@@ -156,7 +156,8 @@ benches/backend/bench_prefix_kvhit.py   # HTTP bench + pytest helpers
 ## CI
 
 Buildkite step **`:python: grpc perf test case`** (`key: grpc-perf-e2e` in
-`.buildkite/pipeline.yml`): NVIDIA **l4x4** pool, `HF_TOKEN`, model
+`.buildkite/pipeline.yml`): EKS **`h100x4`** pool, `PERF_STACK_TIMEOUT=1800`,
+`HF_TOKEN`, model
 `MODEL=Qwen/Qwen3.8-27B`, `cargo build --release`, then for each of
 `rust_grpc`, `rust_http`, `python_http`:
 

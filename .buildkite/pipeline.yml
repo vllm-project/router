@@ -300,11 +300,12 @@ steps:
 
   # ============================================================================
   # gRPC perf e2e — concurrency-16 waves for rust_grpc / rust_http / python_http
+  # (4× H100 on EKS; stack startup timeout 30m via PERF_STACK_TIMEOUT)
   # ============================================================================
   - label: ":python: grpc perf test case"
     key: "grpc-perf-e2e"
     if: build.env("ROCM_ONLY") != "1"
-    timeout_in_minutes: 720
+    timeout_in_minutes: 90
     retry:
       automatic:
         - exit_status: "*"
@@ -326,7 +327,7 @@ steps:
                 operator: Exists
                 effect: NoSchedule
             nodeSelector:
-              vllm.ci/gpu-pool: l4x4
+              vllm.ci/gpu-pool: h100x4
             containers:
               - image: nvidia/cuda:13.0.2-devel-ubuntu22.04
                 resources:
@@ -377,6 +378,8 @@ steps:
         exit 1
       fi
       export MODEL="Qwen/Qwen3.8-27B"
+      export PERF_STACK_TIMEOUT=1800
+      export PERF_WORKER_STARTUP_TIMEOUT=1800
       echo "HF_TOKEN is configured; MODEL=$${MODEL}"
 
       apt-get update && apt-get install -y \

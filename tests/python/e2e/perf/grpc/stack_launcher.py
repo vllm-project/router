@@ -188,7 +188,7 @@ def _router_env(model: str) -> dict[str, str]:
 
 def launch_stack(case: BackendCaseFile, model: str) -> PerfStack:
     """Start worker then router; block until router /health is OK."""
-    timeout = float(os.environ.get("PERF_STACK_TIMEOUT", "3600"))
+    timeout = float(os.environ.get("PERF_STACK_TIMEOUT", "1800"))
     worker_startup_timeout = int(
         os.environ.get("PERF_WORKER_STARTUP_TIMEOUT", str(int(timeout)))
     )
