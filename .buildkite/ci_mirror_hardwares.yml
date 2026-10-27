@@ -82,7 +82,11 @@ mirror_hardwares:
     plugins:
     - docker#v5.14.0:
         image: $ROCM_VLLM_IMAGE
+        # Empty entrypoint skips the vLLM server and also disables the plugin's
+        # default /bin/sh -c. tini would then exec the whole step script as a
+        # filename and exit 127. This shell runs that script.
         entrypoint: ''
+        shell: ["bash", "-euo", "pipefail", "-c"]
         workdir: /workdir
         volumes:
         - /var/lib/buildkite-agent/.cache/huggingface:/root/.cache/huggingface
