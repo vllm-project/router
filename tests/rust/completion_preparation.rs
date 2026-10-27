@@ -1,6 +1,6 @@
-//! Public, offline Completion preparation vectors using the upstream HF backend.
-
 #![cfg(all(feature = "cpu", feature = "ready"))]
+
+//! Public, offline Completion preparation vectors using the upstream HF backend.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};

@@ -1,4 +1,4 @@
-//! Device event-shape admission, separate from structural decoding.
+//! Event-shape admission, separate from structural decoding and transport.
 use crate::kv_index::wire::{BlockStored, ExternalBlockHash, KVEvent, KVEventBatch};
 
 /// Validate the narrow normal-dense GPU event shape, preserving the batch rank.
@@ -89,4 +89,105 @@ fn validate_hash(hash: &ExternalBlockHash) -> Result<(), String> {
         ExternalBlockHash::Bytes(bytes) if bytes.len() == 32 => Ok(()),
         _ => Err("KV hash must be 32-byte sha256_cbor bytes".into()),
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum DenseRejectionReason {
+    ExtraKeys,
+    Layout,
+    Residency,
+    Adapter,
+    ZeroBlockSize,
+    BlockSizeMismatch,
+    TokenCountMismatch,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct DenseBatchRejection {
+    pub(super) reason: DenseRejectionReason,
+    pub(super) event_index: usize,
+}
+
+pub(super) fn validate_dense_batch(
+    batch: &KVEventBatch,
+    expected_block_size: u32,
+) -> Result<(), DenseBatchRejection> {
+    for (event_index, event) in batch.events.iter().enumerate() {
+        let reason = match event {
+            KVEvent::BlockStored(s) => {
+                // Keep unmodeled salt/MM/layout identities out of this token-only
+                // query space. Named LoRA is already isolated by the hash seed.
+                // session_id annotates the request, not the block's cache identity.
+                if s.extra_keys.as_ref().is_some_and(|keys| {
+                    keys.len() != s.block_hashes.len()
+                        || keys.iter().any(|key| {
+                            !key.is_nil()
+                                && !s.lora_name.as_ref().is_some_and(|name| {
+                                    key.as_array().is_some_and(|parts| {
+                                        parts.len() == 1 && parts[0].as_str() == Some(name.as_str())
+                                    })
+                                })
+                        })
+                }) {
+                    Some(DenseRejectionReason::ExtraKeys)
+                } else if s
+                    .kv_cache_spec_kind
+                    .as_deref()
+                    .is_some_and(|kind| kind != "full_attention")
+                    || s.kv_cache_spec_sliding_window.is_some()
+                {
+                    Some(DenseRejectionReason::Layout)
+                } else if !dense_residency_supported(
+                    s.medium.as_deref(),
+                    s.locality.as_deref(),
+                    s.ownership.as_deref(),
+                ) {
+                    Some(DenseRejectionReason::Residency)
+                } else if (s.lora_id.is_some() && s.lora_name.is_none())
+                    || s.lora_name.as_ref().is_some_and(|name| name.is_empty())
+                {
+                    Some(DenseRejectionReason::Adapter)
+                } else if s.block_size == 0 {
+                    Some(DenseRejectionReason::ZeroBlockSize)
+                } else if s.block_size != expected_block_size {
+                    Some(DenseRejectionReason::BlockSizeMismatch)
+                } else if s.block_hashes.len().checked_mul(s.block_size as usize)
+                    != Some(s.token_ids.len())
+                {
+                    Some(DenseRejectionReason::TokenCountMismatch)
+                } else {
+                    None
+                }
+            }
+            KVEvent::BlockRemoved(r) => (!dense_residency_supported(
+                r.medium.as_deref(),
+                r.locality.as_deref(),
+                r.ownership.as_deref(),
+            ))
+            .then_some(DenseRejectionReason::Residency),
+            KVEvent::AllBlocksCleared(_) => None,
+        };
+        if let Some(reason) = reason {
+            return Err(DenseBatchRejection {
+                reason,
+                event_index,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn dense_residency_supported(
+    medium: Option<&str>,
+    locality: Option<&str>,
+    ownership: Option<&str>,
+) -> bool {
+    let pool = ownership.is_some_and(|owner| !owner.is_empty());
+    locality.is_none_or(|locality| locality == if pool { "REMOTE" } else { "LOCAL" })
+        && medium.is_none_or(|medium| {
+            matches!(
+                medium.to_ascii_uppercase().as_str(),
+                "GPU" | "DEVICE" | "CPU" | "HOST" | "HOST_PINNED" | "STORAGE" | "DISK"
+            )
+        })
 }

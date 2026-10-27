@@ -259,6 +259,36 @@ For each candidate, the scorer computes `ptoken = new_prefill_tokens + active_pr
 
 `--router-temperature 0` selects a minimum-cost worker. A positive temperature samples among candidates by their relative costs. Device reuse has full credit; the host, external, and disk `--kv-penalty-*` flags configure transfer-credit ratios for those tiers. A higher credit means more reuse value and lower transfer cost.
 
+### Static HTTP KV event sources
+
+`VLLM_ROUTER_KV_EVENT_SOURCES` is a JSON override for Regular HTTP event
+ingestion. It is captured once when the Router is constructed, not re-read on
+each request or worker addition. For example:
+
+```bash
+export VLLM_ROUTER_KV_EVENT_SOURCES='{
+  "http://worker1:8000": {
+    "endpoints": ["tcp://worker1:5557"],
+    "replay_endpoints": ["tcp://worker1:5558"],
+    "topic": "kv", "hwm": 1000,
+    "block_size": 16, "model": "served-model"
+  }
+}'
+```
+
+Each exact registry URL maps to one independently addressed DP1 source:
+one publisher, optional one replay endpoint, positive source block size and
+nonempty cache-model identity. `topic` defaults to empty; `hwm` is optional and
+must be nonnegative. Publisher/topic streams, replay endpoints and canonical
+worker origins must be independent. Dense whole-batch admission uses that
+source's block size, including live and replay events.
+
+Mappings for an initially empty HTTP pool remain available when the matching
+worker is added later. Unmapped HTTP workers use ordinary discovery and still
+receive Dense admission. gRPC discovery ignores this HTTP override and retains
+its existing rank/tier behavior. This configures ingestion only: it does not
+prepare request tokens or authenticate remote model assets or engine lifetimes.
+
 ---
 
 ## Choosing a Policy

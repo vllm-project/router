@@ -1,4 +1,4 @@
-use super::completion_output::CompletionOutputObserver;
+use super::completion_route::{placement_eligibility, prepare_completion_route, CompletionRoute};
 use super::program_adapter::ProgramCompletion;
 use crate::backend::{
     stream_output::{output_frame_tracking, OutputFrameConsumer, OutputFrameProducer},
@@ -230,12 +230,6 @@ fn hold_request_load_with_output_frame(
         producer_abort,
     };
     Response::from_parts(parts, Body::from_stream(stream))
-}
-
-struct CompletionRoute<'a> {
-    tokens: Option<Vec<u32>>,
-    raw_body: Option<&'a axum::body::Bytes>,
-    echo: bool,
 }
 
 struct TypedDispatch<'a> {
@@ -1267,21 +1261,6 @@ impl Router {
         (field("lora_name"), field("cache_salt"))
     }
 
-    fn completion_placement_eligibility(&self, workers: &[Arc<dyn Worker>]) -> Option<Vec<bool>> {
-        let input = self.completion_input.as_ref()?;
-        // Qualification is per target, not an all-workers grant. Unknown
-        // sources retain ordinary routing and the full known input cost.
-        let urls: Vec<_> = workers.iter().map(|worker| worker.base_url()).collect();
-        let mut eligible = self.kv_index_supervisor.as_ref().map_or_else(
-            || vec![false; workers.len()],
-            |supervisor| supervisor.dense_model_eligibility(&urls, &input.cache_model),
-        );
-        for (eligible, worker) in eligible.iter_mut().zip(workers) {
-            *eligible &= worker.dp_rank().unwrap_or(0) == 0;
-        }
-        Some(eligible)
-    }
-
     /// Select worker for a specific model considering circuit breaker state
     fn select_worker_for_model(
         &self,
@@ -1316,7 +1295,11 @@ impl Router {
         // Convert headers for policies that need them (e.g., consistent_hash)
         let request_headers = Self::headers_to_request_headers(headers);
 
-        let eligibility = self.completion_placement_eligibility(&available);
+        let eligibility = placement_eligibility(
+            self.completion_input.as_ref(),
+            self.kv_index_supervisor.as_deref(),
+            &available,
+        );
         let (idx, kv_receipt) = if let Some(kv_aware) = kv_aware_ops(policy.as_ref()) {
             let receipt = kv_aware.select_worker_with_receipt_and_eligibility(
                 &available,
@@ -1347,39 +1330,6 @@ impl Router {
     ) -> Response {
         self.route_prepared_request(headers, typed_req, route, model_id, None, None)
             .await
-    }
-
-    async fn prepare_completion_route<'a>(
-        &self,
-        request: Arc<CompletionRequest>,
-        raw_body: Option<&'a axum::body::Bytes>,
-        model_id: Option<&str>,
-    ) -> Result<CompletionRoute<'a>, (StatusCode, String)> {
-        let policy = match model_id {
-            Some(model) => self.policy_registry.get_policy_or_default(model),
-            None => self.policy_registry.get_default_policy(),
-        };
-        let echo = request.echo;
-        let tokens = match self.completion_input.as_ref() {
-            Some(input)
-                if kv_aware_ops(policy.as_ref()).is_some()
-                    && request
-                        .model
-                        .as_deref()
-                        .is_none_or(|model| model == input.model) =>
-            {
-                self.completion_preparation
-                    .prepare(request, input.clone())
-                    .await?
-            }
-            _ => None,
-        };
-        // Fallback drops only input credit, not the original body or output contract.
-        Ok(CompletionRoute {
-            tokens,
-            raw_body,
-            echo,
-        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1466,13 +1416,24 @@ impl Router {
         let completion = match completion
             .filter(|_| matches!(pool, Some(crate::backend::WorkerPoolKind::Http)))
         {
-            Some(request) => match self
-                .prepare_completion_route(request, raw_body, model_id)
+            Some(request) => {
+                let policy = match model_id {
+                    Some(model) => self.policy_registry.get_policy_or_default(model),
+                    None => self.policy_registry.get_default_policy(),
+                };
+                match prepare_completion_route(
+                    self.completion_input.as_ref(),
+                    &self.completion_preparation,
+                    policy.as_ref(),
+                    request,
+                    raw_body,
+                )
                 .await
-            {
-                Ok(completion) => Some(completion),
-                Err(error) => return error.into_response(),
-            },
+                {
+                    Ok(completion) => Some(completion),
+                    Err(error) => return error.into_response(),
+                }
+            }
             None => None,
         };
         let token_ids = prepared
@@ -1531,7 +1492,11 @@ impl Router {
                     }) {
                         return Self::program_target_unavailable_response(route);
                     }
-                    let eligibility = self.completion_placement_eligibility(std::slice::from_ref(&worker));
+                    let eligibility = placement_eligibility(
+                        self.completion_input.as_ref(),
+                        self.kv_index_supervisor.as_deref(),
+                        std::slice::from_ref(&worker),
+                    );
                     let kv_receipt = kv_aware_ops(policy.as_ref()).and_then(|kv_aware| {
                         kv_aware.select_worker_with_receipt_and_eligibility(
                             std::slice::from_ref(&worker),
@@ -1783,7 +1748,6 @@ impl Router {
             prepared,
         } = dispatch;
         let completion_echo = completion.map(|input| input.echo);
-        let raw_body = completion.and_then(|input| input.raw_body);
         let load_incremented = load.tracks_worker();
         if crate::backend::is_grpc_url(worker_url) {
             // gRPC workers currently support only the chat and completions
@@ -1823,63 +1787,52 @@ impl Router {
             return response;
         }
 
-        let (mut request_builder, extracted_dp_rank, request_url) = if self
-            .intra_node_data_parallel_size
-            > 1
-        {
-            let (worker_url_prefix, dp_rank) = match dp_utils::extract_dp_rank(worker_url) {
-                Ok(tup) => tup,
-                Err(e) => {
-                    error!("Failed to extract dp_rank: {}", e);
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("Failed to extract dp_rank: {}", e),
-                    )
-                        .into_response();
-                }
-            };
-
-            // Parse the request body
-            let json_val = match serde_json::to_value(typed_req) {
-                Ok(j) => j,
-                Err(e) => {
-                    return (
-                        StatusCode::BAD_REQUEST,
-                        format!("Convert into serde_json::Value failed: {}", e),
-                    )
-                        .into_response();
-                }
-            };
-
-            // Use the original json_val without modification
-
-            let request_url = format!("{}{}", worker_url_prefix, route);
-            (
-                self.client.post(&request_url).json(&json_val),
-                Some(dp_rank),
-                request_url,
-            )
-        } else {
-            let request_url = format!("{}{}", worker_url, route);
-            (
-                if let Some(raw) = raw_body {
-                    self.client
-                        .post(&request_url)
-                        .header(
-                            CONTENT_TYPE,
-                            headers
-                                .and_then(|headers| headers.get(CONTENT_TYPE))
-                                .cloned()
-                                .unwrap_or_else(|| HeaderValue::from_static("application/json")),
+        let (mut request_builder, extracted_dp_rank, request_url) =
+            if self.intra_node_data_parallel_size > 1 {
+                let (worker_url_prefix, dp_rank) = match dp_utils::extract_dp_rank(worker_url) {
+                    Ok(tup) => tup,
+                    Err(e) => {
+                        error!("Failed to extract dp_rank: {}", e);
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("Failed to extract dp_rank: {}", e),
                         )
-                        .body(raw.clone())
-                } else {
-                    self.client.post(&request_url).json(typed_req)
-                },
-                None,
-                request_url,
-            )
-        };
+                            .into_response();
+                    }
+                };
+
+                // Parse the request body
+                let json_val = match serde_json::to_value(typed_req) {
+                    Ok(j) => j,
+                    Err(e) => {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            format!("Convert into serde_json::Value failed: {}", e),
+                        )
+                            .into_response();
+                    }
+                };
+
+                // Use the original json_val without modification
+
+                let request_url = format!("{}{}", worker_url_prefix, route);
+                (
+                    self.client.post(&request_url).json(&json_val),
+                    Some(dp_rank),
+                    request_url,
+                )
+            } else {
+                let request_url = format!("{}{}", worker_url, route);
+                (
+                    if let Some(completion) = completion {
+                        completion.forward_request(&self.client, &request_url, headers, typed_req)
+                    } else {
+                        self.client.post(&request_url).json(typed_req)
+                    },
+                    None,
+                    request_url,
+                )
+            };
 
         // Copy all headers from original request if provided, skipping
         // Content-Type/Content-Length (.json() sets them) and trace headers
@@ -1971,6 +1924,7 @@ impl Router {
 
             response
         } else if load_incremented {
+            let mut completion_output = completion.map(|input| input.output_observer(status));
             // The forwarding task and response body share one cleanup receipt.
             let completion = if status.is_success() {
                 program_completion
@@ -1989,10 +1943,6 @@ impl Router {
 
             let stream = res.bytes_stream();
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-            // Echo text cannot distinguish prompt from generated output.
-            // Keep it (and unsuccessful responses) in prefill until cleanup.
-            let mut completion_output = completion_echo
-                .map(|echo| CompletionOutputObserver::new(echo || !status.is_success()));
             let (mut producer_output_frame, output_frame) = if completion_echo.is_some() {
                 let (producer, consumer) = output_frame_tracking();
                 (Some(producer), Some(consumer))
@@ -4229,7 +4179,11 @@ mod tests {
         });
         router.kv_index_supervisor = Some(Arc::new(supervisor));
         assert_eq!(
-            router.completion_placement_eligibility(&workers),
+            placement_eligibility(
+                router.completion_input.as_ref(),
+                router.kv_index_supervisor.as_deref(),
+                &workers,
+            ),
             Some(vec![true, false, false, false])
         );
         let wrong_rank: Arc<dyn Worker> = Arc::new(crate::core::DPAwareWorker::new(
@@ -4239,7 +4193,11 @@ mod tests {
             WorkerType::Regular,
         ));
         assert_eq!(
-            router.completion_placement_eligibility(&[wrong_rank]),
+            placement_eligibility(
+                router.completion_input.as_ref(),
+                router.kv_index_supervisor.as_deref(),
+                &[wrong_rank],
+            ),
             Some(vec![false])
         );
         router.kv_index_supervisor.as_ref().unwrap().shutdown();
