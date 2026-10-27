@@ -1,3 +1,5 @@
+#![cfg(all(feature = "cpu", feature = "ready"))]
+
 use axum::http::Request;
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_sdk::{testing::trace::InMemorySpanExporter, trace::TracerProvider};

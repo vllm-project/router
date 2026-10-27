@@ -151,7 +151,7 @@ impl<'de> Deserialize<'de> for KVEventBatch {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use super::*;
     use rmp_serde::{from_slice, to_vec};

@@ -1,6 +1,6 @@
 use crate::routes::interface::RouteHandle;
+use crate::{routes::SingleServerRoute, ChatCompletionRequest};
 use crate::{AppError, ChatCompletionResponse};
-use crate::{ChatCompletionRequest, routes::SingleServerRoute};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 

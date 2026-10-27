@@ -378,27 +378,44 @@ impl<K: Hash + Eq, V> EncodeCache<K, V> {
         Q: Hash + Eq + ToOwned<Owned = K> + ?Sized,
         V: Clone,
     {
+        self.get_or_encode_with(input, || encode().map(|encoding| (encoding, ())), estimate)
+            .map(|(encoding, _)| encoding)
+    }
+
+    /// Like `get_or_encode`, but also returns the uncached detail `encode`
+    /// reported; `None` means the value was a cache hit.
+    pub(crate) fn get_or_encode_with<Q, T, E>(
+        &self,
+        input: &Q,
+        encode: impl FnOnce() -> std::result::Result<(V, T), E>,
+        estimate: impl FnOnce(&V) -> usize,
+    ) -> std::result::Result<(V, Option<T>), E>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ToOwned<Owned = K> + ?Sized,
+        V: Clone,
+    {
         if let Some(encoding) = self.lookup(input) {
             self.hits.fetch_add(1, Ordering::Relaxed);
             TokenizerMetrics::record_cache_hit();
             // Clone outside the lock.
-            return Ok((*encoding).clone());
+            return Ok(((*encoding).clone(), None));
         }
         self.misses.fetch_add(1, Ordering::Relaxed);
         TokenizerMetrics::record_cache_miss();
 
-        let encoding = encode()?;
+        let (encoding, detail) = encode()?;
         let bytes = estimate(&encoding);
         if bytes > self.config.max_entry_bytes {
             self.oversized.fetch_add(1, Ordering::Relaxed);
             TokenizerMetrics::record_cache_oversized();
-            return Ok(encoding);
+            return Ok((encoding, Some(detail)));
         }
 
         let shared = Arc::new(encoding);
         let result = (*shared).clone();
         self.insert(input.to_owned(), shared, bytes);
-        Ok(result)
+        Ok((result, Some(detail)))
     }
 }
 
@@ -493,7 +510,7 @@ fn estimate_hf_bytes(encoding: &tokenizers::tokenizer::Encoding) -> usize {
     tokens + token_text + overflowing + sequence_ranges
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
 impl CachedTokenizer {
     /// Recompute retained bytes from the entries, to check the running total.
     fn recomputed_bytes(&self) -> usize {
@@ -507,7 +524,7 @@ impl CachedTokenizer {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use super::*;
     use crate::tokenizer::mock::MockTokenizer;

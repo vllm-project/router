@@ -8,8 +8,6 @@ from typing import Optional
 import pytest
 import requests
 
-from vllm.test.run_eval import run_eval
-
 logger = logging.getLogger(__name__)
 
 
@@ -235,6 +233,8 @@ def test_pd_mmlu(e2e_model: str, pd_cluster):
         num_threads=32,
         temperature=0.1,
     )
+    from vllm.test.run_eval import run_eval
+
     metrics = run_eval(args)
     assert metrics["score"] >= 0.65
 

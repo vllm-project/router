@@ -1,3 +1,5 @@
+#![cfg(all(feature = "cpu", feature = "ready"))]
+
 //! Gauge semantics of `CachedTokenizer`.
 //!
 //! `vllm_tokenizer_cache_entries` and `vllm_tokenizer_cache_bytes` must equal

@@ -1,22 +1,52 @@
-//! Shared prompt encoding cache.
+//! Shared prompt encoding caches: exact-match L0, then prefix L1.
+use std::hash::{BuildHasher, Hash, Hasher};
 use std::mem::size_of;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Once};
+use std::sync::{Arc, LazyLock, Once};
 
 use anyhow::{bail, Context, Result};
-use vllm_text::backend::hf::{ResolvedModelFiles, TokenizerSource};
 use vllm_text::Prompt;
 use vllm_tokenizer::DynTokenizer;
 
+use super::l1_encode_cache::{L1Bypass, L1Encoder};
 use crate::tokenizer::cache::{entry_overhead_bytes, EncodeCache};
 use crate::tokenizer::TokenizerCacheConfig;
 
-#[derive(Clone, Hash, PartialEq, Eq)]
+/// The prompt is hashed once, before the cache lock is taken; the map only
+/// rehashes `hash`.
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) struct EncodingKey {
+    hash: u64,
     instance: u64,
     add_special_tokens: bool,
     cache_salt: Option<String>,
     text: String,
+}
+
+impl EncodingKey {
+    fn new(
+        instance: u64,
+        add_special_tokens: bool,
+        cache_salt: Option<String>,
+        text: String,
+    ) -> Self {
+        // Seeded per process, so prompts cannot be crafted to collide.
+        static PROMPT_HASH: LazyLock<foldhash::quality::RandomState> =
+            LazyLock::new(Default::default);
+        Self {
+            hash: PROMPT_HASH.hash_one((instance, add_special_tokens, &cache_salt, &text)),
+            instance,
+            add_special_tokens,
+            cache_salt,
+            text,
+        }
+    }
+}
+
+impl Hash for EncodingKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.hash.hash(state);
+    }
 }
 
 // Hits share this allocation with `TokenizeOut` instead of copying it.
@@ -26,9 +56,17 @@ pub(crate) type FrontendCache = EncodeCache<EncodingKey, Arc<[u32]>>;
 pub(crate) struct PromptEncoder {
     tokenizer: DynTokenizer,
     cache: Option<Arc<FrontendCache>>,
+    l1: Option<L1Encoder>,
     instance: u64,
     model_id: Arc<str>,
     oversized_warning: Arc<Once>,
+}
+
+/// Prompt IDs and how many of them came from L0 or L1.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Encoded {
+    pub ids: Arc<[u32]>,
+    pub cached_tokens: usize,
 }
 
 impl PromptEncoder {
@@ -42,6 +80,7 @@ impl PromptEncoder {
         Self {
             tokenizer,
             cache,
+            l1: None,
             // Clones share an ID; new instances get distinct IDs.
             instance: NEXT_INSTANCE.fetch_add(1, Ordering::Relaxed),
             model_id: Arc::from(model_id),
@@ -49,34 +88,56 @@ impl PromptEncoder {
         }
     }
 
+    pub(crate) fn with_l1_cache(mut self, l1: Option<L1Encoder>) -> Self {
+        self.l1 = l1;
+        self
+    }
+
+    #[cfg(test)]
     pub(crate) fn encode(
         &self,
         prompt: Prompt,
         add_special_tokens: bool,
         cache_salt: Option<&str>,
     ) -> vllm_tokenizer::Result<Arc<[u32]>> {
+        self.encode_detailed(prompt, add_special_tokens, cache_salt)
+            .map(|encoded| encoded.ids)
+    }
+
+    /// L0 exact match first, then L1 prefix reuse, then the tokenizer.
+    /// An L0 hit returns the cached `Arc` directly.
+    pub(crate) fn encode_detailed(
+        &self,
+        prompt: Prompt,
+        add_special_tokens: bool,
+        cache_salt: Option<&str>,
+    ) -> vllm_tokenizer::Result<Encoded> {
         let text = match prompt {
-            Prompt::TokenIds(ids) => return Ok(Arc::from(ids)),
+            Prompt::TokenIds(ids) => {
+                if let Some(l1) = &self.l1 {
+                    l1.record_bypass(L1Bypass::TokenIds);
+                }
+                return Ok(Encoded {
+                    ids: Arc::from(ids),
+                    cached_tokens: 0,
+                });
+            }
             Prompt::Text(text) => text,
         };
         let Some(cache) = &self.cache else {
-            return self
-                .tokenizer
-                .encode(&text, add_special_tokens)
-                .map(Arc::from);
+            return self.encode_text(&text, add_special_tokens, cache_salt);
         };
-        let key = EncodingKey {
-            instance: self.instance,
+        let key = EncodingKey::new(
+            self.instance,
             add_special_tokens,
-            cache_salt: cache_salt.map(str::to_owned),
+            cache_salt.map(str::to_owned),
             text,
-        };
-        cache.get_or_encode(
+        );
+        let (ids, l1_cached) = cache.get_or_encode_with(
             &key,
             || {
-                self.tokenizer
-                    .encode(&key.text, add_special_tokens)
-                    .map(Arc::from)
+                let encoded = self.encode_text(&key.text, add_special_tokens, cache_salt)?;
+                Ok((encoded.ids, encoded.cached_tokens))
             },
             |ids| {
                 let bytes = entry_overhead_bytes::<EncodingKey, Arc<[u32]>>()
@@ -98,28 +159,35 @@ impl PromptEncoder {
                 }
                 bytes
             },
-        )
+        )?;
+        // An L0 hit serves every ID from the cache.
+        let cached_tokens = l1_cached.unwrap_or(ids.len());
+        Ok(Encoded { ids, cached_tokens })
     }
-}
 
-/// Check source files because the tokenizer trait cannot report determinism.
-pub(crate) async fn deterministic_model(model: &str) -> Result<bool> {
-    let files = ResolvedModelFiles::new(model).await?;
-    match files.tokenizer {
-        TokenizerSource::Tiktoken(_) | TokenizerSource::Tekken(_) => Ok(true),
-        TokenizerSource::HuggingFace(path) => {
-            let json: serde_json::Value = serde_json::from_slice(&std::fs::read(path)?)?;
-            Ok(deterministic_hf_model(&json["model"]))
+    fn encode_text(
+        &self,
+        text: &str,
+        add_special_tokens: bool,
+        cache_salt: Option<&str>,
+    ) -> vllm_tokenizer::Result<Encoded> {
+        if let Some(l1) = &self.l1 {
+            // BOS/EOS post-processing is not prefix-stable, so L1 skips it.
+            if add_special_tokens {
+                l1.record_bypass(L1Bypass::AddSpecialTokens);
+            } else if let Some((ids, cached_tokens)) =
+                l1.encode(self.tokenizer.as_ref(), self.instance, text, cache_salt)?
+            {
+                return Ok(Encoded {
+                    ids: Arc::from(ids),
+                    cached_tokens,
+                });
+            }
         }
-    }
-}
-
-fn deterministic_hf_model(model: &serde_json::Value) -> bool {
-    match model["type"].as_str() {
-        Some("BPE") => model["dropout"].is_null() || model["dropout"].as_f64() == Some(0.0),
-        // Normal encode does not sample.
-        Some("WordPiece" | "WordLevel" | "Unigram") => true,
-        _ => false,
+        Ok(Encoded {
+            ids: Arc::from(self.tokenizer.encode(text, add_special_tokens)?),
+            cached_tokens: 0,
+        })
     }
 }
 
@@ -152,10 +220,9 @@ fn parse_config(read: impl Fn(&str) -> Option<String>) -> Result<Option<Tokenize
     Ok(Some(config))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use super::*;
-    use serde_json::json;
     use std::sync::atomic::AtomicUsize;
     use vllm_tokenizer::{HuggingFaceTokenizer, Tokenizer, TokenizerError};
 
@@ -241,6 +308,40 @@ mod tests {
     }
 
     #[test]
+    fn keys_with_equal_hashes_stay_distinct() {
+        let cache = FrontendCache::new(Default::default()).unwrap();
+        let key =
+            |instance, add_special_tokens, cache_salt: Option<&str>, text: &str| EncodingKey {
+                hash: 7,
+                instance,
+                add_special_tokens,
+                cache_salt: cache_salt.map(str::to_owned),
+                text: text.to_owned(),
+            };
+        let keys = [
+            key(0, false, None, "a"),
+            key(0, false, None, "b"),
+            key(1, false, None, "a"),
+            key(0, true, None, "a"),
+            key(0, false, Some("s"), "a"),
+        ];
+        for round in 0..2 {
+            for (i, key) in keys.iter().enumerate() {
+                let (ids, miss) = cache
+                    .get_or_encode_with(
+                        key,
+                        || Ok::<_, ()>((Arc::<[u32]>::from([i as u32]), ())),
+                        |_| 64,
+                    )
+                    .unwrap();
+                assert_eq!(&*ids, &[i as u32]);
+                assert_eq!(miss.is_some(), round == 0);
+            }
+        }
+        assert_eq!(cache.stats().entries, keys.len());
+    }
+
+    #[test]
     fn cache_salt_isolates_entries_and_counts_retained_bytes() {
         let cache = Arc::new(FrontendCache::new(Default::default()).unwrap());
         let inner = CountingTokenizer::new(0);
@@ -288,6 +389,30 @@ mod tests {
         );
         assert_eq!(small.stats().oversized, 1);
         assert_eq!(small.stats().bytes, unsalted_bytes);
+    }
+
+    #[test]
+    fn cached_tokens_count_only_l0_hits_without_l1() {
+        let cached = |encoder: &PromptEncoder| {
+            encoder
+                .encode_detailed(Prompt::Text("Hello".into()), false, None)
+                .unwrap()
+                .cached_tokens
+        };
+        let cache = Arc::new(FrontendCache::new(Default::default()).unwrap());
+        let encoder = PromptEncoder::new("test-model", CountingTokenizer::new(0), Some(cache));
+        let len = encode(&encoder, "Hello", false).len();
+        assert_eq!(cached(&encoder), len);
+
+        let tiny = Arc::new(
+            FrontendCache::new(TokenizerCacheConfig {
+                max_entry_bytes: 1,
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+        let encoder = PromptEncoder::new("test-model", CountingTokenizer::new(0), Some(tiny));
+        assert_eq!((cached(&encoder), cached(&encoder)), (0, 0));
     }
 
     #[test]
@@ -420,23 +545,6 @@ mod tests {
         cache.clear();
         assert_eq!(Arc::strong_count(&reencoded), 1);
         assert_eq!(reencoded, expected);
-    }
-
-    #[test]
-    fn only_known_deterministic_models_are_cacheable() {
-        for dropout in [json!(null), json!(0.0)] {
-            assert!(deterministic_hf_model(
-                &json!({"type": "BPE", "dropout": dropout})
-            ));
-        }
-        for model in [
-            json!({"type": "BPE", "dropout": 0.1}),
-            json!({"type": "BPE", "dropout": "unknown"}),
-            json!({"type": "future"}),
-            json!(null),
-        ] {
-            assert!(!deterministic_hf_model(&model));
-        }
     }
 
     #[test]
