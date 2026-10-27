@@ -302,6 +302,7 @@ impl Router {
         let pool_kind = crate::backend::classify_worker_urls(&worker_urls)?;
         let request_timeout = Duration::from_secs(ctx.router_config.request_timeout_secs);
         let frontend = if pool_kind == Some(crate::backend::WorkerPoolKind::Http) {
+            crate::backend::frontend::warn_ignored_encoding_caches();
             crate::backend::EngineFrontend::with_request_timeout(request_timeout)
         } else {
             crate::backend::EngineFrontend::from_env(request_timeout)

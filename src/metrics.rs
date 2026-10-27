@@ -378,6 +378,44 @@ pub fn init_metrics() {
         "vllm_tokenizer_cache_bytes",
         "Estimated bytes retained by the tokenizer encode cache"
     );
+
+    // L1 prefix encoding cache metrics
+    describe_counter!(
+        "vllm_tokenizer_l1_lookups_total",
+        "Total prompts encoded through the L1 cache"
+    );
+    describe_counter!(
+        "vllm_tokenizer_l1_hits_total",
+        "Total L1 lookups that reused at least one cached token"
+    );
+    describe_counter!(
+        "vllm_tokenizer_l1_cached_tokens_total",
+        "Total prompt tokens taken from the L1 cache"
+    );
+    describe_counter!(
+        "vllm_tokenizer_l1_encoded_tokens_total",
+        "Total prompt tokens encoded by the tokenizer on the L1 path"
+    );
+    describe_counter!(
+        "vllm_tokenizer_l1_evictions_total",
+        "Total L1 tree nodes evicted to satisfy the byte or node budget"
+    );
+    describe_counter!(
+        "vllm_tokenizer_l1_verify_mismatches_total",
+        "Total L1 verify-mode mismatches"
+    );
+    describe_counter!(
+        "vllm_tokenizer_l1_bypasses_total",
+        "Total prompts on an L1-enabled model that skipped L1, by reason"
+    );
+    describe_gauge!(
+        "vllm_tokenizer_l1_nodes",
+        "Current number of L1 prefix tree nodes"
+    );
+    describe_gauge!(
+        "vllm_tokenizer_l1_bytes",
+        "Estimated bytes retained by the L1 cache"
+    );
 }
 
 pub fn start_prometheus(config: PrometheusConfig) {
@@ -1048,6 +1086,36 @@ impl TokenizerMetrics {
 
     pub fn set_cache_bytes(bytes: usize) {
         gauge!("vllm_tokenizer_cache_bytes").set(bytes as f64);
+    }
+
+    // L1 prefix encoding cache metrics
+    pub fn record_l1_lookup(cached_tokens: usize, encoded_tokens: usize) {
+        counter!("vllm_tokenizer_l1_lookups_total").increment(1);
+        if cached_tokens > 0 {
+            counter!("vllm_tokenizer_l1_hits_total").increment(1);
+        }
+        counter!("vllm_tokenizer_l1_cached_tokens_total").increment(cached_tokens as u64);
+        counter!("vllm_tokenizer_l1_encoded_tokens_total").increment(encoded_tokens as u64);
+    }
+
+    pub fn record_l1_evictions(count: u64) {
+        counter!("vllm_tokenizer_l1_evictions_total").increment(count);
+    }
+
+    pub fn record_l1_verify_mismatch() {
+        counter!("vllm_tokenizer_l1_verify_mismatches_total").increment(1);
+    }
+
+    pub fn record_l1_bypass(reason: &'static str) {
+        counter!("vllm_tokenizer_l1_bypasses_total", "reason" => reason).increment(1);
+    }
+
+    pub fn set_l1_nodes(nodes: usize) {
+        gauge!("vllm_tokenizer_l1_nodes").set(nodes as f64);
+    }
+
+    pub fn set_l1_bytes(bytes: usize) {
+        gauge!("vllm_tokenizer_l1_bytes").set(bytes as f64);
     }
 }
 
