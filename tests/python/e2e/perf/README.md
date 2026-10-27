@@ -7,7 +7,8 @@ GPU-backed performance scenarios live in subdirectories (each with its own
 |-----------|-------------|
 | [`grpc/`](grpc/README.md) | Prefix-KV hit/miss via router + vllm-rs / vllm (rust gRPC, rust HTTP, python HTTP) |
 
-Run a suite:
+Run a suite (**must** target `perf/grpc`: `--perf-case` is registered only in
+`grpc/conftest.py`, not in this directory):
 
 ```bash
 export MODEL=/path/to/model
