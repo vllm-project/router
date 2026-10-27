@@ -178,8 +178,8 @@ struct CliArgs {
     #[arg(long, default_value_t = 120)]
     eviction_interval: u64,
 
-    /// Maximum size of the approximation tree for cache-aware routing
-    #[arg(long, default_value_t = 67108864)] // 2^26
+    /// Per-worker character budget in each model tree (enforced at cache eviction)
+    #[arg(long, default_value_t = 1 << 25)]
     max_tree_size: usize,
 
     /// Softmax temperature for kv_aware (0 selects the minimum cost).

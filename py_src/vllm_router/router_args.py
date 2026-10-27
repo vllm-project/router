@@ -35,7 +35,7 @@ class RouterArgs:
     balance_abs_threshold: int = 64
     balance_rel_threshold: float = 1.5
     eviction_interval_secs: int = 120
-    max_tree_size: int = 2**26
+    max_tree_size: int = 2**25
     max_payload_size: int = 512 * 1024 * 1024  # 512MB default for large batches
     wasm_middleware: Optional[str] = None
     wasm_middleware_sha256: Optional[str] = None
@@ -284,7 +284,7 @@ class RouterArgs:
             f"--{prefix}max-tree-size",
             type=int,
             default=RouterArgs.max_tree_size,
-            help="Maximum size of the approximation tree for cache-aware routing",
+            help="Per-worker character budget in each model tree (enforced at cache eviction)",
         )
         parser.add_argument(
             f"--{prefix}max-payload-size",

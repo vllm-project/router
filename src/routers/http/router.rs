@@ -302,6 +302,7 @@ impl Router {
         let pool_kind = crate::backend::classify_worker_urls(&worker_urls)?;
         let request_timeout = Duration::from_secs(ctx.router_config.request_timeout_secs);
         let frontend = if pool_kind == Some(crate::backend::WorkerPoolKind::Http) {
+            crate::backend::frontend::warn_ignored_encoding_caches();
             crate::backend::EngineFrontend::with_request_timeout(request_timeout)
         } else {
             crate::backend::EngineFrontend::from_env(request_timeout)
@@ -1293,9 +1294,8 @@ impl Router {
         }
 
         // All-grpc chat: tokenize once, outside policy and retry.
-        // Policy still uses extract_text_for_routing (session / empty).
-        // token_ids stay on PreparedRequest for a later token-level policy —
-        // do not dump 131k ids into the cache_aware tree.
+        // Cache-aware placement uses the same full content/session key as
+        // HTTP. PreparedRequest retains full token IDs for backend dispatch.
         //
         // The concrete request comes from `GenerationRequest::grpc_request`
         // rather than a `serde_json::Value` roundtrip: the only two routes a
@@ -1347,6 +1347,7 @@ impl Router {
             ) if route == "/v1/completions" => completion.extract_text_for_grpc_routing(),
             _ => typed_req.extract_text_for_routing(),
         };
+        let cache_key = std::sync::OnceLock::new();
 
         let response = RetryExecutor::execute_response_with_retry(
             &self.retry_config,
@@ -1391,7 +1392,11 @@ impl Router {
                 } else {
                     self.select_worker_for_model(
                         model_id,
-                        Some(&text),
+                        Some(if policy.name() == "cache_aware" {
+                            cache_key.get_or_init(|| typed_req.extract_cache_routing_key())
+                        } else {
+                            &text
+                        }),
                         headers,
                         prepared
                             .as_ref()
@@ -2697,7 +2702,9 @@ impl RouterTrait for Router {
         let policy = self.policy_registry.get_default_policy();
         // Serializing the whole body is expensive when it carries base64
         // media; only consumers that actually read the text pay for it.
-        let request_text = if policy.needs_request_text() || self.program_scheduler.is_some() {
+        let request_text = if (policy.needs_request_text() && policy.name() != "cache_aware")
+            || self.program_scheduler.is_some()
+        {
             serde_json::to_string(&body).ok()
         } else {
             None
@@ -2732,11 +2739,13 @@ impl RouterTrait for Router {
                 .get_by_url(&completion.dispatch().target_id)
                 .filter(|worker| worker.is_available())
         } else {
+            let cache_key = (policy.name() == "cache_aware")
+                .then(|| crate::protocols::spec::cache_routing::for_route(&body, path));
             let request_headers = Self::headers_to_request_headers(headers);
             policy
                 .select_worker_with_headers(
                     &workers,
-                    request_text.as_deref(),
+                    cache_key.as_deref().or(request_text.as_deref()),
                     request_headers.as_ref(),
                 )
                 .and_then(|index| workers.get(index).cloned())

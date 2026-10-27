@@ -24,6 +24,7 @@ class TestRouterArgs:
         # Test basic defaults
         assert args.host == "127.0.0.1"
         assert args.port == 30000
+        assert args.max_tree_size == 2**25
         assert args.policy == "cache_aware"
         assert args.worker_urls == []
         assert args.vllm_pd_disaggregation is False
