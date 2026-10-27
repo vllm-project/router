@@ -702,7 +702,7 @@ fn hex(b: &[u8]) -> String {
     s
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 

@@ -11,6 +11,8 @@ import pytest
 from vllm_router.launch_router import RouterArgs, parse_router_args
 from vllm_router.router import Router, policy_from_str
 
+pytestmark = [pytest.mark.ready, pytest.mark.cpu]
+
 
 class TestRouterArgs:
     """Test RouterArgs dataclass and its methods."""
@@ -22,6 +24,7 @@ class TestRouterArgs:
         # Test basic defaults
         assert args.host == "127.0.0.1"
         assert args.port == 30000
+        assert args.max_tree_size == 2**25
         assert args.policy == "cache_aware"
         assert args.worker_urls == []
         assert args.vllm_pd_disaggregation is False
@@ -483,6 +486,8 @@ class TestParseRouterArgs:
             [
                 "--policy",
                 "kv_aware",
+                "--kv-aware-session-affinity-ttl-secs",
+                "1800",
                 "--router-temperature",
                 "0.25",
                 "--kv-penalty-host",
@@ -503,10 +508,16 @@ class TestParseRouterArgs:
         Router.from_args(args)
 
         assert captured["policy"] == PolicyType.KvAware
+        assert captured["kv_aware_session_affinity_ttl_secs"] == 1800
         assert captured["router_temperature"] == 0.25
         assert captured["kv_penalty_host"] == 0.7
         assert captured["kv_penalty_external"] == 0.5
         assert captured["kv_penalty_disk"] == 0.2
+
+    @pytest.mark.parametrize("ttl", [0, -1, 31_536_001])
+    def test_kv_aware_affinity_ttl_rejects_invalid_values(self, ttl):
+        with pytest.raises(ValueError, match="kv_aware_session_affinity_ttl_secs"):
+            RouterArgs(kv_aware_session_affinity_ttl_secs=ttl)._validate_router_args()
 
     def test_kv_aware_is_not_a_pd_stage_policy(self):
         with pytest.raises(SystemExit):

@@ -1,98 +1,78 @@
+#![cfg(all(feature = "cpu", feature = "ready"))]
+
 //! Integration tests for PolicyRegistry with RouterManager
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use vllm_router_rs::config::{PolicyConfig, RouterConfig};
+use vllm_router_rs::config::RouterConfig;
 use vllm_router_rs::core::WorkerRegistry;
 use vllm_router_rs::policies::PolicyRegistry;
 use vllm_router_rs::protocols::worker_spec::WorkerConfigRequest;
 use vllm_router_rs::routers::router_manager::RouterManager;
 
 #[tokio::test]
-async fn test_policy_registry_with_router_manager() {
-    // Create RouterConfig
+async fn igw_kv_affinity_survives_load_changes_and_rebinds_after_registration() {
+    use vllm_router_rs::policies::{kv_aware_ops, AffinityKey};
+
     let config = RouterConfig {
         enable_igw: true,
-        policy: PolicyConfig::RoundRobin,
+        kv_aware_session_affinity_ttl_secs: Some(60),
         ..Default::default()
     };
-
-    // Create HTTP client
-    let client = reqwest::Client::new();
-
-    // Create shared registries
-    let worker_registry = Arc::new(WorkerRegistry::new());
-    let policy_registry = Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin));
-
-    // Create RouterManager with shared registries
-    let _router_manager = RouterManager::new(
+    let workers = Arc::new(WorkerRegistry::new());
+    let policies = Arc::new(PolicyRegistry::new_with_affinity_ttl(
+        config.policy.clone(),
+        Some(std::time::Duration::from_secs(60)),
+    ));
+    let manager = RouterManager::new(
         config,
-        client,
-        worker_registry.clone(),
-        policy_registry.clone(),
+        reqwest::Client::new(),
+        workers.clone(),
+        policies.clone(),
     );
-
-    // Test adding workers with different models and policies
-
-    // Add first worker for llama-3 with cache_aware policy hint
-    let mut labels1 = HashMap::new();
-    labels1.insert("policy".to_string(), "cache_aware".to_string());
-
-    let _worker1_config = WorkerConfigRequest {
-        url: "http://worker1:8000".to_string(),
-        model_id: Some("llama-3".to_string()),
+    let worker_config = |url: &str| WorkerConfigRequest {
+        url: url.into(),
+        model_id: Some("model".into()),
         worker_type: None,
         priority: None,
         cost: None,
-        labels: labels1,
+        labels: HashMap::from([("policy".into(), "kv_aware".into())]),
         bootstrap_port: None,
     };
-
-    // This would normally connect to a real worker, but for testing we'll just verify the structure
-    // In a real test, we'd need to mock the worker or use a test server
-
-    // Verify PolicyRegistry has the correct policy for llama-3
-    let _llama_policy = policy_registry.get_policy("llama-3");
-    // After first worker is added, llama-3 should have a policy
-
-    // Add second worker for llama-3 with different policy hint (should be ignored)
-    let mut labels2 = HashMap::new();
-    labels2.insert("policy".to_string(), "random".to_string());
-
-    let _worker2_config = WorkerConfigRequest {
-        url: "http://worker2:8000".to_string(),
-        model_id: Some("llama-3".to_string()),
-        worker_type: None,
-        priority: None,
-        cost: None,
-        labels: labels2,
-        bootstrap_port: None,
+    for url in ["http://a", "http://b"] {
+        manager.add_worker(worker_config(url)).await.unwrap();
+    }
+    let policy = policies.get_policy("model").unwrap();
+    let ops = kv_aware_ops(policy.as_ref()).unwrap();
+    let body = serde_json::json!({"session_id": "s"});
+    let identity = vllm_router_rs::request_identity::resolve_affinity_identity(
+        None,
+        vllm_router_rs::request_identity::IdentityFields::from_body(&body),
+    )
+    .unwrap()
+    .unwrap();
+    let key = AffinityKey::from_identity(identity, "model");
+    let select = || {
+        let candidates = workers.get_by_model_fast("model");
+        let receipt = ops
+            .select_worker_with_receipt(&candidates, None, None, None, Some(&key), &[])
+            .unwrap();
+        let worker = candidates[receipt.worker_index].clone();
+        receipt.slot.unwrap().release();
+        worker.decrement_load();
+        worker
     };
+    let first = select();
+    first.increment_load();
+    assert_eq!(select().url(), first.url());
 
-    // The second worker should use the same policy as the first (cache_aware)
-
-    // Add worker for different model (gpt-4) with random policy
-    let mut labels3 = HashMap::new();
-    labels3.insert("policy".to_string(), "random".to_string());
-
-    let _worker3_config = WorkerConfigRequest {
-        url: "http://worker3:8000".to_string(),
-        model_id: Some("gpt-4".to_string()),
-        worker_type: None,
-        priority: None,
-        cost: None,
-        labels: labels3,
-        bootstrap_port: None,
-    };
-
-    // Verify gpt-4 has random policy
-    let _gpt_policy = policy_registry.get_policy("gpt-4");
-
-    // Test removing workers
-    // When we remove both llama-3 workers, the policy should be cleaned up
-
-    println!("PolicyRegistry integration test structure created");
-    println!("Note: This test requires mocking or test servers to fully execute");
+    manager.remove_worker_from_registry(first.url()).unwrap();
+    manager
+        .add_worker(worker_config(first.url()))
+        .await
+        .unwrap();
+    workers.get_by_url(first.url()).unwrap().increment_load();
+    assert_ne!(select().url(), first.url());
 }
 
 #[test]

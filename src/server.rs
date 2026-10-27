@@ -60,17 +60,33 @@ pub struct AppContext {
 
 impl AppContext {
     pub fn new(
-        router_config: RouterConfig,
+        mut router_config: RouterConfig,
         client: Client,
         max_concurrent_requests: usize,
         rate_limit_tokens_per_second: Option<usize>,
         api_key_validation_urls: Vec<String>,
     ) -> Result<Self, String> {
+        if matches!(
+            &router_config.policy,
+            crate::config::PolicyConfig::KvAware { .. }
+        ) {
+            let legacy_sources = std::env::var("VLLM_ROUTER_KV_EVENT_SOURCES").ok();
+            crate::config::normalize_static_kv_event_sources(
+                &mut router_config.policy,
+                legacy_sources.as_deref(),
+            )
+            .map_err(|error| error.to_string())?;
+        }
         let rate_limit_tokens = rate_limit_tokens_per_second.unwrap_or(max_concurrent_requests);
         let rate_limiter = Arc::new(TokenBucket::new(max_concurrent_requests, rate_limit_tokens));
 
         let worker_registry = Arc::new(WorkerRegistry::new());
-        let policy_registry = Arc::new(PolicyRegistry::new(router_config.policy.clone()));
+        let policy_registry = Arc::new(PolicyRegistry::new_with_affinity_ttl(
+            router_config.policy.clone(),
+            router_config
+                .kv_aware_session_affinity_ttl_secs
+                .map(std::time::Duration::from_secs),
+        ));
 
         let router_manager = None;
 
@@ -1272,7 +1288,7 @@ fn create_cors_layer(allowed_origins: Vec<String>) -> tower_http::cors::CorsLaye
     cors.max_age(Duration::from_secs(3600))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use super::*;
 

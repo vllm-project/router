@@ -1,4 +1,6 @@
-#[cfg(test)]
+#![cfg(all(feature = "cpu", feature = "ready"))]
+
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod consistent_hash_policy_tests {
     use std::collections::HashMap;
     use std::sync::Arc;

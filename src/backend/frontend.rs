@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 use axum::response::Response;
 
 use super::grpc::{FirstOutputCallback, GrpcEngineBackend};
+use super::l1_encode_cache::{L1CacheConfig, L1CacheStats};
 use super::preprocess::{tokenize_chat_request_timed, FrontendHandle, TokenizeOut, TokenizerCache};
 use crate::protocols::spec::ChatCompletionRequest;
 use crate::tokenizer::{TokenizerCacheConfig, TokenizerCacheStats};
@@ -88,22 +89,37 @@ impl EngineFrontend {
         request_timeout: Duration,
         config: TokenizerCacheConfig,
     ) -> anyhow::Result<Self> {
+        Self::with_encoding_caches(request_timeout, Some(config), None)
+    }
+
+    /// Enable L0 (exact) and/or L1 (prefix) encoding caches.
+    pub fn with_encoding_caches(
+        request_timeout: Duration,
+        l0: Option<TokenizerCacheConfig>,
+        l1: Option<L1CacheConfig>,
+    ) -> anyhow::Result<Self> {
         Ok(Self {
-            tokenizer: Arc::new(TokenizerCache::with_encoding_cache(config)?),
+            tokenizer: Arc::new(TokenizerCache::with_caches(l0, l1)?),
             ..Self::with_request_timeout(request_timeout)
         })
     }
 
     pub(crate) fn from_env(request_timeout: Duration) -> anyhow::Result<Self> {
-        match super::encode_cache::config_from_env()? {
-            Some(config) => Self::with_tokenizer_cache(request_timeout, config),
-            None => Ok(Self::with_request_timeout(request_timeout)),
-        }
+        Self::with_encoding_caches(
+            request_timeout,
+            super::encode_cache::config_from_env()?,
+            super::l1_encode_cache::config_from_env()?,
+        )
     }
 
     /// L0 stats across models, or None when disabled.
     pub fn tokenizer_cache_stats(&self) -> Option<TokenizerCacheStats> {
         self.tokenizer.encoding_cache_stats()
+    }
+
+    /// L1 stats across models, or None when disabled.
+    pub fn l1_cache_stats(&self) -> Option<L1CacheStats> {
+        self.tokenizer.l1_cache_stats()
     }
 
     /// Tests only: bypass model loading by returning these fake prompt ids.
@@ -141,8 +157,9 @@ impl EngineFrontend {
         mut request: ChatCompletionRequest,
     ) -> Result<PreparedRequest, PrepareError> {
         let (handle, t_req, resolve_ms) = self.resolve_with_defaults(&mut request).await?;
-        let tokenized = tokenize_chat_request_timed(&request, &handle)
+        let mut tokenized = tokenize_chat_request_timed(&request, &handle)
             .map_err(|e| PrepareError::Invalid(format!("preprocess: {e}")))?;
+        truncate_grpc_prompt(&request, &mut tokenized)?;
         Ok(PreparedRequest {
             request: Arc::new(request),
             tokenized,
@@ -164,13 +181,15 @@ impl EngineFrontend {
         emit_token_ids: bool,
     ) -> Result<PreparedRequest, PrepareError> {
         let (handle, t_req, resolve_ms) = self.resolve_with_defaults(&mut request).await?;
-        let tokenized = TokenizeOut {
+        let mut tokenized = TokenizeOut {
             token_ids: Arc::from(token_ids),
             adapt_ms: 0.0,
             template_ms: 0.0,
             encode_ms: 0.0,
             encode_backend: "completions-token-ids",
+            cached_tokens: 0,
         };
+        truncate_grpc_prompt(&request, &mut tokenized)?;
         Ok(PreparedRequest {
             request: Arc::new(request),
             tokenized,
@@ -201,5 +220,97 @@ impl EngineFrontend {
 
     pub fn remove_worker(&self, worker_url: &str) {
         self.grpc.remove_client(worker_url);
+    }
+}
+
+fn truncate_grpc_prompt(
+    request: &ChatCompletionRequest,
+    tokenized: &mut TokenizeOut,
+) -> Result<(), PrepareError> {
+    if let Some(value) = request
+        .other
+        .get("truncate_prompt_tokens")
+        .filter(|value| !value.is_null())
+    {
+        let limit = value
+            .as_u64()
+            .and_then(|value| u32::try_from(value).ok())
+            .ok_or_else(|| {
+                PrepareError::Invalid(
+                    "truncate_prompt_tokens must be a non-negative 32-bit integer on gRPC".into(),
+                )
+            })? as usize;
+        // The gRPC protocol's zero means no truncation; positive limits keep
+        // the suffix. Sending the already-truncated IDs makes placement and
+        // dispatch agree, even when the worker applies the same limit again.
+        if limit > 0 && tokenized.token_ids.len() > limit {
+            let removed = tokenized.token_ids.len() - limit;
+            tokenized.token_ids = Arc::from(&tokenized.token_ids[removed..]);
+            // L1 reuses a prefix; truncation keeps the suffix.
+            tokenized.cached_tokens = tokenized.cached_tokens.saturating_sub(removed);
+        }
+    }
+    Ok(())
+}
+
+/// HTTP pools proxy the request body, so the router never tokenizes and the
+/// L0/L1 switches have no effect. Say so instead of ignoring them silently.
+pub(crate) fn warn_ignored_encoding_caches() {
+    for name in ignored_cache_switches(|name| std::env::var(name).ok()) {
+        tracing::warn!("{name} is ignored: HTTP worker pools do not tokenize in the router");
+    }
+}
+
+fn ignored_cache_switches(read: impl Fn(&str) -> Option<String>) -> Vec<&'static str> {
+    ["VLLM_ROUTER_L0_CACHE", "VLLM_ROUTER_L1_CACHE"]
+        .into_iter()
+        .filter(|name| !matches!(read(name).as_deref(), None | Some("" | "0" | "false")))
+        .collect()
+}
+
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truncation_counts_only_cached_tokens_in_retained_suffix() {
+        let request = serde_json::from_value(serde_json::json!({
+            "messages": [], "truncate_prompt_tokens": 3
+        }))
+        .unwrap();
+        for (cached_tokens, expected) in [(0, 0), (2, 0), (4, 1), (6, 3)] {
+            let mut tokenized = TokenizeOut {
+                token_ids: Arc::from([1, 2, 3, 4, 5, 6]),
+                adapt_ms: 0.0,
+                template_ms: 0.0,
+                encode_ms: 0.0,
+                encode_backend: "test",
+                cached_tokens,
+            };
+            truncate_grpc_prompt(&request, &mut tokenized).unwrap();
+            assert_eq!(tokenized.token_ids.as_ref(), &[4, 5, 6]);
+            assert_eq!(tokenized.cached_tokens, expected);
+        }
+    }
+
+    #[test]
+    fn http_pools_report_requested_cache_switches() {
+        let read = |values: &'static [(&'static str, &'static str)]| {
+            move |name: &str| {
+                values
+                    .iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| value.to_string())
+            }
+        };
+        assert!(ignored_cache_switches(read(&[])).is_empty());
+        assert!(ignored_cache_switches(read(&[("VLLM_ROUTER_L1_CACHE", "0")])).is_empty());
+        assert_eq!(
+            ignored_cache_switches(read(&[
+                ("VLLM_ROUTER_L0_CACHE", "1"),
+                ("VLLM_ROUTER_L1_CACHE", "true"),
+            ])),
+            ["VLLM_ROUTER_L0_CACHE", "VLLM_ROUTER_L1_CACHE"]
+        );
     }
 }

@@ -1,3 +1,5 @@
+#![cfg(all(feature = "cpu", feature = "ready"))]
+
 //! Integration tests for intra-node data-parallel (DP) routing.
 //!
 //! These tests verify that when `intra_node_data_parallel_size > 1`, the router:
@@ -14,7 +16,7 @@
 
 mod common;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod dp_routing_tests {
     use vllm_router_rs::core::{BasicWorker, DPAwareWorker, Worker, WorkerType};
     use vllm_router_rs::routers::http::dp_utils;
@@ -225,7 +227,7 @@ mod dp_routing_tests {
 // reach the correct backend. If @rank corrupted the URL, reqwest
 // would connect to the wrong host and the request would fail.
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod dp_e2e_tests {
     use super::common;
     use axum::body::Body;
@@ -272,6 +274,7 @@ mod dp_e2e_tests {
             circuit_breaker: CircuitBreakerConfig::default(),
             disable_retries: false,
             disable_circuit_breaker: false,
+            kv_aware_session_affinity_ttl_secs: None,
             health_check: vllm_router_rs::config::HealthCheckConfig::default(),
             enable_igw: false,
             connection_mode: ConnectionMode::Http,
@@ -322,6 +325,7 @@ mod dp_e2e_tests {
             circuit_breaker: CircuitBreakerConfig::default(),
             disable_retries: false,
             disable_circuit_breaker: false,
+            kv_aware_session_affinity_ttl_secs: None,
             health_check: vllm_router_rs::config::HealthCheckConfig::default(),
             enable_igw: false,
             connection_mode: ConnectionMode::Http,

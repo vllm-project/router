@@ -5,6 +5,8 @@ import time
 import pytest
 import requests
 
+pytestmark = [pytest.mark.ready, pytest.mark.cpu]
+
 
 @pytest.mark.integration
 def test_pd_power_of_two_decode_attribution(router_manager, mock_workers):
@@ -146,9 +148,9 @@ def test_pd_power_of_two_skews_to_faster_decode(router_manager, mock_workers):
 
     # With sustained load on slow worker, fast worker should get significantly more requests
     # Allow for some variance, but expect at least 60/40 split favoring fast worker
-    assert (
-        counts[fast_id] > counts[slow_id]
-    ), f"Expected fast worker to handle more requests, got {counts}"
-    assert (
-        counts[fast_id] >= counts[slow_id] * 1.2
-    ), f"Expected fast worker to handle at least 20% more requests than slow worker, got {counts}"
+    assert counts[fast_id] > counts[slow_id], (
+        f"Expected fast worker to handle more requests, got {counts}"
+    )
+    assert counts[fast_id] >= counts[slow_id] * 1.2, (
+        f"Expected fast worker to handle at least 20% more requests than slow worker, got {counts}"
+    )

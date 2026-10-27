@@ -1,3 +1,5 @@
+#![cfg(all(feature = "cpu", feature = "ready"))]
+
 /// Tests for PromptInput enum supporting str, list[str], list[int], list[list[int]]
 use vllm_router_rs::protocols::spec::{CompletionRequest, PromptInput};
 

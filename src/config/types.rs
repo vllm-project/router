@@ -71,6 +71,10 @@ pub struct RouterConfig {
     /// Disable circuit breaker (overrides circuit_breaker.failure_threshold to u32::MAX when true)
     #[serde(default)]
     pub disable_circuit_breaker: bool,
+    /// Enable stable-identity affinity in `kv_aware` and expire idle bindings after this TTL.
+    /// `None` disables affinity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kv_aware_session_affinity_ttl_secs: Option<u64>,
     /// Health check configuration
     pub health_check: HealthCheckConfig,
     /// Enable Inference Gateway mode (false = proxy mode, true = IGW mode)
@@ -687,6 +691,10 @@ pub enum PolicyConfig {
         kv_penalty_external: f64,
         #[serde(default = "default_kv_penalty_disk")]
         kv_penalty_disk: f64,
+        /// Optional static KV event sources for workers whose HTTP control
+        /// endpoint does not expose /kv_event_sources.
+        #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+        static_kv_event_sources: Box<HashMap<String, StaticKvEventSources>>,
     },
 
     #[serde(rename = "power_of_two")]
@@ -703,6 +711,39 @@ pub enum PolicyConfig {
 
     #[serde(rename = "rendezvous_hash")]
     RendezvousHash,
+}
+
+/// Manually configured KV event publishers for one regular-mode worker.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct StaticKvEventSources {
+    /// One externally reachable ZMQ PUB endpoint per DP rank.
+    pub endpoints: Vec<String>,
+    /// Optional replay ROUTER endpoint per DP rank for loss recovery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replay_endpoints: Option<Vec<String>>,
+    /// Exact ZMQ subscription topic shared by these ranks.
+    #[serde(default)]
+    pub topic: String,
+    /// Optional subscriber high-water mark.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hwm: Option<i32>,
+    /// Declared adapter boundary, not remotely attested capabilities.
+    #[serde(default)]
+    pub source_contract: StaticKvEventSourceContract,
+    /// KV cache block size used to calculate prefix placement.
+    pub block_size: u32,
+    /// Shared model identity across workers that serve the same model.
+    pub model: String,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum StaticKvEventSourceContract {
+    /// Preserve the generic HTTP/gRPC and per-rank source contract.
+    #[default]
+    Generic,
+    /// One independently addressed HTTP worker with a normal-dense source.
+    HttpDenseDp1,
 }
 
 impl PolicyConfig {
@@ -942,6 +983,7 @@ impl Default for RouterConfig {
             circuit_breaker: CircuitBreakerConfig::default(),
             disable_retries: false,
             disable_circuit_breaker: false,
+            kv_aware_session_affinity_ttl_secs: None,
             health_check: HealthCheckConfig::default(),
             enable_igw: false,
             connection_mode: ConnectionMode::Http,
@@ -1013,7 +1055,7 @@ impl RouterConfig {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use super::*;
 
@@ -1657,6 +1699,7 @@ mod tests {
             circuit_breaker: CircuitBreakerConfig::default(),
             disable_retries: false,
             disable_circuit_breaker: false,
+            kv_aware_session_affinity_ttl_secs: None,
             health_check: HealthCheckConfig::default(),
             enable_igw: false,
             queue_size: 100,
@@ -1725,6 +1768,7 @@ mod tests {
             circuit_breaker: CircuitBreakerConfig::default(),
             disable_retries: false,
             disable_circuit_breaker: false,
+            kv_aware_session_affinity_ttl_secs: None,
             health_check: HealthCheckConfig::default(),
             enable_igw: false,
             queue_size: 100,
@@ -1789,6 +1833,7 @@ mod tests {
             circuit_breaker: CircuitBreakerConfig::default(),
             disable_retries: false,
             disable_circuit_breaker: false,
+            kv_aware_session_affinity_ttl_secs: None,
             health_check: HealthCheckConfig::default(),
             enable_igw: false,
             queue_size: 100,

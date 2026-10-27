@@ -1,3 +1,5 @@
+#![cfg(all(feature = "cpu", feature = "ready"))]
+
 // Integration test for Responses API
 
 use vllm_router_rs::protocols::spec::{

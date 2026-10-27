@@ -120,6 +120,8 @@ does not test live prefix-cache behavior.
 | Wave concurrency | `--concurrency` | | simultaneous requests per batch |
 | Wave request count | `--requests` | | total requests in the wave; use `2 * C` for two batches at concurrency `C` |
 | Cache warmup | `--warmup` | | serial miss/hit before the concurrent wave |
+| Prompt shape | `--shape` | `KVHIT_SHAPE` | `split` (default): one user message cut by `--hit-rate`; `turns`: shared earlier turns + unique last user turn, which the router L1 cache can reuse |
+| Shared turns | `--turns` | | user/assistant messages holding the shared part for `--shape turns` (default 8) |
 | Router | `--router-url` | `ROUTER_URL` | default `http://127.0.0.1:30000` |
 | Served name | `--model` | `MODEL` | request `model` field |
 | HTTP timeout | `--timeout` | | seconds (raise for long ISL) |
@@ -238,12 +240,12 @@ are not a forever ban on a gRPC text prompt.
 
 ```bash
 # always-on, in-process mock (no GPU, no vllm-rs)
-cargo test --test grpc_vs_http_e2e
-cargo test --lib backend::
+cargo test --features cpu,ready --test grpc_vs_http_e2e
+cargo test --features cpu,ready --lib backend::
 
 # optional: rust vllm-chat ids vs Python vLLM (skips if unset)
 export VLLM_ROUTER_MODEL=/path/to/hf-model   # tokenizer.json required
-cargo test --lib vllm_chat_tokenize_matches_python_vllm -- --nocapture
+cargo test --features cpu,ready --lib vllm_chat_tokenize_matches_python_vllm -- --nocapture
 ```
 
 `tests/python_vllm_chat_ids.py` is a helper spawned by the preprocess

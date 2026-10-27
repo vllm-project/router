@@ -1,3 +1,5 @@
+#![cfg(all(feature = "cpu", feature = "ready"))]
+
 //! L0 integration tests with local models and a mock gRPC worker.
 mod common;
 #[path = "common/grpc_frontend_fixture.rs"]
@@ -49,6 +51,27 @@ async fn grpc_frontend_cache_parity_metrics_streaming_and_retries() {
         &first.tokenized.token_ids,
         &second.tokenized.token_ids
     ));
+    assert_eq!(first.tokenized.cached_tokens, 0);
+    assert_eq!(
+        second.tokenized.cached_tokens,
+        second.tokenized.token_ids.len()
+    );
+    // Token-ID completions bypass chat rendering and leave L0 unchanged.
+    let before = on.tokenizer_cache_stats().unwrap();
+    let req = serde_json::from_value(json!({
+        "model": model.path().to_str().unwrap(), "prompt": [4, 5, 6]
+    }))
+    .unwrap();
+    let lowered = vllm_router_rs::backend::prepare_grpc_completion(&req).unwrap();
+    let prepared = on
+        .prepare_token_ids(lowered.chat, lowered.token_ids, lowered.emit_token_ids)
+        .await
+        .unwrap();
+    assert_eq!(prepared.tokenized.token_ids.as_ref(), &[4, 5, 6]);
+    assert_eq!(prepared.tokenized.cached_tokens, 0);
+    assert_eq!(prepared.tokenized.encode_ms, 0.0);
+    assert_eq!(on.tokenizer_cache_stats().unwrap(), before);
+    drop(prepared);
     let stats = on.tokenizer_cache_stats().unwrap();
     assert_eq!((stats.misses, stats.hits, stats.entries), (1, 1, 1));
     assert_eq!(
@@ -169,6 +192,7 @@ async fn grpc_frontend_cache_parity_metrics_streaming_and_retries() {
         },
         policy: PolicyConfig::RoundRobin,
         disable_circuit_breaker: true,
+        kv_aware_session_affinity_ttl_secs: None,
         retry: RetryConfig {
             max_retries: 2,
             initial_backoff_ms: 1,
@@ -282,6 +306,7 @@ async fn grpc_kv_routing_keeps_unavailable_control_a_legal_fallback(
                 kv_penalty_host: 0.8,
                 kv_penalty_external: 0.6,
                 kv_penalty_disk: 0.3,
+                static_kv_event_sources: Default::default(),
             },
             ..Default::default()
         };

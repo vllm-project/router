@@ -1,3 +1,5 @@
+#![cfg(all(feature = "cpu", feature = "ready"))]
+
 //! Comprehensive integration tests for OpenAI backend functionality
 
 use axum::{
