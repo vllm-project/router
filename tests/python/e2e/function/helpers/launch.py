@@ -5,7 +5,6 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
-import shlex
 import shutil
 import socket
 import subprocess
@@ -16,7 +15,14 @@ from urllib.parse import urlparse
 
 import requests
 
-from tests.python.e2e.function.kv_aware.config import kv_aware_kv_events_enabled
+from tests.python.e2e.function.kv_aware.config import (
+    kv_aware_kv_events_enabled,
+    kv_aware_kv_events_endpoint_bind,
+    kv_aware_kv_events_replay_enabled,
+    kv_aware_kv_events_replay_host,
+    kv_aware_use_vllm_serve,
+    worker_serve_extra_argv,
+)
 
 
 def _validate_router_executable(path: str, *, env_key: str) -> str:
@@ -160,6 +166,17 @@ def wait_router_health(base_url: str, timeout: float) -> None:
     raise TimeoutError("Router failed to become healthy in time")
 
 
+def resolve_vllm_cli() -> str | None:
+    """``VLLM_BIN``, then ``vllm`` on PATH."""
+    override = os.environ.get("VLLM_BIN", "").strip()
+    if override:
+        candidate = Path(override).expanduser()
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate.resolve())
+        return None
+    return shutil.which("vllm")
+
+
 def resolve_vllm_rs_bin() -> str | None:
     """``VLLM_RS``, then ``vllm-rs`` on PATH, then ``site-packages/vllm/vllm-rs``."""
     override = os.environ.get("VLLM_RS", "").strip()
@@ -181,33 +198,82 @@ def resolve_vllm_rs_bin() -> str | None:
     return None
 
 
-def vllm_rs_kv_events_config_argv(host: str, zmq_port: int) -> list[str]:
-    """``--kv-events-config`` for router ``GetKvEventSources`` / ZMQ KV index."""
-    payload = json.dumps(
-        {
-            "enable_kv_cache_events": True,
-            "publisher": "zmq",
-            "endpoint": f"tcp://{host}:{zmq_port}",
-        },
-        separators=(",", ":"),
+def kv_events_config_argv(
+    *,
+    zmq_port: int,
+    replay_port: int | None = None,
+    endpoint_bind: str | None = None,
+    replay_host: str | None = None,
+) -> list[str]:
+    """``--kv-events-config`` aligned with manual ``vllm serve`` dev JSON."""
+    bind = (
+        endpoint_bind
+        if endpoint_bind is not None
+        else kv_aware_kv_events_endpoint_bind()
     )
-    return ["--kv-events-config", payload]
+    payload: dict[str, object] = {
+        "enable_kv_cache_events": True,
+        "publisher": "zmq",
+        "endpoint": f"tcp://{bind}:{zmq_port}",
+    }
+    if replay_port is not None and kv_aware_kv_events_replay_enabled():
+        rhost = (
+            replay_host if replay_host is not None else kv_aware_kv_events_replay_host()
+        )
+        payload["replay_endpoint"] = f"tcp://{rhost}:{replay_port}"
+    return ["--kv-events-config", json.dumps(payload, separators=(",", ":"))]
 
 
-def vllm_rs_serve_extra_argv(*, kv_events_zmq_port: int | None = None) -> list[str]:
-    raw = os.environ.get("VLLM_RS_SERVE_EXTRA", "").strip()
-    argv = shlex.split(raw) if raw else ["--enable-prefix-caching"]
+def vllm_rs_kv_events_config_argv(host: str, zmq_port: int) -> list[str]:
+    """Backward-compatible alias (endpoint ``tcp://{host}:{port}``, no replay)."""
+    return kv_events_config_argv(
+        zmq_port=zmq_port,
+        replay_port=None,
+        endpoint_bind=host,
+    )
+
+
+def resolve_worker_serve_launch() -> tuple[str, list[str]]:
+    """Return ``(kind, argv_prefix)`` where ``argv_prefix`` is ``[bin, 'serve']``."""
+    if kv_aware_use_vllm_serve():
+        vllm = resolve_vllm_cli()
+        if vllm:
+            return ("vllm", [vllm, "serve"])
+    vllm_rs = resolve_vllm_rs_bin()
+    if vllm_rs:
+        return ("vllm-rs", [vllm_rs, "serve"])
+    raise RuntimeError(
+        "No worker launcher: set VLLM_BIN or put vllm on PATH "
+        "(KV_AWARE_USE_VLLM_SERVE=1), or set VLLM_RS / vllm-rs on PATH "
+        "(KV_AWARE_USE_VLLM_SERVE=0); see scripts/backend/check_vllm_rs.sh"
+    )
+
+
+def worker_serve_extra_argv_with_kv_events(
+    *,
+    kv_events_zmq_port: int | None = None,
+    kv_events_replay_port: int | None = None,
+    extra_argv: list[str] | None = None,
+) -> list[str]:
+    argv = list(extra_argv if extra_argv is not None else worker_serve_extra_argv())
     if (
         kv_events_zmq_port is not None
         and kv_aware_kv_events_enabled()
         and "--kv-events-config" not in argv
     ):
-        host = (
-            os.environ.get("KV_AWARE_KV_EVENTS_HOST", "127.0.0.1").strip()
-            or "127.0.0.1"
-        )
-        argv = [*argv, *vllm_rs_kv_events_config_argv(host, kv_events_zmq_port)]
+        replay = kv_events_replay_port if kv_aware_kv_events_replay_enabled() else None
+        argv = [
+            *argv,
+            *kv_events_config_argv(
+                zmq_port=kv_events_zmq_port,
+                replay_port=replay,
+            ),
+        ]
     return argv
+
+
+def vllm_rs_serve_extra_argv(*, kv_events_zmq_port: int | None = None) -> list[str]:
+    return worker_serve_extra_argv_with_kv_events(kv_events_zmq_port=kv_events_zmq_port)
 
 
 def popen_launch_vllm_rs_grpc_worker(
@@ -218,25 +284,27 @@ def popen_launch_vllm_rs_grpc_worker(
     grpc_port: int,
     base_gpu_id: int = 0,
     kv_events_zmq_port: int | None = None,
+    kv_events_replay_port: int | None = None,
     extra_argv: list[str] | None = None,
     capture_output: bool = False,
 ) -> subprocess.Popen:
-    """``vllm-rs serve`` with OpenAI ``--port`` and Inference ``--grpc-port``.
+    """``vllm serve`` (default) or ``vllm-rs serve`` with HTTP + ``--grpc-port``.
 
     When ``capture_output`` is true, stdout/stderr are merged into a PIPE for
     ``SubprocessLogPump`` (do not pass a custom stdout object).
     """
-    vllm_rs = resolve_vllm_rs_bin()
-    if not vllm_rs:
-        raise RuntimeError(
-            "vllm-rs not found: set VLLM_RS, put vllm-rs on PATH, or install a vllm wheel "
-            "that bundles site-packages/vllm/vllm-rs (see scripts/backend/check_vllm_rs.sh)"
-        )
+    kind, prefix = resolve_worker_serve_launch()
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = str(base_gpu_id)
+    if kind == "vllm":
+        env["VLLM_USE_RUST_FRONTEND"] = "1"
+    serve_tail = worker_serve_extra_argv_with_kv_events(
+        kv_events_zmq_port=kv_events_zmq_port,
+        kv_events_replay_port=kv_events_replay_port,
+        extra_argv=extra_argv,
+    )
     cmd = [
-        vllm_rs,
-        "serve",
+        *prefix,
         model,
         "--host",
         host,
@@ -244,12 +312,20 @@ def popen_launch_vllm_rs_grpc_worker(
         str(http_port),
         "--grpc-port",
         str(grpc_port),
-        *(
-            extra_argv
-            if extra_argv is not None
-            else vllm_rs_serve_extra_argv(kv_events_zmq_port=kv_events_zmq_port)
-        ),
+        *serve_tail,
     ]
+    zmq_note = f" kv_events_zmq={kv_events_zmq_port}" if kv_events_zmq_port else ""
+    replay_note = (
+        f" kv_events_replay={kv_events_replay_port}"
+        if kv_events_replay_port is not None
+        else ""
+    )
+    print(
+        f"[e2e] worker launch ({kind}) gpu={base_gpu_id} http={http_port} "
+        f"grpc={grpc_port}{zmq_note}{replay_note}",
+        flush=True,
+    )
+    print(f"[e2e] worker cmd ({kind}): {cmd!r}", flush=True)
     popen_kw: dict = {"env": env}
     if capture_output:
         popen_kw["stdout"] = subprocess.PIPE

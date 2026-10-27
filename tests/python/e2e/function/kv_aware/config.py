@@ -1,26 +1,32 @@
 """Model and prompt constants for kv_aware functional e2e.
 
-Workers: **``vllm-rs serve`` + ``grpc://``** only (see ``scripts/backend``).
+Workers: **``vllm serve``** (Rust frontend, default) or **``vllm-rs serve``**, with
+``grpc://`` URLs (see ``scripts/backend``).
 
 Optional environment (see also ``function/helpers/launch.py``):
 
 - ``ROUTER_BIN``: path to ``vllm-router`` after ``cargo build --release``
   (same as ``scripts/backend`` / Buildkite). Alias: ``VLLM_ROUTER_BIN``.
+- ``VLLM_BIN``: path to ``vllm`` CLI (else ``PATH``). Used when ``KV_AWARE_USE_VLLM_SERVE=1``.
 - ``VLLM_RS``: path to ``vllm-rs`` binary (else ``PATH`` or wheel under ``vllm``).
 - Model for workers + router (HF id or local dir), first match wins:
   ``KV_AWARE_E2E_MODEL``, ``MODEL``, ``VLLM_ROUTER_MODEL``, ``MODEL_DIR``;
   default ``Qwen/Qwen3-0.6B`` (see ``kv_aware_e2e_model()``).
-- ``VLLM_RS_SERVE_EXTRA``: extra args to ``vllm-rs serve`` (shell-split), e.g.
-  ``"--max-model-len 8192 --enable-prefix-caching"``. When unset, workers also get
-  per-process ``--kv-events-config`` (ZMQ) unless ``KV_AWARE_KV_EVENTS=0``.
-- ``KV_AWARE_KV_EVENTS``: ``1`` (default) append ZMQ kv-events per worker; ``0`` to disable.
-- ``KV_AWARE_KV_EVENTS_HOST``: bind/publish host in kv-events JSON (default ``127.0.0.1``).
+- ``KV_AWARE_USE_VLLM_SERVE``: ``1`` (default) prefer ``vllm serve`` + ``VLLM_USE_RUST_FRONTEND=1``;
+  ``0`` use ``vllm-rs serve`` only.
+- Worker serve extras (shell-split, first set wins):
+  ``KV_AWARE_WORKER_SERVE_EXTRA``, ``VLLM_SERVE_EXTRA``, ``VLLM_RS_SERVE_EXTRA``;
+  default ``--enable-prefix-caching`` when all unset.
+- ``KV_AWARE_KV_EVENTS``: ``1`` (default) append ``--kv-events-config`` per worker; ``0`` to disable.
+- ``KV_AWARE_KV_EVENTS_REPLAY``: ``1`` (default) add ``replay_endpoint`` per worker (DEALER replay).
+- ``KV_AWARE_KV_EVENTS_ENDPOINT_BIND``: PUB bind in JSON ``endpoint`` (default ``*`` → ``tcp://*:port``).
+- ``KV_AWARE_KV_EVENTS_HOST``: TCP host for ``replay_endpoint`` (default ``127.0.0.1``).
 - Router logs: run pytest with ``-s``; default ``RUST_LOG=vllm_router_rs=info`` on
   the router subprocess (override in the shell for more/less noise).
 - Worker logs: subprocess PIPE → log file + stderr echo when ``pytest -s`` unless
   ``KV_AWARE_WORKER_LOG_QUIET=1`` (file-only under ``[e2e] worker logs: ...``).
 
-Worker GPUs (two ``vllm-rs serve`` processes):
+Worker GPUs (two worker serve processes):
 
 - If ``CUDA_VISIBLE_DEVICES`` is set (e.g. ``0,1,2,3`` or ``2,3,4,5``), worker A/B
   use the **first two entries** in that list (physical ids).
@@ -46,6 +52,7 @@ Prompt metrics (token counts, block estimates for issue #331)::
 from __future__ import annotations
 
 import os
+import shlex
 import subprocess
 
 # Default when no model env is set (see ``kv_aware_e2e_model()``).
@@ -106,9 +113,43 @@ def kv_aware_dual_prime_concurrent() -> bool:
     return raw not in ("0", "false", "no")
 
 
-def kv_aware_kv_events_enabled() -> bool:
-    raw = os.environ.get("KV_AWARE_KV_EVENTS", "1").strip().lower()
+def _env_flag(name: str, *, default: str = "1") -> bool:
+    raw = os.environ.get(name, default).strip().lower()
     return raw not in ("0", "false", "no")
+
+
+def kv_aware_use_vllm_serve() -> bool:
+    return _env_flag("KV_AWARE_USE_VLLM_SERVE", default="1")
+
+
+def kv_aware_kv_events_enabled() -> bool:
+    return _env_flag("KV_AWARE_KV_EVENTS", default="1")
+
+
+def kv_aware_kv_events_replay_enabled() -> bool:
+    return _env_flag("KV_AWARE_KV_EVENTS_REPLAY", default="1")
+
+
+def kv_aware_kv_events_endpoint_bind() -> str:
+    raw = os.environ.get("KV_AWARE_KV_EVENTS_ENDPOINT_BIND", "*").strip()
+    return raw or "*"
+
+
+def kv_aware_kv_events_replay_host() -> str:
+    raw = os.environ.get("KV_AWARE_KV_EVENTS_HOST", "127.0.0.1").strip()
+    return raw or "127.0.0.1"
+
+
+def worker_serve_extra_argv() -> list[str]:
+    for key in (
+        "KV_AWARE_WORKER_SERVE_EXTRA",
+        "VLLM_SERVE_EXTRA",
+        "VLLM_RS_SERVE_EXTRA",
+    ):
+        raw = os.environ.get(key, "").strip()
+        if raw:
+            return shlex.split(raw)
+    return ["--enable-prefix-caching"]
 
 
 def _parse_cuda_visible_device_list(raw: str) -> list[int]:

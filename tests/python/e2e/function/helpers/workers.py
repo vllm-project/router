@@ -1,4 +1,4 @@
-"""Spawn and tear down vllm-rs gRPC workers for kv_aware functional e2e."""
+"""Spawn and tear down vllm / vllm-rs gRPC workers for kv_aware functional e2e."""
 
 from __future__ import annotations
 
@@ -12,19 +12,17 @@ from tests.python.e2e.function.helpers import launch
 from tests.python.e2e.function.helpers.worker_log_pump import SubprocessLogPump
 from tests.python.e2e.function.kv_aware.config import (
     kv_aware_kv_events_enabled,
+    kv_aware_kv_events_replay_enabled,
     kv_aware_worker_gpu_ids,
     kv_aware_worker_logs_quiet,
 )
 
 
-def _require_vllm_rs() -> str:
-    path = launch.resolve_vllm_rs_bin()
-    if path:
-        return path
-    pytest.skip(
-        "vllm-rs not found (set VLLM_RS or install a vllm wheel with vllm-rs); "
-        "see scripts/backend/check_vllm_rs.sh"
-    )
+def _require_worker_launch() -> None:
+    try:
+        launch.resolve_worker_serve_launch()
+    except RuntimeError as exc:
+        pytest.skip(str(exc))
 
 
 def spawn_two_vllm_rs_grpc_workers(
@@ -33,8 +31,8 @@ def spawn_two_vllm_rs_grpc_workers(
     worker_health_timeout: float = 600.0,
     log_dir: Path | None = None,
 ) -> list[SimpleNamespace]:
-    """Two ``vllm-rs serve`` processes; GPUs from ``kv_aware_worker_gpu_ids``."""
-    _require_vllm_rs()
+    """Two worker serve processes; GPUs from ``kv_aware_worker_gpu_ids``."""
+    _require_worker_launch()
     gpu_a, gpu_b = kv_aware_worker_gpu_ids()
     workers: list[SimpleNamespace] = []
     host = "127.0.0.1"
@@ -54,14 +52,26 @@ def spawn_two_vllm_rs_grpc_workers(
         flush=True,
     )
 
-    port_count = 6 if kv_aware_kv_events_enabled() else 4
+    kv_on = kv_aware_kv_events_enabled()
+    replay_on = kv_on and kv_aware_kv_events_replay_enabled()
+    port_count = 8 if replay_on else (6 if kv_on else 4)
     ports = launch.find_distinct_available_ports(port_count)
     http_a, grpc_a, http_b, grpc_b = ports[:4]
-    zmq_a = ports[4] if port_count == 6 else None
-    zmq_b = ports[5] if port_count == 6 else None
+    zmq_a = ports[4] if kv_on else None
+    replay_a = ports[5] if replay_on else None
+    zmq_b = ports[6] if replay_on else (ports[4] if kv_on else None)
+    replay_b = ports[7] if replay_on else None
+
+    def _kv_log(zmq: int | None, replay: int | None) -> str:
+        parts = []
+        if zmq is not None:
+            parts.append(f" kv_events_zmq={zmq}")
+        if replay is not None:
+            parts.append(f" replay={replay}")
+        return "".join(parts)
+
     print(
-        f"[e2e] worker A gpu={gpu_a} http={http_a} grpc={grpc_a}"
-        + (f" kv_events_zmq={zmq_a}" if zmq_a is not None else ""),
+        f"[e2e] worker A gpu={gpu_a} http={http_a} grpc={grpc_a}{_kv_log(zmq_a, replay_a)}",
         flush=True,
     )
     log_a_path = log_dir / f"worker_a_grpc_{grpc_a}.log"
@@ -72,6 +82,7 @@ def spawn_two_vllm_rs_grpc_workers(
         grpc_port=grpc_a,
         base_gpu_id=gpu_a,
         kv_events_zmq_port=zmq_a,
+        kv_events_replay_port=replay_a,
         capture_output=True,
     )
     pump_a = SubprocessLogPump(
@@ -94,8 +105,7 @@ def spawn_two_vllm_rs_grpc_workers(
     workers.append(worker_a)
 
     print(
-        f"[e2e] worker B gpu={gpu_b} http={http_b} grpc={grpc_b}"
-        + (f" kv_events_zmq={zmq_b}" if zmq_b is not None else ""),
+        f"[e2e] worker B gpu={gpu_b} http={http_b} grpc={grpc_b}{_kv_log(zmq_b, replay_b)}",
         flush=True,
     )
     log_b_path = log_dir / f"worker_b_grpc_{grpc_b}.log"
@@ -106,6 +116,7 @@ def spawn_two_vllm_rs_grpc_workers(
         grpc_port=grpc_b,
         base_gpu_id=gpu_b,
         kv_events_zmq_port=zmq_b,
+        kv_events_replay_port=replay_b,
         capture_output=True,
     )
     pump_b = SubprocessLogPump(
