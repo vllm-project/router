@@ -19,7 +19,7 @@ on `release-pipeline.yml` (the `router-release` pipeline) publishes images.
 | File | Level | When it is uploaded | What runs |
 | --- | --- | --- | --- |
 | `test-ready.yml` | L1 ready | non-default branch labeled `ready` | Rust and Python unit/integration tests, product image build, one NVIDIA P/D completion |
-| `test-merge.yml` | L2 merge | default branch (except `NIGHTLY=1`), or any other branch labeled `merge-test` | one-mode xGMI smoke (still opt-in, #363) and RDMA `SMOKE_ONLY` |
+| `test-merge.yml` | L2 merge | default branch (except `NIGHTLY=1`), or any other branch labeled `merge-test` | one-mode xGMI smoke and RDMA `SMOKE_ONLY` |
 | `test-nightly.yml` | L3 nightly | default branch with `NIGHTLY=1`, or any other branch labeled `nightly-test` | Rust and Python unit/integration tests (skipped when the PR also has `ready`), full NVIDIA GSM8K, full xGMI matrix, full RDMA |
 | `release-pipeline.yml` | release | tag / release pipeline | wheels and images only |
 
@@ -91,12 +91,14 @@ The dedicated `router_rocm_mi300_2` queue covers two MoRI lanes:
 - `run_moriio_rdma_accuracy_test.sh` uses one GPU on each of two hosts with the
   RDMA backend.
 
-xGMI stays opt-in (`RUN_ROCM_XGMI=1` on a manual/API build) until the MI300X
-host can pre-pull the digest-pinned image
-(https://github.com/vllm-project/router/issues/363). L2 is one `read_mode`
-plus `LM_EVAL_LIMIT=20`. L3 is the read+write matrix and 500-example GSM8K.
-The restore conditions are comments on those groups; they are the L2/L3
-triggers, not the old "every trusted PR" condition.
+The hosts restore the digest-pinned ROCm image before each job
+(https://github.com/vllm-project/router/issues/363). L2 xGMI is one
+`read_mode` plus `LM_EVAL_LIMIT=20`, and runs for a default-branch push, the
+default-branch merge queue, or a same-repository pull request labeled
+`merge-test`. L3 xGMI is the read+write matrix and 500-example GSM8K. It runs
+for `NIGHTLY=1`, a same-repository pull request labeled `nightly-test`, or a
+manual/API build with `RUN_ROCM_XGMI=1`. These are the L2/L3 triggers, not the
+old "every trusted PR" condition.
 
 L2 RDMA (`test-merge.yml`) sets `SMOKE_ONLY=true` and `read_mode=true`. L3
 RDMA runs both directions for scheduled `NIGHTLY=1`, or a manual/API build

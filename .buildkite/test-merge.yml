@@ -1,7 +1,8 @@
 # L2 merge (https://github.com/vllm-project/router/issues/273).
 # Uploaded for a default-branch push (except NIGHTLY=1) or a non-default
 # branch labeled merge-test.
-# xGMI smoke is one read mode plus a short limit, and is still opt-in (#363).
+# xGMI smoke is one read mode plus a short limit. It runs automatically for
+# this file's L2 upload, except fork pull requests.
 # RDMA smoke is SMOKE_ONLY in one direction.
 
 env:
@@ -20,30 +21,19 @@ steps:
   # Those agents run --no-plugins, while this lane needs the Docker plugin
   # to provide the pinned vLLM/MoRI userspace on a two-GPU xGMI host. Put the
   # condition on the group so fork builds cannot run plugin hooks.
-  # TEMPORARILY DISABLED for automatic builds while the MI300X host cannot
-  # run this lane: the readiness hook on the agent polls for the
-  # digest-pinned ROCm image and fails every build in the pre-command hook,
-  # before any test executes (so pytest.mark.skip would not help either).
-  # The lane stays manually runnable for trusted UI/API builds with
-  # RUN_ROCM_XGMI=1. Once #363 is fixed, swap in the L2 triggers commented
-  # below. Manual RUN_ROCM_XGMI=1 on main also uploads the L3 full matrix.
-  # Tracked in https://github.com/vllm-project/router/issues/363
+  # Hosts restore the digest-pinned image before the job (#363). Keep the
+  # plugin hooks off fork pull requests. Full read+write stays on
+  # test-nightly.yml.
   - group: ":large_purple_circle: ROCm MoRI XGMI smoke"
     key: "pd-disagg-moriio-smoke"
     if: |
-      (build.source == "ui" || build.source == "api") &&
-      build.env("RUN_ROCM_XGMI") == "1"
-    # L2 restore once #363 is fixed. Do not use the old "every trusted PR" if:
-    # full read+write stays on test-nightly.yml. Manual RUN_ROCM_XGMI=1 on
-    # main also uploads that full matrix.
-    # if: |
-    #   build.branch == pipeline.default_branch ||
-    #   build.merge_queue.base_branch == pipeline.default_branch ||
-    #   (
-    #     build.pull_request.id != null &&
-    #     build.pull_request.repository.fork == false &&
-    #     build.pull_request.labels includes "merge-test"
-    #   )
+      build.branch == pipeline.default_branch ||
+      build.merge_queue.base_branch == pipeline.default_branch ||
+      (
+        build.pull_request.id != null &&
+        build.pull_request.repository.fork == false &&
+        build.pull_request.labels includes "merge-test"
+      )
     steps:
       - label: "ROCm MoRI XGMI smoke (read_mode=true, short limit, 2 GPUs)"
         key: "pd-disagg-moriio-smoke-job"
