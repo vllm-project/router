@@ -157,8 +157,9 @@ impl EngineFrontend {
         mut request: ChatCompletionRequest,
     ) -> Result<PreparedRequest, PrepareError> {
         let (handle, t_req, resolve_ms) = self.resolve_with_defaults(&mut request).await?;
-        let tokenized = tokenize_chat_request_timed(&request, &handle)
+        let mut tokenized = tokenize_chat_request_timed(&request, &handle)
             .map_err(|e| PrepareError::Invalid(format!("preprocess: {e}")))?;
+        truncate_grpc_prompt(&request, &mut tokenized)?;
         Ok(PreparedRequest {
             request: Arc::new(request),
             tokenized,
@@ -180,7 +181,7 @@ impl EngineFrontend {
         emit_token_ids: bool,
     ) -> Result<PreparedRequest, PrepareError> {
         let (handle, t_req, resolve_ms) = self.resolve_with_defaults(&mut request).await?;
-        let tokenized = TokenizeOut {
+        let mut tokenized = TokenizeOut {
             token_ids: Arc::from(token_ids),
             adapt_ms: 0.0,
             template_ms: 0.0,
@@ -188,6 +189,7 @@ impl EngineFrontend {
             encode_backend: "completions-token-ids",
             cached_tokens: 0,
         };
+        truncate_grpc_prompt(&request, &mut tokenized)?;
         Ok(PreparedRequest {
             request: Arc::new(request),
             tokenized,
@@ -221,6 +223,36 @@ impl EngineFrontend {
     }
 }
 
+fn truncate_grpc_prompt(
+    request: &ChatCompletionRequest,
+    tokenized: &mut TokenizeOut,
+) -> Result<(), PrepareError> {
+    if let Some(value) = request
+        .other
+        .get("truncate_prompt_tokens")
+        .filter(|value| !value.is_null())
+    {
+        let limit = value
+            .as_u64()
+            .and_then(|value| u32::try_from(value).ok())
+            .ok_or_else(|| {
+                PrepareError::Invalid(
+                    "truncate_prompt_tokens must be a non-negative 32-bit integer on gRPC".into(),
+                )
+            })? as usize;
+        // The gRPC protocol's zero means no truncation; positive limits keep
+        // the suffix. Sending the already-truncated IDs makes placement and
+        // dispatch agree, even when the worker applies the same limit again.
+        if limit > 0 && tokenized.token_ids.len() > limit {
+            let removed = tokenized.token_ids.len() - limit;
+            tokenized.token_ids = Arc::from(&tokenized.token_ids[removed..]);
+            // L1 reuses a prefix; truncation keeps the suffix.
+            tokenized.cached_tokens = tokenized.cached_tokens.saturating_sub(removed);
+        }
+    }
+    Ok(())
+}
+
 /// HTTP pools proxy the request body, so the router never tokenizes and the
 /// L0/L1 switches have no effect. Say so instead of ignoring them silently.
 pub(crate) fn warn_ignored_encoding_caches() {
@@ -238,7 +270,28 @@ fn ignored_cache_switches(read: impl Fn(&str) -> Option<String>) -> Vec<&'static
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
-    use super::ignored_cache_switches;
+    use super::*;
+
+    #[test]
+    fn truncation_counts_only_cached_tokens_in_retained_suffix() {
+        let request = serde_json::from_value(serde_json::json!({
+            "messages": [], "truncate_prompt_tokens": 3
+        }))
+        .unwrap();
+        for (cached_tokens, expected) in [(0, 0), (2, 0), (4, 1), (6, 3)] {
+            let mut tokenized = TokenizeOut {
+                token_ids: Arc::from([1, 2, 3, 4, 5, 6]),
+                adapt_ms: 0.0,
+                template_ms: 0.0,
+                encode_ms: 0.0,
+                encode_backend: "test",
+                cached_tokens,
+            };
+            truncate_grpc_prompt(&request, &mut tokenized).unwrap();
+            assert_eq!(tokenized.token_ids.as_ref(), &[4, 5, 6]);
+            assert_eq!(tokenized.cached_tokens, expected);
+        }
+    }
 
     #[test]
     fn http_pools_report_requested_cache_switches() {

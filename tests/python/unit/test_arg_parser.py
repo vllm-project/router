@@ -486,6 +486,8 @@ class TestParseRouterArgs:
             [
                 "--policy",
                 "kv_aware",
+                "--kv-aware-session-affinity-ttl-secs",
+                "1800",
                 "--router-temperature",
                 "0.25",
                 "--kv-penalty-host",
@@ -506,10 +508,16 @@ class TestParseRouterArgs:
         Router.from_args(args)
 
         assert captured["policy"] == PolicyType.KvAware
+        assert captured["kv_aware_session_affinity_ttl_secs"] == 1800
         assert captured["router_temperature"] == 0.25
         assert captured["kv_penalty_host"] == 0.7
         assert captured["kv_penalty_external"] == 0.5
         assert captured["kv_penalty_disk"] == 0.2
+
+    @pytest.mark.parametrize("ttl", [0, -1, 31_536_001])
+    def test_kv_aware_affinity_ttl_rejects_invalid_values(self, ttl):
+        with pytest.raises(ValueError, match="kv_aware_session_affinity_ttl_secs"):
+            RouterArgs(kv_aware_session_affinity_ttl_secs=ttl)._validate_router_args()
 
     def test_kv_aware_is_not_a_pd_stage_policy(self):
         with pytest.raises(SystemExit):

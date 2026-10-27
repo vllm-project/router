@@ -703,8 +703,11 @@ mod tests {
             router_config: router_config.clone(),
             rate_limiter: Arc::new(TokenBucket::new(1000, 1000)),
             worker_registry: Arc::new(crate::core::WorkerRegistry::new()),
-            policy_registry: Arc::new(crate::policies::PolicyRegistry::new(
+            policy_registry: Arc::new(crate::policies::PolicyRegistry::new_with_affinity_ttl(
                 router_config.policy.clone(),
+                router_config
+                    .kv_aware_session_affinity_ttl_secs
+                    .map(std::time::Duration::from_secs),
             )),
             router_manager: None, // Test doesn't need router manager
             response_storage: Arc::new(crate::data_connector::MemoryResponseStorage::new()),
