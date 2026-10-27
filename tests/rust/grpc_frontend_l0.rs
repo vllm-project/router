@@ -1,3 +1,5 @@
+#![cfg(all(feature = "cpu", feature = "ready"))]
+
 //! L0 integration tests with local models and a mock gRPC worker.
 mod common;
 #[path = "common/grpc_frontend_fixture.rs"]

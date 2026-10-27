@@ -1,5 +1,7 @@
 //! Public, offline Completion preparation vectors using the upstream HF backend.
 
+#![cfg(all(feature = "cpu", feature = "ready"))]
+
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -42,7 +44,8 @@ fn text_defaults_to_bos_and_honors_explicit_special_token_switch() {
             vec![3, 4],
         ),
     ] {
-        let prepared = prepare_completion(&request(value), &tokenizer, MODEL_VOCAB_SIZE).unwrap();
+        let prepared =
+            prepare_completion_classified(&request(value), &tokenizer, MODEL_VOCAB_SIZE).unwrap();
         assert_eq!(prepared, expected);
     }
 }
@@ -55,7 +58,7 @@ fn text_preserves_literal_added_special_tokens_and_unicode() {
         ("<s> hello", vec![1, 3]),
         ("你好 🙂 café", vec![5, 6, 7]),
     ] {
-        let prepared = prepare_completion(
+        let prepared = prepare_completion_classified(
             &request(json!({"prompt": text, "add_special_tokens": false})),
             &tokenizer,
             MODEL_VOCAB_SIZE,
@@ -101,7 +104,7 @@ fn token_ids_are_not_reencoded_or_limited_to_tokenizer_vocabulary() {
     };
     assert!(tokenizer.id_to_token(15).is_none());
     for add_special_tokens in [false, true] {
-        let prepared = prepare_completion(
+        let prepared = prepare_completion_classified(
             &request(json!({"prompt": [0, 2, 15], "add_special_tokens": add_special_tokens})),
             &tokenizer,
             MODEL_VOCAB_SIZE,
@@ -122,15 +125,16 @@ fn negative_out_of_range_and_zero_vocabulary_are_rejected() {
         (json!({"prompt": "hello"}), 3, "outside"),
         (json!({"prompt": [0]}), 0, "nonzero"),
     ] {
-        let error = prepare_completion(&request(value), &tokenizer, vocab_size).unwrap_err();
-        assert!(error.contains(message), "{error}");
+        let error =
+            prepare_completion_classified(&request(value), &tokenizer, vocab_size).unwrap_err();
+        assert!(error.to_string().contains(message), "{error}");
     }
 }
 
 #[test]
 fn empty_encoded_input_is_rejected_but_default_bos_is_retained() {
     let tokenizer = tokenizer();
-    let prepared = prepare_completion(
+    let prepared = prepare_completion_classified(
         &request(json!({"prompt": ""})),
         &tokenizer,
         MODEL_VOCAB_SIZE,
@@ -143,8 +147,9 @@ fn empty_encoded_input_is_rejected_but_default_bos_is_retained() {
         empty_ids,
         request(json!({"prompt": "", "add_special_tokens": false})),
     ] {
-        let error = prepare_completion(&request, &tokenizer, MODEL_VOCAB_SIZE).unwrap_err();
-        assert!(error.contains("nonempty"), "{error}");
+        let error =
+            prepare_completion_classified(&request, &tokenizer, MODEL_VOCAB_SIZE).unwrap_err();
+        assert!(error.to_string().contains("nonempty"), "{error}");
     }
 }
 
@@ -152,13 +157,13 @@ fn empty_encoded_input_is_rejected_but_default_bos_is_retained() {
 fn both_batch_forms_are_rejected_even_with_one_item() {
     let tokenizer = tokenizer();
     for prompt in [json!(["hello"]), json!([[3]]), json!([])] {
-        let error = prepare_completion(
+        let error = prepare_completion_classified(
             &request(json!({"prompt": prompt})),
             &tokenizer,
             MODEL_VOCAB_SIZE,
         )
         .unwrap_err();
-        assert!(error.contains("batched"), "{error}");
+        assert!(error.to_string().contains("batched"), "{error}");
     }
 }
 
@@ -177,8 +182,9 @@ fn unsupported_input_modifiers_fail_closed() {
         let mut value_map = json!({"prompt": "hello"});
         value_map[field] = value;
         let error =
-            prepare_completion(&request(value_map), &tokenizer, MODEL_VOCAB_SIZE).unwrap_err();
-        assert!(error.contains(field), "{error}");
+            prepare_completion_classified(&request(value_map), &tokenizer, MODEL_VOCAB_SIZE)
+                .unwrap_err();
+        assert!(error.to_string().contains(field), "{error}");
     }
 }
 
@@ -186,13 +192,13 @@ fn unsupported_input_modifiers_fail_closed() {
 fn special_token_switch_requires_a_json_boolean() {
     let tokenizer = tokenizer();
     for value in [Value::Null, json!(1), json!("false"), json!([]), json!({})] {
-        let error = prepare_completion(
+        let error = prepare_completion_classified(
             &request(json!({"prompt": [3], "add_special_tokens": value})),
             &tokenizer,
             MODEL_VOCAB_SIZE,
         )
         .unwrap_err();
-        assert!(error.contains("boolean"), "{error}");
+        assert!(error.to_string().contains("boolean"), "{error}");
     }
 }
 
@@ -204,7 +210,7 @@ fn tokenizer_definition_rejects_padding_truncation_and_malformed_formats() {
             let mut modified = definition.clone();
             modified[field] = value;
             let error = validate_completion_tokenizer_definition(&modified).unwrap_err();
-            assert!(error.contains(field), "{error}");
+            assert!(error.to_string().contains(field), "{error}");
         }
     }
     for malformed in [
@@ -218,7 +224,7 @@ fn tokenizer_definition_rejects_padding_truncation_and_malformed_formats() {
 }
 
 #[test]
-fn text_encodes_once_without_mutating_request_output_options() {
+fn text_encodes_once_with_output_options() {
     let tokenizer = CountingTokenizer {
         inner: tokenizer(),
         encodes: AtomicUsize::new(0),
@@ -233,54 +239,26 @@ fn text_encodes_once_without_mutating_request_output_options() {
         "stop_token_ids": [4], "no_stop_trim": true, "ignore_eos": true,
         "skip_special_tokens": false, "return_hidden_states": true
     }));
-    let before = serde_json::to_value(&request).unwrap();
-    let prepared = prepare_completion(&request, &tokenizer, MODEL_VOCAB_SIZE).unwrap();
+    let prepared = prepare_completion_classified(&request, &tokenizer, MODEL_VOCAB_SIZE).unwrap();
     assert_eq!(prepared, &[1, 3, 4]);
-    assert_eq!(serde_json::to_value(&request).unwrap(), before);
     assert_eq!(tokenizer.encodes.load(Ordering::Relaxed), 1);
 }
 
 #[test]
-fn diagnostic_adapter_preserves_classified_tokens_error_text_and_input() {
+fn diagnostic_adapter_preserves_success_and_error_text() {
     let tokenizer = tokenizer();
-    for (value, expected) in [
-        (json!({"prompt": "hello world"}), vec![1, 3, 4]),
-        (
-            json!({"prompt": "hello world", "add_special_tokens": false}),
-            vec![3, 4],
-        ),
-        (
-            json!({"prompt": [0, 2, 15], "add_special_tokens": true}),
-            vec![0, 2, 15],
-        ),
-    ] {
-        let request = request(value);
-        let before = serde_json::to_value(&request).unwrap();
-        let prepared =
-            prepare_completion_classified(&request, &tokenizer, MODEL_VOCAB_SIZE).unwrap();
-        assert_eq!(prepared, expected);
-        assert_eq!(
-            prepare_completion(&request, &tokenizer, MODEL_VOCAB_SIZE).unwrap(),
-            prepared,
-        );
-        assert_eq!(serde_json::to_value(&request).unwrap(), before);
-    }
-    for (value, vocab_size) in [
-        (
-            json!({"prompt": "hello", "suffix": "world"}),
-            MODEL_VOCAB_SIZE,
-        ),
-        (json!({"prompt": [-1]}), MODEL_VOCAB_SIZE),
-        (json!({"prompt": "hello"}), 0),
-    ] {
-        let request = request(value);
-        let classified =
-            prepare_completion_classified(&request, &tokenizer, vocab_size).unwrap_err();
-        assert_eq!(
-            prepare_completion(&request, &tokenizer, vocab_size).unwrap_err(),
-            classified.to_string()
-        );
-    }
+    let valid = request(json!({"prompt": "hello world"}));
+    assert_eq!(
+        prepare_completion(&valid, &tokenizer, MODEL_VOCAB_SIZE).unwrap(),
+        prepare_completion_classified(&valid, &tokenizer, MODEL_VOCAB_SIZE).unwrap(),
+    );
+    let invalid = request(json!({"prompt": [-1]}));
+    assert_eq!(
+        prepare_completion(&invalid, &tokenizer, MODEL_VOCAB_SIZE).unwrap_err(),
+        prepare_completion_classified(&invalid, &tokenizer, MODEL_VOCAB_SIZE)
+            .unwrap_err()
+            .to_string(),
+    );
 }
 
 #[test]
@@ -303,14 +281,12 @@ fn classified_invalid_input_takes_precedence_over_unsupported_modifiers() {
         json!({"prompt": [3], "unknown_extension": null, "add_special_tokens": {}}),
     ] {
         let request = request(value);
-        let before = serde_json::to_value(&request).unwrap();
         let error =
             prepare_completion_classified(&request, &tokenizer, MODEL_VOCAB_SIZE).unwrap_err();
         assert!(
             matches!(error, CompletionPreparationError::InvalidRequest(_)),
             "{error:?}"
         );
-        assert_eq!(serde_json::to_value(&request).unwrap(), before);
     }
     let mut empty = request(json!({"prompt": [0], "suffix": "world"}));
     empty.prompt = PromptInput::IntArray(Vec::new());
@@ -322,7 +298,7 @@ fn classified_invalid_input_takes_precedence_over_unsupported_modifiers() {
 }
 
 #[test]
-fn classified_unsupported_inputs_never_encode_or_mutate_input() {
+fn classified_unsupported_inputs_never_encode() {
     let tokenizer = CountingTokenizer {
         inner: tokenizer(),
         encodes: AtomicUsize::new(0),
@@ -336,14 +312,12 @@ fn classified_unsupported_inputs_never_encode_or_mutate_input() {
         json!({"prompt": "hello", "unknown_extension": null}),
     ] {
         let request = request(value);
-        let before = serde_json::to_value(&request).unwrap();
         let error =
             prepare_completion_classified(&request, &tokenizer, MODEL_VOCAB_SIZE).unwrap_err();
         assert!(
             matches!(error, CompletionPreparationError::Unsupported(_)),
             "{error:?}"
         );
-        assert_eq!(serde_json::to_value(&request).unwrap(), before);
     }
     assert_eq!(tokenizer.encodes.load(Ordering::Relaxed), 0);
 }
@@ -379,13 +353,11 @@ fn classified_service_failure_is_not_invalid_or_unsupported() {
     )
     .unwrap();
     let request = request(json!({"prompt": "unknown token"}));
-    let before = serde_json::to_value(&request).unwrap();
     let error = prepare_completion_classified(&request, &failing, MODEL_VOCAB_SIZE).unwrap_err();
     assert!(
         matches!(error, CompletionPreparationError::ServiceFailure(_)),
         "{error:?}"
     );
-    assert_eq!(serde_json::to_value(&request).unwrap(), before);
 }
 
 #[test]

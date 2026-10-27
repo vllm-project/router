@@ -620,7 +620,7 @@ impl RouterTrait for RouterManager {
     async fn route_completion(
         &self,
         headers: Option<&HeaderMap>,
-        body: &CompletionRequest,
+        body: Arc<CompletionRequest>,
         _model_id: Option<&str>,
     ) -> Response {
         // Select router based on headers and model.
@@ -631,7 +631,9 @@ impl RouterTrait for RouterManager {
         let router = self.select_router_for_request(headers, model_id);
 
         if let Some(router) = router {
-            router.route_completion(headers, body, model_id).await
+            router
+                .route_completion(headers, body.clone(), model_id)
+                .await
         } else {
             let msg = match model_id {
                 Some(m) => format!("Model '{}' not found or no router available", m),
@@ -644,14 +646,14 @@ impl RouterTrait for RouterManager {
     async fn route_completion_raw(
         &self,
         headers: Option<&HeaderMap>,
-        body: &CompletionRequest,
+        body: Arc<CompletionRequest>,
         raw: &axum::body::Bytes,
         _model_id: Option<&str>,
     ) -> Response {
         let model_id = body.model.as_deref();
         if let Some(router) = self.select_router_for_request(headers, model_id) {
             router
-                .route_completion_raw(headers, body, raw, model_id)
+                .route_completion_raw(headers, body.clone(), raw, model_id)
                 .await
         } else {
             let message = model_id.map_or_else(

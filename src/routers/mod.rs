@@ -96,7 +96,7 @@ pub trait RouterTrait: Send + Sync + Debug + WorkerManagement {
     async fn route_completion(
         &self,
         headers: Option<&HeaderMap>,
-        body: &CompletionRequest,
+        body: std::sync::Arc<CompletionRequest>,
         model_id: Option<&str>,
     ) -> Response;
 
@@ -105,7 +105,7 @@ pub trait RouterTrait: Send + Sync + Debug + WorkerManagement {
     async fn route_completion_raw(
         &self,
         headers: Option<&HeaderMap>,
-        body: &CompletionRequest,
+        body: std::sync::Arc<CompletionRequest>,
         raw: &axum::body::Bytes,
         model_id: Option<&str>,
     ) -> Response {

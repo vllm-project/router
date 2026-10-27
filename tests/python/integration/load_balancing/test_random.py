@@ -3,6 +3,8 @@ import collections
 import pytest
 import requests
 
+pytestmark = [pytest.mark.ready, pytest.mark.cpu]
+
 
 @pytest.mark.integration
 def test_random_distribution(mock_workers, router_manager):

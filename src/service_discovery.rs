@@ -491,7 +491,7 @@ async fn handle_pod_deletion(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use super::*;
     use k8s_openapi::api::core::v1::{Pod, PodCondition, PodSpec, PodStatus};

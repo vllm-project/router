@@ -365,7 +365,7 @@ impl super::super::RouterTrait for OpenAIRouter {
     async fn route_completion(
         &self,
         _headers: Option<&HeaderMap>,
-        _body: &CompletionRequest,
+        _body: std::sync::Arc<CompletionRequest>,
         _model_id: Option<&str>,
     ) -> Response {
         // Completion endpoint not implemented for OpenAI backend

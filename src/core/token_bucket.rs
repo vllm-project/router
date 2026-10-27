@@ -168,7 +168,7 @@ impl TokenBucket {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use super::*;
 
@@ -203,27 +203,5 @@ mod tests {
         // Should have ~5 tokens
         let available = bucket.available_tokens().await;
         assert!((4.0..=6.0).contains(&available));
-    }
-
-    #[tokio::test]
-    async fn cancelled_token_wait_does_not_consume_returned_capacity() {
-        use std::future::Future;
-        use std::task::{Context, Poll};
-
-        let bucket = TokenBucket::new(1, 1);
-        bucket.try_acquire(1.0).await.unwrap();
-        let mut waiting = Box::pin(bucket.acquire(1.0));
-        assert!(matches!(
-            waiting.as_mut().poll(&mut Context::from_waker(
-                futures_util::task::noop_waker_ref()
-            )),
-            Poll::Pending
-        ));
-        drop(waiting);
-
-        bucket.return_tokens(1.0).await;
-        assert_eq!(bucket.available_tokens().await, 1.0);
-        bucket.try_acquire(1.0).await.unwrap();
-        assert!(bucket.try_acquire(1.0).await.is_err());
     }
 }

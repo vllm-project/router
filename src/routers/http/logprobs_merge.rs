@@ -270,7 +270,7 @@ pub fn merge_logprobs_in_json(prefill_json: &Value, decode_json: &mut Value) -> 
     merged
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use super::*;
     use serde_json::json;

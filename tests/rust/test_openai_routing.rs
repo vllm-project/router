@@ -1,3 +1,5 @@
+#![cfg(all(feature = "cpu", feature = "ready"))]
+
 //! Comprehensive integration tests for OpenAI backend functionality
 
 use axum::{
@@ -208,7 +210,7 @@ async fn test_unsupported_endpoints() {
     // Test completion endpoint (should also not be supported)
     let completion_request = create_minimal_completion_request();
     let response = router
-        .route_completion(None, &completion_request, None)
+        .route_completion(None, Arc::new(completion_request), None)
         .await;
     assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
 }

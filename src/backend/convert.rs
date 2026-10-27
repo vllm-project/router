@@ -431,7 +431,7 @@ pub fn prepare_grpc_completion(request: &CompletionRequest) -> Result<PreparedCo
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use super::*;
 

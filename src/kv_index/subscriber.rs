@@ -1,8 +1,10 @@
 //! ZMQ SUB + DEALER replay subscriber, one task per (worker, rank).
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use parking_lot::Mutex;
 use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, info, warn};
 
@@ -56,11 +58,12 @@ pub fn spawn(
     signal_tx: Option<mpsc::Sender<IngestionSignal>>,
     ctx: Arc<zmq::Context>,
 ) -> SubscriberHandle {
-    spawn_inner(source, indexer, signal_tx, ctx, None)
+    spawn_inner(source, indexer, signal_tx, ctx, None, None)
 }
 
 /// Dense HTTP inputs can only query identities represented by local token hashes.
 /// Event block boundaries must agree with the source's cache/query identity.
+#[cfg(test)]
 pub(crate) fn spawn_dense(
     source: EventSource,
     indexer: Arc<KvBlockIndexer>,
@@ -68,7 +71,80 @@ pub(crate) fn spawn_dense(
     ctx: Arc<zmq::Context>,
     expected_block_size: u32,
 ) -> SubscriberHandle {
-    spawn_inner(source, indexer, signal_tx, ctx, Some(expected_block_size))
+    spawn_inner(
+        source,
+        indexer,
+        signal_tx,
+        ctx,
+        Some(expected_block_size),
+        None,
+    )
+}
+
+/// The supervisor shares this guard across owners of one publisher/exact topic.
+/// Its active lease only fences this local task, not the remote publisher.
+struct SubscriberBinding {
+    strict_rank: Arc<Mutex<bool>>,
+    active: Arc<AtomicBool>,
+    #[cfg(test)]
+    replay_cleanup_barrier: Option<Arc<tokio::sync::Barrier>>,
+}
+
+pub(crate) fn spawn_bound(
+    source: EventSource,
+    indexer: Arc<KvBlockIndexer>,
+    signal_tx: Option<mpsc::Sender<IngestionSignal>>,
+    ctx: Arc<zmq::Context>,
+    expected_block_size: Option<u32>,
+    strict_rank: Arc<Mutex<bool>>,
+    active: Arc<AtomicBool>,
+) -> SubscriberHandle {
+    spawn_inner(
+        source,
+        indexer,
+        signal_tx,
+        ctx,
+        expected_block_size,
+        Some(SubscriberBinding {
+            strict_rank,
+            active,
+            #[cfg(test)]
+            replay_cleanup_barrier: None,
+        }),
+    )
+}
+
+/// Keep the final rank decision and every index mutation in the same critical
+/// section as supervisor promotion/retirement. Never retain it across an await.
+fn with_binding<T>(
+    binding: Option<&SubscriberBinding>,
+    operation: impl FnOnce(bool) -> T,
+) -> Option<T> {
+    if let Some(binding) = binding {
+        let strict = binding.strict_rank.lock();
+        if !binding.active.load(Ordering::Acquire) {
+            return None;
+        }
+        Some(operation(*strict))
+    } else {
+        Some(operation(false))
+    }
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum BatchRank {
+    Owned,
+    Foreign,
+    Rejected,
+}
+
+fn batch_rank(rank: Option<u32>, dp_rank: u32, strict: bool) -> BatchRank {
+    match rank {
+        Some(rank) if rank == dp_rank => BatchRank::Owned,
+        Some(_) if strict => BatchRank::Foreign,
+        None if !strict => BatchRank::Owned,
+        _ => BatchRank::Rejected,
+    }
 }
 
 fn spawn_inner(
@@ -77,6 +153,7 @@ fn spawn_inner(
     signal_tx: Option<mpsc::Sender<IngestionSignal>>,
     ctx: Arc<zmq::Context>,
     expected_block_size: Option<u32>,
+    binding: Option<SubscriberBinding>,
 ) -> SubscriberHandle {
     let (shutdown_tx, mut shutdown_rx) = broadcast::channel::<()>(1);
     let pub_endpoint = source.pub_endpoint.clone();
@@ -113,9 +190,14 @@ fn spawn_inner(
         let mut last_seq: i64 = -1;
         let mut incarnation: u64 = 0;
         let mut suspended = false;
+        let mut dense_rejection_reported = false;
 
         loop {
-            if is_shutdown(&mut shutdown_rx) {
+            if is_shutdown(&mut shutdown_rx)
+                || binding
+                    .as_ref()
+                    .is_some_and(|binding| !binding.active.load(Ordering::Acquire))
+            {
                 info!("kv_index subscriber {} shutting down", source_id);
                 break;
             }
@@ -130,7 +212,13 @@ fn spawn_inner(
                         continue;
                     }
                     if frames.len() != 3 || frames[1].len() != 8 {
-                        indexer.invalidate_source(&source_id, dp_rank);
+                        if with_binding(binding.as_ref(), |_| {
+                            indexer.invalidate_source(&source_id, dp_rank);
+                        })
+                        .is_none()
+                        {
+                            break;
+                        }
                         suspended = true;
                         tokio::task::yield_now().await;
                         continue;
@@ -145,7 +233,13 @@ fn spawn_inner(
                             "kv_index {}: restart seq {} < {} → incarnation {}",
                             source_id, seq, last_seq, incarnation
                         );
-                        indexer.invalidate_source(&source_id, dp_rank);
+                        if with_binding(binding.as_ref(), |_| {
+                            indexer.invalidate_source(&source_id, dp_rank);
+                        })
+                        .is_none()
+                        {
+                            break;
+                        }
                         suspended = true;
                         last_seq = -1;
                         emit(
@@ -160,23 +254,27 @@ fn spawn_inner(
                         tokio::task::yield_now().await;
                         continue;
                     }
-                    let batch = decode(&frames[2]).filter(|batch| {
-                        let correct_rank =
-                            batch.data_parallel_rank.is_none_or(|rank| rank == dp_rank);
-                        if !correct_rank {
-                            warn!(
-                                "kv_index {}: batch rank differs from subscriber rank {}",
-                                source_id, dp_rank
-                            );
-                        }
-                        correct_rank
-                    });
+                    let batch = decode(&frames[2]);
+                    let Some(valid_rank) = with_binding(binding.as_ref(), |strict| {
+                        batch.as_ref().is_some_and(|batch| {
+                            batch_rank(batch.data_parallel_rank, dp_rank, strict)
+                                != BatchRank::Rejected
+                        })
+                    }) else {
+                        break;
+                    };
                     // Include initial attachment to an already-running publisher.
                     // A corrupt event is a one-event hole, not an applied seq.
-                    if seq > last_seq + 1 || batch.is_none() {
+                    if seq > last_seq + 1 || !valid_rank {
                         let from = last_seq + 1;
-                        let to = if batch.is_none() { seq } else { seq - 1 };
-                        indexer.suspend_source(&source_id, dp_rank);
+                        let to = if !valid_rank { seq } else { seq - 1 };
+                        if with_binding(binding.as_ref(), |_| {
+                            indexer.suspend_source(&source_id, dp_rank);
+                        })
+                        .is_none()
+                        {
+                            break;
+                        }
                         suspended = true;
                         emit(
                             &signals,
@@ -199,11 +297,19 @@ fn spawn_inner(
                                 signals.clone(),
                                 expected_block_size,
                                 &topic,
+                                &mut dense_rejection_reported,
+                                binding.as_ref(),
                             )
                             .await
                             {
                                 last_seq = last_replay;
-                                indexer.resume_source(&source_id, dp_rank);
+                                if with_binding(binding.as_ref(), |_| {
+                                    indexer.resume_source(&source_id, dp_rank);
+                                })
+                                .is_none()
+                                {
+                                    break;
+                                }
                                 suspended = false;
                                 emit(
                                     &signals,
@@ -215,32 +321,74 @@ fn spawn_inner(
                                 tokio::task::yield_now().await;
                                 continue;
                             }
+                            #[cfg(test)]
+                            if let Some(barrier) = binding
+                                .as_ref()
+                                .and_then(|binding| binding.replay_cleanup_barrier.as_ref())
+                            {
+                                barrier.wait().await;
+                                barrier.wait().await;
+                            }
                         }
                         // Partial replay can include stores whose later
                         // evictions were lost. Never expose that partial state.
-                        indexer.invalidate_source(&source_id, dp_rank);
+                        if with_binding(binding.as_ref(), |_| {
+                            indexer.invalidate_source(&source_id, dp_rank);
+                        })
+                        .is_none()
+                        {
+                            break;
+                        }
                     }
                     if let Some(batch) = batch {
                         // After unrecoverable loss, credit only fresh observations
                         // on the now-clean source; absence is a conservative miss.
-                        if !apply_batch(
-                            &indexer,
-                            &source_id,
-                            dp_rank,
-                            incarnation,
-                            &batch,
-                            expected_block_size,
-                        ) {
-                            indexer.invalidate_source(&source_id, dp_rank);
-                            suspended = true;
-                            tokio::task::yield_now().await;
-                            continue;
+                        let applied = with_binding(binding.as_ref(), |strict| {
+                            match batch_rank(batch.data_parallel_rank, dp_rank, strict) {
+                                BatchRank::Owned => {
+                                    if let Err(rejection) = apply_batch(
+                                        &indexer,
+                                        &source_id,
+                                        dp_rank,
+                                        incarnation,
+                                        &batch,
+                                        expected_block_size,
+                                    ) {
+                                        report_dense_rejection(
+                                            rejection,
+                                            &source_id,
+                                            dp_rank,
+                                            &mut dense_rejection_reported,
+                                        );
+                                        indexer.invalidate_source(&source_id, dp_rank);
+                                        suspended = true;
+                                        return false;
+                                    }
+                                    // Promotion/retirement may have invalidated the
+                                    // source outside this task's local state.
+                                    if suspended || binding.is_some() {
+                                        indexer.resume_source(&source_id, dp_rank);
+                                        suspended = false;
+                                    }
+                                    true
+                                }
+                                BatchRank::Foreign => true,
+                                BatchRank::Rejected => {
+                                    indexer.invalidate_source(&source_id, dp_rank);
+                                    suspended = true;
+                                    false
+                                }
+                            }
+                        });
+                        match applied {
+                            None => break,
+                            Some(false) => {
+                                tokio::task::yield_now().await;
+                                continue;
+                            }
+                            Some(true) => {}
                         }
                         last_seq = seq;
-                        if suspended {
-                            indexer.resume_source(&source_id, dp_rank);
-                            suspended = false;
-                        }
                         emit(
                             &signals,
                             IngestionSignal::Advance {
@@ -248,7 +396,7 @@ fn spawn_inner(
                                 last_seq: seq,
                             },
                         );
-                        debug!(source = %source_id, rank = dp_rank, seq, "kv_index live batch applied");
+                        debug!(source = %source_id, rank = dp_rank, seq, "kv_index live sequence advanced");
                     }
                     // A sustained publisher starves EAGAIN; yield so this task
                     // can't monopolize the runtime worker.
@@ -351,23 +499,34 @@ fn hash_str(h: &ExternalBlockHash) -> Arc<str> {
     }
 }
 
-fn apply_batch(
-    indexer: &KvBlockIndexer,
-    source_id: &SourceId,
-    dp_rank: u32,
-    incarnation: u64,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DenseRejectionReason {
+    ExtraKeys,
+    Layout,
+    Residency,
+    Adapter,
+    ZeroBlockSize,
+    BlockSizeMismatch,
+    TokenCountMismatch,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DenseBatchRejection {
+    reason: DenseRejectionReason,
+    event_index: usize,
+}
+
+fn validate_dense_batch(
     batch: &KVEventBatch,
-    expected_block_size: Option<u32>,
-) -> bool {
-    // Batch rank if the 3-element array carries it; else the discovery rank.
-    let rank = batch.data_parallel_rank.unwrap_or(dp_rank);
-    // Reject before publishing any prefix or eviction from an unmodeled batch.
-    if expected_block_size.is_some_and(|expected| {
-        batch.events.iter().any(|event| match event {
+    expected_block_size: u32,
+) -> Result<(), DenseBatchRejection> {
+    for (event_index, event) in batch.events.iter().enumerate() {
+        let reason = match event {
             KVEvent::BlockStored(s) => {
                 // Keep unmodeled salt/MM/layout identities out of this token-only
                 // query space. Named LoRA is already isolated by the hash seed.
-                s.extra_keys.as_ref().is_some_and(|keys| {
+                // session_id annotates the request, not the block's cache identity.
+                if s.extra_keys.as_ref().is_some_and(|keys| {
                     keys.len() != s.block_hashes.len()
                         || keys.iter().any(|key| {
                             !key.is_nil()
@@ -377,34 +536,83 @@ fn apply_batch(
                                     })
                                 })
                         })
-                }) || s
+                }) {
+                    Some(DenseRejectionReason::ExtraKeys)
+                } else if s
                     .kv_cache_spec_kind
                     .as_deref()
                     .is_some_and(|kind| kind != "full_attention")
                     || s.kv_cache_spec_sliding_window.is_some()
-                    || s.session_id.is_some()
-                    || !dense_residency_supported(
-                        s.medium.as_deref(),
-                        s.locality.as_deref(),
-                        s.ownership.as_deref(),
-                    )
-                    || (s.lora_id.is_some() && s.lora_name.is_none())
+                {
+                    Some(DenseRejectionReason::Layout)
+                } else if !dense_residency_supported(
+                    s.medium.as_deref(),
+                    s.locality.as_deref(),
+                    s.ownership.as_deref(),
+                ) {
+                    Some(DenseRejectionReason::Residency)
+                } else if (s.lora_id.is_some() && s.lora_name.is_none())
                     || s.lora_name.as_ref().is_some_and(|name| name.is_empty())
-                    || s.block_size == 0
-                    || s.block_size != expected
-                    || s.block_hashes.len().checked_mul(s.block_size as usize)
-                        != Some(s.token_ids.len())
+                {
+                    Some(DenseRejectionReason::Adapter)
+                } else if s.block_size == 0 {
+                    Some(DenseRejectionReason::ZeroBlockSize)
+                } else if s.block_size != expected_block_size {
+                    Some(DenseRejectionReason::BlockSizeMismatch)
+                } else if s.block_hashes.len().checked_mul(s.block_size as usize)
+                    != Some(s.token_ids.len())
+                {
+                    Some(DenseRejectionReason::TokenCountMismatch)
+                } else {
+                    None
+                }
             }
-            KVEvent::BlockRemoved(r) => !dense_residency_supported(
+            KVEvent::BlockRemoved(r) => (!dense_residency_supported(
                 r.medium.as_deref(),
                 r.locality.as_deref(),
                 r.ownership.as_deref(),
-            ),
-            KVEvent::AllBlocksCleared(_) => false,
-        })
-    }) {
-        return false;
+            ))
+            .then_some(DenseRejectionReason::Residency),
+            KVEvent::AllBlocksCleared(_) => None,
+        };
+        if let Some(reason) = reason {
+            return Err(DenseBatchRejection {
+                reason,
+                event_index,
+            });
+        }
     }
+    Ok(())
+}
+
+fn report_dense_rejection(
+    rejection: DenseBatchRejection,
+    source_id: &SourceId,
+    rank: u32,
+    reported: &mut bool,
+) {
+    // A noisy publisher gets at most one diagnostic per subscription, including replay.
+    if !*reported {
+        debug!(source = %source_id, rank, reason = ?rejection.reason,
+            event_index = rejection.event_index, "kv_index dense batch rejected");
+        *reported = true;
+    }
+}
+
+fn apply_batch(
+    indexer: &KvBlockIndexer,
+    source_id: &SourceId,
+    dp_rank: u32,
+    incarnation: u64,
+    batch: &KVEventBatch,
+    expected_block_size: Option<u32>,
+) -> Result<(), DenseBatchRejection> {
+    // Preflight the whole batch before any Store, Remove, or Clear mutation.
+    if let Some(expected) = expected_block_size {
+        validate_dense_batch(batch, expected)?;
+    }
+    // Batch rank if the 3-element array carries it; else the discovery rank.
+    let rank = batch.data_parallel_rank.unwrap_or(dp_rank);
     for ev in &batch.events {
         match ev {
             KVEvent::BlockStored(s) => {
@@ -435,7 +643,7 @@ fn apply_batch(
             }
         }
     }
-    true
+    Ok(())
 }
 
 fn dense_residency_supported(
@@ -472,6 +680,8 @@ async fn replay(
     signals: Option<mpsc::Sender<IngestionSignal>>,
     expected_block_size: Option<u32>,
     topic: &str,
+    dense_rejection_reported: &mut bool,
+    binding: Option<&SubscriberBinding>,
 ) -> Option<i64> {
     let dealer = match ctx.socket(zmq::DEALER) {
         Ok(s) => s,
@@ -499,6 +709,9 @@ async fn replay(
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     let mut high = last_seq;
     loop {
+        if binding.is_some_and(|binding| !binding.active.load(Ordering::Acquire)) {
+            return None;
+        }
         if tokio::time::Instant::now() >= deadline {
             warn!("kv_index replay {} timed out", source_id);
             break;
@@ -533,21 +746,33 @@ async fn replay(
                     return None;
                 }
                 let batch = decode(&frames[frames.len() - 1])?;
-                if batch.data_parallel_rank.is_some_and(|rank| rank != dp_rank) {
-                    warn!(
-                        "kv_index replay {}: batch rank differs from subscriber rank {}",
-                        source_id, dp_rank
-                    );
-                    return None;
-                }
-                if !apply_batch(
-                    indexer,
-                    source_id,
-                    dp_rank,
-                    incarnation,
-                    &batch,
-                    expected_block_size,
-                ) {
+                let accepted = with_binding(binding, |strict| {
+                    match batch_rank(batch.data_parallel_rank, dp_rank, strict) {
+                        BatchRank::Owned => {
+                            if let Err(rejection) = apply_batch(
+                                indexer,
+                                source_id,
+                                dp_rank,
+                                incarnation,
+                                &batch,
+                                expected_block_size,
+                            ) {
+                                report_dense_rejection(
+                                    rejection,
+                                    source_id,
+                                    dp_rank,
+                                    dense_rejection_reported,
+                                );
+                                false
+                            } else {
+                                true
+                            }
+                        }
+                        BatchRank::Foreign => true,
+                        BatchRank::Rejected => false,
+                    }
+                })?;
+                if !accepted {
                     return None;
                 }
                 high = seq;
@@ -558,7 +783,7 @@ async fn replay(
                         last_seq: seq,
                     },
                 );
-                debug!(source = %source_id, rank = dp_rank, seq, "kv_index replay batch applied");
+                debug!(source = %source_id, rank = dp_rank, seq, "kv_index replay sequence advanced");
                 if high >= through_seq {
                     return Some(high);
                 }
@@ -585,7 +810,7 @@ fn hex(b: &[u8]) -> String {
     s
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use super::*;
     use crate::kv_index::indexer::MatchQuery;
@@ -649,20 +874,22 @@ mod tests {
                 );
                 event.lora_name = name.map(str::to_owned);
                 event.extra_keys = extra.clone();
-                // Generic ingestion retains annotations; the dense consumer's
-                // unmodeled session namespace is covered by its rejection test.
-                event.session_id = (!dense_only).then(|| "session-annotation".to_owned());
-                apply_batch(
-                    &index,
-                    &SourceId::from("p"),
-                    0,
-                    0,
-                    &KVEventBatch {
-                        ts: 1.0,
-                        events: vec![KVEvent::BlockStored(event)],
-                        data_parallel_rank: Some(0),
-                    },
-                    dense_only.then_some(4),
+                event.session_id = Some("session-annotation".to_owned());
+                assert_eq!(
+                    apply_batch(
+                        &index,
+                        &SourceId::from("p"),
+                        0,
+                        0,
+                        &KVEventBatch {
+                            ts: 1.0,
+                            events: vec![KVEvent::BlockStored(event)],
+                            data_parallel_rank: Some(0),
+                        },
+                        dense_only.then_some(4),
+                    )
+                    .is_ok(),
+                    !dense_only || expected > 0
                 );
                 let query = MatchQuery {
                     group_idx: 0,
@@ -703,7 +930,7 @@ mod tests {
             ],
             data_parallel_rank: Some(1),
         };
-        apply_batch(&idx, &SourceId::from("w0"), 0, 0, &batch, None);
+        apply_batch(&idx, &SourceId::from("w0"), 0, 0, &batch, None).unwrap();
 
         let pool_locals: Vec<Arc<str>> = local_hashes(&[1, 2, 3, 4], 4, None)
             .iter()
@@ -749,34 +976,69 @@ mod tests {
             "remote",
             "local-pool",
             "unknown-medium",
-            "session",
             "extra-count",
-            "salt",
+            "salt-array",
+            "salt-scalar",
             "layout",
+            "sliding-window",
+            "unnamed-lora",
             "empty-lora",
+            "token-count",
         ] {
             let index = KvBlockIndexer::new();
             let mut invalid = valid.clone();
-            match case {
-                "remote" => invalid.locality = Some("REMOTE".into()),
+            invalid.block_hashes = vec![ExternalBlockHash::Int(2)];
+            invalid.token_ids = vec![5, 6, 7, 8];
+            let reason = match case {
+                "remote" => {
+                    invalid.locality = Some("REMOTE".into());
+                    DenseRejectionReason::Residency
+                }
                 "local-pool" => {
                     invalid.locality = Some("LOCAL".into());
                     invalid.ownership = Some("pool".into());
+                    DenseRejectionReason::Residency
                 }
-                "unknown-medium" => invalid.medium = Some("unknown".into()),
-                "session" => invalid.session_id = Some("session".into()),
-                "extra-count" => invalid.extra_keys = Some(vec![]),
-                "salt" => {
+                "unknown-medium" => {
+                    invalid.medium = Some("unknown".into());
+                    DenseRejectionReason::Residency
+                }
+                "extra-count" => {
+                    invalid.extra_keys = Some(vec![]);
+                    DenseRejectionReason::ExtraKeys
+                }
+                "salt-array" => {
                     invalid.extra_keys =
-                        Some(vec![rmpv::Value::Array(vec![rmpv::Value::from("tenant")])])
+                        Some(vec![rmpv::Value::Array(vec![rmpv::Value::from("tenant")])]);
+                    DenseRejectionReason::ExtraKeys
                 }
-                "layout" => invalid.kv_cache_spec_kind = Some("sliding_window".into()),
+                "salt-scalar" => {
+                    invalid.extra_keys = Some(vec![rmpv::Value::from("unmodeled-namespace")]);
+                    DenseRejectionReason::ExtraKeys
+                }
+                "layout" => {
+                    invalid.kv_cache_spec_kind = Some("sliding_attention".into());
+                    DenseRejectionReason::Layout
+                }
+                "sliding-window" => {
+                    invalid.kv_cache_spec_sliding_window = Some(8);
+                    DenseRejectionReason::Layout
+                }
+                "unnamed-lora" => {
+                    invalid.lora_id = Some(7);
+                    DenseRejectionReason::Adapter
+                }
                 "empty-lora" => {
                     invalid.lora_id = Some(1);
                     invalid.lora_name = Some(String::new());
+                    DenseRejectionReason::Adapter
+                }
+                "token-count" => {
+                    invalid.block_hashes.push(ExternalBlockHash::Int(3));
+                    DenseRejectionReason::TokenCountMismatch
                 }
                 _ => unreachable!(),
-            }
+            };
             let batch = KVEventBatch {
                 ts: 0.0,
                 events: vec![
@@ -785,16 +1047,40 @@ mod tests {
                 ],
                 data_parallel_rank: Some(0),
             };
-            assert!(
-                !apply_batch(&index, &source, 0, 0, &batch, Some(4)),
+            assert_eq!(
+                apply_batch(&index, &source, 0, 0, &batch, Some(4)),
+                Err(DenseBatchRejection {
+                    reason,
+                    event_index: 1
+                }),
                 "{case}"
             );
-            assert!(
-                hits(&index, &[1, 2, 3, 4]).is_empty(),
-                "valid prefix of rejected batch leaked: {case}"
-            );
+            let query = |tokens: &[u32]| MatchQuery {
+                group_idx: 0,
+                local_hashes: crate::kv_index::local_block_hash_strings(tokens, 4, None),
+                tiers_of_interest: vec![
+                    StorageTier::Device,
+                    StorageTier::HostPinned,
+                    StorageTier::Disk,
+                    StorageTier::External,
+                ],
+            };
+            for tokens in [[1, 2, 3, 4], [5, 6, 7, 8]] {
+                assert!(
+                    index.find_matches(&query(&tokens)).is_empty(),
+                    "rejected batch leaked credit: {case}"
+                );
+            }
             // The default generic subscriber keeps its wider structural domain.
-            assert!(apply_batch(&index, &source, 0, 0, &batch, None), "{case}");
+            assert!(
+                apply_batch(&index, &source, 0, 0, &batch, None).is_ok(),
+                "{case}"
+            );
+            assert_eq!(
+                index.find_matches(&query(&[5, 6, 7, 8])).len(),
+                1,
+                "generic: {case}"
+            );
         }
         for (medium, ownership, locality, tier) in [
             ("GPU", None, "LOCAL", StorageTier::Device),
@@ -809,9 +1095,9 @@ mod tests {
             let batch = KVEventBatch {
                 ts: 0.0,
                 events: vec![KVEvent::BlockStored(event)],
-                data_parallel_rank: Some(0),
+                data_parallel_rank: Some(3),
             };
-            assert!(apply_batch(&index, &source, 0, 0, &batch, Some(4)));
+            assert!(apply_batch(&index, &source, 0, 0, &batch, Some(4)).is_ok());
             let matches = index.find_matches(&MatchQuery {
                 group_idx: 0,
                 local_hashes: crate::kv_index::local_block_hash_strings(&[1, 2, 3, 4], 4, None),
@@ -819,6 +1105,7 @@ mod tests {
             });
             assert_eq!(matches.len(), 1);
             assert_eq!(matches[0].tier, tier);
+            assert_eq!(matches[0].target.dp_rank, 3);
         }
     }
 
@@ -1085,13 +1372,14 @@ mod tests {
         ts: f64,
         events: &[KVEvent],
         rank: Option<u32>,
-    ) {
+    ) -> Vec<i64> {
         // vLLM's EventBatch is array-like, but each tagged event is a map.
         let payload = rmp_serde::to_vec_named(&(ts, events, &rank)).unwrap();
         let decoded = crate::kv_index::decode_batch(&payload);
         assert!(decoded.is_ok(), "invalid publisher fixture: {decoded:?}");
         let seq_bytes = seq.to_be_bytes();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut advances = Vec::new();
         loop {
             assert!(
                 tokio::time::Instant::now() < deadline,
@@ -1100,7 +1388,12 @@ mod tests {
             let frames: Vec<&[u8]> = vec![topic, seq_bytes.as_slice(), payload.as_slice()];
             pub_sock.send_multipart(frames, 0).unwrap();
             match tokio::time::timeout(Duration::from_millis(300), sig_rx.recv()).await {
-                Ok(Some(IngestionSignal::Advance { last_seq, .. })) if last_seq == seq => return,
+                Ok(Some(IngestionSignal::Advance { last_seq, .. })) => {
+                    advances.push(last_seq);
+                    if last_seq == seq {
+                        return advances;
+                    }
+                }
                 Ok(_) => continue,
                 Err(_) if tokio::time::Instant::now() >= deadline => {
                     panic!("subscriber never advanced to seq {seq}")
@@ -1124,6 +1417,14 @@ mod tests {
     }
 
     fn fixture_with_block_size(with_replay: bool, expected_block_size: Option<u32>) -> Fixture {
+        fixture_with_binding(with_replay, expected_block_size, None)
+    }
+
+    fn fixture_with_binding(
+        with_replay: bool,
+        expected_block_size: Option<u32>,
+        binding: Option<SubscriberBinding>,
+    ) -> Fixture {
         use std::sync::atomic::{AtomicU32, Ordering};
         static NEXT: AtomicU32 = AtomicU32::new(0);
         let tag = NEXT.fetch_add(1, Ordering::Relaxed);
@@ -1147,7 +1448,16 @@ mod tests {
             topic: "kv".into(),
             hwm: None,
         };
-        let handle = if let Some(block_size) = expected_block_size {
+        let handle = if let Some(binding) = binding {
+            spawn_inner(
+                source,
+                indexer.clone(),
+                Some(tx),
+                ctx.clone(),
+                expected_block_size,
+                Some(binding),
+            )
+        } else if let Some(block_size) = expected_block_size {
             spawn_dense(source, indexer.clone(), Some(tx), ctx.clone(), block_size)
         } else {
             spawn(source, indexer.clone(), Some(tx), ctx.clone())
@@ -1183,6 +1493,287 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bound_foreign_live_frames_advance_without_mutation_or_resume() {
+        let strict_rank = Arc::new(Mutex::new(true));
+        let mut f = fixture_with_binding(
+            false,
+            Some(4),
+            Some(SubscriberBinding {
+                strict_rank: strict_rank.clone(),
+                active: Arc::new(AtomicBool::new(true)),
+                replay_cleanup_barrier: None,
+            }),
+        );
+        let old = [1, 2, 3, 4];
+        let fresh = [5, 6, 7, 8];
+        let foreign = [9, 10, 11, 12];
+        publish_until_advanced(
+            &f.publisher,
+            &mut f.signals,
+            b"kv",
+            0,
+            0.0,
+            &[store_event(100, &old)],
+            Some(0),
+        )
+        .await;
+        assert_eq!(hits(&f.indexer, &old).len(), 1);
+        {
+            let _guard = strict_rank.lock();
+            f.indexer.suspend_source(&SourceId::from("w0"), 0);
+        }
+        publish_until_advanced(
+            &f.publisher,
+            &mut f.signals,
+            b"kv",
+            1,
+            1.0,
+            &[store_event(200, &foreign)],
+            Some(1),
+        )
+        .await;
+        assert!(
+            hits(&f.indexer, &old).is_empty(),
+            "foreign rank resumed credit"
+        );
+        assert!(
+            hits(&f.indexer, &foreign).is_empty(),
+            "foreign rank acquired credit"
+        );
+        let advances = publish_until_advanced(
+            &f.publisher,
+            &mut f.signals,
+            b"kv",
+            2,
+            2.0,
+            &[store_event(101, &fresh)],
+            Some(0),
+        )
+        .await;
+        assert_eq!(advances, [2], "foreign sequence created an artificial gap");
+        assert_eq!(
+            hits(&f.indexer, &old).len(),
+            1,
+            "foreign frame revoked history"
+        );
+        assert_eq!(hits(&f.indexer, &fresh).len(), 1);
+
+        // A genuine missing global sequence still revokes history even when
+        // the observed frame belongs to another rank.
+        publish_until_advanced(&f.publisher, &mut f.signals, b"kv", 4, 4.0, &[], Some(1)).await;
+        assert!(hits(&f.indexer, &old).is_empty());
+        assert!(hits(&f.indexer, &fresh).is_empty());
+        let advances = publish_until_advanced(
+            &f.publisher,
+            &mut f.signals,
+            b"kv",
+            5,
+            5.0,
+            &[store_event(102, &fresh)],
+            Some(0),
+        )
+        .await;
+        assert_eq!(advances, [5]);
+        assert_eq!(hits(&f.indexer, &fresh).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn bound_replay_tracks_foreign_sequences_and_rejects_missing_rank() {
+        for foreign_rank in [Some(1), None] {
+            let mut f = fixture_with_binding(
+                true,
+                Some(4),
+                Some(SubscriberBinding {
+                    strict_rank: Arc::new(Mutex::new(true)),
+                    active: Arc::new(AtomicBool::new(true)),
+                    replay_cleanup_barrier: None,
+                }),
+            );
+            let old = [1, 2, 3, 4];
+            let recovered = [5, 6, 7, 8];
+            let fresh = [9, 10, 11, 12];
+            let foreign = [13, 14, 15, 16];
+            publish_until_advanced(
+                &f.publisher,
+                &mut f.signals,
+                b"kv",
+                0,
+                0.0,
+                &[store_event(100, &old)],
+                Some(0),
+            )
+            .await;
+            assert_eq!(hits(&f.indexer, &old).len(), 1);
+            let live = [store_event(102, &fresh)];
+            let replies = [
+                (
+                    1,
+                    b"kv".as_slice(),
+                    batch_payload(&[store_event(101, &recovered)], 0),
+                ),
+                (
+                    2,
+                    b"kv".as_slice(),
+                    rmp_serde::to_vec_named(&(2.0, [store_event(200, &foreign)], foreign_rank))
+                        .unwrap(),
+                ),
+                (3, b"kv".as_slice(), batch_payload(&live, 0)),
+            ];
+            let query = MatchQuery {
+                group_idx: 0,
+                local_hashes: crate::kv_index::local_block_hash_strings(&old, 4, None),
+                tiers_of_interest: vec![StorageTier::Device],
+            };
+            let suspended_queries = [query];
+            let (advances, ()) = tokio::join!(
+                publish_until_advanced(&f.publisher, &mut f.signals, b"kv", 3, 3.0, &live, Some(0)),
+                serve_replay(
+                    f.replay_server.as_ref().unwrap(),
+                    &replies,
+                    &f.indexer,
+                    &suspended_queries
+                ),
+            );
+            assert!(
+                advances.contains(&1),
+                "partial owned replay was not applied"
+            );
+            assert_eq!(advances.contains(&2), foreign_rank.is_some());
+            for tokens in [&old, &recovered] {
+                assert_eq!(
+                    hits(&f.indexer, tokens).len(),
+                    usize::from(foreign_rank.is_some())
+                );
+            }
+            assert_eq!(hits(&f.indexer, &fresh).len(), 1);
+            assert!(hits(&f.indexer, &foreign).is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn retired_replay_cannot_clear_or_mutate_a_replacement_subscription() {
+        let strict_rank = Arc::new(Mutex::new(false));
+        let active = Arc::new(AtomicBool::new(true));
+        let cleanup_barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let mut f = fixture_with_binding(
+            true,
+            Some(4),
+            Some(SubscriberBinding {
+                strict_rank: strict_rank.clone(),
+                active: active.clone(),
+                replay_cleanup_barrier: Some(cleanup_barrier.clone()),
+            }),
+        );
+        let old = [1, 2, 3, 4];
+        let partial = [5, 6, 7, 8];
+        let replacement = [9, 10, 11, 12];
+        publish_until_advanced(
+            &f.publisher,
+            &mut f.signals,
+            b"kv",
+            0,
+            0.0,
+            &[store_event(100, &old)],
+            Some(0),
+        )
+        .await;
+        assert_eq!(hits(&f.indexer, &old).len(), 1);
+        f.publisher
+            .send_multipart(
+                [
+                    b"kv".as_slice(),
+                    &3i64.to_be_bytes(),
+                    &batch_payload(&[], 0),
+                ],
+                0,
+            )
+            .unwrap();
+        let server = f.replay_server.as_ref().unwrap();
+        let request = replay_request(server).await;
+        assert!(hits(&f.indexer, &old).is_empty());
+        send_replay_replies(
+            server,
+            &request,
+            &[(
+                1,
+                b"kv".as_slice(),
+                batch_payload(&[store_event(101, &partial)], 0),
+            )],
+        );
+        loop {
+            let signal = tokio::time::timeout(Duration::from_secs(5), f.signals.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            if matches!(signal, IngestionSignal::Advance { last_seq: 1, .. }) {
+                break;
+            }
+        }
+        // Fail replay while its lease is still active, then hold the old task
+        // immediately before cleanup until replacement credit is established.
+        send_replay_replies(server, &request, &[(2, b"kv".as_slice(), vec![0xc1])]);
+        tokio::time::timeout(Duration::from_secs(5), cleanup_barrier.wait())
+            .await
+            .unwrap();
+        assert!(active.load(Ordering::Acquire));
+        {
+            let _guard = strict_rank.lock();
+            active.store(false, Ordering::Release);
+            f.indexer.invalidate_source(&SourceId::from("w0"), 0);
+        }
+
+        let publisher = f._ctx.socket(zmq::PUB).unwrap();
+        let endpoint = format!(
+            "{}-replacement",
+            f.publisher.get_last_endpoint().unwrap().unwrap()
+        );
+        publisher.bind(&endpoint).unwrap();
+        let (tx, mut signals) = mpsc::channel(64);
+        let handle = spawn_bound(
+            EventSource {
+                source: SourceId::from("w0"),
+                dp_rank: 0,
+                pub_endpoint: endpoint,
+                replay_endpoint: None,
+                topic: "kv".into(),
+                hwm: None,
+            },
+            f.indexer.clone(),
+            Some(tx),
+            f._ctx.clone(),
+            Some(4),
+            strict_rank,
+            Arc::new(AtomicBool::new(true)),
+        );
+        publish_until_advanced(
+            &publisher,
+            &mut signals,
+            b"kv",
+            0,
+            0.0,
+            &[store_event(200, &replacement)],
+            Some(0),
+        )
+        .await;
+        assert_eq!(hits(&f.indexer, &replacement).len(), 1);
+        // The retired lease must fence the already-pending cleanup, not merely
+        // exit early before any replacement exists.
+        tokio::time::timeout(Duration::from_secs(5), cleanup_barrier.wait())
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), f.signals.recv())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(hits(&f.indexer, &replacement).len(), 1);
+        assert!(hits(&f.indexer, &old).is_empty());
+        assert!(hits(&f.indexer, &partial).is_empty());
+        handle.shutdown();
+    }
+
+    #[tokio::test]
     async fn unrecoverable_gap_discards_old_claims_but_preserves_other_source_and_rank() {
         let mut f = fixture(false);
         let tokens = [1, 2, 3, 4];
@@ -1208,7 +1799,8 @@ mod tests {
                     data_parallel_rank: Some(rank),
                 },
                 None,
-            );
+            )
+            .unwrap();
         }
         // Seq 1 was a lost eviction; seq 2 contains no replacement store.
         publish_until_advanced(&f.publisher, &mut f.signals, b"kv", 2, 2.0, &[], Some(0)).await;
@@ -1356,6 +1948,96 @@ mod tests {
         rmp_serde::to_vec_named(&(1.0, events, Some(rank))).unwrap()
     }
 
+    #[tokio::test]
+    async fn dense_session_annotation_live_preserves_shared_blocks() {
+        let mut f = fixture_with_block_size(false, Some(4));
+        let shared = [1, 2, 3, 4];
+        let retained = [5, 6, 7, 8];
+        for (seq, session, blocks) in [
+            (0, "session-a", vec![(100, shared), (101, retained)]),
+            (1, "session-b", vec![(100, shared)]),
+        ] {
+            let events: Vec<_> = blocks
+                .into_iter()
+                .map(|(hash, tokens)| {
+                    let mut event = stored(
+                        vec![ExternalBlockHash::Int(hash)],
+                        tokens.to_vec(),
+                        Some("GPU"),
+                        None,
+                    );
+                    event.session_id = Some(session.into());
+                    KVEvent::BlockStored(event)
+                })
+                .collect();
+            publish_until_advanced(
+                &f.publisher,
+                &mut f.signals,
+                b"kv",
+                seq,
+                seq as f64,
+                &events,
+                Some(0),
+            )
+            .await;
+            for tokens in [&shared, &retained] {
+                let matches = hits(&f.indexer, tokens);
+                assert_eq!(matches.len(), 1, "session annotation erased placement");
+                assert_eq!(matches[0].target.instance_id.as_ref(), "w0");
+                assert_eq!(matches[0].target.dp_rank, 0);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn dense_session_annotation_replay_applies_shared_blocks() {
+        let f = fixture_with_block_size(true, Some(4));
+        let tokens = [1, 2, 3, 4];
+        let events: Vec<_> = ["session-a", "session-b"]
+            .into_iter()
+            .map(|session| {
+                let mut event = stored(
+                    vec![ExternalBlockHash::Int(100)],
+                    tokens.to_vec(),
+                    Some("GPU"),
+                    None,
+                );
+                event.session_id = Some(session.into());
+                KVEvent::BlockStored(event)
+            })
+            .collect();
+        let replies = [(1, b"kv".as_slice(), batch_payload(&events, 0))];
+        let endpoint = f
+            .replay_server
+            .as_ref()
+            .unwrap()
+            .get_last_endpoint()
+            .unwrap()
+            .unwrap();
+        let source = SourceId::from("w0");
+        let mut reported = false;
+        let (result, ()) = tokio::join!(
+            replay(
+                &endpoint,
+                0,
+                1,
+                &f._ctx,
+                &f.indexer,
+                &source,
+                0,
+                0,
+                None,
+                Some(4),
+                "kv",
+                &mut reported,
+                None,
+            ),
+            serve_replay(f.replay_server.as_ref().unwrap(), &replies, &f.indexer, &[]),
+        );
+        assert_eq!(result, Some(1));
+        assert_eq!(hits(&f.indexer, &tokens).len(), 1);
+    }
+
     #[test]
     fn dense_block_size_mismatch_preflights_stores_and_removes_atomically() {
         let index = KvBlockIndexer::new();
@@ -1365,7 +2047,7 @@ mod tests {
             events: vec![store_event(100, &[1, 2, 3, 4])],
             data_parallel_rank: Some(0),
         };
-        assert!(apply_batch(&index, &source, 0, 0, &initial, Some(4)));
+        assert!(apply_batch(&index, &source, 0, 0, &initial, Some(4)).is_ok());
         let mut bad = stored(
             vec![ExternalBlockHash::Int(102)],
             (20..28).collect(),
@@ -1384,11 +2066,18 @@ mod tests {
                     locality: None,
                     ownership: None,
                 }),
+                KVEvent::AllBlocksCleared(AllBlocksCleared {}),
                 KVEvent::BlockStored(bad),
             ],
             data_parallel_rank: Some(0),
         };
-        assert!(!apply_batch(&index, &source, 0, 0, &batch, Some(4)));
+        assert_eq!(
+            apply_batch(&index, &source, 0, 0, &batch, Some(4)),
+            Err(DenseBatchRejection {
+                reason: DenseRejectionReason::BlockSizeMismatch,
+                event_index: 3
+            })
+        );
         assert_eq!(
             hits(&index, &[1, 2, 3, 4]).len(),
             1,
@@ -1434,21 +2123,37 @@ mod tests {
                 local_hashes: crate::kv_index::local_block_hash_strings(tokens, expected, None),
                 tiers_of_interest: vec![StorageTier::Device],
             };
-            assert_eq!(f.indexer.find_matches(&query(&old)).len(), 1);
+            let old_hits = f.indexer.find_matches(&query(&old));
+            assert_eq!(old_hits.len(), 1);
+            assert_eq!(old_hits[0].target.instance_id.as_ref(), "w0");
+            assert_eq!(old_hits[0].target.dp_rank, 0);
             let live = [event(400, &fresh, expected)];
             let replies = [
-                (1, batch_payload(&[event(200, &partial, expected)], 0)),
-                (2, batch_payload(&[event(300, &bad, actual)], 0)),
-                (3, batch_payload(&live, 0)),
+                (
+                    1,
+                    b"kv".as_slice(),
+                    batch_payload(&[event(200, &partial, expected)], 0),
+                ),
+                (
+                    2,
+                    b"kv".as_slice(),
+                    batch_payload(&[event(300, &bad, actual)], 0),
+                ),
+                (3, b"kv".as_slice(), batch_payload(&live, 0)),
             ];
-            tokio::join!(
+            let suspended_queries = [query(&old)];
+            let (advances, ()) = tokio::join!(
                 publish_until_advanced(&f.publisher, &mut f.signals, b"kv", 3, 3.0, &live, Some(0)),
                 serve_replay(
                     f.replay_server.as_ref().unwrap(),
                     &replies,
                     &f.indexer,
-                    b"kv"
+                    &suspended_queries
                 ),
+            );
+            assert!(
+                advances.contains(&1),
+                "partial replay Store was not applied"
             );
             assert!(f.indexer.find_matches(&query(&old)).is_empty());
             assert!(f.indexer.find_matches(&query(&partial)).is_empty());
@@ -1459,26 +2164,42 @@ mod tests {
 
     async fn serve_replay(
         socket: &zmq::Socket,
-        replies: &[(i64, Vec<u8>)],
+        replies: &[(i64, &[u8], Vec<u8>)],
         index: &KvBlockIndexer,
-        topic: &[u8],
+        suspended_queries: &[MatchQuery],
     ) {
+        let request = replay_request(socket).await;
+        assert_eq!(read_seq(request.last().unwrap()), 1);
+        // No previously indexed credit may escape while backfill is incomplete.
+        for query in suspended_queries {
+            assert!(
+                index.find_matches(query).is_empty(),
+                "credit escaped during replay"
+            );
+        }
+        send_replay_replies(socket, &request, replies);
+    }
+
+    async fn replay_request(socket: &zmq::Socket) -> Vec<Vec<u8>> {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        let request = loop {
+        loop {
             match socket.recv_multipart(zmq::DONTWAIT) {
-                Ok(request) => break request,
+                Ok(request) => return request,
                 Err(zmq::Error::EAGAIN) => {
                     assert!(tokio::time::Instant::now() < deadline, "no replay request");
                     tokio::task::yield_now().await;
                 }
                 Err(e) => panic!("replay request failed: {e}"),
             }
-        };
-        assert_eq!(read_seq(request.last().unwrap()), 1);
-        // No previously indexed credit may escape while backfill is incomplete.
-        assert!(hits(index, &[1, 2, 3, 4]).is_empty());
-        assert!(hits(index, &[5, 6, 7, 8]).is_empty());
-        for (seq, payload) in replies {
+        }
+    }
+
+    fn send_replay_replies(
+        socket: &zmq::Socket,
+        request: &[Vec<u8>],
+        replies: &[(i64, &[u8], Vec<u8>)],
+    ) {
+        for (seq, topic, payload) in replies {
             socket
                 .send_multipart(
                     [
@@ -1514,6 +2235,17 @@ mod tests {
             Some(0),
         )
         .await;
+        let query = |tokens: &[u32]| MatchQuery {
+            group_idx: 0,
+            local_hashes: crate::kv_index::local_block_hash_strings(tokens, 4, None),
+            tiers_of_interest: vec![StorageTier::Device],
+        };
+        for tokens in [&old, &keep] {
+            let matches = f.indexer.find_matches(&query(tokens));
+            assert_eq!(matches.len(), 1);
+            assert_eq!(matches[0].target.instance_id.as_ref(), "w0");
+            assert_eq!(matches[0].target.dp_rank, 0);
+        }
         let first = batch_payload(&[store_event(200, &partial)], 0);
         let eviction = batch_payload(
             &[KVEvent::BlockRemoved(BlockRemoved {
@@ -1526,19 +2258,25 @@ mod tests {
             0,
         );
         let third = batch_payload(&[store_event(400, &fresh)], 0);
-        let eof = (-1, vec![]);
+        let eof = (-1, b"".as_slice(), vec![]);
+        let topic = b"kv".as_slice();
         let replies = match case {
-            "complete" => vec![(1, first), (2, eviction), (3, third)],
-            "missing_start" => vec![(2, eviction), eof],
-            "middle_gap" => vec![(1, first), (3, third), eof],
-            "corrupt" => vec![(1, first), (2, vec![0xc1]), eof],
-            "early_eof" => vec![(1, first), eof],
-            "wrong_rank" => vec![(1, first), (2, batch_payload(&[], 1)), eof],
-            "wrong_topic" => vec![(1, first), (2, eviction), (3, third)],
+            "complete" => vec![(1, topic, first), (2, topic, eviction), (3, topic, third)],
+            "missing_start" => vec![(2, topic, eviction), eof],
+            "middle_gap" => vec![(1, topic, first), (3, topic, third), eof],
+            "corrupt" => vec![(1, topic, first), (2, topic, vec![0xc1]), eof],
+            "early_eof" => vec![(1, topic, first), eof],
+            "wrong_rank" => vec![(1, topic, first), (2, topic, batch_payload(&[], 1)), eof],
+            "wrong_topic" => vec![
+                (1, topic, first),
+                (2, b"kv-other".as_slice(), eviction),
+                (3, topic, third),
+            ],
             _ => panic!("unknown replay case"),
         };
         let live_events = [store_event(400, &fresh)];
-        tokio::join!(
+        let suspended_queries = [query(&old), query(&keep)];
+        let (advances, ()) = tokio::join!(
             publish_until_advanced(
                 &f.publisher,
                 &mut f.signals,
@@ -1552,13 +2290,15 @@ mod tests {
                 f.replay_server.as_ref().unwrap(),
                 &replies,
                 &f.indexer,
-                if case == "wrong_topic" {
-                    b"kv-other"
-                } else {
-                    b"kv"
-                }
+                &suspended_queries
             ),
         );
+        if case != "missing_start" {
+            assert!(
+                advances.contains(&1),
+                "partial replay Store was not applied: {case}"
+            );
+        }
         assert!(
             hits(&f.indexer, &old).is_empty(),
             "lost eviction must not leave old credit: {case}"
@@ -1616,171 +2356,7 @@ mod tests {
     }
 
     #[test]
-    fn dense_empty_adapter_name_does_not_alias_plain_tokens() {
-        let index = KvBlockIndexer::new();
-        let mut event = stored(
-            vec![ExternalBlockHash::Int(100)],
-            vec![1, 2, 3, 4],
-            Some("GPU"),
-            None,
-        );
-        event.lora_id = Some(7);
-        event.lora_name = Some(String::new());
-        assert!(!apply_batch(
-            &index,
-            &SourceId::from("p"),
-            0,
-            0,
-            &KVEventBatch {
-                ts: 1.0,
-                events: vec![KVEvent::BlockStored(event)],
-                data_parallel_rank: Some(0),
-            },
-            Some(4)
-        ));
-        assert!(hits(&index, &[1, 2, 3, 4]).is_empty());
-    }
-
-    #[test]
-    fn dense_unmodeled_metadata_never_becomes_device_credit() {
-        let mut unexpected = Vec::new();
-        for reason in [
-            "remote-worker",
-            "local-pool",
-            "session",
-            "extra-count",
-            "medium",
-        ] {
-            let index = KvBlockIndexer::new();
-            let mut event = stored(
-                vec![ExternalBlockHash::Int(100)],
-                vec![1, 2, 3, 4],
-                Some("GPU"),
-                None,
-            );
-            match reason {
-                "remote-worker" => event.locality = Some("REMOTE".into()),
-                "local-pool" => {
-                    event.ownership = Some("pool".into());
-                    event.locality = Some("LOCAL".into());
-                }
-                "session" => event.session_id = Some("unmodeled-session".into()),
-                "extra-count" => event.extra_keys = Some(vec![]),
-                "medium" => event.medium = Some("unmodeled-medium".into()),
-                _ => unreachable!(),
-            }
-            apply_batch(
-                &index,
-                &SourceId::from("p"),
-                0,
-                0,
-                &KVEventBatch {
-                    ts: 1.0,
-                    events: vec![KVEvent::BlockStored(event)],
-                    data_parallel_rank: Some(0),
-                },
-                Some(4),
-            );
-            let all = index.find_matches(&MatchQuery {
-                group_idx: 0,
-                local_hashes: local_hashes(&[1, 2, 3, 4], 4, None)
-                    .iter()
-                    .map(|hash| Arc::from(hex(hash)))
-                    .collect(),
-                tiers_of_interest: vec![StorageTier::Device, StorageTier::External],
-            });
-            if !all.is_empty() {
-                unexpected.push(reason);
-            }
-        }
-        assert!(
-            unexpected.is_empty(),
-            "unmodeled metadata received credit: {unexpected:?}"
-        );
-    }
-
-    #[test]
-    fn dense_rejected_batch_does_not_publish_its_valid_prefix() {
-        let index = KvBlockIndexer::new();
-        let mut unsupported = stored(
-            vec![ExternalBlockHash::Int(101)],
-            vec![5, 6, 7, 8],
-            Some("GPU"),
-            None,
-        );
-        unsupported.extra_keys = Some(vec![rmpv::Value::from("unmodeled-namespace")]);
-        apply_batch(
-            &index,
-            &SourceId::from("p"),
-            0,
-            0,
-            &KVEventBatch {
-                ts: 1.0,
-                events: vec![
-                    store_event(100, &[1, 2, 3, 4]),
-                    KVEvent::BlockStored(unsupported),
-                ],
-                data_parallel_rank: Some(0),
-            },
-            Some(4),
-        );
-        assert!(hits(&index, &[1, 2, 3, 4]).is_empty());
-        assert!(hits(&index, &[5, 6, 7, 8]).is_empty());
-    }
-
-    #[test]
-    fn dense_mode_skips_unmodeled_block_stored_variants() {
-        for (kind, sliding, lora_id, extra_hashes, colocated_matches) in [
-            (Some("sliding_attention"), None, None, 1, 1),
-            (None, Some(8), None, 1, 1),
-            (None, None, Some(7), 1, 1),
-            // block_hashes×block_size must equal token_ids.len(): 2×4 ≠ 4.
-            (None, None, None, 2, 1),
-        ] {
-            for dense_only in [false, true] {
-                let index = KvBlockIndexer::new();
-                let tokens = vec![1, 2, 3, 4];
-                let mut event = stored(
-                    vec![ExternalBlockHash::Int(10); extra_hashes],
-                    tokens.clone(),
-                    Some("GPU"),
-                    None,
-                );
-                event.kv_cache_spec_kind = kind.map(str::to_owned);
-                event.kv_cache_spec_sliding_window = sliding;
-                event.lora_id = lora_id;
-                apply_batch(
-                    &index,
-                    &SourceId::from("p"),
-                    0,
-                    0,
-                    &KVEventBatch {
-                        ts: 1.0,
-                        events: vec![KVEvent::BlockStored(event)],
-                        data_parallel_rank: Some(0),
-                    },
-                    dense_only.then_some(4),
-                );
-                let query = MatchQuery {
-                    group_idx: 0,
-                    local_hashes: local_hashes(&tokens, 4, None)
-                        .iter()
-                        .map(|hash| Arc::from(hex(hash)))
-                        .collect(),
-                    tiers_of_interest: vec![StorageTier::Device],
-                };
-                let expected = if dense_only { 0 } else { colocated_matches };
-                assert_eq!(
-                    index.find_matches(&query).len(),
-                    expected,
-                    "kind={kind:?} sliding={sliding:?} lora_id={lora_id:?} extra_hashes={extra_hashes} dense={dense_only}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn dense_mode_skips_zero_block_size_without_panicking() {
+    fn dense_zero_block_size_is_rejected_before_mutation() {
         let index = KvBlockIndexer::new();
         let tokens = vec![1, 2, 3, 4];
         let mut event = stored(
@@ -1790,20 +2366,21 @@ mod tests {
             None,
         );
         event.block_size = 0;
-        apply_batch(
-            &index,
-            &SourceId::from("p"),
-            0,
-            0,
-            &KVEventBatch {
-                ts: 1.0,
-                events: vec![KVEvent::BlockStored(event)],
-                data_parallel_rank: Some(0),
-            },
-            Some(4),
+        let batch = KVEventBatch {
+            ts: 1.0,
+            events: vec![KVEvent::BlockStored(event)],
+            data_parallel_rank: Some(0),
+        };
+        let rejection = Err(DenseBatchRejection {
+            reason: DenseRejectionReason::ZeroBlockSize,
+            event_index: 0,
+        });
+        assert_eq!(validate_dense_batch(&batch, 4), rejection);
+        assert_eq!(
+            apply_batch(&index, &SourceId::from("p"), 0, 0, &batch, Some(4)),
+            rejection
         );
-        // The guard must skip the event before local hashing (which would
-        // panic on a zero chunk size) and publish no credit.
+        // Explicit rejection is required even though zero-size hashing is empty.
         let query = MatchQuery {
             group_idx: 0,
             local_hashes: local_hashes(&tokens, 4, None)

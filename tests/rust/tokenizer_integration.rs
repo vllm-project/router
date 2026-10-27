@@ -1,3 +1,5 @@
+#![cfg(all(feature = "cpu", feature = "ready"))]
+
 //! Integration tests for tokenizers using real tokenizer data
 //!
 //! These tests download the TinyLlama tokenizer from HuggingFace to verify our tokenizer

@@ -291,7 +291,7 @@ async fn v1_completions(
 
     state
         .router
-        .route_completion_raw(Some(&headers), &body, &raw, None)
+        .route_completion_raw(Some(&headers), Arc::new(body), &raw, None)
         .await
 }
 
@@ -1308,7 +1308,7 @@ fn create_cors_layer(allowed_origins: Vec<String>) -> tower_http::cors::CorsLaye
     cors.max_age(Duration::from_secs(3600))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use super::*;
 

@@ -42,14 +42,7 @@ pub trait KvAwareOps: Send + Sync {
         lora_name: Option<&str>,
         cache_salt: Option<&str>,
         eligibility: Option<&[bool]>,
-    ) -> Option<KvSelectionReceipt> {
-        // Existing implementers have no per-target qualification capability.
-        // Preserve their API while conservatively withholding all token credit.
-        let token_ids = token_ids.filter(|_| {
-            eligibility.is_none_or(|mask| mask.len() == workers.len() && mask.iter().all(|v| *v))
-        });
-        self.select_worker_with_receipt(workers, token_ids, lora_name, cache_salt)
-    }
+    ) -> Option<KvSelectionReceipt>;
     fn begin_request(&self, receipt: KvSelectionReceipt) -> Option<KvRequestSlot>;
 }
 
@@ -937,7 +930,7 @@ impl KvAwareOps for KvAwarePolicy {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use super::*;
     use crate::core::{BasicWorker, DPAwareWorker, WorkerType};

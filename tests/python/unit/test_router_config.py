@@ -12,6 +12,8 @@ from vllm_router.launch_router import RouterArgs, launch_router
 from vllm_router.router import policy_from_str
 from vllm_router_rs import PolicyType
 
+pytestmark = [pytest.mark.ready, pytest.mark.cpu]
+
 
 class TestRouterConfigValidation:
     """Test router configuration validation logic."""
