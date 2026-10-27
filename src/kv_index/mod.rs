@@ -1,6 +1,7 @@
 //! Multi-tier KV cache placement index, fed by engine events.
 
 mod admit;
+mod binding;
 mod decode;
 
 use std::sync::Arc;

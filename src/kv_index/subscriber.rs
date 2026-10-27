@@ -1,13 +1,13 @@
 //! ZMQ SUB + DEALER replay subscriber, one task per (worker, rank).
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use parking_lot::Mutex;
 use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, info, warn};
 
+use crate::kv_index::admit::{validate_dense_batch, DenseBatchRejection};
+use crate::kv_index::binding::SourceLease;
 use crate::kv_index::indexer::KvBlockIndexer;
 use crate::kv_index::types::{ClearScope, ResidencyOwner, SourceId, StorageTier};
 use crate::kv_index::wire::{ExternalBlockHash, KVEvent, KVEventBatch};
@@ -84,20 +84,18 @@ pub(crate) fn spawn_dense(
 /// The supervisor shares this guard across owners of one publisher/exact topic.
 /// Its active lease only fences this local task, not the remote publisher.
 struct SubscriberBinding {
-    strict_rank: Arc<Mutex<bool>>,
-    active: Arc<AtomicBool>,
+    lease: SourceLease,
     #[cfg(test)]
     replay_cleanup_barrier: Option<Arc<tokio::sync::Barrier>>,
 }
 
-pub(crate) fn spawn_bound(
+pub(super) fn spawn_bound(
     source: EventSource,
     indexer: Arc<KvBlockIndexer>,
     signal_tx: Option<mpsc::Sender<IngestionSignal>>,
     ctx: Arc<zmq::Context>,
     expected_block_size: Option<u32>,
-    strict_rank: Arc<Mutex<bool>>,
-    active: Arc<AtomicBool>,
+    lease: SourceLease,
 ) -> SubscriberHandle {
     spawn_inner(
         source,
@@ -106,8 +104,7 @@ pub(crate) fn spawn_bound(
         ctx,
         expected_block_size,
         Some(SubscriberBinding {
-            strict_rank,
-            active,
+            lease,
             #[cfg(test)]
             replay_cleanup_barrier: None,
         }),
@@ -121,11 +118,7 @@ fn with_binding<T>(
     operation: impl FnOnce(bool) -> T,
 ) -> Option<T> {
     if let Some(binding) = binding {
-        let strict = binding.strict_rank.lock();
-        if !binding.active.load(Ordering::Acquire) {
-            return None;
-        }
-        Some(operation(*strict))
+        binding.lease.with_active(operation)
     } else {
         Some(operation(false))
     }
@@ -196,7 +189,7 @@ fn spawn_inner(
             if is_shutdown(&mut shutdown_rx)
                 || binding
                     .as_ref()
-                    .is_some_and(|binding| !binding.active.load(Ordering::Acquire))
+                    .is_some_and(|binding| !binding.lease.is_active())
             {
                 info!("kv_index subscriber {} shutting down", source_id);
                 break;
@@ -499,92 +492,6 @@ fn hash_str(h: &ExternalBlockHash) -> Arc<str> {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum DenseRejectionReason {
-    ExtraKeys,
-    Layout,
-    Residency,
-    Adapter,
-    ZeroBlockSize,
-    BlockSizeMismatch,
-    TokenCountMismatch,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct DenseBatchRejection {
-    reason: DenseRejectionReason,
-    event_index: usize,
-}
-
-fn validate_dense_batch(
-    batch: &KVEventBatch,
-    expected_block_size: u32,
-) -> Result<(), DenseBatchRejection> {
-    for (event_index, event) in batch.events.iter().enumerate() {
-        let reason = match event {
-            KVEvent::BlockStored(s) => {
-                // Keep unmodeled salt/MM/layout identities out of this token-only
-                // query space. Named LoRA is already isolated by the hash seed.
-                // session_id annotates the request, not the block's cache identity.
-                if s.extra_keys.as_ref().is_some_and(|keys| {
-                    keys.len() != s.block_hashes.len()
-                        || keys.iter().any(|key| {
-                            !key.is_nil()
-                                && !s.lora_name.as_ref().is_some_and(|name| {
-                                    key.as_array().is_some_and(|parts| {
-                                        parts.len() == 1 && parts[0].as_str() == Some(name.as_str())
-                                    })
-                                })
-                        })
-                }) {
-                    Some(DenseRejectionReason::ExtraKeys)
-                } else if s
-                    .kv_cache_spec_kind
-                    .as_deref()
-                    .is_some_and(|kind| kind != "full_attention")
-                    || s.kv_cache_spec_sliding_window.is_some()
-                {
-                    Some(DenseRejectionReason::Layout)
-                } else if !dense_residency_supported(
-                    s.medium.as_deref(),
-                    s.locality.as_deref(),
-                    s.ownership.as_deref(),
-                ) {
-                    Some(DenseRejectionReason::Residency)
-                } else if (s.lora_id.is_some() && s.lora_name.is_none())
-                    || s.lora_name.as_ref().is_some_and(|name| name.is_empty())
-                {
-                    Some(DenseRejectionReason::Adapter)
-                } else if s.block_size == 0 {
-                    Some(DenseRejectionReason::ZeroBlockSize)
-                } else if s.block_size != expected_block_size {
-                    Some(DenseRejectionReason::BlockSizeMismatch)
-                } else if s.block_hashes.len().checked_mul(s.block_size as usize)
-                    != Some(s.token_ids.len())
-                {
-                    Some(DenseRejectionReason::TokenCountMismatch)
-                } else {
-                    None
-                }
-            }
-            KVEvent::BlockRemoved(r) => (!dense_residency_supported(
-                r.medium.as_deref(),
-                r.locality.as_deref(),
-                r.ownership.as_deref(),
-            ))
-            .then_some(DenseRejectionReason::Residency),
-            KVEvent::AllBlocksCleared(_) => None,
-        };
-        if let Some(reason) = reason {
-            return Err(DenseBatchRejection {
-                reason,
-                event_index,
-            });
-        }
-    }
-    Ok(())
-}
-
 fn report_dense_rejection(
     rejection: DenseBatchRejection,
     source_id: &SourceId,
@@ -646,21 +553,6 @@ fn apply_batch(
     Ok(())
 }
 
-fn dense_residency_supported(
-    medium: Option<&str>,
-    locality: Option<&str>,
-    ownership: Option<&str>,
-) -> bool {
-    let pool = ownership.is_some_and(|owner| !owner.is_empty());
-    locality.is_none_or(|locality| locality == if pool { "REMOTE" } else { "LOCAL" })
-        && medium.is_none_or(|medium| {
-            matches!(
-                medium.to_ascii_uppercase().as_str(),
-                "GPU" | "DEVICE" | "CPU" | "HOST" | "HOST_PINNED" | "STORAGE" | "DISK"
-            )
-        })
-}
-
 /// Backfill `(last_seq, ∞)` from the replay ROUTER via a DEALER socket.
 /// Frames with `seq <= last_seq` are skipped — deduped so an out-of-order
 /// re-send can't re-apply a stale `remove` over a freshly re-`store`d block.
@@ -709,7 +601,7 @@ async fn replay(
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     let mut high = last_seq;
     loop {
-        if binding.is_some_and(|binding| !binding.active.load(Ordering::Acquire)) {
+        if binding.is_some_and(|binding| !binding.lease.is_active()) {
             return None;
         }
         if tokio::time::Instant::now() >= deadline {
@@ -812,7 +704,12 @@ fn hex(b: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use parking_lot::Mutex;
+
     use super::*;
+    use crate::kv_index::admit::DenseRejectionReason;
     use crate::kv_index::indexer::MatchQuery;
     use crate::kv_index::types::Locality;
     use crate::kv_index::wire::{AllBlocksCleared, BlockRemoved, BlockStored};
@@ -1493,14 +1390,102 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bound_active_frames_preserve_generation_and_external_invalidation_recovers() {
+        let ctx = Arc::new(zmq::Context::new());
+        let publisher = ctx.socket(zmq::PUB).unwrap();
+        let endpoint = "inproc://kv-bound-active-resume";
+        publisher.bind(endpoint).unwrap();
+        let indexer = Arc::new(KvBlockIndexer::new());
+        let strict_rank = Arc::new(Mutex::new(true));
+        let (tx, mut signals) = mpsc::channel(64);
+        let handle = spawn_bound(
+            EventSource {
+                source: SourceId::from("w0"),
+                dp_rank: 0,
+                pub_endpoint: endpoint.into(),
+                replay_endpoint: None,
+                topic: "kv".into(),
+                hwm: None,
+            },
+            indexer.clone(),
+            Some(tx),
+            ctx.clone(),
+            Some(4),
+            SourceLease {
+                strict_rank: strict_rank.clone(),
+                active: Arc::new(AtomicBool::new(true)),
+            },
+        );
+        let old = [1, 2, 3, 4];
+        let current = [5, 6, 7, 8];
+        let fresh = [9, 10, 11, 12];
+        publish_until_advanced(
+            &publisher,
+            &mut signals,
+            b"kv",
+            0,
+            0.0,
+            &[store_event(100, &old)],
+            Some(0),
+        )
+        .await;
+        let generation = indexer.source_generation_for_test();
+        publish_until_advanced(
+            &publisher,
+            &mut signals,
+            b"kv",
+            1,
+            1.0,
+            &[store_event(101, &current)],
+            Some(0),
+        )
+        .await;
+        assert_eq!(indexer.source_generation_for_test(), generation);
+        for tokens in [&old, &current] {
+            let found = hits(&indexer, tokens);
+            assert_eq!(found.len(), 1);
+            assert_eq!(found[0].segments, [(0, 1)]);
+        }
+
+        // External promotion/invalidation is not reflected by the subscriber's
+        // local `suspended` flag. Its next owned frame must still restore credit.
+        {
+            let _guard = strict_rank.lock();
+            indexer.invalidate_source(&SourceId::from("w0"), 0);
+        }
+        assert_eq!(indexer.source_generation_for_test(), generation + 1);
+        assert!(hits(&indexer, &current).is_empty());
+        publish_until_advanced(
+            &publisher,
+            &mut signals,
+            b"kv",
+            2,
+            2.0,
+            &[store_event(102, &fresh)],
+            Some(0),
+        )
+        .await;
+        assert_eq!(indexer.source_generation_for_test(), generation + 2);
+        assert!(hits(&indexer, &old).is_empty());
+        assert!(hits(&indexer, &current).is_empty());
+        assert_eq!(hits(&indexer, &fresh)[0].segments, [(0, 1)]);
+        publish_until_advanced(&publisher, &mut signals, b"kv", 3, 3.0, &[], Some(0)).await;
+        assert_eq!(indexer.source_generation_for_test(), generation + 2);
+        assert_eq!(hits(&indexer, &fresh)[0].segments, [(0, 1)]);
+        handle.shutdown();
+    }
+
+    #[tokio::test]
     async fn bound_foreign_live_frames_advance_without_mutation_or_resume() {
         let strict_rank = Arc::new(Mutex::new(true));
         let mut f = fixture_with_binding(
             false,
             Some(4),
             Some(SubscriberBinding {
-                strict_rank: strict_rank.clone(),
-                active: Arc::new(AtomicBool::new(true)),
+                lease: SourceLease {
+                    strict_rank: strict_rank.clone(),
+                    active: Arc::new(AtomicBool::new(true)),
+                },
                 replay_cleanup_barrier: None,
             }),
         );
@@ -1584,8 +1569,10 @@ mod tests {
                 true,
                 Some(4),
                 Some(SubscriberBinding {
-                    strict_rank: Arc::new(Mutex::new(true)),
-                    active: Arc::new(AtomicBool::new(true)),
+                    lease: SourceLease {
+                        strict_rank: Arc::new(Mutex::new(true)),
+                        active: Arc::new(AtomicBool::new(true)),
+                    },
                     replay_cleanup_barrier: None,
                 }),
             );
@@ -1659,8 +1646,10 @@ mod tests {
             true,
             Some(4),
             Some(SubscriberBinding {
-                strict_rank: strict_rank.clone(),
-                active: active.clone(),
+                lease: SourceLease {
+                    strict_rank: strict_rank.clone(),
+                    active: active.clone(),
+                },
                 replay_cleanup_barrier: Some(cleanup_barrier.clone()),
             }),
         );
@@ -1742,8 +1731,10 @@ mod tests {
             Some(tx),
             f._ctx.clone(),
             Some(4),
-            strict_rank,
-            Arc::new(AtomicBool::new(true)),
+            SourceLease {
+                strict_rank,
+                active: Arc::new(AtomicBool::new(true)),
+            },
         );
         publish_until_advanced(
             &publisher,

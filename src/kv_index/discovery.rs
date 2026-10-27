@@ -118,7 +118,7 @@ struct LiveSource {
     publisher: String,
     topic: String,
     rank: u32,
-    strict_rank: Arc<Mutex<bool>>,
+    lease: super::binding::SourceLease,
 }
 
 /// Orchestrates discovery + subscriber lifecycle for the router's workers.
@@ -413,6 +413,7 @@ impl KvIndexSupervisor {
         }
         // No admission can fail below this point. Share rank guards by exact
         // publisher/topic and promote them monotonically before publishing B.
+        let active = Arc::new(AtomicBool::new(true));
         let mut live_sources: Vec<LiveSource> = Vec::with_capacity(event_sources.len());
         for source in &event_sources {
             let strict_rank = workers
@@ -420,7 +421,7 @@ impl KvIndexSupervisor {
                 .flat_map(|worker| &worker.live_sources)
                 .chain(live_sources.iter())
                 .find(|live| live.publisher == source.pub_endpoint && live.topic == source.topic)
-                .map(|live| live.strict_rank.clone())
+                .map(|live| live.lease.strict_rank.clone())
                 .unwrap_or_else(|| Arc::new(Mutex::new(false)));
             let shared_rank = workers
                 .iter()
@@ -455,14 +456,16 @@ impl KvIndexSupervisor {
                 publisher: source.pub_endpoint.clone(),
                 topic: source.topic.clone(),
                 rank: source.dp_rank,
-                strict_rank,
+                lease: super::binding::SourceLease {
+                    strict_rank,
+                    active: active.clone(),
+                },
             });
         }
         if let Some(previous) = workers.remove(worker_url) {
             self.retire_worker(previous);
         }
         let indexer = self.acquire_identity(&key);
-        let active = Arc::new(AtomicBool::new(true));
         let mut ranks = Vec::with_capacity(event_sources.len());
         let mut handles = Vec::with_capacity(event_sources.len());
         for (ev, live) in event_sources.into_iter().zip(&live_sources) {
@@ -474,8 +477,7 @@ impl KvIndexSupervisor {
                 self.ctx.clone(),
                 (self.dense_http && !crate::backend::is_grpc_url(worker_url))
                     .then_some(key.block_size),
-                live.strict_rank.clone(),
-                active.clone(),
+                live.lease.clone(),
             );
             info!(
                 "kv_index {}: spawned subscriber rank{} (instance {})",
@@ -524,7 +526,7 @@ impl KvIndexSupervisor {
             handle.shutdown();
         }
         for live in &subs.live_sources {
-            let _guard = live.strict_rank.lock();
+            let _guard = live.lease.strict_rank.lock();
             subs.indexer.invalidate_source(&subs.source_id, live.rank);
         }
         self.release_identity(&subs.key);
@@ -650,11 +652,12 @@ fn parse_static_sources(value: &str) -> Result<HashMap<String, StaticSingleSourc
     Ok(normalized)
 }
 
-/// Normalize operator configuration into the live discovery shape.
-/// These are operator-provided wire facts, not a remote boot attestation.
+/// Adapt operator configuration to discovery DTOs, not remote observations.
 fn static_discovery(worker_url: &str, config: &StaticSingleSource) -> WorkerDiscovery {
     let server_info = ServerInfo {
+        // Model and block size are operator declarations.
         model_id: Some(config.model.clone()),
+        // The registry URL supplies a stable local key, not an engine boot ID.
         instance_id: Some(worker_url.to_string()),
         kv_block_size: Some(config.block_size),
         ..Default::default()
@@ -662,12 +665,15 @@ fn static_discovery(worker_url: &str, config: &StaticSingleSource) -> WorkerDisc
     WorkerDiscovery {
         server_info: Ok(server_info),
         sources: Ok(HashMap::from([(
+            // This static adapter declares one independently addressed DP1 rank.
             "0".to_owned(),
             KvEventSourceEntry {
+                // Endpoints, exact topic and HWM come from the operator.
                 endpoint: config.endpoint.clone(),
                 replay_endpoint: config.replay_endpoint.clone(),
                 topic: config.topic.clone(),
                 hwm: config.hwm,
+                // Fixed adapter contract, not remotely observed capabilities.
                 publisher: Some("zmq".to_owned()),
                 encoding: Some("msgpack".to_owned()),
                 schema_version: Some(1),
@@ -1301,8 +1307,8 @@ mod tests {
                 assert_eq!(supervisor.workers.lock().len(), 2);
                 if same_publisher && rank_b == 1 {
                     let workers = supervisor.workers.lock();
-                    let guard_a = &workers[&worker_a].live_sources[0].strict_rank;
-                    let guard_b = &workers[&worker_b].live_sources[0].strict_rank;
+                    let guard_a = &workers[&worker_a].live_sources[0].lease.strict_rank;
+                    let guard_b = &workers[&worker_b].live_sources[0].lease.strict_rank;
                     assert!(Arc::ptr_eq(guard_a, guard_b));
                     assert!(*guard_a.lock());
                 }
