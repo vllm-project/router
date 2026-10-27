@@ -78,6 +78,28 @@ pub fn prepare_completion_classified(
     tokenizer: &dyn Tokenizer,
     model_vocab_size: u32,
 ) -> Result<Vec<u32>, CompletionPreparationError> {
+    match preflight_completion(request, model_vocab_size)? {
+        CompletionPreflight::Text {
+            text,
+            add_special_tokens,
+        } => encode_completion_text(text, add_special_tokens, tokenizer, model_vocab_size),
+        CompletionPreflight::TokenIds(ids) => Ok(ids),
+    }
+}
+
+pub(crate) enum CompletionPreflight<'a> {
+    Text {
+        text: &'a str,
+        add_special_tokens: bool,
+    },
+    TokenIds(Vec<u32>),
+}
+
+/// Validate and classify input before acquiring tokenizer-specific capacity.
+pub(crate) fn preflight_completion(
+    request: &CompletionRequest,
+    model_vocab_size: u32,
+) -> Result<CompletionPreflight<'_>, CompletionPreparationError> {
     use CompletionPreparationError::{InvalidRequest, ServiceFailure, Unsupported};
 
     if model_vocab_size == 0 {
@@ -130,27 +152,36 @@ pub fn prepare_completion_classified(
             )));
         }
     }
-    let token_ids = match &request.prompt {
-        PromptInput::String(text) => {
-            let ids = tokenizer
-                .encode(text, add_special_tokens)
-                .map_err(|error| {
-                    ServiceFailure(format!("completion tokenization failed: {error}"))
-                })?;
-            if let Some(id) = ids.iter().find(|&&id| id >= model_vocab_size) {
-                return Err(ServiceFailure(format!(
-                    "completion token ID {id} is outside model vocabulary size {model_vocab_size}"
-                )));
-            }
-            ids
-        }
-        PromptInput::IntArray(ids) => ids.iter().map(|&id| id as u32).collect(),
-        PromptInput::StringArray(_) | PromptInput::IntBatch(_) => {
-            return Err(Unsupported(
-                "completion preparation does not support batched prompts".into(),
-            ));
-        }
-    };
+    match &request.prompt {
+        PromptInput::String(text) => Ok(CompletionPreflight::Text {
+            text,
+            add_special_tokens,
+        }),
+        PromptInput::IntArray(ids) => Ok(CompletionPreflight::TokenIds(
+            ids.iter().map(|&id| id as u32).collect(),
+        )),
+        PromptInput::StringArray(_) | PromptInput::IntBatch(_) => Err(Unsupported(
+            "completion preparation does not support batched prompts".into(),
+        )),
+    }
+}
+
+pub(crate) fn encode_completion_text(
+    text: &str,
+    add_special_tokens: bool,
+    tokenizer: &dyn Tokenizer,
+    model_vocab_size: u32,
+) -> Result<Vec<u32>, CompletionPreparationError> {
+    use CompletionPreparationError::{InvalidRequest, ServiceFailure};
+
+    let token_ids = tokenizer
+        .encode(text, add_special_tokens)
+        .map_err(|error| ServiceFailure(format!("completion tokenization failed: {error}")))?;
+    if let Some(id) = token_ids.iter().find(|&&id| id >= model_vocab_size) {
+        return Err(ServiceFailure(format!(
+            "completion token ID {id} is outside model vocabulary size {model_vocab_size}"
+        )));
+    }
     if token_ids.is_empty() {
         return Err(InvalidRequest(
             "completion preparation requires nonempty token input".into(),

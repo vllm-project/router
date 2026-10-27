@@ -14,8 +14,9 @@ use serde_json::Value;
 use tokio::sync::{Semaphore, TryAcquireError};
 use vllm_tokenizer::DynTokenizer;
 
-use crate::protocols::spec::CompletionRequest;
+use crate::protocols::spec::{CompletionRequest, PromptInput};
 
+use super::completion::{encode_completion_text, preflight_completion, CompletionPreflight};
 use super::preprocess::FrontendHandle;
 use super::{validate_completion_tokenizer_definition, EngineFrontend};
 
@@ -39,6 +40,21 @@ impl Drop for AbortPreparation {
 }
 
 impl CompletionPreparation {
+    #[cfg(all(test, feature = "cpu", feature = "ready"))]
+    pub(crate) fn with_test_capacity(
+        cpu: Arc<Semaphore>,
+        admission: Arc<Semaphore>,
+        request_timeout: Duration,
+        queue_timeout: Duration,
+    ) -> Self {
+        Self {
+            cpu,
+            admission,
+            request_timeout,
+            queue_timeout,
+        }
+    }
+
     #[cfg(all(test, feature = "cpu", feature = "ready"))]
     pub(crate) fn available_admission_permits(&self) -> usize {
         self.admission.available_permits()
@@ -66,6 +82,34 @@ impl CompletionPreparation {
         input: CompletionInput,
     ) -> Result<Option<Vec<u32>>, (StatusCode, String)> {
         let deadline = tokio::time::Instant::now() + self.request_timeout;
+        let prepared = match preflight_completion(&request, input.vocab_size) {
+            Ok(CompletionPreflight::Text {
+                add_special_tokens, ..
+            }) => {
+                return self
+                    .encode_text(request, input, add_special_tokens, deadline)
+                    .await;
+            }
+            Ok(CompletionPreflight::TokenIds(ids)) => Ok(ids),
+            Err(error) => Err(error),
+        };
+        let prepared = completion_preparation_result(prepared)?;
+        if tokio::time::Instant::now() >= deadline {
+            return Err((
+                StatusCode::REQUEST_TIMEOUT,
+                "Completion preparation timed out".into(),
+            ));
+        }
+        Ok(prepared)
+    }
+
+    async fn encode_text(
+        &self,
+        request: Arc<CompletionRequest>,
+        input: CompletionInput,
+        add_special_tokens: bool,
+        deadline: tokio::time::Instant,
+    ) -> Result<Option<Vec<u32>>, (StatusCode, String)> {
         let admission = self.admission.clone().try_acquire_owned().map_err(|_| {
             (
                 StatusCode::TOO_MANY_REQUESTS,
@@ -115,8 +159,12 @@ impl CompletionPreparation {
         }
         let job = tokio::task::spawn_blocking(move || {
             let (_admission, _cpu) = (admission, cpu);
-            super::prepare_completion_classified(
-                &request,
+            let PromptInput::String(text) = &request.prompt else {
+                unreachable!("Completion preflight validated a text prompt");
+            };
+            encode_completion_text(
+                text,
+                add_special_tokens,
                 input.tokenizer.as_ref(),
                 input.vocab_size,
             )
@@ -389,7 +437,7 @@ mod tests {
         });
         permits(&prep, 0, 0).await;
         assert_eq!(
-            prep.prepare(request(serde_json::json!([1])), input.clone())
+            prep.prepare(request(serde_json::json!("excess")), input.clone())
                 .await
                 .unwrap_err()
                 .0,
@@ -489,7 +537,7 @@ mod tests {
         );
         let held = prep.cpu.clone().acquire_owned().await.unwrap();
         assert_eq!(
-            prep.prepare(request(serde_json::json!([1])), input.clone())
+            prep.prepare(request(serde_json::json!("queued")), input.clone())
                 .await,
             Err((
                 StatusCode::REQUEST_TIMEOUT,
@@ -500,7 +548,8 @@ mod tests {
         permits(&prep, 1, 1).await;
         prep.cpu.close();
         assert_eq!(
-            prep.prepare(request(serde_json::json!([1])), input).await,
+            prep.prepare(request(serde_json::json!("unavailable")), input)
+                .await,
             Err((
                 StatusCode::SERVICE_UNAVAILABLE,
                 "Completion preparation unavailable".into(),
@@ -517,7 +566,7 @@ mod tests {
         let held = prep.cpu.clone().acquire_owned().await.unwrap();
         let (input, _started, _release, encodes) = controlled_input();
         let error = prep
-            .prepare(request(serde_json::json!([1])), input.clone())
+            .prepare(request(serde_json::json!("queued")), input.clone())
             .await
             .unwrap_err();
         assert_eq!(error.1, "Completion preparation queue timed out");
@@ -544,6 +593,58 @@ mod tests {
         );
         permits(&prep, 1, 1).await;
         assert_eq!(encodes.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn completion_preflight_preserves_deadline_and_known_error_priority() {
+        let mut prep = preparation(0);
+        Arc::get_mut(&mut prep).unwrap().request_timeout = Duration::ZERO;
+        let held_cpu = prep.cpu.clone().acquire_owned().await.unwrap();
+        let (input, _started, _release, encodes) = controlled_input();
+        for (body, vocab_size, status, error) in [
+            (
+                serde_json::json!({"prompt":[1,15]}),
+                16,
+                StatusCode::REQUEST_TIMEOUT,
+                "Completion preparation timed out",
+            ),
+            (
+                serde_json::json!({"prompt":"hello","cache_salt":"tenant"}),
+                16,
+                StatusCode::REQUEST_TIMEOUT,
+                "Completion preparation timed out",
+            ),
+            (
+                serde_json::json!({"prompt":[-1],"suffix":"tail"}),
+                16,
+                StatusCode::BAD_REQUEST,
+                "completion prompt contains negative token ID -1",
+            ),
+            (
+                serde_json::json!({"prompt":"hello","cache_salt":"tenant","add_special_tokens":1}),
+                16,
+                StatusCode::BAD_REQUEST,
+                "completion add_special_tokens must be a boolean",
+            ),
+            (
+                serde_json::json!({"prompt":[-1],"add_special_tokens":1}),
+                0,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "completion model vocabulary must be nonzero",
+            ),
+        ] {
+            let mut input = input.clone();
+            input.vocab_size = vocab_size;
+            assert_eq!(
+                prep.prepare(Arc::new(serde_json::from_value(body).unwrap()), input)
+                    .await,
+                Err((status, error.into()))
+            );
+            assert_eq!(prep.admission.available_permits(), 0);
+            assert_eq!(prep.cpu.available_permits(), 0);
+        }
+        assert_eq!(encodes.load(Ordering::Relaxed), 0);
+        drop(held_cpu);
     }
 
     #[test]

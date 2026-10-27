@@ -3951,9 +3951,94 @@ mod tests {
 
     #[tokio::test]
     async fn completion_classification_controls_actual_dispatch() {
+        assert_completion_classification_dispatch(None).await;
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum HeldCompletionCapacity {
+        Cpu,
+        Admission,
+    }
+
+    impl HeldCompletionCapacity {
+        fn hold(self, router: &mut Router) -> tokio::sync::OwnedSemaphorePermit {
+            let cpu = Arc::new(tokio::sync::Semaphore::new(1));
+            let admission = Arc::new(tokio::sync::Semaphore::new(1));
+            let held = match self {
+                Self::Cpu => cpu.clone().try_acquire_owned().unwrap(),
+                Self::Admission => admission.clone().try_acquire_owned().unwrap(),
+            };
+            assert_eq!(
+                cpu.available_permits(),
+                usize::from(matches!(self, Self::Admission))
+            );
+            assert_eq!(
+                admission.available_permits(),
+                usize::from(matches!(self, Self::Cpu))
+            );
+            router.completion_preparation =
+                crate::backend::completion_input::CompletionPreparation::with_test_capacity(
+                    cpu,
+                    admission,
+                    Duration::from_secs(2),
+                    Duration::from_millis(20),
+                );
+            held
+        }
+    }
+
+    #[tokio::test]
+    async fn completion_preflight_bypasses_held_cpu_capacity() {
+        assert_completion_classification_dispatch(Some(HeldCompletionCapacity::Cpu)).await;
+        assert_unsupported_completion_stream(Some(HeldCompletionCapacity::Cpu)).await;
+    }
+
+    #[tokio::test]
+    async fn completion_preflight_bypasses_held_admission_capacity() {
+        assert_completion_classification_dispatch(Some(HeldCompletionCapacity::Admission)).await;
+        assert_unsupported_completion_stream(Some(HeldCompletionCapacity::Admission)).await;
+    }
+
+    async fn assert_completion_classification_dispatch(capacity: Option<HeldCompletionCapacity>) {
         for (raw, vocab_size, fixture, status, encodes_expected, dispatched, error) in [
             (
                 bytes::Bytes::from_static(b" { \"model\":\"qwen3\", \"prompt\":\"hello world\", \"cache_salt\":\"tenant\" }\n"),
+                16,
+                "completion_word_level.json",
+                StatusCode::OK,
+                0,
+                true,
+                "",
+            ),
+            (
+                bytes::Bytes::from_static(br#"{"model":"qwen3","prompt":["hello","world"]}"#),
+                16,
+                "completion_word_level.json",
+                StatusCode::OK,
+                0,
+                true,
+                "",
+            ),
+            (
+                bytes::Bytes::from_static(br#"{"model":"qwen3","prompt":[[3],[15]]}"#),
+                16,
+                "completion_word_level.json",
+                StatusCode::OK,
+                0,
+                true,
+                "",
+            ),
+            (
+                bytes::Bytes::from_static(br#"{"model":"qwen3","prompt":"hello world","suffix":"tail"}"#),
+                16,
+                "completion_word_level.json",
+                StatusCode::OK,
+                0,
+                true,
+                "",
+            ),
+            (
+                bytes::Bytes::from_static(br#"{"model":"qwen3","prompt":[0,15,3],"add_special_tokens":true}"#),
                 16,
                 "completion_word_level.json",
                 StatusCode::OK,
@@ -3980,6 +4065,78 @@ mod tests {
                 "completion token ID 16 is outside model vocabulary size 16",
             ),
             (
+                bytes::Bytes::from_static(br#"{"model":"qwen3","prompt":[-1],"suffix":"tail"}"#),
+                16,
+                "completion_word_level.json",
+                StatusCode::BAD_REQUEST,
+                0,
+                false,
+                "completion prompt contains negative token ID -1",
+            ),
+            (
+                bytes::Bytes::from_static(br#"{"model":"qwen3","prompt":[16],"lora_path":"adapter"}"#),
+                16,
+                "completion_word_level.json",
+                StatusCode::BAD_REQUEST,
+                0,
+                false,
+                "completion token ID 16 is outside model vocabulary size 16",
+            ),
+            (
+                bytes::Bytes::from_static(br#"{"model":"qwen3","prompt":[],"cache_salt":"empty-ids"}"#),
+                16,
+                "completion_word_level.json",
+                StatusCode::BAD_REQUEST,
+                0,
+                false,
+                "completion preparation requires nonempty token input",
+            ),
+            (
+                bytes::Bytes::from_static(br#"{"model":"qwen3","prompt":[[3],[-1]],"suffix":"tail"}"#),
+                16,
+                "completion_word_level.json",
+                StatusCode::BAD_REQUEST,
+                0,
+                false,
+                "completion prompt contains negative token ID -1",
+            ),
+            (
+                bytes::Bytes::from_static(br#"{"model":"qwen3","prompt":[[3],[16]],"cache_salt":"tenant"}"#),
+                16,
+                "completion_word_level.json",
+                StatusCode::BAD_REQUEST,
+                0,
+                false,
+                "completion token ID 16 is outside model vocabulary size 16",
+            ),
+            (
+                bytes::Bytes::from_static(br#"{"model":"qwen3","prompt":[[3],[]],"lora_path":"adapter"}"#),
+                16,
+                "completion_word_level.json",
+                StatusCode::BAD_REQUEST,
+                0,
+                false,
+                "completion preparation requires nonempty token input",
+            ),
+            (
+                bytes::Bytes::from_static(br#"{"model":"qwen3","prompt":"hello","suffix":"tail","cache_salt":"tenant","lora_path":"adapter","add_special_tokens":1}"#),
+                16,
+                "completion_word_level.json",
+                StatusCode::BAD_REQUEST,
+                0,
+                false,
+                "completion add_special_tokens must be a boolean",
+            ),
+            (
+                bytes::Bytes::from_static(br#"{"model":"qwen3","prompt":[-1],"suffix":"tail","add_special_tokens":1}"#),
+                0,
+                "completion_word_level.json",
+                StatusCode::SERVICE_UNAVAILABLE,
+                0,
+                false,
+                "completion model vocabulary must be nonzero",
+            ),
+            (
                 bytes::Bytes::from_static(b"{\"model\":\"qwen3\",\"prompt\":\"hello world\"}"),
                 0,
                 "completion_word_level.json",
@@ -3997,13 +4154,39 @@ mod tests {
                 false,
                 "completion tokenization failed:",
             ),
+            (
+                bytes::Bytes::from_static(br#"{"model":"qwen3","prompt":"hello world"}"#),
+                16,
+                "completion_word_level.json",
+                StatusCode::OK,
+                1,
+                true,
+                "",
+            ),
         ] {
+            // Only supported text is subject to either encoding-capacity gate.
+            let (status, encodes_expected, dispatched, error) = match capacity {
+                Some(HeldCompletionCapacity::Cpu) if encodes_expected > 0 => (
+                    StatusCode::REQUEST_TIMEOUT,
+                    0,
+                    false,
+                    "Completion preparation queue timed out",
+                ),
+                Some(HeldCompletionCapacity::Admission) if encodes_expected > 0 => (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    0,
+                    false,
+                    "Completion preparation capacity exhausted",
+                ),
+                _ => (status, encodes_expected, dispatched, error),
+            };
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(
                 format!("http://{}", listener.local_addr().unwrap()),
                 WorkerType::Regular,
             ));
             let mut router = create_test_regular_router();
+            let held_capacity = capacity.map(|capacity| capacity.hold(&mut router));
             router.worker_registry = Arc::new(WorkerRegistry::new());
             router.worker_registry.register(worker.clone());
             router.policy_registry =
@@ -4036,6 +4219,7 @@ mod tests {
                 }),
             });
             let policy = router.policy_registry.get_default_policy();
+            assert_eq!(policy.name(), "kv_aware");
             let kv = policy
                 .as_any()
                 .downcast_ref::<crate::policies::KvAwarePolicy>()
@@ -4045,6 +4229,21 @@ mod tests {
             let captured = Arc::new(Mutex::new(Vec::new()));
             let (bodies, inflight_manager, inflight_target, inflight_worker) =
                 (captured.clone(), manager.clone(), target.clone(), worker.clone());
+            let mut request: CompletionRequest = serde_json::from_slice(&raw).unwrap();
+            // Wire [] is an empty IntBatch under the untagged enum; exercise
+            // the existing typed empty-IntArray contract without changing it.
+            if request.other.get("cache_salt").and_then(serde_json::Value::as_str) == Some("empty-ids") {
+                request.prompt = crate::protocols::spec::PromptInput::IntArray(vec![]);
+            }
+            let input = router.completion_input.as_ref().unwrap();
+            assert_eq!(request.model.as_deref(), Some(input.model.as_str()));
+            assert_eq!(input.model, "qwen3");
+            assert_eq!(input.vocab_size, vocab_size);
+            let explicit_ids = matches!(&request.prompt, crate::protocols::spec::PromptInput::IntArray(ids) if ids == &[0, 15, 3]);
+            if explicit_ids {
+                assert!(input.tokenizer.id_to_token(15).is_none());
+            }
+            let expected_prefill = if explicit_ids || encodes_expected > 0 { 3 } else { 0 };
             let app = axum::Router::new().route(
                 "/v1/completions",
                 axum::routing::post(move |body: axum::body::Bytes| {
@@ -4058,10 +4257,10 @@ mod tests {
                         assert_eq!(
                             manager.sample(&target),
                             crate::policies::LoadSample {
-                                active_prefill_tokens: 0,
+                                active_prefill_tokens: expected_prefill,
                                 active_requests: 1,
                             },
-                            "Unsupported dispatch must not receive prepared-input credit"
+                            "Only prepared IDs/text contribute input load; no source has cache credit"
                         );
                         assert_eq!(worker.load(), 1);
                         bodies.lock().push(body);
@@ -4070,7 +4269,6 @@ mod tests {
                 }),
             );
             let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-            let request: CompletionRequest = serde_json::from_slice(&raw).unwrap();
             let original_request = serde_json::to_value(&request).unwrap();
             let response = tokio::time::timeout(
                 Duration::from_secs(5),
@@ -4089,19 +4287,51 @@ mod tests {
             server.abort();
             assert_eq!(actual_status, status, "{raw:?}: {response_body:?}");
             if !dispatched {
-                assert!(
-                    std::str::from_utf8(&response_body).unwrap().contains(error),
-                    "{response_body:?}"
-                );
+                let actual_error = std::str::from_utf8(&response_body).unwrap();
+                if error == "completion tokenization failed:" {
+                    assert!(actual_error.starts_with(error), "{actual_error}");
+                } else {
+                    assert_eq!(actual_error, error);
+                }
             }
             assert_eq!(serde_json::to_value(&request).unwrap(), original_request);
             assert_eq!(encodes.load(Ordering::Relaxed), encodes_expected);
             assert_eq!(captured.lock().len(), usize::from(dispatched));
             if dispatched {
                 assert_eq!(captured.lock()[0], raw);
+                if encodes_expected == 0 {
+                    // Inspect the same real HTTP preparation consumer as the
+                    // Router dispatch, without a synthetic classification stub.
+                    let completion = prepare_completion_route(
+                        Some(input),
+                        &router.completion_preparation,
+                        policy.as_ref(),
+                        Arc::new(request.clone()),
+                        Some(&raw),
+                    )
+                    .await
+                    .unwrap();
+                    assert_eq!(
+                        completion.tokens,
+                        match request.prompt {
+                            crate::protocols::spec::PromptInput::IntArray(_) => Some(vec![0, 15, 3]),
+                            _ => None,
+                        },
+                        "Unsupported has no tokens; explicit IDs retain exact order without BOS/EOS"
+                    );
+                    assert_eq!(completion.raw_body, Some(&raw));
+                    assert_eq!(encodes.load(Ordering::Relaxed), 0);
+                }
             }
             assert_eq!(worker.load(), 0);
             assert_eq!(manager.sample(&target), crate::policies::LoadSample::default());
+            if let Some(held) = held_capacity {
+                assert_eq!(held.semaphore().available_permits(), 0);
+                assert_eq!(
+                    router.completion_preparation.available_admission_permits(),
+                    usize::from(matches!(capacity, Some(HeldCompletionCapacity::Cpu)))
+                );
+            }
         }
     }
 
@@ -5174,6 +5404,10 @@ mod tests {
 
     #[tokio::test]
     async fn unsupported_completion_stream_keeps_raw_body_and_output_lifecycle() {
+        assert_unsupported_completion_stream(None).await;
+    }
+
+    async fn assert_unsupported_completion_stream(capacity: Option<HeldCompletionCapacity>) {
         for echo in [false, true] {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(
@@ -5181,6 +5415,7 @@ mod tests {
                 WorkerType::Regular,
             ));
             let mut router = create_test_regular_router();
+            let held_capacity = capacity.map(|capacity| capacity.hold(&mut router));
             router.worker_registry = Arc::new(WorkerRegistry::new());
             router.worker_registry.register(worker.clone());
             router.policy_registry =
@@ -5190,19 +5425,22 @@ mod tests {
                     kv_penalty_external: 0.6,
                     kv_penalty_disk: 0.3,
                 }));
+            let encodes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             router.completion_input = Some(crate::backend::completion_input::CompletionInput {
                 model: "qwen3".into(),
                 cache_model: "qwen3".into(),
                 vocab_size: 16,
-                tokenizer: Arc::new(
-                    vllm_tokenizer::HuggingFaceTokenizer::new_hf(
+                tokenizer: Arc::new(CompletionCountingTokenizer {
+                    inner: vllm_tokenizer::HuggingFaceTokenizer::new_hf(
                         &std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                             .join("tests/rust/fixtures/tokenizer/completion_word_level.json"),
                     )
                     .unwrap(),
-                ),
+                    encodes: encodes.clone(),
+                }),
             });
             let policy = router.policy_registry.get_default_policy();
+            assert_eq!(policy.name(), "kv_aware");
             let kv = policy
                 .as_any()
                 .downcast_ref::<crate::policies::KvAwarePolicy>()
@@ -5210,9 +5448,12 @@ mod tests {
             let manager = kv.slot_manager().unwrap();
             let target = kv.target_for_worker(worker.as_ref());
             let raw = bytes::Bytes::from(format!(
-                " {{ \"prompt\": \"hello world\", \"cache_salt\": \"tenant\", \"stream\": true, \"echo\": {echo} }}\n"
+                " {{ \"model\": \"qwen3\", \"prompt\": \"hello world\", \"cache_salt\": \"tenant\", \"stream\": true, \"echo\": {echo} }}\n"
             ));
             let request: CompletionRequest = serde_json::from_slice(&raw).unwrap();
+            let input = router.completion_input.as_ref().unwrap();
+            assert_eq!(request.model.as_deref(), Some(input.model.as_str()));
+            assert_eq!((input.model.as_str(), input.vocab_size), ("qwen3", 16));
             let (tx, rx) =
                 tokio::sync::mpsc::unbounded_channel::<Result<bytes::Bytes, std::io::Error>>();
             let receiver = Arc::new(Mutex::new(Some(rx)));
@@ -5265,6 +5506,14 @@ mod tests {
                 manager.sample(&target),
                 crate::policies::LoadSample::default()
             );
+            assert_eq!(encodes.load(Ordering::Relaxed), 0);
+            if let Some(held) = held_capacity {
+                assert_eq!(held.semaphore().available_permits(), 0);
+                assert_eq!(
+                    router.completion_preparation.available_admission_permits(),
+                    usize::from(matches!(capacity, Some(HeldCompletionCapacity::Cpu)))
+                );
+            }
             server.abort();
         }
     }
