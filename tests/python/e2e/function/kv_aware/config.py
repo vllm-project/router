@@ -43,10 +43,6 @@ Routing scenario (``test_kv_aware_*`` under ``kv_aware/``):
 
 Dual-lane test **checkpoints** (terminal ``[e2e] checkpoint: ...``): prompt contract,
 two-worker prime, index settle, then **first B reuse before any A reuse**.
-
-Prompt metrics (token counts, block estimates for issue #331)::
-
-  python -m tests.python.e2e.function.kv_aware.measure_prompt_metrics --model-dir /path/to/model
 """
 
 from __future__ import annotations
