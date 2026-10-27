@@ -40,7 +40,7 @@ type NodeRef = Arc<RwLock<TreeNode>>;
 type IncomingBlock = (Arc<str>, Arc<str>); // (seq_hash, local_hash)
 type EdgeBlock = (HashSet<Arc<str>>, Arc<str>); // (historical seq hashes, local_hash)
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
 std::thread_local! {
     static AFTER_ANCHOR_CLONE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         const { std::cell::RefCell::new(None) };
@@ -48,7 +48,7 @@ std::thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
 fn after_anchor_clone() {
     let hook = AFTER_ANCHOR_CLONE.with(|slot| slot.borrow_mut().take());
     if let Some(hook) = hook {
@@ -56,7 +56,7 @@ fn after_anchor_clone() {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
 fn after_query_edge() {
     let hook = AFTER_QUERY_EDGE.with(|slot| slot.borrow_mut().take());
     if let Some(hook) = hook {
@@ -179,7 +179,7 @@ impl GroupShard {
                     .expect("known cursor must remain anchored; anchors are insert-only"),
                 None => self.root.clone(),
             };
-            #[cfg(test)]
+            #[cfg(all(test, feature = "cpu", feature = "ready"))]
             after_anchor_clone();
             let mut parent = node.write();
             if let Some(seq) = &cursor {
@@ -384,7 +384,7 @@ impl GroupShard {
             let Some(node) = self.anchors.get(seq).map(|n| n.clone()) else {
                 return;
             };
-            #[cfg(test)]
+            #[cfg(all(test, feature = "cpu", feature = "ready"))]
             after_anchor_clone();
             let mut n = node.write();
             let Some(idx) = n.edge.iter().position(|(aliases, _)| aliases.contains(seq)) else {
@@ -440,7 +440,7 @@ impl GroupShard {
                 .get(qi)
                 .and_then(|local| c.children.get(local).cloned());
             drop(c);
-            #[cfg(test)]
+            #[cfg(all(test, feature = "cpu", feature = "ready"))]
             after_query_edge();
         }
 
@@ -604,7 +604,7 @@ impl crate::policies::TieredMatchProvider for KvBlockIndexer {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use std::{cell::Cell, rc::Rc};
 

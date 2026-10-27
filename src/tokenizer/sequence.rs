@@ -165,7 +165,7 @@ impl Sequence {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use super::*;
     use crate::tokenizer::mock::MockTokenizer;

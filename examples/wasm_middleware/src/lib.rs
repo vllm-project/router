@@ -52,8 +52,13 @@ fn parse_reject_status(body: &[u8]) -> Option<u16> {
 
     if let Some(start) = find_subslice(body, PREFIX) {
         let rest = &body[start + PREFIX.len()..];
-        let digits: Vec<u8> = rest.iter().copied().take_while(|b| b.is_ascii_digit()).collect();
-        if rest.get(digits.len()..)
+        let digits: Vec<u8> = rest
+            .iter()
+            .copied()
+            .take_while(|b| b.is_ascii_digit())
+            .collect();
+        if rest
+            .get(digits.len()..)
             .is_some_and(|tail| tail.starts_with(b"__"))
             && !digits.is_empty()
         {

@@ -215,7 +215,7 @@ fn first_u64(value: &serde_json::Value, fields: &[&str]) -> Option<u64> {
         .find_map(|field| value.get(*field).and_then(serde_json::Value::as_u64))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use super::*;
     use crate::program_scheduling::{ProgramIdentity, ProgramSchedulerConfig, ProgramTarget};

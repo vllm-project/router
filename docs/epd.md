@@ -93,11 +93,11 @@ without P's EC handles. P errors or missing NIXL KV handles stop the pipeline.
 Dynamic P/D discovery is not supported with EPD yet.
 
 ```bash
-cargo test --test test_pd_routing test_epd_handoff
+cargo test --features cpu,ready --test test_pd_routing test_epd_handoff
 ```
 
 Focused tests:
 
 ```bash
-cargo test --lib routers::http::epd::tests
+cargo test --features cpu,ready --lib routers::http::epd::tests
 ```

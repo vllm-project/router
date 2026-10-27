@@ -35,7 +35,7 @@ pub fn error_chain(err: &dyn std::error::Error) -> String {
     chain.join(" caused by: ")
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use super::*;
     use std::fmt;

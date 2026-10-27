@@ -29,7 +29,7 @@ use vllm_router_rs::tokenizer::{
     traits::*,
 };
 
-#[path = "../tests/common/mod.rs"]
+#[path = "../tests/rust/common/mod.rs"]
 mod common;
 use common::ensure_tokenizer_cached;
 

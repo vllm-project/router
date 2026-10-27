@@ -574,7 +574,7 @@ fn discovered_block_size(server_info: &ServerInfo) -> Option<u32> {
         })
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use super::*;
 

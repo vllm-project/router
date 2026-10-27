@@ -215,18 +215,20 @@ vllm-router --policy cache_aware \
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `cache_threshold` | 0.5 | Minimum prefix match ratio to use cache-based routing |
+| `cache_threshold` | 0.5 | Minimum prefix match ratio over the full input |
 | `balance_abs_threshold` | 32 | Absolute load difference threshold for load balancing |
 | `balance_rel_threshold` | 1.1 | Relative load ratio threshold for load balancing |
 | `eviction_interval_secs` | 30 | Interval for cache eviction |
-| `max_tree_size` | 10000 | Maximum nodes per radix tree |
+| `max_tree_size` | 33,554,432 (`2^25`) | Character budget per worker per model |
+
+Trees are trimmed to `max_tree_size` during periodic eviction and may grow beyond it between cycles. This character budget is not a memory limit; actual memory usage also includes tree overhead and scales with the number of workers and models.
 
 ### Behavior
 
 1. **Balanced mode** (when load is even):
    - Find worker with highest prefix match for the request
    - If match rate > `cache_threshold`: route to that worker (cache hit)
-   - Otherwise: route to worker with smallest tree (most cache capacity)
+   - Otherwise: route to worker with lowest load
 
 2. **Imbalanced mode** (when load is skewed):
    - Route to worker with lowest load (shortest queue)

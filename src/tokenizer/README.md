@@ -937,14 +937,14 @@ The `Encoding` enum must:
 - Thread safety validation
 
 **Cache Integration Tests (8 tests + 1 ignored in tokenizer_cache_integration.rs):**
-- Use `tests/fixtures/tokenizer/byte_level_bpe.json`, a checked-in byte-level BPE tokenizer (256 byte symbols, 34 merges, `<s>`/`</s>`/`<unk>`); no network needed
+- Use `tests/rust/fixtures/tokenizer/byte_level_bpe.json`, a checked-in byte-level BPE tokenizer (256 byte symbols, 34 merges, `<s>`/`</s>`/`<unk>`); no network needed
 - Fixture pinned by vocab size, special tokens and token IDs
 - Cached vs uncached HuggingFace encodings compared field by field, including overflowing encodings from truncation
 - Byte accounting against `estimate_entry_bytes`
 - Byte-budget eviction and oversized bypass with real encodings
 - Decode and streaming through the `Tokenizer` wrapper
 - Concurrent access with eviction
-- `#[ignore]` TinyLlama repeat of the comparison plus the hash fixtures (`cargo test --test tokenizer_cache_integration -- --ignored`)
+- `#[ignore]` TinyLlama repeat of the comparison plus the hash fixtures (`cargo test --features cpu,ready --test tokenizer_cache_integration -- --ignored`)
 
 **Cache Metrics Tests (5 tests in tokenizer_cache_metrics.rs):**
 - Capturing `metrics::Recorder` checks the occupancy gauges sum over live instances, follow eviction, `clear()` and `Drop`, and stay consistent under concurrent inserts and clears, including a stalled publication that must not be overtaken by a later clear or by another instance's publication

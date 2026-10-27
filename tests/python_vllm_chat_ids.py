@@ -9,7 +9,7 @@ process can `import vllm`. No model names or golden id lists in-tree.
   python tests/python_vllm_chat_ids.py /path/to/model \\
     '[{"role":"user","content":"hello"}]'
 
-  VLLM_ROUTER_MODEL=/path/to/model cargo test --lib \\
+  VLLM_ROUTER_MODEL=/path/to/model cargo test --features cpu,ready --lib \\
     vllm_chat_tokenize_matches_python_vllm -- --nocapture
 """
 
@@ -34,7 +34,9 @@ def main() -> None:
         return_dict=True,
     )
     # transformers returns BatchEncoding (a Mapping, not necessarily dict).
-    ids = enc["input_ids"] if hasattr(enc, "__getitem__") and "input_ids" in enc else enc
+    ids = (
+        enc["input_ids"] if hasattr(enc, "__getitem__") and "input_ids" in enc else enc
+    )
     if ids and isinstance(ids[0], (list, tuple)):
         ids = ids[0]
     print(json.dumps([int(x) for x in ids]))

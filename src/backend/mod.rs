@@ -22,8 +22,10 @@ pub(crate) mod encode_cache;
 pub mod frontend;
 pub mod grpc;
 pub mod health;
+pub(crate) mod l1_encode_cache;
 pub mod openai;
 pub mod preprocess;
+mod tokenizer_determinism;
 mod vllm_frontend;
 
 /// Opt-in router stage clocks.
@@ -38,13 +40,15 @@ pub use control::{
     get_grpc_model_info, get_grpc_server_info, model_info_json, openai_models_json,
     server_info_json,
 };
+pub use convert::prepare_grpc_completion;
 pub use detect::{
     classify_worker_urls, connection_mode_from_url, grpc_connect_uri, is_grpc_url, parse_dp_rank,
     strip_dp_suffix, WorkerPoolKind,
 };
-pub use frontend::{EngineFrontend, PreparedChat};
+pub use frontend::{EngineFrontend, PrepareError, PreparedRequest};
 pub use grpc::GrpcEngineBackend;
 pub use health::check_grpc_health;
+pub use l1_encode_cache::{L1CacheConfig, L1CacheStats, L1HashStrategy};
 pub use preprocess::TokenizerCache;
 
 /// Prost/Tonic bindings for vLLM Inference + Control (`vllm-proto` on crates.io).
@@ -125,7 +129,7 @@ pub(crate) mod stream_output {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "cpu", feature = "ready"))]
     mod tests {
         use super::*;
 

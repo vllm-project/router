@@ -4,7 +4,7 @@ Uses a local BPE fixture and mock gRPC worker to compare L0 off/on through
 `EngineFrontend::prepare` and `dispatch`. No model download or GPU is needed.
 
 ```bash
-cargo test --release --test grpc_frontend_bench -- --ignored --nocapture
+cargo test --features cpu,ready --release --test grpc_frontend_bench -- --ignored --nocapture
 ```
 
 Settings use the `VLLM_ROUTER_BENCH_` prefix, as in #290:
@@ -29,3 +29,6 @@ hit/miss counts exclude warmup.
 Measurements exclude the HTTP listener, routing policies and model execution.
 Increase `MEASURE_SECS` and repeat on an idle host for comparisons. Results
 with this small fixture may differ from production tokenizers.
+
+The L1 prefix-cache benchmark is in
+[grpc_frontend_l1.md](grpc_frontend_l1.md).

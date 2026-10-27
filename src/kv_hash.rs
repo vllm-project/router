@@ -59,7 +59,7 @@ impl BlockKeyGenerator {
             .collect()
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "cpu", feature = "ready"))]
     pub(crate) fn none_hash(&self) -> SequenceHash {
         self.none_hash
     }
@@ -109,7 +109,7 @@ fn digest(bytes: &[u8]) -> SequenceHash {
     Sha256::digest(bytes).into()
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use super::*;
 
@@ -164,9 +164,10 @@ mod tests {
         // (sha256_cbor) and vllm/v1/core/kv_cache_utils.py
         // (init_none_hash / hash_block_tokens). No engine run is implied.
         // Canonical-CBOR inputs are retained for representation review.
-        let oracle: Oracle =
-            serde_json::from_str(include_str!("../tests/fixtures/kv_cbor/python_oracle.json"))
-                .unwrap();
+        let oracle: Oracle = serde_json::from_str(include_str!(
+            "../tests/rust/fixtures/kv_cbor/python_oracle.json"
+        ))
+        .unwrap();
         assert_eq!(oracle.algorithm, "sha256_cbor");
         assert_eq!(oracle.cbor2_version, "5.6.5");
         assert_eq!(oracle.block_size, 16);

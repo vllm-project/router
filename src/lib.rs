@@ -283,7 +283,7 @@ impl Router {
         balance_abs_threshold = 64,
         balance_rel_threshold = 1.5,
         eviction_interval_secs = 120,
-        max_tree_size = 2usize.pow(26),
+        max_tree_size = 2usize.pow(25),
         max_payload_size = 512 * 1024 * 1024,  // 512MB default for large batches
         intra_node_data_parallel_size = 1,
         api_key = None,

@@ -231,7 +231,7 @@ fn parse_labels(labels: &str) -> HashMap<String, String> {
     result
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use super::*;
 
