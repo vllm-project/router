@@ -25,8 +25,10 @@ pub(crate) mod encode_cache;
 pub mod frontend;
 pub mod grpc;
 pub mod health;
+pub(crate) mod l1_encode_cache;
 pub mod openai;
 pub mod preprocess;
+mod tokenizer_determinism;
 mod vllm_frontend;
 
 /// Opt-in router stage clocks.
@@ -53,6 +55,7 @@ pub use detect::{
 pub use frontend::{EngineFrontend, PrepareError, PreparedRequest};
 pub use grpc::GrpcEngineBackend;
 pub use health::check_grpc_health;
+pub use l1_encode_cache::{L1CacheConfig, L1CacheStats, L1HashStrategy};
 pub use preprocess::TokenizerCache;
 
 /// Prost/Tonic bindings for vLLM Inference + Control (`vllm-proto` on crates.io).

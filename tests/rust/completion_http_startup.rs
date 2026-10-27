@@ -58,6 +58,11 @@ fn completion_public_startup_loads_assets_and_routes_owned_request() {
             .env("VLLM_ROUTER_MODEL", assets.path())
             .env("VLLM_ROUTER_COMPLETION_MODEL_ALIAS", "public")
             .env("VLLM_ROUTER_COMPLETION_CACHE_MODEL", "engine")
+            // HTTP Completion must not parse or construct the gRPC caches.
+            .env("VLLM_ROUTER_L0_CACHE", "1")
+            .env("VLLM_ROUTER_L1_CACHE", "1")
+            .env("VLLM_ROUTER_L0_MAX_BYTES", "invalid")
+            .env("VLLM_ROUTER_L1_MAX_BYTES", "invalid")
             .env_remove("VLLM_ROUTER_TOKENIZER")
             .env_remove("VLLM_ROUTER_KV_EVENT_SOURCES")
             .status()
@@ -111,6 +116,9 @@ fn completion_public_startup_loads_assets_and_routes_owned_request() {
         let response = app.oneshot(Request::builder().method("POST").uri("/v1/completions").header("content-type", "application/json").body(Body::from(r#"{"prompt":[-1]}"#)).unwrap()).await.unwrap();
         assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
         assert_eq!(captured.lock().unwrap().len(), 1, "invalid prepared input cannot dispatch");
+        for name in ["VLLM_ROUTER_L0_CACHE", "VLLM_ROUTER_L1_CACHE", "VLLM_ROUTER_L0_MAX_BYTES", "VLLM_ROUTER_L1_MAX_BYTES"] {
+            std::env::remove_var(name);
+        }
         let error = Router::new(vec!["grpc://127.0.0.1:1".into()], &ctx).await.unwrap_err();
         assert!(error.contains("requires static HTTP Regular kv_aware"), "{error}");
         server.abort();

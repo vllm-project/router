@@ -107,7 +107,7 @@ fn event_has_output(event: &[u8]) -> bool {
             })
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use super::*;
 

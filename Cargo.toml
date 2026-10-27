@@ -63,6 +63,9 @@ ulid = "1.2.1"
 parking_lot = "0.12.4"
 thiserror = "2.0.12"
 regex = "1.10"
+aho-corasick = "1.1"
+foldhash = "0.2"
+hashbrown = "0.16"
 url = "2.5.4"
 tokio-stream = { version = "0.1", features = ["sync"] }
 anyhow = "1.0"
@@ -183,6 +186,10 @@ path = "tests/rust/grpc_frontend_bench.rs"
 [[test]]
 name = "grpc_frontend_l0"
 path = "tests/rust/grpc_frontend_l0.rs"
+
+[[test]]
+name = "grpc_frontend_l1"
+path = "tests/rust/grpc_frontend_l1.rs"
 
 [[test]]
 name = "grpc_vs_http_e2e"

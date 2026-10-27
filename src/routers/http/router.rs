@@ -342,13 +342,13 @@ impl Router {
         };
         let request_timeout = Duration::from_secs(ctx.router_config.request_timeout_secs);
         let completion_enabled = std::env::var_os("VLLM_ROUTER_COMPLETION_MODEL_ALIAS").is_some();
-        let frontend =
-            if pool_kind == Some(crate::backend::WorkerPoolKind::Http) && !completion_enabled {
-                crate::backend::EngineFrontend::with_request_timeout(request_timeout)
-            } else {
-                crate::backend::EngineFrontend::from_env(request_timeout)
-                    .map_err(|error| format!("tokenizer cache: {error}"))?
-            };
+        let frontend = if pool_kind == Some(crate::backend::WorkerPoolKind::Http) {
+            crate::backend::frontend::warn_ignored_encoding_caches();
+            crate::backend::EngineFrontend::with_request_timeout(request_timeout)
+        } else {
+            crate::backend::EngineFrontend::from_env(request_timeout)
+                .map_err(|error| format!("tokenizer cache: {error}"))?
+        };
         let completion_input = if completion_enabled {
             if pool_kind != Some(crate::backend::WorkerPoolKind::Http)
                 || ctx.router_config.intra_node_data_parallel_size != 1
