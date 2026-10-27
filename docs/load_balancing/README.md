@@ -215,18 +215,20 @@ vllm-router --policy cache_aware \
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `cache_threshold` | 0.5 | Minimum prefix match ratio to use cache-based routing |
+| `cache_threshold` | 0.5 | Minimum prefix match ratio over the full input |
 | `balance_abs_threshold` | 32 | Absolute load difference threshold for load balancing |
 | `balance_rel_threshold` | 1.1 | Relative load ratio threshold for load balancing |
 | `eviction_interval_secs` | 30 | Interval for cache eviction |
-| `max_tree_size` | 10000 | Maximum nodes per radix tree |
+| `max_tree_size` | 33,554,432 (`2^25`) | Character budget per worker per model |
+
+Trees are trimmed to `max_tree_size` during periodic eviction and may grow beyond it between cycles. This character budget is not a memory limit; actual memory usage also includes tree overhead and scales with the number of workers and models.
 
 ### Behavior
 
 1. **Balanced mode** (when load is even):
    - Find worker with highest prefix match for the request
    - If match rate > `cache_threshold`: route to that worker (cache hit)
-   - Otherwise: route to worker with smallest tree (most cache capacity)
+   - Otherwise: route to worker with lowest load
 
 2. **Imbalanced mode** (when load is skewed):
    - Route to worker with lowest load (shortest queue)
@@ -242,20 +244,22 @@ vllm-router --policy cache_aware \
 
 ## KV Aware
 
-The `kv_aware` policy scores workers using the request's reusable KV blocks and current load. It is supported in regular, co-located routing mode only; it is not supported with PD disaggregation. In PD mode, the effective prefill and decode policies must use other policies. KV placement credit requires gRPC workers because the gRPC chat route supplies token IDs to the policy. With HTTP workers, the policy degrades to load-only scoring and does not use KV event placement.
+`kv_aware` balances requests using reusable KV blocks and current worker load. Use it for workloads with repeated prompt prefixes. It supports regular HTTP or [gRPC](../backend/grpc.md) worker pools; PD disaggregation is not supported.
 
 ```bash
 vllm-router --policy kv_aware \
-  --router-temperature 0.2 \
-  --kv-penalty-host 0.8 \
-  --kv-penalty-external 0.6 \
-  --kv-penalty-disk 0.3 \
   --worker-urls grpc://worker1:8000 grpc://worker2:8000
 ```
 
-For each candidate, the scorer computes `ptoken = new_prefill_tokens + active_prefill_tokens` and projects the request count as `max(slot_manager.active_requests, Worker::load) + 1`. It multiplies `ptoken` by that projected count, so the score estimates the load after admitting this request and includes its remaining prefill work even when the worker is currently idle. Zero-cost cases, such as a request with no prefill work, are resolved by the KV-work and current-load tie-breaks.
+Workers must publish KV events. If discovery is unavailable, supply `--kv-event-source WORKER_URL=tcp://HOST:PORT` per worker, with matching `--kv-event-model` and `--kv-event-block-size`. HTTP text requests need a render endpoint or, for simple prompts, `/tokenize`. Without usable KV information, requests are routed by load.
 
-`--router-temperature 0` selects a minimum-cost worker. A positive temperature samples among candidates by their relative costs. Device reuse has full credit; the host, external, and disk `--kv-penalty-*` flags configure transfer-credit ratios for those tiers. A higher credit means more reuse value and lower transfer cost.
+`--router-temperature 0` selects the lowest-cost worker; positive values spread requests probabilistically.
+
+### Session affinity
+
+Affinity is off by default. Add `--kv-aware-session-affinity-ttl-secs 1800` for a 30-minute idle timeout. Send the same `session_params.session_id` or `x-session-id` header on each request. Agent metadata (`vllm_xargs.agentic_context`, `agent_hint`) and framework session headers take precedence when present.
+
+Affinity can improve multi-turn cache reuse but may increase waiting time on a busy worker. Unavailable workers trigger fresh selection. Bindings are local to each router, so multiple router replicas need ingress stickiness.
 
 ---
 

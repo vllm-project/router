@@ -42,7 +42,7 @@ pub struct GrpcStreamTask {
 }
 
 impl GrpcStreamTask {
-    #[cfg(test)]
+    #[cfg(all(test, feature = "cpu", feature = "ready"))]
     pub(crate) fn new(handle: tokio::task::JoinHandle<()>) -> Self {
         Self {
             handle: Arc::new(std::sync::Mutex::new(Some(handle))),
@@ -174,6 +174,7 @@ impl GrpcEngineBackend {
         let encode_ms = tokenized.encode_ms;
         let frontend_ms = tokenized.frontend_ms();
         let encode_backend = tokenized.encode_backend;
+        let cached_tokens = tokenized.cached_tokens;
 
         let request_id = match shape {
             ResponseShape::Chat => format!("chatcmpl-{}", Uuid::new_v4()),
@@ -244,6 +245,7 @@ impl GrpcEngineBackend {
             "adapt_ms": adapt_ms,
             "template_ms": template_ms,
             "encode_ms": encode_ms,
+            "encode_cached_tokens": cached_tokens,
             "frontend_ms": frontend_ms,
             "xfer_ms": xfer_ms,
             "grpc_connect_ms": grpc_connect_ms,
@@ -700,7 +702,7 @@ fn has_generated_output(msg: &super::pb::GenerateResponse, text: &str) -> bool {
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use super::*;
     use crate::backend::pb::{GenerateResponse, PromptInfo, SequenceOutput};

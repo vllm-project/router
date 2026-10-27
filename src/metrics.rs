@@ -76,6 +76,14 @@ pub fn init_metrics() {
 
     // Policy metrics
     describe_counter!(
+        "vllm_router_kv_routing_inputs_total",
+        "KV-aware token preparation by transport and result"
+    );
+    describe_counter!(
+        "vllm_router_kv_placement_lookups_total",
+        "KV-aware placement lookups and reasons for skipping them"
+    );
+    describe_counter!(
         "vllm_router_policy_decisions_total",
         "Total routing policy decisions by policy and worker"
     );
@@ -378,6 +386,44 @@ pub fn init_metrics() {
         "vllm_tokenizer_cache_bytes",
         "Estimated bytes retained by the tokenizer encode cache"
     );
+
+    // L1 prefix encoding cache metrics
+    describe_counter!(
+        "vllm_tokenizer_l1_lookups_total",
+        "Total prompts encoded through the L1 cache"
+    );
+    describe_counter!(
+        "vllm_tokenizer_l1_hits_total",
+        "Total L1 lookups that reused at least one cached token"
+    );
+    describe_counter!(
+        "vllm_tokenizer_l1_cached_tokens_total",
+        "Total prompt tokens taken from the L1 cache"
+    );
+    describe_counter!(
+        "vllm_tokenizer_l1_encoded_tokens_total",
+        "Total prompt tokens encoded by the tokenizer on the L1 path"
+    );
+    describe_counter!(
+        "vllm_tokenizer_l1_evictions_total",
+        "Total L1 tree nodes evicted to satisfy the byte or node budget"
+    );
+    describe_counter!(
+        "vllm_tokenizer_l1_verify_mismatches_total",
+        "Total L1 verify-mode mismatches"
+    );
+    describe_counter!(
+        "vllm_tokenizer_l1_bypasses_total",
+        "Total prompts on an L1-enabled model that skipped L1, by reason"
+    );
+    describe_gauge!(
+        "vllm_tokenizer_l1_nodes",
+        "Current number of L1 prefix tree nodes"
+    );
+    describe_gauge!(
+        "vllm_tokenizer_l1_bytes",
+        "Estimated bytes retained by the L1 cache"
+    );
 }
 
 pub fn start_prometheus(config: PrometheusConfig) {
@@ -505,6 +551,12 @@ pub struct RouterMetrics;
 pub struct TokenizerMetrics;
 
 impl RouterMetrics {
+    pub fn record_kv_placement_lookup(result: &'static str) {
+        counter!("vllm_router_kv_placement_lookups_total", "result" => result).increment(1);
+    }
+    pub fn record_kv_routing_input(transport: &'static str, result: &'static str) {
+        counter!("vllm_router_kv_routing_inputs_total", "transport" => transport, "result" => result).increment(1);
+    }
     // Request metrics
     pub fn record_request(route: &str) {
         counter!("vllm_router_requests_total",
@@ -1049,9 +1101,39 @@ impl TokenizerMetrics {
     pub fn set_cache_bytes(bytes: usize) {
         gauge!("vllm_tokenizer_cache_bytes").set(bytes as f64);
     }
+
+    // L1 prefix encoding cache metrics
+    pub fn record_l1_lookup(cached_tokens: usize, encoded_tokens: usize) {
+        counter!("vllm_tokenizer_l1_lookups_total").increment(1);
+        if cached_tokens > 0 {
+            counter!("vllm_tokenizer_l1_hits_total").increment(1);
+        }
+        counter!("vllm_tokenizer_l1_cached_tokens_total").increment(cached_tokens as u64);
+        counter!("vllm_tokenizer_l1_encoded_tokens_total").increment(encoded_tokens as u64);
+    }
+
+    pub fn record_l1_evictions(count: u64) {
+        counter!("vllm_tokenizer_l1_evictions_total").increment(count);
+    }
+
+    pub fn record_l1_verify_mismatch() {
+        counter!("vllm_tokenizer_l1_verify_mismatches_total").increment(1);
+    }
+
+    pub fn record_l1_bypass(reason: &'static str) {
+        counter!("vllm_tokenizer_l1_bypasses_total", "reason" => reason).increment(1);
+    }
+
+    pub fn set_l1_nodes(nodes: usize) {
+        gauge!("vllm_tokenizer_l1_nodes").set(nodes as f64);
+    }
+
+    pub fn set_l1_bytes(bytes: usize) {
+        gauge!("vllm_tokenizer_l1_bytes").set(bytes as f64);
+    }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use super::*;
     use std::net::TcpListener;

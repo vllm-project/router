@@ -6,13 +6,14 @@
 
 use crate::config::RouterConfig;
 use crate::core::{CircuitBreakerConfig, Worker, WorkerFactory, WorkerRegistry, WorkerType};
+use crate::policies::kv_aware_ops;
 use crate::protocols::spec::{
     ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest,
     InferenceGenerateRequest, RerankRequest, ResponsesRequest,
 };
 use crate::protocols::worker_spec::{
-    ServerInfo, WorkerApiResponse, WorkerConfigRequest, WorkerErrorResponse, WorkerInfo,
-    WorkerListResponse, WorkerStats, WorkerTypeStats,
+    WorkerApiResponse, WorkerConfigRequest, WorkerErrorResponse, WorkerInfo, WorkerListResponse,
+    WorkerStats, WorkerTypeStats,
 };
 use crate::routers::{RouterTrait, WorkerManagement};
 use async_trait::async_trait;
@@ -24,6 +25,7 @@ use axum::{
 };
 use dashmap::DashMap;
 use std::sync::Arc;
+use std::time::Duration;
 use tracing::{info, warn};
 
 /// Router identifier
@@ -157,23 +159,15 @@ impl RouterManager {
         // Build labels from configuration
         let mut labels = config.labels.clone();
 
-        // Query server info if model_id not provided
+        // Discover the model through the backend's standard model API if the
+        // caller did not provide it.
         let model_id = if let Some(model_id) = config.model_id {
             model_id
         } else {
-            match self.query_server_info(&config.url).await {
-                Ok(info) => {
-                    // Extract model_id from server info
-                    info.model_id
-                        .or_else(|| {
-                            info.model_path
-                                .as_ref()
-                                .and_then(|path| path.split('/').next_back().map(|s| s.to_string()))
-                        })
-                        .unwrap_or_else(|| "unknown".to_string())
-                }
+            match self.query_model_id(&config.url).await {
+                Ok(model_id) => model_id,
                 Err(e) => {
-                    warn!("Failed to query server info from {}: {}", config.url, e);
+                    warn!("Failed to discover model from {}: {}", config.url, e);
                     "unknown".to_string()
                 }
             }
@@ -217,6 +211,17 @@ impl RouterManager {
         // Extract policy hint from labels if provided
         let policy_hint = labels.get("policy").map(|s| s.as_str());
         let policy = self.policy_registry.on_worker_added(&model_id, policy_hint);
+        if worker_arc.worker_type() == WorkerType::Regular {
+            if let Some(kv) = kv_aware_ops(policy.as_ref()) {
+                kv.register_worker(worker_arc.as_ref(), None, None);
+            }
+            let default = self.policy_registry.get_default_policy();
+            if !Arc::ptr_eq(&policy, &default) {
+                if let Some(kv) = kv_aware_ops(default.as_ref()) {
+                    kv.register_worker(worker_arc.as_ref(), None, None);
+                }
+            }
+        }
 
         // Log which type of router would handle this worker (for debugging)
         let expected_router = match config.worker_type.as_deref() {
@@ -252,21 +257,27 @@ impl RouterManager {
         &self,
         url: &str,
     ) -> Result<WorkerApiResponse, WorkerErrorResponse> {
-        // Get worker to extract model_id before removing
-        let model_id = self
-            .worker_registry
-            .get_by_url(url)
-            .map(|worker| worker.model_id().to_string());
-
-        if let Some(_worker) = self.worker_registry.remove_by_url(url) {
-            // Notify PolicyRegistry about worker removal
-            if let Some(ref model_id) = model_id {
-                self.policy_registry.on_worker_removed(model_id);
-
-                info!("Removed worker with URL {} for model {}", url, model_id);
-            } else {
-                info!("Removed worker with URL {}", url);
+        if let Some(worker) = self.worker_registry.remove_by_url(url) {
+            if worker.worker_type() == WorkerType::Regular {
+                let policy = self
+                    .policy_registry
+                    .get_policy_or_default(worker.model_id());
+                if let Some(kv) = kv_aware_ops(policy.as_ref()) {
+                    kv.unregister_worker(url);
+                }
+                let default = self.policy_registry.get_default_policy();
+                if !Arc::ptr_eq(&policy, &default) {
+                    if let Some(kv) = kv_aware_ops(default.as_ref()) {
+                        kv.unregister_worker(url);
+                    }
+                }
             }
+            self.policy_registry.on_worker_removed(worker.model_id());
+            info!(
+                "Removed worker with URL {} for model {}",
+                url,
+                worker.model_id()
+            );
 
             Ok(WorkerApiResponse {
                 success: true,
@@ -321,23 +332,44 @@ impl RouterManager {
             .map(|w| self.worker_to_info("unknown", &w))
     }
 
-    /// Query server info from a worker URL
-    async fn query_server_info(&self, url: &str) -> Result<ServerInfo, String> {
-        let info_url = format!("{}/get_server_info", url.trim_end_matches('/'));
-
-        match self.client.get(&info_url).send().await {
-            Ok(response) => {
-                if response.status().is_success() {
-                    response
-                        .json::<ServerInfo>()
-                        .await
-                        .map_err(|e| format!("Failed to parse server info: {}", e))
-                } else {
-                    Err(format!("Server returned status: {}", response.status()))
-                }
-            }
-            Err(e) => Err(format!("Failed to connect to server: {}", e)),
+    /// Query model identity through OpenAI `/v1/models` or the gRPC control API.
+    async fn query_model_id(&self, url: &str) -> Result<String, String> {
+        if crate::backend::is_grpc_url(url) {
+            let info = crate::backend::get_grpc_model_info(url, Duration::from_secs(10)).await?;
+            let model_id = if info.served_model_name.is_empty() {
+                info.model_id
+            } else {
+                info.served_model_name
+            };
+            return (!model_id.trim().is_empty())
+                .then_some(model_id)
+                .ok_or_else(|| format!("gRPC GetModelInfo returned no model id for {url}"));
         }
+
+        let models_url = format!("{}/v1/models", url.trim_end_matches('/'));
+        let response = self
+            .client
+            .get(&models_url)
+            .send()
+            .await
+            .map_err(|error| format!("request to {models_url} failed: {error}"))?;
+        if !response.status().is_success() {
+            return Err(format!(
+                "{models_url} returned status {}",
+                response.status()
+            ));
+        }
+        let models: serde_json::Value = response
+            .json()
+            .await
+            .map_err(|error| format!("invalid model list from {models_url}: {error}"))?;
+        models["data"]
+            .as_array()
+            .and_then(|data| data.first())
+            .and_then(|model| model["id"].as_str())
+            .filter(|model_id| !model_id.trim().is_empty())
+            .map(str::to_string)
+            .ok_or_else(|| format!("{models_url} returned no model id"))
     }
 
     /// Convert Worker to WorkerInfo

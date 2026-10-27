@@ -2,14 +2,17 @@
 // This module extends PdRouterBase to handle vLLM-specific two-stage processing
 use super::dp_utils;
 use super::logprobs_merge;
+use super::pd_cached_tokens;
 use super::pd_router::PdRouterBase;
 use super::pd_types::{error_chain, PDRouterError};
+use super::usage_merge;
 use super::vllm_service_discovery::{MoriIOTransferMode, ServiceRegistry, ServiceType};
 use crate::config::KvConnector;
-use crate::core::{BasicWorker, Worker, WorkerType};
+use crate::core::{BasicWorker, Worker, WorkerLoadGuard, WorkerType};
 use crate::metrics::RouterMetrics;
 use crate::otel_http::{self, ClientRequestOptions};
-use crate::policies::PolicyRegistry;
+use crate::policies::{LoadBalancingPolicy, PolicyRegistry, RequestHeaders, SelectionContext};
+use crate::protocols::spec::GenerationRequest;
 use crate::routers::{header_utils, RouterTrait, WorkerManagement};
 use async_trait::async_trait;
 use axum::{
@@ -18,6 +21,7 @@ use axum::{
     http::{HeaderMap, Method, StatusCode},
     response::{IntoResponse, Response},
 };
+use futures_util::StreamExt;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -40,6 +44,8 @@ pub struct VllmPDRouter {
     epd: Option<super::epd::EncoderStage>,
     /// Underlying PD router for most functionality
     pd_router: PdRouterBase,
+    /// Shared admission context for the static decode pool.
+    decode_selection: SelectionContext,
     /// Service discovery registry for dynamic ZMQ address resolution
     service_registry: Arc<ServiceRegistry>,
     /// HTTP client for making requests to discovered services
@@ -70,6 +76,41 @@ pub struct VllmPDRouter {
 /// Must match `MoRIIOConstants.TRANSFER_PREFIX` in the vLLM Python connector.
 const MORIIO_TRANSFER_PREFIX: &str = "tx";
 
+/// Prepare each routing representation once, only if a P/D policy consumes it.
+struct PolicyRequestText {
+    legacy: Option<String>,
+    cache: Option<String>,
+}
+
+impl PolicyRequestText {
+    fn new(
+        prefill: &dyn LoadBalancingPolicy,
+        decode: &dyn LoadBalancingPolicy,
+        legacy_text: impl FnOnce() -> Option<String>,
+        cache_key: impl FnOnce() -> String,
+    ) -> Self {
+        let policies = [prefill, decode];
+        let needs_cache = policies
+            .iter()
+            .any(|policy| policy.needs_cache_routing_key());
+        let needs_legacy = policies
+            .iter()
+            .any(|policy| !policy.needs_cache_routing_key() && policy.needs_request_text());
+        Self {
+            legacy: needs_legacy.then(legacy_text).flatten(),
+            cache: needs_cache.then(cache_key),
+        }
+    }
+
+    fn for_policy(&self, policy: &dyn LoadBalancingPolicy) -> Option<&str> {
+        if policy.needs_cache_routing_key() {
+            self.cache.as_deref()
+        } else {
+            self.legacy.as_deref()
+        }
+    }
+}
+
 /// Discovery-backed P/D routing is ready only after both worker types register.
 /// Without this guard, `PdRouterBase::health` sees the unused static registry and
 /// reports success before a discovered prefill/decode pair can serve requests.
@@ -91,7 +132,176 @@ fn build_prefill_request_builder(
     dp_utils::add_dp_rank_header(builder, dp_rank)
 }
 
+fn response_with_body(
+    status: StatusCode,
+    headers: &HeaderMap,
+    body: Body,
+) -> Result<Response, String> {
+    let mut builder = Response::builder().status(status);
+    for (name, value) in headers {
+        builder = builder.header(name, value);
+    }
+    builder
+        .body(body)
+        .map_err(|error| format!("Failed to build Decode response: {error}"))
+}
+
+/// Shared final response handling for direct/discovery and sequential/concurrent PD paths.
+async fn finalize_decode_response(
+    decode_response: reqwest::Response,
+    prefill_response_json: Option<&Value>,
+    path: &str,
+    is_streaming: bool,
+    needs_logprobs: bool,
+) -> Result<Response, String> {
+    let status = decode_response.status();
+    let mut headers = header_utils::preserve_response_headers(decode_response.headers());
+    headers.remove(axum::http::header::CONTENT_LENGTH);
+    // Classify the upstream bytes even if Connection filtering removes their
+    // encoding header. The shared filter already preserves end-to-end encodings.
+    let is_encoded = decode_response
+        .headers()
+        .get_all(axum::http::header::CONTENT_ENCODING)
+        .iter()
+        .any(|value| {
+            !value
+                .to_str()
+                .is_ok_and(|coding| coding.trim().eq_ignore_ascii_case("identity"))
+        });
+
+    // Only successful generation bodies can be enriched. Preserve worker error
+    // responses as opaque bodies; their status handling is a separate concern.
+    if !status.is_success() {
+        return response_with_body(
+            status,
+            &headers,
+            Body::from_stream(decode_response.bytes_stream()),
+        );
+    }
+
+    let reconcile_cache = pd_cached_tokens::is_supported_path(path);
+    let cached = if reconcile_cache {
+        pd_cached_tokens::prefill_cached_tokens(prefill_response_json)
+    } else {
+        None
+    };
+
+    if is_streaming {
+        let is_sse = headers
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.split(';').next())
+            .is_some_and(|media_type| media_type.trim().eq_ignore_ascii_case("text/event-stream"));
+        let stream = decode_response.bytes_stream();
+        // A streaming request can receive a non-SSE body. Rewrite only upstream
+        // event streams whose bytes are already decoded; forward all others.
+        let body = if reconcile_cache && is_sse && !is_encoded {
+            Body::from_stream(pd_cached_tokens::rewrite_sse_stream(
+                stream,
+                cached,
+                prefill_response_json.and_then(usage_merge::usage_snapshot),
+            ))
+        } else {
+            Body::from_stream(stream)
+        };
+        return response_with_body(status, &headers, body);
+    }
+
+    // Forward bodies that need no enrichment without waiting for or buffering
+    // the complete response, even when the API request is non-streaming.
+    if is_encoded || (!reconcile_cache && !needs_logprobs) {
+        return response_with_body(
+            status,
+            &headers,
+            Body::from_stream(decode_response.bytes_stream()),
+        );
+    }
+
+    // Bound optional enrichment without breaking large legitimate responses.
+    // An oversized body is forwarded verbatim; only its enrichment is skipped.
+    const MAX_JSON_REWRITE_BYTES: usize = 8 * 1024 * 1024;
+    if decode_response
+        .content_length()
+        .is_some_and(|length| length > MAX_JSON_REWRITE_BYTES as u64)
+    {
+        return response_with_body(
+            status,
+            &headers,
+            Body::from_stream(decode_response.bytes_stream()),
+        );
+    }
+    let mut source = decode_response.bytes_stream();
+    let mut original = Vec::new();
+    while let Some(chunk) = source.next().await {
+        let chunk = chunk.map_err(|error| format!("Failed to read Decode response: {error}"))?;
+        if chunk.len() > MAX_JSON_REWRITE_BYTES - original.len() {
+            let prefix = futures_util::stream::iter([
+                Ok::<_, reqwest::Error>(bytes::Bytes::from(original)),
+                Ok(chunk),
+            ]);
+            return response_with_body(status, &headers, Body::from_stream(prefix.chain(source)));
+        }
+        let needed = original.len() + chunk.len();
+        if needed > original.capacity() {
+            let capacity = needed
+                .max(original.capacity().saturating_mul(2))
+                .min(MAX_JSON_REWRITE_BYTES);
+            original.reserve_exact(capacity - original.len());
+        }
+        original.extend_from_slice(&chunk);
+    }
+    let original = bytes::Bytes::from(original);
+
+    let mut json: Value = match serde_json::from_slice(&original) {
+        Ok(json) => json,
+        Err(error) if reconcile_cache => {
+            warn!("Cannot parse successful PD Decode response for cached-token reconciliation: {error}");
+            return response_with_body(status, &headers, Body::from(original));
+        }
+        Err(error) => return Err(format!("Failed to parse Decode response as JSON: {error}")),
+    };
+
+    let mut changed = false;
+    if needs_logprobs {
+        let empty_json = Value::Null;
+        changed |= logprobs_merge::merge_logprobs_in_json(
+            prefill_response_json.unwrap_or(&empty_json),
+            &mut json,
+        );
+    }
+    if reconcile_cache {
+        if let Some(prefill) = prefill_response_json {
+            changed |= usage_merge::merge_pd_usage(prefill, &mut json);
+        }
+        match pd_cached_tokens::reconcile_usage(&mut json, cached, prefill_response_json) {
+            Ok(rewritten) => changed |= rewritten,
+            Err(reason) => warn!("Cannot reconcile PD cached tokens: {reason}"),
+        }
+    }
+
+    if changed {
+        drop(original);
+        let encoded = serde_json::to_vec(&json)
+            .map_err(|error| format!("Failed to serialize Decode response: {error}"))?;
+        headers.remove(axum::http::header::CONTENT_ENCODING);
+        response_with_body(status, &headers, Body::from(encoded))
+    } else {
+        response_with_body(status, &headers, Body::from(original))
+    }
+}
+
 impl VllmPDRouter {
+    /// Include assigned requests in local decode load while prefill is pending.
+    fn select_and_reserve_decode<'a>(
+        &self,
+        policy: &dyn LoadBalancingPolicy,
+        workers: &'a [Arc<dyn Worker>],
+        text: Option<&str>,
+        headers: Option<&RequestHeaders>,
+    ) -> Option<(usize, WorkerLoadGuard<'a>)> {
+        policy.select_and_reserve(&self.decode_selection, workers, text, headers)
+    }
+
     /// Query the Mooncake bootstrap server on a prefill node to get engine_id per dp_rank.
     /// Retries with backoff since the prefill server may not be ready at router startup.
     async fn query_mooncake_bootstrap(
@@ -629,7 +839,7 @@ impl VllmPDRouter {
         &self,
         instances: &[(String, String)],
         is_prefill: bool,
-        request_text: Option<&str>,
+        request_text: &PolicyRequestText,
     ) -> Option<usize> {
         if instances.is_empty() {
             return None;
@@ -646,7 +856,7 @@ impl VllmPDRouter {
         };
 
         // Use policy to select worker
-        policy.select_worker(&workers, request_text)
+        policy.select_worker(&workers, request_text.for_policy(policy.as_ref()))
     }
 
     /// Process vLLM request using pure service discovery
@@ -686,11 +896,17 @@ impl VllmPDRouter {
         }
 
         // Use policy-based load balancing to select prefill and decode workers
-        let request_text = serde_json::to_string(&request_json).ok();
-        let request_str = request_text.as_deref();
+        let prefill_policy = self.policy_registry.get_prefill_policy();
+        let decode_policy = self.policy_registry.get_decode_policy();
+        let request_text = PolicyRequestText::new(
+            prefill_policy.as_ref(),
+            decode_policy.as_ref(),
+            || serde_json::to_string(&request_json).ok(),
+            || crate::protocols::spec::cache_routing::for_route(&request_json, path),
+        );
 
         let prefill_idx =
-            match self.select_worker_with_policy(&prefill_instances, true, request_str) {
+            match self.select_worker_with_policy(&prefill_instances, true, &request_text) {
                 Some(idx) => idx,
                 None => {
                     RouterMetrics::record_pd_error("server_selection");
@@ -702,18 +918,18 @@ impl VllmPDRouter {
                 }
             };
 
-        let decode_idx = match self.select_worker_with_policy(&decode_instances, false, request_str)
-        {
-            Some(idx) => idx,
-            None => {
-                RouterMetrics::record_pd_error("server_selection");
-                return (
-                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                    "Decode policy failed to select a worker".to_string(),
-                )
-                    .into_response();
-            }
-        };
+        let decode_idx =
+            match self.select_worker_with_policy(&decode_instances, false, &request_text) {
+                Some(idx) => idx,
+                None => {
+                    RouterMetrics::record_pd_error("server_selection");
+                    return (
+                        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                        "Decode policy failed to select a worker".to_string(),
+                    )
+                        .into_response();
+                }
+            };
 
         let (prefill_http, prefill_zmq) = &prefill_instances[prefill_idx];
         let (decode_http, decode_zmq) = &decode_instances[decode_idx];
@@ -791,77 +1007,14 @@ impl VllmPDRouter {
             RouterMetrics::record_pd_decode_error(decode_http);
         }
 
-        if needs_logprobs && !is_streaming {
-            debug!("Logprobs requested and non-streaming - merging prefill and decode logprobs");
-
-            let status = decode_response.status();
-            let resp_headers = decode_response.headers().clone();
-            let decode_body = decode_response
-                .bytes()
-                .await
-                .map_err(|e| format!("Failed to read decode response: {}", e))?;
-
-            let mut decode_json: Value = serde_json::from_slice(&decode_body)
-                .map_err(|e| format!("Failed to parse decode response as JSON: {}", e))?;
-
-            let empty_json = Value::Null;
-            let prefill_json_ref = prefill_response_json.unwrap_or(&empty_json);
-            let merged = logprobs_merge::merge_logprobs_in_json(prefill_json_ref, &mut decode_json);
-            if merged {
-                debug!("Successfully merged logprobs from prefill and decode responses");
-            } else {
-                warn!("No logprobs were merged (might be expected if logprobs not in response)");
-            }
-
-            let merged_body = serde_json::to_vec(&decode_json)
-                .map_err(|e| format!("Failed to serialize merged response: {}", e))?;
-
-            let mut response_builder = axum::http::Response::builder().status(status);
-            for (name, value) in resp_headers.iter() {
-                response_builder = response_builder.header(name, value);
-            }
-            return response_builder
-                .body(axum::body::Body::from(merged_body))
-                .map_err(|e| format!("Failed to build response: {}", e));
-        }
-
-        debug!(
-            "No logprobs merging needed (streaming={}, needs_logprobs={})",
-            is_streaming, needs_logprobs
-        );
-
-        let status = decode_response.status();
-
-        if is_streaming {
-            let mut response_builder = axum::http::Response::builder().status(status);
-            let mut decode_headers =
-                header_utils::preserve_response_headers(decode_response.headers());
-            decode_headers.remove(axum::http::header::CONTENT_LENGTH);
-            for (name, value) in decode_headers.iter() {
-                response_builder = response_builder.header(name, value);
-            }
-            let body = axum::body::Body::from_stream(decode_response.bytes_stream());
-            return response_builder.body(body).map_err(|e| {
-                format!(
-                    "Failed to build streaming response from {}: {}",
-                    decode_http, e
-                )
-            });
-        }
-
-        // Non-streaming, no logprobs: read entire body
-        let decode_headers = decode_response.headers().clone();
-        let body = decode_response
-            .bytes()
-            .await
-            .map_err(|e| format!("Failed to read decode response: {}", e))?;
-        let mut response_builder = axum::http::Response::builder().status(status);
-        for (name, value) in decode_headers.iter() {
-            response_builder = response_builder.header(name, value);
-        }
-        response_builder
-            .body(axum::body::Body::from(body))
-            .map_err(|e| format!("Failed to build response: {}", e))
+        finalize_decode_response(
+            decode_response,
+            prefill_response_json,
+            path,
+            is_streaming,
+            needs_logprobs,
+        )
+        .await
     }
 
     /// Two-stage request processing for vLLM disaggregated mode using discovered endpoints
@@ -1263,9 +1416,9 @@ impl VllmPDRouter {
 
     /// Two-stage request processing for vLLM disaggregated mode
     ///
-    /// This function handles fine-grained load tracking: the prefill worker's load is only
-    /// incremented during the prefill phase, and the decode worker's load is only incremented
-    /// during the decode phase. This accurately reflects the sequential nature of PD disaggregation.
+    /// Prefill load is tracked during the prefill phase. The static route caller
+    /// holds the selected decode reservation across this future, including prefill.
+    /// Streaming response-body load tracking is separate from this dispatch scope.
     async fn process_vllm_two_stage_request(
         &self,
         original_request: Value,
@@ -1552,9 +1705,8 @@ impl VllmPDRouter {
         // Stop profiling on prefill server after its work is done
         self.stop_profiling(&prefill_base_url).await;
 
-        // Prefill phase complete: decrement prefill load, increment decode load
+        // Prefill is complete; the caller still holds the decode reservation.
         prefill_worker.decrement_load();
-        decode_worker.increment_load();
 
         debug!("✅ vLLM Stage 1 completed, starting Stage 2 - Decode");
 
@@ -1642,7 +1794,6 @@ impl VllmPDRouter {
         {
             Ok(resp) => resp,
             Err(e) => {
-                decode_worker.decrement_load();
                 let full_error = error_chain(&e);
                 let duration = start_time.elapsed();
                 RouterMetrics::record_pd_decode_error(&decode_base_url);
@@ -1658,11 +1809,8 @@ impl VllmPDRouter {
         // Stop profiling on decode server after response received
         self.stop_profiling(&decode_base_url).await;
 
-        // Decode phase complete: decrement decode load
-        decode_worker.decrement_load();
-
         let status = decode_response.status();
-        let headers = decode_response.headers().clone();
+        let headers = header_utils::preserve_response_headers(decode_response.headers());
 
         info!("📥 Decode response status: {}", status);
         info!("📥 Decode response headers: {:?}", headers);
@@ -1689,76 +1837,15 @@ impl VllmPDRouter {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
-        // If logprobs requested and non-streaming, merge prefill and decode logprobs
-        if needs_logprobs && !is_streaming {
-            debug!("Logprobs requested and non-streaming - merging prefill and decode logprobs");
-
-            // Read decode response body
-            let decode_body =
-                decode_response
-                    .bytes()
-                    .await
-                    .map_err(|e| PDRouterError::NetworkError {
-                        message: format!(
-                            "Failed to read decode response from {}: {}",
-                            decode_url, e
-                        ),
-                    })?;
-
-            // Parse decode response as JSON
-            let mut decode_json: Value =
-                serde_json::from_slice(&decode_body).map_err(|e| PDRouterError::NetworkError {
-                    message: format!("Failed to parse decode response as JSON: {}", e),
-                })?;
-
-            // Merge logprobs from prefill into decode response
-            let merged =
-                logprobs_merge::merge_logprobs_in_json(&prefill_response_json, &mut decode_json);
-            if merged {
-                debug!("Successfully merged logprobs from prefill and decode responses");
-            } else {
-                warn!("No logprobs were merged (might be expected if logprobs not in response)");
-            }
-
-            // Serialize merged response
-            let merged_body =
-                serde_json::to_vec(&decode_json).map_err(|e| PDRouterError::NetworkError {
-                    message: format!("Failed to serialize merged response: {}", e),
-                })?;
-
-            let mut response_builder = Response::builder().status(status);
-            for (key, value) in headers.iter() {
-                if key != "transfer-encoding" && key != "content-length" {
-                    response_builder = response_builder.header(key, value);
-                }
-            }
-
-            response_builder.body(Body::from(merged_body)).map_err(|e| {
-                PDRouterError::NetworkError {
-                    message: format!("Failed to build response from {}: {}", decode_url, e),
-                }
-            })
-        } else {
-            // No logprobs merging needed - return decode response as-is (streaming or no logprobs)
-            debug!(
-                "No logprobs merging needed (streaming={}, needs_logprobs={})",
-                is_streaming, needs_logprobs
-            );
-
-            let mut response_builder = Response::builder().status(status);
-            for (key, value) in headers.iter() {
-                if key != "transfer-encoding" && key != "content-length" {
-                    response_builder = response_builder.header(key, value);
-                }
-            }
-
-            let body = Body::from_stream(decode_response.bytes_stream());
-            response_builder
-                .body(body)
-                .map_err(|e| PDRouterError::NetworkError {
-                    message: format!("Failed to build response from {}: {}", decode_url, e),
-                })
-        }
+        finalize_decode_response(
+            decode_response,
+            Some(&prefill_response_json),
+            path,
+            is_streaming,
+            needs_logprobs,
+        )
+        .await
+        .map_err(|message| PDRouterError::NetworkError { message })
     }
 
     async fn try_build_concurrent_requests(
@@ -1836,7 +1923,6 @@ impl VllmPDRouter {
         };
 
         prefill_worker.increment_load();
-        decode_worker.increment_load();
         self.start_profiling(&prefill_base_url).await;
         self.start_profiling(&decode_base_url).await;
 
@@ -1873,7 +1959,6 @@ impl VllmPDRouter {
                 .ok()
                 .and_then(|b| serde_json::from_slice::<Value>(&b).ok()),
             Ok(resp) => {
-                decode_worker.decrement_load();
                 self.stop_profiling(&decode_base_url).await;
                 RouterMetrics::record_pd_prefill_error(&prefill_base_url);
                 RouterMetrics::record_pd_request(path);
@@ -1899,7 +1984,6 @@ impl VllmPDRouter {
                 });
             }
             Err(e) => {
-                decode_worker.decrement_load();
                 self.stop_profiling(&decode_base_url).await;
                 RouterMetrics::record_pd_prefill_error(&prefill_base_url);
                 RouterMetrics::record_pd_request(path);
@@ -1926,7 +2010,6 @@ impl VllmPDRouter {
         let decode_response = match decode_result {
             Ok(resp) => resp,
             Err(e) => {
-                decode_worker.decrement_load();
                 self.stop_profiling(&decode_base_url).await;
                 RouterMetrics::record_pd_decode_error(&decode_base_url);
                 RouterMetrics::record_pd_request(path);
@@ -1941,7 +2024,6 @@ impl VllmPDRouter {
                 });
             }
         };
-        decode_worker.decrement_load();
 
         let needs_logprobs = decode_request.get("logprobs").is_some()
             || decode_request
@@ -2021,6 +2103,7 @@ impl VllmPDRouter {
                     .clone()
                     .map(super::epd::EncoderStage::new),
                 pd_router,
+                decode_selection: SelectionContext::default(),
                 service_registry: Arc::new(service_registry),
                 http_client,
                 policy_registry: ctx.policy_registry.clone(),
@@ -2116,6 +2199,7 @@ impl VllmPDRouter {
                     .clone()
                     .map(super::epd::EncoderStage::new),
                 pd_router,
+                decode_selection: SelectionContext::default(),
                 service_registry: Arc::new(service_registry),
                 http_client,
                 policy_registry: ctx.policy_registry.clone(),
@@ -2340,8 +2424,14 @@ impl RouterTrait for VllmPDRouter {
             }
 
             // Select workers using policy with headers for consistent hash
-            let request_text = serde_json::to_string(&request_json).ok();
-            let request_str = request_text.as_deref();
+            let prefill_policy = self.policy_registry.get_prefill_policy();
+            let decode_policy = self.policy_registry.get_decode_policy();
+            let request_text = PolicyRequestText::new(
+                prefill_policy.as_ref(),
+                decode_policy.as_ref(),
+                || serde_json::to_string(&request_json).ok(),
+                || body.extract_cache_routing_key(),
+            );
             let request_headers: Option<HashMap<String, String>> = headers.map(|h| {
                 h.iter()
                     .filter_map(|(name, value)| {
@@ -2353,12 +2443,9 @@ impl RouterTrait for VllmPDRouter {
                     .collect()
             });
 
-            let prefill_policy = self.policy_registry.get_prefill_policy();
-            let decode_policy = self.policy_registry.get_decode_policy();
-
             let prefill_idx = match prefill_policy.select_worker_with_headers(
                 &prefill_workers,
-                request_str,
+                request_text.for_policy(prefill_policy.as_ref()),
                 request_headers.as_ref(),
             ) {
                 Some(idx) => idx,
@@ -2372,9 +2459,10 @@ impl RouterTrait for VllmPDRouter {
                 }
             };
 
-            let decode_idx = match decode_policy.select_worker_with_headers(
+            let (decode_idx, _decode_load) = match self.select_and_reserve_decode(
+                decode_policy.as_ref(),
                 &decode_workers,
-                request_str,
+                request_text.for_policy(decode_policy.as_ref()),
                 request_headers.as_ref(),
             ) {
                 Some(idx) => idx,
@@ -2390,8 +2478,7 @@ impl RouterTrait for VllmPDRouter {
 
             let prefill_worker = &prefill_workers[prefill_idx];
             let decode_worker = &decode_workers[decode_idx];
-            // Load tracking is handled inside process_vllm_two_stage_request for fine-grained
-            // tracking: prefill load only during prefill phase, decode load only during decode phase.
+            // Keep the decode reservation through the two-stage dispatch, including prefill.
 
             info!(
                 "Chat: Selected prefill={} [policy:{}], decode={} [policy:{}]",
@@ -2511,8 +2598,14 @@ impl RouterTrait for VllmPDRouter {
             }
 
             // Select workers using policy with headers for consistent hash
-            let request_text = serde_json::to_string(&request_json).ok();
-            let request_str = request_text.as_deref();
+            let prefill_policy = self.policy_registry.get_prefill_policy();
+            let decode_policy = self.policy_registry.get_decode_policy();
+            let request_text = PolicyRequestText::new(
+                prefill_policy.as_ref(),
+                decode_policy.as_ref(),
+                || serde_json::to_string(&request_json).ok(),
+                || body.extract_cache_routing_key(),
+            );
             let request_headers: Option<HashMap<String, String>> = headers.map(|h| {
                 h.iter()
                     .filter_map(|(name, value)| {
@@ -2524,12 +2617,9 @@ impl RouterTrait for VllmPDRouter {
                     .collect()
             });
 
-            let prefill_policy = self.policy_registry.get_prefill_policy();
-            let decode_policy = self.policy_registry.get_decode_policy();
-
             let prefill_idx = match prefill_policy.select_worker_with_headers(
                 &prefill_workers,
-                request_str,
+                request_text.for_policy(prefill_policy.as_ref()),
                 request_headers.as_ref(),
             ) {
                 Some(idx) => idx,
@@ -2543,9 +2633,10 @@ impl RouterTrait for VllmPDRouter {
                 }
             };
 
-            let decode_idx = match decode_policy.select_worker_with_headers(
+            let (decode_idx, _decode_load) = match self.select_and_reserve_decode(
+                decode_policy.as_ref(),
                 &decode_workers,
-                request_str,
+                request_text.for_policy(decode_policy.as_ref()),
                 request_headers.as_ref(),
             ) {
                 Some(idx) => idx,
@@ -2561,8 +2652,7 @@ impl RouterTrait for VllmPDRouter {
 
             let prefill_worker = &prefill_workers[prefill_idx];
             let decode_worker = &decode_workers[decode_idx];
-            // Load tracking is handled inside process_vllm_two_stage_request for fine-grained
-            // tracking: prefill load only during prefill phase, decode load only during decode phase.
+            // Keep the decode reservation through the two-stage dispatch, including prefill.
 
             info!(
                 "Completion: Selected prefill={} [policy:{}], decode={} [policy:{}]",
@@ -2733,8 +2823,14 @@ impl RouterTrait for VllmPDRouter {
             }
 
             // Select workers using policy with headers for consistent hash
-            let request_text = serde_json::to_string(&request_json).ok();
-            let request_str = request_text.as_deref();
+            let prefill_policy = self.policy_registry.get_prefill_policy();
+            let decode_policy = self.policy_registry.get_decode_policy();
+            let request_text = PolicyRequestText::new(
+                prefill_policy.as_ref(),
+                decode_policy.as_ref(),
+                || serde_json::to_string(&request_json).ok(),
+                || crate::protocols::spec::cache_routing::for_route(&request_json, path),
+            );
             let request_headers: Option<HashMap<String, String>> = headers.map(|h| {
                 h.iter()
                     .filter_map(|(name, value)| {
@@ -2746,12 +2842,9 @@ impl RouterTrait for VllmPDRouter {
                     .collect()
             });
 
-            let prefill_policy = self.policy_registry.get_prefill_policy();
-            let decode_policy = self.policy_registry.get_decode_policy();
-
             let prefill_idx = match prefill_policy.select_worker_with_headers(
                 &prefill_workers,
-                request_str,
+                request_text.for_policy(prefill_policy.as_ref()),
                 request_headers.as_ref(),
             ) {
                 Some(idx) => idx,
@@ -2765,9 +2858,10 @@ impl RouterTrait for VllmPDRouter {
                 }
             };
 
-            let decode_idx = match decode_policy.select_worker_with_headers(
+            let (decode_idx, _decode_load) = match self.select_and_reserve_decode(
+                decode_policy.as_ref(),
                 &decode_workers,
-                request_str,
+                request_text.for_policy(decode_policy.as_ref()),
                 request_headers.as_ref(),
             ) {
                 Some(idx) => idx,
@@ -2837,10 +2931,1116 @@ impl WorkerManagement for VllmPDRouter {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use super::*;
+
+    fn test_vllm_pd_router() -> VllmPDRouter {
+        let worker_registry = Arc::new(crate::core::WorkerRegistry::new());
+        let policy_registry =
+            Arc::new(PolicyRegistry::new(crate::config::PolicyConfig::RoundRobin));
+        let pd_router = PdRouterBase {
+            worker_registry,
+            policy_registry: policy_registry.clone(),
+            worker_startup_timeout_secs: 5,
+            worker_startup_check_interval_secs: 1,
+            worker_loads: Arc::new(tokio::sync::watch::channel(HashMap::new()).1),
+            load_monitor_handle: None,
+            client: reqwest::Client::new(),
+            circuit_breaker_config: crate::core::CircuitBreakerConfig::default(),
+            dp_size: 1,
+        };
+        VllmPDRouter {
+            epd: None,
+            pd_router,
+            decode_selection: SelectionContext::default(),
+            service_registry: Arc::new(ServiceRegistry::new()),
+            http_client: reqwest::Client::new(),
+            policy_registry,
+            use_discovery: false,
+            enable_profiling: false,
+            profile_timeout_secs: 0,
+            profiling_tasks: Arc::new(Mutex::new(HashMap::new())),
+            intra_node_data_parallel_size: 1,
+            prefill_dp_round_robin: Arc::new(AtomicUsize::new(0)),
+            kv_connector: KvConnector::Nixl,
+            mooncake_prefill_info: Arc::new(Mutex::new(HashMap::new())),
+            nixl_prefill_info: RwLock::new(HashMap::new()),
+        }
+    }
+
+    async fn spawn_test_server(app: axum::Router) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        url
+    }
+
+    #[tokio::test]
+    async fn test_decode_response_filters_headers_in_every_branch() {
+        let router = test_vllm_pd_router();
+        for (streaming, logprobs) in [(false, false), (false, true), (true, false)] {
+            // A real reqwest response, with a backend content length that will
+            // become invalid when prompt logprobs are merged into the JSON.
+            let decode: reqwest::Response = axum::http::Response::builder()
+                .header("connection", "X-Internal, Content-Encoding")
+                .header("content-encoding", "identity")
+                .header("x-internal", "private")
+                .header("trailer", "x-checksum")
+                .header("content-length", "2")
+                .header("content-type", "application/json")
+                .header("set-cookie", "a=1")
+                .header("set-cookie", "b=2")
+                .body("{}")
+                .unwrap()
+                .into();
+            let prefill = json!({"prompt_logprobs": [1, 2, 3]});
+            let response = router
+                .handle_decode_response(
+                    decode,
+                    Some(&prefill),
+                    "/v1/chat/completions",
+                    "prefill",
+                    "decode",
+                    "decode",
+                    Instant::now(),
+                    streaming,
+                    logprobs,
+                )
+                .await
+                .unwrap();
+            for name in ["connection", "x-internal", "trailer", "content-encoding"] {
+                assert!(
+                    !response.headers().contains_key(name),
+                    "{name} leaked (streaming={streaming}, logprobs={logprobs})"
+                );
+            }
+            assert_eq!(response.headers().get_all("set-cookie").iter().count(), 2);
+            if streaming || logprobs {
+                assert!(!response.headers().contains_key("content-length"));
+            }
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            if logprobs {
+                let decoded: Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(decoded["prompt_logprobs"], prefill["prompt_logprobs"]);
+            } else {
+                assert_eq!(bytes.as_ref(), b"{}");
+            }
+        }
+        for streaming in [false, true] {
+            // Encoded bytes are relayed unchanged; removing their encoding
+            // would make the client interpret compressed data as plaintext.
+            let encoded = vec![0x1f, 0x8b, 0x08, 0x00, 0xff];
+            let decode: reqwest::Response = axum::http::Response::builder()
+                .header("content-encoding", "gzip")
+                .body(encoded.clone())
+                .unwrap()
+                .into();
+            let response = router
+                .handle_decode_response(
+                    decode,
+                    None,
+                    "/v1/chat/completions",
+                    "prefill",
+                    "decode",
+                    "decode",
+                    Instant::now(),
+                    streaming,
+                    false,
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.headers().get("content-encoding").unwrap(), "gzip");
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert_eq!(bytes.as_ref(), encoded.as_slice());
+        }
+    }
     use serde_json::json;
+
+    #[tokio::test]
+    async fn discovery_usage_reconciliation_covers_sequential_and_nixl_push() {
+        use crate::config::{PolicyConfig, RouterConfig};
+        use axum::{extract::State, http::Uri, routing::post, Json};
+
+        async fn prefill(State(push): State<bool>, uri: Uri) -> Json<Value> {
+            let usage = if uri.path().ends_with("/responses") {
+                json!({"input_tokens": 70, "output_tokens": 1, "input_tokens_details": {"cached_tokens": 4}})
+            } else {
+                json!({"prompt_tokens": 70, "completion_tokens": 1, "prompt_tokens_details": {"cached_tokens": 4}})
+            };
+            let mut value =
+                json!({"usage": usage, "kv_transfer_params": {"remote_engine_id": "P"}});
+            if push {
+                value["kv_transfer_params"]["remote_host"] = json!("127.0.0.1");
+                value["kv_transfer_params"]["remote_port"] = json!(9100);
+                value["kv_transfer_params"]["transfer_mode"] = json!("push");
+            }
+            Json(value)
+        }
+        async fn decode(uri: Uri, Json(body): Json<Value>) -> Response {
+            if body["model"] == "error" {
+                return (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    [("retry-after", "7")],
+                    "overloaded",
+                )
+                    .into_response();
+            }
+            let responses = uri.path().ends_with("/responses");
+            let usage = if responses {
+                json!({"input_tokens": 999, "output_tokens": 8, "total_tokens": 1007, "input_tokens_details": {"cached_tokens": 99}})
+            } else {
+                json!({"prompt_tokens": 999, "completion_tokens": 8, "total_tokens": 1007, "prompt_tokens_details": {"cached_tokens": 99}})
+            };
+            if body["stream"] == true {
+                let event = if responses {
+                    json!({"type": "response.completed", "response": {"usage": usage}})
+                } else {
+                    json!({"choices": [], "usage": usage})
+                };
+                return (
+                    [("content-type", "text/event-stream")],
+                    format!("data: {event}\n\ndata: [DONE]\n\n"),
+                )
+                    .into_response();
+            }
+            Json(json!({"usage": usage})).into_response()
+        }
+
+        for push in [false, true] {
+            let mut app = axum::Router::new();
+            for path in ["/v1/chat/completions", "/v1/completions", "/v1/responses"] {
+                app = app.route(&format!("/p{path}"), post(prefill));
+            }
+            let mut app = app.with_state(push);
+            for path in ["/v1/chat/completions", "/v1/completions", "/v1/responses"] {
+                app = app.route(&format!("/d{path}"), post(decode));
+            }
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let client = reqwest::Client::builder()
+                .no_proxy()
+                .timeout(std::time::Duration::from_secs(5))
+                .build()
+                .unwrap();
+            let context = Arc::new(
+                crate::server::AppContext::new(
+                    RouterConfig {
+                        policy: PolicyConfig::Random,
+                        kv_connector: KvConnector::Nixl,
+                        disable_retries: true,
+                        disable_circuit_breaker: true,
+                        ..RouterConfig::default()
+                    },
+                    client,
+                    64,
+                    None,
+                    vec![],
+                )
+                .unwrap(),
+            );
+            // Register directly to isolate the discovery response pipeline
+            // from the ZMQ listener/control plane; no fixed ports are opened.
+            let mut router = VllmPDRouter::new(vec![], vec![], None, &context)
+                .await
+                .unwrap();
+            router.use_discovery = true;
+            for _ in 0..2 {
+                for path in ["/v1/chat/completions", "/v1/completions", "/v1/responses"] {
+                    for streaming in [false, true] {
+                        router.service_registry.register_service(
+                            format!("{address}/p"),
+                            "P".into(),
+                            ServiceType::Prefill,
+                        );
+                        router.service_registry.register_service(
+                            format!("{address}/d"),
+                            "D".into(),
+                            ServiceType::Decode,
+                        );
+                        let response = router.route_transparent(None, path, &Method::POST,
+                            json!({"model": "test", "stream": streaming, "input": "hello", "prompt": "hello", "messages": [{"role": "user", "content": "hello"}]})).await;
+                        assert_eq!(response.status(), StatusCode::OK);
+                        let bytes = axum::body::to_bytes(response.into_body(), 4096)
+                            .await
+                            .unwrap();
+                        let result: Value = if streaming {
+                            let text = std::str::from_utf8(&bytes).unwrap();
+                            assert!(text.ends_with("data: [DONE]\n\n"));
+                            serde_json::from_str(
+                                text.split("\n\n")
+                                    .next()
+                                    .unwrap()
+                                    .strip_prefix("data: ")
+                                    .unwrap(),
+                            )
+                            .unwrap()
+                        } else {
+                            serde_json::from_slice(&bytes).unwrap()
+                        };
+                        let usage = usage_merge::usage_object(&result).unwrap();
+                        let details = if path == "/v1/responses" {
+                            "input_tokens_details"
+                        } else {
+                            "prompt_tokens_details"
+                        };
+                        assert_eq!(usage["total_tokens"], 78);
+                        assert_eq!(usage[details]["cached_tokens"], 4);
+
+                        let response = router
+                            .route_transparent(
+                                None,
+                                path,
+                                &Method::POST,
+                                json!({"model": "error", "stream": streaming, "logprobs": true}),
+                            )
+                            .await;
+                        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+                        assert_eq!(response.headers()["retry-after"], "7");
+                        assert_eq!(
+                            axum::body::to_bytes(response.into_body(), 4096)
+                                .await
+                                .unwrap()
+                                .as_ref(),
+                            b"overloaded"
+                        );
+                    }
+                }
+            }
+            assert_eq!(
+                router
+                    .get_nixl_push_identity(&format!("http://{address}/p"), None)
+                    .is_some(),
+                push
+            );
+            server.abort();
+        }
+    }
+
+    async fn mock_decode_response(
+        status: StatusCode,
+        body: &'static str,
+    ) -> (reqwest::Response, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = axum::Router::new().route(
+            "/",
+            axum::routing::get(move || async move {
+                (status, [("content-type", "application/json")], body)
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let response = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .get(format!("http://{address}/"))
+            .send()
+            .await
+            .unwrap();
+        (response, server)
+    }
+
+    #[tokio::test]
+    async fn finalizer_forwards_non_sse_streaming_body_before_upstream_finishes() {
+        use futures_util::StreamExt;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::time::{timeout, Duration};
+
+        const PREFIX: &[u8] =
+            br#"{"usage":{"prompt_tokens_details":{"cached_tokens":99}},"choices":[]"#;
+        let prefill = json!({"usage":{"prompt_tokens_details":{"cached_tokens":4}}});
+        for path in ["/v1/chat/completions", "/v1/completions", "/v1/responses"] {
+            for content_type in [
+                Some("application/json"),
+                Some("application/octet-stream"),
+                Some("text/plain"),
+                Some("text/event-streaming"),
+                None,
+            ] {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let address = listener.local_addr().unwrap();
+                let (finish, ready_to_finish) = tokio::sync::oneshot::channel();
+                let server = tokio::spawn(async move {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let mut request = [0; 4096];
+                    let bytes_read = socket.read(&mut request).await.unwrap();
+                    assert!(bytes_read > 0, "client closed before sending request");
+                    let mut headers = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n",
+                        PREFIX.len() + 1
+                    );
+                    if let Some(content_type) = content_type {
+                        headers.push_str(&format!("Content-Type: {content_type}\r\n"));
+                    }
+                    headers.push_str("\r\n");
+                    socket.write_all(headers.as_bytes()).await.unwrap();
+                    socket.write_all(PREFIX).await.unwrap();
+                    // Hold the final JSON byte until the downstream receives its prefix.
+                    ready_to_finish.await.unwrap();
+                    socket.write_all(b"}").await.unwrap();
+                    socket.shutdown().await.unwrap();
+                });
+                let decode = reqwest::Client::builder()
+                    .no_proxy()
+                    .timeout(Duration::from_secs(5))
+                    .build()
+                    .unwrap()
+                    .get(format!("http://{address}/"))
+                    .send()
+                    .await
+                    .unwrap();
+                let response = timeout(
+                    Duration::from_secs(2),
+                    finalize_decode_response(decode, Some(&prefill), path, true, true),
+                )
+                .await
+                .expect("non-SSE streaming responses must return before EOF")
+                .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                assert_eq!(
+                    response
+                        .headers()
+                        .get("content-type")
+                        .map(|v| v.to_str().unwrap()),
+                    content_type
+                );
+                let mut body = response.into_body().into_data_stream();
+                let mut prefix = Vec::new();
+                timeout(Duration::from_secs(2), async {
+                    while prefix.len() < PREFIX.len() {
+                        prefix.extend_from_slice(&body.next().await.unwrap().unwrap());
+                    }
+                })
+                .await
+                .expect("non-SSE bytes must be forwarded before the upstream finishes");
+                assert_eq!(
+                    prefix, PREFIX,
+                    "path: {path}, content type: {content_type:?}"
+                );
+                finish.send(()).unwrap();
+                let mut suffix = Vec::new();
+                while let Some(chunk) = body.next().await {
+                    suffix.extend_from_slice(&chunk.unwrap());
+                }
+                assert_eq!(suffix, b"}");
+                server.await.unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn finalizer_forwards_oversized_sse_without_truncating() {
+        use futures_util::StreamExt;
+
+        for path in ["/v1/chat/completions", "/v1/completions", "/v1/responses"] {
+            let prefix = b"data: {\"choices\":[{\"text\":\"ok\"}]}\n\n";
+            let oversized_frame_bytes = 1024 * 1024 + 1;
+            let mut raw = prefix.to_vec();
+            raw.extend_from_slice(b"data: ");
+            // Include the data field prefix and final blank line in the budget.
+            raw.resize(prefix.len() + oversized_frame_bytes - 2, b'x');
+            raw.extend_from_slice(b"\n\n");
+            assert_eq!(raw.len() - prefix.len(), oversized_frame_bytes);
+            raw.extend_from_slice(b"data: [DONE]\n\n");
+            let expected = raw.clone();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let app = axum::Router::new().route(
+                "/",
+                axum::routing::get(move || {
+                    let raw = raw.clone();
+                    async move { ([("content-type", "text/event-stream")], raw) }
+                }),
+            );
+            let server = tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            let decode = reqwest::Client::builder()
+                .no_proxy()
+                .build()
+                .unwrap()
+                .get(format!("http://{address}/"))
+                .send()
+                .await
+                .unwrap();
+            let response = finalize_decode_response(decode, None, path, true, false)
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.headers()["content-type"], "text/event-stream");
+            let mut stream = response.into_body().into_data_stream();
+            assert_eq!(stream.next().await.unwrap().unwrap(), prefix.as_slice());
+            let mut actual = prefix.to_vec();
+            while let Some(chunk) = stream.next().await {
+                actual.extend_from_slice(&chunk.unwrap());
+            }
+            assert_eq!(actual, expected);
+            server.abort();
+        }
+    }
+
+    // Fixed gzip fixtures for a JSON usage body and an SSE usage/DONE stream.
+    const GZIP_JSON: &[u8] = b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x02\xff\xab\x56\x2a\x2d\x4e\x4c\x4f\x55\xb2\xaa\x56\x2a\x28\xca\xcf\x2d\x28\x89\x2f\xc9\xcf\x4e\xcd\x2b\x8e\x4f\x49\x2d\x49\xcc\xcc\x29\x06\x49\x24\x27\x26\x67\xa4\xa6\x40\x25\x94\xac\x2c\x2d\x6b\x6b\x75\x94\x92\x33\xf2\x33\x93\x53\x81\xdc\xe8\xd8\x5a\x00\xe1\x2d\x48\x6b\x45\x00\x00\x00";
+    const GZIP_SSE: &[u8] = b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x02\xff\x4b\x49\x2c\x49\xb4\x52\xa8\x56\x2a\x2d\x4e\x4c\x4f\x55\xb2\xaa\x56\x2a\x28\xca\xcf\x2d\x28\x89\x2f\xc9\xcf\x4e\xcd\x2b\x8e\x4f\x49\x2d\x49\xcc\xcc\x29\x06\x49\x24\x27\x26\x67\xa4\xa6\x40\x25\x94\xac\x2c\x2d\x6b\x6b\x75\x94\x92\x33\xf2\x33\x93\x53\x81\xdc\xe8\xd8\x5a\x2e\xae\x14\xb0\x61\xd1\x2e\xfe\x7e\xae\xb1\x5c\x5c\x00\x62\x9a\xfc\x7a\x5b\x00\x00\x00";
+
+    async fn mock_encoded_decode_response(
+        status: StatusCode,
+        body: &'static [u8],
+        content_type: &'static str,
+        content_encoding: &'static str,
+    ) -> (reqwest::Response, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = axum::Router::new().route(
+            "/",
+            axum::routing::get(move || async move {
+                (
+                    status,
+                    [
+                        ("content-type", content_type),
+                        ("content-encoding", content_encoding),
+                        ("retry-after", "7"),
+                        ("connection", "close"),
+                    ],
+                    body,
+                )
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let response = reqwest::Client::builder()
+            .no_proxy()
+            .no_gzip()
+            .build()
+            .unwrap()
+            .get(format!("http://{address}/"))
+            .send()
+            .await
+            .unwrap();
+        (response, server)
+    }
+
+    #[tokio::test]
+    async fn finalizer_rewrites_only_event_stream_media_type() {
+        let raw = b"data: {\"usage\":{\"prompt_tokens_details\":{\"cached_tokens\":99}},\"choices\":[]}\n\ndata: [DONE]\n\n";
+        let prefill = json!({"usage":{"prompt_tokens_details":{"cached_tokens":4}}});
+        for path in ["/v1/chat/completions", "/v1/completions", "/v1/responses"] {
+            for (content_type, rewrite) in [
+                ("text/event-stream", true),
+                ("text/event-stream; charset=utf-8", true),
+                ("Text/Event-Stream; Charset=UTF-8", true),
+                ("application/json", false),
+                ("text/plain", false),
+                ("text/event-streaming", false),
+                ("application/octet-stream; name=text/event-stream", false),
+            ] {
+                let (decode, server) =
+                    mock_encoded_decode_response(StatusCode::OK, raw, content_type, "identity")
+                        .await;
+                let response = finalize_decode_response(decode, Some(&prefill), path, true, false)
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                assert_eq!(response.headers()["content-type"], content_type);
+                let bytes = axum::body::to_bytes(response.into_body(), 1024)
+                    .await
+                    .unwrap();
+                if rewrite {
+                    let text = std::str::from_utf8(&bytes).unwrap();
+                    let usage: Value = serde_json::from_str(
+                        text.lines().next().unwrap().strip_prefix("data: ").unwrap(),
+                    )
+                    .unwrap();
+                    assert_eq!(usage["usage"]["prompt_tokens_details"]["cached_tokens"], 4);
+                    assert!(text.ends_with("data: [DONE]\n\n"));
+                } else {
+                    assert_eq!(
+                        bytes.as_ref(),
+                        raw,
+                        "path: {path}, content type: {content_type}"
+                    );
+                }
+                server.abort();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn finalizer_preserves_gzip_passthrough_headers_and_body() {
+        let prefill = json!({"usage":{"prompt_tokens_details":{"cached_tokens":4}}});
+        for path in [
+            "/v1/chat/completions",
+            "/v1/completions",
+            "/v1/responses",
+            "/custom",
+        ] {
+            for status in [StatusCode::OK, StatusCode::TOO_MANY_REQUESTS] {
+                for is_streaming in [false, true] {
+                    for needs_logprobs in [false, true] {
+                        let streaming_success = is_streaming && status.is_success();
+                        let (raw, content_type) = if streaming_success {
+                            (GZIP_SSE, "text/event-stream")
+                        } else {
+                            (GZIP_JSON, "application/json")
+                        };
+                        let (decode, server) =
+                            mock_encoded_decode_response(status, raw, content_type, "gzip").await;
+                        let result = finalize_decode_response(
+                            decode,
+                            Some(&prefill),
+                            path,
+                            is_streaming,
+                            needs_logprobs,
+                        )
+                        .await;
+                        let response = result.unwrap();
+                        assert_eq!(response.status(), status);
+                        assert_eq!(response.headers()["content-encoding"], "gzip");
+                        assert_eq!(response.headers()["content-type"], content_type);
+                        assert_eq!(response.headers()["retry-after"], "7");
+                        assert!(response.headers().get("connection").is_none());
+                        assert!(response.headers().get("content-length").is_none());
+                        let bytes = axum::body::to_bytes(response.into_body(), 1024)
+                            .await
+                            .unwrap();
+                        assert_eq!(bytes.as_ref(), raw, "path: {path}");
+                        server.abort();
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn finalizer_preserves_encoded_sse_prefix_on_upstream_error() {
+        use futures_util::StreamExt;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            let bytes_read = socket.read(&mut request).await.unwrap();
+            assert!(bytes_read > 0, "client closed before sending request");
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Encoding: gzip\r\nContent-Encoding: identity\r\nContent-Length: {}\r\n\r\n",
+                GZIP_SSE.len() + 20
+            );
+            socket.write_all(headers.as_bytes()).await.unwrap();
+            socket.write_all(GZIP_SSE).await.unwrap();
+            socket.shutdown().await.unwrap();
+        });
+        let decode = reqwest::Client::builder()
+            .no_proxy()
+            .no_gzip()
+            .build()
+            .unwrap()
+            .get(format!("http://{address}/"))
+            .send()
+            .await
+            .unwrap();
+        let response = finalize_decode_response(decode, None, "/v1/completions", true, false)
+            .await
+            .unwrap();
+        let encodings: Vec<_> = response
+            .headers()
+            .get_all("content-encoding")
+            .iter()
+            .map(|value| value.to_str().unwrap())
+            .collect();
+        assert_eq!(encodings, ["gzip", "identity"]);
+        let mut stream = response.into_body().into_data_stream();
+        let mut received = Vec::new();
+        let mut read_failed = false;
+        while let Some(chunk) = stream.next().await {
+            match chunk {
+                Ok(bytes) => received.extend_from_slice(&bytes),
+                Err(_) => {
+                    read_failed = true;
+                    break;
+                }
+            }
+        }
+        assert!(read_failed);
+        assert_eq!(received, GZIP_SSE);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn finalizer_reconciles_identity_encoded_responses() {
+        let raw = b"data: {\"usage\":{\"prompt_tokens_details\":{\"cached_tokens\":99}},\"choices\":[]}\n\n";
+        let prefill = json!({"usage":{"prompt_tokens_details":{"cached_tokens":4}}});
+        let (decode, server) =
+            mock_encoded_decode_response(StatusCode::OK, raw, "text/event-stream", "identity")
+                .await;
+        let response =
+            finalize_decode_response(decode, Some(&prefill), "/v1/completions", true, false)
+                .await
+                .unwrap();
+        assert_eq!(response.headers()["content-encoding"], "identity");
+        let bytes = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        let result = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(result.contains("\"cached_tokens\":4"));
+        assert!(!result.contains("\"cached_tokens\":99"));
+        server.abort();
+
+        let (decode, server) = mock_encoded_decode_response(
+            StatusCode::OK,
+            br#"{"usage":{"prompt_tokens_details":{"cached_tokens":99}},"choices":[]}"#,
+            "application/json",
+            "identity",
+        )
+        .await;
+        let response =
+            finalize_decode_response(decode, Some(&prefill), "/v1/completions", false, false)
+                .await
+                .unwrap();
+        assert!(response.headers().get("content-encoding").is_none());
+        let bytes = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        let result: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(result["usage"]["prompt_tokens_details"]["cached_tokens"], 4);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn finalizer_reconciles_chat_and_completions_without_decode_details_flag() {
+        let prefill = json!({"usage": {"prompt_tokens_details": {"cached_tokens": 0}}});
+        for path in ["/v1/chat/completions", "/v1/completions"] {
+            let (decode, server) = mock_decode_response(
+                StatusCode::OK,
+                r#"{"usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12,"prompt_tokens_details":null},"metrics":{"x":1}}"#,
+            )
+            .await;
+            let response = finalize_decode_response(decode, Some(&prefill), path, false, false)
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert!(response.headers().get("content-length").is_none());
+            let bytes = axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap();
+            let result: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(result["usage"]["prompt_tokens_details"]["cached_tokens"], 0);
+            assert_eq!(result["usage"]["completion_tokens"], 2);
+            assert_eq!(result["metrics"], json!({"x": 1}));
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn finalizer_reconciles_usage_accounting_edge_cases_for_json_and_sse() {
+        for path in ["/v1/chat/completions", "/v1/completions", "/v1/responses"] {
+            let (input_key, output_key, details_key) = if path == "/v1/responses" {
+                ("input_tokens", "output_tokens", "input_tokens_details")
+            } else {
+                (
+                    "prompt_tokens",
+                    "completion_tokens",
+                    "prompt_tokens_details",
+                )
+            };
+            let prefill = json!({"usage": {input_key: 70, output_key: 1,
+                details_key: {"cached_tokens": 90, "audio_tokens": 3}}});
+            for streaming in [false, true] {
+                for output in [
+                    None,
+                    Some(json!(null)),
+                    Some(json!(-1)),
+                    Some(json!(0)),
+                    Some(json!(8)),
+                ] {
+                    let mut decode = json!({"usage": {input_key: 999, "total_tokens": 1007,
+                        details_key: {"cached_tokens": 99, "audio_tokens": 2, "future": 7}, "future": 9}});
+                    if let Some(output) = &output {
+                        decode["usage"][output_key] = output.clone();
+                    }
+                    if streaming && path == "/v1/responses" {
+                        decode = json!({"type": "response.completed", "response": decode});
+                    }
+                    let (content_type, raw) = if streaming {
+                        (
+                            "text/event-stream",
+                            format!("data: {decode}\n\ndata: [DONE]\n\n").into_bytes(),
+                        )
+                    } else {
+                        ("application/json", serde_json::to_vec(&decode).unwrap())
+                    };
+                    let upstream = axum::http::Response::builder()
+                        .status(StatusCode::OK)
+                        .header("content-type", content_type)
+                        .header("content-length", raw.len())
+                        .body(raw)
+                        .unwrap();
+                    let response = finalize_decode_response(
+                        upstream.into(),
+                        Some(&prefill),
+                        path,
+                        streaming,
+                        false,
+                    )
+                    .await
+                    .unwrap();
+                    assert_eq!(response.status(), StatusCode::OK);
+                    assert_eq!(response.headers()["content-type"], content_type);
+                    assert!(response.headers().get("content-length").is_none());
+                    let bytes = axum::body::to_bytes(response.into_body(), 4096)
+                        .await
+                        .unwrap();
+                    let result: Value = if streaming {
+                        let text = std::str::from_utf8(&bytes).unwrap();
+                        assert!(text.ends_with("data: [DONE]\n\n"));
+                        serde_json::from_str(
+                            text.lines().next().unwrap().strip_prefix("data: ").unwrap(),
+                        )
+                        .unwrap()
+                    } else {
+                        serde_json::from_slice(&bytes).unwrap()
+                    };
+                    let usage = usage_merge::usage_object(&result).unwrap();
+                    assert_eq!(usage[input_key], 70);
+                    assert_eq!(usage.get(output_key), output.as_ref());
+                    let total = output
+                        .as_ref()
+                        .and_then(Value::as_u64)
+                        .map(|count| json!(70 + count));
+                    assert_eq!(usage.get("total_tokens"), total.as_ref());
+                    assert_eq!(usage[details_key], json!({"audio_tokens": 3, "future": 7}));
+                    assert_eq!(usage["future"], 9);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn finalizer_removes_decode_cache_when_prefill_did_not_report_it() {
+        let (decode, server) = mock_decode_response(
+            StatusCode::OK,
+            r#"{"usage":{"prompt_tokens_details":{"cached_tokens":10,"audio_tokens":1}}}"#,
+        )
+        .await;
+        let response =
+            finalize_decode_response(decode, Some(&json!({})), "/v1/completions", false, false)
+                .await
+                .unwrap();
+        let bytes = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        let result: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            result["usage"]["prompt_tokens_details"],
+            json!({"audio_tokens": 1})
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn finalizer_reconciles_responses_api_and_preserves_unparsable_success() {
+        let prefill = json!({"usage": {"prompt_tokens_details": {"cached_tokens": 5}}});
+        let response_body = r#"{"usage":{"input_tokens_details":{"cached_tokens":90}}}"#;
+        let (decode, server) = mock_decode_response(StatusCode::OK, response_body).await;
+        let response =
+            finalize_decode_response(decode, Some(&prefill), "/v1/responses", false, false)
+                .await
+                .unwrap();
+        let bytes = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        let result: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(result["usage"]["input_tokens_details"]["cached_tokens"], 5);
+        server.abort();
+
+        let (decode, server) = mock_decode_response(StatusCode::OK, "not-json").await;
+        let response =
+            finalize_decode_response(decode, Some(&prefill), "/v1/completions", false, false)
+                .await
+                .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        assert_eq!(bytes.as_ref(), b"not-json");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn finalizer_preserves_unenriched_non_streaming_body_verbatim() {
+        for path in [
+            "/v1/responses",
+            "/generate",
+            "/inference/v1/generate",
+            "/custom",
+        ] {
+            let raw = "  upstream plain text\n";
+            let (decode, server) = mock_decode_response(StatusCode::OK, raw).await;
+            let response = finalize_decode_response(decode, None, path, false, false)
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.headers()["content-type"], "application/json");
+            let bytes = axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap();
+            assert_eq!(bytes.as_ref(), raw.as_bytes(), "path: {path}");
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn finalizer_forwards_unenriched_body_before_upstream_finishes() {
+        use futures_util::StreamExt;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::time::{timeout, Duration};
+
+        for path in ["/generate", "/inference/v1/generate", "/custom"] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let (finish, ready_to_finish) = tokio::sync::oneshot::channel();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0; 4096];
+                let bytes_read = socket.read(&mut request).await.unwrap();
+                assert!(bytes_read > 0, "client closed before sending request");
+                socket
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: 12\r\n\r\nprefix")
+                    .await
+                    .unwrap();
+                // The response cannot finish until the client receives its prefix.
+                ready_to_finish.await.unwrap();
+                socket.write_all(b"suffix").await.unwrap();
+                socket.shutdown().await.unwrap();
+            });
+            let decode = reqwest::Client::builder()
+                .no_proxy()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .unwrap()
+                .get(format!("http://{address}/"))
+                .send()
+                .await
+                .unwrap();
+            let response = timeout(
+                Duration::from_secs(2),
+                finalize_decode_response(decode, None, path, false, false),
+            )
+            .await
+            .expect("unenriched responses must not wait for the complete upstream body")
+            .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response.headers()["content-type"],
+                "application/octet-stream"
+            );
+            let mut body = response.into_body().into_data_stream();
+            let mut prefix = Vec::new();
+            timeout(Duration::from_secs(2), async {
+                while prefix.len() < 6 {
+                    prefix.extend_from_slice(&body.next().await.unwrap().unwrap());
+                }
+            })
+            .await
+            .expect("upstream bytes must be forwarded before the body finishes");
+            assert_eq!(prefix, b"prefix");
+            finish.send(()).unwrap();
+            let mut suffix = Vec::new();
+            while let Some(chunk) = body.next().await {
+                suffix.extend_from_slice(&chunk.unwrap());
+            }
+            assert_eq!(suffix, b"suffix");
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn finalizer_reports_truncated_bodies_before_or_after_commit_as_required() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        for path in [
+            "/v1/chat/completions",
+            "/v1/completions",
+            "/v1/responses",
+            "/custom",
+        ] {
+            for needs_logprobs in [false, true] {
+                for is_streaming in [false, true] {
+                    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                    let address = listener.local_addr().unwrap();
+                    let server = tokio::spawn(async move {
+                        let (mut socket, _) = listener.accept().await.unwrap();
+                        let mut request = [0; 4096];
+                        let bytes_read = socket.read(&mut request).await.unwrap();
+                        assert!(bytes_read > 0, "client closed before sending request");
+                        // Send fewer bytes than Content-Length promises, then close.
+                        socket
+                            .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 20\r\n\r\n{")
+                            .await
+                            .unwrap();
+                        socket.shutdown().await.unwrap();
+                    });
+                    let decode = reqwest::Client::builder()
+                        .no_proxy()
+                        .timeout(std::time::Duration::from_secs(5))
+                        .build()
+                        .unwrap()
+                        .get(format!("http://{address}/"))
+                        .send()
+                        .await
+                        .unwrap();
+                    let result =
+                        finalize_decode_response(decode, None, path, is_streaming, needs_logprobs)
+                            .await;
+                    let needs_enrichment =
+                        pd_cached_tokens::is_supported_path(path) || needs_logprobs;
+                    if is_streaming || !needs_enrichment {
+                        let response = result.unwrap();
+                        assert_eq!(response.status(), StatusCode::OK);
+                        assert!(axum::body::to_bytes(response.into_body(), 1024)
+                            .await
+                            .is_err());
+                    } else {
+                        assert!(result
+                            .unwrap_err()
+                            .contains("Failed to read Decode response"));
+                    }
+                    server.await.unwrap();
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn finalizer_forwards_large_json_without_waiting_for_the_suffix() {
+        use bytes::Bytes;
+        use futures_util::{stream, StreamExt};
+        use tokio::time::{timeout, Duration};
+
+        // Exercise both Content-Length preflight and chunked accumulation.
+        for known_length in [false, true] {
+            let prefix_len = 8 * 1024 * 1024 + 1;
+            let (finish, ready) = tokio::sync::oneshot::channel::<()>();
+            let ready = Arc::new(Mutex::new(Some(ready)));
+            let app =
+                axum::Router::new().route(
+                    "/",
+                    axum::routing::get(move || {
+                        let ready = ready.clone();
+                        async move {
+                            let receiver = ready.lock().await.take().unwrap();
+                            let prefix = stream::iter([Ok::<_, std::io::Error>(Bytes::from(
+                                vec![b'x'; prefix_len],
+                            ))]);
+                            let suffix = stream::once(async move {
+                                receiver.await.unwrap();
+                                Ok::<_, std::io::Error>(Bytes::from_static(b"suffix"))
+                            });
+                            let mut builder =
+                                Response::builder().header("content-type", "application/json");
+                            if known_length {
+                                builder = builder.header("content-length", prefix_len + 6);
+                            }
+                            builder
+                                .body(Body::from_stream(prefix.chain(suffix)))
+                                .unwrap()
+                        }
+                    }),
+                );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let decode = reqwest::Client::builder()
+                .no_proxy()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .unwrap()
+                .get(format!("http://{address}/"))
+                .send()
+                .await
+                .unwrap();
+            let response = timeout(
+                Duration::from_secs(2),
+                finalize_decode_response(decode, None, "/v1/completions", false, false),
+            )
+            .await
+            .expect("oversized optional enrichment must switch to passthrough")
+            .unwrap();
+            finish.send(()).unwrap();
+            let bytes = axum::body::to_bytes(response.into_body(), prefix_len + 6)
+                .await
+                .unwrap();
+            assert_eq!(bytes.len(), prefix_len + 6);
+            assert!(bytes[..prefix_len].iter().all(|byte| *byte == b'x'));
+            assert_eq!(&bytes[prefix_len..], b"suffix");
+            server.abort();
+        }
+    }
+
+    #[test]
+    fn pd_request_text_only_builds_representations_consumed_by_policies() {
+        use crate::policies::{
+            CacheAwareConfig, CacheAwarePolicy, ConsistentHashPolicy, RoundRobinPolicy,
+        };
+        use std::cell::Cell;
+
+        let cache = CacheAwarePolicy::with_config(CacheAwareConfig {
+            eviction_interval_secs: 0,
+            ..Default::default()
+        });
+        let plain = RoundRobinPolicy::new();
+        let hash = ConsistentHashPolicy::new();
+        let cache = &cache as &dyn LoadBalancingPolicy;
+        let plain = &plain as &dyn LoadBalancingPolicy;
+        let hash = &hash as &dyn LoadBalancingPolicy;
+        for (prefill, decode, cache_count, legacy_count) in [
+            (plain, plain, 0, 0),
+            (cache, plain, 1, 0),
+            (plain, cache, 1, 0),
+            (cache, cache, 1, 0),
+            (hash, plain, 0, 1),
+            (plain, hash, 0, 1),
+            (hash, hash, 0, 1),
+            (cache, hash, 1, 1),
+            (hash, cache, 1, 1),
+        ] {
+            let cache_calls = Cell::new(0);
+            let legacy_calls = Cell::new(0);
+            let input = PolicyRequestText::new(
+                prefill,
+                decode,
+                || {
+                    legacy_calls.set(legacy_calls.get() + 1);
+                    Some(r#"{"prompt":"raw"}"#.into())
+                },
+                || {
+                    cache_calls.set(cache_calls.get() + 1);
+                    "\0ca:t:raw".into()
+                },
+            );
+            for policy in [prefill, decode] {
+                if policy.needs_cache_routing_key() {
+                    assert_eq!(input.for_policy(policy), Some("\0ca:t:raw"));
+                } else if policy.needs_request_text() {
+                    assert_eq!(input.for_policy(policy), Some(r#"{"prompt":"raw"}"#));
+                }
+            }
+            assert_eq!(cache_calls.get(), cache_count);
+            assert_eq!(legacy_calls.get(), legacy_count);
+        }
+    }
 
     #[test]
     fn test_discovery_health_requires_prefill_and_decode_workers() {
@@ -3112,5 +4312,480 @@ mod tests {
     fn test_moriio_write_decode_params_includes_remote_dp_rank_when_dp_size_gt_1() {
         let params = moriio_write_decode_params(Some("tx-abc"), 4, Some(2));
         assert_eq!(params["remote_dp_rank"], 2);
+    }
+    async fn dispatch_reservation_test_request(router: &VllmPDRouter, path: &str) -> Response {
+        match path {
+            "/v1/chat/completions" => router.route_chat(None, &serde_json::from_value(json!({
+                "model": "test", "messages": [{"role": "user", "content": "hi"}], "stream": true,
+            })).unwrap(), None).await,
+            "/v1/completions" => router.route_completion(None, &serde_json::from_value(json!({
+                "model": "test", "prompt": "hi", "stream": true,
+            })).unwrap(), None).await,
+            _ => router.route_transparent(None, path, &Method::POST, json!({
+                "model": "test", "input": "hi", "stream": true,
+            })).await,
+        }
+    }
+
+    #[tokio::test]
+    async fn selected_decode_is_reserved_while_prefill_is_pending() {
+        for path in ["/v1/chat/completions", "/v1/completions", "/v1/responses"] {
+            let entered = Arc::new(tokio::sync::Notify::new());
+            let signal = entered.clone();
+            let prefill_url = spawn_test_server(axum::Router::new().fallback(move || {
+                let signal = signal.clone();
+                async move {
+                    signal.notify_one();
+                    std::future::pending::<StatusCode>().await
+                }
+            }))
+            .await;
+            let prefill: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+                prefill_url,
+                WorkerType::Prefill {
+                    bootstrap_port: None,
+                },
+            ));
+            let decode: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+                "http://127.0.0.1:1".to_string(),
+                WorkerType::Decode,
+            ));
+            let router = test_vllm_pd_router();
+            router.pd_router.worker_registry.register(prefill.clone());
+            router.pd_router.worker_registry.register(decode.clone());
+            let task =
+                tokio::spawn(async move { dispatch_reservation_test_request(&router, path).await });
+            tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
+                .await
+                .unwrap();
+            let pending_load = decode.load();
+            task.abort();
+            let _ = task.await;
+            assert_eq!(decode.load(), 0, "decode reservation cancellation: {path}");
+            assert_eq!(
+                pending_load, 1,
+                "selected decode must be visible before prefill completes: {path}"
+            );
+        }
+    }
+    #[test]
+    fn test_decode_reservation_serializes_concurrent_admission() {
+        let router = test_vllm_pd_router();
+        let workers: Vec<Arc<dyn Worker>> = (0..2)
+            .map(|i| {
+                Arc::new(BasicWorker::new(
+                    format!("http://decode-{i}"),
+                    WorkerType::Decode,
+                )) as Arc<dyn Worker>
+            })
+            .collect();
+        // With two candidates the existing power-of-two policy always compares
+        // both. No external load samples are installed in this test.
+        let policy = crate::policies::PowerOfTwoPolicy::new();
+        let barrier = std::sync::Barrier::new(32);
+        let guards = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..32)
+                .map(|_| {
+                    scope.spawn(|| {
+                        barrier.wait();
+                        router
+                            .select_and_reserve_decode(&policy, &workers, None, None)
+                            .unwrap()
+                            .1
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(workers[0].load(), 16);
+        assert_eq!(workers[1].load(), 16);
+        drop(guards);
+        assert!(workers.iter().all(|worker| worker.load() == 0));
+    }
+
+    #[test]
+    fn test_decode_reservation_unavailable_does_not_change_load() {
+        let router = test_vllm_pd_router();
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+            "http://decode".to_string(),
+            WorkerType::Decode,
+        ));
+        worker.set_healthy(false);
+        let policy = crate::policies::PowerOfTwoPolicy::new();
+        assert!(router
+            .select_and_reserve_decode(&policy, std::slice::from_ref(&worker), None, None)
+            .is_none());
+        assert_eq!(worker.load(), 0);
+        assert!(router
+            .select_and_reserve_decode(&policy, &[], None, None)
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn concurrent_nixl_keeps_one_reservation_until_cancelled() {
+        let p_entered = Arc::new(tokio::sync::Notify::new());
+        let d_entered = Arc::new(tokio::sync::Notify::new());
+        let mut urls = Vec::new();
+        for signal in [p_entered.clone(), d_entered.clone()] {
+            urls.push(
+                spawn_test_server(axum::Router::new().fallback(move || {
+                    let signal = signal.clone();
+                    async move {
+                        signal.notify_one();
+                        std::future::pending::<StatusCode>().await
+                    }
+                }))
+                .await,
+            );
+        }
+        let prefill: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+            urls[0].clone(),
+            WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+        ));
+        let decode: Arc<dyn Worker> =
+            Arc::new(BasicWorker::new(urls[1].clone(), WorkerType::Decode));
+        let router = test_vllm_pd_router();
+        router.store_nixl_info(
+            prefill.base_url(),
+            None,
+            json!({
+                "transfer_mode": "push", "remote_engine_id": "test-prefill",
+                "remote_host": "127.0.0.1", "remote_port": 1234, "tp_size": 1,
+            }),
+        );
+        router.pd_router.worker_registry.register(prefill.clone());
+        router.pd_router.worker_registry.register(decode.clone());
+        let task = tokio::spawn(async move {
+            dispatch_reservation_test_request(&router, "/v1/chat/completions").await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            p_entered.notified().await;
+            d_entered.notified().await;
+        })
+        .await
+        .expect("cached NIXL push identity must dispatch both stages concurrently");
+        let loads = (prefill.load(), decode.load());
+        task.abort();
+        let _ = task.await;
+        assert_eq!(
+            loads,
+            (1, 1),
+            "the NIXL fast path must reuse the reservation"
+        );
+        assert_eq!(decode.load(), 0);
+    }
+
+    #[tokio::test]
+    async fn prefill_parse_error_releases_decode_reservation() {
+        let prefill_url = spawn_test_server(
+            axum::Router::new().fallback(|| async { (StatusCode::OK, "not JSON") }),
+        )
+        .await;
+        let prefill: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+            prefill_url,
+            WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+        ));
+        let decode: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+            "http://127.0.0.1:1".to_string(),
+            WorkerType::Decode,
+        ));
+        let router = test_vllm_pd_router();
+        router.pd_router.worker_registry.register(prefill.clone());
+        router.pd_router.worker_registry.register(decode.clone());
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            dispatch_reservation_test_request(&router, "/v1/responses"),
+        )
+        .await
+        .unwrap();
+        assert!(response.status().is_server_error());
+        assert_eq!(decode.load(), 0);
+    }
+
+    #[tokio::test]
+    async fn buffered_logprobs_cancellation_releases_decode_reservation() {
+        use axum::{http::header::CONTENT_TYPE, routing::post};
+        use bytes::Bytes;
+        use std::{convert::Infallible, task::Poll};
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let signal = entered.clone();
+        let prefill_url = spawn_test_server(
+            axum::Router::new()
+                .fallback(|| async { axum::Json(json!({"kv_transfer_params": {}})) }),
+        )
+        .await;
+        let decode_url = spawn_test_server(axum::Router::new().route(
+            "/v1/chat/completions",
+            post(move || {
+                let signal = signal.clone();
+                async move {
+                    let stream = futures_util::stream::poll_fn(move |_| {
+                        signal.notify_one();
+                        Poll::Pending::<Option<Result<Bytes, Infallible>>>
+                    });
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(CONTENT_TYPE, "application/json")
+                        .body(Body::from_stream(stream))
+                        .unwrap()
+                }
+            }),
+        ))
+        .await;
+        let prefill: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+            prefill_url,
+            WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+        ));
+        let decode: Arc<dyn Worker> = Arc::new(BasicWorker::new(decode_url, WorkerType::Decode));
+        let router = test_vllm_pd_router();
+        router.pd_router.worker_registry.register(prefill.clone());
+        router.pd_router.worker_registry.register(decode.clone());
+        let task = tokio::spawn(async move {
+            router
+                .route_chat(
+                    None,
+                    &serde_json::from_value(json!({
+                        "model": "test", "messages": [{"role":"user","content":"hi"}],
+                        "stream": false, "logprobs": true,
+                    }))
+                    .unwrap(),
+                    None,
+                )
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
+            .await
+            .unwrap();
+        let decode_load = decode.load();
+        task.abort();
+        let _ = task.await;
+        assert_eq!(decode_load, 1);
+        assert_eq!(decode.load(), 0);
+    }
+    #[tokio::test]
+    async fn ordinary_decode_dispatch_reuses_reservation() {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let signal = entered.clone();
+        let resume = release.clone();
+        let prefill_url = spawn_test_server(
+            axum::Router::new()
+                .fallback(|| async { axum::Json(json!({"kv_transfer_params": {}})) }),
+        )
+        .await;
+        let decode_url = spawn_test_server(axum::Router::new().fallback(move || {
+            let signal = signal.clone();
+            let resume = resume.clone();
+            async move {
+                signal.notify_one();
+                resume.notified().await;
+                axum::Json(json!({"output": []}))
+            }
+        }))
+        .await;
+        let prefill: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+            prefill_url,
+            WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+        ));
+        let decode: Arc<dyn Worker> = Arc::new(BasicWorker::new(decode_url, WorkerType::Decode));
+        let router = test_vllm_pd_router();
+        router.pd_router.worker_registry.register(prefill.clone());
+        router.pd_router.worker_registry.register(decode.clone());
+        let task = tokio::spawn(async move {
+            dispatch_reservation_test_request(&router, "/v1/responses").await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
+            .await
+            .unwrap();
+        assert_eq!(prefill.load(), 0);
+        assert_eq!(
+            decode.load(),
+            1,
+            "dispatch must not increment the reservation twice"
+        );
+        release.notify_one();
+        let response = tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        drop(response);
+        assert_eq!(decode.load(), 0);
+    }
+    #[test]
+    fn cache_aware_affinity_survives_pending_reservations() {
+        use crate::policies::{CacheAwareConfig, CacheAwarePolicy, LoadBalancingPolicy};
+        let router = test_vllm_pd_router();
+        let workers: Vec<Arc<dyn Worker>> = (0..8)
+            .map(|i| {
+                Arc::new(BasicWorker::new(
+                    format!("http://d-{i}"),
+                    WorkerType::Decode,
+                )) as Arc<dyn Worker>
+            })
+            .collect();
+        let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+            eviction_interval_secs: 0,
+            ..Default::default()
+        });
+        policy.init_workers(&workers);
+        let prefix = "shared conversation prefix ".repeat(100);
+        let (warm_idx, guard) = router
+            .select_and_reserve_decode(&policy, &workers, Some(&prefix), None)
+            .unwrap();
+        drop(guard);
+        // Sequential turns preserve affinity as the conversation grows.
+        for turn in 0..8 {
+            let text = format!("{prefix}turn {turn}");
+            let (idx, guard) = router
+                .select_and_reserve_decode(&policy, &workers, Some(&text), None)
+                .unwrap();
+            assert_eq!(idx, warm_idx);
+            drop(guard);
+        }
+        // A pending warm request does not force loss of affinity below the default threshold.
+        let (_, first) = router
+            .select_and_reserve_decode(&policy, &workers, Some(&prefix), None)
+            .unwrap();
+        let (idx, second) = router
+            .select_and_reserve_decode(&policy, &workers, Some(&prefix), None)
+            .unwrap();
+        assert_eq!(idx, warm_idx);
+        // A disjoint cold request can use an unoccupied D without erasing warm affinity.
+        let (cold_idx, cold) = router
+            .select_and_reserve_decode(&policy, &workers, Some("ZZZZ unrelated cold prompt"), None)
+            .unwrap();
+        assert_ne!(cold_idx, warm_idx);
+        drop((first, second, cold));
+        assert!(workers.iter().all(|w| w.load() == 0));
+        let (idx, guard) = router
+            .select_and_reserve_decode(&policy, &workers, Some(&prefix), None)
+            .unwrap();
+        assert_eq!(idx, warm_idx);
+        drop(guard);
+    }
+
+    #[test]
+    fn cold_burst_reservations_balance_across_workers() {
+        use crate::policies::{CacheAwareConfig, CacheAwarePolicy, LoadBalancingPolicy};
+        let router = test_vllm_pd_router();
+        let workers: Vec<Arc<dyn Worker>> = (0..8)
+            .map(|i| {
+                Arc::new(BasicWorker::new(
+                    format!("http://d-{i}"),
+                    WorkerType::Decode,
+                )) as Arc<dyn Worker>
+            })
+            .collect();
+        let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+            eviction_interval_secs: 0,
+            ..Default::default()
+        });
+        policy.init_workers(&workers);
+        let mut guards = Vec::new();
+        for i in 0..24 {
+            let text = char::from_u32(0x400 + i).unwrap().to_string().repeat(100);
+            guards.push(
+                router
+                    .select_and_reserve_decode(&policy, &workers, Some(&text), None)
+                    .unwrap()
+                    .1,
+            );
+        }
+        assert!(workers.iter().all(|w| w.load() == 3));
+        drop(guards);
+        assert!(workers.iter().all(|w| w.load() == 0));
+    }
+
+    #[tokio::test]
+    async fn dispatch_failures_release_only_owned_reservation() {
+        for path in ["/v1/chat/completions", "/v1/completions", "/v1/responses"] {
+            for mode in [
+                "prefill_http",
+                "prefill_transport",
+                "decode_http",
+                "decode_transport",
+                "decode_timeout",
+            ] {
+                let prefill_url = if mode == "prefill_transport" {
+                    "http://127.0.0.1:1".to_string()
+                } else if mode == "prefill_http" {
+                    spawn_test_server(
+                        axum::Router::new()
+                            .fallback(|| async { StatusCode::INTERNAL_SERVER_ERROR }),
+                    )
+                    .await
+                } else {
+                    spawn_test_server(
+                        axum::Router::new()
+                            .fallback(|| async { axum::Json(json!({"kv_transfer_params": {}})) }),
+                    )
+                    .await
+                };
+                let decode_url = if mode == "decode_transport" {
+                    "http://127.0.0.1:1".to_string()
+                } else if mode == "decode_timeout" {
+                    spawn_test_server(
+                        axum::Router::new()
+                            .fallback(|| async { std::future::pending::<StatusCode>().await }),
+                    )
+                    .await
+                } else {
+                    spawn_test_server(
+                        axum::Router::new()
+                            .fallback(|| async { StatusCode::INTERNAL_SERVER_ERROR }),
+                    )
+                    .await
+                };
+                let prefill: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+                    prefill_url,
+                    WorkerType::Prefill {
+                        bootstrap_port: None,
+                    },
+                ));
+                let decode: Arc<dyn Worker> =
+                    Arc::new(BasicWorker::new(decode_url, WorkerType::Decode));
+                let mut router = test_vllm_pd_router();
+                router.http_client = reqwest::Client::builder()
+                    .timeout(std::time::Duration::from_millis(200))
+                    .build()
+                    .unwrap();
+                router.pd_router.client = router.http_client.clone();
+                router.pd_router.worker_registry.register(prefill);
+                router.pd_router.worker_registry.register(decode.clone());
+                // Sentinel load catches accidental double release hidden by saturating counters.
+                decode.increment_load();
+                let response = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    dispatch_reservation_test_request(&router, path),
+                )
+                .await
+                .unwrap();
+                assert!(
+                    response.status().is_server_error(),
+                    "{path} {mode}: {}",
+                    response.status()
+                );
+                assert_eq!(decode.load(), 1, "{path} {mode}");
+                drop(response);
+                assert_eq!(
+                    decode.load(),
+                    1,
+                    "response drop must not release again: {path} {mode}"
+                );
+                decode.decrement_load();
+            }
+        }
     }
 }

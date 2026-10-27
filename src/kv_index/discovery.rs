@@ -1,5 +1,5 @@
-//! Worker discovery: query /get_server_info + /kv_event_sources, spawn one
-//! subscriber per (worker, rank). One indexer per cache-identity core.
+//! Worker discovery: query worker control metadata and KV event sources, then
+//! spawn one subscriber per (worker, rank). One indexer per cache-identity core.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -11,6 +11,7 @@ use serde::Deserialize;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
+use crate::config::StaticKvEventSources;
 use crate::kv_index::indexer::KvBlockIndexer;
 use crate::kv_index::subscriber::{spawn as spawn_subscriber, EventSource, SubscriberHandle};
 use crate::kv_index::{ClearScope, HashMode, IngestionSignal, ResidencyOwner, SourceId};
@@ -90,6 +91,8 @@ struct WorkerSubs {
 pub struct KvIndexSupervisor {
     client: reqwest::Client,
     hash_mode: HashMode,
+    /// Explicit event sources override discovery for configured workers.
+    static_sources: HashMap<String, StaticKvEventSources>,
     /// Shared across every subscriber — one I/O thread pool, not one per task.
     ctx: Arc<zmq::Context>,
     /// One indexer per cache-identity core.
@@ -125,6 +128,7 @@ impl KvIndexSupervisor {
         let supervisor = KvIndexSupervisor {
             client,
             hash_mode,
+            static_sources: HashMap::new(),
             ctx: Arc::new(zmq::Context::new()),
             indexers: DashMap::new(),
             identity_refs: Mutex::new(HashMap::new()),
@@ -137,6 +141,16 @@ impl KvIndexSupervisor {
 
     pub fn hash_mode(&self) -> HashMode {
         self.hash_mode
+    }
+
+    /// Use configured event sources for workers whose HTTP/gRPC control plane
+    /// does not expose KV event discovery.
+    pub fn with_static_sources(
+        mut self,
+        static_sources: HashMap<String, StaticKvEventSources>,
+    ) -> Self {
+        self.static_sources = static_sources;
+        self
     }
 
     /// Query both endpoints for `worker_url`, spawn one subscriber per rank into
@@ -153,12 +167,21 @@ impl KvIndexSupervisor {
             self.on_worker_removed(worker_url);
         }
 
-        let discovery = discover_worker(&self.client, worker_url).await;
+        let discovery = match self.static_sources.get(worker_url) {
+            Some(config) => {
+                info!(
+                    worker_url,
+                    model = %config.model,
+                    block_size = config.block_size,
+                    ranks = config.endpoints.len(),
+                    "using configured static KV event sources"
+                );
+                static_worker_discovery(worker_url, config)
+            }
+            None => discover_worker(&self.client, worker_url).await,
+        };
         let server_info = discovery.server_info.unwrap_or_else(|e| {
-            warn!(
-                "kv_index {}: {} — falling back to URL as instance/model id",
-                worker_url, e
-            );
+            warn!("kv_index {}: {}", worker_url, e);
             ServerInfo {
                 model_id: Some(worker_url.to_string()),
                 ..Default::default()
@@ -208,7 +231,7 @@ impl KvIndexSupervisor {
 
         let Some(block_size) = block_size else {
             warn!(
-                "kv_index {}: no block_size from /get_server_info — cannot index",
+                "kv_index {}: no block_size metadata — cannot index",
                 worker_url
             );
             return Ok(WorkerKvInfo {
@@ -389,6 +412,43 @@ impl KvIndexSupervisor {
     }
 }
 
+fn static_worker_discovery(worker_url: &str, config: &StaticKvEventSources) -> WorkerDiscovery {
+    let model = config.model.trim().to_owned();
+    let server_info = ServerInfo {
+        model_id: Some(model.clone()),
+        instance_id: Some(worker_url.to_owned()),
+        kv_block_size: Some(config.block_size),
+        ..Default::default()
+    };
+    let sources = config
+        .endpoints
+        .iter()
+        .enumerate()
+        .map(|(rank, endpoint)| {
+            (
+                rank.to_string(),
+                KvEventSourceEntry {
+                    endpoint: endpoint.clone(),
+                    replay_endpoint: config
+                        .replay_endpoints
+                        .as_ref()
+                        .and_then(|replay| replay.get(rank).cloned()),
+                    publisher: Some("zmq".to_owned()),
+                    encoding: Some("msgpack".to_owned()),
+                    schema_version: Some(1),
+                    enable_kv_cache_events: Some(true),
+                    ..Default::default()
+                },
+            )
+        })
+        .collect();
+    WorkerDiscovery {
+        server_info: Ok(server_info),
+        sources: Ok(sources),
+        model_id: Ok(Some(model)),
+    }
+}
+
 async fn discover_worker(client: &reqwest::Client, worker_url: &str) -> WorkerDiscovery {
     if crate::backend::is_grpc_url(worker_url) {
         let timeout = Duration::from_secs(10);
@@ -416,15 +476,15 @@ async fn discover_worker(client: &reqwest::Client, worker_url: &str) -> WorkerDi
             model_id: model,
         };
     }
-    let server_info = query_server_info(client, worker_url).await;
-    let model_id = server_info
-        .as_ref()
-        .map(|info| Some(server_model_id(info).unwrap_or_else(|| worker_url.to_string())))
-        .map_err(|error| error.clone());
     WorkerDiscovery {
-        server_info,
+        // Standard vLLM's OpenAI HTTP API does not provide the router-specific
+        // /get_server_info endpoint. HTTP workers need static event metadata;
+        // never probe an endpoint that is not part of vLLM's public API.
+        server_info: Err(
+            "HTTP worker model and block-size metadata must be configured statically".to_string(),
+        ),
         sources: query_kv_event_sources(client, worker_url).await,
-        model_id,
+        model_id: Ok(Some(worker_url.to_string())),
     }
 }
 
@@ -463,20 +523,6 @@ fn grpc_kv_event_source_entries(
         .collect()
 }
 
-fn server_model_id(server_info: &ServerInfo) -> Option<String> {
-    server_info
-        .model_id
-        .clone()
-        .filter(|id| !id.trim().is_empty())
-        .or_else(|| {
-            server_info
-                .model_path
-                .as_ref()
-                .and_then(|path| path.split('/').next_back().map(str::to_string))
-                .filter(|id| !id.trim().is_empty())
-        })
-}
-
 fn grpc_model_id(
     model: Result<crate::backend::pb::ModelInfo, String>,
 ) -> Result<Option<String>, String> {
@@ -484,24 +530,6 @@ fn grpc_model_id(
         let model_id = model.model_id;
         (!model_id.trim().is_empty()).then_some(model_id)
     })
-}
-
-async fn query_server_info(
-    client: &reqwest::Client,
-    worker_url: &str,
-) -> Result<ServerInfo, String> {
-    let url = format!("{}/get_server_info", worker_url.trim_end_matches('/'));
-    let resp = client
-        .get(&url)
-        .send()
-        .await
-        .map_err(|e| format!("get_server_info {url}: {e}"))?;
-    if !resp.status().is_success() {
-        return Err(format!("get_server_info {url}: status {}", resp.status()));
-    }
-    resp.json::<ServerInfo>()
-        .await
-        .map_err(|e| format!("get_server_info parse: {e}"))
 }
 
 async fn query_kv_event_sources(
@@ -574,9 +602,35 @@ fn discovered_block_size(server_info: &ServerInfo) -> Option<u32> {
         })
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn configured_event_sources_skip_unavailable_control_discovery() {
+        let publisher_context = zmq::Context::new();
+        let publisher = publisher_context.socket(zmq::PUB).unwrap();
+        publisher.bind("tcp://127.0.0.1:*").unwrap();
+        let endpoint = publisher.get_last_endpoint().unwrap().unwrap();
+        let worker_url = "grpc://127.0.0.1:1";
+        let source = StaticKvEventSources {
+            endpoints: vec![endpoint],
+            replay_endpoints: None,
+            block_size: 32,
+            model: "shared-model".into(),
+        };
+        let sources = HashMap::from([(worker_url.to_string(), source)]);
+        let (supervisor, _signals) =
+            KvIndexSupervisor::new(reqwest::Client::new(), HashMode::Sha256);
+        let supervisor = supervisor.with_static_sources(sources);
+
+        let info = supervisor.on_worker_added(worker_url).await.unwrap();
+        assert_eq!(info.block_size, Some(32));
+        assert_eq!(info.ranks, vec![0]);
+        assert_eq!(info.cache_key.unwrap().model.as_ref(), "shared-model");
+        assert!(supervisor.match_provider_for_worker(worker_url).is_some());
+        supervisor.on_worker_removed(worker_url);
+    }
 
     #[test]
     fn resolve_endpoint_rewrites_bind_star() {
