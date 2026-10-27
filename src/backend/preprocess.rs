@@ -464,7 +464,7 @@ fn user_content_text(content: &UserMessageContent) -> Result<String> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use super::*;
     use std::path::{Path, PathBuf};

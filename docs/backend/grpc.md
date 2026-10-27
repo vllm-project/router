@@ -191,8 +191,8 @@ Launch helpers for python HTTP, rust HTTP, and rust gRPC are in
 Always-on tests:
 
 ```bash
-cargo test --test grpc_vs_http_e2e
-cargo test --lib backend::
+cargo test --features cpu,ready --test grpc_vs_http_e2e
+cargo test --features cpu,ready --lib backend::
 python3 -m unittest tests/python/test_bench_prefix_kvhit.py
 ```
 
@@ -201,5 +201,5 @@ import are available:
 
 ```bash
 export VLLM_ROUTER_MODEL=/path/to/hf-model
-cargo test --lib vllm_chat_tokenize_matches_python_vllm -- --nocapture
+cargo test --features cpu,ready --lib vllm_chat_tokenize_matches_python_vllm -- --nocapture
 ```

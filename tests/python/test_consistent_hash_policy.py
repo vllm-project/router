@@ -75,14 +75,14 @@ class ConsistentHashTester:
         worker_responses = []
 
         for i in range(num_requests):
-            prompt = f"Request {i+1} for session {session_id}"
+            prompt = f"Request {i + 1} for session {session_id}"
             success, response = self.make_request(prompt, session_id=session_id)
 
             if success:
                 worker_responses.append(response)
-                self.log(f"  Request {i+1}: ✅")
+                self.log(f"  Request {i + 1}: ✅")
             else:
-                self.log(f"  Request {i+1}: ❌ {response}", "ERROR")
+                self.log(f"  Request {i + 1}: ❌ {response}", "ERROR")
                 return False
 
         # Extract worker information from responses (this would depend on your router's response format)
@@ -102,14 +102,14 @@ class ConsistentHashTester:
         worker_responses = []
 
         for i in range(num_requests):
-            prompt = f"Request {i+1} for user {user_id}"
+            prompt = f"Request {i + 1} for user {user_id}"
             success, response = self.make_request(prompt, user_id=user_id)
 
             if success:
                 worker_responses.append(response)
-                self.log(f"  Request {i+1}: ✅")
+                self.log(f"  Request {i + 1}: ✅")
             else:
-                self.log(f"  Request {i+1}: ❌ {response}", "ERROR")
+                self.log(f"  Request {i + 1}: ❌ {response}", "ERROR")
                 return False
 
         self.log(
@@ -129,7 +129,7 @@ class ConsistentHashTester:
         # Make requests with both session_id and user_id in session_params
         responses = []
         for i in range(5):
-            prompt = f"Priority test request {i+1}"
+            prompt = f"Priority test request {i + 1}"
             request_data = {
                 "text": prompt,
                 "sampling_params": {"temperature": 0.7, "max_new_tokens": 30},
@@ -145,15 +145,15 @@ class ConsistentHashTester:
                 )
                 if response.status_code == 200:
                     responses.append(response.text)
-                    self.log(f"  Priority test request {i+1}: ✅")
+                    self.log(f"  Priority test request {i + 1}: ✅")
                 else:
                     self.log(
-                        f"  Priority test request {i+1}: ❌ HTTP {response.status_code}",
+                        f"  Priority test request {i + 1}: ❌ HTTP {response.status_code}",
                         "ERROR",
                     )
                     return False
             except Exception as e:
-                self.log(f"  Priority test request {i+1}: ❌ {e}", "ERROR")
+                self.log(f"  Priority test request {i + 1}: ❌ {e}", "ERROR")
                 return False
 
         self.log(
@@ -179,9 +179,9 @@ class ConsistentHashTester:
 
             if success:
                 successful_requests += 1
-                self.log(f"  Session {i+1}: ✅")
+                self.log(f"  Session {i + 1}: ✅")
             else:
-                self.log(f"  Session {i+1}: ❌ {response}", "ERROR")
+                self.log(f"  Session {i + 1}: ❌ {response}", "ERROR")
 
         success_rate = successful_requests / num_sessions
         if success_rate >= 0.8:  # Allow for some failures
@@ -203,13 +203,13 @@ class ConsistentHashTester:
         self.log("Testing fallback behavior without session_id or user_id...")
 
         for i in range(5):
-            prompt = f"Fallback test request {i+1}"
+            prompt = f"Fallback test request {i + 1}"
             success, response = self.make_request(prompt)  # No session_id or user_id
 
             if success:
-                self.log(f"  Fallback request {i+1}: ✅")
+                self.log(f"  Fallback request {i + 1}: ✅")
             else:
-                self.log(f"  Fallback request {i+1}: ❌ {response}", "ERROR")
+                self.log(f"  Fallback request {i + 1}: ❌ {response}", "ERROR")
                 return False
 
         self.log(
@@ -227,7 +227,7 @@ class ConsistentHashTester:
 
         # Make requests using user field (OpenAI ChatCompletion/Completion style)
         for i in range(5):
-            prompt = f"OpenAI user field test request {i+1}"
+            prompt = f"OpenAI user field test request {i + 1}"
             request_data = {
                 "text": prompt,
                 "user": user,  # OpenAI-style user field (not in session_params)
@@ -239,15 +239,15 @@ class ConsistentHashTester:
                     f"{self.router_url}/generate", json=request_data
                 )
                 if response.status_code == 200:
-                    self.log(f"  OpenAI user request {i+1}: ✅")
+                    self.log(f"  OpenAI user request {i + 1}: ✅")
                 else:
                     self.log(
-                        f"  OpenAI user request {i+1}: ❌ HTTP {response.status_code}",
+                        f"  OpenAI user request {i + 1}: ❌ HTTP {response.status_code}",
                         "ERROR",
                     )
                     return False
             except Exception as e:
-                self.log(f"  OpenAI user request {i+1}: ❌ {e}", "ERROR")
+                self.log(f"  OpenAI user request {i + 1}: ❌ {e}", "ERROR")
                 return False
 
         self.log("✅ OpenAI user field routing test passed")
@@ -305,9 +305,9 @@ class ConsistentHashTester:
             success, response = self.make_request(prompt, session_id=session_id)
 
             if success:
-                self.log(f"  DP session {i+1}: ✅")
+                self.log(f"  DP session {i + 1}: ✅")
             else:
-                self.log(f"  DP session {i+1}: ❌ {response}", "ERROR")
+                self.log(f"  DP session {i + 1}: ❌ {response}", "ERROR")
                 return False
 
         self.log("✅ DP-aware routing test passed")
@@ -400,12 +400,14 @@ class ConsistentHashTester:
                     f"{self.router_url}/generate", json=request_data
                 )
                 if response.status_code == 200:
-                    self.log(f"  Format {i+1}: ✅")
+                    self.log(f"  Format {i + 1}: ✅")
                 else:
-                    self.log(f"  Format {i+1}: ❌ HTTP {response.status_code}", "ERROR")
+                    self.log(
+                        f"  Format {i + 1}: ❌ HTTP {response.status_code}", "ERROR"
+                    )
                     return False
             except Exception as e:
-                self.log(f"  Format {i+1}: ❌ {e}", "ERROR")
+                self.log(f"  Format {i + 1}: ❌ {e}", "ERROR")
                 return False
 
         self.log("✅ Different request formats test passed")

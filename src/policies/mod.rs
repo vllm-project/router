@@ -155,6 +155,7 @@ pub struct CacheAwareConfig {
     pub balance_abs_threshold: usize,
     pub balance_rel_threshold: f32,
     pub eviction_interval_secs: u64,
+    /// Per-worker character budget in each model tree, enforced by periodic eviction.
     pub max_tree_size: usize,
 }
 
@@ -165,7 +166,7 @@ impl Default for CacheAwareConfig {
             balance_abs_threshold: 32,
             balance_rel_threshold: 1.1,
             eviction_interval_secs: 30,
-            max_tree_size: 10000,
+            max_tree_size: 1 << 25,
         }
     }
 }
@@ -192,7 +193,7 @@ pub(crate) fn normalize_model_key(model_id: &str) -> &str {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use super::*;
     use crate::core::{BasicWorker, WorkerType};

@@ -27,7 +27,7 @@
     b. If match rate > cache_threshold:
     Route to the worker with highest match (likely has relevant data cached)
     c. If match rate ≤ cache_threshold:
-    Route to the worker with smallest tree size (most available cache capacity)
+    Route to the worker with the lowest load
     d. Background maintenance:
     Periodically evict least recently used leaf nodes to prevent memory overflow
 
@@ -40,7 +40,7 @@
     ------------------------
     1. cache_threshold: (float, 0.0 to 1.0)
     Minimum prefix match ratio to use highest-match routing.
-    Below this threshold, routes to worker with most available cache space.
+    Below this threshold, routes to the worker with the lowest load.
 
     2. balance_abs_threshold: (integer)
     Absolute difference threshold for load imbalance detection.
@@ -55,14 +55,16 @@
     Interval between LRU eviction cycles for the approximate trees.
 
     5. max_tree_size: (integer)
-    Maximum nodes per tree. When exceeded, LRU leaf nodes are evicted
-    during the next eviction cycle.
+    Maximum characters per worker in each model tree. When exceeded, LRU
+    leaf entries are evicted during the next eviction cycle. This is not
+    a hard process-memory limit.
 */
 
 use super::{get_healthy_worker_indices, CacheAwareConfig, LoadBalancingPolicy, RequestHeaders};
 use crate::core::Worker;
 use crate::metrics::RouterMetrics;
 use crate::policies::normalize_model_key;
+use crate::protocols::spec::cache_routing;
 use crate::tree::Tree;
 use dashmap::DashMap;
 use rand::Rng;
@@ -152,11 +154,8 @@ impl CacheAwarePolicy {
                 let matched_chars = tree.as_ref().map_or(0, |tree| {
                     tree.prefix_match_tenant_char_count(request_text, candidate.target_id)
                 });
-                let affinity = if input_chars == 0 {
-                    0.0
-                } else {
-                    matched_chars as f64 / input_chars as f64
-                };
+                let affinity =
+                    cache_routing::match_rate(request_text, matched_chars, input_chars) as f64;
                 let headroom = 1.0 - candidate.kv_pressure.clamp(0.0, 1.0);
                 (candidate, affinity, headroom, (1.0 + affinity) * headroom)
             })
@@ -305,6 +304,7 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         if healthy_indices.is_empty() {
             return None;
         }
+        let text = request_text.unwrap_or("");
 
         // Determine the model for this set of workers (router pre-filters by model)
         // All workers should be from the same model
@@ -342,8 +342,6 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         }
 
         // Use cache-aware routing when balanced
-        let text = request_text.unwrap_or("");
-
         // Get the tree reference without locking the entire HashMap
         // DashMap only locks the specific shard containing this key
         let tree = self.trees.get(model_id).map(|entry| entry.value().clone());
@@ -372,11 +370,8 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         // Now we work with the tree without holding the HashMap lock
         // Use prefix_match_with_counts to avoid redundant chars().count() calls
         let result = tree.prefix_match_with_counts(text);
-        let match_rate = if result.input_char_count == 0 {
-            0.0
-        } else {
-            result.matched_char_count as f32 / result.input_char_count as f32
-        };
+        let match_rate =
+            cache_routing::match_rate(text, result.matched_char_count, result.input_char_count);
 
         debug!(
             "Cache match for model '{}': matched_chars={}, input_chars={}, match_rate={:.2}",
@@ -546,10 +541,147 @@ impl Drop for CacheAwarePolicy {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use super::*;
     use crate::core::{BasicWorker, WorkerType};
+    use crate::protocols::spec::{CompletionRequest, GenerationRequest};
+
+    fn cache_fixture(
+        worker_count: usize,
+        config: CacheAwareConfig,
+    ) -> (CacheAwarePolicy, Vec<Arc<dyn Worker>>) {
+        let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+            eviction_interval_secs: 0,
+            ..config
+        });
+        let workers: Vec<Arc<dyn Worker>> = (0..worker_count)
+            .map(|i| {
+                Arc::new(BasicWorker::new(
+                    format!("http://w{i}:8000"),
+                    WorkerType::Regular,
+                )) as Arc<dyn Worker>
+            })
+            .collect();
+        policy.init_workers(&workers);
+        (policy, workers)
+    }
+
+    #[test]
+    fn content_keys_distinguish_misses_and_reusable_prefixes() {
+        let key = |value| {
+            serde_json::from_value::<CompletionRequest>(value)
+                .unwrap()
+                .extract_cache_routing_key()
+        };
+        let pairs = [
+            (
+                serde_json::json!({"prompt": [1,2,3,4]}),
+                serde_json::json!({"prompt": [2,3,4,5]}),
+                1,
+            ),
+            (
+                serde_json::json!({"prompt": [1]}),
+                serde_json::json!({"prompt": [2]}),
+                1,
+            ),
+            (
+                serde_json::json!({"prompt": [1,2,3,4]}),
+                serde_json::json!({"prompt": [1,2,9,8]}),
+                1,
+            ),
+            (
+                serde_json::json!({"prompt": "a", "session_params": {"session_id": "sess-0001"}}),
+                serde_json::json!({"prompt": "a", "session_params": {"session_id": "sess-0002"}}),
+                1,
+            ),
+            (
+                serde_json::json!({"prompt": [1,2,3,4]}),
+                serde_json::json!({"prompt": [1,2,3,5]}),
+                0,
+            ),
+        ];
+        for (seed, query, expected) in pairs {
+            let (policy, workers) = cache_fixture(2, CacheAwareConfig::default());
+            let seed = key(seed);
+            policy.commit_placement(workers[0].model_id(), &seed, workers[0].url());
+            workers[0].increment_load();
+            // The absolute imbalance guard does not fire at (1,0).
+            // Only a prefix strictly above cache_threshold keeps worker 0.
+            assert_eq!(
+                policy.select_worker(&workers, Some(&key(query))),
+                Some(expected)
+            );
+            // The original complete key still has affinity to worker 0.
+            assert_eq!(policy.select_worker(&workers, Some(&seed)), Some(0));
+        }
+    }
+
+    #[test]
+    fn long_sessions_balance_shared_opening_and_reuse_their_full_history() {
+        // Cover both a partial and a complete match in the old 2048-token window.
+        for common_tokens in [1800, 8192] {
+            // Use the default tree budget; the fixture disables periodic eviction.
+            let (policy, workers) = cache_fixture(
+                4,
+                CacheAwareConfig {
+                    cache_threshold: 0.3,
+                    balance_abs_threshold: 64,
+                    balance_rel_threshold: 1.5,
+                    ..Default::default()
+                },
+            );
+            let mut sessions = Vec::new();
+            let mut counts = [0; 4];
+            for session in 0..30 {
+                let mut ids = vec![session + 100; 52_000];
+                ids[..common_tokens].fill(42);
+                let idx = policy
+                    .select_worker(&workers, Some(&cache_routing::tokens(&ids)))
+                    .unwrap();
+                workers[idx].increment_load();
+                counts[idx] += 1;
+                sessions.push((ids, idx));
+            }
+            assert_eq!(counts, [8, 8, 7, 7], "shared tokens: {common_tokens}");
+
+            // A new turn must distinguish histories beyond the old 2048-token window.
+            for (mut ids, owner) in sessions {
+                ids.extend([300; 1024]);
+                assert_eq!(
+                    policy.select_worker(&workers, Some(&cache_routing::tokens(&ids))),
+                    Some(owner),
+                    "shared tokens: {common_tokens}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn long_chat_text_does_not_treat_a_shared_opening_as_a_full_match() {
+        let (policy, workers) = cache_fixture(
+            2,
+            CacheAwareConfig {
+                cache_threshold: 0.3,
+                ..Default::default()
+            },
+        );
+        let chat_key = |suffix: &str| {
+            cache_routing::for_route(
+                &serde_json::json!({"messages": [{"role": "user", "content":
+                    format!("{}{}", "界".repeat(18_000), suffix.repeat(82_000))}]}),
+                "/v1/chat/completions",
+            )
+        };
+        let first = chat_key("甲");
+        assert_eq!(policy.select_worker(&workers, Some(&first)), Some(0));
+        workers[0].increment_load();
+        assert_eq!(
+            policy.select_worker(&workers, Some(&chat_key("乙"))),
+            Some(1)
+        );
+        assert_eq!(policy.select_worker(&workers, Some(&first)), Some(0));
+    }
 
     #[test]
     fn unhealthy_worker_load_does_not_disable_cache_affinity() {

@@ -249,7 +249,7 @@ pub fn get_tokenizer_info(file_path: &str) -> Result<TokenizerType> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use super::*;
 

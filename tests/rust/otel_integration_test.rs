@@ -1,3 +1,5 @@
+#![cfg(all(feature = "cpu", feature = "ready"))]
+
 //! Integration tests for OpenTelemetry distributed tracing through the real router.
 //!
 //! These tests exercise the full request path: middleware -> router -> backend ->
