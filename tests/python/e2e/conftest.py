@@ -15,8 +15,6 @@ import pytest
 import requests
 
 from tools.e2e.vllm_test_compat import (
-    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-    DEFAULT_URL_FOR_TEST,
     e2e_model_name,
     vllm_worker_command,
     vllm_worker_popen_env,
