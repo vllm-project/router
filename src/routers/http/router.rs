@@ -1081,25 +1081,11 @@ impl Router {
     }
 
     pub async fn send_health_check(&self, worker_url: &str) -> Response {
-        let health_url = if self.intra_node_data_parallel_size > 1 {
-            // Need to extract the URL from "http://host:port@dp_rank"
-            match dp_utils::extract_dp_rank(worker_url) {
-                Ok((worker_url_prefix, _dp_rank)) => worker_url_prefix,
-                Err(e) => {
-                    error!("Failed to extract dp_rank for health check: {}", e);
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("Failed to extract dp_rank: {}", e),
-                    )
-                        .into_response();
-                }
-            }
-        } else {
-            worker_url
-        };
+        let (health_url, _) = self.worker_endpoint(worker_url);
 
-        if crate::backend::is_grpc_url(health_url) {
-            return match crate::backend::check_grpc_health(health_url, Duration::from_secs(2)).await
+        if crate::backend::is_grpc_url(&health_url) {
+            return match crate::backend::check_grpc_health(&health_url, Duration::from_secs(2))
+                .await
             {
                 Ok(()) => StatusCode::OK.into_response(),
                 Err(e) => (StatusCode::BAD_GATEWAY, e).into_response(),
@@ -1580,14 +1566,12 @@ impl Router {
         response
     }
 
-    // Helper: return base worker URL (strips DP suffix when enabled)
-    fn worker_base_url(&self, worker_url: &str) -> String {
-        if self.intra_node_data_parallel_size > 1 {
-            if let Ok((prefix, _)) = dp_utils::extract_dp_rank(worker_url) {
-                return prefix.to_string();
-            }
-        }
-        worker_url.to_string()
+    fn worker_endpoint(&self, worker_url: &str) -> (String, Option<usize>) {
+        self.worker_registry
+            .get_by_url(worker_url)
+            .filter(|worker| worker.is_dp_aware() || self.intra_node_data_parallel_size <= 1)
+            .map(|worker| (worker.base_url().to_owned(), worker.dp_rank()))
+            .unwrap_or_else(|| dp_utils::parse_worker_url(worker_url))
     }
 
     // Generic simple routing for GET/POST without JSON body
@@ -1606,7 +1590,7 @@ impl Router {
 
         let mut last_response: Option<Response> = None;
         for worker_url in worker_urls {
-            let base = self.worker_base_url(&worker_url);
+            let (base, dp_rank) = self.worker_endpoint(&worker_url);
 
             let url = format!("{}/{}", base, endpoint);
             let route_name = format!("/{}", endpoint);
@@ -1629,6 +1613,7 @@ impl Router {
                     let name_lc = name.as_str().to_lowercase();
                     if name_lc != "content-type"
                         && name_lc != "content-length"
+                        && !(dp_rank.is_some() && name_lc == "x-data-parallel-rank")
                         && !header_utils::TRACE_HEADER_NAMES.contains(&name_lc.as_str())
                     {
                         request_builder = request_builder.header(name, value);
@@ -1636,6 +1621,7 @@ impl Router {
                 }
             }
 
+            request_builder = dp_utils::add_dp_rank_header(request_builder, dp_rank);
             match otel_http::send_client_request(
                 request_builder,
                 headers,
@@ -1760,48 +1746,9 @@ impl Router {
             return response;
         }
 
-        let (mut request_builder, extracted_dp_rank, request_url) =
-            if self.intra_node_data_parallel_size > 1 {
-                let (worker_url_prefix, dp_rank) = match dp_utils::extract_dp_rank(worker_url) {
-                    Ok(tup) => tup,
-                    Err(e) => {
-                        error!("Failed to extract dp_rank: {}", e);
-                        return (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            format!("Failed to extract dp_rank: {}", e),
-                        )
-                            .into_response();
-                    }
-                };
-
-                // Parse the request body
-                let json_val = match serde_json::to_value(typed_req) {
-                    Ok(j) => j,
-                    Err(e) => {
-                        return (
-                            StatusCode::BAD_REQUEST,
-                            format!("Convert into serde_json::Value failed: {}", e),
-                        )
-                            .into_response();
-                    }
-                };
-
-                // Use the original json_val without modification
-
-                let request_url = format!("{}{}", worker_url_prefix, route);
-                (
-                    self.client.post(&request_url).json(&json_val),
-                    Some(dp_rank),
-                    request_url,
-                )
-            } else {
-                let request_url = format!("{}{}", worker_url, route);
-                (
-                    self.client.post(&request_url).json(typed_req),
-                    None,
-                    request_url,
-                )
-            };
+        let (base_url, extracted_dp_rank) = self.worker_endpoint(worker_url);
+        let request_url = format!("{base_url}{route}");
+        let mut request_builder = self.client.post(&request_url).json(typed_req);
 
         // Copy all headers from original request if provided, skipping
         // Content-Type/Content-Length (.json() sets them) and trace headers
@@ -1811,6 +1758,8 @@ impl Router {
             for (name, value) in &forwarded {
                 if *name != CONTENT_TYPE
                     && *name != CONTENT_LENGTH
+                    && !(extracted_dp_rank.is_some()
+                        && name.as_str().eq_ignore_ascii_case("x-data-parallel-rank"))
                     && !header_utils::TRACE_HEADER_NAMES
                         .iter()
                         .any(|&th| name.as_str().eq_ignore_ascii_case(th))
@@ -2268,19 +2217,7 @@ impl Router {
     }
 
     async fn get_worker_load(&self, worker_url: &str) -> Option<isize> {
-        let worker_url = if self.intra_node_data_parallel_size > 1 {
-            // Need to extract the URL from "http://host:port@dp_rank"
-            let (worker_url_prefix, _dp_rank) = match dp_utils::extract_dp_rank(worker_url) {
-                Ok(tup) => tup,
-                Err(e) => {
-                    error!("Failed to extract dp_rank: {}", e);
-                    return None;
-                }
-            };
-            worker_url_prefix
-        } else {
-            worker_url
-        };
+        let (worker_url, _) = self.worker_endpoint(worker_url);
 
         match self
             .client
@@ -2674,23 +2611,7 @@ impl RouterTrait for Router {
         // Send requests to all workers concurrently without headers
         let mut tasks = Vec::new();
         for worker_url in &worker_urls {
-            let worker_url = if self.intra_node_data_parallel_size > 1 {
-                // Need to extract the URL from "http://host:port@dp_rank"
-                let (worker_url_prefix, _dp_rank) = match dp_utils::extract_dp_rank(worker_url) {
-                    Ok(tup) => tup,
-                    Err(e) => {
-                        error!("Failed to extract dp_rank: {}", e);
-                        return (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            format!("Failed to extract dp_rank: {}", e),
-                        )
-                            .into_response();
-                    }
-                };
-                worker_url_prefix
-            } else {
-                worker_url
-            };
+            let (worker_url, _) = self.worker_endpoint(worker_url);
             let request_builder = self.client.post(format!("{}/flush_cache", worker_url));
             tasks.push(request_builder.send());
         }

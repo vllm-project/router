@@ -195,6 +195,10 @@ name = "grpc_vs_http_e2e"
 path = "tests/rust/grpc_vs_http_e2e.rs"
 
 [[test]]
+name = "igw_dp_registration"
+path = "tests/rust/igw_dp_registration.rs"
+
+[[test]]
 name = "kv_device_consumer"
 path = "tests/rust/kv_device_consumer.rs"
 

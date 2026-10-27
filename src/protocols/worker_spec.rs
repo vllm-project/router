@@ -11,6 +11,12 @@ pub struct WorkerConfigRequest {
     /// Worker URL (required)
     pub url: String,
 
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dp_rank: Option<usize>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dp_size: Option<usize>,
+
     /// Model ID (optional, will query from server if not provided)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model_id: Option<String>,
@@ -36,6 +42,38 @@ pub struct WorkerConfigRequest {
     pub labels: HashMap<String, String>,
 }
 
+impl WorkerConfigRequest {
+    pub fn validate_dp(&self) -> Result<(), String> {
+        match (self.dp_rank, self.dp_size) {
+            (None, None) => return Ok(()),
+            (Some(rank), Some(size)) if size > 0 && rank < size => {}
+            _ => {
+                return Err(
+                    "dp_rank and dp_size must be provided together, with 0 <= dp_rank < dp_size"
+                        .into(),
+                )
+            }
+        }
+
+        let url = url::Url::parse(&self.url).map_err(|_| "Invalid DP worker URL")?;
+        if !matches!(url.scheme(), "http" | "https")
+            || url.host_str().is_none()
+            || self.url.contains('@')
+            || url.query().is_some()
+            || url.fragment().is_some()
+        {
+            return Err("DP registration requires an HTTP(S) base URL without credentials, rank suffix, query or fragment".into());
+        }
+        if !matches!(
+            self.worker_type.as_deref(),
+            None | Some("regular" | "prefill" | "decode")
+        ) {
+            return Err("DP worker_type must be regular, prefill or decode".into());
+        }
+        Ok(())
+    }
+}
+
 /// Worker information for API responses
 #[derive(Debug, Clone, Serialize)]
 pub struct WorkerInfo {
@@ -44,6 +82,15 @@ pub struct WorkerInfo {
 
     /// Worker URL
     pub url: String,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dp_rank: Option<usize>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dp_size: Option<usize>,
 
     /// Model ID this worker serves
     pub model_id: String,

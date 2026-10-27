@@ -249,6 +249,59 @@ For detailed configuration options, hash key priorities, and usage examples, see
 
 For the optional agent metadata contract, scheduling enablement, request-scoped hints, and engine KV-control boundary, see [Program Scheduling](docs/program_scheduling.md).
 
+### Explicit DP ranks in the worker API
+
+With `--enable-igw`, register each addressable HTTP worker rank separately:
+
+```bash
+curl http://localhost:30000/workers \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "url": "http://worker:8000",
+    "model_id": "my-model",
+    "worker_type": "prefill",
+    "dp_rank": 1,
+    "dp_size": 2
+  }'
+```
+
+`dp_rank` and `dp_size` are optional together. When provided, `dp_size` must
+be positive and `dp_rank` must be in `0..dp_size`. Use the engine's rank
+numbering and total DP group size; the declared rank must already be
+addressable through the endpoint. The API does not discover or create ranks.
+Prefill and decode endpoints can have independent DP sizes and ranks.
+
+The response and `GET /workers` expose `url` as the logical identity
+`http://worker:8000@1`, plus `base_url`, `dp_rank`, and `dp_size`. Network
+requests use the base URL and carry `X-data-parallel-rank: 1`. Health checks
+and model discovery also use the base URL. Without rank fields, registration
+keeps the existing behavior and response shape.
+Rust callers constructing `WorkerConfigRequest` literals must supply both new
+fields, using `None` for ordinary workers.
+
+Re-registering the same rank and metadata is a no-op. Conflicting metadata,
+mixing ranked and unranked workers at one endpoint, or inconsistent model,
+worker type, or DP size at one endpoint is rejected. To change a rank's
+configuration, remove it before registering it again.
+
+When `model_id` is omitted for an existing rank, its registered model is reused
+without repeating discovery, including an initial `unknown` result. Prefill
+ranks at one endpoint may use different `bootstrap_port` values; changing the
+port of an existing rank requires removing it first.
+
+Remove a specific rank using its URL-encoded logical identity:
+
+```bash
+curl -X DELETE \
+  'http://localhost:30000/workers/http%3A%2F%2Fworker%3A8000%401'
+```
+
+Other ranks remain registered. Remove each rank separately to remove an
+endpoint. Removal changes routing membership; it does not drain active
+requests. Explicit DP registration requires IGW and HTTP(S) base URLs without
+credentials, `@rank` suffixes, queries, or fragments. It enables rank selection;
+the configured routing policy still decides which rank receives a request.
+
 ## Advanced Features
 
 ### Kubernetes Service Discovery

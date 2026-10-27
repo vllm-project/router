@@ -5,7 +5,9 @@
 //! - Multi-Router Mode (enable_igw=true): RouterManager coordinates everything
 
 use crate::config::RouterConfig;
-use crate::core::{CircuitBreakerConfig, Worker, WorkerFactory, WorkerRegistry, WorkerType};
+use crate::core::{
+    BasicWorker, CircuitBreakerConfig, DPAwareWorker, Worker, WorkerRegistry, WorkerType,
+};
 use crate::policies::kv_aware_ops;
 use crate::protocols::spec::{
     ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest,
@@ -24,7 +26,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use dashmap::DashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tracing::{info, warn};
 
@@ -63,6 +65,7 @@ pub struct RouterManager {
     /// Configuration
     #[allow(dead_code)] // May be used in future enhancements
     config: RouterConfig,
+    worker_mutations: Mutex<()>,
 }
 
 impl RouterManager {
@@ -80,6 +83,7 @@ impl RouterManager {
             default_router: Arc::new(std::sync::RwLock::new(None)),
             client,
             config,
+            worker_mutations: Mutex::new(()),
         }
     }
 
@@ -154,15 +158,28 @@ impl RouterManager {
     /// Add a worker to the registry
     pub async fn add_worker(
         &self,
-        config: WorkerConfigRequest,
+        mut config: WorkerConfigRequest,
     ) -> Result<WorkerApiResponse, WorkerErrorResponse> {
+        config.validate_dp().map_err(|error| WorkerErrorResponse {
+            error,
+            code: "INVALID_DP_CONFIG".into(),
+        })?;
+        if config.dp_rank.is_some() {
+            config.url = config.url.trim_end_matches('/').to_owned();
+        }
+        let rank_url = config.dp_rank.map(|rank| format!("{}@{rank}", config.url));
+        let existing = rank_url
+            .as_deref()
+            .and_then(|url| self.worker_registry.get_by_url(url));
         // Build labels from configuration
         let mut labels = config.labels.clone();
 
         // Discover the model through the backend's standard model API if the
         // caller did not provide it.
-        let model_id = if let Some(model_id) = config.model_id {
+        let model_id = if let Some(model_id) = config.model_id.clone() {
             model_id
+        } else if let Some(worker) = existing {
+            worker.model_id().to_owned()
         } else {
             match self.query_model_id(&config.url).await {
                 Ok(model_id) => model_id,
@@ -171,6 +188,20 @@ impl RouterManager {
                     "unknown".to_string()
                 }
             }
+        };
+
+        let _guard = self
+            .worker_mutations
+            .lock()
+            .expect("Worker mutation lock poisoned");
+        let model_id = match (
+            &config.model_id,
+            rank_url
+                .as_deref()
+                .and_then(|url| self.worker_registry.get_by_url(url)),
+        ) {
+            (None, Some(worker)) => worker.model_id().to_owned(),
+            _ => model_id,
         };
 
         // Add configuration to labels
@@ -184,27 +215,66 @@ impl RouterManager {
             labels.insert("cost".to_string(), cost.to_string());
         }
 
-        let worker = match config.worker_type.as_deref() {
-            Some("prefill") => WorkerFactory::create_prefill_with_labels(
-                config.url.clone(),
-                config.bootstrap_port,
-                labels.clone(),
-                CircuitBreakerConfig::default(),
-            ),
-            Some("decode") => WorkerFactory::create_decode_with_labels(
-                config.url.clone(),
-                labels.clone(),
-                CircuitBreakerConfig::default(),
-            ),
-            _ => WorkerFactory::create_regular_with_labels(
-                config.url.clone(),
-                labels.clone(),
-                CircuitBreakerConfig::default(),
-            ),
+        let worker_type = match config.worker_type.as_deref() {
+            Some("prefill") => WorkerType::Prefill {
+                bootstrap_port: config.bootstrap_port,
+            },
+            Some("decode") => WorkerType::Decode,
+            _ => WorkerType::Regular,
         };
-
-        // Register worker
-        let worker_arc: Arc<dyn Worker> = Arc::from(worker);
+        let worker_arc: Arc<dyn Worker> =
+            if let (Some(rank), Some(size)) = (config.dp_rank, config.dp_size) {
+                Arc::new(
+                    DPAwareWorker::new(config.url.clone(), rank, size, worker_type)
+                        .with_labels(labels.clone())
+                        .with_circuit_breaker_config(CircuitBreakerConfig::default()),
+                )
+            } else {
+                Arc::new(
+                    BasicWorker::new(config.url.clone(), worker_type)
+                        .with_labels(labels.clone())
+                        .with_circuit_breaker_config(CircuitBreakerConfig::default()),
+                )
+            };
+        for (id, existing) in self.worker_registry.get_all_with_ids() {
+            if existing.url() != worker_arc.url()
+                && existing.base_url().trim_end_matches('/')
+                    != worker_arc.base_url().trim_end_matches('/')
+            {
+                continue;
+            }
+            if !existing.is_dp_aware() && !worker_arc.is_dp_aware() {
+                continue;
+            }
+            if existing.dp_size() != worker_arc.dp_size()
+                || std::mem::discriminant(&existing.worker_type())
+                    != std::mem::discriminant(&worker_arc.worker_type())
+                || existing.model_id() != worker_arc.model_id()
+            {
+                return Err(WorkerErrorResponse {
+                    error:
+                        "Workers sharing a DP endpoint must have the same model, type and dp_size"
+                            .into(),
+                    code: "WORKER_CONFLICT".into(),
+                });
+            }
+            if existing.url() == worker_arc.url() {
+                if existing.worker_type() != worker_arc.worker_type()
+                    || existing.metadata().labels != worker_arc.metadata().labels
+                {
+                    return Err(WorkerErrorResponse {
+                        error: "DP worker is already registered with a different configuration"
+                            .into(),
+                        code: "WORKER_CONFLICT".into(),
+                    });
+                }
+                return Ok(WorkerApiResponse {
+                    success: true,
+                    message: "Worker already registered".into(),
+                    worker: Some(self.worker_to_info(id.as_str(), &existing)),
+                });
+            }
+        }
         let worker_id = self.worker_registry.register(worker_arc.clone());
 
         // Notify PolicyRegistry about the new worker
@@ -257,6 +327,10 @@ impl RouterManager {
         &self,
         url: &str,
     ) -> Result<WorkerApiResponse, WorkerErrorResponse> {
+        let _guard = self
+            .worker_mutations
+            .lock()
+            .expect("Worker mutation lock poisoned");
         if let Some(worker) = self.worker_registry.remove_by_url(url) {
             if worker.worker_type() == WorkerType::Regular {
                 let policy = self
@@ -379,6 +453,9 @@ impl RouterManager {
         WorkerInfo {
             id: id.to_string(),
             url: worker.url().to_string(),
+            base_url: worker.is_dp_aware().then(|| worker.base_url().to_owned()),
+            dp_rank: worker.dp_rank(),
+            dp_size: worker.dp_size(),
             model_id: worker.model_id().to_string(),
             priority: worker.priority(),
             cost: worker.cost(),
@@ -485,6 +562,8 @@ impl WorkerManagement for RouterManager {
         // Create a basic worker config request
         let config = WorkerConfigRequest {
             url: worker_url.to_string(),
+            dp_rank: None,
+            dp_size: None,
             model_id: None,
             worker_type: None,
             priority: None,

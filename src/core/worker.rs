@@ -517,6 +517,11 @@ impl DPAwareWorker {
         }
     }
 
+    pub fn with_labels(mut self, labels: std::collections::HashMap<String, String>) -> Self {
+        self.base_worker = self.base_worker.with_labels(labels);
+        self
+    }
+
     /// Configure the circuit breaker for this worker
     pub fn with_circuit_breaker_config(mut self, config: CircuitBreakerConfig) -> Self {
         self.base_worker = self.base_worker.with_circuit_breaker_config(config);

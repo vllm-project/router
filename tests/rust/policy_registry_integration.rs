@@ -32,6 +32,8 @@ async fn igw_kv_affinity_survives_load_changes_and_rebinds_after_registration() 
     );
     let worker_config = |url: &str| WorkerConfigRequest {
         url: url.into(),
+        dp_rank: None,
+        dp_size: None,
         model_id: Some("model".into()),
         worker_type: None,
         priority: None,

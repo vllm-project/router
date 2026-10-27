@@ -583,6 +583,17 @@ async fn create_worker(
     }
 
     // Check if we have a RouterManager (enable_igw=true)
+    if state.router_manager.is_none() && (config.dp_rank.is_some() || config.dp_size.is_some()) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(WorkerErrorResponse {
+                error: "Explicit DP registration requires --enable-igw".into(),
+                code: "DP_REGISTRATION_UNSUPPORTED".into(),
+            }),
+        )
+            .into_response();
+    }
+
     if let Some(router_manager) = &state.router_manager {
         // Call RouterManager's add_worker method directly with the full config
         match router_manager.add_worker(config).await {
