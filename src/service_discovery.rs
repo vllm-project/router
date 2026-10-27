@@ -732,7 +732,6 @@ mod tests {
             check_interval: Duration::from_secs(60),
             port: 8080,
             namespace: None,
-            uid: None,
             pd_mode: true,
             prefill_selector,
             decode_selector,
@@ -946,7 +945,6 @@ mod tests {
             status: "Running".into(),
             is_ready: true,
             pod_type: None,
-            uid: None,
             bootstrap_port: None,
         };
         assert!(healthy_pod.is_healthy());
@@ -959,7 +957,6 @@ mod tests {
             status: "Running".into(),
             is_ready: false,
             pod_type: None,
-            uid: None,
             bootstrap_port: None,
         };
         assert!(!not_ready_pod.is_healthy());
@@ -972,7 +969,6 @@ mod tests {
             status: "Pending".into(),
             is_ready: true,
             pod_type: None,
-            uid: None,
             bootstrap_port: None,
         };
         assert!(!not_running_pod.is_healthy());
@@ -988,7 +984,6 @@ mod tests {
             status: "Running".into(),
             is_ready: true,
             pod_type: None,
-            uid: None,
             bootstrap_port: None,
         };
         assert_eq!(pod_info.worker_url(8080), "http://1.2.3.4:8080");
@@ -1004,7 +999,6 @@ mod tests {
             status: "Running".into(),
             is_ready: true,
             pod_type: None,
-            uid: None,
             bootstrap_port: None,
         };
         assert_eq!(
@@ -1023,7 +1017,6 @@ mod tests {
             status: "Running".into(),
             is_ready: true,
             pod_type: Some(PodType::Prefill),
-            uid: None,
             bootstrap_port: Some(8081),
         };
 
@@ -1035,7 +1028,6 @@ mod tests {
             status: "Running".into(),
             is_ready: true,
             pod_type: Some(PodType::Prefill),
-            uid: None,
             bootstrap_port: Some(8081),
         };
 
@@ -1047,7 +1039,6 @@ mod tests {
             status: "Running".into(),
             is_ready: true,
             pod_type: Some(PodType::Decode),
-            uid: None,
             bootstrap_port: None,
         };
 
@@ -1067,7 +1058,6 @@ mod tests {
             status: "Pending".into(),
             is_ready: false,
             pod_type: None,
-            uid: None,
             bootstrap_port: None,
         };
         let port = 8080u16;
@@ -1103,7 +1093,6 @@ mod tests {
             status: "Running".into(),
             is_ready: true,
             pod_type: None,
-            uid: None,
             bootstrap_port: None,
         };
         handle_pod_deletion(
@@ -1130,7 +1119,6 @@ mod tests {
             status: "Running".into(),
             is_ready: true,
             pod_type: Some(PodType::Prefill),
-            uid: None,
             bootstrap_port: Some(8081),
         };
         let port = 8080u16;
@@ -1166,7 +1154,6 @@ mod tests {
             status: "Running".into(),
             is_ready: true,
             pod_type: Some(PodType::Decode),
-            uid: None,
             bootstrap_port: None,
         };
         let port = 8080u16;
@@ -1200,7 +1187,6 @@ mod tests {
             status: "Running".into(),
             is_ready: true,
             pod_type: Some(PodType::Prefill),
-            uid: None,
             bootstrap_port: Some(8081),
         };
 
@@ -1246,7 +1232,6 @@ mod tests {
             status: "Running".into(),
             is_ready: true,
             pod_type: Some(PodType::Decode),
-            uid: None,
             bootstrap_port: None,
         };
         // Don't add pod to tracked set
@@ -1275,7 +1260,6 @@ mod tests {
             status: "Running".into(),
             is_ready: true,
             pod_type: Some(PodType::Regular),
-            uid: None,
             bootstrap_port: None,
         };
         let port = 8080u16;
@@ -1310,7 +1294,6 @@ mod tests {
             status: "Running".into(),
             is_ready: true,
             pod_type: Some(PodType::Prefill),
-            uid: None,
             bootstrap_port: Some(8081),
         };
         let port = 8080u16;
@@ -1345,7 +1328,6 @@ mod tests {
             status: "Running".into(),
             is_ready: true,
             pod_type: Some(PodType::Decode),
-            uid: None,
             bootstrap_port: None,
         };
 
@@ -1392,7 +1374,6 @@ mod tests {
             status: "Running".into(),
             is_ready: false, // Probe failed: Ready=False
             pod_type: None,
-            uid: None,
             bootstrap_port: None,
         };
         let port = 8000u16;
@@ -1439,7 +1420,6 @@ mod tests {
             status: "Running".into(),
             is_ready: true, // Healthy, but label changed (role=canary)
             pod_type: None,
-            uid: None,
             bootstrap_port: None,
         };
         let port = 8000u16;
@@ -1486,7 +1466,6 @@ mod tests {
             status: "Running".into(),
             is_ready: false,
             pod_type: None,
-            uid: None,
             bootstrap_port: None,
         };
         let port = 8000u16;
@@ -1520,7 +1499,6 @@ mod tests {
             status: "Running".into(),
             is_ready: true,
             pod_type: None,
-            uid: None,
             bootstrap_port: None,
         };
 
@@ -1543,7 +1521,6 @@ mod tests {
             status: "Running".into(),
             is_ready: true,
             pod_type: None,
-            uid: None,
             bootstrap_port: None,
         };
 
@@ -1659,7 +1636,6 @@ mod tests {
             status: "Running".into(),
             is_ready: true,
             pod_type: Some(PodType::Regular), // Labels stripped!
-            uid: None,
             bootstrap_port: None,
         };
 
@@ -1695,7 +1671,6 @@ mod tests {
             status: "Running".into(),
             is_ready: true,
             pod_type: None,
-            uid: None,
             bootstrap_port: None,
         };
 
@@ -1721,7 +1696,6 @@ mod tests {
             status: "Running".into(),
             is_ready: true,
             pod_type: None,
-            uid: None,
             bootstrap_port: None,
         };
 
@@ -1842,7 +1816,6 @@ mod tests {
             status: status.into(),
             is_ready,
             pod_type: None,
-            uid: None,
             bootstrap_port: None,
         };
 
@@ -1949,7 +1922,6 @@ mod tests {
             status: "Running".into(),
             is_ready: true,
             pod_type: None,
-            uid: None,
             bootstrap_port: None,
         };
 
@@ -1975,7 +1947,6 @@ mod tests {
             status: "Running".into(),
             is_ready: false, // unready trigger
             pod_type: None,
-            uid: None,
             bootstrap_port: None,
         };
 
@@ -2010,7 +1981,6 @@ mod tests {
             status: "Running".into(),
             is_ready: false,
             pod_type: None,
-            uid: None,
             bootstrap_port: None,
         };
 
@@ -2056,7 +2026,6 @@ mod tests {
             status: "Running".into(),
             is_ready: true,
             pod_type: None,
-            uid: None,
             bootstrap_port: None,
         };
         let unready_pod = PodInfo {
@@ -2264,7 +2233,6 @@ mod tests {
             status: "Running".into(),
             is_ready: true,
             pod_type: None,
-            uid: None,
             bootstrap_port: None,
         };
         let p2 = PodInfo {
@@ -2275,7 +2243,6 @@ mod tests {
             status: "Running".into(),
             is_ready: true,
             pod_type: None,
-            uid: None,
             bootstrap_port: None,
         };
         let p3 = PodInfo {
@@ -2286,7 +2253,6 @@ mod tests {
             status: "Running".into(),
             is_ready: true,
             pod_type: None,
-            uid: None,
             bootstrap_port: None,
         };
 
@@ -2364,7 +2330,6 @@ mod tests {
             status: "Running".into(),
             is_ready: true,
             pod_type: None,
-            uid: None,
             bootstrap_port: None,
         };
 
@@ -2415,7 +2380,6 @@ mod tests {
             status: "Running".into(),
             is_ready: true,
             pod_type: None,
-            uid: None,
             bootstrap_port: None,
         };
         let expected_url = "http://[2001:db8::100]:8000";
@@ -2470,7 +2434,6 @@ mod tests {
             status: "Running".into(),
             is_ready: true,
             pod_type: None,
-            uid: None,
             bootstrap_port: None,
         };
 
@@ -2516,7 +2479,6 @@ mod tests {
             status: "Running".into(),
             is_ready: true,
             pod_type: None,
-            uid: None,
             bootstrap_port: None,
         };
 
@@ -2581,7 +2543,6 @@ mod tests {
             status: "Running".into(),
             is_ready: true,
             pod_type: None,
-            uid: None,
             bootstrap_port: None,
         };
 
@@ -2708,7 +2669,6 @@ mod tests {
             status: "Running".into(),
             is_ready: true,
             pod_type: None,
-            uid: None,
             bootstrap_port: None,
         };
 
@@ -2770,7 +2730,6 @@ mod tests {
             status: "Running".into(),
             is_ready: true,
             pod_type: Some(PodType::Decode),
-            uid: None,
             bootstrap_port: None,
         };
 
