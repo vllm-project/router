@@ -12,7 +12,7 @@ use serde::Deserialize;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
-use crate::config::{StaticKvEventSourceContract, StaticKvEventSources};
+use crate::config::StaticKvEventSources;
 use crate::kv_index::indexer::KvBlockIndexer;
 use crate::kv_index::subscriber::{EventSource, SubscriberHandle};
 use crate::kv_index::{HashMode, IngestionSignal, SourceId};
@@ -170,40 +170,6 @@ impl KvIndexSupervisor {
         (supervisor, signals)
     }
 
-    /// Validate the immutable HTTP override before health checks or DP expansion.
-    pub(crate) fn validate_http_worker(
-        &self,
-        worker_url: &str,
-        dp_size: usize,
-    ) -> Result<(), String> {
-        if !crate::backend::is_grpc_url(worker_url)
-            && self.static_sources.get(worker_url).is_some_and(|source| {
-                source.source_contract == StaticKvEventSourceContract::HttpDenseDp1
-            })
-            && dp_size != 1
-        {
-            return Err(
-                "static HTTP KV sources require independently addressed DP1 workers".into(),
-            );
-        }
-        Ok(())
-    }
-
-    /// Return qualifications in caller order from one short owner snapshot.
-    pub(crate) fn dense_model_eligibility(&self, worker_urls: &[&str], model: &str) -> Vec<bool> {
-        let workers = self.workers.lock();
-        worker_urls
-            .iter()
-            .map(|url| {
-                workers.get(*url).is_some_and(|worker| {
-                    worker.worker_origin.is_some()
-                        && worker.key.model.as_ref() == model
-                        && worker.ranks == [0]
-                })
-            })
-            .collect()
-    }
-
     /// HTTP P/D accepts the native Python control endpoints and dense KV
     /// events.
     pub(crate) fn new_pd(
@@ -259,13 +225,8 @@ impl KvIndexSupervisor {
             };
         }
         let grpc = crate::backend::is_grpc_url(worker_url);
-        let static_source = self.static_sources.get(worker_url).filter(|source| {
-            !grpc || source.source_contract == StaticKvEventSourceContract::Generic
-        });
-        let dense_http = !grpc
-            && static_source
-                .map(|source| source.source_contract == StaticKvEventSourceContract::HttpDenseDp1)
-                .unwrap_or(self.dense_http);
+        let static_source = self.static_sources.get(worker_url);
+        let dense_http = !grpc && self.dense_http;
         match static_source {
             Some(config) => {
                 info!(
@@ -304,12 +265,7 @@ impl KvIndexSupervisor {
         observed: Option<Arc<AtomicBool>>,
     ) -> Result<WorkerKvInfo, String> {
         let grpc = crate::backend::is_grpc_url(worker_url);
-        let dense_http = !grpc
-            && self
-                .static_sources
-                .get(worker_url)
-                .map(|source| source.source_contract == StaticKvEventSourceContract::HttpDenseDp1)
-                .unwrap_or(self.dense_http);
+        let dense_http = !grpc && self.dense_http && !self.static_sources.contains_key(worker_url);
         let dense = dense_http || (self.http_pd && !grpc);
         let server_info = discovery.server_info.unwrap_or_else(|e| {
             warn!(
@@ -658,6 +614,12 @@ impl KvIndexSupervisor {
     }
 }
 
+impl Drop for KvIndexSupervisor {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
 async fn discover_worker(
     client: &reqwest::Client,
     worker_url: &str,
@@ -739,7 +701,7 @@ fn static_worker_discovery(worker_url: &str, config: &StaticKvEventSources) -> W
                         .as_ref()
                         .and_then(|replay| replay.get(rank).cloned()),
                     topic: config.topic.clone(),
-                    hwm: config.hwm,
+                    hwm: None,
                     // Protocol constants are adapter assumptions, not observations.
                     publisher: Some("zmq".to_owned()),
                     encoding: Some("msgpack".to_owned()),
@@ -764,42 +726,15 @@ async fn discover_dense_http_worker(
     worker_url: &str,
     api_key: Option<&str>,
 ) -> WorkerDiscovery {
-    let url = format!("{}/get_server_info", worker_url.trim_end_matches('/'));
-    let server_info = async {
-        let response = worker_get(client, &url, api_key)
-            .send()
-            .await
-            .map_err(|error| format!("get_server_info {url}: {error}"))?;
-        if !response.status().is_success() {
-            return Err(format!(
-                "get_server_info {url}: status {}",
-                response.status()
-            ));
-        }
-        response
-            .json::<ServerInfo>()
-            .await
-            .map_err(|error| format!("get_server_info parse: {error}"))
-    }
-    .await;
+    let server_info =
+        query_worker_json::<ServerInfo>(client, worker_url, "get_server_info", true, api_key).await;
     let model_id = server_info
         .as_ref()
-        .map(|info| {
-            info.model_id
-                .clone()
-                .filter(|id| !id.trim().is_empty())
-                .or_else(|| {
-                    info.model_path
-                        .as_ref()
-                        .and_then(|path| path.split('/').next_back().map(str::to_string))
-                        .filter(|id| !id.trim().is_empty())
-                })
-                .or_else(|| Some(worker_url.to_string()))
-        })
+        .map(|info| Some(server_model_id(info).unwrap_or_else(|| worker_url.to_string())))
         .map_err(Clone::clone);
     WorkerDiscovery {
         server_info,
-        sources: query_worker_json(client, worker_url, "kv_event_sources", false, api_key).await,
+        sources: query_worker_json(client, worker_url, "kv_event_sources", true, api_key).await,
         model_id,
     }
 }
@@ -823,8 +758,6 @@ fn static_pd_discovery(
             endpoints: config.endpoints.clone(),
             replay_endpoints: config.replay_endpoints.clone(),
             topic: String::new(),
-            hwm: None,
-            source_contract: StaticKvEventSourceContract::Generic,
         },
     )
 }
@@ -1053,22 +986,6 @@ fn discovered_block_size(server_info: &ServerInfo) -> Option<u32> {
 mod tests {
     use super::*;
 
-    fn normalized_legacy_sources(
-        value: &str,
-    ) -> Result<HashMap<String, StaticKvEventSources>, String> {
-        let mut policy = serde_json::from_value(serde_json::json!({"type": "kv_aware"})).unwrap();
-        crate::config::normalize_static_kv_event_sources(&mut policy, Some(value))
-            .map_err(|error| error.to_string())?;
-        let crate::config::PolicyConfig::KvAware {
-            static_kv_event_sources,
-            ..
-        } = policy
-        else {
-            unreachable!()
-        };
-        Ok(*static_kv_event_sources)
-    }
-
     #[tokio::test]
     async fn configured_event_sources_skip_unavailable_control_discovery() {
         let publisher_context = zmq::Context::new();
@@ -1086,16 +1003,13 @@ mod tests {
                 block_size: 32,
                 model: "shared-model".into(),
                 topic: "kv/generic".into(),
-                hwm: Some(128),
-                source_contract: StaticKvEventSourceContract::Generic,
             };
             let sources = HashMap::from([(worker_url.to_string(), source)]);
-            // An explicitly Generic entry must also remain generic when
+            // An explicit static entry must remain generic when
             // installed by the HTTP Router's Dense-default constructor.
             let (supervisor, _signals) =
                 KvIndexSupervisor::new_http_dense(reqwest::Client::new(), HashMode::Sha256);
             let supervisor = supervisor.with_static_sources(sources);
-            assert!(supervisor.validate_http_worker(worker_url, 2).is_ok());
 
             let mut info = supervisor.on_worker_added(worker_url).await.unwrap();
             assert_eq!(info.block_size, Some(32));
@@ -1106,10 +1020,6 @@ mod tests {
             assert!(supervisor.workers.lock()[worker_url]
                 .worker_origin
                 .is_none());
-            assert_eq!(
-                supervisor.dense_model_eligibility(&[worker_url], "shared-model"),
-                [false]
-            );
             supervisor.on_worker_removed(worker_url);
         }
     }
@@ -1315,11 +1225,11 @@ mod tests {
     }
 
     #[test]
-    fn static_regular_sources_preserve_mapping_alias_topic_and_hwm() {
-        for (worker_count, block_size, topic, hwm) in [
-            (2, 16, Some("kv/alias-v2"), Some(128)),
-            (1, 8, None, None),
-            (1, 32, Some(""), Some(0)),
+    fn static_regular_sources_preserve_mapping_alias_and_topic() {
+        for (worker_count, block_size, topic) in [
+            (2, 16, Some("kv/alias-v2")),
+            (1, 8, None),
+            (1, 32, Some("")),
         ] {
             let workers: Vec<_> = (0..worker_count)
                 .map(|worker| format!("http://worker-{worker}:8000"))
@@ -1335,12 +1245,10 @@ mod tests {
                 if let Some(topic) = topic {
                     source["topic"] = serde_json::json!(topic);
                 }
-                if let Some(hwm) = hwm {
-                    source["hwm"] = serde_json::json!(hwm);
-                }
                 map.insert(url.clone(), source);
             }
-            let sources = normalized_legacy_sources(&serde_json::to_string(&map).unwrap()).unwrap();
+            let sources: HashMap<String, StaticKvEventSources> =
+                serde_json::from_value(serde_json::Value::Object(map)).unwrap();
             assert_eq!(sources.len(), worker_count);
             for worker in &workers {
                 let discovery = static_worker_discovery(worker, &sources[worker]);
@@ -1360,87 +1268,9 @@ mod tests {
                         .map(|endpoints| endpoints[0].clone())
                 );
                 assert_eq!(entry.topic, topic.unwrap_or_default());
-                assert_eq!(entry.hwm, hwm);
+                assert_eq!(entry.hwm, None);
                 assert!(events_enabled(entry));
             }
-        }
-    }
-
-    #[test]
-    fn static_regular_mapping_allows_worker_without_static_source() {
-        let workers: [String; 2] = ["http://worker:8000".into(), "http://worker:8001".into()];
-        let sources = normalized_legacy_sources(
-            r#"{"http://worker:8000":{"endpoints":["tcp://worker:5557"],"model":"served-alias","block_size":16}}"#,
-        ).unwrap();
-        assert_eq!(sources.len(), 1);
-        assert!(sources.contains_key(&workers[0]));
-        assert!(!sources.contains_key(&workers[1]));
-    }
-
-    #[test]
-    fn static_sources_allow_distinct_topics_on_one_publisher() {
-        let sources = normalized_legacy_sources(r#"{
-            "http://worker:8000":{"endpoints":["tcp://worker:5557"],"model":"m","block_size":8,"topic":"kv/a"},
-            "http://worker:8001":{"endpoints":["tcp://WORKER:5557"],"model":"m","block_size":8,"topic":"kv/b"}
-        }"#).unwrap();
-        assert_eq!(sources.len(), 2);
-        assert_eq!(
-            sources["http://worker:8000"].endpoints[0],
-            sources["http://worker:8001"].endpoints[0]
-        );
-    }
-
-    #[test]
-    fn static_sources_reject_shared_replay_endpoints() {
-        use serde_json::json;
-
-        let workers: [String; 2] = ["http://worker:8000".into(), "http://worker:8001".into()];
-        let value = json!({
-            &workers[0]: {"endpoints": ["tcp://worker:5557"],
-                "replay_endpoints": ["tcp://WORKER:5558"], "block_size": 16, "model": "served-alias"},
-            &workers[1]: {"endpoints": ["tcp://worker:5559"],
-                "replay_endpoints": ["tcp://worker:5558"], "block_size": 16, "model": "served-alias"}
-        });
-        assert!(normalized_legacy_sources(&value.to_string())
-            .unwrap_err()
-            .contains("replay endpoints must be independent"));
-    }
-
-    #[test]
-    fn static_sources_reject_worker_origin_aliases_and_keep_original_keys() {
-        use serde_json::json;
-
-        let source = |publisher: u16, replay: Option<&str>| {
-            let mut value = json!({
-                "endpoints": [format!("tcp://worker:{publisher}")],
-                "block_size": 16, "model": "served-alias"
-            });
-            if let Some(replay) = replay {
-                value["replay_endpoints"] = json!([replay]);
-            }
-            value
-        };
-        for (first, second) in [
-            ("http://worker:8000", "http://worker:8000/"),
-            ("http://WORKER:80", "http://worker/"),
-            ("https://WORKER:443", "https://worker"),
-        ] {
-            let value = json!({first: source(5557, None), second: source(5559, None)});
-            assert!(normalized_legacy_sources(&value.to_string())
-                .unwrap_err()
-                .contains("worker origins must be independent"));
-        }
-        for (first, second) in [
-            ("http://WORKER:80/", "https://worker:443"),
-            ("http://worker:8000/", "http://worker:8001"),
-            ("http://127.0.0.1:8000", "http://[::ffff:127.0.0.1]:8000"),
-        ] {
-            let value =
-                json!({first: source(5557, None), second: source(5559, Some("tcp://worker:5560"))});
-            let parsed = normalized_legacy_sources(&value.to_string()).unwrap();
-            assert_eq!(parsed.len(), 2);
-            assert!(parsed.contains_key(first));
-            assert!(parsed.contains_key(second));
         }
     }
 
@@ -1942,13 +1772,10 @@ mod tests {
                     KvIndexSupervisor::new(reqwest::Client::new(), HashMode::Sha256);
                 supervisor.dense_http = true;
                 if static_a {
-                    supervisor.static_sources = normalized_legacy_sources(
-                        &json!({&worker_a: {
-                            "endpoints": [endpoint_a], "topic": "kv/boundary",
-                            "block_size": 8, "model": "boundary-model"
-                        }})
-                        .to_string(),
-                    )
+                    supervisor.static_sources = serde_json::from_value(json!({&worker_a: {
+                        "endpoints": [endpoint_a], "topic": "kv/boundary",
+                        "block_size": 8, "model": "boundary-model"
+                    }}))
                     .unwrap();
                 }
                 supervisor.on_worker_added(&worker_a).await.unwrap();
@@ -2196,6 +2023,175 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dropping_supervisor_retires_inflight_replay_without_clearing_other_sources() {
+        use crate::kv_index::{MatchQuery, StorageTier};
+        use serde_json::json;
+
+        for explicit_shutdown in [false, true] {
+            let context = Arc::new(zmq::Context::new());
+            let publisher = context.socket(zmq::XPUB).unwrap();
+            let replay = context.socket(zmq::ROUTER).unwrap();
+            for socket in [&publisher, &replay] {
+                socket.bind("tcp://127.0.0.1:*").unwrap();
+            }
+            let (worker, server) = source_boundary_worker(
+                &publisher.get_last_endpoint().unwrap().unwrap(),
+                &replay.get_last_endpoint().unwrap().unwrap(),
+                "retiring-source",
+            )
+            .await;
+            let (supervisor, mut signals) =
+                KvIndexSupervisor::new_http_dense(reqwest::Client::new(), HashMode::Sha256);
+            supervisor.on_worker_added(&worker).await.unwrap();
+            boundary_subscription(&publisher).await;
+            let (indexer, active) = {
+                let workers = supervisor.workers.lock();
+                let entry = &workers[&worker];
+                (entry.indexer.clone(), entry.active.clone())
+            };
+            let provider = supervisor.match_provider_for_worker(&worker).unwrap();
+            let (neighbor_tx, mut neighbor_signals) = mpsc::channel(8);
+            let neighbor = crate::kv_index::subscriber::spawn(
+                EventSource {
+                    source: Arc::from("independent-source"),
+                    dp_rank: 4,
+                    pub_endpoint: publisher.get_last_endpoint().unwrap().unwrap(),
+                    replay_endpoint: None,
+                    topic: "kv/independent".into(),
+                    hwm: None,
+                },
+                indexer,
+                Some(neighbor_tx),
+                context.clone(),
+            );
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    match publisher.recv_bytes(zmq::DONTWAIT) {
+                        Ok(frame) => {
+                            assert_eq!(frame, b"\x01kv/independent");
+                            break;
+                        }
+                        Err(zmq::Error::EAGAIN) => tokio::task::yield_now().await,
+                        Err(error) => panic!("independent subscription: {error}"),
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            let payload =
+                |hash: u32, token: u32, rank: u32| {
+                    rmp_serde::to_vec(&(1.0, [json!({
+                "type": "BlockStored", "block_hashes": [hash], "parent_block_hash": null,
+                "token_ids": vec![token; 8], "block_size": 8, "medium": "GPU",
+                "lora_id": null, "lora_name": null
+            })], rank)).unwrap()
+                };
+            let query = |token| MatchQuery {
+                group_idx: 0,
+                local_hashes: crate::kv_index::local_block_hash_strings(&[token; 8], 8, None),
+                tiers_of_interest: vec![StorageTier::Device],
+            };
+            for (topic, body) in [
+                ("kv/boundary", payload(1, 1, 0)),
+                ("kv/independent", payload(2, 2, 4)),
+            ] {
+                publisher
+                    .send_multipart([topic.as_bytes(), &0i64.to_be_bytes(), &body], 0)
+                    .unwrap();
+            }
+            for receiver in [&mut signals, &mut neighbor_signals] {
+                assert!(matches!(
+                    tokio::time::timeout(Duration::from_secs(5), receiver.recv())
+                        .await
+                        .unwrap(),
+                    Some(IngestionSignal::Advance { last_seq: 0, .. })
+                ));
+            }
+            assert_eq!(provider.find_tiered_matches(&query(1)).len(), 1);
+            assert_eq!(provider.find_tiered_matches(&query(2)).len(), 1);
+            publisher
+                .send_multipart(
+                    [
+                        b"kv/boundary".as_slice(),
+                        &2i64.to_be_bytes(),
+                        &payload(3, 3, 0),
+                    ],
+                    0,
+                )
+                .unwrap();
+            let request = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    match replay.recv_multipart(zmq::DONTWAIT) {
+                        Ok(request) => break request,
+                        Err(zmq::Error::EAGAIN) => tokio::task::yield_now().await,
+                        Err(error) => panic!("retiring replay request: {error}"),
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(request.last().unwrap(), &1i64.to_be_bytes());
+            if explicit_shutdown {
+                supervisor.shutdown();
+                supervisor.shutdown();
+                assert!(supervisor.workers.lock().is_empty());
+                assert!(supervisor.identity_refs.lock().is_empty());
+            }
+            drop(supervisor);
+            assert!(!active.load(Ordering::Acquire));
+            for (seq, body) in [
+                (1i64, payload(4, 4, 0)),
+                (2, payload(3, 3, 0)),
+                (-1, vec![]),
+            ] {
+                replay
+                    .send_multipart(
+                        [
+                            request[0].clone(),
+                            vec![],
+                            if seq == -1 {
+                                vec![]
+                            } else {
+                                b"kv/boundary".to_vec()
+                            },
+                            seq.to_be_bytes().to_vec(),
+                            body,
+                        ],
+                        0,
+                    )
+                    .unwrap();
+            }
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    match publisher.recv_bytes(zmq::DONTWAIT) {
+                        Ok(frame) => {
+                            assert_eq!(frame, b"\x00kv/boundary");
+                            break;
+                        }
+                        Err(zmq::Error::EAGAIN) => tokio::task::yield_now().await,
+                        Err(error) => panic!("retired subscription: {error}"),
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            for token in [1, 3, 4] {
+                assert!(provider.find_tiered_matches(&query(token)).is_empty());
+            }
+            let retained = provider.find_tiered_matches(&query(2));
+            assert_eq!(retained.len(), 1);
+            assert_eq!(
+                retained[0].target.instance_id.as_ref(),
+                "independent-source"
+            );
+            assert_eq!(retained[0].target.dp_rank, 4);
+            assert_eq!(retained[0].segments, [(0, 1)]);
+            neighbor.shutdown();
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
     async fn generic_static_sources_preserve_worker_base_paths_in_dense_router() {
         let context = zmq::Context::new();
         let publisher = context.socket(zmq::XPUB).unwrap();
@@ -2220,8 +2216,6 @@ mod tests {
                 block_size: 8,
                 model: "prefixed-model".into(),
                 topic: "kv/boundary".into(),
-                hwm: None,
-                source_contract: StaticKvEventSourceContract::Generic,
             },
         )]));
         let result = generic.on_worker_added(&prefixed).await;
@@ -2244,88 +2238,31 @@ mod tests {
         assert!(unqualified);
     }
 
-    #[test]
-    fn normalized_legacy_sources_limit_only_the_declared_http_worker() {
-        assert!(normalized_legacy_sources("not valid JSON").is_err());
-        let (supervisor, _) =
-            KvIndexSupervisor::new_http_dense(reqwest::Client::new(), HashMode::Sha256);
-        let supervisor = supervisor.with_static_sources(
-            normalized_legacy_sources(
-                r#"{
-            "http://worker:8000":{"endpoints":["tcp://worker:5557"],"model":"m","block_size":8}
-        }"#,
-            )
-            .unwrap(),
-        );
-        assert!(supervisor
-            .validate_http_worker("http://worker:8000", 1)
-            .is_ok());
-        assert!(supervisor
-            .validate_http_worker("http://worker:8000", 2)
-            .unwrap_err()
-            .contains("DP1 workers"));
-        assert!(supervisor
-            .validate_http_worker("grpc://worker:50051", 2)
-            .is_ok());
-        assert!(supervisor
-            .validate_http_worker("http://worker:8001", 2)
-            .is_ok());
-        supervisor.shutdown();
-        let (generic, _) = KvIndexSupervisor::new(reqwest::Client::new(), HashMode::Sha256);
-        assert!(!generic.dense_http);
-        generic.shutdown();
-    }
-
     #[tokio::test]
     async fn dense_source_block_size_mismatch_revokes_only_affected_source() {
-        for (expected, actual, use_static) in [(16, 8, false), (8, 16, true)] {
-            check_dense_source_block_size(expected, actual, use_static).await;
+        for (expected, actual) in [(16, 8), (8, 16)] {
+            check_dense_source_block_size(expected, actual).await;
         }
     }
 
-    async fn check_dense_source_block_size(expected: u32, actual: u32, use_static: bool) {
+    async fn check_dense_source_block_size(expected: u32, actual: u32) {
         use crate::kv_index::{MatchQuery, StorageTier};
-        use axum::{routing::get, Json, Router};
         use serde_json::json;
 
         let context = zmq::Context::new();
         let publisher = context.socket(zmq::XPUB).unwrap();
         publisher.bind("tcp://127.0.0.1:*").unwrap();
         let endpoint = publisher.get_last_endpoint().unwrap().unwrap();
-        let (mut supervisor, mut signals) =
-            KvIndexSupervisor::new(reqwest::Client::new(), HashMode::Sha256);
-        // Static Regular and the discovered Dense consumer share this admission.
-        supervisor.dense_http = true;
-        let rank = if use_static { 0 } else { 3 };
-        let (worker, http_task) = if use_static {
-            let worker = "http://127.0.0.1:1".to_string();
-            supervisor.static_sources = normalized_legacy_sources(
-                &json!({&worker: {
-                    "endpoints": [endpoint], "block_size": expected,
-                    "model": "dense-model", "topic": "kv/dense"
-                }})
-                .to_string(),
-            )
-            .unwrap();
-            (worker, None)
-        } else {
-            let sources = json!({(rank.to_string()): {
-                "endpoint": endpoint, "topic": "kv/dense", "publisher": "zmq",
-                "encoding": "msgpack", "schema_version": 1, "enable_kv_cache_events": true
-            }});
-            let app = Router::new()
-                .route("/get_server_info", get(move || async move { Json(json!({
-                    "model_id": "dense-model", "instance_id": "dense-boot", "kv_block_size": expected
-                })) }))
-                .route("/kv_event_sources", get(move || {
-                    let sources = sources.clone();
-                    async move { Json(sources) }
-                }));
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let worker = format!("http://{}", listener.local_addr().unwrap());
-            let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-            (worker, Some(task))
-        };
+        let (supervisor, mut signals) =
+            KvIndexSupervisor::new_http_dense(reqwest::Client::new(), HashMode::Sha256);
+        let rank = 3;
+        let sources = json!({(rank.to_string()): {
+            "endpoint": endpoint, "topic": "kv/dense", "publisher": "zmq",
+            "encoding": "msgpack", "schema_version": 1, "enable_kv_cache_events": true
+        }});
+        let (worker, http_task) = source_boundary_worker_with_metadata(
+            json!({"model_id": "dense-model", "instance_id": "dense-boot", "kv_block_size": expected}), sources
+        ).await;
         let info = supervisor.on_worker_added(&worker).await.unwrap();
         assert_eq!(info.cache_key.as_ref().unwrap().block_size, expected);
         assert_eq!(info.ranks, [rank]);
@@ -2427,7 +2364,7 @@ mod tests {
                 [json!({
                     "type": "BlockStored", "block_hashes": [seq + 7], "parent_block_hash": null,
                     "token_ids": tokens, "block_size": block_size, "lora_id": null,
-                    "lora_name": null, "medium": if use_static { "GPU" } else { "CPU" }
+                    "lora_name": null, "medium": "CPU"
                 })],
                 rank,
             ))
@@ -2458,7 +2395,7 @@ mod tests {
                         }
                         if let Ok(signal) = signals.try_recv() {
                             assert!(!matches!(signal, IngestionSignal::Advance { last_seq: 1, .. }),
-                                "accepted mismatched Dense batch: source={expected}, event={actual}, static={use_static}, old={:?}, mismatched={:?}",
+                                "accepted mismatched Dense batch: source={expected}, event={actual}, old={:?}, mismatched={:?}",
                                 indexer.find_matches(&query(&old_tokens)),
                                 indexer.find_matches(&query(&new_tokens)));
                         }
@@ -2469,9 +2406,7 @@ mod tests {
         }
         supervisor.shutdown();
         drop(neighbors);
-        if let Some(task) = http_task {
-            task.abort();
-        }
+        http_task.abort();
     }
 
     #[tokio::test]
@@ -2493,12 +2428,10 @@ mod tests {
                 let value = json!({
                     &worker: {
                         "endpoints": [endpoint], "block_size": block_size,
-                        "model": "served-alias", "topic": "kv/served-alias", "hwm": 128
+                        "model": "served-alias", "topic": "kv/served-alias"
                     }
-                })
-                .to_string();
-                supervisor.dense_http = true;
-                supervisor.static_sources = normalized_legacy_sources(&value).unwrap();
+                });
+                supervisor.static_sources = serde_json::from_value(value).unwrap();
                 (worker, None)
             } else {
                 let sources = json!({(rank.to_string()): {
@@ -2586,50 +2519,6 @@ mod tests {
                 task.abort();
             }
         }
-    }
-
-    #[test]
-    fn static_regular_sources_reject_invalid_dp1_settings() {
-        let worker = "http://worker:8000".to_string();
-        let valid = serde_json::json!({
-            "endpoints": ["tcp://worker:5557"],
-            "block_size": 16,
-            "model": "served-alias"
-        });
-        for (field, invalid) in [
-            ("endpoints", serde_json::json!([])),
-            (
-                "endpoints",
-                serde_json::json!(["tcp://worker:5557", "tcp://worker:5559"]),
-            ),
-            ("endpoints", serde_json::json!(["tcp://worker:0"])),
-            ("replay_endpoints", serde_json::json!([])),
-            ("replay_endpoints", serde_json::json!(["tcp://worker:0"])),
-            ("block_size", serde_json::json!(0)),
-            ("model", serde_json::json!(" ")),
-            ("hwm", serde_json::json!(-1)),
-            ("hwm", serde_json::json!(2147483648_u64)),
-            ("unknown_setting", serde_json::json!(true)),
-        ] {
-            let mut source = valid.clone();
-            source[field] = invalid;
-            let value = serde_json::json!({ &worker: source }).to_string();
-            assert!(normalized_legacy_sources(&value).is_err(), "{value}");
-        }
-        let mut missing_model = valid.clone();
-        missing_model.as_object_mut().unwrap().remove("model");
-        let value = serde_json::json!({ &worker: missing_model }).to_string();
-        assert!(normalized_legacy_sources(&value).is_err());
-
-        let value = serde_json::json!({ "http://unknown:8000": &valid }).to_string();
-        assert!(normalized_legacy_sources(&value)
-            .unwrap()
-            .contains_key("http://unknown:8000"));
-        let other = "http://worker:8001".to_string();
-        let value = serde_json::json!({ &worker: &valid, &other: &valid }).to_string();
-        assert!(normalized_legacy_sources(&value)
-            .unwrap_err()
-            .contains("live KV streams must be independent"));
     }
 
     #[test]

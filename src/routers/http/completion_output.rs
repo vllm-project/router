@@ -1,12 +1,13 @@
 //! Conservative model-output detection for proxied Completion SSE streams.
 
+use super::sse::{sse_lines, FrameScanner};
+
 const MAX_EVENT_BYTES: usize = 1024 * 1024;
 
 pub(super) struct CompletionOutputObserver {
     event: Vec<u8>,
-    line_start: usize,
-    first_line: bool,
-    skip_lf: bool,
+    scanner: FrameScanner,
+    first_event: bool,
     stopped: bool,
 }
 
@@ -14,9 +15,8 @@ impl CompletionOutputObserver {
     pub(super) fn new(disabled: bool) -> Self {
         Self {
             event: Vec::new(),
-            line_start: 0,
-            first_line: true,
-            skip_lf: false,
+            scanner: FrameScanner::default(),
+            first_event: true,
             stopped: disabled,
         }
     }
@@ -24,50 +24,36 @@ impl CompletionOutputObserver {
     /// Return true only once, after a complete SSE event proves model output.
     /// No EOF flush: an unterminated event is not evidence. Oversized events
     /// permanently disable detection for this attempt without affecting bytes.
-    pub(super) fn observe(&mut self, chunk: &[u8]) -> bool {
+    /// The bound counts wire bytes, including CRLF delimiters.
+    pub(super) fn observe(&mut self, mut chunk: &[u8]) -> bool {
         if self.stopped {
             return false;
         }
-        for &byte in chunk {
-            if self.skip_lf {
-                self.skip_lf = false;
-                if byte == b'\n' {
-                    continue;
-                }
-            }
-            // CR is a delimiter immediately; its optional LF may arrive later.
-            let byte = if byte == b'\r' {
-                self.skip_lf = true;
-                b'\n'
-            } else {
-                byte
-            };
-            if self.event.len() == MAX_EVENT_BYTES {
+        while !chunk.is_empty() {
+            let scan_len = chunk.len().min(MAX_EVENT_BYTES - self.event.len() + 1);
+            let end = self.scanner.frame_end(&chunk[..scan_len]);
+            let consumed = end.unwrap_or(scan_len);
+            if consumed > MAX_EVENT_BYTES - self.event.len() {
                 self.event.clear();
                 self.stopped = true;
                 return false;
             }
-            self.event.push(byte);
-            if byte != b'\n' {
-                continue;
-            }
-            if self.first_line {
-                self.first_line = false;
-                if self.event.starts_with(b"\xef\xbb\xbf") {
-                    self.event.drain(..3);
-                }
-            }
-            let line = &self.event[self.line_start..self.event.len() - 1];
-            if line.is_empty() {
-                let output = event_has_output(&self.event);
+            self.event.extend_from_slice(&chunk[..consumed]);
+            chunk = &chunk[consumed..];
+            if end.is_some() {
+                let event = if std::mem::take(&mut self.first_event) {
+                    self.event
+                        .strip_prefix(b"\xef\xbb\xbf")
+                        .unwrap_or(&self.event)
+                } else {
+                    &self.event
+                };
+                let output = event_has_output(event);
                 self.event.clear();
-                self.line_start = 0;
                 if output {
                     self.stopped = true;
                     return true;
                 }
-            } else {
-                self.line_start = self.event.len();
             }
         }
         false
@@ -77,7 +63,7 @@ impl CompletionOutputObserver {
 fn event_has_output(event: &[u8]) -> bool {
     let mut data = Vec::new();
     let mut event_type = None;
-    for line in event.split(|byte| *byte == b'\n') {
+    for (line, _) in sse_lines(event) {
         if let Some(value) = line.strip_prefix(b"data:") {
             if !data.is_empty() {
                 data.push(b'\n');
@@ -145,10 +131,13 @@ mod tests {
     #[test]
     fn one_initial_bom_proves_output_across_every_split() {
         for ending in ["\n", "\r\n", "\r"] {
-            let event =
-                format!("\u{feff}data: {{\"choices\":[{{\"text\":\"output\"}}]}}{ending}{ending}");
-            let complete_at = event.len() - usize::from(ending == "\r\n");
-            assert_output_at(event.as_bytes(), complete_at);
+            for blank_line in ["", ending] {
+                let event = format!(
+                    "\u{feff}{blank_line}data: {{\"choices\":[{{\"text\":\"output\"}}]}}{ending}{ending}"
+                );
+                let complete_at = event.len() - usize::from(ending == "\r\n");
+                assert_output_at(event.as_bytes(), complete_at);
+            }
         }
     }
 

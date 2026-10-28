@@ -127,10 +127,6 @@ impl EngineFrontend {
         self.tokenizer.pin_test_token_ids(token_ids);
     }
 
-    pub(crate) async fn completion_frontend(&self, model: &str) -> anyhow::Result<FrontendHandle> {
-        self.tokenizer.resolve(Some(model)).await
-    }
-
     /// Tokenizer handle + sampling defaults shared by both prepare paths;
     /// returns the request start instant and the resolve-stage milliseconds.
     async fn resolve_with_defaults(
@@ -257,11 +253,11 @@ fn truncate_grpc_prompt(
     Ok(())
 }
 
-/// HTTP Completion prepares tokens directly from the loaded tokenizer, without
-/// the gRPC L0/L1 caches. Say so instead of ignoring their switches silently.
+/// HTTP pools proxy the request body, so the router never tokenizes and the
+/// L0/L1 switches have no effect. Say so instead of ignoring them silently.
 pub(crate) fn warn_ignored_encoding_caches() {
     for name in ignored_cache_switches(|name| std::env::var(name).ok()) {
-        tracing::warn!("{name} is ignored: L0/L1 encoding caches apply only to the gRPC frontend; HTTP Completion preparation uses the loaded tokenizer directly");
+        tracing::warn!("{name} is ignored: HTTP worker pools do not tokenize in the router");
     }
 }
 

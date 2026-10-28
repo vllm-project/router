@@ -1,0 +1,45 @@
+{
+  "backend": "python_http",
+  "stack": {
+    "router_bin": "target/release/vllm-router",
+    "host": "127.0.0.1",
+    "router_port": 16002,
+    "worker_http_port": 18002,
+    "prometheus_port": 29003
+  },
+  "worker": {
+    "cli": [
+      "--tensor-parallel-size",
+      "2",
+      "--enable-auto-tool-choice",
+      "--tool-call-parser",
+      "qwen3_xml",
+      "--reasoning-parser",
+      "qwen3",
+      "--mm-encoder-tp-mode",
+      "data",
+      "--max-model-len",
+      "262144",
+      "--max-num-seqs",
+      "128",
+      "--gpu-memory-utilization",
+      "0.9",
+      "--enable-prefix-caching"
+    ]
+  },
+  "bench": {
+    "tokens": 131072,
+    "max_tokens": 64,
+    "timeout": 1800
+  },
+  "waves": [
+    {"hit_rate": 0.0, "concurrency": 4, "requests": 8},
+    {"hit_rate": 0.0, "concurrency": 8, "requests": 16},
+    {"hit_rate": 0.0, "concurrency": 12, "requests": 24},
+    {"hit_rate": 0.0, "concurrency": 16, "requests": 32},
+    {"hit_rate": 0.99, "concurrency": 4, "requests": 8},
+    {"hit_rate": 0.99, "concurrency": 8, "requests": 16},
+    {"hit_rate": 0.99, "concurrency": 12, "requests": 24},
+    {"hit_rate": 0.99, "concurrency": 16, "requests": 32}
+  ]
+}

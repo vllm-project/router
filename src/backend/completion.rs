@@ -30,49 +30,6 @@ impl std::fmt::Display for CompletionPreparationError {
 
 impl std::error::Error for CompletionPreparationError {}
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CompletionUnsupportedReason {
-    LoraPath,
-    SessionParams,
-    Suffix,
-    ExtensionField,
-    BatchedPrompts,
-}
-
-impl CompletionUnsupportedReason {
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            Self::LoraPath => "lora_path",
-            Self::SessionParams => "session_params",
-            Self::Suffix => "suffix",
-            Self::ExtensionField => "extension_field",
-            Self::BatchedPrompts => "batched_prompts",
-        }
-    }
-}
-
-#[derive(Debug)]
-pub(crate) enum CompletionPreparationFailure {
-    Unsupported {
-        reason: CompletionUnsupportedReason,
-        diagnostic: String,
-    },
-    InvalidRequest(String),
-    ServiceFailure(String),
-}
-
-impl From<CompletionPreparationFailure> for CompletionPreparationError {
-    fn from(failure: CompletionPreparationFailure) -> Self {
-        match failure {
-            CompletionPreparationFailure::Unsupported { diagnostic, .. } => {
-                Self::Unsupported(diagnostic)
-            }
-            CompletionPreparationFailure::InvalidRequest(message) => Self::InvalidRequest(message),
-            CompletionPreparationFailure::ServiceFailure(message) => Self::ServiceFailure(message),
-        }
-    }
-}
-
 /// Reject tokenizer definitions that silently truncate or pad exact input.
 ///
 /// Validate the same definition that will be loaded into the tokenizer. This
@@ -121,31 +78,7 @@ pub fn prepare_completion_classified(
     tokenizer: &dyn Tokenizer,
     model_vocab_size: u32,
 ) -> Result<Vec<u32>, CompletionPreparationError> {
-    preflight_completion(request, model_vocab_size)
-        .and_then(|input| match input {
-            CompletionPreflight::Text {
-                text,
-                add_special_tokens,
-            } => encode_completion_text(text, add_special_tokens, tokenizer, model_vocab_size),
-            CompletionPreflight::TokenIds(ids) => Ok(ids),
-        })
-        .map_err(Into::into)
-}
-
-pub(crate) enum CompletionPreflight<'a> {
-    Text {
-        text: &'a str,
-        add_special_tokens: bool,
-    },
-    TokenIds(Vec<u32>),
-}
-
-/// Validate and classify input before acquiring tokenizer-specific capacity.
-pub(crate) fn preflight_completion(
-    request: &CompletionRequest,
-    model_vocab_size: u32,
-) -> Result<CompletionPreflight<'_>, CompletionPreparationFailure> {
-    use CompletionPreparationFailure::{InvalidRequest, ServiceFailure, Unsupported};
+    use CompletionPreparationError::{InvalidRequest, ServiceFailure, Unsupported};
 
     if model_vocab_size == 0 {
         return Err(ServiceFailure(
@@ -172,22 +105,19 @@ pub(crate) fn preflight_completion(
         .transpose()?
         .unwrap_or(true);
     if request.lora_path.is_some() {
-        return Err(Unsupported {
-            reason: CompletionUnsupportedReason::LoraPath,
-            diagnostic: "completion preparation does not support lora_path".into(),
-        });
+        return Err(Unsupported(
+            "completion preparation does not support lora_path".into(),
+        ));
     }
     if request.session_params.is_some() {
-        return Err(Unsupported {
-            reason: CompletionUnsupportedReason::SessionParams,
-            diagnostic: "completion preparation does not support session_params".into(),
-        });
+        return Err(Unsupported(
+            "completion preparation does not support session_params".into(),
+        ));
     }
     if request.suffix.is_some() {
-        return Err(Unsupported {
-            reason: CompletionUnsupportedReason::Suffix,
-            diagnostic: "completion preparation does not support suffix".into(),
-        });
+        return Err(Unsupported(
+            "completion preparation does not support suffix".into(),
+        ));
     }
     for (field, value) in &request.other {
         // vLLM 0.29 Completion priority controls engine scheduling, not input
@@ -195,43 +125,32 @@ pub(crate) fn preflight_completion(
         // ordinary-path fallback until their input and namespace contracts are
         // established; in particular LoRA and salt are not sampling options.
         if field != "add_special_tokens" && !(field == "priority" && value.as_i64().is_some()) {
-            return Err(Unsupported {
-                reason: CompletionUnsupportedReason::ExtensionField,
-                diagnostic: format!("completion preparation does not support {field}"),
-            });
+            return Err(Unsupported(format!(
+                "completion preparation does not support {field}"
+            )));
         }
     }
-    match &request.prompt {
-        PromptInput::String(text) => Ok(CompletionPreflight::Text {
-            text,
-            add_special_tokens,
-        }),
-        PromptInput::IntArray(ids) => Ok(CompletionPreflight::TokenIds(
-            ids.iter().map(|&id| id as u32).collect(),
-        )),
-        PromptInput::StringArray(_) | PromptInput::IntBatch(_) => Err(Unsupported {
-            reason: CompletionUnsupportedReason::BatchedPrompts,
-            diagnostic: "completion preparation does not support batched prompts".into(),
-        }),
-    }
-}
-
-pub(crate) fn encode_completion_text(
-    text: &str,
-    add_special_tokens: bool,
-    tokenizer: &dyn Tokenizer,
-    model_vocab_size: u32,
-) -> Result<Vec<u32>, CompletionPreparationFailure> {
-    use CompletionPreparationFailure::{InvalidRequest, ServiceFailure};
-
-    let token_ids = tokenizer
-        .encode(text, add_special_tokens)
-        .map_err(|error| ServiceFailure(format!("completion tokenization failed: {error}")))?;
-    if let Some(id) = token_ids.iter().find(|&&id| id >= model_vocab_size) {
-        return Err(ServiceFailure(format!(
-            "completion token ID {id} is outside model vocabulary size {model_vocab_size}"
-        )));
-    }
+    let token_ids = match &request.prompt {
+        PromptInput::String(text) => {
+            let ids = tokenizer
+                .encode(text, add_special_tokens)
+                .map_err(|error| {
+                    ServiceFailure(format!("completion tokenization failed: {error}"))
+                })?;
+            if let Some(id) = ids.iter().find(|&&id| id >= model_vocab_size) {
+                return Err(ServiceFailure(format!(
+                    "completion token ID {id} is outside model vocabulary size {model_vocab_size}"
+                )));
+            }
+            ids
+        }
+        PromptInput::IntArray(ids) => ids.iter().map(|&id| id as u32).collect(),
+        PromptInput::StringArray(_) | PromptInput::IntBatch(_) => {
+            return Err(Unsupported(
+                "completion preparation does not support batched prompts".into(),
+            ));
+        }
+    };
     if token_ids.is_empty() {
         return Err(InvalidRequest(
             "completion preparation requires nonempty token input".into(),
@@ -243,8 +162,8 @@ pub(crate) fn encode_completion_text(
 fn validate_prompt_ids(
     ids: &[i32],
     model_vocab_size: u32,
-) -> Result<(), CompletionPreparationFailure> {
-    use CompletionPreparationFailure::InvalidRequest;
+) -> Result<(), CompletionPreparationError> {
+    use CompletionPreparationError::InvalidRequest;
     if ids.is_empty() {
         return Err(InvalidRequest(
             "completion preparation requires nonempty token input".into(),

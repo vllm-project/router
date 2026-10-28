@@ -4,7 +4,8 @@
 //! file owns atomic state access, target discovery, and observation rebasing.
 
 use super::scheduler_state::{
-    CapacityAccountingSource, ProgramDecisionState, ProgramSchedulerState, RankObservationState,
+    CapacityAccountingSource, PrefillPressure, ProgramDecisionState, ProgramSchedulerState,
+    RankObservationState,
 };
 use super::{
     BackendObservation, ProgramBindingCandidate, ProgramIdentity, ProgramRef,
@@ -338,6 +339,12 @@ impl ProgramScheduler {
             if !state.targets.contains_key(&target_id) {
                 continue;
             }
+            if raw
+                .kv_cache_usage
+                .is_some_and(|usage| !usage.is_finite() || !(0.0..=1.0).contains(&usage))
+            {
+                continue;
+            }
             let native_used_tokens = raw
                 .kv_cache_usage
                 .zip(self.config.progress_ttl.token_capacity)
@@ -353,8 +360,20 @@ impl ProgramScheduler {
                     native_used
                 }
             });
-            let estimated_active_program_tokens = estimated_reasoning_tokens
-                .map(|reasoning| reasoning + checkpoint.active_acting_private_tokens);
+            let estimated_active_program_tokens = if self.config.pd_mode {
+                native_used_tokens.map(|native| {
+                    // Native metrics do not identify which KV belongs to
+                    // Router Programs. A Program can be reserved on D while
+                    // still running on P or waiting on a tool, so treating the
+                    // two figures as overlapping can erase its reservation.
+                    native
+                        + checkpoint.active_reasoning_private_tokens
+                        + checkpoint.active_acting_private_tokens
+                })
+            } else {
+                estimated_reasoning_tokens
+                    .map(|reasoning| reasoning + checkpoint.active_acting_private_tokens)
+            };
             let observation = state.observations.entry(target_id.clone()).or_default();
             observation.active_program_token_delta -= checkpoint.ledger_checkpoint;
             observation.kv_cache_usage = raw.kv_cache_usage;
@@ -497,8 +516,21 @@ impl ProgramScheduler {
             identity.parent_program_id(),
             identity.root_program_id(),
         );
+        let preserve_front = self.config.pd_mode
+            && state.runtime.view(&reference).is_some_and(|p| {
+                // A newly retained tail request must not change the current
+                // front or in-flight turn's budget or context scope in either
+                // direction.
+                p.in_flight_requests > 0 || p.waiting_requests > 1
+            });
         if let Some(decision) = state.decisions.get_mut(&reference) {
-            if estimated_context_tokens >= decision.estimated_context_tokens {
+            // Keep a queued tail from changing the front turn's budget. A new
+            // PD front turn uses its own context even when it is smaller than
+            // the previous turn; non-PD keeps the observed shrink policy.
+            if !preserve_front
+                && (self.config.pd_mode
+                    || estimated_context_tokens >= decision.estimated_context_tokens)
+            {
                 decision.estimated_context_tokens = estimated_context_tokens;
                 decision.context_shrink_observations = 0;
             }
@@ -509,7 +541,9 @@ impl ProgramScheduler {
             decision.blocks_parent = identity.blocks_parent();
             decision.agent_role = identity.agent_role().map(str::to_string);
             decision.spawn_reason = identity.spawn_reason().map(str::to_string);
-            decision.output_token_reservation = identity.request_hints().expected_output_tokens;
+            if !preserve_front {
+                decision.output_token_reservation = identity.request_hints().expected_output_tokens;
+            }
             decision.step_id = identity
                 .step_id()
                 .unwrap_or_else(|| decision.step_id.saturating_add(1));
@@ -636,6 +670,38 @@ impl ProgramScheduler {
         target_id: &str,
         now: Instant,
     ) -> Option<f64> {
+        if self.config.pd_mode {
+            let observation = state
+                .observations
+                .get(target_id)
+                .filter(|observation| self.observation_is_fresh(observation, now))?;
+            let native = observation
+                .kv_cache_usage
+                .zip(self.config.progress_ttl.token_capacity)
+                .map(|(usage, capacity)| usage * capacity as f64)?;
+            let logical: f64 = state
+                .runtime
+                .iter_views()
+                .filter(|program| {
+                    program.state == ProgramState::Active && program.placement == Some(target_id)
+                })
+                .filter_map(|program| state.decisions.get(program.reference))
+                .map(|decision| {
+                    decision.private_tokens(self.config.progress_ttl.decode_buffer_tokens)
+                })
+                .sum();
+            // D metrics do not say which Program reservations they already
+            // cover. The default adds both, so admission never runs ahead of
+            // KV that may still be in prefill or between turns. With exclusive
+            // accounting the two figures are treated as overlapping
+            // observations of the same KV: native occupancy stays a floor and
+            // the larger reservation set covers the sample lag.
+            return Some(if self.config.pd_exclusive_capacity_accounting {
+                native.max(logical)
+            } else {
+                native + logical
+            });
+        }
         state
             .observations
             .get(target_id)
@@ -645,6 +711,54 @@ impl ProgramScheduler {
                     .estimated_active_program_tokens
                     .map(|tokens| (tokens + observation.active_program_token_delta).max(0.0))
             })
+    }
+
+    /// Feed the current P KV-cache usage sample (maximum across P engines).
+    ///
+    /// Exclusive D accounting lets a rank admit until its own KV capacity
+    /// fills, but every Program's prefill also competes for the shared P
+    /// prefix cache. This sample is the P-side bound: once the P KV pool is
+    /// under pressure the Program-count cap tightens back to the configured P
+    /// prefill permits.
+    pub fn observe_prefill_kv_usage(&self, kv_usage: f64) {
+        if !self.config.pd_mode || !kv_usage.is_finite() {
+            return;
+        }
+        let mut state = self.state.lock();
+        state.prefill_pressure = Some(PrefillPressure {
+            kv_usage: kv_usage.clamp(0.0, 1.0),
+            observed_at: Instant::now(),
+        });
+    }
+
+    /// Whether P KV pressure currently exceeds the configured watermark.
+    ///
+    /// Unknown or stale samples keep the guard disengaged.
+    pub(crate) fn prefill_pressure_high(&self, state: &ProgramSchedulerState) -> bool {
+        if !self.config.pd_mode || self.config.pd_prefill_kv_high <= 0.0 {
+            return false;
+        }
+        let freshness = self.config.pd_prefill_kv_window.saturating_mul(3);
+        state.prefill_pressure.is_some_and(|pressure| {
+            pressure.kv_usage >= self.config.pd_prefill_kv_high
+                && pressure.observed_at.elapsed() <= freshness
+        })
+    }
+
+    /// Effective Program-count cap for the current P state.
+    ///
+    /// Under P KV pressure the cap tightens to the P prefill permits so the
+    /// shared P cache is not thrashed; otherwise the configured (or auto)
+    /// limit applies.
+    pub(crate) fn effective_active_cap(&self, state: &ProgramSchedulerState) -> usize {
+        if self.prefill_pressure_high(state) {
+            return self
+                .config
+                .pd_prefill_permits
+                .max(1)
+                .min(self.config.max_active_programs_per_target);
+        }
+        self.config.max_active_programs_per_target
     }
 
     pub(crate) fn adjust_usage(

@@ -146,15 +146,28 @@ pub trait KvAwareOps: Send + Sync {
     /// slice, before health filtering. The built-in policy treats `None` as
     /// unrestricted. Implementers without this extension return `None` without
     /// querying or reserving, rather than silently ignoring a supplied mask.
-    fn select_worker_with_receipt_and_eligibility(
+    #[allow(clippy::too_many_arguments)]
+    fn select_worker_with_qualified_inputs(
         &self,
-        _workers: &[Arc<dyn Worker>],
-        _token_ids: Option<&[u32]>,
-        _lora_name: Option<&str>,
-        _cache_salt: Option<&str>,
-        _eligibility: Option<&[bool]>,
+        workers: &[Arc<dyn Worker>],
+        tokens: KvRequestTokens<'_>,
+        lora_name: Option<&str>,
+        cache_salt: Option<&str>,
+        affinity_key: Option<&AffinityKey>,
+        excluded_workers: &[String],
+        eligibility: Option<&[bool]>,
     ) -> Option<KvSelectionReceipt> {
-        None
+        if eligibility.is_some() {
+            return None;
+        }
+        self.select_worker_with_inputs(
+            workers,
+            tokens,
+            lora_name,
+            cache_salt,
+            affinity_key,
+            excluded_workers,
+        )
     }
 }
 
@@ -1189,28 +1202,6 @@ impl KvAwarePolicy {
         )
     }
 
-    /// Compatibility entry for the original HTTP placement-qualification API.
-    pub fn select_worker_with_receipt_and_eligibility(
-        &self,
-        workers: &[Arc<dyn Worker>],
-        token_ids: Option<&[u32]>,
-        lora_name: Option<&str>,
-        cache_salt: Option<&str>,
-        eligibility: Option<&[bool]>,
-    ) -> Option<KvSelectionReceipt> {
-        self.select_worker_with_qualified_inputs(
-            workers,
-            QualifiedKvInput {
-                tokens: KvRequestTokens::Shared(token_ids),
-                eligibility,
-            },
-            lora_name,
-            cache_salt,
-            None,
-            &[],
-        )
-    }
-
     pub(crate) fn select_worker_with_qualified_inputs(
         &self,
         workers: &[Arc<dyn Worker>],
@@ -1935,21 +1926,27 @@ impl KvAwareOps for KvAwarePolicy {
         self.unregister_target(worker_url);
     }
 
-    fn select_worker_with_receipt_and_eligibility(
+    fn select_worker_with_qualified_inputs(
         &self,
         workers: &[Arc<dyn Worker>],
-        token_ids: Option<&[u32]>,
+        tokens: KvRequestTokens<'_>,
         lora_name: Option<&str>,
         cache_salt: Option<&str>,
+        affinity_key: Option<&AffinityKey>,
+        excluded_workers: &[String],
         eligibility: Option<&[bool]>,
     ) -> Option<KvSelectionReceipt> {
-        KvAwarePolicy::select_worker_with_receipt_and_eligibility(
+        KvAwarePolicy::select_worker_with_qualified_inputs(
             self,
             workers,
-            token_ids,
+            QualifiedKvInput {
+                tokens,
+                eligibility,
+            },
             lora_name,
             cache_salt,
-            eligibility,
+            affinity_key,
+            excluded_workers,
         )
     }
 
@@ -2095,11 +2092,13 @@ mod tests {
                 }
                 let receipt = kv_aware_ops(&policy)
                     .unwrap()
-                    .select_worker_with_receipt_and_eligibility(
+                    .select_worker_with_qualified_inputs(
                         &workers,
-                        Some(&ids),
+                        KvRequestTokens::Shared(Some(&ids)),
                         None,
                         None,
+                        None,
+                        &[],
                         Some(&mask),
                     )
                     .unwrap();
@@ -2152,12 +2151,15 @@ mod tests {
                     }
                 }
                 if count > 1 {
-                    let receipt = policy
-                        .select_worker_with_receipt_and_eligibility(
+                    let receipt = kv_aware_ops(&policy)
+                        .unwrap()
+                        .select_worker_with_qualified_inputs(
                             &workers,
-                            Some(&ids),
+                            KvRequestTokens::Shared(Some(&ids)),
                             None,
                             None,
+                            None,
+                            &[],
                             Some(&mask),
                         )
                         .unwrap();
@@ -2169,12 +2171,15 @@ mod tests {
 
                 for mask in [vec![false; count], vec![true; count + 1], vec![]] {
                     provider.queries.store(0, Ordering::Relaxed);
-                    let receipt = policy
-                        .select_worker_with_receipt_and_eligibility(
+                    let receipt = kv_aware_ops(&policy)
+                        .unwrap()
+                        .select_worker_with_qualified_inputs(
                             &workers,
-                            Some(&ids),
+                            KvRequestTokens::Shared(Some(&ids)),
                             None,
                             None,
+                            None,
+                            &[],
                             Some(&mask),
                         )
                         .unwrap();
@@ -2187,12 +2192,15 @@ mod tests {
                     workers[0].set_healthy(false);
                     let mut mask = vec![false; count];
                     mask[count - 1] = true;
-                    let receipt = policy
-                        .select_worker_with_receipt_and_eligibility(
+                    let receipt = kv_aware_ops(&policy)
+                        .unwrap()
+                        .select_worker_with_qualified_inputs(
                             &workers,
-                            Some(&ids),
+                            KvRequestTokens::Shared(Some(&ids)),
                             None,
                             None,
+                            None,
+                            &[],
                             Some(&mask),
                         )
                         .unwrap();
@@ -3004,16 +3012,18 @@ mod tests {
         let denied = [false];
         for eligibility in [None, Some(denied.as_slice())] {
             assert!(ops
-                .select_worker_with_receipt_and_eligibility(
+                .select_worker_with_qualified_inputs(
                     &workers,
-                    Some(&[1, 2]),
+                    KvRequestTokens::Shared(Some(&[1, 2])),
                     None,
                     None,
+                    None,
+                    &[],
                     eligibility,
                 )
                 .is_none());
         }
-        assert_eq!(ordinary.selections.load(Ordering::Relaxed), 0);
+        assert_eq!(ordinary.selections.load(Ordering::Relaxed), 1);
         assert_eq!(workers[0].load(), 0);
     }
 

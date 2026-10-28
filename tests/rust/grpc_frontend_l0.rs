@@ -311,10 +311,6 @@ async fn grpc_kv_routing_keeps_unavailable_control_a_legal_fallback(
             ..Default::default()
         };
         let context = common::create_test_context(config.clone());
-        std::env::set_var(
-            "VLLM_ROUTER_KV_EVENT_SOURCES",
-            "invalid HTTP-only configuration",
-        );
         let router = Router::new(
             if empty_start {
                 vec![]
@@ -328,7 +324,6 @@ async fn grpc_kv_routing_keeps_unavailable_control_a_legal_fallback(
         if empty_start {
             router.add_worker(&worker.grpc_url).await.unwrap();
         }
-        std::env::remove_var("VLLM_ROUTER_KV_EVENT_SOURCES");
         let app =
             common::test_app::create_test_app(Arc::new(router), reqwest::Client::new(), &config);
         let response = app

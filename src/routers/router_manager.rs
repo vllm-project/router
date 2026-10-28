@@ -677,16 +677,16 @@ impl RouterTrait for RouterManager {
         &self,
         headers: Option<&HeaderMap>,
         body: Arc<CompletionRequest>,
-        raw: &axum::body::Bytes,
+        raw: axum::body::Bytes,
         _model_id: Option<&str>,
     ) -> Response {
-        let model_id = body.model.as_deref();
-        if let Some(router) = self.select_router_for_request(headers, model_id) {
+        let model_id = body.model.clone();
+        if let Some(router) = self.select_router_for_request(headers, model_id.as_deref()) {
             router
-                .route_completion_raw(headers, body.clone(), raw, model_id)
+                .route_completion_raw(headers, body, raw, model_id.as_deref())
                 .await
         } else {
-            let message = model_id.map_or_else(
+            let message = model_id.as_deref().map_or_else(
                 || "No routers registered to handle this request".to_string(),
                 |model| format!("Model '{model}' not found or no router available"),
             );

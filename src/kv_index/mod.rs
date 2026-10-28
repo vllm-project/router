@@ -19,7 +19,7 @@ pub use decode::decode_batch;
 pub use discovery::{
     CacheKey, KvEventSourceEntry, KvEventSourcesResponse, KvIndexSupervisor, WorkerKvInfo,
 };
-pub(crate) use endpoints::{canonical_endpoint, canonical_worker};
+pub(crate) use endpoints::canonical_endpoint;
 pub use endpoints::{parse_endpoint_mapping, resolve_endpoints};
 pub use indexer::{KvBlockIndexer, MatchQuery, TierMatch};
 pub use subscriber::local_hashes;

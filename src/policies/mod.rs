@@ -24,6 +24,8 @@ pub use cache_aware::{CacheAwareCandidate, CacheAwarePlacement, CacheAwarePolicy
 pub use consistent_hash::ConsistentHashPolicy;
 pub use consistent_hash::VIRTUAL_NODES_PER_WORKER;
 pub use factory::PolicyFactory;
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
+pub(crate) use kv_aware::kv_aware_policy;
 pub use kv_aware::{
     cost_components, kv_aware_ops, AffinityKey, AffinityRecord, CandidateView, CostComponents,
     CostDecision, CostParams, InMemorySlotManager, KvAffinityTable, KvAwareOps, KvAwarePolicy,
@@ -31,7 +33,6 @@ pub use kv_aware::{
     MultiplicativeScorer, Picker, PrefillWorkEstimate, Scorer, SelectionError, SlotManager,
     StagePick, TemperaturePicker, TieredMatchProvider, TransferCredits, WorkerTokenInputs,
 };
-pub(crate) use kv_aware::{kv_aware_policy, QualifiedKvInput};
 pub use power_of_two::PowerOfTwoPolicy;
 pub use random::RandomPolicy;
 pub use registry::PolicyRegistry;

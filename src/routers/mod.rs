@@ -106,10 +106,10 @@ pub trait RouterTrait: Send + Sync + Debug + WorkerManagement {
         &self,
         headers: Option<&HeaderMap>,
         body: std::sync::Arc<CompletionRequest>,
-        raw: &axum::body::Bytes,
+        raw: axum::body::Bytes,
         model_id: Option<&str>,
     ) -> Response {
-        let _ = raw;
+        drop(raw);
         self.route_completion(headers, body.as_ref(), model_id)
             .await
     }
@@ -349,7 +349,7 @@ mod tests {
         );
         assert_eq!(
             router
-                .route_completion_raw(Some(&headers), request.clone(), &raw, Some("legacy"))
+                .route_completion_raw(Some(&headers), request.clone(), raw.clone(), Some("legacy"))
                 .await
                 .status(),
             StatusCode::ACCEPTED
@@ -366,7 +366,7 @@ mod tests {
         manager.register_router(router_manager::RouterId::new("legacy".into()), router);
         assert_eq!(
             manager
-                .route_completion_raw(Some(&headers), request, &raw, None)
+                .route_completion_raw(Some(&headers), request, raw, None)
                 .await
                 .status(),
             StatusCode::ACCEPTED

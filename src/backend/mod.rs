@@ -4,8 +4,7 @@
 //! at init / `add_worker` (gRPC is `token_ids` only).
 //!
 //! - All-HTTP: KV-aware routing obtains exact inputs from token arrays or
-//!   the workers' render endpoints. Opt-in static Completion instead uses the
-//!   loaded tokenizer; `router.rs` still proxies the original OpenAI request.
+//!   the workers' render endpoints, then `router.rs` proxies OpenAI JSON.
 //!   Other policies do not prepare tokens.
 //! - All-gRPC: `EngineFrontend::prepare(chat)` → `token_ids`, then policy
 //!   selects, then `EngineFrontend::dispatch` (`convert` + GenerateStream +
@@ -15,10 +14,9 @@
 //! `vllm-chat` + `vllm-tokenizer` only (Cargo git, not `pip install`).
 //!
 //! `VLLM_ROUTER_STAGES=1` emits stage clocks. gRPC always tokenizes; HTTP
-//! retains the Worker serving path and reports worker header/first-byte timings.
+//! remains a transparent proxy and reports worker header/first-byte timings.
 
 pub mod completion;
-pub(crate) mod completion_input;
 pub mod control;
 pub mod convert;
 pub mod detect;

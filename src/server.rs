@@ -60,22 +60,20 @@ pub struct AppContext {
 
 impl AppContext {
     pub fn new(
-        mut router_config: RouterConfig,
+        router_config: RouterConfig,
         client: Client,
         max_concurrent_requests: usize,
         rate_limit_tokens_per_second: Option<usize>,
         api_key_validation_urls: Vec<String>,
     ) -> Result<Self, String> {
-        if matches!(
-            &router_config.policy,
-            crate::config::PolicyConfig::KvAware { .. }
-        ) {
-            let legacy_sources = std::env::var("VLLM_ROUTER_KV_EVENT_SOURCES").ok();
-            crate::config::normalize_static_kv_event_sources(
-                &mut router_config.policy,
-                legacy_sources.as_deref(),
-            )
-            .map_err(|error| error.to_string())?;
+        if let crate::config::PolicyConfig::KvAware {
+            static_kv_event_sources,
+            ..
+        } = &router_config.policy
+        {
+            for (worker, source) in static_kv_event_sources.iter() {
+                source.validate(worker).map_err(|error| error.to_string())?;
+            }
         }
         let rate_limit_tokens = rate_limit_tokens_per_second.unwrap_or(max_concurrent_requests);
         let rate_limiter = Arc::new(TokenBucket::new(max_concurrent_requests, rate_limit_tokens));
@@ -307,7 +305,7 @@ async fn v1_completions(
 
     state
         .router
-        .route_completion_raw(Some(&headers), Arc::new(body), &raw, None)
+        .route_completion_raw(Some(&headers), Arc::new(body), raw, None)
         .await
 }
 

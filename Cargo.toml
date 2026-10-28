@@ -176,10 +176,6 @@ name = "completion_preparation"
 path = "tests/rust/completion_preparation.rs"
 
 [[test]]
-name = "completion_http_startup"
-path = "tests/rust/completion_http_startup.rs"
-
-[[test]]
 name = "grpc_completion_frontend"
 path = "tests/rust/grpc_completion_frontend.rs"
 
@@ -282,6 +278,10 @@ path = "tests/rust/test_extra_args_chat.rs"
 [[test]]
 name = "test_openai_routing"
 path = "tests/rust/test_openai_routing.rs"
+
+[[test]]
+name = "test_pd_program_scheduling"
+path = "tests/rust/test_pd_program_scheduling.rs"
 
 [[test]]
 name = "test_pd_routing"
