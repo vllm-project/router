@@ -3,8 +3,9 @@
 //! Worker pool is all-`http(s)://` or all-`grpc://`. Mixed schemes fail
 //! at init / `add_worker` (gRPC is `token_ids` only).
 //!
-//! - All-HTTP: policy selects, then `router.rs` reverse-proxies OpenAI JSON
-//!   (no chat/tokenizer frontend on the critical path).
+//! - All-HTTP: KV-aware routing obtains exact inputs from token arrays or
+//!   the workers' render endpoints, then `router.rs` proxies OpenAI JSON.
+//!   Other policies do not prepare tokens.
 //! - All-gRPC: `EngineFrontend::prepare(chat)` → `token_ids`, then policy
 //!   selects, then `EngineFrontend::dispatch` (`convert` + GenerateStream +
 //!   detok).
