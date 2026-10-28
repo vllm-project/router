@@ -341,7 +341,8 @@ impl PdRouterBase {
             return;
         }
         let model_id = removed.model_id();
-        self.policy_registry.on_worker_removed(model_id);
+        // The last-worker notification removes the model's policy mapping,
+        // so clean its cache-aware state while the policy is still available.
         if let Some(policy) = self.policy_registry.get_policy(model_id) {
             if let Some(cache_aware) = policy
                 .as_any()
@@ -350,6 +351,7 @@ impl PdRouterBase {
                 cache_aware.remove_worker_by_url(removed.url());
             }
         }
+        self.policy_registry.on_worker_removed(model_id);
     }
 
     pub async fn remove_prefill_server(&self, url: &str) -> Result<String, PDRouterError> {
@@ -1245,6 +1247,133 @@ mod tests {
             .is_some());
         assert!(router.policy_registry.get_worker_counts().is_empty());
         assert!(router.policy_registry.get_policy("unknown").is_none());
+    }
+
+    async fn check_pd_removal_cleans_cache_aware_state(prefill: bool, dp_size: usize) {
+        use crate::policies::{CacheAwareCandidate, CacheAwarePolicy};
+
+        let mut router = create_test_pd_router_with_dp(dp_size);
+        router.policy_registry = Arc::new(PolicyRegistry::new(
+            crate::config::PolicyConfig::CacheAware {
+                cache_threshold: 0.3,
+                balance_abs_threshold: 32,
+                balance_rel_threshold: 1.5,
+                eviction_interval_secs: 0,
+                max_tree_size: 1024,
+            },
+        ));
+        let role = if prefill {
+            WorkerType::Prefill {
+                bootstrap_port: None,
+            }
+        } else {
+            WorkerType::Decode
+        };
+        let base_url = "http://pd:8000";
+        let model_id = "unknown";
+        let prompt = "cached PD prefix";
+        let mut removed_urls = Vec::new();
+        for rank in 0..dp_size {
+            let worker: Arc<dyn Worker> = if dp_size == 1 {
+                Arc::new(BasicWorker::new(base_url.into(), role.clone()))
+            } else {
+                Arc::new(DPAwareWorker::new(
+                    base_url.into(),
+                    rank,
+                    dp_size,
+                    role.clone(),
+                ))
+            };
+            removed_urls.push(worker.url().to_owned());
+            router.register_and_notify(worker);
+        }
+        let survivor_url = "http://other-model:8000";
+        let survivor_model = "other";
+        router.register_and_notify(Arc::new(
+            BasicWorker::new(survivor_url.into(), WorkerType::Decode)
+                .with_labels(HashMap::from([("model_id".into(), survivor_model.into())])),
+        ));
+        let policy = router.policy_registry.get_policy(model_id).unwrap();
+        assert!(Arc::ptr_eq(
+            &policy,
+            &router.policy_registry.get_policy(survivor_model).unwrap()
+        ));
+        let cache_aware = policy.as_any().downcast_ref::<CacheAwarePolicy>().unwrap();
+        for url in &removed_urls {
+            cache_aware.commit_placement(model_id, prompt, url);
+        }
+        cache_aware.commit_placement(survivor_model, prompt, survivor_url);
+        let match_rate = |model, target_id| {
+            cache_aware
+                .evaluate_initial_placement(
+                    model,
+                    prompt,
+                    &[CacheAwareCandidate {
+                        target_id,
+                        kv_pressure: 0.0,
+                    }],
+                )
+                .unwrap()
+                .match_rate
+        };
+        for url in &removed_urls {
+            assert_eq!(match_rate(model_id, url), 1.0);
+        }
+
+        let result = if prefill {
+            router.remove_prefill_server(base_url).await
+        } else {
+            router.remove_decode_server(base_url).await
+        };
+        result.unwrap();
+
+        for url in &removed_urls {
+            assert!(router.worker_registry.get_by_url(url).is_none());
+            assert_eq!(match_rate(model_id, url), 0.0, "stale PD worker: {url}");
+        }
+        assert!(router.policy_registry.get_policy(model_id).is_none());
+        assert_eq!(
+            router.policy_registry.get_worker_counts(),
+            HashMap::from([(survivor_model.to_owned(), 1)])
+        );
+        assert!(router.worker_registry.get_by_url(survivor_url).is_some());
+        assert_eq!(match_rate(survivor_model, survivor_url), 1.0);
+        let repeated = if prefill {
+            router.remove_prefill_server(base_url).await
+        } else {
+            router.remove_decode_server(base_url).await
+        };
+        assert!(matches!(
+            repeated,
+            Err(PDRouterError::WorkerNotFound { .. })
+        ));
+        assert_eq!(
+            router
+                .policy_registry
+                .get_worker_counts()
+                .get(survivor_model),
+            Some(&1)
+        );
+    }
+
+    #[tokio::test]
+    async fn prefill_removal_cleans_cache_aware_state_for_last_consumer() {
+        check_pd_removal_cleans_cache_aware_state(true, 1).await;
+    }
+
+    #[tokio::test]
+    async fn decode_removal_cleans_cache_aware_state_for_last_consumer() {
+        check_pd_removal_cleans_cache_aware_state(false, 1).await;
+    }
+
+    #[tokio::test]
+    async fn prefill_dp_removal_cleans_cache_aware_state_for_last_consumers() {
+        check_pd_removal_cleans_cache_aware_state(true, 2).await;
+    }
+
+    #[tokio::test]
+    async fn decode_dp_removal_cleans_cache_aware_state_for_last_consumers() {
+        check_pd_removal_cleans_cache_aware_state(false, 2).await;
     }
 
     #[tokio::test]
