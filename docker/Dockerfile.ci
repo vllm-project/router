@@ -1,0 +1,31 @@
+# NVIDIA P/D CI image. Built by .buildkite/scripts/build-ci-image.sh and
+# pulled by the l4_4 preset. CPU Rust and Python jobs stay on rust:bookworm.
+# build-ci-image.sh downloads target/release/vllm-router before this build.
+# That COPY is last so the vLLM layers stay cached across commits.
+FROM nvidia/cuda:13.0.2-devel-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+COPY .buildkite/ci_apt_packages.conf /opt/ci/ci_apt_packages.conf
+COPY .buildkite/scripts/install_packages.sh /opt/ci/scripts/install_packages.sh
+RUN bash /opt/ci/scripts/install_packages.sh nvidia_pd \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+ENV PATH="/root/.local/bin:${PATH}"
+
+RUN uv venv --python 3.12 --seed /opt/vllm-router-ci/.venv
+ENV VIRTUAL_ENV=/opt/vllm-router-ci/.venv
+ENV PATH="/opt/vllm-router-ci/.venv/bin:/root/.local/bin:${PATH}"
+
+# Same packages the P/D jobs used to install on every run. L1 skips lm-eval
+# at runtime. vllm and nixl are unpinned; this layer stays cached until the
+# Dockerfile or another image-build cache input changes. The GPU jobs do not
+# recheck the CUDA wheel. A bad image fails in run_accuracy_test.sh.
+RUN uv pip install vllm --torch-backend=cu130 \
+    && uv pip install nixl-cu13 \
+    && uv pip install nixl --no-deps \
+    && uv pip install requests pytest openai hf_transfer 'lm-eval[api]==0.4.12'
+
+COPY target/release/vllm-router /usr/local/bin/vllm-router
+RUN chmod +x /usr/local/bin/vllm-router

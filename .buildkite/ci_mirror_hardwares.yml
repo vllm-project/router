@@ -1,0 +1,163 @@
+# Machine presets for the test pipelines. Steps reference a name with
+# ``mirror_hardwares``; .buildkite/scripts/upload_pipeline.py expands it to
+# ``agents`` and ``plugins`` before Buildkite upload. Same idea as
+# vllm-omni .buildkite/common/ci_mirror_hardwares.yml, limited to the
+# machines this repo runs.
+#
+#   l4_4       EKS l4-k8s, 4x L4 (vllm.ci/gpu-pool=l4x4). 4 GPU = 40 CPU / 160Gi / 96Gi shm.
+#              Image is the router CI image pushed by image-build:
+#              public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:router-$BUILDKITE_COMMIT
+#   mi300_2    router_rocm_mi300_2, same-host xGMI via the ROCm Docker device mount.
+#   mi300_rdma router_rocm_mi300_2 coordinator. No Docker plugin; the job SSHes to the decode host.
+#   h100_4_grpc  mithril-h100-pool, 4x H100 SXM (vllm-omni h100_4 scheduling). Uses cuda:devel
+#              in-job uv/cargo bootstrap (not the router ECR CI image).
+#
+# Test-specific env (MORIIO_READ_MODE, LM_EVAL_LIMIT, LOG_DIR) stays on the step.
+
+mirror_hardwares:
+  l4_4:
+    agents:
+      queue: l4-k8s
+    plugins:
+    - kubernetes:
+        metadata:
+          annotations:
+            cluster-autoscaler.kubernetes.io/safe-to-evict: 'false'
+            karpenter.sh/do-not-disrupt: 'true'
+        podSpec:
+          priorityClassName: ci
+          serviceAccountName: buildkite-gpu-jobs
+          tolerations:
+          - key: nvidia.com/gpu
+            operator: Exists
+            effect: NoSchedule
+          nodeSelector:
+            vllm.ci/gpu-pool: l4x4
+          containers:
+          - image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:router-$BUILDKITE_COMMIT
+            resources:
+              limits:
+                nvidia.com/gpu: 4
+              requests:
+                nvidia.com/gpu: 4
+                cpu: '40'
+                memory: 160Gi
+            volumeMounts:
+            - name: devshm
+              mountPath: /dev/shm
+            - name: hf-cache
+              mountPath: /fsx/hf_cache
+            env:
+            - name: HF_HOME
+              value: /fsx/hf_cache
+            - name: HF_HUB_ENABLE_HF_TRANSFER
+              value: '1'
+            - name: NCCL_CUMEM_HOST_ENABLE
+              value: '0'
+            - name: VLLM_USE_V1
+              value: '1'
+            - name: VLLM_LOGGING_LEVEL
+              value: INFO
+            - name: UCX_TLS
+              value: all
+            - name: UCX_NET_DEVICES
+              value: all
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token-secret
+                  key: token
+            - name: BUILDKITE_SHELL
+              value: /bin/bash -e -c
+          volumes:
+          - name: devshm
+            emptyDir:
+              medium: Memory
+              sizeLimit: 96Gi
+          - name: hf-cache
+            hostPath:
+              path: /fsx/hf_cache
+              type: DirectoryOrCreate
+  mi300_2:
+    agents:
+      queue: router_rocm_mi300_2
+    plugins:
+    - docker#v5.14.0:
+        image: $ROCM_VLLM_IMAGE
+        # Empty entrypoint skips the vLLM server and also disables the plugin's
+        # default /bin/sh -c. tini would then exec the whole step script as a
+        # filename and exit 127. This shell runs that script.
+        entrypoint: ''
+        shell: ["bash", "-euo", "pipefail", "-c"]
+        workdir: /workdir
+        volumes:
+        - /var/lib/buildkite-agent/.cache/huggingface:/root/.cache/huggingface
+        devices:
+        - /dev/kfd
+        - /dev/dri
+        privileged: true
+        init: true
+        tty: false
+        ipc: host
+        mount-buildkite-agent: true
+        chown: true
+        chown-image: busybox@sha256:dc2d74b28e4cf8984fa52af1f39bc7c3d9c73760b41a74d629f5d11b1ab28616
+        shm-size: 256g
+        security-opts:
+        - seccomp=unconfined
+        ulimits:
+        - memlock=-1
+        - stack=67108864
+        propagate-environment: true
+  mi300_rdma:
+    agents:
+      queue: router_rocm_mi300_2
+  h100_4_grpc:
+    agents:
+      queue: mithril-h100-pool
+    plugins:
+    - kubernetes:
+        podSpec:
+          nodeSelector:
+            node.kubernetes.io/instance-type: gpu-h100-sxm
+          containers:
+          - image: nvidia/cuda:13.0.2-devel-ubuntu22.04
+            resources:
+              limits:
+                nvidia.com/gpu: 4
+              requests:
+                nvidia.com/gpu: 4
+                cpu: '40'
+                memory: 160Gi
+            volumeMounts:
+            - name: devshm
+              mountPath: /dev/shm
+            - name: hf-cache
+              mountPath: /root/.cache/huggingface
+            env:
+            - name: HF_HOME
+              value: /root/.cache/huggingface
+            - name: HF_HUB_ENABLE_HF_TRANSFER
+              value: '1'
+            - name: NCCL_CUMEM_HOST_ENABLE
+              value: '0'
+            - name: VLLM_USE_V1
+              value: '1'
+            - name: VLLM_LOGGING_LEVEL
+              value: INFO
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token-secret
+                  key: token
+            - name: BUILDKITE_SHELL
+              value: /bin/bash -e -c
+          volumes:
+          - name: devshm
+            emptyDir:
+              medium: Memory
+              sizeLimit: 96Gi
+          - name: hf-cache
+            hostPath:
+              path: /mnt/hf-cache
+              type: DirectoryOrCreate

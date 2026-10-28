@@ -1,5 +1,9 @@
-# vLLM Router CI/CD Pipeline
-# This pipeline runs automated checks, builds, and tests for the vLLM Router project
+# vLLM Router test pipeline bootstrap.
+# Builds the release binary and wheel, pushes the NVIDIA CI image, then
+# uploads L1–L3 (issue #273).
+# Image publish stays in release-pipeline.yml.
+# NIGHTLY=1 on this pipeline selects tests. NIGHTLY=1 on router-release
+# publishes images. Those are different pipelines.
 
 env:
   RUST_IMAGE: "rust:1.95.0-bookworm"
@@ -10,7 +14,9 @@ env:
   # Enable full Rust backtraces for debugging
   RUST_BACKTRACE: "1"
 
+
 steps:
+
   # ============================================================================
   # Build - Create release artifacts
   # ============================================================================
@@ -31,12 +37,12 @@ steps:
                 - bash
                 - -c
                 - |
-                  apt-get update && apt-get install -y pkg-config libssl-dev protobuf-compiler
+                  bash .buildkite/scripts/install_packages.sh rust
                   cargo build --release
         artifact_paths:
           - "target/release/vllm-router"
         agents:
-          queue: "cpu_queue_premerge"
+          queue: "medium_cpu_queue_premerge"
 
       - label: ":python: Build Python Wheel"
         plugins:
@@ -52,522 +58,91 @@ steps:
                 - bash
                 - -c
                 - |
-                  apt-get update && apt-get install -y pkg-config libssl-dev protobuf-compiler python3 python3-pip python3-dev python3-venv
-                  python3 -m venv /tmp/venv
-                  source /tmp/venv/bin/activate
-                  pip install -U pip setuptools wheel setuptools-rust build
+                  source .buildkite/scripts/install_packages.sh python-wheel
                   python -m build
         artifact_paths:
           - "dist/*.whl"
           - "dist/*.tar.gz"
         agents:
-          queue: "cpu_queue_premerge"
+          queue: "medium_cpu_queue_premerge"
 
-  # Wait for builds to complete before testing
-  - wait: ~
-    continue_on_failure: false
-
-  # ============================================================================
-  # Tests - Run comprehensive test suite
-  # ============================================================================
-  - group: ":test_tube: Tests"
-    key: "tests"
-    steps:
-      - label: ":rust: Rust Unit Tests"
-        plugins:
-          - docker#v5.11.0:
-              image: "$RUST_IMAGE"
-              workdir: /workdir
-              volumes:
-                - ".:/workdir"
-              environment:
-                - "CARGO_INCREMENTAL=0"
-                - "RUST_BACKTRACE=1"
-              command:
-                - bash
-                - -c
-                - |
-                  apt-get update && apt-get install -y pkg-config libssl-dev protobuf-compiler
-                  # wasm_middleware unit tests load the example component artifact
-                  bash examples/wasm_middleware/build.sh
-                  cargo test --features cpu,ready --lib --bins
-        agents:
-          queue: "cpu_queue_premerge"
-
-      - label: ":rust: Rust Integration Tests"
-        plugins:
-          - docker#v5.11.0:
-              image: "$RUST_IMAGE"
-              workdir: /workdir
-              volumes:
-                - ".:/workdir"
-              environment:
-                - "CARGO_INCREMENTAL=0"
-                - "RUST_BACKTRACE=1"
-              command:
-                - bash
-                - -c
-                - |
-                  apt-get update && apt-get install -y pkg-config libssl-dev protobuf-compiler
-                  cargo test --features cpu,ready --test '*'
-        agents:
-          queue: "cpu_queue_premerge"
-
-      - label: ":python: Python Tests"
-        plugins:
-          - docker#v5.11.0:
-              image: "$RUST_IMAGE"
-              workdir: /workdir
-              volumes:
-                - ".:/workdir"
-              environment:
-                - "CARGO_INCREMENTAL=0"
-                - "RUST_BACKTRACE=1"
-              command:
-                - bash
-                - -c
-                - |
-                  apt-get update && apt-get install -y pkg-config libssl-dev protobuf-compiler python3 python3-pip python3-dev python3-venv
-                  # WASM middleware pytest needs the example component + router binary
-                  bash examples/wasm_middleware/build.sh
-                  cargo build --release --bin vllm-router
-                  python3 -m venv /tmp/venv
-                  source /tmp/venv/bin/activate
-                  pip install -U pip setuptools wheel setuptools-rust
-                  pip install -e .[dev]
-                  pip install pytest pytest-cov pytest-asyncio
-                  pytest tests/python/ -v --ignore=tests/python/e2e -m "ready and cpu" --cov=vllm_router --cov-report=xml --cov-report=term
-        artifact_paths:
-          - "coverage.xml"
-        agents:
-          queue: "cpu_queue_premerge"
-
-  # ============================================================================
-  # P/D Disaggregation Integration Test - Run on EKS l4-k8s (4x L4)
-  # ============================================================================
-  - label: ":satellite: P/D Disaggregation Test (4 GPUs)"
-    key: "pd-disagg-test"
-    # ROCm-only scheduled builds use the dedicated MI300X queue and should not
-    # wait for an unrelated NVIDIA worker before the build can finish.
-    if: build.env("ROCM_ONLY") != "1"
-    timeout_in_minutes: 60
-    retry:
-      automatic:
-        - exit_status: "*"
-          limit: 2
-      manual:
-        allowed: true
-        reason: "GPU tests can be flaky - retry if needed"
-    # agent-stack-k8s on the l4x4 pool. Docker plugin does not run on this queue.
-    # Resource requests match ci-infra l4_plugin_template (10 CPU / 40Gi / 24Gi shm per GPU).
-    plugins:
-      - kubernetes:
-          metadata:
-            annotations:
-              cluster-autoscaler.kubernetes.io/safe-to-evict: "false"
-              karpenter.sh/do-not-disrupt: "true"
-          podSpec:
-            priorityClassName: ci
-            serviceAccountName: buildkite-gpu-jobs
-            tolerations:
-              - key: nvidia.com/gpu
-                operator: Exists
-                effect: NoSchedule
-            nodeSelector:
-              vllm.ci/gpu-pool: l4x4
-            containers:
-              - image: nvidia/cuda:13.0.2-devel-ubuntu22.04
-                resources:
-                  limits:
-                    nvidia.com/gpu: 4
-                  requests:
-                    nvidia.com/gpu: 4
-                    cpu: "40"
-                    memory: 160Gi
-                volumeMounts:
-                  - name: devshm
-                    mountPath: /dev/shm
-                  - name: hf-cache
-                    mountPath: /fsx/hf_cache
-                env:
-                  - name: HF_HOME
-                    value: /fsx/hf_cache
-                  - name: HF_HUB_ENABLE_HF_TRANSFER
-                    value: "1"
-                  - name: NCCL_CUMEM_HOST_ENABLE
-                    value: "0"
-                  - name: VLLM_USE_V1
-                    value: "1"
-                  - name: VLLM_LOGGING_LEVEL
-                    value: INFO
-                  - name: UCX_TLS
-                    value: all
-                  - name: UCX_NET_DEVICES
-                    value: all
-                  - name: HF_TOKEN
-                    valueFrom:
-                      secretKeyRef:
-                        name: hf-token-secret
-                        key: token
-                  # agent-stack-k8s defaults to /bin/sh; this job needs bash
-                  # (pipefail, source, nested heredocs).
-                  - name: BUILDKITE_SHELL
-                    value: "/bin/bash -e -c"
-            volumes:
-              - name: devshm
-                emptyDir:
-                  medium: Memory
-                  sizeLimit: 96Gi
-              - name: hf-cache
-                hostPath:
-                  path: /fsx/hf_cache
-                  type: DirectoryOrCreate
-    # agent-stack-k8s invokes the step with /bin/sh. Dash rejects
-    # `set -o pipefail` and `source`, so run the job body under bash.
-    command: |
-      bash <<'BASH'
-      set -euo pipefail
-
-      # Verify HF_TOKEN is set (required for gated models like Llama)
-      if [ -z "$${HF_TOKEN:-}" ]; then
-        echo "ERROR: HF_TOKEN is not set. This is required for gated models."
-        echo "Please configure the hf-token-secret Kubernetes secret."
-        exit 1
-      fi
-      echo "HF_TOKEN is configured."
-
-      # Install system dependencies
-      apt-get update && apt-get install -y \
-        curl \
-        ffmpeg \
-        python3 \
-        python3-pip \
-        pkg-config \
-        libssl-dev \
-        protobuf-compiler \
-        git
-
-      # Install uv for fast Python package management
-      curl -LsSf https://astral.sh/uv/install.sh | sh
-      source /root/.local/bin/env
-
-      # Create Python virtual environment (as recommended by vLLM)
-      uv venv --python 3.12 --seed
-      source .venv/bin/activate
-
-      # Install vLLM with CUDA 13 support
-      uv pip install vllm --torch-backend=cu130
-
-      # Install NIXL library for P/D disaggregation
-      uv pip install nixl-cu13
-      uv pip install nixl --no-deps
-
-      # Fail fast if CUDA-specific wheels do not match the CI image.
-      python - <<'PY'
-      import nixl
-      import nixl_ep
-      import torch
-      import vllm
-
-      assert torch.version.cuda and torch.version.cuda.startswith("13."), torch.version.cuda
-      assert nixl._api.__name__.startswith("nixl_cu13."), nixl._api.__name__
-      print(f"vLLM {vllm.__version__}, torch CUDA {torch.version.cuda}, {nixl._api.__name__}, {nixl_ep.__name__}")
-      PY
-
-      # Install test dependencies
-      uv pip install requests pytest openai
-
-      # Install LM Evaluation Harness with API extras for accuracy testing
-      uv pip install 'lm-eval[api]>=0.4.0' hf_transfer
-
-      # Install Rust for building the router
-      curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-      source /root/.cargo/env
-
-      # Build the router
-      cargo build --release
-      export PATH="$$PWD/target/release:$$PATH"
-
-      # Run P/D disaggregation test
-      cd tests/python/e2e/pd_disagg_vllm
-      bash ./run_accuracy_test.sh
-      BASH
-    agents:
-      queue: "l4-k8s"
+  # After the CPU build, copy target/release/vllm-router into the image.
+  # Steps that depend only on "build" start without waiting for this.
+  # Ready smoke and nightly GSM8K depend on this key.
+  - label: ":docker: Build NVIDIA CI image"
+    key: "image-build"
     depends_on: "build"
-    artifact_paths:
-      - "/tmp/router.log"
-
-  # ============================================================================
-  # gRPC perf e2e — CI runs rust_grpc + python_http (c16-r32 waves); rust_http optional locally
-  # H100 scheduling matches vllm-omni h100_4 (mithril-h100-pool, gpu-h100-sxm,
-  # /mnt/hf-cache). Router bootstraps vLLM + cargo in-container (not omni CI image).
-  # ============================================================================
-  - label: ":python: grpc perf test case"
-    key: "grpc-perf-e2e"
-    if: build.env("ROCM_ONLY") != "1"
-    timeout_in_minutes: 120
-    retry:
-      automatic:
-        - exit_status: "*"
-          limit: 1
-      manual:
-        allowed: true
-        reason: "GPU perf cold starts can be flaky — retry after checking logs"
-    plugins:
-      - kubernetes:
-          podSpec:
-            nodeSelector:
-              node.kubernetes.io/instance-type: gpu-h100-sxm
-            containers:
-              - image: nvidia/cuda:13.0.2-devel-ubuntu22.04
-                resources:
-                  limits:
-                    nvidia.com/gpu: 4
-                  requests:
-                    nvidia.com/gpu: 4
-                    cpu: "40"
-                    memory: 160Gi
-                volumeMounts:
-                  - name: devshm
-                    mountPath: /dev/shm
-                  - name: hf-cache
-                    mountPath: /root/.cache/huggingface
-                env:
-                  - name: HF_HOME
-                    value: /root/.cache/huggingface
-                  - name: HF_HUB_ENABLE_HF_TRANSFER
-                    value: "1"
-                  - name: NCCL_CUMEM_HOST_ENABLE
-                    value: "0"
-                  - name: VLLM_USE_V1
-                    value: "1"
-                  - name: VLLM_LOGGING_LEVEL
-                    value: INFO
-                  - name: HF_TOKEN
-                    valueFrom:
-                      secretKeyRef:
-                        name: hf-token-secret
-                        key: token
-                  - name: BUILDKITE_SHELL
-                    value: "/bin/bash -e -c"
-            volumes:
-              - name: devshm
-                emptyDir:
-                  medium: Memory
-                  sizeLimit: 96Gi
-              - name: hf-cache
-                hostPath:
-                  path: /mnt/hf-cache
-                  type: DirectoryOrCreate
-    command: |
-      bash <<'BASH'
-      set -euo pipefail
-
-      if [ -z "$${HF_TOKEN:-}" ]; then
-        echo "ERROR: HF_TOKEN is not set (required to pull the perf model from Hugging Face)."
-        exit 1
-      fi
-      export MODEL="Qwen/Qwen3.8-27B"
-      export PERF_STACK_TIMEOUT=1800
-      export PERF_WORKER_STARTUP_TIMEOUT=1800
-      echo "HF_TOKEN is configured; MODEL=$${MODEL}"
-
-      apt-get update && apt-get install -y \
-        curl \
-        python3 \
-        python3-pip \
-        pkg-config \
-        libssl-dev \
-        protobuf-compiler \
-        git
-
-      curl -LsSf https://astral.sh/uv/install.sh | sh
-      source /root/.local/bin/env
-
-      uv venv --python 3.12 --seed
-      source .venv/bin/activate
-
-      uv pip install vllm --torch-backend=cu130
-      uv pip install requests pytest
-
-      python - <<'PY'
-      import torch
-      import vllm
-      assert torch.version.cuda and torch.version.cuda.startswith("13."), torch.version.cuda
-      print(f"vLLM {vllm.__version__}, torch CUDA {torch.version.cuda}")
-      PY
-
-      curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-      source /root/.cargo/env
-      cargo build --release
-
-      export ROUTER_BIN="$$PWD/target/release/vllm-router"
-      export PATH="$$PWD/target/release:$$PATH"
-
-      PERF_PYTEST=(
-        python -m pytest -sv tests/python/e2e/perf/grpc
-        -k c16-r32
+    if: |
+      build.env("ROCM_ONLY") != "1" &&
+      (
+        (
+          build.branch != pipeline.default_branch &&
+          build.pull_request.labels includes "ready"
+        ) ||
+        (
+          build.branch == pipeline.default_branch &&
+          build.env("NIGHTLY") == "1"
+        ) ||
+        (
+          build.branch != pipeline.default_branch &&
+          build.pull_request.labels includes "nightly-test"
+        )
       )
-
-      for case in rust_grpc python_http; do
-        echo "=== perf grpc: --perf-case=$${case} (concurrency 16 waves) ==="
-        "$${PERF_PYTEST[@]}" --perf-case="$${case}"
-      done
-
-      echo "=== perf result artifacts ==="
-      find tests/python/e2e/perf/grpc/results -type f -name '*.json' 2>/dev/null || true
-      BASH
+    command: bash .buildkite/scripts/build-ci-image.sh
     agents:
-      queue: "mithril-h100-pool"
-    depends_on: "build"
-    artifact_paths:
-      - "tests/python/e2e/perf/grpc/results/**/*.json"
+      queue: "medium_cpu_queue_premerge"
 
-  # This queue is intentionally separate from the shared amd_mi300_* queues.
-  # Those agents run --no-plugins, while this lane needs the Docker plugin
-  # to provide the pinned vLLM/MoRI userspace on a two-GPU xGMI host. Put the
-  # condition on the group so fork builds cannot run plugin hooks.
-  # The dedicated hosts restore the digest-pinned image before each job. Keep
-  # plugin hooks off untrusted fork pull requests.
-  - group: ":large_purple_circle: ROCm MoRI XGMI P/D"
-    key: "pd-disagg-moriio-tests"
+  # Uploads wait for the build group, not for image-build, and not for each other.
+  # Uploaded jobs depend on their upload step. NVIDIA P/D jobs also wait for image-build.
+  # L1: same gate as Omni READY_LABEL_IF. ROCM_ONLY stays on the smoke job.
+  - label: ":pipeline: Upload L1 ready"
+    key: "upload-ready-pipeline"
+    depends_on: "build"
     if: |
-      (build.pull_request.id == null &&
-       build.branch == pipeline.default_branch) ||
+      build.branch != pipeline.default_branch &&
+      build.pull_request.labels includes "ready"
+    command: |
+      python3 .buildkite/scripts/upload_pipeline.py --upload .buildkite/test-ready.yml
+    agents:
+      queue: "medium_cpu_queue_premerge"
+
+  # L2: default-branch push, its merge queue, or any other branch labeled
+  # merge-test. test-merge.yml has no per-job gate. Scheduled main +
+  # NIGHTLY=1 stays on L3 (same split as Omni MERGE_MAIN_IF).
+  - label: ":pipeline: Upload L2 merge"
+    key: "upload-merge-pipeline"
+    depends_on: "build"
+    if: |
+      (
+        build.branch == pipeline.default_branch &&
+        build.env("NIGHTLY") != "1"
+      ) ||
       build.merge_queue.base_branch == pipeline.default_branch ||
-      (build.pull_request.id != null && build.pull_request.repository.fork == false) ||
-      ((build.source == "ui" || build.source == "api") &&
-       build.env("RUN_ROCM_XGMI") == "1")
-    steps:
-      - label: "ROCm MoRI XGMI (read_mode={{matrix.read_mode}}, 2 GPUs)"
-        key: "pd-disagg-moriio-test"
-        timeout_in_minutes: 60
-        matrix:
-          setup:
-            read_mode:
-              - "true"
-              - "false"
-        retry:
-          automatic:
-            - exit_status: "*"
-              limit: 1
-          manual:
-            allowed: true
-            reason: "Retry transient GPU-agent failures after inspecting the logs"
-        plugins:
-          - docker#v5.14.0:
-              image: "$ROCM_VLLM_IMAGE"
-              # vllm-openai images default to `vllm serve`; run the CI shell instead.
-              entrypoint: ""
-              workdir: /workdir
-              volumes:
-                - "/var/lib/buildkite-agent/.cache/huggingface:/root/.cache/huggingface"
-              devices:
-                - "/dev/kfd"
-                - "/dev/dri"
-              privileged: true
-              init: true
-              tty: false
-              ipc: host
-              mount-buildkite-agent: true
-              chown: true
-              chown-image: "busybox@sha256:dc2d74b28e4cf8984fa52af1f39bc7c3d9c73760b41a74d629f5d11b1ab28616"
-              shm-size: "256g"
-              security-opts:
-                - "seccomp=unconfined"
-              ulimits:
-                - "memlock=-1"
-                - "stack=67108864"
-              environment:
-                - "MORIIO_READ_MODE={{matrix.read_mode}}"
-                - "MORIIO_BACKEND=xgmi"
-                - "MODEL_NAMES=Qwen/Qwen3-0.6B"
-                - "ROUTER_BIN=/workdir/target/release/vllm-router"
-                - "LOG_DIR=/workdir/target/ci-logs/moriio-{{matrix.read_mode}}"
-                - "ENGINE_STARTUP_TIMEOUT=3600"
-              propagate-environment: true
-              command:
-                - bash
-                - -c
-                - |
-                  set -euo pipefail
+      (
+        build.branch != pipeline.default_branch &&
+        build.pull_request.labels includes "merge-test"
+      )
+    command: |
+      python3 .buildkite/scripts/upload_pipeline.py --upload .buildkite/test-merge.yml
+    agents:
+      queue: "medium_cpu_queue_premerge"
 
-                  # Reuse the release binary produced by the CPU build step.
-                  buildkite-agent artifact download "target/release/vllm-router" .
-                  chmod +x target/release/vllm-router
-                  ldd target/release/vllm-router
-                  target/release/vllm-router --version
-
-                  # Pin the evaluation harness; vLLM and MoRI come from the pinned image.
-                  python3 -m pip install --no-cache-dir \
-                    requests \
-                    openai \
-                    'lm-eval[api]==0.4.12'
-
-                  bash tests/python/e2e/pd_disagg_vllm/run_moriio_accuracy_test.sh
-        agents:
-          queue: "router_rocm_mi300_2"
-        depends_on: "build"
-        artifact_paths:
-          - "target/ci-logs/moriio-*/*.log"
-
-  # One coordinator agent owns the paired MI300X worker over a dedicated SSH
-  # link. Keeping this as one Buildkite job avoids coupled two-agent scheduling
-  # and guarantees that both halves are cleaned up together.
-  - label: ":large_purple_circle: ROCm MoRI RDMA P/D (read_mode={{matrix.read_mode}}, 2 nodes)"
-    key: "pd-disagg-moriio-rdma-test"
+  # L3: default-branch NIGHTLY=1, or any other branch labeled nightly-test.
+  # Job-only gates stay in test-nightly.yml: ready overlap, ROCM_ONLY,
+  # RUN_ROCM_XGMI, and the RDMA schedule/label/manual gate.
+  - label: ":pipeline: Upload L3 nightly"
+    key: "upload-nightly-pipeline"
+    depends_on: "build"
     if: |
-      (build.source == "schedule" && build.env("NIGHTLY") == "1") ||
-      ((build.source == "ui" || build.source == "api") &&
-       build.env("RUN_ROCM_RDMA") == "1")
-    timeout_in_minutes: 75
-    matrix:
-      setup:
-        read_mode:
-          - "true"
-          - "false"
-    retry:
-      automatic:
-        - exit_status: "*"
-          limit: 1
-      manual:
-        allowed: true
-        reason: "Retry transient two-node GPU or RDMA failures after inspecting both node logs"
+      (
+        build.branch == pipeline.default_branch &&
+        build.env("NIGHTLY") == "1"
+      ) ||
+      (
+        build.branch != pipeline.default_branch &&
+        build.pull_request.labels includes "nightly-test"
+      )
     command: |
-      set -euo pipefail
-
-      buildkite-agent artifact download "target/release/vllm-router" .
-      chmod +x target/release/vllm-router
-      ldd target/release/vllm-router
-      target/release/vllm-router --version
-
-      export MORIIO_READ_MODE="{{matrix.read_mode}}"
-      export MODEL_NAMES="Qwen/Qwen3-0.6B"
-      export ROUTER_BIN="$$PWD/target/release/vllm-router"
-      export LOG_DIR="$$PWD/target/ci-logs/moriio-rdma-{{matrix.read_mode}}"
-      export ENGINE_STARTUP_TIMEOUT=3600
-      # amd_mori 1.0.0 is stable for sequential cross-node transfers on this
-      # cluster. Concurrency 10 remains covered by the same-host XGMI lane.
-      export NUM_LM_EVAL_CONCURRENT=1
-      export WORKER_SSH_HOST=vllm-router-rocm-worker
-      export COORDINATOR_FABRIC_IP=192.168.200.1
-      export WORKER_FABRIC_IP=192.168.200.2
-
-      bash tests/python/e2e/pd_disagg_vllm/run_moriio_rdma_accuracy_test.sh
+      python3 .buildkite/scripts/upload_pipeline.py --upload .buildkite/test-nightly.yml
     agents:
-      queue: "router_rocm_mi300_2"
-    depends_on: "build"
-    artifact_paths:
-      - "target/ci-logs/moriio-rdma-*/*"
-
-  # ============================================================================
-  # Docker Build - Parallel with tests
-  # ============================================================================
-  - label: ":docker: Build Docker Image"
-    command: |
-      docker build -f Dockerfile.router -t vllm-router:${BUILDKITE_COMMIT} .
-      docker tag vllm-router:${BUILDKITE_COMMIT} vllm-router:latest
-    agents:
-      queue: "cpu_queue_premerge"
-    depends_on: "build"
+      queue: "medium_cpu_queue_premerge"

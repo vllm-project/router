@@ -156,8 +156,8 @@ benches/backend/bench_prefix_kvhit.py   # HTTP bench + pytest helpers
 ## CI
 
 Buildkite step **`:python: grpc perf test case`** (`key: grpc-perf-e2e` in
-`.buildkite/pipeline.yml`): **`mithril-h100-pool`** (4× H100 SXM, vllm-omni
-`h100_4` scheduling), `PERF_STACK_TIMEOUT=1800`,
+`.buildkite/test-ready.yml`, L1 **ready** label): **`mithril-h100-pool`** (preset
+`h100_4_grpc`), `PERF_STACK_TIMEOUT=1800`,
 `HF_TOKEN`, model
 `MODEL=Qwen/Qwen3.8-27B`, `cargo build --release`, step timeout **120 min**, then for each of
 `rust_grpc`, `python_http` (add `rust_http` locally if needed):

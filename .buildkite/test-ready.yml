@@ -1,0 +1,203 @@
+# L1 ready (https://github.com/vllm-project/router/issues/273).
+# pipeline.yml uploads this file when a non-default branch has the ready label.
+# CPU tests have no extra if. The NVIDIA smoke skips
+# when ROCM_ONLY=1, because a skipped image-build is treated as satisfied.
+# Full GSM8K is test-nightly.yml.
+# tests/python/e2e stays ignored here; regular-router, embeddings, and
+# test_pd_router.py are not wired to a GPU lane in this split.
+
+env:
+  RUST_IMAGE: "rust:1.95.0-bookworm"
+  # Pin the ROCm nightly used by the MoRI lane so dependency changes are explicit.
+  ROCM_VLLM_IMAGE: "vllm/vllm-openai-rocm:nightly@sha256:d22922d540810d90c5a3eafe91d3b4a62c2b881f3e990d0b7180b2875a5d176d"
+  # Disable incremental compilation for consistent CI builds
+  CARGO_INCREMENTAL: "0"
+  # Enable full Rust backtraces for debugging
+  RUST_BACKTRACE: "1"
+
+
+steps:
+  # ============================================================================
+  # Tests - Run comprehensive test suite
+  # ============================================================================
+  - group: ":test_tube: Tests"
+    key: "tests"
+    depends_on: "upload-ready-pipeline"
+    steps:
+      - label: ":rust: Rust Unit Tests"
+        plugins:
+          - docker#v5.11.0:
+              image: "$RUST_IMAGE"
+              workdir: /workdir
+              volumes:
+                - ".:/workdir"
+              environment:
+                - "CARGO_INCREMENTAL=0"
+                - "RUST_BACKTRACE=1"
+              command:
+                - bash
+                - -c
+                - |
+                  bash .buildkite/scripts/install_packages.sh rust
+                  cargo test --features cpu,ready --lib --bins
+        agents:
+          queue: "medium_cpu_queue_premerge"
+
+      - label: ":rust: Rust Integration Tests"
+        plugins:
+          - docker#v5.11.0:
+              image: "$RUST_IMAGE"
+              workdir: /workdir
+              volumes:
+                - ".:/workdir"
+              environment:
+                - "CARGO_INCREMENTAL=0"
+                - "RUST_BACKTRACE=1"
+              command:
+                - bash
+                - -c
+                - |
+                  bash .buildkite/scripts/install_packages.sh rust
+                  cargo test --features cpu,ready --test '*'
+        agents:
+          queue: "medium_cpu_queue_premerge"
+
+      - label: ":python: Python Tests"
+        plugins:
+          - docker#v5.11.0:
+              image: "$RUST_IMAGE"
+              workdir: /workdir
+              volumes:
+                - ".:/workdir"
+              environment:
+                - "CARGO_INCREMENTAL=0"
+                - "RUST_BACKTRACE=1"
+              mount-buildkite-agent: true
+              command:
+                - bash
+                - -c
+                - |
+                  source .buildkite/scripts/install_packages.sh python
+                  pytest tests/python/ -v --ignore=tests/python/e2e -m "ready and cpu" --cov=vllm_router --cov-report=xml --cov-report=term
+        artifact_paths:
+          - "coverage.xml"
+        agents:
+          queue: "medium_cpu_queue_premerge"
+
+  # ============================================================================
+  # L1 P/D smoke — one /v1/completions on EKS l4-k8s (4x L4).
+  # /health and /v1/models run inside test_pd_accuracy.py.
+  # Full GSM8K is test-nightly.yml.
+  # ============================================================================
+  - label: ":satellite: P/D Disaggregation Smoke (4 GPUs)"
+    key: "pd-disagg-smoke"
+    # image-build is skipped when ROCM_ONLY=1. A skipped dependency is treated
+    # as satisfied, so this smoke must use the same condition or it will pull
+    # an image that was never pushed.
+    if: build.env("ROCM_ONLY") != "1"
+    timeout_in_minutes: 60
+    retry:
+      automatic:
+        - exit_status: "*"
+          limit: 2
+      manual:
+        allowed: true
+        reason: "GPU tests can be flaky - retry if needed"
+    mirror_hardwares: l4_4
+    # agent-stack-k8s invokes the step with /bin/sh. Dash rejects
+    # `set -o pipefail`, so run the job body under bash.
+    command: |
+      bash <<'BASH'
+      set -euo pipefail
+
+      # vLLM, NIXL, lm-eval, and vllm-router are on PATH in the CI image.
+
+      # L1 smoke: /health, /v1/models, and one completion. Not full GSM8K.
+      cd tests/python/e2e/pd_disagg_vllm
+      export SKIP_LM_EVAL=true
+      export NUM_SANITY_REQUESTS=1
+      bash ./run_accuracy_test.sh
+      BASH
+    depends_on:
+      - "upload-ready-pipeline"
+      - "image-build"
+    artifact_paths:
+      - "/tmp/router.log"
+
+  # ============================================================================
+  # L1 gRPC prefix-KV perf — rust_grpc + python_http (c16-r32), H100×4.
+  # Bootstraps vLLM + cargo in-container (not the router ECR CI image).
+  # ============================================================================
+  - label: ":python: grpc perf test case"
+    key: "grpc-perf-e2e"
+    if: build.env("ROCM_ONLY") != "1"
+    timeout_in_minutes: 120
+    retry:
+      automatic:
+        - exit_status: "*"
+          limit: 1
+      manual:
+        allowed: true
+        reason: "GPU perf cold starts can be flaky — retry after checking logs"
+    mirror_hardwares: h100_4_grpc
+    depends_on: "upload-ready-pipeline"
+    command: |
+      bash <<'BASH'
+      set -euo pipefail
+
+      if [ -z "$${HF_TOKEN:-}" ]; then
+        echo "ERROR: HF_TOKEN is not set (required to pull the perf model from Hugging Face)."
+        exit 1
+      fi
+      export MODEL="Qwen/Qwen3.8-27B"
+      export PERF_STACK_TIMEOUT=1800
+      export PERF_WORKER_STARTUP_TIMEOUT=1800
+      echo "HF_TOKEN is configured; MODEL=$${MODEL}"
+
+      apt-get update && apt-get install -y \
+        curl \
+        python3 \
+        python3-pip \
+        pkg-config \
+        libssl-dev \
+        protobuf-compiler \
+        git
+
+      curl -LsSf https://astral.sh/uv/install.sh | sh
+      source /root/.local/bin/env
+
+      uv venv --python 3.12 --seed
+      source .venv/bin/activate
+
+      uv pip install vllm --torch-backend=cu130
+      uv pip install requests pytest
+
+      python - <<'PY'
+      import torch
+      import vllm
+      assert torch.version.cuda and torch.version.cuda.startswith("13."), torch.version.cuda
+      print(f"vLLM {vllm.__version__}, torch CUDA {torch.version.cuda}")
+      PY
+
+      curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+      source /root/.cargo/env
+      cargo build --release
+
+      export ROUTER_BIN="$$PWD/target/release/vllm-router"
+      export PATH="$$PWD/target/release:$$PATH"
+
+      PERF_PYTEST=(
+        python -m pytest -sv tests/python/e2e/perf/grpc
+        -k c16-r32
+      )
+
+      for case in rust_grpc python_http; do
+        echo "=== perf grpc: --perf-case=$${case} (concurrency 16 waves) ==="
+        "$${PERF_PYTEST[@]}" --perf-case="$${case}"
+      done
+
+      echo "=== perf result artifacts ==="
+      find tests/python/e2e/perf/grpc/results -type f -name '*.json' 2>/dev/null || true
+      BASH
+    artifact_paths:
+      - "tests/python/e2e/perf/grpc/results/**/*.json"
