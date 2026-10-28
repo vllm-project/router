@@ -70,7 +70,12 @@ impl AppContext {
         let rate_limiter = Arc::new(TokenBucket::new(max_concurrent_requests, rate_limit_tokens));
 
         let worker_registry = Arc::new(WorkerRegistry::new());
-        let policy_registry = Arc::new(PolicyRegistry::new(router_config.policy.clone()));
+        let policy_registry = Arc::new(PolicyRegistry::new_with_affinity_ttl(
+            router_config.policy.clone(),
+            router_config
+                .kv_aware_session_affinity_ttl_secs
+                .map(std::time::Duration::from_secs),
+        ));
 
         let router_manager = None;
 

@@ -93,7 +93,7 @@ impl PromptEncoder {
         self
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "cpu", feature = "ready"))]
     pub(crate) fn encode(
         &self,
         prompt: Prompt,

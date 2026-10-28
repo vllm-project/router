@@ -175,6 +175,10 @@ name = "completion_preparation"
 path = "tests/rust/completion_preparation.rs"
 
 [[test]]
+name = "grpc_completion_frontend"
+path = "tests/rust/grpc_completion_frontend.rs"
+
+[[test]]
 name = "grpc_frontend_bench"
 path = "tests/rust/grpc_frontend_bench.rs"
 
