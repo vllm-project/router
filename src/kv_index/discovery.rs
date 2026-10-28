@@ -1,5 +1,5 @@
-//! Worker discovery: query worker control metadata and KV event sources, then
-//! spawn one subscriber per (worker, rank). One indexer per cache-identity core.
+//! Worker discovery: query /get_server_info + /kv_event_sources, spawn one
+//! subscriber per (worker, rank). One indexer per cache-identity core.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -69,9 +69,9 @@ pub struct WorkerKvInfo {
     pub cache_key: Option<CacheKey>,
 }
 
-struct WorkerDiscovery {
-    server_info: Result<ServerInfo, String>,
-    sources: Result<KvEventSourcesResponse, String>,
+pub(crate) struct WorkerDiscovery {
+    pub(crate) server_info: Result<ServerInfo, String>,
+    pub(crate) sources: Result<KvEventSourcesResponse, String>,
     /// gRPC has a separate GetModelInfo RPC; preserve its failure instead of
     /// silently turning the worker URL into a cache identity.
     model_id: Result<Option<String>, String>,
@@ -102,10 +102,15 @@ struct LiveSource {
 /// identity.
 pub struct KvIndexSupervisor {
     client: reqwest::Client,
+    api_key: Option<String>,
     hash_mode: HashMode,
     dense_http: bool,
-    /// Explicit event sources override discovery for configured workers.
+    http_pd: bool,
+    /// Explicit event sources override discovery for configured regular workers.
     static_sources: HashMap<String, StaticKvEventSources>,
+    /// Static KV event sources per prefill URL; these workers skip HTTP
+    /// discovery entirely.
+    static_pd_sources: HashMap<String, crate::config::types::PdKvEventSources>,
     /// Shared across every subscriber — one I/O thread pool, not one per task.
     ctx: Arc<zmq::Context>,
     /// One indexer per cache-identity core.
@@ -140,9 +145,12 @@ impl KvIndexSupervisor {
         let (signal_tx, signal_rx) = mpsc::channel::<IngestionSignal>(256);
         let supervisor = KvIndexSupervisor {
             client,
+            api_key: None,
             hash_mode,
             dense_http: false,
+            http_pd: false,
             static_sources: HashMap::new(),
+            static_pd_sources: HashMap::new(),
             ctx: Arc::new(zmq::Context::new()),
             indexers: DashMap::new(),
             identity_refs: Mutex::new(HashMap::new()),
@@ -196,12 +204,27 @@ impl KvIndexSupervisor {
             .collect()
     }
 
+    /// HTTP P/D accepts the native Python control endpoints and dense KV
+    /// events.
+    pub(crate) fn new_pd(
+        client: reqwest::Client,
+        hash_mode: HashMode,
+        static_pd_sources: HashMap<String, crate::config::types::PdKvEventSources>,
+    ) -> (Self, mpsc::Receiver<IngestionSignal>) {
+        let (mut supervisor, signals) = Self::new(client, hash_mode);
+        supervisor.http_pd = true;
+        supervisor.static_pd_sources = static_pd_sources;
+        (supervisor, signals)
+    }
+
     pub fn hash_mode(&self) -> HashMode {
         self.hash_mode
     }
 
-    /// Use configured event sources for workers whose HTTP/gRPC control plane
-    /// does not expose KV event discovery.
+    pub(crate) fn set_api_key(&mut self, api_key: Option<String>) {
+        self.api_key = api_key;
+    }
+
     pub fn with_static_sources(
         mut self,
         static_sources: HashMap<String, StaticKvEventSources>,
@@ -221,6 +244,20 @@ impl KvIndexSupervisor {
             .lock()
             .get(worker_url)
             .map(|worker| worker.active.clone());
+        let discovery = self.discover(worker_url).await;
+        self.install_observed_worker(worker_url, discovery, observed)
+    }
+
+    /// Prepare metadata once; P/D refresh fingerprints and installs this same snapshot.
+    pub(crate) async fn discover(&self, worker_url: &str) -> WorkerDiscovery {
+        if self.http_pd {
+            return match self.static_pd_sources.get(worker_url) {
+                Some(config) => static_pd_discovery(worker_url, config),
+                None => {
+                    discover_worker(&self.client, worker_url, true, self.api_key.as_deref()).await
+                }
+            };
+        }
         let grpc = crate::backend::is_grpc_url(worker_url);
         let static_source = self.static_sources.get(worker_url).filter(|source| {
             !grpc || source.source_contract == StaticKvEventSourceContract::Generic
@@ -229,7 +266,7 @@ impl KvIndexSupervisor {
             && static_source
                 .map(|source| source.source_contract == StaticKvEventSourceContract::HttpDenseDp1)
                 .unwrap_or(self.dense_http);
-        let discovery = match static_source {
+        match static_source {
             Some(config) => {
                 info!(
                     worker_url,
@@ -240,11 +277,45 @@ impl KvIndexSupervisor {
                 );
                 static_worker_discovery(worker_url, config)
             }
-            None if dense_http => discover_dense_http_worker(&self.client, worker_url).await,
-            None => discover_worker(&self.client, worker_url).await,
-        };
+            None if dense_http => {
+                discover_dense_http_worker(&self.client, worker_url, self.api_key.as_deref()).await
+            }
+            None => discover_worker(&self.client, worker_url, false, self.api_key.as_deref()).await,
+        }
+    }
+
+    pub(crate) fn install_worker(
+        &self,
+        worker_url: &str,
+        discovery: WorkerDiscovery,
+    ) -> Result<WorkerKvInfo, String> {
+        let observed = self
+            .workers
+            .lock()
+            .get(worker_url)
+            .map(|worker| worker.active.clone());
+        self.install_observed_worker(worker_url, discovery, observed)
+    }
+
+    fn install_observed_worker(
+        &self,
+        worker_url: &str,
+        discovery: WorkerDiscovery,
+        observed: Option<Arc<AtomicBool>>,
+    ) -> Result<WorkerKvInfo, String> {
+        let grpc = crate::backend::is_grpc_url(worker_url);
+        let dense_http = !grpc
+            && self
+                .static_sources
+                .get(worker_url)
+                .map(|source| source.source_contract == StaticKvEventSourceContract::HttpDenseDp1)
+                .unwrap_or(self.dense_http);
+        let dense = dense_http || (self.http_pd && !grpc);
         let server_info = discovery.server_info.unwrap_or_else(|e| {
-            warn!("kv_index {}: {}", worker_url, e);
+            warn!(
+                "kv_index {}: {} — falling back to URL as instance/model id",
+                worker_url, e
+            );
             ServerInfo {
                 model_id: Some(worker_url.to_string()),
                 ..Default::default()
@@ -293,7 +364,7 @@ impl KvIndexSupervisor {
 
         let Some(block_size) = block_size else {
             warn!(
-                "kv_index {}: no block_size metadata — cannot index",
+                "kv_index {}: no block_size from /get_server_info — cannot index",
                 worker_url
             );
             return Ok(WorkerKvInfo {
@@ -466,7 +537,7 @@ impl KvIndexSupervisor {
                 indexer.clone(),
                 Some(self.signal_tx.clone()),
                 self.ctx.clone(),
-                dense_http.then_some(key.block_size),
+                dense.then_some(key.block_size),
                 live.lease.clone(),
             );
             info!(
@@ -587,6 +658,64 @@ impl KvIndexSupervisor {
     }
 }
 
+async fn discover_worker(
+    client: &reqwest::Client,
+    worker_url: &str,
+    http_pd: bool,
+    api_key: Option<&str>,
+) -> WorkerDiscovery {
+    if crate::backend::is_grpc_url(worker_url) {
+        let timeout = Duration::from_secs(10);
+        let server = crate::backend::control::get_grpc_server_info(worker_url, timeout).await;
+        let model =
+            grpc_model_id(crate::backend::control::get_grpc_model_info(worker_url, timeout).await);
+        let sources = crate::backend::control::get_grpc_kv_event_sources(worker_url, timeout).await;
+        let server_info = server.map(|server| {
+            let model_id = model.as_ref().ok().and_then(|model| model.clone());
+            ServerInfo {
+                model_id,
+                instance_id: (!server.instance_id.is_empty()).then_some(server.instance_id),
+                kv_block_size: (server.kv_block_size != 0).then_some(server.kv_block_size),
+                effective_attention_block_size: server
+                    .effective_attention_block_size
+                    .and_then(|size| u32::try_from(size).ok()),
+                ..Default::default()
+            }
+        });
+        let sources =
+            sources.map(|response| grpc_kv_event_source_entries(worker_url, response.sources));
+        return WorkerDiscovery {
+            server_info,
+            sources,
+            model_id: model,
+        };
+    }
+    if !http_pd {
+        return WorkerDiscovery {
+            server_info: Err(
+                "HTTP worker model and block-size metadata must be configured statically"
+                    .to_string(),
+            ),
+            sources: query_kv_event_sources(client, worker_url).await,
+            model_id: Ok(Some(worker_url.to_string())),
+        };
+    }
+    let server_info = query_pd_server_info(client, worker_url, api_key).await;
+    let model_id = server_info
+        .as_ref()
+        .map(|info| Some(server_model_id(info).unwrap_or_else(|| worker_url.to_string())))
+        .map_err(|error| error.clone());
+    WorkerDiscovery {
+        server_info,
+        sources: if http_pd {
+            query_pd_kv_event_sources(client, worker_url, api_key).await
+        } else {
+            query_kv_event_sources(client, worker_url).await
+        },
+        model_id,
+    }
+}
+
 fn static_worker_discovery(worker_url: &str, config: &StaticKvEventSources) -> WorkerDiscovery {
     let model = config.model.trim().to_owned();
     let server_info = ServerInfo {
@@ -630,11 +759,14 @@ fn static_worker_discovery(worker_url: &str, config: &StaticKvEventSources) -> W
 // Only the Dense HTTP adapter uses this optional control-metadata contract.
 // Generic discovery retains main's behavior and does not assume stock vLLM
 // exposes /get_server_info.
-async fn discover_dense_http_worker(client: &reqwest::Client, worker_url: &str) -> WorkerDiscovery {
+async fn discover_dense_http_worker(
+    client: &reqwest::Client,
+    worker_url: &str,
+    api_key: Option<&str>,
+) -> WorkerDiscovery {
     let url = format!("{}/get_server_info", worker_url.trim_end_matches('/'));
     let server_info = async {
-        let response = client
-            .get(&url)
+        let response = worker_get(client, &url, api_key)
             .send()
             .await
             .map_err(|error| format!("get_server_info {url}: {error}"))?;
@@ -667,48 +799,34 @@ async fn discover_dense_http_worker(client: &reqwest::Client, worker_url: &str) 
         .map_err(Clone::clone);
     WorkerDiscovery {
         server_info,
-        sources: query_kv_event_sources(client, worker_url).await,
+        sources: query_worker_json(client, worker_url, "kv_event_sources", false, api_key).await,
         model_id,
     }
 }
 
-async fn discover_worker(client: &reqwest::Client, worker_url: &str) -> WorkerDiscovery {
-    if crate::backend::is_grpc_url(worker_url) {
-        let timeout = Duration::from_secs(10);
-        let server = crate::backend::control::get_grpc_server_info(worker_url, timeout).await;
-        let model =
-            grpc_model_id(crate::backend::control::get_grpc_model_info(worker_url, timeout).await);
-        let sources = crate::backend::control::get_grpc_kv_event_sources(worker_url, timeout).await;
-        let server_info = server.map(|server| {
-            let model_id = model.as_ref().ok().and_then(|model| model.clone());
-            ServerInfo {
-                model_id,
-                instance_id: (!server.instance_id.is_empty()).then_some(server.instance_id),
-                kv_block_size: (server.kv_block_size != 0).then_some(server.kv_block_size),
-                effective_attention_block_size: server
-                    .effective_attention_block_size
-                    .and_then(|size| u32::try_from(size).ok()),
-                ..Default::default()
-            }
-        });
-        let sources =
-            sources.map(|response| grpc_kv_event_source_entries(worker_url, response.sources));
-        return WorkerDiscovery {
-            server_info,
-            sources,
-            model_id: model,
-        };
-    }
-    WorkerDiscovery {
-        // Standard vLLM's OpenAI HTTP API does not provide the router-specific
-        // /get_server_info endpoint. HTTP workers need static event metadata;
-        // never probe an endpoint that is not part of vLLM's public API.
-        server_info: Err(
-            "HTTP worker model and block-size metadata must be configured statically".to_string(),
-        ),
-        sources: query_kv_event_sources(client, worker_url).await,
-        model_id: Ok(Some(worker_url.to_string())),
-    }
+/// Build a discovery result purely from static configuration, without
+/// querying the worker's HTTP control plane.
+fn static_pd_discovery(
+    worker_url: &str,
+    config: &crate::config::types::PdKvEventSources,
+) -> WorkerDiscovery {
+    static_worker_discovery(
+        worker_url,
+        &StaticKvEventSources {
+            model: config
+                .model
+                .as_deref()
+                .filter(|model| !model.trim().is_empty())
+                .unwrap_or(worker_url)
+                .to_owned(),
+            block_size: config.block_size,
+            endpoints: config.endpoints.clone(),
+            replay_endpoints: config.replay_endpoints.clone(),
+            topic: String::new(),
+            hwm: None,
+            source_contract: StaticKvEventSourceContract::Generic,
+        },
+    )
 }
 
 fn grpc_kv_event_source_entries(
@@ -746,6 +864,20 @@ fn grpc_kv_event_source_entries(
         .collect()
 }
 
+fn server_model_id(server_info: &ServerInfo) -> Option<String> {
+    server_info
+        .model_id
+        .clone()
+        .filter(|id| !id.trim().is_empty())
+        .or_else(|| {
+            server_info
+                .model_path
+                .as_ref()
+                .and_then(|path| path.split('/').next_back().map(str::to_string))
+                .filter(|id| !id.trim().is_empty())
+        })
+}
+
 fn grpc_model_id(
     model: Result<crate::backend::pb::ModelInfo, String>,
 ) -> Result<Option<String>, String> {
@@ -759,19 +891,33 @@ async fn query_kv_event_sources(
     client: &reqwest::Client,
     worker_url: &str,
 ) -> Result<KvEventSourcesResponse, String> {
-    let url = format!("{}/kv_event_sources", worker_url.trim_end_matches('/'));
-    let resp = client
-        .get(&url)
+    query_worker_json(client, worker_url, "kv_event_sources", false, None).await
+}
+
+async fn query_worker_json<T: serde::de::DeserializeOwned>(
+    client: &reqwest::Client,
+    worker_url: &str,
+    path: &str,
+    authenticated: bool,
+    api_key: Option<&str>,
+) -> Result<T, String> {
+    let url = format!("{}/{path}", worker_url.trim_end_matches('/'));
+    let request = if authenticated {
+        worker_get(client, &url, api_key)
+    } else {
+        client.get(&url)
+    };
+    let response = request
         .send()
         .await
-        .map_err(|e| format!("kv_event_sources {url}: {e}"))?;
-    let status = resp.status();
-    if !status.is_success() {
-        return Err(format!("kv_event_sources {url}: status {status}"));
+        .map_err(|e| format!("{path} {url}: {e}"))?;
+    if !response.status().is_success() {
+        return Err(format!("{path} {url}: status {}", response.status()));
     }
-    resp.json::<KvEventSourcesResponse>()
+    response
+        .json()
         .await
-        .map_err(|e| format!("kv_event_sources parse: {e}"))
+        .map_err(|e| format!("{path} parse: {e}"))
 }
 
 /// A rank emits events only for the one wire format the subscriber decodes.
@@ -786,6 +932,79 @@ fn events_enabled(entry: &KvEventSourceEntry) -> bool {
         return false;
     }
     !entry.endpoint.is_empty()
+}
+
+pub(crate) async fn query_pd_server_info(
+    client: &reqwest::Client,
+    worker_url: &str,
+    api_key: Option<&str>,
+) -> Result<ServerInfo, String> {
+    if let Ok(info) =
+        query_worker_json::<ServerInfo>(client, worker_url, "get_server_info", true, api_key).await
+    {
+        if discovered_block_size(&info).is_some() {
+            return Ok(info);
+        }
+    }
+    // Native Python vLLM exposes engine configuration through this endpoint.
+    let body: serde_json::Value = query_worker_json(
+        client,
+        worker_url,
+        "server_info?config_format=json",
+        true,
+        api_key,
+    )
+    .await?;
+    let config = body
+        .get("vllm_config")
+        .ok_or("server_info: missing vllm_config")?;
+    let model = config
+        .pointer("/model_config/model")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    let block_size = config
+        .pointer("/cache_config/block_size")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|size| u32::try_from(size).ok())
+        .filter(|size| *size > 0);
+    Ok(ServerInfo {
+        model_id: model.clone(),
+        model_path: model,
+        kv_block_size: block_size,
+        ..Default::default()
+    })
+}
+
+pub(crate) async fn query_pd_kv_event_sources(
+    client: &reqwest::Client,
+    worker_url: &str,
+    api_key: Option<&str>,
+) -> Result<KvEventSourcesResponse, String> {
+    let mut sources: KvEventSourcesResponse =
+        query_worker_json(client, worker_url, "kv_event_sources", true, api_key).await?;
+    // Native Python KVEventsConfig omits these fixed ZMQ wire declarations.
+    for source in sources.values_mut() {
+        if source.publisher.as_deref() == Some("zmq")
+            && source.encoding.is_none()
+            && source.schema_version.is_none()
+        {
+            source.encoding = Some("msgpack".into());
+            source.schema_version = Some(1);
+        }
+    }
+    Ok(sources)
+}
+
+pub(crate) fn worker_get(
+    client: &reqwest::Client,
+    url: &str,
+    api_key: Option<&str>,
+) -> reqwest::RequestBuilder {
+    let request = client.get(url);
+    match api_key {
+        Some(key) => request.bearer_auth(key),
+        None => request,
+    }
 }
 
 /// Rewrite a ZMQ bind host before validating the TCP connect endpoint.
@@ -896,6 +1115,26 @@ mod tests {
     }
 
     #[test]
+    fn worker_auth_uses_only_the_configured_key() {
+        let client = reqwest::Client::new();
+        for (key, expected) in [
+            (None, None),
+            (Some("backend-key"), Some("Bearer backend-key")),
+        ] {
+            let request = worker_get(&client, "https://worker/v1/models", key)
+                .build()
+                .unwrap();
+            assert_eq!(
+                request
+                    .headers()
+                    .get("authorization")
+                    .map(|value| value.to_str().unwrap()),
+                expected
+            );
+        }
+    }
+
+    #[test]
     fn resolve_endpoint_rewrites_bind_star() {
         assert_eq!(
             resolve_endpoint("tcp://*:5557", "10.0.0.5").unwrap(),
@@ -957,8 +1196,9 @@ mod tests {
         assert!(!events_enabled(&e)); // empty endpoint
         e.endpoint = "tcp://*:5557".into();
         e.publisher = Some("zmq".into());
-        assert!(!events_enabled(&e)); // encoding and schema are required
+        assert!(!events_enabled(&e)); // Legacy discovery requires explicit wire metadata.
         e.encoding = Some("msgpack".into());
+        assert!(!events_enabled(&e)); // Reject a partial explicit declaration.
         e.schema_version = Some(1);
         assert!(events_enabled(&e));
         e.publisher = Some("null".into());
@@ -2390,5 +2630,192 @@ mod tests {
         assert!(normalized_legacy_sources(&value)
             .unwrap_err()
             .contains("live KV streams must be independent"));
+    }
+
+    #[test]
+    fn static_pd_discovery_builds_one_source_per_rank() {
+        let config = crate::config::types::PdKvEventSources {
+            endpoints: vec!["tcp://10.0.0.5:5557".into(), "tcp://10.0.0.5:5559".into()],
+            replay_endpoints: Some(vec!["tcp://10.0.0.5:5558".into()]),
+            block_size: 32,
+            model: Some("m".into()),
+        };
+        let discovery = static_pd_discovery("http://10.0.0.5:8000", &config);
+
+        let server_info = discovery.server_info.unwrap();
+        assert_eq!(server_info.model_id.as_deref(), Some("m"));
+        assert_eq!(discovered_block_size(&server_info), Some(32));
+        assert_eq!(discovery.model_id, Ok(Some("m".into())));
+
+        let sources = discovery.sources.unwrap();
+        assert_eq!(sources.len(), 2);
+        for rank in ["0", "1"] {
+            assert!(
+                events_enabled(&sources[rank]),
+                "rank {rank} should be enabled"
+            );
+        }
+        assert_eq!(sources["0"].endpoint, "tcp://10.0.0.5:5557");
+        assert_eq!(
+            sources["0"].replay_endpoint.as_deref(),
+            Some("tcp://10.0.0.5:5558")
+        );
+        // Replay list shorter than endpoints: rank 1 has no replay endpoint.
+        assert_eq!(sources["1"].replay_endpoint, None);
+        assert_eq!(sources["1"].endpoint, "tcp://10.0.0.5:5559");
+    }
+
+    #[test]
+    fn static_pd_discovery_falls_back_to_worker_url_as_model() {
+        let config = crate::config::types::PdKvEventSources {
+            endpoints: vec!["tcp://127.0.0.1:5557".into()],
+            replay_endpoints: None,
+            block_size: 16,
+            model: None,
+        };
+        let discovery = static_pd_discovery("http://127.0.0.1:8000", &config);
+        assert_eq!(discovery.model_id, Ok(Some("http://127.0.0.1:8000".into())));
+        // A blank model also falls back — an empty identity would prevent
+        // cache-key creation downstream.
+        let config = crate::config::types::PdKvEventSources {
+            model: Some("  ".into()),
+            ..config
+        };
+        let discovery = static_pd_discovery("http://127.0.0.1:8000", &config);
+        assert_eq!(discovery.model_id, Ok(Some("http://127.0.0.1:8000".into())));
+    }
+
+    /// A worker with static sources must become indexable without any HTTP
+    /// control plane — the discovery client would fail every request.
+    #[tokio::test]
+    async fn static_sources_skip_http_discovery() {
+        let publisher_context = zmq::Context::new();
+        let publisher = publisher_context.socket(zmq::PUB).unwrap();
+        publisher.bind("tcp://127.0.0.1:*").unwrap();
+        let endpoint = publisher.get_last_endpoint().unwrap().unwrap();
+
+        let worker_url = "http://127.0.0.1:1"; // nothing listens here
+        let static_sources = std::iter::once((
+            worker_url.to_string(),
+            crate::config::types::PdKvEventSources {
+                endpoints: vec![endpoint],
+                replay_endpoints: None,
+                block_size: 16,
+                model: None,
+            },
+        ))
+        .collect();
+        let (supervisor, _signals) =
+            KvIndexSupervisor::new_pd(reqwest::Client::new(), HashMode::Sha256, static_sources);
+
+        let info = supervisor.on_worker_added(worker_url).await.unwrap();
+        assert_eq!(info.block_size, Some(16));
+        assert_eq!(info.ranks, vec![0]);
+        let key = info.cache_key.expect("static sources must create a key");
+        assert_eq!(key.model.as_ref(), worker_url);
+        assert!(supervisor.match_provider_for_worker(worker_url).is_some());
+        supervisor.on_worker_removed(worker_url);
+    }
+
+    #[tokio::test]
+    async fn pd_static_dense_rejects_entire_bad_batch_with_source_block_size() {
+        use crate::kv_index::{MatchQuery, StorageTier};
+        use serde_json::json;
+
+        for invalid in ["block-size", "layout"] {
+            let context = zmq::Context::new();
+            let publisher = context.socket(zmq::XPUB).unwrap();
+            publisher.bind("tcp://127.0.0.1:*").unwrap();
+            let endpoint = publisher.get_last_endpoint().unwrap().unwrap();
+            let worker = "http://127.0.0.1:1";
+            let (supervisor, mut signals) = KvIndexSupervisor::new_pd(
+                reqwest::Client::new(),
+                HashMode::Sha256,
+                HashMap::from([(
+                    worker.to_owned(),
+                    crate::config::types::PdKvEventSources {
+                        endpoints: vec![endpoint],
+                        replay_endpoints: None,
+                        block_size: 8,
+                        model: Some("pd-model".into()),
+                    },
+                )]),
+            );
+            let info = supervisor.on_worker_added(worker).await.unwrap();
+            assert_eq!(info.cache_key.unwrap().block_size, 8);
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    match publisher.recv_bytes(zmq::DONTWAIT) {
+                        Ok(frame) => {
+                            assert_eq!(frame, b"\x01");
+                            break;
+                        }
+                        Err(zmq::Error::EAGAIN) => tokio::task::yield_now().await,
+                        Err(error) => panic!("PD subscription: {error}"),
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            let stored = |hash, start, size| {
+                json!({
+                    "type": "BlockStored", "block_hashes": [hash], "parent_block_hash": null,
+                    "token_ids": (start..start + size).collect::<Vec<u32>>(),
+                    "block_size": size, "medium": "GPU", "lora_id": null, "lora_name": null
+                })
+            };
+            let mut bad = stored(1, 20, if invalid == "block-size" { 4 } else { 8 });
+            if invalid == "layout" {
+                bad["kv_cache_spec_kind"] = json!("sliding_attention");
+            }
+            let batch = rmp_serde::to_vec(&(
+                1.0,
+                [
+                    json!({"type": "BlockRemoved", "block_hashes": [9], "medium": "GPU"}),
+                    json!({"type": "AllBlocksCleared"}),
+                    bad,
+                    stored(2, 100, 8),
+                ],
+                0u32,
+            ))
+            .unwrap();
+            publisher
+                .send_multipart([b"".as_slice(), &0i64.to_be_bytes(), &batch], 0)
+                .unwrap();
+            // A subsequent valid frame is a deterministic processing barrier;
+            // a rejected earlier batch must not become visible after resume.
+            let marker = rmp_serde::to_vec(&(2.0, [stored(3, 200, 8)], 0u32)).unwrap();
+            publisher
+                .send_multipart([b"".as_slice(), &1i64.to_be_bytes(), &marker], 0)
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if matches!(
+                        signals.recv().await,
+                        Some(IngestionSignal::Advance { last_seq: 1, .. })
+                    ) {
+                        break;
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            let index = supervisor.workers.lock()[worker].indexer.clone();
+            let query = |start| MatchQuery {
+                group_idx: 0,
+                local_hashes: crate::kv_index::local_block_hash_strings(
+                    &(start..start + 8).collect::<Vec<_>>(),
+                    8,
+                    None,
+                ),
+                tiers_of_interest: vec![StorageTier::Device],
+            };
+            assert!(
+                index.find_matches(&query(100)).is_empty(),
+                "bad {invalid} batch leaked its valid Store"
+            );
+            assert_eq!(index.find_matches(&query(200)).len(), 1);
+            supervisor.shutdown();
+        }
     }
 }

@@ -42,6 +42,11 @@ DECODE_BLOCK_SIZE=${DECODE_BLOCK_SIZE:-128}
 # Intra-node data parallel size (exercises DP-aware routing)
 INTRA_NODE_DP_SIZE=${INTRA_NODE_DP_SIZE:-2}
 
+# L1 smoke (test-ready.yml): SKIP_LM_EVAL=true and NUM_SANITY_REQUESTS=1.
+# L3 / a local run: 20 sanity requests, then full GSM8K.
+NUM_SANITY_REQUESTS=${NUM_SANITY_REQUESTS:-20}
+SKIP_LM_EVAL=${SKIP_LM_EVAL:-false}
+
 # Port configuration
 PREFILL_BASE_PORT=${PREFILL_BASE_PORT:-8100}
 DECODE_BASE_PORT=${DECODE_BASE_PORT:-8200}
@@ -347,7 +352,7 @@ echo "=== Running Router P/D Disaggregation Sanity Test ==="
 python3 "${SCRIPT_DIR}/test_pd_accuracy.py" \
   --router-url "http://localhost:${ROUTER_PORT}" \
   --model "$MODEL_NAMES" \
-  --num-requests 20 \
+  --num-requests "${NUM_SANITY_REQUESTS}" \
   --skip-streaming
 
 SANITY_EXIT_CODE=$?
@@ -355,6 +360,10 @@ SANITY_EXIT_CODE=$?
 if [ $SANITY_EXIT_CODE -ne 0 ]; then
   echo "❌ Router P/D disaggregation sanity test FAILED"
   TEST_EXIT_CODE=$SANITY_EXIT_CODE
+elif [ "${SKIP_LM_EVAL}" = "true" ]; then
+  echo "✅ Router P/D disaggregation sanity test PASSED"
+  echo "Skipping LM-Eval (SKIP_LM_EVAL=true). Full GSM8K stays on the nightly lane."
+  TEST_EXIT_CODE=0
 else
   echo "✅ Router P/D disaggregation sanity test PASSED"
   echo ""

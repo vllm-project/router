@@ -4,8 +4,7 @@
 use crate::core::Worker;
 use crate::metrics::RouterMetrics;
 use crate::policies::WorkerTokenInputs;
-use futures_util::StreamExt;
-use http::{HeaderMap, StatusCode};
+use http::HeaderMap;
 use reqwest::Client;
 use std::path::Path;
 use std::sync::Arc;
@@ -143,7 +142,156 @@ fn http_kv_input(body: &serde_json::Value, route: &str) -> Result<HttpKvInput, &
     Ok(HttpKvInput::Render { path })
 }
 
-fn http_tokenize_fallback(body: &serde_json::Value, route: &str) -> Option<Vec<serde_json::Value>> {
+/// Backend-effective prompts, shared by colocated and PD routing policies.
+pub(crate) struct HttpTokenInput {
+    pub prompts: Arc<[Vec<u32>]>,
+    pub source: &'static str,
+}
+
+pub(crate) async fn prepare_http_token_inputs(
+    client: &Client,
+    mut urls: Vec<String>,
+    body: &serde_json::Value,
+    route: &str,
+    headers: Option<&HeaderMap>,
+    api_key: Option<&str>,
+    budget: Duration,
+) -> std::collections::HashMap<String, Result<HttpTokenInput, &'static str>> {
+    use futures_util::{stream, StreamExt};
+    urls.sort();
+    urls.dedup();
+    let input = match http_kv_input(body, route) {
+        Ok(input) => input,
+        Err(reason) => return urls.into_iter().map(|url| (url, Err(reason))).collect(),
+    };
+    if let HttpKvInput::Direct(prompts) = input {
+        return urls
+            .into_iter()
+            .map(|url| {
+                (
+                    url,
+                    Ok(HttpTokenInput {
+                        prompts: prompts.clone(),
+                        source: "token_ids",
+                    }),
+                )
+            })
+            .collect();
+    }
+    let HttpKvInput::Render { path } = input else {
+        unreachable!()
+    };
+    let expected_prompts = if route == "/v1/completions" {
+        body.get("prompt")
+            .and_then(serde_json::Value::as_array)
+            .filter(|items| {
+                items
+                    .first()
+                    .is_some_and(|item| item.is_string() || item.is_array())
+            })
+            .map_or(1, Vec::len)
+    } else {
+        1
+    };
+    let tokenize_fallback = std::sync::OnceLock::new();
+    let mut inputs: std::collections::HashMap<_, _> = urls
+        .iter()
+        .map(|url| (url.clone(), Err("preparation_unavailable")))
+        .collect();
+    let results = stream::iter(urls)
+        .map(|url| {
+            let tokenize_fallback = &tokenize_fallback;
+            async move {
+                let result = async {
+                    let (prompts, source) =
+                        match http_input_json(client, &url, path, body, headers, api_key).await {
+                            Ok(rendered) => (http_rendered_tokens(&rendered)?, "render"),
+                            Err("render_unavailable") => {
+                                let requests = tokenize_fallback
+                                    .get_or_init(|| http_tokenize_fallback(body, route))
+                                    .as_ref()
+                                    .ok_or("render_unavailable")?;
+                                let mut prompts = Vec::with_capacity(requests.len());
+                                for request in requests {
+                                    let tokenized = http_input_json(
+                                        client,
+                                        &url,
+                                        "/tokenize",
+                                        request,
+                                        headers,
+                                        api_key,
+                                    )
+                                    .await?;
+                                    let ids = dense_token_ids(&tokenized["tokens"])?;
+                                    if tokenized["count"].as_u64() != Some(ids.len() as u64)
+                                        || tokenized["max_model_len"]
+                                            .as_u64()
+                                            .is_some_and(|limit| ids.len() as u64 > limit)
+                                    {
+                                        return Err("invalid_preparation_response");
+                                    }
+                                    prompts.push(ids);
+                                }
+                                (Arc::from(prompts), "tokenize")
+                            }
+                            Err(reason) => return Err(reason),
+                        };
+                    if prompts.len() != expected_prompts {
+                        return Err("invalid_preparation_response");
+                    }
+                    Ok(HttpTokenInput { prompts, source })
+                }
+                .await;
+                (url, result)
+            }
+        })
+        .buffer_unordered(8);
+    futures_util::pin_mut!(results);
+    let deadline = tokio::time::Instant::now() + budget;
+    while let Ok(Some((url, result))) = tokio::time::timeout_at(deadline, results.next()).await {
+        inputs.insert(url, result);
+    }
+    inputs
+}
+
+async fn http_input_json(
+    client: &reqwest::Client,
+    base: &str,
+    path: &str,
+    body: &serde_json::Value,
+    headers: Option<&http::HeaderMap>,
+    api_key: Option<&str>,
+) -> Result<serde_json::Value, &'static str> {
+    let mut request = client
+        .post(format!("{}{path}", base.trim_end_matches('/')))
+        .timeout(std::time::Duration::from_secs(5))
+        .json(body);
+    if let Some(key) = api_key {
+        request = request.bearer_auth(key);
+    } else if let Some(value) = headers.and_then(|headers| headers.get("authorization")) {
+        request = request.header("authorization", value);
+    }
+    let response = request
+        .send()
+        .await
+        .map_err(|_| "preparation_unavailable")?;
+    match response.status() {
+        reqwest::StatusCode::NOT_FOUND
+        | reqwest::StatusCode::METHOD_NOT_ALLOWED
+        | reqwest::StatusCode::NOT_IMPLEMENTED => return Err("render_unavailable"),
+        status if !status.is_success() => return Err("preparation_rejected"),
+        _ => {}
+    }
+    response
+        .json()
+        .await
+        .map_err(|_| "invalid_preparation_response")
+}
+
+pub(crate) fn http_tokenize_fallback(
+    body: &serde_json::Value,
+    route: &str,
+) -> Option<Vec<serde_json::Value>> {
     // /tokenize has fewer fields than generation in vLLM 0.30. Complex chat
     // must use /render; silently dropping tool/template options is not exact.
     for field in [
@@ -231,41 +379,6 @@ fn http_rendered_tokens(body: &serde_json::Value) -> Result<Arc<[Vec<u32>]>, &'s
     Ok(Arc::from(prompts))
 }
 
-async fn worker_input_json(
-    client: &Client,
-    worker_url: &str,
-    path: &str,
-    body: &serde_json::Value,
-    headers: Option<&HeaderMap>,
-    api_key: Option<&str>,
-) -> Result<serde_json::Value, &'static str> {
-    let mut request = client
-        .post(format!("{}{path}", worker_url.trim_end_matches('/')))
-        .timeout(Duration::from_secs(5))
-        .json(body);
-    if let Some(value) = headers.and_then(|headers| headers.get("authorization")) {
-        request = request.header("authorization", value);
-    }
-    if let Some(key) = api_key {
-        request = request.bearer_auth(key);
-    }
-    let response = request
-        .send()
-        .await
-        .map_err(|_| "preparation_unavailable")?;
-    match response.status() {
-        StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED | StatusCode::NOT_IMPLEMENTED => {
-            return Err("render_unavailable")
-        }
-        status if !status.is_success() => return Err("preparation_rejected"),
-        _ => {}
-    }
-    response
-        .json()
-        .await
-        .map_err(|_| "invalid_preparation_response")
-}
-
 pub(crate) async fn prepare_http_kv_inputs(
     client: &Client,
     workers: &[Arc<dyn Worker>],
@@ -274,101 +387,27 @@ pub(crate) async fn prepare_http_kv_inputs(
     route: &str,
     api_key: Option<&str>,
     budget: Duration,
-) -> Option<WorkerTokenInputs> {
-    let input = match http_kv_input(body, route) {
-        Ok(input) => input,
-        Err(reason) => {
-            RouterMetrics::record_kv_routing_input("http", reason);
-            return None;
-        }
-    };
-    let mut urls: Vec<_> = workers
+) -> WorkerTokenInputs {
+    let urls = workers
         .iter()
-        .map(|worker| worker.base_url().to_string())
+        .map(|worker| worker.base_url().to_owned())
         .collect();
-    urls.sort();
-    urls.dedup();
-    if urls.is_empty() {
-        return None;
-    }
-    if let HttpKvInput::Direct(prompts) = input {
-        RouterMetrics::record_kv_routing_input("http", "token_ids");
-        return Some(urls.into_iter().map(|url| (url, prompts.clone())).collect());
-    }
-    let HttpKvInput::Render { path } = input else {
-        unreachable!()
-    };
-    let expected_prompts = if route == "/v1/completions" {
-        body.get("prompt")
-            .and_then(serde_json::Value::as_array)
-            .filter(|items| {
-                items
-                    .first()
-                    .is_some_and(|item| item.is_string() || item.is_array())
-            })
-            .map_or(1, Vec::len)
-    } else {
-        1
-    };
-    let tokenize_fallback = std::sync::OnceLock::new();
-    let results = futures_util::stream::iter(urls)
-        .map(|url| {
-            let tokenize_fallback = &tokenize_fallback;
-            async move {
-                let (prompts, source) =
-                    match worker_input_json(client, &url, path, body, headers, api_key).await {
-                        Ok(rendered) => (http_rendered_tokens(&rendered)?, "render"),
-                        Err("render_unavailable") => {
-                            let requests = tokenize_fallback
-                                .get_or_init(|| http_tokenize_fallback(body, route))
-                                .as_ref()
-                                .ok_or("render_unavailable")?;
-                            let mut prompts = Vec::with_capacity(requests.len());
-                            for request in requests {
-                                let tokenized = worker_input_json(
-                                    client,
-                                    &url,
-                                    "/tokenize",
-                                    request,
-                                    headers,
-                                    api_key,
-                                )
-                                .await?;
-                                let ids = dense_token_ids(&tokenized["tokens"])?;
-                                if tokenized["count"].as_u64() != Some(ids.len() as u64) {
-                                    return Err("invalid_preparation_response");
-                                }
-                                prompts.push(ids);
-                            }
-                            (Arc::from(prompts), "tokenize")
-                        }
-                        Err(reason) => return Err(reason),
-                    };
-                if prompts.len() != expected_prompts {
-                    return Err("invalid_preparation_response");
-                }
-                Ok((url, prompts, source))
-            }
-        })
-        .buffer_unordered(8);
-    futures_util::pin_mut!(results);
-    // Preparation is optional placement evidence. Keep completed workers'
-    // results and cancel slow candidates after one shared ingress budget.
-    let deadline = tokio::time::Instant::now() + budget;
+    let results =
+        prepare_http_token_inputs(client, urls, body, route, headers, api_key, budget).await;
     let mut inputs = WorkerTokenInputs::new();
-    while let Ok(Some(result)) = tokio::time::timeout_at(deadline, results.next()).await {
+    for (url, result) in results {
         match result {
-            Ok((url, prompts, source)) => {
-                RouterMetrics::record_kv_routing_input("http", source);
-                inputs.insert(url, prompts);
+            Ok(input) => {
+                RouterMetrics::record_kv_routing_input("http", input.source);
+                inputs.insert(url, input.prompts);
             }
             Err(reason) => {
                 RouterMetrics::record_kv_routing_input("http", reason);
-                debug!(reason, "KV-aware candidate received no placement credit");
+                debug!(worker = %url, reason, "Prefix input preparation unavailable");
             }
         }
     }
-    Some(inputs)
+    inputs
 }
 
 #[derive(Clone)]
@@ -852,6 +891,50 @@ fn user_content_text(content: &UserMessageContent) -> Result<String> {
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
+    #[tokio::test]
+    async fn shared_http_preparation_retains_good_workers_and_exact_tool_payloads() {
+        use super::prepare_http_token_inputs;
+        use axum::{routing::post, Json, Router};
+        use serde_json::json;
+        let app = Router::new()
+            .route(
+                "/good/v1/chat/completions/render",
+                post(|Json(body): Json<serde_json::Value>| async move {
+                    assert_eq!(body["tools"], json!([]));
+                    assert_eq!(body["messages"][0]["tool_calls"][0]["id"], "call-1");
+                    assert_eq!(body["truncate_prompt_tokens"], 3);
+                    Json(json!({"token_ids":[7,8,9]}))
+                }),
+            )
+            .route(
+                "/bad/v1/chat/completions/render",
+                post(|| async { axum::http::StatusCode::INTERNAL_SERVER_ERROR }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let good = format!("{base}/good");
+        let bad = format!("{base}/bad");
+        let body = json!({"messages":[{"role":"assistant","tool_calls":[{"id":"call-1"}]}],
+            "tools":[],"truncate_prompt_tokens":3});
+        let results = prepare_http_token_inputs(
+            &reqwest::Client::new(),
+            vec![good.clone(), bad.clone()],
+            &body,
+            "/v1/chat/completions",
+            None,
+            None,
+            Duration::from_secs(1),
+        )
+        .await;
+        assert_eq!(
+            results[&good].as_ref().ok().unwrap().prompts.as_ref(),
+            &[vec![7, 8, 9]]
+        );
+        assert!(results[&bad].is_err());
+        server.abort();
+    }
+
     #[test]
     fn http_inputs_keep_prompt_boundaries_and_require_exact_render_for_options() {
         use super::{http_kv_input, http_rendered_tokens, HttpKvInput};

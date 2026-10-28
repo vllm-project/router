@@ -652,7 +652,7 @@ impl RouterTrait for RouterManager {
     async fn route_completion(
         &self,
         headers: Option<&HeaderMap>,
-        body: Arc<CompletionRequest>,
+        body: &CompletionRequest,
         _model_id: Option<&str>,
     ) -> Response {
         // Select router based on headers and model.
@@ -663,9 +663,7 @@ impl RouterTrait for RouterManager {
         let router = self.select_router_for_request(headers, model_id);
 
         if let Some(router) = router {
-            router
-                .route_completion(headers, body.clone(), model_id)
-                .await
+            router.route_completion(headers, body, model_id).await
         } else {
             let msg = match model_id {
                 Some(m) => format!("Model '{}' not found or no router available", m),

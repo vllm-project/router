@@ -1331,7 +1331,16 @@ impl Router {
             });
         }
 
-        let idx = policy.select_worker_with_headers(available, text, request_headers.as_ref())?;
+        let idx = if let Some(cache) = policy
+            .as_any()
+            .downcast_ref::<crate::policies::CacheAwarePolicy>()
+        {
+            cache.select_worker_with_inputs(
+                available, token_ids, model_id, lora_name, cache_salt, "regular",
+            )?
+        } else {
+            policy.select_worker_with_headers(available, text, request_headers.as_ref())?
+        };
         Some(SelectedWorker {
             worker: available.get(idx)?.clone(),
             kv_receipt: None,
@@ -1517,7 +1526,7 @@ impl Router {
                 let excluded_workers = failed_workers.lock().clone();
                 let inputs = if prepared.is_none()
                     && !completion.is_some_and(|completion| completion.input_active)
-                    && kv_ops.is_some()
+                    && (kv_ops.is_some() || policy.needs_cache_routing_key())
                     && !(excluded_workers.is_empty()
                         && affinity_key.as_ref().is_some_and(|key| {
                             kv_ops.is_some_and(|ops| {
@@ -1527,7 +1536,7 @@ impl Router {
                     http_inputs
                         .get_or_init(|| async {
                             match serde_json::to_value(typed_req) {
-                                Ok(body) => {
+                                Ok(body) => Some(
                                     prepare_http_kv_inputs(
                                         &self.client,
                                         &workers,
@@ -1537,8 +1546,8 @@ impl Router {
                                         self.api_key.as_deref(),
                                         Duration::from_secs(1),
                                     )
-                                    .await
-                                }
+                                    .await,
+                                ),
                                 Err(_) => None,
                             }
                         })
@@ -2744,15 +2753,17 @@ impl RouterTrait for Router {
     async fn route_completion(
         &self,
         headers: Option<&HeaderMap>,
-        body: Arc<CompletionRequest>,
+        body: &CompletionRequest,
         model_id: Option<&str>,
     ) -> Response {
         self.route_prepared_request(
             headers,
-            body.as_ref(),
+            body,
             "/v1/completions",
             model_id,
-            Some(body.clone()),
+            // Only legacy borrowed callers need an owned preparation input.
+            // The server uses route_completion_raw and keeps its original Arc.
+            Some(Arc::new(body.clone())),
             None,
         )
         .await
@@ -2766,10 +2777,10 @@ impl RouterTrait for Router {
         model_id: Option<&str>,
     ) -> Response {
         // DP rewrites and non-KV routes preserve their pre-existing typed wire.
-        let policy = match model_id {
-            Some(model) => self.policy_registry.get_policy_or_default(model),
-            None => self.policy_registry.get_default_policy(),
-        };
+        let effective_model_id = model_id
+            .or_else(|| body.get_model())
+            .filter(|model| self.worker_registry.has_model(model));
+        let policy = self.policy_for_model(effective_model_id);
         let preserve_raw =
             self.intra_node_data_parallel_size == 1 && kv_aware_ops(policy.as_ref()).is_some();
         self.route_prepared_request(
@@ -3014,20 +3025,22 @@ impl RouterTrait for Router {
                     })
             });
         let http_inputs = if *method == Method::POST
-            && kv_ops.is_some()
+            && (kv_ops.is_some() || policy.needs_cache_routing_key())
             && !affinity_key.as_ref().is_some_and(|key| {
                 kv_ops.is_some_and(|ops| ops.has_affinity(&workers, lora_name, cache_salt, key))
             }) {
-            prepare_http_kv_inputs(
-                &self.client,
-                &workers,
-                headers,
-                &body,
-                path,
-                self.api_key.as_deref(),
-                Duration::from_secs(1),
+            Some(
+                prepare_http_kv_inputs(
+                    &self.client,
+                    &workers,
+                    headers,
+                    &body,
+                    path,
+                    self.api_key.as_deref(),
+                    Duration::from_secs(1),
+                )
+                .await,
             )
-            .await
         } else {
             None
         };
@@ -3085,6 +3098,23 @@ impl RouterTrait for Router {
                 worker: workers[receipt.worker_index].clone(),
                 kv_receipt: Some(receipt),
             })
+        } else if let Some(cache) = policy
+            .as_any()
+            .downcast_ref::<crate::policies::CacheAwarePolicy>()
+        {
+            cache
+                .select_worker_with_inputs(
+                    &workers,
+                    request_tokens,
+                    model_id,
+                    lora_name,
+                    cache_salt,
+                    "regular",
+                )
+                .map(|index| SelectedWorker {
+                    worker: workers[index].clone(),
+                    kv_receipt: None,
+                })
         } else {
             let cache_key = (policy.needs_cache_routing_key())
                 .then(|| crate::protocols::spec::cache_routing::for_route(&body, path));
@@ -3740,13 +3770,19 @@ mod tests {
     }
 
     struct CompletionBarrierTokenizer {
+        prompt_address: usize,
         started: tokio::sync::mpsc::UnboundedSender<()>,
         finished: tokio::sync::mpsc::UnboundedSender<()>,
         release: Mutex<std::sync::mpsc::Receiver<()>>,
     }
 
     impl vllm_tokenizer::Tokenizer for CompletionBarrierTokenizer {
-        fn encode(&self, _: &str, _: bool) -> vllm_tokenizer::Result<Vec<u32>> {
+        fn encode(&self, text: &str, _: bool) -> vllm_tokenizer::Result<Vec<u32>> {
+            assert_eq!(
+                text.as_ptr() as usize,
+                self.prompt_address,
+                "owned ingress must not deep-clone the prompt"
+            );
             self.started.send(()).unwrap();
             self.release
                 .lock()
@@ -3800,11 +3836,17 @@ mod tests {
         let (started, mut encoding) = tokio::sync::mpsc::unbounded_channel();
         let (finished, mut encoded) = tokio::sync::mpsc::unbounded_channel();
         let (release, released) = std::sync::mpsc::channel();
+        let raw = bytes::Bytes::from_static(b"{\"model\":\"qwen3\",\"prompt\":\"hello world\"}");
+        let request: Arc<CompletionRequest> = Arc::new(serde_json::from_slice(&raw).unwrap());
+        let crate::protocols::spec::PromptInput::String(prompt) = &request.prompt else {
+            unreachable!();
+        };
         router.completion_input = Some(crate::backend::completion_input::CompletionInput {
             model: "qwen3".into(),
             cache_model: "qwen3".into(),
             vocab_size: 16,
             tokenizer: Arc::new(CompletionBarrierTokenizer {
+                prompt_address: prompt.as_ptr() as usize,
                 started,
                 finished,
                 release: Mutex::new(released),
@@ -3814,18 +3856,7 @@ mod tests {
         let router = Arc::new(router);
         let task = tokio::spawn({
             let router = router.clone();
-            async move {
-                let raw =
-                    bytes::Bytes::from_static(b"{\"model\":\"qwen3\",\"prompt\":\"hello world\"}");
-                router
-                    .route_completion_raw(
-                        None,
-                        Arc::new(serde_json::from_slice(&raw).unwrap()),
-                        &raw,
-                        None,
-                    )
-                    .await
-            }
+            async move { router.route_completion_raw(None, request, &raw, None).await }
         });
         tokio::time::timeout(Duration::from_secs(5), encoding.recv())
             .await
@@ -4844,32 +4875,33 @@ mod tests {
                 "qwen3",
                 Some(if model_kv { "kv_aware" } else { "round_robin" }),
             );
-            let response = router
-                .route_completion_raw(
-                    Some(&headers),
-                    Arc::new(request.clone()),
-                    &raw,
-                    Some("qwen3"),
-                )
-                .await;
-            assert_eq!(response.status(), StatusCode::OK);
-            to_bytes(response.into_body(), usize::MAX).await.unwrap();
-            let bodies = captured.lock();
-            let (sent_headers, sent) = bodies.last().unwrap();
-            let expected = if model_kv {
-                raw.clone()
-            } else {
-                bytes::Bytes::from(serde_json::to_vec(&request).unwrap())
-            };
-            assert_eq!(sent, &expected);
-            assert_eq!(
-                sent_headers[CONTENT_TYPE],
-                if model_kv {
-                    "application/problem+json; charset=utf-8"
+            for model_id in [Some("qwen3"), None] {
+                let response = router
+                    .route_completion_raw(Some(&headers), Arc::new(request.clone()), &raw, model_id)
+                    .await;
+                assert_eq!(response.status(), StatusCode::OK);
+                to_bytes(response.into_body(), usize::MAX).await.unwrap();
+                let bodies = captured.lock();
+                let (sent_headers, sent) = bodies.last().unwrap();
+                let expected = if model_kv {
+                    raw.clone()
                 } else {
-                    "application/json"
-                }
-            );
+                    bytes::Bytes::from(serde_json::to_vec(&request).unwrap())
+                };
+                assert_eq!(
+                    sent, &expected,
+                    "model_kv={model_kv}, model_id={model_id:?}"
+                );
+                assert_eq!(
+                    sent_headers[CONTENT_TYPE],
+                    if model_kv {
+                        "application/problem+json; charset=utf-8"
+                    } else {
+                        "application/json"
+                    },
+                    "model_kv={model_kv}, model_id={model_id:?}",
+                );
+            }
         }
         server.abort();
     }

@@ -176,6 +176,16 @@ pub fn parse_worker_url(worker_url: &str) -> (String, Option<usize>) {
     }
 }
 
+/// Return the ranks represented by one endpoint, preserving an explicitly
+/// pinned rank and expanding an unpinned multi-rank endpoint.
+pub fn expand_dp_ranks(pinned_rank: Option<usize>, dp_size: usize) -> Vec<Option<usize>> {
+    match pinned_rank {
+        Some(rank) => vec![Some(rank)],
+        None if dp_size > 1 => (0..dp_size).map(Some).collect(),
+        None => vec![None],
+    }
+}
+
 /// Add X-data-parallel-rank header to a reqwest RequestBuilder if dp_rank is present
 ///
 /// This is a utility function to standardize how DP rank headers are added to HTTP requests.
