@@ -14,7 +14,7 @@ Both install an executable named `vllm-router`. Check which executable is on
 your `PATH` before copying flags between installations. Their options are
 similar, but they are not interchangeable. In particular:
 
-- Rust accepts `rendezvous_hash`; Python does not. Both support `kv_aware` for the regular routing policy, but not for prefill/decode policies. Rust also exposes backend
+- Rust accepts `rendezvous_hash`; Python does not. Both support `kv_aware` in regular and P/D routing. Rust also exposes backend
   selection, tracing, API-key validation URLs, history storage and profiling.
 - Python exposes `--mini-lb`, queue settings and the token bucket refill rate.
   The Rust CLI fixes queue size at `100`, queue timeout at `60` seconds, and
@@ -82,6 +82,10 @@ while an earlier request is still running, even with `--max-concurrent-requests 
 | `--enable-igw` | `flag` | `false` | `flag` | `false` | Enable Inference Gateway mode for multi-model routing. |
 | `--history-backend` | `memory, none` | `memory` | — | — | Inference Gateway history storage: in-memory storage or no storage. |
 | `--profile` | `flag` | `false` | — | — | Enable profiling calls to vLLM workers; the Rust CLI uses a 10-second profiling timeout. |
+| `--kv-event-source` | `string (repeatable)` | `[]` | `string (repeatable)` | `[]` | Static KV-event source as `WORKER_URL=ENDPOINT[,ENDPOINT...]`; repeatable, one entry per worker. |
+| `--kv-event-replay-source` | `string (repeatable)` | `[]` | `string (repeatable)` | `[]` | Replay endpoint(s) for a static KV-event source, same `WORKER_URL=ENDPOINT[,ENDPOINT...]` form. |
+| `--kv-event-block-size` | `u32` | `16` | `integer` | `16` | KV cache block size in tokens for workers registered through `--kv-event-source`. |
+| `--kv-event-model` | `string` | `unset` | `string` | `unset` | Model id advertised to static KV-event sources; `unset` keeps the served model id. |
 
 The Rust CLI requires worker URLs in regular mode unless service discovery is
 enabled. The Python launcher permits an empty worker list without service
@@ -94,23 +98,19 @@ and the Rust OpenAI backend use different configuration paths. See
 | Option | Rust value | Rust default | Python value | Python default | Description |
 | --- | --- | --- | --- | --- | --- |
 | `--policy` | `random, round_robin, cache_aware, kv_aware, power_of_two, consistent_hash, rendezvous_hash` | `cache_aware` | `random, round_robin, cache_aware, kv_aware, power_of_two, consistent_hash` | `cache_aware` | Request-level routing policy; also the fallback for both PD stages. |
-| `--prefill-policy` | `random, round_robin, cache_aware, power_of_two, consistent_hash, rendezvous_hash` | `unset` | `random, round_robin, cache_aware, power_of_two, consistent_hash` | `unset` | PD prefill policy; unset inherits `--policy`. |
-| `--decode-policy` | `random, round_robin, cache_aware, power_of_two, consistent_hash, rendezvous_hash` | `unset` | `random, round_robin, cache_aware, power_of_two, consistent_hash` | `unset` | PD decode policy; unset inherits `--policy`. |
-| `--router-temperature` | `f64` | `0.0` | `float` | `0.0` | Softmax temperature for regular-mode kv_aware routing; zero selects the minimum-cost worker. |
+| `--prefill-policy` | `random, round_robin, cache_aware, kv_aware, power_of_two, consistent_hash, rendezvous_hash` | `unset` | `random, round_robin, cache_aware, kv_aware, power_of_two, consistent_hash` | `unset` | PD prefill policy; unset inherits `--policy`. |
+| `--decode-policy` | `random, round_robin, cache_aware, kv_aware, power_of_two, consistent_hash, rendezvous_hash` | `unset` | `random, round_robin, cache_aware, kv_aware, power_of_two, consistent_hash` | `unset` | PD decode policy; unset inherits `--policy`. |
+| `--router-temperature` | `f64` | `0.0` | `float` | `0.0` | KV-aware selection temperature for regular routing and PD prefill; zero selects the lowest-cost worker. |
 | `--kv-penalty-host` | `f64` | `0.8` | `float` | `0.8` | Host-tier KV transfer credit for kv_aware. |
 | `--kv-penalty-external` | `f64` | `0.6` | `float` | `0.6` | External-tier KV transfer credit for kv_aware. |
 | `--kv-penalty-disk` | `f64` | `0.3` | `float` | `0.3` | Disk-tier KV transfer credit for kv_aware. |
-| `--kv-aware-session-affinity-ttl-secs` | `u64` | `unset` | `integer` | `unset` | Enable KV-aware session affinity with an idle TTL of 1–31536000 seconds; unset disables it. |
-| `--kv-event-source` | `string (repeatable)` | `[]` | `string (repeatable)` | `[]` | Static event endpoints as WORKER_URL=ENDPOINT[,ENDPOINT...], repeated per worker. |
-| `--kv-event-replay-source` | `string (repeatable)` | `[]` | `string (repeatable)` | `[]` | Replay endpoints matching the static event source for a worker. |
-| `--kv-event-block-size` | `u32` | `16` | `integer` | `16` | Block size declared for static event sources. |
-| `--kv-event-model` | `string` | `unset` | `string` | `unset` | Shared model identity declared for static event sources. |
+| `--kv-aware-session-affinity-ttl-secs` | `u64` | `unset` | `integer` | `unset` | Idle affinity TTL in seconds (1–31536000); unset disables affinity. In PD mode, applies only to decode. |
 | `--cache-threshold` | `f32` | `0.3` | `float` | `0.3` | Cache-match threshold from 0.0 to 1.0 for cache-aware routing. |
 | `--balance-abs-threshold` | `usize` | `64` | `integer` | `64` | Cache-aware load balancing absolute threshold; used together with the relative threshold. |
 | `--balance-rel-threshold` | `f32` | `1.5` | `float` | `1.5` | Cache-aware load balancing relative threshold; used together with the absolute threshold. |
 | `--eviction-interval` | `u64` | `120` | — | — | Seconds between cache-aware approximation-tree eviction operations (Rust spelling). |
 | `--eviction-interval-secs` | — | — | `integer` | `120` | Seconds between cache-aware approximation-tree eviction operations (Python spelling). |
-| `--max-tree-size` | `usize` | `1 << 25` | `integer` | `33554432` | Maximum cache-aware approximation-tree size. |
+| `--max-tree-size` | `usize` | `1 << 25` | `integer` | `33554432` | Per-worker character budget per model, trimmed during cache eviction. |
 
 Cache-aware tuning applies only to policies using `cache_aware`. Load balancing
 is triggered when both `(max_load - min_load) > balance_abs_threshold` and
@@ -134,6 +134,7 @@ PD stage using an explicit power-of-two policy needs two workers for that stage.
 | `--decode` | `string (repeatable)` | `[]` | `string (repeatable)` | `unset` | Add one decode URL per occurrence: `--decode URL`. |
 | `--vllm-discovery-address` | `string` | `unset` | `string` | `unset` | ZMQ registration address for vLLM workers, e.g. `0.0.0.0:30001`. |
 | `--kv-connector` | `nixl, mooncake, moriio` | `nixl` | `nixl, mooncake, moriio` | `nixl` | PD KV transfer connector: NIXL, Mooncake or MoRI-IO. MoRI-IO requires vLLM ZMQ discovery. |
+| `--pd-kv-events` | `string (repeatable)` | `[]` | `string (repeatable)` | `[]` | Static prefill KV publishers as URL=ENDPOINT[,ENDPOINT...]; requires kv_aware prefill. Endpoints follow DP-rank order; block size is 16. |
 
 PD workers can come from static URLs, vLLM ZMQ discovery, or Kubernetes
 discovery. For static configuration, provide both prefill and decode workers:

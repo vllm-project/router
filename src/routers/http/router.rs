@@ -1304,7 +1304,16 @@ impl Router {
             });
         }
 
-        let idx = policy.select_worker_with_headers(available, text, request_headers.as_ref())?;
+        let idx = if let Some(cache) = policy
+            .as_any()
+            .downcast_ref::<crate::policies::CacheAwarePolicy>()
+        {
+            cache.select_worker_with_inputs(
+                available, token_ids, model_id, lora_name, cache_salt, "regular",
+            )?
+        } else {
+            policy.select_worker_with_headers(available, text, request_headers.as_ref())?
+        };
         Some(SelectedWorker {
             worker: available.get(idx)?.clone(),
             kv_receipt: None,
@@ -1399,7 +1408,6 @@ impl Router {
             ) if route == "/v1/completions" => completion.extract_text_for_grpc_routing(),
             _ => typed_req.extract_text_for_routing(),
         };
-        let cache_key = std::sync::OnceLock::new();
 
         let http_inputs = tokio::sync::OnceCell::new();
 
@@ -1445,7 +1453,7 @@ impl Router {
                 let workers = self.available_workers(model_id);
                 let excluded_workers = failed_workers.lock().clone();
                 let inputs = if prepared.is_none()
-                    && kv_ops.is_some()
+                    && (kv_ops.is_some() || policy.needs_cache_routing_key())
                     && !(excluded_workers.is_empty()
                         && affinity_key.as_ref().is_some_and(|key| {
                             kv_ops.is_some_and(|ops| {
@@ -1455,7 +1463,7 @@ impl Router {
                     http_inputs
                         .get_or_init(|| async {
                             match serde_json::to_value(typed_req) {
-                                Ok(body) => {
+                                Ok(body) => Some(
                                     prepare_http_kv_inputs(
                                         &self.client,
                                         &workers,
@@ -1465,8 +1473,8 @@ impl Router {
                                         self.api_key.as_deref(),
                                         Duration::from_secs(1),
                                     )
-                                    .await
-                                }
+                                    .await,
+                                ),
                                 Err(_) => None,
                             }
                         })
@@ -1508,11 +1516,7 @@ impl Router {
                     self.select_worker_for_model(
                         model_id,
                         &workers,
-                        Some(if policy.needs_cache_routing_key() {
-                            cache_key.get_or_init(|| typed_req.extract_cache_routing_key())
-                        } else {
-                            &text
-                        }),
+                        Some(&text),
                         headers,
                         request_tokens,
                         lora_name,
@@ -2839,20 +2843,22 @@ impl RouterTrait for Router {
                     })
             });
         let http_inputs = if *method == Method::POST
-            && kv_ops.is_some()
+            && (kv_ops.is_some() || policy.needs_cache_routing_key())
             && !affinity_key.as_ref().is_some_and(|key| {
                 kv_ops.is_some_and(|ops| ops.has_affinity(&workers, lora_name, cache_salt, key))
             }) {
-            prepare_http_kv_inputs(
-                &self.client,
-                &workers,
-                headers,
-                &body,
-                path,
-                self.api_key.as_deref(),
-                Duration::from_secs(1),
+            Some(
+                prepare_http_kv_inputs(
+                    &self.client,
+                    &workers,
+                    headers,
+                    &body,
+                    path,
+                    self.api_key.as_deref(),
+                    Duration::from_secs(1),
+                )
+                .await,
             )
-            .await
         } else {
             None
         };
@@ -2910,6 +2916,23 @@ impl RouterTrait for Router {
                 worker: workers[receipt.worker_index].clone(),
                 kv_receipt: Some(receipt),
             })
+        } else if let Some(cache) = policy
+            .as_any()
+            .downcast_ref::<crate::policies::CacheAwarePolicy>()
+        {
+            cache
+                .select_worker_with_inputs(
+                    &workers,
+                    request_tokens,
+                    model_id,
+                    lora_name,
+                    cache_salt,
+                    "regular",
+                )
+                .map(|index| SelectedWorker {
+                    worker: workers[index].clone(),
+                    kv_receipt: None,
+                })
         } else {
             let cache_key = (policy.needs_cache_routing_key())
                 .then(|| crate::protocols::spec::cache_routing::for_route(&body, path));

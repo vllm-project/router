@@ -93,8 +93,10 @@ def rust_options():
                 value = "string"
             elif field_type in ("u16", "u32", "u64", "usize"):
                 value = field_type
-            elif field_type == "Option<u64>":
-                value = "u64"
+            elif field_type.startswith("Option<") and field_type.endswith(">"):
+                # Optional scalar: document the inner type; `unset` marks the
+                # absent default below.
+                value = field_type[len("Option<") : -1]
             elif field_type in ("f32", "f64"):
                 value = field_type
             else:

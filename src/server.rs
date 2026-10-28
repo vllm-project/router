@@ -440,6 +440,7 @@ struct UrlQuery {
     url: String,
 }
 
+#[allow(clippy::result_large_err)]
 async fn authorize_request(
     state: &Arc<AppState>,
     headers: &http::HeaderMap,

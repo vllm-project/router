@@ -53,8 +53,8 @@ pub struct MoriIOServiceRegistration {
     pub transfer_mode: String, // "READ" or "WRITE"
     #[serde(default = "default_one")]
     pub tp_size: usize,
-    #[serde(default = "default_one")]
-    pub dp_size: usize,
+    #[serde(default)]
+    pub dp_size: Option<usize>,
 }
 
 fn default_one() -> usize {
@@ -77,7 +77,7 @@ pub struct ServiceInstance {
     pub zmq_address: String,
     pub expires_at: u64, // Unix timestamp
     pub tp_size: usize,
-    pub dp_size: usize,
+    pub dp_size: Option<usize>,
 }
 
 /// Service registry maintaining prefill and decode instances
@@ -104,7 +104,7 @@ fn parse_registration(
     ServiceRegistration,
     Option<MoriIOTransferMode>,
     usize,
-    usize,
+    Option<usize>,
 )> {
     if matches!(kv_connector, KvConnector::MoriIO) {
         let reg: MoriIOServiceRegistration = match rmp_serde::from_slice(message_data) {
@@ -140,7 +140,7 @@ fn parse_registration(
         Some((reg.base, Some(mode), reg.tp_size, reg.dp_size))
     } else {
         match rmp_serde::from_slice(message_data) {
-            Ok(data) => Some((data, None, 1, 1)),
+            Ok(data) => Some((data, None, 1, None)),
             Err(e) => {
                 warn!("Failed to parse service registration: {}", e);
                 None
@@ -397,7 +397,7 @@ impl ServiceRegistry {
             zmq_address: zmq_address.clone(),
             expires_at: current_time + DEFAULT_PING_SECONDS,
             tp_size: 1,
-            dp_size: 1,
+            dp_size: Some(1),
         };
 
         match service_type {
@@ -429,8 +429,25 @@ impl ServiceRegistry {
         let guard = instances.lock().unwrap();
         guard
             .get(http_address)
-            .map(|i| (i.tp_size, i.dp_size))
+            .map(|i| (i.tp_size, i.dp_size.unwrap_or(1)))
             .unwrap_or((1, 1))
+    }
+
+    /// Snapshot all registered endpoints and their optional DP sizes under a
+    /// single registry lock for request-path candidate construction.
+    pub fn get_instance_snapshots(
+        &self,
+        service_type: ServiceType,
+    ) -> Vec<(String, String, Option<usize>)> {
+        let instances = match service_type {
+            ServiceType::Prefill => &self.prefill_instances,
+            ServiceType::Decode => &self.decode_instances,
+        };
+        let guard = instances.lock().unwrap();
+        guard
+            .iter()
+            .map(|(http, instance)| (http.clone(), instance.zmq_address.clone(), instance.dp_size))
+            .collect()
     }
 
     /// Get ZMQ address for a given HTTP address
@@ -444,24 +461,6 @@ impl ServiceRegistry {
         guard
             .get(http_address)
             .map(|instance| instance.zmq_address.clone())
-    }
-
-    /// Get all available prefill instances as `(http_address, zmq_address)`.
-    pub fn get_prefill_instances(&self) -> Vec<(String, String)> {
-        let guard = self.prefill_instances.lock().unwrap();
-        guard
-            .iter()
-            .map(|(http, instance)| (http.clone(), instance.zmq_address.clone()))
-            .collect()
-    }
-
-    /// Get all available decode instances as `(http_address, zmq_address)`.
-    pub fn get_decode_instances(&self) -> Vec<(String, String)> {
-        let guard = self.decode_instances.lock().unwrap();
-        guard
-            .iter()
-            .map(|(http, instance)| (http.clone(), instance.zmq_address.clone()))
-            .collect()
     }
 
     /// Get instance count for debugging
@@ -543,5 +542,27 @@ mod tests {
         assert!(result.is_some());
         let (_, mode, _, _) = result.unwrap();
         assert_eq!(mode, Some(MoriIOTransferMode::Write));
+    }
+
+    #[test]
+    fn test_moriio_registration_dp_size_defaults_to_none() {
+        // Omitted dp_size must surface as None (not 1) so the router can
+        // distinguish "engine reported a single rank" from "engine did not
+        // report" when applying the intra-node DP fallback — the difference
+        // that decides whether a single-DP engine gets phantom-expanded.
+        let bytes = make_moriio_msgpack("P", "WRITE");
+        let reg: MoriIOServiceRegistration = rmp_serde::from_slice(&bytes).unwrap();
+        assert_eq!(reg.dp_size, None);
+
+        let mut payload = serde_json::json!({
+            "type": "D",
+            "http_address": "1.2.3.4:8001",
+            "zmq_address": "host:1.2.3.4,handshake:6301,notify:61005",
+            "transfer_mode": "WRITE",
+        });
+        payload["dp_size"] = serde_json::json!(4);
+        let bytes = rmp_serde::to_vec_named(&payload).unwrap();
+        let reg: MoriIOServiceRegistration = rmp_serde::from_slice(&bytes).unwrap();
+        assert_eq!(reg.dp_size, Some(4));
     }
 }

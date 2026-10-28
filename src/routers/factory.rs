@@ -66,11 +66,18 @@ impl RouterFactory {
         main_policy_config: &PolicyConfig,
         ctx: &Arc<AppContext>,
     ) -> Result<Box<dyn RouterTrait>, String> {
-        // Initialize policies in PolicyRegistry - use specific policies if provided, otherwise fall back to main policy
-        let prefill_policy =
-            PolicyFactory::create_from_config(prefill_policy_config.unwrap_or(main_policy_config));
-        let decode_policy =
-            PolicyFactory::create_from_config(decode_policy_config.unwrap_or(main_policy_config));
+        // Both stages inherit the main policy unless they have a stage override.
+        // Build both policies against the registry-owned affinity table so the
+        // router-level kv_aware session-affinity TTL applies to the PD path too.
+        let kv_affinity_table = ctx.policy_registry.kv_affinity_table();
+        let prefill_policy = PolicyFactory::create_from_config(
+            prefill_policy_config.unwrap_or(main_policy_config),
+            Some(&kv_affinity_table),
+        );
+        let decode_policy = PolicyFactory::create_from_config(
+            decode_policy_config.unwrap_or(main_policy_config),
+            Some(&kv_affinity_table),
+        );
 
         // Set the prefill and decode policies in the registry
         ctx.policy_registry.set_prefill_policy(prefill_policy);
@@ -118,5 +125,64 @@ impl RouterFactory {
             OpenAIRouter::new(base_url, Some(ctx.router_config.circuit_breaker.clone())).await?;
 
         Ok(Box::new(router))
+    }
+}
+
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
+mod tests {
+    use super::*;
+    use crate::config::{PolicyConfig, RouterConfig, RoutingMode};
+    use crate::policies::kv_aware_ops;
+
+    /// The PD path builds its prefill/decode policies through PolicyFactory,
+    /// bypassing the registry default policy. If the factory-built policies
+    /// are not wired to the registry's TTL'd affinity table, the CLI
+    /// `--kv-aware-session-affinity-ttl-secs` flag silently no-ops.
+    #[tokio::test]
+    async fn pd_router_policies_inherit_registry_affinity_ttl() {
+        let config = RouterConfig {
+            policy: PolicyConfig::KvAware {
+                router_temperature: 0.0,
+                kv_penalty_host: 0.8,
+                kv_penalty_external: 0.6,
+                kv_penalty_disk: 0.3,
+                static_kv_event_sources: Default::default(),
+            },
+            kv_aware_session_affinity_ttl_secs: Some(1800),
+            // Worker lists stay empty on purpose: the prefill/decode policies
+            // are wired before worker startup, and an empty set keeps this test
+            // off the network (a populated set would block on the 600s health
+            // wait).
+            mode: RoutingMode::VllmPrefillDecode {
+                prefill_urls: vec![],
+                decode_urls: vec![],
+                prefill_policy: None,
+                decode_policy: None,
+                discovery_address: None,
+            },
+            ..RouterConfig::default()
+        };
+
+        let ctx = Arc::new(
+            AppContext::new(config, reqwest::Client::new(), 8, None, vec![])
+                .expect("test app context"),
+        );
+        RouterFactory::create_router(&ctx)
+            .await
+            .expect("PD policies inherit the main policy and registry TTL");
+
+        for name in ["prefill", "decode"] {
+            let policy = match name {
+                "prefill" => ctx.policy_registry.get_prefill_policy(),
+                _ => ctx.policy_registry.get_decode_policy(),
+            };
+            assert_eq!(policy.name(), "kv_aware", "{name} policy");
+            assert!(
+                kv_aware_ops(policy.as_ref())
+                    .expect("kv_aware policy")
+                    .session_affinity_enabled(),
+                "{name} policy must inherit the registry affinity TTL"
+            );
+        }
     }
 }

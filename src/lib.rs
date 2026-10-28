@@ -48,6 +48,7 @@ struct Router {
     kv_penalty_external: f64,
     kv_penalty_disk: f64,
     kv_aware_session_affinity_ttl_secs: Option<u64>,
+    pd_kv_events: Vec<String>,
     kv_event_source: Vec<String>,
     kv_event_replay_source: Vec<String>,
     kv_event_block_size: u32,
@@ -146,7 +147,7 @@ impl Router {
                     kv_penalty_host: self.kv_penalty_host,
                     kv_penalty_external: self.kv_penalty_external,
                     kv_penalty_disk: self.kv_penalty_disk,
-                    static_kv_event_sources: Default::default(),
+                    static_kv_event_sources: Box::default(),
                 },
                 PolicyType::PowerOfTwo => ConfigPolicyConfig::PowerOfTwo {
                     load_check_interval_secs: 5, // Default value
@@ -177,21 +178,21 @@ impl Router {
             }
         };
 
-        // Convert main policy
+        // Convert main policy and attach static regular-mode KV event sources.
         let mut policy = convert_policy(&self.policy);
-        let static_kv_event_sources = config::parse_static_kv_event_sources(
+        let static_sources = config::parse_static_kv_event_sources(
             &self.kv_event_source,
             &self.kv_event_replay_source,
             self.kv_event_block_size,
             self.kv_event_model.as_deref(),
         )?;
         if let ConfigPolicyConfig::KvAware {
-            static_kv_event_sources: configured,
+            static_kv_event_sources,
             ..
         } = &mut policy
         {
-            **configured = static_kv_event_sources;
-        } else if !static_kv_event_sources.is_empty() {
+            **static_kv_event_sources = static_sources;
+        } else if !static_sources.is_empty() {
             return Err(config::ConfigError::IncompatibleConfig {
                 reason: "--kv-event-source requires the kv_aware policy".to_string(),
             });
@@ -225,6 +226,7 @@ impl Router {
         Ok(config::RouterConfig {
             epd: None,
             mode,
+            pd_kv_event_sources: config::parse_pd_kv_events(&self.pd_kv_events)?,
             policy,
             host: self.host.clone(),
             port: self.port,
@@ -373,6 +375,7 @@ impl Router {
         kv_penalty_external = 0.6,
         kv_penalty_disk = 0.3,
         kv_aware_session_affinity_ttl_secs = None,
+        pd_kv_events = vec![],
         kv_event_source = vec![],
         kv_event_replay_source = vec![],
         kv_event_block_size = 16,
@@ -449,6 +452,7 @@ impl Router {
         kv_penalty_external: f64,
         kv_penalty_disk: f64,
         kv_aware_session_affinity_ttl_secs: Option<u64>,
+        pd_kv_events: Vec<String>,
         kv_event_source: Vec<String>,
         kv_event_replay_source: Vec<String>,
         kv_event_block_size: u32,
@@ -479,6 +483,7 @@ impl Router {
             kv_penalty_external,
             kv_penalty_disk,
             kv_aware_session_affinity_ttl_secs,
+            pd_kv_events,
             kv_event_source,
             kv_event_replay_source,
             kv_event_block_size,

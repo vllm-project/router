@@ -740,26 +740,33 @@ mod tests {
 
     #[test]
     fn unmodeled_extra_keys_never_alias_plain_or_named_lora_credit() {
-        for (name, extra, expected) in [
-            (None, None, 1),
+        for (name, lora_id, extra, expected) in [
+            (None, None, None, 1),
             (
+                None,
                 None,
                 Some(vec![rmpv::Value::Array(vec![rmpv::Value::from("salt")])]),
                 0,
             ),
             (
                 Some("adapter"),
+                Some(7),
                 Some(vec![rmpv::Value::Array(vec![rmpv::Value::from("adapter")])]),
                 1,
             ),
             (
                 Some("adapter"),
+                Some(7),
                 Some(vec![rmpv::Value::Array(vec![
                     rmpv::Value::from("adapter"),
                     rmpv::Value::from("salt"),
                 ])]),
                 0,
             ),
+            (None, None, Some(vec![]), 0),
+            (None, None, Some(vec![rmpv::Value::from("salt")]), 0),
+            (None, Some(7), None, 0),
+            (Some(""), Some(7), None, 0),
         ] {
             for dense_only in [false, true] {
                 let index = KvBlockIndexer::new();
@@ -770,6 +777,7 @@ mod tests {
                     None,
                 );
                 event.lora_name = name.map(str::to_owned);
+                event.lora_id = lora_id;
                 event.extra_keys = extra.clone();
                 event.session_id = Some("session-annotation".to_owned());
                 assert_eq!(
@@ -861,7 +869,7 @@ mod tests {
     }
 
     #[test]
-    fn dense_batch_rejects_unmodeled_residency_and_namespace_atomically() {
+    fn dense_batch_rejects_unmodeled_residency_and_layout_atomically() {
         let source = SourceId::from("dense");
         let valid = stored(
             vec![ExternalBlockHash::Int(1)],
@@ -873,13 +881,8 @@ mod tests {
             "remote",
             "local-pool",
             "unknown-medium",
-            "extra-count",
-            "salt-array",
-            "salt-scalar",
             "layout",
             "sliding-window",
-            "unnamed-lora",
-            "empty-lora",
             "token-count",
         ] {
             let index = KvBlockIndexer::new();
@@ -900,19 +903,6 @@ mod tests {
                     invalid.medium = Some("unknown".into());
                     DenseRejectionReason::Residency
                 }
-                "extra-count" => {
-                    invalid.extra_keys = Some(vec![]);
-                    DenseRejectionReason::ExtraKeys
-                }
-                "salt-array" => {
-                    invalid.extra_keys =
-                        Some(vec![rmpv::Value::Array(vec![rmpv::Value::from("tenant")])]);
-                    DenseRejectionReason::ExtraKeys
-                }
-                "salt-scalar" => {
-                    invalid.extra_keys = Some(vec![rmpv::Value::from("unmodeled-namespace")]);
-                    DenseRejectionReason::ExtraKeys
-                }
                 "layout" => {
                     invalid.kv_cache_spec_kind = Some("sliding_attention".into());
                     DenseRejectionReason::Layout
@@ -920,15 +910,6 @@ mod tests {
                 "sliding-window" => {
                     invalid.kv_cache_spec_sliding_window = Some(8);
                     DenseRejectionReason::Layout
-                }
-                "unnamed-lora" => {
-                    invalid.lora_id = Some(7);
-                    DenseRejectionReason::Adapter
-                }
-                "empty-lora" => {
-                    invalid.lora_id = Some(1);
-                    invalid.lora_name = Some(String::new());
-                    DenseRejectionReason::Adapter
                 }
                 "token-count" => {
                     invalid.block_hashes.push(ExternalBlockHash::Int(3));
