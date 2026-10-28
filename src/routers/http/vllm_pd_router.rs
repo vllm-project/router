@@ -23,7 +23,7 @@ use axum::{
 };
 use futures_util::StreamExt;
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
@@ -781,13 +781,13 @@ impl VllmPDRouter {
     }
 
     /// Modify request for prefill stage (limit output to 1 token)
-    /// - For inference/v1/generate: patch sampling_params.max_tokens and sampling_params.min_tokens
+    /// - For generate endpoints: patch sampling_params.max_tokens and sampling_params.min_tokens
     /// - For /v1/responses: patch max_output_tokens (the only token-limit field for Responses API)
     /// - For other OpenAI endpoints (chat/completions): patch max_tokens, max_completion_tokens, min_tokens
     ///
     /// stream=false and stream_options removal are always applied at top level.
-    fn prepare_prefill_request(mut request: Value, path: &str) -> Value {
-        if path.contains("inference/v1/generate") {
+    fn prepare_prefill_request(mut request: Value, path: &str, typed_generate: bool) -> Value {
+        if typed_generate || path == "/inference/v1/generate" {
             // Generate API: max_tokens and min_tokens are in sampling_params
             if let Some(sampling_params) = request.get_mut("sampling_params") {
                 sampling_params["max_tokens"] = json!(1);
@@ -865,6 +865,8 @@ impl VllmPDRouter {
         request_json: Value,
         path: &str,
         headers: Option<&HeaderMap>,
+        model_id: Option<&str>,
+        generate: Option<&crate::protocols::spec::InferenceGenerateRequest>,
     ) -> Response {
         debug!("Processing vLLM request for path: {}", path);
         debug!(
@@ -873,8 +875,32 @@ impl VllmPDRouter {
         );
 
         // Get available instances from service discovery
-        let prefill_instances = self.service_registry.get_prefill_instances();
-        let decode_instances = self.service_registry.get_decode_instances();
+        let mut prefill_instances = self.service_registry.get_prefill_instances();
+        let mut decode_instances = self.service_registry.get_decode_instances();
+        if let Some(model) = model_id {
+            let workers = self.pd_router.worker_registry.get_by_model_fast(model);
+            let mut prefill_urls = HashSet::new();
+            let mut decode_urls = HashSet::new();
+            for worker in workers.iter().filter(|worker| worker.is_available()) {
+                let url = worker.base_url();
+                let address = url.strip_prefix("http://").unwrap_or(url);
+                match worker.worker_type() {
+                    WorkerType::Prefill { .. } => {
+                        prefill_urls.insert(address);
+                    }
+                    WorkerType::Decode => {
+                        decode_urls.insert(address);
+                    }
+                    _ => {}
+                }
+            }
+            prefill_instances.retain(|(url, _)| {
+                prefill_urls.contains(url.strip_prefix("http://").unwrap_or(url.as_str()))
+            });
+            decode_instances.retain(|(url, _)| {
+                decode_urls.contains(url.strip_prefix("http://").unwrap_or(url.as_str()))
+            });
+        }
 
         debug!(
             "Found {} prefill instances, {} decode instances from service discovery",
@@ -901,8 +927,14 @@ impl VllmPDRouter {
         let request_text = PolicyRequestText::new(
             prefill_policy.as_ref(),
             decode_policy.as_ref(),
-            || serde_json::to_string(&request_json).ok(),
-            || crate::protocols::spec::cache_routing::for_route(&request_json, path),
+            || match generate {
+                Some(body) => Some(body.extract_text_for_routing()),
+                None => serde_json::to_string(&request_json).ok(),
+            },
+            || match generate {
+                Some(body) => body.extract_cache_routing_key(),
+                None => crate::protocols::spec::cache_routing::for_route(&request_json, path),
+            },
         );
 
         let prefill_idx =
@@ -955,6 +987,7 @@ impl VllmPDRouter {
                 &decode_instances[decode_idx],
                 path,
                 headers,
+                generate.is_some(),
             )
             .await
         {
@@ -1025,6 +1058,7 @@ impl VllmPDRouter {
         decode_instance: &(String, String),
         path: &str,
         headers: Option<&HeaderMap>,
+        typed_generate: bool,
     ) -> Result<Response, String> {
         let (prefill_http, prefill_zmq) = prefill_instance;
         let (decode_http, decode_zmq) = decode_instance;
@@ -1046,7 +1080,8 @@ impl VllmPDRouter {
         // The P2P metadata will be sent in X-Request-Id header instead
 
         // Prepare prefill request (max_tokens=1 to force prefill-only mode)
-        let mut prefill_request = Self::prepare_prefill_request(request_json.clone(), path);
+        let mut prefill_request =
+            Self::prepare_prefill_request(request_json.clone(), path, typed_generate);
 
         // Generate a connector-specific transfer_id (None for NIXL)
         let transfer_id = self.generate_transfer_id();
@@ -1426,6 +1461,7 @@ impl VllmPDRouter {
         decode_worker: Arc<dyn Worker>,
         path: &str,
         headers: Option<&HeaderMap>,
+        typed_generate: bool,
     ) -> Result<Response, PDRouterError> {
         debug!("ENTERED process_vllm_two_stage_request method");
         let start_time = Instant::now();
@@ -1464,7 +1500,13 @@ impl VllmPDRouter {
         };
 
         if let Some((prefill_request, decode_request, request_id)) = self
-            .try_build_concurrent_requests(&original_request, &prefill_worker, &decode_worker, path)
+            .try_build_concurrent_requests(
+                &original_request,
+                &prefill_worker,
+                &decode_worker,
+                path,
+                typed_generate,
+            )
             .await
         {
             return self
@@ -1507,7 +1549,8 @@ impl VllmPDRouter {
         );
 
         // Stage 1: Prepare prefill request with max_tokens=1 and kv_transfer_params
-        let mut prefill_request = Self::prepare_prefill_request(original_request.clone(), path);
+        let mut prefill_request =
+            Self::prepare_prefill_request(original_request.clone(), path, typed_generate);
 
         // Generate a connector-specific transfer_id (None for NIXL)
         let transfer_id = self.generate_transfer_id();
@@ -1854,6 +1897,7 @@ impl VllmPDRouter {
         prefill_worker: &Arc<dyn Worker>,
         decode_worker: &Arc<dyn Worker>,
         path: &str,
+        typed_generate: bool,
     ) -> Option<(Value, Value, String)> {
         if !matches!(self.kv_connector, KvConnector::Nixl) {
             return None;
@@ -1869,7 +1913,8 @@ impl VllmPDRouter {
         let request_id = Self::generate_vllm_request_id(&prefill_zmq_addr, &decode_zmq_addr);
 
         let decode_base_url = decode_worker.base_url().to_string();
-        let mut prefill_request = Self::prepare_prefill_request(original_request.clone(), path);
+        let mut prefill_request =
+            Self::prepare_prefill_request(original_request.clone(), path, typed_generate);
         prefill_request["kv_transfer_params"] = self
             .build_prefill_kv_transfer_params(None, Some(&decode_base_url), decode_worker.dp_rank())
             .ok()?;
@@ -2320,7 +2365,18 @@ impl RouterTrait for VllmPDRouter {
         &self,
         headers: Option<&HeaderMap>,
         body: &crate::protocols::spec::InferenceGenerateRequest,
-        _model_id: Option<&str>,
+        model_id: Option<&str>,
+    ) -> Response {
+        self.route_inference_generate_path(headers, body, "/inference/v1/generate", model_id)
+            .await
+    }
+
+    async fn route_inference_generate_path(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &crate::protocols::spec::InferenceGenerateRequest,
+        path: &str,
+        model_id: Option<&str>,
     ) -> Response {
         let request_json = match serde_json::to_value(body) {
             Ok(json) => json,
@@ -2332,13 +2388,8 @@ impl RouterTrait for VllmPDRouter {
                     .into_response()
             }
         };
-        self.route_transparent(
-            headers,
-            "/inference/v1/generate",
-            &Method::POST,
-            request_json,
-        )
-        .await
+        self.route_transparent_with_context(headers, path, request_json, model_id, Some(body))
+            .await
     }
 
     // Override OpenAI-compatible routes for vLLM two-stage processing
@@ -2376,7 +2427,7 @@ impl RouterTrait for VllmPDRouter {
             };
 
             // Process vLLM two-stage request with service discovery
-            self.process_vllm_request(request_json, "/v1/chat/completions", headers)
+            self.process_vllm_request(request_json, "/v1/chat/completions", headers, None, None)
                 .await
         } else {
             // Direct URL mode - implement routing logic here (not delegating to PdRouterBase)
@@ -2496,6 +2547,7 @@ impl RouterTrait for VllmPDRouter {
                     decode_worker.clone(),
                     "/v1/chat/completions",
                     headers,
+                    false,
                 )
                 .await
             {
@@ -2550,7 +2602,7 @@ impl RouterTrait for VllmPDRouter {
             };
 
             // Process vLLM two-stage request with service discovery
-            self.process_vllm_request(request_json, "/v1/completions", headers)
+            self.process_vllm_request(request_json, "/v1/completions", headers, None, None)
                 .await
         } else {
             // Direct URL mode - implement routing logic here (not delegating to PdRouterBase)
@@ -2670,6 +2722,7 @@ impl RouterTrait for VllmPDRouter {
                     decode_worker.clone(),
                     "/v1/completions",
                     headers,
+                    false,
                 )
                 .await
             {
@@ -2783,29 +2836,41 @@ impl RouterTrait for VllmPDRouter {
                 .into_response();
         }
 
-        debug!(
-            "Transparent proxy: routing {} {} through P/D pipeline",
-            method, path
-        );
+        self.route_transparent_with_context(headers, path, body, None, None)
+            .await
+    }
+}
 
-        // Body is already a serde_json::Value, use it directly
-        let request_json = body;
+impl VllmPDRouter {
+    async fn route_transparent_with_context(
+        &self,
+        headers: Option<&HeaderMap>,
+        path: &str,
+        request_json: Value,
+        model_id: Option<&str>,
+        generate: Option<&crate::protocols::spec::InferenceGenerateRequest>,
+    ) -> Response {
+        debug!(
+            "Transparent proxy: routing POST {} through P/D pipeline",
+            path
+        );
 
         if self.use_discovery {
             // Discovery mode - use vLLM-specific two-stage processing
-            self.process_vllm_request(request_json, path, headers).await
+            self.process_vllm_request(request_json, path, headers, model_id, generate)
+                .await
         } else {
             // Direct URL mode - use worker registry, filtered by availability
             let all_prefill = self.pd_router.worker_registry.get_prefill_workers();
             let prefill_workers: Vec<Arc<dyn Worker>> = all_prefill
                 .iter()
-                .filter(|w| w.is_available())
+                .filter(|w| w.is_available() && model_id.is_none_or(|model| w.model_id() == model))
                 .cloned()
                 .collect();
             let all_decode = self.pd_router.worker_registry.get_decode_workers();
             let decode_workers: Vec<Arc<dyn Worker>> = all_decode
                 .iter()
-                .filter(|w| w.is_available())
+                .filter(|w| w.is_available() && model_id.is_none_or(|model| w.model_id() == model))
                 .cloned()
                 .collect();
 
@@ -2828,8 +2893,14 @@ impl RouterTrait for VllmPDRouter {
             let request_text = PolicyRequestText::new(
                 prefill_policy.as_ref(),
                 decode_policy.as_ref(),
-                || serde_json::to_string(&request_json).ok(),
-                || crate::protocols::spec::cache_routing::for_route(&request_json, path),
+                || match generate {
+                    Some(body) => Some(body.extract_text_for_routing()),
+                    None => serde_json::to_string(&request_json).ok(),
+                },
+                || match generate {
+                    Some(body) => body.extract_cache_routing_key(),
+                    None => crate::protocols::spec::cache_routing::for_route(&request_json, path),
+                },
             );
             let request_headers: Option<HashMap<String, String>> = headers.map(|h| {
                 h.iter()
@@ -2892,6 +2963,7 @@ impl RouterTrait for VllmPDRouter {
                     decode_worker.clone(),
                     path,
                     headers,
+                    generate.is_some(),
                 )
                 .await
             {
@@ -2934,6 +3006,285 @@ impl WorkerManagement for VllmPDRouter {
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use super::*;
+    use crate::policies::RequestHeaders;
+    use crate::protocols::spec::{
+        ChatCompletionRequest, CompletionRequest, InferenceGenerateRequest,
+    };
+    use crate::routers::router_manager::{RouterId, RouterManager};
+
+    #[derive(Debug)]
+    struct Selection {
+        worker_urls: Vec<String>,
+        text: Option<String>,
+    }
+
+    #[derive(Debug, Default)]
+    struct RecordingPolicy {
+        selections: std::sync::Mutex<Vec<Selection>>,
+        select_worker: bool,
+        cache: bool,
+    }
+
+    impl LoadBalancingPolicy for RecordingPolicy {
+        fn select_worker_with_headers(
+            &self,
+            workers: &[Arc<dyn Worker>],
+            request_text: Option<&str>,
+            _headers: Option<&RequestHeaders>,
+        ) -> Option<usize> {
+            self.selections.lock().unwrap().push(Selection {
+                worker_urls: workers
+                    .iter()
+                    .map(|worker| worker.url().to_owned())
+                    .collect(),
+                text: request_text.map(str::to_owned),
+            });
+            self.select_worker.then_some(0)
+        }
+
+        fn name(&self) -> &'static str {
+            if self.cache {
+                "cache_aware"
+            } else {
+                "recording"
+            }
+        }
+
+        fn needs_request_text(&self) -> bool {
+            true
+        }
+
+        fn needs_cache_routing_key(&self) -> bool {
+            self.cache
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    fn recording_router(
+        discovery: bool,
+        cache: bool,
+    ) -> (VllmPDRouter, Arc<RecordingPolicy>, Arc<RecordingPolicy>) {
+        let prefill = Arc::new(RecordingPolicy {
+            select_worker: true,
+            cache,
+            ..Default::default()
+        });
+        // Stop after both policy selections, before dispatching any HTTP requests.
+        let decode = Arc::new(RecordingPolicy {
+            cache,
+            ..Default::default()
+        });
+        let policies = Arc::new(PolicyRegistry::new(crate::config::PolicyConfig::Random));
+        policies.set_prefill_policy(prefill.clone());
+        policies.set_decode_policy(decode.clone());
+        let (_, worker_loads) = tokio::sync::watch::channel(HashMap::new());
+        let client = reqwest::Client::new();
+        let router = VllmPDRouter {
+            epd: None,
+            pd_router: PdRouterBase {
+                worker_registry: Arc::new(crate::core::WorkerRegistry::new()),
+                policy_registry: policies.clone(),
+                worker_startup_timeout_secs: 1,
+                worker_startup_check_interval_secs: 1,
+                worker_loads: Arc::new(worker_loads),
+                load_monitor_handle: None,
+                client: client.clone(),
+                circuit_breaker_config: crate::core::CircuitBreakerConfig::default(),
+                dp_size: 1,
+            },
+            decode_selection: SelectionContext::default(),
+            service_registry: Arc::new(ServiceRegistry::new()),
+            http_client: client,
+            policy_registry: policies,
+            use_discovery: discovery,
+            enable_profiling: false,
+            profile_timeout_secs: 1,
+            profiling_tasks: Arc::new(Mutex::new(HashMap::new())),
+            intra_node_data_parallel_size: 1,
+            prefill_dp_round_robin: Arc::new(AtomicUsize::new(0)),
+            kv_connector: KvConnector::Nixl,
+            mooncake_prefill_info: Arc::new(Mutex::new(HashMap::new())),
+            nixl_prefill_info: RwLock::new(HashMap::new()),
+        };
+        (router, prefill, decode)
+    }
+
+    fn register_model_pair(router: &VllmPDRouter, model: &str) {
+        for (role, worker_type, service_type) in [
+            (
+                "prefill",
+                WorkerType::Prefill {
+                    bootstrap_port: None,
+                },
+                ServiceType::Prefill,
+            ),
+            ("decode", WorkerType::Decode, ServiceType::Decode),
+        ] {
+            let address = format!("{model}-{role}:8000");
+            let worker = BasicWorker::new(format!("http://{address}"), worker_type)
+                .with_labels(HashMap::from([("model_id".into(), model.into())]));
+            router.pd_router.worker_registry.register(Arc::new(worker));
+            router.service_registry.register_service(
+                address,
+                format!("zmq-{model}-{role}"),
+                service_type,
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_generate_routes_preserve_model_and_token_policy_context() {
+        for (discovery, cache) in [(false, false), (true, false), (false, true), (true, true)] {
+            let (router, prefill, decode) = recording_router(discovery, cache);
+            register_model_pair(&router, "model-a");
+            register_model_pair(&router, "model-b");
+            let manager = RouterManager::new(
+                crate::config::RouterConfig::default(),
+                reqwest::Client::new(),
+                router.pd_router.worker_registry.clone(),
+                router.policy_registry.clone(),
+            );
+            manager.register_router(RouterId::new("http-pd".into()), Arc::new(router));
+
+            for (path, seed) in [
+                ("/inference/v1/generate", 1),
+                ("/inference/v1/generate", 2),
+                ("/custom/v1/generate", 1),
+                ("/custom/v1/generate", 2),
+            ] {
+                let body: InferenceGenerateRequest = serde_json::from_value(json!({
+                    "model": "model-b", "token_ids": [123, 456],
+                    "sampling_params": {"seed": seed}, "request_id": format!("request-{seed}"),
+                    "prompt": format!("extension-{seed}"),
+                    "session_params": {"session_id": format!("unrelated-{seed}")}
+                }))
+                .unwrap();
+                let response = if path == "/inference/v1/generate" {
+                    manager.route_inference_generate(None, &body, None).await
+                } else {
+                    manager
+                        .route_inference_generate_path(None, &body, path, None)
+                        .await
+                };
+                assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            }
+
+            for (role, policy) in [("prefill", prefill), ("decode", decode)] {
+                let selections = policy.selections.lock().unwrap();
+                assert_eq!(selections.len(), 4);
+                for selection in selections.iter() {
+                    assert_eq!(
+                        selection.worker_urls,
+                        [format!("http://model-b-{role}:8000")]
+                    );
+                    let expected = if cache {
+                        crate::protocols::spec::cache_routing::tokens(&[123, 456])
+                    } else {
+                        "123 456".to_string()
+                    };
+                    assert_eq!(selection.text.as_deref(), Some(expected.as_str()));
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_custom_generate_uses_token_policy_context_without_model_scope() {
+        for discovery in [false, true] {
+            let (router, prefill, decode) = recording_router(discovery, false);
+            register_model_pair(&router, "model-a");
+            for seed in [1, 2] {
+                let body: InferenceGenerateRequest = serde_json::from_value(json!({
+                    "token_ids": [123, 456], "sampling_params": {"seed": seed},
+                    "request_id": format!("request-{seed}")
+                }))
+                .unwrap();
+                let response = router
+                    .route_inference_generate_path(None, &body, "/custom/v1/generate", None)
+                    .await;
+                assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            }
+            for policy in [prefill, decode] {
+                let selections = policy.selections.lock().unwrap();
+                assert_eq!(selections.len(), 2);
+                assert!(selections
+                    .iter()
+                    .all(|selection| selection.text.as_deref() == Some("123 456")));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_custom_generate_rejects_unknown_model_in_both_pools() {
+        for discovery in [false, true] {
+            let (router, prefill, decode) = recording_router(discovery, false);
+            register_model_pair(&router, "model-a");
+            let body: InferenceGenerateRequest = serde_json::from_value(json!({
+                "model": "unknown-model", "token_ids": [123]
+            }))
+            .unwrap();
+            let response = router
+                .route_inference_generate_path(
+                    None,
+                    &body,
+                    "/custom/v1/generate",
+                    Some("unknown-model"),
+                )
+                .await;
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert!(prefill.selections.lock().unwrap().is_empty());
+            assert!(decode.selections.lock().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_custom_generate_discovery_requires_metadata_only_for_model_scope() {
+        for model in [None, Some("model-a")] {
+            let (router, prefill, decode) = recording_router(true, false);
+            for (role, service_type) in [
+                ("prefill", ServiceType::Prefill),
+                ("decode", ServiceType::Decode),
+            ] {
+                router.service_registry.register_service(
+                    format!("model-a-{role}:8000"),
+                    format!("zmq-{role}"),
+                    service_type,
+                );
+            }
+            let body: InferenceGenerateRequest =
+                serde_json::from_value(json!({"token_ids": [123]})).unwrap();
+            let response = router
+                .route_inference_generate_path(None, &body, "/custom/v1/generate", model)
+                .await;
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            for policy in [prefill, decode] {
+                assert_eq!(
+                    policy.selections.lock().unwrap().len(),
+                    usize::from(model.is_none())
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_prefill_additional_generate_path_patches_sampling_params() {
+        let request = json!({
+            "token_ids": [123, 456],
+            "sampling_params": {
+                "max_tokens": 512,
+                "min_tokens": 50,
+                "temperature": 0.7
+            }
+        });
+        let result = VllmPDRouter::prepare_prefill_request(request, "/custom/v1/generate", true);
+        assert_eq!(result["sampling_params"]["max_tokens"], 1);
+        assert_eq!(result["sampling_params"]["min_tokens"], 1);
+        assert_eq!(result["sampling_params"]["temperature"], 0.7);
+        assert!(result.get("max_tokens").is_none());
+    }
 
     fn test_vllm_pd_router() -> VllmPDRouter {
         let worker_registry = Arc::new(crate::core::WorkerRegistry::new());
@@ -4054,6 +4405,25 @@ mod tests {
     // --- OpenAI-style endpoint tests (chat/completions, completions) ---
 
     #[test]
+    fn test_prefill_unregistered_paths_with_token_ids_preserve_route_limits() {
+        for path in ["/custom/proxy", "/v1/responses/response-id/cancel"] {
+            let request = json!({
+                "token_ids": [123],
+                "max_tokens": 512,
+                "max_output_tokens": 512
+            });
+            let result = VllmPDRouter::prepare_prefill_request(request, path, false);
+            let limit = if path.starts_with("/v1/responses/") {
+                "max_output_tokens"
+            } else {
+                "max_tokens"
+            };
+            assert_eq!(result[limit], 1, "{path}");
+            assert!(result.get("sampling_params").is_none(), "{path}");
+        }
+    }
+
+    #[test]
     fn test_prefill_chat_completion_sets_max_tokens_1() {
         let request = json!({
             "model": "test",
@@ -4061,7 +4431,7 @@ mod tests {
             "max_tokens": 512,
             "stream": true
         });
-        let result = VllmPDRouter::prepare_prefill_request(request, "/v1/chat/completions");
+        let result = VllmPDRouter::prepare_prefill_request(request, "/v1/chat/completions", false);
         assert_eq!(result["max_tokens"], 1);
         assert_eq!(result["min_tokens"], 1);
         assert_eq!(result["stream"], false);
@@ -4069,27 +4439,48 @@ mod tests {
 
     #[test]
     fn test_prefill_chat_completion_sets_max_completion_tokens_1() {
-        let request = json!({
-            "model": "test",
-            "messages": [{"role": "user", "content": "hi"}],
-            "max_tokens": 512,
-            "max_completion_tokens": 256
-        });
-        let result = VllmPDRouter::prepare_prefill_request(request, "/v1/chat/completions");
-        assert_eq!(result["max_tokens"], 1);
-        assert_eq!(result["max_completion_tokens"], 1);
+        for token_ids in [None, Some(json!([123, 456]))] {
+            let mut request = json!({
+                "model": "test",
+                "messages": [{"role": "user", "content": "hi"}],
+                "max_tokens": 512,
+                "max_completion_tokens": 256
+            });
+            if let Some(token_ids) = token_ids {
+                request["token_ids"] = token_ids;
+            }
+            let request: ChatCompletionRequest = serde_json::from_value(request).unwrap();
+            let result = VllmPDRouter::prepare_prefill_request(
+                serde_json::to_value(request).unwrap(),
+                "/v1/chat/completions",
+                false,
+            );
+            assert_eq!(result["max_tokens"], 1);
+            assert_eq!(result["max_completion_tokens"], 1);
+        }
     }
 
     #[test]
     fn test_prefill_chat_completion_clamps_min_tokens() {
-        let request = json!({
-            "model": "test",
-            "max_tokens": 512,
-            "min_tokens": 100
-        });
-        let result = VllmPDRouter::prepare_prefill_request(request, "/v1/completions");
-        assert_eq!(result["max_tokens"], 1);
-        assert_eq!(result["min_tokens"], 1);
+        for token_ids in [None, Some(json!([123, 456]))] {
+            let mut request = json!({
+                "model": "test",
+                "prompt": "hi",
+                "max_tokens": 512,
+                "min_tokens": 100
+            });
+            if let Some(token_ids) = token_ids {
+                request["token_ids"] = token_ids;
+            }
+            let request: CompletionRequest = serde_json::from_value(request).unwrap();
+            let result = VllmPDRouter::prepare_prefill_request(
+                serde_json::to_value(request).unwrap(),
+                "/v1/completions",
+                false,
+            );
+            assert_eq!(result["max_tokens"], 1);
+            assert_eq!(result["min_tokens"], 1);
+        }
     }
 
     #[test]
@@ -4099,7 +4490,7 @@ mod tests {
             "max_tokens": 512,
             "min_tokens": 0
         });
-        let result = VllmPDRouter::prepare_prefill_request(request, "/v1/completions");
+        let result = VllmPDRouter::prepare_prefill_request(request, "/v1/completions", false);
         assert_eq!(result["max_tokens"], 1);
         assert_eq!(result["min_tokens"], 1);
     }
@@ -4112,7 +4503,7 @@ mod tests {
             "stream": true,
             "stream_options": {"include_usage": true}
         });
-        let result = VllmPDRouter::prepare_prefill_request(request, "/v1/chat/completions");
+        let result = VllmPDRouter::prepare_prefill_request(request, "/v1/chat/completions", false);
         assert_eq!(result["stream"], false);
         assert!(result.get("stream_options").is_none());
     }
@@ -4127,7 +4518,7 @@ mod tests {
             "max_output_tokens": 1024,
             "stream": true
         });
-        let result = VllmPDRouter::prepare_prefill_request(request, "/v1/responses");
+        let result = VllmPDRouter::prepare_prefill_request(request, "/v1/responses", false);
         assert_eq!(result["max_output_tokens"], 1);
         // Responses API doesn't use max_tokens, so it should not be injected
         assert!(result.get("max_tokens").is_none());
@@ -4141,7 +4532,7 @@ mod tests {
             "input": "Hello",
             "stream": false
         });
-        let result = VllmPDRouter::prepare_prefill_request(request, "/v1/responses");
+        let result = VllmPDRouter::prepare_prefill_request(request, "/v1/responses", false);
         // For /v1/responses, max_output_tokens should always be forced to 1
         assert_eq!(result["max_output_tokens"], 1);
         // Responses API doesn't use max_tokens, so it should not be injected
@@ -4160,7 +4551,8 @@ mod tests {
                 "temperature": 0.7
             }
         });
-        let result = VllmPDRouter::prepare_prefill_request(request, "/inference/v1/generate");
+        let result =
+            VllmPDRouter::prepare_prefill_request(request, "/inference/v1/generate", false);
         // sampling_params.max_tokens should be capped
         assert_eq!(result["sampling_params"]["max_tokens"], 1);
         // Inject min_tokens when sampling_params is present but omits it.
@@ -4180,7 +4572,8 @@ mod tests {
                 "min_tokens": 50
             }
         });
-        let result = VllmPDRouter::prepare_prefill_request(request, "/inference/v1/generate");
+        let result =
+            VllmPDRouter::prepare_prefill_request(request, "/inference/v1/generate", false);
         assert_eq!(result["sampling_params"]["max_tokens"], 1);
         assert_eq!(result["sampling_params"]["min_tokens"], 1);
     }
@@ -4191,7 +4584,8 @@ mod tests {
         let request = json!({
             "token_ids": [123, 456],
         });
-        let result = VllmPDRouter::prepare_prefill_request(request, "/inference/v1/generate");
+        let result =
+            VllmPDRouter::prepare_prefill_request(request, "/inference/v1/generate", false);
         // stream should still be forced to false
         assert_eq!(result["stream"], false);
         // top-level max_tokens should NOT be set (generate path)
@@ -4209,7 +4603,8 @@ mod tests {
             "stream": true,
             "stream_options": {"include_usage": true}
         });
-        let result = VllmPDRouter::prepare_prefill_request(request, "/inference/v1/generate");
+        let result =
+            VllmPDRouter::prepare_prefill_request(request, "/inference/v1/generate", false);
         assert_eq!(result["stream"], false);
         assert!(result.get("stream_options").is_none());
     }

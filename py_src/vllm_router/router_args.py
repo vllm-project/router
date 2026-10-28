@@ -5,6 +5,31 @@ from typing import Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
+_RESERVED_GENERATE_PATHS = {
+    "/generate",
+    "/inference/v1/generate",
+    "/v1/chat/completions",
+    "/v1/completions",
+    "/rerank",
+    "/v1/rerank",
+    "/v1/responses",
+    "/v1/embeddings",
+    "/liveness",
+    "/readiness",
+    "/health",
+    "/health_generate",
+    "/v1/models",
+    "/get_model_info",
+    "/get_server_info",
+    "/add_worker",
+    "/remove_worker",
+    "/list_workers",
+    "/flush_cache",
+    "/get_loads",
+    "/scheduling/diagnostics",
+    "/workers",
+}
+
 
 @dataclasses.dataclass
 class RouterArgs:
@@ -102,6 +127,8 @@ class RouterArgs:
     cb_timeout_duration_secs: int = 60
     cb_window_duration_secs: int = 120
     disable_circuit_breaker: bool = False
+    # Additional typed inference-generate routes
+    extra_generate_paths: List[str] = dataclasses.field(default_factory=list)
 
     @staticmethod
     def add_cli_args(
@@ -140,6 +167,16 @@ class RouterArgs:
             nargs="*",
             default=[],
             help="List of worker URLs (e.g., http://worker1:8000 http://worker2:8000)",
+        )
+        parser.add_argument(
+            f"--{prefix}extra-generate-paths",
+            type=str,
+            nargs="*",
+            default=[],
+            help=(
+                "Additional HTTP paths using the inference-generate request schema. "
+                "Built-in routes and the /v1/responses/ and /workers/ prefixes are reserved."
+            ),
         )
 
         parser.add_argument(
@@ -628,6 +665,19 @@ class RouterArgs:
         return cls(**args_dict)
 
     def _validate_router_args(self):
+        if len(set(self.extra_generate_paths)) != len(self.extra_generate_paths):
+            raise ValueError("extra_generate_paths must not contain duplicates")
+        for path in self.extra_generate_paths:
+            if (
+                len(path) < 2
+                or not path.startswith("/")
+                or any(character in path for character in "?#{}*")
+                or any(segment.startswith(":") for segment in path.split("/"))
+                or path in _RESERVED_GENERATE_PATHS
+                or path.startswith(("/v1/responses/", "/workers/"))
+            ):
+                raise ValueError(f"invalid or conflicting extra generate path: {path}")
+
         if self.kv_aware_session_affinity_ttl_secs is not None and not (
             1 <= self.kv_aware_session_affinity_ttl_secs <= 31_536_000
         ):

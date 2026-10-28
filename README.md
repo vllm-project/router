@@ -82,6 +82,30 @@ vllm-router \
     --intra-node-data-parallel-size 8
 ```
 
+#### Additional Generate Paths
+
+Register extension endpoints that use the `/inference/v1/generate` request
+schema. Configured paths use typed request handling and active-load accounting.
+Regular routing also applies the configured retries and circuit breaking. PD
+routing uses the existing two-stage dispatch, which does not add coordinated
+retries or record dispatch outcomes for circuit breaking. Built-in routes keep
+their existing handlers. Workers must expose the configured paths.
+
+Custom PD routes use token IDs as policy input and preserve model selection
+when IGW is enabled. In discovery mode, model-scoped requests require matching
+model and worker-role metadata in the worker registry. They return 503 when no
+matching prefill or decode worker is registered.
+
+Rust embedders must set `ServerConfig.extra_generate_paths`. Use an empty vector
+to keep only the built-in typed routes.
+
+```bash
+vllm-router \
+  --worker-urls http://worker1:8000 http://worker2:8000 \
+  --policy cache_aware \
+  --extra-generate-paths /custom/v1/generate
+```
+
 #### Optional WASM OnRequest middleware
 
 Load an independently built WASM Component plugin (see `examples/wasm_middleware/` and [RFC #236](https://github.com/vllm-project/router/issues/236)). By default it attaches only to `POST /v1/chat/completions` and fails closed on plugin errors:

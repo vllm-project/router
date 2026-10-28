@@ -119,6 +119,11 @@ struct CliArgs {
     #[arg(long, num_args = 0..)]
     worker_urls: Vec<String>,
 
+    /// Additional HTTP paths using the inference-generate request schema
+    /// Built-in routes and the /v1/responses/ and /workers/ prefixes are reserved.
+    #[arg(long, num_args = 0..)]
+    extra_generate_paths: Vec<String>,
+
     /// Load balancing policy to use. kv_aware is supported only in regular mode, not PD disaggregation.
     #[arg(long, default_value = "cache_aware", value_parser = ["random", "round_robin", "cache_aware", "kv_aware", "power_of_two", "consistent_hash", "rendezvous_hash"])]
     policy: String,
@@ -700,6 +705,7 @@ impl CliArgs {
             port: self.port,
             router_config,
             max_payload_size: self.max_payload_size,
+            extra_generate_paths: self.extra_generate_paths.clone(),
             wasm_middleware: self.wasm_middleware.clone(),
             wasm_middleware_sha256: self.wasm_middleware_sha256.clone(),
             wasm_middleware_routes: self.wasm_middleware_routes.clone(),
