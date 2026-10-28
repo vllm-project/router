@@ -31,7 +31,7 @@ class Router:
             - PolicyType.Random: Randomly select workers
             - PolicyType.RoundRobin: Distribute requests in round-robin fashion
             - PolicyType.CacheAware: Distribute requests based on cache state and load balance
-            - PolicyType.KvAware: Select by held KV segments and live load (regular mode only)
+            - PolicyType.KvAware: KV/load selection, with stage-specific load profiles in PD mode
             - PolicyType.PowerOfTwo: Select best of two random workers based on load (PD mode only)
         host: Host address to bind the router server. Default: '127.0.0.1'
         port: Port number to bind the router server. Default: 3001
@@ -81,6 +81,11 @@ class Router:
         kv_penalty_host: Host-tier transfer credit for kv_aware. Default: 0.8
         kv_penalty_external: External-tier transfer credit for kv_aware. Default: 0.6
         kv_penalty_disk: Disk-tier transfer credit for kv_aware. Default: 0.3
+        kv_aware_session_affinity_ttl_secs: Idle TTL in seconds for kv_aware session
+            affinity (1-31536000). None disables affinity. Default: None
+        pd_kv_events: Static prefill KV sources as URL=ENDPOINT[,ENDPOINT...],
+            one entry per worker. Endpoints are ordered by DP rank; block size is 16.
+            Requires PD mode and a kv_aware prefill policy. Default: []
         request_id_headers: List of HTTP headers to check for request IDs. If not specified,
             uses common defaults: ['x-request-id', 'x-correlation-id', 'x-trace-id', 'request-id'].
             Example: ['x-my-request-id', 'x-custom-trace-id']. Default: None

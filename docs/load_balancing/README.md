@@ -14,7 +14,7 @@ the policy is the same for `grpc://host:port`.
 | `consistent_hash` | Multi-turn conversations, KV cache reuse | Yes | No |
 | `power_of_two` | Load-sensitive workloads | No | Yes |
 | `cache_aware` | Prefix caching optimization | Yes (cache-based) | Yes |
-| `kv_aware` | Tiered KV reuse and live-load scoring | No | Yes |
+| `kv_aware` | KV reuse and stage-aware load scoring | No | Yes |
 
 ---
 
@@ -244,22 +244,40 @@ Trees are trimmed to `max_tree_size` during periodic eviction and may grow beyon
 
 ## KV Aware
 
-`kv_aware` balances requests using reusable KV blocks and current worker load. Use it for workloads with repeated prompt prefixes. It supports regular HTTP or [gRPC](../backend/grpc.md) worker pools; PD disaggregation is not supported.
+`kv_aware` uses KV cache reuse and worker load to route requests. It suits workloads with repeated prompt prefixes and supports HTTP, [gRPC](../backend/grpc.md), and HTTP P/D disaggregation.
 
 ```bash
 vllm-router --policy kv_aware \
   --worker-urls grpc://worker1:8000 grpc://worker2:8000
 ```
 
-Workers must publish KV events. If discovery is unavailable, supply `--kv-event-source WORKER_URL=tcp://HOST:PORT` per worker, with matching `--kv-event-model` and `--kv-event-block-size`. HTTP text requests need a render endpoint or, for simple prompts, `/tokenize`. Without usable KV information, requests are routed by load.
+Enable KV events on the workers. HTTP text requests also need a render endpoint or, for simple prompts, `/tokenize`. Without usable KV information, routing falls back to load.
 
-`--router-temperature 0` selects the lowest-cost worker; positive values spread requests probabilistically.
+For regular pools without event discovery, configure `--kv-event-source WORKER_URL=tcp://HOST:PORT` per worker, plus matching `--kv-event-model` and `--kv-event-block-size`.
+
+### P/D disaggregation
+
+```bash
+vllm-router --vllm-pd-disaggregation \
+  --prefill http://prefill:8000 --decode http://decode:8000 \
+  --prefill-policy kv_aware --decode-policy kv_aware
+```
+
+Prefill selection considers reusable KV and current work. Decode selection favors the least busy worker. Both stages inherit `--policy` unless overridden.
+
+Configure the engines' P/D connector and enable prefix caching and KV events on prefill workers. For native Python vLLM metadata discovery, set `VLLM_SERVER_DEV_MODE=1`.
+
+If event discovery is unavailable, add `--pd-kv-events http://prefill:8000=tcp://prefill:5557` for each prefill worker.
 
 ### Session affinity
 
-Affinity is off by default. Add `--kv-aware-session-affinity-ttl-secs 1800` for a 30-minute idle timeout. Send the same `session_params.session_id` or `x-session-id` header on each request. Agent metadata (`vllm_xargs.agentic_context`, `agent_hint`) and framework session headers take precedence when present.
+Affinity is off by default. Add `--kv-aware-session-affinity-ttl-secs 1800` to retain bindings for 30 minutes of inactivity.
 
-Affinity can improve multi-turn cache reuse but may increase waiting time on a busy worker. Unavailable workers trigger fresh selection. Bindings are local to each router, so multiple router replicas need ingress stickiness.
+Send the same `x-session-id` header or `session_params.session_id` on each turn; agent metadata and framework session headers take precedence.
+
+In P/D mode, affinity applies only to decode. A busy decoder may be replaced by a less busy one; prefill is selected independently for each request.
+
+Multiple router replicas need ingress stickiness to preserve affinity.
 
 ---
 
@@ -319,4 +337,4 @@ vllm-router \
 
 This allows optimizing each stage independently:
 - **Prefill**: Use `consistent_hash` for cache locality
-- **Decode**: Use `round_robin` or `power_of_two` for load distribution
+- **Decode**: Inherits the main policy; override with `--decode-policy` (for example `round_robin`)
