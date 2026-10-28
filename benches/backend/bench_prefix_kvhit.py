@@ -446,6 +446,10 @@ def run_prefix_kvhit_wave(
     user = _resolve_user_text(settings)
     do_warmup = settings["warmup"] if warmup is None else warmup
     miss_user, hit_user = make_bodies(hit_rate, user)
+    miss_messages, hit_messages = user_messages(miss_user), user_messages(hit_user)
+    wave_messages = [
+        user_messages(body) for body in make_wave_bodies(hit_rate, user, requests)
+    ]
     result: dict[str, Any] = {
         "router": settings["router_url"],
         "model": settings["model"],
@@ -458,14 +462,14 @@ def run_prefix_kvhit_wave(
             "miss": post_chat(
                 settings["router_url"],
                 settings["model"],
-                miss_user,
+                miss_messages,
                 settings["max_tokens"],
                 settings["timeout"],
             ),
             "hit": post_chat(
                 settings["router_url"],
                 settings["model"],
-                hit_user,
+                hit_messages,
                 settings["max_tokens"],
                 settings["timeout"],
             ),
@@ -473,7 +477,7 @@ def run_prefix_kvhit_wave(
     result["wave"] = post_hit_wave(
         settings["router_url"],
         settings["model"],
-        make_wave_bodies(hit_rate, user, requests),
+        wave_messages,
         settings["max_tokens"],
         settings["timeout"],
         concurrency,
