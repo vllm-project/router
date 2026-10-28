@@ -213,7 +213,7 @@ docker network rm vllm_pd_test_network
 
 ## CI/CD Integration
 
-These tests are integrated into the Buildkite pipeline. See `.buildkite/pipeline.yml` for the CI configuration.
+These tests are integrated into the Buildkite pipeline. L1 runs one completion from `.buildkite/test-ready.yml`. Full GSM8K runs from `.buildkite/test-nightly.yml`.
 
 The tests run on a 4-GPU (L4) queue with a 30-minute timeout:
 - Uses Llama-3.2-1B-Instruct (fits well on L4 GPUs)

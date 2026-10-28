@@ -1,0 +1,125 @@
+# L1 ready (https://github.com/vllm-project/router/issues/273).
+# pipeline.yml uploads this file when a non-default branch has the ready label.
+# CPU tests have no extra if. The NVIDIA smoke skips
+# when ROCM_ONLY=1, because a skipped image-build is treated as satisfied.
+# Full GSM8K is test-nightly.yml.
+# tests/python/e2e stays ignored here; regular-router, embeddings, and
+# test_pd_router.py are not wired to a GPU lane in this split.
+
+env:
+  RUST_IMAGE: "rust:1.95.0-bookworm"
+  # Pin the ROCm nightly used by the MoRI lane so dependency changes are explicit.
+  ROCM_VLLM_IMAGE: "vllm/vllm-openai-rocm:nightly@sha256:d22922d540810d90c5a3eafe91d3b4a62c2b881f3e990d0b7180b2875a5d176d"
+  # Disable incremental compilation for consistent CI builds
+  CARGO_INCREMENTAL: "0"
+  # Enable full Rust backtraces for debugging
+  RUST_BACKTRACE: "1"
+
+
+steps:
+  # ============================================================================
+  # Tests - Run comprehensive test suite
+  # ============================================================================
+  - group: ":test_tube: Tests"
+    key: "tests"
+    depends_on: "upload-ready-pipeline"
+    steps:
+      - label: ":rust: Rust Unit Tests"
+        plugins:
+          - docker#v5.11.0:
+              image: "$RUST_IMAGE"
+              workdir: /workdir
+              volumes:
+                - ".:/workdir"
+              environment:
+                - "CARGO_INCREMENTAL=0"
+                - "RUST_BACKTRACE=1"
+              command:
+                - bash
+                - -c
+                - |
+                  bash .buildkite/scripts/install_packages.sh rust
+                  cargo test --features cpu,ready --lib --bins
+        agents:
+          queue: "medium_cpu_queue_premerge"
+
+      - label: ":rust: Rust Integration Tests"
+        plugins:
+          - docker#v5.11.0:
+              image: "$RUST_IMAGE"
+              workdir: /workdir
+              volumes:
+                - ".:/workdir"
+              environment:
+                - "CARGO_INCREMENTAL=0"
+                - "RUST_BACKTRACE=1"
+              command:
+                - bash
+                - -c
+                - |
+                  bash .buildkite/scripts/install_packages.sh rust
+                  cargo test --features cpu,ready --test '*'
+        agents:
+          queue: "medium_cpu_queue_premerge"
+
+      - label: ":python: Python Tests"
+        plugins:
+          - docker#v5.11.0:
+              image: "$RUST_IMAGE"
+              workdir: /workdir
+              volumes:
+                - ".:/workdir"
+              environment:
+                - "CARGO_INCREMENTAL=0"
+                - "RUST_BACKTRACE=1"
+              mount-buildkite-agent: true
+              command:
+                - bash
+                - -c
+                - |
+                  source .buildkite/scripts/install_packages.sh python
+                  pytest tests/python/ -v --ignore=tests/python/e2e -m "ready and cpu" --cov=vllm_router --cov-report=xml --cov-report=term
+        artifact_paths:
+          - "coverage.xml"
+        agents:
+          queue: "medium_cpu_queue_premerge"
+
+  # ============================================================================
+  # L1 P/D smoke — one /v1/completions on EKS l4-k8s (4x L4).
+  # /health and /v1/models run inside test_pd_accuracy.py.
+  # Full GSM8K is test-nightly.yml.
+  # ============================================================================
+  - label: ":satellite: P/D Disaggregation Smoke (4 GPUs)"
+    key: "pd-disagg-smoke"
+    # image-build is skipped when ROCM_ONLY=1. A skipped dependency is treated
+    # as satisfied, so this smoke must use the same condition or it will pull
+    # an image that was never pushed.
+    if: build.env("ROCM_ONLY") != "1"
+    timeout_in_minutes: 60
+    retry:
+      automatic:
+        - exit_status: "*"
+          limit: 2
+      manual:
+        allowed: true
+        reason: "GPU tests can be flaky - retry if needed"
+    mirror_hardwares: l4_4
+    # agent-stack-k8s invokes the step with /bin/sh. Dash rejects
+    # `set -o pipefail`, so run the job body under bash.
+    command: |
+      bash <<'BASH'
+      set -euo pipefail
+
+      # vLLM, NIXL, lm-eval, and vllm-router are on PATH in the CI image.
+
+      # L1 smoke: /health, /v1/models, and one completion. Not full GSM8K.
+      cd tests/python/e2e/pd_disagg_vllm
+      export SKIP_LM_EVAL=true
+      export NUM_SANITY_REQUESTS=1
+      bash ./run_accuracy_test.sh
+      BASH
+    depends_on:
+      - "upload-ready-pipeline"
+      - "image-build"
+    artifact_paths:
+      - "/tmp/router.log"
