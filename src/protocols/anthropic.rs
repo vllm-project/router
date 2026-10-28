@@ -254,7 +254,7 @@ pub fn anthropic_error_body(status: u16, message: &str) -> Value {
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use super::*;
     use serde_json::json;

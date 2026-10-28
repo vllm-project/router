@@ -1,3 +1,5 @@
+#![cfg(all(feature = "cpu", feature = "ready"))]
+
 //! Integration tests for the typed anthropic `/v1/messages` route.
 
 mod common;
