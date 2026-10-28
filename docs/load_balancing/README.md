@@ -279,35 +279,6 @@ In P/D mode, affinity applies only to decode. A busy decoder may be replaced by 
 
 Multiple router replicas need ingress stickiness to preserve affinity.
 
-### Static HTTP KV event sources
-
-Set `VLLM_ROUTER_KV_EVENT_SOURCES` when a Regular HTTP worker cannot advertise
-its event endpoints. Each registry URL maps to one independently addressed
-DP1 worker:
-
-```bash
-export VLLM_ROUTER_KV_EVENT_SOURCES='{
-  "http://worker1:8000": {
-    "endpoints": ["tcp://worker1:5557"],
-    "replay_endpoints": ["tcp://worker1:5558"],
-    "topic": "kv", "hwm": 1000,
-    "block_size": 16, "model": "served-model"
-  }
-}'
-```
-
-Replay is optional; `topic` defaults to empty and `hwm` is optional and
-nonnegative. Use the worker's actual block size and a shared cache-model
-identity. Worker origins, publisher/topic streams and replay endpoints must be
-independent. Do not supply both a nonempty explicit source map and this
-compatibility map.
-
-Regular HTTP metadata discovery and this mapping use strict Dense batch
-validation. Explicit static sources default to Generic, as does gRPC discovery;
-their existing multiple-rank support is unchanged. For PD configuration see
-[P/D disaggregation](#pd-disaggregation) and [#386](https://github.com/vllm-project/router/pull/386).
-Completion input preparation is separate in [#396](https://github.com/vllm-project/router/pull/396).
-
 ---
 
 ## Choosing a Policy

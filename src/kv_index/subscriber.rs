@@ -61,26 +61,6 @@ pub fn spawn(
     spawn_inner(source, indexer, signal_tx, ctx, None, None)
 }
 
-/// Dense HTTP inputs can only query identities represented by local token hashes.
-/// Event block boundaries must agree with the source's cache/query identity.
-#[cfg(test)]
-pub(crate) fn spawn_dense(
-    source: EventSource,
-    indexer: Arc<KvBlockIndexer>,
-    signal_tx: Option<mpsc::Sender<IngestionSignal>>,
-    ctx: Arc<zmq::Context>,
-    expected_block_size: u32,
-) -> SubscriberHandle {
-    spawn_inner(
-        source,
-        indexer,
-        signal_tx,
-        ctx,
-        Some(expected_block_size),
-        None,
-    )
-}
-
 /// The supervisor shares this guard across owners of one publisher/exact topic.
 /// Its active lease only fences this local task, not the remote publisher.
 struct SubscriberBinding {
@@ -1326,20 +1306,14 @@ mod tests {
             topic: "kv".into(),
             hwm: None,
         };
-        let handle = if let Some(binding) = binding {
-            spawn_inner(
-                source,
-                indexer.clone(),
-                Some(tx),
-                ctx.clone(),
-                expected_block_size,
-                Some(binding),
-            )
-        } else if let Some(block_size) = expected_block_size {
-            spawn_dense(source, indexer.clone(), Some(tx), ctx.clone(), block_size)
-        } else {
-            spawn(source, indexer.clone(), Some(tx), ctx.clone())
-        };
+        let handle = spawn_inner(
+            source,
+            indexer.clone(),
+            Some(tx),
+            ctx.clone(),
+            expected_block_size,
+            binding,
+        );
         Fixture {
             _ctx: ctx,
             publisher,
@@ -1963,7 +1937,11 @@ mod tests {
 
     #[tokio::test]
     async fn dense_session_annotation_replay_applies_shared_blocks() {
-        let f = fixture_with_block_size(true, Some(4));
+        let context = zmq::Context::new();
+        let replay_server = context.socket(zmq::ROUTER).unwrap();
+        let endpoint = "inproc://kv-session-replay";
+        replay_server.bind(endpoint).unwrap();
+        let indexer = Arc::new(KvBlockIndexer::new());
         let tokens = [1, 2, 3, 4];
         let events: Vec<_> = ["session-a", "session-b"]
             .into_iter()
@@ -1979,22 +1957,15 @@ mod tests {
             })
             .collect();
         let replies = [(1, b"kv".as_slice(), batch_payload(&events, 0))];
-        let endpoint = f
-            .replay_server
-            .as_ref()
-            .unwrap()
-            .get_last_endpoint()
-            .unwrap()
-            .unwrap();
         let source = SourceId::from("w0");
         let mut reported = false;
         let (result, ()) = tokio::join!(
             replay(
-                &endpoint,
+                endpoint,
                 0,
                 1,
-                &f._ctx,
-                &f.indexer,
+                &context,
+                &indexer,
                 &source,
                 0,
                 0,
@@ -2004,62 +1975,67 @@ mod tests {
                 &mut reported,
                 None,
             ),
-            serve_replay(f.replay_server.as_ref().unwrap(), &replies, &f.indexer, &[]),
+            serve_replay(&replay_server, &replies, &indexer, &[]),
         );
         assert_eq!(result, Some(1));
-        assert_eq!(hits(&f.indexer, &tokens).len(), 1);
+        assert_eq!(hits(&indexer, &tokens).len(), 1);
     }
 
     #[test]
     fn dense_block_size_mismatch_preflights_stores_and_removes_atomically() {
-        let index = KvBlockIndexer::new();
-        let source = SourceId::from("dense");
-        let initial = KVEventBatch {
-            ts: 0.0,
-            events: vec![store_event(100, &[1, 2, 3, 4])],
-            data_parallel_rank: Some(0),
-        };
-        assert!(apply_batch(&index, &source, 0, 0, &initial, Some(4)).is_ok());
-        let mut bad = stored(
-            vec![ExternalBlockHash::Int(102)],
-            (20..28).collect(),
-            Some("GPU"),
-            None,
-        );
-        bad.block_size = 8;
-        let batch = KVEventBatch {
-            ts: 1.0,
-            events: vec![
-                store_event(101, &[5, 6, 7, 8]),
-                KVEvent::BlockRemoved(BlockRemoved {
-                    block_hashes: vec![ExternalBlockHash::Int(100)],
-                    medium: Some("GPU".into()),
-                    group_idx: Some(0),
-                    locality: None,
-                    ownership: None,
-                }),
-                KVEvent::AllBlocksCleared(AllBlocksCleared {}),
-                KVEvent::BlockStored(bad),
-            ],
-            data_parallel_rank: Some(0),
-        };
-        assert_eq!(
-            apply_batch(&index, &source, 0, 0, &batch, Some(4)),
-            Err(DenseBatchRejection {
-                reason: DenseRejectionReason::BlockSizeMismatch,
-                event_index: 3
-            })
-        );
-        assert_eq!(
-            hits(&index, &[1, 2, 3, 4]).len(),
-            1,
-            "rejected batch applied an eviction"
-        );
-        assert!(
-            hits(&index, &[5, 6, 7, 8]).is_empty(),
-            "rejected batch published a valid store"
-        );
-        assert!(hits(&index, &(20..28).collect::<Vec<_>>()).is_empty());
+        for (actual, reason) in [
+            (0, DenseRejectionReason::ZeroBlockSize),
+            (8, DenseRejectionReason::BlockSizeMismatch),
+        ] {
+            let index = KvBlockIndexer::new();
+            let source = SourceId::from("dense");
+            let initial = KVEventBatch {
+                ts: 0.0,
+                events: vec![store_event(100, &[1, 2, 3, 4])],
+                data_parallel_rank: Some(0),
+            };
+            assert!(apply_batch(&index, &source, 0, 0, &initial, Some(4)).is_ok());
+            let mut bad = stored(
+                vec![ExternalBlockHash::Int(102)],
+                (20..28).collect(),
+                Some("GPU"),
+                None,
+            );
+            bad.block_size = actual;
+            let batch = KVEventBatch {
+                ts: 1.0,
+                events: vec![
+                    store_event(101, &[5, 6, 7, 8]),
+                    KVEvent::BlockRemoved(BlockRemoved {
+                        block_hashes: vec![ExternalBlockHash::Int(100)],
+                        medium: Some("GPU".into()),
+                        group_idx: Some(0),
+                        locality: None,
+                        ownership: None,
+                    }),
+                    KVEvent::AllBlocksCleared(AllBlocksCleared {}),
+                    KVEvent::BlockStored(bad),
+                ],
+                data_parallel_rank: Some(0),
+            };
+            assert_eq!(
+                apply_batch(&index, &source, 0, 0, &batch, Some(4)),
+                Err(DenseBatchRejection {
+                    reason,
+                    event_index: 3
+                })
+            );
+            assert_eq!(
+                hits(&index, &[1, 2, 3, 4]).len(),
+                1,
+                "rejected batch applied an eviction"
+            );
+            assert!(
+                hits(&index, &[5, 6, 7, 8]).is_empty(),
+                "rejected batch published a valid store"
+            );
+            assert!(hits(&index, &(20..28).collect::<Vec<_>>()).is_empty());
+        }
     }
 
     #[tokio::test]
@@ -2325,42 +2301,5 @@ mod tests {
     #[tokio::test]
     async fn replay_wrong_topic_clears_partial_stores() {
         check_replay_case("wrong_topic").await;
-    }
-
-    #[test]
-    fn dense_zero_block_size_is_rejected_before_mutation() {
-        let index = KvBlockIndexer::new();
-        let tokens = vec![1, 2, 3, 4];
-        let mut event = stored(
-            vec![ExternalBlockHash::Int(10)],
-            tokens.clone(),
-            Some("GPU"),
-            None,
-        );
-        event.block_size = 0;
-        let batch = KVEventBatch {
-            ts: 1.0,
-            events: vec![KVEvent::BlockStored(event)],
-            data_parallel_rank: Some(0),
-        };
-        let rejection = Err(DenseBatchRejection {
-            reason: DenseRejectionReason::ZeroBlockSize,
-            event_index: 0,
-        });
-        assert_eq!(validate_dense_batch(&batch, 4), rejection);
-        assert_eq!(
-            apply_batch(&index, &SourceId::from("p"), 0, 0, &batch, Some(4)),
-            rejection
-        );
-        // Explicit rejection is required even though zero-size hashing is empty.
-        let query = MatchQuery {
-            group_idx: 0,
-            local_hashes: local_hashes(&tokens, 4, None)
-                .iter()
-                .map(|hash| Arc::from(hex(hash)))
-                .collect(),
-            tiers_of_interest: vec![StorageTier::Device],
-        };
-        assert_eq!(index.find_matches(&query).len(), 0);
     }
 }

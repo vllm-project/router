@@ -181,6 +181,28 @@ fn parse_vllm_metrics(text: &str) -> HashMap<usize, VllmEngineMetrics> {
     engines
 }
 
+/// Maximum value of one Prometheus gauge family across all series.
+pub(crate) fn max_prometheus_gauge(text: &str, family: &str) -> Option<f64> {
+    let mut maximum: Option<f64> = None;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((series, value)) = split_series_value(line) else {
+            continue;
+        };
+        let (name, _labels) = parse_series(series);
+        if name != family {
+            continue;
+        }
+        if let Ok(value) = value.parse::<f64>() {
+            maximum = Some(maximum.map_or(value, |current| current.max(value)));
+        }
+    }
+    maximum
+}
+
 fn split_series_value(line: &str) -> Option<(&str, &str)> {
     let split = line.rfind(char::is_whitespace)?;
     Some((line[..split].trim(), line[split..].trim()))
@@ -279,6 +301,20 @@ unrelated_metric{engine="1",label="escaped\"comma,value"} 99
         assert_eq!(observations[1].target_id, "worker@1");
         assert_eq!(observations[1].waiting_requests, Some(3));
         assert_eq!(observations[0].observed_at, observations[1].observed_at);
+    }
+
+    #[test]
+    fn max_gauge_picks_the_largest_series() {
+        let text = concat!(
+            "# HELP vllm:kv_cache_usage_perc usage\n",
+            "vllm:kv_cache_usage_perc{engine=\"0\"} 0.25\n",
+            "vllm:kv_cache_usage_perc{engine=\"1\"} 0.75\n",
+        );
+        assert_eq!(
+            max_prometheus_gauge(text, "vllm:kv_cache_usage_perc"),
+            Some(0.75)
+        );
+        assert_eq!(max_prometheus_gauge(text, "missing_gauge"), None);
     }
 
     #[test]
