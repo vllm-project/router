@@ -300,7 +300,8 @@ steps:
 
   # ============================================================================
   # gRPC perf e2e — concurrency-16 waves for rust_grpc / rust_http / python_http
-  # (4× H100 on EKS; stack startup timeout 30m via PERF_STACK_TIMEOUT)
+  # H100 scheduling matches vllm-omni h100_4 (mithril-h100-pool, gpu-h100-sxm,
+  # /mnt/hf-cache). Router bootstraps vLLM + cargo in-container (not omni CI image).
   # ============================================================================
   - label: ":python: grpc perf test case"
     key: "grpc-perf-e2e"
@@ -315,19 +316,9 @@ steps:
         reason: "GPU perf cold starts can be flaky — retry after checking logs"
     plugins:
       - kubernetes:
-          metadata:
-            annotations:
-              cluster-autoscaler.kubernetes.io/safe-to-evict: "false"
-              karpenter.sh/do-not-disrupt: "true"
           podSpec:
-            priorityClassName: ci
-            serviceAccountName: buildkite-gpu-jobs
-            tolerations:
-              - key: nvidia.com/gpu
-                operator: Exists
-                effect: NoSchedule
             nodeSelector:
-              vllm.ci/gpu-pool: h100x4
+              node.kubernetes.io/instance-type: gpu-h100-sxm
             containers:
               - image: nvidia/cuda:13.0.2-devel-ubuntu22.04
                 resources:
@@ -341,10 +332,10 @@ steps:
                   - name: devshm
                     mountPath: /dev/shm
                   - name: hf-cache
-                    mountPath: /fsx/hf_cache
+                    mountPath: /root/.cache/huggingface
                 env:
                   - name: HF_HOME
-                    value: /fsx/hf_cache
+                    value: /root/.cache/huggingface
                   - name: HF_HUB_ENABLE_HF_TRANSFER
                     value: "1"
                   - name: NCCL_CUMEM_HOST_ENABLE
@@ -367,7 +358,7 @@ steps:
                   sizeLimit: 96Gi
               - name: hf-cache
                 hostPath:
-                  path: /fsx/hf_cache
+                  path: /mnt/hf-cache
                   type: DirectoryOrCreate
     command: |
       bash <<'BASH'
@@ -428,7 +419,7 @@ steps:
       find tests/python/e2e/perf/grpc/results -type f -name '*.json' 2>/dev/null || true
       BASH
     agents:
-      queue: "l4-k8s"
+      queue: "mithril-h100-pool"
     depends_on: "build"
     artifact_paths:
       - "tests/python/e2e/perf/grpc/results/**/*.json"
