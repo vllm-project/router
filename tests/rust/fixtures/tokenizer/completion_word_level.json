@@ -1,0 +1,23 @@
+{
+  "version": "1.0",
+  "truncation": null,
+  "padding": null,
+  "added_tokens": [
+    {"id": 1, "content": "<s>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true},
+    {"id": 2, "content": "<added>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": {"type": "WhitespaceSplit"},
+  "post_processor": {
+    "type": "TemplateProcessing",
+    "single": [{"SpecialToken": {"id": "<s>", "type_id": 0}}, {"Sequence": {"id": "A", "type_id": 0}}],
+    "pair": [{"Sequence": {"id": "A", "type_id": 0}}, {"Sequence": {"id": "B", "type_id": 1}}],
+    "special_tokens": {"<s>": {"id": "<s>", "ids": [1], "tokens": ["<s>"]}}
+  },
+  "decoder": null,
+  "model": {
+    "type": "WordLevel",
+    "vocab": {"<unk>": 0, "<s>": 1, "<added>": 2, "hello": 3, "world": 4, "你好": 5, "🙂": 6, "café": 7},
+    "unk_token": "<unk>"
+  }
+}
