@@ -1,4 +1,9 @@
-"""kv_aware: reuse request should route to the same worker as prime."""
+"""kv_aware: reuse request should route to the same worker as prime.
+
+Workers are the gRPC mock. It records ``request_id`` in its log, but it does
+not publish KV-cache events, so these stickiness assertions are not expected
+to pass until a real worker (or a fake event publisher) is used.
+"""
 
 from __future__ import annotations
 

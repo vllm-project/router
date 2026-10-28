@@ -1,17 +1,19 @@
 """Functional e2e: kv_aware routing policy (PR #371).
 
-Uses **vllm-rs serve** workers and ``grpc://`` worker URLs so the router
-tokenizes ``/v1/chat/completions`` and can exercise kv_aware discovery.
+Uses two ``mock-grpc-worker`` processes and ``grpc://`` worker URLs. The router
+still tokenizes ``/v1/chat/completions`` with ``VLLM_ROUTER_MODEL``.
 Run (avoids importing ``tests/python/e2e/conftest`` / ``vllm.test``)::
 
   pytest tests/python/e2e/function/kv_aware --confcutdir=tests/python/e2e/function/kv_aware -m e2e -v -s
 
-Prerequisites: ``vllm-rs`` (``export VLLM_RS=...`` or ``scripts/backend/check_vllm_rs.sh``),
-``ROUTER_BIN`` or ``cargo build --release``, two GPUs.
+Prerequisites: ``cargo`` on ``PATH`` (the fixture builds the mock), and
+``ROUTER_BIN`` or ``cargo build --release``. No GPU and no ``vllm-rs``.
+Prefix-stickiness tests still expect real KV-cache events, which this mock
+does not publish.
 
   .venv/bin/python -m pytest tests/python/e2e/function/kv_aware/test_kv_aware.py -m e2e -v -s
 
-Use ``-s`` so vllm-rs worker and vllm-router logs appear on the terminal.
+Use ``-s`` so mock worker and vllm-router logs appear on the terminal.
 
 kv_aware worker stickiness: ``test_kv_aware_prefix_cache.py`` (reuse → same worker as prime).
 """
@@ -40,12 +42,10 @@ def test_kv_aware_live_routing_and_streaming(
     kv_aware_two_workers,
 ):
     """
-    Smoke-test kv_aware with two gRPC (vllm-rs) workers.
+    Smoke-test kv_aware with two mock gRPC workers.
 
     Exercises router tokenization on chat, worker registration, concurrent
-    routing, and streaming. Stronger KV placement assertions can be added once
-    observability (worker id / metrics) is wired in the test harness.
-    Requires at least two GPUs (see ``kv_aware_two_workers``).
+    routing, and streaming. The mock returns a fixed completion string.
     """
     base = kv_aware_router.url
     workers = kv_aware_two_workers

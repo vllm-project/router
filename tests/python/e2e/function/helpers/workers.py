@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import os
+import shutil
+import subprocess
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
@@ -167,6 +170,116 @@ def spawn_two_vllm_rs_grpc_workers(
         launch.wait_worker_health(
             worker_b.http_url, worker_health_timeout, proc=worker_b.proc
         )
+        return workers
+    except Exception:
+        terminate_workers(workers)
+        raise
+
+
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parents[5]
+
+
+def mock_grpc_worker_exe() -> Path:
+    """Built ``mock-grpc-worker`` binary. ``MOCK_GRPC_WORKER`` overrides the path."""
+    override = os.environ.get("MOCK_GRPC_WORKER", "").strip()
+    if override:
+        path = Path(override)
+        if not path.is_file():
+            raise RuntimeError(f"MOCK_GRPC_WORKER is not a file: {path}")
+        return path
+
+    manifest = (
+        _repo_root()
+        / "tests"
+        / "python"
+        / "fixtures"
+        / "mock_grpc_worker"
+        / "Cargo.toml"
+    )
+    if not manifest.is_file():
+        raise RuntimeError(f"missing mock grpc worker manifest: {manifest}")
+    cargo = shutil.which("cargo")
+    if cargo is None:
+        raise RuntimeError(
+            "cargo is not on PATH; build mock-grpc-worker and set MOCK_GRPC_WORKER"
+        )
+    print(f"[e2e] cargo build {manifest}", flush=True)
+    subprocess.run(
+        [cargo, "build", "--manifest-path", str(manifest)],
+        check=True,
+    )
+    name = "mock-grpc-worker.exe" if os.name == "nt" else "mock-grpc-worker"
+    exe = manifest.parent / "target" / "debug" / name
+    if not exe.is_file():
+        raise RuntimeError(f"mock-grpc-worker binary missing after build: {exe}")
+    return exe
+
+
+def spawn_two_mock_grpc_workers(
+    model: str,
+    *,
+    worker_health_timeout: float = 30.0,
+    log_dir: Path | None = None,
+    text: str = "mock",
+) -> list[SimpleNamespace]:
+    """Two ``mock-grpc-worker`` processes. No GPU and no ``vllm-rs``."""
+    exe = mock_grpc_worker_exe()
+    workers: list[SimpleNamespace] = []
+    host = "127.0.0.1"
+
+    if log_dir is None:
+        log_dir = Path(tempfile.mkdtemp(prefix="kv_aware_worker_logs_"))
+    log_dir.mkdir(parents=True, exist_ok=True)
+    quiet_logs = kv_aware_worker_logs_quiet()
+    echo = not quiet_logs
+    print(f"[e2e] worker logs: {log_dir}", flush=True)
+
+    http_a, grpc_a, http_b, grpc_b = launch.find_distinct_available_ports(4)
+
+    def _start(label: str, http_port: int, grpc_port: int) -> None:
+        log_path = log_dir / f"worker_{label}_grpc_{grpc_port}.log"
+        cmd = [
+            str(exe),
+            "--grpc-port",
+            str(grpc_port),
+            "--http-port",
+            str(http_port),
+            "--model",
+            model,
+            "--text",
+            text,
+        ]
+        print(f"[e2e] mock worker {label} cmd: {cmd!r}", flush=True)
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+        )
+        worker = SimpleNamespace(
+            proc=proc,
+            url=f"grpc://{host}:{grpc_port}",
+            http_url=f"http://{host}:{http_port}",
+            gpu_id=None,
+            log_path=str(log_path),
+            log_pump=None,
+        )
+        workers.append(worker)
+        worker.log_pump = SubprocessLogPump(
+            proc,
+            log_path,
+            echo=echo,
+            prefix=f"[worker {label} grpc={grpc_port}] ",
+        )
+        launch.wait_worker_health(worker.http_url, worker_health_timeout, proc=proc)
+
+    try:
+        _start("a", http_a, grpc_a)
+        _start("b", http_b, grpc_b)
         return workers
     except Exception:
         terminate_workers(workers)

@@ -1,7 +1,10 @@
 """Model and prompt constants for kv_aware functional e2e.
 
-Workers: **``vllm-rs serve``** with ``grpc://`` URLs (see ``scripts/backend``).
-``vllm serve`` does not accept ``--grpc-port`` (``docs/backend/grpc.md``).
+Workers: ``mock-grpc-worker`` (``tests/python/fixtures/mock_grpc_worker``) on
+``grpc://`` URLs. The fixture builds it with ``cargo build`` unless
+``MOCK_GRPC_WORKER`` points at a binary. The router still tokenizes with
+``kv_aware_e2e_model()`` / ``VLLM_ROUTER_MODEL``. The ``vllm-rs`` launcher
+below is unused by this fixture.
 
 Optional environment (see also ``function/helpers/launch.py``):
 
