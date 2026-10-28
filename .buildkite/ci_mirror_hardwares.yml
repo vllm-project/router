@@ -9,8 +9,8 @@
 #              public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:router-$BUILDKITE_COMMIT
 #   mi300_2    router_rocm_mi300_2, same-host xGMI via the ROCm Docker device mount.
 #   mi300_rdma router_rocm_mi300_2 coordinator. No Docker plugin; the job SSHes to the decode host.
-#   h100_4_grpc  mithril-h100-pool, 4x H100 SXM (vllm-omni h100_4 scheduling). Uses cuda:devel
-#              in-job uv/cargo bootstrap (not the router ECR CI image).
+#   h100_2     mithril-h100-pool, 2x H100 SXM (vllm-omni h100_2 scheduling).
+#              Image is the same router CI image as l4_4. 2 GPU = 20 CPU / 80Gi / 48Gi shm.
 #
 # Test-specific env (MORIIO_READ_MODE, LM_EVAL_LIMIT, LOG_DIR) stays on the step.
 
@@ -112,7 +112,7 @@ mirror_hardwares:
   mi300_rdma:
     agents:
       queue: router_rocm_mi300_2
-  h100_4_grpc:
+  h100_2:
     agents:
       queue: mithril-h100-pool
     plugins:
@@ -121,14 +121,14 @@ mirror_hardwares:
           nodeSelector:
             node.kubernetes.io/instance-type: gpu-h100-sxm
           containers:
-          - image: nvidia/cuda:13.0.2-devel-ubuntu22.04
+          - image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:router-$BUILDKITE_COMMIT
             resources:
               limits:
-                nvidia.com/gpu: 4
+                nvidia.com/gpu: 2
               requests:
-                nvidia.com/gpu: 4
-                cpu: '40'
-                memory: 160Gi
+                nvidia.com/gpu: 2
+                cpu: '20'
+                memory: 80Gi
             volumeMounts:
             - name: devshm
               mountPath: /dev/shm
@@ -156,7 +156,7 @@ mirror_hardwares:
           - name: devshm
             emptyDir:
               medium: Memory
-              sizeLimit: 96Gi
+              sizeLimit: 48Gi
           - name: hf-cache
             hostPath:
               path: /mnt/hf-cache

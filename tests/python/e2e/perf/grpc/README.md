@@ -156,10 +156,12 @@ benches/backend/bench_prefix_kvhit.py   # HTTP bench + pytest helpers
 ## CI
 
 Buildkite step **`:python: grpc perf test case`** (`key: grpc-perf-e2e` in
-`.buildkite/test-ready.yml`, L1 **ready** label): **`mithril-h100-pool`** (preset
-`h100_4_grpc`), `PERF_STACK_TIMEOUT=1800`,
+`.buildkite/test-nightly.yml`, L3 **nightly**): **`mithril-h100-pool`** (preset
+`h100_2`), `PERF_STACK_TIMEOUT=1800`,
 `HF_TOKEN`, model
-`MODEL=Qwen/Qwen3.8-27B`, `cargo build --release`, step timeout **120 min**, then for each of
+`MODEL=Qwen/Qwen3.8-27B`. The job pulls the router CI image
+(`vllm-router` at `/usr/local/bin/vllm-router`); it does not build in-job.
+Step timeout **120 min**, then for each of
 `rust_grpc`, `python_http` (add `rust_http` locally if needed):
 
 `python -m pytest -sv tests/python/e2e/perf/grpc -k c16-r32 --perf-case=<case>`
