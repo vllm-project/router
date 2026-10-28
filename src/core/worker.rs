@@ -58,7 +58,8 @@ pub trait Worker: Send + Sync + fmt::Debug {
     /// Decrement the load counter
     fn decrement_load(&self);
 
-    /// Reset the load counter to 0 (for sync/recovery)
+    /// Reset the load counter to 0 for explicit recovery after active requests drain.
+    /// Health checks must not call this: active guards still own their reservations.
     fn reset_load(&self) {
         // Default implementation - does nothing
         // Workers that track load should override this
@@ -825,6 +826,7 @@ pub fn workers_to_urls(workers: &[Box<dyn Worker>]) -> Vec<String> {
 /// RAII guard for worker load management
 pub struct WorkerLoadGuard<'a> {
     workers: Vec<&'a dyn Worker>,
+    owned_worker: Option<Arc<dyn Worker>>,
 }
 
 impl<'a> WorkerLoadGuard<'a> {
@@ -833,6 +835,7 @@ impl<'a> WorkerLoadGuard<'a> {
         worker.increment_load();
         Self {
             workers: vec![worker],
+            owned_worker: None,
         }
     }
 
@@ -842,7 +845,39 @@ impl<'a> WorkerLoadGuard<'a> {
         for worker in &workers {
             worker.increment_load();
         }
-        Self { workers }
+        Self {
+            workers,
+            owned_worker: None,
+        }
+    }
+
+    /// Transfer a single-worker reservation without changing its load counter.
+    pub(crate) fn into_owned(mut self, worker: Arc<dyn Worker>) -> WorkerLoadGuard<'static> {
+        assert!(
+            (self.workers.len() == 1 && std::ptr::addr_eq(self.workers[0], worker.as_ref()))
+                || self
+                    .owned_worker
+                    .as_ref()
+                    .is_some_and(|reserved| Arc::ptr_eq(reserved, &worker)),
+            "the owned worker must match the reserved worker"
+        );
+        self.workers.clear();
+        self.owned_worker.take();
+        WorkerLoadGuard {
+            workers: Vec::new(),
+            owned_worker: Some(worker),
+        }
+    }
+}
+
+impl WorkerLoadGuard<'static> {
+    /// Create an owned guard that can follow a worker into a response body.
+    pub fn new_owned(worker: Arc<dyn Worker>) -> Self {
+        worker.increment_load();
+        Self {
+            workers: Vec::new(),
+            owned_worker: Some(worker),
+        }
     }
 }
 
@@ -850,6 +885,9 @@ impl<'a> Drop for WorkerLoadGuard<'a> {
     fn drop(&mut self) {
         // Decrement load counters for all workers
         for worker in &self.workers {
+            worker.decrement_load();
+        }
+        if let Some(worker) = &self.owned_worker {
             worker.decrement_load();
         }
     }
@@ -894,10 +932,6 @@ pub fn start_health_checker(
         let mut interval =
             tokio::time::interval(tokio::time::Duration::from_secs(check_interval_secs));
 
-        // Counter for periodic load reset (every 10 health check cycles)
-        let mut check_count = 0u64;
-        const LOAD_RESET_INTERVAL: u64 = 10;
-
         loop {
             interval.tick().await;
 
@@ -907,8 +941,6 @@ pub fn start_health_checker(
                 break;
             }
 
-            check_count += 1;
-
             // Check health of all workers
             let workers_to_check = match workers.read() {
                 Ok(guard) => guard.clone(),
@@ -917,22 +949,6 @@ pub fn start_health_checker(
                     continue;
                 }
             };
-
-            // Periodically reset load counters to prevent drift
-            // Only do this when we believe all workers should be idle
-            if check_count.is_multiple_of(LOAD_RESET_INTERVAL) {
-                let max_load = workers_to_check.iter().map(|w| w.load()).max().unwrap_or(0);
-                // Only reset if load appears to be very low (likely drift)
-                if max_load <= 2 {
-                    tracing::debug!(
-                        "Resetting load counters to prevent drift (max_load: {})",
-                        max_load
-                    );
-                    for worker in &workers_to_check {
-                        worker.reset_load();
-                    }
-                }
-            }
 
             // Perform health checks concurrently
             let health_checks = workers_to_check.iter().map(|worker| {
@@ -1417,6 +1433,24 @@ mod tests {
         }
 
         // Guard dropped, load decremented
+        assert_eq!(worker.load(), 0);
+    }
+
+    #[test]
+    fn test_load_guard_ownership_transfer_preserves_reservation() {
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+            "http://test:8080".to_string(),
+            WorkerType::Regular,
+        ));
+        let other = WorkerLoadGuard::new_owned(worker.clone());
+        let borrowed = WorkerLoadGuard::new(worker.as_ref());
+        let owned = borrowed.into_owned(worker.clone());
+        let owned = owned.into_owned(worker.clone());
+        assert_eq!(worker.load(), 2);
+
+        drop(owned);
+        assert_eq!(worker.load(), 1);
+        drop(other);
         assert_eq!(worker.load(), 0);
     }
 

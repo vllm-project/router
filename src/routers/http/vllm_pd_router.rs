@@ -21,11 +21,14 @@ use axum::{
     http::{HeaderMap, Method, StatusCode},
     response::{IntoResponse, Response},
 };
-use futures_util::StreamExt;
+use bytes::Bytes;
+use futures_util::{Stream, StreamExt};
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
+use std::task::{Context, Poll};
 use std::time::Instant;
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
@@ -75,6 +78,35 @@ pub struct VllmPDRouter {
 /// Transfer ID prefix used by MoRI-IO to correlate prefill and decode legs.
 /// Must match `MoRIIOConstants.TRANSFER_PREFIX` in the vLLM Python connector.
 const MORIIO_TRANSFER_PREFIX: &str = "tx";
+
+struct LoadTrackedDecodeStream<E> {
+    inner: Pin<Box<dyn Stream<Item = Result<Bytes, E>> + Send>>,
+    load_guard: Option<WorkerLoadGuard<'static>>,
+}
+
+impl<E: 'static> LoadTrackedDecodeStream<E> {
+    fn new(
+        stream: impl Stream<Item = Result<Bytes, E>> + Send + 'static,
+        load_guard: WorkerLoadGuard<'static>,
+    ) -> Self {
+        Self {
+            inner: Box::pin(stream),
+            load_guard: Some(load_guard),
+        }
+    }
+}
+
+impl<E: 'static> Stream for LoadTrackedDecodeStream<E> {
+    type Item = Result<Bytes, E>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let poll = self.inner.as_mut().poll_next(cx);
+        if matches!(&poll, Poll::Ready(None) | Poll::Ready(Some(Err(_)))) {
+            self.load_guard.take();
+        }
+        poll
+    }
+}
 
 /// Prepare each routing representation once, only if a P/D policy consumes it.
 struct PolicyRequestText {
@@ -153,6 +185,7 @@ async fn finalize_decode_response(
     path: &str,
     is_streaming: bool,
     needs_logprobs: bool,
+    decode_load: Option<WorkerLoadGuard<'static>>,
 ) -> Result<Response, String> {
     let status = decode_response.status();
     let mut headers = header_utils::preserve_response_headers(decode_response.headers());
@@ -168,15 +201,19 @@ async fn finalize_decode_response(
                 .to_str()
                 .is_ok_and(|coding| coding.trim().eq_ignore_ascii_case("identity"))
         });
+    let content_length = decode_response.content_length();
+    let source = decode_response.bytes_stream();
+    let mut source = match decode_load {
+        Some(load) => {
+            futures_util::future::Either::Left(LoadTrackedDecodeStream::new(source, load))
+        }
+        None => futures_util::future::Either::Right(source),
+    };
 
     // Only successful generation bodies can be enriched. Preserve worker error
     // responses as opaque bodies; their status handling is a separate concern.
     if !status.is_success() {
-        return response_with_body(
-            status,
-            &headers,
-            Body::from_stream(decode_response.bytes_stream()),
-        );
+        return response_with_body(status, &headers, Body::from_stream(source));
     }
 
     let reconcile_cache = pd_cached_tokens::is_supported_path(path);
@@ -192,7 +229,7 @@ async fn finalize_decode_response(
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.split(';').next())
             .is_some_and(|media_type| media_type.trim().eq_ignore_ascii_case("text/event-stream"));
-        let stream = decode_response.bytes_stream();
+        let stream = source;
         // A streaming request can receive a non-SSE body. Rewrite only upstream
         // event streams whose bytes are already decoded; forward all others.
         let body = if reconcile_cache && is_sse && !is_encoded {
@@ -210,27 +247,15 @@ async fn finalize_decode_response(
     // Forward bodies that need no enrichment without waiting for or buffering
     // the complete response, even when the API request is non-streaming.
     if is_encoded || (!reconcile_cache && !needs_logprobs) {
-        return response_with_body(
-            status,
-            &headers,
-            Body::from_stream(decode_response.bytes_stream()),
-        );
+        return response_with_body(status, &headers, Body::from_stream(source));
     }
 
     // Bound optional enrichment without breaking large legitimate responses.
     // An oversized body is forwarded verbatim; only its enrichment is skipped.
     const MAX_JSON_REWRITE_BYTES: usize = 8 * 1024 * 1024;
-    if decode_response
-        .content_length()
-        .is_some_and(|length| length > MAX_JSON_REWRITE_BYTES as u64)
-    {
-        return response_with_body(
-            status,
-            &headers,
-            Body::from_stream(decode_response.bytes_stream()),
-        );
+    if content_length.is_some_and(|length| length > MAX_JSON_REWRITE_BYTES as u64) {
+        return response_with_body(status, &headers, Body::from_stream(source));
     }
-    let mut source = decode_response.bytes_stream();
     let mut original = Vec::new();
     while let Some(chunk) = source.next().await {
         let chunk = chunk.map_err(|error| format!("Failed to read Decode response: {error}"))?;
@@ -292,14 +317,16 @@ async fn finalize_decode_response(
 
 impl VllmPDRouter {
     /// Include assigned requests in local decode load while prefill is pending.
-    fn select_and_reserve_decode<'a>(
+    fn select_and_reserve_decode(
         &self,
         policy: &dyn LoadBalancingPolicy,
-        workers: &'a [Arc<dyn Worker>],
+        workers: &[Arc<dyn Worker>],
         text: Option<&str>,
         headers: Option<&RequestHeaders>,
-    ) -> Option<(usize, WorkerLoadGuard<'a>)> {
-        policy.select_and_reserve(&self.decode_selection, workers, text, headers)
+    ) -> Option<(usize, WorkerLoadGuard<'static>)> {
+        let (index, reservation) =
+            policy.select_and_reserve(&self.decode_selection, workers, text, headers)?;
+        Some((index, reservation.into_owned(workers[index].clone())))
     }
 
     /// Query the Mooncake bootstrap server on a prefill node to get engine_id per dp_rank.
@@ -988,6 +1015,7 @@ impl VllmPDRouter {
         start_time: Instant,
         is_streaming: bool,
         needs_logprobs: bool,
+        decode_load: Option<WorkerLoadGuard<'static>>,
     ) -> Result<Response, String> {
         debug!(
             "Decode server responded with status: {}",
@@ -1013,6 +1041,7 @@ impl VllmPDRouter {
             path,
             is_streaming,
             needs_logprobs,
+            decode_load,
         )
         .await
     }
@@ -1369,6 +1398,7 @@ impl VllmPDRouter {
                     start_time,
                     is_streaming,
                     needs_logprobs,
+                    None,
                 )
                 .await;
         }
@@ -1410,20 +1440,21 @@ impl VllmPDRouter {
             start_time,
             is_streaming,
             needs_logprobs,
+            None,
         )
         .await
     }
 
     /// Two-stage request processing for vLLM disaggregated mode
     ///
-    /// Prefill load is tracked during the prefill phase. The static route caller
-    /// holds the selected decode reservation across this future, including prefill.
-    /// Streaming response-body load tracking is separate from this dispatch scope.
+    /// Prefill load follows its phase; the selected decode reservation follows
+    /// the request through prefill and then transfers to the decode response body.
     async fn process_vllm_two_stage_request(
         &self,
         original_request: Value,
         prefill_worker: Arc<dyn Worker>,
         decode_worker: Arc<dyn Worker>,
+        decode_load: WorkerLoadGuard<'static>,
         path: &str,
         headers: Option<&HeaderMap>,
     ) -> Result<Response, PDRouterError> {
@@ -1473,6 +1504,7 @@ impl VllmPDRouter {
                     decode_request,
                     prefill_worker,
                     decode_worker,
+                    decode_load,
                     request_id,
                     path,
                     headers,
@@ -1489,8 +1521,7 @@ impl VllmPDRouter {
             path
         );
 
-        // Increment prefill load at the start of the prefill phase
-        prefill_worker.increment_load();
+        let prefill_load = WorkerLoadGuard::new(prefill_worker.as_ref());
 
         let prefill_zmq_addr =
             self.get_zmq_address(prefill_worker.base_url(), ServiceType::Prefill);
@@ -1585,7 +1616,6 @@ impl VllmPDRouter {
         {
             Ok(resp) => resp,
             Err(e) => {
-                prefill_worker.decrement_load();
                 let full_error = error_chain(&e);
                 let duration = start_time.elapsed();
                 RouterMetrics::record_pd_prefill_error(&prefill_base_url);
@@ -1604,7 +1634,6 @@ impl VllmPDRouter {
         );
 
         if !prefill_response.status().is_success() {
-            prefill_worker.decrement_load();
             let status = prefill_response.status();
             let content_type = prefill_response
                 .headers()
@@ -1634,7 +1663,6 @@ impl VllmPDRouter {
         let prefill_bytes = match prefill_response.bytes().await {
             Ok(bytes) => bytes,
             Err(e) => {
-                prefill_worker.decrement_load();
                 let full_error = error_chain(&e);
                 let duration = start_time.elapsed();
                 RouterMetrics::record_pd_prefill_error(&prefill_base_url);
@@ -1664,7 +1692,6 @@ impl VllmPDRouter {
         let prefill_response_json: Value = match serde_json::from_slice(&prefill_bytes) {
             Ok(json) => json,
             Err(e) => {
-                prefill_worker.decrement_load();
                 let duration = start_time.elapsed();
                 RouterMetrics::record_pd_prefill_error(&prefill_base_url);
                 RouterMetrics::record_pd_request(path);
@@ -1682,7 +1709,6 @@ impl VllmPDRouter {
                 .get("kv_transfer_params")
                 .is_some_and(Value::is_object)
         {
-            prefill_worker.decrement_load();
             self.stop_profiling(&prefill_base_url).await;
             let duration = start_time.elapsed();
             RouterMetrics::record_pd_prefill_error(&prefill_base_url);
@@ -1705,8 +1731,7 @@ impl VllmPDRouter {
         // Stop profiling on prefill server after its work is done
         self.stop_profiling(&prefill_base_url).await;
 
-        // Prefill is complete; the caller still holds the decode reservation.
-        prefill_worker.decrement_load();
+        drop(prefill_load);
 
         debug!("✅ vLLM Stage 1 completed, starting Stage 2 - Decode");
 
@@ -1843,6 +1868,7 @@ impl VllmPDRouter {
             path,
             is_streaming,
             needs_logprobs,
+            Some(decode_load),
         )
         .await
         .map_err(|message| PDRouterError::NetworkError { message })
@@ -1894,6 +1920,7 @@ impl VllmPDRouter {
         decode_request: Value,
         prefill_worker: Arc<dyn Worker>,
         decode_worker: Arc<dyn Worker>,
+        decode_load: WorkerLoadGuard<'static>,
         request_id: String,
         path: &str,
         headers: Option<&HeaderMap>,
@@ -1922,7 +1949,7 @@ impl VllmPDRouter {
             )
         };
 
-        prefill_worker.increment_load();
+        let prefill_load = WorkerLoadGuard::new(prefill_worker.as_ref());
         self.start_profiling(&prefill_base_url).await;
         self.start_profiling(&decode_base_url).await;
 
@@ -1949,7 +1976,6 @@ impl VllmPDRouter {
             ),
         );
 
-        prefill_worker.decrement_load();
         self.stop_profiling(&prefill_base_url).await;
 
         let prefill_response_json = match prefill_result {
@@ -1997,6 +2023,7 @@ impl VllmPDRouter {
                 });
             }
         };
+        drop(prefill_load);
         if let Some(prefill_json) = prefill_response_json.as_ref() {
             self.maybe_cache_nixl_push_identity(&prefill_base_url, prefill_dp_rank, prefill_json);
         }
@@ -2051,6 +2078,7 @@ impl VllmPDRouter {
             start_time,
             is_streaming,
             needs_logprobs,
+            Some(decode_load),
         )
         .await
         .map_err(|message| PDRouterError::NetworkError { message })
@@ -2459,7 +2487,7 @@ impl RouterTrait for VllmPDRouter {
                 }
             };
 
-            let (decode_idx, _decode_load) = match self.select_and_reserve_decode(
+            let (decode_idx, decode_load) = match self.select_and_reserve_decode(
                 decode_policy.as_ref(),
                 &decode_workers,
                 request_text.for_policy(decode_policy.as_ref()),
@@ -2478,7 +2506,6 @@ impl RouterTrait for VllmPDRouter {
 
             let prefill_worker = &prefill_workers[prefill_idx];
             let decode_worker = &decode_workers[decode_idx];
-            // Keep the decode reservation through the two-stage dispatch, including prefill.
 
             info!(
                 "Chat: Selected prefill={} [policy:{}], decode={} [policy:{}]",
@@ -2494,6 +2521,7 @@ impl RouterTrait for VllmPDRouter {
                     request_json,
                     prefill_worker.clone(),
                     decode_worker.clone(),
+                    decode_load,
                     "/v1/chat/completions",
                     headers,
                 )
@@ -2633,7 +2661,7 @@ impl RouterTrait for VllmPDRouter {
                 }
             };
 
-            let (decode_idx, _decode_load) = match self.select_and_reserve_decode(
+            let (decode_idx, decode_load) = match self.select_and_reserve_decode(
                 decode_policy.as_ref(),
                 &decode_workers,
                 request_text.for_policy(decode_policy.as_ref()),
@@ -2652,7 +2680,6 @@ impl RouterTrait for VllmPDRouter {
 
             let prefill_worker = &prefill_workers[prefill_idx];
             let decode_worker = &decode_workers[decode_idx];
-            // Keep the decode reservation through the two-stage dispatch, including prefill.
 
             info!(
                 "Completion: Selected prefill={} [policy:{}], decode={} [policy:{}]",
@@ -2668,6 +2695,7 @@ impl RouterTrait for VllmPDRouter {
                     request_json,
                     prefill_worker.clone(),
                     decode_worker.clone(),
+                    decode_load,
                     "/v1/completions",
                     headers,
                 )
@@ -2858,7 +2886,7 @@ impl RouterTrait for VllmPDRouter {
                 }
             };
 
-            let (decode_idx, _decode_load) = match self.select_and_reserve_decode(
+            let (decode_idx, decode_load) = match self.select_and_reserve_decode(
                 decode_policy.as_ref(),
                 &decode_workers,
                 request_text.for_policy(decode_policy.as_ref()),
@@ -2890,6 +2918,7 @@ impl RouterTrait for VllmPDRouter {
                     request_json,
                     prefill_worker.clone(),
                     decode_worker.clone(),
+                    decode_load,
                     path,
                     headers,
                 )
@@ -2934,6 +2963,7 @@ impl WorkerManagement for VllmPDRouter {
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     fn test_vllm_pd_router() -> VllmPDRouter {
         let worker_registry = Arc::new(crate::core::WorkerRegistry::new());
@@ -3008,6 +3038,7 @@ mod tests {
                     Instant::now(),
                     streaming,
                     logprobs,
+                    None,
                 )
                 .await
                 .unwrap();
@@ -3051,6 +3082,7 @@ mod tests {
                     Instant::now(),
                     streaming,
                     false,
+                    None,
                 )
                 .await
                 .unwrap();
@@ -3061,7 +3093,415 @@ mod tests {
             assert_eq!(bytes.as_ref(), encoded.as_slice());
         }
     }
-    use serde_json::json;
+    async fn stalled_header_worker(
+        worker_type: WorkerType,
+    ) -> (Arc<dyn Worker>, Arc<tokio::sync::Notify>) {
+        use axum::routing::post;
+
+        let started = Arc::new(tokio::sync::Notify::new());
+        let handler_started = started.clone();
+        let url = spawn_test_server(axum::Router::new().route(
+            "/v1/chat/completions",
+            post(move || {
+                let started = handler_started.clone();
+                async move {
+                    started.notify_one();
+                    std::future::pending::<Response>().await
+                }
+            }),
+        ))
+        .await;
+        (Arc::new(BasicWorker::new(url, worker_type)), started)
+    }
+
+    #[tokio::test]
+    async fn sequential_header_cancellation_preserves_other_requests_load() {
+        use axum::routing::post;
+
+        for pause_prefill in [true, false] {
+            let (decode_worker, decode_started) = stalled_header_worker(WorkerType::Decode).await;
+            let (prefill_worker, started): (Arc<dyn Worker>, _) = if pause_prefill {
+                stalled_header_worker(WorkerType::Prefill {
+                    bootstrap_port: None,
+                })
+                .await
+            } else {
+                let prefill_url = spawn_test_server(axum::Router::new().route(
+                    "/v1/chat/completions",
+                    post(|| async { axum::Json(json!({"kv_transfer_params": {}})) }),
+                ))
+                .await;
+                (
+                    Arc::new(BasicWorker::new(
+                        prefill_url,
+                        WorkerType::Prefill {
+                            bootstrap_port: None,
+                        },
+                    )),
+                    decode_started,
+                )
+            };
+            let other_prefill = WorkerLoadGuard::new_owned(prefill_worker.clone());
+            let other_decode = WorkerLoadGuard::new_owned(decode_worker.clone());
+            let request_prefill = prefill_worker.clone();
+            let request_decode = decode_worker.clone();
+            let request = tokio::spawn(async move {
+                let decode_load = WorkerLoadGuard::new_owned(request_decode.clone());
+                test_vllm_pd_router()
+                    .process_vllm_two_stage_request(
+                        json!({"messages": []}),
+                        request_prefill,
+                        request_decode,
+                        decode_load,
+                        "/v1/chat/completions",
+                        None,
+                    )
+                    .await
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(5), started.notified())
+                .await
+                .expect("the current stage should reach its worker");
+            assert_eq!(prefill_worker.load(), if pause_prefill { 2 } else { 1 });
+            assert_eq!(decode_worker.load(), 2);
+
+            request.abort();
+            assert!(request.await.unwrap_err().is_cancelled());
+            assert_eq!(prefill_worker.load(), 1);
+            assert_eq!(decode_worker.load(), 1);
+            drop(other_prefill);
+            drop(other_decode);
+            assert_eq!(prefill_worker.load(), 0);
+            assert_eq!(decode_worker.load(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_header_cancellation_preserves_other_requests_load() {
+        let (prefill_worker, prefill_started) = stalled_header_worker(WorkerType::Prefill {
+            bootstrap_port: None,
+        })
+        .await;
+        let (decode_worker, decode_started) = stalled_header_worker(WorkerType::Decode).await;
+        let other_prefill = WorkerLoadGuard::new_owned(prefill_worker.clone());
+        let other_decode = WorkerLoadGuard::new_owned(decode_worker.clone());
+        let request_prefill = prefill_worker.clone();
+        let request_decode = decode_worker.clone();
+        let request = tokio::spawn(async move {
+            let decode_load = WorkerLoadGuard::new_owned(request_decode.clone());
+            test_vllm_pd_router()
+                .process_concurrent_two_stage(
+                    json!({"messages": []}),
+                    json!({"messages": []}),
+                    request_prefill,
+                    request_decode,
+                    decode_load,
+                    "request-id".to_string(),
+                    "/v1/chat/completions",
+                    None,
+                    Instant::now(),
+                    None,
+                )
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(prefill_started.notified(), decode_started.notified());
+        })
+        .await
+        .expect("both stages should reach their workers");
+        assert_eq!(prefill_worker.load(), 2);
+        assert_eq!(decode_worker.load(), 2);
+
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+        assert_eq!(prefill_worker.load(), 1);
+        assert_eq!(decode_worker.load(), 1);
+        drop(other_prefill);
+        drop(other_decode);
+        assert_eq!(prefill_worker.load(), 0);
+        assert_eq!(decode_worker.load(), 0);
+    }
+
+    #[tokio::test]
+    async fn concurrent_prefill_load_follows_stalled_response_body() {
+        use axum::routing::post;
+        use futures_util::StreamExt;
+        use std::convert::Infallible;
+
+        let mut observed_loads = Vec::new();
+        for status in [StatusCode::OK, StatusCode::BAD_REQUEST] {
+            let body_started = Arc::new(tokio::sync::Notify::new());
+            let handler_started = body_started.clone();
+            let prefill_url = spawn_test_server(axum::Router::new().route(
+                "/v1/chat/completions",
+                post(move || {
+                    let body_started = handler_started.clone();
+                    async move {
+                        let stream = futures_util::stream::once(async move {
+                            body_started.notify_one();
+                            Ok::<_, Infallible>(Bytes::from_static(b"{"))
+                        })
+                        .chain(futures_util::stream::pending());
+                        Response::builder()
+                            .status(status)
+                            .body(Body::from_stream(stream))
+                            .unwrap()
+                    }
+                }),
+            ))
+            .await;
+            let decode_url = spawn_test_server(axum::Router::new().route(
+                "/v1/chat/completions",
+                post(|| async { axum::Json(json!({"choices": []})) }),
+            ))
+            .await;
+            let prefill_worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+                prefill_url,
+                WorkerType::Prefill {
+                    bootstrap_port: None,
+                },
+            ));
+            let decode_worker: Arc<dyn Worker> =
+                Arc::new(BasicWorker::new(decode_url, WorkerType::Decode));
+            let other_prefill = WorkerLoadGuard::new_owned(prefill_worker.clone());
+            let other_decode = WorkerLoadGuard::new_owned(decode_worker.clone());
+            let request_prefill = prefill_worker.clone();
+            let request_decode = decode_worker.clone();
+            let mut request = tokio::spawn(async move {
+                let decode_load = WorkerLoadGuard::new_owned(request_decode.clone());
+                test_vllm_pd_router()
+                    .process_concurrent_two_stage(
+                        json!({"messages": []}),
+                        json!({"messages": []}),
+                        request_prefill,
+                        request_decode,
+                        decode_load,
+                        "request-id".to_string(),
+                        "/v1/chat/completions",
+                        None,
+                        Instant::now(),
+                        None,
+                    )
+                    .await
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(5), body_started.notified())
+                .await
+                .expect("prefill should start its response body");
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(100), &mut request,)
+                    .await
+                    .is_err()
+            );
+            observed_loads.push((status, prefill_worker.load()));
+            assert_eq!(decode_worker.load(), 2);
+
+            request.abort();
+            assert!(request.await.unwrap_err().is_cancelled());
+            assert_eq!(prefill_worker.load(), 1);
+            assert_eq!(decode_worker.load(), 1);
+            drop(other_prefill);
+            drop(other_decode);
+            assert_eq!(prefill_worker.load(), 0);
+            assert_eq!(decode_worker.load(), 0);
+        }
+        assert!(
+            observed_loads.iter().all(|(_, load)| *load == 2),
+            "stalled prefill bodies released active load: {observed_loads:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn prefill_errors_preserve_other_requests_load() {
+        use axum::routing::post;
+
+        let mut observed_loads = Vec::new();
+        for status in [
+            StatusCode::BAD_REQUEST,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::OK,
+        ] {
+            let prefill_url = spawn_test_server(axum::Router::new().route(
+                "/v1/chat/completions",
+                post(move || async move { (status, axum::Json(json!({"choices": []}))) }),
+            ))
+            .await;
+            let prefill_worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+                prefill_url,
+                WorkerType::Prefill {
+                    bootstrap_port: None,
+                },
+            ));
+            let decode_worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+                "http://unused:8080".to_string(),
+                WorkerType::Decode,
+            ));
+            let mut router = test_vllm_pd_router();
+            router.epd = Some(super::super::epd::EncoderStage::new(
+                crate::config::EpdConfig {
+                    encoder_urls: vec!["http://unused:8081".to_string()],
+                    consumer_zmq_addrs: Default::default(),
+                },
+            ));
+            let other_request = WorkerLoadGuard::new(prefill_worker.as_ref());
+            let response = router
+                .process_vllm_two_stage_request(
+                    json!({"messages": []}),
+                    prefill_worker.clone(),
+                    decode_worker.clone(),
+                    WorkerLoadGuard::new_owned(decode_worker.clone()),
+                    "/v1/chat/completions",
+                    None,
+                )
+                .await;
+
+            if status.is_client_error() {
+                assert_eq!(response.unwrap().status(), status);
+            } else {
+                assert!(matches!(response, Err(PDRouterError::NetworkError { .. })));
+            }
+            observed_loads.push((status, prefill_worker.load()));
+            assert_eq!(decode_worker.load(), 0);
+            drop(other_request);
+            assert_eq!(prefill_worker.load(), 0);
+        }
+        assert!(
+            observed_loads.iter().all(|(_, load)| *load == 1),
+            "prefill failures changed another request's load: {observed_loads:?}"
+        );
+    }
+
+    async fn check_decode_load_follows_stalled_response_body(concurrent: bool) {
+        use axum::{http::header::CONTENT_TYPE, routing::post};
+        use std::convert::Infallible;
+
+        for (streaming, status, encoding) in [
+            (true, StatusCode::OK, None),
+            (false, StatusCode::BAD_REQUEST, None),
+            (false, StatusCode::OK, Some("gzip")),
+        ] {
+            let prefill_url = spawn_test_server(axum::Router::new().route(
+                "/v1/chat/completions",
+                post(|| async { axum::Json(json!({"kv_transfer_params": {}})) }),
+            ))
+            .await;
+            let decode_url = spawn_test_server(axum::Router::new().route(
+                "/v1/chat/completions",
+                post(move || async move {
+                    let body = Body::from_stream(futures_util::stream::pending::<
+                        Result<Bytes, Infallible>,
+                    >());
+                    let mut response = Response::builder().status(status).header(
+                        CONTENT_TYPE,
+                        if streaming {
+                            "text/event-stream"
+                        } else {
+                            "application/json"
+                        },
+                    );
+                    if let Some(encoding) = encoding {
+                        response = response.header("content-encoding", encoding);
+                    }
+                    response.body(body).unwrap()
+                }),
+            ))
+            .await;
+            let prefill_worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+                prefill_url,
+                WorkerType::Prefill {
+                    bootstrap_port: None,
+                },
+            ));
+            let decode_worker: Arc<dyn Worker> =
+                Arc::new(BasicWorker::new(decode_url, WorkerType::Decode));
+            let request = json!({
+                "model": "test",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": streaming,
+            });
+            let router = test_vllm_pd_router();
+            if concurrent {
+                router.store_nixl_info(
+                    prefill_worker.base_url(),
+                    None,
+                    json!({
+                        "transfer_mode": "push", "remote_engine_id": "test-prefill",
+                        "remote_host": "127.0.0.1", "remote_port": 1234, "tp_size": 1,
+                    }),
+                );
+            }
+            router
+                .pd_router
+                .worker_registry
+                .register(prefill_worker.clone());
+            router
+                .pd_router
+                .worker_registry
+                .register(decode_worker.clone());
+            let response = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                router.route_chat(None, &serde_json::from_value(request).unwrap(), None),
+            )
+            .await
+            .expect("decode headers should arrive while the body is stalled");
+
+            assert_eq!(response.status(), status);
+            assert_eq!(prefill_worker.load(), 0);
+            assert_eq!(
+                decode_worker.load(),
+                1,
+                "streaming={streaming}, status={status}, encoding={encoding:?}"
+            );
+            drop(response);
+            assert_eq!(decode_worker.load(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn decode_load_follows_stalled_response_body() {
+        check_decode_load_follows_stalled_response_body(false).await;
+    }
+
+    #[tokio::test]
+    async fn concurrent_decode_load_follows_stalled_response_body() {
+        check_decode_load_follows_stalled_response_body(true).await;
+    }
+
+    #[tokio::test]
+    async fn decode_load_releases_at_response_eof() {
+        use futures_util::StreamExt;
+
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+            "http://decode".to_string(),
+            WorkerType::Decode,
+        ));
+        let guard = WorkerLoadGuard::new_owned(worker.clone());
+        let mut stream = LoadTrackedDecodeStream::new(
+            futures_util::stream::empty::<Result<Bytes, reqwest::Error>>(),
+            guard,
+        );
+
+        assert_eq!(worker.load(), 1);
+        assert!(stream.next().await.is_none());
+        assert_eq!(worker.load(), 0);
+    }
+
+    #[tokio::test]
+    async fn decode_load_releases_on_response_error() {
+        use futures_util::StreamExt;
+
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+            "http://decode".to_string(),
+            WorkerType::Decode,
+        ));
+        let guard = WorkerLoadGuard::new_owned(worker.clone());
+        let mut stream = LoadTrackedDecodeStream::new(
+            futures_util::stream::iter([Err::<Bytes, _>(std::io::Error::other("disconnected"))]),
+            guard,
+        );
+
+        assert_eq!(worker.load(), 1);
+        assert!(stream.next().await.unwrap().is_err());
+        assert_eq!(worker.load(), 0);
+    }
 
     #[tokio::test]
     async fn discovery_usage_reconciliation_covers_sequential_and_nixl_push() {
@@ -3301,7 +3741,7 @@ mod tests {
                     .unwrap();
                 let response = timeout(
                     Duration::from_secs(2),
-                    finalize_decode_response(decode, Some(&prefill), path, true, true),
+                    finalize_decode_response(decode, Some(&prefill), path, true, true, None),
                 )
                 .await
                 .expect("non-SSE streaming responses must return before EOF")
@@ -3373,7 +3813,7 @@ mod tests {
                 .send()
                 .await
                 .unwrap();
-            let response = finalize_decode_response(decode, None, path, true, false)
+            let response = finalize_decode_response(decode, None, path, true, false, None)
                 .await
                 .unwrap();
             assert_eq!(response.status(), StatusCode::OK);
@@ -3448,9 +3888,10 @@ mod tests {
                 let (decode, server) =
                     mock_encoded_decode_response(StatusCode::OK, raw, content_type, "identity")
                         .await;
-                let response = finalize_decode_response(decode, Some(&prefill), path, true, false)
-                    .await
-                    .unwrap();
+                let response =
+                    finalize_decode_response(decode, Some(&prefill), path, true, false, None)
+                        .await
+                        .unwrap();
                 assert_eq!(response.status(), StatusCode::OK);
                 assert_eq!(response.headers()["content-type"], content_type);
                 let bytes = axum::body::to_bytes(response.into_body(), 1024)
@@ -3502,6 +3943,7 @@ mod tests {
                             path,
                             is_streaming,
                             needs_logprobs,
+                            None,
                         )
                         .await;
                         let response = result.unwrap();
@@ -3551,7 +3993,7 @@ mod tests {
             .send()
             .await
             .unwrap();
-        let response = finalize_decode_response(decode, None, "/v1/completions", true, false)
+        let response = finalize_decode_response(decode, None, "/v1/completions", true, false, None)
             .await
             .unwrap();
         let encodings: Vec<_> = response
@@ -3586,7 +4028,7 @@ mod tests {
             mock_encoded_decode_response(StatusCode::OK, raw, "text/event-stream", "identity")
                 .await;
         let response =
-            finalize_decode_response(decode, Some(&prefill), "/v1/completions", true, false)
+            finalize_decode_response(decode, Some(&prefill), "/v1/completions", true, false, None)
                 .await
                 .unwrap();
         assert_eq!(response.headers()["content-encoding"], "identity");
@@ -3605,10 +4047,16 @@ mod tests {
             "identity",
         )
         .await;
-        let response =
-            finalize_decode_response(decode, Some(&prefill), "/v1/completions", false, false)
-                .await
-                .unwrap();
+        let response = finalize_decode_response(
+            decode,
+            Some(&prefill),
+            "/v1/completions",
+            false,
+            false,
+            None,
+        )
+        .await
+        .unwrap();
         assert!(response.headers().get("content-encoding").is_none());
         let bytes = axum::body::to_bytes(response.into_body(), 1024)
             .await
@@ -3627,9 +4075,10 @@ mod tests {
                 r#"{"usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12,"prompt_tokens_details":null},"metrics":{"x":1}}"#,
             )
             .await;
-            let response = finalize_decode_response(decode, Some(&prefill), path, false, false)
-                .await
-                .unwrap();
+            let response =
+                finalize_decode_response(decode, Some(&prefill), path, false, false, None)
+                    .await
+                    .unwrap();
             assert_eq!(response.status(), StatusCode::OK);
             assert!(response.headers().get("content-length").is_none());
             let bytes = axum::body::to_bytes(response.into_body(), 1024)
@@ -3693,6 +4142,7 @@ mod tests {
                         path,
                         streaming,
                         false,
+                        None,
                     )
                     .await
                     .unwrap();
@@ -3734,10 +4184,16 @@ mod tests {
             r#"{"usage":{"prompt_tokens_details":{"cached_tokens":10,"audio_tokens":1}}}"#,
         )
         .await;
-        let response =
-            finalize_decode_response(decode, Some(&json!({})), "/v1/completions", false, false)
-                .await
-                .unwrap();
+        let response = finalize_decode_response(
+            decode,
+            Some(&json!({})),
+            "/v1/completions",
+            false,
+            false,
+            None,
+        )
+        .await
+        .unwrap();
         let bytes = axum::body::to_bytes(response.into_body(), 1024)
             .await
             .unwrap();
@@ -3755,7 +4211,7 @@ mod tests {
         let response_body = r#"{"usage":{"input_tokens_details":{"cached_tokens":90}}}"#;
         let (decode, server) = mock_decode_response(StatusCode::OK, response_body).await;
         let response =
-            finalize_decode_response(decode, Some(&prefill), "/v1/responses", false, false)
+            finalize_decode_response(decode, Some(&prefill), "/v1/responses", false, false, None)
                 .await
                 .unwrap();
         let bytes = axum::body::to_bytes(response.into_body(), 1024)
@@ -3766,10 +4222,16 @@ mod tests {
         server.abort();
 
         let (decode, server) = mock_decode_response(StatusCode::OK, "not-json").await;
-        let response =
-            finalize_decode_response(decode, Some(&prefill), "/v1/completions", false, false)
-                .await
-                .unwrap();
+        let response = finalize_decode_response(
+            decode,
+            Some(&prefill),
+            "/v1/completions",
+            false,
+            false,
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let bytes = axum::body::to_bytes(response.into_body(), 1024)
             .await
@@ -3788,7 +4250,7 @@ mod tests {
         ] {
             let raw = "  upstream plain text\n";
             let (decode, server) = mock_decode_response(StatusCode::OK, raw).await;
-            let response = finalize_decode_response(decode, None, path, false, false)
+            let response = finalize_decode_response(decode, None, path, false, false, None)
                 .await
                 .unwrap();
             assert_eq!(response.status(), StatusCode::OK);
@@ -3836,7 +4298,7 @@ mod tests {
                 .unwrap();
             let response = timeout(
                 Duration::from_secs(2),
-                finalize_decode_response(decode, None, path, false, false),
+                finalize_decode_response(decode, None, path, false, false, None),
             )
             .await
             .expect("unenriched responses must not wait for the complete upstream body")
@@ -3901,9 +4363,15 @@ mod tests {
                         .send()
                         .await
                         .unwrap();
-                    let result =
-                        finalize_decode_response(decode, None, path, is_streaming, needs_logprobs)
-                            .await;
+                    let result = finalize_decode_response(
+                        decode,
+                        None,
+                        path,
+                        is_streaming,
+                        needs_logprobs,
+                        None,
+                    )
+                    .await;
                     let needs_enrichment =
                         pd_cached_tokens::is_supported_path(path) || needs_logprobs;
                     if is_streaming || !needs_enrichment {
@@ -3973,7 +4441,7 @@ mod tests {
                 .unwrap();
             let response = timeout(
                 Duration::from_secs(2),
-                finalize_decode_response(decode, None, "/v1/completions", false, false),
+                finalize_decode_response(decode, None, "/v1/completions", false, false, None),
             )
             .await
             .expect("oversized optional enrichment must switch to passthrough")
@@ -4777,7 +5245,11 @@ mod tests {
                     "{path} {mode}: {}",
                     response.status()
                 );
-                assert_eq!(decode.load(), 1, "{path} {mode}");
+                assert_eq!(
+                    decode.load(),
+                    if mode == "decode_http" { 2 } else { 1 },
+                    "{path} {mode}"
+                );
                 drop(response);
                 assert_eq!(
                     decode.load(),

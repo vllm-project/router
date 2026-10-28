@@ -3180,6 +3180,127 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
+    #[test]
+    fn request_load_guard_preserves_concurrent_load() {
+        let worker = Arc::new(BasicWorker::new(
+            "http://worker:8080".to_string(),
+            WorkerType::Regular,
+        ));
+        worker.increment_load();
+
+        {
+            worker.increment_load();
+            let _guard = RequestLoadGuard::new(Some(worker.clone()), None);
+            assert_eq!(worker.load(), 2);
+        }
+
+        assert_eq!(worker.load(), 1);
+    }
+
+    #[tokio::test]
+    async fn request_load_guard_releases_load_when_request_is_cancelled() {
+        let worker = Arc::new(BasicWorker::new(
+            "http://worker:8080".to_string(),
+            WorkerType::Regular,
+        ));
+        let worker_for_request: Arc<dyn Worker> = worker.clone();
+        let request = tokio::spawn(async move {
+            worker_for_request.increment_load();
+            let _guard = RequestLoadGuard::new(Some(worker_for_request), None);
+            std::future::pending::<()>().await;
+        });
+
+        while worker.load() == 0 {
+            tokio::task::yield_now().await;
+        }
+        request.abort();
+        let _ = request.await;
+
+        assert_eq!(worker.load(), 0);
+    }
+
+    #[tokio::test]
+    async fn streaming_client_drop_releases_load_while_upstream_stalls() {
+        use axum::{routing::post, Router as AxumRouter};
+        use std::convert::Infallible;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let worker_url = format!("http://{}", listener.local_addr().unwrap());
+        let app = AxumRouter::new().route(
+            "/generate",
+            post(|| async {
+                let body = Body::from_stream(futures_util::stream::pending::<
+                    Result<bytes::Bytes, Infallible>,
+                >());
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header(CONTENT_TYPE, "text/event-stream")
+                    .body(body)
+                    .unwrap()
+            }),
+        );
+        let _server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        let worker = Arc::new(BasicWorker::new(worker_url, WorkerType::Regular));
+        worker_registry.register(worker.clone());
+        let policy_registry = Arc::new(PolicyRegistry::new(
+            crate::config::types::PolicyConfig::CacheAware {
+                cache_threshold: 0.5,
+                balance_abs_threshold: 32,
+                balance_rel_threshold: 1.5,
+                eviction_interval_secs: 60,
+                max_tree_size: 1000,
+            },
+        ));
+        let (_, rx) = tokio::sync::watch::channel(HashMap::new());
+        let router = Router {
+            epd: None,
+            worker_registry,
+            policy_registry,
+            client: Client::new(),
+            worker_startup_timeout_secs: 5,
+            worker_startup_check_interval_secs: 1,
+            intra_node_data_parallel_size: 1,
+            api_key: None,
+            retry_config: RetryConfig::default(),
+            circuit_breaker_config: CircuitBreakerConfig::default(),
+            kv_aware_session_affinity_ttl_secs: None,
+            health_config: HealthConfig::default(),
+            frontend: crate::backend::EngineFrontend::new(),
+            _worker_loads: Arc::new(rx),
+            _load_monitor_handle: None,
+            kv_index_supervisor: None,
+            _kv_signal_handle: None,
+            program_scheduler: None,
+            _program_observation_handle: None,
+            program_targets_cache: Mutex::new(HashMap::new()),
+            program_token_estimator: Arc::new(MomentumTokenEstimator::default()),
+        };
+        let request: GenerateRequest =
+            serde_json::from_str(r#"{"text":"hello","stream":true}"#).unwrap();
+
+        let response = tokio::time::timeout(
+            Duration::from_secs(5),
+            router.route_typed_request(None, &request, "/generate", None),
+        )
+        .await
+        .expect("response headers should arrive while the body is stalled");
+        assert_eq!(worker.load(), 1);
+
+        drop(response);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while worker.load() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("client disconnect should release the worker load");
+    }
+
     #[tokio::test]
     async fn test_transparent_response_preserves_encoding_and_filters_connection() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -4233,6 +4354,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn transparent_request_cancellation_preserves_other_requests_load() {
+        use axum::routing::post;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let app = axum::Router::new().route(
+            "/v1/chat/completions",
+            post(std::future::pending::<Response>),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(url, WorkerType::Regular));
+        let mut router = create_test_regular_router();
+        router.worker_registry = Arc::new(WorkerRegistry::new());
+        router.worker_registry.register(worker.clone());
+        router.policy_registry = Arc::new(PolicyRegistry::new(
+            crate::config::PolicyConfig::CacheAware {
+                cache_threshold: 0.5,
+                balance_abs_threshold: 32,
+                balance_rel_threshold: 1.5,
+                eviction_interval_secs: 60,
+                max_tree_size: 1000,
+            },
+        ));
+        worker.increment_load();
+        let other_request = RequestLoadGuard::new(Some(worker.clone()), None);
+        let request = tokio::spawn(async move {
+            router
+                .route_transparent(
+                    None,
+                    "/v1/chat/completions",
+                    &Method::POST,
+                    serde_json::json!({"messages": []}),
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while worker.load() != 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("transparent request should acquire its own load guard");
+
+        request.abort();
+        let _ = request.await;
+        assert_eq!(worker.load(), 1);
+        drop(other_request);
+        assert_eq!(worker.load(), 0);
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn streaming_body_holds_load_until_consumed_or_dropped() {
         let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(
             "grpc://worker:50051".to_string(),
@@ -4265,6 +4438,100 @@ mod tests {
             Some(worker),
             Some(KvRequestSlot::new(manager, target, 64, None)),
         )
+    }
+
+    async fn check_health_preserves_guarded_load(registry_checker: bool) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+            format!("http://{}", listener.local_addr().unwrap()),
+            WorkerType::Regular,
+        ));
+        let checks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let checked = Arc::new(tokio::sync::Notify::new());
+        let handler_checks = checks.clone();
+        let handler_checked = checked.clone();
+        let app = axum::Router::new().route(
+            "/health",
+            axum::routing::get(move || {
+                let checks = handler_checks.clone();
+                let checked = handler_checked.clone();
+                async move {
+                    checks.fetch_add(1, Ordering::Release);
+                    checked.notify_one();
+                    StatusCode::OK
+                }
+            }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let manager = Arc::new(crate::policies::InMemorySlotManager::new());
+        let target = crate::kv_index::RoutableTarget {
+            instance_id: Arc::from(worker.url()),
+            dp_rank: 0,
+        };
+        let old_request = admitted_kv_load(worker.clone(), manager.clone(), target.clone());
+        let health_checker = if registry_checker {
+            let registry = WorkerRegistry::new();
+            registry.register(worker.clone());
+            registry.start_health_checker(1)
+        } else {
+            crate::core::start_health_checker(
+                Arc::new(std::sync::RwLock::new(vec![worker.clone()])),
+                1,
+            )
+        };
+
+        // The eleventh request starts after the old tenth-cycle reset point.
+        let completed = tokio::time::timeout(Duration::from_secs(20), async {
+            while checks.load(Ordering::Acquire) < 11 {
+                checked.notified().await;
+            }
+        })
+        .await;
+        let load_after_checks = worker.load();
+        let slots_after_checks = crate::policies::LoadProvider::sample(manager.as_ref(), &target);
+        let new_request = admitted_kv_load(worker.clone(), manager.clone(), target.clone());
+        drop(old_request);
+        let load_after_old_release = worker.load();
+        let remaining = crate::policies::LoadProvider::sample(manager.as_ref(), &target);
+        drop(new_request);
+        health_checker.shutdown().await;
+        server.abort();
+
+        completed.expect("health checker must execute more than ten cycles");
+        assert_eq!(
+            (load_after_checks, load_after_old_release),
+            (1, 1),
+            "worker load after health checks and after releasing the older reservation"
+        );
+        assert_eq!(
+            slots_after_checks,
+            crate::policies::LoadSample {
+                active_prefill_tokens: 64,
+                active_requests: 1,
+            }
+        );
+        assert_eq!(
+            remaining,
+            crate::policies::LoadSample {
+                active_prefill_tokens: 64,
+                active_requests: 1,
+            }
+        );
+        assert_eq!(worker.load(), 0);
+        assert_eq!(
+            crate::policies::LoadProvider::sample(manager.as_ref(), &target),
+            crate::policies::LoadSample::default()
+        );
+    }
+
+    #[tokio::test]
+    async fn registry_health_checker_preserves_guarded_load() {
+        check_health_preserves_guarded_load(true).await;
+    }
+
+    #[tokio::test]
+    async fn collection_health_checker_preserves_guarded_load() {
+        check_health_preserves_guarded_load(false).await;
     }
 
     #[tokio::test]
