@@ -13,7 +13,7 @@ source "${HOME}/.cargo/env"
 cargo build --release
 
 # Build Python wheels using Python 3.9 (available in manylinux image)
-/opt/python/cp39-cp39/bin/pip install -U pip setuptools wheel setuptools-rust build auditwheel
+/opt/python/cp39-cp39/bin/pip install -U pip build auditwheel
 /opt/python/cp39-cp39/bin/python -m build
 
 # Repair wheel to have proper manylinux tags

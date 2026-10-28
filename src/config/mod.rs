@@ -81,6 +81,33 @@ pub fn parse_static_kv_event_sources(
     Ok(sources)
 }
 
+/// Parse repeatable static PD KV-source specifications for both launchers.
+pub fn parse_pd_kv_events(
+    specs: &[String],
+) -> ConfigResult<std::collections::HashMap<String, PdKvEventSources>> {
+    let mut sources = std::collections::HashMap::new();
+    for spec in specs {
+        let (url, endpoints) = parse_event_source_spec(spec, "pd-kv-events")?;
+        if sources
+            .insert(
+                url.to_owned(),
+                PdKvEventSources {
+                    endpoints,
+                    replay_endpoints: None,
+                    block_size: 16,
+                    model: None,
+                },
+            )
+            .is_some()
+        {
+            return Err(ConfigError::ValidationFailed {
+                reason: format!("duplicate --pd-kv-events worker URL '{url}'"),
+            });
+        }
+    }
+    Ok(sources)
+}
+
 fn parse_event_source_spec<'a>(spec: &'a str, flag: &str) -> ConfigResult<(&'a str, Vec<String>)> {
     let (worker, endpoints) =
         spec.split_once('=')
@@ -133,14 +160,7 @@ impl StaticKvEventSources {
             .iter()
             .chain(self.replay_endpoints.iter().flatten())
         {
-            let valid = url::Url::parse(endpoint).is_ok_and(|parsed| {
-                parsed.scheme() == "tcp"
-                    && parsed
-                        .host_str()
-                        .is_some_and(|host| host != "*" && host != "0.0.0.0" && host != "::")
-                    && parsed.port().is_some_and(|port| port != 0)
-            });
-            if !valid {
+            if !is_reachable_tcp_endpoint(endpoint) {
                 return Err(ConfigError::ValidationFailed {
                     reason: format!(
                         "static KV event endpoint must be reachable tcp://HOST:PORT: '{endpoint}'"
@@ -150,6 +170,20 @@ impl StaticKvEventSources {
         }
         Ok(())
     }
+}
+
+fn is_reachable_tcp_endpoint(endpoint: &str) -> bool {
+    url::Url::parse(endpoint).is_ok_and(|parsed| {
+        parsed.scheme() == "tcp"
+            && parsed.host_str().is_some_and(|host| {
+                let host = host.trim_start_matches('[').trim_end_matches(']');
+                host != "*"
+                    && !host
+                        .parse::<std::net::IpAddr>()
+                        .is_ok_and(|ip| ip.is_unspecified())
+            })
+            && parsed.port().is_some_and(|port| port != 0)
+    })
 }
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
@@ -182,10 +216,28 @@ mod static_kv_event_source_tests {
     }
 
     #[test]
+    fn pd_event_sources_reject_duplicate_workers() {
+        let specs = [
+            "http://worker:8000=tcp://10.0.0.1:5557".to_owned(),
+            "http://worker:8000=tcp://10.0.0.1:9999".to_owned(),
+        ];
+        let error = parse_pd_kv_events(&specs).unwrap_err().to_string();
+        assert!(
+            error.contains("duplicate --pd-kv-events worker URL"),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn static_event_sources_require_model_and_reachable_endpoints() {
         let missing_model = vec!["http://worker:8000=tcp://10.0.0.1:5557".to_string()];
         assert!(parse_static_kv_event_sources(&missing_model, &[], 16, None).is_err());
-        for endpoint in ["tcp://*:5557", "tcp://0.0.0.0:5557", "tcp://10.0.0.1:0"] {
+        for endpoint in [
+            "tcp://*:5557",
+            "tcp://0.0.0.0:5557",
+            "tcp://[::]:5557",
+            "tcp://10.0.0.1:0",
+        ] {
             let specs = vec![format!("http://worker:8000={endpoint}")];
             assert!(parse_static_kv_event_sources(&specs, &[], 16, Some("model")).is_err());
         }

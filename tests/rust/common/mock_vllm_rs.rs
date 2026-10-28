@@ -160,7 +160,7 @@ impl Inference for MockVllmRs {
 
         if self
             .failures_remaining
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
             .is_ok()
         {
             return Err(Status::unavailable("retry test"));
