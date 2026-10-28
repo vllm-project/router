@@ -9,14 +9,6 @@ from typing import Any
 import requests
 
 
-def attach_workers(router_url: str, workers) -> None:
-    for w in workers:
-        r = requests.post(
-            f"{router_url}/add_worker", params={"url": w.url}, timeout=180
-        )
-        r.raise_for_status()
-
-
 def post_chat_completion(
     session: requests.Session,
     router_url: str,
@@ -101,6 +93,8 @@ def post_chat_stream_timed(
             obj = json.loads(payload)
         except json.JSONDecodeError:
             continue
+        if obj.get("error") is not None:
+            raise RuntimeError(f"SSE error: {obj['error']}")
         chunk_id = obj.get("id")
         if isinstance(chunk_id, str) and chunk_id:
             request_id = chunk_id
@@ -119,7 +113,7 @@ def post_chat_stream_timed(
         if chunk and ttft_ms is None:
             ttft_ms = (time.perf_counter() - t0) * 1000.0
     if not saw_done:
-        raise RuntimeError("incomplete SSE stream (no [DONE])")
+        raise RuntimeError("incomplete SSE stream (EOF before [DONE])")
     if ttft_ms is None:
         raise RuntimeError("no streamed output (ttft unavailable)")
     if not request_id:
@@ -139,72 +133,3 @@ def post_chat_stream_timed(
         "cached_tokens": cached_tokens_from_usage(usage),
         "stages": stages,
     }
-
-
-def first_token_ms_from_timed(row: dict[str, Any]) -> float:
-    """Prefer router ``x-router-stages`` ``first_token_ms`` over client TTFT."""
-    stages = row.get("stages")
-    if isinstance(stages, dict):
-        ft = stages.get("first_token_ms")
-        if isinstance(ft, (int, float)):
-            return float(ft)
-    return float(row["ttft_ms"])
-
-
-def post_chat_stream_collect_usage(
-    session: requests.Session,
-    router_url: str,
-    *,
-    model: str,
-    content: str,
-    max_tokens: int = 8,
-    temperature: float = 0.0,
-    timeout: float = 120.0,
-) -> dict[str, Any]:
-    """Stream chat to completion; return final ``usage`` (needs ``include_usage``)."""
-    response = session.post(
-        f"{router_url}/v1/chat/completions",
-        json={
-            "model": model,
-            "messages": [{"role": "user", "content": content}],
-            "max_tokens": max_tokens,
-            "stream": True,
-            "temperature": temperature,
-            "stream_options": {"include_usage": True},
-        },
-        timeout=timeout,
-        stream=True,
-    )
-    response.raise_for_status()
-    usage: dict[str, Any] = {}
-    saw_done = False
-    for line in response.iter_lines(decode_unicode=True):
-        if not line:
-            continue
-        if not line.startswith("data: "):
-            continue
-        payload = line[6:].strip()
-        if payload == "[DONE]":
-            saw_done = True
-            break
-        try:
-            obj = json.loads(payload)
-        except json.JSONDecodeError:
-            continue
-        if obj.get("usage"):
-            usage = obj["usage"]
-    if not saw_done:
-        raise RuntimeError("incomplete SSE stream (no [DONE])")
-    if not usage:
-        raise RuntimeError(
-            "stream ended without usage (enable prefix caching / include_usage)"
-        )
-    return usage
-
-
-def drain_sse_stream(response: requests.Response) -> None:
-    for line in response.iter_lines(decode_unicode=True):
-        if not line:
-            continue
-        if line.strip() == "data: [DONE]":
-            break

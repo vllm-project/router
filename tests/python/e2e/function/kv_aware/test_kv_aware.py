@@ -71,27 +71,27 @@ def test_kv_aware_live_routing_and_streaming(
         assert choices[0].get("message", {}).get("content") is not None
 
         def one_request(i: int) -> None:
-            r = router_http.post_chat_completion(
-                session,
-                base,
-                model=model,
-                content=_user_message(f" req-{i}"),
-                stream=False,
-            )
-            r.raise_for_status()
-            body = r.json()
-            assert body.get("choices"), body
+            with requests.Session() as thread_session:
+                r = router_http.post_chat_completion(
+                    thread_session,
+                    base,
+                    model=model,
+                    content=_user_message(f" req-{i}"),
+                    stream=False,
+                )
+                r.raise_for_status()
+                body = r.json()
+                assert body.get("choices"), body
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
             list(pool.map(one_request, range(16)))
 
-        stream_resp = router_http.post_chat_completion(
+        streamed = router_http.post_chat_stream_timed(
             session,
             base,
             model=model,
             content=_user_message(" stream"),
-            stream=True,
             max_tokens=4,
         )
-        stream_resp.raise_for_status()
-        router_http.drain_sse_stream(stream_resp)
+        assert streamed["ttft_ms"] >= 0
+        assert streamed["request_id"]

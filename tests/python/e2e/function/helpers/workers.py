@@ -12,15 +12,25 @@ from tests.python.e2e.function.helpers import launch
 from tests.python.e2e.function.helpers.worker_log_pump import SubprocessLogPump
 from tests.python.e2e.function.kv_aware.config import (
     kv_aware_kv_events_enabled,
+    kv_aware_kv_events_endpoint_bind,
     kv_aware_kv_events_replay_enabled,
+    kv_aware_kv_events_replay_host,
+    kv_aware_use_vllm_serve,
     kv_aware_worker_gpu_ids,
     kv_aware_worker_logs_quiet,
+    worker_serve_extra_argv,
 )
 
 
 def _require_worker_launch() -> None:
+    if kv_aware_use_vllm_serve():
+        raise RuntimeError(
+            "KV_AWARE_USE_VLLM_SERVE=1 selects `vllm serve`, which does not "
+            "accept --grpc-port (docs/backend/grpc.md). Set "
+            "KV_AWARE_USE_VLLM_SERVE=0 and use vllm-rs serve."
+        )
     try:
-        launch.resolve_worker_serve_launch()
+        launch.resolve_worker_serve_launch(prefer_vllm_serve=False)
     except RuntimeError as exc:
         pytest.skip(str(exc))
 
@@ -57,10 +67,19 @@ def spawn_two_vllm_rs_grpc_workers(
     port_count = 8 if replay_on else (6 if kv_on else 4)
     ports = launch.find_distinct_available_ports(port_count)
     http_a, grpc_a, http_b, grpc_b = ports[:4]
-    zmq_a = ports[4] if kv_on else None
-    replay_a = ports[5] if replay_on else None
-    zmq_b = ports[6] if replay_on else (ports[4] if kv_on else None)
-    replay_b = ports[7] if replay_on else None
+    # Replay uses four extra ports (zmq+replay per worker). Without replay,
+    # each worker still needs its own PUB port — do not share ports[4].
+    if replay_on:
+        zmq_a, replay_a, zmq_b, replay_b = ports[4], ports[5], ports[6], ports[7]
+    elif kv_on:
+        zmq_a, zmq_b = ports[4], ports[5]
+        replay_a = replay_b = None
+    else:
+        zmq_a = zmq_b = replay_a = replay_b = None
+    serve_extra = worker_serve_extra_argv()
+    endpoint_bind = kv_aware_kv_events_endpoint_bind()
+    replay_host = kv_aware_kv_events_replay_host()
+    prefer_vllm_serve = kv_aware_use_vllm_serve()
 
     def _kv_log(zmq: int | None, replay: int | None) -> str:
         parts = []
@@ -70,75 +89,88 @@ def spawn_two_vllm_rs_grpc_workers(
             parts.append(f" replay={replay}")
         return "".join(parts)
 
-    print(
-        f"[e2e] worker A gpu={gpu_a} http={http_a} grpc={grpc_a}{_kv_log(zmq_a, replay_a)}",
-        flush=True,
-    )
-    log_a_path = log_dir / f"worker_a_grpc_{grpc_a}.log"
-    proc_a = launch.popen_launch_vllm_rs_grpc_worker(
-        model,
-        host=host,
-        http_port=http_a,
-        grpc_port=grpc_a,
-        base_gpu_id=gpu_a,
-        kv_events_zmq_port=zmq_a,
-        kv_events_replay_port=replay_a,
-        capture_output=True,
-    )
-    pump_a = SubprocessLogPump(
-        proc_a,
-        log_a_path,
-        echo=echo,
-        prefix=f"[worker A grpc={grpc_a}] ",
-    )
-    worker_a = SimpleNamespace(
-        proc=proc_a,
-        url=f"grpc://{host}:{grpc_a}",
-        http_url=f"http://{host}:{http_a}",
-        gpu_id=gpu_a,
-        log_path=str(log_a_path),
-        log_pump=pump_a,
-    )
-    launch.wait_worker_health(
-        worker_a.http_url, worker_health_timeout, proc=worker_a.proc
-    )
-    workers.append(worker_a)
+    try:
+        print(
+            f"[e2e] worker A gpu={gpu_a} http={http_a} grpc={grpc_a}"
+            f"{_kv_log(zmq_a, replay_a)}",
+            flush=True,
+        )
+        log_a_path = log_dir / f"worker_a_grpc_{grpc_a}.log"
+        proc_a = launch.popen_launch_vllm_rs_grpc_worker(
+            model,
+            host=host,
+            http_port=http_a,
+            grpc_port=grpc_a,
+            base_gpu_id=gpu_a,
+            kv_events_zmq_port=zmq_a,
+            kv_events_replay_port=replay_a,
+            extra_argv=serve_extra,
+            endpoint_bind=endpoint_bind,
+            replay_host=replay_host,
+            prefer_vllm_serve=prefer_vllm_serve,
+            capture_output=True,
+        )
+        worker_a = SimpleNamespace(
+            proc=proc_a,
+            url=f"grpc://{host}:{grpc_a}",
+            http_url=f"http://{host}:{http_a}",
+            gpu_id=gpu_a,
+            log_path=str(log_a_path),
+            log_pump=None,
+        )
+        workers.append(worker_a)
+        worker_a.log_pump = SubprocessLogPump(
+            proc_a,
+            log_a_path,
+            echo=echo,
+            prefix=f"[worker A grpc={grpc_a}] ",
+        )
+        launch.wait_worker_health(
+            worker_a.http_url, worker_health_timeout, proc=worker_a.proc
+        )
 
-    print(
-        f"[e2e] worker B gpu={gpu_b} http={http_b} grpc={grpc_b}{_kv_log(zmq_b, replay_b)}",
-        flush=True,
-    )
-    log_b_path = log_dir / f"worker_b_grpc_{grpc_b}.log"
-    proc_b = launch.popen_launch_vllm_rs_grpc_worker(
-        model,
-        host=host,
-        http_port=http_b,
-        grpc_port=grpc_b,
-        base_gpu_id=gpu_b,
-        kv_events_zmq_port=zmq_b,
-        kv_events_replay_port=replay_b,
-        capture_output=True,
-    )
-    pump_b = SubprocessLogPump(
-        proc_b,
-        log_b_path,
-        echo=echo,
-        prefix=f"[worker B grpc={grpc_b}] ",
-    )
-    worker_b = SimpleNamespace(
-        proc=proc_b,
-        url=f"grpc://{host}:{grpc_b}",
-        http_url=f"http://{host}:{http_b}",
-        gpu_id=gpu_b,
-        log_path=str(log_b_path),
-        log_pump=pump_b,
-    )
-    launch.wait_worker_health(
-        worker_b.http_url, worker_health_timeout, proc=worker_b.proc
-    )
-    workers.append(worker_b)
-
-    return workers
+        print(
+            f"[e2e] worker B gpu={gpu_b} http={http_b} grpc={grpc_b}"
+            f"{_kv_log(zmq_b, replay_b)}",
+            flush=True,
+        )
+        log_b_path = log_dir / f"worker_b_grpc_{grpc_b}.log"
+        proc_b = launch.popen_launch_vllm_rs_grpc_worker(
+            model,
+            host=host,
+            http_port=http_b,
+            grpc_port=grpc_b,
+            base_gpu_id=gpu_b,
+            kv_events_zmq_port=zmq_b,
+            kv_events_replay_port=replay_b,
+            extra_argv=serve_extra,
+            endpoint_bind=endpoint_bind,
+            replay_host=replay_host,
+            prefer_vllm_serve=prefer_vllm_serve,
+            capture_output=True,
+        )
+        worker_b = SimpleNamespace(
+            proc=proc_b,
+            url=f"grpc://{host}:{grpc_b}",
+            http_url=f"http://{host}:{http_b}",
+            gpu_id=gpu_b,
+            log_path=str(log_b_path),
+            log_pump=None,
+        )
+        workers.append(worker_b)
+        worker_b.log_pump = SubprocessLogPump(
+            proc_b,
+            log_b_path,
+            echo=echo,
+            prefix=f"[worker B grpc={grpc_b}] ",
+        )
+        launch.wait_worker_health(
+            worker_b.http_url, worker_health_timeout, proc=worker_b.proc
+        )
+        return workers
+    except Exception:
+        terminate_workers(workers)
+        raise
 
 
 def terminate_workers(workers) -> None:

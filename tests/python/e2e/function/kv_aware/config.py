@@ -1,19 +1,18 @@
 """Model and prompt constants for kv_aware functional e2e.
 
-Workers: **``vllm serve``** (Rust frontend, default) or **``vllm-rs serve``**, with
-``grpc://`` URLs (see ``scripts/backend``).
+Workers: **``vllm-rs serve``** with ``grpc://`` URLs (see ``scripts/backend``).
+``vllm serve`` does not accept ``--grpc-port`` (``docs/backend/grpc.md``).
 
 Optional environment (see also ``function/helpers/launch.py``):
 
 - ``ROUTER_BIN``: path to ``vllm-router`` after ``cargo build --release``
   (same as ``scripts/backend`` / Buildkite). Alias: ``VLLM_ROUTER_BIN``.
-- ``VLLM_BIN``: path to ``vllm`` CLI (else ``PATH``). Used when ``KV_AWARE_USE_VLLM_SERVE=1``.
 - ``VLLM_RS``: path to ``vllm-rs`` binary (else ``PATH`` or wheel under ``vllm``).
 - Model for workers + router (HF id or local dir), first match wins:
   ``KV_AWARE_E2E_MODEL``, ``MODEL``, ``VLLM_ROUTER_MODEL``, ``MODEL_DIR``;
   default ``Qwen/Qwen3-0.6B`` (see ``kv_aware_e2e_model()``).
-- ``KV_AWARE_USE_VLLM_SERVE``: ``1`` (default) prefer ``vllm serve`` + ``VLLM_USE_RUST_FRONTEND=1``;
-  ``0`` use ``vllm-rs serve`` only.
+- ``KV_AWARE_USE_VLLM_SERVE``: ``0`` (default) use ``vllm-rs serve``.
+  ``1`` is rejected: ``vllm serve`` cannot be a ``grpc://`` worker.
 - Worker serve extras (shell-split, first set wins):
   ``KV_AWARE_WORKER_SERVE_EXTRA``, ``VLLM_SERVE_EXTRA``, ``VLLM_RS_SERVE_EXTRA``;
   default ``--enable-prefix-caching`` when all unset.
@@ -53,9 +52,6 @@ import subprocess
 
 # Default when no model env is set (see ``kv_aware_e2e_model()``).
 KV_AWARE_E2E_MODEL_DEFAULT = "Qwen/Qwen3-0.6B"
-
-# Backward-compatible name for the default id (not live env resolution).
-KV_AWARE_E2E_MODEL = KV_AWARE_E2E_MODEL_DEFAULT
 
 
 def kv_aware_e2e_model() -> str:
@@ -115,7 +111,7 @@ def _env_flag(name: str, *, default: str = "1") -> bool:
 
 
 def kv_aware_use_vllm_serve() -> bool:
-    return _env_flag("KV_AWARE_USE_VLLM_SERVE", default="1")
+    return _env_flag("KV_AWARE_USE_VLLM_SERVE", default="0")
 
 
 def kv_aware_kv_events_enabled() -> bool:

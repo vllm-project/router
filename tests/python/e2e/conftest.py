@@ -124,10 +124,6 @@ def _popen_launch_router_only(
     intra_node_data_parallel_size: int = 1,
     enable_igw: bool = False,
     api_key: str | None = None,
-    router_temperature: float | None = None,
-    kv_penalty_host: float | None = None,
-    kv_penalty_external: float | None = None,
-    kv_penalty_disk: float | None = None,
 ) -> subprocess.Popen:
     host, port = _parse_url(base_url)
 
@@ -149,14 +145,6 @@ def _popen_launch_router_only(
         cmd += ["--enable-igw"]
     if api_key is not None:
         cmd += ["--api-key", api_key]
-    if router_temperature is not None:
-        cmd += ["--router-temperature", str(router_temperature)]
-    if kv_penalty_host is not None:
-        cmd += ["--kv-penalty-host", str(kv_penalty_host)]
-    if kv_penalty_external is not None:
-        cmd += ["--kv-penalty-external", str(kv_penalty_external)]
-    if kv_penalty_disk is not None:
-        cmd += ["--kv-penalty-disk", str(kv_penalty_disk)]
     cmd += [
         "--prometheus-port",
         str(prom_port),
@@ -728,23 +716,6 @@ def e2e_router_only_rr():
         _terminate(proc)
 
 
-@pytest.fixture
-def e2e_router_only_kv_aware():
-    """Router-only instance with kv_aware (minimum-cost selection by default)."""
-    port = _find_available_port()
-    base_url = f"http://127.0.0.1:{port}"
-    proc = _popen_launch_router_only(
-        base_url,
-        policy="kv_aware",
-        timeout=180.0,
-        router_temperature=0.0,
-    )
-    try:
-        yield SimpleNamespace(proc=proc, url=base_url)
-    finally:
-        _terminate(proc)
-
-
 @pytest.fixture(scope="session")
 def e2e_embedding_model() -> str:
     """Embedding model to use for E2E tests.
@@ -810,27 +781,6 @@ def e2e_worker_dp2_api(e2e_model: str, e2e_router_only_rr_dp_aware_api):
         yield SimpleNamespace(proc=proc, url=base_url)
     finally:
         _terminate(proc)
-
-
-@pytest.fixture(scope="session")
-def e2e_two_workers_single_gpu(e2e_model: str):
-    """Two single-GPU workers for multi-target kv_aware routing tests."""
-    workers = []
-    try:
-        port_a = _find_available_port()
-        url_a = f"http://127.0.0.1:{port_a}"
-        proc_a = _popen_launch_worker(e2e_model, url_a, base_gpu_id=0)
-        workers.append(SimpleNamespace(proc=proc_a, url=url_a))
-
-        port_b = _find_available_port()
-        url_b = f"http://127.0.0.1:{port_b}"
-        proc_b = _popen_launch_worker(e2e_model, url_b, base_gpu_id=1)
-        workers.append(SimpleNamespace(proc=proc_b, url=url_b))
-
-        yield workers
-    finally:
-        for w in workers:
-            _terminate(w.proc)
 
 
 @pytest.fixture(scope="session")

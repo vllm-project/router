@@ -7,7 +7,6 @@ span, then different tails (mirroring ``benches/backend/bench_prefix_kvhit.py``)
 
 from __future__ import annotations
 
-import time
 from dataclasses import dataclass
 
 from tests.python.e2e.function.kv_aware.config import (
@@ -19,27 +18,19 @@ from tests.python.e2e.function.kv_aware.config import (
 
 @dataclass(frozen=True)
 class PrefixReuseScenario:
-    """Three chat bodies: prime cache, reuse prefix, control miss."""
+    """Two chat bodies: prime cache, then reuse the same prefix."""
 
     name: str
     prime_user: str
     reuse_user: str
-    control_user: str
 
 
 def default_prefix_reuse_scenario() -> PrefixReuseScenario:
-    """Shared long prefix on prime/reuse; control is unrelated text (true miss)."""
-    stamp = time.time_ns()
-    # Control must not repeat KV_AWARE_SHARED_PREFIX or it also prefix-hits after prime.
-    control_filler = (
-        f"Unrelated control request {stamp}. "
-        "Discuss weather and hiking trails in one short sentence. " + ("misc-" * 48)
-    )
+    """Shared long prefix on prime and reuse."""
     return PrefixReuseScenario(
         name="shared-prefix-reuse",
         prime_user=KV_AWARE_SHARED_PREFIX + " Prime this prefix on one worker.",
         reuse_user=KV_AWARE_SHARED_PREFIX + " Follow-up with the same prefix block.",
-        control_user=control_filler,
     )
 
 
@@ -71,9 +62,9 @@ def assert_lane_reuse_shares_prefix(lane: str, *, round_index: int = 1) -> None:
     prefix = lane_prefix(lane)
     prime = lane_prime_user(lane)
     reuse = lane_reuse_user(lane, round_index=round_index)
-    assert prime.startswith(prefix) and reuse.startswith(
-        prefix
-    ), f"lane {lane}: prime/reuse must start with lane prefix"
+    assert prime.startswith(prefix) and reuse.startswith(prefix), (
+        f"lane {lane}: prime/reuse must start with lane prefix"
+    )
     assert len(reuse) > len(prefix) and len(prime) > len(prefix)
 
 
@@ -81,12 +72,3 @@ def assert_dual_lane_prefixes_distinct() -> None:
     assert lane_prefix("A") != lane_prefix("B")
     assert not lane_prime_user("B").startswith(lane_prefix("A"))
     assert not lane_prime_user("A").startswith(lane_prefix("B"))
-
-
-def control_user_message(index: int) -> str:
-    """Unrelated prompt (no ``KV_AWARE_SHARED_PREFIX``); unique per index."""
-    stamp = time.time_ns()
-    return (
-        f"Unrelated control #{index} {stamp}. "
-        "Discuss weather and hiking trails in one short sentence. " + ("misc-" * 48)
-    )

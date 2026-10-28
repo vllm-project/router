@@ -25,8 +25,9 @@ def kv_aware_two_workers():
     )
     from tests.python.e2e.function.kv_aware.config import kv_aware_e2e_model
 
-    workers = spawn_two_vllm_rs_grpc_workers(kv_aware_e2e_model())
+    workers: list = []
     try:
+        workers = spawn_two_vllm_rs_grpc_workers(kv_aware_e2e_model())
         yield workers
     finally:
         terminate_workers(workers)
