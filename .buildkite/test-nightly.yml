@@ -113,7 +113,7 @@ steps:
     # image-build is skipped when ROCM_ONLY=1. A skipped dependency is treated
     # as satisfied, so this job must use the same condition.
     if: build.env("ROCM_ONLY") != "1"
-    timeout_in_minutes: 120
+    timeout_in_minutes: 90
     retry:
       automatic:
         - exit_status: "*"
@@ -129,28 +129,13 @@ steps:
       bash <<'BASH'
       set -euo pipefail
 
-      if [ -z "$${HF_TOKEN:-}" ]; then
-        echo "ERROR: HF_TOKEN is not set (required to pull the perf model from Hugging Face)."
-        exit 1
-      fi
       export MODEL="Qwen/Qwen3.8-27B"
       export PERF_STACK_TIMEOUT=1800
       export PERF_WORKER_STARTUP_TIMEOUT=1800
-      export ROUTER_BIN="/usr/local/bin/vllm-router"
-      echo "HF_TOKEN is configured; MODEL=$${MODEL}; ROUTER_BIN=$${ROUTER_BIN}"
 
-      PERF_PYTEST=(
-        python -m pytest -sv tests/python/e2e/perf/grpc
-        -k c16-r32
-      )
+      python -m pytest -sv tests/python/e2e/perf/grpc -k c16-r32 --perf-case=rust_grpc
+      python -m pytest -sv tests/python/e2e/perf/grpc -k c16-r32 --perf-case=python_http
 
-      for case in rust_grpc python_http; do
-        echo "=== perf grpc: --perf-case=$${case} (concurrency 16 waves) ==="
-        "$${PERF_PYTEST[@]}" --perf-case="$${case}"
-      done
-
-      echo "=== perf result artifacts ==="
-      find tests/python/e2e/perf/grpc/results -type f -name '*.json' 2>/dev/null || true
       BASH
     artifact_paths:
       - "tests/python/e2e/perf/grpc/results/**/*.json"

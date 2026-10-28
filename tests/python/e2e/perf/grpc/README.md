@@ -157,14 +157,15 @@ benches/backend/bench_prefix_kvhit.py   # HTTP bench + pytest helpers
 
 Buildkite step **`:python: grpc perf test case`** (`key: grpc-perf-e2e` in
 `.buildkite/test-nightly.yml`, L3 **nightly**): **`mithril-h100-pool`** (preset
-`h100_2`), `PERF_STACK_TIMEOUT=1800`,
-`HF_TOKEN`, model
-`MODEL=Qwen/Qwen3.8-27B`. The job pulls the router CI image
-(`vllm-router` at `/usr/local/bin/vllm-router`); it does not build in-job.
-Step timeout **120 min**, then for each of
-`rust_grpc`, `python_http` (add `rust_http` locally if needed):
+`h100_2`). The job pulls the router CI image and does not build in-job.
+`vllm-router` is on `PATH` (`/usr/local/bin/vllm-router`); the step does not set
+`ROUTER_BIN`. `HF_TOKEN` comes from the `h100_2` pod secret. The step sets
+`MODEL=Qwen/Qwen3.8-27B`, `PERF_STACK_TIMEOUT=1800`, and
+`PERF_WORKER_STARTUP_TIMEOUT=1800`. Step timeout **90 min**, then:
 
-`python -m pytest -sv tests/python/e2e/perf/grpc -k c16-r32 --perf-case=<case>`
+`python -m pytest -sv tests/python/e2e/perf/grpc -k c16-r32 --perf-case=rust_grpc`
+
+`python -m pytest -sv tests/python/e2e/perf/grpc -k c16-r32 --perf-case=python_http`
 
 Wave JSON under `results/` is collected as build artifacts.
 
