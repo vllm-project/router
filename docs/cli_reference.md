@@ -82,6 +82,10 @@ while an earlier request is still running, even with `--max-concurrent-requests 
 | `--enable-igw` | `flag` | `false` | `flag` | `false` | Enable Inference Gateway mode for multi-model routing. |
 | `--history-backend` | `memory, none` | `memory` | — | — | Inference Gateway history storage: in-memory storage or no storage. |
 | `--profile` | `flag` | `false` | — | — | Enable profiling calls to vLLM workers; the Rust CLI uses a 10-second profiling timeout. |
+| `--kv-event-source` | `string (repeatable)` | `[]` | `string (repeatable)` | `[]` | Static KV-event source as `WORKER_URL=ENDPOINT[,ENDPOINT...]`; repeatable, one entry per worker. |
+| `--kv-event-replay-source` | `string (repeatable)` | `[]` | `string (repeatable)` | `[]` | Replay endpoint(s) for a static KV-event source, same `WORKER_URL=ENDPOINT[,ENDPOINT...]` form. |
+| `--kv-event-block-size` | `u32` | `16` | `integer` | `16` | KV cache block size in tokens for workers registered through `--kv-event-source`. |
+| `--kv-event-model` | `string` | `unset` | `string` | `unset` | Model id advertised to static KV-event sources; `unset` keeps the served model id. |
 
 The Rust CLI requires worker URLs in regular mode unless service discovery is
 enabled. The Python launcher permits an empty worker list without service
@@ -105,7 +109,8 @@ and the Rust OpenAI backend use different configuration paths. See
 | `--balance-rel-threshold` | `f32` | `1.5` | `float` | `1.5` | Cache-aware load balancing relative threshold; used together with the absolute threshold. |
 | `--eviction-interval` | `u64` | `120` | — | — | Seconds between cache-aware approximation-tree eviction operations (Rust spelling). |
 | `--eviction-interval-secs` | — | — | `integer` | `120` | Seconds between cache-aware approximation-tree eviction operations (Python spelling). |
-| `--max-tree-size` | `usize` | `67108864` | `integer` | `67108864` | Maximum cache-aware approximation-tree size. |
+| `--max-tree-size` | `usize` | `1 << 25` | `integer` | `33554432` | Maximum cache-aware approximation-tree size. |
+| `--kv-aware-session-affinity-ttl-secs` | `u64` | `unset` | `integer` | `unset` | Idle TTL in seconds for kv_aware session affinity; `unset` disables session affinity while keeping KV-aware routing. |
 
 Cache-aware tuning applies only to policies using `cache_aware`. Load balancing
 is triggered when both `(max_load - min_load) > balance_abs_threshold` and

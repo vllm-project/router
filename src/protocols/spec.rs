@@ -112,21 +112,23 @@ impl<'de> Deserialize<'de> for ChatMessage {
     {
         use serde::de::Error;
 
-        let value = Value::deserialize(deserializer)?;
+        let mut value = Value::deserialize(deserializer)?;
         let role = value
             .get("role")
             .ok_or_else(|| D::Error::custom("missing role field"))?
             .as_str()
-            .ok_or_else(|| D::Error::custom("role field must be a string"))?;
+            .ok_or_else(|| D::Error::custom("role field must be a string"))?
+            .to_string();
+        // `Other` must keep `value` intact, so only the known-role arms take fields.
+        fn take(value: &mut Value, key: &str) -> Option<Value> {
+            value.get_mut(key).map(Value::take)
+        }
 
-        match role {
+        match role.as_str() {
             "assistant" => Ok(ChatMessage::Assistant {
-                role: role.to_string(),
-                content: value.get("content").and_then(|content| {
-                    (!content.is_null())
-                        .then(|| serde_json::from_value(content.clone()).ok())
-                        .flatten()
-                }),
+                content: take(&mut value, "content")
+                    .filter(|content| !content.is_null())
+                    .and_then(|content| serde_json::from_value(content).ok()),
                 name: value.get("name").and_then(|n| {
                     if n.is_null() {
                         None
@@ -134,20 +136,12 @@ impl<'de> Deserialize<'de> for ChatMessage {
                         n.as_str().map(String::from)
                     }
                 }),
-                tool_calls: value.get("tool_calls").and_then(|tc| {
-                    if tc.is_null() {
-                        None
-                    } else {
-                        serde_json::from_value(tc.clone()).ok()
-                    }
-                }),
-                function_call: value.get("function_call").and_then(|fc| {
-                    if fc.is_null() {
-                        None
-                    } else {
-                        serde_json::from_value(fc.clone()).ok()
-                    }
-                }),
+                tool_calls: take(&mut value, "tool_calls")
+                    .filter(|tc| !tc.is_null())
+                    .and_then(|tc| serde_json::from_value(tc).ok()),
+                function_call: take(&mut value, "function_call")
+                    .filter(|fc| !fc.is_null())
+                    .and_then(|fc| serde_json::from_value(fc).ok()),
                 // `reasoning` is vLLM's canonical field. Prefer a usable canonical
                 // string when both keys are present; otherwise fall back to the
                 // deprecated `reasoning_content` alias, including when `reasoning`
@@ -157,12 +151,11 @@ impl<'de> Deserialize<'de> for ChatMessage {
                     .and_then(Value::as_str)
                     .or_else(|| value.get("reasoning_content").and_then(Value::as_str))
                     .map(String::from),
+                role,
             }),
             "system" => Ok(ChatMessage::System {
-                role: role.to_string(),
-                content: value
-                    .get("content")
-                    .and_then(|content| serde_json::from_value(content.clone()).ok())
+                content: take(&mut value, "content")
+                    .and_then(|content| serde_json::from_value(content).ok())
                     .unwrap_or(UserMessageContent::Text(String::new())),
                 name: value.get("name").and_then(|n| {
                     if n.is_null() {
@@ -171,17 +164,16 @@ impl<'de> Deserialize<'de> for ChatMessage {
                         n.as_str().map(String::from)
                     }
                 }),
+                role,
             }),
             "user" => {
-                let content = value
-                    .get("content")
+                let content = take(&mut value, "content")
                     .map(|c| {
-                        serde_json::from_value(c.clone())
-                            .unwrap_or(UserMessageContent::Text(String::new()))
+                        serde_json::from_value(c).unwrap_or(UserMessageContent::Text(String::new()))
                     })
                     .unwrap_or(UserMessageContent::Text(String::new()));
                 Ok(ChatMessage::User {
-                    role: role.to_string(),
+                    role,
                     content,
                     name: value.get("name").and_then(|n| {
                         if n.is_null() {
@@ -193,19 +185,16 @@ impl<'de> Deserialize<'de> for ChatMessage {
                 })
             }
             "tool" => Ok(ChatMessage::Tool {
-                role: role.to_string(),
-                content: value
-                    .get("content")
-                    .cloned()
+                content: take(&mut value, "content")
                     .unwrap_or_else(|| Value::String(String::new())),
                 tool_call_id: value
                     .get("tool_call_id")
                     .and_then(|t| t.as_str())
                     .unwrap_or("")
                     .to_string(),
+                role,
             }),
             "function" => Ok(ChatMessage::Function {
-                role: role.to_string(),
                 content: value
                     .get("content")
                     .and_then(|c| c.as_str())
@@ -216,6 +205,7 @@ impl<'de> Deserialize<'de> for ChatMessage {
                     .and_then(|n| n.as_str())
                     .unwrap_or("")
                     .to_string(),
+                role,
             }),
             _ => Ok(ChatMessage::Other(value)),
         }
@@ -5105,6 +5095,53 @@ mod tests {
             }
             _ => panic!("Expected Assistant message"),
         }
+    }
+
+    #[test]
+    fn test_chat_request_reparse_is_identity() {
+        // The gRPC chat path clones the parsed request instead of re-parsing a
+        // serialized copy; that is only equivalent while this holds.
+        let json = serde_json::json!({
+            "model": "m",
+            "messages": [
+                {"role": "system", "content": "be brief", "name": "sys"},
+                {"role": "user", "content": [{"type": "text", "text": "hi"}]},
+                {"role": "assistant", "content": null, "reasoning_content": "think",
+                 "tool_calls": [{"id": "c1", "type": "function",
+                                 "function": {"name": "f", "arguments": "{}"}}]},
+                {"role": "tool", "content": {"ok": true}, "tool_call_id": "c1"},
+                {"role": "function", "content": "done", "name": "f"},
+                {"role": "developer", "content": "keep me", "extra": [1, 2]}
+            ],
+            "stream": true,
+            "stream_options": {"include_usage": true},
+            "stop": ["END", "STOP"],
+            "logit_bias": {"42": -10.0, "7": 1.5},
+            "temperature": 0.3,
+            "response_format": {"type": "json_schema",
+                                "json_schema": {"name": "a", "schema": {"type": "object"}}},
+            "session_params": {"session_id": "s1"},
+            "chat_template_kwargs": {"enable_thinking": false},
+            "cache_salt": "salt",
+            "priority": 3,
+            "documents": [{"title": "d", "text": "t"}]
+        });
+        let parsed: ChatCompletionRequest = serde_json::from_value(json).unwrap();
+        let reparsed: ChatCompletionRequest =
+            serde_json::from_value(serde_json::to_value(&parsed).unwrap()).unwrap();
+        assert_eq!(
+            serde_json::to_value(parsed.clone()).unwrap(),
+            serde_json::to_value(&reparsed).unwrap()
+        );
+        assert!(matches!(
+            &parsed.messages[3],
+            ChatMessage::Tool { content, .. } if content == &serde_json::json!({"ok": true})
+        ));
+        assert!(matches!(
+            &parsed.messages[5],
+            ChatMessage::Other(value)
+                if value == &serde_json::json!({"role": "developer", "content": "keep me", "extra": [1, 2]})
+        ));
     }
 
     #[test]
