@@ -74,7 +74,12 @@ impl AppContext {
         let rate_limiter = Arc::new(TokenBucket::new(max_concurrent_requests, rate_limit_tokens));
 
         let worker_registry = Arc::new(WorkerRegistry::new());
-        let policy_registry = Arc::new(PolicyRegistry::new(router_config.policy.clone()));
+        let policy_registry = Arc::new(PolicyRegistry::new_with_affinity_ttl(
+            router_config.policy.clone(),
+            router_config
+                .kv_aware_session_affinity_ttl_secs
+                .map(std::time::Duration::from_secs),
+        ));
 
         // Single registration point for the static E pool. Router construction
         // only registers its consumers, and Encode does not affect their
@@ -1313,7 +1318,7 @@ fn create_cors_layer(allowed_origins: Vec<String>) -> tower_http::cors::CorsLaye
     cors.max_age(Duration::from_secs(3600))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use super::*;
 

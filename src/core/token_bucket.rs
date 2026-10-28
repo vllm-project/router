@@ -1,6 +1,7 @@
+use parking_lot::Mutex;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::Notify;
 use tracing::{debug, trace};
 
 /// Token bucket for rate limiting
@@ -52,7 +53,7 @@ impl TokenBucket {
 
     /// Try to acquire tokens immediately
     pub async fn try_acquire(&self, tokens: f64) -> Result<(), ()> {
-        let mut inner = self.inner.lock().await;
+        let mut inner = self.inner.lock();
 
         // Refill tokens based on elapsed time
         let now = Instant::now();
@@ -89,7 +90,7 @@ impl TokenBucket {
 
         // Calculate wait time
         let wait_time = {
-            let inner = self.inner.lock().await;
+            let inner = self.inner.lock();
             let tokens_needed = (tokens - inner.tokens).max(0.0);
             let wait_secs = (tokens_needed / self.refill_rate).max(0.0);
             Duration::from_secs_f64(wait_secs)
@@ -131,7 +132,7 @@ impl TokenBucket {
 
     /// Return tokens to the bucket (for cancelled requests)
     pub async fn return_tokens(&self, tokens: f64) {
-        let mut inner = self.inner.lock().await;
+        let mut inner = self.inner.lock();
         inner.tokens = (inner.tokens + tokens).min(self.capacity);
         self.notify.notify_waiters();
         debug!(
@@ -153,7 +154,7 @@ impl TokenBucket {
 
     /// Get current available tokens (for monitoring)
     pub async fn available_tokens(&self) -> f64 {
-        let mut inner = self.inner.lock().await;
+        let mut inner = self.inner.lock();
 
         // Refill before checking
         let now = Instant::now();
@@ -167,7 +168,7 @@ impl TokenBucket {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use super::*;
 

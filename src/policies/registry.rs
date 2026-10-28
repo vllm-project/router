@@ -5,12 +5,14 @@
 /// All subsequent workers of the same model use the established policy.
 /// When the last worker of a model is removed, the policy mapping is cleaned up.
 use super::{
-    CacheAwareConfig, CacheAwarePolicy, ConsistentHashPolicy, LoadBalancingPolicy,
-    PowerOfTwoPolicy, RandomPolicy, RendezvousHashPolicy, RoundRobinPolicy,
+    CacheAwareConfig, CacheAwarePolicy, ConsistentHashPolicy, CostParams, KvAffinityTable,
+    KvAwarePolicy, LoadBalancingPolicy, PowerOfTwoPolicy, RandomPolicy, RendezvousHashPolicy,
+    RoundRobinPolicy, TransferCredits,
 };
 use crate::config::types::{EncodePolicy, PolicyConfig};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 use tracing::{debug, info, warn};
 
 /// Registry for managing model-to-policy mappings
@@ -33,12 +35,26 @@ pub struct PolicyRegistry {
 
     /// Decode policy for PD mode
     decode_policy: Arc<RwLock<Option<Arc<dyn LoadBalancingPolicy>>>>,
+
+    /// Affinity table shared by every KV-aware policy this registry creates,
+    /// bounding affinity state across models.
+    kv_affinity_table: Arc<KvAffinityTable>,
 }
 
 impl PolicyRegistry {
     /// Create a new PolicyRegistry with a default policy
     pub fn new(default_policy_config: PolicyConfig) -> Self {
-        let default_policy = Self::create_policy_from_config(&default_policy_config);
+        Self::new_with_affinity_ttl(default_policy_config, None)
+    }
+
+    /// Create a policy registry with an optional idle TTL for KV-aware affinity.
+    pub fn new_with_affinity_ttl(
+        default_policy_config: PolicyConfig,
+        affinity_ttl: Option<Duration>,
+    ) -> Self {
+        let kv_affinity_table = Arc::new(KvAffinityTable::with_ttl(affinity_ttl));
+        let default_policy =
+            Self::create_policy_from_config(&default_policy_config, &kv_affinity_table);
 
         Self {
             model_policies: Arc::new(RwLock::new(HashMap::new())),
@@ -49,6 +65,7 @@ impl PolicyRegistry {
             ))),
             prefill_policy: Arc::new(RwLock::new(None)),
             decode_policy: Arc::new(RwLock::new(None)),
+            kv_affinity_table,
         }
     }
 
@@ -177,6 +194,9 @@ impl PolicyRegistry {
             "round_robin" => Arc::new(RoundRobinPolicy::new()),
             "random" => Arc::new(RandomPolicy::new()),
             "cache_aware" => Arc::new(CacheAwarePolicy::new()),
+            "kv_aware" => Arc::new(
+                KvAwarePolicy::default().with_shared_affinity(Arc::clone(&self.kv_affinity_table)),
+            ),
             "power_of_two" => Arc::new(PowerOfTwoPolicy::new()),
             "rendezvous_hash" => Arc::new(RendezvousHashPolicy::new()),
             _ => {
@@ -187,7 +207,10 @@ impl PolicyRegistry {
     }
 
     /// Create a policy from a PolicyConfig
-    fn create_policy_from_config(config: &PolicyConfig) -> Arc<dyn LoadBalancingPolicy> {
+    fn create_policy_from_config(
+        config: &PolicyConfig,
+        kv_affinity_table: &Arc<KvAffinityTable>,
+    ) -> Arc<dyn LoadBalancingPolicy> {
         match config {
             PolicyConfig::RoundRobin => Arc::new(RoundRobinPolicy::new()),
             PolicyConfig::Random => Arc::new(RandomPolicy::new()),
@@ -207,6 +230,25 @@ impl PolicyRegistry {
                 };
                 Arc::new(CacheAwarePolicy::with_config(cache_config))
             }
+            PolicyConfig::KvAware {
+                router_temperature,
+                kv_penalty_host,
+                kv_penalty_external,
+                kv_penalty_disk,
+                ..
+            } => Arc::new(
+                KvAwarePolicy::new(CostParams {
+                    router_temperature: *router_temperature,
+                    transfer_credits: TransferCredits {
+                        device: 1.0,
+                        host_pinned: *kv_penalty_host,
+                        external: *kv_penalty_external,
+                        disk: *kv_penalty_disk,
+                    },
+                    ..CostParams::default()
+                })
+                .with_shared_affinity(Arc::clone(kv_affinity_table)),
+            ),
             PolicyConfig::PowerOfTwo { .. } => Arc::new(PowerOfTwoPolicy::new()),
             PolicyConfig::ConsistentHash { .. } => Arc::new(ConsistentHashPolicy::new()),
             PolicyConfig::RendezvousHash => Arc::new(RendezvousHashPolicy::new()),
@@ -227,12 +269,14 @@ impl PolicyRegistry {
         self.model_worker_counts.read().unwrap().clone()
     }
 
-    /// Clear all policies (useful for testing)
+    /// Clear all policies (useful for testing). Policy rebuilds also drop
+    /// every affinity binding recorded against the old policy set.
     pub fn clear(&self) {
         let mut policies = self.model_policies.write().unwrap();
         policies.clear();
         let mut counts = self.model_worker_counts.write().unwrap();
         counts.clear();
+        self.kv_affinity_table.clear();
     }
 
     fn create_encode_policy(config: EncodePolicy) -> Arc<dyn LoadBalancingPolicy> {
@@ -293,7 +337,7 @@ impl std::fmt::Debug for PolicyRegistry {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use super::*;
 

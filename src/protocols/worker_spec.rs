@@ -136,7 +136,7 @@ pub struct WorkerErrorResponse {
     pub code: String,
 }
 
-/// Server info response from /get_server_info endpoint
+/// Worker metadata used when constructing a KV cache identity.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct ServerInfo {
     #[serde(skip_serializing_if = "Option::is_none")]

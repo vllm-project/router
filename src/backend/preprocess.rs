@@ -1,15 +1,23 @@
-//! gRPC chat rendering and tokenization via `vllm-chat` and `vllm-tokenizer`.
-//! Loaded models share an optional L0 encoding cache.
+//! HTTP input preparation and gRPC chat rendering/tokenization.
+//! Loaded models share optional L0 (exact) and L1 (prefix) encoding caches.
 
+use crate::core::Worker;
+use crate::metrics::RouterMetrics;
+use crate::policies::WorkerTokenInputs;
+use futures_util::StreamExt;
+use http::{HeaderMap, StatusCode};
+use reqwest::Client;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
+use tracing::debug;
 
 use anyhow::{anyhow, Result};
 use dashmap::DashMap;
 use parking_lot::RwLock;
 
 use super::encode_cache::FrontendCache;
+use super::l1_encode_cache::{L1Cache, L1CacheConfig, L1CacheStats};
 use crate::tokenizer::{TokenizerCacheConfig, TokenizerCacheStats};
 
 use super::vllm_frontend::{
@@ -23,6 +31,345 @@ use vllm_chat::{
     AssistantContentBlock, AssistantToolCall, ChatTool, ChatToolChoice,
     ReasoningEffort as VllmReasoningEffort,
 };
+
+/// HTTP routing uses the worker's own render contract, not the gRPC model
+/// frontend: HTTP workers can have different templates and tokenizer settings.
+enum HttpKvInput {
+    Direct(Arc<[Vec<u32>]>),
+    Render { path: &'static str },
+}
+
+fn dense_token_ids(value: &serde_json::Value) -> Result<Vec<u32>, &'static str> {
+    let ids = value.as_array().ok_or("invalid_token_ids")?;
+    if ids.is_empty() {
+        return Err("empty_input");
+    }
+    ids.iter()
+        .map(|id| {
+            id.as_u64()
+                .and_then(|id| u32::try_from(id).ok())
+                .ok_or("invalid_token_ids")
+        })
+        .collect()
+}
+
+fn token_prompts(value: &serde_json::Value) -> Result<Arc<[Vec<u32>]>, &'static str> {
+    let items = value.as_array().ok_or("invalid_token_ids")?;
+    let prompts = if items.first().is_some_and(serde_json::Value::is_array) {
+        items
+            .iter()
+            .map(dense_token_ids)
+            .collect::<Result<Vec<_>, _>>()?
+    } else {
+        vec![dense_token_ids(value)?]
+    };
+    Ok(Arc::from(prompts))
+}
+
+fn http_kv_input(body: &serde_json::Value, route: &str) -> Result<HttpKvInput, &'static str> {
+    // The event index cannot identify multimodal/embedding or prompt-adapter
+    // cache keys from token IDs alone. HTTP adapter names also need an explicit
+    // mapping to the names carried by KV events before they can earn credit.
+    for field in [
+        "features",
+        "prompt_embeds",
+        "input_embeds",
+        "input_embeddings",
+        "multi_modal_data",
+        "lora_path",
+        "lora_name",
+        "prompt_adapter_request",
+    ] {
+        if body.get(field).is_some_and(|value| !value.is_null()) {
+            return Err("unsupported_cache_identity");
+        }
+    }
+    if let Some(messages) = body.get("messages").and_then(serde_json::Value::as_array) {
+        for message in messages {
+            if let Some(parts) = message.get("content").and_then(serde_json::Value::as_array) {
+                if parts.iter().any(|part| {
+                    part.get("type").and_then(serde_json::Value::as_str) != Some("text")
+                }) {
+                    return Err("multimodal_input");
+                }
+            }
+        }
+    }
+    let path = match route {
+        "/v1/completions" => {
+            if body
+                .get("truncate_prompt_tokens")
+                .is_none_or(serde_json::Value::is_null)
+                && body.get("suffix").is_none_or(serde_json::Value::is_null)
+            {
+                if let Some(items) = body.get("prompt").and_then(serde_json::Value::as_array) {
+                    if items.is_empty() {
+                        return Err("empty_input");
+                    }
+                    if items[0].is_number() || items[0].is_array() {
+                        return Ok(HttpKvInput::Direct(token_prompts(&body["prompt"])?));
+                    }
+                }
+            }
+            "/v1/completions/render"
+        }
+        "/v1/chat/completions" => "/v1/chat/completions/render",
+        "/v1/responses" => {
+            if body
+                .get("previous_response_id")
+                .is_some_and(|value| !value.is_null())
+            {
+                return Err("stateful_input");
+            }
+            "/v1/responses/render"
+        }
+        "/generate" => {
+            // Text/prompt take precedence over input_ids on the native route.
+            if ["text", "prompt"]
+                .iter()
+                .any(|field| body.get(field).is_some_and(|value| !value.is_null()))
+            {
+                return Err("unsupported_input");
+            }
+            return Ok(HttpKvInput::Direct(token_prompts(&body["input_ids"])?));
+        }
+        "/inference/v1/generate" => {
+            return Ok(HttpKvInput::Direct(Arc::from(vec![dense_token_ids(
+                &body["token_ids"],
+            )?])))
+        }
+        _ => return Err("unsupported_route"),
+    };
+    Ok(HttpKvInput::Render { path })
+}
+
+fn http_tokenize_fallback(body: &serde_json::Value, route: &str) -> Option<Vec<serde_json::Value>> {
+    // /tokenize has fewer fields than generation in vLLM 0.30. Complex chat
+    // must use /render; silently dropping tool/template options is not exact.
+    for field in [
+        "truncate_prompt_tokens",
+        "suffix",
+        "tools",
+        "tool_choice",
+        "functions",
+        "function_call",
+        "response_format",
+        "reasoning_effort",
+        "documents",
+    ] {
+        if body.get(field).is_some_and(|value| !value.is_null()) {
+            return None;
+        }
+    }
+    let mut payload = serde_json::Map::new();
+    for field in [
+        "model",
+        "add_special_tokens",
+        "chat_template",
+        "chat_template_kwargs",
+        "add_generation_prompt",
+        "continue_final_message",
+    ] {
+        if let Some(value) = body.get(field).filter(|value| !value.is_null()) {
+            payload.insert(field.into(), value.clone());
+        }
+    }
+    match route {
+        "/v1/completions" => {
+            let prompts = match body.get("prompt")? {
+                serde_json::Value::String(text) => vec![text.as_str()],
+                serde_json::Value::Array(items) => items
+                    .iter()
+                    .map(serde_json::Value::as_str)
+                    .collect::<Option<Vec<_>>>()?,
+                _ => return None,
+            };
+            Some(
+                prompts
+                    .into_iter()
+                    .map(|prompt| {
+                        let mut payload = payload.clone();
+                        payload.insert("prompt".into(), prompt.into());
+                        serde_json::Value::Object(payload)
+                    })
+                    .collect(),
+            )
+        }
+        "/v1/chat/completions" => {
+            let messages = body.get("messages")?.as_array()?;
+            if messages.iter().any(|message| {
+                ["tool_calls", "function_call"]
+                    .iter()
+                    .any(|field| message.get(field).is_some_and(|value| !value.is_null()))
+            }) {
+                return None;
+            }
+            payload.insert("messages".into(), body["messages"].clone());
+            Some(vec![serde_json::Value::Object(payload)])
+        }
+        _ => None,
+    }
+}
+
+fn http_rendered_tokens(body: &serde_json::Value) -> Result<Arc<[Vec<u32>]>, &'static str> {
+    let items = match body {
+        serde_json::Value::Array(items) => items.iter().collect::<Vec<_>>(),
+        item => vec![item],
+    };
+    if items.is_empty() {
+        return Err("empty_input");
+    }
+    let prompts = items
+        .into_iter()
+        .map(|item| {
+            if item.get("features").is_some_and(|value| !value.is_null()) {
+                return Err("multimodal_input");
+            }
+            dense_token_ids(&item["token_ids"])
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Arc::from(prompts))
+}
+
+async fn worker_input_json(
+    client: &Client,
+    worker_url: &str,
+    path: &str,
+    body: &serde_json::Value,
+    headers: Option<&HeaderMap>,
+    api_key: Option<&str>,
+) -> Result<serde_json::Value, &'static str> {
+    let mut request = client
+        .post(format!("{}{path}", worker_url.trim_end_matches('/')))
+        .timeout(Duration::from_secs(5))
+        .json(body);
+    if let Some(value) = headers.and_then(|headers| headers.get("authorization")) {
+        request = request.header("authorization", value);
+    }
+    if let Some(key) = api_key {
+        request = request.bearer_auth(key);
+    }
+    let response = request
+        .send()
+        .await
+        .map_err(|_| "preparation_unavailable")?;
+    match response.status() {
+        StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED | StatusCode::NOT_IMPLEMENTED => {
+            return Err("render_unavailable")
+        }
+        status if !status.is_success() => return Err("preparation_rejected"),
+        _ => {}
+    }
+    response
+        .json()
+        .await
+        .map_err(|_| "invalid_preparation_response")
+}
+
+pub(crate) async fn prepare_http_kv_inputs(
+    client: &Client,
+    workers: &[Arc<dyn Worker>],
+    headers: Option<&HeaderMap>,
+    body: &serde_json::Value,
+    route: &str,
+    api_key: Option<&str>,
+    budget: Duration,
+) -> Option<WorkerTokenInputs> {
+    let input = match http_kv_input(body, route) {
+        Ok(input) => input,
+        Err(reason) => {
+            RouterMetrics::record_kv_routing_input("http", reason);
+            return None;
+        }
+    };
+    let mut urls: Vec<_> = workers
+        .iter()
+        .map(|worker| worker.base_url().to_string())
+        .collect();
+    urls.sort();
+    urls.dedup();
+    if urls.is_empty() {
+        return None;
+    }
+    if let HttpKvInput::Direct(prompts) = input {
+        RouterMetrics::record_kv_routing_input("http", "token_ids");
+        return Some(urls.into_iter().map(|url| (url, prompts.clone())).collect());
+    }
+    let HttpKvInput::Render { path } = input else {
+        unreachable!()
+    };
+    let expected_prompts = if route == "/v1/completions" {
+        body.get("prompt")
+            .and_then(serde_json::Value::as_array)
+            .filter(|items| {
+                items
+                    .first()
+                    .is_some_and(|item| item.is_string() || item.is_array())
+            })
+            .map_or(1, Vec::len)
+    } else {
+        1
+    };
+    let tokenize_fallback = std::sync::OnceLock::new();
+    let results = futures_util::stream::iter(urls)
+        .map(|url| {
+            let tokenize_fallback = &tokenize_fallback;
+            async move {
+                let (prompts, source) =
+                    match worker_input_json(client, &url, path, body, headers, api_key).await {
+                        Ok(rendered) => (http_rendered_tokens(&rendered)?, "render"),
+                        Err("render_unavailable") => {
+                            let requests = tokenize_fallback
+                                .get_or_init(|| http_tokenize_fallback(body, route))
+                                .as_ref()
+                                .ok_or("render_unavailable")?;
+                            let mut prompts = Vec::with_capacity(requests.len());
+                            for request in requests {
+                                let tokenized = worker_input_json(
+                                    client,
+                                    &url,
+                                    "/tokenize",
+                                    request,
+                                    headers,
+                                    api_key,
+                                )
+                                .await?;
+                                let ids = dense_token_ids(&tokenized["tokens"])?;
+                                if tokenized["count"].as_u64() != Some(ids.len() as u64) {
+                                    return Err("invalid_preparation_response");
+                                }
+                                prompts.push(ids);
+                            }
+                            (Arc::from(prompts), "tokenize")
+                        }
+                        Err(reason) => return Err(reason),
+                    };
+                if prompts.len() != expected_prompts {
+                    return Err("invalid_preparation_response");
+                }
+                Ok((url, prompts, source))
+            }
+        })
+        .buffer_unordered(8);
+    futures_util::pin_mut!(results);
+    // Preparation is optional placement evidence. Keep completed workers'
+    // results and cancel slow candidates after one shared ingress budget.
+    let deadline = tokio::time::Instant::now() + budget;
+    let mut inputs = WorkerTokenInputs::new();
+    while let Ok(Some(result)) = tokio::time::timeout_at(deadline, results.next()).await {
+        match result {
+            Ok((url, prompts, source)) => {
+                RouterMetrics::record_kv_routing_input("http", source);
+                inputs.insert(url, prompts);
+            }
+            Err(reason) => {
+                RouterMetrics::record_kv_routing_input("http", reason);
+                debug!(reason, "KV-aware candidate received no placement credit");
+            }
+        }
+    }
+    Some(inputs)
+}
 
 #[derive(Clone)]
 enum Frontend {
@@ -38,6 +385,7 @@ pub struct TokenizerCache {
     by_model: Arc<DashMap<String, Arc<VllmFrontend>>>,
     load_lock: Arc<tokio::sync::Mutex<()>>,
     encoding_cache: Option<Arc<FrontendCache>>,
+    l1_cache: Option<Arc<L1Cache>>,
 }
 
 impl std::fmt::Debug for TokenizerCache {
@@ -59,13 +407,23 @@ impl TokenizerCache {
             by_model: Arc::new(DashMap::new()),
             load_lock: Arc::new(tokio::sync::Mutex::new(())),
             encoding_cache: None,
+            l1_cache: None,
         }
     }
 
     /// Enable L0 with a shared budget across models.
     pub fn with_encoding_cache(config: TokenizerCacheConfig) -> Result<Self> {
+        Self::with_caches(Some(config), None)
+    }
+
+    /// Enable L0 and/or L1, each with one budget shared across models.
+    pub fn with_caches(
+        l0: Option<TokenizerCacheConfig>,
+        l1: Option<L1CacheConfig>,
+    ) -> Result<Self> {
         Ok(Self {
-            encoding_cache: Some(Arc::new(FrontendCache::new(config)?)),
+            encoding_cache: l0.map(FrontendCache::new).transpose()?.map(Arc::new),
+            l1_cache: l1.map(L1Cache::new).transpose()?.map(Arc::new),
             ..Self::new()
         })
     }
@@ -73,6 +431,11 @@ impl TokenizerCache {
     /// L0 stats across models, or None when disabled.
     pub fn encoding_cache_stats(&self) -> Option<TokenizerCacheStats> {
         self.encoding_cache.as_ref().map(|cache| cache.stats())
+    }
+
+    /// L1 stats across models, or None when disabled.
+    pub fn l1_cache_stats(&self) -> Option<L1CacheStats> {
+        self.l1_cache.as_ref().map(|cache| cache.stats())
     }
 
     /// Tests only: bypass model loading by returning these fake prompt ids.
@@ -95,9 +458,14 @@ impl TokenizerCache {
             return Ok(FrontendHandle(Frontend::Vllm(hit.clone())));
         }
         let frontend = Arc::new(
-            VllmFrontend::load(&source, Default::default(), self.encoding_cache.clone())
-                .await
-                .map_err(|e| anyhow!("vllm-chat load {source} for key {key}: {e}"))?,
+            VllmFrontend::load(
+                &source,
+                Default::default(),
+                self.encoding_cache.clone(),
+                self.l1_cache.clone(),
+            )
+            .await
+            .map_err(|e| anyhow!("vllm-chat load {source} for key {key}: {e}"))?,
         );
         self.by_model.insert(key, frontend.clone());
         Ok(FrontendHandle(Frontend::Vllm(frontend)))
@@ -170,6 +538,8 @@ pub struct TokenizeOut {
     pub template_ms: f64,
     pub encode_ms: f64,
     pub encode_backend: &'static str,
+    /// Prompt tokens served by L0 or L1 instead of the tokenizer.
+    pub cached_tokens: usize,
 }
 
 impl TokenizeOut {
@@ -193,6 +563,7 @@ pub fn tokenize_chat_request_timed(
                 template_ms: 0.0,
                 encode_ms: 0.0,
                 encode_backend: "test-pin",
+                cached_tokens: 0,
             })
         }
         Frontend::Vllm(vllm) => tokenize_vllm(request, vllm),
@@ -284,18 +655,19 @@ fn tokenize_vllm(request: &ChatCompletionRequest, frontend: &VllmFrontend) -> Re
         session_id,
     })?;
     let adapt_ms = t0.elapsed().as_secs_f64() * 1000.0;
-    let (token_ids, template_ms, encode_ms) = frontend
+    let (token_ids, cached_tokens, template_ms, encode_ms) = frontend
         .chat_tokenize_timed(&upstream)
         .map_err(|e| anyhow!("vllm-chat tokenize: {e}"))?;
     if token_ids.is_empty() {
         return Err(anyhow!("vllm-chat produced empty token_ids"));
     }
     Ok(TokenizeOut {
-        token_ids: Arc::from(token_ids),
+        token_ids,
         adapt_ms,
         template_ms,
         encode_ms,
         encode_backend: "vllm-tokenizer",
+        cached_tokens,
     })
 }
 
@@ -441,11 +813,18 @@ fn user_content_text(content: &UserMessageContent) -> Result<String> {
         UserMessageContent::Parts(parts) => {
             let mut text = String::new();
             for part in parts {
-                match part {
-                    crate::protocols::spec::ContentPart::Text { text: part } => {
-                        text.push_str(part);
+                match part.get("type").and_then(serde_json::Value::as_str) {
+                    Some("text") => {
+                        let part_text = part
+                            .get("text")
+                            .and_then(serde_json::Value::as_str)
+                            .ok_or_else(|| {
+                                anyhow!("text content part is missing a string `text` field")
+                            })?;
+                        text.push_str(part_text);
                     }
-                    crate::protocols::spec::ContentPart::ImageUrl { .. } => {
+                    // The token_ids-only gRPC path cannot carry non-text parts.
+                    _ => {
                         return Err(anyhow!(
                             "multimodal chat is not supported by the token_ids-only gRPC path"
                         ));
@@ -457,8 +836,57 @@ fn user_content_text(content: &UserMessageContent) -> Result<String> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
+    #[test]
+    fn http_inputs_keep_prompt_boundaries_and_require_exact_render_for_options() {
+        use super::{http_kv_input, http_rendered_tokens, HttpKvInput};
+        use serde_json::json;
+        let HttpKvInput::Direct(prompts) =
+            http_kv_input(&json!({"prompt":[[1,2],[3,4]]}), "/v1/completions").unwrap()
+        else {
+            panic!("direct ids")
+        };
+        assert_eq!(prompts.as_ref(), &[vec![1, 2], vec![3, 4]]);
+        assert!(http_kv_input(&json!({"prompt":[-1,2]}), "/v1/completions").is_err());
+        for ids in [json!([1, 2]), json!([[1, 2], [3, 4]])] {
+            let HttpKvInput::Direct(prompts) =
+                http_kv_input(&json!({"input_ids":ids}), "/generate").unwrap()
+            else {
+                panic!("native token ids")
+            };
+            assert_eq!(prompts[0], vec![1, 2]);
+        }
+        for body in [
+            json!({"input_ids":[]}),
+            json!({"input_ids":[-1]}),
+            json!({"input_ids":[1], "text":"preferred"}),
+            json!({"input_ids":[1], "prompt":"preferred"}),
+        ] {
+            assert!(http_kv_input(&body, "/generate").is_err());
+        }
+
+        for body in [
+            json!({"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}],"tools":[{"type":"function","function":{"name":"f"}}],"tool_choice":"auto"}),
+            json!({"messages":[{"role":"assistant","tool_calls":[]}],"response_format":{"type":"json_object"}}),
+            json!({"prompt":[1,2,3],"truncate_prompt_tokens":2}),
+        ] {
+            let route = if body.get("prompt").is_some() {
+                "/v1/completions"
+            } else {
+                "/v1/chat/completions"
+            };
+            let HttpKvInput::Render { .. } = http_kv_input(&body, route).unwrap() else {
+                panic!("render options")
+            };
+            assert!(super::http_tokenize_fallback(&body, route).is_none());
+        }
+        assert!(http_kv_input(&json!({"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"image"}}]}]}),"/v1/chat/completions").is_err());
+        assert!(http_rendered_tokens(
+            &json!({"token_ids":[1,2],"features":{"mm_hashes":{"image":["x"]}}})
+        )
+        .is_err());
+    }
     use super::*;
     use std::path::{Path, PathBuf};
     use std::process::Command;
@@ -524,7 +952,7 @@ mod tests {
     }
 
     async fn rust_vllm_chat_ids(model: &str, messages: serde_json::Value) -> Vec<u32> {
-        let frontend = VllmFrontend::load(model, Default::default(), None)
+        let frontend = VllmFrontend::load(model, Default::default(), None, None)
             .await
             .expect("vllm-chat load_model_backends");
         let req: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
@@ -684,6 +1112,45 @@ mod tests {
         assert_eq!(
             rust_ids, py_ids,
             "vllm-chat+vllm-tokenizer must match Python vllm on system+user"
+        );
+    }
+
+    #[test]
+    fn test_user_content_text_rejects_non_text_parts() {
+        let parts = UserMessageContent::Parts(vec![
+            serde_json::json!({
+                "type": "audio_url",
+                "audio_url": {"url": "data:audio/wav;base64,AAAA"}
+            }),
+            serde_json::json!({"type": "text", "text": "hello"}),
+        ]);
+        let err = user_content_text(&parts).unwrap_err();
+        assert!(
+            err.to_string().contains("multimodal chat is not supported"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_user_content_text_concatenates_text_parts() {
+        let plain = UserMessageContent::Text("plain".to_string());
+        assert_eq!(user_content_text(&plain).unwrap(), "plain");
+
+        let parts = UserMessageContent::Parts(vec![
+            serde_json::json!({"type": "text", "text": "foo"}),
+            serde_json::json!({"type": "text", "text": "bar"}),
+        ]);
+        assert_eq!(user_content_text(&parts).unwrap(), "foobar");
+    }
+
+    #[test]
+    fn test_user_content_text_rejects_malformed_text_part() {
+        // `type == "text"` but no string `text` field.
+        let parts = UserMessageContent::Parts(vec![serde_json::json!({"type": "text"})]);
+        let err = user_content_text(&parts).unwrap_err();
+        assert!(
+            err.to_string().contains("missing a string `text` field"),
+            "unexpected error: {err}"
         );
     }
 }

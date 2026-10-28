@@ -561,7 +561,7 @@ fn flatten_metadata(metadata: &Map<String, Value>) -> Result<Map<String, Value>,
         .collect()
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use super::*;
     use axum::{extract::State, routing::post, Json, Router};

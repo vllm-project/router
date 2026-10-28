@@ -1,12 +1,15 @@
 //! Concurrent radix-tree index of resident KV blocks, keyed by local hash.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use dashmap::DashMap;
 use parking_lot::RwLock;
 
-use crate::kv_index::types::{ClearScope, Locality, ResidencyOwner, RoutableTarget, StorageTier};
+use crate::kv_index::types::{
+    ClearScope, Locality, ResidencyOwner, RoutableTarget, SourceId, StorageTier,
+};
 
 /// One request's query against the index.
 #[derive(Debug, Clone)]
@@ -37,15 +40,25 @@ type NodeRef = Arc<RwLock<TreeNode>>;
 type IncomingBlock = (Arc<str>, Arc<str>); // (seq_hash, local_hash)
 type EdgeBlock = (HashSet<Arc<str>>, Arc<str>); // (historical seq hashes, local_hash)
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
 std::thread_local! {
     static AFTER_ANCHOR_CLONE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         const { std::cell::RefCell::new(None) };
+    static AFTER_QUERY_EDGE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
 fn after_anchor_clone() {
     let hook = AFTER_ANCHOR_CLONE.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
+fn after_query_edge() {
+    let hook = AFTER_QUERY_EDGE.with(|slot| slot.borrow_mut().take());
     if let Some(hook) = hook {
         hook();
     }
@@ -147,17 +160,15 @@ impl GroupShard {
         blocks: &[IncomingBlock],
     ) {
         let key = (owner, tier);
-        // Preserve the inherited unknown-parent root fallback, not ancestry
-        // recovery: block-local hashes cannot prove a full request prefix.
-        // Missing-ancestry recovery/trust gating belongs to the source lifecycle.
-        // Later cursors were recorded here and must follow their current anchor.
-        let mut cursor = parent_seq.filter(|seq| {
-            let known = self.anchors.contains_key(seq);
-            if !known && !seq.is_empty() {
-                tracing::debug!(parent_seq = %seq, "kv_index: unknown parent; using root fallback");
+        // An unknown ancestor cannot be replaced by root: block-local hashes
+        // do not prove that this suffix is a stand-alone request prefix.
+        if let Some(seq) = &parent_seq {
+            if !self.anchors.contains_key(seq) {
+                tracing::debug!(parent_seq = %seq, "kv_index: unknown parent; skipping unanchored store");
+                return;
             }
-            known
-        });
+        }
+        let mut cursor = parent_seq;
         let mut bi = 0;
         while bi < blocks.len() {
             let node = match &cursor {
@@ -168,7 +179,7 @@ impl GroupShard {
                     .expect("known cursor must remain anchored; anchors are insert-only"),
                 None => self.root.clone(),
             };
-            #[cfg(test)]
+            #[cfg(all(test, feature = "cpu", feature = "ready"))]
             after_anchor_clone();
             let mut parent = node.write();
             if let Some(seq) = &cursor {
@@ -337,6 +348,28 @@ impl GroupShard {
         }
     }
 
+    /// Forget only this publisher/rank's observations, including pool copies
+    /// attributed to it. A pool-wide clear would erase other publishers too.
+    fn clear_source(&self, source: &SourceId, dp_rank: u32) {
+        let keys: Vec<OwnerTier> = self
+            .reverse
+            .iter()
+            .filter(|entry| {
+                let target = entry.key().0.target();
+                target.instance_id == *source && target.dp_rank == dp_rank
+            })
+            .map(|entry| entry.key().clone())
+            .collect();
+        for key in keys {
+            let seqs: Vec<Arc<str>> = self
+                .reverse
+                .get(&key)
+                .map(|seqs| seqs.iter().cloned().collect())
+                .unwrap_or_default();
+            self.remove(&key.0, key.1, &seqs);
+            self.reverse.remove_if(&key, |_, seqs| seqs.is_empty());
+        }
+    }
     /// Drop the logical block claim only after its last active alias is gone.
     fn remove_claim(&self, seq: &Arc<str>, key: &OwnerTier) {
         // Contract: within a shard an engine key always identifies the same
@@ -351,7 +384,7 @@ impl GroupShard {
             let Some(node) = self.anchors.get(seq).map(|n| n.clone()) else {
                 return;
             };
-            #[cfg(test)]
+            #[cfg(all(test, feature = "cpu", feature = "ready"))]
             after_anchor_clone();
             let mut n = node.write();
             let Some(idx) = n.edge.iter().position(|(aliases, _)| aliases.contains(seq)) else {
@@ -377,38 +410,38 @@ impl GroupShard {
     /// edge element's claims are the claims of the node that edge belongs to.
     pub fn find_matches(&self, query: &MatchQuery) -> Vec<TierMatch> {
         let mut node_claims: Vec<Vec<OwnerTier>> = Vec::with_capacity(query.local_hashes.len());
-        let mut cur = self.root.clone();
         let mut qi = 0; // index into query.local_hashes
-        while qi < query.local_hashes.len() {
-            let child_local = &query.local_hashes[qi];
-            let child = {
-                let n = cur.read();
-                n.children.get(child_local).cloned()
-            };
-            let child = match child {
-                Some(c) => c,
-                None => break,
-            };
-            // Match under the read guard and copy only matching claims, never
-            // the potentially unbounded historical identity sets.
-            let (advanced, fully_matched) = {
-                let c = child.read();
-                let mut advanced = 0;
-                while advanced < c.edge.len()
-                    && qi + advanced < query.local_hashes.len()
-                    && c.edge[advanced].1 == query.local_hashes[qi + advanced]
-                {
-                    node_claims.push(c.claims[advanced].clone());
-                    advanced += 1;
-                }
-                (advanced, advanced == c.edge.len())
-            };
-            // Retain the matched prefix, but never skip an unmatched edge suffix.
-            if !fully_matched {
+        let mut next = query
+            .local_hashes
+            .first()
+            .and_then(|local| self.root.read().children.get(local).cloned());
+        while let Some(child) = next {
+            // Match and resolve the next child under the same read guard. A
+            // split moves children behind the remainder edge; re-reading this
+            // node's children after advancing by its old length misaligns depth.
+            let c = child.read();
+            let mut advanced = 0;
+            while advanced < c.edge.len()
+                && qi + advanced < query.local_hashes.len()
+                && c.edge[advanced].1 == query.local_hashes[qi + advanced]
+            {
+                // Copy only matched claims, never historical alias sets.
+                node_claims.push(c.claims[advanced].clone());
+                advanced += 1;
+            }
+            // Partial edge match: children sit after the full edge in the chain,
+            // so descending on a partial match misaligns chain positions.
+            if advanced == 0 || advanced < c.edge.len() {
                 break;
             }
             qi += advanced;
-            cur = child;
+            next = query
+                .local_hashes
+                .get(qi)
+                .and_then(|local| c.children.get(local).cloned());
+            drop(c);
+            #[cfg(all(test, feature = "cpu", feature = "ready"))]
+            after_query_edge();
         }
 
         // Per (target, tier), run-length collect the maximal contiguous
@@ -462,12 +495,17 @@ pub struct KvBlockIndexer {
     // ponytail: group_idx is None on the wire → 0; single-spec models have one
     // group and multi-spec always emits group_idx, so 0 is a safe default.
     shards: DashMap<u32, Arc<GroupShard>>,
+    suspended_sources: DashMap<(SourceId, u32), ()>,
+    /// Reject query snapshots crossing an invalidation/resume boundary.
+    source_generation: AtomicU64,
 }
 
 impl KvBlockIndexer {
     pub fn new() -> Self {
         KvBlockIndexer {
             shards: DashMap::new(),
+            suspended_sources: DashMap::new(),
+            source_generation: AtomicU64::new(0),
         }
     }
 
@@ -513,8 +551,44 @@ impl KvBlockIndexer {
         }
     }
 
+    /// Hide a source's observations while contiguous replay repairs its state.
+    /// Correctness does not depend on delivery of advisory ingestion signals.
+    pub fn suspend_source(&self, source: &SourceId, dp_rank: u32) {
+        self.suspended_sources.insert((source.clone(), dp_rank), ());
+        self.source_generation.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Stop crediting a lossy source and discard all its old observations.
+    pub fn invalidate_source(&self, source: &SourceId, dp_rank: u32) {
+        self.suspend_source(source, dp_rank);
+        let shards: Vec<Arc<GroupShard>> = self.shards.iter().map(|e| e.value().clone()).collect();
+        for shard in shards {
+            shard.clear_source(source, dp_rank);
+        }
+    }
+
+    /// Enable fresh observations after complete replay, or after discarding
+    /// incomplete replay and applying a new valid live batch to a clean source.
+    pub fn resume_source(&self, source: &SourceId, dp_rank: u32) {
+        self.source_generation.fetch_add(1, Ordering::AcqRel);
+        self.suspended_sources.remove(&(source.clone(), dp_rank));
+    }
+
     pub fn find_matches(&self, query: &MatchQuery) -> Vec<TierMatch> {
-        self.shard(query.group_idx).find_matches(query)
+        let generation = self.source_generation.load(Ordering::Acquire);
+        let matches = self.shard(query.group_idx).find_matches(query);
+        let matches = matches
+            .into_iter()
+            .filter(|hit| {
+                !self
+                    .suspended_sources
+                    .contains_key(&(hit.target.instance_id.clone(), hit.target.dp_rank))
+            })
+            .collect();
+        if self.source_generation.load(Ordering::Acquire) != generation {
+            return Vec::new();
+        }
+        matches
     }
 }
 
@@ -524,13 +598,13 @@ impl Default for KvBlockIndexer {
     }
 }
 
-impl crate::kv_index::TieredMatchProvider for KvBlockIndexer {
+impl crate::policies::TieredMatchProvider for KvBlockIndexer {
     fn find_tiered_matches(&self, query: &MatchQuery) -> Vec<TierMatch> {
         self.find_matches(query)
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use std::{cell::Cell, rc::Rc};
 
@@ -581,6 +655,84 @@ mod tests {
         Arc::<str>::from(s)
     }
 
+    #[test]
+    fn source_suspension_and_invalidation_cover_tiers_groups_and_only_that_rank() {
+        let idx = KvBlockIndexer::new();
+        let tiers = [
+            StorageTier::Device,
+            StorageTier::HostPinned,
+            StorageTier::External,
+        ];
+        for group in [0, 1] {
+            for (owner, tier, seq) in [
+                (worker("a"), StorageTier::Device, "a-gpu"),
+                (worker("a"), StorageTier::HostPinned, "a-cpu"),
+                (pool("shared", "a"), StorageTier::External, "a-pool"),
+                (worker_rank("a", 1), StorageTier::Device, "a-rank1"),
+                (pool("shared", "b"), StorageTier::External, "b-pool"),
+            ] {
+                idx.store(group, owner, tier, None, &[(h(seq), h("x"))]);
+            }
+            assert_eq!(
+                idx.find_matches(&query_group(group, &["x"], &tiers)).len(),
+                5
+            );
+        }
+        let source = SourceId::from("a");
+        idx.suspend_source(&source, 0);
+        for group in [0, 1] {
+            let hits = idx.find_matches(&query_group(group, &["x"], &tiers));
+            assert_eq!(hits.len(), 2);
+            assert!(hits
+                .iter()
+                .all(|hit| hit.target.instance_id != source || hit.target.dp_rank != 0));
+        }
+        // Complete replay may resume credit without forgetting still-valid claims.
+        idx.resume_source(&source, 0);
+        assert_eq!(idx.find_matches(&query(&["x"], &tiers)).len(), 5);
+        idx.invalidate_source(&source, 0);
+        idx.resume_source(&source, 0);
+        for group in [0, 1] {
+            assert_eq!(
+                idx.find_matches(&query_group(group, &["x"], &tiers)).len(),
+                2
+            );
+        }
+        // Only a fresh store can restore a cleared observation.
+        idx.store(
+            0,
+            worker("a"),
+            StorageTier::Device,
+            None,
+            &[(h("fresh"), h("y"))],
+        );
+        assert_eq!(idx.find_matches(&query(&["y"], &tiers)).len(), 1);
+        assert_eq!(idx.find_matches(&query(&["x"], &tiers)).len(), 2);
+    }
+
+    #[test]
+    fn query_discards_snapshot_crossing_invalidation_and_resume() {
+        let idx = Arc::new(KvBlockIndexer::new());
+        idx.store(
+            0,
+            worker("a"),
+            StorageTier::Device,
+            None,
+            &[(h("s"), h("x"))],
+        );
+        let invalidating = idx.clone();
+        AFTER_QUERY_EDGE.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                let source = SourceId::from("a");
+                invalidating.invalidate_source(&source, 0);
+                invalidating.resume_source(&source, 0);
+            }));
+        });
+        assert!(idx
+            .find_matches(&query(&["x"], &[StorageTier::Device]))
+            .is_empty());
+    }
+
     fn segments_of(res: &[TierMatch], target_id: &str, tier: StorageTier) -> Vec<(u32, u32)> {
         res.iter()
             .find(|m| &*m.target.instance_id == target_id && m.tier == tier)
@@ -589,11 +741,10 @@ mod tests {
     }
 
     fn depth_of(res: &[TierMatch], target_id: &str, tier: StorageTier) -> u32 {
-        res.iter()
-            .find(|m| &*m.target.instance_id == target_id && m.tier == tier)
-            .map_or(0, |m| {
-                m.segments.iter().map(|(start, end)| end - start).sum()
-            })
+        segments_of(res, target_id, tier)
+            .into_iter()
+            .find(|(start, _)| *start == 0)
+            .map_or(0, |(_, end)| end)
     }
 
     fn assert_observations(shard: &GroupShard, key: &OwnerTier, expected: &[&str]) {
@@ -1403,7 +1554,7 @@ mod tests {
     }
 
     #[test]
-    fn store_resumes_from_registered_incoming_seq_after_full_and_partial_matches() {
+    fn store_resumes_from_incoming_alias_after_full_and_partial_matches() {
         for original in [
             vec![(h("sx"), h("x")), (h("sy"), h("y"))],
             vec![(h("sx"), h("x")), (h("sy"), h("y")), (h("sz"), h("z"))],
@@ -1423,24 +1574,31 @@ mod tests {
             );
 
             assert_eq!(
-                depth_of(
+                segments_of(
                     &shard.find_matches(&query(&["x", "y", "w"], &[StorageTier::Device])),
                     "w0",
                     StorageTier::Device,
                 ),
-                3
+                vec![(0, 3)]
             );
             assert_eq!(
-                depth_of(
+                segments_of(
                     &shard.find_matches(&query(&["x", "y", "z"], &[StorageTier::Device])),
                     "w0",
                     StorageTier::Device,
                 ),
-                original.len() as u32
+                vec![(0, original.len() as u32)]
             );
             assert!(shard.anchors.contains_key("incoming-x"));
             assert!(shard.anchors.contains_key("incoming-y"));
             assert!(!shard.root.read().children.contains_key("w"));
+            assert_eq!(
+                *shard
+                    .counts
+                    .get(&(worker("w0"), StorageTier::Device))
+                    .unwrap(),
+                original.len() + 3
+            );
             // Matching local hashes registers incoming observations alongside
             // the original identities, rather than only claiming stored keys.
             let mut expected: Vec<&str> = original
@@ -1661,12 +1819,16 @@ mod tests {
             (vec!["w"], 0),
         ] {
             assert_eq!(
-                depth_of(
+                segments_of(
                     &shard.find_matches(&query(&hashes, &[StorageTier::Device])),
                     "w0",
                     StorageTier::Device,
                 ),
-                expected,
+                if expected == 0 {
+                    vec![]
+                } else {
+                    vec![(0, expected)]
+                },
                 "query {hashes:?}"
             );
         }
@@ -1818,5 +1980,48 @@ mod tests {
         ));
         assert_eq!(segments_of(&res, "w0", StorageTier::Device), vec![(0, 1)]);
         assert!(segments_of(&res, "w0", StorageTier::HostPinned).is_empty());
+    }
+
+    #[test]
+    fn query_split_between_edges_preserves_position_and_tier() {
+        let idx = Arc::new(KvBlockIndexer::new());
+        idx.store(
+            0,
+            worker("a"),
+            StorageTier::Device,
+            None,
+            &[(h("s0"), h("x")), (h("s1"), h("y"))],
+        );
+        // Repeating token-local hashes at different chain positions is legal.
+        idx.store(
+            0,
+            worker("a"),
+            StorageTier::HostPinned,
+            Some(h("s1")),
+            &[(h("s2"), h("y"))],
+        );
+        let splitting = idx.clone();
+        AFTER_QUERY_EDGE.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                // Another owner's store splits the edge after query matched it.
+                // Neither the local path nor A's residency changes.
+                splitting.store(
+                    0,
+                    worker("b"),
+                    StorageTier::Device,
+                    None,
+                    &[(h("b0"), h("x"))],
+                );
+            }));
+        });
+        let hits = idx.find_matches(&query(
+            &["x", "y", "y"],
+            &[StorageTier::Device, StorageTier::HostPinned],
+        ));
+        assert_eq!(segments_of(&hits, "a", StorageTier::Device), vec![(0, 2)]);
+        assert_eq!(
+            segments_of(&hits, "a", StorageTier::HostPinned),
+            vec![(2, 3)]
+        );
     }
 }

@@ -7,6 +7,15 @@ pub struct ConfigValidator;
 impl ConfigValidator {
     /// Validate a complete router configuration
     pub fn validate(config: &RouterConfig) -> ConfigResult<()> {
+        if let Some(ttl_secs) = config.kv_aware_session_affinity_ttl_secs {
+            if !(1..=31_536_000).contains(&ttl_secs) {
+                return Err(ConfigError::InvalidValue {
+                    field: "kv_aware_session_affinity_ttl_secs".to_string(),
+                    value: ttl_secs.to_string(),
+                    reason: "Must be between 1 and 31536000 seconds".to_string(),
+                });
+            }
+        }
         // Check if service discovery is enabled (either via discovery config or vLLM mode)
         let has_service_discovery = config.discovery.as_ref().is_some_and(|d| d.enabled)
             || matches!(
@@ -438,6 +447,37 @@ impl ConfigValidator {
                     });
                 }
             }
+            PolicyConfig::KvAware {
+                router_temperature,
+                kv_penalty_host,
+                kv_penalty_external,
+                kv_penalty_disk,
+                static_kv_event_sources,
+            } => {
+                if !router_temperature.is_finite() || *router_temperature < 0.0 {
+                    return Err(ConfigError::InvalidValue {
+                        field: "router_temperature".to_string(),
+                        value: router_temperature.to_string(),
+                        reason: "Must be finite and >= 0.0".to_string(),
+                    });
+                }
+                for (field, value) in [
+                    ("kv_penalty_host", kv_penalty_host),
+                    ("kv_penalty_external", kv_penalty_external),
+                    ("kv_penalty_disk", kv_penalty_disk),
+                ] {
+                    if !value.is_finite() || !(0.0..=1.0).contains(value) {
+                        return Err(ConfigError::InvalidValue {
+                            field: field.to_string(),
+                            value: value.to_string(),
+                            reason: "Must be finite and between 0.0 and 1.0".to_string(),
+                        });
+                    }
+                }
+                for (worker, source) in static_kv_event_sources.iter() {
+                    source.validate(worker)?;
+                }
+            }
             PolicyConfig::PowerOfTwo {
                 load_check_interval_secs,
             } => {
@@ -669,8 +709,53 @@ impl ConfigValidator {
             return Ok(());
         }
 
-        // All policies are now supported for both router types thanks to the unified trait design
-        // No mode/policy restrictions needed anymore
+        if let RoutingMode::VllmPrefillDecode {
+            prefill_policy,
+            decode_policy,
+            ..
+        } = &config.mode
+        {
+            let effective_prefill = prefill_policy.as_ref().unwrap_or(&config.policy);
+            let effective_decode = decode_policy.as_ref().unwrap_or(&config.policy);
+            if matches!(effective_prefill, PolicyConfig::KvAware { .. })
+                || matches!(effective_decode, PolicyConfig::KvAware { .. })
+            {
+                return Err(ConfigError::IncompatibleConfig {
+                    reason: "kv_aware is supported only in regular mode, not PD disaggregation"
+                        .to_string(),
+                });
+            }
+        }
+
+        if let PolicyConfig::KvAware {
+            static_kv_event_sources,
+            ..
+        } = &config.policy
+        {
+            if !static_kv_event_sources.is_empty() {
+                let RoutingMode::Regular { worker_urls } = &config.mode else {
+                    return Err(ConfigError::IncompatibleConfig {
+                        reason: "static --kv-event-source is only supported in regular mode"
+                            .to_string(),
+                    });
+                };
+                if !config
+                    .discovery
+                    .as_ref()
+                    .is_some_and(|discovery| discovery.enabled)
+                {
+                    for worker in static_kv_event_sources.keys() {
+                        if !worker_urls.contains(worker) {
+                            return Err(ConfigError::ValidationFailed {
+                                reason: format!(
+                                    "static KV event source worker '{worker}' is not in --worker-urls"
+                                ),
+                            });
+                        }
+                    }
+                }
+            }
+        }
 
         // Check if service discovery is enabled for worker count validation.
         // This covers both K8s service discovery (config.discovery) and vLLM ZMQ
@@ -812,9 +897,28 @@ impl ConfigValidator {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_affinity_ttl_is_optional_and_bounded() {
+        let mut config = RouterConfig::new(
+            RoutingMode::Regular {
+                worker_urls: vec!["http://worker:8000".to_string()],
+            },
+            PolicyConfig::Random,
+        );
+        assert!(ConfigValidator::validate(&config).is_ok());
+
+        config.kv_aware_session_affinity_ttl_secs = Some(300);
+        assert!(ConfigValidator::validate(&config).is_ok());
+
+        for ttl in [0, 31_536_001] {
+            config.kv_aware_session_affinity_ttl_secs = Some(ttl);
+            assert!(ConfigValidator::validate(&config).is_err());
+        }
+    }
 
     #[test]
     fn test_validate_program_scheduling_boundaries() {
@@ -1341,6 +1445,29 @@ mod tests {
 
         let result = ConfigValidator::validate(&config);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_rejects_kv_aware_for_disaggregated_pd_mode() {
+        let config = RouterConfig::new(
+            RoutingMode::VllmPrefillDecode {
+                prefill_urls: vec![("http://prefill:8000".to_string(), None)],
+                decode_urls: vec!["http://decode:8000".to_string()],
+                prefill_policy: None,
+                decode_policy: None,
+                discovery_address: None,
+            },
+            PolicyConfig::KvAware {
+                router_temperature: 0.0,
+                kv_penalty_host: 0.8,
+                kv_penalty_external: 0.6,
+                kv_penalty_disk: 0.3,
+                static_kv_event_sources: Default::default(),
+            },
+        );
+
+        let error = ConfigValidator::validate(&config).unwrap_err();
+        assert!(error.to_string().contains("not PD disaggregation"));
     }
 
     #[test]

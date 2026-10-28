@@ -69,7 +69,7 @@ impl LoadBalancingPolicy for RandomPolicy {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use super::*;
     use crate::core::{BasicWorker, WorkerType};

@@ -71,6 +71,10 @@ pub struct RouterConfig {
     /// Disable circuit breaker (overrides circuit_breaker.failure_threshold to u32::MAX when true)
     #[serde(default)]
     pub disable_circuit_breaker: bool,
+    /// Enable stable-identity affinity in `kv_aware` and expire idle bindings after this TTL.
+    /// `None` disables affinity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kv_aware_session_affinity_ttl_secs: Option<u64>,
     /// Health check configuration
     pub health_check: HealthCheckConfig,
     /// Enable Inference Gateway mode (false = proxy mode, true = IGW mode)
@@ -706,6 +710,25 @@ pub enum PolicyConfig {
         max_tree_size: usize,
     },
 
+    /// Event-driven, multi-tier KV placement plus live prefill/load scoring.
+    #[serde(rename = "kv_aware")]
+    KvAware {
+        /// Zero selects the minimum cost; positive values softmax-sample.
+        #[serde(default)]
+        router_temperature: f64,
+        /// Transfer credits in [0, 1]; lower means a costlier tier.
+        #[serde(default = "default_kv_penalty_host")]
+        kv_penalty_host: f64,
+        #[serde(default = "default_kv_penalty_external")]
+        kv_penalty_external: f64,
+        #[serde(default = "default_kv_penalty_disk")]
+        kv_penalty_disk: f64,
+        /// Optional static KV event sources for workers whose HTTP control
+        /// endpoint does not expose /kv_event_sources.
+        #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+        static_kv_event_sources: Box<HashMap<String, StaticKvEventSources>>,
+    },
+
     #[serde(rename = "power_of_two")]
     PowerOfTwo {
         /// Interval for load monitoring (seconds)
@@ -722,17 +745,44 @@ pub enum PolicyConfig {
     RendezvousHash,
 }
 
+/// Manually configured KV event publishers for one regular-mode worker.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct StaticKvEventSources {
+    /// One externally reachable ZMQ PUB endpoint per DP rank.
+    pub endpoints: Vec<String>,
+    /// Optional replay ROUTER endpoint per DP rank for loss recovery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replay_endpoints: Option<Vec<String>>,
+    /// KV cache block size used to calculate prefix placement.
+    pub block_size: u32,
+    /// Shared model identity across workers that serve the same model.
+    pub model: String,
+}
+
 impl PolicyConfig {
     pub fn name(&self) -> &'static str {
         match self {
             PolicyConfig::Random => "random",
             PolicyConfig::RoundRobin => "round_robin",
             PolicyConfig::CacheAware { .. } => "cache_aware",
+            PolicyConfig::KvAware { .. } => "kv_aware",
             PolicyConfig::PowerOfTwo { .. } => "power_of_two",
             PolicyConfig::ConsistentHash { .. } => "consistent_hash",
             PolicyConfig::RendezvousHash => "rendezvous_hash",
         }
     }
+}
+
+fn default_kv_penalty_host() -> f64 {
+    0.8
+}
+
+fn default_kv_penalty_external() -> f64 {
+    0.6
+}
+
+fn default_kv_penalty_disk() -> f64 {
+    0.3
 }
 
 /// Service discovery configuration
@@ -946,6 +996,7 @@ impl Default for RouterConfig {
             circuit_breaker: CircuitBreakerConfig::default(),
             disable_retries: false,
             disable_circuit_breaker: false,
+            kv_aware_session_affinity_ttl_secs: None,
             health_check: HealthCheckConfig::default(),
             enable_igw: false,
             connection_mode: ConnectionMode::Http,
@@ -1017,7 +1068,7 @@ impl RouterConfig {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use super::*;
 
@@ -1732,6 +1783,7 @@ mod tests {
             circuit_breaker: CircuitBreakerConfig::default(),
             disable_retries: false,
             disable_circuit_breaker: false,
+            kv_aware_session_affinity_ttl_secs: None,
             health_check: HealthCheckConfig::default(),
             enable_igw: false,
             queue_size: 100,
@@ -1800,6 +1852,7 @@ mod tests {
             circuit_breaker: CircuitBreakerConfig::default(),
             disable_retries: false,
             disable_circuit_breaker: false,
+            kv_aware_session_affinity_ttl_secs: None,
             health_check: HealthCheckConfig::default(),
             enable_igw: false,
             queue_size: 100,
@@ -1864,6 +1917,7 @@ mod tests {
             circuit_breaker: CircuitBreakerConfig::default(),
             disable_retries: false,
             disable_circuit_breaker: false,
+            kv_aware_session_affinity_ttl_secs: None,
             health_check: HealthCheckConfig::default(),
             enable_igw: false,
             queue_size: 100,

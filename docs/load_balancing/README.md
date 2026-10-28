@@ -14,6 +14,7 @@ the policy is the same for `grpc://host:port`.
 | `consistent_hash` | Multi-turn conversations, KV cache reuse | Yes | No |
 | `power_of_two` | Load-sensitive workloads | No | Yes |
 | `cache_aware` | Prefix caching optimization | Yes (cache-based) | Yes |
+| `kv_aware` | Tiered KV reuse and live-load scoring | No | Yes |
 
 ---
 
@@ -214,18 +215,20 @@ vllm-router --policy cache_aware \
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `cache_threshold` | 0.5 | Minimum prefix match ratio to use cache-based routing |
+| `cache_threshold` | 0.5 | Minimum prefix match ratio over the full input |
 | `balance_abs_threshold` | 32 | Absolute load difference threshold for load balancing |
 | `balance_rel_threshold` | 1.1 | Relative load ratio threshold for load balancing |
 | `eviction_interval_secs` | 30 | Interval for cache eviction |
-| `max_tree_size` | 10000 | Maximum nodes per radix tree |
+| `max_tree_size` | 33,554,432 (`2^25`) | Character budget per worker per model |
+
+Trees are trimmed to `max_tree_size` during periodic eviction and may grow beyond it between cycles. This character budget is not a memory limit; actual memory usage also includes tree overhead and scales with the number of workers and models.
 
 ### Behavior
 
 1. **Balanced mode** (when load is even):
    - Find worker with highest prefix match for the request
    - If match rate > `cache_threshold`: route to that worker (cache hit)
-   - Otherwise: route to worker with smallest tree (most cache capacity)
+   - Otherwise: route to worker with lowest load
 
 2. **Imbalanced mode** (when load is skewed):
    - Route to worker with lowest load (shortest queue)
@@ -236,6 +239,27 @@ vllm-router --policy cache_aware \
 - Workloads with repeated prompt prefixes (system prompts, few-shot examples)
 - When prefix caching is enabled on vLLM workers
 - Multi-tenant deployments with distinct prompt patterns
+
+---
+
+## KV Aware
+
+`kv_aware` balances requests using reusable KV blocks and current worker load. Use it for workloads with repeated prompt prefixes. It supports regular HTTP or [gRPC](../backend/grpc.md) worker pools; PD disaggregation is not supported.
+
+```bash
+vllm-router --policy kv_aware \
+  --worker-urls grpc://worker1:8000 grpc://worker2:8000
+```
+
+Workers must publish KV events. If discovery is unavailable, supply `--kv-event-source WORKER_URL=tcp://HOST:PORT` per worker, with matching `--kv-event-model` and `--kv-event-block-size`. HTTP text requests need a render endpoint or, for simple prompts, `/tokenize`. Without usable KV information, requests are routed by load.
+
+`--router-temperature 0` selects the lowest-cost worker; positive values spread requests probabilistically.
+
+### Session affinity
+
+Affinity is off by default. Add `--kv-aware-session-affinity-ttl-secs 1800` for a 30-minute idle timeout. Send the same `session_params.session_id` or `x-session-id` header on each request. Agent metadata (`vllm_xargs.agentic_context`, `agent_hint`) and framework session headers take precedence when present.
+
+Affinity can improve multi-turn cache reuse but may increase waiting time on a busy worker. Unavailable workers trigger fresh selection. Bindings are local to each router, so multiple router replicas need ingress stickiness.
 
 ---
 

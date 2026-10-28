@@ -15,6 +15,41 @@ The current gRPC wire sends router-produced `token_ids`:
 This is the current backend contract, not a policy that gRPC can never support
 text prompts or richer payloads.
 
+## API Compatibility
+
+Support status of the OpenAI HTTP surface when the worker pool is `grpc://`:
+
+| API | Status | Behavior |
+|---|---|---|
+| `/v1/chat/completions` | Supported | The router renders the chat template and tokenizes, then sends `TokenIds`. |
+| `/v1/completions` | Supported, token-id prompts only | `prompt` must be `list[int]`; ids go straight to the wire. Text prompts and fields the chat shape cannot express (`suffix`, `best_of`, `n > 1`, `json_schema`, `logprobs`, `echo`, `return_hidden_states`, `documents`) are rejected with `400`. |
+| `/v1/responses`, `/v1/embeddings`, `/v1/rerank`, `/generate`, `/inference/v1/generate` | Not supported | Rejected with `400` before dispatch, so they are client errors and never reach a worker. |
+| `/v1/models`, `/health` | Supported | Answered through the gRPC control/health services. |
+| `/health_generate` | Not supported | Returns `501`; use `/health` for gRPC readiness. |
+
+Chat-level gaps (tool calling, `reasoning_effort`, multimodal content) are
+listed under [Capability Boundaries](#capability-boundaries).
+
+### `/v1/completions` on a gRPC pool
+
+A gRPC pool also serves `/v1/completions` with token-id prompts only:
+`prompt: [int]` skips the chat template (step 2 above) and the client's ids go
+straight to the worker. Text and nested prompts return 400. Routing honors
+`session_params.session_id` like chat; without one, token-id prompts create no
+prefix-cache affinity (cache_aware balances them on load alone).
+
+The reply is shaped for completion clients — `text_completion` chunks and body
+with `choices[].text`, `cmpl-` ids — while reusing the chat pipeline internally.
+`return_token_ids` gates whether the reply writes `choices[].token_ids`; chat
+responses never carry them. Streaming emits every id even from frames whose
+text is empty. The non-streaming choice also carries `prompt_token_ids` (the
+client's ids) under the same flag; streaming never echoes prompt ids, matching
+vLLM HTTP where that happens only under `echo`.
+
+`suffix`, `best_of`, `n > 1`, `json_schema`, `logprobs`, `echo`,
+`return_hidden_states`, `documents`, negative prompt ids, and unknown
+passthrough keys return 400 instead of being dropped.
+
 ## Pool Behavior
 
 A worker pool is all HTTP or all gRPC. Mixed schemes fail during startup or
@@ -64,11 +99,88 @@ Keys include rendered text, tokenizer instance, `add_special_tokens` and
 `cache_salt`. Only successful deterministic encodings are cached; unknown
 configurations and `Prompt::TokenIds` bypass L0. Model assets must stay fixed
 during loading; restart the router to reload them. Rendering and validation
-still run per request, and retries reuse `PreparedChat`.
+still run per request, and retries reuse `PreparedRequest`.
 
 L0 shares the existing LRU and `vllm_tokenizer_cache_*` metrics. Rust callers
 can use `EngineFrontend::with_tokenizer_cache(timeout, config)`. See the
 [benchmark guide](../benchmarks/grpc_frontend_l0.md) for measurement details.
+
+## Optional L1 prefix encoding cache
+
+L1 reuses token IDs for the longest previously seen prefix of a rendered
+prompt, so a growing conversation only encodes its new turns. It caches
+router-side tokenizer output and is unrelated to the worker's KV prefix cache
+(`enable_prefix_caching`). It is off by default:
+
+```bash
+VLLM_ROUTER_L1_CACHE=1 vllm-router --worker-urls grpc://127.0.0.1:50051
+```
+
+| Environment variable | Default | Meaning |
+|---|---:|---|
+| `VLLM_ROUTER_L1_CACHE` | `0` | Enable with `1` or `true` |
+| `VLLM_ROUTER_L1_MAX_BYTES` | `268435456` | Estimated heap byte limit across models (contents and containers) |
+| `VLLM_ROUTER_L1_MAX_NODES` | `65536` | Tree node limit across models |
+| `VLLM_ROUTER_L1_MAX_INSERT_BYTES` | `33554432` | Bytes one request may add (at most the total) |
+| `VLLM_ROUTER_L1_MAX_INSERT_SEGMENTS` | `4096` | Boundary segments one request may add |
+| `VLLM_ROUTER_L1_HASH_STRATEGY` | `first_last_64` | Child-key hashing strategy: `first_last_64` or `full` |
+| `VLLM_ROUTER_L1_VERIFY` | `0` | Also run a full encode and compare (debugging) |
+
+`first_last_64` is the default because it avoids hashing an entire long
+segment on the common path. Use `VLLM_ROUTER_L1_HASH_STRATEGY=full` when a
+workload is likely to create many long sibling segments with the same length,
+same first 64 bytes, and same last 64 bytes, for example fixed-size templated
+inputs whose middle changes but whose head and tail are identical.
+
+How it works:
+
+- **Boundaries.** Tokenizers split input on added tokens before normalizing
+  and pre-tokenizing. A prefix that ends right after a *boundary* added token
+  therefore encodes the same alone as inside the full prompt. Cut positions
+  come from an automaton over all added tokens that matches like the
+  tokenizer (leftmost-longest). Boundary tokens have no `lstrip`/`rstrip`/
+  `single_word` flags and no edge whitespace, and no longer added token
+  contains them before its end. If any added token is `single_word`, a
+  boundary must not end in a Unicode `\w` character (letters, digits,
+  combining marks, `_`), the same test Hugging Face uses to accept a
+  `single_word` match. `normalized` tokens qualify only when the
+  normalizer is a no-op and they cannot overlap non-normalized tokens
+  (otherwise fastokens and Hugging Face split differently, and stricter rules
+  apply). For Qwen these are `<|im_start|>`, `<|im_end|>`, `<tool_call>`,
+  `<think>` and the other added tokens. At load, each candidate is probed by
+  comparing split and full encodes; failures are dropped. Rejected tokens are
+  logged with their reason at debug level.
+- **Tree.** A radix tree over rendered text, one namespace per model instance
+  and `cache_salt`. Edges end at boundaries and store their token IDs and the
+  offsets of inner boundaries, so a lookup can stop inside an edge: editing
+  message `k` still reuses messages before it. Text after the last boundary
+  (usually the generation prompt) is not cached.
+- **Encode.** IDs for the matched prefix are copied from the tree. The rest
+  is encoded in one call, and its new boundary segments are inserted as one
+  edge. Lookups take a read lock. Inserts take a write lock and evict
+  least-recently-used leaves until both limits hold again. The byte estimate
+  counts node contents plus the tree's container capacity.
+
+L1 runs after L0 when both are enabled. It is skipped for
+`add_special_tokens=true`, `Prompt::TokenIds`, tiktoken/tekken tokenizers, and
+`tokenizer.json` files with BPE dropout, truncation, padding or Metaspace
+`prepend_scheme: first`. With `VLLM_ROUTER_L1_VERIFY=1`, a mismatch logs an
+error, returns the full encode and disables L1 for that model.
+
+Metrics: `vllm_tokenizer_l1_{lookups,hits,cached_tokens,encoded_tokens,evictions,verify_mismatches}_total`
+and the `vllm_tokenizer_l1_{nodes,bytes}` gauges.
+`vllm_tokenizer_l1_bypasses_total{reason}` counts prompts on an L1-enabled
+model that skipped the tree: `token_ids` (e.g. Harmony), `add_special_tokens`,
+`no_boundary`, or `disabled` after a verify mismatch. A model that cannot use
+L1 at all logs `L1 disabled for this model` with the reason at load. With an
+HTTP worker pool the router does not tokenize, so `VLLM_ROUTER_L0_CACHE` and
+`VLLM_ROUTER_L1_CACHE` are ignored with a warning at startup. With
+`VLLM_ROUTER_STAGES=1`, `x-router-stages` reports `encode_cached_tokens`.
+Rust callers can use `EngineFrontend::with_encoding_caches(timeout, l0, l1)`.
+See the [L1 benchmark guide](../benchmarks/grpc_frontend_l1.md).
+
+Future work: multimodal placeholders (this path is text-only), tiktoken and
+tekken tokenizers, boundaries inside long messages, and HTTP worker pools.
 
 ## Capability Boundaries
 
@@ -94,11 +206,11 @@ proto media fields and adding parity tests against vLLM HTTP behavior.
 |---|---|
 | `src/backend/mod.rs` | Shared backend exports and `pb` aliases for `vllm-proto` |
 | `src/backend/detect.rs` | Scheme detection, pool-kind locking, DP rank stripping, tonic URI conversion |
-| `src/backend/frontend.rs` | `EngineFrontend`: `prepare(chat)` and `dispatch(ids, url)` |
+| `src/backend/frontend.rs` | `EngineFrontend`: `prepare(chat)`, `prepare_token_ids(chat, ids)`, and `dispatch` |
 | `src/backend/health.rs` | gRPC health checks for startup and worker probes |
 | `src/backend/preprocess.rs` | Tokenizer/model cache and chat render/encode |
 | `src/backend/vllm_frontend.rs` | Adapter around `vllm-chat`, `vllm-tokenizer`, and `vllm-text` |
-| `src/backend/convert.rs` | OpenAI request fields to `GenerateRequest` |
+| `src/backend/convert.rs` | OpenAI request fields to `GenerateRequest`; `prepare_grpc_completion` lowers `/v1/completions` onto the chat shape |
 | `src/backend/grpc.rs` | Cached tonic `InferenceClient` and `GenerateStream` |
 | `src/backend/openai.rs` | Proto chunks to OpenAI JSON/SSE for clients |
 
@@ -156,9 +268,9 @@ Launch helpers for python HTTP, rust HTTP, and rust gRPC are in
 Always-on tests:
 
 ```bash
-cargo test --test grpc_vs_http_e2e
-cargo test --lib backend::
-python3 -m unittest tests/test_bench_prefix_kvhit.py
+cargo test --features cpu,ready --test grpc_vs_http_e2e
+cargo test --features cpu,ready --lib backend::
+python3 -m unittest tests/python/test_bench_prefix_kvhit.py
 ```
 
 Optional tokenizer parity check, skipped unless the model dir and Python vLLM
@@ -166,5 +278,5 @@ import are available:
 
 ```bash
 export VLLM_ROUTER_MODEL=/path/to/hf-model
-cargo test --lib vllm_chat_tokenize_matches_python_vllm -- --nocapture
+cargo test --features cpu,ready --lib vllm_chat_tokenize_matches_python_vllm -- --nocapture
 ```
