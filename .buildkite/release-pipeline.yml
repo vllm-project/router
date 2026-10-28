@@ -59,7 +59,7 @@ steps:
             - "RUST_BACKTRACE=1"
           command:
             - "bash"
-            - ".buildkite/build-wheel.sh"
+            - ".buildkite/scripts/build-wheel.sh"
     artifact_paths:
       - "target/release/vllm-router"
       - "dist/*.whl"
@@ -81,7 +81,7 @@ steps:
             - "RUST_BACKTRACE=1"
           command:
             - "bash"
-            - ".buildkite/build-wheel.sh"
+            - ".buildkite/scripts/build-wheel.sh"
     artifact_paths:
       - "dist/*.whl"
     depends_on: "version-check"

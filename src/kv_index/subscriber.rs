@@ -57,6 +57,25 @@ pub fn spawn(
     signal_tx: Option<mpsc::Sender<IngestionSignal>>,
     ctx: Arc<zmq::Context>,
 ) -> SubscriberHandle {
+    spawn_inner(source, indexer, signal_tx, ctx, false)
+}
+
+pub(crate) fn spawn_pd(
+    source: EventSource,
+    indexer: Arc<KvBlockIndexer>,
+    signal_tx: Option<mpsc::Sender<IngestionSignal>>,
+    ctx: Arc<zmq::Context>,
+) -> SubscriberHandle {
+    spawn_inner(source, indexer, signal_tx, ctx, true)
+}
+
+fn spawn_inner(
+    source: EventSource,
+    indexer: Arc<KvBlockIndexer>,
+    signal_tx: Option<mpsc::Sender<IngestionSignal>>,
+    ctx: Arc<zmq::Context>,
+    pd_dense: bool,
+) -> SubscriberHandle {
     let (shutdown_tx, mut shutdown_rx) = broadcast::channel::<()>(1);
     let pub_endpoint = source.pub_endpoint.clone();
     let replay_endpoint = source.replay_endpoint.clone();
@@ -168,6 +187,7 @@ pub fn spawn(
                                 dp_rank,
                                 incarnation,
                                 signals.clone(),
+                                pd_dense,
                             )
                             .await
                             {
@@ -192,7 +212,7 @@ pub fn spawn(
                     if let Some(batch) = batch {
                         // After unrecoverable loss, credit only fresh observations
                         // on the now-clean source; absence is a conservative miss.
-                        apply_batch(&indexer, &source_id, dp_rank, incarnation, &batch);
+                        apply_batch(&indexer, &source_id, dp_rank, incarnation, &batch, pd_dense);
                         last_seq = seq;
                         if suspended {
                             indexer.resume_source(&source_id, dp_rank);
@@ -313,12 +333,38 @@ fn apply_batch(
     dp_rank: u32,
     incarnation: u64,
     batch: &KVEventBatch,
+    pd_dense: bool,
 ) {
     // Batch rank if the 3-element array carries it; else the discovery rank.
     let rank = batch.data_parallel_rank.unwrap_or(dp_rank);
     for ev in &batch.events {
         match ev {
             KVEvent::BlockStored(s) => {
+                // Local token hashes cannot distinguish salt/MM/layout
+                // identities. Never publish credit for an unmodeled event.
+                // Named LoRA remains isolated by the local hash seed.
+                if pd_dense
+                    && (s.extra_keys.as_ref().is_some_and(|keys| {
+                        keys.iter().any(|key| {
+                            !key.is_nil()
+                                && !s.lora_name.as_ref().is_some_and(|name| {
+                                    key.as_array().is_some_and(|parts| {
+                                        parts.len() == 1 && parts[0].as_str() == Some(name.as_str())
+                                    })
+                                })
+                        })
+                    }) || s
+                        .kv_cache_spec_kind
+                        .as_deref()
+                        .is_some_and(|kind| kind != "full_attention")
+                        || s.kv_cache_spec_sliding_window.is_some()
+                        || (s.lora_id.is_some() && s.lora_name.is_none())
+                        || s.block_size == 0
+                        || s.block_hashes.len().checked_mul(s.block_size as usize)
+                            != Some(s.token_ids.len()))
+                {
+                    continue;
+                }
                 let group = s.group_idx.unwrap_or(0);
                 let owner = event_owner(source_id, rank, incarnation, s.ownership.as_deref());
                 let tier = event_tier(&owner, s.medium.as_deref());
@@ -365,6 +411,7 @@ async fn replay(
     dp_rank: u32,
     incarnation: u64,
     signals: Option<mpsc::Sender<IngestionSignal>>,
+    pd_dense: bool,
 ) -> Option<i64> {
     let dealer = match ctx.socket(zmq::DEALER) {
         Ok(s) => s,
@@ -426,7 +473,7 @@ async fn replay(
                     );
                     return None;
                 }
-                apply_batch(indexer, source_id, dp_rank, incarnation, &batch);
+                apply_batch(indexer, source_id, dp_rank, incarnation, &batch, pd_dense);
                 high = seq;
                 emit(
                     &signals,
@@ -493,6 +540,68 @@ mod tests {
     }
 
     #[test]
+    fn unmodeled_extra_keys_never_alias_plain_or_named_lora_credit() {
+        for (name, extra, expected) in [
+            (None, None, 1),
+            (
+                None,
+                Some(vec![rmpv::Value::Array(vec![rmpv::Value::from("salt")])]),
+                0,
+            ),
+            (
+                Some("adapter"),
+                Some(vec![rmpv::Value::Array(vec![rmpv::Value::from("adapter")])]),
+                1,
+            ),
+            (
+                Some("adapter"),
+                Some(vec![rmpv::Value::Array(vec![
+                    rmpv::Value::from("adapter"),
+                    rmpv::Value::from("salt"),
+                ])]),
+                0,
+            ),
+        ] {
+            for dense_only in [false, true] {
+                let index = KvBlockIndexer::new();
+                let mut event = stored(
+                    vec![ExternalBlockHash::Int(10)],
+                    vec![1, 2, 3, 4],
+                    Some("GPU"),
+                    None,
+                );
+                event.lora_name = name.map(str::to_owned);
+                event.extra_keys = extra.clone();
+                event.session_id = Some("session-annotation".to_owned());
+                apply_batch(
+                    &index,
+                    &SourceId::from("p"),
+                    0,
+                    0,
+                    &KVEventBatch {
+                        ts: 1.0,
+                        events: vec![KVEvent::BlockStored(event)],
+                        data_parallel_rank: Some(0),
+                    },
+                    dense_only,
+                );
+                let query = MatchQuery {
+                    group_idx: 0,
+                    local_hashes: local_hashes(&[1, 2, 3, 4], 4, name)
+                        .iter()
+                        .map(|hash| Arc::from(hex(hash)))
+                        .collect(),
+                    tiers_of_interest: vec![StorageTier::Device],
+                };
+                assert_eq!(
+                    index.find_matches(&query).len(),
+                    if dense_only { expected } else { 1 }
+                );
+            }
+        }
+    }
+
+    #[test]
     fn apply_batch_routes_ownership_to_tier_and_rank_from_batch() {
         let idx = Arc::new(KvBlockIndexer::new());
         let batch = KVEventBatch {
@@ -515,7 +624,7 @@ mod tests {
             ],
             data_parallel_rank: Some(1),
         };
-        apply_batch(&idx, &SourceId::from("w0"), 0, 0, &batch);
+        apply_batch(&idx, &SourceId::from("w0"), 0, 0, &batch, false);
 
         let pool_locals: Vec<Arc<str>> = local_hashes(&[1, 2, 3, 4], 4, None)
             .iter()
@@ -859,6 +968,7 @@ mod tests {
                     events: vec![store_event(100, &tokens)],
                     data_parallel_rank: Some(rank),
                 },
+                false,
             );
         }
         // Seq 1 was a lost eviction; seq 2 contains no replacement store.
@@ -1069,5 +1179,92 @@ mod tests {
     #[tokio::test]
     async fn replay_wrong_rank_clears_partial_stores() {
         check_replay_case("wrong_rank").await;
+    }
+
+    #[test]
+    fn dense_mode_skips_unmodeled_block_stored_variants() {
+        for (kind, sliding, lora_id, extra_hashes, colocated_matches) in [
+            (Some("sliding_attention"), None, None, 1, 1),
+            (None, Some(8), None, 1, 1),
+            (None, None, Some(7), 1, 1),
+            // block_hashes×block_size must equal token_ids.len(): 2×4 ≠ 4.
+            (None, None, None, 2, 1),
+        ] {
+            for dense_only in [false, true] {
+                let index = KvBlockIndexer::new();
+                let tokens = vec![1, 2, 3, 4];
+                let mut event = stored(
+                    vec![ExternalBlockHash::Int(10); extra_hashes],
+                    tokens.clone(),
+                    Some("GPU"),
+                    None,
+                );
+                event.kv_cache_spec_kind = kind.map(str::to_owned);
+                event.kv_cache_spec_sliding_window = sliding;
+                event.lora_id = lora_id;
+                apply_batch(
+                    &index,
+                    &SourceId::from("p"),
+                    0,
+                    0,
+                    &KVEventBatch {
+                        ts: 1.0,
+                        events: vec![KVEvent::BlockStored(event)],
+                        data_parallel_rank: Some(0),
+                    },
+                    dense_only,
+                );
+                let query = MatchQuery {
+                    group_idx: 0,
+                    local_hashes: local_hashes(&tokens, 4, None)
+                        .iter()
+                        .map(|hash| Arc::from(hex(hash)))
+                        .collect(),
+                    tiers_of_interest: vec![StorageTier::Device],
+                };
+                let expected = if dense_only { 0 } else { colocated_matches };
+                assert_eq!(
+                    index.find_matches(&query).len(),
+                    expected,
+                    "kind={kind:?} sliding={sliding:?} lora_id={lora_id:?} extra_hashes={extra_hashes} dense={dense_only}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dense_mode_skips_zero_block_size_without_panicking() {
+        let index = KvBlockIndexer::new();
+        let tokens = vec![1, 2, 3, 4];
+        let mut event = stored(
+            vec![ExternalBlockHash::Int(10)],
+            tokens.clone(),
+            Some("GPU"),
+            None,
+        );
+        event.block_size = 0;
+        apply_batch(
+            &index,
+            &SourceId::from("p"),
+            0,
+            0,
+            &KVEventBatch {
+                ts: 1.0,
+                events: vec![KVEvent::BlockStored(event)],
+                data_parallel_rank: Some(0),
+            },
+            true,
+        );
+        // The guard must skip the event before local hashing (which would
+        // panic on a zero chunk size) and publish no credit.
+        let query = MatchQuery {
+            group_idx: 0,
+            local_hashes: local_hashes(&tokens, 4, None)
+                .iter()
+                .map(|hash| Arc::from(hex(hash)))
+                .collect(),
+            tiers_of_interest: vec![StorageTier::Device],
+        };
+        assert_eq!(index.find_matches(&query).len(), 0);
     }
 }

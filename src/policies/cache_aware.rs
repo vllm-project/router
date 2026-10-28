@@ -18,9 +18,10 @@
 
     1. Cache-Aware Routing (Approximate Tree)
     -------------------------------------------
-    This strategy maintains an approximate radix tree for each worker based on request history,
-    eliminating the need for direct cache state queries. The tree stores raw text characters
-    instead of token IDs to avoid tokenization overhead.
+    This strategy maintains an approximate radix tree from request history.
+    Router paths use backend-effective token keys, shared with KV-aware input
+    preparation, including every prompt in a batch. Legacy text-only callers
+    can still supply text keys. This history is not an engine residency index.
 
     Process:
     a. For each request, find the worker with the highest prefix match
@@ -55,17 +56,21 @@
     Interval between LRU eviction cycles for the approximate trees.
 
     5. max_tree_size: (integer)
-    Maximum characters per worker in each model tree. When exceeded, LRU
+    Maximum characters per worker in each model tree, shared across LoRA and
+    cache-salt identities. When exceeded, LRU
     leaf entries are evicted during the next eviction cycle. This is not
     a hard process-memory limit.
 */
 
-use super::{get_healthy_worker_indices, CacheAwareConfig, LoadBalancingPolicy, RequestHeaders};
-use crate::core::Worker;
+use super::{
+    get_healthy_worker_indices, CacheAwareConfig, KvRequestTokens, LoadBalancingPolicy,
+    RequestHeaders, SelectionContext,
+};
+use crate::core::{Worker, WorkerLoadGuard};
 use crate::metrics::RouterMetrics;
 use crate::policies::normalize_model_key;
 use crate::protocols::spec::cache_routing;
-use crate::tree::Tree;
+use crate::tree::{PrefixMatchResult, Tree};
 use dashmap::DashMap;
 use rand::Rng;
 use std::collections::HashMap;
@@ -86,6 +91,12 @@ pub struct CacheAwareCandidate<'a> {
 pub struct CacheAwarePlacement {
     pub target_id: String,
     pub match_rate: f32,
+}
+
+/// Prefix matching prepared before PD admission; selection samples fresh load.
+pub(crate) struct PreparedCacheSelection {
+    tree: Arc<Tree>,
+    candidates: HashMap<String, (Vec<Arc<str>>, f64)>,
 }
 
 /// Cache-aware routing policy
@@ -238,6 +249,149 @@ impl CacheAwarePolicy {
         }
     }
 
+    /// Compare backend-effective prompts, scoped by the request's model.
+    pub fn select_worker_with_inputs(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        tokens: KvRequestTokens<'_>,
+        model_id: Option<&str>,
+        lora_name: Option<&str>,
+        cache_salt: Option<&str>,
+        stage: &'static str,
+    ) -> Option<usize> {
+        let prepared = self.prepare_selection(workers, tokens, model_id, lora_name, cache_salt);
+        self.select_prepared(workers, prepared.as_ref(), stage)
+    }
+
+    pub(crate) fn prepare_selection(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        tokens: KvRequestTokens<'_>,
+        model_id: Option<&str>,
+        lora_name: Option<&str>,
+        cache_salt: Option<&str>,
+    ) -> Option<PreparedCacheSelection> {
+        let healthy = get_healthy_worker_indices(workers);
+        let first = workers.get(*healthy.first()?)?;
+        // PD workers may have no model label. Request model/adapter names must
+        // still isolate their cache history even when every label is unknown.
+        let model = normalize_model_key(model_id.unwrap_or_else(|| first.model_id())).to_owned();
+        // Keep cache identities in the keys so all scopes share the model's
+        // per-worker eviction budget instead of allocating a tree per salt.
+        let scope_prefix = if lora_name.is_some() || cache_salt.is_some() {
+            use sha2::{Digest, Sha256};
+            let identity = serde_json::to_vec(&(lora_name, cache_salt)).ok()?;
+            format!("\0ca:s:{:x}:", Sha256::digest(identity))
+        } else {
+            String::new()
+        };
+        let tree = self
+            .trees
+            .entry(model)
+            .or_insert_with(|| Arc::new(Tree::new()))
+            .clone();
+        // Token arrays and DP ranks commonly share prompts. Encode each
+        // distinct prompt once rather than allocating eight bytes per token
+        // for every candidate.
+        let mut encoded: HashMap<&[u32], Arc<str>> = HashMap::new();
+        let mut candidates = HashMap::new();
+        for index in healthy {
+            let worker = &workers[index];
+            let prompts = tokens.prompts_for(worker.as_ref());
+            if prompts.is_empty() || prompts.iter().any(|ids| ids.is_empty()) {
+                continue;
+            }
+            let keys: Vec<_> = prompts
+                .into_iter()
+                .map(|ids| {
+                    encoded
+                        .entry(ids)
+                        .or_insert_with(|| {
+                            Arc::from(cache_routing::token_ids_with_prefix(ids, &scope_prefix))
+                        })
+                        .clone()
+                })
+                .collect();
+            let mut matched = 0usize;
+            let mut input = 0usize;
+            for key in &keys {
+                let hit = tree.prefix_match_tenant_char_count(key, worker.url());
+                // The ASCII identity prefix isolates caches but earns no
+                // token credit, including partial matches between digests.
+                let (hit_tokens, input_tokens) = cache_routing::token_prefix_counts(
+                    &key[scope_prefix.len()..],
+                    hit.saturating_sub(scope_prefix.len()),
+                );
+                matched += hit_tokens;
+                input += input_tokens;
+            }
+            let rate = if input == 0 {
+                0.0
+            } else {
+                matched as f64 / input as f64
+            };
+            candidates.insert(worker.url().to_owned(), (keys, rate));
+        }
+        Some(PreparedCacheSelection { tree, candidates })
+    }
+
+    pub(crate) fn select_prepared(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        prepared: Option<&PreparedCacheSelection>,
+        stage: &'static str,
+    ) -> Option<usize> {
+        let healthy = get_healthy_worker_indices(workers);
+        let (min_load, max_load) = self.load_range(workers, &healthy);
+        let imbalanced = self.is_imbalanced(min_load, max_load);
+        if imbalanced {
+            RouterMetrics::record_load_balancing_event();
+            RouterMetrics::set_load_range(max_load, min_load);
+        }
+        let matches: Option<Vec<_>> = healthy
+            .iter()
+            .map(|&i| prepared?.candidates.get(workers[i].url()))
+            .collect();
+        let Some((prepared, matches)) = prepared.zip(matches) else {
+            RouterMetrics::record_prefix_routing_decision("cache_aware", stage, "missing_tokens");
+            let index = Self::least_loaded(workers, &healthy)?;
+            Self::record_selection(workers, index);
+            return Some(index);
+        };
+        let best_rate = matches
+            .iter()
+            .map(|(_, rate)| *rate)
+            .fold(0.0_f64, f64::max);
+        let use_prefix = !imbalanced && best_rate > self.config.cache_threshold as f64;
+        let position = (0..healthy.len())
+            .filter(|&i| !use_prefix || matches[i].1 == best_rate)
+            .min_by_key(|&i| workers[healthy[i]].load())?;
+        let index = healthy[position];
+        for key in &matches[position].0 {
+            prepared.tree.insert(key, workers[index].url());
+        }
+        RouterMetrics::record_prefix_routing_decision(
+            "cache_aware",
+            stage,
+            if imbalanced {
+                "load_imbalance"
+            } else if use_prefix {
+                "prefix_hit"
+            } else {
+                "prefix_miss"
+            },
+        );
+        debug!(
+            stage,
+            selected = workers[index].url(),
+            match_rate = matches[position].1,
+            batch_prompts = matches[position].0.len(),
+            "Cache prefix decision"
+        );
+        Self::record_selection(workers, index);
+        Some(index)
+    }
+
     fn select_worker_min_load(
         &self,
         workers: &[Arc<dyn Worker>],
@@ -260,35 +414,149 @@ impl CacheAwarePolicy {
         RouterMetrics::record_load_balancing_event();
         RouterMetrics::set_load_range(max_load, min_load);
 
-        // Use shortest queue when imbalanced
-        let min_load_idx = healthy_indices
-            .iter()
-            .min_by_key(|&&idx| workers[idx].load())
-            .copied()?;
+        let min_load_idx = Self::least_loaded(workers, healthy_indices)?;
 
         // Even in imbalanced mode, update the tree to maintain cache state
         if let Some(text) = request_text {
-            // Get the tree reference without locking the entire HashMap
-            // DashMap only locks the specific shard containing this key
-            let tree = self.trees.get(model_id).map(|entry| entry.value().clone());
-
-            if let Some(tree) = tree {
-                let worker_url = workers[min_load_idx].url();
-                tree.insert(text, worker_url);
-            } else {
-                debug!(
-                    "Warning: No tree found for model '{}', skipping cache update",
-                    model_id
-                );
-            }
+            self.trees
+                .entry(model_id.to_owned())
+                .or_insert_with(|| Arc::new(Tree::new()))
+                .insert(text, workers[min_load_idx].url());
         }
 
-        // Increment processed counter
-        workers[min_load_idx].increment_processed();
-        RouterMetrics::record_processed_request(workers[min_load_idx].url());
-        RouterMetrics::record_policy_decision(self.name(), workers[min_load_idx].url());
+        Self::record_selection(workers, min_load_idx);
 
         Some(min_load_idx)
+    }
+
+    fn load_range(&self, workers: &[Arc<dyn Worker>], healthy: &[usize]) -> (usize, usize) {
+        // Use the same eligible workers for load statistics and selection.
+        let (min, max) = healthy
+            .iter()
+            .fold((usize::MAX, 0usize), |(min, max), &idx| {
+                let load = workers[idx].load();
+                (min.min(load), max.max(load))
+            });
+        (if min == usize::MAX { 0 } else { min }, max)
+    }
+
+    fn is_imbalanced(&self, min: usize, max: usize) -> bool {
+        max.saturating_sub(min) > self.config.balance_abs_threshold
+            && (max as f32) > (min as f32 * self.config.balance_rel_threshold)
+    }
+
+    fn least_loaded(workers: &[Arc<dyn Worker>], healthy: &[usize]) -> Option<usize> {
+        healthy
+            .iter()
+            .min_by_key(|&&idx| workers[idx].load())
+            .copied()
+    }
+
+    /// Choose using an approximate affinity observation, but current eligibility
+    /// and load. Called within the pool's admission critical section, when used.
+    /// Returns whether the observed cache target has become unavailable.
+    fn choose_from_affinity(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        healthy: &[usize],
+        affinity: Option<&PrefixMatchResult>,
+        text: &str,
+    ) -> Option<(usize, bool)> {
+        let Some(result) = affinity else {
+            let idx = *healthy.get(rand::rng().random_range(0..healthy.len()))?;
+            return Some((idx, false));
+        };
+        let match_rate =
+            cache_routing::match_rate(text, result.matched_char_count, result.input_char_count);
+        if match_rate > self.config.cache_threshold {
+            if let Some(idx) = workers
+                .iter()
+                .position(|worker| worker.url() == result.tenant.as_ref())
+                .filter(|&idx| workers[idx].is_healthy())
+            {
+                return Some((idx, false));
+            }
+            return healthy.first().copied().map(|idx| (idx, true));
+        }
+        Self::least_loaded(workers, healthy).map(|idx| (idx, false))
+    }
+
+    fn record_selection(workers: &[Arc<dyn Worker>], idx: usize) {
+        workers[idx].increment_processed();
+        RouterMetrics::record_processed_request(workers[idx].url());
+        RouterMetrics::record_policy_decision("cache_aware", workers[idx].url());
+    }
+
+    /// Prepare cache affinity outside the admission lock, then recheck load and
+    /// eligibility before committing. Legacy selection keeps its original
+    /// single-pass flow and shares the policy decisions below.
+    fn select_with_commit<T>(
+        &self,
+        context: &SelectionContext,
+        workers: &[Arc<dyn Worker>],
+        request_text: Option<&str>,
+        commit: impl FnOnce(usize) -> T,
+    ) -> Option<(usize, T)> {
+        let selection = context.lock.lock();
+        let healthy = get_healthy_worker_indices(workers);
+        let model_id = normalize_model_key(workers[*healthy.first()?].model_id());
+        let (min, max) = self.load_range(workers, &healthy);
+        if self.is_imbalanced(min, max) {
+            let idx = Self::least_loaded(workers, &healthy)?;
+            let reservation = commit(idx);
+            drop(selection);
+            // Do not scan the prompt when load balancing already decides placement.
+            if let Some(text) = request_text {
+                let tree = self.trees.get(model_id).map(|entry| entry.value().clone());
+                if let Some(tree) = tree {
+                    tree.insert(text, workers[idx].url());
+                }
+            }
+            RouterMetrics::record_load_balancing_event();
+            RouterMetrics::set_load_range(max, min);
+            Self::record_selection(workers, idx);
+            return Some((idx, reservation));
+        }
+        drop(selection);
+
+        let text = request_text.unwrap_or("");
+        let tree = self.trees.get(model_id).map(|entry| entry.value().clone());
+        // The tree is an approximate history of assignments, not an authoritative
+        // KV directory. Concurrent requests can observe the same older affinity.
+        let affinity = tree
+            .as_ref()
+            .map(|tree| tree.prefix_match_with_counts(text));
+
+        let selection = context.lock.lock();
+        let healthy = get_healthy_worker_indices(workers);
+        healthy.first()?;
+        let (min, max) = self.load_range(workers, &healthy);
+        let imbalanced = self.is_imbalanced(min, max);
+        let (idx, stale) = if imbalanced {
+            (Self::least_loaded(workers, &healthy)?, false)
+        } else {
+            self.choose_from_affinity(workers, &healthy, affinity.as_ref(), text)?
+        };
+        let reservation = commit(idx);
+        drop(selection);
+
+        if let Some(tree) = tree {
+            if stale {
+                if let Some(result) = affinity {
+                    tree.remove_tenant(result.tenant.as_ref());
+                }
+            } else if !imbalanced || request_text.is_some() {
+                // Publish placement before returning, but do not serialize other
+                // admissions behind a potentially long radix-tree insertion.
+                tree.insert(text, workers[idx].url());
+            }
+        }
+        if imbalanced {
+            RouterMetrics::record_load_balancing_event();
+            RouterMetrics::set_load_range(max, min);
+        }
+        Self::record_selection(workers, idx);
+        Some((idx, reservation))
     }
 }
 
@@ -299,133 +567,63 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         request_text: Option<&str>,
         _headers: Option<&RequestHeaders>,
     ) -> Option<usize> {
-        let healthy_indices = get_healthy_worker_indices(workers);
-
-        if healthy_indices.is_empty() {
-            return None;
-        }
-        let text = request_text.unwrap_or("");
-
-        // Determine the model for this set of workers (router pre-filters by model)
-        // All workers should be from the same model
-        let model_id = normalize_model_key(workers[healthy_indices[0]].model_id());
-
-        // Base the load decision on workers that are eligible for selection.
-        // Unhealthy workers must not affect whether healthy workers use cache
-        // affinity or load balancing.
-        let (min_load, max_load) = healthy_indices
-            .iter()
-            .map(|&idx| workers[idx].load())
-            .fold((usize::MAX, 0usize), |(min, max), load| {
-                (min.min(load), max.max(load))
-            });
-        let min_load = if min_load == usize::MAX { 0 } else { min_load };
-
-        // Check if load is imbalanced
-        let is_imbalanced = max_load.saturating_sub(min_load) > self.config.balance_abs_threshold
-            && (max_load as f32) > (min_load as f32 * self.config.balance_rel_threshold);
-
-        debug!(
-            "Load status for model: max_load={}, min_load={}, is_imbalanced={}",
-            max_load, min_load, is_imbalanced
-        );
-
-        if is_imbalanced {
+        let healthy = get_healthy_worker_indices(workers);
+        let model_id = normalize_model_key(workers[*healthy.first()?].model_id());
+        let (min, max) = self.load_range(workers, &healthy);
+        if self.is_imbalanced(min, max) {
             return self.select_worker_min_load(
                 workers,
                 request_text,
-                &healthy_indices,
+                &healthy,
                 model_id,
-                max_load,
-                min_load,
+                max,
+                min,
             );
         }
 
-        // Use cache-aware routing when balanced
-        // Get the tree reference without locking the entire HashMap
-        // DashMap only locks the specific shard containing this key
+        // Preserve legacy selection without adding a reservation or a second
+        // load check. Only the atomic admission hook rechecks after preparation.
+        let text = request_text.unwrap_or("");
         let tree = self.trees.get(model_id).map(|entry| entry.value().clone());
-
-        let keys: Vec<_> = self.trees.iter().map(|entry| entry.key().clone()).collect();
-        debug!("Available tree keys: {:?}", keys);
-
-        let Some(tree) = tree else {
-            // No tree for this model, log warning and use random selection
-            debug!(
-                "Warning: No tree found for model '{}', using random worker selection",
-                model_id
-            );
-            // Return a random healthy worker
-            let mut rng = rand::rng();
-            let random_idx = rng.random_range(0..healthy_indices.len());
-            let selected_idx = healthy_indices[random_idx];
-
-            workers[selected_idx].increment_processed();
-            RouterMetrics::record_processed_request(workers[selected_idx].url());
-            RouterMetrics::record_policy_decision(self.name(), workers[selected_idx].url());
-
-            return Some(selected_idx);
-        };
-        debug!("Using cache-aware routing for model '{}'", model_id);
-        // Now we work with the tree without holding the HashMap lock
-        // Use prefix_match_with_counts to avoid redundant chars().count() calls
-        let result = tree.prefix_match_with_counts(text);
-        let match_rate =
-            cache_routing::match_rate(text, result.matched_char_count, result.input_char_count);
-
-        debug!(
-            "Cache match for model '{}': matched_chars={}, input_chars={}, match_rate={:.2}",
-            model_id, result.matched_char_count, result.input_char_count, match_rate
-        );
-        // Select worker without String allocation
-        let selected_idx = if match_rate > self.config.cache_threshold {
-            // Cache hit path: find worker by URL (compare &str directly, no allocation)
-            let tenant_url: &str = &result.tenant;
-            workers
-                .iter()
-                .position(|w| w.url() == tenant_url)
-                .filter(|&idx| workers[idx].is_healthy())
-        } else {
-            // Low cache match: use worker with minimum load
-            healthy_indices
-                .iter()
-                .min_by_key(|&&idx| workers[idx].load())
-                .copied()
-        };
-
-        if let Some(idx) = selected_idx {
-            // Update the tree with this request (use worker URL directly, no allocation)
-            tree.insert(text, workers[idx].url());
-
-            // Increment processed counter
-            workers[idx].increment_processed();
-            RouterMetrics::record_processed_request(workers[idx].url());
-            RouterMetrics::record_policy_decision(self.name(), workers[idx].url());
-
-            return Some(idx);
+        let affinity = tree
+            .as_ref()
+            .map(|tree| tree.prefix_match_with_counts(text));
+        let (idx, stale) = self.choose_from_affinity(workers, &healthy, affinity.as_ref(), text)?;
+        if let Some(tree) = tree {
+            if stale {
+                if let Some(result) = affinity {
+                    tree.remove_tenant(result.tenant.as_ref());
+                }
+            } else {
+                tree.insert(text, workers[idx].url());
+            }
         }
+        Self::record_selection(workers, idx);
+        Some(idx)
+    }
 
-        // Selected worker no longer exists or unhealthy, remove stale tenant from tree
-        if match_rate > self.config.cache_threshold {
-            let tenant_url: &str = &result.tenant;
-            tree.remove_tenant(tenant_url);
-            debug!("Removed stale worker {} from cache tree", tenant_url);
-        }
+    fn select_and_reserve<'a>(
+        &self,
+        context: &SelectionContext,
+        workers: &'a [Arc<dyn Worker>],
+        request_text: Option<&str>,
+        _headers: Option<&RequestHeaders>,
+    ) -> Option<(usize, WorkerLoadGuard<'a>)> {
+        self.select_with_commit(context, workers, request_text, |idx| {
+            WorkerLoadGuard::new(workers[idx].as_ref())
+        })
+    }
 
-        // Fallback to first healthy worker
-        if let Some(idx) = healthy_indices.first().copied() {
-            workers[idx].increment_processed();
-            RouterMetrics::record_processed_request(workers[idx].url());
-            RouterMetrics::record_policy_decision(self.name(), workers[idx].url());
-
-            Some(idx)
-        } else {
-            None
-        }
+    fn tracks_request_load(&self) -> bool {
+        true
     }
 
     fn name(&self) -> &'static str {
         "cache_aware"
+    }
+
+    fn needs_cache_routing_key(&self) -> bool {
+        true
     }
 
     fn needs_request_text(&self) -> bool {
@@ -565,6 +763,230 @@ mod tests {
             .collect();
         policy.init_workers(&workers);
         (policy, workers)
+    }
+
+    #[test]
+    fn cache_identity_scopes_share_budget_without_sharing_prefix_credit() {
+        let config = CacheAwareConfig {
+            cache_threshold: 0.4,
+            max_tree_size: 256,
+            eviction_interval_secs: 0,
+            ..Default::default()
+        };
+        let policy = CacheAwarePolicy::with_config(config.clone());
+        let workers: Vec<Arc<dyn Worker>> = (0..2)
+            .map(|i| {
+                Arc::new(BasicWorker::new(
+                    format!("http://w{i}:8000"),
+                    WorkerType::Regular,
+                )) as Arc<dyn Worker>
+            })
+            .collect();
+        workers[1].increment_load();
+        let ids = [1, 2, 3, 4];
+        for (lora, salt) in [
+            (None, None),
+            (Some("adapter"), None),
+            (None, Some("salt")),
+            (Some("adapter"), Some("salt")),
+        ] {
+            let fresh = policy
+                .prepare_selection(
+                    &workers,
+                    KvRequestTokens::Shared(Some(&ids)),
+                    Some("model"),
+                    lora,
+                    salt,
+                )
+                .unwrap();
+            assert_eq!(fresh.candidates[workers[1].url()].1, 0.0);
+            policy.select_worker_with_inputs(
+                std::slice::from_ref(&workers[1]),
+                KvRequestTokens::Shared(Some(&ids)),
+                Some("model"),
+                lora,
+                salt,
+                "regular",
+            );
+            let partial = policy
+                .prepare_selection(
+                    &workers,
+                    KvRequestTokens::Shared(Some(&[1, 2, 9, 10])),
+                    Some("model"),
+                    lora,
+                    salt,
+                )
+                .unwrap();
+            // Namespace characters must not inflate either token count.
+            assert_eq!(partial.candidates[workers[1].url()].1, 0.5);
+            assert_eq!(
+                policy.select_prepared(&workers, Some(&partial), "prefill"),
+                Some(1)
+            );
+        }
+        // Each salted prompt fits the budget individually. Their combined
+        // history must still be reclaimed, for every worker, on each cycle.
+        for cycle in 0..2 {
+            for session in 0..32 {
+                let salt = format!("session-{cycle}-{session}");
+                for worker in &workers {
+                    policy.select_worker_with_inputs(
+                        std::slice::from_ref(worker),
+                        KvRequestTokens::Shared(Some(&ids)),
+                        Some("model"),
+                        None,
+                        Some(&salt),
+                        "prefill",
+                    );
+                }
+            }
+            assert_eq!(policy.trees.len(), 1);
+            let tree = policy.trees.get("model").unwrap();
+            for worker in &workers {
+                assert!(tree.get_tenant_char_count()[worker.url()] > config.max_tree_size);
+            }
+            drop(tree);
+            policy.evict_cache(config.max_tree_size);
+            let tree = policy.trees.get("model").unwrap();
+            for worker in &workers {
+                assert!(tree.get_tenant_char_count()[worker.url()] <= config.max_tree_size);
+            }
+        }
+    }
+
+    #[test]
+    fn discovered_pools_use_all_effective_batch_prompts_without_initialization() {
+        let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+            eviction_interval_secs: 0,
+            ..Default::default()
+        });
+        let workers: Vec<Arc<dyn Worker>> = (0..2)
+            .map(|i| {
+                Arc::new(BasicWorker::new(
+                    format!("http://w{i}:8000"),
+                    WorkerType::Regular,
+                )) as Arc<dyn Worker>
+            })
+            .collect();
+        let seed: Arc<[Vec<u32>]> = Arc::from(vec![vec![1], vec![7; 64]]);
+        let seed_inputs = workers
+            .iter()
+            .map(|worker| (worker.base_url().to_owned(), seed.clone()))
+            .collect();
+        // Discovery can first expose only rank/worker 1. No init_workers call.
+        assert_eq!(
+            policy.select_worker_with_inputs(
+                std::slice::from_ref(&workers[1]),
+                KvRequestTokens::PerWorker(&seed_inputs),
+                Some("model-a"),
+                None,
+                None,
+                "prefill"
+            ),
+            Some(0)
+        );
+        workers[1].increment_load();
+        let query: Arc<[Vec<u32>]> = Arc::from(vec![vec![999], vec![7; 64]]);
+        let query_inputs = workers
+            .iter()
+            .map(|worker| (worker.base_url().to_owned(), query.clone()))
+            .collect();
+        // Prompt 0 misses. The long second prompt must still retain affinity.
+        assert_eq!(
+            policy.select_worker_with_inputs(
+                &workers,
+                KvRequestTokens::PerWorker(&query_inputs),
+                Some("model-a"),
+                None,
+                None,
+                "prefill"
+            ),
+            Some(1)
+        );
+        // Unlabeled PD workers must not share hints across request models.
+        assert_eq!(
+            policy.select_worker_with_inputs(
+                &workers,
+                KvRequestTokens::PerWorker(&query_inputs),
+                Some("model-b"),
+                None,
+                None,
+                "prefill",
+            ),
+            Some(0)
+        );
+        // A salt identifies a distinct engine cache and historical hint scope.
+        assert_eq!(
+            policy.select_worker_with_inputs(
+                &workers,
+                KvRequestTokens::PerWorker(&query_inputs),
+                Some("model-a"),
+                None,
+                Some("another-cache"),
+                "prefill"
+            ),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn incomplete_effective_inputs_do_not_claim_a_prefix_hit() {
+        let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+            eviction_interval_secs: 0,
+            ..Default::default()
+        });
+        let workers: Vec<Arc<dyn Worker>> = (0..2)
+            .map(|i| {
+                Arc::new(BasicWorker::new(
+                    format!("http://w{i}:8000"),
+                    WorkerType::Regular,
+                )) as Arc<dyn Worker>
+            })
+            .collect();
+        let ids = [1, 2, 3, 4];
+        policy
+            .select_worker_with_inputs(
+                std::slice::from_ref(&workers[1]),
+                KvRequestTokens::Shared(Some(&ids)),
+                None,
+                None,
+                None,
+                "regular",
+            )
+            .unwrap();
+        workers[1].increment_load();
+        let mut inputs = crate::policies::WorkerTokenInputs::new();
+        inputs.insert(
+            workers[1].base_url().to_owned(),
+            Arc::from(vec![ids.to_vec()]),
+        );
+        assert_eq!(
+            policy.select_worker_with_inputs(
+                &workers,
+                KvRequestTokens::PerWorker(&inputs),
+                None,
+                None,
+                None,
+                "regular"
+            ),
+            Some(0)
+        );
+        // Restoring the missing worker restores a real prefix comparison.
+        inputs.insert(
+            workers[0].base_url().to_owned(),
+            Arc::from(vec![ids.to_vec()]),
+        );
+        assert_eq!(
+            policy.select_worker_with_inputs(
+                &workers,
+                KvRequestTokens::PerWorker(&inputs),
+                None,
+                None,
+                None,
+                "regular"
+            ),
+            Some(1)
+        );
     }
 
     #[test]
@@ -715,6 +1137,170 @@ mod tests {
         // Both eligible workers have equal load, so the unhealthy zero-load
         // worker must not switch the policy into load-balancing mode.
         assert_eq!(policy.select_worker(&workers, Some("sticky")), Some(1));
+    }
+
+    #[test]
+    fn unhealthy_worker_load_does_not_disable_reserved_cache_affinity() {
+        let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+            cache_threshold: 0.5,
+            balance_abs_threshold: 0,
+            balance_rel_threshold: 1.0,
+            eviction_interval_secs: 0,
+            max_tree_size: 100,
+        });
+        let workers: Vec<Arc<dyn Worker>> = (0..3)
+            .map(|index| {
+                Arc::new(BasicWorker::new(
+                    format!("http://worker-{index}:8000"),
+                    WorkerType::Regular,
+                )) as Arc<dyn Worker>
+            })
+            .collect();
+        workers[0].set_healthy(false);
+        workers[2].set_healthy(false);
+        policy.init_workers(&workers);
+        for _ in 0..5 {
+            workers[0].increment_load();
+            workers[1].increment_load();
+        }
+
+        // Establish affinity while worker 1 is the only healthy worker.
+        assert_eq!(policy.select_worker(&workers, Some("sticky")), Some(1));
+        workers[0].set_healthy(true);
+
+        // Both eligible workers have equal load, so the unhealthy zero-load
+        // worker must not switch the policy into load-balancing mode.
+        let context = SelectionContext::default();
+        let (idx, guard) = policy
+            .select_and_reserve(&context, &workers, Some("sticky"), None)
+            .unwrap();
+        assert_eq!(idx, 1);
+        assert_eq!(workers[1].load(), 6);
+        drop(guard);
+        assert_eq!(workers[1].load(), 5);
+    }
+
+    #[test]
+    fn concurrent_cold_reservations_observe_each_other() {
+        use std::sync::Barrier;
+        let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+            eviction_interval_secs: 0,
+            ..Default::default()
+        });
+        let workers: Vec<Arc<dyn Worker>> = (0..8)
+            .map(|i| {
+                Arc::new(BasicWorker::new(
+                    format!("http://d-{i}"),
+                    WorkerType::Decode,
+                )) as Arc<dyn Worker>
+            })
+            .collect();
+        policy.init_workers(&workers);
+        let context = SelectionContext::default();
+        let start = Barrier::new(32);
+        let selected = Barrier::new(32);
+        std::thread::scope(|scope| {
+            let tasks: Vec<_> = (0..32)
+                .map(|i| {
+                    let (policy, workers, context, start, selected) =
+                        (&policy, &workers, &context, &start, &selected);
+                    scope.spawn(move || {
+                        let text = char::from_u32(0x400 + i).unwrap().to_string().repeat(8192);
+                        start.wait();
+                        let (_, guard) = policy
+                            .select_and_reserve(context, workers, Some(&text), None)
+                            .unwrap();
+                        selected.wait();
+                        guard
+                    })
+                })
+                .collect();
+            let guards: Vec<_> = tasks.into_iter().map(|task| task.join().unwrap()).collect();
+            assert!(workers.iter().all(|w| w.load() == 4));
+            drop(guards);
+        });
+        assert!(workers.iter().all(|w| w.load() == 0));
+    }
+
+    #[test]
+    fn prepared_affinity_rechecks_worker_eligibility_and_cold_load() {
+        let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+            eviction_interval_secs: 0,
+            ..Default::default()
+        });
+        let workers: Vec<Arc<dyn Worker>> = (0..2)
+            .map(|i| {
+                Arc::new(BasicWorker::new(
+                    format!("http://d-{i}"),
+                    WorkerType::Decode,
+                )) as Arc<dyn Worker>
+            })
+            .collect();
+        let tree = Tree::new();
+        tree.insert("warm conversation", workers[0].url());
+        let warm = tree.prefix_match_with_counts("warm conversation");
+        let cold = tree.prefix_match_with_counts("unrelated text");
+        // Both observations precede the changed load and health state.
+        let pending = WorkerLoadGuard::new(workers[0].as_ref());
+        assert_eq!(
+            policy.choose_from_affinity(&workers, &[0, 1], Some(&cold), "unrelated text"),
+            Some((1, false))
+        );
+        workers[0].set_healthy(false);
+        let healthy = get_healthy_worker_indices(&workers);
+        assert_eq!(
+            policy.choose_from_affinity(&workers, &healthy, Some(&warm), "warm conversation"),
+            Some((1, true))
+        );
+        drop(pending);
+    }
+
+    #[test]
+    fn reservation_commits_under_pool_lock_and_preserves_sentinel_load() {
+        let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+            eviction_interval_secs: 0,
+            ..Default::default()
+        });
+        let workers: Vec<Arc<dyn Worker>> = vec![Arc::new(BasicWorker::new(
+            "http://d".into(),
+            WorkerType::Decode,
+        ))];
+        policy.init_workers(&workers);
+        let context = SelectionContext::default();
+        let sentinel = WorkerLoadGuard::new(workers[0].as_ref());
+        let (_, guard) = policy
+            .select_with_commit(&context, &workers, Some("text"), |idx| {
+                assert!(context.lock.try_lock().is_none());
+                WorkerLoadGuard::new(workers[idx].as_ref())
+            })
+            .unwrap();
+        assert!(context.lock.try_lock().is_some());
+        assert_eq!(workers[0].load(), 2);
+        drop(guard);
+        assert_eq!(workers[0].load(), 1);
+        drop(sentinel);
+    }
+
+    #[test]
+    fn shared_policy_does_not_share_pool_admission_locks() {
+        let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+            eviction_interval_secs: 0,
+            ..Default::default()
+        });
+        let workers: Vec<Arc<dyn Worker>> = vec![Arc::new(BasicWorker::new(
+            "http://d".into(),
+            WorkerType::Decode,
+        ))];
+        policy.init_workers(&workers);
+        let other_pool = SelectionContext::default();
+        let context = SelectionContext::default();
+        let _held = other_pool.lock.lock();
+        let (_, guard) = policy
+            .select_and_reserve(&context, &workers, Some("text"), None)
+            .unwrap();
+        assert_eq!(workers[0].load(), 1);
+        drop(guard);
+        assert_eq!(workers[0].load(), 0);
     }
 
     #[test]

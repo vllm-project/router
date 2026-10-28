@@ -35,6 +35,7 @@ fn test_config(worker_urls: Vec<String>) -> RouterConfig {
     RouterConfig {
         epd: None,
         mode: RoutingMode::Regular { worker_urls },
+        pd_kv_event_sources: Default::default(),
         policy: PolicyConfig::RoundRobin,
         host: "127.0.0.1".to_string(),
         port: 3002,
@@ -62,6 +63,7 @@ fn test_config(worker_urls: Vec<String>) -> RouterConfig {
         circuit_breaker: CircuitBreakerConfig::default(),
         disable_retries: true,
         disable_circuit_breaker: true,
+        kv_aware_session_affinity_ttl_secs: None,
         health_check: vllm_router_rs::config::HealthCheckConfig::default(),
         enable_igw: false,
         connection_mode: ConnectionMode::Http,
@@ -146,7 +148,13 @@ async fn system_grpc_chat_sends_token_ids_not_messages() {
                 .method("POST")
                 .uri("/v1/chat/completions")
                 .header("content-type", "application/json")
-                .body(axum::body::Body::from(CHAT_BODY))
+                .body(axum::body::Body::from({
+                    let mut body: serde_json::Value = serde_json::from_str(CHAT_BODY).unwrap();
+                    body["vllm_xargs"] = json!({"agentic_context": {"session_id": "session"}});
+                    body["agent_hint"] = json!({"session_id": "hint"});
+                    body["session_id"] = json!("fallback");
+                    body.to_string()
+                }))
                 .unwrap(),
         )
         .await

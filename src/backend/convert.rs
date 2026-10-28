@@ -6,7 +6,7 @@
 
 use crate::backend::pb;
 use crate::protocols::spec::{
-    ChatCompletionRequest, CompletionRequest, PromptInput, StringOrArray,
+    ChatCompletionRequest, CompletionRequest, GenerationRequest, PromptInput, StringOrArray,
 };
 
 /// Passthrough keys the gRPC pipeline forwards to the worker. Anything else is
@@ -24,11 +24,16 @@ const SUPPORTED_OTHER: [&str; 7] = [
 /// Completions-only response option; never part of the chat shape.
 const RETURN_TOKEN_IDS: &str = "return_token_ids";
 
+// Consumed by routing, never sent as generation options.
+const ROUTING_ONLY: [&str; 4] = ["vllm_xargs", "agent_hint", "session_id", "user_id"];
+
 fn ensure_supported_other<'a>(
     keys: impl Iterator<Item = &'a str>,
     endpoint: &str,
 ) -> Result<(), String> {
-    let unsupported: Vec<&str> = keys.filter(|key| !SUPPORTED_OTHER.contains(key)).collect();
+    let unsupported: Vec<&str> = keys
+        .filter(|key| !SUPPORTED_OTHER.contains(key) && !ROUTING_ONLY.contains(key))
+        .collect();
     if unsupported.is_empty() {
         Ok(())
     } else {
@@ -83,6 +88,10 @@ pub fn chat_to_generate_request(
     }
     ensure_supported_other(request.other.keys().map(String::as_str), "chat")?;
     other_bool(request, "add_special_tokens")?;
+    // Validate types before using the same scope as routing.
+    other_string(request, "lora_name")?;
+    other_string(request, "cache_salt")?;
+    let (lora_name, cache_salt) = request.cache_identity();
     let max_new_tokens = request
         .max_completion_tokens
         .or(request.max_tokens)
@@ -162,9 +171,7 @@ pub fn chat_to_generate_request(
             ..Default::default()
         }),
         kv: Some(pb::KvCacheParameters {
-            cache_salt: other_string(request, "cache_salt")?
-                .unwrap_or_default()
-                .to_string(),
+            cache_salt: cache_salt.unwrap_or_default().to_string(),
             ..Default::default()
         }),
         truncate_prompt_tokens: other_u32(request, "truncate_prompt_tokens")?.unwrap_or(0),
@@ -176,9 +183,7 @@ pub fn chat_to_generate_request(
             .and_then(serde_json::Value::as_str)
             .filter(|id| !id.is_empty())
             .map(str::to_string),
-        lora_name: other_string(request, "lora_name")?
-            .unwrap_or_default()
-            .to_string(),
+        lora_name: lora_name.unwrap_or_default().to_string(),
         watermarking: other_bool(request, "watermarking")?,
         ..Default::default()
     })
@@ -327,6 +332,9 @@ pub fn prepare_grpc_completion(request: &CompletionRequest) -> Result<PreparedCo
             "gRPC /v1/completions requires a single token-id prompt (list[int])".to_string(),
         );
     };
+    if ids.is_empty() {
+        return Err("completion prompt token_ids must not be empty".to_string());
+    }
     let token_ids = ids
         .iter()
         .map(|id| {
@@ -375,7 +383,9 @@ pub fn prepare_grpc_completion(request: &CompletionRequest) -> Result<PreparedCo
     let other = request
         .other
         .iter()
-        .filter(|(key, _)| key.as_str() != RETURN_TOKEN_IDS)
+        .filter(|(key, _)| {
+            key.as_str() != RETURN_TOKEN_IDS && !ROUTING_ONLY.contains(&key.as_str())
+        })
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect();
     let chat = ChatCompletionRequest {
@@ -437,6 +447,29 @@ mod tests {
 
     fn chat(json: serde_json::Value) -> ChatCompletionRequest {
         serde_json::from_value(json).unwrap()
+    }
+
+    #[test]
+    fn completion_routing_metadata_preserves_worker_cache_scope() {
+        let request: CompletionRequest = serde_json::from_value(serde_json::json!({
+            "prompt": [1, 2], "lora_name": "adapter", "cache_salt": "tenant",
+            "session_id": "s", "user_id": "u", "agent_hint": {"agent_id": "a"},
+            "vllm_xargs": {"agentic_context": {"session_id": "s"}},
+            "session_params": {"session_id": "typed-session"}, "return_token_ids": true
+        }))
+        .unwrap();
+        let prepared = prepare_grpc_completion(&request).unwrap();
+        assert_eq!(prepared.token_ids, vec![1, 2]);
+        assert!(prepared.emit_token_ids);
+        assert_eq!(prepared.chat.cache_identity(), request.cache_identity());
+        assert_eq!(prepared.chat.session_params, request.session_params);
+        for key in ROUTING_ONLY {
+            assert!(!prepared.chat.other.contains_key(key));
+        }
+        let proto =
+            chat_to_generate_request(&prepared.chat, prepared.token_ids, "r".into()).unwrap();
+        assert_eq!(proto.lora_name, "adapter");
+        assert_eq!(proto.kv.unwrap().cache_salt, "tenant");
     }
 
     #[test]

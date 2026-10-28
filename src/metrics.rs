@@ -76,6 +76,14 @@ pub fn init_metrics() {
 
     // Policy metrics
     describe_counter!(
+        "vllm_router_kv_routing_inputs_total",
+        "KV-aware token preparation by transport and result"
+    );
+    describe_counter!(
+        "vllm_router_kv_placement_lookups_total",
+        "KV-aware placement lookups and reasons for skipping them"
+    );
+    describe_counter!(
         "vllm_router_policy_decisions_total",
         "Total routing policy decisions by policy and worker"
     );
@@ -543,6 +551,45 @@ pub struct RouterMetrics;
 pub struct TokenizerMetrics;
 
 impl RouterMetrics {
+    /// Separates real prefix decisions, explicit binding, and load fallback.
+    pub fn record_prefix_routing_decision(
+        policy: &'static str,
+        stage: &'static str,
+        outcome: &'static str,
+    ) {
+        counter!("vllm_router_prefix_routing_decisions_total",
+            "policy" => policy, "stage" => stage, "outcome" => outcome)
+        .increment(1);
+    }
+
+    pub fn record_kv_placement_lookup(result: &'static str) {
+        counter!("vllm_router_kv_placement_lookups_total", "result" => result).increment(1);
+    }
+    pub fn record_kv_routing_input(transport: &'static str, result: &'static str) {
+        counter!("vllm_router_kv_routing_inputs_total", "transport" => transport, "result" => result).increment(1);
+    }
+
+    pub fn record_pd_kv_decision(work: Option<u64>, credit: Option<u64>, fallback: Option<&str>) {
+        counter!("vllm_router_pd_prefill_decisions_total",
+            "fallback" => fallback.unwrap_or("none").to_owned())
+        .increment(1);
+        if let Some(work) = work {
+            histogram!("vllm_router_pd_new_prefill_tokens").record(work as f64);
+        }
+        if let Some(credit) = credit {
+            counter!("vllm_router_pd_credited_prefix_tokens_total").increment(credit);
+        }
+    }
+
+    /// Per-stage kv_aware session-affinity outcome: bind / sticky_hit / rebind /
+    /// no_session / capacity_bypass.
+    pub fn record_pd_affinity_decision(stage: &str, outcome: &str) {
+        counter!("vllm_router_pd_affinity_decisions_total",
+            "stage" => stage.to_owned(),
+            "outcome" => outcome.to_owned())
+        .increment(1);
+    }
+
     // Request metrics
     pub fn record_request(route: &str) {
         counter!("vllm_router_requests_total",
@@ -870,6 +917,15 @@ impl RouterMetrics {
     pub fn record_pd_decode_error(worker: &str) {
         counter!("vllm_router_pd_decode_errors_total",
             "worker" => worker.to_string()
+        )
+        .increment(1);
+    }
+
+    /// A router-buffered stage body exceeded the fixed buffer cap and the
+    /// request failed instead of buffering unbounded.
+    pub fn record_pd_body_over_limit(stage: &str) {
+        counter!("vllm_router_pd_body_over_limit_total",
+            "stage" => stage.to_string()
         )
         .increment(1);
     }
