@@ -97,9 +97,9 @@ and the Rust OpenAI backend use different configuration paths. See
 
 | Option | Rust value | Rust default | Python value | Python default | Description |
 | --- | --- | --- | --- | --- | --- |
-| `--policy` | `random, round_robin, cache_aware, kv_aware, power_of_two, consistent_hash, rendezvous_hash` | `cache_aware` | `random, round_robin, cache_aware, kv_aware, power_of_two, consistent_hash` | `cache_aware` | Request-level routing policy; also the fallback for both PD stages. |
-| `--prefill-policy` | `random, round_robin, cache_aware, power_of_two, consistent_hash, rendezvous_hash` | `unset` | `random, round_robin, cache_aware, power_of_two, consistent_hash` | `unset` | PD prefill policy; unset inherits `--policy`. |
-| `--decode-policy` | `random, round_robin, cache_aware, power_of_two, consistent_hash, rendezvous_hash` | `unset` | `random, round_robin, cache_aware, power_of_two, consistent_hash` | `unset` | PD decode policy; unset inherits `--policy`. |
+| `--policy` | `random, round_robin, cache_aware, kv_aware, power_of_two, consistent_hash, sticky_least_loaded, rendezvous_hash` | `cache_aware` | `random, round_robin, cache_aware, kv_aware, power_of_two, consistent_hash, sticky_least_loaded` | `cache_aware` | Request-level routing policy; also the fallback for both PD stages. |
+| `--prefill-policy` | `random, round_robin, cache_aware, power_of_two, consistent_hash, sticky_least_loaded, rendezvous_hash` | `unset` | `random, round_robin, cache_aware, power_of_two, consistent_hash, sticky_least_loaded` | `unset` | PD prefill policy; unset inherits `--policy`. |
+| `--decode-policy` | `random, round_robin, cache_aware, power_of_two, consistent_hash, sticky_least_loaded, rendezvous_hash` | `unset` | `random, round_robin, cache_aware, power_of_two, consistent_hash, sticky_least_loaded` | `unset` | PD decode policy; unset inherits `--policy`. |
 | `--router-temperature` | `f64` | `0.0` | `float` | `0.0` | Softmax temperature for regular-mode kv_aware routing; zero selects the minimum-cost worker. |
 | `--kv-penalty-host` | `f64` | `0.8` | `float` | `0.8` | Host-tier KV transfer credit for kv_aware. |
 | `--kv-penalty-external` | `f64` | `0.6` | `float` | `0.6` | External-tier KV transfer credit for kv_aware. |

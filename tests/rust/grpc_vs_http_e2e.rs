@@ -472,6 +472,96 @@ fn streamed(chunks: &[serde_json::Value]) -> (String, Vec<u64>) {
     (text, token_ids)
 }
 
+#[tokio::test]
+async fn grpc_completions_preserve_sticky_body_sessions() {
+    use vllm_router_rs::policies::StickyLeastLoadedPolicy;
+    use vllm_router_rs::server::{build_app, AppState};
+
+    let workers = [
+        MockVllmRsServer::spawn().await,
+        MockVllmRsServer::spawn().await,
+    ];
+    let urls: Vec<_> = workers
+        .iter()
+        .map(|worker| worker.grpc_url.clone())
+        .collect();
+    let mut config = test_config(urls.clone());
+    config.policy = PolicyConfig::StickyLeastLoaded;
+    let ctx = create_test_context(config.clone());
+    let router = Router::new(urls.clone(), &ctx).await.unwrap();
+    router.pin_test_token_ids(vec![9, 9, 9]);
+    let app = build_app(
+        Arc::new(AppState {
+            router: Arc::new(router),
+            context: ctx.clone(),
+            concurrency_queue_tx: None,
+            router_manager: None,
+        }),
+        config.max_payload_size,
+        vec![],
+        vec![],
+        true,
+    );
+    let policy = ctx.policy_registry.get_default_policy();
+    let sticky = policy
+        .as_any()
+        .downcast_ref::<StickyLeastLoadedPolicy>()
+        .unwrap();
+
+    for (session, prompt, temperature) in [
+        ("completion-a", vec![1, 2, 3], 0.1),
+        ("completion-b", vec![4, 5, 6], 0.2),
+        ("completion-a", vec![7, 8, 9], 0.9),
+    ] {
+        let response = post_completion(
+            app.clone(),
+            json!({
+                "model": "test-model", "prompt": prompt, "max_tokens": 8,
+                "temperature": temperature, "session_params": {"session_id": session}
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), 200);
+        assert_eq!(body_json(response).await["object"], "text_completion");
+    }
+
+    assert_eq!(sticky.active_session_count(), 2);
+    for url in &urls {
+        assert_eq!(sticky.active_count_for(url), 1);
+    }
+    let mut captured: Vec<Vec<Vec<u32>>> = workers
+        .iter()
+        .map(|worker| {
+            worker
+                .captured()
+                .into_iter()
+                .map(|request| request.token_ids)
+                .collect()
+        })
+        .collect();
+    captured.sort_by_key(Vec::len);
+    assert_eq!(
+        captured,
+        [vec![vec![4, 5, 6]], vec![vec![1, 2, 3], vec![7, 8, 9]]]
+    );
+
+    for (session, remaining) in [("completion-a", 1), ("completion-b", 0)] {
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(format!("/finish_session?session_id={session}"))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        assert_eq!(sticky.active_session_count(), remaining);
+    }
+}
+
 /// `/v1/completions` on a gRPC pool must answer with `text_completion`, not
 /// the internal chat shape: Completion clients read `choices[].text`.
 #[tokio::test]

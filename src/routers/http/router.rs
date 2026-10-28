@@ -1381,12 +1381,29 @@ impl Router {
             _ => None,
         };
 
-        let text = match (pool, typed_req.grpc_request()) {
-            (
-                Some(crate::backend::WorkerPoolKind::Grpc),
-                Some(GrpcRequestRef::Completion(completion)),
-            ) if route == "/v1/completions" => completion.extract_text_for_grpc_routing(),
-            _ => typed_req.extract_text_for_routing(),
+        let policy = match model_id {
+            Some(model) => self.policy_registry.get_policy_or_default(model),
+            None => self.policy_registry.get_default_policy(),
+        };
+        let text = if policy.needs_request_body() {
+            match serde_json::to_string(typed_req) {
+                Ok(body) => body,
+                Err(error) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Serialization error: {error}"),
+                    )
+                        .into_response();
+                }
+            }
+        } else {
+            match (pool, typed_req.grpc_request()) {
+                (
+                    Some(crate::backend::WorkerPoolKind::Grpc),
+                    Some(GrpcRequestRef::Completion(completion)),
+                ) if route == "/v1/completions" => completion.extract_text_for_grpc_routing(),
+                _ => typed_req.extract_text_for_routing(),
+            }
         };
         let cache_key = std::sync::OnceLock::new();
 

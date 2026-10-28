@@ -18,6 +18,7 @@ mod random;
 mod registry;
 mod rendezvous_hash;
 mod round_robin;
+mod sticky_least_loaded;
 
 pub use cache_aware::{CacheAwareCandidate, CacheAwarePlacement, CacheAwarePolicy};
 pub use consistent_hash::ConsistentHashPolicy;
@@ -36,6 +37,7 @@ pub use random::RandomPolicy;
 pub use registry::PolicyRegistry;
 pub use rendezvous_hash::RendezvousHashPolicy;
 pub use round_robin::RoundRobinPolicy;
+pub use sticky_least_loaded::StickyLeastLoadedPolicy;
 
 /// HTTP headers passed to policies for routing decisions
 /// Key is lowercase header name, value is header value
@@ -134,12 +136,27 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
         // Default: no-op for stateless policies
     }
 
+    /// Mark a session (e.g. an RL trajectory) as finished.
+    ///
+    /// Session-aware policies (e.g. `sticky_least_loaded`) use this to
+    /// release the active-session assignment. Stateless policies, and
+    /// policies that don't track sessions, ignore this.
+    fn finish_session(&self, _session_id: &str) {
+        // Default: no-op for policies that don't track sessions
+    }
+
     /// Get policy name for metrics and debugging
     fn name(&self) -> &'static str;
 
     /// Check if this policy needs request text for routing decisions
     fn needs_request_text(&self) -> bool {
         false // Default: most policies don't need request text
+    }
+
+    /// Whether typed routes should supply the serialized body instead of their
+    /// prompt-derived routing key, for policies that inspect structured fields.
+    fn needs_request_body(&self) -> bool {
+        false
     }
 
     /// Whether request text must use the content-preserving cache routing key.
