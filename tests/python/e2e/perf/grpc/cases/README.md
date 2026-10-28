@@ -2,6 +2,17 @@
 
 Each `*.json` file drives one backend (`rust_grpc`, `rust_http`, `python_http`).
 
+## `--perf-case` selector
+
+| Form | Behavior |
+|------|----------|
+| `rust_grpc` | Loads bundled `cases/rust_grpc.json` |
+| `cases/rust_grpc.json` | Same (relative to repo) |
+| `/abs/path/to/rust_grpc.json` | Must exist; **no** silent fallback |
+| `rust_grpc.json` only (basename) | Must exist in **cwd**; if missing but `cases/rust_grpc.json` exists, pytest errors and asks for stem `rust_grpc` |
+
+Use the stem (`rust_grpc`) in CI/docs for bundled cases.
+
 ## Model
 
 Optional **`model`** in JSON (HF id or local path). For perf runs, set **`export MODEL=...`**

@@ -198,9 +198,12 @@ def _case_path_from_selector(raw: str) -> Path:
             return candidate.resolve()
         if len(candidate.parts) > 1:
             raise FileNotFoundError(f"{candidate} not found")
-        under_cases = CASES_DIR / candidate.name
-        if under_cases.is_file():
-            return under_cases.resolve()
+        bundled = CASES_DIR / candidate.name
+        if bundled.is_file():
+            raise FileNotFoundError(
+                f"{candidate} not found in cwd; use --perf-case={candidate.stem!r} "
+                f"for bundled cases/{candidate.name}"
+            )
         raise FileNotFoundError(f"{candidate} not found")
     path = CASES_DIR / f"{text}.json"
     if not path.is_file():

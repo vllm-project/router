@@ -106,6 +106,13 @@ def vllm_worker_command(
     return cmd
 
 
+def _cuda_visible_devices_list() -> list[str] | None:
+    raw = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if raw is None or not raw.strip():
+        return None
+    return [part.strip() for part in raw.split(",") if part.strip()]
+
+
 def vllm_worker_popen_env(
     *,
     base_gpu_id: int | None = 0,
@@ -117,7 +124,18 @@ def vllm_worker_popen_env(
         return env
     start = int(base_gpu_id or 0)
     width = max(1, int(dp_size) if dp_size is not None and dp_size > 0 else 1)
-    env["CUDA_VISIBLE_DEVICES"] = ",".join(str(start + i) for i in range(width))
+    visible = _cuda_visible_devices_list()
+    if visible is not None:
+        end = start + width
+        if end > len(visible):
+            raise ValueError(
+                f"requested worker GPUs base_gpu_id={start} dp_size={width} but "
+                f"CUDA_VISIBLE_DEVICES only lists {len(visible)} device(s): "
+                f"{','.join(visible)!r}"
+            )
+        env["CUDA_VISIBLE_DEVICES"] = ",".join(visible[start:end])
+    else:
+        env["CUDA_VISIBLE_DEVICES"] = ",".join(str(start + i) for i in range(width))
     return env
 
 

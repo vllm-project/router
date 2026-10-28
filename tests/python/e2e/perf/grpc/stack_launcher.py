@@ -135,6 +135,31 @@ def _router_bin(case: BackendCaseFile | None = None) -> str:
     )
 
 
+def _preflight_router_bin(router_bin: str) -> None:
+    """Fail before starting GPU workers if the router binary cannot run."""
+    path = Path(router_bin)
+    if path.is_file() and not os.access(path, os.X_OK):
+        raise PermissionError(f"vllm-router not executable: {router_bin}")
+    try:
+        proc = subprocess.run(
+            [router_bin, "--help"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except OSError as exc:
+        raise RuntimeError(
+            f"vllm-router preflight failed ({router_bin!r}): {exc}"
+        ) from exc
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip()[-2000:]
+        raise RuntimeError(
+            f"vllm-router preflight failed ({router_bin} --help exit "
+            f"{proc.returncode}): {detail}"
+        )
+
+
 def _vllm_rs_bin(case: BackendCaseFile | None = None) -> str:
     if raw := os.environ.get("VLLM_RS", "").strip():
         return raw
@@ -199,6 +224,7 @@ def launch_stack(case: BackendCaseFile, model: str) -> PerfStack:
     cli = list(case.worker_cli)
 
     router_bin = _router_bin(case)
+    _preflight_router_bin(router_bin)
 
     backend = case.backend
     if backend == "rust_grpc":

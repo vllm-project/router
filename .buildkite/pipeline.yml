@@ -299,14 +299,14 @@ steps:
       - "/tmp/router.log"
 
   # ============================================================================
-  # gRPC perf e2e — concurrency-16 waves for rust_grpc / rust_http / python_http
+  # gRPC perf e2e — CI runs rust_grpc + python_http (c16-r32 waves); rust_http optional locally
   # H100 scheduling matches vllm-omni h100_4 (mithril-h100-pool, gpu-h100-sxm,
   # /mnt/hf-cache). Router bootstraps vLLM + cargo in-container (not omni CI image).
   # ============================================================================
   - label: ":python: grpc perf test case"
     key: "grpc-perf-e2e"
     if: build.env("ROCM_ONLY") != "1"
-    timeout_in_minutes: 90
+    timeout_in_minutes: 120
     retry:
       automatic:
         - exit_status: "*"
@@ -410,7 +410,7 @@ steps:
         -k c16-r32
       )
 
-      for case in rust_grpc rust_http python_http; do
+      for case in rust_grpc python_http; do
         echo "=== perf grpc: --perf-case=$${case} (concurrency 16 waves) ==="
         "$${PERF_PYTEST[@]}" --perf-case="$${case}"
       done

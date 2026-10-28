@@ -159,8 +159,8 @@ Buildkite step **`:python: grpc perf test case`** (`key: grpc-perf-e2e` in
 `.buildkite/pipeline.yml`): **`mithril-h100-pool`** (4× H100 SXM, vllm-omni
 `h100_4` scheduling), `PERF_STACK_TIMEOUT=1800`,
 `HF_TOKEN`, model
-`MODEL=Qwen/Qwen3.8-27B`, `cargo build --release`, then for each of
-`rust_grpc`, `rust_http`, `python_http`:
+`MODEL=Qwen/Qwen3.8-27B`, `cargo build --release`, step timeout **120 min**, then for each of
+`rust_grpc`, `python_http` (add `rust_http` locally if needed):
 
 `python -m pytest -sv tests/python/e2e/perf/grpc -k c16-r32 --perf-case=<case>`
 
