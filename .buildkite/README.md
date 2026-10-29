@@ -28,7 +28,9 @@ A pull request labeled `ready` uploads `test-ready.yml`, including forks.
 
 GPU machine presets are in [`ci_mirror_hardwares.yml`](ci_mirror_hardwares.yml).
 A step names one with `mirror_hardwares`. `scripts/upload_pipeline.py` expands
-that name into `agents` and `plugins` before Buildkite upload.
+that name into `agents` and `plugins` before Buildkite upload. A preset that
+injects `VLLM_CI_HF_TOKEN` also exports that value as `HF_TOKEN` in the job
+shell. A build-level `HF_TOKEN` would override a pod env entry of the same name.
 
 | Name | Machine |
 | --- | --- |

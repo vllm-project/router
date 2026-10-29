@@ -129,6 +129,9 @@ mirror_hardwares:
               mountPath: /dev/shm
             - name: hf-cache
               mountPath: /root/.cache/huggingface
+            # Not HF_TOKEN: a build-level HF_TOKEN overrides a pod env entry
+            # with the same name. upload_pipeline.py exports HF_TOKEN from
+            # this alias inside the job shell.
             env:
             - name: HF_HOME
               value: /root/.cache/huggingface
