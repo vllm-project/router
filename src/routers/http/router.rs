@@ -1,6 +1,6 @@
 use super::completion_route::{placement_eligibility, prepare_completion_route, CompletionRoute};
 use super::program_adapter::ProgramCompletion;
-use crate::backend::preprocess::{prepare_http_direct_inputs, prepare_http_kv_inputs};
+use crate::backend::preprocess::{prepare_completion_direct_inputs, prepare_http_kv_inputs};
 use crate::backend::{
     stream_output::{output_frame_tracking, OutputFrameConsumer, OutputFrameProducer},
     PrepareError,
@@ -1498,12 +1498,14 @@ impl Router {
                         })
                     });
                 if needs_http_input && binding_skips_rpc && http_inputs.get().is_none()
-                    && matches!(typed_req.grpc_request(), Some(GrpcRequestRef::Completion(request)) if request.prompt.is_token_based())
+                    && route == "/v1/completions"
                 {
-                    if let Some(direct) = serde_json::to_value(typed_req).ok().and_then(|body| {
-                        prepare_http_direct_inputs(&workers, &body, route)
-                    }) {
-                        http_inputs.get_or_init(|| async { Some(direct) }).await;
+                    if let Some(GrpcRequestRef::Completion(request)) = typed_req.grpc_request() {
+                        if request.prompt.is_token_based() {
+                            if let Some(direct) = prepare_completion_direct_inputs(request, &workers) {
+                                http_inputs.get_or_init(|| async { Some(direct) }).await;
+                            }
+                        }
                     }
                 }
                 let inputs = if !needs_http_input {
@@ -4984,6 +4986,10 @@ mod tests {
             );
         }
         for (body, prefill) in [
+            (
+                serde_json::json!({"model":"local","prompt":[1,2,3,4,5,6]}),
+                2,
+            ),
             (
                 serde_json::json!({"model":"local","prompt":[[1,2,3,4,5,6]]}),
                 2,
