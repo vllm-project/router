@@ -1,0 +1,49 @@
+{
+  "id": "c16-kv_aware",
+  "runtime": {
+    "perf_work_root": "test-results/router_policy",
+    "python": "python",
+    "vllm_rs": "vllm-rs",
+    "model": "Qwen/Qwen3-4B-Instruct-2507",
+    "served_model_name": "Qwen/Qwen3-4B-Instruct-2507",
+    "router_binary": "target/release/vllm-router",
+    "trace_path": "tests/python/e2e/perf/router_policy/data/agentx-128-t4.jsonl"
+  },
+  "benchmark_params": {
+    "task-num": 32,
+    "max-concurrency": 16,
+    "gap_scale": 0.0,
+    "max_inflight": 1,
+    "task_stagger": 0
+  },
+  "workload": {
+    "requests": 180,
+    "sessions": 32
+  },
+  "workers": {
+    "count": 4,
+    "protocol": "grpc",
+    "per_worker": {
+      "tensor_parallel_size": 1,
+      "max_model_len": 196608,
+      "max_num_seqs": 16,
+      "max_num_batched_tokens": 131072,
+      "kv_cache_memory_bytes": 51539607552,
+      "cpu_kv_bytes": 17179869184,
+      "dtype": "bfloat16",
+      "enable_prefix_caching": true
+    }
+  },
+  "router_params": {
+    "protocol": "grpc",
+    "router_temperature": 0,
+    "cache_threshold": 0.3,
+    "balance_abs_threshold": 64,
+    "balance_rel_threshold": 1.5,
+    "kv_penalty_host": 0.8,
+    "kv_penalty_external": 0.6,
+    "kv_penalty_disk": 0.3,
+    "worker_startup_timeout_secs": 60,
+    "policy": "kv_aware"
+  }
+}
