@@ -34,7 +34,12 @@ import yaml
 
 SCENARIO_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SCENARIO_DIR))
-from helpers.case_config import cell_output_dir, load_case, require_runtime  # noqa: E402
+from helpers.case_config import (  # noqa: E402
+    cell_output_dir,
+    load_case,
+    packaged_replay_agentx_yaml,
+    require_runtime,
+)
 
 CASE: dict[str, Any] = {}
 ROOT: Path
@@ -99,7 +104,8 @@ def bootstrap(case_path: Path) -> None:
     RS = runtime["vllm_rs"]
     MODEL = runtime["model"]
     ROUTER = runtime["router_binary"]
-    REPLAY_CONFIG = Path(runtime["replay_config_path"])
+    replay_path = str(runtime.get("replay_config_path") or "").strip()
+    REPLAY_CONFIG = Path(replay_path) if replay_path else packaged_replay_agentx_yaml()
     raw_source = str(runtime.get("agent_infer", "") or "").strip()
     AGENT_INFER_SOURCE = Path(raw_source) if raw_source else None
     OPENSSL_LIB = runtime.get("openssl_lib_dir") or ""
@@ -283,6 +289,14 @@ def engine_command(i):
         "--enable-prefix-caching",
         "--dtype",
         str(pw.get("dtype", "bfloat16")),
+        *(
+            [
+                "--gpu-memory-utilization",
+                str(pw["gpu_memory_utilization"]),
+            ]
+            if pw.get("gpu_memory_utilization") is not None
+            else []
+        ),
         "--kv-cache-memory-bytes",
         str(pw.get("kv_cache_memory_bytes", 107374182400)),
         "--safetensors-load-strategy",

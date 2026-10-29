@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -34,8 +35,9 @@ def packaged_replay_agentx_yaml() -> Path:
         import agentinfer
     except ImportError as exc:
         raise RuntimeError(
-            "agentinfer is not installed in this Python env; "
-            "pip install the agentinfer wheel before running router_policy perf"
+            "agentinfer is not installed in this Python env "
+            f"({sys.executable}); pip install the agentinfer wheel before running "
+            "router_policy perf"
         ) from exc
 
     package_root = Path(agentinfer.__file__).resolve().parent
@@ -89,7 +91,8 @@ def resolve_runtime(case: dict[str, Any]) -> dict[str, Any]:
     if replay_override:
         rt["replay_config_path"] = str(_resolve_repo_path(replay_override, repo))
     else:
-        rt["replay_config_path"] = str(packaged_replay_agentx_yaml())
+        # Resolved in run_cell bootstrap (same env as runtime.python), not at pytest import.
+        rt["replay_config_path"] = ""
 
     for key in _CMD_KEYS:
         val = str(rt.get(key, "") or "").strip()

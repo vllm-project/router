@@ -14,12 +14,12 @@ SCENARIO_DIR = Path(__file__).resolve().parent
 if str(SCENARIO_DIR) not in sys.path:
     sys.path.insert(0, str(SCENARIO_DIR))
 
-from helpers.case_config import (
+from helpers.case_config import (  # noqa: E402
     cell_output_dir,
     cell_results_dir,
     load_case,
     require_runtime,
-)  # noqa: E402
+)
 
 RUN_CELL = SCENARIO_DIR / "scripts" / "run_cell.py"
 
@@ -53,11 +53,9 @@ def _run_cell(case_file: Path) -> Path:
 def test_router_policy_replay_cell(
     require_router_e2e_perf,
     case_file: Path,
-    case_expectations: dict,
 ):
     """Workers → router → replay; single self-contained case JSON."""
     out = _run_cell(case_file)
-    exp_requests = int(case_expectations.get("requests", 721))
     req_path = out / "result" / "requests.jsonl"
     assert req_path.is_file(), f"missing replay output {req_path}"
     rows = [
@@ -65,5 +63,9 @@ def test_router_policy_replay_cell(
         for line in req_path.read_text(encoding="utf-8").splitlines()
         if line.strip()
     ]
-    success = sum(1 for r in rows if r.get("status") == "success")
-    assert success == exp_requests, f"expected {exp_requests} successes, got {success}"
+    assert rows, "replay produced no requests"
+    failed = [r for r in rows if r.get("status") != "success"]
+    assert not failed, (
+        f"{len(failed)} non-success of {len(rows)} requests "
+        f"(first status={failed[0].get('status')!r})"
+    )

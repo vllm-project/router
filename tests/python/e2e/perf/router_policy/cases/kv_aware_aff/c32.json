@@ -17,7 +17,6 @@
     "task_stagger": 0
   },
   "workload": {
-    "requests": 360,
     "sessions": 64
   },
   "workers": {
