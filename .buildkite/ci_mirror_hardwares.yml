@@ -4,6 +4,7 @@
 # vllm-omni .buildkite/common/ci_mirror_hardwares.yml, limited to the
 # machines this repo runs.
 #
+#   l4_2       EKS l4-k8s, same l4x4 pool, pod requests 2x L4. 2 GPU = 20 CPU / 80Gi / 48Gi shm.
 #   l4_4       EKS l4-k8s, 4x L4 (vllm.ci/gpu-pool=l4x4). 4 GPU = 40 CPU / 160Gi / 96Gi shm.
 #              Image is the router CI image pushed by image-build:
 #              public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:router-$BUILDKITE_COMMIT
@@ -72,6 +73,69 @@ mirror_hardwares:
             emptyDir:
               medium: Memory
               sizeLimit: 96Gi
+          - name: hf-cache
+            hostPath:
+              path: /fsx/hf_cache
+              type: DirectoryOrCreate
+  l4_2:
+    agents:
+      queue: l4-k8s
+    plugins:
+    - kubernetes:
+        metadata:
+          annotations:
+            cluster-autoscaler.kubernetes.io/safe-to-evict: 'false'
+            karpenter.sh/do-not-disrupt: 'true'
+        podSpec:
+          priorityClassName: ci
+          serviceAccountName: buildkite-gpu-jobs
+          tolerations:
+          - key: nvidia.com/gpu
+            operator: Exists
+            effect: NoSchedule
+          nodeSelector:
+            vllm.ci/gpu-pool: l4x4
+          containers:
+          - image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:router-$BUILDKITE_COMMIT
+            resources:
+              limits:
+                nvidia.com/gpu: 2
+              requests:
+                nvidia.com/gpu: 2
+                cpu: '20'
+                memory: 80Gi
+            volumeMounts:
+            - name: devshm
+              mountPath: /dev/shm
+            - name: hf-cache
+              mountPath: /fsx/hf_cache
+            env:
+            - name: HF_HOME
+              value: /fsx/hf_cache
+            - name: HF_HUB_ENABLE_HF_TRANSFER
+              value: '1'
+            - name: NCCL_CUMEM_HOST_ENABLE
+              value: '0'
+            - name: VLLM_USE_V1
+              value: '1'
+            - name: VLLM_LOGGING_LEVEL
+              value: INFO
+            - name: UCX_TLS
+              value: all
+            - name: UCX_NET_DEVICES
+              value: all
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token-secret
+                  key: token
+            - name: BUILDKITE_SHELL
+              value: /bin/bash -e -c
+          volumes:
+          - name: devshm
+            emptyDir:
+              medium: Memory
+              sizeLimit: 48Gi
           - name: hf-cache
             hostPath:
               path: /fsx/hf_cache
