@@ -33,7 +33,7 @@ that name into `agents` and `plugins` before Buildkite upload.
 | Name | Machine |
 | --- | --- |
 | `l4_4` | EKS `l4-k8s`, 4× L4, image `public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:router-$BUILDKITE_COMMIT` |
-| `h100_2` | `mithril-h100-pool`, 2× H100 SXM, same router CI image |
+| `h100_2` | `mithril-h100-pool`, 2× H100 SXM, us-west-2 pull-through cache of the router CI image, GPU limit 2 |
 | `mi300_2` | `router_rocm_mi300_2`, same-host xGMI Docker devices |
 | `mi300_rdma` | `router_rocm_mi300_2` coordinator, no Docker plugin |
 

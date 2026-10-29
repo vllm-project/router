@@ -159,7 +159,7 @@ Buildkite step **`:python: grpc perf test case`** (`key: grpc-perf-e2e` in
 `.buildkite/test-nightly.yml`, L3 **nightly**): **`mithril-h100-pool`** (preset
 `h100_2`). The job pulls the router CI image and does not build in-job.
 `vllm-router` is on `PATH` (`/usr/local/bin/vllm-router`); the step does not set
-`ROUTER_BIN`. `HF_TOKEN` comes from the `h100_2` pod secret. The step sets
+`ROUTER_BIN`. `VLLM_CI_HF_TOKEN` comes from the `h100_2` pod secret. The step sets
 `MODEL=Qwen/Qwen3.8-27B`, `PERF_STACK_TIMEOUT=1800`, and
 `PERF_WORKER_STARTUP_TIMEOUT=1800`. Step timeout **90 min**, then:
 
