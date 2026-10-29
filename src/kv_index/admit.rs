@@ -1,7 +1,7 @@
 //! Event-shape admission, separate from structural decoding and transport.
 use crate::kv_index::wire::{BlockStored, ExternalBlockHash, KVEvent, KVEventBatch};
 
-/// Validate the narrow normal-dense GPU event shape, preserving the batch rank.
+/// Validate the narrow full-attention GPU event shape, preserving the batch rank.
 /// This does not establish publisher identity, deployment layout, independently
 /// addressable ranks, cache namespace, hash algorithm or freshness. The source
 /// adapter/target layer must bind sources to ranks and establish route eligibility;
@@ -25,7 +25,7 @@ pub fn validate_device_batch(
                 &event.ownership,
             ),
             KVEvent::BlockStored(event) => {
-                if !normal_dense_shape(event, expected_block_size)
+                if !has_expected_complete_blocks(event, expected_block_size)
                     || !no_unsupported_extensions(event)
                 {
                     return Err(
@@ -63,7 +63,7 @@ pub fn validate_device_batch(
     Ok(())
 }
 
-fn normal_dense_shape(event: &BlockStored, expected_block_size: usize) -> bool {
+fn has_expected_complete_blocks(event: &BlockStored, expected_block_size: usize) -> bool {
     event.block_size as usize == expected_block_size
         && event.block_hashes.len().checked_mul(expected_block_size) == Some(event.token_ids.len())
 }
@@ -92,7 +92,7 @@ fn validate_hash(hash: &ExternalBlockHash) -> Result<(), String> {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum DenseRejectionReason {
+pub(super) enum FullAttentionRejectionReason {
     ExtraKeys,
     Layout,
     Residency,
@@ -103,15 +103,20 @@ pub(super) enum DenseRejectionReason {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct DenseBatchRejection {
-    pub(super) reason: DenseRejectionReason,
+pub(super) struct FullAttentionBatchRejection {
+    pub(super) reason: FullAttentionRejectionReason,
     pub(super) event_index: usize,
 }
 
-pub(super) fn validate_dense_batch(
+/// Admit full-attention KV layouts, not a dense-versus-MoE model type.
+/// Stores must use the actual source block size and contain complete blocks of
+/// tokens, with only modeled extra keys, named adapters, and residency metadata.
+/// Session annotations, multiple storage tiers, and absent layout metadata remain
+/// compatible. Acceptance is not proof of remote identity or recovery.
+pub(super) fn validate_full_attention_batch(
     batch: &KVEventBatch,
     expected_block_size: u32,
-) -> Result<(), DenseBatchRejection> {
+) -> Result<(), FullAttentionBatchRejection> {
     for (event_index, event) in batch.events.iter().enumerate() {
         let reason = match event {
             KVEvent::BlockStored(s) => {
@@ -129,46 +134,46 @@ pub(super) fn validate_dense_batch(
                                 })
                         })
                 }) {
-                    Some(DenseRejectionReason::ExtraKeys)
+                    Some(FullAttentionRejectionReason::ExtraKeys)
                 } else if s
                     .kv_cache_spec_kind
                     .as_deref()
                     .is_some_and(|kind| kind != "full_attention")
                     || s.kv_cache_spec_sliding_window.is_some()
                 {
-                    Some(DenseRejectionReason::Layout)
-                } else if !dense_residency_supported(
+                    Some(FullAttentionRejectionReason::Layout)
+                } else if !is_supported_residency(
                     s.medium.as_deref(),
                     s.locality.as_deref(),
                     s.ownership.as_deref(),
                 ) {
-                    Some(DenseRejectionReason::Residency)
+                    Some(FullAttentionRejectionReason::Residency)
                 } else if (s.lora_id.is_some() && s.lora_name.is_none())
                     || s.lora_name.as_ref().is_some_and(|name| name.is_empty())
                 {
-                    Some(DenseRejectionReason::Adapter)
+                    Some(FullAttentionRejectionReason::Adapter)
                 } else if s.block_size == 0 {
-                    Some(DenseRejectionReason::ZeroBlockSize)
+                    Some(FullAttentionRejectionReason::ZeroBlockSize)
                 } else if s.block_size != expected_block_size {
-                    Some(DenseRejectionReason::BlockSizeMismatch)
+                    Some(FullAttentionRejectionReason::BlockSizeMismatch)
                 } else if s.block_hashes.len().checked_mul(s.block_size as usize)
                     != Some(s.token_ids.len())
                 {
-                    Some(DenseRejectionReason::TokenCountMismatch)
+                    Some(FullAttentionRejectionReason::TokenCountMismatch)
                 } else {
                     None
                 }
             }
-            KVEvent::BlockRemoved(r) => (!dense_residency_supported(
+            KVEvent::BlockRemoved(r) => (!is_supported_residency(
                 r.medium.as_deref(),
                 r.locality.as_deref(),
                 r.ownership.as_deref(),
             ))
-            .then_some(DenseRejectionReason::Residency),
+            .then_some(FullAttentionRejectionReason::Residency),
             KVEvent::AllBlocksCleared(_) => None,
         };
         if let Some(reason) = reason {
-            return Err(DenseBatchRejection {
+            return Err(FullAttentionBatchRejection {
                 reason,
                 event_index,
             });
@@ -177,7 +182,7 @@ pub(super) fn validate_dense_batch(
     Ok(())
 }
 
-fn dense_residency_supported(
+fn is_supported_residency(
     medium: Option<&str>,
     locality: Option<&str>,
     ownership: Option<&str>,
@@ -197,7 +202,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn dense_block_size_matrix_preserves_rejection_reason_and_event_index() {
+    fn full_attention_block_size_matrix_preserves_rejection_reason_and_event_index() {
         for expected in [8, 16, 32] {
             for actual in [0, 8, 16, 32] {
                 let stored = serde_json::from_value(serde_json::json!({
@@ -213,15 +218,15 @@ mod tests {
                     data_parallel_rank: Some(3),
                 };
                 let reason = if actual == 0 {
-                    Some(DenseRejectionReason::ZeroBlockSize)
+                    Some(FullAttentionRejectionReason::ZeroBlockSize)
                 } else if actual as u32 != expected {
-                    Some(DenseRejectionReason::BlockSizeMismatch)
+                    Some(FullAttentionRejectionReason::BlockSizeMismatch)
                 } else {
                     None
                 };
                 assert_eq!(
-                    validate_dense_batch(&batch, expected),
-                    reason.map_or(Ok(()), |reason| Err(DenseBatchRejection {
+                    validate_full_attention_batch(&batch, expected),
+                    reason.map_or(Ok(()), |reason| Err(FullAttentionBatchRejection {
                         reason,
                         event_index: 1,
                     })),
@@ -233,9 +238,9 @@ mod tests {
                     };
                     stored.token_ids.pop();
                     assert_eq!(
-                        validate_dense_batch(&batch, expected),
-                        Err(DenseBatchRejection {
-                            reason: DenseRejectionReason::TokenCountMismatch,
+                        validate_full_attention_batch(&batch, expected),
+                        Err(FullAttentionBatchRejection {
+                            reason: FullAttentionRejectionReason::TokenCountMismatch,
                             event_index: 1,
                         })
                     );

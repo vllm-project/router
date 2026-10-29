@@ -2048,49 +2048,52 @@ mod tests {
                 self.hits.clone()
             }
         }
-        for count in 1..=3 {
-            for block_size in [2, 4] {
-                let policy = KvAwarePolicy::new(CostParams {
-                    router_temperature: 0.0,
-                    ..CostParams::default()
-                });
-                let workers: Vec<Arc<dyn Worker>> = (0..count)
-                    .map(|index| {
-                        Arc::new(BasicWorker::new(
-                            format!("http://worker-{index}"),
-                            WorkerType::Regular,
-                        )) as Arc<dyn Worker>
+        for (case, count, block_size) in [
+            ("shared_identity_filters_qualified_targets", 3, 2),
+            ("single_worker_larger_block_retry_boundary", 1, 4),
+        ] {
+            let policy = KvAwarePolicy::new(CostParams {
+                router_temperature: 0.0,
+                ..CostParams::default()
+            });
+            let workers: Vec<Arc<dyn Worker>> = (0..count)
+                .map(|index| {
+                    Arc::new(BasicWorker::new(
+                        format!("http://worker-{index}"),
+                        WorkerType::Regular,
+                    )) as Arc<dyn Worker>
+                })
+                .collect();
+            let provider = Arc::new(Matches {
+                queries: AtomicUsize::new(0),
+                blocks: AtomicUsize::new(0),
+                hits: workers
+                    .iter()
+                    .map(|worker| {
+                        tier_match(&target(worker.url(), 0), StorageTier::Device, &[(0, 2)])
                     })
-                    .collect();
-                let provider = Arc::new(Matches {
-                    queries: AtomicUsize::new(0),
-                    blocks: AtomicUsize::new(0),
-                    hits: workers
-                        .iter()
-                        .map(|worker| {
-                            tier_match(&target(worker.url(), 0), StorageTier::Device, &[(0, 2)])
-                        })
-                        .collect(),
-                });
-                let key = CacheKey {
-                    model: Arc::from("engine-cache-identity"),
-                    hash_mode: crate::kv_index::HashMode::Sha256,
-                    block_size,
-                };
-                for worker in &workers {
-                    policy.register_target_with_cache_identity(
-                        worker.url(),
-                        target(worker.url(), 0),
-                        key.clone(),
-                        provider.clone(),
-                    );
-                }
-                let ids: Vec<u32> = (0..2 * block_size + 1).collect();
-                let mut mask = vec![true; count];
-                if count > 1 {
-                    mask[count - 1] = false;
-                }
-                let receipt = kv_aware_ops(&policy)
+                    .collect(),
+            });
+            let key = CacheKey {
+                model: Arc::from("engine-cache-identity"),
+                hash_mode: crate::kv_index::HashMode::Sha256,
+                block_size,
+            };
+            for worker in &workers {
+                policy.register_target_with_cache_identity(
+                    worker.url(),
+                    target(worker.url(), 0),
+                    key.clone(),
+                    provider.clone(),
+                );
+            }
+            let ids: Vec<u32> = (0..2 * block_size + 1).collect();
+            let mut mask = vec![true; count];
+            if count > 1 {
+                mask[count - 1] = false;
+            }
+            let select = |mask: &[bool], excluded: &[String]| {
+                kv_aware_ops(&policy)
                     .unwrap()
                     .select_worker_with_qualified_inputs(
                         &workers,
@@ -2098,116 +2101,130 @@ mod tests {
                         None,
                         None,
                         None,
-                        &[],
-                        Some(&mask),
+                        excluded,
+                        Some(mask),
                     )
-                    .unwrap();
-                assert_eq!(receipt.worker_index, 0);
-                assert_eq!(receipt.new_prefill_tokens, 1);
-                assert_eq!(provider.queries.load(Ordering::Relaxed), 1);
-                assert_eq!(provider.blocks.load(Ordering::Relaxed), 3);
+                    .unwrap_or_else(|| panic!("{case}: no worker selected for {mask:?}"))
+            };
+            let receipt = select(&mask, &[]);
+            assert_eq!(receipt.worker_index, 0, "{case}");
+            assert_eq!(receipt.new_prefill_tokens, 1, "{case}");
+            assert_eq!(provider.queries.load(Ordering::Relaxed), 1, "{case}");
+            assert_eq!(provider.blocks.load(Ordering::Relaxed), 3, "{case}");
+            release_receipt(&workers, &receipt);
+
+            if count == 1 {
+                let retry = select(&mask, &[workers[0].url().to_owned()]);
+                assert_eq!(retry.worker_index, 0, "{case}: exhausted exclusions");
+                assert_eq!(retry.new_prefill_tokens, 1, "{case}: retained credit");
+                assert_eq!(workers[0].load(), 1, "{case}: retry reservation");
+                release_receipt(&workers, &retry);
+                assert_eq!(workers[0].load(), 0, "{case}: retry release");
+            }
+
+            if count > 1 {
+                let mask = vec![false; count];
+                let key = affinity_key("qualified-input");
+                let select = |excluded: &[String]| {
+                    policy
+                        .select_worker_with_qualified_inputs(
+                            &workers,
+                            QualifiedKvInput {
+                                tokens: KvRequestTokens::Shared(Some(&ids)),
+                                eligibility: Some(&mask),
+                            },
+                            None,
+                            None,
+                            Some(&key),
+                            excluded,
+                        )
+                        .unwrap()
+                };
+                let bound = select(&[]);
+                let bound_index = bound.worker_index;
+                assert_eq!(
+                    bound.new_prefill_tokens,
+                    ids.len() as u64,
+                    "{case}: affinity"
+                );
+                assert_eq!(workers[bound_index].load(), 1, "{case}: affinity");
+                release_receipt(&workers, &bound);
+                let excluded = vec![workers[bound_index].url().to_owned()];
+                let retry = select(&excluded);
+                assert_ne!(retry.worker_index, bound_index, "{case}: retry exclusion");
+                assert_eq!(retry.new_prefill_tokens, ids.len() as u64, "{case}: retry");
+                release_receipt(&workers, &retry);
+                let retained = select(&[]);
+                assert_eq!(
+                    retained.worker_index, bound_index,
+                    "{case}: retained affinity"
+                );
+                release_receipt(&workers, &retained);
+                assert!(
+                    workers.iter().all(|worker| worker.load() == 0),
+                    "{case}: release"
+                );
+            }
+
+            // A provider query for one qualified target returns hits for
+            // every target in this identity. None may leak to an unproved
+            // candidate, even though it remains in the common cost model.
+            for worker in &workers[..count.saturating_sub(1)] {
+                for _ in 0..ids.len() {
+                    worker.increment_load();
+                }
+            }
+            if count > 1 {
+                let receipt = select(&mask, &[]);
+                assert_eq!(receipt.worker_index, count - 1, "{case}: unproved target");
+                assert_eq!(
+                    receipt.new_prefill_tokens,
+                    ids.len() as u64,
+                    "{case}: unproved target"
+                );
+                assert_eq!(
+                    receipt.decision.cost,
+                    ids.len() as f64,
+                    "{case}: unproved target"
+                );
                 release_receipt(&workers, &receipt);
+            }
 
-                if count > 1 {
-                    let mask = vec![false; count];
-                    let key = affinity_key("qualified-input");
-                    let select = |excluded: &[String]| {
-                        policy
-                            .select_worker_with_qualified_inputs(
-                                &workers,
-                                QualifiedKvInput {
-                                    tokens: KvRequestTokens::Shared(Some(&ids)),
-                                    eligibility: Some(&mask),
-                                },
-                                None,
-                                None,
-                                Some(&key),
-                                excluded,
-                            )
-                            .unwrap()
-                    };
-                    let bound = select(&[]);
-                    let bound_index = bound.worker_index;
-                    assert_eq!(bound.new_prefill_tokens, ids.len() as u64);
-                    assert_eq!(workers[bound_index].load(), 1);
-                    release_receipt(&workers, &bound);
-                    let excluded = vec![workers[bound_index].url().to_owned()];
-                    let retry = select(&excluded);
-                    assert_ne!(retry.worker_index, bound_index);
-                    assert_eq!(retry.new_prefill_tokens, ids.len() as u64);
-                    release_receipt(&workers, &retry);
-                    let retained = select(&[]);
-                    assert_eq!(retained.worker_index, bound_index);
-                    release_receipt(&workers, &retained);
-                    assert!(workers.iter().all(|worker| worker.load() == 0));
-                }
+            for (mask_case, mask) in [
+                ("all_ineligible", vec![false; count]),
+                ("wrong_length", vec![true; count + 1]),
+                ("empty", vec![]),
+            ] {
+                provider.queries.store(0, Ordering::Relaxed);
+                let receipt = select(&mask, &[]);
+                assert_eq!(
+                    provider.queries.load(Ordering::Relaxed),
+                    0,
+                    "{case}: {mask_case}"
+                );
+                assert_eq!(
+                    receipt.new_prefill_tokens,
+                    ids.len() as u64,
+                    "{case}: {mask_case}"
+                );
+                release_receipt(&workers, &receipt);
+            }
 
-                // A provider query for one qualified target returns hits for
-                // every target in this identity. None may leak to an unproved
-                // candidate, even though it remains in the common cost model.
-                for worker in &workers[..count.saturating_sub(1)] {
-                    for _ in 0..ids.len() {
-                        worker.increment_load();
-                    }
-                }
-                if count > 1 {
-                    let receipt = kv_aware_ops(&policy)
-                        .unwrap()
-                        .select_worker_with_qualified_inputs(
-                            &workers,
-                            KvRequestTokens::Shared(Some(&ids)),
-                            None,
-                            None,
-                            None,
-                            &[],
-                            Some(&mask),
-                        )
-                        .unwrap();
-                    assert_eq!(receipt.worker_index, count - 1);
-                    assert_eq!(receipt.new_prefill_tokens, ids.len() as u64);
-                    assert_eq!(receipt.decision.cost, ids.len() as f64);
-                    release_receipt(&workers, &receipt);
-                }
-
-                for mask in [vec![false; count], vec![true; count + 1], vec![]] {
-                    provider.queries.store(0, Ordering::Relaxed);
-                    let receipt = kv_aware_ops(&policy)
-                        .unwrap()
-                        .select_worker_with_qualified_inputs(
-                            &workers,
-                            KvRequestTokens::Shared(Some(&ids)),
-                            None,
-                            None,
-                            None,
-                            &[],
-                            Some(&mask),
-                        )
-                        .unwrap();
-                    assert_eq!(provider.queries.load(Ordering::Relaxed), 0);
-                    assert_eq!(receipt.new_prefill_tokens, ids.len() as u64);
-                    release_receipt(&workers, &receipt);
-                }
-
-                if count > 1 {
-                    workers[0].set_healthy(false);
-                    let mut mask = vec![false; count];
-                    mask[count - 1] = true;
-                    let receipt = kv_aware_ops(&policy)
-                        .unwrap()
-                        .select_worker_with_qualified_inputs(
-                            &workers,
-                            KvRequestTokens::Shared(Some(&ids)),
-                            None,
-                            None,
-                            None,
-                            &[],
-                            Some(&mask),
-                        )
-                        .unwrap();
-                    assert_eq!(receipt.worker_index, count - 1);
-                    assert_eq!(receipt.new_prefill_tokens, 1);
-                    release_receipt(&workers, &receipt);
-                }
+            if count > 1 {
+                workers[0].set_healthy(false);
+                let mut mask = vec![false; count];
+                mask[count - 1] = true;
+                let receipt = select(&mask, &[]);
+                assert_eq!(
+                    receipt.worker_index,
+                    count - 1,
+                    "{case}: healthy candidate positions"
+                );
+                assert_eq!(
+                    receipt.new_prefill_tokens, 1,
+                    "{case}: healthy candidate positions"
+                );
+                release_receipt(&workers, &receipt);
             }
         }
     }

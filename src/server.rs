@@ -1527,32 +1527,26 @@ mod tests {
                 );
             }
         }
-        for content_type in [
-            None,
-            Some(http::HeaderValue::from_static("text/plain")),
-            Some(http::HeaderValue::from_static("application/json; broken")),
-            Some(http::HeaderValue::from_bytes(b"\xff").unwrap()),
-        ] {
-            let polls = Arc::new(AtomicUsize::new(0));
-            let observed = polls.clone();
-            let body = Body::from_stream(futures_util::stream::poll_fn(move |_| {
-                observed.fetch_add(1, Ordering::Relaxed);
-                std::task::Poll::Pending::<Option<Result<Bytes, std::io::Error>>>
-            }));
-            let mut request = Request::builder().method("POST").uri("/v1/completions");
-            if let Some(content_type) = content_type {
-                request = request.header(http::header::CONTENT_TYPE, content_type);
-            }
-            let response = tokio::time::timeout(
-                Duration::from_secs(1),
-                app.clone().oneshot(request.body(body).unwrap()),
-            )
+        // MIME boundaries live in the extractor parity table; keep one real
+        // handler request proving rejection does not poll an unfinished body.
+        let polls = Arc::new(AtomicUsize::new(0));
+        let observed = polls.clone();
+        let body = Body::from_stream(futures_util::stream::poll_fn(move |_| {
+            observed.fetch_add(1, Ordering::Relaxed);
+            std::task::Poll::Pending::<Option<Result<Bytes, std::io::Error>>>
+        }));
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/completions")
+            .header(http::header::CONTENT_TYPE, "text/plain")
+            .body(body)
+            .unwrap();
+        let response = tokio::time::timeout(Duration::from_secs(1), app.clone().oneshot(request))
             .await
             .expect("invalid header must not wait for an unfinished body")
             .unwrap();
-            assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
-            assert_eq!(polls.load(Ordering::Relaxed), 0);
-        }
+        assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        assert_eq!(polls.load(Ordering::Relaxed), 0);
         for (body, status) in [
             (Body::from(" ".repeat(129)), StatusCode::PAYLOAD_TOO_LARGE),
             (
