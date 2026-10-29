@@ -223,6 +223,44 @@ def health(url, proc, timeout=900):
     raise TimeoutError(url)
 
 
+def _tail_file(path: Path, *, max_lines: int = 40, label: str | None = None) -> None:
+    tag = label or path.name
+    if not path.is_file():
+        print(f"LOG_TAIL {tag}: (missing {path})", flush=True)
+        return
+    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    tail = lines[-max_lines:] if lines else []
+    print(f"LOG_TAIL {tag} (last {len(tail)} lines):", flush=True)
+    for line in tail:
+        print(line, flush=True)
+
+
+def print_artifacts(out: Path, workers: int) -> None:
+    entries: list[tuple[str, Path]] = [
+        ("cell_dir", out),
+        ("calibration.json", out / "calibration.json"),
+        ("requests.jsonl", out / "result" / "requests.jsonl"),
+        ("ports.json", out / "ports.json"),
+        ("router.log", out / "router.log"),
+        ("replay.log", out / "replay.log"),
+    ]
+    for i in range(workers):
+        entries.append((f"engine{i}.log", out / f"engine{i}.log"))
+    print("ARTIFACTS", flush=True)
+    for name, path in entries:
+        print(f"  {name}: {path.resolve()}", flush=True)
+
+
+def print_failure_diagnostics(out: Path, workers: int, *, hint: str = "") -> None:
+    if hint:
+        print(f"DIAGNOSTIC {hint}", flush=True)
+    print_artifacts(out, workers)
+    for i in range(workers):
+        _tail_file(out / f"engine{i}.log", label=f"engine{i}.log")
+    _tail_file(out / "router.log")
+    _tail_file(out / "replay.log")
+
+
 def allocate_ports(n):
     socks = []
 
@@ -456,20 +494,26 @@ raise SystemExit(main(["vllm", *sys.argv[1:]]))
 
     started = time.monotonic()
     try:
-        engines = [
-            start(
-                engine_command(i),
-                OUT / f"engine{i}.log",
-                {"CUDA_VISIBLE_DEVICES": GPUS[i]},
-            )
-            for i in range(WORKERS)
-        ]
-        for i, proc in enumerate(engines):
-            health(f"http://127.0.0.1:{ports['http'][i]}/health", proc, timeout=1800)
-        print(f"ENGINES_READY {time.monotonic() - started:.0f}s", flush=True)
-        router = start(router_command(), OUT / "router.log")
-        health(f"http://127.0.0.1:{ports['router']}/health", router, timeout=180)
-        print(f"ROUTER_READY {time.monotonic() - started:.0f}s", flush=True)
+        try:
+            engines = [
+                start(
+                    engine_command(i),
+                    OUT / f"engine{i}.log",
+                    {"CUDA_VISIBLE_DEVICES": GPUS[i]},
+                )
+                for i in range(WORKERS)
+            ]
+            for i, proc in enumerate(engines):
+                health(
+                    f"http://127.0.0.1:{ports['http'][i]}/health", proc, timeout=1800
+                )
+            print(f"ENGINES_READY {time.monotonic() - started:.0f}s", flush=True)
+            router = start(router_command(), OUT / "router.log")
+            health(f"http://127.0.0.1:{ports['router']}/health", router, timeout=180)
+            print(f"ROUTER_READY {time.monotonic() - started:.0f}s", flush=True)
+        except (RuntimeError, TimeoutError) as exc:
+            print_failure_diagnostics(OUT, WORKERS, hint=str(exc))
+            raise SystemExit(1) from exc
         snapshot(OUT / "before")
         result = OUT / "result"
         replay = start(
@@ -551,6 +595,9 @@ raise SystemExit(main(["vllm", *sys.argv[1:]]))
                     print(f"SNAPSHOT_FAIL {exc}", flush=True)
                 print(f"TICK {tick * 10}s", flush=True)
         snapshot(OUT / "after")
+        if replay.returncode not in (0, None):
+            print(f"REPLAY exit code {replay.returncode}", flush=True)
+            _tail_file(OUT / "replay.log", label="replay.log")
         wall = time.monotonic() - started
         rows = [
             json.loads(line)
@@ -611,7 +658,13 @@ raise SystemExit(main(["vllm", *sys.argv[1:]]))
         }
         (OUT / "calibration.json").write_text(json.dumps(stats, indent=2))
         print("STATS " + json.dumps(stats), flush=True)
+        print_artifacts(OUT, WORKERS)
         if stalled or stats["success"] != stats["requests"]:
+            print_failure_diagnostics(
+                OUT,
+                WORKERS,
+                hint="stalled or non-success rows in requests.jsonl",
+            )
             raise SystemExit(1)
     finally:
         cleanup()

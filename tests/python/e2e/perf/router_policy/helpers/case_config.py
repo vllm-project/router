@@ -2,10 +2,18 @@
 
 from __future__ import annotations
 
+import importlib.util
 import json
+import os
+import shutil
 import sys
 from pathlib import Path
 from typing import Any
+
+MODEL_ENV = "MODEL"
+VLLM_RS_ENV = "VLLM_RS"
+ROUTER_BIN_ENV = "ROUTER_BIN"
+PYTHON_ENV_KEYS = ("AGENTX_PYTHON", "PYTHON")
 
 _PATH_KEYS = (
     "perf_work_root",
@@ -14,7 +22,6 @@ _PATH_KEYS = (
     "replay_config",
     "openssl_lib_dir",
 )
-_CMD_KEYS = ("python", "vllm_rs")
 
 
 def repo_root() -> Path:
@@ -26,6 +33,50 @@ def repo_root() -> Path:
 def _resolve_repo_path(raw: str, repo: Path) -> Path:
     path = Path(raw)
     return path if path.is_absolute() else (repo / path).resolve()
+
+
+def _env_first(*keys: str) -> str:
+    for key in keys:
+        val = os.environ.get(key, "").strip()
+        if val:
+            return val
+    return ""
+
+
+def _resolve_vllm_rs(case_value: str, repo: Path, *, case_id: str) -> str:
+    """Same order as ``scripts/backend/common.sh`` / ``perf/grpc/stack_launcher``."""
+
+    if pinned := _env_first(VLLM_RS_ENV):
+        return pinned
+    val = (case_value or "").strip()
+    if val and ("/" in val or "\\" in val):
+        return str(_resolve_repo_path(val, repo))
+    if val:
+        found = shutil.which(val)
+        if found:
+            return found
+    spec = importlib.util.find_spec("vllm")
+    if spec and spec.origin:
+        candidate = Path(spec.origin).resolve().parent / "vllm-rs"
+        if candidate.is_file():
+            return str(candidate)
+    raise RuntimeError(
+        f"case {case_id}: vllm-rs not found; export {VLLM_RS_ENV} or run "
+        "scripts/backend/check_vllm_rs.sh"
+    )
+
+
+def _resolve_python(case_value: str, repo: Path, *, case_id: str) -> str:
+    if pinned := _env_first(*PYTHON_ENV_KEYS):
+        return pinned
+    val = (case_value or "").strip()
+    if val in ("", "python"):
+        # Same interpreter as pytest / ``run_cell`` (no absolute path in JSON).
+        return sys.executable
+    if "/" in val or "\\" in val:
+        return str(_resolve_repo_path(val, repo))
+    found = shutil.which(val)
+    return found if found else val
 
 
 def packaged_replay_agentx_yaml() -> Path:
@@ -71,19 +122,36 @@ def resolve_runtime(case: dict[str, Any]) -> dict[str, Any]:
     repo = repo_root()
     rt: dict[str, Any] = dict(raw)
 
-    model = (rt.get("model") or rt.get("model_path") or "").strip()
+    case_id = str(case.get("id", "?"))
+    model = (
+        _env_first(MODEL_ENV) or (rt.get("model") or rt.get("model_path") or "").strip()
+    )
     if not model:
         raise RuntimeError(
-            f"case {case.get('id')}: runtime.model (HF model id) is required"
+            f"case {case_id}: set export {MODEL_ENV}=... or runtime.model in JSON"
         )
     rt["model"] = model
-    rt["served_model_name"] = (rt.get("served_model_name") or model).strip()
+    rt["served_model_name"] = (
+        _env_first("VLLM_ROUTER_MODEL")
+        or (rt.get("served_model_name") or model).strip()
+    )
+
+    router_bin = (
+        _env_first(ROUTER_BIN_ENV) or str(rt.get("router_binary") or "").strip()
+    )
+    if not router_bin:
+        raise RuntimeError(
+            f"case {case_id}: set export {ROUTER_BIN_ENV}=... or runtime.router_binary"
+        )
+    rt["router_binary"] = str(_resolve_repo_path(router_bin, repo))
 
     for key in _PATH_KEYS:
+        if key == "router_binary":
+            continue
         val = str(rt.get(key, "") or "").strip()
         if not val:
-            if key in ("perf_work_root", "router_binary", "trace_path"):
-                raise RuntimeError(f"case {case.get('id')}: runtime.{key} is required")
+            if key in ("perf_work_root", "trace_path"):
+                raise RuntimeError(f"case {case_id}: runtime.{key} is required")
             continue
         rt[key] = str(_resolve_repo_path(val, repo))
 
@@ -94,14 +162,10 @@ def resolve_runtime(case: dict[str, Any]) -> dict[str, Any]:
         # Resolved in run_cell bootstrap (same env as runtime.python), not at pytest import.
         rt["replay_config_path"] = ""
 
-    for key in _CMD_KEYS:
-        val = str(rt.get(key, "") or "").strip()
-        if not val:
-            raise RuntimeError(f"case {case.get('id')}: runtime.{key} is required")
-        if "/" in val or "\\" in val:
-            rt[key] = str(_resolve_repo_path(val, repo))
-        else:
-            rt[key] = val
+    rt["python"] = _resolve_python(str(rt.get("python") or ""), repo, case_id=case_id)
+    rt["vllm_rs"] = _resolve_vllm_rs(
+        str(rt.get("vllm_rs") or ""), repo, case_id=case_id
+    )
 
     return rt
 

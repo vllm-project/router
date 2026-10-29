@@ -39,12 +39,23 @@ def _run_cell(case_file: Path) -> Path:
         timeout=timeout,
         check=False,
     )
-    assert proc.returncode == 0, f"run_cell failed for {case_file.name}"
+    if proc.returncode != 0:
+        print(
+            f"run_cell exit {proc.returncode}; see ARTIFACTS / LOG_TAIL above "
+            f"or logs under {out.resolve()}",
+            flush=True,
+        )
+        assert proc.returncode == 0, f"run_cell failed for {case_file.name}"
     cal_path = out / "calibration.json"
+    summary: Path | None = None
     if cal_path.is_file():
         summary = cell_results_dir(case) / f"{case['id']}.json"
         summary.parent.mkdir(parents=True, exist_ok=True)
         summary.write_text(cal_path.read_text(encoding="utf-8"), encoding="utf-8")
+    print("ARTIFACTS pytest_copy:", flush=True)
+    print(
+        f"  results_summary.json: {summary.resolve() if summary else 'n/a'}", flush=True
+    )
     return out
 
 
