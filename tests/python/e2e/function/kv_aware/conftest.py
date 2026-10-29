@@ -18,16 +18,16 @@ def pytest_configure(config):
 
 @pytest.fixture(scope="session")
 def kv_aware_two_workers():
-    """Two ``mock-grpc-worker`` processes; health via each ``GET /health`` port."""
+    """``vllm-rs serve`` ×2; health via each worker OpenAI ``/health`` port."""
     from tests.python.e2e.function.helpers.workers import (
-        spawn_two_mock_grpc_workers,
+        spawn_two_vllm_rs_grpc_workers,
         terminate_workers,
     )
     from tests.python.e2e.function.kv_aware.config import kv_aware_e2e_model
 
     workers: list = []
     try:
-        workers = spawn_two_mock_grpc_workers(kv_aware_e2e_model())
+        workers = spawn_two_vllm_rs_grpc_workers(kv_aware_e2e_model())
         yield workers
     finally:
         terminate_workers(workers)
