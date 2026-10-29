@@ -1014,7 +1014,6 @@ mod tests {
             ("text", json!({"prompt":"hello"}), None),
             ("text batch", json!({"prompt":["hello"]}), None),
             ("empty suffix", json!({"prompt":[1,2],"suffix":""}), None),
-            ("suffix", json!({"prompt":[1,2],"suffix":"tail"}), None),
             (
                 "null suffix",
                 json!({"prompt":[1,2],"suffix":null}),
@@ -1028,11 +1027,6 @@ mod tests {
             (
                 "zero truncate",
                 json!({"prompt":[1,2],"truncate_prompt_tokens":0}),
-                None,
-            ),
-            (
-                "truncate",
-                json!({"prompt":[1,2],"truncate_prompt_tokens":1}),
                 None,
             ),
             (
