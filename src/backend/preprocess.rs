@@ -983,101 +983,166 @@ mod tests {
     }
 
     #[test]
+    fn http_cache_identity_checks_extensions_and_message_parts() {
+        use serde_json::json;
+        for field in [
+            "features",
+            "prompt_embeds",
+            "input_embeds",
+            "input_embeddings",
+            "multi_modal_data",
+            "lora_path",
+            "lora_name",
+            "prompt_adapter_request",
+        ] {
+            for (state, value, expected) in [
+                ("missing", None, Ok(())),
+                ("null", Some(json!(null)), Ok(())),
+                (
+                    "nonnull",
+                    Some(json!("adapter")),
+                    Err("unsupported_cache_identity"),
+                ),
+            ] {
+                let mut fields = serde_json::Map::new();
+                if let Some(value) = value {
+                    fields.insert(field.into(), value);
+                }
+                assert_eq!(
+                    super::http_cache_identity(&fields),
+                    expected,
+                    "{field}: {state}"
+                );
+            }
+        }
+        for (name, fields, expected) in [
+            ("missing messages", json!({}), Ok(())),
+            ("null messages", json!({"messages":null}), Ok(())),
+            ("nonarray messages", json!({"messages":{}}), Ok(())),
+            (
+                "text parts",
+                json!({"messages":[{"content":[{"type":"text","text":"hi"}]}]}),
+                Ok(()),
+            ),
+            (
+                "nonarray content",
+                json!({"messages":[{"content":"hi"}]}),
+                Ok(()),
+            ),
+            (
+                "multimodal parts",
+                json!({"messages":[{"content":[{"type":"image_url"}]}]}),
+                Err("multimodal_input"),
+            ),
+            (
+                "untyped parts",
+                json!({"messages":[{"content":[{}]}]}),
+                Err("multimodal_input"),
+            ),
+            (
+                "unknown extension",
+                json!({"private_adapter":"unknown"}),
+                Ok(()),
+            ),
+            ("salt", json!({"cache_salt":"tenant"}), Ok(())),
+        ] {
+            assert_eq!(
+                super::http_cache_identity(fields.as_object().unwrap()),
+                expected,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
     fn http_inputs_keep_prompt_boundaries_and_require_exact_render_for_options() {
         use super::{
             http_kv_input, http_rendered_tokens, prepare_completion_direct_inputs, HttpKvInput,
         };
         use crate::core::{BasicWorker, WorkerType};
         use serde_json::json;
-        let workers: Vec<Arc<dyn Worker>> = ["http://worker-a", "http://worker-b"]
-            .into_iter()
-            .map(|url| {
-                Arc::new(BasicWorker::new(url.into(), WorkerType::Regular)) as Arc<dyn Worker>
-            })
-            .collect();
+        let workers: Vec<Arc<dyn Worker>> = vec![Arc::new(BasicWorker::new(
+            "http://worker-a".into(),
+            WorkerType::Regular,
+        ))];
         let mut cases: Vec<_> = [
             (
                 "single order and i32 max",
                 json!({"prompt":[3,1,3,i32::MAX,0]}),
-                Some(vec![vec![3, 1, 3, 2_147_483_647u32, 0]]),
+                Ok(Some(vec![vec![3, 1, 3, 2_147_483_647u32, 0]])),
             ),
             (
                 "batch boundaries",
                 json!({"prompt":[[1,2],[3,4]]}),
-                Some(vec![vec![1, 2], vec![3, 4]]),
+                Ok(Some(vec![vec![1, 2], vec![3, 4]])),
             ),
-            ("empty prompt", json!({"prompt":[]}), None),
-            ("empty first batch", json!({"prompt":[[],[1]]}), None),
-            ("empty later batch", json!({"prompt":[[1],[]]}), None),
-            ("negative single", json!({"prompt":[-1,2]}), None),
-            ("negative batch", json!({"prompt":[[1],[-1]]}), None),
-            ("text", json!({"prompt":"hello"}), None),
-            ("text batch", json!({"prompt":["hello"]}), None),
-            ("empty suffix", json!({"prompt":[1,2],"suffix":""}), None),
+            ("empty prompt", json!({"prompt":[]}), Err("empty_input")),
+            (
+                "empty first batch",
+                json!({"prompt":[[],[1]]}),
+                Err("empty_input"),
+            ),
+            (
+                "empty later batch",
+                json!({"prompt":[[1],[]]}),
+                Err("empty_input"),
+            ),
+            (
+                "negative single",
+                json!({"prompt":[-1,2]}),
+                Err("invalid_token_ids"),
+            ),
+            (
+                "negative batch",
+                json!({"prompt":[[1],[-1]]}),
+                Err("invalid_token_ids"),
+            ),
+            ("text", json!({"prompt":"hello"}), Ok(None)),
+            ("text batch", json!({"prompt":["hello"]}), Ok(None)),
+            (
+                "empty suffix",
+                json!({"prompt":[1,2],"suffix":""}),
+                Ok(None),
+            ),
             (
                 "null suffix",
                 json!({"prompt":[1,2],"suffix":null}),
-                Some(vec![vec![1, 2]]),
+                Ok(Some(vec![vec![1, 2]])),
             ),
             (
                 "null truncate",
                 json!({"prompt":[1,2],"truncate_prompt_tokens":null}),
-                Some(vec![vec![1, 2]]),
+                Ok(Some(vec![vec![1, 2]])),
             ),
             (
                 "zero truncate",
                 json!({"prompt":[1,2],"truncate_prompt_tokens":0}),
-                None,
+                Ok(None),
             ),
             (
                 "lora null batch",
                 json!({"prompt":[1,2],"lora_path":[null]}),
-                None,
+                Err("unsupported_cache_identity"),
             ),
             (
                 "lora empty batch",
                 json!({"prompt":[1,2],"lora_path":[]}),
-                None,
-            ),
-            (
-                "null messages",
-                json!({"prompt":[1,2],"messages":null}),
-                Some(vec![vec![1, 2]]),
-            ),
-            (
-                "nonarray messages",
-                json!({"prompt":[1,2],"messages":{}}),
-                Some(vec![vec![1, 2]]),
+                Err("unsupported_cache_identity"),
             ),
             (
                 "text parts",
                 json!({"prompt":[1,2],"messages":[{"content":[{"type":"text","text":"hi"}]}]}),
-                Some(vec![vec![1, 2]]),
-            ),
-            (
-                "nonarray content",
-                json!({"prompt":[1,2],"messages":[{"content":"hi"}]}),
-                Some(vec![vec![1, 2]]),
+                Ok(Some(vec![vec![1, 2]])),
             ),
             (
                 "multimodal parts",
                 json!({"prompt":[1,2],"messages":[{"content":[{"type":"image_url"}]}]}),
-                None,
-            ),
-            (
-                "untyped parts",
-                json!({"prompt":[1,2],"messages":[{"content":[{}]}]}),
-                None,
-            ),
-            (
-                "unknown extension",
-                json!({"prompt":[1,2],"private_adapter":"unknown"}),
-                Some(vec![vec![1, 2]]),
+                Err("multimodal_input"),
             ),
             (
                 "salt",
                 json!({"prompt":[1,2],"cache_salt":"tenant"}),
-                Some(vec![vec![1, 2]]),
+                Ok(Some(vec![vec![1, 2]])),
             ),
         ]
         .into_iter()
@@ -1089,36 +1154,6 @@ mod tests {
             )
         })
         .collect();
-        for field in [
-            "features",
-            "prompt_embeds",
-            "input_embeds",
-            "input_embeddings",
-            "multi_modal_data",
-            "lora_path",
-            "lora_name",
-            "prompt_adapter_request",
-        ] {
-            for (value, expected) in [
-                (json!(null), Some(vec![vec![1, 2]])),
-                (json!("adapter"), None),
-            ] {
-                let mut body = json!({"prompt":[1,2]});
-                body[field] = value;
-                cases.push((
-                    format!(
-                        "identity {field} {}",
-                        if expected.is_some() {
-                            "null"
-                        } else {
-                            "nonnull"
-                        }
-                    ),
-                    serde_json::from_value(body).unwrap(),
-                    expected,
-                ));
-            }
-        }
         let request: CompletionRequest = serde_json::from_value(json!({"prompt":[1,2]})).unwrap();
         cases.extend([
             (
@@ -1127,7 +1162,7 @@ mod tests {
                     prompt: PromptInput::IntArray(vec![]),
                     ..request.clone()
                 },
-                None,
+                Err("empty_input"),
             ),
             (
                 "manual empty IntBatch".into(),
@@ -1135,7 +1170,7 @@ mod tests {
                     prompt: PromptInput::IntBatch(vec![]),
                     ..request.clone()
                 },
-                None,
+                Err("empty_input"),
             ),
             (
                 "single null lora".into(),
@@ -1143,7 +1178,7 @@ mod tests {
                     lora_path: Some(LoRAPath::Single(None)),
                     ..request.clone()
                 },
-                Some(vec![vec![1, 2]]),
+                Ok(Some(vec![vec![1, 2]])),
             ),
             (
                 "flatten null overrides lora batch".into(),
@@ -1152,7 +1187,7 @@ mod tests {
                     other: json!({"lora_path":null}).as_object().unwrap().clone(),
                     ..request.clone()
                 },
-                Some(vec![vec![1, 2]]),
+                Ok(Some(vec![vec![1, 2]])),
             ),
             (
                 "flatten null overrides suffix".into(),
@@ -1161,7 +1196,7 @@ mod tests {
                     other: json!({"suffix":null}).as_object().unwrap().clone(),
                     ..request.clone()
                 },
-                Some(vec![vec![1, 2]]),
+                Ok(Some(vec![vec![1, 2]])),
             ),
             (
                 "flatten prompt overrides negative".into(),
@@ -1170,54 +1205,63 @@ mod tests {
                     other: json!({"prompt":[[7,8],[9]]}).as_object().unwrap().clone(),
                     ..request.clone()
                 },
-                Some(vec![vec![7, 8], vec![9]]),
+                Ok(Some(vec![vec![7, 8], vec![9]])),
             ),
             (
                 "flatten prompt overrides empty".into(),
                 CompletionRequest {
                     prompt: PromptInput::IntBatch(vec![]),
                     other: json!({"prompt":[7,8]}).as_object().unwrap().clone(),
-                    ..request
+                    ..request.clone()
                 },
-                Some(vec![vec![7, 8]]),
+                Ok(Some(vec![vec![7, 8]])),
             ),
         ]);
         for (name, request, expected) in cases {
             let body = serde_json::to_value(&request).unwrap();
-            let planned = match http_kv_input(&body, "/v1/completions") {
-                Ok(HttpKvInput::Direct(prompts)) => Some(prompts),
-                _ => None,
-            };
+            let planned = http_kv_input(&body, "/v1/completions").map(|input| match input {
+                HttpKvInput::Direct(prompts) => Some(prompts),
+                HttpKvInput::Render { .. } => None,
+            });
             assert_eq!(
-                planned.as_deref(),
-                expected.as_deref(),
+                planned.as_ref().map(|prompts| prompts.as_deref()),
+                expected.as_ref().map(|prompts| prompts.as_deref()),
                 "JSON planner: {name}"
             );
             let prepared = prepare_completion_direct_inputs(&request, &workers);
             assert_eq!(
                 prepared.is_some(),
-                planned.is_some(),
+                matches!(planned, Ok(Some(_))),
                 "typed planner: {name}"
             );
             if let Some(inputs) = prepared {
-                assert_eq!(inputs.len(), 2, "{name}");
-                for worker in &workers {
-                    assert_eq!(
-                        inputs[worker.base_url()].as_ref(),
-                        planned.as_deref().unwrap(),
-                        "{name}"
-                    );
-                }
-                assert!(
-                    Arc::ptr_eq(
-                        &inputs[workers[0].base_url()],
-                        &inputs[workers[1].base_url()]
-                    ),
+                assert_eq!(inputs.len(), 1, "{name}");
+                assert_eq!(
+                    inputs[workers[0].base_url()].as_ref(),
+                    expected.unwrap().as_deref().unwrap(),
                     "{name}"
                 );
             }
         }
-        assert!(http_kv_input(&json!({"prompt":[-1,2]}), "/v1/completions").is_err());
+        let mut batch_workers = workers;
+        batch_workers.push(Arc::new(BasicWorker::new(
+            "http://worker-b".into(),
+            WorkerType::Regular,
+        )));
+        let batch = CompletionRequest {
+            prompt: PromptInput::IntBatch(vec![vec![1, 2], vec![3, 4]]),
+            ..request
+        };
+        let inputs = prepare_completion_direct_inputs(&batch, &batch_workers).unwrap();
+        assert_eq!(inputs.len(), 2);
+        assert_eq!(
+            inputs[batch_workers[0].base_url()].as_ref(),
+            &[vec![1, 2], vec![3, 4]]
+        );
+        assert!(Arc::ptr_eq(
+            &inputs[batch_workers[0].base_url()],
+            &inputs[batch_workers[1].base_url()]
+        ));
         for ids in [json!([1, 2]), json!([[1, 2], [3, 4]])] {
             let HttpKvInput::Direct(prompts) =
                 http_kv_input(&json!({"input_ids":ids}), "/generate").unwrap()

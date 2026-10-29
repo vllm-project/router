@@ -202,6 +202,59 @@ mod tests {
     use super::*;
 
     #[test]
+    fn full_attention_shape_matrix_preserves_rejection_reason_and_event_index() {
+        let valid: BlockStored = serde_json::from_value(serde_json::json!({
+            "block_hashes": [1], "parent_block_hash": null,
+            "token_ids": [1, 2, 3, 4], "block_size": 4, "medium": "GPU",
+            "lora_id": null, "lora_name": null
+        }))
+        .unwrap();
+        let mut batch = KVEventBatch {
+            ts: 0.0,
+            events: vec![
+                KVEvent::AllBlocksCleared(Default::default()),
+                KVEvent::BlockStored(valid.clone()),
+            ],
+            data_parallel_rank: Some(0),
+        };
+        assert_eq!(validate_full_attention_batch(&batch, 4), Ok(()));
+        for (case, reason) in [
+            ("remote", FullAttentionRejectionReason::Residency),
+            ("local-pool", FullAttentionRejectionReason::Residency),
+            ("unknown-medium", FullAttentionRejectionReason::Residency),
+            ("layout", FullAttentionRejectionReason::Layout),
+            ("sliding-window", FullAttentionRejectionReason::Layout),
+            (
+                "token-count",
+                FullAttentionRejectionReason::TokenCountMismatch,
+            ),
+        ] {
+            let mut event = valid.clone();
+            match case {
+                "remote" => event.locality = Some("REMOTE".into()),
+                "local-pool" => {
+                    event.locality = Some("LOCAL".into());
+                    event.ownership = Some("pool".into());
+                }
+                "unknown-medium" => event.medium = Some("unknown".into()),
+                "layout" => event.kv_cache_spec_kind = Some("sliding_attention".into()),
+                "sliding-window" => event.kv_cache_spec_sliding_window = Some(8),
+                "token-count" => event.block_hashes.push(ExternalBlockHash::Int(2)),
+                _ => unreachable!(),
+            }
+            batch.events[1] = KVEvent::BlockStored(event);
+            assert_eq!(
+                validate_full_attention_batch(&batch, 4),
+                Err(FullAttentionBatchRejection {
+                    reason,
+                    event_index: 1
+                }),
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
     fn full_attention_block_size_matrix_preserves_rejection_reason_and_event_index() {
         for expected in [8, 16, 32] {
             for actual in [0, 8, 16, 32] {

@@ -1375,47 +1375,75 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn concurrent_source_admission_preserves_topic_rank_and_cache_identity_boundaries() {
-        use serde_json::json;
-
-        for (topic_b, rank_b, model_b, same_publisher, accepted) in [
+    async fn source_installation_preserves_topic_rank_and_cache_identity_boundaries() {
+        for (case, (topic_b, rank_b, model_b, same_publisher, accepted)) in [
             ("kv/other", 0u32, "boundary-model", true, true),
             ("kv/boundary", 1, "boundary-model", true, true),
             ("kv/boundary", 0, "other-model", false, true),
             ("kv/boundary", 0, "other-model", true, false),
             ("kv/boundary", 0, "boundary-model", true, false),
             ("kv/boundary", 0, "boundary-model", false, false),
-        ] {
-            let context = zmq::Context::new();
-            let publisher_a = context.socket(zmq::XPUB).unwrap();
-            let publisher_b = context.socket(zmq::XPUB).unwrap();
-            for publisher in [&publisher_a, &publisher_b] {
-                publisher.bind("tcp://127.0.0.1:*").unwrap();
-            }
-            let endpoint_a = publisher_a.get_last_endpoint().unwrap().unwrap();
-            let endpoint_b = publisher_b.get_last_endpoint().unwrap().unwrap();
-            let sources = |endpoint: &str, topic: &str, rank: u32| {
-                json!({rank.to_string(): {
-                    "endpoint": endpoint, "topic": topic, "publisher": "zmq",
-                    "encoding": "msgpack", "schema_version": 1, "enable_kv_cache_events": true
-                }})
-            };
-            let info = |model, instance| json!({"model_id": model, "instance_id": instance, "kv_block_size": 8});
-            let (worker_a, task_a) = source_boundary_worker_with_metadata(
-                info("boundary-model", "shared-target"),
-                sources(&endpoint_a, "kv/boundary", 0),
-            )
-            .await;
-            let (worker_b, task_b) = source_boundary_worker_with_metadata(
-                info(
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let endpoint_a = format!("inproc://source-boundary-{case}-a");
+            let endpoint_b = format!("inproc://source-boundary-{case}-b");
+            let discovery =
+                |model: &str, instance: &str, endpoint: &str, topic: &str, rank: u32| {
+                    WorkerDiscovery {
+                        server_info: Ok(ServerInfo {
+                            instance_id: Some(instance.into()),
+                            kv_block_size: Some(8),
+                            ..Default::default()
+                        }),
+                        model_id: Ok(Some(model.into())),
+                        sources: Ok(HashMap::from([(
+                            rank.to_string(),
+                            KvEventSourceEntry {
+                                endpoint: endpoint.into(),
+                                topic: topic.into(),
+                                publisher: Some("zmq".into()),
+                                encoding: Some("msgpack".into()),
+                                schema_version: Some(1),
+                                enable_kv_cache_events: Some(true),
+                                ..Default::default()
+                            },
+                        )])),
+                    }
+                };
+            let worker_a = "http://worker-a:8000";
+            let worker_b = "http://worker-b:8000";
+            let (supervisor, _) = KvIndexSupervisor::new_http_full_attention(
+                reqwest::Client::new(),
+                HashMode::Sha256,
+            );
+            let a = supervisor
+                .install_worker(
+                    worker_a,
+                    discovery(
+                        "boundary-model",
+                        "shared-target",
+                        &endpoint_a,
+                        "kv/boundary",
+                        0,
+                    ),
+                )
+                .unwrap();
+            assert_eq!(a.ranks, [0]);
+            assert_eq!(
+                a.cache_key.as_ref().unwrap().model.as_ref(),
+                "boundary-model"
+            );
+            let b = supervisor.install_worker(
+                worker_b,
+                discovery(
                     model_b,
                     if topic_b == "kv/other" {
                         "other-topic-target"
                     } else {
                         "shared-target"
                     },
-                ),
-                sources(
                     if same_publisher {
                         &endpoint_a
                     } else {
@@ -1424,65 +1452,87 @@ mod tests {
                     topic_b,
                     rank_b,
                 ),
-            )
-            .await;
-            let (supervisor, _) = KvIndexSupervisor::new_http_full_attention(
-                reqwest::Client::new(),
-                HashMode::Sha256,
-            );
-            let (a, b) = tokio::join!(
-                supervisor.on_worker_added(&worker_a),
-                supervisor.on_worker_added(&worker_b)
             );
             if accepted {
-                assert!(a.is_ok() && b.is_ok(), "{a:?} {b:?}");
+                let b = b.unwrap();
+                assert_eq!(b.ranks, [rank_b]);
+                assert_eq!(b.cache_key.as_ref().unwrap().model.as_ref(), model_b);
                 assert_eq!(supervisor.workers.lock().len(), 2);
+                assert_eq!(
+                    supervisor.indexers.len(),
+                    if model_b == "boundary-model" { 1 } else { 2 }
+                );
                 if same_publisher && rank_b == 1 {
                     let workers = supervisor.workers.lock();
-                    let guard_a = &workers[&worker_a].live_sources[0].lease.strict_rank;
-                    let guard_b = &workers[&worker_b].live_sources[0].lease.strict_rank;
+                    let guard_a = &workers[worker_a].live_sources[0].lease.strict_rank;
+                    let guard_b = &workers[worker_b].live_sources[0].lease.strict_rank;
                     assert!(Arc::ptr_eq(guard_a, guard_b));
                     assert!(*guard_a.lock());
                 }
             } else {
-                assert_ne!(a.is_ok(), b.is_ok(), "{a:?} {b:?}");
+                let error = b.unwrap_err();
+                assert!(
+                    error.contains(if same_publisher {
+                        "live KV streams"
+                    } else {
+                        "KV index targets"
+                    }),
+                    "{error}"
+                );
                 assert_eq!(supervisor.workers.lock().len(), 1);
+                assert!(!supervisor.workers.lock().contains_key(worker_b));
+                assert_eq!(supervisor.indexers.len(), 1);
             }
+            assert!(supervisor.workers.lock().contains_key(worker_a));
+            assert_eq!(
+                supervisor
+                    .identity_refs
+                    .lock()
+                    .values()
+                    .copied()
+                    .sum::<usize>(),
+                if accepted { 2 } else { 1 }
+            );
             supervisor.shutdown();
-            task_a.abort();
-            task_b.abort();
+            assert!(supervisor.workers.lock().is_empty());
+            assert!(supervisor.indexers.is_empty());
+            assert!(supervisor.identity_refs.lock().is_empty());
         }
     }
 
     #[tokio::test]
     async fn source_group_rejects_duplicate_normalized_ranks_without_mutation() {
-        use serde_json::json;
-
-        let context = zmq::Context::new();
-        let publisher = context.socket(zmq::XPUB).unwrap();
-        publisher.bind("tcp://127.0.0.1:*").unwrap();
-        let entry = json!({"endpoint": publisher.get_last_endpoint().unwrap().unwrap(),
-            "publisher": "zmq", "encoding": "msgpack", "schema_version": 1,
-            "enable_kv_cache_events": true});
-        let (worker, task) = source_boundary_worker_with_metadata(
-            json!({"model_id": "boundary-model", "instance_id": "duplicate-rank", "kv_block_size": 8}),
-            json!({"0": entry, "00": entry}),
-        ).await;
+        let entry = KvEventSourceEntry {
+            endpoint: "inproc://duplicate-normalized-rank".into(),
+            publisher: Some("zmq".into()),
+            encoding: Some("msgpack".into()),
+            schema_version: Some(1),
+            enable_kv_cache_events: Some(true),
+            ..Default::default()
+        };
         let (supervisor, _) =
             KvIndexSupervisor::new_http_full_attention(reqwest::Client::new(), HashMode::Sha256);
         assert!(supervisor
-            .on_worker_added(&worker)
-            .await
+            .install_worker(
+                "http://worker:8000",
+                WorkerDiscovery {
+                    server_info: Ok(ServerInfo {
+                        instance_id: Some("duplicate-rank".into()),
+                        kv_block_size: Some(8),
+                        ..Default::default()
+                    }),
+                    model_id: Ok(Some("boundary-model".into())),
+                    sources: Ok(HashMap::from([
+                        ("0".into(), entry.clone()),
+                        ("00".into(), entry)
+                    ])),
+                }
+            )
             .unwrap_err()
             .contains("duplicate normalized"));
         assert!(supervisor.workers.lock().is_empty());
         assert!(supervisor.indexers.is_empty());
         assert!(supervisor.identity_refs.lock().is_empty());
-        assert!(matches!(
-            publisher.recv_bytes(zmq::DONTWAIT),
-            Err(zmq::Error::EAGAIN)
-        ));
-        task.abort();
     }
 
     #[tokio::test]
@@ -1915,6 +1965,9 @@ mod tests {
 
     #[tokio::test]
     async fn discovered_source_bindings_are_atomic_and_released_with_the_worker() {
+        use axum::{routing::get, Json, Router};
+        use serde_json::json;
+
         let context = zmq::Context::new();
         let publisher_a = context.socket(zmq::XPUB).unwrap();
         let publisher_b = context.socket(zmq::XPUB).unwrap();
@@ -1923,25 +1976,78 @@ mod tests {
             socket.bind("tcp://127.0.0.1:*").unwrap();
         }
         let replay_endpoint = replay.get_last_endpoint().unwrap().unwrap();
-        let (worker_a, http_a) = source_boundary_worker(
-            &publisher_a.get_last_endpoint().unwrap().unwrap(),
-            &replay_endpoint,
-            "binding-a",
-        )
-        .await;
-        let (worker_b, http_b) = source_boundary_worker(
-            &publisher_b.get_last_endpoint().unwrap().unwrap(),
-            &replay_endpoint,
-            "binding-b",
-        )
-        .await;
+        let (entered_tx, mut entered) = mpsc::channel(2);
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let mut metadata_workers = Vec::new();
+        for (publisher, instance) in [(&publisher_a, "binding-a"), (&publisher_b, "binding-b")] {
+            let info =
+                json!({"model_id": "boundary-model", "instance_id": instance, "kv_block_size": 8});
+            let sources = json!({"0": {
+                "endpoint": publisher.get_last_endpoint().unwrap().unwrap(),
+                "replay_endpoint": replay_endpoint, "topic": "kv/boundary",
+                "publisher": "zmq", "encoding": "msgpack", "schema_version": 1,
+                "enable_kv_cache_events": true
+            }});
+            let first = Arc::new(AtomicBool::new(true));
+            let entered_tx = entered_tx.clone();
+            let release = release.clone();
+            let app = Router::new()
+                .route(
+                    "/get_server_info",
+                    get(move || {
+                        let (info, first, entered_tx, release) = (
+                            info.clone(),
+                            first.clone(),
+                            entered_tx.clone(),
+                            release.clone(),
+                        );
+                        async move {
+                            // Only the initial discovery waits; later re-adds use this same server.
+                            if first.swap(false, Ordering::AcqRel) {
+                                entered_tx.send(instance).await.unwrap();
+                                release.acquire().await.unwrap().forget();
+                            }
+                            Json(info)
+                        }
+                    }),
+                )
+                .route(
+                    "/kv_event_sources",
+                    get(move || {
+                        let sources = sources.clone();
+                        async move { Json(sources) }
+                    }),
+                );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let worker = format!("http://{}", listener.local_addr().unwrap());
+            let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            metadata_workers.push((worker, task));
+        }
+        let (worker_b, http_b) = metadata_workers.pop().unwrap();
+        let (worker_a, http_a) = metadata_workers.pop().unwrap();
         let worker_a = format!("{worker_a}/");
         let (supervisor, _signals) =
             KvIndexSupervisor::new_http_full_attention(reqwest::Client::new(), HashMode::Sha256);
-        let (a, b) = tokio::join!(
-            supervisor.on_worker_added(&worker_a),
-            supervisor.on_worker_added(&worker_b)
-        );
+        let discoveries = async {
+            tokio::join!(
+                supervisor.on_worker_added(&worker_a),
+                supervisor.on_worker_added(&worker_b)
+            )
+        };
+        let waiting_metadata = async {
+            let mut waiting = [entered.recv().await.unwrap(), entered.recv().await.unwrap()];
+            waiting.sort_unstable();
+            assert_eq!(waiting, ["binding-a", "binding-b"]);
+            assert!(supervisor.workers.lock().is_empty());
+            assert!(supervisor.indexers.is_empty());
+            assert!(supervisor.identity_refs.lock().is_empty());
+            release.add_permits(2);
+        };
+        let ((a, b), ()) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(discoveries, waiting_metadata)
+        })
+        .await
+        .unwrap();
         assert_ne!(a.is_ok(), b.is_ok());
         let (accepted, rejected) = if a.is_ok() {
             (&worker_a, &worker_b)

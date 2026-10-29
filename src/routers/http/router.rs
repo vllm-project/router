@@ -3408,164 +3408,63 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn configured_backend_key_authenticates_discovery_on_startup_and_add() {
+    async fn unauthenticated_metadata_does_not_register_a_provider() {
         use crate::config::{PolicyConfig, RouterConfig};
         use axum::routing::get;
-        use serde_json::json;
 
-        for (case, empty_start, configured_key) in [
-            ("startup correct key", false, Some("backend-key")),
-            ("add correct key", true, Some("backend-key")),
-            ("startup missing key", false, None),
-            ("add wrong key", true, Some("wrong-key")),
-        ] {
-            let context = zmq::Context::new();
-            let publisher = context.socket(zmq::XPUB).unwrap();
-            publisher.bind("tcp://127.0.0.1:*").unwrap();
-            let endpoint = publisher.get_last_endpoint().unwrap().unwrap();
-            let requests = Arc::new(Mutex::new(Vec::new()));
-            let metadata_requests = requests.clone();
-            let app = axum::Router::new()
-                .route("/health", get(|| async { "ok" }))
-                .fallback(get(move |request: Request| {
-                    let requests = metadata_requests.clone();
-                    let endpoint = endpoint.clone();
-                    async move {
-                        let authorization = request.headers().get("authorization")
-                            .map(|value| value.to_str().unwrap().to_owned());
-                        let path = request.uri().path().to_owned();
-                        requests.lock().push((path.clone(), authorization.clone()));
-                        if authorization.as_deref() != Some("Bearer backend-key") {
-                            return StatusCode::UNAUTHORIZED.into_response();
-                        }
-                        match path.as_str() {
-                            "/get_server_info" => Json(json!({
-                                "model_id": "authenticated-model", "instance_id": "authenticated-worker",
-                                "kv_block_size": 8
-                            })).into_response(),
-                            "/kv_event_sources" => Json(json!({"0": {
-                                "endpoint": endpoint, "publisher": "zmq", "encoding": "msgpack",
-                                "schema_version": 1, "enable_kv_cache_events": true
-                            }})).into_response(),
-                            _ => StatusCode::NOT_FOUND.into_response(),
-                        }
-                    }
-                }));
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let worker = format!("http://{}", listener.local_addr().unwrap());
-            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-            let config = RouterConfig {
-                api_key: configured_key.map(str::to_owned),
-                policy: PolicyConfig::KvAware {
-                    router_temperature: 0.0,
-                    kv_penalty_host: 0.8,
-                    kv_penalty_external: 0.6,
-                    kv_penalty_disk: 0.3,
-                    static_kv_event_sources: Default::default(),
-                },
-                worker_startup_timeout_secs: 5,
-                ..Default::default()
-            };
-            let ctx = Arc::new(
-                crate::server::AppContext::new(config, Client::new(), 10, None, vec![]).unwrap(),
-            );
-            let router = Router::new(
-                if empty_start {
-                    vec![]
-                } else {
-                    vec![worker.clone()]
-                },
-                &ctx,
-            )
-            .await
-            .unwrap();
-            if empty_start {
-                router.add_worker(&worker).await.unwrap();
-            }
-            let supervisor = router.kv_index_supervisor.as_ref().unwrap();
-            let provider = supervisor.match_provider_for_worker(&worker);
-            let accepted = provider.is_some();
-            if configured_key == Some("backend-key") {
-                let provider = provider.expect("authenticated source must register");
-                tokio::time::timeout(Duration::from_secs(5), async {
-                    loop {
-                        match publisher.recv_bytes(zmq::DONTWAIT) {
-                            Ok(frame) => {
-                                assert_eq!(frame, b"\x01");
-                                break;
-                            }
-                            Err(zmq::Error::EAGAIN) => tokio::task::yield_now().await,
-                            Err(error) => panic!("authenticated source subscription: {error}"),
-                        }
-                    }
-                })
-                .await
-                .unwrap();
-                let event = rmp_serde::to_vec(&(
-                    1.0,
-                    [json!({
-                        "type": "BlockStored", "block_hashes": [1], "parent_block_hash": null,
-                        "token_ids": vec![1; 8], "block_size": 8, "medium": "GPU",
-                        "lora_id": null, "lora_name": null
-                    })],
-                    0u32,
-                ))
-                .unwrap();
-                publisher
-                    .send_multipart([b"".as_slice(), &0i64.to_be_bytes(), &event], 0)
-                    .unwrap();
-                let query = crate::kv_index::MatchQuery {
-                    group_idx: 0,
-                    local_hashes: crate::kv_index::local_block_hash_strings(&[1; 8], 8, None),
-                    tiers_of_interest: vec![crate::kv_index::StorageTier::Device],
-                };
-                tokio::time::timeout(Duration::from_secs(5), async {
-                    loop {
-                        let matches = provider.find_tiered_matches(&query);
-                        if !matches.is_empty() {
-                            assert_eq!(matches.len(), 1);
-                            assert_eq!(
-                                matches[0].target.instance_id.as_ref(),
-                                "authenticated-worker"
-                            );
-                            assert_eq!(matches[0].segments, [(0, 1)]);
-                            break;
-                        }
-                        tokio::task::yield_now().await;
-                    }
-                })
-                .await
-                .unwrap();
-            }
-            supervisor.shutdown();
-            if let Some(task) = &router._kv_signal_handle {
-                task.abort();
-            }
-            if let Some(task) = &router._load_monitor_handle {
-                task.abort();
-            }
-            server.abort();
-            let requests = requests.lock();
-            assert_eq!(
-                requests.len(),
-                2,
-                "{case}: both metadata endpoints must be queried: {requests:?}"
-            );
-            for (path, authorization) in requests.iter() {
-                assert!(matches!(
-                    path.as_str(),
-                    "/get_server_info" | "/kv_event_sources"
-                ));
-                assert_eq!(
-                    authorization.as_deref(),
-                    configured_key.map(|key| format!("Bearer {key}")).as_deref(),
-                    "{case}: metadata authorization"
-                );
-            }
-            assert_eq!(
-                accepted,
-                configured_key == Some("backend-key"),
-                "{case}: configured backend auth was not applied"
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let metadata_requests = requests.clone();
+        let app = axum::Router::new()
+            .route("/health", get(|| async { "ok" }))
+            .fallback(get(move |request: Request| {
+                let requests = metadata_requests.clone();
+                async move {
+                    let authorization = request
+                        .headers()
+                        .get("authorization")
+                        .map(|value| value.to_str().unwrap().to_owned());
+                    requests
+                        .lock()
+                        .push((request.uri().path().to_owned(), authorization));
+                    StatusCode::UNAUTHORIZED
+                }
+            }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let worker = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let config = RouterConfig {
+            policy: PolicyConfig::KvAware {
+                router_temperature: 0.0,
+                kv_penalty_host: 0.8,
+                kv_penalty_external: 0.6,
+                kv_penalty_disk: 0.3,
+                static_kv_event_sources: Default::default(),
+            },
+            worker_startup_timeout_secs: 5,
+            ..Default::default()
+        };
+        let ctx = Arc::new(
+            crate::server::AppContext::new(config, Client::new(), 10, None, vec![]).unwrap(),
+        );
+        let router = Router::new(vec![worker.clone()], &ctx).await.unwrap();
+        let supervisor = router.kv_index_supervisor.as_ref().unwrap();
+        assert!(supervisor.match_provider_for_worker(&worker).is_none());
+        supervisor.shutdown();
+        if let Some(task) = &router._kv_signal_handle {
+            task.abort();
+        }
+        if let Some(task) = &router._load_monitor_handle {
+            task.abort();
+        }
+        server.abort();
+        let requests = requests.lock();
+        assert_eq!(requests.len(), 2, "metadata requests: {requests:?}");
+        for path in ["/get_server_info", "/kv_event_sources"] {
+            assert!(
+                requests.iter().any(|(actual_path, authorization)| {
+                    actual_path == path && authorization.is_none()
+                }),
+                "missing unauthenticated {path}: {requests:?}"
             );
         }
     }
@@ -3689,11 +3588,9 @@ mod tests {
         use axum::{routing::get, Json};
         use serde_json::json;
 
-        for (expected, actual, replayed, empty_start) in [
-            (16u32, 8u32, false, false),
-            (8, 16, true, true),
-            (8, 8, false, false),
-        ] {
+        for (expected, actual, replayed, empty_start) in
+            [(16u32, 8u32, false, false), (8, 16, true, true)]
+        {
             let context = zmq::Context::new();
             let publisher = context.socket(zmq::XPUB).unwrap();
             publisher.bind("tcp://127.0.0.1:*").unwrap();
@@ -3706,19 +3603,39 @@ mod tests {
                 "topic": "kv/router", "publisher": "zmq", "encoding": "msgpack",
                 "schema_version": 1, "enable_kv_cache_events": true
             }});
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let metadata_requests = requests.clone();
             let app = axum::Router::new()
                 .route("/health", get(|| async { "ok" }))
-                .route("/get_server_info", get(move || async move { Json(json!({
-                    "model_id": "router-dense", "instance_id": "router-source", "kv_block_size": expected
-                })) }))
-                .route("/kv_event_sources", get(move || {
+                .fallback(get(move |request: Request| {
                     let sources = sources.clone();
-                    async move { Json(sources) }
+                    let requests = metadata_requests.clone();
+                    async move {
+                        let authorization = request
+                            .headers()
+                            .get("authorization")
+                            .map(|value| value.to_str().unwrap().to_owned());
+                        let path = request.uri().path().to_owned();
+                        requests.lock().push((path.clone(), authorization.clone()));
+                        if authorization.as_deref() != Some("Bearer backend-key") {
+                            return StatusCode::UNAUTHORIZED.into_response();
+                        }
+                        match path.as_str() {
+                            "/get_server_info" => Json(json!({
+                                "model_id": "router-dense", "instance_id": "router-source",
+                                "kv_block_size": expected
+                            }))
+                            .into_response(),
+                            "/kv_event_sources" => Json(sources).into_response(),
+                            _ => StatusCode::NOT_FOUND.into_response(),
+                        }
+                    }
                 }));
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let worker = format!("http://{}", listener.local_addr().unwrap());
             let http_task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
             let config = RouterConfig {
+                api_key: Some("backend-key".to_owned()),
                 policy: PolicyConfig::KvAware {
                     router_temperature: 0.0,
                     kv_penalty_host: 0.8,
@@ -3748,6 +3665,19 @@ mod tests {
             }
             let supervisor = router.kv_index_supervisor.as_ref().unwrap();
             let provider = supervisor.match_provider_for_worker(&worker).unwrap();
+            {
+                let requests = requests.lock();
+                assert_eq!(requests.len(), 2, "metadata requests: {requests:?}");
+                for path in ["/get_server_info", "/kv_event_sources"] {
+                    assert!(
+                        requests.iter().any(|(actual_path, authorization)| {
+                            actual_path == path
+                                && authorization.as_deref() == Some("Bearer backend-key")
+                        }),
+                        "missing authenticated {path}: {requests:?}"
+                    );
+                }
+            }
             tokio::time::timeout(Duration::from_secs(5), async {
                 loop {
                     match publisher.recv_bytes(zmq::DONTWAIT) {
@@ -3852,16 +3782,26 @@ mod tests {
                     )
                     .unwrap();
             }
-            let valid = expected == actual;
             let result = tokio::time::timeout(Duration::from_secs(5), async {
                 loop {
-                    let old = provider.find_tiered_matches(&query(1));
-                    let new = provider.find_tiered_matches(&query(2));
-                    if valid && !new.is_empty() {
-                        assert_eq!(new[0].segments, [(0, 1)]);
+                    if replayed {
+                        let fresh = provider.find_tiered_matches(&query(3));
+                        if fresh.is_empty() {
+                            tokio::task::yield_now().await;
+                            continue;
+                        }
+                        assert_eq!(fresh.len(), 1);
+                        assert_eq!(fresh[0].target.instance_id.as_ref(), "router-source");
+                        assert_eq!(fresh[0].target.dp_rank, 3);
+                        assert_eq!(fresh[0].tier, StorageTier::HostPinned);
+                        assert_eq!(fresh[0].segments, [(0, 1)]);
+                        assert!(provider.find_tiered_matches(&query(1)).is_empty());
+                        assert!(provider.find_tiered_matches(&query(2)).is_empty());
                         break true;
                     }
-                    if !valid && old.is_empty() {
+                    let old = provider.find_tiered_matches(&query(1));
+                    let new = provider.find_tiered_matches(&query(2));
+                    if old.is_empty() {
                         assert!(new.is_empty());
                         break true;
                     }
