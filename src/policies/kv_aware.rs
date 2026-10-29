@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
-use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -155,11 +155,16 @@ pub fn kv_aware_ops(policy: &dyn LoadBalancingPolicy) -> Option<&dyn KvAwareOps>
 pub struct KvRequestSlot {
     manager: Arc<dyn SlotManager>,
     target: RoutableTarget,
+    accounting: Arc<Mutex<KvSlotAccounting>>,
+}
+
+struct KvSlotAccounting {
     prefill_tokens: u64,
     /// Affinity binding reference acquired with this reservation, if any.
     affinity: Option<Arc<AffinityRecord>>,
+    sequence: u64,
     // 0 = prefill, 1 = decode, 2 = freed.
-    state: Arc<AtomicU8>,
+    state: u8,
 }
 
 impl KvRequestSlot {
@@ -172,45 +177,82 @@ impl KvRequestSlot {
         Self {
             manager,
             target,
-            prefill_tokens,
-            affinity,
-            state: Arc::new(AtomicU8::new(0)),
+            accounting: Arc::new(Mutex::new(KvSlotAccounting {
+                prefill_tokens,
+                affinity,
+                sequence: 0,
+                state: 0,
+            })),
         }
     }
 
+    /// Replace this request's remaining prefill work with a newer worker snapshot.
+    pub fn update_prefill_progress(&self, sequence: u64, remaining_tokens: u64) {
+        let mut accounting = self.accounting.lock();
+        if accounting.state == 2 || sequence <= accounting.sequence {
+            return;
+        }
+        let previous = accounting.prefill_tokens;
+        accounting.prefill_tokens = remaining_tokens;
+        accounting.sequence = sequence;
+        self.manager
+            .adjust_prefill(&self.target, previous, remaining_tokens);
+        self.trace_ledger("progress", previous, remaining_tokens);
+    }
+
     pub fn begin_decode(&self) {
-        if self
-            .state
-            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-        {
+        let mut accounting = self.accounting.lock();
+        if accounting.state == 0 {
+            accounting.state = 1;
+            let prefill_tokens = std::mem::take(&mut accounting.prefill_tokens);
             self.manager
-                .begin_decode(&self.target, &self.target, self.prefill_tokens);
+                .begin_decode(&self.target, &self.target, prefill_tokens);
+            self.trace_ledger("first_output", prefill_tokens, 0);
         }
     }
 
     pub fn release(&self) {
-        self.begin_decode();
-        if self
-            .state
-            .compare_exchange(1, 2, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-        {
+        let mut accounting = self.accounting.lock();
+        if accounting.state != 2 {
+            accounting.state = 2;
+            let prefill_tokens = std::mem::take(&mut accounting.prefill_tokens);
+            self.manager.adjust_prefill(&self.target, prefill_tokens, 0);
             self.manager.free(&self.target);
-            if let Some(record) = &self.affinity {
+            if let Some(record) = &accounting.affinity {
                 record.release_ref();
             }
+            self.trace_ledger("release", prefill_tokens, 0);
+        }
+    }
+
+    /// Debug-only view of the per-target ledger after a transition. Disabled
+    /// by default; carries no request identity.
+    fn trace_ledger(&self, event: &'static str, old_tokens: u64, new_tokens: u64) {
+        if tracing::enabled!(target: "kv_ledger", tracing::Level::DEBUG) {
+            let sample = self.manager.sample(&self.target);
+            tracing::debug!(
+                target: "kv_ledger",
+                event,
+                instance = %self.target.instance_id,
+                dp_rank = self.target.dp_rank,
+                old_tokens,
+                new_tokens,
+                active_prefill_tokens = sample.active_prefill_tokens,
+                active_requests = sample.active_requests,
+                "kv slot ledger"
+            );
         }
     }
 }
 
 impl std::fmt::Debug for KvRequestSlot {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let accounting = self.accounting.lock();
         formatter
             .debug_struct("KvRequestSlot")
             .field("target", &self.target)
-            .field("prefill_tokens", &self.prefill_tokens)
-            .field("state", &self.state.load(Ordering::Relaxed))
+            .field("prefill_tokens", &accounting.prefill_tokens)
+            .field("state", &accounting.state)
             .finish()
     }
 }
@@ -227,6 +269,7 @@ pub trait LoadProvider: Send + Sync {
 
 pub trait SlotManager: LoadProvider {
     fn begin_prefill(&self, target: &RoutableTarget, prefill_tokens: u64);
+    fn adjust_prefill(&self, target: &RoutableTarget, old_tokens: u64, new_tokens: u64);
     fn begin_decode(
         &self,
         prefill_target: &RoutableTarget,
@@ -311,6 +354,17 @@ impl SlotManager for InMemorySlotManager {
             slot.active_prefill_tokens
                 .fetch_add(prefill_tokens, Ordering::AcqRel);
             slot.active_requests.fetch_add(1, Ordering::AcqRel);
+        });
+    }
+
+    fn adjust_prefill(&self, target: &RoutableTarget, old_tokens: u64, new_tokens: u64) {
+        self.update_or_insert(target, |slot| {
+            if new_tokens >= old_tokens {
+                slot.active_prefill_tokens
+                    .fetch_add(new_tokens - old_tokens, Ordering::AcqRel);
+            } else {
+                atomic_saturating_sub_u64(&slot.active_prefill_tokens, old_tokens - new_tokens);
+            }
         });
     }
 
@@ -1963,6 +2017,53 @@ mod tests {
         slots.free(&decode);
         slots.free(&decode); // duplicate cleanup saturates
         assert_eq!(slots.sample(&decode).active_requests, 0);
+    }
+
+    #[test]
+    fn request_slot_tracks_reprefill_after_first_output_until_release() {
+        let manager = Arc::new(InMemorySlotManager::new());
+        let target = target("worker", 0);
+        manager.begin_prefill(&target, 100);
+        manager.begin_prefill(&target, 50);
+        let slot = KvRequestSlot::new(manager.clone(), target.clone(), 100, None);
+
+        slot.update_prefill_progress(1, 60);
+        slot.begin_decode();
+        assert_eq!(manager.sample(&target).active_prefill_tokens, 50);
+
+        slot.update_prefill_progress(2, 40);
+        slot.begin_decode();
+        assert_eq!(manager.sample(&target).active_prefill_tokens, 90);
+        assert_eq!(manager.sample(&target).active_requests, 2);
+
+        slot.release();
+        slot.update_prefill_progress(3, 80);
+        slot.release();
+        assert_eq!(
+            manager.sample(&target),
+            LoadSample {
+                active_prefill_tokens: 50,
+                active_requests: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn request_slot_replaces_prefill_estimate_with_newer_snapshots() {
+        let manager = Arc::new(InMemorySlotManager::new());
+        let target = target("worker", 0);
+        manager.begin_prefill(&target, 100);
+        let slot = KvRequestSlot::new(manager.clone(), target.clone(), 100, None);
+
+        slot.update_prefill_progress(2, 60);
+        slot.update_prefill_progress(1, 90);
+        assert_eq!(manager.sample(&target).active_prefill_tokens, 60);
+
+        slot.begin_decode();
+        slot.update_prefill_progress(3, 0);
+        assert_eq!(manager.sample(&target).active_prefill_tokens, 0);
+        slot.release();
+        assert_eq!(manager.sample(&target), LoadSample::default());
     }
 
     #[test]

@@ -142,6 +142,33 @@ fn http_kv_input(body: &serde_json::Value, route: &str) -> Result<HttpKvInput, &
     Ok(HttpKvInput::Render { path })
 }
 
+/// Router-tokenized prompts for every worker. The same cache-identity checks
+/// as the HTTP render path apply, so an input the event index cannot key
+/// earns no credit on either transport.
+pub(crate) fn prepared_token_inputs(
+    urls: Vec<String>,
+    body: &serde_json::Value,
+    route: &str,
+    token_ids: &[u32],
+) -> std::collections::HashMap<String, Result<HttpTokenInput, &'static str>> {
+    let result = http_kv_input(body, route).map(|_| HttpTokenInput {
+        prompts: Arc::from(vec![token_ids.to_vec()]),
+        source: "prepared",
+    });
+    urls.into_iter()
+        .map(|url| {
+            let result = match &result {
+                Ok(input) => Ok(HttpTokenInput {
+                    prompts: input.prompts.clone(),
+                    source: input.source,
+                }),
+                Err(reason) => Err(*reason),
+            };
+            (url, result)
+        })
+        .collect()
+}
+
 /// Backend-effective prompts, shared by colocated and PD routing policies.
 pub(crate) struct HttpTokenInput {
     pub prompts: Arc<[Vec<u32>]>,

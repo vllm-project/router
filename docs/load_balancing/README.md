@@ -279,6 +279,8 @@ In P/D mode, affinity applies only to decode. A busy decoder may be replaced by 
 
 Multiple router replicas need ingress stickiness to preserve affinity.
 
+Worker-reported prefill progress is opt-in and disabled by default. To enable it for `kv_aware` gRPC workers, including the prefill stage of gRPC P/D, set `--prefill-progress-stale-after-secs <seconds>`. The value is Router's receipt-age threshold: after that much time without a newer valid snapshot, Router marks the last-known reservation stale and keeps it (it does not assume the request completed). The value must be at least 2 seconds and less than `--request-timeout-secs`. Worker capability is checked before Router requests progress; unsupported workers continue with the admission estimate. This setting does not create a worker refresh interval, so it does not guarantee updates at a fixed cadence.
+
 ---
 
 ## Choosing a Policy
@@ -338,3 +340,8 @@ vllm-router \
 This allows optimizing each stage independently:
 - **Prefill**: Use `consistent_hash` for cache locality
 - **Decode**: Inherits the main policy; override with `--decode-policy` (for example `round_robin`)
+
+`grpc://` prefill and decode workers must run vLLM ≥ 0.30.0. The router
+warns at startup when a worker reports an older `engine_version`, and
+`power_of_two` uses the router's local load counts for them. See
+[gRPC P/D disaggregation](../backend/grpc.md#pd-disaggregation).

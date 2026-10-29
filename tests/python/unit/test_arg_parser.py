@@ -72,6 +72,21 @@ class TestKvLauncherArgs:
 class TestRouterArgs:
     """Test RouterArgs dataclass and its methods."""
 
+    @pytest.mark.parametrize("use_router_prefix", [False, True])
+    def test_prefill_progress_is_explicitly_enabled(self, use_router_prefix):
+        parser = argparse.ArgumentParser()
+        RouterArgs.add_cli_args(parser, use_router_prefix=use_router_prefix)
+        disabled = RouterArgs.from_cli_args(
+            parser.parse_args([]), use_router_prefix=use_router_prefix
+        )
+        assert disabled.prefill_progress_stale_after_secs is None
+        prefix = "router-" if use_router_prefix else ""
+        enabled = RouterArgs.from_cli_args(
+            parser.parse_args([f"--{prefix}prefill-progress-stale-after-secs", "5"]),
+            use_router_prefix=use_router_prefix,
+        )
+        assert enabled.prefill_progress_stale_after_secs == 5
+
     def test_default_values(self):
         """Test that RouterArgs has correct default values."""
         args = RouterArgs()

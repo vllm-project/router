@@ -1,7 +1,8 @@
-//! In-process vLLM 0.29 `Inference` gRPC worker for router tests.
+//! In-process vLLM `Inference` gRPC worker for router tests.
 //!
 //! Also serves `grpc.health.v1` as `SERVING` so `Router::new` startup
-//! probes pass. Used by `tests/rust/grpc_vs_http_e2e.rs`. Records `token_ids`
+//! probes pass, and records `Control.Abort` calls. Used by
+//! `tests/rust/grpc_vs_http_e2e.rs`. Records `token_ids`
 //! vs text prompt on each `GenerateStream`. Not Python EngineCore.
 
 #![allow(dead_code)]
@@ -9,12 +10,16 @@
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::Stream;
 use tonic::{transport::Server, Request, Response, Status};
+use vllm_router_rs::backend::convert::{json_to_proto_struct, proto_struct_to_json};
 use vllm_router_rs::backend::pb::{
+    self,
+    control_server::{Control, ControlServer},
     finish_info, generate_request,
     inference_server::{Inference, InferenceServer},
     FinishInfo, GenerateRequest, GenerateResponse, PromptInfo, SequenceOutput, TokenIds,
@@ -26,6 +31,17 @@ pub struct CapturedGrpcGenerate {
     pub had_text_prompt: bool,
     pub model: String,
     pub cache_salt: String,
+    pub request_id: String,
+    pub max_new_tokens: u32,
+    pub min_new_tokens: u32,
+    pub kv_transfer_params: Option<serde_json::Value>,
+    /// Unary `Generate` rather than `GenerateStream`.
+    pub unary: bool,
+    /// `x-data-parallel-rank` request metadata.
+    pub dp_rank: Option<String>,
+    /// `GenerateRequest.include_prefill_progress`.
+    pub include_prefill_progress: bool,
+    pub received_at: Option<Instant>,
 }
 
 #[derive(Clone)]
@@ -38,6 +54,24 @@ pub struct MockVllmRs {
     pub frames: Option<Vec<(String, Vec<u32>)>>,
     pub capture_limit: usize,
     pub failures_remaining: Arc<AtomicUsize>,
+    /// Returned in `FinishInfo.kv_transfer_params`, as a P/D prefill engine does.
+    pub finish_kv_transfer_params: Option<serde_json::Value>,
+    /// Wait before sending any output, as a long prefill would.
+    pub reply_delay: Duration,
+    /// Streams the client cancelled before their first output.
+    pub cancelled: Arc<AtomicUsize>,
+    /// Streams to fail with a gRPC error after their prompt info, i.e.
+    /// after the stream has opened.
+    pub stream_failures_remaining: Arc<AtomicUsize>,
+    /// Requests to finish with `FinishReason::Aborted` instead of `Stop`.
+    pub aborted_finishes_remaining: Arc<AtomicUsize>,
+    /// Request ids received by `Control.Abort`.
+    pub aborts: Arc<Mutex<Vec<String>>>,
+    /// `ServerInfo.supports_prefill_progress`.
+    pub supports_prefill_progress: bool,
+    /// Remaining-work snapshots sent, in order, before `reply_delay` on
+    /// streams that opted into prefill progress.
+    pub prefill_progress: Vec<u32>,
 }
 
 impl Default for MockVllmRs {
@@ -48,6 +82,14 @@ impl Default for MockVllmRs {
             frames: None,
             capture_limit: usize::MAX,
             failures_remaining: Arc::new(AtomicUsize::new(0)),
+            finish_kv_transfer_params: None,
+            reply_delay: Duration::ZERO,
+            cancelled: Arc::new(AtomicUsize::new(0)),
+            stream_failures_remaining: Arc::new(AtomicUsize::new(0)),
+            aborted_finishes_remaining: Arc::new(AtomicUsize::new(0)),
+            aborts: Arc::new(Mutex::new(Vec::new())),
+            supports_prefill_progress: false,
+            prefill_progress: Vec::new(),
         }
     }
 }
@@ -74,10 +116,12 @@ impl MockVllmRsServer {
             .set_service_status("", tonic_health::ServingStatus::Serving)
             .await;
         let svc = InferenceServer::new(state.clone());
+        let control = ControlServer::new(state.clone());
         let handle = tokio::spawn(async move {
             Server::builder()
                 .add_service(health_service)
                 .add_service(svc)
+                .add_service(control)
                 .serve_with_incoming(incoming)
                 .await
                 .unwrap();
@@ -95,6 +139,10 @@ impl MockVllmRsServer {
     pub fn captured(&self) -> Vec<CapturedGrpcGenerate> {
         self.state.captured.lock().unwrap().clone()
     }
+
+    pub fn aborts(&self) -> Vec<String> {
+        self.state.aborts.lock().unwrap().clone()
+    }
 }
 
 type ResponseStream = Pin<Box<dyn Stream<Item = Result<GenerateResponse, Status>> + Send>>;
@@ -107,7 +155,16 @@ impl Inference for MockVllmRs {
         &self,
         request: Request<GenerateRequest>,
     ) -> Result<Response<GenerateResponse>, Status> {
+        // vLLM accepts progress opt-in only on GenerateStream.
+        if request.get_ref().include_prefill_progress {
+            return Err(Status::invalid_argument(
+                "include_prefill_progress requires GenerateStream",
+            ));
+        }
         let mut stream = self.generate_stream(request).await?.into_inner();
+        if let Some(last) = self.captured.lock().unwrap().last_mut() {
+            last.unary = true;
+        }
         let mut text = String::new();
         let mut prompt_info = None;
         let mut finish = None;
@@ -133,6 +190,7 @@ impl Inference for MockVllmRs {
                 finish_info: finish,
                 ..Default::default()
             }),
+            prefill_progress: None,
         }))
     }
 
@@ -140,7 +198,14 @@ impl Inference for MockVllmRs {
         &self,
         request: Request<GenerateRequest>,
     ) -> Result<Response<Self::GenerateStreamStream>, Status> {
+        let dp_rank = request
+            .metadata()
+            .get("x-data-parallel-rank")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
         let req = request.into_inner();
+        let include_prefill_progress = req.include_prefill_progress;
+        let progress_request_id = req.request_id.clone();
         let (token_ids, had_text_prompt) = match req.prompt {
             Some(generate_request::Prompt::TokenIds(TokenIds { ids })) => (ids, false),
             Some(generate_request::Prompt::Text(_)) => (Vec::new(), true),
@@ -149,11 +214,27 @@ impl Inference for MockVllmRs {
         {
             let mut captured = self.captured.lock().unwrap();
             if captured.len() < self.capture_limit {
+                let stopping = req.stopping.unwrap_or_default();
                 captured.push(CapturedGrpcGenerate {
                     token_ids: token_ids.clone(),
                     had_text_prompt,
                     model: req.model,
-                    cache_salt: req.kv.map(|kv| kv.cache_salt).unwrap_or_default(),
+                    cache_salt: req
+                        .kv
+                        .as_ref()
+                        .map(|kv| kv.cache_salt.clone())
+                        .unwrap_or_default(),
+                    request_id: req.request_id,
+                    max_new_tokens: stopping.max_new_tokens,
+                    min_new_tokens: stopping.min_new_tokens,
+                    kv_transfer_params: req
+                        .kv
+                        .and_then(|kv| kv.kv_transfer_params)
+                        .map(|params| proto_struct_to_json(&params)),
+                    unary: false,
+                    dp_rank,
+                    include_prefill_progress,
+                    received_at: Some(Instant::now()),
                 });
             }
         }
@@ -172,7 +253,53 @@ impl Inference for MockVllmRs {
             .clone()
             .unwrap_or_else(|| vec![(self.reply_text.clone(), vec![7, 8, 9])]);
         let n_prompt = token_ids.len() as u32;
+        let finish_kv = self
+            .finish_kv_transfer_params
+            .as_ref()
+            .map(|params| json_to_proto_struct(params).expect("JSON object"));
+        let reply_delay = self.reply_delay;
+        let cancelled = self.cancelled.clone();
+        let progress = if include_prefill_progress {
+            self.prefill_progress.clone()
+        } else {
+            Vec::new()
+        };
+        let fail_stream = self
+            .stream_failures_remaining
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+            .is_ok();
+        let finish_reason = if self
+            .aborted_finishes_remaining
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+            .is_ok()
+        {
+            finish_info::FinishReason::Aborted
+        } else {
+            finish_info::FinishReason::Stop
+        };
         tokio::spawn(async move {
+            for (index, remaining) in progress.into_iter().enumerate() {
+                let snapshot = GenerateResponse {
+                    prefill_progress: Some(pb::PrefillProgress {
+                        request_id: progress_request_id.clone(),
+                        sequence: index as u64 + 1,
+                        prompt_tokens: n_prompt,
+                        remaining_compute_tokens: remaining,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                };
+                if tx.send(Ok(snapshot)).await.is_err() {
+                    return;
+                }
+            }
+            tokio::select! {
+                _ = tokio::time::sleep(reply_delay) => {}
+                _ = tx.closed() => {
+                    cancelled.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
+            }
             let _ = tx
                 .send(Ok(GenerateResponse {
                     prompt_info: Some(PromptInfo {
@@ -180,14 +307,21 @@ impl Inference for MockVllmRs {
                         ..Default::default()
                     }),
                     outputs: None,
+                    prefill_progress: None,
                 }))
                 .await;
+            if fail_stream {
+                let _ = tx.send(Err(Status::internal("decode failed"))).await;
+                return;
+            }
             let last = frames.len().saturating_sub(1);
             let total: u32 = frames.iter().map(|(_, ids)| ids.len() as u32).sum();
+            let mut finish_kv = finish_kv;
             for (index, (text, token_ids)) in frames.into_iter().enumerate() {
                 let finish_info = (index == last).then(|| FinishInfo {
                     num_output_tokens: total,
-                    finish_reason: finish_info::FinishReason::Stop as i32,
+                    finish_reason: finish_reason as i32,
+                    kv_transfer_params: finish_kv.take(),
                     ..Default::default()
                 });
                 let sent = tx
@@ -201,6 +335,7 @@ impl Inference for MockVllmRs {
                             finish_info,
                             ..Default::default()
                         }),
+                        prefill_progress: None,
                     }))
                     .await;
                 if sent.is_err() {
@@ -210,4 +345,76 @@ impl Inference for MockVllmRs {
         });
         Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
     }
+}
+
+macro_rules! mock_control {
+    ($($method:ident($request:ident) -> $response:ident;)*) => {
+        /// Records `Abort` and serves model and server info; every other
+        /// Control RPC is unimplemented.
+        #[tonic::async_trait]
+        impl Control for MockVllmRs {
+            async fn abort(
+                &self,
+                request: Request<pb::AbortRequest>,
+            ) -> Result<Response<pb::AbortResponse>, Status> {
+                self.aborts
+                    .lock()
+                    .unwrap()
+                    .extend(request.into_inner().request_ids);
+                Ok(Response::new(pb::AbortResponse {}))
+            }
+
+            async fn get_model_info(
+                &self,
+                _request: Request<pb::GetModelInfoRequest>,
+            ) -> Result<Response<pb::ModelInfo>, Status> {
+                Ok(Response::new(pb::ModelInfo {
+                    model_id: "mock-model".into(),
+                    supports_token_ids_input: true,
+                    ..Default::default()
+                }))
+            }
+
+            async fn get_server_info(
+                &self,
+                _request: Request<pb::GetServerInfoRequest>,
+            ) -> Result<Response<pb::ServerInfo>, Status> {
+                Ok(Response::new(pb::ServerInfo {
+                    engine_version: "mock".into(),
+                    supports_prefill_progress: self.supports_prefill_progress,
+                    ..Default::default()
+                }))
+            }
+
+            $(
+                async fn $method(
+                    &self,
+                    _request: Request<pb::$request>,
+                ) -> Result<Response<pb::$response>, Status> {
+                    Err(Status::unimplemented(stringify!($method)))
+                }
+            )*
+        }
+    };
+}
+
+mock_control! {
+    shutdown(ShutdownRequest) -> ShutdownResponse;
+    load_lora(LoadLoraRequest) -> LoadLoraResponse;
+    unload_lora(UnloadLoraRequest) -> UnloadLoraResponse;
+    list_loras(ListLorasRequest) -> ListLorasResponse;
+    get_kv_event_sources(GetKvEventSourcesRequest) -> GetKvEventSourcesResponse;
+    pause_generation(PauseGenerationRequest) -> PauseGenerationResponse;
+    resume_generation(ResumeGenerationRequest) -> ResumeGenerationResponse;
+    is_paused(IsPausedRequest) -> IsPausedResponse;
+    sleep(SleepRequest) -> SleepResponse;
+    wake_up(WakeUpRequest) -> WakeUpResponse;
+    is_sleeping(IsSleepingRequest) -> IsSleepingResponse;
+    init_weight_transfer_engine(InitWeightTransferEngineRequest) -> InitWeightTransferEngineResponse;
+    start_weight_update(StartWeightUpdateRequest) -> StartWeightUpdateResponse;
+    start_draft_weight_update(StartDraftWeightUpdateRequest) -> StartDraftWeightUpdateResponse;
+    update_weights(UpdateWeightsRequest) -> UpdateWeightsResponse;
+    finish_weight_update(FinishWeightUpdateRequest) -> FinishWeightUpdateResponse;
+    update_weight_version(UpdateWeightVersionRequest) -> UpdateWeightVersionResponse;
+    get_weight_version(GetWeightVersionRequest) -> GetWeightVersionResponse;
 }

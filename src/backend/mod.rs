@@ -43,8 +43,8 @@ pub use completion::{
     CompletionPreparationError,
 };
 pub use control::{
-    get_grpc_model_info, get_grpc_server_info, model_info_json, openai_models_json,
-    server_info_json,
+    get_grpc_model_info, get_grpc_server_info, grpc_engine_version_older_than_0_30,
+    model_info_json, openai_models_json, server_info_json, warn_old_grpc_pd_workers,
 };
 pub use convert::prepare_grpc_completion;
 pub use detect::{
@@ -73,7 +73,7 @@ pub(crate) mod stream_output {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
-    use tokio::sync::mpsc::UnboundedSender;
+    use tokio::sync::mpsc::Sender;
 
     pub(crate) struct OutputFrameProducer {
         first_output: Arc<AtomicUsize>,
@@ -102,13 +102,16 @@ pub(crate) mod stream_output {
     }
 
     impl OutputFrameProducer {
-        /// Own both indexing and enqueueing so every emitted chunk is counted.
-        pub(crate) fn send<T, E>(
+        /// Reserve bounded capacity before publishing a frame's output marker.
+        pub(crate) async fn send<T, E>(
             &mut self,
-            tx: &UnboundedSender<Result<T, E>>,
+            tx: &Sender<Result<T, E>>,
             chunk: T,
             has_generated_output: bool,
         ) -> bool {
+            let Ok(permit) = tx.reserve().await else {
+                return false;
+            };
             let next = self.emitted.saturating_add(1);
             if has_generated_output {
                 let _ = self.first_output.compare_exchange(
@@ -118,9 +121,7 @@ pub(crate) mod stream_output {
                     Ordering::Relaxed,
                 );
             }
-            if tx.send(Ok(chunk)).is_err() {
-                return false;
-            }
+            permit.send(Ok(chunk));
             self.emitted = next;
             true
         }
@@ -139,14 +140,14 @@ pub(crate) mod stream_output {
     mod tests {
         use super::*;
 
-        #[test]
-        fn queued_output_does_not_transition_an_earlier_metadata_frame() {
-            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Result<&str, ()>>();
+        #[tokio::test]
+        async fn queued_output_does_not_transition_an_earlier_metadata_frame() {
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<&str, ()>>(4);
             let (mut producer, mut consumer) = output_frame_tracking();
-            assert!(producer.send(&tx, "prompt info", false));
-            assert!(producer.send(&tx, "first token", true));
-            assert!(producer.send(&tx, "second token", true));
-            assert!(producer.send(&tx, "usage", false));
+            assert!(producer.send(&tx, "prompt info", false).await);
+            assert!(producer.send(&tx, "first token", true).await);
+            assert!(producer.send(&tx, "second token", true).await);
+            assert!(producer.send(&tx, "usage", false).await);
 
             for (chunk, started) in [
                 ("prompt info", false),
@@ -159,29 +160,29 @@ pub(crate) mod stream_output {
             }
         }
 
-        #[test]
-        fn metadata_and_terminal_chunks_never_signal_model_output() {
-            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Result<&str, ()>>();
+        #[tokio::test]
+        async fn metadata_and_terminal_chunks_never_signal_model_output() {
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<&str, ()>>(4);
             let (mut producer, mut consumer) = output_frame_tracking();
             for chunk in ["stages", "prompt info", "error", "done"] {
-                assert!(producer.send(&tx, chunk, false));
+                assert!(producer.send(&tx, chunk, false).await);
                 assert_eq!(rx.try_recv().unwrap(), Ok(chunk));
                 assert!(!consumer.on_frame());
             }
         }
 
-        #[test]
-        fn consumer_can_catch_up_before_the_producer_generates_output() {
-            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Result<&str, ()>>();
+        #[tokio::test]
+        async fn consumer_can_catch_up_before_the_producer_generates_output() {
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<&str, ()>>(4);
             let (mut producer, mut consumer) = output_frame_tracking();
-            assert!(producer.send(&tx, "prompt info", false));
+            assert!(producer.send(&tx, "prompt info", false).await);
             assert_eq!(rx.try_recv().unwrap(), Ok("prompt info"));
             assert!(!consumer.on_frame());
-            assert!(producer.send(&tx, "first token", true));
+            assert!(producer.send(&tx, "first token", true).await);
             assert_eq!(rx.try_recv().unwrap(), Ok("first token"));
             assert!(consumer.on_frame());
             drop(rx);
-            assert!(!producer.send(&tx, "cancelled", true));
+            assert!(!producer.send(&tx, "cancelled", true).await);
         }
     }
 }

@@ -29,6 +29,38 @@ impl ConfigValidator {
         Self::validate_mode(&config.mode, has_service_discovery)?;
         Self::validate_policy(&config.policy)?;
         Self::validate_server_settings(config)?;
+        if let Some(stale_after) = config.prefill_progress_stale_after_secs {
+            if stale_after < 2 || stale_after >= config.request_timeout_secs {
+                return Err(ConfigError::InvalidValue {
+                    field: "prefill_progress_stale_after_secs".into(),
+                    value: stale_after.to_string(),
+                    reason: "Must be at least 2 seconds and less than request_timeout_secs".into(),
+                });
+            }
+            // Regular pools score by the main policy; P/D accepts progress
+            // for its prefill stage only, over gRPC workers.
+            let supported = match &config.mode {
+                RoutingMode::Regular { .. } => {
+                    matches!(config.policy, PolicyConfig::KvAware { .. })
+                }
+                RoutingMode::VllmPrefillDecode { prefill_urls, .. } => {
+                    matches!(
+                        config.mode.get_prefill_policy(&config.policy),
+                        PolicyConfig::KvAware { .. }
+                    ) && !prefill_urls.is_empty()
+                        && prefill_urls
+                            .iter()
+                            .all(|(url, _)| crate::backend::is_grpc_url(url))
+                }
+                _ => false,
+            };
+            if !supported {
+                return Err(ConfigError::IncompatibleConfig {
+                    reason: "Prefill progress requires kv_aware routing: regular gRPC                              workers, or a kv_aware prefill policy on gRPC P/D workers"
+                        .into(),
+                });
+            }
+        }
         if let Some(program_scheduling) = &config.program_scheduling {
             Self::validate_program_scheduling(program_scheduling)?;
         }
@@ -313,6 +345,18 @@ impl ConfigValidator {
                         prefill_urls.iter().map(|(url, _)| url.clone()).collect();
                     all.extend(decode_urls.iter().cloned());
                     Self::reject_mixed_worker_urls(&all)?;
+                }
+                // Discovered P/D workers register as http://, so a grpc://
+                // static pool would end up mixed at runtime.
+                let has_grpc_url = prefill_urls
+                    .iter()
+                    .map(|(url, _)| url.as_str())
+                    .chain(decode_urls.iter().map(String::as_str))
+                    .any(crate::backend::is_grpc_url);
+                if has_service_discovery && has_grpc_url {
+                    return Err(ConfigError::ValidationFailed {
+                        reason: "grpc:// P/D workers cannot be combined with service discovery, which registers http:// workers".to_string(),
+                    });
                 }
 
                 // Validate bootstrap ports
@@ -941,6 +985,74 @@ fn base_url_without_rank(url: &str) -> &str {
 mod tests {
     use super::*;
 
+    fn kv_aware_config() -> RouterConfig {
+        RouterConfig::new(
+            RoutingMode::Regular {
+                worker_urls: vec!["grpc://worker:8000".to_string()],
+            },
+            PolicyConfig::KvAware {
+                router_temperature: 0.0,
+                kv_penalty_host: 0.8,
+                kv_penalty_external: 0.6,
+                kv_penalty_disk: 0.3,
+                static_kv_event_sources: Default::default(),
+            },
+        )
+    }
+
+    #[test]
+    fn test_prefill_progress_stale_threshold_is_opt_in_and_bounded() {
+        let mut config = kv_aware_config();
+        assert!(ConfigValidator::validate(&config).is_ok());
+
+        config.prefill_progress_stale_after_secs = Some(10);
+        assert!(ConfigValidator::validate(&config).is_ok());
+
+        config.prefill_progress_stale_after_secs = Some(1);
+        assert!(ConfigValidator::validate(&config).is_err());
+
+        config.prefill_progress_stale_after_secs = Some(config.request_timeout_secs);
+        assert!(ConfigValidator::validate(&config).is_err());
+    }
+
+    #[test]
+    fn test_prefill_progress_requires_regular_kv_aware_routing() {
+        let mut config = kv_aware_config();
+        config.policy = PolicyConfig::Random;
+        config.prefill_progress_stale_after_secs = Some(10);
+        assert!(ConfigValidator::validate(&config).is_err());
+    }
+
+    #[test]
+    fn test_prefill_progress_accepts_kv_aware_grpc_pd_prefill() {
+        let pd = |scheme: &str, prefill_policy: Option<PolicyConfig>| {
+            let mut config = RouterConfig::new(
+                RoutingMode::VllmPrefillDecode {
+                    prefill_urls: vec![(format!("{scheme}://prefill:50051"), None)],
+                    decode_urls: vec![format!("{scheme}://decode:50052")],
+                    prefill_policy,
+                    decode_policy: Some(PolicyConfig::RoundRobin),
+                    discovery_address: None,
+                },
+                PolicyConfig::RoundRobin,
+            );
+            config.prefill_progress_stale_after_secs = Some(10);
+            config
+        };
+        let kv_aware = || PolicyConfig::KvAware {
+            router_temperature: 0.0,
+            kv_penalty_host: 0.8,
+            kv_penalty_external: 0.6,
+            kv_penalty_disk: 0.3,
+            static_kv_event_sources: Default::default(),
+        };
+        assert!(ConfigValidator::validate(&pd("grpc", Some(kv_aware()))).is_ok());
+        // HTTP P/D workers serve no progress stream.
+        assert!(ConfigValidator::validate(&pd("http", Some(kv_aware()))).is_err());
+        // The prefill stage, not the main policy, must be kv_aware.
+        assert!(ConfigValidator::validate(&pd("grpc", None)).is_err());
+    }
+
     #[test]
     fn session_affinity_ttl_is_optional_and_bounded() {
         let mut config = RouterConfig::new(
@@ -1543,5 +1655,36 @@ mod tests {
         };
         let err = ConfigValidator::validate(&config).unwrap_err().to_string();
         assert!(err.contains("requires a kv_aware prefill policy"), "{err}");
+    }
+
+    #[test]
+    fn test_grpc_pd_workers_reject_service_discovery() {
+        let pd_mode = |discovery_address: Option<String>| RoutingMode::VllmPrefillDecode {
+            prefill_urls: vec![("grpc://prefill:50051".to_string(), None)],
+            decode_urls: vec!["grpc://decode:50052".to_string()],
+            prefill_policy: None,
+            decode_policy: None,
+            discovery_address,
+        };
+
+        let zmq = RouterConfig::new(
+            pd_mode(Some("0.0.0.0:36367".to_string())),
+            PolicyConfig::Random,
+        );
+        let mut k8s = RouterConfig::new(pd_mode(None), PolicyConfig::Random);
+        k8s.discovery = Some(DiscoveryConfig {
+            enabled: true,
+            prefill_selector: vec![("role".to_string(), "prefill".to_string())]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        });
+        for config in [zmq, k8s] {
+            let err = ConfigValidator::validate(&config).unwrap_err();
+            assert!(err.to_string().contains("service discovery"), "{err}");
+        }
+
+        let static_only = RouterConfig::new(pd_mode(None), PolicyConfig::Random);
+        assert!(ConfigValidator::validate(&static_only).is_ok());
     }
 }

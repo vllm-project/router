@@ -224,11 +224,12 @@ impl PdLoadManager {
             decode: selection.decode.endpoint.clone(),
             prefill_worker: Mutex::new(None),
             decode_worker: Mutex::new(None),
-            prefill_tokens: selection.prefill.new_prefill_tokens,
             affinity: selection.decode.affinity.clone(),
             state: Mutex::new(AttemptState {
                 prefill: true,
                 decode: DecodeState::Pending,
+                prefill_tokens: selection.prefill.new_prefill_tokens,
+                progress_sequence: 0,
             }),
         }));
         Some((selection, attempt))
@@ -287,6 +288,11 @@ enum DecodeState {
 struct AttemptState {
     prefill: bool,
     decode: DecodeState,
+    /// This attempt's share of `active_prefill_tokens`; `None` counts it in
+    /// `unknown_prefill_requests` instead.
+    prefill_tokens: Option<u64>,
+    /// Last accepted worker progress snapshot.
+    progress_sequence: u64,
 }
 
 struct AttemptInner {
@@ -296,7 +302,6 @@ struct AttemptInner {
     decode: PdEndpoint,
     prefill_worker: Mutex<Option<Arc<dyn Worker>>>,
     decode_worker: Mutex<Option<Arc<dyn Worker>>>,
-    prefill_tokens: Option<u64>,
     /// Decode binding held alive until this attempt finishes.
     affinity: Option<Arc<AffinityRecord>>,
     state: Mutex<AttemptState>,
@@ -312,7 +317,7 @@ impl AttemptInner {
         let key = (Stage::Prefill, self.prefill.clone());
         if let Some(load) = loads.get_mut(&key) {
             load.prefill_requests -= 1;
-            if let Some(tokens) = self.prefill_tokens {
+            if let Some(tokens) = state.prefill_tokens {
                 load.active_prefill_tokens -= tokens;
             } else {
                 load.unknown_prefill_requests -= 1;
@@ -326,6 +331,26 @@ impl AttemptInner {
             worker.decrement_load();
         }
         state.prefill = false;
+    }
+
+    /// Replace this attempt's prefill work with a newer worker snapshot.
+    /// Unknown admission work becomes known; nothing changes once P is done.
+    fn update_prefill_progress(&self, sequence: u64, remaining_tokens: u64) {
+        let mut state = self.state.lock();
+        if !state.prefill || sequence <= state.progress_sequence {
+            return;
+        }
+        state.progress_sequence = sequence;
+        let mut loads = self.loads.lock();
+        let Some(load) = loads.get_mut(&(Stage::Prefill, self.prefill.clone())) else {
+            return;
+        };
+        match state.prefill_tokens.replace(remaining_tokens) {
+            Some(previous) => load.active_prefill_tokens -= previous,
+            None => load.unknown_prefill_requests -= 1,
+        }
+        load.active_prefill_tokens += remaining_tokens;
+        load.publish(Stage::Prefill, &self.prefill);
     }
 
     fn begin_decode(&self) {
@@ -425,6 +450,9 @@ impl PdAttempt {
 
     pub fn finish_prefill(&self) {
         self.0.finish_prefill();
+    }
+    pub fn update_prefill_progress(&self, sequence: u64, remaining_tokens: u64) {
+        self.0.update_prefill_progress(sequence, remaining_tokens);
     }
     pub fn begin_decode(&self) {
         self.0.begin_decode();

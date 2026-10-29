@@ -7352,9 +7352,8 @@ dependencies = [
 
 [[package]]
 name = "vllm-proto"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "24b93fe7d8a27c54819d60b372ca57eb6dd23445bdabcf7c70325fc9572e8cc8"
+version = "0.7.0"
+source = "git+https://github.com/vllm-project/vllm?rev=ce750e6e51c4267980736099cab4f6db85370021#ce750e6e51c4267980736099cab4f6db85370021"
 dependencies = [
  "prost 0.14.4",
  "prost-types",
@@ -7447,6 +7446,7 @@ dependencies = [
  "opentelemetry_sdk",
  "parking_lot",
  "portpicker",
+ "prost-types",
  "pyo3",
  "rand 0.9.5",
  "regex",

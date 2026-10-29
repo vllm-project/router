@@ -15,6 +15,39 @@ The current gRPC wire sends router-produced `token_ids`:
 This is the current backend contract, not a policy that gRPC can never support
 text prompts or richer payloads.
 
+## Prefill progress
+
+The gRPC-to-SSE queue holds at most 32 frames per request. A slow HTTP consumer
+backpressures only that request's producer; tokens, usage, and terminal frames
+keep their order. The absolute request deadline also bounds waits for queue
+capacity. On timeout, accepted frames drain before the body reports a transport
+error; no extra SSE queue slot is needed for that error. Dropping the body
+cancels the producer through the existing request cleanup path.
+
+Progress-only responses update accounting directly and never enter the SSE
+queue. Worker-side coalescing keeps only the latest pending pure-progress
+snapshot. Backpressure can delay receipt and stale detection, so receipt age
+alone is not an end-to-end freshness guarantee.
+
+For a regular `kv_aware` gRPC pool, or gRPC P/D workers with a `kv_aware`
+prefill policy, `--prefill-progress-stale-after-secs 5` opts in to worker
+progress; omitting the option preserves static admission accounting. In P/D,
+P's snapshots replace that request's share of the prefill stage's admitted
+tokens until P finishes. Unsupported workers retain that fallback. The threshold must be
+at least 2 seconds and less than `--request-timeout-secs`.
+
+Only newer snapshots for the current request update the reservation or its
+receipt time. Stale progress increments
+`vllm_router_prefill_progress_stale_total` and retains the last-known balance;
+`vllm_router_prefill_progress_update_gap_seconds` records gaps between valid
+snapshots, and `vllm_router_prefill_progress_updates_total{outcome}` counts
+accepted snapshots and those ignored for a different request identity or a
+non-increasing sequence. With `RUST_LOG=kv_ledger=debug`, each reservation
+transition logs the resulting per-target ledger. Receipt age is not sample age. Prefill can resume after first
+output, and completion, errors and cancellation release the current balance
+exactly once. The overall gRPC request deadline is independent of progress;
+incoming progress frames do not reset it.
+
 ## API Compatibility
 
 Support status of the OpenAI HTTP surface when the worker pool is `grpc://`:
@@ -199,6 +232,37 @@ Multimodal content also currently returns 400 on the gRPC path. The proto has
 `GenerateRequest.media`, but the router does not yet populate it from OpenAI
 chat content. Supporting it requires mapping OpenAI image/media parts into the
 proto media fields and adding parity tests against vLLM HTTP behavior.
+
+## P/D Disaggregation
+
+`--vllm-pd-disaggregation` accepts all-`grpc://` prefill and decode pools.
+The router tokenizes the chat once, before P/D admission, so `kv_aware` scores
+P by those tokens; both legs reuse them. It sends P a one-token prefill and D a
+`GenerateStream`, both carrying the connector's JSON in
+`GenerateRequest.kv.kv_transfer_params`. P's leg is a unary `Generate`, or a
+`GenerateStream` when prefill progress is on and P supports it.
+P's `FinishInfo.kv_transfer_params` is handed to D. NIXL push mode runs both
+legs concurrently once P's push identity is cached.
+
+**P/D workers must run vLLM ≥ 0.30.0.** v0.29.x passes integer connector
+fields such as ports to the engine as floats, so every decode finishes
+`abort` with no tokens. Those workers still pass the gRPC health probe.
+At startup the router reads each gRPC P/D worker's `engine_version` and
+warns when it is older than 0.30.0. Colocated gRPC serving works on v0.29.
+
+A P or D leg that finishes `abort` fails the request. A streaming decode that
+fails after its stream opened still counts as a decode error. When a leg is
+dropped before it finishes, for example on client disconnect or a failed
+sibling leg, the router sends that worker `Control.Abort` for the engine
+request id, and repeats it once shortly after if the worker had not yet
+answered the RPC.
+
+The info endpoints behave as in colocated gRPC mode: `/v1/models`,
+`/get_model_info`, and `/get_server_info` are answered from the first prefill
+worker's gRPC control service, and `/health_generate` returns `501`.
+`/flush_cache` also returns `501`, because vLLM's gRPC control service has no
+cache reset. `power_of_two` uses the router's own in-flight counts, since
+`grpc://` workers serve no HTTP `/get_load`.
 
 ## Backend Modules
 
