@@ -6,7 +6,7 @@ use std::time::Duration;
 use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, info, warn};
 
-use crate::kv_index::admit::{validate_dense_batch, DenseBatchRejection};
+use crate::kv_index::admit::{validate_full_attention_batch, FullAttentionBatchRejection};
 use crate::kv_index::binding::SourceLease;
 use crate::kv_index::indexer::KvBlockIndexer;
 use crate::kv_index::types::{ClearScope, ResidencyOwner, SourceId, StorageTier};
@@ -163,7 +163,7 @@ fn spawn_inner(
         let mut last_seq: i64 = -1;
         let mut incarnation: u64 = 0;
         let mut suspended = false;
-        let mut dense_rejection_reported = false;
+        let mut full_attention_rejection_reported = false;
 
         loop {
             if is_shutdown(&mut shutdown_rx)
@@ -270,7 +270,7 @@ fn spawn_inner(
                                 signals.clone(),
                                 expected_block_size,
                                 &topic,
-                                &mut dense_rejection_reported,
+                                &mut full_attention_rejection_reported,
                                 binding.as_ref(),
                             )
                             .await
@@ -327,11 +327,11 @@ fn spawn_inner(
                                         &batch,
                                         expected_block_size,
                                     ) {
-                                        report_dense_rejection(
+                                        report_full_attention_rejection(
                                             rejection,
                                             &source_id,
                                             dp_rank,
-                                            &mut dense_rejection_reported,
+                                            &mut full_attention_rejection_reported,
                                         );
                                         indexer.invalidate_source(&source_id, dp_rank);
                                         suspended = true;
@@ -472,8 +472,8 @@ fn hash_str(h: &ExternalBlockHash) -> Arc<str> {
     }
 }
 
-fn report_dense_rejection(
-    rejection: DenseBatchRejection,
+fn report_full_attention_rejection(
+    rejection: FullAttentionBatchRejection,
     source_id: &SourceId,
     rank: u32,
     reported: &mut bool,
@@ -493,10 +493,10 @@ fn apply_batch(
     incarnation: u64,
     batch: &KVEventBatch,
     expected_block_size: Option<u32>,
-) -> Result<(), DenseBatchRejection> {
+) -> Result<(), FullAttentionBatchRejection> {
     // Preflight the whole batch before any Store, Remove, or Clear mutation.
     if let Some(expected) = expected_block_size {
-        validate_dense_batch(batch, expected)?;
+        validate_full_attention_batch(batch, expected)?;
     }
     // Batch rank if the 3-element array carries it; else the discovery rank.
     let rank = batch.data_parallel_rank.unwrap_or(dp_rank);
@@ -552,7 +552,7 @@ async fn replay(
     signals: Option<mpsc::Sender<IngestionSignal>>,
     expected_block_size: Option<u32>,
     topic: &str,
-    dense_rejection_reported: &mut bool,
+    full_attention_rejection_reported: &mut bool,
     binding: Option<&SubscriberBinding>,
 ) -> Option<i64> {
     let dealer = match ctx.socket(zmq::DEALER) {
@@ -629,11 +629,11 @@ async fn replay(
                                 &batch,
                                 expected_block_size,
                             ) {
-                                report_dense_rejection(
+                                report_full_attention_rejection(
                                     rejection,
                                     source_id,
                                     dp_rank,
-                                    dense_rejection_reported,
+                                    full_attention_rejection_reported,
                                 );
                                 false
                             } else {
@@ -689,7 +689,7 @@ mod tests {
     use parking_lot::Mutex;
 
     use super::*;
-    use crate::kv_index::admit::DenseRejectionReason;
+    use crate::kv_index::admit::FullAttentionRejectionReason;
     use crate::kv_index::indexer::MatchQuery;
     use crate::kv_index::types::Locality;
     use crate::kv_index::wire::{AllBlocksCleared, BlockRemoved, BlockStored};
@@ -748,7 +748,7 @@ mod tests {
             (None, Some(7), None, 0),
             (Some(""), Some(7), None, 0),
         ] {
-            for dense_only in [false, true] {
+            for full_attention_only in [false, true] {
                 let index = KvBlockIndexer::new();
                 let mut event = stored(
                     vec![ExternalBlockHash::Int(10)],
@@ -771,10 +771,10 @@ mod tests {
                             events: vec![KVEvent::BlockStored(event)],
                             data_parallel_rank: Some(0),
                         },
-                        dense_only.then_some(4),
+                        full_attention_only.then_some(4),
                     )
                     .is_ok(),
-                    !dense_only || expected > 0
+                    !full_attention_only || expected > 0
                 );
                 let query = MatchQuery {
                     group_idx: 0,
@@ -786,7 +786,7 @@ mod tests {
                 };
                 assert_eq!(
                     index.find_matches(&query).len(),
-                    if dense_only { expected } else { 1 }
+                    if full_attention_only { expected } else { 1 }
                 );
             }
         }
@@ -849,7 +849,7 @@ mod tests {
     }
 
     #[test]
-    fn dense_batch_rejects_unmodeled_residency_and_layout_atomically() {
+    fn full_attention_batch_rejects_unmodeled_residency_and_layout_atomically() {
         let source = SourceId::from("dense");
         let valid = stored(
             vec![ExternalBlockHash::Int(1)],
@@ -872,28 +872,28 @@ mod tests {
             let reason = match case {
                 "remote" => {
                     invalid.locality = Some("REMOTE".into());
-                    DenseRejectionReason::Residency
+                    FullAttentionRejectionReason::Residency
                 }
                 "local-pool" => {
                     invalid.locality = Some("LOCAL".into());
                     invalid.ownership = Some("pool".into());
-                    DenseRejectionReason::Residency
+                    FullAttentionRejectionReason::Residency
                 }
                 "unknown-medium" => {
                     invalid.medium = Some("unknown".into());
-                    DenseRejectionReason::Residency
+                    FullAttentionRejectionReason::Residency
                 }
                 "layout" => {
                     invalid.kv_cache_spec_kind = Some("sliding_attention".into());
-                    DenseRejectionReason::Layout
+                    FullAttentionRejectionReason::Layout
                 }
                 "sliding-window" => {
                     invalid.kv_cache_spec_sliding_window = Some(8);
-                    DenseRejectionReason::Layout
+                    FullAttentionRejectionReason::Layout
                 }
                 "token-count" => {
                     invalid.block_hashes.push(ExternalBlockHash::Int(3));
-                    DenseRejectionReason::TokenCountMismatch
+                    FullAttentionRejectionReason::TokenCountMismatch
                 }
                 _ => unreachable!(),
             };
@@ -907,7 +907,7 @@ mod tests {
             };
             assert_eq!(
                 apply_batch(&index, &source, 0, 0, &batch, Some(4)),
-                Err(DenseBatchRejection {
+                Err(FullAttentionBatchRejection {
                     reason,
                     event_index: 1
                 }),
@@ -1895,7 +1895,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dense_session_annotation_live_preserves_shared_blocks() {
+    async fn full_attention_session_annotation_live_preserves_shared_blocks() {
         let mut f = fixture_with_block_size(false, Some(4));
         let shared = [1, 2, 3, 4];
         let retained = [5, 6, 7, 8];
@@ -1936,7 +1936,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dense_session_annotation_replay_applies_shared_blocks() {
+    async fn full_attention_session_annotation_replay_applies_shared_blocks() {
         let context = zmq::Context::new();
         let replay_server = context.socket(zmq::ROUTER).unwrap();
         let endpoint = "inproc://kv-session-replay";
@@ -1982,10 +1982,10 @@ mod tests {
     }
 
     #[test]
-    fn dense_block_size_mismatch_preflights_stores_and_removes_atomically() {
+    fn full_attention_block_size_mismatch_preflights_stores_and_removes_atomically() {
         for (actual, reason) in [
-            (0, DenseRejectionReason::ZeroBlockSize),
-            (8, DenseRejectionReason::BlockSizeMismatch),
+            (0, FullAttentionRejectionReason::ZeroBlockSize),
+            (8, FullAttentionRejectionReason::BlockSizeMismatch),
         ] {
             let index = KvBlockIndexer::new();
             let source = SourceId::from("dense");
@@ -2020,7 +2020,7 @@ mod tests {
             };
             assert_eq!(
                 apply_batch(&index, &source, 0, 0, &batch, Some(4)),
-                Err(DenseBatchRejection {
+                Err(FullAttentionBatchRejection {
                     reason,
                     event_index: 3
                 })
@@ -2039,7 +2039,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dense_replay_block_size_mismatch_clears_partial_recovery() {
+    async fn full_attention_replay_block_size_mismatch_clears_partial_recovery() {
         for (expected, actual) in [(16, 8), (8, 16)] {
             let mut f = fixture_with_block_size(true, Some(expected));
             let old: Vec<u32> = (0..expected).collect();

@@ -325,10 +325,11 @@ impl Router {
         let pool_kind = crate::backend::classify_worker_urls(&worker_urls)?;
         let default_policy = ctx.policy_registry.get_default_policy();
         let pending_kv_supervisor = if kv_aware_ops(default_policy.as_ref()).is_some() {
-            let (mut supervisor, signals) = crate::kv_index::KvIndexSupervisor::new_http_dense(
-                ctx.client.clone(),
-                crate::kv_index::HashMode::Sha256,
-            );
+            let (mut supervisor, signals) =
+                crate::kv_index::KvIndexSupervisor::new_http_full_attention(
+                    ctx.client.clone(),
+                    crate::kv_index::HashMode::Sha256,
+                );
             supervisor.set_api_key(ctx.router_config.api_key.clone());
             let static_sources = match &ctx.router_config.policy {
                 crate::config::PolicyConfig::KvAware {
@@ -3485,7 +3486,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn discovered_http_sources_use_dense_admission_through_router_startup_and_add() {
+    async fn discovered_http_sources_use_full_attention_admission_through_router_startup_and_add() {
         use crate::config::{PolicyConfig, RouterConfig};
         use crate::kv_index::{MatchQuery, StorageTier};
         use axum::{routing::get, Json};

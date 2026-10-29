@@ -104,7 +104,7 @@ pub struct KvIndexSupervisor {
     client: reqwest::Client,
     api_key: Option<String>,
     hash_mode: HashMode,
-    dense_http: bool,
+    full_attention_http: bool,
     http_pd: bool,
     /// Explicit event sources override discovery for configured regular workers.
     static_sources: HashMap<String, StaticKvEventSources>,
@@ -147,7 +147,7 @@ impl KvIndexSupervisor {
             client,
             api_key: None,
             hash_mode,
-            dense_http: false,
+            full_attention_http: false,
             http_pd: false,
             static_sources: HashMap::new(),
             static_pd_sources: HashMap::new(),
@@ -161,16 +161,16 @@ impl KvIndexSupervisor {
         (supervisor, signal_rx)
     }
 
-    pub(crate) fn new_http_dense(
+    pub(crate) fn new_http_full_attention(
         client: reqwest::Client,
         hash_mode: HashMode,
     ) -> (Self, mpsc::Receiver<IngestionSignal>) {
         let (mut supervisor, signals) = Self::new(client, hash_mode);
-        supervisor.dense_http = true;
+        supervisor.full_attention_http = true;
         (supervisor, signals)
     }
 
-    /// HTTP P/D accepts the native Python control endpoints and dense KV
+    /// HTTP P/D accepts the native Python control endpoints and full-attention KV
     /// events.
     pub(crate) fn new_pd(
         client: reqwest::Client,
@@ -226,7 +226,7 @@ impl KvIndexSupervisor {
         }
         let grpc = crate::backend::is_grpc_url(worker_url);
         let static_source = self.static_sources.get(worker_url);
-        let dense_http = !grpc && self.dense_http;
+        let full_attention_http = !grpc && self.full_attention_http;
         match static_source {
             Some(config) => {
                 info!(
@@ -238,8 +238,13 @@ impl KvIndexSupervisor {
                 );
                 static_worker_discovery(worker_url, config)
             }
-            None if dense_http => {
-                discover_dense_http_worker(&self.client, worker_url, self.api_key.as_deref()).await
+            None if full_attention_http => {
+                discover_full_attention_http_worker(
+                    &self.client,
+                    worker_url,
+                    self.api_key.as_deref(),
+                )
+                .await
             }
             None => discover_worker(&self.client, worker_url, false, self.api_key.as_deref()).await,
         }
@@ -265,8 +270,9 @@ impl KvIndexSupervisor {
         observed: Option<Arc<AtomicBool>>,
     ) -> Result<WorkerKvInfo, String> {
         let grpc = crate::backend::is_grpc_url(worker_url);
-        let dense_http = !grpc && self.dense_http && !self.static_sources.contains_key(worker_url);
-        let dense = dense_http || (self.http_pd && !grpc);
+        let full_attention_http =
+            !grpc && self.full_attention_http && !self.static_sources.contains_key(worker_url);
+        let full_attention = full_attention_http || (self.http_pd && !grpc);
         let server_info = discovery.server_info.unwrap_or_else(|e| {
             warn!(
                 "kv_index {}: {} — falling back to URL as instance/model id",
@@ -375,9 +381,9 @@ impl KvIndexSupervisor {
             event_sources.push(ev);
         }
 
-        // Dense HTTP bindings require plain origins. Generic discovery retains
+        // Full-attention HTTP bindings require plain origins. Generic discovery retains
         // its backend-specific URI scope, including HTTP base paths.
-        let worker_origin = if dense_http {
+        let worker_origin = if full_attention_http {
             Some(super::endpoints::canonical_worker(worker_url)?.0)
         } else {
             None
@@ -493,7 +499,7 @@ impl KvIndexSupervisor {
                 indexer.clone(),
                 Some(self.signal_tx.clone()),
                 self.ctx.clone(),
-                dense.then_some(key.block_size),
+                full_attention.then_some(key.block_size),
                 live.lease.clone(),
             );
             info!(
@@ -718,10 +724,10 @@ fn static_worker_discovery(worker_url: &str, config: &StaticKvEventSources) -> W
         model_id: Ok(Some(model)),
     }
 }
-// Only the Dense HTTP adapter uses this optional control-metadata contract.
+// Only the full-attention HTTP adapter uses this optional control-metadata contract.
 // Generic discovery retains main's behavior and does not assume stock vLLM
 // exposes /get_server_info.
-async fn discover_dense_http_worker(
+async fn discover_full_attention_http_worker(
     client: &reqwest::Client,
     worker_url: &str,
     api_key: Option<&str>,
@@ -985,6 +991,7 @@ fn discovered_block_size(server_info: &ServerInfo) -> Option<u32> {
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use super::*;
+    use crate::kv_index::{MatchQuery, StorageTier};
 
     #[tokio::test]
     async fn configured_event_sources_skip_unavailable_control_discovery() {
@@ -1002,9 +1009,11 @@ mod tests {
             };
             let sources = HashMap::from([(worker_url.to_string(), source)]);
             // An explicit static entry must remain generic when
-            // installed by the HTTP Router's Dense-default constructor.
-            let (supervisor, _signals) =
-                KvIndexSupervisor::new_http_dense(reqwest::Client::new(), HashMode::Sha256);
+            // installed by the HTTP Router's full-attention constructor.
+            let (supervisor, _signals) = KvIndexSupervisor::new_http_full_attention(
+                reqwest::Client::new(),
+                HashMode::Sha256,
+            );
             let supervisor = supervisor.with_static_sources(sources);
 
             let mut info = supervisor.on_worker_added(worker_url).await.unwrap();
@@ -1315,13 +1324,15 @@ mod tests {
         (worker, task)
     }
 
-    async fn boundary_subscription(publisher: &zmq::Socket) {
+    async fn boundary_subscription(publisher: &zmq::Socket, topic: &str, skip_unsubscribe: bool) {
+        let subscribed = [b"\x01".as_slice(), topic.as_bytes()].concat();
+        let unsubscribed = [b"\x00".as_slice(), topic.as_bytes()].concat();
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 match publisher.recv_bytes(zmq::DONTWAIT) {
-                    Ok(frame) if frame == b"\x00kv/boundary" => continue,
+                    Ok(frame) if skip_unsubscribe && frame == unsubscribed => continue,
                     Ok(frame) => {
-                        assert_eq!(frame, b"\x01kv/boundary");
+                        assert_eq!(frame, subscribed);
                         break;
                     }
                     Err(zmq::Error::EAGAIN) => tokio::task::yield_now().await,
@@ -1331,6 +1342,32 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    fn stored_block(hash: i64, tokens: &[u32], block_size: u32, medium: &str) -> serde_json::Value {
+        serde_json::json!({
+            "type": "BlockStored", "block_hashes": [hash], "parent_block_hash": null,
+            "token_ids": tokens, "block_size": block_size, "medium": medium,
+            "lora_id": null, "lora_name": null
+        })
+    }
+
+    fn store_payload(
+        hash: i64,
+        tokens: &[u32],
+        block_size: u32,
+        medium: &str,
+        rank: Option<u32>,
+    ) -> Vec<u8> {
+        rmp_serde::to_vec(&(1.0, [stored_block(hash, tokens, block_size, medium)], rank)).unwrap()
+    }
+
+    fn block_query(tokens: &[u32], block_size: u32, tiers: &[StorageTier]) -> MatchQuery {
+        MatchQuery {
+            group_idx: 0,
+            local_hashes: crate::kv_index::local_block_hash_strings(tokens, block_size, None),
+            tiers_of_interest: tiers.to_vec(),
+        }
     }
 
     #[tokio::test]
@@ -1385,8 +1422,10 @@ mod tests {
                 ),
             )
             .await;
-            let (supervisor, _) =
-                KvIndexSupervisor::new_http_dense(reqwest::Client::new(), HashMode::Sha256);
+            let (supervisor, _) = KvIndexSupervisor::new_http_full_attention(
+                reqwest::Client::new(),
+                HashMode::Sha256,
+            );
             let (a, b) = tokio::join!(
                 supervisor.on_worker_added(&worker_a),
                 supervisor.on_worker_added(&worker_b)
@@ -1426,7 +1465,7 @@ mod tests {
             json!({"0": entry, "00": entry}),
         ).await;
         let (supervisor, _) =
-            KvIndexSupervisor::new_http_dense(reqwest::Client::new(), HashMode::Sha256);
+            KvIndexSupervisor::new_http_full_attention(reqwest::Client::new(), HashMode::Sha256);
         assert!(supervisor
             .on_worker_added(&worker)
             .await
@@ -1444,7 +1483,6 @@ mod tests {
 
     #[tokio::test]
     async fn failed_readd_preserves_registration_then_accepted_readd_retires_it() {
-        use crate::kv_index::{MatchQuery, StorageTier};
         use axum::{routing::get, Json, Router};
         use serde_json::json;
 
@@ -1489,25 +1527,12 @@ mod tests {
         )
         .await;
         let (supervisor, mut signals) =
-            KvIndexSupervisor::new_http_dense(reqwest::Client::new(), HashMode::Sha256);
+            KvIndexSupervisor::new_http_full_attention(reqwest::Client::new(), HashMode::Sha256);
         supervisor.on_worker_added(&worker_a).await.unwrap();
         supervisor.on_worker_added(&worker_b).await.unwrap();
-        boundary_subscription(&publisher_a).await;
-        let payload = rmp_serde::to_vec(&(
-            1.0,
-            [json!({
-                "type": "BlockStored", "block_hashes": [1], "parent_block_hash": null,
-                "token_ids": vec![1; 8], "block_size": 8, "medium": "GPU",
-                "lora_id": null, "lora_name": null
-            })],
-            0u32,
-        ))
-        .unwrap();
-        let query = MatchQuery {
-            group_idx: 0,
-            local_hashes: crate::kv_index::local_block_hash_strings(&[1; 8], 8, None),
-            tiers_of_interest: vec![StorageTier::Device],
-        };
+        boundary_subscription(&publisher_a, "kv/boundary", true).await;
+        let payload = store_payload(1, &[1; 8], 8, "GPU", Some(0));
+        let query = block_query(&[1; 8], 8, &[StorageTier::Device]);
         publisher_a
             .send_multipart(
                 [b"kv/boundary".as_slice(), &0i64.to_be_bytes(), &payload],
@@ -1579,7 +1604,7 @@ mod tests {
             &supervisor.workers.lock()[&worker_a].active
         ));
         assert!(provider.find_tiered_matches(&query).is_empty());
-        boundary_subscription(&publisher_a).await;
+        boundary_subscription(&publisher_a, "kv/boundary", true).await;
         publisher_a
             .send_multipart(
                 [b"kv/boundary".as_slice(), &0i64.to_be_bytes(), &payload],
@@ -1601,7 +1626,6 @@ mod tests {
 
     #[tokio::test]
     async fn shared_publisher_rank_promotion_revokes_unranked_credit_before_registration() {
-        use crate::kv_index::{MatchQuery, StorageTier};
         use serde_json::json;
 
         let context = zmq::Context::new();
@@ -1625,13 +1649,9 @@ mod tests {
         let (worker_b, task_b) =
             source_boundary_worker_with_metadata(info("promotion-b"), source(1)).await;
         let (supervisor, mut signals) =
-            KvIndexSupervisor::new_http_dense(reqwest::Client::new(), HashMode::Sha256);
+            KvIndexSupervisor::new_http_full_attention(reqwest::Client::new(), HashMode::Sha256);
         let send = |sequence: i64, token: u32, rank: Option<u32>| {
-            let payload = rmp_serde::to_vec(&(1.0, [json!({
-                "type": "BlockStored", "block_hashes": [sequence + 1], "parent_block_hash": null,
-                "token_ids": vec![token; 8], "block_size": 8, "medium": "GPU",
-                "lora_id": null, "lora_name": null
-            })], rank)).unwrap();
+            let payload = store_payload(sequence + 1, &[token; 8], 8, "GPU", rank);
             publisher
                 .send_multipart(
                     [b"kv/boundary".as_slice(), &sequence.to_be_bytes(), &payload],
@@ -1639,13 +1659,9 @@ mod tests {
                 )
                 .unwrap();
         };
-        let query = |token| MatchQuery {
-            group_idx: 0,
-            local_hashes: crate::kv_index::local_block_hash_strings(&[token; 8], 8, None),
-            tiers_of_interest: vec![StorageTier::Device],
-        };
+        let query = |token| block_query(&[token; 8], 8, &[StorageTier::Device]);
         supervisor.on_worker_added(&worker_a).await.unwrap();
-        boundary_subscription(&publisher).await;
+        boundary_subscription(&publisher, "kv/boundary", true).await;
         send(0, 1, None);
         assert!(
             matches!(tokio::time::timeout(Duration::from_secs(5), signals.recv()).await.unwrap(),
@@ -1657,7 +1673,7 @@ mod tests {
         assert_eq!(positive[0].target.instance_id.as_ref(), "promotion-a");
         supervisor.on_worker_added(&worker_b).await.unwrap();
         assert!(provider.find_tiered_matches(&query(1)).is_empty());
-        boundary_subscription(&publisher).await;
+        boundary_subscription(&publisher, "kv/boundary", true).await;
 
         send(1, 2, None);
         let mut rejected_sources = HashSet::new();
@@ -1718,7 +1734,6 @@ mod tests {
 
     #[tokio::test]
     async fn live_source_and_target_conflicts_reject_before_subscription_without_replay() {
-        use crate::kv_index::{MatchQuery, StorageTier};
         use serde_json::json;
 
         for static_a in [false, true] {
@@ -1766,7 +1781,7 @@ mod tests {
                 .await;
                 let (mut supervisor, mut signals) =
                     KvIndexSupervisor::new(reqwest::Client::new(), HashMode::Sha256);
-                supervisor.dense_http = true;
+                supervisor.full_attention_http = true;
                 if static_a {
                     supervisor.static_sources = serde_json::from_value(json!({&worker_a: {
                         "endpoints": [endpoint_a], "topic": "kv/boundary",
@@ -1775,17 +1790,8 @@ mod tests {
                     .unwrap();
                 }
                 supervisor.on_worker_added(&worker_a).await.unwrap();
-                boundary_subscription(&publisher_a).await;
-                let payload = rmp_serde::to_vec(&(
-                    1.0,
-                    [json!({
-                        "type": "BlockStored", "block_hashes": [1], "parent_block_hash": null,
-                        "token_ids": vec![1; 8], "block_size": 8, "medium": "GPU",
-                        "lora_id": null, "lora_name": null
-                    })],
-                    0u32,
-                ))
-                .unwrap();
+                boundary_subscription(&publisher_a, "kv/boundary", true).await;
+                let payload = store_payload(1, &[1; 8], 8, "GPU", Some(0));
                 publisher_a
                     .send_multipart(
                         [b"kv/boundary".as_slice(), &0i64.to_be_bytes(), &payload],
@@ -1798,11 +1804,7 @@ mod tests {
                         .unwrap(),
                     Some(IngestionSignal::Advance { last_seq: 0, .. })
                 ));
-                let query = MatchQuery {
-                    group_idx: 0,
-                    local_hashes: crate::kv_index::local_block_hash_strings(&[1; 8], 8, None),
-                    tiers_of_interest: vec![StorageTier::Device],
-                };
+                let query = block_query(&[1; 8], 8, &[StorageTier::Device]);
                 let provider = supervisor.match_provider_for_worker(&worker_a).unwrap();
                 assert_eq!(provider.find_tiered_matches(&query).len(), 1);
                 let admission = supervisor.on_worker_added(&worker_b).await;
@@ -1839,9 +1841,6 @@ mod tests {
 
     #[tokio::test]
     async fn discovered_sources_reject_shared_replay_before_wrong_owner_is_published() {
-        use crate::kv_index::{MatchQuery, StorageTier};
-        use serde_json::json;
-
         let context = zmq::Context::new();
         let a = context.socket(zmq::XPUB).unwrap();
         let b = context.socket(zmq::XPUB).unwrap();
@@ -1863,26 +1862,14 @@ mod tests {
         )
         .await;
         let (supervisor, mut signals) =
-            KvIndexSupervisor::new_http_dense(reqwest::Client::new(), HashMode::Sha256);
+            KvIndexSupervisor::new_http_full_attention(reqwest::Client::new(), HashMode::Sha256);
         supervisor.on_worker_added(&worker_a).await.unwrap();
-        boundary_subscription(&a).await;
-        let payload = |hash: u32, token: u32| {
-            rmp_serde::to_vec(&(
-                1.0,
-                [json!({
-                    "type": "BlockStored", "block_hashes": [hash], "parent_block_hash": null,
-                    "token_ids": vec![token; 8], "block_size": 8, "medium": "GPU",
-                    "lora_id": null, "lora_name": null
-                })],
-                0u32,
-            ))
-            .unwrap()
-        };
+        boundary_subscription(&a, "kv/boundary", true).await;
         a.send_multipart(
             [
                 b"kv/boundary".as_slice(),
                 &0i64.to_be_bytes(),
-                &payload(1, 1),
+                &store_payload(1, &[1; 8], 8, "GPU", Some(0)),
             ],
             0,
         )
@@ -1891,11 +1878,7 @@ mod tests {
             matches!(tokio::time::timeout(Duration::from_secs(5), signals.recv()).await.unwrap(),
             Some(IngestionSignal::Advance { source, last_seq: 0 }) if source.as_ref() == "boundary-a")
         );
-        let query = |token| MatchQuery {
-            group_idx: 0,
-            local_hashes: crate::kv_index::local_block_hash_strings(&[token; 8], 8, None),
-            tiers_of_interest: vec![StorageTier::Device],
-        };
+        let query = |token| block_query(&[token; 8], 8, &[StorageTier::Device]);
         assert_eq!(
             supervisor
                 .match_provider_for_worker(&worker_a)
@@ -1950,7 +1933,7 @@ mod tests {
         .await;
         let worker_a = format!("{worker_a}/");
         let (supervisor, _signals) =
-            KvIndexSupervisor::new_http_dense(reqwest::Client::new(), HashMode::Sha256);
+            KvIndexSupervisor::new_http_full_attention(reqwest::Client::new(), HashMode::Sha256);
         let (a, b) = tokio::join!(
             supervisor.on_worker_added(&worker_a),
             supervisor.on_worker_added(&worker_b)
@@ -2020,9 +2003,6 @@ mod tests {
 
     #[tokio::test]
     async fn dropping_supervisor_retires_inflight_replay_without_clearing_other_sources() {
-        use crate::kv_index::{MatchQuery, StorageTier};
-        use serde_json::json;
-
         for explicit_shutdown in [false, true] {
             let context = Arc::new(zmq::Context::new());
             let publisher = context.socket(zmq::XPUB).unwrap();
@@ -2036,10 +2016,12 @@ mod tests {
                 "retiring-source",
             )
             .await;
-            let (supervisor, mut signals) =
-                KvIndexSupervisor::new_http_dense(reqwest::Client::new(), HashMode::Sha256);
+            let (supervisor, mut signals) = KvIndexSupervisor::new_http_full_attention(
+                reqwest::Client::new(),
+                HashMode::Sha256,
+            );
             supervisor.on_worker_added(&worker).await.unwrap();
-            boundary_subscription(&publisher).await;
+            boundary_subscription(&publisher, "kv/boundary", true).await;
             let (indexer, active) = {
                 let workers = supervisor.workers.lock();
                 let entry = &workers[&worker];
@@ -2060,33 +2042,10 @@ mod tests {
                 Some(neighbor_tx),
                 context.clone(),
             );
-            tokio::time::timeout(Duration::from_secs(5), async {
-                loop {
-                    match publisher.recv_bytes(zmq::DONTWAIT) {
-                        Ok(frame) => {
-                            assert_eq!(frame, b"\x01kv/independent");
-                            break;
-                        }
-                        Err(zmq::Error::EAGAIN) => tokio::task::yield_now().await,
-                        Err(error) => panic!("independent subscription: {error}"),
-                    }
-                }
-            })
-            .await
-            .unwrap();
+            boundary_subscription(&publisher, "kv/independent", false).await;
             let payload =
-                |hash: u32, token: u32, rank: u32| {
-                    rmp_serde::to_vec(&(1.0, [json!({
-                "type": "BlockStored", "block_hashes": [hash], "parent_block_hash": null,
-                "token_ids": vec![token; 8], "block_size": 8, "medium": "GPU",
-                "lora_id": null, "lora_name": null
-            })], rank)).unwrap()
-                };
-            let query = |token| MatchQuery {
-                group_idx: 0,
-                local_hashes: crate::kv_index::local_block_hash_strings(&[token; 8], 8, None),
-                tiers_of_interest: vec![StorageTier::Device],
-            };
+                |hash, token, rank| store_payload(hash, &[token; 8], 8, "GPU", Some(rank));
+            let query = |token| block_query(&[token; 8], 8, &[StorageTier::Device]);
             for (topic, body) in [
                 ("kv/boundary", payload(1, 1, 0)),
                 ("kv/independent", payload(2, 2, 4)),
@@ -2188,7 +2147,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn generic_static_sources_preserve_worker_base_paths_in_dense_router() {
+    async fn generic_static_sources_preserve_worker_base_paths_in_full_attention_router() {
         let context = zmq::Context::new();
         let publisher = context.socket(zmq::XPUB).unwrap();
         let replay = context.socket(zmq::ROUTER).unwrap();
@@ -2203,7 +2162,7 @@ mod tests {
         .await;
         let prefixed = format!("{worker}/proxy");
         let (generic, _) =
-            KvIndexSupervisor::new_http_dense(reqwest::Client::new(), HashMode::Sha256);
+            KvIndexSupervisor::new_http_full_attention(reqwest::Client::new(), HashMode::Sha256);
         let generic = generic.with_static_sources(HashMap::from([(
             prefixed.clone(),
             StaticKvEventSources {
@@ -2219,30 +2178,33 @@ mod tests {
         let original_absent = generic.match_provider_for_worker(&worker).is_none();
         assert!(generic.workers.lock()[&prefixed].worker_origin.is_none());
         generic.shutdown();
-        let (dense, _) =
-            KvIndexSupervisor::new_http_dense(reqwest::Client::new(), HashMode::Sha256);
-        let dense_result = dense.on_worker_added(&prefixed).await;
-        let unqualified = dense.match_provider_for_worker(&prefixed).is_none();
-        dense.shutdown();
+        let (full_attention, _) =
+            KvIndexSupervisor::new_http_full_attention(reqwest::Client::new(), HashMode::Sha256);
+        let full_attention_result = full_attention.on_worker_added(&prefixed).await;
+        let unqualified = full_attention
+            .match_provider_for_worker(&prefixed)
+            .is_none();
+        full_attention.shutdown();
         http_task.abort();
         let info = result.unwrap();
         assert_eq!(info.instance_id, prefixed);
         assert_eq!(info.ranks, [0]);
         assert!(registered);
         assert!(original_absent);
-        assert!(dense_result.unwrap_err().contains("plain HTTP(S) origins"));
+        assert!(full_attention_result
+            .unwrap_err()
+            .contains("plain HTTP(S) origins"));
         assert!(unqualified);
     }
 
     #[tokio::test]
-    async fn dense_source_block_size_mismatch_revokes_only_affected_source() {
+    async fn full_attention_source_block_size_mismatch_revokes_only_affected_source() {
         for (expected, actual) in [(16, 8), (8, 16)] {
-            check_dense_source_block_size(expected, actual).await;
+            check_full_attention_source_block_size(expected, actual).await;
         }
     }
 
-    async fn check_dense_source_block_size(expected: u32, actual: u32) {
-        use crate::kv_index::{MatchQuery, StorageTier};
+    async fn check_full_attention_source_block_size(expected: u32, actual: u32) {
         use serde_json::json;
 
         let context = zmq::Context::new();
@@ -2250,7 +2212,7 @@ mod tests {
         publisher.bind("tcp://127.0.0.1:*").unwrap();
         let endpoint = publisher.get_last_endpoint().unwrap().unwrap();
         let (supervisor, mut signals) =
-            KvIndexSupervisor::new_http_dense(reqwest::Client::new(), HashMode::Sha256);
+            KvIndexSupervisor::new_http_full_attention(reqwest::Client::new(), HashMode::Sha256);
         let rank = 3;
         let sources = json!({(rank.to_string()): {
             "endpoint": endpoint, "topic": "kv/dense", "publisher": "zmq",
@@ -2262,20 +2224,7 @@ mod tests {
         let info = supervisor.on_worker_added(&worker).await.unwrap();
         assert_eq!(info.cache_key.as_ref().unwrap().block_size, expected);
         assert_eq!(info.ranks, [rank]);
-        tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                match publisher.recv_bytes(zmq::DONTWAIT) {
-                    Ok(frame) => {
-                        assert_eq!(frame, b"\x01kv/dense");
-                        break;
-                    }
-                    Err(zmq::Error::EAGAIN) => tokio::task::yield_now().await,
-                    Err(error) => panic!("XPUB subscription: {error}"),
-                }
-            }
-        })
-        .await
-        .unwrap();
+        boundary_subscription(&publisher, "kv/dense", false).await;
         let indexer = supervisor
             .workers
             .lock()
@@ -2285,10 +2234,12 @@ mod tests {
             .clone();
         let old_tokens: Vec<u32> = (0..expected).collect();
         let new_tokens: Vec<u32> = (100..100 + actual).collect();
-        let query = |tokens: &[u32]| MatchQuery {
-            group_idx: 0,
-            local_hashes: crate::kv_index::local_block_hash_strings(tokens, expected, None),
-            tiers_of_interest: vec![StorageTier::Device, StorageTier::HostPinned],
+        let query = |tokens: &[u32]| {
+            block_query(
+                tokens,
+                expected,
+                &[StorageTier::Device, StorageTier::HostPinned],
+            )
         };
         let mut neighbors = Vec::new();
         for (source, neighbor_rank, topic) in [
@@ -2309,30 +2260,8 @@ mod tests {
                 Some(tx),
                 Arc::new(zmq::Context::new()),
             ));
-            tokio::time::timeout(Duration::from_secs(5), async {
-                loop {
-                    match publisher.recv_bytes(zmq::DONTWAIT) {
-                        Ok(frame) => {
-                            assert_eq!(&frame[1..], topic.as_bytes());
-                            break;
-                        }
-                        Err(zmq::Error::EAGAIN) => tokio::task::yield_now().await,
-                        Err(error) => panic!("XPUB neighbor subscription: {error}"),
-                    }
-                }
-            })
-            .await
-            .unwrap();
-            let payload = rmp_serde::to_vec(&(
-                1.0,
-                [json!({
-                    "type": "BlockStored", "block_hashes": [70], "parent_block_hash": null,
-                    "token_ids": old_tokens, "block_size": expected, "medium": "GPU",
-                    "lora_id": null, "lora_name": null
-                })],
-                neighbor_rank,
-            ))
-            .unwrap();
+            boundary_subscription(&publisher, topic, false).await;
+            let payload = store_payload(70, &old_tokens, expected, "GPU", Some(neighbor_rank));
             assert!(crate::kv_index::decode_batch(&payload).is_ok());
             publisher
                 .send_multipart([topic.as_bytes(), &0i64.to_be_bytes(), &payload], 0)
@@ -2355,16 +2284,7 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         for (seq, block_size, tokens) in [(0i64, expected, &old_tokens), (1, actual, &new_tokens)] {
-            let payload = rmp_serde::to_vec(&(
-                1.0,
-                [json!({
-                    "type": "BlockStored", "block_hashes": [seq + 7], "parent_block_hash": null,
-                    "token_ids": tokens, "block_size": block_size, "lora_id": null,
-                    "lora_name": null, "medium": "CPU"
-                })],
-                rank,
-            ))
-            .unwrap();
+            let payload = store_payload(seq + 7, tokens, block_size, "CPU", Some(rank));
             publisher
                 .send_multipart([b"kv/dense".as_slice(), &seq.to_be_bytes(), &payload], 0)
                 .unwrap();
@@ -2407,8 +2327,6 @@ mod tests {
 
     #[tokio::test]
     async fn http_and_static_sources_ingest_nonempty_topics_through_live_zmq() {
-        use crate::kv_index::{MatchQuery, StorageTier};
-        use axum::{routing::get, Json, Router};
         use serde_json::json;
 
         for (use_static, block_size) in [(false, 8u32), (true, 32)] {
@@ -2417,8 +2335,10 @@ mod tests {
             publisher.bind("tcp://127.0.0.1:*").unwrap();
             let endpoint = publisher.get_last_endpoint().unwrap().unwrap();
             let rank = if use_static { 0u32 } else { 3 };
-            let (mut supervisor, mut signals) =
-                KvIndexSupervisor::new_http_dense(reqwest::Client::new(), HashMode::Sha256);
+            let (mut supervisor, mut signals) = KvIndexSupervisor::new_http_full_attention(
+                reqwest::Client::new(),
+                HashMode::Sha256,
+            );
             let (worker, http_task) = if use_static {
                 let worker = "http://127.0.0.1:1".to_string();
                 let value = json!({
@@ -2435,17 +2355,13 @@ mod tests {
                     "publisher": "zmq", "encoding": "msgpack", "schema_version": 1,
                     "enable_kv_cache_events": true
                 }});
-                let app = Router::new()
-                    .route("/get_server_info", get(move || async move { Json(json!({
+                let (worker, task) = source_boundary_worker_with_metadata(
+                    json!({
                         "model_id": "served-alias", "instance_id": "observed-boot", "kv_block_size": block_size
-                    })) }))
-                    .route("/kv_event_sources", get(move || {
-                        let sources = sources.clone();
-                        async move { Json(sources) }
-                    }));
-                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-                let worker = format!("http://{}", listener.local_addr().unwrap());
-                let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+                    }),
+                    sources,
+                )
+                .await;
                 (worker, Some(task))
             };
             let info = supervisor.on_worker_added(&worker).await.unwrap();
@@ -2454,27 +2370,15 @@ mod tests {
                 info.cache_key.as_ref().unwrap().model.as_ref(),
                 "served-alias"
             );
-            let subscription = tokio::time::timeout(Duration::from_secs(5), async {
-                loop {
-                    match publisher.recv_bytes(zmq::DONTWAIT) {
-                        Ok(frame) => break frame,
-                        Err(zmq::Error::EAGAIN) => {
-                            tokio::time::sleep(Duration::from_millis(10)).await
-                        }
-                        Err(error) => panic!("XPUB subscription: {error}"),
-                    }
-                }
-            })
-            .await
-            .unwrap();
-            assert_eq!(&subscription, b"\x01kv/served-alias");
+            boundary_subscription(&publisher, "kv/served-alias", false).await;
             let tokens: Vec<u32> = (0..block_size).collect();
-            let event = json!({
-                "type": "BlockStored", "block_hashes": [7], "parent_block_hash": null,
-                "token_ids": tokens, "block_size": block_size, "lora_id": null, "lora_name": null,
-                "medium": if use_static { "GPU" } else { "CPU" }
-            });
-            let payload = rmp_serde::to_vec(&(1.0, [event], rank)).unwrap();
+            let payload = store_payload(
+                7,
+                &tokens,
+                block_size,
+                if use_static { "GPU" } else { "CPU" },
+                Some(rank),
+            );
             assert!(crate::kv_index::decode_batch(&payload).is_ok());
             publisher
                 .send_multipart(
@@ -2500,11 +2404,7 @@ mod tests {
                 .unwrap()
                 .indexer
                 .clone();
-            let hits = indexer.find_matches(&MatchQuery {
-                group_idx: 0,
-                local_hashes: crate::kv_index::local_block_hash_strings(&tokens, block_size, None),
-                tiers_of_interest: vec![tier],
-            });
+            let hits = indexer.find_matches(&block_query(&tokens, block_size, &[tier]));
             assert_eq!(hits.len(), 1, "use_static={use_static}");
             assert_eq!(hits[0].target.instance_id.as_ref(), info.instance_id);
             assert_eq!(hits[0].target.dp_rank, rank);
@@ -2603,8 +2503,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pd_static_dense_rejects_entire_bad_batch_with_source_block_size() {
-        use crate::kv_index::{MatchQuery, StorageTier};
+    async fn pd_static_full_attention_rejects_entire_bad_batch_with_source_block_size() {
         use serde_json::json;
 
         for invalid in ["block-size", "layout"] {
@@ -2628,26 +2527,14 @@ mod tests {
             );
             let info = supervisor.on_worker_added(worker).await.unwrap();
             assert_eq!(info.cache_key.unwrap().block_size, 8);
-            tokio::time::timeout(Duration::from_secs(5), async {
-                loop {
-                    match publisher.recv_bytes(zmq::DONTWAIT) {
-                        Ok(frame) => {
-                            assert_eq!(frame, b"\x01");
-                            break;
-                        }
-                        Err(zmq::Error::EAGAIN) => tokio::task::yield_now().await,
-                        Err(error) => panic!("PD subscription: {error}"),
-                    }
-                }
-            })
-            .await
-            .unwrap();
+            boundary_subscription(&publisher, "", false).await;
             let stored = |hash, start, size| {
-                json!({
-                    "type": "BlockStored", "block_hashes": [hash], "parent_block_hash": null,
-                    "token_ids": (start..start + size).collect::<Vec<u32>>(),
-                    "block_size": size, "medium": "GPU", "lora_id": null, "lora_name": null
-                })
+                stored_block(
+                    hash,
+                    &(start..start + size).collect::<Vec<_>>(),
+                    size,
+                    "GPU",
+                )
             };
             let mut bad = stored(1, 20, if invalid == "block-size" { 4 } else { 8 });
             if invalid == "layout" {
@@ -2686,14 +2573,12 @@ mod tests {
             .await
             .unwrap();
             let index = supervisor.workers.lock()[worker].indexer.clone();
-            let query = |start| MatchQuery {
-                group_idx: 0,
-                local_hashes: crate::kv_index::local_block_hash_strings(
+            let query = |start| {
+                block_query(
                     &(start..start + 8).collect::<Vec<_>>(),
                     8,
-                    None,
-                ),
-                tiers_of_interest: vec![StorageTier::Device],
+                    &[StorageTier::Device],
+                )
             };
             assert!(
                 index.find_matches(&query(100)).is_empty(),
