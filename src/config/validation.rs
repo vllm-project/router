@@ -29,6 +29,22 @@ impl ConfigValidator {
         Self::validate_mode(&config.mode, has_service_discovery)?;
         Self::validate_policy(&config.policy)?;
         Self::validate_server_settings(config)?;
+        if let Some(stale_after) = config.prefill_progress_stale_after_secs {
+            if stale_after < 2 || stale_after >= config.request_timeout_secs {
+                return Err(ConfigError::InvalidValue {
+                    field: "prefill_progress_stale_after_secs".into(),
+                    value: stale_after.to_string(),
+                    reason: "Must be at least 2 seconds and less than request_timeout_secs".into(),
+                });
+            }
+            if !matches!(config.mode, RoutingMode::Regular { .. })
+                || !matches!(config.policy, PolicyConfig::KvAware { .. })
+            {
+                return Err(ConfigError::IncompatibleConfig {
+                    reason: "Prefill progress requires regular kv_aware routing".into(),
+                });
+            }
+        }
         if let Some(program_scheduling) = &config.program_scheduling {
             Self::validate_program_scheduling(program_scheduling)?;
         }
@@ -940,6 +956,44 @@ fn base_url_without_rank(url: &str) -> &str {
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use super::*;
+
+    fn kv_aware_config() -> RouterConfig {
+        RouterConfig::new(
+            RoutingMode::Regular {
+                worker_urls: vec!["grpc://worker:8000".to_string()],
+            },
+            PolicyConfig::KvAware {
+                router_temperature: 0.0,
+                kv_penalty_host: 0.8,
+                kv_penalty_external: 0.6,
+                kv_penalty_disk: 0.3,
+                static_kv_event_sources: Default::default(),
+            },
+        )
+    }
+
+    #[test]
+    fn test_prefill_progress_stale_threshold_is_opt_in_and_bounded() {
+        let mut config = kv_aware_config();
+        assert!(ConfigValidator::validate(&config).is_ok());
+
+        config.prefill_progress_stale_after_secs = Some(10);
+        assert!(ConfigValidator::validate(&config).is_ok());
+
+        config.prefill_progress_stale_after_secs = Some(1);
+        assert!(ConfigValidator::validate(&config).is_err());
+
+        config.prefill_progress_stale_after_secs = Some(config.request_timeout_secs);
+        assert!(ConfigValidator::validate(&config).is_err());
+    }
+
+    #[test]
+    fn test_prefill_progress_requires_regular_kv_aware_routing() {
+        let mut config = kv_aware_config();
+        config.policy = PolicyConfig::Random;
+        config.prefill_progress_stale_after_secs = Some(10);
+        assert!(ConfigValidator::validate(&config).is_err());
+    }
 
     #[test]
     fn session_affinity_ttl_is_optional_and_bounded() {

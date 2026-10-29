@@ -255,6 +255,12 @@ Enable KV events on the workers. HTTP text requests also need a render endpoint 
 
 For regular pools without event discovery, configure `--kv-event-source WORKER_URL=tcp://HOST:PORT` per worker, plus matching `--kv-event-model` and `--kv-event-block-size`.
 
+### Prefill progress
+
+For regular `kv_aware` gRPC pools, add `--prefill-progress-stale-after-secs 5`
+to enable worker-reported progress. Disabled by default.
+See [configuration and requirements](../backend/grpc.md#prefill-progress).
+
 ### P/D disaggregation
 
 ```bash

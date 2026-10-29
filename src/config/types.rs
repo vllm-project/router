@@ -33,6 +33,9 @@ pub struct RouterConfig {
     pub max_payload_size: usize,
     /// Request timeout in seconds
     pub request_timeout_secs: u64,
+    /// Enable KV-aware gRPC progress, marking updates stale after this interval.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefill_progress_stale_after_secs: Option<u64>,
     /// Worker startup timeout in seconds
     pub worker_startup_timeout_secs: u64,
     /// Worker health check interval in seconds
@@ -1026,6 +1029,7 @@ impl Default for RouterConfig {
             port: 3001,
             max_payload_size: 536_870_912, // 512MB
             request_timeout_secs: 1800,    // 30 minutes
+            prefill_progress_stale_after_secs: None,
             worker_startup_timeout_secs: 600,
             worker_startup_check_interval_secs: 30,
             intra_node_data_parallel_size: 1,
@@ -1810,6 +1814,7 @@ mod tests {
             port: 3000,
             max_payload_size: 1048576,
             request_timeout_secs: 120,
+            prefill_progress_stale_after_secs: None,
             worker_startup_timeout_secs: 60,
             worker_startup_check_interval_secs: 5,
             intra_node_data_parallel_size: 1,
@@ -1880,6 +1885,7 @@ mod tests {
             port: 3001,
             max_payload_size: 536870912,
             request_timeout_secs: 300,
+            prefill_progress_stale_after_secs: None,
             worker_startup_timeout_secs: 180,
             worker_startup_check_interval_secs: 15,
             intra_node_data_parallel_size: 1,
@@ -1941,6 +1947,7 @@ mod tests {
             port: 8888,
             max_payload_size: 1024 * 1024 * 512, // 512MB
             request_timeout_secs: 900,
+            prefill_progress_stale_after_secs: None,
             worker_startup_timeout_secs: 600,
             worker_startup_check_interval_secs: 20,
             intra_node_data_parallel_size: 1,

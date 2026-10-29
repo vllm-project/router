@@ -15,6 +15,8 @@ use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::Stream;
 use tonic::{transport::Server, Request, Response, Status};
 use vllm_router_rs::backend::pb::{
+    self,
+    control_server::{Control, ControlServer},
     finish_info, generate_request,
     inference_server::{Inference, InferenceServer},
     FinishInfo, GenerateRequest, GenerateResponse, PromptInfo, SequenceOutput, TokenIds,
@@ -22,6 +24,8 @@ use vllm_router_rs::backend::pb::{
 
 #[derive(Clone, Default)]
 pub struct CapturedGrpcGenerate {
+    pub request_id: String,
+    pub include_prefill_progress: bool,
     pub token_ids: Vec<u32>,
     pub had_text_prompt: bool,
     pub model: String,
@@ -38,6 +42,10 @@ pub struct MockVllmRs {
     pub frames: Option<Vec<(String, Vec<u32>)>>,
     pub capture_limit: usize,
     pub failures_remaining: Arc<AtomicUsize>,
+    /// `None` models a worker without capability discovery.
+    pub prefill_progress_supported: Option<bool>,
+    /// Optional externally driven stream for lifecycle and progress tests.
+    pub scripted_stream: Arc<Mutex<Option<ResponseStream>>>,
 }
 
 impl Default for MockVllmRs {
@@ -48,6 +56,8 @@ impl Default for MockVllmRs {
             frames: None,
             capture_limit: usize::MAX,
             failures_remaining: Arc::new(AtomicUsize::new(0)),
+            prefill_progress_supported: None,
+            scripted_stream: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -74,10 +84,12 @@ impl MockVllmRsServer {
             .set_service_status("", tonic_health::ServingStatus::Serving)
             .await;
         let svc = InferenceServer::new(state.clone());
+        let control = ControlServer::new(state.clone());
         let handle = tokio::spawn(async move {
             Server::builder()
                 .add_service(health_service)
                 .add_service(svc)
+                .add_service(control)
                 .serve_with_incoming(incoming)
                 .await
                 .unwrap();
@@ -97,7 +109,7 @@ impl MockVllmRsServer {
     }
 }
 
-type ResponseStream = Pin<Box<dyn Stream<Item = Result<GenerateResponse, Status>> + Send>>;
+pub type ResponseStream = Pin<Box<dyn Stream<Item = Result<GenerateResponse, Status>> + Send>>;
 
 #[tonic::async_trait]
 impl Inference for MockVllmRs {
@@ -133,6 +145,7 @@ impl Inference for MockVllmRs {
                 finish_info: finish,
                 ..Default::default()
             }),
+            prefill_progress: None,
         }))
     }
 
@@ -150,6 +163,8 @@ impl Inference for MockVllmRs {
             let mut captured = self.captured.lock().unwrap();
             if captured.len() < self.capture_limit {
                 captured.push(CapturedGrpcGenerate {
+                    request_id: req.request_id,
+                    include_prefill_progress: req.include_prefill_progress,
                     token_ids: token_ids.clone(),
                     had_text_prompt,
                     model: req.model,
@@ -166,6 +181,10 @@ impl Inference for MockVllmRs {
             return Err(Status::unavailable("retry test"));
         }
 
+        if let Some(stream) = self.scripted_stream.lock().unwrap().take() {
+            return Ok(Response::new(stream));
+        }
+
         let (tx, rx) = mpsc::channel(4);
         let frames = self
             .frames
@@ -180,6 +199,7 @@ impl Inference for MockVllmRs {
                         ..Default::default()
                     }),
                     outputs: None,
+                    prefill_progress: None,
                 }))
                 .await;
             let last = frames.len().saturating_sub(1);
@@ -201,6 +221,7 @@ impl Inference for MockVllmRs {
                             finish_info,
                             ..Default::default()
                         }),
+                        prefill_progress: None,
                     }))
                     .await;
                 if sent.is_err() {
@@ -210,4 +231,55 @@ impl Inference for MockVllmRs {
         });
         Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
     }
+}
+
+macro_rules! mock_control {
+    ($($method:ident($request:ident) -> $response:ident;)*) => {
+        #[tonic::async_trait]
+        impl Control for MockVllmRs {
+            async fn get_server_info(
+                &self,
+                _request: Request<pb::GetServerInfoRequest>,
+            ) -> Result<Response<pb::ServerInfo>, Status> {
+                let supported = self.prefill_progress_supported
+                    .ok_or_else(|| Status::unimplemented("GetServerInfo"))?;
+                Ok(Response::new(pb::ServerInfo {
+                    supports_prefill_progress: supported,
+                    ..Default::default()
+                }))
+            }
+
+            $(
+                async fn $method(
+                    &self,
+                    _request: Request<pb::$request>,
+                ) -> Result<Response<pb::$response>, Status> {
+                    Err(Status::unimplemented(stringify!($method)))
+                }
+            )*
+        }
+    };
+}
+
+mock_control! {
+    get_model_info(GetModelInfoRequest) -> ModelInfo;
+    shutdown(ShutdownRequest) -> ShutdownResponse;
+    abort(AbortRequest) -> AbortResponse;
+    load_lora(LoadLoraRequest) -> LoadLoraResponse;
+    unload_lora(UnloadLoraRequest) -> UnloadLoraResponse;
+    list_loras(ListLorasRequest) -> ListLorasResponse;
+    get_kv_event_sources(GetKvEventSourcesRequest) -> GetKvEventSourcesResponse;
+    pause_generation(PauseGenerationRequest) -> PauseGenerationResponse;
+    resume_generation(ResumeGenerationRequest) -> ResumeGenerationResponse;
+    is_paused(IsPausedRequest) -> IsPausedResponse;
+    sleep(SleepRequest) -> SleepResponse;
+    wake_up(WakeUpRequest) -> WakeUpResponse;
+    is_sleeping(IsSleepingRequest) -> IsSleepingResponse;
+    init_weight_transfer_engine(InitWeightTransferEngineRequest) -> InitWeightTransferEngineResponse;
+    start_weight_update(StartWeightUpdateRequest) -> StartWeightUpdateResponse;
+    start_draft_weight_update(StartDraftWeightUpdateRequest) -> StartDraftWeightUpdateResponse;
+    update_weights(UpdateWeightsRequest) -> UpdateWeightsResponse;
+    finish_weight_update(FinishWeightUpdateRequest) -> FinishWeightUpdateResponse;
+    update_weight_version(UpdateWeightVersionRequest) -> UpdateWeightVersionResponse;
+    get_weight_version(GetWeightVersionRequest) -> GetWeightVersionResponse;
 }

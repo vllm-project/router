@@ -323,6 +323,14 @@ impl Router {
 
         // All-http or all-grpc. Mixed schemes fail here (not a silent fallback).
         let pool_kind = crate::backend::classify_worker_urls(&worker_urls)?;
+        if ctx
+            .router_config
+            .prefill_progress_stale_after_secs
+            .is_some()
+            && pool_kind == Some(crate::backend::WorkerPoolKind::Http)
+        {
+            return Err("Prefill progress requires a gRPC worker pool".into());
+        }
         let request_timeout = Duration::from_secs(ctx.router_config.request_timeout_secs);
         let frontend = if pool_kind == Some(crate::backend::WorkerPoolKind::Http) {
             crate::backend::frontend::warn_ignored_encoding_caches();
@@ -330,7 +338,12 @@ impl Router {
         } else {
             crate::backend::EngineFrontend::from_env(request_timeout)
                 .map_err(|error| format!("tokenizer cache: {error}"))?
-        };
+        }
+        .with_prefill_progress_stale_after(
+            ctx.router_config
+                .prefill_progress_stale_after_secs
+                .map(Duration::from_secs),
+        );
 
         // Wait for workers to be healthy (skip if empty - for service discovery mode)
         if !worker_urls.is_empty() {
@@ -1744,16 +1757,24 @@ impl Router {
                 )
                     .into_response();
             };
-            let on_first_output = if is_stream {
-                None
-            } else {
-                let load = load.clone();
-                Some(Arc::new(move || load.begin_decode())
-                    as crate::backend::grpc::FirstOutputCallback)
-            };
+            // Callbacks update accounting but do not own attempt cleanup:
+            // capability fallback may drop them before inference starts.
+            let on_first_output = load.state.kv_slot.clone().map(|slot| {
+                Arc::new(move || slot.begin_decode()) as crate::backend::grpc::FirstOutputCallback
+            });
+            let on_prefill_progress = load.state.kv_slot.clone().map(|slot| {
+                Arc::new(move |sequence, remaining| {
+                    slot.update_prefill_progress(sequence, remaining)
+                }) as crate::backend::grpc::PrefillProgressCallback
+            });
             let mut response = self
                 .frontend
-                .dispatch_with_first_output(worker_url, prepared, on_first_output)
+                .dispatch_with_first_output(
+                    worker_url,
+                    prepared,
+                    on_first_output,
+                    on_prefill_progress,
+                )
                 .await;
             if is_stream && response.status().is_success() {
                 response = hold_request_load_until_body_done(response, load);
@@ -4408,28 +4429,38 @@ mod tests {
         let (mut producer_output_frame, output_frame) =
             crate::backend::stream_output::output_frame_tracking();
         let (body_tx, body_rx) =
-            tokio::sync::mpsc::unbounded_channel::<Result<bytes::Bytes, std::io::Error>>();
+            tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(2);
         let (queued_tx, queued_rx) = tokio::sync::oneshot::channel();
         let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
         let producer = tokio::spawn(async move {
-            assert!(producer_output_frame.send(
-                &body_tx,
-                bytes::Bytes::from_static(b"data: prompt_info_only\n\n"),
-                false,
-            ));
+            assert!(
+                producer_output_frame
+                    .send(
+                        &body_tx,
+                        bytes::Bytes::from_static(b"data: prompt_info_only\n\n"),
+                        false,
+                    )
+                    .await
+            );
             // Model the gRPC producer getting ahead of the client: by the
             // time the first body frame is polled, it has already queued the
             // generated-output frame too.
-            assert!(producer_output_frame.send(
-                &body_tx,
-                bytes::Bytes::from_static(b"data: generated_token\n\n"),
-                true,
-            ));
+            assert!(
+                producer_output_frame
+                    .send(
+                        &body_tx,
+                        bytes::Bytes::from_static(b"data: generated_token\n\n"),
+                        true,
+                    )
+                    .await
+            );
             queued_tx.send(()).unwrap();
             let _ = finish_rx.await;
         });
         queued_rx.await.unwrap();
-        let mut response = Response::new(Body::from_stream(UnboundedReceiverStream::new(body_rx)));
+        let mut response = Response::new(Body::from_stream(
+            tokio_stream::wrappers::ReceiverStream::new(body_rx),
+        ));
         response
             .extensions_mut()
             .insert(crate::backend::grpc::GrpcStreamTask::with_output_frame(
@@ -4487,6 +4518,15 @@ mod tests {
         worker.increment_load();
         for cancel in [false, true] {
             let load = admitted_kv_load(worker.clone(), manager.clone(), target.clone());
+            let slot = load.state.kv_slot.as_ref().unwrap().clone();
+            slot.update_prefill_progress(1, 40);
+            load.begin_decode();
+            slot.update_prefill_progress(2, 32);
+            assert_eq!(
+                crate::policies::LoadProvider::sample(manager.as_ref(), &target)
+                    .active_prefill_tokens,
+                39,
+            );
             let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
             let producer = tokio::spawn(async move {
                 let _ = finish_rx.await;
@@ -4511,6 +4551,7 @@ mod tests {
                 .unwrap();
                 drop(response);
             }
+            slot.update_prefill_progress(3, 64);
             assert_eq!(worker.load(), 1);
             assert_eq!(
                 crate::policies::LoadProvider::sample(manager.as_ref(), &target),

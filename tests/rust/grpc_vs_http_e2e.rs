@@ -15,6 +15,278 @@
 
 mod common;
 
+mod prefill_progress_regressions {
+    use super::*;
+    use std::time::Duration;
+    use tokio::sync::mpsc;
+    use tokio_stream::wrappers::ReceiverStream;
+    use vllm_router_rs::backend::pb::{
+        finish_info, FinishInfo, GenerateResponse, PrefillProgress, SequenceOutput,
+    };
+    use vllm_router_rs::core::Worker;
+    use vllm_router_rs::kv_index::{CacheKey, HashMode, KvBlockIndexer, RoutableTarget};
+    use vllm_router_rs::policies::{KvAwarePolicy, LoadSample, SlotManager};
+    use vllm_router_rs::protocols::spec::ChatCompletionRequest;
+
+    struct Harness {
+        router: Arc<Router>,
+        server: MockVllmRsServer,
+        worker: Arc<dyn Worker>,
+        slots: Arc<dyn SlotManager>,
+        target: RoutableTarget,
+        tx: mpsc::Sender<Result<GenerateResponse, tonic::Status>>,
+    }
+
+    async fn wait_until(mut condition: impl FnMut() -> bool) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !condition() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("gRPC dispatch/accounting did not reach the expected state");
+    }
+
+    impl Harness {
+        async fn new(enabled: bool, supported: Option<bool>) -> Self {
+            let (tx, rx) = mpsc::channel(8);
+            let state = MockVllmRs {
+                prefill_progress_supported: supported,
+                scripted_stream: Arc::new(Mutex::new(Some(Box::pin(ReceiverStream::new(rx))))),
+                ..Default::default()
+            };
+            let server = MockVllmRsServer::spawn_with_state(state).await;
+            let mut config = test_config(vec![server.grpc_url.clone()]);
+            config.policy = PolicyConfig::KvAware {
+                router_temperature: 0.0,
+                kv_penalty_host: 0.8,
+                kv_penalty_external: 0.6,
+                kv_penalty_disk: 0.3,
+                static_kv_event_sources: Default::default(),
+            };
+            config.prefill_progress_stale_after_secs = enabled.then_some(10);
+            let ctx = create_test_context(config);
+            let router = Router::new(vec![server.grpc_url.clone()], &ctx)
+                .await
+                .unwrap();
+            router.pin_test_token_ids(vec![1; 100]);
+            let policy = ctx.policy_registry.get_default_policy();
+            let policy = policy.as_any().downcast_ref::<KvAwarePolicy>().unwrap();
+            let target = RoutableTarget {
+                instance_id: Arc::from("progress-worker"),
+                dp_rank: 0,
+            };
+            policy.register_target_with_cache_identity(
+                &server.grpc_url,
+                target.clone(),
+                CacheKey {
+                    model: Arc::from("model"),
+                    hash_mode: HashMode::Sha256,
+                    block_size: 2,
+                },
+                Arc::new(KvBlockIndexer::new()),
+            );
+            Self {
+                router: Arc::new(router),
+                worker: ctx.worker_registry.get_by_url(&server.grpc_url).unwrap(),
+                slots: policy.slot_manager().unwrap(),
+                target,
+                server,
+                tx,
+            }
+        }
+
+        async fn dispatch(
+            &self,
+            stream: bool,
+        ) -> tokio::task::JoinHandle<axum::response::Response> {
+            let router = self.router.clone();
+            let request: ChatCompletionRequest = serde_json::from_value(json!({
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": stream,
+                "stream_options": {"include_usage": true},
+                "max_tokens": 8,
+            }))
+            .unwrap();
+            let task = tokio::spawn(async move {
+                router
+                    .route_typed_request(None, &request, "/v1/chat/completions", None)
+                    .await
+            });
+            wait_until(|| !self.server.captured().is_empty()).await;
+            task
+        }
+
+        fn assert_load(&self, remaining: u64, requests: usize) {
+            assert_eq!(self.worker.load(), requests);
+            assert_eq!(
+                self.slots.sample(&self.target),
+                LoadSample {
+                    active_prefill_tokens: remaining,
+                    active_requests: requests,
+                }
+            );
+        }
+
+        async fn progress(&self, sequence: u64, remaining: u32) {
+            self.tx
+                .send(Ok(GenerateResponse {
+                    prefill_progress: Some(PrefillProgress {
+                        request_id: self.server.captured()[0].request_id.clone(),
+                        sequence,
+                        prompt_tokens: 100,
+                        remaining_compute_tokens: remaining,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }))
+                .await
+                .unwrap();
+        }
+
+        async fn output(&self, text: &str, finished: bool) {
+            self.tx
+                .send(Ok(GenerateResponse {
+                    outputs: Some(SequenceOutput {
+                        text: text.into(),
+                        num_tokens: 1,
+                        finish_info: finished.then_some(FinishInfo {
+                            num_output_tokens: 2,
+                            finish_reason: finish_info::FinishReason::Stop as i32,
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }))
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn grpc_progress_fallback_retains_admission_until_output() {
+        use http_body_util::BodyExt;
+        for stream in [false, true] {
+            for (enabled, supported) in [(false, Some(true)), (true, Some(false)), (true, None)] {
+                let h = Harness::new(enabled, supported).await;
+                let mut task = Some(h.dispatch(stream).await);
+                assert!(!h.server.captured()[0].include_prefill_progress);
+                h.assert_load(100, 1);
+                let mut response = if stream {
+                    Some(task.take().unwrap().await.unwrap())
+                } else {
+                    None
+                };
+                h.output("hello", false).await;
+                if let Some(response) = &mut response {
+                    response.body_mut().frame().await.unwrap().unwrap();
+                }
+                wait_until(|| h.slots.sample(&h.target).active_prefill_tokens == 0).await;
+                h.assert_load(0, 1);
+                h.output(" world", true).await;
+                drop(h.tx);
+                let response = match response {
+                    Some(response) => response,
+                    None => task.take().unwrap().await.unwrap(),
+                };
+                assert!(response.status().is_success());
+                axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                wait_until(|| h.worker.load() == 0).await;
+                assert_eq!(h.slots.sample(&h.target), LoadSample::default());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn grpc_progress_consumers_track_reprefill_and_hide_progress_frames() {
+        use http_body_util::BodyExt;
+        for stream in [false, true] {
+            let h = Harness::new(true, Some(true)).await;
+            let mut task = Some(h.dispatch(stream).await);
+            assert!(h.server.captured()[0].include_prefill_progress);
+            h.progress(2, 40).await;
+            wait_until(|| h.slots.sample(&h.target).active_prefill_tokens == 40).await;
+            h.assert_load(40, 1);
+            h.progress(1, 90).await; // An older snapshot must not replace seq 2.
+            let mut response = if stream {
+                let mut response = task.take().unwrap().await.unwrap();
+                assert!(response.status().is_success());
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(50), response.body_mut().frame())
+                        .await
+                        .is_err(),
+                    "progress-only frames must not produce SSE chunks"
+                );
+                Some(response)
+            } else {
+                None
+            };
+            h.output("hello", false).await;
+            wait_until(|| h.slots.sample(&h.target).active_prefill_tokens == 0).await;
+            h.assert_load(0, 1);
+            h.progress(3, 25).await;
+            wait_until(|| h.slots.sample(&h.target).active_prefill_tokens == 25).await;
+            h.assert_load(25, 1);
+            h.output(" world", true).await;
+            drop(h.tx);
+            let response = match response.take() {
+                Some(response) => response,
+                None => task.take().unwrap().await.unwrap(),
+            };
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let text = std::str::from_utf8(&bytes).unwrap();
+            assert!(!text.contains("prefill_progress"));
+            if stream {
+                let events: Vec<serde_json::Value> = text
+                    .lines()
+                    .filter_map(|line| line.strip_prefix("data: "))
+                    .filter(|line| *line != "[DONE]")
+                    .map(|line| serde_json::from_str(line).unwrap())
+                    .collect();
+                assert_eq!(
+                    events.len(),
+                    3,
+                    "only two output chunks and usage are expected: {text}"
+                );
+                assert_eq!(events[0]["choices"][0]["delta"]["content"], "hello");
+                assert_eq!(events[1]["choices"][0]["delta"]["content"], " world");
+                assert_eq!(events[2]["usage"]["prompt_tokens"], 100);
+            } else {
+                let reply: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(reply["choices"][0]["message"]["content"], "hello world");
+                assert_eq!(reply["usage"]["prompt_tokens"], 100);
+            }
+            wait_until(|| h.worker.load() == 0).await;
+            assert_eq!(h.slots.sample(&h.target), LoadSample::default());
+        }
+    }
+
+    #[tokio::test]
+    async fn grpc_progress_cancellation_releases_latest_balance() {
+        for stream in [false, true] {
+            let h = Harness::new(true, Some(true)).await;
+            let task = h.dispatch(stream).await;
+            h.progress(2, 40).await;
+            wait_until(|| h.slots.sample(&h.target).active_prefill_tokens == 40).await;
+            h.assert_load(40, 1);
+            if stream {
+                drop(task.await.unwrap());
+            } else {
+                task.abort();
+                assert!(task.await.unwrap_err().is_cancelled());
+            }
+            wait_until(|| h.worker.load() == 0).await;
+            assert_eq!(h.slots.sample(&h.target), LoadSample::default());
+        }
+    }
+}
+
 use std::sync::{Arc, Mutex};
 
 use axum::{extract::Json, routing::get, routing::post, Router as AxumRouter};
@@ -41,6 +313,7 @@ fn test_config(worker_urls: Vec<String>) -> RouterConfig {
         port: 3002,
         max_payload_size: 16 * 1024 * 1024,
         request_timeout_secs: 30,
+        prefill_progress_stale_after_secs: None,
         worker_startup_timeout_secs: 5,
         worker_startup_check_interval_secs: 1,
         intra_node_data_parallel_size: 1,

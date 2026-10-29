@@ -15,6 +15,20 @@ The current gRPC wire sends router-produced `token_ids`:
 This is the current backend contract, not a policy that gRPC can never support
 text prompts or richer payloads.
 
+## Prefill progress
+
+Enable worker-reported prefill progress for more accurate `kv_aware` load estimates:
+
+```bash
+vllm-router --worker-urls grpc://worker:50051 \
+  --policy kv_aware --prefill-progress-stale-after-secs 5
+```
+
+- Supported for regular gRPC pools; P/D mode is not supported.
+- Disabled by default. Workers without progress support continue using estimated load.
+- Set the stale threshold to at least 2 seconds and below `--request-timeout-secs`.
+  This is a freshness threshold, not the worker's reporting interval.
+
 ## API Compatibility
 
 Support status of the OpenAI HTTP surface when the worker pool is `grpc://`:
