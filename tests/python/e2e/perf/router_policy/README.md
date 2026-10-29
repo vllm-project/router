@@ -49,6 +49,8 @@ Each run writes a **new** cell directory:
 
 Before replay, **`run_cell` still removes `result/`** if reusing the same `AGENTX_OUT`. **`run_cell` fails if replay exit code ≠ 0**.
 
+**Port / ZMQ (`Address already in use`)**: cells reserve ports until each engine binds (sequential worker start). Between pytest cells, default **`AGENTX_CELL_GAP_SEC=5`**; before allocate, **`AGENTX_PORT_SETTLE_SEC=2`**. If one cell still fails, check stale `vllm-rs serve` (`ss -ltnp | grep <port>` from `PORTS allocated …`) and raise the gap (e.g. `export AGENTX_CELL_GAP_SEC=15`). Do not run multiple matrix jobs on one host in parallel.
+
 Optional **`export AGENTX_STREAM_LOGS=1`**: stream **worker + router** logs to stderr in real time (prefix `[engineN]` / `[router]`); replay stays file-only. Use **pytest `-sv`** so stderr is visible.
 
 At the end of a cell, `run_cell` **stops workers/router first** (so live streams do not bury the footer), then prints **`STATS`**, **`ARTIFACTS`** (includes **`results_summary.json`** when pytest sets `AGENTX_RESULTS_SUMMARY`), **`PORTS`**, and **`LOG_SUMMARY`** (error scan + last N lines of every engine/router/replay log; `AGENTX_LOG_TAIL`, default 50). With **`AGENTX_STREAM_LOGS=1`**, a `--- run_cell summary ---` banner marks this block.

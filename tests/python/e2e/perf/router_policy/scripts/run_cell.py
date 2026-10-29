@@ -179,6 +179,7 @@ active = []
 handles = []
 stream_pumps: list[tuple[subprocess.Popen[Any], threading.Thread]] = []
 ports = None
+_port_holders: list[socket.socket | None] = []
 _did_cleanup = False
 RESULTS_SUMMARY_ENV = "AGENTX_RESULTS_SUMMARY"
 
@@ -273,6 +274,43 @@ def stop(proc):
         _join_stream_pump(proc, stream_thread)
 
 
+def _release_all_port_holders() -> None:
+    global _port_holders
+    for idx, sock in enumerate(_port_holders):
+        if sock is None:
+            continue
+        try:
+            sock.close()
+        except OSError:
+            pass
+        _port_holders[idx] = None
+    _port_holders.clear()
+
+
+def _release_worker_port_holders(worker: int, workers: int) -> None:
+    n = workers
+    for idx in (worker, n + worker, 2 * n + worker, 3 * n + worker):
+        if idx >= len(_port_holders) or _port_holders[idx] is None:
+            continue
+        try:
+            _port_holders[idx].close()
+        except OSError:
+            pass
+        _port_holders[idx] = None
+
+
+def _release_router_port_holders(workers: int) -> None:
+    n = workers
+    for idx in (4 * n, 4 * n + 1):
+        if idx >= len(_port_holders) or _port_holders[idx] is None:
+            continue
+        try:
+            _port_holders[idx].close()
+        except OSError:
+            pass
+        _port_holders[idx] = None
+
+
 def cleanup(*_):
     global _did_cleanup
     if _did_cleanup:
@@ -285,6 +323,7 @@ def cleanup(*_):
     for handle in handles:
         handle.close()
     handles.clear()
+    _release_all_port_holders()
 
 
 def interrupted(*_):
@@ -459,22 +498,28 @@ def print_failure_diagnostics(out: Path, workers: int, *, hint: str = "") -> Non
     print_log_summary(out, workers, tail_lines=fail_tail, scan_errors=True)
 
 
-def allocate_ports(n):
-    socks = []
+def allocate_ports(n: int) -> dict[str, Any]:
+    """Reserve TCP ports until each worker/router binds (avoids ZMQ EADDRINUSE)."""
 
-    def free():
-        s = socket.socket()
-        s.bind(("0.0.0.0", 0))
-        socks.append(s)
-        return s.getsockname()[1]
+    global _port_holders
+    _release_all_port_holders()
+    holders: list[socket.socket] = []
 
-    alloc = {
-        name: [free() for _ in range(n)]
+    def reserve() -> int:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind(("127.0.0.1", 0))
+        port = int(s.getsockname()[1])
+        holders.append(s)
+        return port
+
+    alloc: dict[str, Any] = {
+        name: [reserve() for _ in range(n)]
         for name in ["http", "grpc", "kv_pub", "kv_replay"]
     }
-    alloc.update(router=free(), metrics=free())
-    for s in socks:
-        s.close()
+    alloc["router"] = reserve()
+    alloc["metrics"] = reserve()
+    _port_holders = holders
     return alloc
 
 
@@ -660,9 +705,13 @@ def main() -> None:
 def _run_cell() -> None:
     global _did_cleanup
     _did_cleanup = False
+    settle = float(os.environ.get("AGENTX_PORT_SETTLE_SEC", "2"))
+    if settle > 0:
+        time.sleep(settle)
     global ports
     ports = allocate_ports(WORKERS)
     env["HHC_KV_PUB_PORTS"] = json.dumps(ports["kv_pub"])
+    print(f"PORTS allocated {json.dumps(ports)}", flush=True)
     entry = OUT / "agentx_entry.py"
     entry.write_text(
         """import asyncio
@@ -695,20 +744,24 @@ raise SystemExit(main(["vllm", *sys.argv[1:]]))
     started = time.monotonic()
     try:
         try:
-            engines = [
-                start(
-                    engine_command(i),
-                    OUT / f"engine{i}.log",
-                    {"CUDA_VISIBLE_DEVICES": GPUS[i]},
-                    stream_prefix=f"[engine{i}] ",
+            engines: list[subprocess.Popen[Any]] = []
+            for i in range(WORKERS):
+                _release_worker_port_holders(i, WORKERS)
+                engines.append(
+                    start(
+                        engine_command(i),
+                        OUT / f"engine{i}.log",
+                        {"CUDA_VISIBLE_DEVICES": GPUS[i]},
+                        stream_prefix=f"[engine{i}] ",
+                    )
                 )
-                for i in range(WORKERS)
-            ]
-            for i, proc in enumerate(engines):
                 health(
-                    f"http://127.0.0.1:{ports['http'][i]}/health", proc, timeout=1800
+                    f"http://127.0.0.1:{ports['http'][i]}/health",
+                    engines[-1],
+                    timeout=1800,
                 )
             print(f"ENGINES_READY {time.monotonic() - started:.0f}s", flush=True)
+            _release_router_port_holders(WORKERS)
             router = start(
                 router_command(), OUT / "router.log", stream_prefix="[router] "
             )
