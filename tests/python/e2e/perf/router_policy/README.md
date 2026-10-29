@@ -24,6 +24,13 @@ export RUN_ROUTER_E2E_PERF=1
 pytest tests/python/e2e/perf/router_policy/test_router_policy_scenarios.py -m perf -v
 ```
 
+Live worker + router logs during a long cell (replay still file-only):
+
+```bash
+export AGENTX_STREAM_LOGS=1
+pytest tests/python/e2e/perf/router_policy/test_router_policy_scenarios.py -m perf -sv -k 'kv_aware/c16'
+```
+
 Single cell:
 
 ```bash
@@ -44,7 +51,7 @@ Before replay, **`run_cell` still removes `result/`** if reusing the same `AGENT
 
 Optional **`export AGENTX_STREAM_LOGS=1`**: stream **worker + router** logs to stderr in real time (prefix `[engineN]` / `[router]`); replay stays file-only. Use **pytest `-sv`** so stderr is visible.
 
-At the end of a cell, `run_cell` prints **`ARTIFACTS`** (JSON paths, log paths, `*.command.json` argv dumps), **`PORTS`**, then **`LOG_SUMMARY`** (error scan + last N lines of **every** engine/router/replay log; `AGENTX_LOG_TAIL`, default 50). Failures use longer tails (~80+). Pytest adds **`results_summary.json`** under `test-results/router_policy/results/`.
+At the end of a cell, `run_cell` **stops workers/router first** (so live streams do not bury the footer), then prints **`STATS`**, **`ARTIFACTS`** (includes **`results_summary.json`** when pytest sets `AGENTX_RESULTS_SUMMARY`), **`PORTS`**, and **`LOG_SUMMARY`** (error scan + last N lines of every engine/router/replay log; `AGENTX_LOG_TAIL`, default 50). With **`AGENTX_STREAM_LOGS=1`**, a `--- run_cell summary ---` banner marks this block.
 
 ```bash
 python tests/python/e2e/perf/router_policy/scripts/collect_stats.py test-results/router_policy/runs

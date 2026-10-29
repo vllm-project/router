@@ -135,6 +135,13 @@ def bootstrap(case_path: Path) -> None:
             "STREAM_LOGS worker+router -> stderr (set AGENTX_STREAM_LOGS=0 to disable)",
             flush=True,
         )
+    else:
+        print(
+            "LOGS worker/router/replay -> files under cell_dir only "
+            "(export AGENTX_STREAM_LOGS=1 and use pytest -sv for live "
+            "[engineN]/[router] on stderr)",
+            flush=True,
+        )
 
     env = os.environ.copy()
     py_prefix = str(Path(PY).parent) if ("/" in PY or "\\" in PY) else ""
@@ -172,6 +179,8 @@ active = []
 handles = []
 stream_pumps: list[tuple[subprocess.Popen[Any], threading.Thread]] = []
 ports = None
+_did_cleanup = False
+RESULTS_SUMMARY_ENV = "AGENTX_RESULTS_SUMMARY"
 
 
 def _stream_logs_enabled() -> bool:
@@ -265,6 +274,10 @@ def stop(proc):
 
 
 def cleanup(*_):
+    global _did_cleanup
+    if _did_cleanup:
+        return
+    _did_cleanup = True
     for proc in reversed(active):
         stop(proc)
     active.clear()
@@ -354,7 +367,12 @@ def _component_logs(out: Path, workers: int) -> list[tuple[str, Path]]:
     return items
 
 
-def print_artifacts(out: Path, workers: int) -> None:
+def print_artifacts(
+    out: Path,
+    workers: int,
+    *,
+    extras: list[tuple[str, Path]] | None = None,
+) -> None:
     entries: list[tuple[str, Path]] = [
         ("cell_dir", out),
         ("calibration.json", out / "calibration.json"),
@@ -364,6 +382,8 @@ def print_artifacts(out: Path, workers: int) -> None:
     for label, log_path in _component_logs(out, workers):
         entries.append((label, log_path))
         entries.append((f"{label}.command.json", Path(str(log_path) + ".command.json")))
+    if extras:
+        entries.extend(extras)
     print("ARTIFACTS", flush=True)
     for name, path in entries:
         print(f"  {name}: {path.resolve()}", flush=True)
@@ -383,10 +403,58 @@ def print_log_summary(
         _tail_file(log_path, max_lines=n, label=label)
 
 
+def _write_results_summary_from_calibration(out: Path) -> list[tuple[str, Path]]:
+    raw = os.environ.get(RESULTS_SUMMARY_ENV, "").strip()
+    if not raw:
+        return []
+    dest = Path(raw)
+    cal = out / "calibration.json"
+    if not cal.is_file():
+        return []
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text(cal.read_text(encoding="utf-8"), encoding="utf-8")
+    return [("results_summary.json", dest)]
+
+
+def _emit_run_summary(
+    out: Path,
+    workers: int,
+    stats: dict,
+    *,
+    replay_rc: int | None,
+    stalled: bool,
+) -> None:
+    """Print STATS / ARTIFACTS / LOG_SUMMARY after stopping workers (quiet streams)."""
+
+    cleanup()
+    if _stream_logs_enabled():
+        print("\n--- run_cell summary (worker/router streams stopped) ---", flush=True)
+    summary_extra = _write_results_summary_from_calibration(out)
+    print("STATS " + json.dumps(stats), flush=True)
+    print_artifacts(out, workers, extras=summary_extra)
+    fail_tail = max(_log_tail_lines(), 80)
+    if replay_rc not in (0, None):
+        print(f"DIAGNOSTIC replay failed (exit {replay_rc})", flush=True)
+        print_log_summary(out, workers, tail_lines=fail_tail)
+        raise SystemExit(1)
+    if stalled or stats["success"] != stats["requests"]:
+        print(
+            "DIAGNOSTIC stalled or non-success rows in requests.jsonl",
+            flush=True,
+        )
+        print_log_summary(out, workers, tail_lines=fail_tail)
+        raise SystemExit(1)
+    print_log_summary(out, workers)
+
+
 def print_failure_diagnostics(out: Path, workers: int, *, hint: str = "") -> None:
+    cleanup()
+    if _stream_logs_enabled():
+        print("\n--- run_cell summary (worker/router streams stopped) ---", flush=True)
     if hint:
         print(f"DIAGNOSTIC {hint}", flush=True)
-    print_artifacts(out, workers)
+    extras = _write_results_summary_from_calibration(out)
+    print_artifacts(out, workers, extras=extras)
     fail_tail = max(_log_tail_lines(), 80)
     print_log_summary(out, workers, tail_lines=fail_tail, scan_errors=True)
 
@@ -590,6 +658,8 @@ def main() -> None:
 
 
 def _run_cell() -> None:
+    global _did_cleanup
+    _did_cleanup = False
     global ports
     ports = allocate_ports(WORKERS)
     env["HHC_KV_PUB_PORTS"] = json.dumps(ports["kv_pub"])
@@ -728,7 +798,25 @@ raise SystemExit(main(["vllm", *sys.argv[1:]]))
                     snapshot(OUT / "metrics" / f"{tick * 10:05}")
                 except Exception as exc:
                     print(f"SNAPSHOT_FAIL {exc}", flush=True)
-                print(f"TICK {tick * 10}s", flush=True)
+                replay_lines = 0
+                if progress_file.is_file():
+                    replay_lines = sum(
+                        1
+                        for line in progress_file.read_text(
+                            encoding="utf-8", errors="replace"
+                        ).splitlines()
+                        if line.strip()
+                    )
+                running = engines_busy()
+                tick_extra = f" replay_ok={replay_lines}"
+                if running is not None:
+                    tick_extra += f" engines_running={running}"
+                print(f"TICK {tick * 10}s{tick_extra}", flush=True)
+        try:
+            replay.wait(timeout=120)
+        except subprocess.TimeoutExpired:
+            replay.kill()
+            replay.wait(timeout=30)
         snapshot(OUT / "after")
         replay_rc = replay.returncode
         if replay_rc not in (0, None):
@@ -797,23 +885,13 @@ raise SystemExit(main(["vllm", *sys.argv[1:]]))
             ),
         }
         (OUT / "calibration.json").write_text(json.dumps(stats, indent=2))
-        print("STATS " + json.dumps(stats), flush=True)
-        print_artifacts(OUT, WORKERS)
-        if replay_rc not in (0, None):
-            print_failure_diagnostics(
-                OUT,
-                WORKERS,
-                hint=f"replay failed (exit {replay_rc})",
-            )
-            raise SystemExit(1)
-        if stalled or stats["success"] != stats["requests"]:
-            print_failure_diagnostics(
-                OUT,
-                WORKERS,
-                hint="stalled or non-success rows in requests.jsonl",
-            )
-            raise SystemExit(1)
-        print_log_summary(OUT, WORKERS)
+        _emit_run_summary(
+            OUT,
+            WORKERS,
+            stats,
+            replay_rc=replay_rc,
+            stalled=stalled,
+        )
     finally:
         cleanup()
 

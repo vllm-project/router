@@ -34,6 +34,9 @@ def _run_cell(case_file: Path) -> Path:
     env["AGENTX_CASE_FILE"] = str(case_file.resolve())
     env["AGENTX_RUN_SUFFIX"] = run_suffix
     env["AGENTX_OUT"] = str(out)
+    env["AGENTX_RESULTS_SUMMARY"] = str(
+        cell_results_summary_path(case, run_suffix=run_suffix)
+    )
     timeout = int(env.get("AGENTX_PERF_TIMEOUT_SEC", str(4 * 3600)))
     proc = subprocess.run(
         [runtime["python"], "-u", str(RUN_CELL)],
@@ -49,16 +52,8 @@ def _run_cell(case_file: Path) -> Path:
             flush=True,
         )
         assert proc.returncode == 0, f"run_cell failed for {case_file.name}"
-    cal_path = out / "calibration.json"
-    summary: Path | None = None
-    if cal_path.is_file():
-        summary = cell_results_summary_path(case, run_suffix=run_suffix)
-        summary.parent.mkdir(parents=True, exist_ok=True)
-        summary.write_text(cal_path.read_text(encoding="utf-8"), encoding="utf-8")
-    print("ARTIFACTS pytest_copy:", flush=True)
-    print(
-        f"  results_summary.json: {summary.resolve() if summary else 'n/a'}", flush=True
-    )
+    summary = cell_results_summary_path(case, run_suffix=run_suffix)
+    assert summary.is_file(), f"missing results summary copy {summary}"
     return out
 
 
