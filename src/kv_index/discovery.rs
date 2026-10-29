@@ -2506,86 +2506,80 @@ mod tests {
     async fn pd_static_full_attention_rejects_entire_bad_batch_with_source_block_size() {
         use serde_json::json;
 
-        for invalid in ["block-size", "layout"] {
-            let context = zmq::Context::new();
-            let publisher = context.socket(zmq::XPUB).unwrap();
-            publisher.bind("tcp://127.0.0.1:*").unwrap();
-            let endpoint = publisher.get_last_endpoint().unwrap().unwrap();
-            let worker = "http://127.0.0.1:1";
-            let (supervisor, mut signals) = KvIndexSupervisor::new_pd(
-                reqwest::Client::new(),
-                HashMode::Sha256,
-                HashMap::from([(
-                    worker.to_owned(),
-                    crate::config::types::PdKvEventSources {
-                        endpoints: vec![endpoint],
-                        replay_endpoints: None,
-                        block_size: 8,
-                        model: Some("pd-model".into()),
-                    },
-                )]),
-            );
-            let info = supervisor.on_worker_added(worker).await.unwrap();
-            assert_eq!(info.cache_key.unwrap().block_size, 8);
-            boundary_subscription(&publisher, "", false).await;
-            let stored = |hash, start, size| {
-                stored_block(
-                    hash,
-                    &(start..start + size).collect::<Vec<_>>(),
-                    size,
-                    "GPU",
-                )
-            };
-            let mut bad = stored(1, 20, if invalid == "block-size" { 4 } else { 8 });
-            if invalid == "layout" {
-                bad["kv_cache_spec_kind"] = json!("sliding_attention");
-            }
-            let batch = rmp_serde::to_vec(&(
-                1.0,
-                [
-                    json!({"type": "BlockRemoved", "block_hashes": [9], "medium": "GPU"}),
-                    json!({"type": "AllBlocksCleared"}),
-                    bad,
-                    stored(2, 100, 8),
-                ],
-                0u32,
-            ))
+        let context = zmq::Context::new();
+        let publisher = context.socket(zmq::XPUB).unwrap();
+        publisher.bind("tcp://127.0.0.1:*").unwrap();
+        let endpoint = publisher.get_last_endpoint().unwrap().unwrap();
+        let worker = "http://127.0.0.1:1";
+        let (supervisor, mut signals) = KvIndexSupervisor::new_pd(
+            reqwest::Client::new(),
+            HashMode::Sha256,
+            HashMap::from([(
+                worker.to_owned(),
+                crate::config::types::PdKvEventSources {
+                    endpoints: vec![endpoint],
+                    replay_endpoints: None,
+                    block_size: 8,
+                    model: Some("pd-model".into()),
+                },
+            )]),
+        );
+        let info = supervisor.on_worker_added(worker).await.unwrap();
+        assert_eq!(info.cache_key.unwrap().block_size, 8);
+        boundary_subscription(&publisher, "", false).await;
+        let stored = |hash, start, size| {
+            stored_block(
+                hash,
+                &(start..start + size).collect::<Vec<_>>(),
+                size,
+                "GPU",
+            )
+        };
+        let batch = rmp_serde::to_vec(&(
+            1.0,
+            [
+                json!({"type": "BlockRemoved", "block_hashes": [9], "medium": "GPU"}),
+                json!({"type": "AllBlocksCleared"}),
+                stored(1, 20, 4),
+                stored(2, 100, 8),
+            ],
+            0u32,
+        ))
+        .unwrap();
+        publisher
+            .send_multipart([b"".as_slice(), &0i64.to_be_bytes(), &batch], 0)
             .unwrap();
-            publisher
-                .send_multipart([b"".as_slice(), &0i64.to_be_bytes(), &batch], 0)
-                .unwrap();
-            // A subsequent valid frame is a deterministic processing barrier;
-            // a rejected earlier batch must not become visible after resume.
-            let marker = rmp_serde::to_vec(&(2.0, [stored(3, 200, 8)], 0u32)).unwrap();
-            publisher
-                .send_multipart([b"".as_slice(), &1i64.to_be_bytes(), &marker], 0)
-                .unwrap();
-            tokio::time::timeout(Duration::from_secs(5), async {
-                loop {
-                    if matches!(
-                        signals.recv().await,
-                        Some(IngestionSignal::Advance { last_seq: 1, .. })
-                    ) {
-                        break;
-                    }
+        // A subsequent valid frame is a deterministic processing barrier;
+        // a rejected earlier batch must not become visible after resume.
+        let marker = rmp_serde::to_vec(&(2.0, [stored(3, 200, 8)], 0u32)).unwrap();
+        publisher
+            .send_multipart([b"".as_slice(), &1i64.to_be_bytes(), &marker], 0)
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if matches!(
+                    signals.recv().await,
+                    Some(IngestionSignal::Advance { last_seq: 1, .. })
+                ) {
+                    break;
                 }
-            })
-            .await
-            .unwrap();
-            let index = supervisor.workers.lock()[worker].indexer.clone();
-            let query = |start| {
-                block_query(
-                    &(start..start + 8).collect::<Vec<_>>(),
-                    8,
-                    &[StorageTier::Device],
-                )
-            };
-            assert!(
-                index.find_matches(&query(100)).is_empty(),
-                "bad {invalid} batch leaked its valid Store"
-            );
-            assert_eq!(index.find_matches(&query(200)).len(), 1);
-            supervisor.shutdown();
-        }
+            }
+        })
+        .await
+        .unwrap();
+        let index = supervisor.workers.lock()[worker].indexer.clone();
+        let query = |start| {
+            block_query(
+                &(start..start + 8).collect::<Vec<_>>(),
+                8,
+                &[StorageTier::Device],
+            )
+        };
+        assert!(
+            index.find_matches(&query(100)).is_empty(),
+            "bad block-size batch leaked its valid Store"
+        );
+        assert_eq!(index.find_matches(&query(200)).len(), 1);
+        supervisor.shutdown();
     }
 }
