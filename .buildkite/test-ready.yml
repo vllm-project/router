@@ -126,12 +126,11 @@ steps:
       - "/tmp/router.log"
 
   # kv_aware functional e2e. Two vllm-rs workers, default model
-  # Qwen/Qwen3-0.6B. elapsed_sec in the log is the pytest wall time.
-  # The Buildkite step time also includes image pull and model load.
-  - label: ":stopwatch: kv_aware e2e (2x L4)"
+  # Qwen/Qwen3-0.6B.
+  - label: ":gpu: kv_aware e2e (2x L4)"
     key: "kv-aware-e2e"
     if: build.env("ROCM_ONLY") != "1"
-    timeout_in_minutes: 90
+    timeout_in_minutes: 60
     retry:
       manual:
         allowed: true
@@ -142,11 +141,9 @@ steps:
       set -euo pipefail
       ./scripts/backend/check_vllm_rs.sh
       echo "kv_aware model=${KV_AWARE_E2E_MODEL:-Qwen/Qwen3-0.6B}"
-      start=$(date +%s)
       pytest tests/python/e2e/function/kv_aware \
         --confcutdir=tests/python/e2e/function/kv_aware \
         -m e2e -v -s
-      echo "kv_aware elapsed_sec=$(( $(date +%s) - start ))"
       BASH
     depends_on:
       - "upload-ready-pipeline"
