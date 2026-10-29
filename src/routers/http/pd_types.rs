@@ -233,6 +233,47 @@ impl PdLoadManager {
         }));
         Some((selection, attempt))
     }
+
+    /// Charge a P/D pair the caller already bound.
+    ///
+    /// Program scheduling picks the decode engine by affinity before dispatch,
+    /// so it cannot go through policy selection, but its occupancy must stay
+    /// visible to native admission and to `/metrics`. The prefill token count is
+    /// unknown here, so the attempt is charged as an unknown-size prefill.
+    pub(super) fn admit_bound(
+        &self,
+        prefill_worker: Arc<dyn Worker>,
+        decode_worker: Arc<dyn Worker>,
+    ) -> PdAttempt {
+        let prefill = PdEndpoint::for_worker(prefill_worker.as_ref());
+        let decode = PdEndpoint::for_worker(decode_worker.as_ref());
+        {
+            let mut loads = self.loads.lock();
+            let p = loads.entry((Stage::Prefill, prefill.clone())).or_default();
+            p.prefill_requests += 1;
+            p.unknown_prefill_requests += 1;
+            p.publish(Stage::Prefill, &prefill);
+            let d = loads.entry((Stage::Decode, decode.clone())).or_default();
+            d.pending_decode_requests += 1;
+            d.publish(Stage::Decode, &decode);
+        }
+        let attempt = PdAttempt(Arc::new(AttemptInner {
+            admitted_at: std::time::Instant::now(),
+            loads: self.loads.clone(),
+            prefill,
+            decode,
+            prefill_worker: Mutex::new(None),
+            decode_worker: Mutex::new(None),
+            prefill_tokens: None,
+            affinity: None,
+            state: Mutex::new(AttemptState {
+                prefill: true,
+                decode: DecodeState::Pending,
+            }),
+        }));
+        attempt.attach_workers(prefill_worker, decode_worker);
+        attempt
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -279,6 +279,10 @@ name = "test_openai_routing"
 path = "tests/rust/test_openai_routing.rs"
 
 [[test]]
+name = "test_pd_program_scheduling"
+path = "tests/rust/test_pd_program_scheduling.rs"
+
+[[test]]
 name = "test_pd_routing"
 path = "tests/rust/test_pd_routing.rs"
 

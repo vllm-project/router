@@ -104,6 +104,42 @@ steps:
     artifact_paths:
       - "/tmp/router.log"
 
+  # ============================================================================
+  # L3 gRPC prefix-KV perf — rust_grpc + python_http (c16-r32), H100×2.
+  # Pulls the router CI image from image-build (vLLM + vllm-router on PATH).
+  # ============================================================================
+  - label: ":python: grpc perf test case"
+    key: "grpc-perf-e2e"
+    # image-build is skipped when ROCM_ONLY=1. A skipped dependency is treated
+    # as satisfied, so this job must use the same condition.
+    if: build.env("ROCM_ONLY") != "1"
+    timeout_in_minutes: 90
+    retry:
+      automatic:
+        - exit_status: "*"
+          limit: 1
+      manual:
+        allowed: true
+        reason: "GPU perf cold starts can be flaky — retry after checking logs"
+    mirror_hardwares: h100_2
+    depends_on:
+      - "upload-nightly-pipeline"
+      - "image-build"
+    command: |
+      bash <<'BASH'
+      set -euo pipefail
+
+      export MODEL="Qwen/Qwen3.8-27B"
+      export PERF_STACK_TIMEOUT=1800
+      export PERF_WORKER_STARTUP_TIMEOUT=1800
+
+      python -m pytest -sv tests/python/e2e/perf/grpc -k c16-r32 --perf-case=rust_grpc
+      python -m pytest -sv tests/python/e2e/perf/grpc -k c16-r32 --perf-case=python_http
+
+      BASH
+    artifact_paths:
+      - "tests/python/e2e/perf/grpc/results/**/*.json"
+
   # This queue is intentionally separate from the shared amd_mi300_* queues.
   # Those agents run --no-plugins, while this lane needs the Docker plugin
   # to provide the pinned vLLM/MoRI userspace on a two-GPU xGMI host.
