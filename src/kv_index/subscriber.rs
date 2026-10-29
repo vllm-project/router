@@ -849,7 +849,7 @@ mod tests {
     }
 
     #[test]
-    fn full_attention_batch_rejects_unmodeled_residency_and_layout_atomically() {
+    fn full_attention_and_generic_subscribers_preserve_residency_boundaries() {
         let source = SourceId::from("dense");
         let valid = stored(
             vec![ExternalBlockHash::Int(1)],
@@ -857,89 +857,16 @@ mod tests {
             Some("GPU"),
             None,
         );
-        for case in [
-            "remote",
-            "local-pool",
-            "unknown-medium",
-            "layout",
-            "sliding-window",
-            "token-count",
-        ] {
-            let index = KvBlockIndexer::new();
-            let mut invalid = valid.clone();
-            invalid.block_hashes = vec![ExternalBlockHash::Int(2)];
-            invalid.token_ids = vec![5, 6, 7, 8];
-            let reason = match case {
-                "remote" => {
-                    invalid.locality = Some("REMOTE".into());
-                    FullAttentionRejectionReason::Residency
-                }
-                "local-pool" => {
-                    invalid.locality = Some("LOCAL".into());
-                    invalid.ownership = Some("pool".into());
-                    FullAttentionRejectionReason::Residency
-                }
-                "unknown-medium" => {
-                    invalid.medium = Some("unknown".into());
-                    FullAttentionRejectionReason::Residency
-                }
-                "layout" => {
-                    invalid.kv_cache_spec_kind = Some("sliding_attention".into());
-                    FullAttentionRejectionReason::Layout
-                }
-                "sliding-window" => {
-                    invalid.kv_cache_spec_sliding_window = Some(8);
-                    FullAttentionRejectionReason::Layout
-                }
-                "token-count" => {
-                    invalid.block_hashes.push(ExternalBlockHash::Int(3));
-                    FullAttentionRejectionReason::TokenCountMismatch
-                }
-                _ => unreachable!(),
-            };
-            let batch = KVEventBatch {
-                ts: 0.0,
-                events: vec![
-                    KVEvent::BlockStored(valid.clone()),
-                    KVEvent::BlockStored(invalid),
-                ],
-                data_parallel_rank: Some(0),
-            };
-            assert_eq!(
-                apply_batch(&index, &source, 0, 0, &batch, Some(4)),
-                Err(FullAttentionBatchRejection {
-                    reason,
-                    event_index: 1
-                }),
-                "{case}"
-            );
-            let query = |tokens: &[u32]| MatchQuery {
-                group_idx: 0,
-                local_hashes: crate::kv_index::local_block_hash_strings(tokens, 4, None),
-                tiers_of_interest: vec![
-                    StorageTier::Device,
-                    StorageTier::HostPinned,
-                    StorageTier::Disk,
-                    StorageTier::External,
-                ],
-            };
-            for tokens in [[1, 2, 3, 4], [5, 6, 7, 8]] {
-                assert!(
-                    index.find_matches(&query(&tokens)).is_empty(),
-                    "rejected batch leaked credit: {case}"
-                );
-            }
-            // The default generic subscriber keeps its wider structural domain.
-            assert!(
-                apply_batch(&index, &source, 0, 0, &batch, None).is_ok(),
-                "{case}"
-            );
-            assert_eq!(
-                index.find_matches(&query(&[5, 6, 7, 8])).len(),
-                1,
-                "generic: {case}"
-            );
-        }
+        let generic = KvBlockIndexer::new();
+        let mut remote = valid.clone();
+        remote.locality = Some("REMOTE".into());
+        let batch = KVEventBatch {
+            ts: 0.0,
+            events: vec![KVEvent::BlockStored(remote)],
+            data_parallel_rank: Some(0),
+        };
+        assert!(apply_batch(&generic, &source, 0, 0, &batch, None).is_ok());
+        assert_eq!(hits(&generic, &[1, 2, 3, 4]).len(), 1);
         for (medium, ownership, locality, tier) in [
             ("GPU", None, "LOCAL", StorageTier::Device),
             ("CPU", None, "LOCAL", StorageTier::HostPinned),
@@ -1331,6 +1258,14 @@ mod tests {
             Some("GPU"),
             None,
         ))
+    }
+
+    fn session_store_event(seq_hash: u64, tokens: &[u32], session: &str) -> KVEvent {
+        let KVEvent::BlockStored(mut event) = store_event(seq_hash, tokens) else {
+            unreachable!()
+        };
+        event.session_id = Some(session.into());
+        KVEvent::BlockStored(event)
     }
 
     fn hits(index: &KvBlockIndexer, tokens: &[u32]) -> Vec<crate::kv_index::TierMatch> {
@@ -1818,7 +1753,7 @@ mod tests {
 
     #[tokio::test]
     async fn live_topic_prefix_does_not_publish_or_consume_the_sequence() {
-        let mut f = fixture(false);
+        let mut f = fixture_with_block_size(false, Some(4));
         publish_until_advanced(&f.publisher, &mut f.signals, b"kv", 0, 0.0, &[], Some(0)).await;
         let unrelated = [1, 2, 3, 4];
         let expected = [5, 6, 7, 8];
@@ -1832,12 +1767,15 @@ mod tests {
             b"kv",
             1,
             1.0,
-            &[store_event(101, &expected)],
+            &[session_store_event(101, &expected, "session-live")],
             Some(0),
         )
         .await;
         assert!(hits(&f.indexer, &unrelated).is_empty());
-        assert_eq!(hits(&f.indexer, &expected).len(), 1);
+        let matches = hits(&f.indexer, &expected);
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].target.instance_id.as_ref(), "w0");
+        assert_eq!(matches[0].target.dp_rank, 0);
     }
 
     #[tokio::test]
@@ -1894,9 +1832,10 @@ mod tests {
         rmp_serde::to_vec_named(&(1.0, events, Some(rank))).unwrap()
     }
 
-    #[tokio::test]
-    async fn full_attention_session_annotation_live_preserves_shared_blocks() {
-        let mut f = fixture_with_block_size(false, Some(4));
+    #[test]
+    fn full_attention_session_annotations_preserve_shared_and_unrelated_blocks() {
+        let index = KvBlockIndexer::new();
+        let source = SourceId::from("w0");
         let shared = [1, 2, 3, 4];
         let retained = [5, 6, 7, 8];
         for (seq, session, blocks) in [
@@ -1905,80 +1844,21 @@ mod tests {
         ] {
             let events: Vec<_> = blocks
                 .into_iter()
-                .map(|(hash, tokens)| {
-                    let mut event = stored(
-                        vec![ExternalBlockHash::Int(hash)],
-                        tokens.to_vec(),
-                        Some("GPU"),
-                        None,
-                    );
-                    event.session_id = Some(session.into());
-                    KVEvent::BlockStored(event)
-                })
+                .map(|(hash, tokens)| session_store_event(hash, &tokens, session))
                 .collect();
-            publish_until_advanced(
-                &f.publisher,
-                &mut f.signals,
-                b"kv",
-                seq,
-                seq as f64,
-                &events,
-                Some(0),
-            )
-            .await;
+            let batch = KVEventBatch {
+                ts: seq as f64,
+                events,
+                data_parallel_rank: Some(0),
+            };
+            assert!(apply_batch(&index, &source, 0, 0, &batch, Some(4)).is_ok());
             for tokens in [&shared, &retained] {
-                let matches = hits(&f.indexer, tokens);
+                let matches = hits(&index, tokens);
                 assert_eq!(matches.len(), 1, "session annotation erased placement");
                 assert_eq!(matches[0].target.instance_id.as_ref(), "w0");
                 assert_eq!(matches[0].target.dp_rank, 0);
             }
         }
-    }
-
-    #[tokio::test]
-    async fn full_attention_session_annotation_replay_applies_shared_blocks() {
-        let context = zmq::Context::new();
-        let replay_server = context.socket(zmq::ROUTER).unwrap();
-        let endpoint = "inproc://kv-session-replay";
-        replay_server.bind(endpoint).unwrap();
-        let indexer = Arc::new(KvBlockIndexer::new());
-        let tokens = [1, 2, 3, 4];
-        let events: Vec<_> = ["session-a", "session-b"]
-            .into_iter()
-            .map(|session| {
-                let mut event = stored(
-                    vec![ExternalBlockHash::Int(100)],
-                    tokens.to_vec(),
-                    Some("GPU"),
-                    None,
-                );
-                event.session_id = Some(session.into());
-                KVEvent::BlockStored(event)
-            })
-            .collect();
-        let replies = [(1, b"kv".as_slice(), batch_payload(&events, 0))];
-        let source = SourceId::from("w0");
-        let mut reported = false;
-        let (result, ()) = tokio::join!(
-            replay(
-                endpoint,
-                0,
-                1,
-                &context,
-                &indexer,
-                &source,
-                0,
-                0,
-                None,
-                Some(4),
-                "kv",
-                &mut reported,
-                None,
-            ),
-            serve_replay(&replay_server, &replies, &indexer, &[]),
-        );
-        assert_eq!(result, Some(1));
-        assert_eq!(hits(&indexer, &tokens).len(), 1);
     }
 
     #[test]
@@ -2168,7 +2048,7 @@ mod tests {
     }
 
     async fn check_replay_case(case: &str) {
-        let mut f = fixture(true);
+        let mut f = fixture_with_block_size(true, (case == "complete").then_some(4));
         let old = [1, 2, 3, 4];
         let keep = [5, 6, 7, 8];
         let partial = [9, 10, 11, 12];
@@ -2194,7 +2074,7 @@ mod tests {
             assert_eq!(matches[0].target.instance_id.as_ref(), "w0");
             assert_eq!(matches[0].target.dp_rank, 0);
         }
-        let first = batch_payload(&[store_event(200, &partial)], 0);
+        let first = batch_payload(&[session_store_event(200, &partial, "session-replay")], 0);
         let eviction = batch_payload(
             &[KVEvent::BlockRemoved(BlockRemoved {
                 block_hashes: vec![ExternalBlockHash::Int(100)],
@@ -2261,6 +2141,11 @@ mod tests {
             usize::from(case == "complete"),
             "partial replay must not escape: {case}"
         );
+        if case == "complete" {
+            let matches = hits(&f.indexer, &partial);
+            assert_eq!(matches[0].target.instance_id.as_ref(), "w0");
+            assert_eq!(matches[0].target.dp_rank, 0);
+        }
         assert_eq!(
             hits(&f.indexer, &fresh).len(),
             1,
