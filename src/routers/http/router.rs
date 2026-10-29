@@ -3994,20 +3994,7 @@ mod tests {
 
     #[tokio::test]
     async fn completion_retry_reselects_another_worker_and_preserves_active_request() {
-        let first_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let second_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let first: Arc<dyn Worker> = Arc::new(BasicWorker::new(
-            format!("http://{}", first_listener.local_addr().unwrap()),
-            WorkerType::Regular,
-        ));
-        let second: Arc<dyn Worker> = Arc::new(BasicWorker::new(
-            format!("http://{}", second_listener.local_addr().unwrap()),
-            WorkerType::Regular,
-        ));
-        second.set_healthy(false);
         let mut router = create_test_kv_router();
-        router.worker_registry.register(first.clone());
-        router.worker_registry.register(second.clone());
         router.retry_config = RetryConfig {
             max_retries: 2,
             initial_backoff_ms: 0,
@@ -4015,163 +4002,74 @@ mod tests {
             jitter_factor: 0.0,
             ..Default::default()
         };
+        let mut servers = Vec::new();
+        for _ in 0..2 {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+                format!("http://{}", listener.local_addr().unwrap()),
+                WorkerType::Regular,
+            ));
+            router.worker_registry.register(worker.clone());
+            let (captured, requests) = tokio::sync::mpsc::unbounded_channel();
+            let preparations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let prepare = preparations.clone();
+            let app = axum::Router::new()
+                .route(
+                    "/v1/completions/render",
+                    axum::routing::post(move || {
+                        prepare.fetch_add(1, Ordering::Relaxed);
+                        async { Json(serde_json::json!([{"token_ids":[1,3,4],"features":null}])) }
+                    }),
+                )
+                .route(
+                    "/v1/completions",
+                    axum::routing::post(move |body: bytes::Bytes| {
+                        let (reply, response) = tokio::sync::oneshot::channel::<Response>();
+                        captured.send((body, reply)).unwrap();
+                        async move { response.await.unwrap() }
+                    }),
+                );
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            servers.push((worker, requests, preparations, server));
+        }
+        let (first, mut first_requests, first_preparations, first_server) = servers.remove(0);
+        let (second, mut second_requests, second_preparations, second_server) = servers.remove(0);
+        second.set_healthy(false);
         let policy = router.policy_registry.get_default_policy();
-        let kv = policy
-            .as_any()
-            .downcast_ref::<crate::policies::KvAwarePolicy>()
-            .unwrap();
+        let kv = kv_aware_policy(policy.as_ref()).unwrap();
         let manager = kv.slot_manager().unwrap();
         let first_target = kv.target_for_worker(first.as_ref());
         let second_target = kv.target_for_worker(second.as_ref());
-        let captured = Arc::new(Mutex::new(Vec::new()));
-        let (arrived, mut arrivals) = tokio::sync::mpsc::unbounded_channel();
-        let (release, held) = tokio::sync::oneshot::channel();
-        let held = Arc::new(Mutex::new(Some(held)));
-        let second_background = Arc::new(Mutex::new(None::<RequestLoadGuard>));
-        let release_second = second_background.clone();
-        let preparations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let prepare = preparations.clone();
-        let app = axum::Router::new()
-            .route(
-                "/v1/completions/render",
-                axum::routing::post(move || {
-                    prepare.fetch_add(1, Ordering::Relaxed);
-                    async { Json(serde_json::json!([{"token_ids":[1,3,4],"features":null}])) }
-                }),
-            )
-            .route(
-                "/v1/completions",
-                axum::routing::post({
-                    let (first, second, manager, target, captured) = (
-                        first.clone(),
-                        second.clone(),
-                        manager.clone(),
-                        first_target.clone(),
-                        captured.clone(),
-                    );
-                    move |body: bytes::Bytes| {
-                        let (first, second, manager, target, captured, arrived, held) = (
-                            first.clone(),
-                            second.clone(),
-                            manager.clone(),
-                            target.clone(),
-                            captured.clone(),
-                            arrived.clone(),
-                            held.clone(),
-                        );
-                        let release_second = release_second.clone();
-                        async move {
-                            let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
-                            if request["prompt"].is_array() {
-                                let held = held.lock().take().unwrap();
-                                assert_eq!(
-                                    manager.sample(&target),
-                                    crate::policies::LoadSample {
-                                        active_prefill_tokens: 2,
-                                        active_requests: 1
-                                    }
-                                );
-                                arrived.send(()).unwrap();
-                                held.await.unwrap();
-                                Json(serde_json::json!({"choices":[]})).into_response()
-                            } else {
-                                assert_eq!(
-                                    manager.sample(&target),
-                                    crate::policies::LoadSample {
-                                        active_prefill_tokens: 5,
-                                        active_requests: 2
-                                    }
-                                );
-                                assert_eq!(first.load(), 2);
-                                captured.lock().push(("A", body));
-                                drop(release_second.lock().take());
-                                first.set_healthy(false);
-                                second.set_healthy(true);
-                                StatusCode::INTERNAL_SERVER_ERROR.into_response()
-                            }
-                        }
-                    }
-                }),
-            );
-        let first_server =
-            tokio::spawn(async move { axum::serve(first_listener, app).await.unwrap() });
-        let prepare = preparations.clone();
-        let app = axum::Router::new()
-            .route(
-                "/v1/completions/render",
-                axum::routing::post(move || {
-                    prepare.fetch_add(1, Ordering::Relaxed);
-                    async { Json(serde_json::json!([{"token_ids":[1,3,4],"features":null}])) }
-                }),
-            )
-            .route(
-                "/v1/completions",
-                axum::routing::post({
-                    let (first, second, manager, first_target, second_target, captured) = (
-                        first.clone(),
-                        second.clone(),
-                        manager.clone(),
-                        first_target.clone(),
-                        second_target.clone(),
-                        captured.clone(),
-                    );
-                    move |body: bytes::Bytes| {
-                        let (first, second, manager, first_target, second_target, captured) = (
-                            first.clone(),
-                            second.clone(),
-                            manager.clone(),
-                            first_target.clone(),
-                            second_target.clone(),
-                            captured.clone(),
-                        );
-                        async move {
-                            assert_eq!(
-                                manager.sample(&first_target),
-                                crate::policies::LoadSample {
-                                    active_prefill_tokens: 2,
-                                    active_requests: 1
-                                }
-                            );
-                            assert_eq!(
-                                manager.sample(&second_target),
-                                crate::policies::LoadSample {
-                                    active_prefill_tokens: 3,
-                                    active_requests: 1
-                                }
-                            );
-                            assert_eq!((first.load(), second.load()), (1, 1));
-                            captured.lock().push(("B", body));
-                            Json(serde_json::json!({"choices":[{"text":"ok"}]}))
-                        }
-                    }
-                }),
-            );
-        let second_server =
-            tokio::spawn(async move { axum::serve(second_listener, app).await.unwrap() });
         let router = Arc::new(router);
-        let background = tokio::spawn({
+        let dispatch = |raw: bytes::Bytes| {
             let router = router.clone();
-            async move {
-                let raw = bytes::Bytes::from_static(b"{\"model\":\"qwen3\",\"prompt\":[1,2]}");
-                let response = router
-                    .route_completion_raw(
-                        None,
-                        Arc::new(serde_json::from_slice(&raw).unwrap()),
-                        raw,
-                        None,
-                    )
-                    .await;
+            tokio::spawn(async move {
+                let request = Arc::new(serde_json::from_slice(&raw).unwrap());
+                let response = router.route_completion_raw(None, request, raw, None).await;
                 assert_eq!(response.status(), StatusCode::OK);
                 to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            })
+        };
+        // Keep a real request active on A throughout the foreground request's retry.
+        let background = dispatch(bytes::Bytes::from_static(
+            b"{\"model\":\"qwen3\",\"prompt\":[1,2]}",
+        ));
+        let (_, background_reply) =
+            tokio::time::timeout(Duration::from_secs(5), first_requests.recv())
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(first.load(), 1);
+        assert_eq!(
+            manager.sample(&first_target),
+            crate::policies::LoadSample {
+                active_prefill_tokens: 2,
+                active_requests: 1,
             }
-        });
-        tokio::time::timeout(Duration::from_secs(5), arrivals.recv())
-            .await
-            .unwrap()
-            .unwrap();
+        );
         manager.begin_prefill(&second_target, 64);
         second.increment_load();
-        *second_background.lock() = Some(RequestLoadGuard::new(
+        let second_background = RequestLoadGuard::new(
             Some(second.clone()),
             Some(KvRequestSlot::new(
                 manager.clone(),
@@ -4179,42 +4077,79 @@ mod tests {
                 64,
                 None,
             )),
-        ));
+        );
         second.set_healthy(true);
         let raw =
             bytes::Bytes::from_static(b" { \"model\":\"qwen3\", \"prompt\":\"hello world\" }\n");
-        let response = tokio::time::timeout(
-            Duration::from_secs(5),
-            router.route_completion_raw(
-                None,
-                Arc::new(serde_json::from_slice(&raw).unwrap()),
-                raw.clone(),
-                None,
-            ),
-        )
-        .await
-        .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        assert_eq!(*captured.lock(), vec![("A", raw.clone()), ("B", raw)]);
+        let foreground = dispatch(raw.clone());
+        let (body, reply) = tokio::time::timeout(Duration::from_secs(5), first_requests.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(body, raw);
+        assert_eq!(first.load(), 2);
         assert_eq!(
-            preparations.load(Ordering::Relaxed),
-            2,
-            "one Worker preparation per target, reused by retry"
+            manager.sample(&first_target),
+            crate::policies::LoadSample {
+                active_prefill_tokens: 5,
+                active_requests: 2,
+            }
+        );
+        drop(second_background);
+        first.set_healthy(false);
+        reply
+            .send(StatusCode::INTERNAL_SERVER_ERROR.into_response())
+            .unwrap();
+        let (body, reply) = tokio::time::timeout(Duration::from_secs(5), second_requests.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(body, raw);
+        assert_eq!((first.load(), second.load()), (1, 1));
+        assert_eq!(
+            manager.sample(&first_target),
+            crate::policies::LoadSample {
+                active_prefill_tokens: 2,
+                active_requests: 1,
+            }
+        );
+        assert_eq!(
+            manager.sample(&second_target),
+            crate::policies::LoadSample {
+                active_prefill_tokens: 3,
+                active_requests: 1,
+            }
+        );
+        reply
+            .send(Json(serde_json::json!({"choices":[{"text":"ok"}]})).into_response())
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), foreground)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (
+                first_preparations.load(Ordering::Relaxed),
+                second_preparations.load(Ordering::Relaxed),
+            ),
+            (1, 1),
+            "prepare each target once across retries"
         );
         assert_eq!((first.load(), second.load()), (1, 0));
         assert_eq!(
             manager.sample(&first_target),
             crate::policies::LoadSample {
                 active_prefill_tokens: 2,
-                active_requests: 1
+                active_requests: 1,
             }
         );
         assert_eq!(
             manager.sample(&second_target),
             crate::policies::LoadSample::default()
         );
-        release.send(()).unwrap();
+        background_reply
+            .send(Json(serde_json::json!({"choices":[]})).into_response())
+            .unwrap();
         tokio::time::timeout(Duration::from_secs(5), background)
             .await
             .unwrap()
@@ -4222,6 +4157,10 @@ mod tests {
         assert_eq!((first.load(), second.load()), (0, 0));
         assert_eq!(
             manager.sample(&first_target),
+            crate::policies::LoadSample::default()
+        );
+        assert_eq!(
+            manager.sample(&second_target),
             crate::policies::LoadSample::default()
         );
         first_server.abort();
@@ -5972,22 +5911,16 @@ mod tests {
 
     #[tokio::test]
     async fn http_completion_stream_requires_complete_model_output() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(
-            format!("http://{}", listener.local_addr().unwrap()),
-            WorkerType::Regular,
-        ));
+        let fixture = completion_response_fixture().await;
+        let worker = fixture.worker.clone();
         let (tx, rx) =
             tokio::sync::mpsc::unbounded_channel::<Result<bytes::Bytes, std::io::Error>>();
-        let receiver = Arc::new(Mutex::new(Some(rx)));
-        let app = axum::Router::new().route(
-            "/v1/completions",
-            axum::routing::post(move || {
-                let rx = receiver.lock().take().unwrap();
-                async move { Response::new(Body::from_stream(UnboundedReceiverStream::new(rx))) }
-            }),
-        );
-        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        fixture
+            .responses
+            .send(Response::new(Body::from_stream(
+                UnboundedReceiverStream::new(rx),
+            )))
+            .unwrap();
         let manager = Arc::new(crate::policies::InMemorySlotManager::new());
         let target = crate::kv_index::RoutableTarget {
             instance_id: Arc::from(worker.url()),
@@ -6009,8 +5942,8 @@ mod tests {
             raw_body: None,
             echo: request.echo,
         };
-        let router = create_test_regular_router();
-        let response = router
+        let response = fixture
+            .router
             .send_typed_request(
                 &request,
                 TypedDispatch {
@@ -6101,7 +6034,6 @@ mod tests {
             crate::policies::LoadProvider::sample(manager.as_ref(), &target),
             crate::policies::LoadSample::default()
         );
-        server.abort();
     }
 
     #[tokio::test]
