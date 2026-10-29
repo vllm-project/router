@@ -14,7 +14,12 @@ SCENARIO_DIR = Path(__file__).resolve().parent
 if str(SCENARIO_DIR) not in sys.path:
     sys.path.insert(0, str(SCENARIO_DIR))
 
-from helpers.case_config import cell_output_dir, cell_results_dir, load_case, require_runtime  # noqa: E402
+from helpers.case_config import (
+    cell_output_dir,
+    cell_results_dir,
+    load_case,
+    require_runtime,
+)  # noqa: E402
 
 RUN_CELL = SCENARIO_DIR / "scripts" / "run_cell.py"
 
