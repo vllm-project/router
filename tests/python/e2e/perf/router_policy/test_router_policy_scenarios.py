@@ -16,7 +16,8 @@ if str(SCENARIO_DIR) not in sys.path:
 
 from helpers.case_config import (  # noqa: E402
     cell_output_dir,
-    cell_results_dir,
+    cell_results_summary_path,
+    cell_run_suffix,
     load_case,
     require_runtime,
 )
@@ -27,9 +28,11 @@ RUN_CELL = SCENARIO_DIR / "scripts" / "run_cell.py"
 def _run_cell(case_file: Path) -> Path:
     case = load_case(case_file, scenario_dir=SCENARIO_DIR)
     runtime = require_runtime(case)
-    out = cell_output_dir(case)
+    run_suffix = cell_run_suffix()
+    out = cell_output_dir(case, run_suffix=run_suffix)
     env = os.environ.copy()
     env["AGENTX_CASE_FILE"] = str(case_file.resolve())
+    env["AGENTX_RUN_SUFFIX"] = run_suffix
     env["AGENTX_OUT"] = str(out)
     timeout = int(env.get("AGENTX_PERF_TIMEOUT_SEC", str(4 * 3600)))
     proc = subprocess.run(
@@ -49,7 +52,7 @@ def _run_cell(case_file: Path) -> Path:
     cal_path = out / "calibration.json"
     summary: Path | None = None
     if cal_path.is_file():
-        summary = cell_results_dir(case) / f"{case['id']}.json"
+        summary = cell_results_summary_path(case, run_suffix=run_suffix)
         summary.parent.mkdir(parents=True, exist_ok=True)
         summary.write_text(cal_path.read_text(encoding="utf-8"), encoding="utf-8")
     print("ARTIFACTS pytest_copy:", flush=True)

@@ -20,11 +20,13 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import signal
 import socket
 import statistics
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -128,6 +130,11 @@ def bootstrap(case_path: Path) -> None:
 
     OUT = Path(os.environ.get("AGENTX_OUT") or cell_output_dir(CASE))
     OUT.mkdir(parents=True, exist_ok=True)
+    if _stream_logs_enabled():
+        print(
+            "STREAM_LOGS worker+router -> stderr (set AGENTX_STREAM_LOGS=0 to disable)",
+            flush=True,
+        )
 
     env = os.environ.copy()
     py_prefix = str(Path(PY).parent) if ("/" in PY or "\\" in PY) else ""
@@ -163,25 +170,89 @@ def bootstrap(case_path: Path) -> None:
 
 active = []
 handles = []
+stream_pumps: list[tuple[subprocess.Popen[Any], threading.Thread]] = []
 ports = None
 
 
-def start(command, log, extra=None):
-    handle = open(log, "w")
-    handles.append(handle)
-    proc = subprocess.Popen(
-        command,
-        stdout=handle,
-        stderr=subprocess.STDOUT,
-        env=env | (extra or {}),
-        start_new_session=True,
+def _stream_logs_enabled() -> bool:
+    return os.environ.get("AGENTX_STREAM_LOGS", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
     )
-    active.append(proc)
+
+
+def _sanitize_stream_line(line: str) -> str:
+    if "\r" not in line:
+        return line
+    return line.split("\r")[-1]
+
+
+def _stream_pump(proc: subprocess.Popen[Any], log_fp, prefix: str) -> None:
+    assert proc.stdout is not None
+    try:
+        for line in proc.stdout:
+            log_fp.write(line)
+            log_fp.flush()
+            sys.stderr.write(f"{prefix}{_sanitize_stream_line(line)}")
+            sys.stderr.flush()
+    except ValueError:
+        pass
+    finally:
+        log_fp.flush()
+
+
+def start(command, log, extra=None, *, stream_prefix: str | None = None):
+    extra_env = env | (extra or {})
     Path(str(log) + ".command.json").write_text(json.dumps(command, indent=2))
+    component = (stream_prefix or "").strip() or Path(str(log)).stem
+    if stream_prefix and _stream_logs_enabled():
+        log_fp = open(log, "w")
+        handles.append(log_fp)
+        proc = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            env=extra_env,
+            start_new_session=True,
+            text=True,
+            bufsize=1,
+        )
+        thread = threading.Thread(
+            target=_stream_pump,
+            args=(proc, log_fp, stream_prefix),
+            name=f"stream-{component}",
+            daemon=True,
+        )
+        thread.start()
+        stream_pumps.append((proc, thread))
+    else:
+        handle = open(log, "w")
+        handles.append(handle)
+        proc = subprocess.Popen(
+            command,
+            stdout=handle,
+            stderr=subprocess.STDOUT,
+            env=extra_env,
+            start_new_session=True,
+        )
+    active.append(proc)
     return proc
 
 
+def _join_stream_pump(proc: subprocess.Popen[Any], thread: threading.Thread) -> None:
+    if proc.stdout is not None:
+        proc.stdout.close()
+    thread.join(timeout=15)
+
+
 def stop(proc):
+    stream_thread: threading.Thread | None = None
+    for idx, (p, thread) in enumerate(stream_pumps):
+        if p is proc:
+            stream_thread = thread
+            stream_pumps.pop(idx)
+            break
     if proc.poll() is None:
         os.killpg(proc.pid, signal.SIGTERM)
         try:
@@ -189,12 +260,15 @@ def stop(proc):
         except subprocess.TimeoutExpired:
             os.killpg(proc.pid, signal.SIGKILL)
             proc.wait(timeout=15)
+    if stream_thread is not None:
+        _join_stream_pump(proc, stream_thread)
 
 
 def cleanup(*_):
     for proc in reversed(active):
         stop(proc)
     active.clear()
+    stream_pumps.clear()
     for handle in handles:
         handle.close()
     handles.clear()
@@ -223,6 +297,17 @@ def health(url, proc, timeout=900):
     raise TimeoutError(url)
 
 
+_LOG_ERROR_MARKERS = ("error", "exception", "traceback", "failed", "fatal", "cuda")
+
+
+def _log_tail_lines() -> int:
+    raw = os.environ.get("AGENTX_LOG_TAIL", "50").strip()
+    try:
+        return max(5, int(raw))
+    except ValueError:
+        return 50
+
+
 def _tail_file(path: Path, *, max_lines: int = 40, label: str | None = None) -> None:
     tag = label or path.name
     if not path.is_file():
@@ -230,9 +315,43 @@ def _tail_file(path: Path, *, max_lines: int = 40, label: str | None = None) -> 
         return
     lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
     tail = lines[-max_lines:] if lines else []
-    print(f"LOG_TAIL {tag} (last {len(tail)} lines):", flush=True)
+    print(f"LOG_TAIL {tag} (last {len(tail)} of {len(lines)} lines):", flush=True)
     for line in tail:
         print(line, flush=True)
+
+
+def _scan_log_errors(path: Path, label: str, *, max_hits: int = 8) -> None:
+    if not path.is_file():
+        return
+    hits: list[tuple[int, str]] = []
+    for idx, line in enumerate(
+        path.read_text(encoding="utf-8", errors="replace").splitlines()
+    ):
+        low = line.lower()
+        if any(marker in low for marker in _LOG_ERROR_MARKERS):
+            hits.append((idx + 1, line))
+    if not hits:
+        return
+    print(
+        f"LOG_ERRORS {label} ({len(hits)} hit(s), last {min(max_hits, len(hits))}):",
+        flush=True,
+    )
+    for line_no, line in hits[-max_hits:]:
+        snippet = line if len(line) <= 240 else line[:237] + "..."
+        print(f"  L{line_no}: {snippet}", flush=True)
+
+
+def _component_logs(out: Path, workers: int) -> list[tuple[str, Path]]:
+    items: list[tuple[str, Path]] = []
+    for i in range(workers):
+        items.append((f"engine{i}.log", out / f"engine{i}.log"))
+    items.extend(
+        [
+            ("router.log", out / "router.log"),
+            ("replay.log", out / "replay.log"),
+        ]
+    )
+    return items
 
 
 def print_artifacts(out: Path, workers: int) -> None:
@@ -241,24 +360,35 @@ def print_artifacts(out: Path, workers: int) -> None:
         ("calibration.json", out / "calibration.json"),
         ("requests.jsonl", out / "result" / "requests.jsonl"),
         ("ports.json", out / "ports.json"),
-        ("router.log", out / "router.log"),
-        ("replay.log", out / "replay.log"),
     ]
-    for i in range(workers):
-        entries.append((f"engine{i}.log", out / f"engine{i}.log"))
+    for label, log_path in _component_logs(out, workers):
+        entries.append((label, log_path))
+        entries.append((f"{label}.command.json", Path(str(log_path) + ".command.json")))
     print("ARTIFACTS", flush=True)
     for name, path in entries:
         print(f"  {name}: {path.resolve()}", flush=True)
+    ports = out / "ports.json"
+    if ports.is_file():
+        print(f"PORTS {ports.read_text(encoding='utf-8').strip()}", flush=True)
+
+
+def print_log_summary(
+    out: Path, workers: int, *, tail_lines: int | None = None, scan_errors: bool = True
+) -> None:
+    n = tail_lines if tail_lines is not None else _log_tail_lines()
+    print(f"LOG_SUMMARY tail={n} lines per component:", flush=True)
+    for label, log_path in _component_logs(out, workers):
+        if scan_errors:
+            _scan_log_errors(log_path, label)
+        _tail_file(log_path, max_lines=n, label=label)
 
 
 def print_failure_diagnostics(out: Path, workers: int, *, hint: str = "") -> None:
     if hint:
         print(f"DIAGNOSTIC {hint}", flush=True)
     print_artifacts(out, workers)
-    for i in range(workers):
-        _tail_file(out / f"engine{i}.log", label=f"engine{i}.log")
-    _tail_file(out / "router.log")
-    _tail_file(out / "replay.log")
+    fail_tail = max(_log_tail_lines(), 80)
+    print_log_summary(out, workers, tail_lines=fail_tail, scan_errors=True)
 
 
 def allocate_ports(n):
@@ -500,6 +630,7 @@ raise SystemExit(main(["vllm", *sys.argv[1:]]))
                     engine_command(i),
                     OUT / f"engine{i}.log",
                     {"CUDA_VISIBLE_DEVICES": GPUS[i]},
+                    stream_prefix=f"[engine{i}] ",
                 )
                 for i in range(WORKERS)
             ]
@@ -508,7 +639,9 @@ raise SystemExit(main(["vllm", *sys.argv[1:]]))
                     f"http://127.0.0.1:{ports['http'][i]}/health", proc, timeout=1800
                 )
             print(f"ENGINES_READY {time.monotonic() - started:.0f}s", flush=True)
-            router = start(router_command(), OUT / "router.log")
+            router = start(
+                router_command(), OUT / "router.log", stream_prefix="[router] "
+            )
             health(f"http://127.0.0.1:{ports['router']}/health", router, timeout=180)
             print(f"ROUTER_READY {time.monotonic() - started:.0f}s", flush=True)
         except (RuntimeError, TimeoutError) as exc:
@@ -516,6 +649,8 @@ raise SystemExit(main(["vllm", *sys.argv[1:]]))
             raise SystemExit(1) from exc
         snapshot(OUT / "before")
         result = OUT / "result"
+        if result.exists():
+            shutil.rmtree(result)
         replay = start(
             [
                 PY,
@@ -595,15 +730,20 @@ raise SystemExit(main(["vllm", *sys.argv[1:]]))
                     print(f"SNAPSHOT_FAIL {exc}", flush=True)
                 print(f"TICK {tick * 10}s", flush=True)
         snapshot(OUT / "after")
-        if replay.returncode not in (0, None):
-            print(f"REPLAY exit code {replay.returncode}", flush=True)
-            _tail_file(OUT / "replay.log", label="replay.log")
+        replay_rc = replay.returncode
+        if replay_rc not in (0, None):
+            print(f"REPLAY exit code {replay_rc}", flush=True)
         wall = time.monotonic() - started
-        rows = [
-            json.loads(line)
-            for line in (result / "requests.jsonl").read_text().splitlines()
-            if line.strip()
-        ]
+        req_path = result / "requests.jsonl"
+        rows = (
+            [
+                json.loads(line)
+                for line in req_path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            if req_path.is_file()
+            else []
+        )
         ttft = [r["ttft_seconds"] for r in rows if r.get("ttft_seconds") is not None]
         lat = [
             r["latency_seconds"] for r in rows if r.get("latency_seconds") is not None
@@ -611,7 +751,7 @@ raise SystemExit(main(["vllm", *sys.argv[1:]]))
         stats = {
             "router_policy": ROUTER_POLICY,
             "arm": ROUTER_POLICY,
-            "returncode": replay.returncode,
+            "returncode": replay_rc,
             "wall_seconds": wall,
             "stalled": stalled,
             "requests": len(rows),
@@ -659,6 +799,13 @@ raise SystemExit(main(["vllm", *sys.argv[1:]]))
         (OUT / "calibration.json").write_text(json.dumps(stats, indent=2))
         print("STATS " + json.dumps(stats), flush=True)
         print_artifacts(OUT, WORKERS)
+        if replay_rc not in (0, None):
+            print_failure_diagnostics(
+                OUT,
+                WORKERS,
+                hint=f"replay failed (exit {replay_rc})",
+            )
+            raise SystemExit(1)
         if stalled or stats["success"] != stats["requests"]:
             print_failure_diagnostics(
                 OUT,
@@ -666,6 +813,7 @@ raise SystemExit(main(["vllm", *sys.argv[1:]]))
                 hint="stalled or non-success rows in requests.jsonl",
             )
             raise SystemExit(1)
+        print_log_summary(OUT, WORKERS)
     finally:
         cleanup()
 

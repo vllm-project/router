@@ -31,9 +31,20 @@ export AGENTX_CASE_FILE=tests/python/e2e/perf/router_policy/cases/kv_aware/c16.j
 python -u tests/python/e2e/perf/router_policy/scripts/run_cell.py
 ```
 
-## Analysis
+## Artifacts layout
 
-At the end of a cell, `run_cell` prints **`ARTIFACTS`** (paths to `calibration.json`, `requests.jsonl`, logs). On failure it also prints **`LOG_TAIL`** snippets from engine/router/replay logs. Pytest adds **`results_summary.json`** under `test-results/router_policy/results/`.
+Each run writes a **new** cell directory:
+
+- `test-results/router_policy/runs/<case_id>-<run_suffix>/` — logs, metrics snapshots, `result/requests.jsonl`, `calibration.json`
+- `test-results/router_policy/results/<case_id>-<run_suffix>.json` — copy of `calibration.json` for pytest
+
+`<run_suffix>` is local time `YYYYMMDDhhmmss` unless you set **`AGENTX_RUN_SUFFIX`** (same suffix for all cells in one matrix, e.g. `export AGENTX_RUN_SUFFIX=202510291713`). Override the run dir with **`AGENTX_OUT`**.
+
+Before replay, **`run_cell` still removes `result/`** if reusing the same `AGENTX_OUT`. **`run_cell` fails if replay exit code ≠ 0**.
+
+Optional **`export AGENTX_STREAM_LOGS=1`**: stream **worker + router** logs to stderr in real time (prefix `[engineN]` / `[router]`); replay stays file-only. Use **pytest `-sv`** so stderr is visible.
+
+At the end of a cell, `run_cell` prints **`ARTIFACTS`** (JSON paths, log paths, `*.command.json` argv dumps), **`PORTS`**, then **`LOG_SUMMARY`** (error scan + last N lines of **every** engine/router/replay log; `AGENTX_LOG_TAIL`, default 50). Failures use longer tails (~80+). Pytest adds **`results_summary.json`** under `test-results/router_policy/results/`.
 
 ```bash
 python tests/python/e2e/perf/router_policy/scripts/collect_stats.py test-results/router_policy/runs

@@ -7,8 +7,11 @@ import json
 import os
 import shutil
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import Any
+
+RUN_SUFFIX_ENV = "AGENTX_RUN_SUFFIX"
 
 MODEL_ENV = "MODEL"
 VLLM_RS_ENV = "VLLM_RS"
@@ -174,10 +177,30 @@ def require_runtime(case: dict[str, Any]) -> dict[str, Any]:
     return resolve_runtime(case)
 
 
-def cell_output_dir(case: dict[str, Any]) -> Path:
+def cell_run_suffix(*, run_suffix: str | None = None) -> str:
+    """Run id for artifact dirs (local time, seconds resolution).
+
+    Re-use one suffix for a whole pytest matrix via ``export AGENTX_RUN_SUFFIX=…``.
+    """
+
+    if run_suffix:
+        return run_suffix
+    from_env = os.environ.get(RUN_SUFFIX_ENV)
+    if from_env:
+        return from_env
+    return datetime.now().strftime("%Y%m%d%H%M%S")
+
+
+def cell_output_dir(case: dict[str, Any], *, run_suffix: str | None = None) -> Path:
     runtime = resolve_runtime(case)
     cell_id = str(case["id"])
-    return Path(runtime["perf_work_root"]) / "runs" / cell_id
+    suffix = cell_run_suffix(run_suffix=run_suffix)
+    return Path(runtime["perf_work_root"]) / "runs" / f"{cell_id}-{suffix}"
+
+
+def cell_results_summary_path(case: dict[str, Any], *, run_suffix: str) -> Path:
+    cell_id = str(case["id"])
+    return cell_results_dir(case) / f"{cell_id}-{run_suffix}.json"
 
 
 def cell_results_dir(case: dict[str, Any]) -> Path:
