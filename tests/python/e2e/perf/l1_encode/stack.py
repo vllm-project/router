@@ -1,4 +1,4 @@
-"""One vllm-rs worker for the session; restart only the router between L1 arms."""
+"""One vllm-rs worker for the L1-on matrix. Worker and router both restart before L1 off."""
 
 from __future__ import annotations
 
@@ -147,7 +147,7 @@ def _pipe(
 
 
 class L1Stack:
-    """Worker process lives for the session. The router is replaced per arm."""
+    """Worker stays up while L1 is on. Crossing to L1 off restarts worker and router."""
 
     def __init__(self, case: L1Case, model: str) -> None:
         self.case = case
@@ -194,17 +194,13 @@ class L1Stack:
         if "CUDA_VISIBLE_DEVICES" not in os.environ and case.cuda_visible_devices:
             env["CUDA_VISIBLE_DEVICES"] = case.cuda_visible_devices
         _progress(
-            "worker stays up for every arm; router restarts (L1 on per hit rate, "
-            "then one L1 off cold start). Logs are prefixed [vllm-rs] and [vllm-router]."
+            "worker stays up through L1 on (router restarts per hit rate). "
+            "Before L1 off, worker and router both cold-start. "
+            "Logs are prefixed [vllm-rs] and [vllm-router]."
         )
-        self.worker_proc = _popen(cmd, env=env)
-        self.worker_thread = _pipe(self.worker_proc, "vllm-rs", None, self._lock)
-        self._wait_http(
-            f"http://{case.host}:{case.worker_http_port}/v1/models",
-            self._timeout(),
-            self.worker_proc,
-            "worker",
-        )
+        self._worker_cmd = cmd
+        self._worker_env = env
+        self._launch_worker()
 
     def ensure_router(self, l1_on: bool, hit_rate: float) -> None:
         from tests.python.e2e.perf.l1_encode.report import hit_tag
@@ -224,6 +220,22 @@ class L1Stack:
                 f"reuse router L1 cache {'on' if l1_on else 'off'} "
                 f"hit_rate={hit_rate:g}"
             )
+            return
+        previous_mode = self.arm_key[0] if self.arm_key else None
+        mode = "on" if l1_on else "off"
+        if previous_mode is not None and previous_mode != mode:
+            _progress(
+                f"cold start between L1 {previous_mode} and L1 {mode}: "
+                "restart worker and router"
+            )
+            self._stop_router()
+            self._stop_worker()
+            pause = float(os.environ.get("PERF_STACK_STOP_SLEEP", "2"))
+            if pause > 0:
+                time.sleep(pause)
+            self._launch_worker()
+            self._start_router(l1_on)
+            self.arm_key = key
             return
         if self.router_proc is not None:
             _progress(
@@ -257,6 +269,20 @@ class L1Stack:
 
     def stop(self) -> None:
         self._stop_router()
+        self._stop_worker()
+
+    def _launch_worker(self) -> None:
+        case = self.case
+        self.worker_proc = _popen(self._worker_cmd, env=self._worker_env)
+        self.worker_thread = _pipe(self.worker_proc, "vllm-rs", None, self._lock)
+        self._wait_http(
+            f"http://{case.host}:{case.worker_http_port}/v1/models",
+            self._timeout(),
+            self.worker_proc,
+            "worker",
+        )
+
+    def _stop_worker(self) -> None:
         proc = self.worker_proc
         thread = self.worker_thread
         self.worker_proc = None

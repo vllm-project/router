@@ -1,7 +1,7 @@
 """L1 prefix encoding cache perf: Qwen3.8-27B, 16k, shape turns.
 
-One vllm-rs worker stays up. Router L1 on runs every hit rate (fresh router
-per hit rate), then one router cold start with L1 off.
+The worker stays up through L1 on (fresh router per hit rate). Before L1 off,
+the worker and the router both cold-start.
 
     export VLLM_RS=/path/to/vllm-rs
     # optional local snapshot; default is Qwen/Qwen3.8-27B
