@@ -869,6 +869,40 @@ impl PdRouterBase {
                 cache_aware.init_workers(&model_workers);
             }
         }
+        self.sync_role_policies(&[]);
+    }
+
+    /// Push the current prefill/decode worker sets into the role-specific
+    /// policies.
+    ///
+    /// The constructor only initializes these instances when the worker lists
+    /// are known up front (direct-URL mode). With service discovery the lists
+    /// start empty, so without this the prefill/decode policies keep empty
+    /// affinity trees and `cache_aware` silently falls back to a random pick
+    /// for every PD selection. Re-running is idempotent: policies that need no
+    /// initialization are skipped, and the cache-aware trees keep existing
+    /// entries apart from the tenants removed here.
+    fn sync_role_policies(&self, removed_urls: &[String]) {
+        let prefill_policy = self.policy_registry.get_prefill_policy();
+        let decode_policy = self.policy_registry.get_decode_policy();
+
+        for url in removed_urls {
+            for policy in [&prefill_policy, &decode_policy] {
+                if let Some(cache_aware) = policy
+                    .as_any()
+                    .downcast_ref::<crate::policies::CacheAwarePolicy>()
+                {
+                    cache_aware.remove_worker_by_url(url);
+                }
+            }
+        }
+
+        if prefill_policy.requires_initialization() {
+            prefill_policy.init_workers(&self.worker_registry.get_prefill_workers());
+        }
+        if decode_policy.requires_initialization() {
+            decode_policy.init_workers(&self.worker_registry.get_decode_workers());
+        }
     }
 
     pub async fn remove_prefill_server(&self, url: &str) -> Result<String, PDRouterError> {
@@ -901,6 +935,7 @@ impl PdRouterBase {
                     }
                 }
             }
+            self.sync_role_policies(&[url.to_string()]);
         }
 
         if removed.is_some() {
@@ -947,6 +982,7 @@ impl PdRouterBase {
                     }
                 }
             }
+            self.sync_role_policies(&[url.to_string()]);
         }
 
         if removed.is_some() {
@@ -966,6 +1002,7 @@ impl PdRouterBase {
         let prefix = format!("{}@", url);
         let all_workers = self.worker_registry.get_all();
         let mut removed_count = 0;
+        let mut removed_urls = Vec::new();
         for w in all_workers.iter() {
             if w.url().starts_with(&prefix) {
                 let model_id = w.model_id().to_string();
@@ -988,11 +1025,13 @@ impl PdRouterBase {
                             }
                         }
                     }
+                    removed_urls.push(w.url().to_string());
                     removed_count += 1;
                 }
             }
         }
         if removed_count > 0 {
+            self.sync_role_policies(&removed_urls);
             info!(
                 "Removed {} DP-expanded {} workers for {}",
                 removed_count, role, url
@@ -1594,6 +1633,7 @@ impl PdRouterBase {
 mod tests {
     use super::*;
     use crate::core::{BasicWorker, DPAwareWorker, Worker, WorkerFactory, WorkerType};
+    use crate::policies::{CacheAwareCandidate, CacheAwarePolicy};
 
     fn create_test_pd_router() -> PdRouterBase {
         let worker_registry = Arc::new(WorkerRegistry::new());
@@ -2373,6 +2413,98 @@ mod tests {
             router.worker_registry.get_prefill_workers().len(),
             4,
             "Only host 2's workers should remain"
+        );
+    }
+
+    // ============= Role Policy Refresh Tests =============
+
+    fn prefill_worker(url: &str) -> Arc<dyn Worker> {
+        Arc::from(create_test_worker(
+            url.to_string(),
+            WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+            true,
+        ))
+    }
+
+    fn affinity_for(policy: &CacheAwarePolicy, model_id: &str, url: &str, text: &str) -> f32 {
+        policy
+            .evaluate_initial_placement(
+                model_id,
+                text,
+                &[CacheAwareCandidate {
+                    target_id: url,
+                    kv_pressure: 0.0,
+                }],
+            )
+            .expect("placement should be computed")
+            .match_rate
+    }
+
+    /// Discovery registers workers after construction, so the role policy has
+    /// to be initialized by the registration path; otherwise its affinity tree
+    /// stays empty and every selection degrades to a random pick.
+    #[tokio::test]
+    async fn test_dynamic_registration_initializes_role_policy_trees() {
+        let router = create_test_pd_router();
+        let cache_aware = Arc::new(CacheAwarePolicy::new());
+        router
+            .policy_registry
+            .set_prefill_policy(cache_aware.clone());
+
+        let url = "http://127.0.0.1:9101";
+        router.register_and_notify(prefill_worker(url));
+
+        let workers = router.worker_registry.get_prefill_workers();
+        assert_eq!(workers.len(), 1);
+
+        let text = "a shared tenant prefix used for affinity";
+        let idx = cache_aware
+            .select_worker_with_headers(&workers, Some(text), None)
+            .expect("prefill selection should succeed");
+
+        assert!(
+            affinity_for(
+                &cache_aware,
+                workers[idx].model_id(),
+                workers[idx].url(),
+                text
+            ) > 0.0,
+            "role policy tree was not initialized, so the selection could not publish affinity"
+        );
+    }
+
+    /// Removing a discovered worker has to prune the role policy tree as well,
+    /// otherwise a replacement worker inherits affinity meant for a dead URL.
+    #[tokio::test]
+    async fn test_dynamic_removal_prunes_role_policy_trees() {
+        let router = create_test_pd_router();
+        let cache_aware = Arc::new(CacheAwarePolicy::new());
+        router
+            .policy_registry
+            .set_prefill_policy(cache_aware.clone());
+
+        let url = "http://127.0.0.1:9102";
+        router.register_and_notify(prefill_worker(url));
+
+        let workers = router.worker_registry.get_prefill_workers();
+        let text = "a shared tenant prefix used for affinity";
+        let idx = cache_aware
+            .select_worker_with_headers(&workers, Some(text), None)
+            .expect("prefill selection should succeed");
+        let model_id = workers[idx].model_id().to_string();
+        assert!(affinity_for(&cache_aware, &model_id, url, text) > 0.0);
+
+        router
+            .remove_prefill_server(url)
+            .await
+            .expect("removal should succeed");
+
+        assert_eq!(
+            affinity_for(&cache_aware, &model_id, url, text),
+            0.0,
+            "removed worker kept its affinity in the role policy tree"
         );
     }
 }
