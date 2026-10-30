@@ -10,6 +10,7 @@ use super::{
     RoundRobinPolicy, TransferCredits,
 };
 use crate::config::types::{EncodePolicy, PolicyConfig};
+use crate::core::{Worker, WorkerType};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -118,7 +119,47 @@ impl PolicyRegistry {
         policy
     }
 
-    /// Called when a worker is removed
+    /// Clean policy state for a successfully removed worker, then update its
+    /// consumer count. Call once with the object returned by registry removal.
+    /// Encode workers do not participate in consumer policies or accounting.
+    pub fn notify_consumer_removed(&self, removed: &dyn Worker) {
+        if !removed.worker_type().is_consumer() {
+            return;
+        }
+        let model_id = removed.model_id();
+        let mut policies = Vec::new();
+        if let Some(policy) = self.get_policy(model_id) {
+            policies.push(policy);
+        }
+        // PD routing uses role-specific instances, even when their configs
+        // match the model policy. Clean the actual removed worker's role.
+        let routing_policy = match removed.worker_type() {
+            WorkerType::Prefill { .. } => Some(self.get_prefill_policy()),
+            WorkerType::Decode => Some(self.get_decode_policy()),
+            _ => None,
+        };
+        if let Some(policy) = routing_policy {
+            // Unconfigured PD policies fall back to the shared default Arc.
+            if !policies
+                .iter()
+                .any(|existing| Arc::ptr_eq(existing, &policy))
+            {
+                policies.push(policy);
+            }
+        }
+        // The last-worker notification removes the model's policy mapping,
+        // so clean both instances before updating the count.
+        for policy in policies {
+            if let Some(cache_aware) = policy.as_any().downcast_ref::<CacheAwarePolicy>() {
+                cache_aware.remove_worker_by_url(removed.url());
+                debug!("Removed worker from cache-aware tree: {}", removed.url());
+            }
+        }
+        self.on_worker_removed(model_id);
+    }
+
+    /// Decrement model accounting without worker-specific cleanup.
+    /// Use `notify_consumer_removed` after removing a consumer from the registry.
     pub fn on_worker_removed(&self, model_id: &str) {
         let should_cleanup = {
             let mut counts = self.model_worker_counts.write().unwrap();

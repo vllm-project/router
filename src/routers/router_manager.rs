@@ -295,9 +295,8 @@ impl RouterManager {
                 }
             }
             // Notify for the object actually removed, not an earlier lookup.
-            if worker.worker_type().is_consumer() {
-                self.policy_registry.on_worker_removed(worker.model_id());
-            }
+            self.policy_registry
+                .notify_consumer_removed(worker.as_ref());
             info!(
                 "Removed worker with URL {} for model {}",
                 url,

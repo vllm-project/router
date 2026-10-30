@@ -2191,24 +2191,6 @@ impl Router {
         }
     }
 
-    /// Clean the actual removed consumer before its last-worker notification
-    /// can remove the model's policy mapping.
-    fn notify_consumer_removed(&self, removed: &dyn Worker) {
-        if !removed.worker_type().is_consumer() {
-            return;
-        }
-        if let Some(policy) = self.policy_registry.get_policy(removed.model_id()) {
-            if let Some(cache_aware) = policy
-                .as_any()
-                .downcast_ref::<crate::policies::CacheAwarePolicy>()
-            {
-                cache_aware.remove_worker_by_url(removed.url());
-                info!("Removed worker from cache-aware tree: {}", removed.url());
-            }
-        }
-        self.policy_registry.on_worker_removed(removed.model_id());
-    }
-
     pub fn remove_worker(&self, worker_url: &str) {
         if self.intra_node_data_parallel_size > 1 {
             // remove dp-aware workers in a prefix-matching fashion
@@ -2225,7 +2207,8 @@ impl Router {
                         self.frontend.remove_worker(&removed_url);
                         info!("Removed worker: {}", removed_url);
                         removed_workers.push(removed_url);
-                        self.notify_consumer_removed(removed_worker.as_ref());
+                        self.policy_registry
+                            .notify_consumer_removed(removed_worker.as_ref());
                     } else {
                         warn!("Worker {} not found, skipping removal", w.url());
                     }
@@ -2241,7 +2224,8 @@ impl Router {
                 self.frontend.remove_worker(worker_url);
                 info!("Removed worker: {}", worker_url);
 
-                self.notify_consumer_removed(removed_worker.as_ref());
+                self.policy_registry
+                    .notify_consumer_removed(removed_worker.as_ref());
 
                 RouterMetrics::set_active_workers(
                     self.worker_registry.get_regular_workers(None).len(),

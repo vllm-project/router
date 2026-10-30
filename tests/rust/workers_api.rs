@@ -12,7 +12,10 @@ use tower::ServiceExt;
 use vllm_router_rs::{
     config::{ConfigValidator, EpdConfig, PolicyConfig, RouterConfig, RoutingMode},
     policies::{CacheAwareCandidate, CacheAwarePolicy, LoadBalancingPolicy},
-    routers::{RouterFactory, RouterTrait},
+    routers::{
+        router_manager::{RouterId, RouterManager},
+        RouterFactory, RouterTrait,
+    },
     server::{build_app_with_request_tracing, AppContext, AppState},
 };
 
@@ -311,6 +314,233 @@ async fn pd_epd_http_delete_prefill_first_cleans_cache_aware_policy() {
 #[tokio::test]
 async fn pd_epd_http_delete_decode_first_cleans_cache_aware_policy() {
     assert_pd_epd_http_delete_cleans_policy(false).await;
+}
+
+async fn assert_igw_http_delete_cleans_policy(prefill_first: bool) {
+    let cache_config = PolicyConfig::CacheAware {
+        cache_threshold: 0.3,
+        balance_abs_threshold: 32,
+        balance_rel_threshold: 1.5,
+        eviction_interval_secs: 3600,
+        max_tree_size: 1024,
+    };
+    for main_policy in [cache_config.clone(), PolicyConfig::RoundRobin] {
+        let config = RouterConfig {
+            enable_igw: true,
+            policy: main_policy.clone(),
+            ..RouterConfig::default()
+        };
+        ConfigValidator::validate(&config).unwrap();
+        let context = Arc::new(
+            AppContext::new(config.clone(), reqwest::Client::new(), 64, None, vec![]).unwrap(),
+        );
+        let manager = Arc::new(RouterManager::new(
+            config,
+            context.client.clone(),
+            context.worker_registry.clone(),
+            context.policy_registry.clone(),
+        ));
+        // Mirror IGW startup: both child routers share the management registries.
+        let regular = RouterFactory::create_regular_router(&[], &context)
+            .await
+            .unwrap();
+        manager.register_router(RouterId::new("http-regular".into()), Arc::from(regular));
+        // None mirrors production IGW fallback. RoundRobin additionally checks
+        // the factory's independent cache-aware role policies without a cache-aware model policy.
+        let role_config = matches!(main_policy, PolicyConfig::RoundRobin).then_some(&cache_config);
+        let pd = RouterFactory::create_vllm_pd_router(
+            &[],
+            &[],
+            None,
+            role_config,
+            role_config,
+            &main_policy,
+            &context,
+        )
+        .await
+        .unwrap();
+        manager.register_router(RouterId::new("http-pd".into()), Arc::from(pd));
+        let app = build_app_with_request_tracing(
+            Arc::new(AppState {
+                router: manager.clone(),
+                context: context.clone(),
+                concurrency_queue_tx: None,
+                router_manager: Some(manager),
+            }),
+            1024 * 1024,
+            vec![],
+            vec![],
+            false,
+            false,
+        );
+        let urls = [
+            "http://regular:8000",
+            "http://prefill:8000",
+            "http://decode:8000",
+        ];
+        let survivor_url = "http://survivor:8000";
+        // Use POST rather than direct registry registration to exercise model
+        // policy assignment and the complete IGW HTTP lifecycle.
+        for (url, role, model) in [
+            (urls[0], "regular", "model"),
+            (urls[1], "prefill", "model"),
+            (urls[2], "decode", "model"),
+            (survivor_url, "regular", "survivor"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::post("/workers")
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            serde_json::json!({
+                                "url": url, "worker_type": role, "model_id": model,
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        let policies = &context.policy_registry;
+        let model_policy = policies.get_policy("model").unwrap();
+        let prefill_policy = policies.get_prefill_policy();
+        let decode_policy = policies.get_decode_policy();
+        assert!(Arc::ptr_eq(&model_policy, &policies.get_default_policy()));
+        assert!(!Arc::ptr_eq(&model_policy, &prefill_policy));
+        assert!(!Arc::ptr_eq(&model_policy, &decode_policy));
+        assert!(!Arc::ptr_eq(&prefill_policy, &decode_policy));
+        let prompt = "cached dynamic IGW HTTP deletion prefix";
+        let seed = |policy: &Arc<dyn LoadBalancingPolicy>, model: &str, url: &str| {
+            if let Some(cache) = policy.as_any().downcast_ref::<CacheAwarePolicy>() {
+                cache.commit_placement(model, prompt, url);
+            }
+        };
+        for url in urls {
+            seed(&model_policy, "model", url);
+        }
+        seed(&model_policy, "survivor", survivor_url);
+        seed(&prefill_policy, "model", urls[1]);
+        seed(&decode_policy, "model", urls[2]);
+        let affinity = |policy: &Arc<dyn LoadBalancingPolicy>, model: &str, url: &str| {
+            policy
+                .as_any()
+                .downcast_ref::<CacheAwarePolicy>()
+                .map(|cache| {
+                    cache
+                        .evaluate_initial_placement(
+                            model,
+                            prompt,
+                            &[CacheAwareCandidate {
+                                target_id: url,
+                                kv_pressure: 0.0,
+                            }],
+                        )
+                        .unwrap()
+                        .match_rate
+                })
+        };
+        let mut present = [true; 3];
+        let assert_state = |present: &[bool; 3]| {
+            let count = present.iter().filter(|&&value| value).count();
+            assert_eq!(
+                policies
+                    .get_worker_counts()
+                    .get("model")
+                    .copied()
+                    .unwrap_or(0),
+                count
+            );
+            assert_eq!(policies.get_policy("model").is_some(), count > 0);
+            assert_eq!(policies.get_worker_counts().get("survivor"), Some(&1));
+            if model_policy.name() == "cache_aware" {
+                assert_eq!(affinity(&model_policy, "survivor", survivor_url), Some(1.0));
+            }
+            for (index, url) in urls.iter().enumerate() {
+                let expected = if present[index] { 1.0 } else { 0.0 };
+                assert_eq!(
+                    context.worker_registry.get_by_url(url).is_some(),
+                    present[index]
+                );
+                if model_policy.name() == "cache_aware" {
+                    assert_eq!(
+                        affinity(&model_policy, "model", url),
+                        Some(expected),
+                        "model: {url}"
+                    );
+                }
+                if index > 0 {
+                    let role_policy = if index == 1 {
+                        &prefill_policy
+                    } else {
+                        &decode_policy
+                    };
+                    assert_eq!(
+                        affinity(role_policy, "model", url),
+                        Some(expected),
+                        "role: {url}"
+                    );
+                }
+            }
+        };
+        assert_state(&present);
+        let (first, second) = if prefill_first { (1, 2) } else { (2, 1) };
+        // Last consumer cleanup, duplicate deletion, and unknown URL errors
+        // must preserve the surviving model sharing the default policy Arc.
+        for index in [
+            None,
+            Some(first),
+            Some(first),
+            Some(0),
+            Some(second),
+            Some(second),
+        ] {
+            let url = index.map_or("http://missing:8000", |index| urls[index]);
+            let existed = index.is_some_and(|index| present[index]);
+            let encoded: String = url::form_urlencoded::byte_serialize(url.as_bytes()).collect();
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::delete(format!("/workers/{encoded}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                if existed {
+                    StatusCode::OK
+                } else {
+                    StatusCode::BAD_REQUEST
+                }
+            );
+            let body: Value =
+                serde_json::from_slice(&to_bytes(response.into_body(), 16384).await.unwrap())
+                    .unwrap();
+            if existed {
+                assert_eq!(body["success"], true);
+            } else {
+                assert_eq!(body["code"], "WORKER_NOT_FOUND");
+            }
+            if let Some(index) = index {
+                present[index] = false;
+            }
+            assert_state(&present);
+        }
+    }
+}
+
+#[tokio::test]
+async fn igw_http_delete_prefill_first_cleans_cache_aware_policy() {
+    assert_igw_http_delete_cleans_policy(true).await;
+}
+
+#[tokio::test]
+async fn igw_http_delete_decode_first_cleans_cache_aware_policy() {
+    assert_igw_http_delete_cleans_policy(false).await;
 }
 
 #[tokio::test]

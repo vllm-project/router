@@ -334,46 +334,6 @@ impl PdRouterBase {
         }
     }
 
-    /// Only consumer roles were counted on registration. Use the actual
-    /// removed object for both policy accounting and cache-aware cleanup.
-    fn notify_consumer_removed(&self, removed: &dyn Worker) {
-        if !removed.worker_type().is_consumer() {
-            return;
-        }
-        let model_id = removed.model_id();
-        let mut policies = Vec::new();
-        if let Some(policy) = self.policy_registry.get_policy(model_id) {
-            policies.push(policy);
-        }
-        // PD routing uses role-specific instances, even when their configs
-        // match the model policy. Clean the actual removed worker's role.
-        let routing_policy = match removed.worker_type() {
-            WorkerType::Prefill { .. } => Some(self.policy_registry.get_prefill_policy()),
-            WorkerType::Decode => Some(self.policy_registry.get_decode_policy()),
-            _ => None,
-        };
-        if let Some(policy) = routing_policy {
-            // Unconfigured PD policies fall back to the shared default Arc.
-            if !policies
-                .iter()
-                .any(|existing| Arc::ptr_eq(existing, &policy))
-            {
-                policies.push(policy);
-            }
-        }
-        // The last-worker notification removes the model's policy mapping,
-        // so clean both instances before updating the count.
-        for policy in policies {
-            if let Some(cache_aware) = policy
-                .as_any()
-                .downcast_ref::<crate::policies::CacheAwarePolicy>()
-            {
-                cache_aware.remove_worker_by_url(removed.url());
-            }
-        }
-        self.policy_registry.on_worker_removed(model_id);
-    }
-
     pub async fn remove_prefill_server(&self, url: &str) -> Result<String, PDRouterError> {
         // A bare URL that is not registered as-is was expanded per DP rank.
         if !url.contains('@') && self.worker_registry.get_by_url(url).is_none() {
@@ -382,7 +342,8 @@ impl PdRouterBase {
 
         // Exact URL match (with @rank or dp_size==1)
         if let Some(removed) = self.worker_registry.remove_by_url(url) {
-            self.notify_consumer_removed(removed.as_ref());
+            self.policy_registry
+                .notify_consumer_removed(removed.as_ref());
             info!("Removed prefill server: {}", url);
             Ok(format!("Successfully removed prefill server: {}", url))
         } else {
@@ -398,7 +359,8 @@ impl PdRouterBase {
         }
 
         if let Some(removed) = self.worker_registry.remove_by_url(url) {
-            self.notify_consumer_removed(removed.as_ref());
+            self.policy_registry
+                .notify_consumer_removed(removed.as_ref());
             info!("Removed decode server: {}", url);
             Ok(format!("Successfully removed decode server: {}", url))
         } else {
@@ -418,7 +380,8 @@ impl PdRouterBase {
         for w in all_workers.iter() {
             if w.url().starts_with(&prefix) {
                 if let Some(removed) = self.worker_registry.remove_by_url(w.url()) {
-                    self.notify_consumer_removed(removed.as_ref());
+                    self.policy_registry
+                        .notify_consumer_removed(removed.as_ref());
                     removed_count += 1;
                 }
             }
@@ -749,7 +712,8 @@ impl PdRouterBase {
     pub fn remove_worker(&self, worker_url: &str) {
         // Remove from registry
         if let Some(worker) = self.worker_registry.remove_by_url(worker_url) {
-            self.notify_consumer_removed(worker.as_ref());
+            self.policy_registry
+                .notify_consumer_removed(worker.as_ref());
             match worker.worker_type() {
                 WorkerType::Prefill { .. } => {
                     info!("Removed prefill worker: {}", worker_url);
