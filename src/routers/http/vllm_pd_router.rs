@@ -4360,11 +4360,171 @@ mod tests {
             let _ = task.await;
             assert_eq!(decode.load(), 0, "decode reservation cancellation: {path}");
             assert_eq!(
+                prefill.load(),
+                0,
+                "prefill reservation cancellation: {path}"
+            );
+            assert_eq!(
                 pending_load, 1,
                 "selected decode must be visible before prefill completes: {path}"
             );
         }
     }
+    /// Cancelling the concurrent P/D dispatch while both stages wait for their
+    /// response headers must release this request's prefill reservation and
+    /// leave the reservation of another in-flight request untouched.
+    #[tokio::test]
+    async fn concurrent_prefill_cancellation_releases_only_this_request_load() {
+        let prefill_entered = Arc::new(tokio::sync::Notify::new());
+        let decode_entered = Arc::new(tokio::sync::Notify::new());
+        let prefill_signal = prefill_entered.clone();
+        let prefill_url = spawn_test_server(axum::Router::new().fallback(move || {
+            let signal = prefill_signal.clone();
+            async move {
+                signal.notify_one();
+                std::future::pending::<StatusCode>().await
+            }
+        }))
+        .await;
+        let decode_signal = decode_entered.clone();
+        let decode_url = spawn_test_server(axum::Router::new().fallback(move || {
+            let signal = decode_signal.clone();
+            async move {
+                signal.notify_one();
+                std::future::pending::<StatusCode>().await
+            }
+        }))
+        .await;
+        let prefill: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+            prefill_url,
+            WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+        ));
+        let decode: Arc<dyn Worker> = Arc::new(BasicWorker::new(decode_url, WorkerType::Decode));
+
+        // A second request stays in flight for the whole test, so an
+        // implementation that zeroes the counter instead of releasing its own
+        // reservation cannot pass.
+        let router = test_vllm_pd_router().await;
+        let other_attempt = router
+            .pd_router
+            .pd_load
+            .admit_bound(prefill.clone(), decode.clone());
+        let attempt = router
+            .pd_router
+            .pd_load
+            .admit_bound(prefill.clone(), decode.clone());
+        let request_prefill = prefill.clone();
+        let request_decode = decode.clone();
+        let request = tokio::spawn(async move {
+            router
+                .process_concurrent_two_stage(
+                    ConcurrentDispatch {
+                        prefill_request: json!({"model": "test", "messages": []}),
+                        decode_request: json!({"model": "test", "messages": []}),
+                        prefill_worker: request_prefill,
+                        decode_worker: request_decode,
+                        request_id: "cancelled-request".to_string(),
+                    },
+                    "/v1/chat/completions",
+                    None,
+                    Instant::now(),
+                    None,
+                    attempt,
+                    None,
+                )
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(prefill_entered.notified(), decode_entered.notified());
+        })
+        .await
+        .expect("both stages must reach their workers");
+        assert_eq!(
+            prefill.load(),
+            2,
+            "the pending request must hold a prefill reservation"
+        );
+        assert_eq!(decode.load(), 2);
+
+        request.abort();
+        let _ = request.await;
+        assert_eq!(
+            prefill.load(),
+            1,
+            "cancelling must release this request's prefill reservation only"
+        );
+        assert_eq!(decode.load(), 1);
+        drop(other_attempt);
+        assert_eq!(decode.load(), 0);
+        assert_eq!(prefill.load(), 0);
+    }
+
+    /// Poll the shared sequential/concurrent prefill body consumer after HTTP
+    /// headers have arrived, so cancellation is exercised inside body reading.
+    #[tokio::test]
+    async fn prefill_stage_load_covers_stalled_response_body() {
+        use std::convert::Infallible;
+
+        let prefill_url = spawn_test_server(axum::Router::new().fallback(|| async {
+            Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "application/json")
+                .body(Body::from_stream(futures_util::stream::pending::<
+                    Result<Bytes, Infallible>,
+                >()))
+                .unwrap()
+        }))
+        .await;
+        let prefill: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+            prefill_url.clone(),
+            WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+        ));
+        let decode: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+            "http://127.0.0.1:1".to_string(),
+            WorkerType::Decode,
+        ));
+        let router = test_vllm_pd_router().await;
+        let other_attempt = router
+            .pd_router
+            .pd_load
+            .admit_bound(prefill.clone(), decode.clone());
+        let attempt = router
+            .pd_router
+            .pd_load
+            .admit_bound(prefill.clone(), decode.clone());
+        let response = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .get(&prefill_url)
+            .send()
+            .await
+            .unwrap();
+        let mut stage =
+            Box::pin(router.finish_prefill_response(Ok(response), &prefill_url, &attempt));
+        assert!(matches!(
+            futures_util::poll!(&mut stage),
+            std::task::Poll::Pending
+        ));
+        assert_eq!(
+            prefill.load(),
+            2,
+            "prefill occupancy must cover the stalled body"
+        );
+
+        drop(stage);
+        drop(attempt);
+        assert_eq!(prefill.load(), 1, "cancellation releases only this attempt");
+        assert_eq!(decode.load(), 1);
+        drop(other_attempt);
+        assert_eq!(prefill.load(), 0);
+        assert_eq!(decode.load(), 0);
+    }
+
     #[test]
     fn test_decode_reservation_serializes_concurrent_admission() {
         let context = crate::policies::SelectionContext::default();
@@ -4475,6 +4635,7 @@ mod tests {
             "the NIXL fast path must reuse the reservation"
         );
         assert_eq!(decode.load(), 0);
+        assert_eq!(prefill.load(), 0);
     }
 
     #[tokio::test]
