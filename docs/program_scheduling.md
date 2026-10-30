@@ -239,3 +239,62 @@ Report absolute and relative results for job completion time, request throughput
 ## Engine KV-control boundary
 
 Progress-TTL currently protects KV indirectly by controlling request admission. Physical eviction, offload, and prefetch are not executed by this feature. A future Router-to-engine KV hint must receive explicit `accepted`, `rejected`, or `unsupported` feedback and an eventual `applied`, `failed`, or `expired` result. Router residency accounting must not change until the engine reports `applied`.
+
+## Workflow prediction shadow profiles
+
+Program scheduling can collect two independent shadow signals without changing
+TTL, pause ordering, or admission:
+
+- Return-time prediction conditions completion-to-next-arrival intervals on
+  stable workflow identity. Explicit terminal completions contribute
+  `no_return`; TTL expiration and process shutdown remain censored.
+- Output-length prediction conditions completion-token histograms on workflow,
+  model pool, and profile role. The profile role uses
+  `spawn_reason` (for example `planner`, `explorer`, `engineer`, `reviewer`, or
+  `verifier`) and falls back to `agent_role` when no workflow stage is supplied.
+
+Requests may supply `workflow_profile_id` and `profile_version` inside
+`vllm_xargs.agentic_context`. These values select a compatible offline seed;
+they are never metric labels. Both predictors always maintain a bounded online
+overlay when `prediction_profile.mode` is `shadow`.
+
+```json
+{
+  "prediction_profile": {
+    "mode": "shadow",
+    "profile_path": "/etc/vllm-router/workflow-profile.json",
+    "snapshot_path": "/var/lib/vllm-router/workflow-profile-online.json",
+    "snapshot_interval_seconds": 60,
+    "prior_weight": 1.0,
+    "max_keys": 4096,
+    "return_time_bucket_bounds_seconds": [1, 2, 5, 10],
+    "return_time_min_support": 20,
+    "return_time_horizon_seconds": 5,
+    "step_bucket_size": 4,
+    "output_length_bucket_bounds_tokens": [32, 64, 128, 256, 512, 1024],
+    "output_length_quantile": 0.95,
+    "output_length_min_support": 100,
+    "output_length_tail_samples": 5,
+    "stability_window_size": 100,
+    "stability_tolerance": 0.15
+  }
+}
+```
+
+All thresholds and bucket boundaries are configuration, not hard-coded policy.
+An exact state with insufficient support backs off through role/model/global
+profiles. Output maturity additionally requires enough tail observations and a
+stable recent window. Explicit `expected_output_length` and
+`kv_retention_ttl_seconds` keep their existing semantics.
+
+The offline JSON uses schema version `1`, contains the exact configured return
+and output bucket boundaries, and stores keyed bucket counts. The online
+snapshot uses the same schema, so an operator may validate and promote it as a
+future offline seed. File serialization and replacement occur outside the
+scheduler mutex.
+
+In V0, `off` and `shadow` are the only modes. Shadow predictions are visible in
+structured logs, `/scheduling_diagnostics`, and bounded-cardinality metrics,
+but real decisions continue to use the existing rank-level fitted TTL and
+`decode_buffer_tokens` fallback. Activation requires a separate rollout after
+calibration has been evaluated.

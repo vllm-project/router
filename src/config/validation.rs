@@ -190,6 +190,58 @@ impl ConfigValidator {
                     .to_string(),
             });
         }
+        let prediction = &config.prediction_profile;
+        if !prediction.snapshot_interval_seconds.is_finite()
+            || prediction.snapshot_interval_seconds <= 0.0
+            || !prediction.prior_weight.is_finite()
+            || prediction.prior_weight < 0.0
+            || prediction.max_keys == 0
+            || prediction.return_time_min_support == 0
+            || prediction.output_length_min_support == 0
+            || prediction.output_length_tail_samples == 0
+            || prediction.stability_window_size == 0
+            || prediction.step_bucket_size == 0
+        {
+            return Err(ConfigError::ValidationFailed {
+                reason: "Prediction profile intervals, weights, supports, windows, and limits must be valid and non-zero".to_string(),
+            });
+        }
+        if !prediction.return_time_horizon_seconds.is_finite()
+            || prediction.return_time_horizon_seconds <= 0.0
+            || !prediction.output_length_quantile.is_finite()
+            || !(0.0..1.0).contains(&prediction.output_length_quantile)
+            || !prediction.stability_tolerance.is_finite()
+            || prediction.stability_tolerance < 0.0
+        {
+            return Err(ConfigError::ValidationFailed {
+                reason: "Prediction horizons, quantiles, and stability tolerance are invalid"
+                    .to_string(),
+            });
+        }
+        if !strictly_increasing_f64(&prediction.return_time_bucket_bounds_seconds)
+            || !strictly_increasing_usize(&prediction.output_length_bucket_bounds_tokens)
+        {
+            return Err(ConfigError::ValidationFailed {
+                reason:
+                    "Prediction bucket bounds must be non-empty, positive, and strictly increasing"
+                        .to_string(),
+            });
+        }
+        if let Some(path) = prediction.profile_path.as_deref() {
+            let raw =
+                std::fs::read_to_string(path).map_err(|error| ConfigError::ValidationFailed {
+                    reason: format!("Unable to read prediction profile '{path}': {error}"),
+                })?;
+            crate::program_scheduling::prediction_profile::validate_profile_json(
+                &raw,
+                &prediction.return_time_bucket_bounds_seconds,
+                &prediction.output_length_bucket_bounds_tokens,
+                prediction.max_keys,
+            )
+            .map_err(|error| ConfigError::ValidationFailed {
+                reason: format!("Invalid prediction profile '{path}': {error}"),
+            })?;
+        }
         Ok(())
     }
 
@@ -923,6 +975,18 @@ impl ConfigValidator {
         }
         Ok(())
     }
+}
+
+fn strictly_increasing_f64(values: &[f64]) -> bool {
+    !values.is_empty()
+        && values.iter().all(|value| value.is_finite() && *value > 0.0)
+        && values.windows(2).all(|pair| pair[0] < pair[1])
+}
+
+fn strictly_increasing_usize(values: &[usize]) -> bool {
+    !values.is_empty()
+        && values.iter().all(|value| *value > 0)
+        && values.windows(2).all(|pair| pair[0] < pair[1])
 }
 
 /// Base URL without the optional `@dp_rank` suffix.

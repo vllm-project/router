@@ -70,6 +70,8 @@ pub struct ProgramIdentity {
     blocks_parent: bool,
     agent_role: Option<String>,
     spawn_reason: Option<String>,
+    workflow_profile_id: Option<String>,
+    profile_version: Option<String>,
     step_id: Option<u64>,
     request_hints: ProgramRequestHints,
 }
@@ -128,6 +130,8 @@ impl ProgramIdentity {
             blocks_parent: false,
             agent_role: None,
             spawn_reason: None,
+            workflow_profile_id: None,
+            profile_version: None,
             step_id: None,
             request_hints: ProgramRequestHints::default(),
         }
@@ -240,6 +244,8 @@ impl ProgramIdentity {
             blocks_parent: false,
             agent_role: None,
             spawn_reason: None,
+            workflow_profile_id: None,
+            profile_version: None,
             step_id: None,
             request_hints: ProgramRequestHints::default(),
         })
@@ -271,6 +277,8 @@ impl ProgramIdentity {
             ("root_program_id", self.root_program_id.as_deref()),
             ("agent_role", self.agent_role.as_deref()),
             ("spawn_reason", self.spawn_reason.as_deref()),
+            ("workflow_profile_id", self.workflow_profile_id.as_deref()),
+            ("profile_version", self.profile_version.as_deref()),
             ("request_id", self.request_hints.request_id.as_deref()),
         ];
         for (name, value) in fields {
@@ -338,6 +346,14 @@ impl ProgramIdentity {
 
     pub fn spawn_reason(&self) -> Option<&str> {
         self.spawn_reason.as_deref()
+    }
+
+    pub fn workflow_profile_id(&self) -> Option<&str> {
+        self.workflow_profile_id.as_deref()
+    }
+
+    pub fn profile_version(&self) -> Option<&str> {
+        self.profile_version.as_deref()
     }
 
     pub fn step_id(&self) -> Option<u64> {
@@ -434,6 +450,9 @@ fn apply_canonical_scheduling(
     identity.agent_role = agent_role;
     identity.spawn_reason =
         context_string(context, &["spawn_reason", "subagent_type", "agent_type"])?;
+    identity.workflow_profile_id =
+        context_string(context, &["workflow_profile_id", "workflow_type"])?;
+    identity.profile_version = context_string(context, &["profile_version"])?;
     identity.step_id = context_u64(context, &["step_id"])?;
     identity.request_hints = ProgramRequestHints {
         request_id: context_string(context, &["request_id"])?,
@@ -728,6 +747,8 @@ mod tests {
                 "expected_resume": true,
                 "agent_role": "subagent",
                 "spawn_reason": "research",
+                "workflow_profile_id": "autogen-swebench",
+                "profile_version": "2026-10-13",
                 "request_id": "request-a",
                 "step_id": 7,
                 "priority": 9,
@@ -747,6 +768,8 @@ mod tests {
         assert_eq!(identity.parent_program_id(), Some("workflow:lead"));
         assert_eq!(identity.root_program_id(), Some("workflow:root"));
         assert_eq!(identity.step_id(), Some(7));
+        assert_eq!(identity.workflow_profile_id(), Some("autogen-swebench"));
+        assert_eq!(identity.profile_version(), Some("2026-10-13"));
         assert_eq!(
             identity.request_hints().request_id.as_deref(),
             Some("request-a")
@@ -773,6 +796,8 @@ mod tests {
             "root_program_id",
             "agent_role",
             "spawn_reason",
+            "workflow_profile_id",
+            "profile_version",
             "request_id",
         ] {
             let mut context = serde_json::json!({

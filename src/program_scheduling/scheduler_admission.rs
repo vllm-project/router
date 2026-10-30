@@ -3,12 +3,14 @@
 //! This module owns request-scoped ordering hints, yield-aware resume order,
 //! and capacity checks. Global Queue placement is implemented separately.
 
+use super::output_length;
 use super::scheduler::ProgramScheduler;
 use super::scheduler_state::{ProgramPauseReason, ProgramResumeOrder, ProgramSchedulerState};
 use super::{
     BatchGainInputs, ContinuitySample, ProgramDispatch, ProgramIdentity, ProgramRef,
     ProgramRequestHandle, ProgramState, ProgramStatus, ProgramTarget, ScheduleError,
 };
+use crate::config::types::PredictionMode;
 use crate::metrics::{AgentAwareAdmissionMetrics, RouterMetrics};
 use std::cmp::Ordering;
 use std::sync::Arc;
@@ -93,30 +95,69 @@ impl ProgramScheduler {
                                     cache_miss_impact_seconds: decision
                                         .last_cache_miss_impact_seconds,
                                 },
+                                decision.pending_return_prediction.clone(),
                             )
                         })
                     })
                 });
-            if let Some((Some(target_id), sample)) = continuity {
+            if let Some((target_id, sample, pending_prediction)) = continuity {
                 if sample.interval_seconds.is_finite() && sample.interval_seconds >= 0.0 {
-                    let factors = state.rank_factors.entry(target_id.clone()).or_default();
-                    debug!(
-                        event = "continuity_sample",
-                        program = %reference.redacted_id(),
-                        target = %target_id,
-                        interval_seconds = sample.interval_seconds,
-                        previous_cache_miss_impact_seconds = sample.cache_miss_impact_seconds,
-                        window_samples_before = factors.continuity_sample_count(),
-                        window_complete_before = factors.continuity_window_complete(
-                            self.config.progress_ttl.stats_window_size
-                        ),
-                        "Program scheduling diagnostic"
-                    );
-                    RouterMetrics::record_agent_aware_request_interval(
-                        &target_id,
-                        sample.interval_seconds,
-                    );
-                    factors.push_continuity(sample, self.config.progress_ttl.stats_window_size);
+                    if let Some(target_id) = target_id.as_deref() {
+                        let factors = state.rank_factors.entry(target_id.to_string()).or_default();
+                        debug!(
+                            event = "continuity_sample",
+                            program = %reference.redacted_id(),
+                            target = %target_id,
+                            interval_seconds = sample.interval_seconds,
+                            previous_cache_miss_impact_seconds = sample.cache_miss_impact_seconds,
+                            window_samples_before = factors.continuity_sample_count(),
+                            window_complete_before = factors.continuity_window_complete(
+                                self.config.progress_ttl.stats_window_size
+                            ),
+                            "Program scheduling diagnostic"
+                        );
+                        RouterMetrics::record_agent_aware_request_interval(
+                            target_id,
+                            sample.interval_seconds,
+                        );
+                        factors.push_continuity(sample, self.config.progress_ttl.stats_window_size);
+                    }
+                    if self.config.prediction_profile.mode != PredictionMode::Off {
+                        if let Some(pending) = pending_prediction {
+                            if let Some(target_id) = target_id.as_deref() {
+                                RouterMetrics::record_workflow_return_observation(
+                                    target_id,
+                                    sample.interval_seconds,
+                                    pending
+                                        .prediction
+                                        .as_ref()
+                                        .map(|prediction| prediction.probability),
+                                    self.config.prediction_profile.return_time_horizon_seconds,
+                                );
+                            }
+                            state
+                                .prediction_profiles
+                                .observe_return(&pending.keys, sample.interval_seconds);
+                            debug!(
+                                event = "return_time_observed",
+                                program = %reference.redacted_id(),
+                                actual_seconds = sample.interval_seconds,
+                                predicted_probability = pending
+                                    .prediction
+                                    .as_ref()
+                                    .map(|prediction| prediction.probability),
+                                predicted_ttl_seconds = pending
+                                    .prediction
+                                    .as_ref()
+                                    .map(|prediction| prediction.suggested_ttl_seconds),
+                                "Workflow prediction shadow observation"
+                            );
+                        }
+                    }
+                    if let Some(decision) = state.decisions.get_mut(&reference) {
+                        decision.pending_return_prediction = None;
+                        decision.last_return_actual_seconds = Some(sample.interval_seconds);
+                    }
                 }
             }
             let previous_tokens = state.decisions.get(&reference).map_or(0.0, |decision| {
@@ -130,6 +171,51 @@ impl ProgramScheduler {
                 arrived_at,
                 routing_text.as_deref(),
             );
+            if self.config.prediction_profile.mode != PredictionMode::Off {
+                let keys = output_length::keys_for_request(&identity);
+                let prediction = state.prediction_profiles.predict_output(
+                    &keys,
+                    self.config.prediction_profile.output_length_quantile,
+                    self.config.prediction_profile.output_length_min_support,
+                    self.config.prediction_profile.output_length_tail_samples,
+                    self.config.prediction_profile.prior_weight,
+                    self.config.prediction_profile.stability_window_size,
+                    self.config.prediction_profile.stability_tolerance,
+                );
+                debug!(
+                    event = "output_length_prediction",
+                    program = %reference.redacted_id(),
+                    predicted_tokens = prediction.as_ref().map(|value| value.tokens),
+                    support = prediction.as_ref().map(|value| value.support),
+                    mature = prediction.as_ref().is_some_and(|value| value.mature),
+                    backoff_level = prediction.as_ref().map(|value| value.backoff_level),
+                    source = prediction
+                        .as_ref()
+                        .map(|value| value.source.as_str())
+                        .unwrap_or("none"),
+                    "Workflow prediction shadow result"
+                );
+                if let (Some(target_id), Some(prediction)) = (
+                    state
+                        .decisions
+                        .get(&reference)
+                        .and_then(|decision| decision.last_target.as_deref()),
+                    prediction.as_ref(),
+                ) {
+                    RouterMetrics::record_workflow_output_prediction(
+                        target_id,
+                        prediction.source.as_str(),
+                        prediction.tokens,
+                        prediction.support,
+                        prediction.mature,
+                        prediction.backoff_level,
+                    );
+                }
+                if let Some(decision) = state.decisions.get_mut(&reference) {
+                    decision.pending_output_prediction =
+                        Some(output_length::PendingOutputPrediction { keys, prediction });
+                }
+            }
             let current_tokens = state.decisions[&reference]
                 .private_tokens(self.config.progress_ttl.decode_buffer_tokens);
             if let Some(placement) = state
@@ -1067,6 +1153,53 @@ mod tests {
         assert_eq!(state.rank_factors["rank-0"].continuity_sample_count(), 1);
         drop(state);
         scheduler.complete(&second, true, true, Some(110), Some(0.1));
+    }
+
+    #[tokio::test]
+    async fn output_prediction_is_shadow_only() {
+        use crate::program_scheduling::prediction_profile::OutputLengthKey;
+
+        let mut config = ProgramSchedulerConfig::default();
+        config.prediction_profile.output_length_quantile = 0.5;
+        config.prediction_profile.output_length_min_support = 1;
+        config.prediction_profile.output_length_tail_samples = 1;
+        config.prediction_profile.stability_window_size = 2;
+        config.prediction_profile.stability_tolerance = 10.0;
+        let scheduler = ProgramScheduler::new(config);
+        {
+            let mut state = scheduler.state.lock();
+            let global = OutputLengthKey {
+                workflow_profile_id: None,
+                profile_version: None,
+                model_pool: None,
+                profile_role: None,
+            };
+            state
+                .prediction_profiles
+                .observe_output(std::slice::from_ref(&global), 200);
+            state
+                .prediction_profiles
+                .observe_output(std::slice::from_ref(&global), 220);
+        }
+
+        let dispatch = scheduler
+            .acquire(identity("shadow-output"), 100, &[target()], None)
+            .await
+            .unwrap();
+        let state = scheduler.state.lock();
+        let decision = &state.decisions[dispatch.program()];
+        let prediction = decision
+            .pending_output_prediction
+            .as_ref()
+            .and_then(|pending| pending.prediction.as_ref())
+            .unwrap();
+        assert_eq!(prediction.tokens, 256);
+        assert!(prediction.mature);
+        assert_eq!(decision.output_token_reservation, None);
+        assert_eq!(
+            decision.private_tokens(scheduler.config.progress_ttl.decode_buffer_tokens),
+            200.0
+        );
     }
 
     #[test]

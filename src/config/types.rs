@@ -129,6 +129,78 @@ fn default_intra_node_data_parallel_size() -> usize {
 /// This is intentionally separate from request-level `PolicyConfig`. The
 /// binding policy is evaluated once for a new Program generation; admission
 /// and resume remain ProgramScheduler decisions.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PredictionMode {
+    /// Disable workflow-profile prediction and online collection.
+    Off,
+    /// Collect and evaluate predictions without changing scheduling decisions.
+    #[default]
+    Shadow,
+}
+
+/// Shared configuration for workflow-profile shadow predictors.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PredictionProfileConfig {
+    #[serde(default)]
+    pub mode: PredictionMode,
+    /// Optional versioned offline seed consumed at Router startup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_path: Option<String>,
+    /// Optional path used for periodic online-overlay snapshots.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_path: Option<String>,
+    #[serde(default = "default_prediction_snapshot_interval_seconds")]
+    pub snapshot_interval_seconds: f64,
+    #[serde(default = "default_prediction_prior_weight")]
+    pub prior_weight: f64,
+    #[serde(default = "default_prediction_max_keys")]
+    pub max_keys: usize,
+    #[serde(default = "default_return_time_bucket_bounds_seconds")]
+    pub return_time_bucket_bounds_seconds: Vec<f64>,
+    #[serde(default = "default_return_time_min_support")]
+    pub return_time_min_support: usize,
+    #[serde(default = "default_return_time_horizon_seconds")]
+    pub return_time_horizon_seconds: f64,
+    #[serde(default = "default_prediction_step_bucket_size")]
+    pub step_bucket_size: u64,
+    #[serde(default = "default_output_length_bucket_bounds_tokens")]
+    pub output_length_bucket_bounds_tokens: Vec<usize>,
+    #[serde(default = "default_output_length_quantile")]
+    pub output_length_quantile: f64,
+    #[serde(default = "default_output_length_min_support")]
+    pub output_length_min_support: usize,
+    #[serde(default = "default_output_length_tail_samples")]
+    pub output_length_tail_samples: usize,
+    #[serde(default = "default_prediction_stability_window_size")]
+    pub stability_window_size: usize,
+    #[serde(default = "default_prediction_stability_tolerance")]
+    pub stability_tolerance: f64,
+}
+
+impl Default for PredictionProfileConfig {
+    fn default() -> Self {
+        Self {
+            mode: PredictionMode::Shadow,
+            profile_path: None,
+            snapshot_path: None,
+            snapshot_interval_seconds: default_prediction_snapshot_interval_seconds(),
+            prior_weight: default_prediction_prior_weight(),
+            max_keys: default_prediction_max_keys(),
+            return_time_bucket_bounds_seconds: default_return_time_bucket_bounds_seconds(),
+            return_time_min_support: default_return_time_min_support(),
+            return_time_horizon_seconds: default_return_time_horizon_seconds(),
+            step_bucket_size: default_prediction_step_bucket_size(),
+            output_length_bucket_bounds_tokens: default_output_length_bucket_bounds_tokens(),
+            output_length_quantile: default_output_length_quantile(),
+            output_length_min_support: default_output_length_min_support(),
+            output_length_tail_samples: default_output_length_tail_samples(),
+            stability_window_size: default_prediction_stability_window_size(),
+            stability_tolerance: default_prediction_stability_tolerance(),
+        }
+    }
+}
+
 /// First rollout of RFC-PD-PROGRAM-SCHEDULING: one-way remote execution.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
@@ -223,6 +295,9 @@ pub struct ProgramSchedulingConfig {
     pub stats_window_size: usize,
     #[serde(default = "default_program_enable_batch_gain_admission")]
     pub enable_batch_gain_admission: bool,
+    /// Offline-seeded, online-updated workflow prediction in off/shadow mode.
+    #[serde(default)]
+    pub prediction_profile: PredictionProfileConfig,
     /// Offline-calibrated cold-prefill cost and mixed-batch decode impact.
     #[serde(default)]
     pub prefill_cost_model: PrefillCostModel,
@@ -341,6 +416,7 @@ impl Default for ProgramSchedulingConfig {
             max_segment_rounds: default_program_max_segment_rounds(),
             stats_window_size: default_program_stats_window_size(),
             enable_batch_gain_admission: default_program_enable_batch_gain_admission(),
+            prediction_profile: PredictionProfileConfig::default(),
             prefill_cost_model: PrefillCostModel::default(),
             decode_throughput_model: DecodeThroughputModel::default(),
             explicit_calibration_fields: ExplicitCalibrationFields::default(),
@@ -402,6 +478,8 @@ struct ProgramSchedulingConfigInput {
     stats_window_size: usize,
     #[serde(default = "default_program_enable_batch_gain_admission")]
     enable_batch_gain_admission: bool,
+    #[serde(default)]
+    prediction_profile: PredictionProfileConfig,
     #[serde(default)]
     prefill_cost_model: PrefillCostModelInput,
     #[serde(default)]
@@ -512,6 +590,7 @@ impl<'de> Deserialize<'de> for ProgramSchedulingConfig {
             max_segment_rounds: input.max_segment_rounds,
             stats_window_size: input.stats_window_size,
             enable_batch_gain_admission: input.enable_batch_gain_admission,
+            prediction_profile: input.prediction_profile,
             prefill_cost_model,
             decode_throughput_model,
             explicit_calibration_fields: ExplicitCalibrationFields(explicit_calibration_fields),
@@ -591,6 +670,58 @@ fn default_program_stats_window_size() -> usize {
 
 fn default_program_enable_batch_gain_admission() -> bool {
     true
+}
+
+fn default_prediction_snapshot_interval_seconds() -> f64 {
+    60.0
+}
+
+fn default_prediction_prior_weight() -> f64 {
+    1.0
+}
+
+fn default_prediction_max_keys() -> usize {
+    4096
+}
+
+fn default_return_time_bucket_bounds_seconds() -> Vec<f64> {
+    vec![1.0, 2.0, 5.0, 10.0]
+}
+
+fn default_return_time_min_support() -> usize {
+    20
+}
+
+fn default_return_time_horizon_seconds() -> f64 {
+    5.0
+}
+
+fn default_prediction_step_bucket_size() -> u64 {
+    4
+}
+
+fn default_output_length_bucket_bounds_tokens() -> Vec<usize> {
+    vec![32, 64, 128, 256, 512, 1024, 2048, 4096, 8192]
+}
+
+fn default_output_length_quantile() -> f64 {
+    0.95
+}
+
+fn default_output_length_min_support() -> usize {
+    100
+}
+
+fn default_output_length_tail_samples() -> usize {
+    5
+}
+
+fn default_prediction_stability_window_size() -> usize {
+    100
+}
+
+fn default_prediction_stability_tolerance() -> f64 {
+    0.15
 }
 
 /// History backend configuration

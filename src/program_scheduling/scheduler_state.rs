@@ -4,10 +4,14 @@
 //! They are decision facts, not an additional Program lifecycle state machine.
 
 use super::lineage::ProgramLineage;
+use super::output_length::PendingOutputPrediction;
+use super::prediction_profile::PredictionProfileStore;
+use super::return_time::PendingReturnPrediction;
 use super::{
     ProgramBindingStrategy, ProgramBindings, ProgramRef, ProgramRuntime,
     ProgramSchedulingEnableKey, ProgramTarget, ProgressTtlConfig, ProgressTtlFactors,
 };
+use crate::config::types::PredictionProfileConfig;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -69,6 +73,8 @@ pub struct ProgramSchedulerConfig {
     pub shared_prefix_freshness_kv_turnovers: f64,
     /// Rank-local Progress-TTL formulas and calibration.
     pub progress_ttl: ProgressTtlConfig,
+    /// Optional offline-seeded shadow predictors.
+    pub prediction_profile: PredictionProfileConfig,
 }
 
 impl Default for ProgramSchedulerConfig {
@@ -96,6 +102,7 @@ impl Default for ProgramSchedulerConfig {
             shared_prefix_freshness_warmup: Duration::from_secs(100),
             shared_prefix_freshness_kv_turnovers: 2.0,
             progress_ttl: ProgressTtlConfig::default(),
+            prediction_profile: PredictionProfileConfig::default(),
         }
     }
 }
@@ -170,6 +177,7 @@ impl From<&crate::config::types::ProgramSchedulingConfig> for ProgramSchedulerCo
                 prefill: config.prefill_cost_model,
                 decode: config.decode_throughput_model,
             },
+            prediction_profile: config.prediction_profile.clone(),
         }
     }
 }
@@ -206,8 +214,11 @@ pub(crate) struct ProgramDecisionState {
     pub(crate) agent_id: Option<String>,
     pub(crate) parent_program_id: Option<String>,
     pub(crate) blocks_parent: bool,
+    pub(crate) expected_resume: bool,
     pub(crate) agent_role: Option<String>,
     pub(crate) spawn_reason: Option<String>,
+    pub(crate) workflow_profile_id: Option<String>,
+    pub(crate) profile_version: Option<String>,
     pub(crate) step_id: u64,
     pub(crate) home_target: Option<String>,
     pub(crate) last_target: Option<String>,
@@ -241,6 +252,10 @@ pub(crate) struct ProgramDecisionState {
     pub(crate) last_pause_reason: Option<ProgramPauseReason>,
     pub(crate) pause_when_idle: bool,
     pub(crate) terminate_when_idle: bool,
+    pub(crate) pending_return_prediction: Option<PendingReturnPrediction>,
+    pub(crate) pending_output_prediction: Option<PendingOutputPrediction>,
+    pub(crate) last_return_actual_seconds: Option<f64>,
+    pub(crate) last_output_actual_tokens: Option<usize>,
 }
 
 impl ProgramDecisionState {
@@ -259,8 +274,11 @@ impl ProgramDecisionState {
             agent_id: None,
             parent_program_id: None,
             blocks_parent: false,
+            expected_resume: true,
             agent_role: None,
             spawn_reason: None,
+            workflow_profile_id: None,
+            profile_version: None,
             step_id: 0,
             last_target: home_target.clone(),
             home_target,
@@ -294,6 +312,10 @@ impl ProgramDecisionState {
             last_pause_reason: None,
             pause_when_idle: false,
             terminate_when_idle: false,
+            pending_return_prediction: None,
+            pending_output_prediction: None,
+            last_return_actual_seconds: None,
+            last_output_actual_tokens: None,
         }
     }
 
@@ -396,6 +418,8 @@ pub(crate) struct ProgramSchedulerState {
     pub(crate) global_queues: HashMap<String, VecDeque<ProgramRef>>,
     pub(crate) observations: HashMap<String, RankObservationState>,
     pub(crate) rank_factors: HashMap<String, ProgressTtlFactors>,
+    pub(crate) prediction_profiles: PredictionProfileStore,
+    pub(crate) next_prediction_snapshot_at: Instant,
     pub(crate) lineage: ProgramLineage,
     /// Most recent P-side KV-cache pressure sample.
     pub(crate) prefill_pressure: Option<PrefillPressure>,
@@ -422,6 +446,20 @@ impl ProgramSchedulerState {
             global_queues: HashMap::new(),
             observations: HashMap::new(),
             rank_factors: HashMap::new(),
+            prediction_profiles: PredictionProfileStore::empty(
+                config
+                    .prediction_profile
+                    .return_time_bucket_bounds_seconds
+                    .clone(),
+                config
+                    .prediction_profile
+                    .output_length_bucket_bounds_tokens
+                    .clone(),
+                config.prediction_profile.max_keys,
+                config.prediction_profile.stability_window_size,
+            ),
+            next_prediction_snapshot_at: Instant::now()
+                + Duration::from_secs_f64(config.prediction_profile.snapshot_interval_seconds),
             lineage: ProgramLineage::default(),
             prefill_pressure: None,
         }
