@@ -251,14 +251,9 @@ class L1Stack:
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
             _progress(f"metrics unavailable: {exc}")
             return ""
-        lines = [
+        return "\n".join(
             line for line in text.splitlines() if line.startswith("vllm_tokenizer_l1_")
-        ]
-        if lines:
-            _progress("metrics:\n" + "\n".join(lines))
-        else:
-            _progress("metrics: no vllm_tokenizer_l1_* lines")
-        return "\n".join(lines)
+        )
 
     def stop(self) -> None:
         self._stop_router()

@@ -16,7 +16,7 @@ export MODEL=/path/to/model
 python -m pytest -sv tests/python/e2e/perf/grpc --perf-case=rust_grpc
 ```
 
-L1 prefix encoding cache (16k, `--shape turns`). One worker stays up. Router L1 on, then a router cold start with L1 off. `-s` streams `[vllm-rs]` and `[vllm-router]` logs. Each scenario prints its own `encode_ms`, `encode_reuse`, and JSON path.
+L1 prefix encoding cache (16k, `--shape turns`). One worker stays up. Router L1 on, then a router cold start with L1 off. `-s` streams `[vllm-rs]` and `[vllm-router]` logs. Each scenario prints its wave `ttft_ms`, `e2e_ms`, `encode_ms`, `frontend_ms`, and JSON path.
 
 ```bash
 # MODEL defaults to Qwen/Qwen3.8-27B; set it to a local directory to override

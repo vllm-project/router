@@ -29,32 +29,10 @@ def summary_p50(summary: dict[str, Any], key: str) -> float | None:
     return None
 
 
-def first_prompt_tokens(payload: dict[str, Any]) -> int | None:
-    wave = payload.get("wave") or {}
-    details = wave.get("requests_detail") or []
-    if details and isinstance(details[0].get("prompt_tokens"), int):
-        return int(details[0]["prompt_tokens"])
-    warmup = payload.get("warmup") or {}
-    for name in ("hit", "miss"):
-        row = warmup.get(name) or {}
-        if isinstance(row.get("prompt_tokens"), int):
-            return int(row["prompt_tokens"])
-    return None
-
-
-def format_stage_brief(fields: dict[str, Any]) -> str:
-    encode = fields.get("encode_ms")
-    reuse = fields.get("encode_reuse")
-    if not isinstance(encode, (int, float)):
-        return "n/a"
-    reuse_s = f"{reuse:.4f}" if isinstance(reuse, (int, float)) else "n/a"
-    return f"encode_ms={float(encode):.3f} encode_reuse={reuse_s}"
-
-
 def check_encode_reuse(
     summary: dict[str, Any], *, l1_on: bool, hit_rate: float
 ) -> None:
-    """Structural L1 signal. Encode-time ratios are printed, not asserted."""
+    """Structural L1 signal. Encode time is printed, not compared across scenarios."""
     if summary_p50(summary, "encode_ms") is None:
         raise AssertionError(
             "missing wave.summary.encode_ms; start the router with VLLM_ROUTER_STAGES=1"
@@ -122,25 +100,28 @@ def l1_bypass_lines(metrics_text: str) -> list[str]:
     return bad
 
 
+def _fmt_summary_block(block: Any) -> str:
+    if not isinstance(block, dict):
+        return "n/a"
+    parts: list[str] = []
+    for stat in ("min", "p50", "avg", "max"):
+        value = block.get(stat)
+        if isinstance(value, (int, float)):
+            parts.append(f"{stat}={float(value):.3f}")
+    return " ".join(parts) if parts else "n/a"
+
+
 def format_scenario_result(
     *,
     scenario_id: str,
-    encode_ms_p50: float | None,
-    encode_reuse_p50: float | None,
-    prompt_tokens: int | None,
+    summary: dict[str, Any],
     artifact: str | None,
 ) -> str:
-    """One scenario's bench numbers and the JSON path. No cross-scenario summary."""
-
-    def num(value: float | None, digits: int) -> str:
-        if isinstance(value, (int, float)):
-            return f"{float(value):.{digits}f}"
-        return "n/a"
-
-    prompt = str(prompt_tokens) if prompt_tokens is not None else "n/a"
-    path = artifact or "(not saved)"
-    return (
-        f"[perf] {scenario_id} encode_ms p50={num(encode_ms_p50, 3)} "
-        f"encode_reuse p50={num(encode_reuse_p50, 4)} prompt_tokens={prompt}\n"
-        f"[perf] result path: {path}"
+    """One scenario's wave stats and the JSON path. No warmup, no cross-scenario summary."""
+    lines = [f"[perf] {scenario_id}"]
+    lines.extend(
+        f"[perf] {key} {_fmt_summary_block(summary.get(key))}"
+        for key in ("ttft_ms", "e2e_ms", "encode_ms", "frontend_ms")
     )
+    lines.append(f"[perf] result path: {artifact or '(not saved)'}")
+    return "\n".join(lines)

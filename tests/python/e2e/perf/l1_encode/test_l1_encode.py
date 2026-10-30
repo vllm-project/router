@@ -20,11 +20,8 @@ from pathlib import Path
 from tests.python.e2e.perf.l1_encode.report import (
     check_encode_reuse,
     check_l1_startup_log,
-    first_prompt_tokens,
     format_scenario_result,
-    format_stage_brief,
     l1_bypass_lines,
-    summary_p50,
     wave_id,
 )
 
@@ -87,22 +84,10 @@ def test_l1_encode(
             **payload,
         },
     )
-    warmup = payload.get("warmup") or {}
-    for name in ("miss", "hit"):
-        row = warmup.get(name)
-        if isinstance(row, dict):
-            brief = format_stage_brief(bench_mod.stage_fields(row))
-            print(
-                f"[perf] {row_id} warmup {name}: {brief}",
-                file=sys.stderr,
-                flush=True,
-            )
     print(
         format_scenario_result(
             scenario_id=row_id,
-            encode_ms_p50=summary_p50(summary, "encode_ms"),
-            encode_reuse_p50=summary_p50(summary, "encode_reuse"),
-            prompt_tokens=first_prompt_tokens(payload),
+            summary=summary,
             artifact=artifact,
         ),
         file=sys.stderr,

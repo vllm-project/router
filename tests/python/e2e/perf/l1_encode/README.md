@@ -74,7 +74,7 @@ After the prompt is rendered, read `prompt_tokens` in the summary. If the worker
 
 ## Logs and artifacts
 
-`-sv` prints `[vllm-rs]` and `[vllm-router]` lines as they arrive. When a scenario finishes it prints that wave's `encode_ms`, `encode_reuse`, `prompt_tokens`, and the JSON path. There is no cross-scenario summary. L1 Prometheus text from `http://127.0.0.1:29000/metrics` is printed when the router exposes it (`vllm_tokenizer_l1_*`). A `vllm_tokenizer_l1_bypasses_total` value above 0 fails the on arm.
+`-sv` prints `[vllm-rs]` and `[vllm-router]` lines as they arrive. When a scenario finishes it prints that wave's `ttft_ms`, `e2e_ms`, `encode_ms`, and `frontend_ms` (`min`, `p50`, `avg`, `max`) and the JSON path. Warmup is not printed. There is no cross-scenario summary. L1 Prometheus text is stored on the JSON (`metrics_l1`) and is not printed. A `vllm_tokenizer_l1_bypasses_total` value above 0 fails the on arm.
 
 JSON is written under `tests/python/e2e/perf/l1_encode/results/<timestamp>/` (one object per wave, not the bench CLI's two-document stdout). `PERF_SAVE_RESULTS=0` skips the files. `PERF_OUTPUT_DIR` overrides the directory.
 
