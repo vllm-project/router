@@ -37,11 +37,10 @@ Routing scenario (``test_kv_aware_*`` under ``kv_aware/``):
 - ``KV_AWARE_INDEX_SETTLE_SEC``: wait after prime for KV events / index (default 5).
 - ``KV_AWARE_REQUEST_LOG_POLL_SEC``: max wait for ``request_id`` in worker logs (default 60).
 - ``KV_AWARE_REUSE_ROUNDS``: reuse rounds per lane in the dual-lane test (default 3).
-- ``KV_AWARE_DUAL_PRIME_CONCURRENT``: ``1`` (default) fire lane A/B primes together;
-  ``0`` serial primes (more reliable one-worker-per-lane on cold start).
 
-Dual-lane test **checkpoints** (terminal ``[e2e] checkpoint: ...``): prompt contract,
-two-worker prime, index settle, then **first B reuse before any A reuse**.
+Dual-lane primes go to each worker's HTTP endpoint (lane A on the first worker,
+lane B on the second). Checkpoints (terminal ``[e2e] checkpoint: ...``): prompt
+contract, two-worker prime, index settle, then **first B reuse before any A reuse**.
 """
 
 from __future__ import annotations
@@ -98,11 +97,6 @@ def kv_aware_reuse_rounds() -> int:
     if value < 1:
         raise ValueError("KV_AWARE_REUSE_ROUNDS must be >= 1")
     return value
-
-
-def kv_aware_dual_prime_concurrent() -> bool:
-    raw = os.environ.get("KV_AWARE_DUAL_PRIME_CONCURRENT", "1").strip().lower()
-    return raw not in ("0", "false", "no")
 
 
 def _env_flag(name: str, *, default: str = "1") -> bool:

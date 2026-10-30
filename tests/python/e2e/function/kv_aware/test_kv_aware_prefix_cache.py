@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import concurrent.futures
 import time
 from collections import Counter
 
@@ -14,7 +13,6 @@ from tests.python.e2e.function.helpers.worker_logs import worker_url_for_request
 from tests.python.e2e.function.kv_aware.config import (
     KV_AWARE_SHARED_PREFIX,
     kv_aware_e2e_model,
-    kv_aware_dual_prime_concurrent,
     kv_aware_index_settle_sec,
     kv_aware_request_log_poll_sec,
     kv_aware_reuse_rounds,
@@ -50,24 +48,22 @@ def _chat_worker(
     )
 
 
-def _prime_lane(
-    lane: str,
-    *,
-    base: str,
-    model: str,
-    workers,
-    log_poll: float,
-) -> tuple[str, str]:
+def _prime_worker_http(worker, *, model: str, content: str) -> str:
+    """Seed one lane on a chosen worker, bypassing router scheduling."""
+    http_url = getattr(worker, "http_url", None)
+    if not http_url:
+        raise RuntimeError(f"worker {getattr(worker, 'url', worker)!r} has no http_url")
     with requests.Session() as session:
-        worker = _chat_worker(
+        response = router_http.post_chat_completion(
             session,
-            base=base,
+            http_url,
             model=model,
-            workers=workers,
-            content=lane_prime_user(lane),
-            log_poll=log_poll,
+            content=content,
+            stream=False,
+            max_tokens=8,
         )
-    return lane, worker
+        response.raise_for_status()
+    return worker.url
 
 
 @pytest.mark.e2e
@@ -123,11 +119,9 @@ def test_kv_aware_dual_lane_prime_and_reuse(kv_aware_router, kv_aware_two_worker
     Two **lanes** (different long prefixes): prime A and prime B, then reuse per lane.
 
     - Lanes use **different** token prefixes (``alpha-`` vs ``beta-`` blocks).
-    - Primes: concurrent by default (``KV_AWARE_DUAL_PRIME_CONCURRENT=1``); set ``0``
-      for serial primes if cold-start routing puts both on one worker.
-    - Expect **one prime per worker** when both workers are idle and costs differ
-      after the first index update; if both primes land on the same worker, the
-      test fails (see env above).
+    - Primes go to each worker's own HTTP ``/v1/chat/completions``, lane A on
+      the first worker and lane B on the second, so placement does not depend
+      on router scheduling.
     - Each lane's reuse(s) must match that lane's ``prime_worker``.
     - Reuses are **interleaved B then A** each round so lane B is not sent only
       after many lane-A hits on one worker (load/KV index timing).
@@ -135,7 +129,7 @@ def test_kv_aware_dual_lane_prime_and_reuse(kv_aware_router, kv_aware_two_worker
     **Checkpoints (preconditions before sticky assert):**
 
     1. Prompt contract — reuse shares lane prefix; A/B prefixes differ.
-    2. Dual prime — two distinct ``grpc://`` workers.
+    2. Dual prime — lane A on workers[0], lane B on workers[1], via HTTP.
     3. Index settle — ``KV_AWARE_INDEX_SETTLE_SEC`` sleep after prime.
     4. First B reuse — one B reuse **before any A reuse**, must match ``prime_B``.
     """
@@ -146,7 +140,6 @@ def test_kv_aware_dual_lane_prime_and_reuse(kv_aware_router, kv_aware_two_worker
     settle = kv_aware_index_settle_sec()
     log_poll = kv_aware_request_log_poll_sec()
     n_reuse = kv_aware_reuse_rounds()
-    concurrent_prime = kv_aware_dual_prime_concurrent()
 
     assert_dual_lane_prefixes_distinct()
     for lane in ("A", "B"):
@@ -156,53 +149,15 @@ def test_kv_aware_dual_lane_prime_and_reuse(kv_aware_router, kv_aware_two_worker
         flush=True,
     )
 
-    if concurrent_prime:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
-            fut_a = pool.submit(
-                _prime_lane,
-                "A",
-                base=base,
-                model=model,
-                workers=workers,
-                log_poll=log_poll,
-            )
-            fut_b = pool.submit(
-                _prime_lane,
-                "B",
-                base=base,
-                model=model,
-                workers=workers,
-                log_poll=log_poll,
-            )
-            prime_pairs = [fut_a.result(), fut_b.result()]
-    else:
-        prime_pairs = [
-            _prime_lane(
-                "A",
-                base=base,
-                model=model,
-                workers=workers,
-                log_poll=log_poll,
-            ),
-            _prime_lane(
-                "B",
-                base=base,
-                model=model,
-                workers=workers,
-                log_poll=log_poll,
-            ),
-        ]
-
-    prime_by_lane = dict(prime_pairs)
+    if len(workers) != 2:
+        raise RuntimeError(f"dual-lane prime needs two workers, got {len(workers)}")
+    prime_by_lane = {
+        "A": _prime_worker_http(workers[0], model=model, content=lane_prime_user("A")),
+        "B": _prime_worker_http(workers[1], model=model, content=lane_prime_user("B")),
+    }
     print(f"[e2e] prime_by_lane={prime_by_lane}", flush=True)
-    assert set(prime_by_lane) == {"A", "B"}
-    assert set(prime_by_lane.values()) <= worker_urls
-    assert len(set(prime_by_lane.values())) == 2, (
-        "expected lane A and lane B primes on two different workers; "
-        f"got {prime_by_lane}. "
-        "Cold concurrent primes often tie on one worker — retry with "
-        "KV_AWARE_DUAL_PRIME_CONCURRENT=0 (serial primes)."
-    )
+    assert prime_by_lane == {"A": workers[0].url, "B": workers[1].url}
+    assert set(prime_by_lane.values()) == worker_urls
     print("[e2e] checkpoint: dual prime on two workers OK", flush=True)
 
     print(f"[e2e] checkpoint: index settle {settle}s after prime", flush=True)
