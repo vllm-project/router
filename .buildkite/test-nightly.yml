@@ -140,6 +140,45 @@ steps:
     artifact_paths:
       - "tests/python/e2e/perf/grpc/results/**/*.json"
 
+  # ============================================================================
+  # L3 L1 prefix-encoding perf — full matrix (24 waves), 1× L4.
+  # Same router CI image as the other NVIDIA jobs (vLLM + vllm-router on PATH).
+  # Case default is Qwen/Qwen3-0.6B, TP1, GPU 0. One pytest session: worker
+  # stays up through L1 on, then worker and router cold-start before L1 off.
+  # ============================================================================
+  - label: ":python: l1 encode perf test case"
+    key: "l1-encode-perf-e2e"
+    # image-build is skipped when ROCM_ONLY=1. A skipped dependency is treated
+    # as satisfied, so this job must use the same condition.
+    if: build.env("ROCM_ONLY") != "1"
+    timeout_in_minutes: 120
+    retry:
+      automatic:
+        - exit_status: "*"
+          limit: 1
+      manual:
+        allowed: true
+        reason: "GPU perf cold starts can be flaky — retry after checking logs"
+    mirror_hardwares: l4_1
+    depends_on:
+      - "upload-nightly-pipeline"
+      - "image-build"
+    command: |
+      bash <<'BASH'
+      set -euo pipefail
+
+      export MODEL="Qwen/Qwen3-0.6B"
+      export CUDA_VISIBLE_DEVICES=0
+      export PERF_TENSOR_PARALLEL_SIZE=1
+      export PERF_STACK_TIMEOUT=1800
+      export PERF_WORKER_STARTUP_TIMEOUT=1800
+
+      python -m pytest -sv tests/python/e2e/perf/l1_encode/test_l1_encode.py::test_l1_encode
+
+      BASH
+    artifact_paths:
+      - "tests/python/e2e/perf/l1_encode/results/**/*.json"
+
   # This queue is intentionally separate from the shared amd_mi300_* queues.
   # Those agents run --no-plugins, while this lane needs the Docker plugin
   # to provide the pinned vLLM/MoRI userspace on a two-GPU xGMI host.

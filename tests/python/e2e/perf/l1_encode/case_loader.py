@@ -12,7 +12,7 @@ CASES_DIR = Path(__file__).resolve().parent / "cases"
 CASE_FILE = CASES_DIR / "qwen3_16k.json"
 
 # Hugging Face id. ``MODEL`` overrides this (local directory or another id).
-DEFAULT_MODEL = "Qwen/Qwen3.8-27B"
+DEFAULT_MODEL = "Qwen/Qwen3-0.6B"
 
 # Chat-template role markers sit on top of ``--tokens``. The worker's
 # ``--max-model-len`` has to cover that plus ``--max-tokens``.
@@ -44,6 +44,22 @@ class L1Case:
     bench_timeout: float
     turns: int
     waves: tuple[WaveSpec, ...]
+
+
+def _apply_tp_override(cli: tuple[str, ...]) -> tuple[str, ...]:
+    """``PERF_TENSOR_PARALLEL_SIZE`` rewrites ``--tensor-parallel-size`` for a 1-GPU run."""
+    raw = os.environ.get("PERF_TENSOR_PARALLEL_SIZE", "").strip()
+    if not raw:
+        return cli
+    items = list(cli)
+    for index, arg in enumerate(items):
+        if arg == "--tensor-parallel-size" and index + 1 < len(items):
+            items[index + 1] = raw
+            return tuple(items)
+        if arg.startswith("--tensor-parallel-size="):
+            items[index] = f"--tensor-parallel-size={raw}"
+            return tuple(items)
+    return (*items, "--tensor-parallel-size", raw)
 
 
 def cli_value(cli: tuple[str, ...], flag: str) -> str | None:
@@ -158,10 +174,10 @@ def load_case(path: Path | None = None) -> L1Case:
         worker_http_port=int(stack.get("worker_http_port", 8000)),
         worker_grpc_port=int(stack.get("worker_grpc_port", 50051)),
         prometheus_port=int(stack.get("prometheus_port", 29000)),
-        cuda_visible_devices=str(stack.get("cuda_visible_devices", "0,1")),
+        cuda_visible_devices=str(stack.get("cuda_visible_devices", "0")),
         router_bin=_optional_str(stack.get("router_bin")),
         vllm_rs_bin=_optional_str(stack.get("vllm_rs_bin")),
-        worker_cli=tuple(cli),
+        worker_cli=_apply_tp_override(tuple(cli)),
         bench_tokens=int(bench.get("tokens", 16384)),
         bench_max_tokens=int(bench.get("max_tokens", 64)),
         bench_timeout=float(bench.get("timeout", 1800)),

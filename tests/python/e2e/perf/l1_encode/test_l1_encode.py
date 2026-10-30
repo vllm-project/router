@@ -1,11 +1,11 @@
-"""L1 prefix encoding cache perf: Qwen3.8-27B, 16k, shape turns.
+"""L1 prefix encoding cache perf: Qwen3-0.6B, 16k, shape turns.
 
 The worker stays up through L1 on (fresh router per hit rate). Before L1 off,
 the worker and the router both cold-start.
 
     export VLLM_RS=/path/to/vllm-rs
-    # optional local snapshot; default is Qwen/Qwen3.8-27B
-    # export MODEL=/path/to/Qwen3.8-27B
+    # optional local snapshot; default is Qwen/Qwen3-0.6B
+    # export MODEL=/path/to/Qwen3-0.6B
     pytest -sv tests/python/e2e/perf/l1_encode/test_l1_encode.py::test_l1_encode \\
         -k "l1on and hit030 and c4"
 """

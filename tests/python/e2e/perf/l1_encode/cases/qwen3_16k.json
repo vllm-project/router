@@ -1,5 +1,5 @@
 {
-  "model": "Qwen/Qwen3.8-27B",
+  "model": "Qwen/Qwen3-0.6B",
   "stack": {
     "router_bin": "target/release/vllm-router",
     "host": "127.0.0.1",
@@ -7,11 +7,11 @@
     "worker_http_port": 8000,
     "worker_grpc_port": 50051,
     "prometheus_port": 29000,
-    "cuda_visible_devices": "0,1"
+    "cuda_visible_devices": "0"
   },
   "worker": {
     "cli": [
-      "--tensor-parallel-size", "2",
+      "--tensor-parallel-size", "1",
       "--max-model-len", "32768",
       "--max-num-seqs", "16",
       "--max-num-batched-tokens", "32768",
