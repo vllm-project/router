@@ -908,17 +908,7 @@ impl VllmPDRouter {
             .flatten();
         let needs_headers = forward_policy_headers
             && (prefill_policy.needs_headers() || decode_policy.needs_headers());
-        let policy_headers = headers.filter(|_| needs_headers).map(|headers| {
-            headers
-                .iter()
-                .filter_map(|(name, value)| {
-                    value
-                        .to_str()
-                        .ok()
-                        .map(|value| (name.as_str().to_lowercase(), value.to_owned()))
-                })
-                .collect()
-        });
+        let policy_headers = header_utils::to_policy_headers(headers.filter(|_| needs_headers));
         let (prefill_inputs, decode_inputs) = tokio::join!(
             self.pd_router
                 .prepare_prefill_inputs(prefill_workers, request, path, headers),
@@ -1169,21 +1159,9 @@ impl VllmPDRouter {
         } else {
             None
         };
-        let policy_headers = policy.needs_headers().then(|| {
-            headers
-                .map(|headers| {
-                    headers
-                        .iter()
-                        .filter_map(|(name, value)| {
-                            value
-                                .to_str()
-                                .ok()
-                                .map(|value| (name.as_str().to_lowercase(), value.to_owned()))
-                        })
-                        .collect::<HashMap<String, String>>()
-                })
-                .unwrap_or_default()
-        });
+        let policy_headers = policy
+            .needs_headers()
+            .then(|| header_utils::to_policy_headers(headers).unwrap_or_default());
         let index = policy.select_worker_with_headers(
             &workers,
             request_text.as_deref(),
@@ -1233,13 +1211,14 @@ impl VllmPDRouter {
         }
     }
 
-    /// Discovery supplies candidates; admission and dispatch are shared with static pools.
-    async fn process_vllm_request(
+    /// Select a P/D pair among the discovered instances. Request headers reach
+    /// the policies, so session-aware policies behave as in direct-URL mode.
+    async fn admit_discovered_pair(
         &self,
-        request: Value,
+        request: &Value,
         path: &str,
         headers: Option<&HeaderMap>,
-    ) -> Response {
+    ) -> Option<(Arc<dyn Worker>, Arc<dyn Worker>, PdAttempt)> {
         let prefill_workers = self.discovery_candidates(
             self.service_registry
                 .get_instance_snapshots(ServiceType::Prefill),
@@ -1250,16 +1229,32 @@ impl VllmPDRouter {
                 .get_instance_snapshots(ServiceType::Decode),
             ServiceType::Decode,
         );
-        let Some((selection, attempt)) = self
+        let (selection, attempt) = self
             .admit_pair(
                 &prefill_workers,
                 &decode_workers,
-                &request,
+                request,
                 path,
                 headers,
-                false,
+                true,
             )
-            .await
+            .await?;
+        Some((
+            prefill_workers[selection.prefill.worker_index].clone(),
+            decode_workers[selection.decode.worker_index].clone(),
+            attempt,
+        ))
+    }
+
+    /// Discovery supplies candidates; admission and dispatch are shared with static pools.
+    async fn process_vllm_request(
+        &self,
+        request: Value,
+        path: &str,
+        headers: Option<&HeaderMap>,
+    ) -> Response {
+        let Some((prefill_worker, decode_worker, attempt)) =
+            self.admit_discovered_pair(&request, path, headers).await
         else {
             RouterMetrics::record_pd_error("server_selection");
             return (StatusCode::SERVICE_UNAVAILABLE, "No eligible P/D pair").into_response();
@@ -1267,8 +1262,8 @@ impl VllmPDRouter {
         match self
             .process_vllm_two_stage_request(
                 request,
-                prefill_workers[selection.prefill.worker_index].clone(),
-                decode_workers[selection.decode.worker_index].clone(),
+                prefill_worker,
+                decode_worker,
                 path,
                 headers,
                 attempt.clone(),
@@ -3996,6 +3991,69 @@ mod tests {
             assert!(cancelled.await.unwrap_err().is_cancelled());
             assert!(router.pd_router.pd_load.snapshot().is_empty());
             server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn test_discovery_sticky_least_loaded_pins_sessions_on_both_roles() {
+        use crate::policies::StickyLeastLoadedPolicy;
+
+        let ctx = Arc::new(
+            crate::server::AppContext::new(
+                crate::config::RouterConfig::default(),
+                reqwest::Client::new(),
+                64,
+                None,
+                vec![],
+            )
+            .unwrap(),
+        );
+        let prefill_policy = Arc::new(StickyLeastLoadedPolicy::new());
+        let decode_policy = Arc::new(StickyLeastLoadedPolicy::new());
+        ctx.policy_registry
+            .set_prefill_policy(prefill_policy.clone());
+        ctx.policy_registry.set_decode_policy(decode_policy.clone());
+        let router = VllmPDRouter::new(vec![], vec![], None, &ctx).await.unwrap();
+        for (role, service) in [
+            ("prefill", ServiceType::Prefill),
+            ("decode", ServiceType::Decode),
+        ] {
+            for i in 0..2 {
+                router.service_registry.register_service(
+                    format!("{role}-{i}:8000"),
+                    format!("tcp://{role}-{i}:5557"),
+                    service.clone(),
+                );
+            }
+        }
+
+        for session in 0..4 {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                "x-session-id",
+                format!("session-{session}").parse().unwrap(),
+            );
+            let mut pairs = std::collections::HashSet::new();
+            for turn in 0..3 {
+                let request = json!({"model": "m", "prompt": format!("turn {turn}")});
+                let (prefill, decode, _attempt) = router
+                    .admit_discovered_pair(&request, "/v1/completions", Some(&headers))
+                    .await
+                    .expect("a P/D pair should be admitted");
+                pairs.insert((prefill.url().to_owned(), decode.url().to_owned()));
+            }
+            assert_eq!(pairs.len(), 1, "session-{session} moved: {pairs:?}");
+        }
+
+        // New sessions go to the least-loaded instance: 2/2 on each role.
+        for (policy, role) in [(&prefill_policy, "prefill"), (&decode_policy, "decode")] {
+            assert_eq!(policy.active_session_count(), 4);
+            for i in 0..2 {
+                assert_eq!(
+                    policy.active_count_for(&format!("http://{role}-{i}:8000")),
+                    2
+                );
+            }
         }
     }
 

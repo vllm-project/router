@@ -18,6 +18,7 @@ mod random;
 mod registry;
 mod rendezvous_hash;
 mod round_robin;
+mod sticky_least_loaded;
 
 pub(crate) use cache_aware::PreparedCacheSelection;
 pub use cache_aware::{CacheAwareCandidate, CacheAwarePlacement, CacheAwarePolicy};
@@ -36,6 +37,7 @@ pub use random::RandomPolicy;
 pub use registry::PolicyRegistry;
 pub use rendezvous_hash::RendezvousHashPolicy;
 pub use round_robin::RoundRobinPolicy;
+pub use sticky_least_loaded::StickyLeastLoadedPolicy;
 
 /// HTTP headers passed to policies for routing decisions
 /// Key is lowercase header name, value is header value
@@ -132,6 +134,15 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
     /// policies to update their internal state.
     fn on_request_complete(&self, _worker_url: &str, _success: bool) {
         // Default: no-op for stateless policies
+    }
+
+    /// Mark a session (e.g. an RL trajectory) as finished.
+    ///
+    /// Session-aware policies (e.g. `sticky_least_loaded`) use this to
+    /// release the replica capacity held by the session. Stateless policies, and
+    /// policies that don't track sessions, ignore this.
+    fn finish_session(&self, _session_id: &str) {
+        // Default: no-op for policies that don't track sessions
     }
 
     /// Get policy name for metrics and debugging

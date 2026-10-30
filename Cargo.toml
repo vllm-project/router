@@ -291,6 +291,10 @@ name = "test_prompt_input"
 path = "tests/rust/test_prompt_input.rs"
 
 [[test]]
+name = "test_sticky_least_loaded_pd"
+path = "tests/rust/test_sticky_least_loaded_pd.rs"
+
+[[test]]
 name = "test_transparent_proxy_routing"
 path = "tests/rust/test_transparent_proxy_routing.rs"
 

@@ -120,7 +120,7 @@ struct CliArgs {
     worker_urls: Vec<String>,
 
     /// Load balancing policy to use. kv_aware uses stage-specific load profiles in PD mode.
-    #[arg(long, default_value = "cache_aware", value_parser = ["random", "round_robin", "cache_aware", "kv_aware", "power_of_two", "consistent_hash", "rendezvous_hash"])]
+    #[arg(long, default_value = "cache_aware", value_parser = ["random", "round_robin", "cache_aware", "kv_aware", "power_of_two", "consistent_hash", "sticky_least_loaded", "rendezvous_hash"])]
     policy: String,
 
     /// Enable Program-level scheduling independently of the request-level
@@ -159,11 +159,11 @@ struct CliArgs {
     pd_kv_events: Vec<String>,
 
     /// Specific policy for prefill nodes in PD mode. kv_aware uses the prefill load profile.
-    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "kv_aware", "power_of_two", "consistent_hash", "rendezvous_hash"])]
+    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "kv_aware", "power_of_two", "consistent_hash", "sticky_least_loaded", "rendezvous_hash"])]
     prefill_policy: Option<String>,
 
     /// Specific policy for decode nodes in PD mode (defaults to --policy).
-    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "kv_aware", "power_of_two", "consistent_hash", "rendezvous_hash"])]
+    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "kv_aware", "power_of_two", "consistent_hash", "sticky_least_loaded", "rendezvous_hash"])]
     decode_policy: Option<String>,
 
     /// Timeout in seconds for worker startup
@@ -462,6 +462,7 @@ impl CliArgs {
             "consistent_hash" => PolicyConfig::ConsistentHash {
                 virtual_nodes: 160, // Default value
             },
+            "sticky_least_loaded" => PolicyConfig::StickyLeastLoaded,
             "rendezvous_hash" => PolicyConfig::RendezvousHash,
             _ => PolicyConfig::RoundRobin, // Fallback
         }
