@@ -13,7 +13,7 @@
     "cli": [
       "--tensor-parallel-size", "2",
       "--max-model-len", "32768",
-      "--max-num-seqs", "4",
+      "--max-num-seqs", "16",
       "--max-num-batched-tokens", "32768",
       "--gpu-memory-utilization", "0.90",
       "--enable-prefix-caching",
@@ -30,9 +30,15 @@
   "waves": [
     {"hit_rate": 0.0, "concurrency": 1, "requests": 2},
     {"hit_rate": 0.0, "concurrency": 4, "requests": 8},
+    {"hit_rate": 0.0, "concurrency": 8, "requests": 16},
+    {"hit_rate": 0.0, "concurrency": 16, "requests": 32},
     {"hit_rate": 0.30, "concurrency": 1, "requests": 2},
     {"hit_rate": 0.30, "concurrency": 4, "requests": 8},
+    {"hit_rate": 0.30, "concurrency": 8, "requests": 16},
+    {"hit_rate": 0.30, "concurrency": 16, "requests": 32},
     {"hit_rate": 0.99999, "concurrency": 1, "requests": 2},
-    {"hit_rate": 0.99999, "concurrency": 4, "requests": 8}
+    {"hit_rate": 0.99999, "concurrency": 4, "requests": 8},
+    {"hit_rate": 0.99999, "concurrency": 8, "requests": 16},
+    {"hit_rate": 0.99999, "concurrency": 16, "requests": 32}
   ]
 }

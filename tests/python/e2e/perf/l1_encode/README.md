@@ -39,7 +39,7 @@ Omit `-k` for the full matrix (L1 on, then L1 off).
 | `hit030` | hit rate 0.30 |
 | `hit99999` | hit rate 0.99999 |
 | `hit0-` | hit rate 0 (`hit0` also matches `hit030`) |
-| `c1` / `c4` | concurrency |
+| `c1-` / `c4` / `c8` / `c16` | concurrency (`c1` also matches `c16`) |
 
 Examples:
 
@@ -60,7 +60,7 @@ Node ids look like `l1on-hit030-c4-r8`.
 3. **L1 off:** one more router cold start (`VLLM_ROUTER_L1_CACHE=0`). Every off-arm hit rate and concurrency shares that router.
 4. Each wave is `benches/backend/bench_prefix_kvhit.py` with `--shape turns --turns 8 --tokens 16384 --max-tokens 64 --warmup`.
 
-Hit rates `0`, `0.30`, and `0.99999`. Concurrency `1` (2 requests) and `4` (8 requests). `--max-num-seqs` is 4 because that is the highest concurrency. `0.99999` uses the same shape as any rate ≥ 0.99: the whole paragraph is shared turns, and only the last-turn tag changes.
+Hit rates `0`, `0.30`, and `0.99999`. Concurrency `1`, `4`, `8`, and `16` (requests are twice the concurrency: 2, 8, 16, 32). `--max-num-seqs` is 16 because that is the highest concurrency. `0.99999` uses the same shape as any rate ≥ 0.99: the whole paragraph is shared turns, and only the last-turn tag changes.
 
 | hit rate | L1 on `encode_reuse` | encode time vs L1 off |
 |----------|----------------------|------------------------|
