@@ -3,6 +3,7 @@
 use super::dp_utils;
 use super::logprobs_merge;
 use super::pd_cached_tokens;
+use super::pd_program_adapter::{self, PdProgramRuntime};
 use super::pd_router::PdRouterBase;
 use super::pd_types::{error_chain, PDRouterError, PdAttempt, PdRequestContext};
 use super::usage_merge;
@@ -15,6 +16,7 @@ use crate::policies::{
     kv_aware_ops, AffinityKey, CacheAwarePolicy, KvRequestTokens, LoadBalancingPolicy,
     PolicyRegistry, WorkerTokenInputs,
 };
+use crate::program_scheduling::ProgramIdentity;
 use crate::routers::{header_utils, RouterTrait, WorkerManagement};
 use async_trait::async_trait;
 use axum::{
@@ -29,7 +31,7 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OwnedSemaphorePermit};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
@@ -61,12 +63,24 @@ struct ConcurrentDispatch {
     request_id: String,
 }
 
+/// Terminal 503 for a Program turn whose bound endpoints could not be dispatched.
+/// The Program reservation is settled as a failure so the next turn can re-admit.
+fn program_unavailable(
+    completion: &super::program_adapter::ProgramCompletion,
+    message: &str,
+) -> Response {
+    completion.finish(false);
+    (StatusCode::SERVICE_UNAVAILABLE, message.to_string()).into_response()
+}
+
 /// vLLM PD Router that extends PdRouterBase with vLLM-specific request handling
 #[derive(Debug)]
 pub struct VllmPDRouter {
     epd: Option<super::epd::EncoderStage>,
     /// Underlying PD router for most functionality
     pd_router: PdRouterBase,
+    /// Opt-in Program-scoped PD scheduling; `None` keeps native PD routing.
+    program_runtime: Option<PdProgramRuntime>,
     /// Service discovery registry for dynamic ZMQ address resolution
     service_registry: Arc<ServiceRegistry>,
     /// HTTP client for making requests to discovered services
@@ -965,6 +979,260 @@ impl VllmPDRouter {
             .select_and_admit(prefill_workers, decode_workers, &context)
     }
 
+    /// Cheap opt-in gate: only Program-capable requests are serialized twice.
+    fn program_turn_enabled(
+        &self,
+        headers: Option<&HeaderMap>,
+        other: &serde_json::Map<String, Value>,
+    ) -> bool {
+        self.program_runtime.as_ref().is_some_and(|runtime| {
+            ProgramIdentity::may_be_enabled(headers, other, runtime.scheduler.enable_key())
+        })
+    }
+
+    /// One Program turn: the scheduler binds D, P is selected per turn, and P
+    /// capacity is bounded per target before dispatch.
+    ///
+    /// `None` means the request is not a Program turn after all, so the caller
+    /// must fall back to native PD routing.
+    async fn process_program_request(
+        &self,
+        mut request: Value,
+        path: &str,
+        headers: Option<&HeaderMap>,
+    ) -> Option<Response> {
+        let runtime = self.program_runtime.as_ref()?;
+        let streaming = request
+            .get("stream")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let decode_targets = if self.use_discovery {
+            pd_program_adapter::discovered_decode_instances(
+                &self.service_registry,
+                self.intra_node_data_parallel_size,
+            )
+            .iter()
+            .map(|(address, _)| pd_program_adapter::discovered_target(address))
+            .collect::<Vec<_>>()
+        } else {
+            self.pd_router
+                .worker_registry
+                .get_decode_workers()
+                .into_iter()
+                .filter(|worker| worker.is_available())
+                .map(|worker| pd_program_adapter::worker_target(&worker))
+                .collect::<Vec<_>>()
+        };
+        let completion = match runtime
+            .acquire(headers, &request, path, &decode_targets)
+            .await
+        {
+            Ok(Some(completion)) => completion,
+            Ok(None) => return None,
+            Err(error) => return Some(pd_program_adapter::error_response(error)),
+        };
+        // Transfer addresses and block IDs can only come from registered engines.
+        if let Some(object) = request.as_object_mut() {
+            object.remove("kv_transfer_params");
+        }
+        let target_id = completion.dispatch().target_id.clone();
+        // Admission waits, so resolve the committed D against the live pool
+        // instead of the candidate list used to propose targets before the wait.
+        let Some(decode_worker) = self.program_decode_worker(&target_id) else {
+            return Some(program_unavailable(
+                &completion,
+                "Program decode target left the pool",
+            ));
+        };
+        let prefill_candidates = self.program_prefill_candidates();
+        let selected = self.select_program_prefill(&prefill_candidates, &request, path, headers);
+        let Some((prefill_id, prefill_worker)) = selected else {
+            RouterMetrics::record_pd_error("server_selection");
+            return Some(program_unavailable(
+                &completion,
+                "No feasible registered P/D pair",
+            ));
+        };
+        let permit = match runtime.reserve_prefill(&prefill_id).await {
+            Ok(permit) => permit,
+            Err(error) => {
+                completion.finish(false);
+                return Some(pd_program_adapter::error_response(error));
+            }
+        };
+        if !self.program_targets_are_live(&prefill_id, &target_id) {
+            return Some(program_unavailable(
+                &completion,
+                "PD target changed while waiting for prefill capacity",
+            ));
+        }
+        // Program turns bypass native selection, so charge their P and D
+        // occupancy explicitly; otherwise they would be invisible to native
+        // admission and to `/metrics`.
+        let attempt = self
+            .pd_router
+            .pd_load
+            .admit_bound(prefill_worker.clone(), decode_worker.clone());
+        let result = self
+            .process_vllm_two_stage_request(
+                request,
+                prefill_worker,
+                decode_worker,
+                path,
+                headers,
+                attempt.clone(),
+                Some(permit),
+            )
+            .await;
+        Some(match result {
+            Ok(response) => pd_program_adapter::track_response(
+                attempt.track_response(response),
+                completion,
+                streaming,
+            ),
+            Err(error) => {
+                attempt.release();
+                completion.finish(false);
+                (StatusCode::SERVICE_UNAVAILABLE, error.to_string()).into_response()
+            }
+        })
+    }
+
+    /// Decode worker for the D target the scheduler committed to.
+    fn program_decode_worker(&self, target_id: &str) -> Option<Arc<dyn Worker>> {
+        if self.use_discovery {
+            return pd_program_adapter::discovered_decode_worker(
+                &self.service_registry,
+                self.intra_node_data_parallel_size,
+                target_id,
+            );
+        }
+        self.pd_router
+            .worker_registry
+            .get_decode_workers()
+            .into_iter()
+            .find(|worker| {
+                worker.is_available() && pd_program_adapter::worker_target(worker).id == target_id
+            })
+    }
+
+    /// P candidates as `(admission id, worker)`. Discovered registrations stay
+    /// keyed by their registration so a rank expansion cannot change the
+    /// prefill capacity gate it is charged to.
+    fn program_prefill_candidates(&self) -> Vec<(String, Arc<dyn Worker>)> {
+        if self.use_discovery {
+            let mut candidates = Vec::new();
+            for snapshot in self
+                .service_registry
+                .get_instance_snapshots(ServiceType::Prefill)
+            {
+                let id = pd_program_adapter::discovered_target(&snapshot.0).id;
+                for worker in self.discovery_candidates(vec![snapshot], ServiceType::Prefill) {
+                    candidates.push((id.clone(), worker));
+                }
+            }
+            candidates
+        } else {
+            self.pd_router
+                .worker_registry
+                .get_prefill_workers()
+                .into_iter()
+                .filter(|worker| worker.is_available())
+                .map(|worker| (pd_program_adapter::worker_target(&worker).id, worker))
+                .collect()
+        }
+    }
+
+    /// P is chosen anew for every admitted turn so D continuity cannot pin a
+    /// prefill worker.
+    fn select_program_prefill(
+        &self,
+        candidates: &[(String, Arc<dyn Worker>)],
+        request: &Value,
+        path: &str,
+        headers: Option<&HeaderMap>,
+    ) -> Option<(String, Arc<dyn Worker>)> {
+        if candidates.is_empty() {
+            return None;
+        }
+        let policy = self.policy_registry.get_prefill_policy();
+        let workers = candidates
+            .iter()
+            .map(|(_, worker)| worker.clone())
+            .collect::<Vec<_>>();
+        let request_text = if policy.needs_cache_routing_key() {
+            Some(crate::protocols::spec::cache_routing::for_route(
+                request, path,
+            ))
+        } else if policy.needs_request_text() {
+            serde_json::to_string(request).ok()
+        } else {
+            None
+        };
+        let policy_headers = policy.needs_headers().then(|| {
+            headers
+                .map(|headers| {
+                    headers
+                        .iter()
+                        .filter_map(|(name, value)| {
+                            value
+                                .to_str()
+                                .ok()
+                                .map(|value| (name.as_str().to_lowercase(), value.to_owned()))
+                        })
+                        .collect::<HashMap<String, String>>()
+                })
+                .unwrap_or_default()
+        });
+        let index = policy.select_worker_with_headers(
+            &workers,
+            request_text.as_deref(),
+            policy_headers.as_ref(),
+        )?;
+        Some(candidates[index].clone())
+    }
+
+    /// Recheck the bound endpoints after a capacity wait: an expired
+    /// registration or a removed worker must not receive the dispatch.
+    fn program_targets_are_live(&self, prefill_id: &str, decode_id: &str) -> bool {
+        if self.use_discovery {
+            let prefill_live =
+                self.service_registry
+                    .get_prefill_instances()
+                    .iter()
+                    .any(|(address, _)| {
+                        pd_program_adapter::discovered_target(address).id == prefill_id
+                    });
+            let decode_live = pd_program_adapter::discovered_decode_instance_by_id(
+                &self.service_registry,
+                self.intra_node_data_parallel_size,
+                decode_id,
+            )
+            .is_some();
+            prefill_live && decode_live
+        } else {
+            let prefill_live = self
+                .pd_router
+                .worker_registry
+                .get_prefill_workers()
+                .iter()
+                .any(|worker| {
+                    worker.is_available()
+                        && pd_program_adapter::worker_target(worker).id == prefill_id
+                });
+            let decode_live = self
+                .pd_router
+                .worker_registry
+                .get_decode_workers()
+                .iter()
+                .any(|worker| {
+                    worker.is_available()
+                        && pd_program_adapter::worker_target(worker).id == decode_id
+                });
+            prefill_live && decode_live
+        }
+    }
+
     /// Discovery supplies candidates; admission and dispatch are shared with static pools.
     async fn process_vllm_request(
         &self,
@@ -1004,6 +1272,7 @@ impl VllmPDRouter {
                 path,
                 headers,
                 attempt.clone(),
+                None,
             )
             .await
         {
@@ -1103,7 +1372,9 @@ impl VllmPDRouter {
     /// Two-stage request processing for vLLM disaggregated mode
     ///
     /// Admission already reserved P and pending D. Dispatch drives independent
-    /// stage transitions; D occupancy follows response-body ownership.
+    /// Stage transitions; D occupancy follows response-body ownership. The
+    /// Program path additionally holds its P admission permit for the call.
+    #[allow(clippy::too_many_arguments)]
     async fn process_vllm_two_stage_request(
         &self,
         original_request: Value,
@@ -1112,6 +1383,7 @@ impl VllmPDRouter {
         path: &str,
         headers: Option<&HeaderMap>,
         attempt: PdAttempt,
+        prefill_permit: Option<OwnedSemaphorePermit>,
     ) -> Result<Response, PDRouterError> {
         debug!("ENTERED process_vllm_two_stage_request method");
         let start_time = Instant::now();
@@ -1167,6 +1439,7 @@ impl VllmPDRouter {
                     start_time,
                     ec_transfers,
                     attempt,
+                    prefill_permit,
                 )
                 .await;
         }
@@ -1268,14 +1541,18 @@ impl VllmPDRouter {
             },
         )
         .await;
-        let (status, content_type, prefill_bytes) = self
+        let finished_prefill = self
             .finish_prefill_response(prefill_response, &prefill_base_url, &attempt)
             .await
             .inspect_err(|_| {
                 RouterMetrics::record_pd_prefill_error(&prefill_base_url);
                 RouterMetrics::record_pd_request(path);
                 RouterMetrics::record_pd_request_duration(path, start_time.elapsed());
-            })?;
+            });
+        // The whole P body has been consumed (or never started): do not hold P
+        // admission capacity while D generates the response.
+        drop(prefill_permit);
+        let (status, content_type, prefill_bytes) = finished_prefill?;
         if !status.is_success() {
             RouterMetrics::record_pd_prefill_error(&prefill_base_url);
             RouterMetrics::record_pd_request(path);
@@ -1514,6 +1791,8 @@ impl VllmPDRouter {
         Some((prefill_request, decode_request, request_id))
     }
 
+    /// Concurrent dispatch owns the P admission permit until the P body ends.
+    #[allow(clippy::too_many_arguments)]
     async fn process_concurrent_two_stage(
         &self,
         dispatch: ConcurrentDispatch,
@@ -1522,6 +1801,7 @@ impl VllmPDRouter {
         start_time: Instant,
         mut ec_transfers: Option<super::epd::EcTransferGuard>,
         attempt: PdAttempt,
+        prefill_permit: Option<OwnedSemaphorePermit>,
     ) -> Result<Response, PDRouterError> {
         let ConcurrentDispatch {
             prefill_request,
@@ -1556,6 +1836,9 @@ impl VllmPDRouter {
         self.start_profiling(&decode_base_url).await;
 
         let prefill_fut = async {
+            // Hold the P admission slot until the prefill body is consumed, then
+            // release it even if D is still running.
+            let prefill_permit = prefill_permit;
             let response = otel_http::send_client_request(
                 stage_builder(&prefill_url, prefill_dp_rank).json(&prefill_request),
                 headers,
@@ -1567,8 +1850,11 @@ impl VllmPDRouter {
                 },
             )
             .await;
-            self.finish_prefill_response(response, &prefill_base_url, &attempt)
-                .await
+            let finished = self
+                .finish_prefill_response(response, &prefill_base_url, &attempt)
+                .await;
+            drop(prefill_permit);
+            finished
         };
         attempt.begin_decode();
         let (prefill_result, decode_result) = tokio::join!(
@@ -1719,6 +2005,10 @@ impl VllmPDRouter {
                 kv_connector
             );
 
+            // The Program runtime observes the same registry the request path reads.
+            let service_registry = Arc::new(service_registry);
+            let program_runtime = PdProgramRuntime::new(ctx, service_registry.clone(), true)?;
+
             Ok(Self {
                 epd: ctx
                     .router_config
@@ -1726,7 +2016,8 @@ impl VllmPDRouter {
                     .clone()
                     .map(super::epd::EncoderStage::new),
                 pd_router,
-                service_registry: Arc::new(service_registry),
+                program_runtime,
+                service_registry,
                 http_client,
                 policy_registry: ctx.policy_registry.clone(),
                 use_discovery: true,
@@ -1750,7 +2041,8 @@ impl VllmPDRouter {
             let pd_router = PdRouterBase::new(prefill_urls.clone(), decode_urls, ctx).await?;
 
             // No service discovery in direct URL mode
-            let service_registry = ServiceRegistry::new();
+            let service_registry = Arc::new(ServiceRegistry::new());
+            let program_runtime = PdProgramRuntime::new(ctx, service_registry.clone(), false)?;
 
             info!("VllmPDRouter created successfully with direct URLs");
 
@@ -1820,7 +2112,8 @@ impl VllmPDRouter {
                     .clone()
                     .map(super::epd::EncoderStage::new),
                 pd_router,
-                service_registry: Arc::new(service_registry),
+                program_runtime,
+                service_registry,
                 http_client,
                 policy_registry: ctx.policy_registry.clone(),
                 use_discovery: false,
@@ -1987,6 +2280,20 @@ impl RouterTrait for VllmPDRouter {
         body: &crate::protocols::spec::ChatCompletionRequest,
         _model_id: Option<&str>,
     ) -> Response {
+        if self.program_turn_enabled(headers, &body.other) {
+            let request = match serde_json::to_value(body) {
+                Ok(request) => request,
+                Err(error) => {
+                    return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
+                }
+            };
+            if let Some(response) = self
+                .process_program_request(request, "/v1/chat/completions", headers)
+                .await
+            {
+                return response;
+            }
+        }
         match serde_json::to_value(body) {
             Ok(body) => {
                 self.route_transparent(headers, "/v1/chat/completions", &Method::POST, body)
@@ -2006,6 +2313,20 @@ impl RouterTrait for VllmPDRouter {
         body: &crate::protocols::spec::CompletionRequest,
         _model_id: Option<&str>,
     ) -> Response {
+        if self.program_turn_enabled(headers, &body.other) {
+            let request = match serde_json::to_value(body) {
+                Ok(request) => request,
+                Err(error) => {
+                    return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
+                }
+            };
+            if let Some(response) = self
+                .process_program_request(request, "/v1/completions", headers)
+                .await
+            {
+                return response;
+            }
+        }
         match serde_json::to_value(body) {
             Ok(body) => {
                 self.route_transparent(headers, "/v1/completions", &Method::POST, body)
@@ -2083,7 +2404,36 @@ impl RouterTrait for VllmPDRouter {
     }
 
     async fn get_worker_loads(&self) -> Response {
-        self.pd_router.get_worker_loads().await
+        let response = self.pd_router.get_worker_loads().await;
+        let Some(runtime) = &self.program_runtime else {
+            return response;
+        };
+        let (mut parts, body) = response.into_parts();
+        let bytes = match axum::body::to_bytes(body, 8 * 1024 * 1024).await {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
+            }
+        };
+        let mut value: Value = match serde_json::from_slice(&bytes) {
+            Ok(value) => value,
+            Err(_) => return Response::from_parts(parts, Body::from(bytes)),
+        };
+        if let Some(object) = value.as_object_mut() {
+            object.insert(
+                "program_scheduling".into(),
+                json!({
+                    "path": "cold_remote",
+                    "warm_enabled": false,
+                    "scheduler": runtime.scheduler.diagnostics(),
+                }),
+            );
+        }
+        parts.headers.remove(axum::http::header::CONTENT_LENGTH);
+        match serde_json::to_vec(&value) {
+            Ok(bytes) => Response::from_parts(parts, Body::from(bytes)),
+            Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+        }
     }
 
     fn router_type(&self) -> &'static str {
@@ -2190,6 +2540,7 @@ impl RouterTrait for VllmPDRouter {
                     path,
                     headers,
                     attempt.clone(),
+                    None,
                 )
                 .await
             {
