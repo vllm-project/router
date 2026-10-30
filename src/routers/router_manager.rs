@@ -213,6 +213,12 @@ impl RouterManager {
             .register_with_previous(worker_arc.clone());
         let worker_id = registration.worker_id;
 
+        if let Some(previous) = registration.previous.as_ref() {
+            self.invalidate_child_worker_state(previous.as_ref());
+            self.policy_registry
+                .clear_consumer_cache_state(previous.as_ref());
+        }
+
         // Notify PolicyRegistry about the new worker
         // Extract policy hint from labels if provided
         let policy_hint = labels.get("policy").map(|s| s.as_str());
@@ -273,6 +279,12 @@ impl RouterManager {
         })
     }
 
+    fn invalidate_child_worker_state(&self, worker: &dyn Worker) {
+        for router in self.routers.iter() {
+            router.value().invalidate_worker_state(worker);
+        }
+    }
+
     /// Remove a worker from the registry
     pub fn remove_worker_from_registry(
         &self,
@@ -280,6 +292,7 @@ impl RouterManager {
     ) -> Result<WorkerApiResponse, WorkerErrorResponse> {
         let _mutation = self.worker_mutation.lock();
         if let Some(worker) = self.worker_registry.remove_by_url(url) {
+            self.invalidate_child_worker_state(worker.as_ref());
             if worker.worker_type() == WorkerType::Regular {
                 let policy = self
                     .policy_registry

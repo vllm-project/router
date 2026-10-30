@@ -126,6 +126,16 @@ impl PolicyRegistry {
         if !removed.worker_type().is_consumer() {
             return;
         }
+        self.clear_consumer_cache_state(removed);
+        self.on_worker_removed(removed.model_id());
+    }
+
+    /// Invalidate affinity for an actual removed or replaced consumer without
+    /// changing model accounting. Same-model replacements retain their policy.
+    pub fn clear_consumer_cache_state(&self, removed: &dyn Worker) {
+        if !removed.worker_type().is_consumer() {
+            return;
+        }
         if matches!(removed.worker_type(), WorkerType::Decode) {
             if let Some(kv) = super::kv_aware_ops(self.get_decode_policy().as_ref()) {
                 kv.unregister_worker(removed.url());
@@ -160,7 +170,6 @@ impl PolicyRegistry {
                 debug!("Removed worker from cache-aware tree: {}", removed.url());
             }
         }
-        self.on_worker_removed(model_id);
     }
 
     /// Decrement model accounting without worker-specific cleanup.
