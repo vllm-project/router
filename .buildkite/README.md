@@ -28,13 +28,15 @@ A pull request labeled `ready` uploads `test-ready.yml`, including forks.
 
 GPU machine presets are in [`ci_mirror_hardwares.yml`](ci_mirror_hardwares.yml).
 A step names one with `mirror_hardwares`. `scripts/upload_pipeline.py` expands
-that name into `agents` and `plugins` before Buildkite upload.
+that name into `agents` and `plugins` before Buildkite upload. A preset that
+injects `VLLM_CI_HF_TOKEN` also exports that value as `HF_TOKEN` in the job
+shell. A build-level `HF_TOKEN` would override a pod env entry of the same name.
 
 | Name | Machine |
 | --- | --- |
 | `l4_4` | EKS `l4-k8s`, 4× L4, image `public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:router-$BUILDKITE_COMMIT` |
 | `l4_1` | Same L4 pool and image, 1× L4 |
-| `h100_2` | `mithril-h100-pool`, 2× H100 SXM, same router CI image |
+| `h100_2` | `mithril-h100-pool`, 2× H100 SXM, us-west-2 pull-through cache of the router CI image, GPU limit 2 |
 | `mi300_2` | `router_rocm_mi300_2`, same-host xGMI Docker devices |
 | `mi300_rdma` | `router_rocm_mi300_2` coordinator, no Docker plugin |
 
