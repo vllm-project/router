@@ -7,21 +7,26 @@ import os
 import shutil
 import subprocess
 import sys
-import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-import requests
+_E2E_DIR = Path(__file__).resolve().parents[3]
+if str(_E2E_DIR) not in sys.path:
+    sys.path.insert(0, str(_E2E_DIR))
+
+from helpers.binaries import resolve_router_bin, resolve_vllm_rs  # noqa: E402
+from helpers.http_ready import wait_for_http_ok  # noqa: E402
+from helpers.paths import repo_root  # noqa: E402
+from helpers.subprocess_io import start_stderr_pump_thread  # noqa: E402
 
 if TYPE_CHECKING:
     from case_loader import BackendCaseFile
 
 logger = logging.getLogger(__name__)
 
-# File is ``tests/python/e2e/perf/grpc/stack_launcher.py`` → repo root is parents[5].
-REPO_ROOT = Path(__file__).resolve().parents[5]
+REPO_ROOT = repo_root()
 
 
 def _progress(msg: str) -> None:
@@ -31,14 +36,7 @@ def _progress(msg: str) -> None:
 def _pipe_process_output(proc: subprocess.Popen, label: str) -> None:
     """Avoid PIPE deadlock and surface worker/router logs under pytest -s."""
 
-    def _reader() -> None:
-        stream = proc.stdout
-        if stream is None:
-            return
-        for line in stream:
-            print(f"[{label}] {line}", end="", file=sys.stderr, flush=True)
-
-    threading.Thread(target=_reader, daemon=True).start()
+    start_stderr_pump_thread(proc, stderr_prefix=f"[{label}] ")
 
 
 @dataclass
@@ -71,68 +69,19 @@ def _proc_exit_error(proc: subprocess.Popen, label: str) -> RuntimeError:
 def _wait_router_health(
     base_url: str, timeout: float, *, proc: subprocess.Popen | None = None
 ) -> None:
-    start = time.monotonic()
     url = base_url.rstrip("/") + "/health"
-    last_log = start
-    with requests.Session() as session:
-        while time.monotonic() - start < timeout:
-            if proc is not None:
-                if proc.poll() is not None:
-                    raise _proc_exit_error(proc, "router")
-            try:
-                r = session.get(url, timeout=5)
-                if r.status_code == 200:
-                    _progress(
-                        f"router healthy at {url} ({time.monotonic() - start:.0f}s)"
-                    )
-                    return
-            except requests.RequestException:
-                pass
-            now = time.monotonic()
-            if now - last_log >= 30:
-                _progress(
-                    f"waiting for {url} ({now - start:.0f}s / {timeout:.0f}s timeout)…"
-                )
-                last_log = now
-            time.sleep(2)
-    raise TimeoutError(f"router not healthy at {url} within {timeout}s")
-
-
-def _resolve_bin_path(raw: str) -> str | None:
-    """Resolve case JSON path (absolute, repo-relative, or PATH name)."""
-    text = raw.strip()
-    if not text:
-        return None
-    candidate = Path(text).expanduser()
-    if not candidate.is_absolute():
-        candidate = (REPO_ROOT / candidate).resolve()
-    if candidate.is_file():
-        return str(candidate)
-    found = shutil.which(text)
-    if found:
-        return found
-    return None
+    wait_for_http_ok(
+        url,
+        timeout_seconds=timeout,
+        proc=proc,
+        prefix="[perf stack] ",
+    )
 
 
 def _router_bin(case: BackendCaseFile | None = None) -> str:
-    if raw := os.environ.get("ROUTER_BIN", "").strip():
-        return raw
-    if case and case.stack.router_bin:
-        if resolved := _resolve_bin_path(case.stack.router_bin):
-            return resolved
-    hint = REPO_ROOT / "target" / "release" / "vllm-router"
-    if hint.is_file():
-        return str(hint)
-    found = shutil.which("vllm-router")
-    if found:
-        return found
-    tried = [str(hint)]
-    if case and case.stack.router_bin:
-        tried.insert(0, case.stack.router_bin)
-    raise FileNotFoundError(
-        f"vllm-router not found (repo root={REPO_ROOT}, tried {tried!r}); "
-        "set ROUTER_BIN, stack.router_bin in case JSON, or build target/release/vllm-router"
-    )
+    case_value = case.stack.router_bin if case and case.stack.router_bin else ""
+    label = f"grpc case {case.path.name}" if case else "grpc perf"
+    return resolve_router_bin(case_value=case_value, repo=REPO_ROOT, label=label)
 
 
 def _preflight_router_bin(router_bin: str) -> None:
@@ -161,22 +110,9 @@ def _preflight_router_bin(router_bin: str) -> None:
 
 
 def _vllm_rs_bin(case: BackendCaseFile | None = None) -> str:
-    if raw := os.environ.get("VLLM_RS", "").strip():
-        return raw
-    if case and case.stack.vllm_rs_bin:
-        if resolved := _resolve_bin_path(case.stack.vllm_rs_bin):
-            return resolved
-    found = shutil.which("vllm-rs")
-    if found:
-        return found
-    import importlib.util
-
-    spec = importlib.util.find_spec("vllm")
-    if spec and spec.origin:
-        candidate = Path(spec.origin).parent / "vllm-rs"
-        if candidate.exists():
-            return str(candidate)
-    raise FileNotFoundError("vllm-rs not found; set VLLM_RS (vLLM 0.29 rust wheel)")
+    case_value = case.stack.vllm_rs_bin if case and case.stack.vllm_rs_bin else ""
+    label = f"grpc case {case.path.name}" if case else "grpc perf"
+    return resolve_vllm_rs(case_value=case_value, repo=REPO_ROOT, label=label)
 
 
 def _vllm_cli() -> str:

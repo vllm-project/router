@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import importlib.util
 import json
 import os
 import shutil
@@ -11,11 +10,20 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+_E2E_DIR = Path(__file__).resolve().parents[4]
+if str(_E2E_DIR) not in sys.path:
+    sys.path.insert(0, str(_E2E_DIR))
+
+from helpers.binaries import (  # noqa: E402
+    resolve_repo_path,
+    resolve_router_bin,
+    resolve_vllm_rs,
+)
+from helpers.paths import repo_root  # noqa: E402
+
 RUN_SUFFIX_ENV = "AGENTX_RUN_SUFFIX"
 
 MODEL_ENV = "MODEL"
-VLLM_RS_ENV = "VLLM_RS"
-ROUTER_BIN_ENV = "ROUTER_BIN"
 PYTHON_ENV_KEYS = ("AGENTX_PYTHON", "PYTHON")
 
 _PATH_KEYS = (
@@ -27,46 +35,12 @@ _PATH_KEYS = (
 )
 
 
-def repo_root() -> Path:
-    """vllm-router root (``router_policy/helpers`` → six levels up)."""
-
-    return Path(__file__).resolve().parents[6]
-
-
-def _resolve_repo_path(raw: str, repo: Path) -> Path:
-    path = Path(raw)
-    return path if path.is_absolute() else (repo / path).resolve()
-
-
 def _env_first(*keys: str) -> str:
     for key in keys:
         val = os.environ.get(key, "").strip()
         if val:
             return val
     return ""
-
-
-def _resolve_vllm_rs(case_value: str, repo: Path, *, case_id: str) -> str:
-    """Same order as ``scripts/backend/common.sh`` / ``perf/grpc/stack_launcher``."""
-
-    if pinned := _env_first(VLLM_RS_ENV):
-        return pinned
-    val = (case_value or "").strip()
-    if val and ("/" in val or "\\" in val):
-        return str(_resolve_repo_path(val, repo))
-    if val:
-        found = shutil.which(val)
-        if found:
-            return found
-    spec = importlib.util.find_spec("vllm")
-    if spec and spec.origin:
-        candidate = Path(spec.origin).resolve().parent / "vllm-rs"
-        if candidate.is_file():
-            return str(candidate)
-    raise RuntimeError(
-        f"case {case_id}: vllm-rs not found; export {VLLM_RS_ENV} or run "
-        "scripts/backend/check_vllm_rs.sh"
-    )
 
 
 def _resolve_python(case_value: str, repo: Path, *, case_id: str) -> str:
@@ -77,7 +51,7 @@ def _resolve_python(case_value: str, repo: Path, *, case_id: str) -> str:
         # Same interpreter as pytest / ``run_cell`` (no absolute path in JSON).
         return sys.executable
     if "/" in val or "\\" in val:
-        return str(_resolve_repo_path(val, repo))
+        return str(resolve_repo_path(val, repo))
     found = shutil.which(val)
     return found if found else val
 
@@ -139,14 +113,14 @@ def resolve_runtime(case: dict[str, Any]) -> dict[str, Any]:
         or (rt.get("served_model_name") or model).strip()
     )
 
-    router_bin = (
-        _env_first(ROUTER_BIN_ENV) or str(rt.get("router_binary") or "").strip()
-    )
-    if not router_bin:
-        raise RuntimeError(
-            f"case {case_id}: set export {ROUTER_BIN_ENV}=... or runtime.router_binary"
+    try:
+        rt["router_binary"] = resolve_router_bin(
+            case_value=str(rt.get("router_binary") or ""),
+            repo=repo,
+            label=f"case {case_id}",
         )
-    rt["router_binary"] = str(_resolve_repo_path(router_bin, repo))
+    except FileNotFoundError as exc:
+        raise RuntimeError(str(exc)) from exc
 
     for key in _PATH_KEYS:
         if key == "router_binary":
@@ -156,19 +130,24 @@ def resolve_runtime(case: dict[str, Any]) -> dict[str, Any]:
             if key in ("perf_work_root", "trace_path"):
                 raise RuntimeError(f"case {case_id}: runtime.{key} is required")
             continue
-        rt[key] = str(_resolve_repo_path(val, repo))
+        rt[key] = str(resolve_repo_path(val, repo))
 
     replay_override = str(rt.get("replay_config") or "").strip()
     if replay_override:
-        rt["replay_config_path"] = str(_resolve_repo_path(replay_override, repo))
+        rt["replay_config_path"] = str(resolve_repo_path(replay_override, repo))
     else:
         # Resolved in run_cell bootstrap (same env as runtime.python), not at pytest import.
         rt["replay_config_path"] = ""
 
     rt["python"] = _resolve_python(str(rt.get("python") or ""), repo, case_id=case_id)
-    rt["vllm_rs"] = _resolve_vllm_rs(
-        str(rt.get("vllm_rs") or ""), repo, case_id=case_id
-    )
+    try:
+        rt["vllm_rs"] = resolve_vllm_rs(
+            case_value=str(rt.get("vllm_rs") or ""),
+            repo=repo,
+            label=f"case {case_id}",
+        )
+    except FileNotFoundError as exc:
+        raise RuntimeError(str(exc)) from exc
 
     return rt
 

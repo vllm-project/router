@@ -34,6 +34,7 @@ that name into `agents` and `plugins` before Buildkite upload.
 | --- | --- |
 | `l4_4` | EKS `l4-k8s`, 4× L4, image `public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:router-$BUILDKITE_COMMIT` |
 | `h100_2` | `mithril-h100-pool`, 2× H100 SXM, same router CI image |
+| `h100_4` | `mithril-h100-pool`, 4× H100 SXM, same router CI image (router_policy perf) |
 | `mi300_2` | `router_rocm_mi300_2`, same-host xGMI Docker devices |
 | `mi300_rdma` | `router_rocm_mi300_2` coordinator, no Docker plugin |
 
@@ -106,8 +107,9 @@ scheduled `NIGHTLY=1`, a pull request labeled `nightly-test`, or a manual/API
 build with `RUN_ROCM_RDMA=1`.
 
 ROCm-only scheduled builds should set both `NIGHTLY=1` and `ROCM_ONLY=1`.
-`ROCM_ONLY=1` skips the NVIDIA four-GPU step and the H100 gRPC perf job
-while retaining the CPU build that supplies the router artifact to the ROCm jobs.
+`ROCM_ONLY=1` skips the NVIDIA four-GPU step, the H100 gRPC perf job, and the
+H100 router_policy perf job while retaining the CPU build that supplies the router
+artifact to the ROCm jobs.
 
 The L3 matrices use a digest-pinned ROCm vLLM image and run health, sanity,
 and 500-example GSM8K accuracy checks. The RDMA job is coordinator-owned and
@@ -194,7 +196,7 @@ Builds Docker image for the router.
 
 - `medium_cpu_queue_premerge`: CPU-only tasks (builds, lints, unit tests)
 - `l4-k8s`: NVIDIA L4 GPU tests on EKS (4-GPU P/D disaggregation)
-- `mithril-h100-pool`: NVIDIA H100 SXM tests (2-GPU gRPC prefix-KV perf)
+- `mithril-h100-pool`: NVIDIA H100 SXM tests (2-GPU gRPC prefix-KV perf; 4-GPU router_policy c16)
 - `router_rocm_mi300_2`: dedicated two-node MI300X MoRI tests (`spawn=1`)
 - `default`: General purpose queue
 

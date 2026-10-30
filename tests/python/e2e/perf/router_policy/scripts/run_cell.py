@@ -42,6 +42,7 @@ from helpers.case_config import (  # noqa: E402
     packaged_replay_agentx_yaml,
     require_runtime,
 )
+from helpers.e2e_shared import pump_subprocess_stdout, wait_for_http_ok  # noqa: E402
 
 CASE: dict[str, Any] = {}
 ROOT: Path
@@ -192,24 +193,8 @@ def _stream_logs_enabled() -> bool:
     )
 
 
-def _sanitize_stream_line(line: str) -> str:
-    if "\r" not in line:
-        return line
-    return line.split("\r")[-1]
-
-
 def _stream_pump(proc: subprocess.Popen[Any], log_fp, prefix: str) -> None:
-    assert proc.stdout is not None
-    try:
-        for line in proc.stdout:
-            log_fp.write(line)
-            log_fp.flush()
-            sys.stderr.write(f"{prefix}{_sanitize_stream_line(line)}")
-            sys.stderr.flush()
-    except ValueError:
-        pass
-    finally:
-        log_fp.flush()
+    pump_subprocess_stdout(proc, log_fp=log_fp, stderr_prefix=prefix)
 
 
 def start(command, log, extra=None, *, stream_prefix: str | None = None):
@@ -336,17 +321,13 @@ signal.signal(signal.SIGINT, interrupted)
 
 
 def health(url, proc, timeout=900):
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if proc.poll() is not None:
-            raise RuntimeError(f"process {proc.pid} exited {proc.returncode}: {url}")
-        try:
-            if clients.get(url).is_success:
-                return
-        except httpx.HTTPError:
-            pass
-        time.sleep(3)
-    raise TimeoutError(url)
+    wait_for_http_ok(
+        url,
+        timeout_seconds=float(timeout),
+        proc=proc,
+        log_path=None,
+        prefix="",
+    )
 
 
 _LOG_ERROR_MARKERS = ("error", "exception", "traceback", "failed", "fatal", "cuda")

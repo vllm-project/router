@@ -8,8 +8,6 @@ import subprocess
 import sys
 from pathlib import Path
 
-import pytest
-
 SCENARIO_DIR = Path(__file__).resolve().parent
 if str(SCENARIO_DIR) not in sys.path:
     sys.path.insert(0, str(SCENARIO_DIR))
@@ -57,12 +55,7 @@ def _run_cell(case_file: Path) -> Path:
     return out
 
 
-@pytest.mark.e2e
-@pytest.mark.perf
-def test_router_policy_replay_cell(
-    require_router_e2e_perf,
-    case_file: Path,
-):
+def test_router_policy_replay_cell(case_file: Path):
     """Workers → router → replay; single self-contained case JSON."""
     out = _run_cell(case_file)
     req_path = out / "result" / "requests.jsonl"

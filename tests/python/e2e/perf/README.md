@@ -22,15 +22,16 @@ python -m pytest -sv tests/python/e2e/perf/grpc --perf-case=rust_grpc
 
 ## router_policy
 
-Set **`RUN_ROUTER_E2E_PERF=1`** and configure paths in each case JSON under
-`router_policy/cases/<policy>/`. Then, for example:
+Configure paths in each case JSON under `router_policy/cases/<policy>/` (see
+[`router_policy/README.md`](router_policy/README.md)). Run only that file (manual
+GPU benchmark; not part of default CI):
 
 ```bash
-export RUN_ROUTER_E2E_PERF=1
-pytest tests/python/e2e/perf/router_policy/test_router_policy_scenarios.py -m perf -v
+export MODEL=/path/to/model
+pytest tests/python/e2e/perf/router_policy/test_router_policy_scenarios.py -v
 ```
 
-Shared pytest gate and marker: [`conftest.py`](conftest.py). Reusable helpers for
-e2e live under [`../helpers/`](../helpers/).
+Shared path setup: [`conftest.py`](conftest.py). Reusable helpers live under
+[`../helpers/`](../helpers/).
 
 Additional perf suites can be added as siblings without sharing fixtures.

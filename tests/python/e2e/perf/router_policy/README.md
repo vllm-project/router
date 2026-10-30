@@ -11,6 +11,8 @@ Each **case JSON** under `cases/<policy>/` is self-contained (three policies × 
 
 Example: [cases/kv_aware/c16.json](cases/kv_aware/c16.json).
 
+Binary resolution, HTTP readiness, and log streaming reuse [`tests/python/e2e/helpers/`](../../helpers/) (same as `perf/grpc`).
+
 ## Run
 
 ```bash
@@ -20,15 +22,14 @@ export ROUTER_BIN=$PWD/target/release/vllm-router
 # optional if you launch pytest/run_cell with that venv’s python (case "python" → sys.executable):
 # export AGENTX_PYTHON=/path/to/.venv/bin/python
 
-export RUN_ROUTER_E2E_PERF=1
-pytest tests/python/e2e/perf/router_policy/test_router_policy_scenarios.py -m perf -v
+pytest tests/python/e2e/perf/router_policy/test_router_policy_scenarios.py -v
 ```
 
 Live worker + router logs during a long cell (replay still file-only):
 
 ```bash
 export AGENTX_STREAM_LOGS=1
-pytest tests/python/e2e/perf/router_policy/test_router_policy_scenarios.py -m perf -sv -k 'kv_aware/c16'
+pytest tests/python/e2e/perf/router_policy/test_router_policy_scenarios.py -sv -k 'kv_aware/c16'
 ```
 
 Single cell:
@@ -58,3 +59,13 @@ At the end of a cell, `run_cell` **stops workers/router first** (so live streams
 ```bash
 python tests/python/e2e/perf/router_policy/scripts/collect_stats.py test-results/router_policy/runs
 ```
+
+## Buildkite nightly (L3)
+
+Job **`router-policy-perf-e2e`** in [`.buildkite/test-nightly.yml`](../../../../../.buildkite/test-nightly.yml)
+runs **`cache_aware/c16`**, **`kv_aware/c16`**, **`kv_aware_aff/c16`** on **`h100_4`** (4× H100).
+Case JSON reserves ~48 GiB KV cache per worker and `max_model_len=196608`; **L4 (24 GB) is not sufficient**.
+
+Nightly step runs `pip install agentinfer==0.2.0` then three pytest invocations (`-k …/c16`).
+Optional Buildkite env **`AGENTX_TRACE_JSONL_URL`** to download `data/agentx-128-t4.jsonl` when the file is not in the checkout.
+See [`.buildkite/test-nightly.yml`](../../../../../.buildkite/test-nightly.yml) (`router-policy-perf-e2e`).
