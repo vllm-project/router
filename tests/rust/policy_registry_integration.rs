@@ -182,6 +182,114 @@ async fn test_model_replacement_moves_policy_count() {
     assert!(policies.get_all_mappings().is_empty());
 }
 
+#[tokio::test]
+async fn igw_replacement_cleans_previous_consumer_affinity_without_changing_counts() {
+    use vllm_router_rs::policies::{CacheAwareCandidate, CacheAwarePolicy, PolicyFactory};
+
+    let cache_config = PolicyConfig::CacheAware {
+        cache_threshold: 0.3,
+        balance_abs_threshold: 32,
+        balance_rel_threshold: 1.5,
+        eviction_interval_secs: 3600,
+        max_tree_size: 1024,
+    };
+    for keep_old_model in [false, true] {
+        for (old_role, new_role, new_model) in [
+            ("prefill", "prefill", "old"),
+            ("prefill", "prefill", "new"),
+            ("prefill", "decode", "old"),
+            ("decode", "prefill", "old"),
+            ("regular", "prefill", "old"),
+            ("prefill", "regular", "old"),
+        ] {
+            let config = RouterConfig {
+                enable_igw: true,
+                policy: cache_config.clone(),
+                ..Default::default()
+            };
+            let workers = Arc::new(WorkerRegistry::new());
+            let policies = Arc::new(PolicyRegistry::new(cache_config.clone()));
+            policies.set_prefill_policy(PolicyFactory::create_from_config(&cache_config));
+            policies.set_decode_policy(PolicyFactory::create_from_config(&cache_config));
+            let manager = RouterManager::new(
+                config,
+                reqwest::Client::new(),
+                workers.clone(),
+                policies.clone(),
+            );
+            let mut initial = worker_config("old");
+            initial.worker_type = Some(old_role.into());
+            // The model policy must retain its identity on same-model replacement,
+            // including when it was created from a hint instead of the default.
+            initial.labels.insert("policy".into(), "cache_aware".into());
+            manager.add_worker(initial).await.unwrap();
+            if keep_old_model {
+                let mut survivor = worker_config("old");
+                survivor.url = "http://survivor:8000".into();
+                manager.add_worker(survivor).await.unwrap();
+            }
+            let model_policy = policies.get_policy("old").unwrap();
+            let role_policy = match old_role {
+                "prefill" => policies.get_prefill_policy(),
+                "decode" => policies.get_decode_policy(),
+                _ => model_policy.clone(),
+            };
+            let prompt = "replacement cache affinity";
+            for policy in [&model_policy, &role_policy] {
+                let cache = policy.as_any().downcast_ref::<CacheAwarePolicy>().unwrap();
+                cache.commit_placement("old", prompt, "http://worker:8000");
+                cache.commit_placement("old", prompt, "http://survivor:8000");
+            }
+            let mut replacement = worker_config(new_model);
+            replacement.worker_type = Some(new_role.into());
+            manager.add_worker(replacement).await.unwrap();
+            for policy in [&model_policy, &role_policy] {
+                let cache = policy.as_any().downcast_ref::<CacheAwarePolicy>().unwrap();
+                for (url, expected) in [("http://worker:8000", 0.0), ("http://survivor:8000", 1.0)]
+                {
+                    assert_eq!(
+                        cache
+                            .evaluate_initial_placement(
+                                "old",
+                                prompt,
+                                &[CacheAwareCandidate {
+                                    target_id: url,
+                                    kv_pressure: 0.0,
+                                }]
+                            )
+                            .unwrap()
+                            .match_rate,
+                        expected,
+                        "{old_role} -> {new_role}, {new_model}, keep_old={keep_old_model}: {url}"
+                    );
+                }
+            }
+            let mut expected = HashMap::from([(new_model.to_string(), 1)]);
+            if keep_old_model {
+                *expected.entry("old".into()).or_insert(0) += 1;
+            }
+            assert_eq!(policies.get_worker_counts(), expected);
+            if new_model == "old" {
+                assert!(Arc::ptr_eq(
+                    &model_policy,
+                    &policies.get_policy("old").unwrap()
+                ));
+            } else {
+                assert_eq!(policies.get_policy("old").is_some(), keep_old_model);
+            }
+            let current = workers.get_by_url("http://worker:8000").unwrap();
+            assert_eq!(current.model_id(), new_model);
+            manager.remove_worker_from_registry(current.url()).unwrap();
+            if keep_old_model {
+                manager
+                    .remove_worker_from_registry("http://survivor:8000")
+                    .unwrap();
+            }
+            assert!(policies.get_worker_counts().is_empty());
+        }
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_concurrent_management_add_remove_keeps_policy_count_consistent() {
     let (manager, workers, policies) = manager_fixture();
