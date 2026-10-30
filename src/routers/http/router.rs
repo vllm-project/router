@@ -267,6 +267,9 @@ struct TypedDispatch<'a> {
     route: &'a str,
     worker_url: &'a str,
     is_stream: bool,
+    /// A configured worker api_key replaces the client's Authorization
+    /// header, as route_transparent does. Set for `/v1/messages`.
+    worker_key_overrides_auth: bool,
     completion: Option<&'a CompletionRoute>,
     load: RequestLoadGuard,
     prepared: Option<crate::backend::PreparedRequest>,
@@ -1447,10 +1450,12 @@ impl Router {
         route: &str,
         model_id: Option<&str>,
     ) -> Response {
-        self.route_prepared_request(headers, typed_req, route, model_id, None)
+        self.route_prepared_request(headers, typed_req, route, model_id, None, false)
             .await
     }
 
+    /// `worker_key_overrides_auth` makes a configured worker api_key win over
+    /// the client's Authorization; set for `/v1/messages`.
     #[allow(clippy::too_many_arguments)]
     async fn route_prepared_request<T: GenerationRequest + serde::Serialize + Clone>(
         &self,
@@ -1459,6 +1464,7 @@ impl Router {
         route: &str,
         model_id: Option<&str>,
         raw_body: Option<axum::body::Bytes>,
+        worker_key_overrides_auth: bool,
     ) -> Response {
         let start = Instant::now();
         let is_stream = typed_req.is_stream();
@@ -1755,6 +1761,7 @@ impl Router {
                             route,
                             worker_url: worker.url(),
                             is_stream,
+                            worker_key_overrides_auth,
                             completion,
                             load,
                             prepared: (*prepared).clone(),
@@ -1938,6 +1945,7 @@ impl Router {
             route,
             worker_url,
             is_stream,
+            worker_key_overrides_auth,
             completion,
             load,
             prepared,
@@ -2032,11 +2040,10 @@ impl Router {
         // Copy all headers from original request if provided, skipping
         // Content-Type/Content-Length (.json() sets them) and trace headers
         // (propagate_trace_headers below injects fresh context).
-        // sanitize_request_headers drops host and hop-by-hop headers. On
-        // `/v1/messages` a configured worker api_key also wins over the
-        // client's Authorization, matching route_transparent.
-        let is_messages = route == "/v1/messages";
-        let worker_key = if is_messages {
+        // sanitize_request_headers drops host and hop-by-hop headers. With
+        // worker_key_overrides_auth a configured worker api_key also wins
+        // over the client's Authorization, matching route_transparent.
+        let worker_key = if worker_key_overrides_auth {
             self.api_key.as_deref()
         } else {
             None
@@ -2867,7 +2874,7 @@ impl RouterTrait for Router {
         body: &CompletionRequest,
         model_id: Option<&str>,
     ) -> Response {
-        self.route_prepared_request(headers, body, "/v1/completions", model_id, None)
+        self.route_prepared_request(headers, body, "/v1/completions", model_id, None, false)
             .await
     }
 
@@ -2891,8 +2898,15 @@ impl RouterTrait for Router {
             drop(raw);
             None
         };
-        self.route_prepared_request(headers, body.as_ref(), "/v1/completions", model_id, raw)
-            .await
+        self.route_prepared_request(
+            headers,
+            body.as_ref(),
+            "/v1/completions",
+            model_id,
+            raw,
+            false,
+        )
+        .await
     }
 
     async fn route_responses(
@@ -2921,7 +2935,7 @@ impl RouterTrait for Router {
         body: &MessagesRequest,
         model_id: Option<&str>,
     ) -> Response {
-        self.route_typed_request(headers, body, "/v1/messages", model_id)
+        self.route_prepared_request(headers, body, "/v1/messages", model_id, None, true)
             .await
     }
 
@@ -4720,6 +4734,7 @@ mod tests {
                     route: "/v1/chat/completions",
                     worker_url: &worker_url,
                     is_stream: false,
+                    worker_key_overrides_auth: false,
                     completion: None,
                     // No worker is tracked, so this dispatch does not count against
                     // a worker's load — the same state the old `load_incremented:
@@ -6194,6 +6209,7 @@ mod tests {
                     route: "/v1/completions",
                     worker_url: worker.url(),
                     is_stream: true,
+                    worker_key_overrides_auth: false,
                     completion: Some(&completion),
                     load,
                     prepared: None,
@@ -6377,6 +6393,7 @@ mod tests {
                         route: "/v1/completions",
                         worker_url: fixture.worker.url(),
                         is_stream: true,
+                        worker_key_overrides_auth: false,
                         completion: Some(&completion),
                         load,
                         prepared: None,

@@ -491,6 +491,39 @@ async fn messages_handler(
             .into_response();
     }
 
+    if payload.get("stream").and_then(|v| v.as_bool()) == Some(true) {
+        // Anthropic sse: named events and no `data: [DONE]` at the end.
+        let id = format!("msg_{}", Uuid::new_v4());
+        let model = payload.get("model").cloned().unwrap_or(json!("mock-model"));
+        let events = vec![
+            (
+                "message_start",
+                json!({"type": "message_start", "message": {"id": id, "type": "message", "role": "assistant", "model": model, "content": [], "worker_port": config.port}}),
+            ),
+            (
+                "content_block_start",
+                json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}),
+            ),
+            (
+                "content_block_delta",
+                json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "ok"}}),
+            ),
+            (
+                "content_block_stop",
+                json!({"type": "content_block_stop", "index": 0}),
+            ),
+            (
+                "message_delta",
+                json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 1}}),
+            ),
+            ("message_stop", json!({"type": "message_stop"})),
+        ];
+        let stream = stream::iter(events.into_iter().map(|(name, data)| {
+            Ok::<_, Infallible>(Event::default().event(name).data(data.to_string()))
+        }));
+        return Sse::new(stream).into_response();
+    }
+
     Json(json!({
         "id": format!("msg_{}", Uuid::new_v4()),
         "type": "message",

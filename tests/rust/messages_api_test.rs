@@ -326,6 +326,62 @@ async fn messages_stream_worker_json_error_keeps_status_and_content_type() {
     ctx.shutdown().await;
 }
 
+#[tokio::test]
+async fn messages_stream_forwards_sse_events() {
+    let ctx = Ctx::new(PolicyConfig::RoundRobin, vec![worker(0.0)], |_| {}).await;
+    let mut body = agent_body(None, "hi");
+    body["stream"] = json!(true);
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/messages")
+        .header(CONTENT_TYPE, "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let resp = ctx.app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let ct = resp.headers()[CONTENT_TYPE].to_str().unwrap().to_string();
+    assert!(ct.contains("text/event-stream"), "content-type: {ct}");
+    // the stream ends without `data: [DONE]`, so reading it to the end also
+    // checks the router doesn't wait for one.
+    let bytes = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        axum::body::to_bytes(resp.into_body(), usize::MAX),
+    )
+    .await
+    .expect("stream did not finish")
+    .unwrap();
+    let text = String::from_utf8(bytes.to_vec()).unwrap();
+    let names: Vec<&str> = text
+        .lines()
+        .filter_map(|l| l.strip_prefix("event:").map(str::trim))
+        .collect();
+    assert_eq!(
+        names,
+        [
+            "message_start",
+            "content_block_start",
+            "content_block_delta",
+            "content_block_stop",
+            "message_delta",
+            "message_stop"
+        ],
+        "body: {text}"
+    );
+    assert!(!text.contains("[DONE]"), "body: {text}");
+    let start: Value = serde_json::from_str(
+        text.lines()
+            .find_map(|l| l.strip_prefix("data:"))
+            .unwrap()
+            .trim(),
+    )
+    .unwrap();
+    let port = start["message"]["worker_port"].as_u64().unwrap() as u16;
+    assert!(captured_messages(port)
+        .iter()
+        .any(|c| c.path == "/v1/messages"));
+    ctx.shutdown().await;
+}
+
 /// A worker (or a reverse proxy in front of it) that rejects
 /// `/v1/messages` with a large non-json body. Every other path is healthy.
 async fn start_plain_text_error_worker(body: String) -> String {

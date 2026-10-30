@@ -46,7 +46,7 @@ Anthropic messages over grpc needs a messages rpc in the vllm proto first.
 | body | unknown fields are kept and forwarded, so the worker gets the same json the client sent |
 | routing text | `system` (string or text blocks), then `tools[].name` and `tools[].description`, then message text in order. image, document, tool_use and tool_result blocks add a short marker, not their payload |
 | session affinity | headers first (`x-session-id`, `x-user-id`, ...), then nested `metadata.user_id` |
-| router errors | anthropic shape `{"type":"error","error":{"type":...,"message":...}}`, including invalid json and missing fields (400, `invalid_request_error`) |
+| router errors | anthropic shape `{"type":"error","error":{"type":...,"message":...}}`, including invalid json and missing fields (400, `invalid_request_error`). routers on the transparent path (pd, `--backend openai`) can't tell their own errors from worker responses, so their errors (404, 405, 503 with no prefill workers) are passed through unshaped |
 | worker errors | passed through unchanged |
 | non streaming | first class |
 | streaming | forwarded as sse; anthropic event parsing for ttft and usage is a follow up |
@@ -57,5 +57,5 @@ Anthropic messages over grpc needs a messages rpc in the vllm proto first.
 
 | backend | `/v1/messages` |
 |---|---|
-| `--backend openai` | not routed (404) |
+| `--backend openai` | not routed (plain text 404, not the anthropic error shape) |
 | `--backend anthropic`, `--backend trtllm` | not implemented yet, these fall back to the regular router, so the first class route applies. trtllm engines without the route return their own 404 |
