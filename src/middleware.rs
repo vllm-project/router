@@ -1,13 +1,19 @@
 use axum::{
-    extract::Request, extract::State, http::header, http::HeaderValue, http::StatusCode,
-    middleware::Next, response::IntoResponse, response::Response,
+    body::{Body, HttpBody},
+    extract::Request,
+    extract::State,
+    http::StatusCode,
+    http::{header, HeaderValue},
+    middleware::Next,
+    response::IntoResponse,
+    response::Response,
 };
+use http_body::{Frame, SizeHint};
 use rand::Rng;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
-use std::time::Instant;
-use tokio::sync::{mpsc, oneshot};
+use std::time::{Duration, Instant};
+use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore, TryAcquireError};
 use tower::{Layer, Service};
 use tower_http::classify::ServerErrorsFailureClass;
 use tower_http::trace::{MakeSpan, OnFailure, OnRequest, OnResponse, TraceLayer};
@@ -18,6 +24,8 @@ pub use crate::core::token_bucket::TokenBucket;
 
 use crate::metrics::RouterMetrics;
 use crate::server::AppState;
+
+static EMBEDDINGS_QUEUE_SIZE: AtomicU64 = AtomicU64::new(0);
 
 /// Generate OpenAI-compatible request ID based on endpoint
 fn generate_request_id(path: &str) -> String {
@@ -383,9 +391,9 @@ pub fn log_request(entry: RequestLogEntry) {
 /// Request queue entry
 pub struct QueuedRequest {
     /// Time when the request was queued
-    queued_at: Instant,
+    queued_at: tokio::time::Instant,
     /// Channel to send the permit back when acquired
-    permit_tx: oneshot::Sender<Result<(), StatusCode>>,
+    permit_tx: oneshot::Sender<Result<OwnedSemaphorePermit, StatusCode>>,
 }
 
 /// Queue metrics for monitoring
@@ -400,6 +408,7 @@ pub struct QueueMetrics {
 /// Queue processor that handles queued requests
 pub struct QueueProcessor {
     token_bucket: Arc<TokenBucket>,
+    concurrency_semaphore: Arc<Semaphore>,
     queue_rx: mpsc::Receiver<QueuedRequest>,
     queue_timeout: Duration,
 }
@@ -407,54 +416,90 @@ pub struct QueueProcessor {
 impl QueueProcessor {
     pub fn new(
         token_bucket: Arc<TokenBucket>,
+        concurrency_semaphore: Arc<Semaphore>,
         queue_rx: mpsc::Receiver<QueuedRequest>,
         queue_timeout: Duration,
     ) -> Self {
         Self {
             token_bucket,
+            concurrency_semaphore,
             queue_rx,
             queue_timeout,
         }
     }
 
-    pub async fn run(mut self) {
+    pub async fn run(self) {
+        let Self {
+            token_bucket,
+            concurrency_semaphore,
+            mut queue_rx,
+            queue_timeout,
+        } = self;
         info!("Starting concurrency queue processor");
 
-        // Process requests in a single task to reduce overhead
-        while let Some(queued) = self.queue_rx.recv().await {
-            // Check timeout immediately
-            let elapsed = queued.queued_at.elapsed();
-            if elapsed >= self.queue_timeout {
-                warn!("Request already timed out in queue");
-                let _ = queued.permit_tx.send(Err(StatusCode::REQUEST_TIMEOUT));
-                continue;
-            }
+        // Process one queued request at a time. This keeps the bounded channel
+        // as the actual cap on waiting requests instead of spawning a detached
+        // task per dequeued request, which could grow without bound as senders
+        // refill the channel.
+        while let Some(mut queued) = queue_rx.recv().await {
+            let deadline = queued.queued_at + queue_timeout;
+            let acquisition = tokio::time::timeout_at(deadline, async {
+                let token_bucket = token_bucket.clone();
+                let concurrency_semaphore = concurrency_semaphore.clone();
 
-            let remaining_timeout = self.queue_timeout - elapsed;
+                if tokio::time::Instant::now() >= deadline {
+                    return Some(Err(StatusCode::REQUEST_TIMEOUT));
+                }
 
-            // Try to acquire token for this request
-            if self.token_bucket.try_acquire(1.0).await.is_ok() {
-                // Got token immediately
-                debug!("Queue: acquired token immediately for queued request");
-                let _ = queued.permit_tx.send(Ok(()));
-            } else {
-                // Need to wait for token
-                let token_bucket = self.token_bucket.clone();
+                let permit = tokio::select! {
+                    biased;
+                    _ = queued.permit_tx.closed() => return None,
+                    result = concurrency_semaphore.acquire_owned() => match result {
+                        Ok(permit) => permit,
+                        Err(_) => return Some(Err(StatusCode::SERVICE_UNAVAILABLE)),
+                    },
+                };
 
-                // Spawn task only when we actually need to wait
-                tokio::spawn(async move {
-                    if token_bucket
-                        .acquire_timeout(1.0, remaining_timeout)
-                        .await
-                        .is_ok()
-                    {
-                        debug!("Queue: acquired token after waiting");
-                        let _ = queued.permit_tx.send(Ok(()));
-                    } else {
-                        warn!("Queue: request timed out waiting for token");
-                        let _ = queued.permit_tx.send(Err(StatusCode::REQUEST_TIMEOUT));
+                loop {
+                    if queued.permit_tx.is_closed() {
+                        return None;
                     }
-                });
+
+                    tokio::select! {
+                        biased;
+                        _ = queued.permit_tx.closed() => return None,
+                        _ = token_bucket.wait_until_available(1.0) => {}
+                    }
+
+                    if queued.permit_tx.is_closed() {
+                        return None;
+                    }
+
+                    if token_bucket.try_acquire(1.0).await.is_ok() {
+                        return Some(Ok(permit));
+                    }
+                }
+            })
+            .await;
+
+            match acquisition {
+                Ok(Some(Ok(permit))) => {
+                    if queued.permit_tx.send(Ok(permit)).is_err() {
+                        debug!("Queued request was cancelled before permit delivery");
+                        token_bucket.return_tokens(1.0).await;
+                    }
+                }
+                Ok(Some(Err(status))) => {
+                    debug!("Queue: request rejected with {}", status);
+                    let _ = queued.permit_tx.send(Err(status));
+                }
+                Ok(None) => {
+                    debug!("Queued request was cancelled while waiting for a permit or rate token");
+                }
+                Err(_) => {
+                    warn!("Queue: request timed out waiting for a permit or rate token");
+                    let _ = queued.permit_tx.send(Err(StatusCode::REQUEST_TIMEOUT));
+                }
             }
         }
 
@@ -471,12 +516,14 @@ impl ConcurrencyLimiter {
     /// Create new concurrency limiter with optional queue
     pub fn new(
         token_bucket: Arc<TokenBucket>,
+        concurrency_semaphore: Arc<Semaphore>,
         queue_size: usize,
         queue_timeout: Duration,
     ) -> (Self, Option<QueueProcessor>) {
         if queue_size > 0 {
             let (queue_tx, queue_rx) = mpsc::channel(queue_size);
-            let processor = QueueProcessor::new(token_bucket, queue_rx, queue_timeout);
+            let processor =
+                QueueProcessor::new(token_bucket, concurrency_semaphore, queue_rx, queue_timeout);
 
             (
                 Self {
@@ -486,6 +533,81 @@ impl ConcurrencyLimiter {
             )
         } else {
             (Self { queue_tx: None }, None)
+        }
+    }
+}
+
+/// Hold the concurrency slot until the response body has been fully sent.
+///
+/// `next.run()` returns as soon as the upstream response head is ready. On a streaming
+/// endpoint the body is still being forwarded at that point, so releasing the permit
+/// there frees the slot at the first token instead of at the end of generation, and
+/// `--max-concurrent-requests` ends up bounding time-to-first-token rather than
+/// concurrent generations. Moving the permit into the body ties the slot to the whole
+/// response, including a client disconnect, which drops the body.
+fn hold_permit_for_body(response: Response, permit: OwnedSemaphorePermit) -> Response {
+    let (parts, body) = response.into_parts();
+    if body.is_end_stream() {
+        drop(permit);
+        Response::from_parts(parts, body)
+    } else {
+        Response::from_parts(
+            parts,
+            Body::new(ConcurrencyBody {
+                body,
+                permit: Some(permit),
+            }),
+        )
+    }
+}
+
+struct ConcurrencyBody {
+    body: Body,
+    permit: Option<OwnedSemaphorePermit>,
+}
+
+impl HttpBody for ConcurrencyBody {
+    type Data = bytes::Bytes;
+    type Error = axum::Error;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let frame = std::pin::Pin::new(&mut self.body).poll_frame(cx);
+        if matches!(frame, std::task::Poll::Ready(None | Some(Err(_)))) || self.body.is_end_stream()
+        {
+            self.permit.take();
+        }
+        frame
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.body.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.body.size_hint()
+    }
+}
+
+struct EmbeddingsQueueMetricGuard(bool);
+
+impl EmbeddingsQueueMetricGuard {
+    fn new(is_embeddings: bool) -> Self {
+        if is_embeddings {
+            let new_val = EMBEDDINGS_QUEUE_SIZE.fetch_add(1, Ordering::Relaxed) + 1;
+            RouterMetrics::set_embeddings_queue_size(new_val as usize);
+        }
+        Self(is_embeddings)
+    }
+}
+
+impl Drop for EmbeddingsQueueMetricGuard {
+    fn drop(&mut self) {
+        if self.0 {
+            let new_val = EMBEDDINGS_QUEUE_SIZE.fetch_sub(1, Ordering::Relaxed) - 1;
+            RouterMetrics::set_embeddings_queue_size(new_val as usize);
         }
     }
 }
@@ -511,92 +633,74 @@ pub async fn concurrency_limit_middleware(
     request: Request<axum::body::Body>,
     next: Next,
 ) -> Response {
-    // Static counter for embeddings queue size
-    static EMBEDDINGS_QUEUE_SIZE: AtomicU64 = AtomicU64::new(0);
-
     // Identify if this is an embeddings request based on path
     let is_embeddings = request.uri().path().contains("/v1/embeddings");
     let token_bucket = app_state.context.rate_limiter.clone();
+    let concurrency_semaphore = app_state.context.concurrency_semaphore.clone();
 
-    // Try to acquire token immediately
-    if token_bucket.try_acquire(1.0).await.is_ok() {
-        debug!("Acquired token immediately");
-        let response = next.run(request).await;
+    // Acquire concurrency before consuming a rate token.
+    match concurrency_semaphore.clone().try_acquire_owned() {
+        Ok(permit) => {
+            if token_bucket.try_acquire(1.0).await.is_ok() {
+                debug!("Acquired concurrency permit and rate token immediately");
+                let response = next.run(request).await;
+                return hold_permit_for_body(response, permit);
+            }
 
-        // Return the token to the bucket
-        token_bucket.return_tokens(1.0).await;
+            drop(permit);
+            warn!("Rate limit exhausted, attempting to queue request");
+        }
+        Err(TryAcquireError::Closed) => {
+            warn!("Concurrency limiter closed; returning 503");
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+        Err(TryAcquireError::NoPermits) => {
+            debug!("Concurrency permits exhausted");
+        }
+    }
 
-        response
-    } else {
-        // No tokens available, try to queue if enabled
-        if let Some(queue_tx) = &app_state.concurrency_queue_tx {
-            debug!("No tokens available, attempting to queue request");
+    // No concurrency permit or rate token is available. Queue if enabled.
+    if let Some(queue_tx) = &app_state.concurrency_queue_tx {
+        debug!("No immediate admission available, attempting to queue request");
 
-            // Create a channel for the token response
-            let (permit_tx, permit_rx) = oneshot::channel();
+        // Receive the semaphore permit from the queue processor.
+        let (permit_tx, permit_rx) = oneshot::channel();
 
-            let queued = QueuedRequest {
-                queued_at: Instant::now(),
-                permit_tx,
-            };
+        let queued = QueuedRequest {
+            queued_at: tokio::time::Instant::now(),
+            permit_tx,
+        };
 
-            // Try to send to queue
-            match queue_tx.try_send(queued) {
-                Ok(_) => {
-                    // On successful enqueue, update embeddings queue gauge if applicable
-                    if is_embeddings {
-                        let new_val = EMBEDDINGS_QUEUE_SIZE.fetch_add(1, Ordering::Relaxed) + 1;
-                        RouterMetrics::set_embeddings_queue_size(new_val as usize);
+        // Try to send to queue
+        match queue_tx.try_send(queued) {
+            Ok(_) => {
+                let queue_metric = EmbeddingsQueueMetricGuard::new(is_embeddings);
+                let permit_result = permit_rx.await;
+                drop(queue_metric);
+
+                match permit_result {
+                    Ok(Ok(permit)) => {
+                        debug!("Acquired concurrency permit from queue");
+                        let response = next.run(request).await;
+                        hold_permit_for_body(response, permit)
                     }
-
-                    // Wait for token from queue processor
-                    match permit_rx.await {
-                        Ok(Ok(())) => {
-                            debug!("Acquired token from queue");
-                            // Dequeue for embeddings
-                            if is_embeddings {
-                                let new_val =
-                                    EMBEDDINGS_QUEUE_SIZE.fetch_sub(1, Ordering::Relaxed) - 1;
-                                RouterMetrics::set_embeddings_queue_size(new_val as usize);
-                            }
-
-                            let response = next.run(request).await;
-
-                            // Return the token to the bucket
-                            token_bucket.return_tokens(1.0).await;
-
-                            response
-                        }
-                        Ok(Err(status)) => {
-                            warn!("Queue returned error status: {}", status);
-                            // Dequeue for embeddings on error
-                            if is_embeddings {
-                                let new_val =
-                                    EMBEDDINGS_QUEUE_SIZE.fetch_sub(1, Ordering::Relaxed) - 1;
-                                RouterMetrics::set_embeddings_queue_size(new_val as usize);
-                            }
-                            status.into_response()
-                        }
-                        Err(_) => {
-                            error!("Queue response channel closed");
-                            // Dequeue for embeddings on channel error
-                            if is_embeddings {
-                                let new_val =
-                                    EMBEDDINGS_QUEUE_SIZE.fetch_sub(1, Ordering::Relaxed) - 1;
-                                RouterMetrics::set_embeddings_queue_size(new_val as usize);
-                            }
-                            StatusCode::INTERNAL_SERVER_ERROR.into_response()
-                        }
+                    Ok(Err(status)) => {
+                        warn!("Queue returned error status: {}", status);
+                        status.into_response()
                     }
-                }
-                Err(_) => {
-                    warn!("Request queue is full, returning 429");
-                    too_many_requests(&token_bucket).await
+                    Err(_) => {
+                        error!("Queue response channel closed");
+                        StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                    }
                 }
             }
-        } else {
-            warn!("No tokens available and queuing is disabled, returning 429");
-            too_many_requests(&token_bucket).await
+            Err(_) => {
+                warn!("Request queue is full, returning 429");
+                too_many_requests(&token_bucket).await
+            }
         }
+    } else {
+        warn!("No admission capacity available and queuing is disabled, returning 429");
+        too_many_requests(&token_bucket).await
     }
 }
