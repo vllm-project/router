@@ -235,6 +235,19 @@ pub fn init_metrics() {
         "PD request duration by route"
     );
 
+    describe_counter!(
+        "vllm_router_pd_phase_errors_total",
+        "Returned P/D failures by phase and fixed error category"
+    );
+    describe_counter!(
+        "vllm_router_pd_error_body_total",
+        "Captured P/D HTTP error bodies by phase and bounded read state"
+    );
+    describe_counter!(
+        "vllm_router_pd_response_body_errors_total",
+        "P/D response body transport failures after response commitment"
+    );
+
     // Service discovery metrics
     describe_counter!(
         "vllm_router_discovery_updates_total",

@@ -235,11 +235,18 @@ mod test_pd_routing {
                     "path={path}, streaming={streaming}",
                 );
                 assert_eq!(response.headers()["retry-after"], "7");
-                assert_eq!(response.headers()["content-type"], "text/plain");
+                assert_eq!(response.headers()["content-type"], "application/json");
                 let bytes = axum::body::to_bytes(response.into_body(), 4096)
                     .await
                     .unwrap();
-                assert_eq!(bytes.as_ref(), b"decode is overloaded\n");
+                let error: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(error["error"]["type"], "rate_limit_error");
+                assert_eq!(error["error"]["code"], "429");
+                assert!(error["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("decode"));
+                assert!(!std::str::from_utf8(&bytes).unwrap().contains("overloaded"));
             }
         }
         server.abort();
@@ -422,7 +429,7 @@ mod test_pd_routing {
             if model.starts_with("prefill-") {
                 assert_eq!(
                     serde_json::from_slice::<Value>(&bytes).unwrap(),
-                    json!({"error": "invalid sampling parameters"})
+                    json!({"error": {"message": format!("Upstream prefill request failed (HTTP {}).", status.as_u16()), "type": if status.as_u16() == 429 { "rate_limit_error" } else if status.is_client_error() { "invalid_request_error" } else { "server_error" }, "code": status.as_u16().to_string()}})
                 );
             }
             let seen = seen.lock().unwrap();
@@ -686,7 +693,7 @@ mod test_pd_routing {
             .unwrap();
         assert_eq!(
             serde_json::from_slice::<Value>(&bytes).unwrap(),
-            json!({"error": "invalid sampling parameters"})
+            json!({"error": {"message": "Upstream prefill request failed (HTTP 422).", "type": "invalid_request_error", "code": "422"}})
         );
         server.abort();
     }
