@@ -246,8 +246,10 @@ def _release_all_port_holders() -> None:
 
 
 def _release_worker_port_holders(worker: int, workers: int) -> None:
+    """Drop the HTTP and gRPC holders for one worker (indices match allocate_ports)."""
+
     n = workers
-    for idx in (worker, n + worker, 2 * n + worker, 3 * n + worker):
+    for idx in (worker, n + worker):
         if idx >= len(_port_holders) or _port_holders[idx] is None:
             continue
         try:
@@ -259,7 +261,7 @@ def _release_worker_port_holders(worker: int, workers: int) -> None:
 
 def _release_router_port_holders(workers: int) -> None:
     n = workers
-    for idx in (4 * n, 4 * n + 1):
+    for idx in (2 * n, 2 * n + 1):
         if idx >= len(_port_holders) or _port_holders[idx] is None:
             continue
         try:
@@ -453,7 +455,14 @@ def print_failure_diagnostics(out: Path, workers: int, *, hint: str = "") -> Non
 
 
 def allocate_ports(n: int) -> dict[str, Any]:
-    """Reserve TCP ports until each worker/router binds (avoids ZMQ EADDRINUSE)."""
+    """Reserve HTTP, gRPC, and router ports.
+
+    KV event sockets are not reserved here. ``engine_command`` passes
+    ``tcp://*:0`` so vLLM binds an OS-assigned port at startup and publishes
+    the resolved endpoint on ``/kv_event_sources``. Pre-picking those ports
+    and releasing them before model load loses the race (``tcp://*:PORT``
+    Address already in use).
+    """
 
     global _port_holders
     _release_all_port_holders()
@@ -461,15 +470,13 @@ def allocate_ports(n: int) -> dict[str, Any]:
 
     def reserve() -> int:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         s.bind(("127.0.0.1", 0))
         port = int(s.getsockname()[1])
         holders.append(s)
         return port
 
     alloc: dict[str, Any] = {
-        name: [reserve() for _ in range(n)]
-        for name in ["http", "grpc", "kv_pub", "kv_replay"]
+        name: [reserve() for _ in range(n)] for name in ["http", "grpc"]
     }
     alloc["router"] = reserve()
     alloc["metrics"] = reserve()
@@ -482,8 +489,8 @@ def engine_command(i):
     events = {
         "enable_kv_cache_events": True,
         "publisher": "zmq",
-        "endpoint": f"tcp://*:{ports['kv_pub'][i]}",
-        "replay_endpoint": f"tcp://127.0.0.1:{ports['kv_replay'][i]}",
+        "endpoint": "tcp://*:0",
+        "replay_endpoint": "tcp://*:0",
         "buffer_steps": 10000,
     }
     transfer = {
@@ -689,8 +696,10 @@ def _run_cell() -> None:
         time.sleep(settle)
     global ports
     ports = allocate_ports(WORKERS)
-    env["HHC_KV_PUB_PORTS"] = json.dumps(ports["kv_pub"])
-    print(f"PORTS allocated {json.dumps(ports)}", flush=True)
+    print(
+        f"PORTS allocated {json.dumps(ports)} (kv events tcp://*:0)",
+        flush=True,
+    )
     entry = OUT / "agentx_entry.py"
     entry.write_text(
         """import asyncio

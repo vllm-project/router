@@ -49,7 +49,7 @@ Each run writes a **new** cell directory:
 
 Before replay, the cell runner **removes `result/`** if reusing the same `AGENTX_OUT`. The cell **fails if replay exit code ≠ 0**.
 
-**Port / ZMQ (`Address already in use`)**: cells reserve ports until each engine binds (sequential worker start). Between pytest cells, default **`AGENTX_CELL_GAP_SEC=5`**; before allocate, **`AGENTX_PORT_SETTLE_SEC=2`**. If one cell still fails, check stale `vllm-rs serve` (`ss -ltnp | grep <port>` from `PORTS allocated …`) and raise the gap (e.g. `export AGENTX_CELL_GAP_SEC=15`). Do not run multiple matrix jobs on one host in parallel.
+**Ports**: HTTP, gRPC, and the router use OS-assigned ports held until that process starts. KV event PUB/replay use **`tcp://*:0`**: vLLM binds a free port at startup and the router reads the resolved address from `/kv_event_sources`. This needs a vLLM that resolves port 0 (it must not advertise `tcp://*:0` itself). Between pytest cells, default **`AGENTX_CELL_GAP_SEC=5`**; before allocate, **`AGENTX_PORT_SETTLE_SEC=2`**. Do not run multiple matrix jobs on one host in parallel.
 
 Optional **`export AGENTX_STREAM_LOGS=1`**: stream **worker + router** logs to stderr in real time (prefix `[engineN]` / `[router]`); replay stays file-only. Use **pytest `-sv`** so stderr is visible.
 
