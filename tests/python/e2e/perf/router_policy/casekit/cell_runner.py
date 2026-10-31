@@ -8,7 +8,7 @@ Flow:
   5. Run agentinfer replay bench against the router.
 
 Workload is fixed ahead of time: AgentX session trace JSONL (``AGENTX_TRACE``), generated
-once via ``make_trace.py``. Replay executes that plan and writes ``result/requests.jsonl``
+once via ``data/make_trace.py``. Replay executes that plan and writes ``result/requests.jsonl``
 (per-request TTFT/latency — analysis output, not the bench input).
 
 Configuration: ``AGENTX_CASE_FILE`` points to one self-contained case JSON
@@ -35,14 +35,21 @@ import httpx
 import yaml
 
 SCENARIO_DIR = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(SCENARIO_DIR))
-from helpers.case_config import (  # noqa: E402
+if str(SCENARIO_DIR) not in sys.path:
+    sys.path.insert(0, str(SCENARIO_DIR))
+
+from casekit.case_config import (  # noqa: E402
     cell_output_dir,
     load_case,
     packaged_replay_agentx_yaml,
     require_runtime,
 )
-from helpers.e2e_shared import pump_subprocess_stdout, wait_for_http_ok  # noqa: E402
+from helpers.http_ready import wait_for_http_ok  # noqa: E402
+from helpers.perf_process import (  # noqa: E402
+    graceful_stop_subprocess,
+    join_log_pump,
+    start_process_with_log,
+)
 
 CASE: dict[str, Any] = {}
 ROOT: Path
@@ -193,52 +200,24 @@ def _stream_logs_enabled() -> bool:
     )
 
 
-def _stream_pump(proc: subprocess.Popen[Any], log_fp, prefix: str) -> None:
-    pump_subprocess_stdout(proc, log_fp=log_fp, stderr_prefix=prefix)
-
-
 def start(command, log, extra=None, *, stream_prefix: str | None = None):
     extra_env = env | (extra or {})
     Path(str(log) + ".command.json").write_text(json.dumps(command, indent=2))
-    component = (stream_prefix or "").strip() or Path(str(log)).stem
-    if stream_prefix and _stream_logs_enabled():
-        log_fp = open(log, "w")
+    stream = bool(stream_prefix and _stream_logs_enabled())
+    proc, thread, log_fp = start_process_with_log(
+        command,
+        Path(log),
+        extra_env,
+        stream_to_stderr=stream,
+        stderr_prefix=stream_prefix or "",
+        start_new_session=True,
+    )
+    if log_fp is not None:
         handles.append(log_fp)
-        proc = subprocess.Popen(
-            command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            env=extra_env,
-            start_new_session=True,
-            text=True,
-            bufsize=1,
-        )
-        thread = threading.Thread(
-            target=_stream_pump,
-            args=(proc, log_fp, stream_prefix),
-            name=f"stream-{component}",
-            daemon=True,
-        )
-        thread.start()
+    if thread is not None:
         stream_pumps.append((proc, thread))
-    else:
-        handle = open(log, "w")
-        handles.append(handle)
-        proc = subprocess.Popen(
-            command,
-            stdout=handle,
-            stderr=subprocess.STDOUT,
-            env=extra_env,
-            start_new_session=True,
-        )
     active.append(proc)
     return proc
-
-
-def _join_stream_pump(proc: subprocess.Popen[Any], thread: threading.Thread) -> None:
-    if proc.stdout is not None:
-        proc.stdout.close()
-    thread.join(timeout=15)
 
 
 def stop(proc):
@@ -248,15 +227,9 @@ def stop(proc):
             stream_thread = thread
             stream_pumps.pop(idx)
             break
-    if proc.poll() is None:
-        os.killpg(proc.pid, signal.SIGTERM)
-        try:
-            proc.wait(timeout=45)
-        except subprocess.TimeoutExpired:
-            os.killpg(proc.pid, signal.SIGKILL)
-            proc.wait(timeout=15)
+    graceful_stop_subprocess(proc, 45, process_group=True, kill_grace=15)
     if stream_thread is not None:
-        _join_stream_pump(proc, stream_thread)
+        join_log_pump(proc, stream_thread)
 
 
 def _release_all_port_holders() -> None:
@@ -448,7 +421,7 @@ def _emit_run_summary(
 
     cleanup()
     if _stream_logs_enabled():
-        print("\n--- run_cell summary (worker/router streams stopped) ---", flush=True)
+        print("\n--- cell summary (worker/router streams stopped) ---", flush=True)
     summary_extra = _write_results_summary_from_calibration(out)
     print("STATS " + json.dumps(stats), flush=True)
     print_artifacts(out, workers, extras=summary_extra)
@@ -470,7 +443,7 @@ def _emit_run_summary(
 def print_failure_diagnostics(out: Path, workers: int, *, hint: str = "") -> None:
     cleanup()
     if _stream_logs_enabled():
-        print("\n--- run_cell summary (worker/router streams stopped) ---", flush=True)
+        print("\n--- cell summary (worker/router streams stopped) ---", flush=True)
     if hint:
         print(f"DIAGNOSTIC {hint}", flush=True)
     extras = _write_results_summary_from_calibration(out)
@@ -686,10 +659,26 @@ def pct(values, p):
     return ordered[lo] + (ordered[hi] - ordered[lo]) * (rank - lo)
 
 
-def main() -> None:
-    case_file = Path(os.environ["AGENTX_CASE_FILE"])
-    bootstrap(case_path=case_file)
+def run_router_policy_cell(
+    case_file: Path,
+    *,
+    out_dir: Path | None = None,
+    run_suffix: str | None = None,
+    results_summary: Path | None = None,
+) -> Path:
+    """Start workers, router, and AgentX replay for one case JSON."""
+
+    case_path = case_file.resolve()
+    os.environ["AGENTX_CASE_FILE"] = str(case_path)
+    if run_suffix is not None:
+        os.environ["AGENTX_RUN_SUFFIX"] = run_suffix
+    if out_dir is not None:
+        os.environ["AGENTX_OUT"] = str(out_dir)
+    if results_summary is not None:
+        os.environ[RESULTS_SUMMARY_ENV] = str(results_summary)
+    bootstrap(case_path=case_path)
     _run_cell()
+    return OUT
 
 
 def _run_cell() -> None:
@@ -937,7 +926,3 @@ raise SystemExit(main(["vllm", *sys.argv[1:]]))
         )
     finally:
         cleanup()
-
-
-if __name__ == "__main__":
-    main()

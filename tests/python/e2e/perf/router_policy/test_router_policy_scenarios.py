@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import json
-import os
-import subprocess
 import sys
 from pathlib import Path
 
@@ -12,47 +10,28 @@ SCENARIO_DIR = Path(__file__).resolve().parent
 if str(SCENARIO_DIR) not in sys.path:
     sys.path.insert(0, str(SCENARIO_DIR))
 
-from helpers.case_config import (  # noqa: E402
+from casekit.case_config import (  # noqa: E402
     cell_output_dir,
     cell_results_summary_path,
     cell_run_suffix,
     load_case,
-    require_runtime,
 )
-
-RUN_CELL = SCENARIO_DIR / "scripts" / "run_cell.py"
+from casekit.cell_runner import run_router_policy_cell  # noqa: E402
 
 
 def _run_cell(case_file: Path) -> Path:
     case = load_case(case_file, scenario_dir=SCENARIO_DIR)
-    runtime = require_runtime(case)
     run_suffix = cell_run_suffix()
     out = cell_output_dir(case, run_suffix=run_suffix)
-    env = os.environ.copy()
-    env["AGENTX_CASE_FILE"] = str(case_file.resolve())
-    env["AGENTX_RUN_SUFFIX"] = run_suffix
-    env["AGENTX_OUT"] = str(out)
-    env["AGENTX_RESULTS_SUMMARY"] = str(
-        cell_results_summary_path(case, run_suffix=run_suffix)
-    )
-    timeout = int(env.get("AGENTX_PERF_TIMEOUT_SEC", str(4 * 3600)))
-    proc = subprocess.run(
-        [runtime["python"], "-u", str(RUN_CELL)],
-        cwd=SCENARIO_DIR,
-        env=env,
-        timeout=timeout,
-        check=False,
-    )
-    if proc.returncode != 0:
-        print(
-            f"run_cell exit {proc.returncode}; see ARTIFACTS / LOG_TAIL above "
-            f"or logs under {out.resolve()}",
-            flush=True,
-        )
-        assert proc.returncode == 0, f"run_cell failed for {case_file.name}"
     summary = cell_results_summary_path(case, run_suffix=run_suffix)
+    cell_out = run_router_policy_cell(
+        case_file,
+        out_dir=out,
+        run_suffix=run_suffix,
+        results_summary=summary,
+    )
     assert summary.is_file(), f"missing results summary copy {summary}"
-    return out
+    return cell_out
 
 
 def test_router_policy_replay_cell(case_file: Path):

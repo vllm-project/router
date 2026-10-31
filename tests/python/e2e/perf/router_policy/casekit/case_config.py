@@ -10,9 +10,12 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-_E2E_DIR = Path(__file__).resolve().parents[4]
-if str(_E2E_DIR) not in sys.path:
-    sys.path.insert(0, str(_E2E_DIR))
+_E2E_DIR = Path(__file__).resolve().parents[3]
+_HELPERS = _E2E_DIR / "helpers"
+for _entry in (_HELPERS, _E2E_DIR):
+    _path = str(_entry)
+    if _path not in sys.path:
+        sys.path.insert(0, _path)
 
 from helpers.binaries import (  # noqa: E402
     resolve_repo_path,
@@ -48,7 +51,7 @@ def _resolve_python(case_value: str, repo: Path, *, case_id: str) -> str:
         return pinned
     val = (case_value or "").strip()
     if val in ("", "python"):
-        # Same interpreter as pytest / ``run_cell`` (no absolute path in JSON).
+        # Same interpreter as pytest (no absolute path in JSON).
         return sys.executable
     if "/" in val or "\\" in val:
         return str(resolve_repo_path(val, repo))
@@ -136,7 +139,7 @@ def resolve_runtime(case: dict[str, Any]) -> dict[str, Any]:
     if replay_override:
         rt["replay_config_path"] = str(resolve_repo_path(replay_override, repo))
     else:
-        # Resolved in run_cell bootstrap (same env as runtime.python), not at pytest import.
+        # Resolved in cell bootstrap (same env as runtime.python), not at pytest import.
         rt["replay_config_path"] = ""
 
     rt["python"] = _resolve_python(str(rt.get("python") or ""), repo, case_id=case_id)
