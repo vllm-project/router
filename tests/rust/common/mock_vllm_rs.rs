@@ -38,6 +38,8 @@ pub struct MockVllmRs {
     pub frames: Option<Vec<(String, Vec<u32>)>>,
     pub capture_limit: usize,
     pub failures_remaining: Arc<AtomicUsize>,
+    /// Sleep after the request is recorded so callers can observe in-flight load.
+    pub response_delay: std::time::Duration,
 }
 
 impl Default for MockVllmRs {
@@ -48,6 +50,7 @@ impl Default for MockVllmRs {
             frames: None,
             capture_limit: usize::MAX,
             failures_remaining: Arc::new(AtomicUsize::new(0)),
+            response_delay: std::time::Duration::ZERO,
         }
     }
 }
@@ -164,6 +167,9 @@ impl Inference for MockVllmRs {
             .is_ok()
         {
             return Err(Status::unavailable("retry test"));
+        }
+        if !self.response_delay.is_zero() {
+            tokio::time::sleep(self.response_delay).await;
         }
 
         let (tx, rx) = mpsc::channel(4);

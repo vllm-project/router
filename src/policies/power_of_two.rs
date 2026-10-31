@@ -96,6 +96,13 @@ impl LoadBalancingPolicy for PowerOfTwoPolicy {
         Some(selected_idx)
     }
 
+    fn tracks_request_load(&self) -> bool {
+        // `/get_load` is the steady-state source. Until that cache is filled
+        // (gRPC workers never expose it), selection falls back to the local
+        // in-flight counter, which only moves when the router tracks load.
+        true
+    }
+
     fn name(&self) -> &'static str {
         "power_of_two"
     }
