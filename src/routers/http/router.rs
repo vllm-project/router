@@ -37,7 +37,7 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use futures_util::StreamExt;
+use futures_util::{Stream, StreamExt};
 use parking_lot::Mutex;
 use reqwest::Client;
 use std::collections::HashMap;
@@ -62,6 +62,95 @@ use tracing::{debug, error, info, warn};
 /// socket buffers, and nothing here caps how large a single upstream chunk can
 /// be. Size it as a queue depth, not as an RSS ceiling.
 pub(crate) const SSE_FORWARD_QUEUE_CHUNKS: usize = 8;
+
+/// The error that ended a forwarded stream, published beside the data queue
+/// instead of through it.
+///
+/// The forwarder can be parked on a full queue when the worker's stream fails,
+/// and it must not wait for a slot: the request is over, so its accounting has
+/// to finish. Recording the failure in a slot that never blocks lets the
+/// forwarder end immediately while the body still reports a truncated stream
+/// rather than a clean end of body. The body reads the slot only once the queue
+/// is drained, so the frames already handed over still reach the client first.
+#[derive(Default)]
+pub(crate) struct TerminalError(Mutex<Option<String>>);
+
+impl TerminalError {
+    fn set(&self, message: String) {
+        let mut slot = self.0.lock();
+        if slot.is_none() {
+            *slot = Some(message);
+        }
+    }
+
+    fn take(&self) -> Option<String> {
+        self.0.lock().take()
+    }
+}
+
+/// Hand-off from a forwarding task to the body of a streaming response: data
+/// goes through the bounded queue, the terminal error goes around it.
+pub(crate) struct SseForward {
+    tx: tokio::sync::mpsc::Sender<bytes::Bytes>,
+    terminal: Arc<TerminalError>,
+}
+
+impl SseForward {
+    /// Hands one upstream frame to the client, waiting for a free slot. `false`
+    /// means the client is gone and the forwarder should stop reading.
+    pub(crate) async fn send(&self, chunk: bytes::Bytes) -> bool {
+        self.tx.send(chunk).await.is_ok()
+    }
+
+    /// Records the error that ended the upstream stream, then lets the
+    /// forwarder return: this never waits for the queue.
+    pub(crate) fn fail(&self, message: String) {
+        self.terminal.set(message);
+    }
+}
+
+/// Body of a forwarded streaming response: every frame the worker produced,
+/// then the error that ended it, if there was one.
+pub(crate) struct SseForwardBody {
+    rx: ReceiverStream<bytes::Bytes>,
+    terminal: Arc<TerminalError>,
+    read_terminal: bool,
+}
+
+impl Stream for SseForwardBody {
+    type Item = Result<bytes::Bytes, String>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        match Pin::new(&mut this.rx).poll_next(cx) {
+            Poll::Ready(Some(chunk)) => Poll::Ready(Some(Ok(chunk))),
+            // The queue is drained, which is the first moment the client can be
+            // told the stream failed without losing frames it is owed.
+            Poll::Ready(None) if !this.read_terminal => {
+                this.read_terminal = true;
+                Poll::Ready(this.terminal.take().map(Err))
+            }
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+pub(crate) fn sse_forward_channel() -> (SseForward, SseForwardBody) {
+    let (tx, rx) = tokio::sync::mpsc::channel(SSE_FORWARD_QUEUE_CHUNKS);
+    let terminal = Arc::new(TerminalError::default());
+    (
+        SseForward {
+            tx,
+            terminal: terminal.clone(),
+        },
+        SseForwardBody {
+            rx: ReceiverStream::new(rx),
+            terminal,
+            read_terminal: false,
+        },
+    )
+}
 
 fn prepare_error_status(error: &PrepareError) -> StatusCode {
     match error {
@@ -89,13 +178,10 @@ fn http_stages_json(http_ttfb_ms: f64, first_sse_ms: f64) -> serde_json::Value {
     })
 }
 
-async fn emit_http_first_sse<E>(
-    tx: &tokio::sync::mpsc::Sender<Result<bytes::Bytes, E>>,
-    stages: &serde_json::Value,
-) {
+async fn emit_http_first_sse(forward: &SseForward, stages: &serde_json::Value) {
     let comment = format!(": router-stages {stages}\n\n");
     info!(%stages, "http proxy stages");
-    let _ = tx.send(Ok(bytes::Bytes::from(comment))).await;
+    let _ = forward.send(bytes::Bytes::from(comment)).await;
 }
 
 struct LoadTrackedBody {
@@ -1928,7 +2014,7 @@ impl Router {
             }
 
             let stream = res.bytes_stream();
-            let (tx, rx) = tokio::sync::mpsc::channel(SSE_FORWARD_QUEUE_CHUNKS);
+            let (forward, body_stream) = sse_forward_channel();
 
             // Spawn task to forward stream and detect completion
             let producer_load = load.clone();
@@ -1945,7 +2031,7 @@ impl Router {
                                 let first_ms = t_send.elapsed().as_secs_f64() * 1000.0;
                                 if stages_on {
                                     let stages = http_stages_json(http_ttfb_ms, first_ms);
-                                    emit_http_first_sse(&tx, &stages).await;
+                                    emit_http_first_sse(&forward, &stages).await;
                                 }
                             }
                             if let Some(completion) = &completion {
@@ -1959,20 +2045,14 @@ impl Router {
                             {
                                 producer_load.release();
                             }
-                            if tx.send(Ok(bytes)).await.is_err() {
+                            if !forward.send(bytes).await {
                                 stream_succeeded = false;
                                 break;
                             }
                         }
                         Err(e) => {
                             stream_succeeded = false;
-                            // Never awaited: a full queue means the client is not
-                            // reading, and waiting for a slot here would park
-                            // this task ahead of `completion.finish` and hold
-                            // the accounting of a request the worker has already
-                            // failed. A dropped frame costs the client the error
-                            // text only; the body ends either way.
-                            let _ = tx.try_send(Err(format!("Stream error: {}", e)));
+                            forward.fail(format!("Stream error: {}", e));
                             break;
                         }
                     }
@@ -1982,8 +2062,7 @@ impl Router {
                 }
             });
 
-            let stream = ReceiverStream::new(rx);
-            let body = Body::from_stream(stream);
+            let body = Body::from_stream(body_stream);
 
             let mut response = Response::new(body);
             *response.status_mut() = status;
@@ -2001,7 +2080,7 @@ impl Router {
             }
 
             let stream = res.bytes_stream();
-            let (tx, rx) = tokio::sync::mpsc::channel(SSE_FORWARD_QUEUE_CHUNKS);
+            let (forward, body_stream) = sse_forward_channel();
             let completion = if status.is_success() {
                 program_completion
             } else {
@@ -2021,26 +2100,20 @@ impl Router {
                                 let first_ms = t_send.elapsed().as_secs_f64() * 1000.0;
                                 if stages_on {
                                     let stages = http_stages_json(http_ttfb_ms, first_ms);
-                                    emit_http_first_sse(&tx, &stages).await;
+                                    emit_http_first_sse(&forward, &stages).await;
                                 }
                             }
                             if let Some(completion) = &completion {
                                 completion.observe_sse_chunk(&bytes);
                             }
-                            if tx.send(Ok(bytes)).await.is_err() {
+                            if !forward.send(bytes).await {
                                 stream_succeeded = false;
                                 break;
                             }
                         }
                         Err(e) => {
                             stream_succeeded = false;
-                            // Never awaited: a full queue means the client is not
-                            // reading, and waiting for a slot here would park
-                            // this task ahead of `completion.finish` and hold
-                            // the accounting of a request the worker has already
-                            // failed. A dropped frame costs the client the error
-                            // text only; the body ends either way.
-                            let _ = tx.try_send(Err(format!("Stream error: {}", e)));
+                            forward.fail(format!("Stream error: {}", e));
                             break;
                         }
                     }
@@ -2050,8 +2123,7 @@ impl Router {
                 }
             });
 
-            let stream = ReceiverStream::new(rx);
-            let body = Body::from_stream(stream);
+            let body = Body::from_stream(body_stream);
 
             let mut response = Response::new(body);
             *response.status_mut() = status;
@@ -3149,7 +3221,7 @@ impl RouterTrait for Router {
                     }
                 } else {
                     let stream = response.bytes_stream();
-                    let (tx, rx) = tokio::sync::mpsc::channel(SSE_FORWARD_QUEUE_CHUNKS);
+                    let (forward, body_stream) = sse_forward_channel();
                     let completion = status.is_success().then_some(program_completion).flatten();
                     tokio::spawn(async move {
                         let mut stream = stream;
@@ -3160,18 +3232,14 @@ impl RouterTrait for Router {
                                     if let Some(completion) = &completion {
                                         completion.observe_sse_chunk(&bytes);
                                     }
-                                    if tx.send(Ok(bytes)).await.is_err() {
+                                    if !forward.send(bytes).await {
                                         stream_ok = false;
                                         break;
                                     }
                                 }
                                 Err(error) => {
                                     stream_ok = false;
-                                    // Same as the other forwarders: deliver the
-                                    // terminal error without waiting, so a client
-                                    // that stopped reading cannot park this task
-                                    // ahead of `completion.finish`.
-                                    let _ = tx.try_send(Err(format!("Stream error: {error}")));
+                                    forward.fail(format!("Stream error: {error}"));
                                     break;
                                 }
                             }
@@ -3181,7 +3249,7 @@ impl RouterTrait for Router {
                         }
                     });
                     response_builder
-                        .body(Body::from_stream(ReceiverStream::new(rx)))
+                        .body(Body::from_stream(body_stream))
                         .unwrap_or_else(|error| {
                             (
                                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -4698,31 +4766,38 @@ mod tests {
         server.abort();
     }
 
-    /// A worker that fails mid-stream must not keep the request accounted for
-    /// just because the client stopped reading.
+    /// A worker that hands over exactly one frame per queue slot and only then
+    /// fails its stream, so the forwarder reaches the error arm with every slot
+    /// occupied.
     ///
-    /// The backend hands over exactly as many chunks as the queue can hold and
-    /// only then fails, so the forwarding task reaches the error arm with every
-    /// slot occupied. `reached` reports that the forwarder has polled the
-    /// failing chunk — and therefore completed every data hand-off — while
-    /// `release` keeps the failure from arriving before the queue is full.
-    #[tokio::test]
-    async fn worker_error_with_a_stalled_client_still_releases_worker_load() {
+    /// `reached` fires when the forwarder polls the failing chunk, which it can
+    /// only do after every data hand-off that does not need a reader has
+    /// completed. `release` keeps the failure back until the test asks for it,
+    /// so the error always lands on a full queue.
+    struct FailingStreamWorker {
+        url: String,
+        worker: Arc<dyn Worker>,
+        reached: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+        server: tokio::task::JoinHandle<()>,
+    }
+
+    /// One frame per queue slot. Frames are kept small on purpose: a large
+    /// frame can be split across reads and would fill the queue before the
+    /// error is reached, turning these tests into plain back-pressure checks.
+    const FAILING_STREAM_CHUNK_BYTES: usize = 64;
+
+    async fn spawn_worker_that_fails_on_a_full_queue() -> FailingStreamWorker {
         use axum::routing::post;
 
-        // One frame per queue slot. The frames are kept small on purpose: a
-        // large frame can be split across reads and would fill the queue before
-        // the error is reached, turning this into a plain back-pressure test.
-        const CHUNK_BYTES: usize = 64;
         const CHUNKS: usize = SSE_FORWARD_QUEUE_CHUNKS;
 
         let reached = Arc::new(tokio::sync::Notify::new());
         let release = Arc::new(tokio::sync::Notify::new());
         let (handler_reached, handler_release) = (reached.clone(), release.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let worker_url = format!("http://{}", listener.local_addr().unwrap());
-        let worker: Arc<dyn Worker> =
-            Arc::new(BasicWorker::new(worker_url.clone(), WorkerType::Regular));
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(url.clone(), WorkerType::Regular));
         let app = axum::Router::new().route(
             "/v1/chat/completions",
             post(move || {
@@ -4731,7 +4806,10 @@ mod tests {
                 async move {
                     let body = futures_util::stream::iter(0..CHUNKS)
                         .map(|_| {
-                            Ok::<_, std::io::Error>(bytes::Bytes::from(vec![b'a'; CHUNK_BYTES]))
+                            Ok::<_, std::io::Error>(bytes::Bytes::from(vec![
+                                b'a';
+                                FAILING_STREAM_CHUNK_BYTES
+                            ]))
                         })
                         .chain(futures_util::stream::once(async move {
                             reached.notify_one();
@@ -4743,51 +4821,119 @@ mod tests {
             }),
         );
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        FailingStreamWorker {
+            url,
+            worker,
+            reached,
+            release,
+            server,
+        }
+    }
+
+    /// Dispatches one streaming request at `worker` and returns the response
+    /// with the body still unread, which is the state both tests below need.
+    async fn stalled_stream_response(worker: &FailingStreamWorker) -> Response {
         let router = create_test_regular_router();
 
         // Admission: the dispatch owns a guard on the worker, and this path
         // releases it when the forwarding task ends — not when the body is
-        // dropped, which is why the body below is held for the whole check.
-        worker.increment_load();
+        // dropped, which is why the bodies below are held for the whole check.
+        worker.worker.increment_load();
         let response = router
             .send_typed_request(
                 &serde_json::json!({"model": "test", "messages": [], "stream": true}),
                 TypedDispatch {
                     headers: None,
                     route: "/v1/chat/completions",
-                    worker_url: &worker_url,
+                    worker_url: &worker.url,
                     is_stream: true,
-                    load: RequestLoadGuard::new(Some(worker.clone()), None),
+                    load: RequestLoadGuard::new(Some(worker.worker.clone()), None),
                     prepared: None,
                 },
                 None,
             )
             .await;
         assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(worker.load(), 1, "the request was never accounted for");
+        assert_eq!(
+            worker.worker.load(),
+            1,
+            "the request was never accounted for"
+        );
+        response
+    }
 
-        tokio::time::timeout(Duration::from_secs(10), reached.notified())
+    /// A worker that fails mid-stream must not keep the request accounted for
+    /// just because the client stopped reading.
+    #[tokio::test]
+    async fn worker_error_with_a_stalled_client_still_releases_worker_load() {
+        let worker = spawn_worker_that_fails_on_a_full_queue().await;
+        let response = stalled_stream_response(&worker).await;
+
+        tokio::time::timeout(Duration::from_secs(10), worker.reached.notified())
             .await
             .expect("the forwarder never reached the failing chunk");
         assert_eq!(
-            worker.load(),
+            worker.worker.load(),
             1,
             "the stream failed while the client was still counted"
         );
-        release.notify_one();
+        worker.release.notify_one();
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        while worker.load() != 0 && tokio::time::Instant::now() < deadline {
+        while worker.worker.load() != 0 && tokio::time::Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert_eq!(
-            worker.load(),
+            worker.worker.load(),
             0,
             "a worker whose stream failed is still counted as running"
         );
 
         drop(response);
-        server.abort();
+        worker.server.abort();
+    }
+
+    /// A stream that fails while the client is not reading must still tell the
+    /// client it failed, and must do it after the frames it already handed
+    /// over: ending the body cleanly turns a truncated response into a
+    /// successful one for every client that trusts end of stream.
+    #[tokio::test]
+    async fn worker_error_with_a_stalled_client_reaches_the_client() {
+        let worker = spawn_worker_that_fails_on_a_full_queue().await;
+        let response = stalled_stream_response(&worker).await;
+
+        tokio::time::timeout(Duration::from_secs(10), worker.reached.notified())
+            .await
+            .expect("the forwarder never reached the failing chunk");
+        // The client has read nothing, the queue is full, and the worker has
+        // already failed: this is the moment the error used to be dropped.
+        worker.release.notify_one();
+
+        let mut frames = response.into_body().into_data_stream();
+        let mut delivered = 0;
+        let terminal = loop {
+            match tokio::time::timeout(Duration::from_secs(5), frames.next()).await {
+                Ok(Some(Ok(_))) => delivered += 1,
+                Ok(Some(Err(error))) => break Some(error.to_string()),
+                Ok(None) => break None,
+                Err(_) => panic!("the body neither produced a frame nor ended"),
+            }
+        };
+
+        assert_eq!(
+            delivered, SSE_FORWARD_QUEUE_CHUNKS,
+            "the client was not given every frame the queue held before the failure"
+        );
+        let error = terminal.expect("the body ended cleanly after the worker failed mid-stream");
+        // reqwest wraps the worker's own message ("error decoding response
+        // body"), so what is asserted here is the forwarder's error, not the
+        // text the mock backend returned.
+        assert!(
+            error.contains("Stream error"),
+            "the body ended with something other than the forwarder's error: {error}"
+        );
+
+        worker.server.abort();
     }
 
     #[tokio::test]
