@@ -559,6 +559,15 @@ def engine_command(i):
             if pw.get("gpu_memory_utilization") is not None
             else []
         ),
+        *(["--kv-cache-metrics"] if pw.get("kv_cache_metrics") else []),
+        *(
+            [
+                "--kv-cache-metrics-sample",
+                str(pw["kv_cache_metrics_sample"]),
+            ]
+            if pw.get("kv_cache_metrics_sample") is not None
+            else []
+        ),
         "--kv-cache-memory-bytes",
         str(pw.get("kv_cache_memory_bytes", 107374182400)),
         "--safetensors-load-strategy",

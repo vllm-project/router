@@ -30,7 +30,9 @@
       "kv_cache_memory_bytes": 51539607552,
       "cpu_kv_bytes": 17179869184,
       "dtype": "bfloat16",
-      "enable_prefix_caching": true
+      "enable_prefix_caching": true,
+      "kv_cache_metrics": true,
+      "kv_cache_metrics_sample": 0.01
     }
   },
   "router_params": {
