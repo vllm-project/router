@@ -434,6 +434,38 @@ def _resolve_user_text(settings: dict[str, Any]) -> str:
     return make_user_text(settings["chars"])
 
 
+def _messages_for_shape(
+    *,
+    shape: str,
+    hit_rate: float,
+    user: str,
+    requests: int,
+    turns: int,
+) -> tuple[list[dict], list[dict], list[list[dict]]]:
+    """Miss, hit, and wave chat bodies.
+
+    ``split`` cuts inside one user message (worker KV). ``turns`` puts the
+    shared span in earlier chat turns so L1 has a template boundary to reuse.
+    """
+    if shape == "turns":
+        stamp = time.time_ns()
+        miss_messages = make_turn_messages(hit_rate, user, turns, f"MISS-{stamp}")
+        hit_messages = make_turn_messages(hit_rate, user, turns, f"HIT-{stamp}")
+        wave_messages = [
+            make_turn_messages(hit_rate, user, turns, f"TAIL-WAVE-{stamp}-{idx}")
+            for idx in range(requests)
+        ]
+        return miss_messages, hit_messages, wave_messages
+    if shape != "split":
+        raise ValueError(f"shape must be split or turns, got {shape!r}")
+    miss_user, hit_user = make_bodies(hit_rate, user)
+    return (
+        user_messages(miss_user),
+        user_messages(hit_user),
+        [user_messages(body) for body in make_wave_bodies(hit_rate, user, requests)],
+    )
+
+
 def run_prefix_kvhit_wave(
     settings: dict[str, Any],
     *,
@@ -441,22 +473,36 @@ def run_prefix_kvhit_wave(
     concurrency: int,
     requests: int,
     warmup: bool | None = None,
+    shape: str | None = None,
+    turns: int | None = None,
 ) -> dict[str, Any]:
-    """One warmup (optional) + concurrent wave; used by pytest perf and callable from tests."""
+    """One warmup (optional) + concurrent wave; used by pytest perf and callable from tests.
+
+    ``shape`` defaults to ``split`` (one user message). Pass ``turns`` to exercise
+    the router L1 encoding cache, which only reuses tokens up to a chat-template
+    boundary.
+    """
     user = _resolve_user_text(settings)
     do_warmup = settings["warmup"] if warmup is None else warmup
-    miss_user, hit_user = make_bodies(hit_rate, user)
-    miss_messages, hit_messages = user_messages(miss_user), user_messages(hit_user)
-    wave_messages = [
-        user_messages(body) for body in make_wave_bodies(hit_rate, user, requests)
-    ]
+    shape = shape or str(settings.get("shape") or "split")
+    turn_count = turns if turns is not None else int(settings.get("turns") or 8)
+    miss_messages, hit_messages, wave_messages = _messages_for_shape(
+        shape=shape,
+        hit_rate=hit_rate,
+        user=user,
+        requests=requests,
+        turns=turn_count,
+    )
     result: dict[str, Any] = {
         "router": settings["router_url"],
         "model": settings["model"],
         "hit_rate": hit_rate,
+        "shape": shape,
         "concurrency": concurrency,
         "requests": requests,
     }
+    if shape == "turns":
+        result["turns"] = turn_count
     if do_warmup:
         result["warmup"] = {
             "miss": post_chat(

@@ -20,7 +20,7 @@ on `release-pipeline.yml` (the `router-release` pipeline) publishes images.
 | --- | --- | --- | --- |
 | `test-ready.yml` | L1 ready | non-default branch labeled `ready` | Rust and Python unit/integration tests, one NVIDIA P/D completion (`ROCM_ONLY != 1` on that job) |
 | `test-merge.yml` | L2 merge | default branch (except `NIGHTLY=1`), its merge queue, or any other branch labeled `merge-test` | one-mode xGMI smoke and RDMA `SMOKE_ONLY` |
-| `test-nightly.yml` | L3 nightly | default branch with `NIGHTLY=1`, or any other branch labeled `nightly-test` | Rust and Python unit/integration tests (skipped when the PR also has `ready`), full NVIDIA GSM8K (`ROCM_ONLY != 1`), gRPC prefix-KV perf on 2× H100 (`ROCM_ONLY != 1`), full xGMI matrix, full RDMA |
+| `test-nightly.yml` | L3 nightly | default branch with `NIGHTLY=1`, or any other branch labeled `nightly-test` | Rust and Python unit/integration tests (skipped when the PR also has `ready`), full NVIDIA GSM8K (`ROCM_ONLY != 1`), gRPC prefix-KV perf on 2× H100 (`ROCM_ONLY != 1`), L1 prefix-encoding perf on 1× L4 with Qwen3-0.6B (`ROCM_ONLY != 1`, 24 waves), full xGMI matrix, full RDMA |
 | `release-pipeline.yml` | release | tag / release pipeline | wheels and images only |
 
 A pull request labeled `ready` uploads `test-ready.yml`, including forks.
@@ -35,6 +35,7 @@ shell. A build-level `HF_TOKEN` would override a pod env entry of the same name.
 | Name | Machine |
 | --- | --- |
 | `l4_4` | EKS `l4-k8s`, 4× L4, image `public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:router-$BUILDKITE_COMMIT` |
+| `l4_1` | Same L4 pool and image, 1× L4 |
 | `h100_2` | `mithril-h100-pool`, 2× H100 SXM, us-west-2 pull-through cache of the router CI image, GPU limit 2 |
 | `mi300_2` | `router_rocm_mi300_2`, same-host xGMI Docker devices |
 | `mi300_rdma` | `router_rocm_mi300_2` coordinator, no Docker plugin |
