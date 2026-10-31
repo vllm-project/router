@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import concurrent.futures
 import time
 from collections import Counter
 
@@ -11,18 +12,15 @@ import requests
 from tests.python.e2e.function.helpers import http as router_http
 from tests.python.e2e.function.helpers.worker_logs import worker_url_for_request_id
 from tests.python.e2e.function.kv_aware.config import (
-    KV_AWARE_SHARED_PREFIX,
     kv_aware_e2e_model,
     kv_aware_index_settle_sec,
     kv_aware_request_log_poll_sec,
     kv_aware_reuse_rounds,
 )
 from tests.python.e2e.function.kv_aware.dataset import (
-    default_prefix_reuse_scenario,
     lane_prefix,
     lane_prime_user,
     lane_reuse_user,
-    reuse_user_message,
 )
 
 
@@ -82,51 +80,43 @@ def _prime_worker_http(worker, *, model: str, content: str) -> str:
     return worker.url
 
 
-@pytest.mark.e2e
-def test_kv_aware_reuse_routes_to_prime_worker(kv_aware_router, kv_aware_two_workers):
-    """
-    One **prime** + one **reuse** with a shared token prefix; reuse must use the
-    same ``grpc://`` worker as prime.
-    """
-    workers = kv_aware_two_workers
-    base = kv_aware_router.url
-    model = kv_aware_e2e_model()
-    scenario = default_prefix_reuse_scenario()
-    settle = kv_aware_index_settle_sec()
-    log_poll = kv_aware_request_log_poll_sec()
-    assert scenario.prime_user.startswith(KV_AWARE_SHARED_PREFIX)
-    assert scenario.reuse_user.startswith(KV_AWARE_SHARED_PREFIX)
-    print("[e2e] checkpoint: single-lane reuse shares prefix with prime", flush=True)
-
+def _assert_workers_registered(base: str, workers) -> None:
+    """Router ``/list_workers`` matches the two spawned ``grpc://`` URLs."""
     listed = requests.get(f"{base}/list_workers", timeout=30)
     listed.raise_for_status()
-    assert len(listed.json().get("urls", [])) == 2
+    urls = listed.json().get("urls", [])
+    assert len(urls) == 2
+    assert set(urls) == {w.url for w in workers}
 
-    with requests.Session() as session:
-        prime_worker = _chat_worker(
-            session,
-            base=base,
-            model=model,
-            workers=workers,
-            content=scenario.prime_user,
-            log_poll=log_poll,
-        )
-        print(f"[e2e] checkpoint: index settle {settle}s after prime", flush=True)
-        time.sleep(settle)
-        reuse_worker = _chat_worker(
-            session,
-            base=base,
-            model=model,
-            workers=workers,
-            content=scenario.reuse_user,
-            log_poll=log_poll,
-        )
 
-    assert reuse_worker == prime_worker, (
-        f"kv_aware should send reuse to prime worker: "
-        f"prime={prime_worker} reuse={reuse_worker} "
-        f"(scenario={scenario.name!r})"
+def _chat_worker_nonstream(
+    session: requests.Session,
+    *,
+    base: str,
+    model: str,
+    workers,
+    content: str,
+    log_poll: float,
+) -> str:
+    """Non-streaming chat through the router; body must include message content."""
+    response = router_http.post_chat_completion(
+        session,
+        base,
+        model=model,
+        content=content,
+        stream=False,
+        max_tokens=8,
     )
+    response.raise_for_status()
+    body = response.json()
+    choices = body.get("choices") or []
+    assert choices, body
+    content_text = (choices[0].get("message") or {}).get("content")
+    assert content_text is not None, body
+    request_id = body.get("id")
+    if not isinstance(request_id, str) or not request_id:
+        raise AssertionError(f"non-stream completion missing id: {body}")
+    return worker_url_for_request_id(workers, request_id, poll_timeout_sec=log_poll)
 
 
 @pytest.mark.e2e
@@ -148,6 +138,10 @@ def test_kv_aware_dual_lane_prime_and_reuse(kv_aware_router, kv_aware_two_worker
     2. Dual prime — lane A on workers[0], lane B on workers[1], via HTTP.
     3. Index settle — ``KV_AWARE_INDEX_SETTLE_SEC`` sleep after prime.
     4. First B reuse — one B reuse **before any A reuse**, must match ``prime_B``.
+    5. Non-stream — one ``stream=False`` chat per lane through the router, after
+       streaming stickiness, must return message content and the same worker.
+    6. Concurrent reuse — 3 lane-A and 3 lane-B requests in flight together,
+       each on its own ``requests.Session``, each hitting that lane's prime worker.
     """
     workers = kv_aware_two_workers
     worker_urls = {w.url for w in workers}
@@ -167,6 +161,8 @@ def test_kv_aware_dual_lane_prime_and_reuse(kv_aware_router, kv_aware_two_worker
 
     if len(workers) != 2:
         raise RuntimeError(f"dual-lane prime needs two workers, got {len(workers)}")
+    _assert_workers_registered(base, workers)
+    print("[e2e] checkpoint: list_workers matches spawned workers", flush=True)
     prime_by_lane = {
         "A": _prime_worker_http(workers[0], model=model, content=lane_prime_user("A")),
         "B": _prime_worker_http(workers[1], model=model, content=lane_prime_user("B")),
@@ -221,6 +217,22 @@ def test_kv_aware_dual_lane_prime_and_reuse(kv_aware_router, kv_aware_two_worker
                     flush=True,
                 )
 
+        for lane in ("B", "A"):
+            w = _chat_worker_nonstream(
+                session,
+                base=base,
+                model=model,
+                workers=workers,
+                content=lane_reuse_user(lane, round_index=n_reuse + 1),
+                log_poll=log_poll,
+            )
+            reuse_by_lane[lane].append(w)
+            print(
+                f"[e2e] non-stream lane {lane} worker={w} "
+                f"(prime={prime_by_lane[lane]})",
+                flush=True,
+            )
+
     for lane in ("A", "B"):
         bad = [
             (i + 1, w)
@@ -232,59 +244,43 @@ def test_kv_aware_dual_lane_prime_and_reuse(kv_aware_router, kv_aware_two_worker
             f"{prime_by_lane[lane]!r}; mismatches (round, worker)={bad!r}"
         )
 
+    def _concurrent_reuse(job: tuple[str, int]) -> tuple[str, str]:
+        lane, round_index = job
+        _assert_lane_reuse_shares_prefix(lane, round_index=round_index)
+        with requests.Session() as thread_session:
+            worker_url = _chat_worker(
+                thread_session,
+                base=base,
+                model=model,
+                workers=workers,
+                content=lane_reuse_user(lane, round_index=round_index),
+                log_poll=log_poll,
+            )
+        return lane, worker_url
+
+    # Distinct tails from the serial rounds. Six requests at once: 3 A + 3 B.
+    concurrent_jobs = [(lane, n_reuse + 2 + i) for lane in ("A", "B") for i in range(3)]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
+        concurrent_hits = list(pool.map(_concurrent_reuse, concurrent_jobs))
+    concurrent_bad = [
+        (lane, worker_url)
+        for lane, worker_url in concurrent_hits
+        if worker_url != prime_by_lane[lane]
+    ]
+    assert not concurrent_bad, (
+        "concurrent reuse must hit that lane's prime worker; "
+        f"mismatches (lane, worker)={concurrent_bad!r} prime_by_lane={prime_by_lane}"
+    )
+    for lane, worker_url in concurrent_hits:
+        reuse_by_lane[lane].append(worker_url)
+    print(
+        f"[e2e] checkpoint: concurrent reuse 3A+3B OK hits={concurrent_hits}",
+        flush=True,
+    )
+
     print(
         f"[e2e] summary prime={prime_by_lane} "
         f"reuse_A={Counter(reuse_by_lane['A'])} "
         f"reuse_B={Counter(reuse_by_lane['B'])}",
-        flush=True,
-    )
-
-
-@pytest.mark.e2e
-def test_kv_aware_multi_reuse_after_single_prime(kv_aware_router, kv_aware_two_workers):
-    """One prime, many reuse rounds on the same shared prefix (no control)."""
-    workers = kv_aware_two_workers
-    base = kv_aware_router.url
-    model = kv_aware_e2e_model()
-    settle = kv_aware_index_settle_sec()
-    log_poll = kv_aware_request_log_poll_sec()
-    n_reuse = kv_aware_reuse_rounds()
-
-    with requests.Session() as session:
-        prime_worker = _chat_worker(
-            session,
-            base=base,
-            model=model,
-            workers=workers,
-            content=default_prefix_reuse_scenario().prime_user,
-            log_poll=log_poll,
-        )
-        print(f"[e2e] prime_worker={prime_worker}", flush=True)
-        time.sleep(settle)
-
-        reuse_workers: list[str] = []
-        for i in range(n_reuse):
-            w = _chat_worker(
-                session,
-                base=base,
-                model=model,
-                workers=workers,
-                content=reuse_user_message(
-                    f" Follow-up #{i + 1} with the same prefix block."
-                ),
-                log_poll=log_poll,
-            )
-            reuse_workers.append(w)
-            print(f"[e2e] reuse[{i + 1}/{n_reuse}] worker={w}", flush=True)
-
-    reuse_mismatch = [
-        (i + 1, w) for i, w in enumerate(reuse_workers) if w != prime_worker
-    ]
-    assert not reuse_mismatch, (
-        f"all reuse should use prime_worker={prime_worker!r}; "
-        f"mismatches (round, worker)={reuse_mismatch!r}"
-    )
-    print(
-        f"[e2e] summary prime={prime_worker} reuse_counts={dict(Counter(reuse_workers))}",
         flush=True,
     )

@@ -62,11 +62,6 @@ def kv_aware_e2e_model() -> str:
     return KV_AWARE_E2E_MODEL_DEFAULT
 
 
-KV_AWARE_SHARED_PREFIX = (
-    "You are a concise assistant. Answer in one short sentence. Context block: "
-    + ("token-" * 48)
-)
-
 # Independent long prefixes so two lanes do not share KV block hashes.
 KV_AWARE_LANE_A_PREFIX = "Lane A assistant. One short sentence. Context block A: " + (
     "alpha-" * 48

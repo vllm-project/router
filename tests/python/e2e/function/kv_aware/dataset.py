@@ -1,42 +1,15 @@
-"""Prompt scenarios for kv_aware routing (shared token prefix on prime/reuse).
+"""Prompt text for the kv_aware dual-lane stickiness test.
 
-These are not a static file on disk — they are structured cases built from
-``KV_AWARE_SHARED_PREFIX`` so the router and workers see a long shared leading
-span, then different tails (mirroring ``benches/backend/bench_prefix_kvhit.py``).
+Lane A and lane B use different long prefixes so each reuse can be credited
+only to the worker that was primed with that lane.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-
 from tests.python.e2e.function.kv_aware.config import (
     KV_AWARE_LANE_A_PREFIX,
     KV_AWARE_LANE_B_PREFIX,
-    KV_AWARE_SHARED_PREFIX,
 )
-
-
-@dataclass(frozen=True)
-class PrefixReuseScenario:
-    """Two chat bodies: prime cache, then reuse the same prefix."""
-
-    name: str
-    prime_user: str
-    reuse_user: str
-
-
-def default_prefix_reuse_scenario() -> PrefixReuseScenario:
-    """Shared long prefix on prime and reuse."""
-    return PrefixReuseScenario(
-        name="shared-prefix-reuse",
-        prime_user=KV_AWARE_SHARED_PREFIX + " Prime this prefix on one worker.",
-        reuse_user=KV_AWARE_SHARED_PREFIX + " Follow-up with the same prefix block.",
-    )
-
-
-def reuse_user_message(suffix: str) -> str:
-    """Same shared token prefix as prime; only the trailing text differs."""
-    return KV_AWARE_SHARED_PREFIX + suffix
 
 
 def lane_prefix(lane: str) -> str:

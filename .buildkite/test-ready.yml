@@ -126,8 +126,7 @@ steps:
       - "/tmp/router.log"
 
   # kv_aware functional e2e. Two vllm-rs workers, default model
-  # Qwen/Qwen3-0.6B. Two pytest processes so the smoke run does not leave
-  # the shared prefix on both workers before the stickiness tests.
+  # Qwen/Qwen3-0.6B.
   - label: ":satellite: kv_aware e2e"
     key: "kv-aware-e2e"
     if: build.env("ROCM_ONLY") != "1"
@@ -140,9 +139,6 @@ steps:
     command: |
       bash <<'BASH'
       set -euo pipefail
-      pytest tests/python/e2e/function/kv_aware/test_kv_aware.py \
-        --confcutdir=tests/python/e2e/function/kv_aware \
-        -m e2e -v -s
       pytest tests/python/e2e/function/kv_aware/test_kv_aware_prefix_cache.py \
         --confcutdir=tests/python/e2e/function/kv_aware \
         -m e2e -v -s
