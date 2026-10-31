@@ -37,7 +37,7 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use futures_util::StreamExt;
+use futures_util::{Stream, StreamExt};
 use parking_lot::Mutex;
 use reqwest::Client;
 use std::collections::HashMap;
@@ -46,8 +46,111 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
-use tokio_stream::wrappers::UnboundedReceiverStream;
+use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, error, info, warn};
+
+/// Number of upstream body chunks the Router is willing to hold on behalf of a
+/// client that is not reading.
+///
+/// The forwarding task hands bytes over one chunk at a time, so this queue is
+/// the only Router-owned buffer on a streaming response. When it is unbounded
+/// the task pulls from the worker as fast as the worker produces, no matter how
+/// fast the client reads, and a stalled reader turns into unbounded memory.
+///
+/// This bounds the number of held chunks, not bytes: Router-owned memory on a
+/// stalled stream is up to `SSE_FORWARD_QUEUE_CHUNKS * max_chunk_size` plus the
+/// socket buffers, and nothing here caps how large a single upstream chunk can
+/// be. Size it as a queue depth, not as an RSS ceiling.
+pub(crate) const SSE_FORWARD_QUEUE_CHUNKS: usize = 8;
+
+/// The error that ended a forwarded stream, published beside the data queue
+/// instead of through it.
+///
+/// The forwarder can be parked on a full queue when the worker's stream fails,
+/// and it must not wait for a slot: the request is over, so its accounting has
+/// to finish. Recording the failure in a slot that never blocks lets the
+/// forwarder end immediately while the body still reports a truncated stream
+/// rather than a clean end of body. The body reads the slot only once the queue
+/// is drained, so the frames already handed over still reach the client first.
+#[derive(Default)]
+pub(crate) struct TerminalError(Mutex<Option<String>>);
+
+impl TerminalError {
+    fn set(&self, message: String) {
+        let mut slot = self.0.lock();
+        if slot.is_none() {
+            *slot = Some(message);
+        }
+    }
+
+    fn take(&self) -> Option<String> {
+        self.0.lock().take()
+    }
+}
+
+/// Hand-off from a forwarding task to the body of a streaming response: data
+/// goes through the bounded queue, the terminal error goes around it.
+pub(crate) struct SseForward {
+    tx: tokio::sync::mpsc::Sender<bytes::Bytes>,
+    terminal: Arc<TerminalError>,
+}
+
+impl SseForward {
+    /// Hands one upstream frame to the client, waiting for a free slot. `false`
+    /// means the client is gone and the forwarder should stop reading.
+    pub(crate) async fn send(&self, chunk: bytes::Bytes) -> bool {
+        self.tx.send(chunk).await.is_ok()
+    }
+
+    /// Records the error that ended the upstream stream, then lets the
+    /// forwarder return: this never waits for the queue.
+    pub(crate) fn fail(&self, message: String) {
+        self.terminal.set(message);
+    }
+}
+
+/// Body of a forwarded streaming response: every frame the worker produced,
+/// then the error that ended it, if there was one.
+pub(crate) struct SseForwardBody {
+    rx: ReceiverStream<bytes::Bytes>,
+    terminal: Arc<TerminalError>,
+    read_terminal: bool,
+}
+
+impl Stream for SseForwardBody {
+    type Item = Result<bytes::Bytes, String>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        match Pin::new(&mut this.rx).poll_next(cx) {
+            Poll::Ready(Some(chunk)) => Poll::Ready(Some(Ok(chunk))),
+            // The queue is drained, which is the first moment the client can be
+            // told the stream failed without losing frames it is owed.
+            Poll::Ready(None) if !this.read_terminal => {
+                this.read_terminal = true;
+                Poll::Ready(this.terminal.take().map(Err))
+            }
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+pub(crate) fn sse_forward_channel() -> (SseForward, SseForwardBody) {
+    let (tx, rx) = tokio::sync::mpsc::channel(SSE_FORWARD_QUEUE_CHUNKS);
+    let terminal = Arc::new(TerminalError::default());
+    (
+        SseForward {
+            tx,
+            terminal: terminal.clone(),
+        },
+        SseForwardBody {
+            rx: ReceiverStream::new(rx),
+            terminal,
+            read_terminal: false,
+        },
+    )
+}
 
 fn prepare_error_status(error: &PrepareError) -> StatusCode {
     match error {
@@ -75,13 +178,10 @@ fn http_stages_json(http_ttfb_ms: f64, first_sse_ms: f64) -> serde_json::Value {
     })
 }
 
-fn emit_http_first_sse<E>(
-    tx: &tokio::sync::mpsc::UnboundedSender<Result<bytes::Bytes, E>>,
-    stages: &serde_json::Value,
-) {
+async fn emit_http_first_sse(forward: &SseForward, stages: &serde_json::Value) {
     let comment = format!(": router-stages {stages}\n\n");
     info!(%stages, "http proxy stages");
-    let _ = tx.send(Ok(bytes::Bytes::from(comment)));
+    let _ = forward.send(bytes::Bytes::from(comment)).await;
 }
 
 struct LoadTrackedBody {
@@ -1921,7 +2021,7 @@ impl Router {
             }
 
             let stream = res.bytes_stream();
-            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            let (forward, body_stream) = sse_forward_channel();
 
             // Spawn task to forward stream and detect completion
             let producer_load = load.clone();
@@ -1938,7 +2038,7 @@ impl Router {
                                 let first_ms = t_send.elapsed().as_secs_f64() * 1000.0;
                                 if stages_on {
                                     let stages = http_stages_json(http_ttfb_ms, first_ms);
-                                    emit_http_first_sse(&tx, &stages);
+                                    emit_http_first_sse(&forward, &stages).await;
                                 }
                             }
                             if let Some(completion) = &completion {
@@ -1952,14 +2052,14 @@ impl Router {
                             {
                                 producer_load.release();
                             }
-                            if tx.send(Ok(bytes)).is_err() {
+                            if !forward.send(bytes).await {
                                 stream_succeeded = false;
                                 break;
                             }
                         }
                         Err(e) => {
                             stream_succeeded = false;
-                            let _ = tx.send(Err(format!("Stream error: {}", e)));
+                            forward.fail(format!("Stream error: {}", e));
                             break;
                         }
                     }
@@ -1969,8 +2069,7 @@ impl Router {
                 }
             });
 
-            let stream = UnboundedReceiverStream::new(rx);
-            let body = Body::from_stream(stream);
+            let body = Body::from_stream(body_stream);
 
             let mut response = Response::new(body);
             *response.status_mut() = status;
@@ -1988,7 +2087,7 @@ impl Router {
             }
 
             let stream = res.bytes_stream();
-            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            let (forward, body_stream) = sse_forward_channel();
             let completion = if status.is_success() {
                 program_completion
             } else {
@@ -2008,20 +2107,20 @@ impl Router {
                                 let first_ms = t_send.elapsed().as_secs_f64() * 1000.0;
                                 if stages_on {
                                     let stages = http_stages_json(http_ttfb_ms, first_ms);
-                                    emit_http_first_sse(&tx, &stages);
+                                    emit_http_first_sse(&forward, &stages).await;
                                 }
                             }
                             if let Some(completion) = &completion {
                                 completion.observe_sse_chunk(&bytes);
                             }
-                            if tx.send(Ok(bytes)).is_err() {
+                            if !forward.send(bytes).await {
                                 stream_succeeded = false;
                                 break;
                             }
                         }
                         Err(e) => {
                             stream_succeeded = false;
-                            let _ = tx.send(Err(format!("Stream error: {}", e)));
+                            forward.fail(format!("Stream error: {}", e));
                             break;
                         }
                     }
@@ -2031,8 +2130,7 @@ impl Router {
                 }
             });
 
-            let stream = UnboundedReceiverStream::new(rx);
-            let body = Body::from_stream(stream);
+            let body = Body::from_stream(body_stream);
 
             let mut response = Response::new(body);
             *response.status_mut() = status;
@@ -3130,7 +3228,7 @@ impl RouterTrait for Router {
                     }
                 } else {
                     let stream = response.bytes_stream();
-                    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                    let (forward, body_stream) = sse_forward_channel();
                     let completion = status.is_success().then_some(program_completion).flatten();
                     tokio::spawn(async move {
                         let mut stream = stream;
@@ -3141,14 +3239,14 @@ impl RouterTrait for Router {
                                     if let Some(completion) = &completion {
                                         completion.observe_sse_chunk(&bytes);
                                     }
-                                    if tx.send(Ok(bytes)).is_err() {
+                                    if !forward.send(bytes).await {
                                         stream_ok = false;
                                         break;
                                     }
                                 }
                                 Err(error) => {
                                     stream_ok = false;
-                                    let _ = tx.send(Err(format!("Stream error: {error}")));
+                                    forward.fail(format!("Stream error: {error}"));
                                     break;
                                 }
                             }
@@ -3158,7 +3256,7 @@ impl RouterTrait for Router {
                         }
                     });
                     response_builder
-                        .body(Body::from_stream(UnboundedReceiverStream::new(rx)))
+                        .body(Body::from_stream(body_stream))
                         .unwrap_or_else(|error| {
                             (
                                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -4850,7 +4948,9 @@ mod tests {
             let _ = finish_rx.await;
         });
         queued_rx.await.unwrap();
-        let mut response = Response::new(Body::from_stream(UnboundedReceiverStream::new(body_rx)));
+        let mut response = Response::new(Body::from_stream(
+            tokio_stream::wrappers::UnboundedReceiverStream::new(body_rx),
+        ));
         response
             .extensions_mut()
             .insert(crate::backend::grpc::GrpcStreamTask::with_output_frame(
@@ -5007,6 +5107,254 @@ mod tests {
             );
             server.abort();
         }
+    }
+
+    /// A client that does not read must not let the forwarding task drain the
+    /// worker's response into Router memory: the hand-off queue is the only
+    /// Router-owned buffer on a streaming response, so it has to pull the
+    /// worker only as fast as the client consumes.
+    #[tokio::test]
+    async fn streaming_response_pulls_from_the_worker_only_as_the_client_reads() {
+        use axum::routing::post;
+        use std::sync::atomic::AtomicUsize;
+
+        const CHUNK_BYTES: usize = 8 * 1024;
+        const CHUNKS: usize = 8192;
+
+        let produced = Arc::new(AtomicUsize::new(0));
+        let counter = produced.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+            format!("http://{}", listener.local_addr().unwrap()),
+            WorkerType::Regular,
+        ));
+        let app = axum::Router::new().route(
+            "/v1/chat/completions",
+            post(move || {
+                let counter = counter.clone();
+                async move {
+                    let stream = futures_util::stream::iter(0..CHUNKS).map(move |_| {
+                        counter.fetch_add(1, Ordering::Relaxed);
+                        Ok::<_, std::io::Error>(bytes::Bytes::from(vec![b'a'; CHUNK_BYTES]))
+                    });
+                    Response::new(Body::from_stream(stream))
+                }
+            }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut router = create_test_regular_router();
+        router.worker_registry = Arc::new(WorkerRegistry::new());
+        router.worker_registry.register(worker);
+        router.policy_registry =
+            Arc::new(PolicyRegistry::new(crate::config::PolicyConfig::KvAware {
+                router_temperature: 0.0,
+                kv_penalty_host: 0.8,
+                kv_penalty_external: 0.6,
+                kv_penalty_disk: 0.3,
+                static_kv_event_sources: Default::default(),
+            }));
+        let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "messages": [{"role": "user", "content": "hello"}], "stream": true,
+        }))
+        .unwrap();
+
+        let response = router
+            .route_typed_request(None, &request, "/v1/chat/completions", None)
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Hold the response without reading a single byte of the body.
+        tokio::time::sleep(Duration::from_millis(1000)).await;
+        let buffered_bytes = produced.load(Ordering::Relaxed) * CHUNK_BYTES;
+        assert!(buffered_bytes > 0, "the response never started streaming");
+        // Loopback socket buffers and the client connection's read buffer hold
+        // roughly a megabyte no matter how the queue is sized, so the bar has to
+        // be a byte budget rather than a chunk count: with the queue bounded the
+        // forwarding task parks after 8 chunks and this lands near 1.1 MiB, while
+        // an unbounded hand-off drains tens of megabytes of the 64 MiB response.
+        assert!(
+            buffered_bytes < 8 * 1024 * 1024,
+            "the router pulled {buffered_bytes} bytes of a {} byte response while the client read nothing",
+            CHUNKS * CHUNK_BYTES
+        );
+
+        // Reading the body still yields every byte the worker produced.
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(body.len(), CHUNKS * CHUNK_BYTES);
+        assert!(body.iter().all(|byte| *byte == b'a'));
+        server.abort();
+    }
+
+    /// A worker that hands over exactly one frame per queue slot and only then
+    /// fails its stream, so the forwarder reaches the error arm with every slot
+    /// occupied.
+    ///
+    /// `reached` fires when the forwarder polls the failing chunk, which it can
+    /// only do after every data hand-off that does not need a reader has
+    /// completed. `release` keeps the failure back until the test asks for it,
+    /// so the error always lands on a full queue.
+    struct FailingStreamWorker {
+        url: String,
+        worker: Arc<dyn Worker>,
+        reached: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+        server: tokio::task::JoinHandle<()>,
+    }
+
+    /// One frame per queue slot. Frames are kept small on purpose: a large
+    /// frame can be split across reads and would fill the queue before the
+    /// error is reached, turning these tests into plain back-pressure checks.
+    const FAILING_STREAM_CHUNK_BYTES: usize = 64;
+
+    async fn spawn_worker_that_fails_on_a_full_queue() -> FailingStreamWorker {
+        use axum::routing::post;
+
+        const CHUNKS: usize = SSE_FORWARD_QUEUE_CHUNKS;
+
+        let reached = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let (handler_reached, handler_release) = (reached.clone(), release.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(url.clone(), WorkerType::Regular));
+        let app = axum::Router::new().route(
+            "/v1/chat/completions",
+            post(move || {
+                let reached = handler_reached.clone();
+                let release = handler_release.clone();
+                async move {
+                    let body = futures_util::stream::iter(0..CHUNKS)
+                        .map(|_| {
+                            Ok::<_, std::io::Error>(bytes::Bytes::from(vec![
+                                b'a';
+                                FAILING_STREAM_CHUNK_BYTES
+                            ]))
+                        })
+                        .chain(futures_util::stream::once(async move {
+                            reached.notify_one();
+                            release.notified().await;
+                            Err(std::io::Error::other("backend died mid-stream"))
+                        }));
+                    Response::new(Body::from_stream(body))
+                }
+            }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        FailingStreamWorker {
+            url,
+            worker,
+            reached,
+            release,
+            server,
+        }
+    }
+
+    /// Dispatches one streaming request at `worker` and returns the response
+    /// with the body still unread, which is the state both tests below need.
+    async fn stalled_stream_response(worker: &FailingStreamWorker) -> Response {
+        let router = create_test_regular_router();
+
+        // Admission: the dispatch owns a guard on the worker, and this path
+        // releases it when the forwarding task ends — not when the body is
+        // dropped, which is why the bodies below are held for the whole check.
+        worker.worker.increment_load();
+        let response = router
+            .send_typed_request(
+                &serde_json::json!({"model": "test", "messages": [], "stream": true}),
+                TypedDispatch {
+                    headers: None,
+                    route: "/v1/chat/completions",
+                    worker_url: &worker.url,
+                    is_stream: true,
+                    load: RequestLoadGuard::new(Some(worker.worker.clone()), None),
+                    prepared: None,
+                },
+                None,
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            worker.worker.load(),
+            1,
+            "the request was never accounted for"
+        );
+        response
+    }
+
+    /// A worker that fails mid-stream must not keep the request accounted for
+    /// just because the client stopped reading.
+    #[tokio::test]
+    async fn worker_error_with_a_stalled_client_still_releases_worker_load() {
+        let worker = spawn_worker_that_fails_on_a_full_queue().await;
+        let response = stalled_stream_response(&worker).await;
+
+        tokio::time::timeout(Duration::from_secs(10), worker.reached.notified())
+            .await
+            .expect("the forwarder never reached the failing chunk");
+        assert_eq!(
+            worker.worker.load(),
+            1,
+            "the stream failed while the client was still counted"
+        );
+        worker.release.notify_one();
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while worker.worker.load() != 0 && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            worker.worker.load(),
+            0,
+            "a worker whose stream failed is still counted as running"
+        );
+
+        drop(response);
+        worker.server.abort();
+    }
+
+    /// A stream that fails while the client is not reading must still tell the
+    /// client it failed, and must do it after the frames it already handed
+    /// over: ending the body cleanly turns a truncated response into a
+    /// successful one for every client that trusts end of stream.
+    #[tokio::test]
+    async fn worker_error_with_a_stalled_client_reaches_the_client() {
+        let worker = spawn_worker_that_fails_on_a_full_queue().await;
+        let response = stalled_stream_response(&worker).await;
+
+        tokio::time::timeout(Duration::from_secs(10), worker.reached.notified())
+            .await
+            .expect("the forwarder never reached the failing chunk");
+        // The client has read nothing, the queue is full, and the worker has
+        // already failed: this is the moment the error used to be dropped.
+        worker.release.notify_one();
+
+        let mut frames = response.into_body().into_data_stream();
+        let mut delivered = 0;
+        let terminal = loop {
+            match tokio::time::timeout(Duration::from_secs(5), frames.next()).await {
+                Ok(Some(Ok(_))) => delivered += 1,
+                Ok(Some(Err(error))) => break Some(error.to_string()),
+                Ok(None) => break None,
+                Err(_) => panic!("the body neither produced a frame nor ended"),
+            }
+        };
+
+        assert_eq!(
+            delivered, SSE_FORWARD_QUEUE_CHUNKS,
+            "the client was not given every frame the queue held before the failure"
+        );
+        let error = terminal.expect("the body ended cleanly after the worker failed mid-stream");
+        // reqwest wraps the worker's own message ("error decoding response
+        // body"), so what is asserted here is the forwarder's error, not the
+        // text the mock backend returned.
+        assert!(
+            error.contains("Stream error"),
+            "the body ended with something other than the forwarder's error: {error}"
+        );
+
+        worker.server.abort();
     }
 
     #[tokio::test]
