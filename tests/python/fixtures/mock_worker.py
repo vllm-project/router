@@ -142,6 +142,17 @@ def create_app(args: argparse.Namespace) -> FastAPI:
     async def get_load():
         return JSONResponse({"load": _inflight})
 
+    @app.get("/metrics")
+    async def metrics():
+        # Program scheduling scrapes vLLM's Prometheus gauges. Zeros keep the
+        # scheduler able to admit while this process stays a routing mock.
+        lines = []
+        for rank in range(int(args.dp_size)):
+            lines.append(f'vllm:kv_cache_usage_perc{{engine="{rank}"}} 0')
+            lines.append(f'vllm:num_requests_running{{engine="{rank}"}} 0')
+            lines.append(f'vllm:num_requests_waiting{{engine="{rank}"}} 0')
+        return PlainTextResponse("\n".join(lines) + "\n")
+
     def make_json_response(obj: dict, status_code: int = 200) -> JSONResponse:
         resp = JSONResponse(obj, status_code=status_code)
         resp.headers["X-Worker-Id"] = worker_id
