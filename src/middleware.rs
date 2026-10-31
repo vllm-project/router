@@ -16,6 +16,10 @@ use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 pub use crate::core::token_bucket::TokenBucket;
 
+#[cfg(test)]
+#[path = "middleware_queue_timeout_tests.rs"]
+mod queue_timeout_tests;
+
 use crate::metrics::RouterMetrics;
 use crate::server::AppState;
 
