@@ -869,6 +869,54 @@ impl PdRouterBase {
                 cache_aware.init_workers(&model_workers);
             }
         }
+        self.reinit_role_policies();
+    }
+
+    /// Re-initialize the prefill/decode policy instances from the current
+    /// registry contents. Under Kubernetes service discovery workers
+    /// register only after router construction, so the constructor-time
+    /// role-policy init (which the direct-URL branch performs) never runs
+    /// for them, and `register_and_notify` only refreshed the general
+    /// per-model policy. The role-specific cache_aware trees would
+    /// otherwise stay empty forever and every PD selection falls into the
+    /// no-affinity random arm (see #468). `init_workers` preserves
+    /// existing trees, so repeating this per event is safe.
+    pub fn reinit_role_policies(&self) {
+        let prefill_policy = self.policy_registry.get_prefill_policy();
+        if prefill_policy.requires_initialization() {
+            prefill_policy.init_workers(&self.worker_registry.get_prefill_workers());
+        }
+        let decode_policy = self.policy_registry.get_decode_policy();
+        if decode_policy.requires_initialization() {
+            decode_policy.init_workers(&self.worker_registry.get_decode_workers());
+        }
+    }
+
+    /// Evict a removed prefill server's prefix tenants from the prefill ROLE
+    /// policy. The per-model eviction in the remove paths above only covers
+    /// the general policy; the role policies keep independent cache_aware
+    /// tree instances and must be cleaned separately, otherwise prefixes
+    /// owned by a removed worker keep steering requests to a healthy
+    /// fallback until the stale-tenant self-heal eventually catches up.
+    fn evict_prefill_role_tenants(&self, url: &str) {
+        self.evict_role_policy_tenants(self.policy_registry.get_prefill_policy().as_ref(), url);
+    }
+
+    /// Same as [`Self::evict_prefill_role_tenants`] for the decode role
+    /// policy instance.
+    fn evict_decode_role_tenants(&self, url: &str) {
+        self.evict_role_policy_tenants(self.policy_registry.get_decode_policy().as_ref(), url);
+    }
+
+    fn evict_role_policy_tenants(&self, policy: &dyn LoadBalancingPolicy, url: &str) {
+        if policy.name() == "cache_aware" {
+            if let Some(cache_aware) = policy
+                .as_any()
+                .downcast_ref::<crate::policies::CacheAwarePolicy>()
+            {
+                cache_aware.remove_worker_by_url(url);
+            }
+        }
     }
 
     pub async fn remove_prefill_server(&self, url: &str) -> Result<String, PDRouterError> {
@@ -904,6 +952,7 @@ impl PdRouterBase {
         }
 
         if removed.is_some() {
+            self.evict_prefill_role_tenants(url);
             info!("Removed prefill server: {}", url);
             Ok(format!("Successfully removed prefill server: {}", url))
         } else {
@@ -950,6 +999,7 @@ impl PdRouterBase {
         }
 
         if removed.is_some() {
+            self.evict_decode_role_tenants(url);
             info!("Removed decode server: {}", url);
             Ok(format!("Successfully removed decode server: {}", url))
         } else {
@@ -987,6 +1037,11 @@ impl PdRouterBase {
                                 cache_aware.remove_worker_by_url(w.url());
                             }
                         }
+                    }
+                    if role == "prefill" {
+                        self.evict_prefill_role_tenants(w.url());
+                    } else if role == "decode" {
+                        self.evict_decode_role_tenants(w.url());
                     }
                     removed_count += 1;
                 }
@@ -1901,6 +1956,112 @@ mod tests {
         let received = router.worker_loads.borrow().clone();
         assert_eq!(received.get("http://worker1"), Some(&10));
         assert_eq!(received.get("http://worker2"), Some(&5));
+    }
+
+    fn create_test_pd_router_with_cache_aware_roles() -> PdRouterBase {
+        let router = create_test_pd_router();
+        let prefill_policy: Arc<dyn LoadBalancingPolicy> =
+            Arc::new(crate::policies::CacheAwarePolicy::new());
+        let decode_policy: Arc<dyn LoadBalancingPolicy> =
+            Arc::new(crate::policies::CacheAwarePolicy::new());
+        router.policy_registry.set_prefill_policy(prefill_policy);
+        router.policy_registry.set_decode_policy(decode_policy);
+        router
+    }
+
+    fn prefill_test_worker(name: &str) -> Arc<dyn Worker> {
+        Arc::new(BasicWorker::new(
+            format!("http://{}:8000", name),
+            WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+        ))
+    }
+
+    #[test]
+    fn test_registration_initializes_role_policy_trees() {
+        let router = create_test_pd_router_with_cache_aware_roles();
+        let workers: Vec<Arc<dyn Worker>> = vec![
+            prefill_test_worker("prefill-a"),
+            prefill_test_worker("prefill-b"),
+        ];
+        for worker in &workers {
+            router.register_and_notify(worker.clone());
+        }
+
+        // register_and_notify used to only refresh the GENERAL per-model
+        // policy. The prefill ROLE policy tree stayed empty, so identical
+        // prompts matched no affinity and every selection fell into the
+        // no-tree random arm. With the role tree initialized, the first
+        // distinct prompt takes the deterministic cold path (least_loaded)
+        // and every following identical selection must pin to the same
+        // worker instead of flipping at random.
+        let policy = router.policy_registry.get_prefill_policy();
+        let text = "shared prompt prefix for role policy affinity";
+        let first = policy
+            .select_worker_with_headers(&workers, Some(text), None)
+            .expect("prefill role policy must select a worker");
+        for _ in 0..9 {
+            let again = policy
+                .select_worker_with_headers(&workers, Some(text), None)
+                .expect("prefill role policy must select a worker again");
+            assert_eq!(
+                again, first,
+                "identical prompts must stick to the same prefill worker"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_remove_prefill_server_evicts_role_policy_tenants() {
+        let router = create_test_pd_router_with_cache_aware_roles();
+        let workers: Vec<Arc<dyn Worker>> = vec![
+            prefill_test_worker("prefill-a"),
+            prefill_test_worker("prefill-b"),
+            prefill_test_worker("prefill-c"),
+        ];
+        for worker in &workers {
+            router.register_and_notify(worker.clone());
+        }
+
+        // Warm the prefill role tree: the full-text insert pins the shared
+        // prompt to the first worker (all-zero loads tie-break to healthy
+        // first), and a repeated identical selection must stay pinned.
+        let policy = router.policy_registry.get_prefill_policy();
+        let text = "shared prompt prefix for role policy affinity";
+        let pinned = policy
+            .select_worker_with_headers(&workers, Some(text), None)
+            .expect("pin selection");
+        assert_eq!(pinned, 0, "fixture expects the pin on worker 0");
+        let repeated = policy
+            .select_worker_with_headers(&workers, Some(text), None)
+            .expect("second identical selection");
+        assert_eq!(repeated, pinned, "identical prompt must stay pinned");
+
+        // Remove the pinned worker and unbalance the remaining two.
+        router
+            .remove_prefill_server("http://prefill-a:8000")
+            .await
+            .expect("remove prefill server");
+        for _ in 0..5 {
+            workers[1].increment_load();
+        }
+        workers[2].increment_load();
+
+        let remaining: Vec<Arc<dyn Worker>> = vec![workers[1].clone(), workers[2].clone()];
+        let selected = policy
+            .select_worker_with_headers(&remaining, Some(text), None)
+            .expect("post-removal selection");
+
+        // Without eviction the stale tenant of the removed worker fails the
+        // position lookup and choose_from_affinity falls back to
+        // healthy.first() (index 0, the loaded worker). With eviction the
+        // prompt has no tenant again and the cold path picks the idle worker
+        // (index 1) via least_loaded().
+        assert_eq!(
+            selected, 1,
+            "stale tenants of removed workers must be evicted from role trees"
+        );
     }
 
     // ============= Concurrent Operations Tests =============
