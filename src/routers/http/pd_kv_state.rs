@@ -310,7 +310,6 @@ impl PdKvState {
                     // The subscriber handshake runs without the map locks; a
                     // concurrent prepare() sees no binding and denies credit
                     // until the rebuild completes.
-                    self.supervisor.on_worker_removed(&base);
                     let snapshot = discovery.expect("successful discovery probe");
                     let info = self
                         .supervisor
@@ -654,6 +653,9 @@ mod kv_input_tests {
             let publisher = publisher_context.socket(zmq::PUB).unwrap();
             publisher.bind("tcp://127.0.0.1:*").unwrap();
             let endpoint = publisher.get_last_endpoint().unwrap().unwrap();
+            let source_metadata = Arc::new(parking_lot::Mutex::new(json!({"0": {
+                "publisher": "zmq", "endpoint": endpoint, "enable_kv_cache_events": true
+            }})));
             let mut app = Router::new().route(
                 "/v1/models",
                 get(|| async { Json(json!({"data":[{"id":"m", "parent":null}]})) }),
@@ -664,10 +666,10 @@ mod kv_input_tests {
             async move { probes.fetch_add(1, Ordering::Relaxed);
                 Json(json!({"vllm_config":{"model_config":{"model":"engine-model"},"cache_config":{"block_size":16}}}))
             }}))
-            .route("/kv_event_sources", get({ let endpoint = endpoint.clone(); move || {
-                let endpoint = endpoint.clone();
+            .route("/kv_event_sources", get({ let sources = source_metadata.clone(); move || {
+                let sources = sources.lock().clone();
                 let probes = source_probes.clone();
-                async move { probes.fetch_add(1, Ordering::Relaxed); Json(json!({"0":{"publisher":"zmq", "endpoint":endpoint, "enable_kv_cache_events":true}})) }
+                async move { probes.fetch_add(1, Ordering::Relaxed); Json(sources) }
             }}));
             }
             let app = app.layer(axum::middleware::from_fn(
@@ -757,6 +759,34 @@ mod kv_input_tests {
                 .await;
             assert_eq!(warm[&base].work_by_rank[&None].new_prefill_tokens, 1);
             assert!(warm[&base].work_by_rank[&None].placement_verified);
+            if !static_source {
+                use crate::kv_index::{MatchQuery, StorageTier};
+
+                let provider = state.supervisor.match_provider_for_worker(&base).unwrap();
+                let query = MatchQuery {
+                    group_idx: 0,
+                    local_hashes: crate::kv_index::local_block_hash_strings(&tokens, 16, None),
+                    tiers_of_interest: vec![StorageTier::Device],
+                };
+                assert_eq!(provider.find_tiered_matches(&query).len(), 1);
+                let valid = source_metadata.lock()["0"].clone();
+                *source_metadata.lock() = json!({"not-a-rank": valid});
+                state.bindings.lock().await.get_mut(&base).unwrap().checked =
+                    Instant::now() - REFRESH_INTERVAL;
+                state.bind(&workers, ops).await;
+                // Installation rejects the complete new snapshot before
+                // retiring the old subscriber, but the changed PD binding
+                // itself falls back without granting that old credit.
+                assert!(state.supervisor.match_provider_for_worker(&base).is_some());
+                assert_eq!(provider.find_tiered_matches(&query).len(), 1);
+                assert!(state.bindings.lock().await[&base].info.is_none());
+                let fallback = state
+                    .prepare(&workers, &policy, &request, "/v1/completions", None)
+                    .await;
+                assert_eq!(fallback[&base].work_by_rank[&None].new_prefill_tokens, 33);
+                assert!(!fallback[&base].work_by_rank[&None].placement_verified);
+                assert_eq!(probes.load(Ordering::Relaxed), 4);
+            }
             drop(state);
             task.abort();
         }
