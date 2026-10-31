@@ -7,6 +7,7 @@
 use crate::config::RouterConfig;
 use crate::core::{CircuitBreakerConfig, Worker, WorkerFactory, WorkerRegistry, WorkerType};
 use crate::policies::kv_aware_ops;
+use crate::protocols::anthropic::MessagesRequest;
 use crate::protocols::spec::{
     ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest,
     InferenceGenerateRequest, RerankRequest, ResponsesRequest,
@@ -747,6 +748,27 @@ impl RouterTrait for RouterManager {
 
         if let Some(router) = router {
             router.route_embeddings(headers, body, model_id).await
+        } else {
+            let msg = match model_id {
+                Some(m) => format!("Model '{}' not found or no router available", m),
+                None => "No routers registered to handle this request".to_string(),
+            };
+            (StatusCode::NOT_FOUND, msg).into_response()
+        }
+    }
+
+    /// Route anthropic messages request
+    async fn route_messages(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &MessagesRequest,
+        _model_id: Option<&str>,
+    ) -> Response {
+        let model_id = Some(body.model.as_str());
+        let router = self.select_router_for_request(headers, model_id);
+
+        if let Some(router) = router {
+            router.route_messages(headers, body, model_id).await
         } else {
             let msg = match model_id {
                 Some(m) => format!("Model '{}' not found or no router available", m),

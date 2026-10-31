@@ -211,6 +211,10 @@ name = "kv_index_sequence_lifecycle"
 path = "tests/rust/kv_index_sequence_lifecycle.rs"
 
 [[test]]
+name = "messages_api_test"
+path = "tests/rust/messages_api_test.rs"
+
+[[test]]
 name = "otel_config_test"
 path = "tests/rust/otel_config_test.rs"
 

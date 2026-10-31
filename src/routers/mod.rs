@@ -9,6 +9,7 @@ use axum::{
 };
 use std::fmt::Debug;
 
+use crate::protocols::anthropic::MessagesRequest;
 use crate::protocols::spec::{
     ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest,
     InferenceGenerateRequest, RerankRequest, ResponsesRequest,
@@ -27,6 +28,13 @@ pub use http::{openai_router, pd_router, pd_types, router};
 ///
 /// This trait is separate from RouterTrait to allow Send futures
 /// for use in service discovery and other background tasks
+/// Response extension set on responses that came from a worker (or from a
+/// transparent proxy path). `/v1/messages` rewrites only responses without it
+/// into the anthropic error shape, so worker errors always pass through as
+/// sent, whatever their content type or size.
+#[derive(Debug, Clone, Copy)]
+pub struct UpstreamResponse;
+
 #[async_trait]
 pub trait WorkerManagement: Send + Sync {
     /// Add a worker to the router
@@ -150,6 +158,35 @@ pub trait RouterTrait: Send + Sync + Debug + WorkerManagement {
         body: &RerankRequest,
         model_id: Option<&str>,
     ) -> Response;
+
+    /// Route an anthropic messages request (`POST /v1/messages`).
+    ///
+    /// Routers without a typed implementation keep today's behavior and pass
+    /// the request to `route_transparent`, which returns 404 when the
+    /// transparent proxy is not supported.
+    async fn route_messages(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &MessagesRequest,
+        _model_id: Option<&str>,
+    ) -> Response {
+        match serde_json::to_value(body) {
+            Ok(value) => {
+                // The transparent path does not separate its own errors from
+                // worker responses, so keep its responses untouched as before.
+                let mut response = self
+                    .route_transparent(headers, "/v1/messages", &Method::POST, value)
+                    .await;
+                response.extensions_mut().insert(UpstreamResponse);
+                response
+            }
+            Err(e) => (
+                StatusCode::BAD_REQUEST,
+                format!("Invalid request body: {e}"),
+            )
+                .into_response(),
+        }
+    }
 
     /// Flush cache on all workers
     async fn flush_cache(&self) -> Response;

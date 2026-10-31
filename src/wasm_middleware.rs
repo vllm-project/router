@@ -87,6 +87,7 @@ pub const SUPPORTED_WASM_ROUTES: &[&str] = &[
     "/v1/rerank",
     "/v1/responses",
     "/v1/embeddings",
+    "/v1/messages",
 ];
 
 #[derive(Debug, Clone)]
@@ -1113,5 +1114,13 @@ mod tests {
             .validate()
             .expect_err("unsupported route");
         assert!(matches!(err, WasmMiddlewareError::InvalidConfig(_)));
+    }
+
+    #[test]
+    fn messages_route_passes_validation() {
+        WasmMiddlewareConfig::from_path("/tmp/unused.component.wasm")
+            .with_routes(vec!["/v1/messages".into()])
+            .validate()
+            .expect("/v1/messages is a supported wasm route");
     }
 }
