@@ -241,6 +241,7 @@ async fn grpc_frontend_cache_parity_metrics_streaming_and_retries() {
     }
 
     http_ignores_l0_config(&request).await;
+    grpc_kv_routing_keeps_unavailable_control_a_legal_fallback(&worker, &request).await;
 
     // Oversized inputs must preserve cached entries.
     let small = EngineFrontend::with_tokenizer_cache(
@@ -290,6 +291,63 @@ async fn grpc_frontend_cache_parity_metrics_streaming_and_retries() {
         worker.captured().last().unwrap().token_ids,
         expected.tokenized.token_ids.as_ref()
     );
+}
+
+async fn grpc_kv_routing_keeps_unavailable_control_a_legal_fallback(
+    worker: &MockVllmRsServer,
+    request: &vllm_router_rs::protocols::spec::ChatCompletionRequest,
+) {
+    // This fixture serves health/Inference, not Control. It proves legal routing
+    // with unavailable metadata, not successful gRPC KV-event ingestion.
+    for empty_start in [false, true] {
+        let config = RouterConfig {
+            policy: PolicyConfig::KvAware {
+                router_temperature: 0.0,
+                kv_penalty_host: 0.8,
+                kv_penalty_external: 0.6,
+                kv_penalty_disk: 0.3,
+                static_kv_event_sources: Default::default(),
+            },
+            ..Default::default()
+        };
+        let context = common::create_test_context(config.clone());
+        let router = Router::new(
+            if empty_start {
+                vec![]
+            } else {
+                vec![worker.grpc_url.clone()]
+            },
+            &context,
+        )
+        .await
+        .unwrap();
+        if empty_start {
+            router.add_worker(&worker.grpc_url).await.unwrap();
+        }
+        let app =
+            common::test_app::create_test_app(Arc::new(router), reqwest::Client::new(), &config);
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(request).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(
+            context
+                .worker_registry
+                .get_by_url(&worker.grpc_url)
+                .unwrap()
+                .load(),
+            0
+        );
+    }
 }
 
 async fn http_ignores_l0_config(request: &vllm_router_rs::protocols::spec::ChatCompletionRequest) {

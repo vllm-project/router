@@ -10,8 +10,9 @@
 #              public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:router-$BUILDKITE_COMMIT
 #   mi300_2    router_rocm_mi300_2, same-host xGMI via the ROCm Docker device mount.
 #   mi300_rdma router_rocm_mi300_2 coordinator. No Docker plugin; the job SSHes to the decode host.
-#   h100_2     mithril-h100-pool, 2x H100 SXM (vllm-omni h100_2 scheduling).
-#              Image is the same router CI image as l4_4. 2 GPU = 20 CPU / 80Gi / 48Gi shm.
+#   h100_2     mithril-h100-pool, 2x H100 SXM (node.kubernetes.io/instance-type=gpu-h100-sxm).
+#              Image is the us-west-2 pull-through cache of the router CI image.
+#              Scheduling sets a GPU limit of 2 and does not request CPU, memory, or shm size.
 #
 # Test-specific env (MORIIO_READ_MODE, LM_EVAL_LIMIT, LOG_DIR) stays on the step.
 
@@ -182,45 +183,33 @@ mirror_hardwares:
     plugins:
     - kubernetes:
         podSpec:
-          nodeSelector:
-            node.kubernetes.io/instance-type: gpu-h100-sxm
           containers:
-          - image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:router-$BUILDKITE_COMMIT
+          - image: 936637512419.dkr.ecr.us-west-2.amazonaws.com/vllm-ci-pull-through-cache/q9t5s3a7/vllm-ci-test-repo:router-$BUILDKITE_COMMIT
             resources:
               limits:
                 nvidia.com/gpu: 2
-              requests:
-                nvidia.com/gpu: 2
-                cpu: '20'
-                memory: 80Gi
             volumeMounts:
             - name: devshm
               mountPath: /dev/shm
             - name: hf-cache
               mountPath: /root/.cache/huggingface
+            # Not HF_TOKEN: a build-level HF_TOKEN overrides a pod env entry
+            # with the same name. upload_pipeline.py exports HF_TOKEN from
+            # this alias inside the job shell.
             env:
             - name: HF_HOME
               value: /root/.cache/huggingface
-            - name: HF_HUB_ENABLE_HF_TRANSFER
-              value: '1'
-            - name: NCCL_CUMEM_HOST_ENABLE
-              value: '0'
-            - name: VLLM_USE_V1
-              value: '1'
-            - name: VLLM_LOGGING_LEVEL
-              value: INFO
-            - name: HF_TOKEN
+            - name: VLLM_CI_HF_TOKEN
               valueFrom:
                 secretKeyRef:
                   name: hf-token-secret
                   key: token
-            - name: BUILDKITE_SHELL
-              value: /bin/bash -e -c
+          nodeSelector:
+            node.kubernetes.io/instance-type: gpu-h100-sxm
           volumes:
           - name: devshm
             emptyDir:
               medium: Memory
-              sizeLimit: 48Gi
           - name: hf-cache
             hostPath:
               path: /mnt/hf-cache

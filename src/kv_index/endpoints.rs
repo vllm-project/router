@@ -60,7 +60,7 @@ pub fn resolve_endpoints(
 // Worker identity is URL-syntax canonical, not inferred physical-host identity:
 // keep mapped IPv6 distinct here, while publisher comparison folds it in
 // canonical_endpoint. Returned ownership keys remain the exact registry strings.
-fn canonical_worker(value: &str) -> Result<(String, String), String> {
+pub(crate) fn canonical_worker(value: &str) -> Result<(String, String), String> {
     let parsed = Url::parse(value).map_err(|error| format!("invalid worker URL: {error}"))?;
     if !matches!(parsed.scheme(), "http" | "https")
         || parsed.host().is_none()
@@ -79,7 +79,7 @@ fn canonical_worker(value: &str) -> Result<(String, String), String> {
     Ok((parsed.to_string().trim_end_matches('/').to_string(), host))
 }
 
-fn canonical_endpoint(value: &str) -> Result<String, String> {
+pub(crate) fn canonical_endpoint(value: &str) -> Result<String, String> {
     let parsed = Url::parse(value).map_err(|error| format!("invalid KV endpoint: {error}"))?;
     if parsed.scheme() != "tcp"
         || parsed.host().is_none()
