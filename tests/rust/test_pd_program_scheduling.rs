@@ -222,7 +222,7 @@ async fn router_with_capacity(
                 "token_capacity_per_dp_rank":capacity,"enable_batch_gain_admission":false,
                 "decode_buffer_tokens":8,
                 "metrics_interval_seconds":0.02,"queue_timeout_seconds":2,"force_resume_timeout_seconds":1,
-                "pd":{"enabled":true,"explicit_ttl":true}
+                "pd":{"explicit_ttl":true}
             }))
             .unwrap(),
         );
@@ -375,9 +375,7 @@ async fn no_identity_and_disabled_feature_keep_native_round_robin() {
 
 #[test]
 fn pd_requires_explicit_capacity_and_rejects_unverified_modes() {
-    let valid: ProgramSchedulingConfig =
-        serde_json::from_value(json!({"pd":{"enabled":true}})).unwrap();
-    assert!(valid.pd.enabled);
+    let valid: ProgramSchedulingConfig = serde_json::from_value(json!({"pd":{}})).unwrap();
     let mut config = RouterConfig {
         mode: RoutingMode::VllmPrefillDecode {
             prefill_urls: vec![("http://p:8000".into(), None)],
@@ -406,11 +404,7 @@ fn pd_requires_explicit_capacity_and_rejects_unverified_modes() {
         assert!(ConfigValidator::validate(&bad).is_err());
     }
     assert!(serde_json::from_value::<ProgramSchedulingConfig>(
-        json!({"pd":{"enabled":true,"local_append":true}})
-    )
-    .is_err());
-    assert!(serde_json::from_value::<ProgramSchedulingConfig>(
-        json!({"pd":{"enabled":true,"bidirectional_multiturn":true}})
+        json!({"pd":{"bidirectional_multiturn":true}})
     )
     .is_err());
 }

@@ -9,6 +9,7 @@ mod pd_kv_state;
 mod pd_program_adapter;
 pub mod pd_router;
 pub mod pd_types;
+mod pd_warm_remote;
 mod program_adapter;
 pub mod router;
 mod usage_merge;

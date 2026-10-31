@@ -239,3 +239,9 @@ Report absolute and relative results for job completion time, request throughput
 ## Engine KV-control boundary
 
 Progress-TTL currently protects KV indirectly by controlling request admission. Physical eviction, offload, and prefetch are not executed by this feature. A future Router-to-engine KV hint must receive explicit `accepted`, `rejected`, or `unsupported` feedback and an eventual `applied`, `failed`, or `expired` result. Router residency accounting must not change until the engine reports `applied`.
+
+## PD Program scheduling
+
+Program-scoped PD scheduling and warm remote KV reuse with automatic TTL are documented in
+[PD Program Scheduling](pd-program-scheduling.md), including router/engine/client requirements, the full configuration
+reference, diagnostics, tuning recipes and troubleshooting.

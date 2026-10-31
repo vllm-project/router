@@ -655,7 +655,7 @@ impl Router {
             reference_decode_context_tokens_per_request = REFERENCE_DECODE_CONTEXT_TOKENS_PER_REQUEST as u64,
             reference_decode_context_tokens = REFERENCE_DECODE_CONTEXT_TOKENS as u64,
             reference_decode_throughput_tokens_per_second,
-            calibration_docs = "docs/program_scheduling.md#offline-calibration-models",
+            calibration_docs = "docs/program_scheduling/program-scheduling.md#offline-calibration-models",
             "Program scheduling is using one or more reference calibration coefficients; deployment-specific performance differences may degrade scheduling decisions"
         );
     }

@@ -1,12 +1,14 @@
 //! Opt-in, one-way PD Program scheduling and response-lifetime settlement.
 use super::dp_utils;
+use super::pd_warm_remote::{PdResponseContext, PdWarmRemoteRuntime};
 use super::program_adapter::ProgramCompletion;
 use super::vllm_service_discovery::{ServiceRegistry, ServiceType};
 use crate::core::{BasicWorker, DPAwareWorker, Worker, WorkerRegistry, WorkerType};
 use crate::kv_index::{HashMode, KvIndexSupervisor};
 use crate::program_scheduling::{
-    max_prometheus_gauge, BackendObservationProvider, ProgramIdentity, ProgramScheduler,
-    ProgramSchedulerConfig, ProgramTarget, ScheduleError, VllmMetricsObservationProvider,
+    max_prometheus_gauge, sum_prometheus_gauge, BackendObservationProvider, ProgramIdentity,
+    ProgramScheduler, ProgramSchedulerConfig, ProgramTarget, ScheduleError,
+    VllmMetricsObservationProvider,
 };
 use crate::server::AppContext;
 use crate::token_estimator::{MomentumTokenEstimator, TokenEstimateScope};
@@ -33,6 +35,9 @@ use tracing::warn;
 #[derive(Debug)]
 pub(super) struct PdProgramRuntime {
     pub scheduler: Arc<ProgramScheduler>,
+    pub warm_remote: Option<Arc<PdWarmRemoteRuntime>>,
+    pub worker_registry: Arc<WorkerRegistry>,
+    pub discovery: bool,
     estimator: Arc<MomentumTokenEstimator>,
     prefill_gates: Arc<Mutex<HashMap<String, Arc<Semaphore>>>>,
     prefill_limit: usize,
@@ -51,10 +56,17 @@ impl PdProgramRuntime {
         let Some(config) = ctx.router_config.program_scheduling.as_ref() else {
             return Ok(None);
         };
-        if !config.pd.enabled {
-            return Ok(None);
+        let warm_remote = config
+            .pd
+            .warm_remote_enabled()
+            .then(|| Arc::new(PdWarmRemoteRuntime::new(config.pd.clone())));
+        if let Some(warm_remote) = &warm_remote {
+            warm_remote.set_event_tracking(config.pd.kv_events);
         }
-        let scheduler = Arc::new(ProgramScheduler::new(ProgramSchedulerConfig::from(config)));
+        let observer_warm_remote = warm_remote.clone();
+        let scheduler = Arc::new(ProgramScheduler::new(
+            ProgramSchedulerConfig::from_program_config(config, true),
+        ));
         let observation_scheduler = scheduler.clone();
         let workers = ctx.worker_registry.clone();
         let dp_size = ctx.router_config.intra_node_data_parallel_size;
@@ -77,6 +89,7 @@ impl PdProgramRuntime {
         let kv_workers_registry = workers.clone();
         let kv_services = services.clone();
         let kv_interval = scheduler.metrics_interval().max(Duration::from_secs(1));
+        let kv_warm_remote = warm_remote.clone();
         let kv_observer = if kv_config.kv_events {
             Some(
                 tokio::spawn(async move {
@@ -86,12 +99,44 @@ impl PdProgramRuntime {
                     );
                     let mut previous = BTreeSet::new();
                     let mut subscribed = BTreeSet::new();
+                    let mut loss_epoch = crate::kv_index::signal_loss_epoch();
                     let mut interval = tokio::time::interval(kv_interval);
                     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                     loop {
                         interval.tick().await;
-                        while signals.try_recv().is_ok() {}
+                        while let Ok(signal) = signals.try_recv() {
+                            use crate::kv_index::IngestionSignal;
+                            if let Some(warm_remote) = &kv_warm_remote {
+                                let invalidation = match signal {
+                                    IngestionSignal::Invalidated {
+                                        source, dp_rank, ..
+                                    } => Some((source, Some(dp_rank as usize))),
+                                    IngestionSignal::Gap { source, .. }
+                                    | IngestionSignal::IncarnationReset { source, .. } => {
+                                        Some((source, None))
+                                    }
+                                    _ => None,
+                                };
+                                if let Some((source, rank)) = invalidation {
+                                    for url in supervisor.worker_urls_for_source(&source) {
+                                        warm_remote.invalidate_target(&url, rank);
+                                    }
+                                }
+                            }
+                        }
+                        let current_loss = crate::kv_index::signal_loss_epoch();
+                        if current_loss != loss_epoch {
+                            if let Some(warm_remote) = &kv_warm_remote {
+                                warm_remote.invalidate_all();
+                            }
+                            loss_epoch = current_loss;
+                        }
                         let urls = all_worker_bases(&kv_workers_registry, &kv_services, discovery);
+                        for removed in previous.difference(&urls) {
+                            if let Some(warm_remote) = &kv_warm_remote {
+                                warm_remote.invalidate_target(removed, None);
+                            }
+                        }
                         refresh_kv_workers(&supervisor, &mut previous, &mut subscribed, urls).await;
                     }
                 })
@@ -106,7 +151,8 @@ impl PdProgramRuntime {
         let pressure_scheduler = scheduler.clone();
         let pressure_interval =
             Duration::from_secs_f64(config.pd.prefill_kv_window_seconds.max(1.0));
-        let prefill_observer = if config.pd.prefill_kv_high_watermark > 0.0 {
+        let prefill_observer = if config.pd.prefill_kv_high_watermark > 0.0 || warm_remote.is_some()
+        {
             Some(
                 tokio::spawn(async move {
                     let mut interval = tokio::time::interval(pressure_interval);
@@ -130,9 +176,13 @@ impl PdProgramRuntime {
                                 _ => None,
                             };
                             let Some(text) = text else { continue };
-                            if let Some(usage) =
-                                max_prometheus_gauge(&text, "vllm:kv_cache_usage_perc")
-                            {
+                            let usage = max_prometheus_gauge(&text, "vllm:kv_cache_usage_perc");
+                            let running = sum_prometheus_gauge(&text, "vllm:num_requests_running")
+                                .and_then(|n| usize::try_from(n).ok());
+                            if usage.is_some() || running.is_some() {
+                                pressure_scheduler.observe_prefill_target(&url, usage, running);
+                            }
+                            if let Some(usage) = usage {
                                 kv_pressure = Some(
                                     kv_pressure.map_or(usage, |current: f64| current.max(usage)),
                                 );
@@ -157,6 +207,9 @@ impl PdProgramRuntime {
             loop {
                 interval.tick().await;
                 let targets = decode_targets(&workers, &services, discovery, dp_size);
+                if let Some(warm_remote) = &observer_warm_remote {
+                    warm_remote.retain_sources(&targets);
+                }
                 for pool in observation_scheduler.model_pools() {
                     observation_scheduler.sync_targets(&pool, &targets);
                 }
@@ -190,6 +243,9 @@ impl PdProgramRuntime {
         .abort_handle();
         Ok(Some(Self {
             scheduler,
+            warm_remote,
+            worker_registry: ctx.worker_registry.clone(),
+            discovery,
             estimator: Arc::new(MomentumTokenEstimator::default()),
             prefill_gates,
             prefill_limit: config.pd.max_prefill_requests_per_target,
@@ -601,12 +657,46 @@ pub(super) fn track_response(
     completion: ProgramCompletion,
     streaming: bool,
 ) -> Response {
+    track_response_inner(response, completion, streaming, None)
+}
+
+pub(super) fn track_warm_remote_response(
+    response: Response,
+    completion: ProgramCompletion,
+    streaming: bool,
+    warm_remote: PdResponseContext,
+) -> Response {
+    track_response_inner(response, completion, streaming, Some(warm_remote))
+}
+
+/// Forward an upstream error response untouched. The Program turn is still
+/// settled as failed when the body completes; no candidate is published.
+pub(super) fn track_forwarded_response(
+    response: Response,
+    completion: ProgramCompletion,
+    streaming: bool,
+) -> Response {
+    track_response_inner(response, completion, streaming, None)
+}
+
+fn track_response_inner(
+    response: Response,
+    completion: ProgramCompletion,
+    streaming: bool,
+    warm_remote: Option<PdResponseContext>,
+) -> Response {
     let success_status = response.status().is_success();
+    let buffer_limit = warm_remote
+        .as_ref()
+        .map_or(PdTrackedBody::MAX_BUFFER, |context| {
+            context.response_buffer_limit()
+        });
     let (parts, body) = response.into_parts();
     Response::from_parts(
         parts,
         Body::from_stream(PdTrackedBody {
             inner: Box::pin(body.into_data_stream()),
+            warm_remote,
             completion,
             streaming,
             success_status,
@@ -615,11 +705,13 @@ pub(super) fn track_response(
             buffer_overflow: false,
             skipping_oversized_line: false,
             buffer: Vec::new(),
+            buffer_limit,
         }),
     )
 }
 
 struct PdTrackedBody {
+    warm_remote: Option<PdResponseContext>,
     inner: Pin<Box<dyn Stream<Item = Result<Bytes, axum::Error>> + Send>>,
     completion: ProgramCompletion,
     streaming: bool,
@@ -629,6 +721,9 @@ struct PdTrackedBody {
     buffer_overflow: bool,
     skipping_oversized_line: bool,
     buffer: Vec<u8>,
+    /// Body-buffer bound: the configured response bound for warm_remote turns,
+    /// the conservative fixed bound otherwise.
+    buffer_limit: usize,
 }
 
 impl PdTrackedBody {
@@ -643,7 +738,7 @@ impl PdTrackedBody {
                     }
                     continue;
                 }
-                if self.buffer.len().saturating_add(segment.len()) > Self::MAX_BUFFER {
+                if self.buffer.len().saturating_add(segment.len()) > self.buffer_limit {
                     self.buffer.clear();
                     self.skipping_oversized_line = segment.last() != Some(&b'\n');
                     continue;
@@ -655,7 +750,7 @@ impl PdTrackedBody {
                 }
             }
         } else if !self.buffer_overflow {
-            if self.buffer.len().saturating_add(bytes.len()) > Self::MAX_BUFFER {
+            if self.buffer.len().saturating_add(bytes.len()) > self.buffer_limit {
                 self.buffer_overflow = true;
                 self.buffer.clear();
             } else {
@@ -679,6 +774,13 @@ impl PdTrackedBody {
                         .is_some_and(|v| v.get("error").is_some())
                 {
                     self.failed = true;
+                }
+                if self.warm_remote.is_some() {
+                    if let Ok(value) = serde_json::from_str::<Value>(data) {
+                        if let Some(warm_remote) = &mut self.warm_remote {
+                            warm_remote.observe(&value);
+                        }
+                    }
                 }
             }
         }
@@ -710,10 +812,22 @@ impl Stream for PdTrackedBody {
                     self.observe_line(&tail);
                 } else {
                     self.completion.observe_json(&self.buffer);
+                    if let Ok(value) = serde_json::from_slice::<Value>(&self.buffer) {
+                        if value.get("error").is_some() {
+                            self.failed = true;
+                        }
+                        if let Some(warm_remote) = &mut self.warm_remote {
+                            warm_remote.observe(&value);
+                        }
+                    }
                 }
-                self.completion.finish(
-                    self.success_status && !self.failed && (!self.streaming || self.terminal),
-                );
+                let success =
+                    self.success_status && !self.failed && (!self.streaming || self.terminal);
+                let completion = self.completion.clone();
+                if let Some(mut warm_remote) = self.warm_remote.take() {
+                    warm_remote.finish(success, &completion);
+                }
+                self.completion.finish(success);
                 Poll::Ready(None)
             }
             Poll::Pending => Poll::Pending,

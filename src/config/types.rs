@@ -133,7 +133,6 @@ fn default_intra_node_data_parallel_size() -> usize {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct PdProgramSchedulingConfig {
-    pub enabled: bool,
     /// Event residency is advisory and never authorizes a warm transfer.
     pub kv_events: bool,
     pub kv_hash_mode: String,
@@ -151,12 +150,64 @@ pub struct PdProgramSchedulingConfig {
     pub prefill_kv_high_watermark: f64,
     /// P KV-cache sampling window in seconds for the guard above.
     pub prefill_kv_window_seconds: f64,
+
+    // Warm remote KV reuse (PD disaggregation): a Program turn may read the
+    // source KV that its previous turn left on the same decode engine instead
+    // of recomputing it on P.
+    /// Engine feedback protocol spoken by the warm-read path.
+    pub protocol_revision: String,
+    /// Route a returning turn through the warm remote read when a verified
+    /// candidate exists.
+    pub warm_remote: bool,
+    /// Keep the decode engine local when the source already holds the prefix.
+    pub local_append: bool,
+    /// Only report warm when P KV usage is at least this value (0 = always).
+    pub warm_min_p_kv_usage: f64,
+    /// Only report warm when P running requests are at most this value.
+    pub warm_max_p_running: usize,
+    /// Total prompt-prefix tokens retained across all candidates.
+    pub max_candidate_tokens: usize,
+    /// Candidate-count bound.
+    pub max_candidates: usize,
+    /// Router-side capability identity cache. 0 disables it; a restart at the
+    /// same URL is otherwise re-probed within this window.
+    pub capability_cache_seconds: f64,
+    /// Largest verified prefix that may be published or pulled.
+    pub max_prefix_tokens: usize,
+    /// Bound on the `kv_transfer_params` metadata inspected per message.
+    pub max_metadata_bytes: usize,
+    /// Bound on a buffered non-streaming response body (text, token IDs,
+    /// logprobs). Forwarded bodies are otherwise unbounded; this only limits
+    /// what the Router must hold to inspect a completed response.
+    pub max_response_bytes: usize,
+    /// Safety margin before the source lease expires.
+    pub lease_margin_seconds: f64,
+    /// Local decode requests per target.
+    pub max_local_requests_per_target: usize,
+    /// Local decode miss budget per request.
+    pub local_execution_budget_tokens: usize,
+
+    // Automatic Acting TTL for the retained seat across tool gaps.
+    /// Enable the automatic Acting TTL.
+    pub automatic_ttl: bool,
+    /// Fit the automatic TTL from online rank statistics when no versioned
+    /// calibration table is supplied. Never exceeds the verified source lease.
+    pub ttl_online: bool,
+    /// Wait-cost weight in the TTL solver.
+    pub ttl_gamma: f64,
+    /// Interval samples required before the solver may return a positive TTL.
+    pub ttl_min_samples: usize,
+    /// Minimum utility for a positive TTL.
+    pub ttl_min_gain_seconds: f64,
+    /// Use measured residency probability in TTL keep/drop.
+    pub feedback: bool,
+    /// Offline-calibrated PD cost table (optional).
+    pub calibration: Option<crate::program_scheduling::pd_cost::PdCalibration>,
 }
 
 impl Default for PdProgramSchedulingConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
             kv_events: false,
             kv_hash_mode: "sha256".to_string(),
             max_prefill_requests_per_target: 1,
@@ -164,7 +215,80 @@ impl Default for PdProgramSchedulingConfig {
             exclusive_capacity_accounting: true,
             prefill_kv_high_watermark: 0.85,
             prefill_kv_window_seconds: 10.0,
+            protocol_revision: "vllm-0.28.0-pd-feedback-v1".into(),
+            warm_remote: false,
+            local_append: false,
+            warm_min_p_kv_usage: 0.0,
+            warm_max_p_running: usize::MAX,
+            max_candidate_tokens: 2_097_152,
+            max_candidates: 4096,
+            capability_cache_seconds: 15.0,
+            max_prefix_tokens: 32768,
+            max_metadata_bytes: 262144,
+            max_response_bytes: 8_388_608,
+            lease_margin_seconds: 1.0,
+            max_local_requests_per_target: 1,
+            local_execution_budget_tokens: 512,
+            automatic_ttl: false,
+            ttl_online: false,
+            ttl_gamma: 1.0,
+            ttl_min_samples: 16,
+            ttl_min_gain_seconds: 0.001,
+            feedback: false,
+            calibration: None,
         }
+    }
+}
+
+impl PdProgramSchedulingConfig {
+    /// True when any warm-read or automatic-TTL behavior is requested.
+    pub fn warm_remote_enabled(&self) -> bool {
+        self.warm_remote
+            || self.local_append
+            || self.automatic_ttl
+            || self.feedback
+            || self.ttl_online
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self.protocol_revision != "vllm-0.28.0-pd-feedback-v1"
+            || !(1..=65536).contains(&self.max_candidates)
+            || !(1..=1048576).contains(&self.max_prefix_tokens)
+            || !(1024..=1048576).contains(&self.max_metadata_bytes)
+            || self.max_response_bytes < self.max_metadata_bytes
+            || self.max_response_bytes > 268_435_456
+            || !(1..=128).contains(&self.max_local_requests_per_target)
+            || self.local_execution_budget_tokens == 0
+            || !(2..=10000).contains(&self.ttl_min_samples)
+            || self.max_candidate_tokens < self.max_prefix_tokens
+            || self.max_candidate_tokens > 67_108_864
+            || !self.capability_cache_seconds.is_finite()
+            || !(0.0..=600.0).contains(&self.capability_cache_seconds)
+            || !self.warm_min_p_kv_usage.is_finite()
+            || !(0.0..=1.0).contains(&self.warm_min_p_kv_usage)
+        {
+            return Err("Invalid bounded PD warm-remote configuration or unknown protocol".into());
+        }
+        if !self.lease_margin_seconds.is_finite()
+            || self.lease_margin_seconds < 0.0
+            || self.lease_margin_seconds > 86400.0
+            || !self.ttl_gamma.is_finite()
+            || self.ttl_gamma <= 0.0
+            || !self.ttl_min_gain_seconds.is_finite()
+            || self.ttl_min_gain_seconds < 0.0
+        {
+            return Err("PD warm-remote TTL/lease parameters must be finite".into());
+        }
+        if self.local_append && self.calibration.is_none() {
+            return Err("LocalAppend requires a versioned PD calibration".into());
+        }
+        if self.automatic_ttl && self.calibration.is_none() && !self.ttl_online {
+            return Err("automatic TTL requires a versioned PD calibration or ttl_online".into());
+        }
+        if let Some(c) = &self.calibration {
+            c.validate()?;
+        }
+        Ok(())
     }
 }
 
@@ -1158,9 +1282,7 @@ mod tests {
         assert_eq!(default.pd.prefill_kv_window_seconds, 10.0);
 
         let parsed: ProgramSchedulingConfig =
-            serde_json::from_str(r#"{"pd":{"enabled":true,"exclusive_capacity_accounting":true}}"#)
-                .unwrap();
-        assert!(parsed.pd.enabled);
+            serde_json::from_str(r#"{"pd":{"exclusive_capacity_accounting":true}}"#).unwrap();
         assert!(parsed.pd.exclusive_capacity_accounting);
     }
 

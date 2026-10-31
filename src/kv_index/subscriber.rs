@@ -305,6 +305,11 @@ fn spawn_inner(
                         }
                         // Partial replay can include stores whose later
                         // evictions were lost. Never expose that partial state.
+                        //
+                        // A full or partial replay gap is an unrecoverable
+                        // loss: bump the out-of-band fence so Program warm
+                        // candidates and their leases are dropped as well.
+                        crate::kv_index::record_signal_loss();
                         if with_binding(binding.as_ref(), |_| {
                             indexer.invalidate_source(&source_id, dp_rank);
                         })

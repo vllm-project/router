@@ -651,11 +651,21 @@ impl ConfigValidator {
         if let Some(program) = &config.program_scheduling {
             let pd_mode = matches!(config.mode, RoutingMode::VllmPrefillDecode { .. });
             if (!matches!(config.mode, RoutingMode::Regular { .. }) && !pd_mode)
-                || pd_mode != program.pd.enabled
                 || (pd_mode && config.connection_mode != ConnectionMode::Http)
             {
                 return Err(ConfigError::IncompatibleConfig {
-                    reason: "Program scheduling requires regular HTTP mode, or vLLM PD HTTP mode with pd.enabled=true".to_string(),
+                    reason: "Program scheduling requires regular HTTP mode or vLLM PD HTTP mode"
+                        .to_string(),
+                });
+            }
+            if pd_mode {
+                program
+                    .pd
+                    .validate()
+                    .map_err(|reason| ConfigError::IncompatibleConfig { reason })?;
+            } else if program.pd.warm_remote_enabled() {
+                return Err(ConfigError::IncompatibleConfig {
+                    reason: "warm remote KV reuse and automatic TTL require HTTP PD mode".into(),
                 });
             }
             if pd_mode

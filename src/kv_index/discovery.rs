@@ -183,6 +183,16 @@ impl KvIndexSupervisor {
         (supervisor, signals)
     }
 
+    /// Resolve source-owned feedback to registered URLs, never remote metadata addresses.
+    pub fn worker_urls_for_source(&self, source: &SourceId) -> Vec<String> {
+        self.workers
+            .lock()
+            .iter()
+            .filter(|(_, w)| &w.source_id == source)
+            .map(|(url, _)| url.clone())
+            .collect()
+    }
+
     pub fn hash_mode(&self) -> HashMode {
         self.hash_mode
     }

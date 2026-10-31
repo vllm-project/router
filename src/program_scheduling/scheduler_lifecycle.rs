@@ -51,7 +51,27 @@ impl ProgramScheduler {
         usage: impl Into<ProgramUsageObservation>,
         decode_seconds: Option<f64>,
     ) {
-        let usage = usage.into();
+        self.complete_with_pd_ttl(
+            dispatch,
+            success,
+            terminate,
+            usage.into(),
+            decode_seconds,
+            None,
+        );
+    }
+
+    /// A trusted PD adapter supplies its independently calibrated keep/drop TTL.
+    /// Capacity repair and the existing generation/placement/deadline transaction remain authoritative.
+    pub fn complete_with_pd_ttl(
+        &self,
+        dispatch: &ProgramDispatch,
+        success: bool,
+        terminate: bool,
+        usage: ProgramUsageObservation,
+        decode_seconds: Option<f64>,
+        pd_ttl: Option<std::time::Duration>,
+    ) {
         let now = Instant::now();
         let mut state = self.state.lock();
         let Some(runtime_before) = state.runtime.view(dispatch.program()) else {
@@ -102,13 +122,14 @@ impl ProgramScheduler {
             .unwrap_or(policy_acting_ttl);
         if self.config.pd_mode {
             acting_ttl = if self.config.pd_explicit_ttl {
-                dispatch
-                    .request_hints()
-                    .kv_retention_ttl
+                pd_ttl
+                    .or(dispatch.request_hints().kv_retention_ttl)
                     .unwrap_or_default()
                     .min(self.config.progress_ttl.max_acting_ttl)
             } else {
-                std::time::Duration::ZERO
+                pd_ttl
+                    .unwrap_or_default()
+                    .min(self.config.progress_ttl.max_acting_ttl)
             };
         }
         let ttl_window_samples = state

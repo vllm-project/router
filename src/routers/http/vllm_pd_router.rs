@@ -1044,6 +1044,65 @@ impl VllmPDRouter {
                 "Program decode target left the pool",
             ));
         };
+        if let Some(warm_remote) = &runtime.warm_remote {
+            // The warm-remote protocol has no discovery incarnation fence, and
+            // execute() rejects discovery; keep discovery on the M1 path.
+            if !self.use_discovery && matches!(self.kv_connector, KvConnector::Nixl) {
+                let prefill_workers = self
+                    .pd_router
+                    .worker_registry
+                    .get_prefill_workers()
+                    .into_iter()
+                    .filter(|w| w.is_available())
+                    .collect::<Vec<_>>();
+                let prefills = prefill_workers
+                    .iter()
+                    .map(pd_program_adapter::worker_target)
+                    .collect::<Vec<_>>();
+                let selection = self
+                    .policy_registry
+                    .get_prefill_policy()
+                    .select_worker(&prefill_workers, None);
+                if let Some(index) = selection {
+                    let started = Instant::now();
+                    if let Some(result) = super::pd_warm_remote::execute(
+                        runtime,
+                        warm_remote.clone(),
+                        &self.pd_router.client,
+                        &completion,
+                        &request,
+                        path,
+                        headers,
+                        &prefills,
+                        &decode_targets,
+                        index,
+                        &self.pd_router.pd_load,
+                        prefill_workers[index].clone(),
+                        decode_worker.clone(),
+                    )
+                    .await
+                    {
+                        RouterMetrics::record_pd_request(path);
+                        RouterMetrics::record_pd_request_duration(path, started.elapsed());
+                        return Some(match result {
+                            Ok((response, Some(context))) => {
+                                pd_program_adapter::track_warm_remote_response(
+                                    response, completion, streaming, context,
+                                )
+                            }
+                            Ok((response, None)) => pd_program_adapter::track_forwarded_response(
+                                response, completion, streaming,
+                            ),
+                            Err(error) => {
+                                RouterMetrics::record_pd_error("program_warm_remote");
+                                completion.finish(false);
+                                (StatusCode::SERVICE_UNAVAILABLE, error).into_response()
+                            }
+                        });
+                    }
+                }
+            }
+        }
         let prefill_candidates = self.program_prefill_candidates();
         let selected = self.select_program_prefill(&prefill_candidates, &request, path, headers);
         let Some((prefill_id, prefill_worker)) = selected else {
@@ -2420,14 +2479,18 @@ impl RouterTrait for VllmPDRouter {
             Err(_) => return Response::from_parts(parts, Body::from(bytes)),
         };
         if let Some(object) = value.as_object_mut() {
-            object.insert(
-                "program_scheduling".into(),
-                json!({
-                    "path": "cold_remote",
-                    "warm_enabled": false,
-                    "scheduler": runtime.scheduler.diagnostics(),
-                }),
-            );
+            let mut program = json!({
+                "path": "program_pd",
+                "warm_enabled": runtime
+                    .warm_remote
+                    .as_ref()
+                    .is_some_and(|a| a.config.warm_remote),
+                "scheduler": runtime.scheduler.diagnostics(),
+            });
+            if let Some(warm_remote) = runtime.warm_remote.as_ref() {
+                program["warm_remote"] = warm_remote.diagnostics();
+            }
+            object.insert("program_scheduling".into(), program);
         }
         parts.headers.remove(axum::http::header::CONTENT_LENGTH);
         match serde_json::to_vec(&value) {
