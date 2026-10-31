@@ -140,6 +140,56 @@ steps:
     artifact_paths:
       - "tests/python/e2e/perf/grpc/results/**/*.json"
 
+  # ============================================================================
+  # L3 router_policy AgentX replay — cache_aware / kv_aware / kv_aware_aff @ c16.
+  # 4× vllm-rs + router per cell (~48GiB KV/worker in case JSON) → H100×4, not L4.
+  # Optional: AGENTX_TRACE_JSONL_URL to fetch data/agentx-128-t4.jsonl before pytest.
+  # ============================================================================
+  - label: ":python: router policy perf (c16 × 3 policies)"
+    key: "router-policy-perf-e2e"
+    if: build.env("ROCM_ONLY") != "1"
+    timeout_in_minutes: 240
+    retry:
+      automatic:
+        - exit_status: "*"
+          limit: 1
+      manual:
+        allowed: true
+        reason: "GPU perf cold starts / long replay — retry after checking logs"
+    mirror_hardwares: h100_4
+    depends_on:
+      - "upload-nightly-pipeline"
+      - "image-build"
+    command: |
+      bash <<'BASH'
+      set -euo pipefail
+
+      python -m pip install --no-cache-dir 'agentinfer==0.2.0'
+
+      export ROUTER_BIN="${ROUTER_BIN:-/usr/local/bin/vllm-router}"
+      export MODEL="${MODEL:-Qwen/Qwen3-4B-Instruct-2507}"
+      export VLLM_RS="${VLLM_RS:-$(python -c 'import importlib.util; from pathlib import Path; s=importlib.util.find_spec("vllm"); assert s and s.origin; p=Path(s.origin).resolve().parent/"vllm-rs"; assert p.is_file(); print(p)')}"
+      export AGENTX_RUN_SUFFIX="${AGENTX_RUN_SUFFIX:-$(date -u +%Y%m%d%H%M%S)}"
+      export AGENTX_CELL_GAP_SEC="${AGENTX_CELL_GAP_SEC:-15}"
+      export AGENTX_PORT_SETTLE_SEC="${AGENTX_PORT_SETTLE_SEC:-5}"
+      export AGENTX_PERF_TIMEOUT_SEC="${AGENTX_PERF_TIMEOUT_SEC:-14400}"
+
+      trace="tests/python/e2e/perf/router_policy/data/agentx-128-t4.jsonl"
+      if [[ -n "${AGENTX_TRACE_JSONL_URL:-}" ]]; then
+        mkdir -p "$(dirname "${trace}")"
+        curl -fsSL "${AGENTX_TRACE_JSONL_URL}" -o "${trace}"
+      fi
+      test -f "${trace}"
+
+      python -m pytest -sv tests/python/e2e/perf/router_policy/test_router_policy_scenarios.py -k 'cache_aware/c16'
+      python -m pytest -sv tests/python/e2e/perf/router_policy/test_router_policy_scenarios.py -k 'kv_aware/c16'
+      python -m pytest -sv tests/python/e2e/perf/router_policy/test_router_policy_scenarios.py -k 'kv_aware_aff/c16'
+
+      BASH
+    artifact_paths:
+      - "test-results/router_policy/runs/**/*"
+      - "test-results/router_policy/results/*.json"
+
   # This queue is intentionally separate from the shared amd_mi300_* queues.
   # Those agents run --no-plugins, while this lane needs the Docker plugin
   # to provide the pinned vLLM/MoRI userspace on a two-GPU xGMI host.
