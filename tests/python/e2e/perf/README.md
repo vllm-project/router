@@ -20,7 +20,7 @@ L1 prefix encoding cache (16k, `--shape turns`). The worker stays up through L1 
 
 ```bash
 # MODEL defaults to Qwen/Qwen3-0.6B; set it to a local directory to override
-python -m pytest -sv tests/python/e2e/perf/l1_encode/test_l1_encode.py::test_l1_encode -k "l1on and hit030 and c4"
+python -m pytest -sv tests/python/e2e/perf/l1_encode/test_l1_encode.py::test_l1_encode -k "l1on and hit0.30 and c4"
 ```
 
 Additional perf suites can be added as siblings of `grpc/` without sharing fixtures.

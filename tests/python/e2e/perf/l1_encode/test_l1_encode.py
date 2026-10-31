@@ -7,7 +7,7 @@ the worker and the router both cold-start.
     # optional local snapshot; default is Qwen/Qwen3-0.6B
     # export MODEL=/path/to/Qwen3-0.6B
     pytest -sv tests/python/e2e/perf/l1_encode/test_l1_encode.py::test_l1_encode \\
-        -k "l1on and hit030 and c4"
+        -k "l1on and hit0.30 and c4"
 """
 
 from __future__ import annotations

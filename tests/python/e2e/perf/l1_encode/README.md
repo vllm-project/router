@@ -28,7 +28,7 @@ export VLLM_RS=/path/to/vllm-rs
 # optional: export ROUTER_BIN=$PWD/target/release/vllm-router
 
 python -m pytest -sv tests/python/e2e/perf/l1_encode/test_l1_encode.py::test_l1_encode \
-  -k "l1on and hit030 and c4"
+  -k "l1on and hit0.30 and c4"
 ```
 
 Omit `-k` for the full matrix (L1 on, then L1 off).
@@ -36,22 +36,22 @@ Omit `-k` for the full matrix (L1 on, then L1 off).
 | `-k` | Selects |
 |------|---------|
 | `l1on` / `l1off` | router arm |
-| `hit030` | hit rate 0.30 |
-| `hit99999` | hit rate 0.99999 |
-| `hit0-` | hit rate 0 (`hit0` also matches `hit030`) |
+| `hit0.30` | hit rate 0.30 |
+| `hit0.99999` | hit rate 0.99999 |
+| `hit0-` | hit rate 0 (`hit0` also matches `hit0.30` and `hit0.99999`) |
 | `c1-` / `c4` / `c8` / `c16` | concurrency (`c1` also matches `c16`) |
 
 Examples:
 
 ```bash
 python -m pytest -sv tests/python/e2e/perf/l1_encode/test_l1_encode.py::test_l1_encode \
-  -k "l1off and hit99999 and c1"
+  -k "l1off and hit0.99999 and c1"
 
 python -m pytest -sv tests/python/e2e/perf/l1_encode/test_l1_encode.py::test_l1_encode \
   -k "hit0- and c4"
 ```
 
-Node ids look like `l1on-hit030-c4-r8`.
+Node ids look like `l1on-hit0.30-c4-r8`.
 
 ## What one session does
 

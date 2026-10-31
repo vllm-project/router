@@ -6,15 +6,15 @@ from typing import Any
 
 
 def hit_tag(hit_rate: float) -> str:
-    """Node-id fragment. ``hit0-`` is not a substring of ``hit030``."""
+    """Node-id fragment. The number is the configured hit rate, decimal kept.
+
+    ``hit0-`` selects rate 0. ``hit0`` also matches ``hit0.30`` and ``hit0.99999``.
+    """
     if hit_rate <= 0.0:
         return "0"
-    if abs(hit_rate - 0.3) < 1e-9:
-        return "030"
-    if abs(hit_rate - 0.99999) < 1e-8:
-        return "99999"
-    text = f"{hit_rate:.5f}".rstrip("0").rstrip(".")
-    return text.replace(".", "")
+    if hit_rate >= 0.99:
+        return f"{hit_rate:.5f}".rstrip("0").rstrip(".")
+    return f"{hit_rate:.2f}"
 
 
 def wave_id(l1_on: bool, hit_rate: float, concurrency: int, requests: int) -> str:
