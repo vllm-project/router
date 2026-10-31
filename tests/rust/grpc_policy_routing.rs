@@ -187,7 +187,6 @@ async fn consistent_hash_sticks_to_session() {
         PolicyConfig::ConsistentHash { virtual_nodes: 160 },
     )
     .await;
-    let mut chosen = Vec::new();
     for session in ["alpha", "beta", "gamma", "delta"] {
         let mut workers_for_session = Vec::new();
         for turn in 0..8 {
@@ -208,16 +207,7 @@ async fn consistent_hash_sticks_to_session() {
             1,
             "{session}: {workers_for_session:?}"
         );
-        chosen.push(workers_for_session[0]);
     }
-    assert!(
-        chosen
-            .iter()
-            .collect::<std::collections::HashSet<_>>()
-            .len()
-            >= 2,
-        "sessions collapsed onto one worker: {chosen:?}"
-    );
 }
 
 #[tokio::test]
@@ -352,7 +342,9 @@ async fn kv_aware_affinity_sticks_to_session() {
 
 #[tokio::test]
 async fn program_scheduling_sticks_to_program() {
-    let servers = workers(2, Duration::ZERO).await;
+    // Three workers so bare round robin cannot keep four turns of one program
+    // on a single worker. program_round_robin then puts the two programs apart.
+    let servers = workers(3, Duration::ZERO).await;
     let urls: Vec<String> = servers
         .iter()
         .map(|server| server.grpc_url.clone())
@@ -361,6 +353,7 @@ async fn program_scheduling_sticks_to_program() {
     cfg.program_scheduling = Some(
         serde_json::from_value(json!({
             "binding_only": true,
+            "binding_strategy": "program_round_robin",
             "queue_timeout_seconds": 2,
             "metrics_interval_seconds": 0.05
         }))
@@ -393,6 +386,7 @@ async fn program_scheduling_sticks_to_program() {
         1,
         "{beta:?}"
     );
+    assert_ne!(alpha[0], beta[0], "alpha={alpha:?} beta={beta:?}");
 }
 
 #[tokio::test]

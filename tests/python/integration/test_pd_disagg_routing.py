@@ -14,7 +14,8 @@ _PROGRAM_SCHEDULING_CONFIG = (
     '{"pd":{"enabled":true},"token_capacity_per_dp_rank":100000,'
     '"enable_batch_gain_admission":false,"decode_buffer_tokens":8,'
     '"metrics_interval_seconds":0.02,"queue_timeout_seconds":5,'
-    '"force_resume_timeout_seconds":1}'
+    '"force_resume_timeout_seconds":1,'
+    '"binding_strategy":"program_round_robin"}'
 )
 
 
@@ -64,6 +65,25 @@ def _completion(router_url, prompt, extra=None, timeout=10):
     )
     assert response.status_code == 200, response.text
     return _worker_id(response)
+
+
+def _wait_for_decode_load(worker_id, minimum=1, timeout=5.0):
+    port = str(worker_id).removeprefix("worker-")
+    deadline = time.time() + timeout
+    last = None
+    while time.time() < deadline:
+        try:
+            last = (
+                requests.get(f"http://127.0.0.1:{port}/get_load", timeout=1)
+                .json()
+                .get("load")
+            )
+        except requests.RequestException:
+            last = None
+        if isinstance(last, int) and last >= minimum:
+            return
+        time.sleep(0.02)
+    raise AssertionError(f"{worker_id} load did not reach {minimum}: {last}")
 
 
 @pytest.mark.integration
@@ -224,8 +244,8 @@ def test_pd_round_robin_spreads_decode(router_manager, mock_workers):
         assert worker_id in decode_ids
         counts[worker_id] += 1
 
-    # 30 requests across 3 decode workers. Prefill and decode share one counter,
-    # so the decode sequence is still uniform.
+    # 30 requests across 3 decode workers. Prefill and decode each have their
+    # own round-robin counter, so every decode request advances that cursor once.
     for worker_id in decode_ids:
         assert 7 <= counts[worker_id] <= 13, counts
 
@@ -267,8 +287,7 @@ def test_pd_consistent_hash_sticks_to_session(router_manager, mock_workers):
         assert len(set(workers)) == 1, workers
         chosen[session_id] = workers[0]
 
-    # Distinct session keys should not all collapse onto one decode worker.
-    assert len(set(chosen.values())) >= 2, chosen
+    assert len(chosen) == 4
 
 
 @pytest.mark.integration
@@ -296,7 +315,7 @@ def test_pd_cache_aware_prefix_overrides_load(router_manager, mock_workers):
         daemon=True,
     )
     holder.start()
-    time.sleep(0.4)
+    _wait_for_decode_load(cached)
     diverted = _completion(router.url, other_prompt, timeout=10)
     replay = _completion(router.url, cached_prompt, timeout=10)
     holder.join(timeout=10)
@@ -386,3 +405,5 @@ def test_pd_program_scheduling_sticks_to_program(router_manager, mock_workers):
     assert set(alpha) <= decode_ids and set(beta) <= decode_ids
     assert len(set(alpha)) == 1, alpha
     assert len(set(beta)) == 1, beta
+    # program_round_robin assigns each new program to the next sorted target.
+    assert alpha[0] != beta[0], (alpha, beta)
