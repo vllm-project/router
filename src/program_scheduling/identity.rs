@@ -75,6 +75,39 @@ pub struct ProgramIdentity {
 }
 
 impl ProgramIdentity {
+    /// Cheap conservative gate for typed requests before serializing the body.
+    /// The full parser still validates any metadata that passes this gate.
+    pub(crate) fn may_be_enabled(
+        headers: Option<&HeaderMap>,
+        other: &JsonMap<String, JsonValue>,
+        enable_key: ProgramSchedulingEnableKey,
+    ) -> bool {
+        if other.contains_key("vllm_xargs") {
+            return true;
+        }
+        enable_key == ProgramSchedulingEnableKey::Auto
+            && (other.contains_key("agent_hint")
+                || headers.is_some_and(|headers| {
+                    [
+                        CLAUDE_SESSION_HEADER,
+                        CODEX_SESSION_HEADER,
+                        GENERIC_SESSION_HEADER,
+                    ]
+                    .iter()
+                    .any(|name| headers.contains_key(*name))
+                }))
+    }
+
+    /// Reserve at least the wire output limit, regardless of a smaller hint.
+    pub(crate) fn reserve_pd_output(&mut self, wire_limit: usize) {
+        self.request_hints.expected_output_tokens = Some(
+            self.request_hints
+                .expected_output_tokens
+                .unwrap_or(0)
+                .max(wire_limit),
+        );
+    }
+
     pub(crate) fn for_rebinding(
         reference: &super::ProgramRef,
         placement_hash_key: String,
@@ -895,5 +928,58 @@ mod tests {
         )
         .unwrap()
         .is_some());
+    }
+
+    #[test]
+    fn typed_program_gate_keeps_plain_requests_out_and_all_identity_sources_in() {
+        let mut other = JsonMap::new();
+        let mut headers = HeaderMap::new();
+        assert!(!ProgramIdentity::may_be_enabled(
+            None,
+            &other,
+            ProgramSchedulingEnableKey::AgenticContext,
+        ));
+        assert!(!ProgramIdentity::may_be_enabled(
+            None,
+            &other,
+            ProgramSchedulingEnableKey::Auto,
+        ));
+
+        headers.insert(CLAUDE_AGENT_HEADER, "agent-a".parse().unwrap());
+        assert!(!ProgramIdentity::may_be_enabled(
+            Some(&headers),
+            &other,
+            ProgramSchedulingEnableKey::Auto,
+        ));
+        headers.insert(CLAUDE_SESSION_HEADER, "session-a".parse().unwrap());
+        assert!(ProgramIdentity::may_be_enabled(
+            Some(&headers),
+            &other,
+            ProgramSchedulingEnableKey::Auto,
+        ));
+        assert!(!ProgramIdentity::may_be_enabled(
+            Some(&headers),
+            &other,
+            ProgramSchedulingEnableKey::AgenticContext,
+        ));
+
+        other.insert("agent_hint".into(), JsonValue::Null);
+        assert!(ProgramIdentity::may_be_enabled(
+            None,
+            &other,
+            ProgramSchedulingEnableKey::Auto,
+        ));
+        assert!(!ProgramIdentity::may_be_enabled(
+            None,
+            &other,
+            ProgramSchedulingEnableKey::AgenticContext,
+        ));
+
+        other.insert("vllm_xargs".into(), JsonValue::String("invalid".into()));
+        assert!(ProgramIdentity::may_be_enabled(
+            None,
+            &other,
+            ProgramSchedulingEnableKey::AgenticContext,
+        ));
     }
 }

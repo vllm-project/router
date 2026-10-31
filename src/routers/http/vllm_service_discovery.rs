@@ -450,6 +450,72 @@ impl ServiceRegistry {
             .collect()
     }
 
+    /// All registered endpoints of one service type as `(http_address, zmq_address)`.
+    /// Program scheduling only needs the endpoints; DP sizes stay available
+    /// through `get_instance_snapshots` and `get_reported_dp_size`.
+    pub fn get_prefill_instances(&self) -> Vec<(String, String)> {
+        Self::instance_pairs(self.get_instance_snapshots(ServiceType::Prefill))
+    }
+
+    /// All registered decode endpoints as `(http_address, zmq_address)`.
+    pub fn get_decode_instances(&self) -> Vec<(String, String)> {
+        Self::instance_pairs(self.get_instance_snapshots(ServiceType::Decode))
+    }
+
+    fn instance_pairs(snapshots: Vec<(String, String, Option<usize>)>) -> Vec<(String, String)> {
+        snapshots
+            .into_iter()
+            .map(|(http, zmq, _)| (http, zmq))
+            .collect()
+    }
+
+    /// DP size the registration supplied, if any. Distinguishes an explicit
+    /// `dp_size=1` from an unreported size so callers fall back to the router
+    /// configuration only when the engine said nothing.
+    pub fn get_reported_dp_size(
+        &self,
+        http_address: &str,
+        service_type: ServiceType,
+    ) -> Option<usize> {
+        let instances = match service_type {
+            ServiceType::Prefill => &self.prefill_instances,
+            ServiceType::Decode => &self.decode_instances,
+        };
+        let guard = instances.lock().unwrap();
+        guard.get(http_address).and_then(|i| i.dp_size)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn register_test_instance(
+        &self,
+        http_address: String,
+        zmq_address: String,
+        service_type: ServiceType,
+        tp_size: usize,
+        dp_size: Option<usize>,
+    ) {
+        let instance = ServiceInstance {
+            zmq_address,
+            expires_at: u64::MAX,
+            tp_size,
+            dp_size,
+        };
+        match service_type {
+            ServiceType::Prefill => {
+                self.prefill_instances
+                    .lock()
+                    .unwrap()
+                    .insert(http_address, instance);
+            }
+            ServiceType::Decode => {
+                self.decode_instances
+                    .lock()
+                    .unwrap()
+                    .insert(http_address, instance);
+            }
+        }
+    }
+
     /// Get ZMQ address for a given HTTP address
     pub fn get_zmq_address(&self, http_address: &str, service_type: ServiceType) -> Option<String> {
         let instances = match service_type {

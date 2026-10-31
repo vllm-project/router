@@ -158,14 +158,15 @@ impl ConfigValidator {
                 reason: "Must be finite and > 0".to_string(),
             });
         }
+        // Zero admission bounds mean "auto" and are resolved from the P permit
+        // count when the scheduler is built, so they are valid here.
         if config.hash_virtual_nodes == 0
-            || config.max_active_programs_per_target == 0
             || config.stats_window_size == 0
             || config.max_segment_rounds == 0
             || config.token_capacity_per_dp_rank == Some(0)
         {
             return Err(ConfigError::ValidationFailed {
-                reason: "Program scheduling counts and configured token capacity must be > 0"
+                reason: "Program scheduling counts and configured token capacity must be > 0; zero admission bounds mean auto sizing"
                     .to_string(),
             });
         }
@@ -647,13 +648,40 @@ impl ConfigValidator {
 
     /// Validate compatibility between different configuration sections
     fn validate_compatibility(config: &RouterConfig) -> ConfigResult<()> {
-        if config.program_scheduling.is_some()
-            && !matches!(config.mode, RoutingMode::Regular { .. })
-        {
-            return Err(ConfigError::IncompatibleConfig {
-                reason: "Program scheduling currently requires regular HTTP routing mode"
-                    .to_string(),
-            });
+        if let Some(program) = &config.program_scheduling {
+            let pd_mode = matches!(config.mode, RoutingMode::VllmPrefillDecode { .. });
+            if (!matches!(config.mode, RoutingMode::Regular { .. }) && !pd_mode)
+                || pd_mode != program.pd.enabled
+                || (pd_mode && config.connection_mode != ConnectionMode::Http)
+            {
+                return Err(ConfigError::IncompatibleConfig {
+                    reason: "Program scheduling requires regular HTTP mode, or vLLM PD HTTP mode with pd.enabled=true".to_string(),
+                });
+            }
+            if pd_mode
+                && (!(0.0..=1.0).contains(&program.pd.prefill_kv_high_watermark)
+                    || program.pd.prefill_kv_window_seconds <= 0.0
+                    || !program.pd.prefill_kv_window_seconds.is_finite())
+            {
+                return Err(ConfigError::IncompatibleConfig {
+                    reason: "PD prefill_kv_high_watermark must be within [0, 1] and prefill_kv_window_seconds must be finite and > 0; a zero watermark disables the guard".to_string(),
+                });
+            }
+            if pd_mode
+                && (program.binding_only
+                    || program.enable_batch_gain_admission
+                    || program.token_capacity_per_dp_rank.is_none()
+                    || program.pd.max_prefill_requests_per_target == 0
+                    || program.pd.max_prefill_requests_per_target > u32::MAX as usize
+                    || !matches!(
+                        program.pd.kv_hash_mode.as_str(),
+                        "sha256" | "python_hash_seed" | "xxhash_cbor"
+                    ))
+            {
+                return Err(ConfigError::IncompatibleConfig {
+                    reason: "PD scheduling requires per-rank capacity, positive bounded P concurrency and a known KV hash mode; binding_only and uncalibrated batch gain are unsupported".to_string(),
+                });
+            }
         }
         // IGW mode is independent - skip other compatibility checks when enabled
         if config.enable_igw {
