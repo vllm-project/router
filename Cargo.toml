@@ -100,6 +100,8 @@ async-channel = "2"
 tonic = { version = "0.14", features = ["transport"] }
 tonic-health = "0.14"
 vllm-proto = "0.2"
+# `kv_transfer_params` is a protobuf `Struct`.
+prost-types = "0.14"
 # Rust crates in the vLLM tree (not pip). Unpublished on crates.io; Cargo
 # finds the package by name under rust/src/. Override with a path patch
 # to a local checkout if you already have the rust workspace.
@@ -189,6 +191,10 @@ path = "tests/rust/grpc_frontend_l0.rs"
 [[test]]
 name = "grpc_frontend_l1"
 path = "tests/rust/grpc_frontend_l1.rs"
+
+[[test]]
+name = "grpc_pd_routing"
+path = "tests/rust/grpc_pd_routing.rs"
 
 [[test]]
 name = "grpc_vs_http_e2e"

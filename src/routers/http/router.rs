@@ -49,7 +49,7 @@ use std::time::{Duration, Instant};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, error, info, warn};
 
-fn prepare_error_status(error: &PrepareError) -> StatusCode {
+pub(super) fn prepare_error_status(error: &PrepareError) -> StatusCode {
     match error {
         PrepareError::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
         PrepareError::Invalid(_) => StatusCode::BAD_REQUEST,
@@ -104,12 +104,12 @@ struct RequestLoadState {
 /// Owns an admitted attempt across dispatch and response consumption. Any
 /// cancellation or completion releases the shared counters exactly once.
 #[derive(Clone)]
-struct RequestLoadGuard {
+pub(super) struct RequestLoadGuard {
     state: Arc<RequestLoadState>,
 }
 
 impl RequestLoadGuard {
-    fn new(worker: Option<Arc<dyn Worker>>, kv_slot: Option<KvRequestSlot>) -> Self {
+    pub(super) fn new(worker: Option<Arc<dyn Worker>>, kv_slot: Option<KvRequestSlot>) -> Self {
         Self {
             state: Arc::new(RequestLoadState {
                 worker,
@@ -213,7 +213,12 @@ fn hold_load_until_body_done(
     hold_request_load_until_body_done(response, RequestLoadGuard::new(Some(worker), kv_slot))
 }
 
-fn hold_request_load_until_body_done(mut response: Response, load: RequestLoadGuard) -> Response {
+/// Keeps `load` until the body ends or is dropped. A dropped body also aborts
+/// the gRPC producer, which cancels the RPC instead of waiting for its next output.
+pub(super) fn hold_request_load_until_body_done(
+    mut response: Response,
+    load: RequestLoadGuard,
+) -> Response {
     let task = response
         .extensions_mut()
         .remove::<crate::backend::grpc::GrpcStreamTask>();

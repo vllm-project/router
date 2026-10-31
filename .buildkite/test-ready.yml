@@ -123,3 +123,34 @@ steps:
       - "image-build"
     artifact_paths:
       - "/tmp/router.log"
+
+  # ============================================================================
+  # L1 Rust gRPC P/D smoke — chat only on EKS l4-k8s (4x L4). gRPC P/D
+  # returns 400 for /v1/completions. Full GSM8K is test-nightly.yml.
+  # ============================================================================
+  - label: ":satellite: gRPC P/D Disaggregation Smoke (4 GPUs)"
+    key: "grpc-pd-disagg-smoke"
+    if: build.env("ROCM_ONLY") != "1"
+    timeout_in_minutes: 60
+    retry:
+      automatic:
+        - exit_status: "*"
+          limit: 2
+      manual:
+        allowed: true
+        reason: "GPU tests can be flaky - retry if needed"
+    mirror_hardwares: l4_4
+    command: |
+      bash <<'BASH'
+      set -euo pipefail
+      export RUN_LM_EVAL=0
+      export NUM_REQUESTS=4
+      export NUM_STREAMING_REQUESTS=1
+      export LOG_DIR=/tmp/vllm-router-grpc-pd
+      pytest tests/python/integration/test_grpc_pd_disagg.py -v -m "ready and L4 and cards_4"
+      BASH
+    depends_on:
+      - "upload-ready-pipeline"
+      - "image-build"
+    artifact_paths:
+      - "/tmp/vllm-router-grpc-pd/*.log"

@@ -244,7 +244,7 @@ Trees are trimmed to `max_tree_size` during periodic eviction and may grow beyon
 
 ## KV Aware
 
-`kv_aware` uses KV cache reuse and worker load to route requests. It suits workloads with repeated prompt prefixes and supports HTTP, [gRPC](../backend/grpc.md), and HTTP P/D disaggregation.
+`kv_aware` uses KV cache reuse and worker load to route requests. It suits workloads with repeated prompt prefixes and supports HTTP, [gRPC](../backend/grpc.md), and P/D disaggregation over HTTP or gRPC.
 
 ```bash
 vllm-router --policy kv_aware \
@@ -338,3 +338,8 @@ vllm-router \
 This allows optimizing each stage independently:
 - **Prefill**: Use `consistent_hash` for cache locality
 - **Decode**: Inherits the main policy; override with `--decode-policy` (for example `round_robin`)
+
+`grpc://` prefill and decode workers must run vLLM ≥ 0.30.0. The router
+warns at startup when a worker reports an older `engine_version`, and
+`power_of_two` uses the router's local load counts for them. See
+[gRPC P/D disaggregation](../backend/grpc.md#pd-disaggregation).

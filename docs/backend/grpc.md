@@ -200,6 +200,40 @@ Multimodal content also currently returns 400 on the gRPC path. The proto has
 chat content. Supporting it requires mapping OpenAI image/media parts into the
 proto media fields and adding parity tests against vLLM HTTP behavior.
 
+## P/D Disaggregation
+
+`--vllm-pd-disaggregation` accepts all-`grpc://` prefill and decode pools.
+The router sends P a unary one-token `Generate` and D a `GenerateStream`, both
+carrying the connector's JSON in `GenerateRequest.kv.kv_transfer_params`.
+P's `FinishInfo.kv_transfer_params` is handed to D. NIXL push mode runs both
+legs concurrently once P's push identity is cached.
+
+**P/D workers must run vLLM ≥ 0.30.0.** v0.29.x passes integer connector
+fields such as ports to the engine as floats, so every decode finishes
+`abort` with no tokens. Those workers still pass the gRPC health probe.
+At startup the router reads each gRPC P/D worker's `engine_version` and
+warns when it is older than 0.30.0. Colocated gRPC serving works on v0.29.
+
+A P or D leg that finishes `abort` fails the request. A streaming decode that
+fails after its stream opened still counts as a decode error. When a leg is
+dropped before it finishes, for example on client disconnect or a failed
+sibling leg, the router sends that worker `Control.Abort` for the engine
+request id, and repeats it once shortly after if the worker had not yet
+answered the RPC.
+
+The info endpoints behave as in colocated gRPC mode: `/v1/models`,
+`/get_model_info`, and `/get_server_info` are answered from the first prefill
+worker's gRPC control service, and `/health_generate` returns `501`.
+`/flush_cache` also returns `501`, because vLLM's gRPC control service has no
+cache reset. `power_of_two` uses the router's own in-flight counts, since
+`grpc://` workers serve no HTTP `/get_load`.
+
+`--prefill-policy kv_aware` and `cache_aware` score the token ids the router
+sends P, so gRPC P/D needs no HTTP `/tokenize`. KV event sources come from
+each prefill's `Control.GetKvEventSources`, or from
+`--pd-kv-events grpc://prefill:50051=tcp://prefill:5557` when the worker does
+not report them.
+
 ## Backend Modules
 
 | File | Role |

@@ -1,8 +1,9 @@
 //! OpenAI chat fields → `vllm-proto` `GenerateRequest`.
 //!
-//! This version always sets `prompt = TokenIds`. Proto also has text /
-//! `media` / KV-transfer fields; they are unused here. Sampling-default
-//! merge still lives in worker `vllm-text`; this only fills proto.
+//! This version always sets `prompt = TokenIds`. Proto also has text and
+//! `media` fields; they are unused here. KV-transfer fields are set only by
+//! the P/D router. Sampling-default merge still lives in worker `vllm-text`;
+//! this only fills proto.
 
 use crate::backend::pb;
 use crate::protocols::spec::{
@@ -312,6 +313,90 @@ fn other_i32(request: &ChatCompletionRequest, key: &str) -> Result<Option<i32>, 
         .transpose()
 }
 
+/// Turn a chat request into the prefill leg of a P/D pair: one sampled token,
+/// with the connector's `kv_transfer_params`.
+pub fn limit_to_prefill(proto: &mut pb::GenerateRequest) {
+    let stopping = proto.stopping.get_or_insert_with(Default::default);
+    stopping.max_new_tokens = 1;
+    stopping.min_new_tokens = 1;
+}
+
+pub fn set_kv_transfer_params(
+    proto: &mut pb::GenerateRequest,
+    params: &serde_json::Value,
+) -> Result<(), String> {
+    proto
+        .kv
+        .get_or_insert_with(Default::default)
+        .kv_transfer_params = Some(json_to_proto_struct(params)?);
+    Ok(())
+}
+
+/// protobuf `Struct` numbers are `f64`; integers above 2^53 lose precision.
+pub fn json_to_proto_struct(value: &serde_json::Value) -> Result<prost_types::Struct, String> {
+    match json_to_proto_value(value).kind {
+        Some(prost_types::value::Kind::StructValue(fields)) => Ok(fields),
+        _ => Err("kv_transfer_params must be a JSON object".to_string()),
+    }
+}
+
+fn json_to_proto_value(value: &serde_json::Value) -> prost_types::Value {
+    use prost_types::value::Kind;
+    use serde_json::Value;
+
+    let kind = match value {
+        Value::Null => Kind::NullValue(prost_types::NullValue::NullValue as i32),
+        Value::Bool(value) => Kind::BoolValue(*value),
+        Value::Number(value) => Kind::NumberValue(value.as_f64().unwrap_or_default()),
+        Value::String(value) => Kind::StringValue(value.clone()),
+        Value::Array(items) => Kind::ListValue(prost_types::ListValue {
+            values: items.iter().map(json_to_proto_value).collect(),
+        }),
+        Value::Object(map) => Kind::StructValue(prost_types::Struct {
+            fields: map
+                .iter()
+                .map(|(key, value)| (key.clone(), json_to_proto_value(value)))
+                .collect(),
+        }),
+    };
+    prost_types::Value { kind: Some(kind) }
+}
+
+/// Whole numbers come back as JSON integers, so block ids and ports keep the
+/// shape the HTTP connector JSON uses.
+pub fn proto_struct_to_json(value: &prost_types::Struct) -> serde_json::Value {
+    serde_json::Value::Object(
+        value
+            .fields
+            .iter()
+            .map(|(key, value)| (key.clone(), proto_value_to_json(value)))
+            .collect(),
+    )
+}
+
+fn proto_value_to_json(value: &prost_types::Value) -> serde_json::Value {
+    use prost_types::value::Kind;
+    use serde_json::Value;
+
+    const MAX_EXACT_INTEGER: f64 = 9_007_199_254_740_992.0;
+    match &value.kind {
+        None | Some(Kind::NullValue(_)) => Value::Null,
+        Some(Kind::BoolValue(value)) => Value::Bool(*value),
+        Some(Kind::NumberValue(value)) => {
+            if value.fract() == 0.0 && value.abs() <= MAX_EXACT_INTEGER {
+                Value::from(*value as i64)
+            } else {
+                serde_json::Number::from_f64(*value).map_or(Value::Null, Value::Number)
+            }
+        }
+        Some(Kind::StringValue(value)) => Value::String(value.clone()),
+        Some(Kind::ListValue(list)) => {
+            Value::Array(list.values.iter().map(proto_value_to_json).collect())
+        }
+        Some(Kind::StructValue(fields)) => proto_struct_to_json(fields),
+    }
+}
+
 /// A `/v1/completions` request lowered onto the gRPC pipeline.
 #[derive(Debug)]
 pub struct PreparedCompletion {
@@ -599,6 +684,42 @@ mod tests {
         }));
         let proto = chat_to_generate_request(&visible, vec![1], "r".into()).unwrap();
         assert_eq!(proto.response.unwrap().output_text, Some(false));
+    }
+
+    #[test]
+    fn kv_transfer_params_round_trip_through_proto_struct() {
+        let params = serde_json::json!({
+            "do_remote_prefill": true,
+            "do_remote_decode": false,
+            "remote_block_ids": [[7, 8], [9]],
+            "remote_engine_id": "P",
+            "remote_port": 5600,
+            "remote_host": null,
+            "ratio": 0.5,
+        });
+        let proto = json_to_proto_struct(&params).unwrap();
+        assert_eq!(proto_struct_to_json(&proto), params);
+        assert!(json_to_proto_struct(&serde_json::json!([1])).is_err());
+    }
+
+    #[test]
+    fn prefill_leg_samples_one_token_and_carries_kv_params() {
+        let req = chat(serde_json::json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 64,
+            "cache_salt": "salt"
+        }));
+        let mut proto = chat_to_generate_request(&req, vec![1, 2], "r".into()).unwrap();
+        limit_to_prefill(&mut proto);
+        set_kv_transfer_params(&mut proto, &serde_json::json!({"do_remote_decode": true})).unwrap();
+        let stopping = proto.stopping.unwrap();
+        assert_eq!((stopping.max_new_tokens, stopping.min_new_tokens), (1, 1));
+        let kv = proto.kv.unwrap();
+        assert_eq!(kv.cache_salt, "salt");
+        assert_eq!(
+            proto_struct_to_json(kv.kv_transfer_params.as_ref().unwrap()),
+            serde_json::json!({"do_remote_decode": true})
+        );
     }
 
     fn completion(json: serde_json::Value) -> CompletionRequest {

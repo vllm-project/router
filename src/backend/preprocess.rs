@@ -66,23 +66,7 @@ fn token_prompts(value: &serde_json::Value) -> Result<Arc<[Vec<u32>]>, &'static 
 }
 
 fn http_kv_input(body: &serde_json::Value, route: &str) -> Result<HttpKvInput, &'static str> {
-    // The event index cannot identify multimodal/embedding or prompt-adapter
-    // cache keys from token IDs alone. HTTP adapter names also need an explicit
-    // mapping to the names carried by KV events before they can earn credit.
-    for field in [
-        "features",
-        "prompt_embeds",
-        "input_embeds",
-        "input_embeddings",
-        "multi_modal_data",
-        "lora_path",
-        "lora_name",
-        "prompt_adapter_request",
-    ] {
-        if body.get(field).is_some_and(|value| !value.is_null()) {
-            return Err("unsupported_cache_identity");
-        }
-    }
+    unsupported_cache_identity(body)?;
     if let Some(messages) = body.get("messages").and_then(serde_json::Value::as_array) {
         for message in messages {
             if let Some(parts) = message.get("content").and_then(serde_json::Value::as_array) {
@@ -143,9 +127,45 @@ fn http_kv_input(body: &serde_json::Value, route: &str) -> Result<HttpKvInput, &
 }
 
 /// Backend-effective prompts, shared by colocated and PD routing policies.
+#[derive(Clone)]
 pub(crate) struct HttpTokenInput {
     pub prompts: Arc<[Vec<u32>]>,
     pub source: &'static str,
+}
+
+/// The event index cannot identify multimodal/embedding or prompt-adapter
+/// cache keys from token IDs alone. Adapter names also need an explicit
+/// mapping to the names carried by KV events before they can earn credit.
+fn unsupported_cache_identity(body: &serde_json::Value) -> Result<(), &'static str> {
+    for field in [
+        "features",
+        "prompt_embeds",
+        "input_embeds",
+        "input_embeddings",
+        "multi_modal_data",
+        "lora_path",
+        "lora_name",
+        "prompt_adapter_request",
+    ] {
+        if body.get(field).is_some_and(|value| !value.is_null()) {
+            return Err("unsupported_cache_identity");
+        }
+    }
+    Ok(())
+}
+
+/// The router's own token ids for `grpc://` pools, which take token ids and
+/// serve no `/tokenize`. Every backend gets the same ids it will be sent.
+pub(crate) fn router_token_inputs(
+    urls: impl IntoIterator<Item = String>,
+    body: &serde_json::Value,
+    prompts: &Arc<[Vec<u32>]>,
+) -> std::collections::HashMap<String, Result<HttpTokenInput, &'static str>> {
+    let input = unsupported_cache_identity(body).map(|()| HttpTokenInput {
+        prompts: prompts.clone(),
+        source: "prepared",
+    });
+    urls.into_iter().map(|url| (url, input.clone())).collect()
 }
 
 pub(crate) async fn prepare_http_token_inputs(
@@ -877,6 +897,26 @@ fn user_content_text(content: &UserMessageContent) -> Result<String> {
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
+    #[test]
+    fn router_tokens_refuse_adapter_cache_identities() {
+        use super::router_token_inputs;
+        use serde_json::json;
+        let prompts: std::sync::Arc<[Vec<u32>]> = std::sync::Arc::from([vec![1, 2, 3]]);
+        let urls = || ["grpc://p0:50051".to_string(), "grpc://p1:50051".to_string()];
+        let base = json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]});
+        let inputs = router_token_inputs(urls(), &base, &prompts);
+        assert_eq!(inputs.len(), 2);
+        for input in inputs.values() {
+            let input = input.as_ref().unwrap();
+            assert_eq!((&*input.prompts, input.source), (&*prompts, "prepared"));
+        }
+        let mut lora = base;
+        lora["lora_name"] = json!("adapter");
+        for input in router_token_inputs(urls(), &lora, &prompts).values() {
+            assert_eq!(input.as_ref().err(), Some(&"unsupported_cache_identity"));
+        }
+    }
+
     #[tokio::test]
     async fn shared_http_preparation_retains_good_workers_and_exact_tool_payloads() {
         use super::prepare_http_token_inputs;

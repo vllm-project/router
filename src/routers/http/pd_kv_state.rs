@@ -1,7 +1,7 @@
 //! P/D prefill KV discovery, refresh, and request-input preparation.
 
 use super::pd_types::PdPrefillInput;
-use crate::backend::preprocess::prepare_http_token_inputs;
+use crate::backend::preprocess::{prepare_http_token_inputs, router_token_inputs};
 use crate::core::Worker;
 use crate::kv_index::discovery::{worker_get, WorkerDiscovery};
 use crate::kv_index::{HashMode, KvIndexSupervisor, WorkerKvInfo};
@@ -369,6 +369,22 @@ impl PdKvState {
         let mut sources: Vec<_> = sources.iter().collect();
         sources.sort_by(|left, right| left.0.cmp(right.0));
         let signature = format!("{info:?}:{sources:?}");
+        // gRPC workers serve no HTTP /v1/models; Control.GetModelInfo names
+        // the served model, including for statically configured sources.
+        if crate::backend::is_grpc_url(base) {
+            let base_models = crate::backend::control::get_grpc_model_info(base, CONTROL_TIMEOUT)
+                .await
+                .ok()
+                .map(|info| info.model_id)
+                .filter(|model| !model.trim().is_empty())
+                .into_iter()
+                .collect();
+            return Ok(Discovery {
+                signature,
+                base_models,
+                worker,
+            });
+        }
         let models_request = worker_get(
             &self.client,
             &format!("{}/v1/models", base.trim_end_matches('/')),
@@ -394,6 +410,8 @@ impl PdKvState {
         })
     }
 
+    /// `router_prompts` are the router's own token ids for `grpc://` pools;
+    /// HTTP pools pass `None` and render through each backend.
     pub(super) async fn prepare(
         &self,
         workers: &[Arc<dyn Worker>],
@@ -401,6 +419,7 @@ impl PdKvState {
         request: &Value,
         route: &str,
         headers: Option<&HeaderMap>,
+        router_prompts: Option<&Arc<[Vec<u32>]>>,
     ) -> HashMap<String, PdPrefillInput> {
         let started = Instant::now();
         *self.refresh_inputs.lock().await = RefreshInputs {
@@ -429,16 +448,21 @@ impl PdKvState {
                 (base.clone(), allowed)
             })
             .collect();
-        let results = prepare_http_token_inputs(
-            &self.client,
-            bases,
-            request,
-            route,
-            headers,
-            self.api_key.as_deref(),
-            Duration::from_secs(1),
-        )
-        .await;
+        let results = match router_prompts {
+            Some(prompts) => router_token_inputs(bases, request, prompts),
+            None => {
+                prepare_http_token_inputs(
+                    &self.client,
+                    bases,
+                    request,
+                    route,
+                    headers,
+                    self.api_key.as_deref(),
+                    Duration::from_secs(1),
+                )
+                .await
+            }
+        };
         let mut prepared = HashMap::new();
         for (base, result) in results {
             let fallback = KvAwarePolicy::credit_fallback(
@@ -547,7 +571,7 @@ mod kv_input_tests {
             ),
         ] {
             let prepared = state
-                .prepare(&workers, &policy, &request, route, None)
+                .prepare(&workers, &policy, &request, route, None, None)
                 .await;
             let input = &prepared[&base];
             assert!(input.prompts.is_none());
@@ -626,6 +650,7 @@ mod kv_input_tests {
                     &json!({"model":"m","prompt":"hello"}),
                     "/v1/completions",
                     Some(&headers),
+                    None,
                 )
                 .await;
             assert_eq!(
@@ -721,7 +746,7 @@ mod kv_input_tests {
                 if static_source { 0 } else { 2 }
             );
             let initial = state
-                .prepare(&workers, &policy, &request, "/v1/completions", None)
+                .prepare(&workers, &policy, &request, "/v1/completions", None, None)
                 .await;
             assert_eq!(initial[&base].work_by_rank[&None].new_prefill_tokens, 33);
             assert!(initial[&base].work_by_rank[&None].placement_verified);
@@ -755,7 +780,7 @@ mod kv_input_tests {
             .await
             .expect("subscriber should ingest the warm prefix");
             let warm = state
-                .prepare(&workers, &policy, &request, "/v1/completions", None)
+                .prepare(&workers, &policy, &request, "/v1/completions", None, None)
                 .await;
             assert_eq!(warm[&base].work_by_rank[&None].new_prefill_tokens, 1);
             assert!(warm[&base].work_by_rank[&None].placement_verified);
@@ -890,7 +915,7 @@ mod kv_input_tests {
         // First bind: discovery succeeds and installs a binding with info.
         state.bind(&workers, ops).await;
         let inputs = state
-            .prepare(&workers, &policy, &request, "/v1/completions", None)
+            .prepare(&workers, &policy, &request, "/v1/completions", None, None)
             .await;
         assert!(inputs[&base].allow_credit);
         {
@@ -906,7 +931,7 @@ mod kv_input_tests {
             rewind(&state, &base).await;
             state.bind(&workers, ops).await;
             let inputs = state
-                .prepare(&workers, &policy, &request, "/v1/completions", None)
+                .prepare(&workers, &policy, &request, "/v1/completions", None, None)
                 .await;
             assert!(
                 inputs[&base].allow_credit,
@@ -925,7 +950,7 @@ mod kv_input_tests {
         rewind(&state, &base).await;
         state.bind(&workers, ops).await;
         let inputs = state
-            .prepare(&workers, &policy, &request, "/v1/completions", None)
+            .prepare(&workers, &policy, &request, "/v1/completions", None, None)
             .await;
         assert!(!inputs[&base].allow_credit);
         let bindings = state.bindings.lock().await;

@@ -105,6 +105,37 @@ steps:
       - "/tmp/router.log"
 
   # ============================================================================
+  # L3 Rust gRPC P/D full GSM8K — same layout as the HTTP job above: one
+  # prefill and one decode, each at data-parallel size 2, on four L4s.
+  # ============================================================================
+  - label: ":satellite: gRPC P/D Disaggregation Test (4 GPUs)"
+    key: "grpc-pd-disagg-test"
+    if: build.env("ROCM_ONLY") != "1"
+    timeout_in_minutes: 60
+    retry:
+      automatic:
+        - exit_status: "*"
+          limit: 2
+      manual:
+        allowed: true
+        reason: "GPU tests can be flaky - retry if needed"
+    mirror_hardwares: l4_4
+    # vLLM, NIXL, lm-eval, and vllm-router are on PATH in the CI image. The
+    # script exits early when vllm-rs is older than 0.30.0.
+    command: |
+      bash <<'BASH'
+      set -euo pipefail
+      export RUN_LM_EVAL=1
+      export LOG_DIR=/tmp/vllm-router-grpc-pd
+      pytest tests/python/integration/test_grpc_pd_disagg.py -v -m "ready and L4 and cards_4"
+      BASH
+    depends_on:
+      - "upload-nightly-pipeline"
+      - "image-build"
+    artifact_paths:
+      - "/tmp/vllm-router-grpc-pd/*.log"
+
+  # ============================================================================
   # L3 gRPC prefix-KV perf — rust_grpc + python_http (c16-r32), H100×2.
   # Pulls the router CI image from image-build (vLLM + vllm-router on PATH).
   # ============================================================================

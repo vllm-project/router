@@ -314,6 +314,18 @@ impl ConfigValidator {
                     all.extend(decode_urls.iter().cloned());
                     Self::reject_mixed_worker_urls(&all)?;
                 }
+                // Discovered P/D workers register as http://, so a grpc://
+                // static pool would end up mixed at runtime.
+                let has_grpc_url = prefill_urls
+                    .iter()
+                    .map(|(url, _)| url.as_str())
+                    .chain(decode_urls.iter().map(String::as_str))
+                    .any(crate::backend::is_grpc_url);
+                if has_service_discovery && has_grpc_url {
+                    return Err(ConfigError::ValidationFailed {
+                        reason: "grpc:// P/D workers cannot be combined with service discovery, which registers http:// workers".to_string(),
+                    });
+                }
 
                 // Validate bootstrap ports
                 for (_url, port) in prefill_urls {
@@ -657,6 +669,23 @@ impl ConfigValidator {
                 return Err(ConfigError::IncompatibleConfig {
                     reason: "Program scheduling requires regular HTTP mode, or vLLM PD HTTP mode with pd.enabled=true".to_string(),
                 });
+            }
+            if let RoutingMode::VllmPrefillDecode {
+                prefill_urls,
+                decode_urls,
+                ..
+            } = &config.mode
+            {
+                if prefill_urls
+                    .iter()
+                    .map(|(url, _)| url.as_str())
+                    .chain(decode_urls.iter().map(String::as_str))
+                    .any(crate::backend::is_grpc_url)
+                {
+                    return Err(ConfigError::IncompatibleConfig {
+                        reason: "Program scheduling dispatches over HTTP and cannot run on grpc:// P/D workers".to_string(),
+                    });
+                }
             }
             if pd_mode
                 && (!(0.0..=1.0).contains(&program.pd.prefill_kv_high_watermark)
@@ -1412,6 +1441,62 @@ mod tests {
 
         let result = ConfigValidator::validate(&config);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_grpc_pd_workers_reject_service_discovery() {
+        let pd_mode = |discovery_address: Option<String>| RoutingMode::VllmPrefillDecode {
+            prefill_urls: vec![("grpc://prefill:50051".to_string(), None)],
+            decode_urls: vec!["grpc://decode:50052".to_string()],
+            prefill_policy: None,
+            decode_policy: None,
+            discovery_address,
+        };
+
+        let zmq = RouterConfig::new(
+            pd_mode(Some("0.0.0.0:36367".to_string())),
+            PolicyConfig::Random,
+        );
+        let mut k8s = RouterConfig::new(pd_mode(None), PolicyConfig::Random);
+        k8s.discovery = Some(DiscoveryConfig {
+            enabled: true,
+            prefill_selector: vec![("role".to_string(), "prefill".to_string())]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        });
+        for config in [zmq, k8s] {
+            let err = ConfigValidator::validate(&config).unwrap_err();
+            assert!(err.to_string().contains("service discovery"), "{err}");
+        }
+
+        let static_only = RouterConfig::new(pd_mode(None), PolicyConfig::Random);
+        assert!(ConfigValidator::validate(&static_only).is_ok());
+    }
+
+    #[test]
+    fn test_grpc_pd_workers_reject_program_scheduling() {
+        let program: ProgramSchedulingConfig = serde_json::from_value(serde_json::json!({
+            "pd": {"enabled": true},
+            "token_capacity_per_dp_rank": 100000,
+            "enable_batch_gain_admission": false,
+        }))
+        .unwrap();
+        let config = |prefill: &str, decode: &str| RouterConfig {
+            mode: RoutingMode::VllmPrefillDecode {
+                prefill_urls: vec![(prefill.to_string(), None)],
+                decode_urls: vec![decode.to_string()],
+                prefill_policy: None,
+                decode_policy: None,
+                discovery_address: None,
+            },
+            program_scheduling: Some(program.clone()),
+            ..RouterConfig::default()
+        };
+        assert!(ConfigValidator::validate(&config("http://p:8000", "http://d:8000")).is_ok());
+        let err =
+            ConfigValidator::validate(&config("grpc://p:50051", "grpc://d:50052")).unwrap_err();
+        assert!(err.to_string().contains("grpc://"), "{err}");
     }
 
     fn pd_config_with_static_kv_sources() -> RouterConfig {
