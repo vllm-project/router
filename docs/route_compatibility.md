@@ -45,6 +45,7 @@ Anthropic messages over grpc needs a messages rpc in the vllm proto first.
 | engines | passthrough to engines that serve `/v1/messages` natively (vllm). no translation to chat completions. engines without the route return their own 404 |
 | body | unknown fields are kept and forwarded, so the worker gets the same json the client sent |
 | routing text | `system` (string or text blocks), then `tools[].name` and `tools[].description`, then message text in order. image, document, tool_use and tool_result blocks add a short marker, not their payload |
+| cache aware / kv aware routing | worker tokens from each worker's `/v1/messages/render`; when a worker does not serve it (vllm exposes it with `--enable-scale-out`), `/tokenize` on the chat form vllm converts a text only body into. image and document blocks skip preparation and route least loaded; tool, thinking and inline `system` content needs render, since the `/tokenize` fallback has no exact form for it |
 | session affinity | headers first (`x-session-id`, `x-user-id`, ...), then nested `metadata.user_id` |
 | router errors | anthropic shape `{"type":"error","error":{"type":...,"message":...}}`, including invalid json and missing fields (400, `invalid_request_error`). routers on the transparent path (pd, `--backend openai`) can't tell their own errors from worker responses, so their errors (404, 405, 503 with no prefill workers) are passed through unshaped |
 | worker errors | passed through unchanged |

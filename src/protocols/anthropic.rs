@@ -197,7 +197,9 @@ impl GenerationRequest for MessagesRequest {
 
     /// System prompt first, then tool names and descriptions, then message
     /// text in order. The stable parts lead, so turns of one conversation
-    /// share a prefix for cache aware routing.
+    /// share a prefix for text keyed policies. Cache aware and kv aware
+    /// routing use worker tokens from `/v1/messages/render` (or `/tokenize`)
+    /// instead; see `backend::preprocess::http_kv_input`.
     fn extract_text_for_routing(&self) -> String {
         let mut parts = Vec::new();
         if let Some(system) = present(&self.system) {

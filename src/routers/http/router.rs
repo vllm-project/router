@@ -4900,6 +4900,143 @@ mod tests {
             .unwrap() as usize
     }
 
+    /// `/v1/messages` prepares tokens through each worker's
+    /// `/v1/messages/render`, or `/tokenize` on the translated chat body when
+    /// render is not served. Repeated conversation prefixes then populate and
+    /// hit the cache aware tree instead of the least loaded fallback.
+    #[tokio::test]
+    async fn messages_cache_aware_routing_uses_prepared_prefixes() {
+        for render_available in [true, false] {
+            use axum::{extract::OriginalUri, routing::post};
+            let mut router = create_test_regular_router();
+            router.worker_registry = Arc::new(WorkerRegistry::new());
+            router.policy_registry = Arc::new(PolicyRegistry::new(
+                crate::config::PolicyConfig::CacheAware {
+                    cache_threshold: 0.5,
+                    balance_abs_threshold: 20,
+                    balance_rel_threshold: 10.0,
+                    eviction_interval_secs: 0,
+                    max_tree_size: 1 << 20,
+                },
+            ));
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let mut servers = Vec::new();
+            let mut workers: Vec<Arc<dyn Worker>> = Vec::new();
+            for worker_index in 0..2usize {
+                let captured = calls.clone();
+                let app = axum::Router::new().fallback(post(
+                    move |OriginalUri(uri): OriginalUri, Json(body): Json<serde_json::Value>| {
+                        let captured = captured.clone();
+                        async move {
+                            let path = uri.path().to_string();
+                            captured
+                                .lock()
+                                .push((worker_index, path.clone(), body.clone()));
+                            if path == "/v1/messages/render" && !render_available {
+                                return StatusCode::NOT_FOUND.into_response();
+                            }
+                            if path == "/tokenize" || path == "/v1/messages/render" {
+                                // One token per byte of the conversation text.
+                                let mut text = if path == "/tokenize" {
+                                    String::new()
+                                } else {
+                                    body["system"].to_string()
+                                };
+                                for m in body["messages"].as_array().unwrap() {
+                                    text.push_str(&format!("{}:{}|", m["role"], m["content"]));
+                                }
+                                let tokens: Vec<u32> = text.bytes().map(u32::from).collect();
+                                return Json(if path == "/tokenize" {
+                                    serde_json::json!({"tokens": tokens, "count": tokens.len()})
+                                } else {
+                                    serde_json::json!({"token_ids": tokens, "features": null})
+                                })
+                                .into_response();
+                            }
+                            Json(serde_json::json!({"worker": worker_index, "content": []}))
+                                .into_response()
+                        }
+                    },
+                ));
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let url = format!("http://{}", listener.local_addr().unwrap());
+                servers.push(tokio::spawn(async move {
+                    axum::serve(listener, app).await.unwrap()
+                }));
+                let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(url, WorkerType::Regular));
+                router.worker_registry.register(worker.clone());
+                workers.push(worker);
+            }
+            let policy = router.policy_registry.get_default_policy();
+            policy
+                .as_any()
+                .downcast_ref::<crate::policies::CacheAwarePolicy>()
+                .unwrap()
+                .init_workers(&workers);
+            let system = "you are a careful assistant; ".repeat(8);
+            let first: MessagesRequest = serde_json::from_value(serde_json::json!({
+                "model": "m", "max_tokens": 8, "system": system,
+                "messages": [{"role": "user", "content": "first question"}],
+            }))
+            .unwrap();
+            let warm = selected_http_worker(router.route_messages(None, &first, None).await).await;
+            {
+                let calls = calls.lock();
+                let count = |path: &str| calls.iter().filter(|(_, p, _)| p == path).count();
+                assert_eq!(
+                    count("/v1/messages/render"),
+                    2,
+                    "each worker renders its own prompt"
+                );
+                if render_available {
+                    assert_eq!(count("/tokenize"), 0);
+                } else {
+                    let tokenize: Vec<_> =
+                        calls.iter().filter(|(_, p, _)| p == "/tokenize").collect();
+                    assert_eq!(tokenize.len(), 2);
+                    assert_eq!(
+                        tokenize[0].2["messages"],
+                        serde_json::json!([
+                            {"role": "system", "content": system},
+                            {"role": "user", "content": "first question"},
+                        ])
+                    );
+                }
+            }
+            // Least loaded would now pick the other worker; only a cache hit on
+            // the shared prefix keeps the next turn on the warm worker.
+            for _ in 0..3 {
+                workers[warm].increment_load();
+            }
+            let second: MessagesRequest = serde_json::from_value(serde_json::json!({
+                "model": "m", "max_tokens": 8, "system": system,
+                "messages": [
+                    {"role": "user", "content": "first question"},
+                    {"role": "assistant", "content": [{"type": "text", "text": "ok"}]},
+                    {"role": "user", "content": "next"},
+                ],
+            }))
+            .unwrap();
+            assert_eq!(
+                selected_http_worker(router.route_messages(None, &second, None).await).await,
+                warm
+            );
+            // An unrelated conversation has no prefix credit and goes least loaded.
+            let other: MessagesRequest = serde_json::from_value(serde_json::json!({
+                "model": "m", "max_tokens": 8,
+                "messages": [{"role": "user", "content": "a different conversation entirely"}],
+            }))
+            .unwrap();
+            assert_eq!(
+                selected_http_worker(router.route_messages(None, &other, None).await).await,
+                1 - warm
+            );
+            for server in servers {
+                server.abort();
+            }
+        }
+    }
+
     #[tokio::test]
     async fn http_completion_ids_use_real_prefix_placement() {
         let ids = vec![1, 2, 3, 4, 5, 6];
