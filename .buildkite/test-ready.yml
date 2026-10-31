@@ -3,8 +3,9 @@
 # CPU tests have no extra if. The NVIDIA smoke skips
 # when ROCM_ONLY=1, because a skipped image-build is treated as satisfied.
 # Full GSM8K is test-nightly.yml.
-# tests/python/e2e stays ignored here; regular-router, embeddings, and
-# test_pd_router.py are not wired to a GPU lane in this split.
+# tests/python/e2e stays ignored on the CPU pytest job. kv_aware runs on
+# the 2x L4 step below. regular-router, embeddings, and test_pd_router.py
+# are not wired to a GPU lane in this split.
 
 env:
   RUST_IMAGE: "rust:1.95.0-bookworm"
@@ -123,3 +124,25 @@ steps:
       - "image-build"
     artifact_paths:
       - "/tmp/router.log"
+
+  # kv_aware functional e2e. Two vllm-rs workers, default model
+  # Qwen/Qwen3-0.6B.
+  - label: ":satellite: kv_aware e2e"
+    key: "kv-aware-e2e"
+    if: build.env("ROCM_ONLY") != "1"
+    timeout_in_minutes: 60
+    retry:
+      manual:
+        allowed: true
+        reason: "GPU tests can be flaky - retry if needed"
+    mirror_hardwares: l4_2
+    command: |
+      bash <<'BASH'
+      set -euo pipefail
+      pytest tests/python/e2e/function/kv_aware/test_kv_aware_prefix_cache.py \
+        --confcutdir=tests/python/e2e/function/kv_aware \
+        -m e2e -v -s
+      BASH
+    depends_on:
+      - "upload-ready-pipeline"
+      - "image-build"
