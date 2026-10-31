@@ -6,10 +6,8 @@ import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 
-import pytest
-
 from tests.python.e2e.function.helpers import launch
-from tests.python.e2e.function.helpers.worker_log_pump import SubprocessLogPump
+from tests.python.e2e.function.helpers.worker_logs import SubprocessLogPump
 from tests.python.e2e.function.kv_aware.config import (
     kv_aware_kv_events_enabled,
     kv_aware_kv_events_endpoint_bind,
@@ -29,10 +27,7 @@ def _require_worker_launch() -> None:
             "accept --grpc-port (docs/backend/grpc.md). Set "
             "KV_AWARE_USE_VLLM_SERVE=0 and use vllm-rs serve."
         )
-    try:
-        launch.resolve_worker_serve_launch(prefer_vllm_serve=False)
-    except RuntimeError as exc:
-        pytest.skip(str(exc))
+    launch.resolve_worker_serve_launch(prefer_vllm_serve=False)
 
 
 def spawn_two_vllm_rs_grpc_workers(

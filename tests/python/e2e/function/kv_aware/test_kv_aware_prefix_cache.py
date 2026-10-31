@@ -18,13 +18,29 @@ from tests.python.e2e.function.kv_aware.config import (
     kv_aware_reuse_rounds,
 )
 from tests.python.e2e.function.kv_aware.dataset import (
-    assert_dual_lane_prefixes_distinct,
-    assert_lane_reuse_shares_prefix,
     default_prefix_reuse_scenario,
+    lane_prefix,
     lane_prime_user,
     lane_reuse_user,
     reuse_user_message,
 )
+
+
+def _assert_lane_reuse_shares_prefix(lane: str, *, round_index: int = 1) -> None:
+    """Reuse body must extend the same lane prefix as prime (KV credit input)."""
+    prefix = lane_prefix(lane)
+    prime = lane_prime_user(lane)
+    reuse = lane_reuse_user(lane, round_index=round_index)
+    assert prime.startswith(prefix) and reuse.startswith(prefix), (
+        f"lane {lane}: prime/reuse must start with lane prefix"
+    )
+    assert len(reuse) > len(prefix) and len(prime) > len(prefix)
+
+
+def _assert_dual_lane_prefixes_distinct() -> None:
+    assert lane_prefix("A") != lane_prefix("B")
+    assert not lane_prime_user("B").startswith(lane_prefix("A"))
+    assert not lane_prime_user("A").startswith(lane_prefix("B"))
 
 
 def _chat_worker(
@@ -141,9 +157,9 @@ def test_kv_aware_dual_lane_prime_and_reuse(kv_aware_router, kv_aware_two_worker
     log_poll = kv_aware_request_log_poll_sec()
     n_reuse = kv_aware_reuse_rounds()
 
-    assert_dual_lane_prefixes_distinct()
+    _assert_dual_lane_prefixes_distinct()
     for lane in ("A", "B"):
-        assert_lane_reuse_shares_prefix(lane, round_index=1)
+        _assert_lane_reuse_shares_prefix(lane, round_index=1)
     print(
         "[e2e] checkpoint: lane prompt contract OK (reuse shares prime prefix)",
         flush=True,
@@ -189,7 +205,7 @@ def test_kv_aware_dual_lane_prime_and_reuse(kv_aware_router, kv_aware_two_worker
             for lane in ("B", "A"):
                 if lane == "B" and r == 1:
                     continue
-                assert_lane_reuse_shares_prefix(lane, round_index=r)
+                _assert_lane_reuse_shares_prefix(lane, round_index=r)
                 w = _chat_worker(
                     session,
                     base=base,

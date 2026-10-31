@@ -128,7 +128,7 @@ steps:
   # kv_aware functional e2e. Two vllm-rs workers, default model
   # Qwen/Qwen3-0.6B. Two pytest processes so the smoke run does not leave
   # the shared prefix on both workers before the stickiness tests.
-  - label: ":gpu: kv_aware e2e (2x L4)"
+  - label: ":satellite: kv_aware e2e"
     key: "kv-aware-e2e"
     if: build.env("ROCM_ONLY") != "1"
     timeout_in_minutes: 60
@@ -140,8 +140,6 @@ steps:
     command: |
       bash <<'BASH'
       set -euo pipefail
-      ./scripts/backend/check_vllm_rs.sh
-      echo "kv_aware model=${KV_AWARE_E2E_MODEL:-Qwen/Qwen3-0.6B}"
       pytest tests/python/e2e/function/kv_aware/test_kv_aware.py \
         --confcutdir=tests/python/e2e/function/kv_aware \
         -m e2e -v -s
