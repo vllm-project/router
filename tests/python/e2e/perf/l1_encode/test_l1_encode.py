@@ -17,6 +17,11 @@ import os
 import sys
 from pathlib import Path
 
+from tests.python.e2e.perf.l1_encode.case_loader import (
+    bench_max_tokens,
+    bench_timeout,
+    bench_tokens,
+)
 from tests.python.e2e.perf.l1_encode.report import (
     check_encode_reuse,
     check_l1_startup_log,
@@ -49,9 +54,9 @@ def test_l1_encode(
     os.environ["MODEL"] = l1_case.model
     settings = bench_mod.read_perf_settings(
         backend_label="l1on" if l1_on else "l1off",
-        bench_tokens=l1_case.bench_tokens,
-        bench_max_tokens=l1_case.bench_max_tokens,
-        bench_timeout=l1_case.bench_timeout,
+        bench_tokens=bench_tokens(l1_case),
+        bench_max_tokens=bench_max_tokens(l1_case),
+        bench_timeout=bench_timeout(l1_case),
     )
     try:
         payload = bench_mod.run_prefix_kvhit_wave(

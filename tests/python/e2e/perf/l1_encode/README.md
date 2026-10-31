@@ -78,7 +78,7 @@ After the prompt is rendered, read `prompt_tokens` in the summary. If the worker
 
 JSON is written under `tests/python/e2e/perf/l1_encode/results/<timestamp>/` (one object per wave, not the bench CLI's two-document stdout). `PERF_SAVE_RESULTS=0` skips the files. `PERF_OUTPUT_DIR` overrides the directory.
 
-`PERF_TOKENS` overrides 16384. The worker flags still have to cover `tokens + max_tokens + template`. `PERF_EXTERNAL=1` plus `ROUTER_URL` skips launch and does **not** switch L1; select one arm with `-k`.
+`PERF_TOKENS`, `PERF_MAX_TOKENS`, and `PERF_TIMEOUT` override the case JSON for both the worker preflight and the wave. The worker flags still have to cover `tokens + max_tokens + template`. `PERF_EXTERNAL=1` plus `ROUTER_URL` skips launch and does **not** switch L1; select one arm with `-k`.
 
 ## Ports
 

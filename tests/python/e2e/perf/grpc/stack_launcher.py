@@ -15,13 +15,23 @@ from typing import TYPE_CHECKING
 
 import requests
 
+from tests.python.e2e.perf.binaries import (
+    graceful_stop as _graceful_stop,
+)
+from tests.python.e2e.perf.binaries import (
+    preflight_router_bin as _preflight_router_bin,
+)
+from tests.python.e2e.perf.binaries import (
+    router_bin as _shared_router_bin,
+)
+from tests.python.e2e.perf.binaries import (
+    vllm_rs_bin as _shared_vllm_rs_bin,
+)
+
 if TYPE_CHECKING:
     from case_loader import BackendCaseFile
 
 logger = logging.getLogger(__name__)
-
-# File is ``tests/python/e2e/perf/grpc/stack_launcher.py`` → repo root is parents[5].
-REPO_ROOT = Path(__file__).resolve().parents[5]
 
 
 def _progress(msg: str) -> None:
@@ -50,17 +60,6 @@ class PerfStack:
     def stop(self, timeout: float = 120.0) -> None:
         for proc in (self.router_proc, self.worker_proc):
             _graceful_stop(proc, timeout)
-
-
-def _graceful_stop(proc: subprocess.Popen, timeout: float) -> None:
-    if proc.poll() is not None:
-        return
-    proc.terminate()
-    start = time.monotonic()
-    while proc.poll() is None and time.monotonic() - start < timeout:
-        time.sleep(1)
-    if proc.poll() is None:
-        proc.kill()
 
 
 def _proc_exit_error(proc: subprocess.Popen, label: str) -> RuntimeError:
@@ -98,85 +97,14 @@ def _wait_router_health(
     raise TimeoutError(f"router not healthy at {url} within {timeout}s")
 
 
-def _resolve_bin_path(raw: str) -> str | None:
-    """Resolve case JSON path (absolute, repo-relative, or PATH name)."""
-    text = raw.strip()
-    if not text:
-        return None
-    candidate = Path(text).expanduser()
-    if not candidate.is_absolute():
-        candidate = (REPO_ROOT / candidate).resolve()
-    if candidate.is_file():
-        return str(candidate)
-    found = shutil.which(text)
-    if found:
-        return found
-    return None
-
-
 def _router_bin(case: BackendCaseFile | None = None) -> str:
-    if raw := os.environ.get("ROUTER_BIN", "").strip():
-        return raw
-    if case and case.stack.router_bin:
-        if resolved := _resolve_bin_path(case.stack.router_bin):
-            return resolved
-    hint = REPO_ROOT / "target" / "release" / "vllm-router"
-    if hint.is_file():
-        return str(hint)
-    found = shutil.which("vllm-router")
-    if found:
-        return found
-    tried = [str(hint)]
-    if case and case.stack.router_bin:
-        tried.insert(0, case.stack.router_bin)
-    raise FileNotFoundError(
-        f"vllm-router not found (repo root={REPO_ROOT}, tried {tried!r}); "
-        "set ROUTER_BIN, stack.router_bin in case JSON, or build target/release/vllm-router"
-    )
-
-
-def _preflight_router_bin(router_bin: str) -> None:
-    """Fail before starting GPU workers if the router binary cannot run."""
-    path = Path(router_bin)
-    if path.is_file() and not os.access(path, os.X_OK):
-        raise PermissionError(f"vllm-router not executable: {router_bin}")
-    try:
-        proc = subprocess.run(
-            [router_bin, "--help"],
-            capture_output=True,
-            text=True,
-            timeout=30,
-            check=False,
-        )
-    except OSError as exc:
-        raise RuntimeError(
-            f"vllm-router preflight failed ({router_bin!r}): {exc}"
-        ) from exc
-    if proc.returncode != 0:
-        detail = (proc.stderr or proc.stdout or "").strip()[-2000:]
-        raise RuntimeError(
-            f"vllm-router preflight failed ({router_bin} --help exit "
-            f"{proc.returncode}): {detail}"
-        )
+    case_bin = case.stack.router_bin if case is not None else None
+    return _shared_router_bin(case_bin)
 
 
 def _vllm_rs_bin(case: BackendCaseFile | None = None) -> str:
-    if raw := os.environ.get("VLLM_RS", "").strip():
-        return raw
-    if case and case.stack.vllm_rs_bin:
-        if resolved := _resolve_bin_path(case.stack.vllm_rs_bin):
-            return resolved
-    found = shutil.which("vllm-rs")
-    if found:
-        return found
-    import importlib.util
-
-    spec = importlib.util.find_spec("vllm")
-    if spec and spec.origin:
-        candidate = Path(spec.origin).parent / "vllm-rs"
-        if candidate.exists():
-            return str(candidate)
-    raise FileNotFoundError("vllm-rs not found; set VLLM_RS (vLLM 0.29 rust wheel)")
+    case_bin = case.stack.vllm_rs_bin if case is not None else None
+    return _shared_vllm_rs_bin(case_bin)
 
 
 def _vllm_cli() -> str:
