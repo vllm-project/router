@@ -32,6 +32,20 @@ pub enum KvRequestTokens<'a> {
     PerWorker(&'a WorkerTokenInputs),
 }
 
+/// Request-local placement qualification; it restricts credit, not candidacy.
+#[derive(Clone, Copy)]
+pub(crate) struct QualifiedKvInput<'a> {
+    pub(crate) tokens: KvRequestTokens<'a>,
+    pub(crate) eligibility: Option<&'a [bool]>,
+}
+
+impl QualifiedKvInput<'_> {
+    fn allows_credit(self, index: usize, worker_count: usize) -> bool {
+        self.eligibility
+            .is_none_or(|mask| mask.len() == worker_count && mask.get(index) == Some(&true))
+    }
+}
+
 impl<'a> KvRequestTokens<'a> {
     pub(crate) fn prompts_for(self, worker: &dyn Worker) -> Vec<&'a [u32]> {
         match self {
@@ -128,6 +142,33 @@ pub trait KvAwareOps: Send + Sync {
         affinity_key: Option<&AffinityKey>,
         excluded_workers: &[String],
     ) -> Option<KvSelectionReceipt>;
+    /// Optional placement qualification aligned with the original `workers`
+    /// slice, before health filtering. The built-in policy treats `None` as
+    /// unrestricted. Implementers without this extension return `None` without
+    /// querying or reserving, rather than silently ignoring a supplied mask.
+    #[allow(clippy::too_many_arguments)]
+    fn select_worker_with_qualified_inputs(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        tokens: KvRequestTokens<'_>,
+        lora_name: Option<&str>,
+        cache_salt: Option<&str>,
+        affinity_key: Option<&AffinityKey>,
+        excluded_workers: &[String],
+        eligibility: Option<&[bool]>,
+    ) -> Option<KvSelectionReceipt> {
+        if eligibility.is_some() {
+            return None;
+        }
+        self.select_worker_with_inputs(
+            workers,
+            tokens,
+            lora_name,
+            cache_salt,
+            affinity_key,
+            excluded_workers,
+        )
+    }
 }
 
 /// One stage's selection result: the picked candidate, how session affinity
@@ -143,10 +184,11 @@ pub struct StagePick {
 /// Resolve the optional capability at the policy boundary. Keep concrete policy
 /// discovery here so adapters and LoadBalancingPolicy stay independent of it.
 pub fn kv_aware_ops(policy: &dyn LoadBalancingPolicy) -> Option<&dyn KvAwareOps> {
-    policy
-        .as_any()
-        .downcast_ref::<KvAwarePolicy>()
-        .map(|policy| policy as &dyn KvAwareOps)
+    kv_aware_policy(policy).map(|policy| policy as &dyn KvAwareOps)
+}
+
+pub(crate) fn kv_aware_policy(policy: &dyn LoadBalancingPolicy) -> Option<&KvAwarePolicy> {
+    policy.as_any().downcast_ref::<KvAwarePolicy>()
 }
 
 /// Shared request accounting handle. The adapter signals output and completion;
@@ -1099,7 +1141,10 @@ impl KvAwarePolicy {
     ) -> Option<(usize, CostDecision)> {
         let plan = self.prepare_selection(
             workers,
-            KvRequestTokens::Shared(token_ids),
+            QualifiedKvInput {
+                tokens: KvRequestTokens::Shared(token_ids),
+                eligibility: None,
+            },
             lora_name,
             cache_salt,
         )?;
@@ -1144,6 +1189,28 @@ impl KvAwarePolicy {
         affinity_key: Option<&AffinityKey>,
         excluded_workers: &[String],
     ) -> Option<KvSelectionReceipt> {
+        self.select_worker_with_qualified_inputs(
+            workers,
+            QualifiedKvInput {
+                tokens,
+                eligibility: None,
+            },
+            lora_name,
+            cache_salt,
+            affinity_key,
+            excluded_workers,
+        )
+    }
+
+    pub(crate) fn select_worker_with_qualified_inputs(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        input: QualifiedKvInput<'_>,
+        lora_name: Option<&str>,
+        cache_salt: Option<&str>,
+        affinity_key: Option<&AffinityKey>,
+        excluded_workers: &[String],
+    ) -> Option<KvSelectionReceipt> {
         let digest = affinity_key.map(|key| key.scoped_digest(lora_name, cache_salt));
         // Re-query at most three times under registration churn. The final
         // attempt snapshots current targets and reserves using live load only.
@@ -1161,7 +1228,7 @@ impl KvAwarePolicy {
                     has_tokens: false,
                 }
             } else {
-                self.prepare_selection(workers, tokens, lora_name, cache_salt)?
+                self.prepare_selection(workers, input, lora_name, cache_salt)?
             };
             let excluded = |position: usize| {
                 excluded_workers
@@ -1329,7 +1396,7 @@ impl KvAwarePolicy {
     fn prepare_selection(
         &self,
         workers: &[Arc<dyn Worker>],
-        tokens: KvRequestTokens<'_>,
+        input: QualifiedKvInput<'_>,
         lora_name: Option<&str>,
         cache_salt: Option<&str>,
     ) -> Option<SelectionPlan> {
@@ -1344,7 +1411,7 @@ impl KvAwarePolicy {
         let credit_fallback = Self::credit_fallback(cache_salt, true);
         let prompts: Vec<_> = healthy
             .iter()
-            .map(|&index| tokens.prompts_for(workers[index].as_ref()))
+            .map(|&index| input.tokens.prompts_for(workers[index].as_ref()))
             .collect();
         // Keep verified matches when another worker cannot render. Unknown
         // candidates receive no cache credit and the largest known input size.
@@ -1361,12 +1428,17 @@ impl KvAwarePolicy {
         let mut grouped = Vec::with_capacity(bindings.len());
         let mut input_tokens = Vec::with_capacity(bindings.len());
         let mut prefill_tokens = Vec::with_capacity(bindings.len());
-        for (binding, prompts) in bindings.iter().zip(prompts) {
+        for ((binding, prompts), &worker_index) in bindings.iter().zip(prompts).zip(&healthy) {
             let mut total_input = 0usize;
             let mut total_prefill = 0u64;
             let mut single_matches = Vec::new();
             if has_tokens {
                 for ids in &prompts {
+                    if !input.allows_credit(worker_index, workers.len()) {
+                        total_input = total_input.saturating_add(ids.len());
+                        total_prefill = total_prefill.saturating_add(ids.len() as u64);
+                        continue;
+                    }
                     let hits = query_cache
                         .entry((binding.cache_key.clone(), ids))
                         .or_insert_with(|| {
@@ -1854,6 +1926,30 @@ impl KvAwareOps for KvAwarePolicy {
         self.unregister_target(worker_url);
     }
 
+    fn select_worker_with_qualified_inputs(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        tokens: KvRequestTokens<'_>,
+        lora_name: Option<&str>,
+        cache_salt: Option<&str>,
+        affinity_key: Option<&AffinityKey>,
+        excluded_workers: &[String],
+        eligibility: Option<&[bool]>,
+    ) -> Option<KvSelectionReceipt> {
+        KvAwarePolicy::select_worker_with_qualified_inputs(
+            self,
+            workers,
+            QualifiedKvInput {
+                tokens,
+                eligibility,
+            },
+            lora_name,
+            cache_salt,
+            affinity_key,
+            excluded_workers,
+        )
+    }
+
     fn reconcile_decode_workers(&self, workers: &[Arc<dyn Worker>]) {
         let current: HashSet<_> = workers.iter().map(|worker| worker.url()).collect();
         let removed: Vec<_> = self
@@ -1935,6 +2031,202 @@ mod tests {
             Arc::new(TemperaturePicker::new(params.router_temperature)),
             params,
         )
+    }
+
+    #[test]
+    fn placement_eligibility_keeps_unknown_targets_selectable_without_shared_identity_credit() {
+        struct Matches {
+            queries: AtomicUsize,
+            blocks: AtomicUsize,
+            hits: Vec<TierMatch>,
+        }
+        impl TieredMatchProvider for Matches {
+            fn find_tiered_matches(&self, query: &MatchQuery) -> Vec<TierMatch> {
+                self.queries.fetch_add(1, Ordering::Relaxed);
+                self.blocks
+                    .store(query.local_hashes.len(), Ordering::Relaxed);
+                self.hits.clone()
+            }
+        }
+        for (case, count, block_size) in [
+            ("shared_identity_filters_qualified_targets", 3, 2),
+            ("single_worker_larger_block_retry_boundary", 1, 4),
+        ] {
+            let policy = KvAwarePolicy::new(CostParams {
+                router_temperature: 0.0,
+                ..CostParams::default()
+            });
+            let workers: Vec<Arc<dyn Worker>> = (0..count)
+                .map(|index| {
+                    Arc::new(BasicWorker::new(
+                        format!("http://worker-{index}"),
+                        WorkerType::Regular,
+                    )) as Arc<dyn Worker>
+                })
+                .collect();
+            let provider = Arc::new(Matches {
+                queries: AtomicUsize::new(0),
+                blocks: AtomicUsize::new(0),
+                hits: workers
+                    .iter()
+                    .map(|worker| {
+                        tier_match(&target(worker.url(), 0), StorageTier::Device, &[(0, 2)])
+                    })
+                    .collect(),
+            });
+            let key = CacheKey {
+                model: Arc::from("engine-cache-identity"),
+                hash_mode: crate::kv_index::HashMode::Sha256,
+                block_size,
+            };
+            for worker in &workers {
+                policy.register_target_with_cache_identity(
+                    worker.url(),
+                    target(worker.url(), 0),
+                    key.clone(),
+                    provider.clone(),
+                );
+            }
+            let ids: Vec<u32> = (0..2 * block_size + 1).collect();
+            let mut mask = vec![true; count];
+            if count > 1 {
+                mask[count - 1] = false;
+            }
+            let select = |mask: &[bool], excluded: &[String]| {
+                kv_aware_ops(&policy)
+                    .unwrap()
+                    .select_worker_with_qualified_inputs(
+                        &workers,
+                        KvRequestTokens::Shared(Some(&ids)),
+                        None,
+                        None,
+                        None,
+                        excluded,
+                        Some(mask),
+                    )
+                    .unwrap_or_else(|| panic!("{case}: no worker selected for {mask:?}"))
+            };
+            let receipt = select(&mask, &[]);
+            assert_eq!(receipt.worker_index, 0, "{case}");
+            assert_eq!(receipt.new_prefill_tokens, 1, "{case}");
+            assert_eq!(provider.queries.load(Ordering::Relaxed), 1, "{case}");
+            assert_eq!(provider.blocks.load(Ordering::Relaxed), 3, "{case}");
+            release_receipt(&workers, &receipt);
+
+            if count == 1 {
+                let retry = select(&mask, &[workers[0].url().to_owned()]);
+                assert_eq!(retry.worker_index, 0, "{case}: exhausted exclusions");
+                assert_eq!(retry.new_prefill_tokens, 1, "{case}: retained credit");
+                assert_eq!(workers[0].load(), 1, "{case}: retry reservation");
+                release_receipt(&workers, &retry);
+                assert_eq!(workers[0].load(), 0, "{case}: retry release");
+            }
+
+            if count > 1 {
+                let mask = vec![false; count];
+                let key = affinity_key("qualified-input");
+                let select = |excluded: &[String]| {
+                    policy
+                        .select_worker_with_qualified_inputs(
+                            &workers,
+                            QualifiedKvInput {
+                                tokens: KvRequestTokens::Shared(Some(&ids)),
+                                eligibility: Some(&mask),
+                            },
+                            None,
+                            None,
+                            Some(&key),
+                            excluded,
+                        )
+                        .unwrap()
+                };
+                let bound = select(&[]);
+                let bound_index = bound.worker_index;
+                assert_eq!(
+                    bound.new_prefill_tokens,
+                    ids.len() as u64,
+                    "{case}: affinity"
+                );
+                assert_eq!(workers[bound_index].load(), 1, "{case}: affinity");
+                release_receipt(&workers, &bound);
+                let excluded = vec![workers[bound_index].url().to_owned()];
+                let retry = select(&excluded);
+                assert_ne!(retry.worker_index, bound_index, "{case}: retry exclusion");
+                assert_eq!(retry.new_prefill_tokens, ids.len() as u64, "{case}: retry");
+                release_receipt(&workers, &retry);
+                let retained = select(&[]);
+                assert_eq!(
+                    retained.worker_index, bound_index,
+                    "{case}: retained affinity"
+                );
+                release_receipt(&workers, &retained);
+                assert!(
+                    workers.iter().all(|worker| worker.load() == 0),
+                    "{case}: release"
+                );
+            }
+
+            // A provider query for one qualified target returns hits for
+            // every target in this identity. None may leak to an unproved
+            // candidate, even though it remains in the common cost model.
+            for worker in &workers[..count.saturating_sub(1)] {
+                for _ in 0..ids.len() {
+                    worker.increment_load();
+                }
+            }
+            if count > 1 {
+                let receipt = select(&mask, &[]);
+                assert_eq!(receipt.worker_index, count - 1, "{case}: unproved target");
+                assert_eq!(
+                    receipt.new_prefill_tokens,
+                    ids.len() as u64,
+                    "{case}: unproved target"
+                );
+                assert_eq!(
+                    receipt.decision.cost,
+                    ids.len() as f64,
+                    "{case}: unproved target"
+                );
+                release_receipt(&workers, &receipt);
+            }
+
+            for (mask_case, mask) in [
+                ("all_ineligible", vec![false; count]),
+                ("wrong_length", vec![true; count + 1]),
+                ("empty", vec![]),
+            ] {
+                provider.queries.store(0, Ordering::Relaxed);
+                let receipt = select(&mask, &[]);
+                assert_eq!(
+                    provider.queries.load(Ordering::Relaxed),
+                    0,
+                    "{case}: {mask_case}"
+                );
+                assert_eq!(
+                    receipt.new_prefill_tokens,
+                    ids.len() as u64,
+                    "{case}: {mask_case}"
+                );
+                release_receipt(&workers, &receipt);
+            }
+
+            if count > 1 {
+                workers[0].set_healthy(false);
+                let mut mask = vec![false; count];
+                mask[count - 1] = true;
+                let receipt = select(&mask, &[]);
+                assert_eq!(
+                    receipt.worker_index,
+                    count - 1,
+                    "{case}: healthy candidate positions"
+                );
+                assert_eq!(
+                    receipt.new_prefill_tokens, 1,
+                    "{case}: healthy candidate positions"
+                );
+                release_receipt(&workers, &receipt);
+            }
+        }
     }
 
     #[test]
@@ -2651,6 +2943,105 @@ mod tests {
     #[test]
     fn stateless_policy_has_no_kv_capability() {
         assert!(kv_aware_ops(&RoundRobinPolicy::new()).is_none());
+    }
+
+    #[test]
+    fn optional_qualification_does_not_invoke_an_ordinary_only_implementer() {
+        struct OrdinaryOnly {
+            selections: AtomicUsize,
+        }
+
+        impl KvAwareOps for OrdinaryOnly {
+            fn estimate_prefill_work(
+                &self,
+                _inputs: &[(&dyn Worker, &[Vec<u32>], bool)],
+            ) -> Vec<PrefillWorkEstimate> {
+                unreachable!("ordinary-only qualification must not enter PD selection")
+            }
+
+            fn pick_prefill(&self, _costs: &[f64], _occupancy: &[usize]) -> Option<usize> {
+                unreachable!("ordinary-only qualification must not enter PD selection")
+            }
+
+            fn pick_decode(&self, _loads: &[usize]) -> Option<usize> {
+                unreachable!("ordinary-only qualification must not enter PD selection")
+            }
+
+            fn select_decode(
+                &self,
+                _workers: &[Arc<dyn Worker>],
+                _session: Option<&AffinityKey>,
+                _cache_salt: Option<&str>,
+            ) -> Option<StagePick> {
+                unreachable!("ordinary-only qualification must not enter PD selection")
+            }
+
+            fn session_affinity_enabled(&self) -> bool {
+                false
+            }
+
+            fn reconcile_decode_workers(&self, _workers: &[Arc<dyn Worker>]) {
+                unreachable!("ordinary-only qualification must not enter PD selection")
+            }
+
+            fn register_worker(
+                &self,
+                _worker: &dyn Worker,
+                _info: Option<&WorkerKvInfo>,
+                _matches: Option<Arc<dyn TieredMatchProvider>>,
+            ) {
+            }
+
+            fn unregister_worker(&self, _worker_url: &str) {}
+
+            fn has_affinity(
+                &self,
+                _workers: &[Arc<dyn Worker>],
+                _lora_name: Option<&str>,
+                _cache_salt: Option<&str>,
+                _affinity_key: &AffinityKey,
+            ) -> bool {
+                false
+            }
+
+            fn select_worker_with_inputs(
+                &self,
+                _workers: &[Arc<dyn Worker>],
+                _tokens: KvRequestTokens<'_>,
+                _lora_name: Option<&str>,
+                _cache_salt: Option<&str>,
+                _affinity_key: Option<&AffinityKey>,
+                _excluded_workers: &[String],
+            ) -> Option<KvSelectionReceipt> {
+                self.selections.fetch_add(1, Ordering::Relaxed);
+                None
+            }
+        }
+
+        let ordinary = OrdinaryOnly {
+            selections: AtomicUsize::new(0),
+        };
+        let ops: &dyn KvAwareOps = &ordinary;
+        let workers: Vec<Arc<dyn Worker>> = vec![Arc::new(BasicWorker::new(
+            "http://ordinary".into(),
+            WorkerType::Regular,
+        ))];
+        let denied = [false];
+        for eligibility in [None, Some(denied.as_slice())] {
+            assert!(ops
+                .select_worker_with_qualified_inputs(
+                    &workers,
+                    KvRequestTokens::Shared(Some(&[1, 2])),
+                    None,
+                    None,
+                    None,
+                    &[],
+                    eligibility,
+                )
+                .is_none());
+        }
+        assert_eq!(ordinary.selections.load(Ordering::Relaxed), 1);
+        assert_eq!(workers[0].load(), 0);
     }
 
     fn registered_worker_pair(policy: &KvAwarePolicy) -> Vec<Arc<dyn Worker>> {

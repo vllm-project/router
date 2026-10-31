@@ -246,6 +246,8 @@ Trees are trimmed to `max_tree_size` during periodic eviction and may grow beyon
 
 `kv_aware` uses KV cache reuse and worker load to route requests. It suits workloads with repeated prompt prefixes and supports HTTP, [gRPC](../backend/grpc.md), and HTTP P/D disaggregation.
 
+HTTP Completion uses the existing [Direct/Worker input preparation](http_completion_kv.md), without local tokenizer assets. Unmodeled identities and unqualified targets stay routable without cache credit.
+
 ```bash
 vllm-router --policy kv_aware \
   --worker-urls grpc://worker1:8000 grpc://worker2:8000

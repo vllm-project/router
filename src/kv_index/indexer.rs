@@ -578,7 +578,7 @@ impl KvBlockIndexer {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "cpu", feature = "ready"))]
     pub(super) fn source_generation_for_test(&self) -> u64 {
         self.source_generation.load(Ordering::Acquire)
     }
