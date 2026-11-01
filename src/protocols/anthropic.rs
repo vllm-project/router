@@ -236,6 +236,16 @@ impl GenerationRequest for MessagesRequest {
     fn extract_program_identity_payload(&self) -> Option<Value> {
         crate::protocols::spec::program_identity_payload(Some(&self.other), None)
     }
+
+    /// `lora_name` and `cache_salt` ride in the forwarded `other` fields and
+    /// reach the engine, so cache aware and kv aware routing must key on them
+    /// the same way the other typed requests do.
+    fn cache_identity(&self) -> (Option<&str>, Option<&str>) {
+        (
+            crate::protocols::spec::passthrough_string(&self.other, "lora_name"),
+            crate::protocols::spec::passthrough_string(&self.other, "cache_salt"),
+        )
+    }
 }
 
 /// Anthropic error `type` for a router generated status code.
@@ -452,5 +462,37 @@ mod tests {
             "messages": [{"role": "user", "content": "hi"}]
         }));
         assert!(plain.extract_program_identity_payload().is_none());
+    }
+
+    #[test]
+    fn cache_identity_keeps_salt_for_identical_prompts() {
+        let body = |salt: &str| {
+            json!({
+                "system": "sys",
+                "messages": [{"role": "user", "content": "same prompt"}],
+                "lora_name": "adapter",
+                "cache_salt": salt
+            })
+        };
+        let a = parse_with_required(&body("tenant-a"));
+        let b = parse_with_required(&body("tenant-b"));
+
+        // Same prompt, so the routing text matches; only the salt differs.
+        assert_eq!(a.extract_text_for_routing(), b.extract_text_for_routing());
+        assert_eq!(a.cache_identity(), (Some("adapter"), Some("tenant-a")));
+        assert_eq!(b.cache_identity(), (Some("adapter"), Some("tenant-b")));
+        assert_ne!(a.cache_identity(), b.cache_identity());
+
+        // The salt is still forwarded to the engine.
+        let out = serde_json::to_value(&a).unwrap();
+        assert_eq!(out["cache_salt"], "tenant-a");
+
+        // Missing or empty fields give no identity, as on the other routes.
+        let plain = parse_with_required(&json!({
+            "messages": [{"role": "user", "content": "same prompt"}],
+            "lora_name": "",
+            "cache_salt": ""
+        }));
+        assert_eq!(plain.cache_identity(), (None, None));
     }
 }

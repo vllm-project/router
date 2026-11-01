@@ -2625,7 +2625,7 @@ pub trait GenerationRequest: Send + Sync {
     }
 }
 
-fn passthrough_string<'a>(
+pub(crate) fn passthrough_string<'a>(
     other: &'a serde_json::Map<String, serde_json::Value>,
     name: &str,
 ) -> Option<&'a str> {
