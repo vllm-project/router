@@ -443,6 +443,33 @@ async fn capability_probe_uses_operator_key_when_configured() {
 }
 
 #[tokio::test]
+async fn automatic_ttl_without_warm_reads_publishes_no_candidates() {
+    let p = engine(true, false, false).await;
+    let d = engine(false, false, false).await;
+    // Only the automatic TTL is requested: the executor is needed for seat
+    // sizing, but no candidate can ever be consumed.
+    let r = router_with_warm_remote(
+        &p,
+        &d,
+        false,
+        json!({"warm_remote": false, "automatic_ttl": true, "ttl_online": true}),
+    )
+    .await;
+    assert_eq!(call(&r, vec![1, 2, 3], false).await.0, StatusCode::OK);
+    assert_eq!(call(&r, next_prompt(), false).await.0, StatusCode::OK);
+    let response = r.get_worker_loads().await;
+    let bytes = axum::body::to_bytes(response.into_body(), 8 * 1024 * 1024)
+        .await
+        .unwrap();
+    let value: Value = serde_json::from_slice(&bytes).unwrap();
+    let counters = value
+        .pointer("/program_scheduling/warm_remote/counters")
+        .expect("warm-remote diagnostics");
+    assert!(counters.get("candidate_published").is_none());
+    assert!(counters.get("candidate_claimed").is_none());
+}
+
+#[tokio::test]
 async fn warm_read_failure_retries_cold_without_reusing_source() {
     let p = engine(true, true, false).await;
     let d = engine(false, false, false).await;

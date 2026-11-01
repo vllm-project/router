@@ -1046,7 +1046,7 @@ impl VllmPDRouter {
         };
         if let Some(warm_remote) = &runtime.warm_remote {
             // The warm-remote protocol has no discovery incarnation fence, and
-            // execute() rejects discovery; keep discovery on the M1 path.
+            // execute() rejects discovery; keep discovery on the native PD path.
             if !self.use_discovery && matches!(self.kv_connector, KvConnector::Nixl) {
                 let prefill_workers = self
                     .pd_router

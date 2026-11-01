@@ -396,7 +396,7 @@ fn bounded_metadata(params: &Value, max: usize) -> bool {
         && params.get("transfer_mode").and_then(Value::as_str) == Some("pull")
 }
 /// Capability probes sit on the turn's hot path; a failed probe safely falls
-/// back to cold/M1, so do not stall a turn for the engine-core queue.
+/// back to the cold path, so do not stall a turn for the engine-core queue.
 const CAPABILITY_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Resolve the Authorization header for engine calls: the operator key wins,
@@ -617,7 +617,8 @@ async fn local_prefix(
         .and_then(|n| usize::try_from(n).ok())
 }
 
-/// Fully separate from native PD: unsupported exact-token/capability requests use M1.
+/// Fully separate from native PD: unsupported exact-token/capability requests use
+/// the native two-stage path.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn execute(
     runtime: &PdProgramRuntime,
@@ -644,7 +645,7 @@ pub(super) async fn execute(
         Some(prompt) => prompt,
         None => {
             // Text prompts, n>1, missing return_token_ids, or an over-budget
-            // context: all fall back to M1, but operators need to see why.
+            // context: all fall back to the native path, but operators need to see why.
             warm_remote.count("request_shape_unsupported");
             return None;
         }
@@ -652,7 +653,8 @@ pub(super) async fn execute(
     let mut dispatch = completion.dispatch().clone();
     let d = targets.iter().find(|t| t.id == dispatch.target_id)?;
     let p = prefills.get(policy_prefill)?;
-    // Capability failure is a conservative M1 fallback, never a warm/local guess.
+    // Capability failure is a conservative fallback to the native path, never a
+    // warm/local guess.
     let (de, pe) = match tokio::join!(
         warm_remote.identify(client, d, headers, topology_revision),
         warm_remote.identify(client, p, headers, topology_revision)
@@ -665,7 +667,13 @@ pub(super) async fn execute(
         }
     };
     let identity = request_identity(request);
-    let mut candidate = warm_remote.claim(&dispatch, &prompt, identity);
+    // Without warm reads or local reuse there is no consumer for a candidate;
+    // claiming one would only consume it and inflate the claim counters.
+    let mut candidate = if warm_remote.config.warm_remote || warm_remote.config.local_append {
+        warm_remote.claim(&dispatch, &prompt, identity)
+    } else {
+        None
+    };
     if let Some(c) = candidate.as_ref() {
         // A candidate must be validated against a *fresh* source identity:
         // a restart at the same URL keeps the URL but drops the retained KV.
@@ -799,7 +807,8 @@ pub(super) async fn execute(
     }
     let event_revision = warm_remote.revision_for(d);
     let started = Instant::now();
-    // Charge the same native P/D accounting M1 uses so load-aware policies and
+    // Charge the same native P/D accounting the native two-stage path uses so
+    // load-aware policies and
     // the published PD occupancy metrics see Program traffic too.
     // admit_bound charges PdLoadManager and attaches the workers itself, so
     // do not attach again: finish/Drop decrement exactly once.
@@ -1496,6 +1505,11 @@ impl PdResponseContext {
             if let Some(hint) = self.dispatch.request_hints().kv_retention_ttl {
                 completion.set_pd_ttl(hint.min(bounded_pd_duration(budget)));
             }
+        }
+        if !(self.runtime.config.warm_remote || self.runtime.config.local_append) {
+            // The turn still settled its TTL above, but no consumer can reuse
+            // this prefix, so do not retain candidate state.
+            return;
         }
         if prefix.len() > self.runtime.config.max_candidate_tokens {
             // A single candidate larger than the whole retention budget can never fit.
