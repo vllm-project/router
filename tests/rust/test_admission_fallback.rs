@@ -1,3 +1,5 @@
+#![cfg(all(feature = "cpu", feature = "ready"))]
+
 //! Unmatched paths go to the router's fallback (the transparent proxy). The
 //! fallback must get the same global layers as the named routes: axum's
 //! `Router::layer` wraps only the routes and fallback that exist when it is
