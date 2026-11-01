@@ -76,7 +76,17 @@ async fn generate(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("none")
         .to_string();
+    let failed_phase = request.get("mock_error_phase").and_then(Value::as_str);
+    let fail = failed_phase == Some(if state.prefill { "prefill" } else { "decode" });
     state.calls.lock().unwrap().push((rank, request));
+    if fail {
+        let status = if state.prefill {
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        } else {
+            axum::http::StatusCode::TOO_MANY_REQUESTS
+        };
+        return (status, [("retry-after", "7")], "private worker diagnostic").into_response();
+    }
     let mut value = if state.prefill {
         json!({"kv_transfer_params":{"do_remote_prefill":true,"do_remote_decode":false,
             "remote_engine_id":"registered-prefill","remote_block_ids":[1]},
@@ -126,6 +136,53 @@ async fn prefill_slot_covers_full_p_body_but_not_decode_wait() {
 async fn concurrent_push_releases_p_slot_before_decode_headers() {
     check_prefill_slot(true).await;
 }
+
+#[tokio::test]
+async fn program_failures_preserve_phase_and_status_and_allow_readmission() {
+    for push in [false, true] {
+        for phase in ["prefill", "decode"] {
+            let p = mock_with_options(true, None, push).await;
+            let d = mock(false).await;
+            let router = router(&p, &d, true).await;
+            if push {
+                let response = router
+                    .route_completion(None, &request(true), Some("test"))
+                    .await;
+                assert!(response.status().is_success());
+                axum::body::to_bytes(response.into_body(), 4096)
+                    .await
+                    .unwrap();
+            }
+            let mut value = serde_json::to_value(request(true)).unwrap();
+            value["mock_error_phase"] = json!(phase);
+            let failed = serde_json::from_value(value).unwrap();
+            let response = router.route_completion(None, &failed, Some("test")).await;
+            assert_eq!(
+                response.status().as_u16(),
+                if phase == "prefill" { 503 } else { 429 }
+            );
+            assert_eq!(response.headers()["retry-after"], "7");
+            assert_eq!(response.headers()["content-type"], "application/json");
+            let bytes = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+            let error: Value = serde_json::from_slice(&bytes).unwrap();
+            assert!(error["error"]["message"].as_str().unwrap().contains(phase));
+            assert!(!String::from_utf8_lossy(&bytes).contains("private worker diagnostic"));
+            let response = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                router.route_completion(None, &request(true), Some("test")),
+            )
+            .await
+            .expect("failed Program turns must release admission state");
+            assert!(response.status().is_success());
+            axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+        }
+    }
+}
+
 async fn check_prefill_slot(push: bool) {
     let p_gate = Arc::new(tokio::sync::Semaphore::new(0));
     let d_gate = Arc::new(tokio::sync::Semaphore::new(0));

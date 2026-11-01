@@ -3,9 +3,13 @@
 use super::dp_utils;
 use super::logprobs_merge;
 use super::pd_cached_tokens;
+use super::pd_dispatch::{prefill_first, PdDispatchError, RequestMetrics};
 use super::pd_program_adapter::{self, PdProgramRuntime};
+use super::pd_request_error::{
+    decode_stream, pd_error_description, InternalErrorReason, PdPhase, PdRequestError,
+};
 use super::pd_router::PdRouterBase;
-use super::pd_types::{error_chain, PDRouterError, PdAttempt, PdRequestContext};
+use super::pd_types::{PDRouterError, PdAttempt, PdRequestContext};
 use super::usage_merge;
 use super::vllm_service_discovery::{MoriIOTransferMode, ServiceRegistry, ServiceType};
 use crate::config::KvConnector;
@@ -30,7 +34,6 @@ use futures_util::StreamExt;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
-use std::time::Instant;
 use tokio::sync::{Mutex, OwnedSemaphorePermit};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
@@ -49,7 +52,6 @@ struct DecodeResponseContext<'a> {
     prefill_http: &'a str,
     decode_http: &'a str,
     decode_base_url: &'a str,
-    start_time: Instant,
     request: &'a Value,
 }
 
@@ -109,6 +111,18 @@ pub struct VllmPDRouter {
 /// Must match `MoRIIOConstants.TRANSFER_PREFIX` in the vLLM Python connector.
 const MORIIO_TRANSFER_PREFIX: &str = "tx";
 
+fn moriio_read_params(mut params: Value, dp_size: usize) -> Option<Value> {
+    // serde_json's old indexed assignment promoted null to an object. Keep
+    // that behavior, while avoiding a panic for other non-object values.
+    if params.is_null() {
+        params = json!({});
+    }
+    params
+        .as_object_mut()?
+        .insert("remote_dp_size".into(), json!(dp_size));
+    Some(params)
+}
+
 /// Discovery-backed P/D routing is ready only after both worker types register.
 /// Without this guard, `PdRouterBase::health` sees the unused static registry and
 /// reports success before a discovered prefill/decode pair can serve requests.
@@ -122,21 +136,18 @@ const PD_BUFFERED_BODY_LIMIT_BYTES: usize = 64 * 1024 * 1024;
 const MAX_JSON_REWRITE_BYTES: usize = 8 * 1024 * 1024;
 
 /// Prefill control metadata must fit in the buffer; Decode may stream the rest.
-async fn read_prefill_body(response: reqwest::Response, url: &str) -> Result<Bytes, PDRouterError> {
+async fn read_prefill_body(
+    response: reqwest::Response,
+    _url: &str,
+) -> Result<Bytes, PdRequestError> {
     match read_response_body(response, PD_BUFFERED_BODY_LIMIT_BYTES)
         .await
-        .map_err(|error| PDRouterError::NetworkError {
-            message: format!("Failed to read response body from {url}: {error}"),
-        })? {
+        .map_err(|error| PdRequestError::from_reqwest(PdPhase::Prefill, error))?
+    {
         ResponseBody::Buffered(body) => Ok(body),
         ResponseBody::Passthrough(_) => {
             RouterMetrics::record_pd_body_over_limit("prefill");
-            Err(PDRouterError::NetworkError {
-                message: format!(
-                    "Response body from {url} exceeds the {} MiB router buffer limit",
-                    PD_BUFFERED_BODY_LIMIT_BYTES / (1024 * 1024)
-                ),
-            })
+            Err(PdRequestError::protocol(PdPhase::Prefill))
         }
     }
 }
@@ -154,9 +165,9 @@ async fn read_response_body(
         .content_length()
         .is_some_and(|length| length > limit as u64)
     {
-        return Ok(ResponseBody::Passthrough(Body::from_stream(
+        return Ok(ResponseBody::Passthrough(Body::from_stream(decode_stream(
             response.bytes_stream(),
-        )));
+        ))));
     }
     let mut buffered = Vec::new();
     let mut source = response.bytes_stream();
@@ -167,9 +178,9 @@ async fn read_response_body(
                 Ok::<_, reqwest::Error>(Bytes::from(buffered)),
                 Ok(chunk),
             ]);
-            return Ok(ResponseBody::Passthrough(Body::from_stream(
+            return Ok(ResponseBody::Passthrough(Body::from_stream(decode_stream(
                 prefix.chain(source),
-            )));
+            ))));
         }
         buffered.extend_from_slice(&chunk);
     }
@@ -180,14 +191,14 @@ fn response_with_body(
     status: StatusCode,
     headers: &HeaderMap,
     body: Body,
-) -> Result<Response, String> {
+) -> Result<Response, PdRequestError> {
     let mut builder = Response::builder().status(status);
     for (name, value) in headers {
         builder = builder.header(name, value);
     }
     builder
         .body(body)
-        .map_err(|error| format!("Failed to build Decode response: {error}"))
+        .map_err(|_| PdRequestError::Internal(InternalErrorReason::BuildResponse))
 }
 
 /// Rewrite successful SSE responses; relay all other streams unchanged.
@@ -195,7 +206,7 @@ fn finalize_decode_stream(
     decode_response: reqwest::Response,
     prefill_response_json: Option<&Value>,
     path: &str,
-) -> Result<Response, String> {
+) -> Result<Response, PdRequestError> {
     let status = decode_response.status();
     let is_encoded = response_is_encoded(decode_response.headers());
     let mut headers = header_utils::preserve_response_headers(decode_response.headers());
@@ -205,7 +216,7 @@ fn finalize_decode_stream(
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.split(';').next())
         .is_some_and(|media_type| media_type.trim().eq_ignore_ascii_case("text/event-stream"));
-    let stream = decode_response.bytes_stream();
+    let stream = decode_stream(decode_response.bytes_stream());
     let body = if status.is_success()
         && pd_cached_tokens::is_supported_path(path)
         && is_sse
@@ -240,7 +251,7 @@ fn finalize_decode_body(
     prefill_response_json: Option<&Value>,
     path: &str,
     needs_logprobs: bool,
-) -> Result<Response, String> {
+) -> Result<Response, PdRequestError> {
     let is_encoded = response_is_encoded(&headers);
     let mut headers = header_utils::preserve_response_headers(&headers);
     headers.remove(http::header::CONTENT_LENGTH);
@@ -259,16 +270,20 @@ fn finalize_decode_body(
             warn!("Cannot parse successful PD Decode response for cached-token reconciliation: {error}");
             return response_with_body(status, &headers, Body::from(original));
         }
-        Err(error) => return Err(format!("Failed to parse Decode response as JSON: {error}")),
+        Err(_) => return Err(PdRequestError::protocol(PdPhase::Decode)),
     };
 
     let mut changed = false;
     if needs_logprobs {
         let empty_json = Value::Null;
-        changed |= logprobs_merge::merge_logprobs_in_json(
+        let merged = logprobs_merge::merge_logprobs_in_json(
             prefill_response_json.unwrap_or(&empty_json),
             &mut json,
         );
+        if merged {
+            debug!("Successfully merged logprobs from prefill and decode responses");
+        }
+        changed |= merged;
     }
     if reconcile_cache {
         if let Some(prefill) = prefill_response_json {
@@ -283,7 +298,7 @@ fn finalize_decode_body(
     if changed {
         drop(original);
         let encoded = serde_json::to_vec(&json)
-            .map_err(|error| format!("Failed to serialize Decode response: {error}"))?;
+            .map_err(|_| PdRequestError::Internal(InternalErrorReason::SerializeResponse))?;
         headers.remove(axum::http::header::CONTENT_ENCODING);
         response_with_body(status, &headers, Body::from(encoded))
     } else {
@@ -529,11 +544,13 @@ impl VllmPDRouter {
                     Some(params)
                 } else {
                     // READ mode: extract params from prefill response and inject remote_dp_size.
-                    let mut params = prefill_response_json?.get("kv_transfer_params")?.clone();
-                    params["remote_dp_size"] = json!(prefill_dp_size
-                        .unwrap_or(self.intra_node_data_parallel_size)
-                        .max(1));
-                    Some(params)
+                    let params = prefill_response_json?.get("kv_transfer_params")?.clone();
+                    moriio_read_params(
+                        params,
+                        prefill_dp_size
+                            .unwrap_or(self.intra_node_data_parallel_size)
+                            .max(1),
+                    )
                 }
             }
             KvConnector::Nixl => {
@@ -1093,7 +1110,7 @@ impl VllmPDRouter {
             Err(error) => {
                 attempt.release();
                 completion.finish(false);
-                (StatusCode::SERVICE_UNAVAILABLE, error.to_string()).into_response()
+                error.into_response()
             }
         })
     }
@@ -1277,25 +1294,39 @@ impl VllmPDRouter {
             .await
         {
             Ok(response) => attempt.track_response(response),
-            Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+            Err(error) => error.into_response(),
         }
     }
 
-    /// Consume every prefill response with the same bound and stage cleanup.
+    /// Consume successful control responses with the upstream bound. HTTP errors
+    /// stay unread until the caller releases local dispatch and admission state.
     async fn finish_prefill_response(
         &self,
         response: Result<reqwest::Response, reqwest::Error>,
         base: &str,
         attempt: &PdAttempt,
-    ) -> Result<(StatusCode, Option<http::HeaderValue>, Bytes), PDRouterError> {
+    ) -> Result<Bytes, PdDispatchError> {
         let result = async {
-            let response = response.map_err(|error| PDRouterError::NetworkError {
-                message: format!("Prefill request to {base} failed: {}", error_chain(&error)),
-            })?;
-            let status = response.status();
-            let content_type = response.headers().get(http::header::CONTENT_TYPE).cloned();
+            let response =
+                response.map_err(|error| PdRequestError::from_reqwest(PdPhase::Prefill, error))?;
+            debug!("📥 Prefill response status: {}", response.status());
+            if !response.status().is_success() {
+                debug!(
+                    header_count = response.headers().len(),
+                    "📥 Prefill response headers omitted for non-success response"
+                );
+                return Err(PdDispatchError::http(PdPhase::Prefill, response));
+            }
+            debug!("📥 Prefill response headers: {:?}", response.headers());
             let bytes = read_prefill_body(response, base).await?;
-            Ok((status, content_type, bytes))
+            debug!("📥 Prefill response body size: {} bytes", bytes.len());
+            if bytes.len() < 1024 {
+                debug!(
+                    "📥 Prefill response body content: {}",
+                    String::from_utf8_lossy(&bytes)
+                );
+            }
+            Ok(bytes)
         }
         .await;
         attempt.finish_prefill();
@@ -1303,33 +1334,40 @@ impl VllmPDRouter {
         result
     }
 
-    /// Handle the decode response shared by both sequential and concurrent dispatch paths.
-    /// Stops decode profiling, records metrics, then routes to streaming, logprobs-merge,
-    /// or plain full-body response depending on the original request.
+    /// Header observations stay outside success-body processing and error capture.
     async fn handle_decode_response(
         &self,
         decode_response: reqwest::Response,
         prefill_response_json: Option<&Value>,
         context: DecodeResponseContext<'_>,
         attempt: &PdAttempt,
-    ) -> Result<Response, String> {
+        request_metrics: &mut RequestMetrics<'_>,
+    ) -> Result<Response, PdDispatchError> {
         let DecodeResponseContext {
             path,
             prefill_http,
             decode_http,
             decode_base_url,
-            start_time,
             request,
         } = context;
         self.stop_profiling(decode_base_url).await;
-        RouterMetrics::record_pd_request(path);
-        RouterMetrics::record_pd_request_duration(path, start_time.elapsed());
+        request_metrics.record();
         RouterMetrics::record_pd_prefill_request(prefill_http);
         RouterMetrics::record_pd_decode_request(decode_http);
+        info!("📥 Decode response status: {}", decode_response.status());
         if !decode_response.status().is_success() {
+            info!(
+                header_count = decode_response.headers().len(),
+                "📥 Decode response headers omitted for non-success response"
+            );
             RouterMetrics::record_pd_decode_error(decode_http);
             attempt.finish_decode();
+            return Err(PdDispatchError::http(PdPhase::Decode, decode_response));
         }
+        info!(
+            "📥 Decode response headers: {:?}",
+            decode_response.headers()
+        );
         let is_streaming = request
             .get("stream")
             .and_then(Value::as_bool)
@@ -1340,15 +1378,14 @@ impl VllmPDRouter {
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
         if is_streaming {
-            finalize_decode_stream(decode_response, prefill_response_json, path)
+            finalize_decode_stream(decode_response, prefill_response_json, path).map_err(Into::into)
         } else {
             let status = decode_response.status();
             let headers = decode_response.headers().clone();
             match read_response_body(decode_response, PD_BUFFERED_BODY_LIMIT_BYTES)
                 .await
-                .map_err(|error| {
-                    format!("Failed to read response body from {decode_base_url}: {error}")
-                })? {
+                .map_err(|error| PdRequestError::from_reqwest(PdPhase::Decode, error))?
+            {
                 ResponseBody::Buffered(bytes) => {
                     attempt.finish_decode();
                     finalize_decode_body(
@@ -1359,12 +1396,47 @@ impl VllmPDRouter {
                         path,
                         needs_logprobs,
                     )
+                    .map_err(Into::into)
                 }
                 ResponseBody::Passthrough(body) => {
                     let mut headers = header_utils::preserve_response_headers(&headers);
                     headers.remove(http::header::CONTENT_LENGTH);
-                    response_with_body(status, &headers, body)
+                    response_with_body(status, &headers, body).map_err(Into::into)
                 }
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn process_vllm_two_stage_request(
+        &self,
+        request: Value,
+        prefill_worker: Arc<dyn Worker>,
+        decode_worker: Arc<dyn Worker>,
+        path: &str,
+        headers: Option<&HeaderMap>,
+        attempt: PdAttempt,
+        prefill_permit: Option<OwnedSemaphorePermit>,
+    ) -> Result<Response, PdRequestError> {
+        let mut metrics = RequestMetrics::new(path);
+        match self
+            .process_vllm_two_stage_request_inner(
+                request,
+                prefill_worker.clone(),
+                decode_worker.clone(),
+                path,
+                headers,
+                attempt.clone(),
+                prefill_permit,
+                &mut metrics,
+            )
+            .await
+        {
+            Ok(response) => Ok(response),
+            Err(error) => {
+                attempt.release();
+                metrics.record_failure(&error, prefill_worker.base_url(), decode_worker.base_url());
+                Err(error.resolve().await)
             }
         }
     }
@@ -1375,7 +1447,7 @@ impl VllmPDRouter {
     /// Stage transitions; D occupancy follows response-body ownership. The
     /// Program path additionally holds its P admission permit for the call.
     #[allow(clippy::too_many_arguments)]
-    async fn process_vllm_two_stage_request(
+    async fn process_vllm_two_stage_request_inner(
         &self,
         original_request: Value,
         prefill_worker: Arc<dyn Worker>,
@@ -1384,9 +1456,9 @@ impl VllmPDRouter {
         headers: Option<&HeaderMap>,
         attempt: PdAttempt,
         prefill_permit: Option<OwnedSemaphorePermit>,
-    ) -> Result<Response, PDRouterError> {
+        request_metrics: &mut RequestMetrics<'_>,
+    ) -> Result<Response, PdDispatchError> {
         debug!("ENTERED process_vllm_two_stage_request method");
-        let start_time = Instant::now();
         if !original_request.is_object() {
             return Ok((
                 StatusCode::BAD_REQUEST,
@@ -1436,10 +1508,10 @@ impl VllmPDRouter {
                     },
                     path,
                     headers,
-                    start_time,
                     ec_transfers,
                     attempt,
                     prefill_permit,
+                    request_metrics,
                 )
                 .await;
         }
@@ -1479,7 +1551,9 @@ impl VllmPDRouter {
                 decode_worker.dp_size(),
                 decode_worker.dp_rank(),
             )
-            .map_err(|reason| PDRouterError::InvalidConfiguration { reason })?;
+            .map_err(|_| {
+                PdRequestError::Internal(InternalErrorReason::MoriIoTransferModeMissing)
+            })?;
 
         debug!(
             "Added kv_transfer_params to prefill request for {:?} connector",
@@ -1530,7 +1604,7 @@ impl VllmPDRouter {
         prefill_request_builder =
             dp_utils::add_dp_rank_header(prefill_request_builder, prefill_dp_rank);
 
-        let prefill_response = otel_http::send_client_request(
+        let prefill_response = otel_http::prepare_client_request(
             prefill_request_builder.json(&prefill_request),
             headers,
             ClientRequestOptions {
@@ -1540,54 +1614,17 @@ impl VllmPDRouter {
                 request_phase: Some("prefill"),
             },
         )
+        .with_error_description(pd_error_description)
+        .send()
         .await;
         let finished_prefill = self
             .finish_prefill_response(prefill_response, &prefill_base_url, &attempt)
-            .await
-            .inspect_err(|_| {
-                RouterMetrics::record_pd_prefill_error(&prefill_base_url);
-                RouterMetrics::record_pd_request(path);
-                RouterMetrics::record_pd_request_duration(path, start_time.elapsed());
-            });
-        // The whole P body has been consumed (or never started): do not hold P
-        // admission capacity while D generates the response.
+            .await;
+        // Program permits cover successful Prefill body consumption, not Decode.
         drop(prefill_permit);
-        let (status, content_type, prefill_bytes) = finished_prefill?;
-        if !status.is_success() {
-            RouterMetrics::record_pd_prefill_error(&prefill_base_url);
-            RouterMetrics::record_pd_request(path);
-            RouterMetrics::record_pd_request_duration(path, start_time.elapsed());
-            if status.is_client_error() {
-                let mut response = (status, prefill_bytes).into_response();
-                if let Some(content_type) = content_type {
-                    response
-                        .headers_mut()
-                        .insert(http::header::CONTENT_TYPE, content_type);
-                }
-                return Ok(response);
-            }
-            return Err(PDRouterError::NetworkError {
-                message: format!(
-                    "Prefill server {prefill_url} returned {status}: {}",
-                    String::from_utf8_lossy(&prefill_bytes)
-                ),
-            });
-        }
-
-        // Parse prefill response to extract kv_transfer_params
-        let prefill_response_json: Value = match serde_json::from_slice(&prefill_bytes) {
-            Ok(json) => json,
-            Err(e) => {
-                let duration = start_time.elapsed();
-                RouterMetrics::record_pd_prefill_error(&prefill_base_url);
-                RouterMetrics::record_pd_request(path);
-                RouterMetrics::record_pd_request_duration(path, duration);
-                return Err(PDRouterError::NetworkError {
-                    message: format!("Failed to parse prefill response as JSON: {}", e),
-                });
-            }
-        };
-
+        let prefill_bytes = finished_prefill?;
+        let prefill_response_json: Value = serde_json::from_slice(&prefill_bytes)
+            .map_err(|_| PdRequestError::protocol(PdPhase::Prefill))?;
         if self.epd.is_some()
             && !matches!(self.kv_connector, KvConnector::Mooncake)
             && !matches!(self.moriio_transfer_mode(), Some(MoriIOTransferMode::Write))
@@ -1595,15 +1632,7 @@ impl VllmPDRouter {
                 .get("kv_transfer_params")
                 .is_some_and(Value::is_object)
         {
-            let duration = start_time.elapsed();
-            RouterMetrics::record_pd_prefill_error(&prefill_base_url);
-            RouterMetrics::record_pd_request(path);
-            RouterMetrics::record_pd_request_duration(path, duration);
-            return Err(PDRouterError::NetworkError {
-                message:
-                    "Prefill returned no KV transfer parameters; refusing metadata-only decode"
-                        .into(),
-            });
+            return Err(PdRequestError::protocol(PdPhase::Prefill).into());
         }
 
         // Prefill succeeded and consumed the embeddings; the pending EC
@@ -1691,7 +1720,7 @@ impl VllmPDRouter {
             dp_utils::add_dp_rank_header(decode_request_builder, decode_dp_rank);
 
         attempt.begin_decode();
-        let decode_response = match otel_http::send_client_request(
+        let decode_response = match otel_http::prepare_client_request(
             decode_request_builder.json(&decode_request),
             headers,
             ClientRequestOptions {
@@ -1701,20 +1730,16 @@ impl VllmPDRouter {
                 request_phase: Some("decode"),
             },
         )
+        .with_error_description(pd_error_description)
+        .send()
         .await
         {
             Ok(resp) => resp,
             Err(e) => {
                 attempt.finish_decode();
-                let full_error = error_chain(&e);
-                let duration = start_time.elapsed();
-                RouterMetrics::record_pd_decode_error(&decode_base_url);
-                RouterMetrics::record_pd_request(path);
-                RouterMetrics::record_pd_request_duration(path, duration);
+                self.stop_profiling(&decode_base_url).await;
                 RouterMetrics::record_pd_prefill_request(&prefill_base_url);
-                return Err(PDRouterError::NetworkError {
-                    message: format!("Decode request failed to {}: {}", decode_url, full_error),
-                });
+                return Err(PdRequestError::from_reqwest(PdPhase::Decode, e).into());
             }
         };
 
@@ -1726,13 +1751,12 @@ impl VllmPDRouter {
                 prefill_http: &prefill_base_url,
                 decode_http: &decode_base_url,
                 decode_base_url: &decode_base_url,
-                start_time,
                 request: &original_request,
             },
             &attempt,
+            request_metrics,
         )
         .await
-        .map_err(|message| PDRouterError::NetworkError { message })
     }
 
     async fn try_build_concurrent_requests(
@@ -1798,11 +1822,11 @@ impl VllmPDRouter {
         dispatch: ConcurrentDispatch,
         path: &str,
         headers: Option<&HeaderMap>,
-        start_time: Instant,
         mut ec_transfers: Option<super::epd::EcTransferGuard>,
         attempt: PdAttempt,
         prefill_permit: Option<OwnedSemaphorePermit>,
-    ) -> Result<Response, PDRouterError> {
+        request_metrics: &mut RequestMetrics<'_>,
+    ) -> Result<Response, PdDispatchError> {
         let ConcurrentDispatch {
             prefill_request,
             decode_request,
@@ -1836,10 +1860,9 @@ impl VllmPDRouter {
         self.start_profiling(&decode_base_url).await;
 
         let prefill_fut = async {
-            // Hold the P admission slot until the prefill body is consumed, then
-            // release it even if D is still running.
-            let prefill_permit = prefill_permit;
-            let response = otel_http::send_client_request(
+            // Own the Program Prefill permit until its successful body is consumed.
+            let _prefill_permit = prefill_permit;
+            let response = otel_http::prepare_client_request(
                 stage_builder(&prefill_url, prefill_dp_rank).json(&prefill_request),
                 headers,
                 ClientRequestOptions {
@@ -1849,97 +1872,47 @@ impl VllmPDRouter {
                     request_phase: Some("prefill"),
                 },
             )
+            .with_error_description(pd_error_description)
+            .send()
             .await;
-            let finished = self
+            let bytes = self
                 .finish_prefill_response(response, &prefill_base_url, &attempt)
-                .await;
-            drop(prefill_permit);
-            finished
+                .await?;
+            // Push identities can make the successful P body optional JSON.
+            let prefill_json = serde_json::from_slice::<Value>(&bytes).ok();
+            if let Some(json) = prefill_json.as_ref() {
+                self.maybe_cache_nixl_push_identity(&prefill_base_url, prefill_dp_rank, json);
+            }
+            if let Some(transfers) = ec_transfers.as_mut() {
+                transfers.disarm();
+            }
+            Ok(prefill_json)
         };
         attempt.begin_decode();
-        let (prefill_result, decode_result) = tokio::join!(
-            prefill_fut,
-            otel_http::send_client_request(
-                stage_builder(&decode_url, decode_dp_rank).json(&decode_request),
-                headers,
-                ClientRequestOptions {
-                    method: "POST",
-                    url: &decode_url,
-                    route: Some(path),
-                    request_phase: Some("decode"),
-                },
-            ),
-        );
-
-        let prefill_response_json = match prefill_result {
-            Ok((status, _, bytes)) if status.is_success() => {
-                serde_json::from_slice::<Value>(&bytes).ok()
-            }
-            Ok((status, content_type, bytes)) => {
-                attempt.finish_decode();
-                self.stop_profiling(&decode_base_url).await;
-                RouterMetrics::record_pd_prefill_error(&prefill_base_url);
-                RouterMetrics::record_pd_request(path);
-                RouterMetrics::record_pd_request_duration(path, start_time.elapsed());
-                if status.is_client_error() {
-                    let mut response = (status, bytes).into_response();
-                    if let Some(content_type) = content_type {
-                        response
-                            .headers_mut()
-                            .insert(http::header::CONTENT_TYPE, content_type);
-                    }
-                    return Ok(response);
-                }
-                return Err(PDRouterError::NetworkError {
-                    message: format!(
-                        "Prefill request failed to {} with status {}",
-                        prefill_url, status
-                    ),
-                });
-            }
-            Err(e) => {
-                attempt.finish_decode();
-                self.stop_profiling(&decode_base_url).await;
-                RouterMetrics::record_pd_prefill_error(&prefill_base_url);
-                RouterMetrics::record_pd_request(path);
-                RouterMetrics::record_pd_request_duration(path, start_time.elapsed());
-                return Err(PDRouterError::NetworkError {
-                    message: format!(
-                        "Prefill request failed to {}: {}",
-                        prefill_url,
-                        error_chain(&e)
-                    ),
-                });
-            }
-        };
-        if let Some(prefill_json) = prefill_response_json.as_ref() {
-            self.maybe_cache_nixl_push_identity(&prefill_base_url, prefill_dp_rank, prefill_json);
-        }
-        // Prefill succeeded and consumed the embeddings; the pending EC
-        // transfers are now owned by the decode phase, so disarm the
-        // cancel-on-abandon guard.
-        if let Some(transfers) = ec_transfers.as_mut() {
-            transfers.disarm();
-        }
-
-        let decode_response = match decode_result {
-            Ok(resp) => resp,
-            Err(e) => {
-                attempt.finish_decode();
-                self.stop_profiling(&decode_base_url).await;
-                RouterMetrics::record_pd_decode_error(&decode_base_url);
-                RouterMetrics::record_pd_request(path);
-                RouterMetrics::record_pd_request_duration(path, start_time.elapsed());
+        let decode_fut = otel_http::prepare_client_request(
+            stage_builder(&decode_url, decode_dp_rank).json(&decode_request),
+            headers,
+            ClientRequestOptions {
+                method: "POST",
+                url: &decode_url,
+                route: Some(path),
+                request_phase: Some("decode"),
+            },
+        )
+        .with_error_description(pd_error_description)
+        .send();
+        let result = prefill_first(prefill_fut, decode_fut).await;
+        if let Err(error) = &result {
+            // Drop local sends/responses and release both stages before capturing
+            // an error body; Prefill failure wins when both legs fail.
+            attempt.release();
+            self.stop_profiling(&decode_base_url).await;
+            if matches!(error, PdDispatchError::Classified(e) if matches!(e.phase(), Some(PdPhase::Decode)))
+            {
                 RouterMetrics::record_pd_prefill_request(&prefill_base_url);
-                return Err(PDRouterError::NetworkError {
-                    message: format!(
-                        "Decode request failed to {}: {}",
-                        decode_url,
-                        error_chain(&e)
-                    ),
-                });
             }
-        };
+        }
+        let (prefill_response_json, decode_response) = result?;
 
         let prefill_http = prefill_base_url
             .strip_prefix("http://")
@@ -1956,13 +1929,12 @@ impl VllmPDRouter {
                 prefill_http,
                 decode_http,
                 decode_base_url: &decode_base_url,
-                start_time,
                 request: &decode_request,
             },
             &attempt,
+            request_metrics,
         )
         .await
-        .map_err(|message| PDRouterError::NetworkError { message })
     }
 
     /// Create a new vLLM PD router
@@ -2236,11 +2208,8 @@ impl RouterTrait for VllmPDRouter {
     ) -> Response {
         let request_json = match serde_json::to_value(body) {
             Ok(json) => json,
-            Err(e) => {
-                return (
-                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Serialization error: {}", e),
-                )
+            Err(_) => {
+                return PdRequestError::Internal(InternalErrorReason::SerializeRequest)
                     .into_response()
             }
         };
@@ -2256,11 +2225,8 @@ impl RouterTrait for VllmPDRouter {
     ) -> Response {
         let request_json = match serde_json::to_value(body) {
             Ok(json) => json,
-            Err(e) => {
-                return (
-                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Serialization error: {}", e),
-                )
+            Err(_) => {
+                return PdRequestError::Internal(InternalErrorReason::SerializeRequest)
                     .into_response()
             }
         };
@@ -2283,8 +2249,9 @@ impl RouterTrait for VllmPDRouter {
         if self.program_turn_enabled(headers, &body.other) {
             let request = match serde_json::to_value(body) {
                 Ok(request) => request,
-                Err(error) => {
-                    return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
+                Err(_) => {
+                    return PdRequestError::Internal(InternalErrorReason::SerializeRequest)
+                        .into_response()
                 }
             };
             if let Some(response) = self
@@ -2296,14 +2263,16 @@ impl RouterTrait for VllmPDRouter {
         }
         match serde_json::to_value(body) {
             Ok(body) => {
+                debug!(
+                    "Serialized chat request: {}",
+                    serde_json::to_string_pretty(&body).unwrap_or_default()
+                );
                 self.route_transparent(headers, "/v1/chat/completions", &Method::POST, body)
                     .await
             }
-            Err(error) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Serialization error: {error}"),
-            )
-                .into_response(),
+            Err(_) => {
+                PdRequestError::Internal(InternalErrorReason::SerializeRequest).into_response()
+            }
         }
     }
 
@@ -2316,8 +2285,9 @@ impl RouterTrait for VllmPDRouter {
         if self.program_turn_enabled(headers, &body.other) {
             let request = match serde_json::to_value(body) {
                 Ok(request) => request,
-                Err(error) => {
-                    return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
+                Err(_) => {
+                    return PdRequestError::Internal(InternalErrorReason::SerializeRequest)
+                        .into_response()
                 }
             };
             if let Some(response) = self
@@ -2332,11 +2302,9 @@ impl RouterTrait for VllmPDRouter {
                 self.route_transparent(headers, "/v1/completions", &Method::POST, body)
                     .await
             }
-            Err(error) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Serialization error: {error}"),
-            )
-                .into_response(),
+            Err(_) => {
+                PdRequestError::Internal(InternalErrorReason::SerializeRequest).into_response()
+            }
         }
     }
 
@@ -2348,11 +2316,8 @@ impl RouterTrait for VllmPDRouter {
     ) -> Response {
         let request_json = match serde_json::to_value(body) {
             Ok(json) => json,
-            Err(e) => {
-                return (
-                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Serialization error: {}", e),
-                )
+            Err(_) => {
+                return PdRequestError::Internal(InternalErrorReason::SerializeRequest)
                     .into_response()
             }
         };
@@ -2387,11 +2352,8 @@ impl RouterTrait for VllmPDRouter {
     ) -> Response {
         let request_json = match serde_json::to_value(body) {
             Ok(json) => json,
-            Err(e) => {
-                return (
-                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Serialization error: {}", e),
-                )
+            Err(_) => {
+                return PdRequestError::Internal(InternalErrorReason::SerializeRequest)
                     .into_response()
             }
         };
@@ -2552,11 +2514,7 @@ impl RouterTrait for VllmPDRouter {
                         decode_worker.url(),
                         e
                     );
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("Transparent proxy request failed: {}", e),
-                    )
-                        .into_response()
+                    e.into_response()
                 }
             }
         }
@@ -2588,7 +2546,7 @@ mod tests {
         path: &str,
         streaming: bool,
         logprobs: bool,
-    ) -> Result<Response, String> {
+    ) -> Result<Response, PdRequestError> {
         if streaming {
             finalize_decode_stream(response, prefill, path)
         } else {
@@ -2596,7 +2554,7 @@ mod tests {
             let headers = response.headers().clone();
             match read_response_body(response, PD_BUFFERED_BODY_LIMIT_BYTES)
                 .await
-                .map_err(|error| format!("Failed to read response body: {error}"))?
+                .map_err(|error| PdRequestError::from_reqwest(PdPhase::Decode, error))?
             {
                 ResponseBody::Buffered(bytes) => {
                     finalize_decode_body(status, headers, bytes, prefill, path, logprobs)
@@ -2650,7 +2608,12 @@ mod tests {
         let client = reqwest::Client::new();
         let response = client.get(&url).send().await.unwrap();
         let error = read_prefill_body(response, &url).await.unwrap_err();
-        assert!(error.to_string().contains("exceeds"));
+        assert!(matches!(
+            error,
+            PdRequestError::Protocol {
+                phase: PdPhase::Prefill
+            }
+        ));
     }
 
     #[tokio::test]
@@ -2743,10 +2706,10 @@ mod tests {
                         prefill_http: "prefill",
                         decode_http: "decode",
                         decode_base_url: "decode",
-                        start_time: Instant::now(),
                         request: &request,
                     },
                     &attempt,
+                    &mut RequestMetrics::new("/v1/chat/completions"),
                 )
                 .await
                 .expect("large successful decode response must be preserved");
@@ -2825,10 +2788,10 @@ mod tests {
                         prefill_http: "prefill",
                         decode_http: "decode",
                         decode_base_url: "decode",
-                        start_time: Instant::now(),
                         request: &request,
                     },
                     &attempt,
+                    &mut RequestMetrics::new("/v1/chat/completions"),
                 )
                 .await
                 .unwrap();
@@ -2892,10 +2855,10 @@ mod tests {
                         prefill_http: "prefill",
                         decode_http: "decode",
                         decode_base_url: "decode",
-                        start_time: Instant::now(),
                         request: &request,
                     },
                     &attempt,
+                    &mut RequestMetrics::new("/v1/chat/completions"),
                 )
                 .await
                 .unwrap();
@@ -3049,13 +3012,18 @@ mod tests {
                             .await;
                         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
                         assert_eq!(response.headers()["retry-after"], "7");
-                        assert_eq!(
-                            axum::body::to_bytes(response.into_body(), 4096)
-                                .await
-                                .unwrap()
-                                .as_ref(),
-                            b"overloaded"
-                        );
+                        assert_eq!(response.headers()["content-type"], "application/json");
+                        let bytes = axum::body::to_bytes(response.into_body(), 4096)
+                            .await
+                            .unwrap();
+                        let error: Value = serde_json::from_slice(&bytes).unwrap();
+                        assert_eq!(error["error"]["type"], "rate_limit_error");
+                        assert_eq!(error["error"]["code"], "429");
+                        assert!(error["error"]["message"]
+                            .as_str()
+                            .unwrap()
+                            .contains("decode"));
+                        assert!(!std::str::from_utf8(&bytes).unwrap().contains("overloaded"));
                     }
                 }
             }
@@ -3682,7 +3650,7 @@ mod tests {
                     .await
                     .is_err());
             } else {
-                assert!(result.unwrap_err().contains("Failed to read response body"));
+                assert!(matches!(result, Err(PdRequestError::Transport(_))));
             }
             server.await.unwrap();
         }
@@ -4751,6 +4719,26 @@ mod tests {
                 );
                 decode.decrement_load();
             }
+        }
+    }
+}
+
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
+mod kv_compatibility_tests {
+    use super::*;
+
+    #[test]
+    fn moriio_read_keeps_null_promotion_and_existing_fields_without_panicking() {
+        assert_eq!(
+            moriio_read_params(Value::Null, 4),
+            Some(json!({"remote_dp_size":4}))
+        );
+        assert_eq!(
+            moriio_read_params(json!({"remote_engine_id":"P", "remote_dp_size":1}), 4),
+            Some(json!({"remote_engine_id":"P", "remote_dp_size":4}))
+        );
+        for params in [json!([1, 2]), json!("invalid"), json!(true), json!(3)] {
+            assert!(moriio_read_params(params, 4).is_none());
         }
     }
 }

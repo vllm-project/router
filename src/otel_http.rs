@@ -16,11 +16,23 @@ pub struct ClientRequestOptions<'a> {
 pub struct PreparedClientRequest {
     request: reqwest::RequestBuilder,
     span: Span,
+    error_description: Option<fn(&reqwest::Error) -> &'static str>,
 }
 
 impl PreparedClientRequest {
+    /// Override the description recorded for send errors without changing the
+    /// returned error. Request phase labels do not select an error policy.
+    pub fn with_error_description(mut self, describe: fn(&reqwest::Error) -> &'static str) -> Self {
+        self.error_description = Some(describe);
+        self
+    }
+
     pub async fn send(self) -> Result<reqwest::Response, reqwest::Error> {
-        let Self { request, span } = self;
+        let Self {
+            request,
+            span,
+            error_description,
+        } = self;
 
         let response = if span.is_none() {
             request.send().await
@@ -46,7 +58,9 @@ impl PreparedClientRequest {
             }
             Err(error) => {
                 if !span.is_disabled() {
-                    let message = error.to_string();
+                    let message = error_description
+                        .map(|describe| describe(&error).to_owned())
+                        .unwrap_or_else(|| error.to_string());
                     span.record("error", message.as_str());
                     span.set_status(opentelemetry::trace::Status::error(message));
                 }
@@ -100,7 +114,11 @@ pub fn prepare_client_request(
         Span::none()
     };
 
-    PreparedClientRequest { request, span }
+    PreparedClientRequest {
+        request,
+        span,
+        error_description: None,
+    }
 }
 
 pub async fn send_client_request(
