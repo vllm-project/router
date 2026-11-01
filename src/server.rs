@@ -888,16 +888,13 @@ pub fn build_app_with_wasm_middleware(
         .merge(admin_routes)
         .merge(worker_routes);
 
-    // Choose fallback based on transparent proxy mode. Add it before the
-    // layers below: `Router::layer` only wraps the routes and fallback that
-    // already exist, so a fallback added afterwards would skip them.
+    // Choose fallback based on transparent proxy mode
     let base_app = if enable_transparent_proxy {
         base_app.fallback(transparent_proxy_handler)
     } else {
         base_app.fallback(sink_handler)
     };
 
-    // Request body size limiting
     let base_app = base_app
         .layer(DefaultBodyLimit::max(max_payload_size))
         .layer(tower_http::limit::RequestBodyLimitLayer::new(
