@@ -66,6 +66,15 @@ impl AppContext {
         rate_limit_tokens_per_second: Option<usize>,
         api_key_validation_urls: Vec<String>,
     ) -> Result<Self, String> {
+        if let crate::config::PolicyConfig::KvAware {
+            static_kv_event_sources,
+            ..
+        } = &router_config.policy
+        {
+            for (worker, source) in static_kv_event_sources.iter() {
+                source.validate(worker).map_err(|error| error.to_string())?;
+            }
+        }
         let rate_limit_tokens = rate_limit_tokens_per_second.unwrap_or(max_concurrent_requests);
         let rate_limiter = Arc::new(TokenBucket::new(max_concurrent_requests, rate_limit_tokens));
 

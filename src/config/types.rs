@@ -794,6 +794,10 @@ pub enum PolicyConfig {
 }
 
 /// Manually configured KV event publishers for one regular-mode worker.
+///
+/// Rust struct literals must supply `topic: String::new()` to retain the
+/// previous empty subscription topic. Serde defaults preserve old JSON
+/// configurations, but do not provide Rust source compatibility.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct StaticKvEventSources {
     /// One externally reachable ZMQ PUB endpoint per DP rank.
@@ -801,6 +805,9 @@ pub struct StaticKvEventSources {
     /// Optional replay ROUTER endpoint per DP rank for loss recovery.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replay_endpoints: Option<Vec<String>>,
+    /// Exact ZMQ subscription topic shared by these ranks.
+    #[serde(default)]
+    pub topic: String,
     /// KV cache block size used to calculate prefix placement.
     pub block_size: u32,
     /// Shared model identity across workers that serve the same model.
