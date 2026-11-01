@@ -167,14 +167,14 @@ Upstream failures are forwarded unchanged: if a prefill or decode target rejects
 | Field | Default | Notes |
 | --- | --- | --- |
 | `automatic_ttl` | `false` | enable the automatic Acting TTL |
-| `ttl_online` | `false` | fit the TTL from online rank statistics when no calibration table exists |
+| `ttl_online` | `false` | fit the TTL from online rank statistics when no calibration table exists; sub-knob, requires `warm_remote`, `local_append` or `automatic_ttl` |
 | `ttl_gamma` | `1.0` | wait-cost weight in the TTL solver |
 | `ttl_min_samples` | `16` | interval samples required before the solver may return a positive TTL |
 | `ttl_min_gain_seconds` | `0.001` | minimum utility for a positive TTL |
-| `feedback` | `false` | use measured residency probability in TTL keep/drop |
+| `feedback` | `false` | use measured residency probability in TTL keep/drop; sub-knob, requires `warm_remote`, `local_append` or `automatic_ttl` |
 | `calibration` | none | offline-calibrated PD cost table |
 
-Configuration is strict: unknown fields inside `program_scheduling`/`pd` are rejected, and numeric bounds are validated at startup.
+Configuration is strict: unknown fields inside `program_scheduling`/`pd` are rejected, and numeric bounds are validated at startup. `feedback` and `ttl_online` are sub-knobs: configuring them without `warm_remote`, `local_append` or `automatic_ttl` is rejected instead of silently enabling the warm executor.
 
 `warm_min_p_kv_usage` and `warm_max_p_running` read the per-P metrics scrape (`/metrics` of each prefill endpoint, sampled every `pd.prefill_kv_window_seconds`, values fresh for three windows). The scrape runs whenever warm reads are enabled, even if `pd.prefill_kv_high_watermark` is `0`. When a sample is missing or stale the gate stays open (warm is not suppressed) and `warm_skipped_pressure` only counts samples that actually blocked a warm read.
 

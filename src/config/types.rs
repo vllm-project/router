@@ -241,13 +241,13 @@ impl Default for PdProgramSchedulingConfig {
 }
 
 impl PdProgramSchedulingConfig {
-    /// True when any warm-read or automatic-TTL behavior is requested.
+    /// True when a warm-read or automatic-TTL *master* switch is on.
+    ///
+    /// `feedback` and `ttl_online` are sub-knobs: on their own they must not
+    /// enable the warm-remote executor, because it changes how every token-id
+    /// Program completion is dispatched while the sub-knob itself has no effect.
     pub fn warm_remote_enabled(&self) -> bool {
-        self.warm_remote
-            || self.local_append
-            || self.automatic_ttl
-            || self.feedback
-            || self.ttl_online
+        self.warm_remote || self.local_append || self.automatic_ttl
     }
 
     pub fn validate(&self) -> Result<(), String> {
@@ -287,6 +287,14 @@ impl PdProgramSchedulingConfig {
         }
         if let Some(c) = &self.calibration {
             c.validate()?;
+        }
+        if (self.feedback || self.ttl_online)
+            && !(self.automatic_ttl || self.warm_remote || self.local_append)
+        {
+            return Err(
+                "feedback/ttl_online are sub-knobs and require warm_remote, local_append or automatic_ttl"
+                    .into(),
+            );
         }
         Ok(())
     }

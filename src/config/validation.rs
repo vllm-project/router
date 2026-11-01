@@ -1246,6 +1246,46 @@ mod tests {
     }
 
     #[test]
+    fn ttl_subknobs_alone_do_not_enable_the_warm_executor() {
+        let mode = || RoutingMode::VllmPrefillDecode {
+            prefill_urls: vec![("http://prefill:8000".to_string(), None)],
+            decode_urls: vec!["http://decode:8000".to_string()],
+            prefill_policy: None,
+            decode_policy: None,
+            discovery_address: None,
+        };
+        for pd in [
+            serde_json::json!({"feedback": true}),
+            serde_json::json!({"ttl_online": true}),
+        ] {
+            let mut config = RouterConfig::new(mode(), PolicyConfig::RoundRobin);
+            config.program_scheduling = Some(
+                serde_json::from_value(serde_json::json!({
+                    "token_capacity_per_dp_rank": 100000,
+                    "enable_batch_gain_admission": false,
+                    "pd": pd
+                }))
+                .unwrap(),
+            );
+            assert!(
+                ConfigValidator::validate(&config).is_err(),
+                "accepted a TTL sub-knob without automatic_ttl: {pd}"
+            );
+        }
+        // A master switch keeps the sub-knob valid.
+        let mut config = RouterConfig::new(mode(), PolicyConfig::RoundRobin);
+        config.program_scheduling = Some(
+            serde_json::from_value(serde_json::json!({
+                "token_capacity_per_dp_rank": 100000,
+                "enable_batch_gain_admission": false,
+                "pd": {"warm_remote": true, "feedback": true}
+            }))
+            .unwrap(),
+        );
+        assert!(ConfigValidator::validate(&config).is_ok());
+    }
+
+    #[test]
     fn test_validate_roundrobin_with_pd_mode() {
         // RoundRobin with PD mode is now supported
         let config = RouterConfig::new(
