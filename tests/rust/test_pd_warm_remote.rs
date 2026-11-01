@@ -31,6 +31,7 @@ struct StateData {
     large_text: Arc<AtomicUsize>,
     metrics_kv_milli: Arc<AtomicU64>,
     metrics_running: Arc<AtomicU64>,
+    auth_gate: Arc<AtomicBool>,
 }
 struct Engine {
     url: String,
@@ -55,6 +56,7 @@ async fn engine(p: bool, fail_warm: bool, partial: bool) -> Engine {
         large_text: Arc::new(AtomicUsize::new(0)),
         metrics_kv_milli: Arc::new(AtomicU64::new(0)),
         metrics_running: Arc::new(AtomicU64::new(0)),
+        auth_gate: Arc::new(AtomicBool::new(false)),
     };
     let app=Router::new().route("/health",get(||async{"ok"}))
         .route("/get_server_info",get(||async{Json(json!({"model_id":"test","data_parallel_size":1}))}))
@@ -64,7 +66,15 @@ async fn engine(p: bool, fail_warm: bool, partial: bool) -> Engine {
             let running = s.metrics_running.load(Ordering::SeqCst);
             format!("vllm:kv_cache_usage_perc{{engine=\"0\"}} {kv}\nvllm:num_requests_running{{engine=\"0\"}} {running}\nvllm:num_requests_waiting{{engine=\"0\"}} 0\n")
         }))
-        .route("/pd_capabilities",get(|State(s):State<StateData>|async move{s.capability_probes.fetch_add(1,Ordering::SeqCst);Json(json!({"protocol_revision":"vllm-0.28.0-pd-feedback-v1","instance_epoch":s.epoch.load(Ordering::SeqCst).to_string(),"profile":"test-profile","dp_rank":0,"bidirectional":true,"fail_on_load_error":true,"read_margin_millis":5000,"local_miss_guard":true,"local_prefix_probe":true,"store":false}))}))
+        .route("/pd_capabilities",get(|State(s):State<StateData>,headers:HeaderMap|async move{
+            s.capability_probes.fetch_add(1,Ordering::SeqCst);
+            if s.auth_gate.load(Ordering::SeqCst)
+                && headers.get(header::AUTHORIZATION).and_then(|value| value.to_str().ok()) != Some("Bearer op-key")
+            {
+                return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
+            }
+            Json(json!({"protocol_revision":"vllm-0.28.0-pd-feedback-v1","instance_epoch":s.epoch.load(Ordering::SeqCst).to_string(),"profile":"test-profile","dp_rank":0,"bidirectional":true,"fail_on_load_error":true,"read_margin_millis":5000,"local_miss_guard":true,"local_prefix_probe":true,"store":false})).into_response()
+        }))
         .route("/v1/completions",post(generate)).with_state(state.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
@@ -403,6 +413,32 @@ async fn warm_remote_turns_do_not_leak_worker_load() {
         (prefill, decode),
         (0, 0),
         "warm-remote turns leaked worker load (prefill={prefill}, decode={decode})"
+    );
+}
+
+#[tokio::test]
+async fn capability_probe_uses_operator_key_when_configured() {
+    struct EnvGuard;
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            std::env::remove_var("OPENAI_API_KEY");
+        }
+    }
+    let _guard = EnvGuard;
+    std::env::set_var("OPENAI_API_KEY", "op-key");
+    let p = engine(true, false, false).await;
+    let d = engine(false, false, false).await;
+    // The engine now requires the operator key on the capability endpoint,
+    // exactly like real operator-key deployments.
+    p.state.auth_gate.store(true, Ordering::SeqCst);
+    let r = router(&p, &d).await;
+    assert_eq!(call(&r, vec![1, 2, 3], false).await.0, StatusCode::OK);
+    assert_eq!(call(&r, next_prompt(), false).await.0, StatusCode::OK);
+    assert!(p.state.capability_probes.load(Ordering::SeqCst) > 0);
+    assert_eq!(
+        p.state.calls.lock().unwrap()[1].pointer("/kv_transfer_params/remote_engine_id"),
+        Some(&json!("d-engine")),
+        "warm read never engaged although completions authenticate with the operator key"
     );
 }
 

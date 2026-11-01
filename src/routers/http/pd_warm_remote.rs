@@ -395,6 +395,26 @@ fn bounded_metadata(params: &Value, max: usize) -> bool {
             })
         && params.get("transfer_mode").and_then(Value::as_str) == Some("pull")
 }
+/// Capability probes sit on the turn's hot path; a failed probe safely falls
+/// back to cold/M1, so do not stall a turn for the engine-core queue.
+const CAPABILITY_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Resolve the Authorization header for engine calls: the operator key wins,
+/// and the client's own header is the fallback.
+fn engine_authorization(
+    headers: Option<&HeaderMap>,
+    operator_key: Option<&str>,
+) -> Option<axum::http::HeaderValue> {
+    operator_key
+        .filter(|key| !key.is_empty())
+        .and_then(|key| axum::http::HeaderValue::from_str(&format!("Bearer {key}")).ok())
+        .or_else(|| {
+            headers
+                .and_then(|h| h.get(axum::http::header::AUTHORIZATION))
+                .cloned()
+        })
+}
+
 fn builder(
     client: &reqwest::Client,
     target: &ProgramTarget,
@@ -410,16 +430,8 @@ fn builder(
     // operator's OPENAI_API_KEY. Match it when configured, and otherwise
     // fall back to the client's Authorization so client-key deployments
     // keep working.
-    let auth = std::env::var("OPENAI_API_KEY")
-        .ok()
-        .filter(|key| !key.is_empty())
-        .and_then(|key| axum::http::HeaderValue::from_str(&format!("Bearer {key}")).ok())
-        .or_else(|| {
-            headers
-                .and_then(|h| h.get(axum::http::header::AUTHORIZATION))
-                .cloned()
-        });
-    if let Some(auth) = auth {
+    let operator_key = std::env::var("OPENAI_API_KEY").ok();
+    if let Some(auth) = engine_authorization(headers, operator_key.as_deref()) {
         b = b.header(axum::http::header::AUTHORIZATION, auth);
     }
     header_utils::propagate_trace_headers(b, headers)
@@ -434,9 +446,10 @@ async fn identify_uncached(
         client.get(format!("{}/pd_capabilities", target.base_url)),
         target.dp_rank,
     )
-    .timeout(Duration::from_secs(30));
-    if let Some(auth) = headers.and_then(|h| h.get(axum::http::header::AUTHORIZATION)) {
-        b = b.header(axum::http::header::AUTHORIZATION, auth.clone());
+    .timeout(CAPABILITY_PROBE_TIMEOUT);
+    let operator_key = std::env::var("OPENAI_API_KEY").ok();
+    if let Some(auth) = engine_authorization(headers, operator_key.as_deref()) {
+        b = b.header(axum::http::header::AUTHORIZATION, auth);
     }
     let response = b
         .send()
@@ -1558,6 +1571,26 @@ mod tests {
             local_prefix_probe: true,
             store: false,
         }
+    }
+    #[test]
+    fn engine_authorization_prefers_operator_key_then_client_header() {
+        use axum::http::{header::AUTHORIZATION, HeaderValue};
+        let mut headers = HeaderMap::new();
+        headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer client-key"));
+        assert_eq!(
+            engine_authorization(Some(&headers), Some("op-key")),
+            Some(HeaderValue::from_static("Bearer op-key"))
+        );
+        assert_eq!(
+            engine_authorization(Some(&headers), None),
+            Some(HeaderValue::from_static("Bearer client-key"))
+        );
+        assert_eq!(
+            engine_authorization(None, Some("op-key")),
+            Some(HeaderValue::from_static("Bearer op-key"))
+        );
+        assert_eq!(engine_authorization(None, None), None);
+        assert_eq!(engine_authorization(None, Some("")), None);
     }
     #[test]
     fn invalidate_target_without_rank_clears_all_cached_identities_for_base() {
