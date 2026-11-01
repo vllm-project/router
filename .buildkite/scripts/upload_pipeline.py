@@ -3,9 +3,12 @@
 
 An explicit name such as ``mirror_hardwares: l4_4`` is replaced with that
 entry from ``ci_mirror_hardwares.yml`` (``agents`` and, when present,
-``plugins``). A step-level ``retry`` is kept. This is the router-sized
-slice of vllm-omni's uploader: no ``MIRROR_HW`` switch and no inference
-from pytest marks.
+``plugins``). A step-level ``retry`` is kept. A preset that injects
+``VLLM_CI_HF_TOKEN`` also gets a shell export of ``HF_TOKEN`` from that
+value. A build-level ``HF_TOKEN`` would override a pod env entry of the
+same name, so the secret stays under the alias until the job shell runs.
+This is the router-sized slice of vllm-omni's uploader: no ``MIRROR_HW``
+switch and no inference from pytest marks.
 
 Usage:
   python3 .buildkite/scripts/upload_pipeline.py .buildkite/test-ready.yml
@@ -25,6 +28,11 @@ import yaml
 
 BUILDKITE_DIR = Path(__file__).resolve().parent.parent
 HARDWARE_PATH = BUILDKITE_DIR / "ci_mirror_hardwares.yml"
+# ``$$`` survives Buildkite upload interpolation as a single ``$``.
+CUDA_HF_TOKEN_ENV = "VLLM_CI_HF_TOKEN"
+CUDA_HF_TOKEN_EXPORT = (
+    f'if [ -n "$${{{CUDA_HF_TOKEN_ENV}:-}}" ]; then export HF_TOKEN="$${{{CUDA_HF_TOKEN_ENV}}}"; fi'
+)
 
 
 class _Dumper(yaml.SafeDumper):
@@ -54,6 +62,47 @@ def load_presets() -> dict[str, dict[str, Any]]:
 def _step_label(step: dict[str, Any]) -> str:
     label = step.get("label") or step.get("key") or "<unlabeled>"
     return str(label)
+
+
+def _preset_env_names(preset: dict[str, Any]) -> set[str]:
+    names: set[str] = set()
+    plugins = preset.get("plugins")
+    if not isinstance(plugins, list):
+        return names
+    for plugin in plugins:
+        if not isinstance(plugin, dict):
+            continue
+        for spec in plugin.values():
+            if not isinstance(spec, dict):
+                continue
+            pod = spec.get("podSpec")
+            if not isinstance(pod, dict):
+                continue
+            containers = pod.get("containers")
+            if not isinstance(containers, list):
+                continue
+            for container in containers:
+                if not isinstance(container, dict):
+                    continue
+                env = container.get("env")
+                if not isinstance(env, list):
+                    continue
+                for item in env:
+                    if isinstance(item, dict) and isinstance(item.get("name"), str):
+                        names.add(item["name"])
+    return names
+
+
+def _prepend_hf_token_export(merged: dict[str, Any]) -> None:
+    """Restore ``HF_TOKEN`` after Buildkite has merged build-level env."""
+    key = "commands" if "commands" in merged else "command"
+    existing = merged.get(key)
+    if isinstance(existing, list):
+        merged[key] = [CUDA_HF_TOKEN_EXPORT, *existing]
+    elif existing is None:
+        merged[key] = [CUDA_HF_TOKEN_EXPORT]
+    else:
+        merged[key] = [CUDA_HF_TOKEN_EXPORT, existing]
 
 
 def expand_steps(steps: list[Any], presets: dict[str, dict[str, Any]]) -> list[Any]:
@@ -86,6 +135,8 @@ def expand_steps(steps: list[Any], presets: dict[str, dict[str, Any]]) -> list[A
 
         merged = {key: value for key, value in step.items() if key != "mirror_hardwares"}
         merged.update(copy.deepcopy(preset))
+        if CUDA_HF_TOKEN_ENV in _preset_env_names(preset):
+            _prepend_hf_token_export(merged)
         if "retry" in step:
             merged["retry"] = step["retry"]
         expanded.append(merged)
