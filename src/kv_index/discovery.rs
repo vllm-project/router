@@ -999,9 +999,13 @@ mod tests {
         let publisher = publisher_context.socket(zmq::PUB).unwrap();
         publisher.bind("tcp://127.0.0.1:*").unwrap();
         let endpoint = publisher.get_last_endpoint().unwrap().unwrap();
-        for worker_url in ["grpc://127.0.0.1:1", "http://127.0.0.1:1/proxy"] {
+        for (worker_url, rank_count) in [
+            ("grpc://127.0.0.1:1", 2),
+            ("http://127.0.0.1:1/proxy", 2),
+            ("http://127.0.0.1:1", 1),
+        ] {
             let source = StaticKvEventSources {
-                endpoints: vec![endpoint.clone(), endpoint.clone()],
+                endpoints: vec![endpoint.clone(); rank_count],
                 replay_endpoints: None,
                 block_size: 32,
                 model: "shared-model".into(),
@@ -1019,7 +1023,7 @@ mod tests {
             let mut info = supervisor.on_worker_added(worker_url).await.unwrap();
             assert_eq!(info.block_size, Some(32));
             info.ranks.sort_unstable();
-            assert_eq!(info.ranks, vec![0, 1]);
+            assert_eq!(info.ranks, (0..rank_count as u32).collect::<Vec<_>>());
             assert_eq!(info.cache_key.unwrap().model.as_ref(), "shared-model");
             assert!(supervisor.match_provider_for_worker(worker_url).is_some());
             assert!(supervisor.workers.lock()[worker_url]
