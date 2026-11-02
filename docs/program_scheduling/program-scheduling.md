@@ -298,3 +298,9 @@ structured logs, `/scheduling_diagnostics`, and bounded-cardinality metrics,
 but real decisions continue to use the existing rank-level fitted TTL and
 `decode_buffer_tokens` fallback. Activation requires a separate rollout after
 calibration has been evaluated.
+
+## PD Program scheduling
+
+Program-scoped PD scheduling and warm remote KV reuse with automatic TTL are documented in
+[PD Program Scheduling](pd-program-scheduling.md), including router/engine/client requirements, the full configuration
+reference, diagnostics, tuning recipes and troubleshooting.

@@ -25,6 +25,8 @@ struct ProgramCompletionInner {
     token_estimator: Arc<MomentumTokenEstimator>,
     token_estimate_calibration: TokenEstimateCalibration,
     finished: AtomicBool,
+    pd_ttl: Mutex<Option<std::time::Duration>>,
+    replacement_dispatch: Mutex<Option<ProgramDispatch>>,
 }
 
 impl ProgramCompletion {
@@ -43,6 +45,8 @@ impl ProgramCompletion {
                 token_estimator,
                 token_estimate_calibration,
                 finished: AtomicBool::new(false),
+                pd_ttl: Mutex::new(None),
+                replacement_dispatch: Mutex::new(None),
             }),
         }
     }
@@ -60,6 +64,18 @@ impl ProgramCompletion {
             let _ = self.inner.first_stream_output_at.set(Instant::now());
         }
         self.inner.usage.lock().observe_sse_chunk(chunk);
+    }
+
+    pub(super) fn restart_pd_attempt(&self) -> Option<ProgramDispatch> {
+        let mut replacement = self.inner.replacement_dispatch.lock();
+        let current = replacement.as_ref().unwrap_or(&self.inner.dispatch);
+        let next = self.inner.scheduler.restart_pd_attempt(current)?;
+        *replacement = Some(next.clone());
+        Some(next)
+    }
+
+    pub(super) fn set_pd_ttl(&self, ttl: std::time::Duration) {
+        *self.inner.pd_ttl.lock() = Some(ttl);
     }
 
     pub(super) fn finish(&self, success: bool) {
@@ -86,11 +102,19 @@ impl ProgramCompletionInner {
                 .saturating_duration_since(*first_output)
                 .as_secs_f64()
         });
+        let replacement = self.replacement_dispatch.lock();
+        let dispatch = replacement.as_ref().unwrap_or(&self.dispatch);
         // V0 no-return labeling depends on upstream honoring the existing contract:
         // `expected_resume=false` means no later model request is expected after this round.
-        let terminate = !self.dispatch.expected_resume();
-        self.scheduler
-            .complete(&self.dispatch, success, terminate, usage, decode_seconds);
+        let terminate = !dispatch.expected_resume();
+        self.scheduler.complete_with_pd_ttl(
+            dispatch,
+            success,
+            terminate,
+            usage,
+            decode_seconds,
+            *self.pd_ttl.lock(),
+        );
     }
 }
 

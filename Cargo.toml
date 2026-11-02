@@ -37,6 +37,7 @@ futures = "0.3"
 pyo3 = { version = "0.26", features = ["extension-module"] }
 dashmap = "6.1.0"
 http = "1.1.0"
+mime = "0.3"
 tokio = { version = "1.42.0", features = ["full"] }
 async-trait = "0.1"
 tracing = "0.1"
@@ -277,6 +278,10 @@ path = "tests/rust/test_extra_args_chat.rs"
 [[test]]
 name = "test_openai_routing"
 path = "tests/rust/test_openai_routing.rs"
+
+[[test]]
+name = "test_pd_warm_remote"
+path = "tests/rust/test_pd_warm_remote.rs"
 
 [[test]]
 name = "test_pd_program_scheduling"

@@ -28,6 +28,44 @@ pub(crate) struct RankAdmissionPlan {
 }
 
 impl ProgramScheduler {
+    /// Commit a new pre-output retry attempt with an atomic resource recheck.
+    /// Existing q is counted once. Force deadlines never bypass this gate.
+    pub fn restart_pd_attempt(&self, old: &ProgramDispatch) -> Option<ProgramDispatch> {
+        let now = Instant::now();
+        let mut state = self.state.lock();
+        if !self.config.pd_mode
+            || !state.runtime.is_live_attempt(old)
+            || !state.targets.contains_key(&old.target_id)
+        {
+            return None;
+        }
+        let observation = state.observations.get(&old.target_id)?;
+        if !self.observation_is_fresh(observation, now) || observation.kv_cache_usage.is_none() {
+            return None;
+        }
+        let waiting = observation.waiting_requests?;
+        if self.config.admission_waiting_request_threshold > 0
+            && waiting >= self.config.admission_waiting_request_threshold
+        {
+            return None;
+        }
+        let low = self.config.progress_ttl.token_capacity? as f64
+            * self.config.progress_ttl.low_watermark_ratio;
+        let active = state
+            .runtime
+            .iter_views()
+            .filter(|p| {
+                p.state == ProgramState::Active && p.placement == Some(old.target_id.as_str())
+            })
+            .count();
+        if self.target_usage(&state, &old.target_id, now) > low
+            || active > self.config.max_active_programs_per_target
+        {
+            return None;
+        }
+        state.runtime.restart_attempt(old, now)
+    }
+
     /// Retain one Program request until rank-local admission permits dispatch.
     pub async fn acquire(
         &self,
@@ -1048,10 +1086,14 @@ mod tests {
     use std::time::Duration;
 
     fn identity(program: &str) -> ProgramIdentity {
+        identity_with_expected_resume(program, true)
+    }
+
+    fn identity_with_expected_resume(program: &str, expected_resume: bool) -> ProgramIdentity {
         ProgramIdentity::from_request(
             None,
             Some(&json!({"vllm_xargs":{"agentic_context":{
-                "program_id":program,"task_id":null,"expected_resume":true
+                "program_id":program,"task_id":null,"expected_resume":expected_resume
             }}})),
             Some("model"),
         )
@@ -2107,6 +2149,34 @@ mod tests {
                     observed_at: Instant::now(),
                 }),
         );
+    }
+
+    #[tokio::test]
+    async fn pd_retry_rechecks_capacity_and_fences_old_completion() {
+        let mut scheduler = pd_scheduler(100);
+        scheduler.config.progress_ttl.low_watermark_ratio = 0.9;
+        let first = scheduler
+            .acquire(
+                identity_with_expected_resume("retry", false),
+                20,
+                &[target()],
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(!first.expected_resume());
+        assert!(first.pending_output_prediction().is_some());
+        let retry = scheduler.restart_pd_attempt(&first).unwrap();
+        assert_ne!(first.attempt_id(), retry.attempt_id());
+        assert!(!retry.expected_resume());
+        assert!(retry.pending_output_prediction().is_some());
+        scheduler.complete(&first, false, false, Some(20), None);
+        assert!(scheduler.dispatch_is_current(&retry));
+        pd_observe(&scheduler, 0.95);
+        assert!(scheduler.restart_pd_attempt(&retry).is_none());
+        assert!(scheduler.dispatch_is_current(&retry));
+        scheduler.complete(&retry, false, false, Some(20), None);
+        assert!(!scheduler.dispatch_is_current(&retry));
     }
 
     #[tokio::test]
