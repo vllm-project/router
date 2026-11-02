@@ -1,14 +1,18 @@
 #![cfg(all(feature = "cpu", feature = "ready"))]
 
-//! End-to-end tests for the `sticky_least_loaded` policy in vLLM P/D
-//! disaggregation mode.
+//! End-to-end tests for the `sticky_least_loaded` policy in regular and vLLM
+//! P/D disaggregation mode.
 //!
-//! A real `VllmPrefillDecode` router fronts two prefill and two decode mock
-//! workers, with `sticky_least_loaded` as both the prefill and the decode
-//! policy. The tests check that the `X-Session-ID` header reaches both
+//! In P/D mode, a real `VllmPrefillDecode` router fronts two prefill and two
+//! decode mock workers, with `sticky_least_loaded` as both the prefill and the
+//! decode policy. The tests check that the `X-Session-ID` header reaches both
 //! policies on the request path: every turn of a session goes to the same
 //! prefill and decode worker, new sessions are balanced across workers, and
 //! `/finish_session` releases the session on both roles.
+//!
+//! In regular mode, the tests check that the session id comes from the
+//! request's stable identity: a body `session_params.session_id` is sticky,
+//! while request-scoped headers and JSON prompts create no session.
 
 mod common;
 
@@ -261,6 +265,183 @@ mod sticky_least_loaded_pd_tests {
         assert!(!prefill_ports.is_empty());
         assert_eq!(fx.active_sessions(true), 0);
         assert_eq!(fx.active_sessions(false), 0);
+
+        fx.stop().await;
+    }
+}
+
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
+mod sticky_least_loaded_regular_tests {
+    use super::common;
+    use axum::body::Body;
+    use axum::extract::Request;
+    use axum::Router;
+    use common::mock_worker::{
+        clear_captured_requests, get_captured_requests, HealthStatus, MockWorker, MockWorkerConfig,
+        WorkerType,
+    };
+    use serde_json::{json, Value};
+    use std::sync::Arc;
+    use tower::ServiceExt;
+    use vllm_router_rs::config::{PolicyConfig, RouterConfig, RoutingMode};
+    use vllm_router_rs::policies::StickyLeastLoadedPolicy;
+    use vllm_router_rs::routers::RouterFactory;
+    use vllm_router_rs::server::AppContext;
+
+    /// Regular-mode router over 2 mock workers.
+    struct RegularFixture {
+        app: Router,
+        context: Arc<AppContext>,
+        ports: Vec<u16>,
+        workers: Vec<MockWorker>,
+    }
+
+    impl RegularFixture {
+        async fn start() -> Self {
+            let mut workers = Vec::new();
+            let mut urls = Vec::new();
+            for _ in 0..2 {
+                let mut worker = MockWorker::new(MockWorkerConfig {
+                    port: 0,
+                    worker_type: WorkerType::Regular,
+                    health_status: HealthStatus::Healthy,
+                    response_delay_ms: 0,
+                    fail_rate: 0.0,
+                });
+                let url = worker.start().await.unwrap();
+                clear_captured_requests(port_of(&url));
+                urls.push(url);
+                workers.push(worker);
+            }
+
+            let config = RouterConfig {
+                mode: RoutingMode::Regular {
+                    worker_urls: urls.clone(),
+                },
+                policy: PolicyConfig::StickyLeastLoaded,
+                port: 0,
+                request_timeout_secs: 10,
+                worker_startup_timeout_secs: 5,
+                worker_startup_check_interval_secs: 1,
+                max_concurrent_requests: 64,
+                queue_size: 0,
+                ..RouterConfig::default()
+            };
+            let context = common::create_test_context(config.clone());
+            let router = RouterFactory::create_router(&context).await.unwrap();
+            let app = common::test_app::create_test_app_with_context(
+                Arc::from(router),
+                Arc::clone(&context),
+                &config,
+            );
+            Self {
+                app,
+                context,
+                ports: urls.iter().map(|u| port_of(u)).collect(),
+                workers,
+            }
+        }
+
+        fn active_sessions(&self) -> usize {
+            self.context
+                .policy_registry
+                .get_default_policy()
+                .as_any()
+                .downcast_ref::<StickyLeastLoadedPolicy>()
+                .expect("sticky_least_loaded policy")
+                .active_session_count()
+        }
+
+        /// Send one request and return the worker port that served it.
+        async fn send(&self, path: &str, headers: &[(&str, &str)], body: Value) -> u16 {
+            let before = self.served_counts(path);
+            let mut request = Request::builder()
+                .method("POST")
+                .uri(path)
+                .header("content-type", "application/json");
+            for (name, value) in headers {
+                request = request.header(*name, *value);
+            }
+            let request = request
+                .body(Body::from(serde_json::to_string(&body).unwrap()))
+                .unwrap();
+            let status = self.app.clone().oneshot(request).await.unwrap().status();
+            assert_eq!(status.as_u16(), 200);
+
+            let after = self.served_counts(path);
+            let hit: Vec<u16> = self
+                .ports
+                .iter()
+                .copied()
+                .zip(before.iter().zip(&after))
+                .filter(|(_, (b, a))| a > b)
+                .map(|(port, _)| port)
+                .collect();
+            assert_eq!(hit.len(), 1, "expected exactly one worker, got {:?}", hit);
+            hit[0]
+        }
+
+        fn served_counts(&self, path: &str) -> Vec<usize> {
+            self.ports
+                .iter()
+                .map(|&port| {
+                    get_captured_requests(port)
+                        .iter()
+                        .filter(|r| r.path == path)
+                        .count()
+                })
+                .collect()
+        }
+
+        async fn stop(mut self) {
+            for worker in &mut self.workers {
+                worker.stop().await;
+            }
+        }
+    }
+
+    fn port_of(url: &str) -> u16 {
+        url.rsplit(':').next().unwrap().parse().unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_regular_body_session_is_sticky() {
+        let fx = RegularFixture::start().await;
+
+        // Typed chat routing does not pass the request body to policies, so
+        // the session id must come from the resolved identity.
+        let mut served = Vec::new();
+        for turn in 0..4 {
+            let body = json!({
+                "model": "mock-model",
+                "messages": [{"role": "user", "content": format!("turn {turn}")}],
+                "session_params": {"session_id": "traj-1"},
+            });
+            served.push(fx.send("/v1/chat/completions", &[], body).await);
+        }
+        assert!(served.windows(2).all(|w| w[0] == w[1]), "{served:?}");
+        assert_eq!(fx.active_sessions(), 1);
+
+        fx.stop().await;
+    }
+
+    #[tokio::test]
+    async fn test_regular_request_ids_and_json_prompts_are_not_sessions() {
+        let fx = RegularFixture::start().await;
+
+        for i in 0..4 {
+            let request_id = format!("req-{i}");
+            // A prompt that is itself JSON with session fields.
+            let prompt = json!({"session_id": format!("s-{i}"), "user": "u"}).to_string();
+            let body = json!({"model": "mock-model", "prompt": prompt, "max_tokens": 4});
+            fx.send(
+                "/v1/completions",
+                &[("x-request-id", &request_id), ("x-trace-id", &request_id)],
+                body,
+            )
+            .await;
+        }
+        assert_eq!(fx.active_sessions(), 0);
 
         fx.stop().await;
     }

@@ -1184,6 +1184,14 @@ impl VllmPDRouter {
         // The prepared selection gates deferral; token inputs are retained so
         // cache matches can be recomputed against the tree at dispatch.
         let decode_cache = decode_cache.map(Arc::new);
+        let session_id = (prefill_policy.needs_session_id() || decode_policy.needs_session_id())
+            .then(|| {
+                crate::request_identity::resolve_session_key(
+                    headers,
+                    crate::request_identity::IdentityFields::from_body(request),
+                )
+            })
+            .flatten();
         let context = PdRequestContext {
             prefill_inputs: prefill_inputs.as_ref(),
             model_id,
@@ -1193,6 +1201,7 @@ impl VllmPDRouter {
             headers: policy_headers.as_ref(),
             affinity_key: affinity_key.clone(),
             lora_name: request.get(NAMED_LORA_FIELD).and_then(Value::as_str),
+            session_id: session_id.as_deref(),
             cache_salt,
             route: path,
         };
@@ -1354,6 +1363,7 @@ impl VllmPDRouter {
             headers: None,
             affinity_key: input.affinity_key.clone(),
             lora_name: request.get(NAMED_LORA_FIELD).and_then(Value::as_str),
+            session_id: None,
             cache_salt: input.cache_salt.as_deref(),
             route: &input.route,
         };
@@ -1693,12 +1703,26 @@ impl VllmPDRouter {
         let policy_headers = policy
             .needs_headers()
             .then(|| header_utils::to_policy_headers(headers).unwrap_or_default());
+        let session_id = policy
+            .needs_session_id()
+            .then(|| {
+                crate::request_identity::resolve_session_key(
+                    headers,
+                    crate::request_identity::IdentityFields::from_body(request),
+                )
+            })
+            .flatten();
         // Both callers index the worker slice with this value. A policy that
         // returns an out-of-range index is a policy bug, but it must degrade to
         // the same "no feasible P" 503 as an empty pool instead of panicking the
         // request task.
         policy
-            .select_worker_with_headers(workers, request_text.as_deref(), policy_headers.as_ref())
+            .select_worker_for_session(
+                workers,
+                request_text.as_deref(),
+                policy_headers.as_ref(),
+                session_id.as_deref(),
+            )
             .filter(|index| *index < workers.len())
     }
 
