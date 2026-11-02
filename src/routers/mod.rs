@@ -100,6 +100,20 @@ pub trait RouterTrait: Send + Sync + Debug + WorkerManagement {
         model_id: Option<&str>,
     ) -> Response;
 
+    /// Preserve validated ingress bytes where a router supports transparent
+    /// Completion forwarding. Other backends retain their typed behavior.
+    async fn route_completion_raw(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: std::sync::Arc<CompletionRequest>,
+        raw: axum::body::Bytes,
+        model_id: Option<&str>,
+    ) -> Response {
+        drop(raw);
+        self.route_completion(headers, body.as_ref(), model_id)
+            .await
+    }
+
     /// Route a responses request
     async fn route_responses(
         &self,
@@ -186,5 +200,177 @@ pub trait RouterTrait: Send + Sync + Debug + WorkerManagement {
     ) -> Response {
         // Default: not supported - return 404
         (StatusCode::NOT_FOUND, "Not Found").into_response()
+    }
+}
+
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
+mod tests {
+    use super::*;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    // An implementation of the pre-existing borrowed API, with no raw override.
+    #[derive(Debug)]
+    struct LegacyRouter {
+        request: Arc<CompletionRequest>,
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl WorkerManagement for LegacyRouter {
+        async fn add_worker(&self, _: &str) -> Result<String, String> {
+            Ok(String::new())
+        }
+        fn remove_worker(&self, _: &str) {}
+        fn get_worker_urls(&self) -> Vec<String> {
+            vec![]
+        }
+    }
+
+    #[async_trait]
+    impl RouterTrait for LegacyRouter {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        async fn health(&self, _: Request<Body>) -> Response {
+            unreachable!()
+        }
+        async fn health_generate(&self, _: Request<Body>) -> Response {
+            unreachable!()
+        }
+        async fn get_server_info(&self, _: Request<Body>) -> Response {
+            unreachable!()
+        }
+        async fn get_models(&self, _: Request<Body>) -> Response {
+            unreachable!()
+        }
+        async fn get_model_info(&self, _: Request<Body>) -> Response {
+            unreachable!()
+        }
+        async fn route_generate(
+            &self,
+            _: Option<&HeaderMap>,
+            _: &GenerateRequest,
+            _: Option<&str>,
+        ) -> Response {
+            unreachable!()
+        }
+        async fn route_inference_generate(
+            &self,
+            _: Option<&HeaderMap>,
+            _: &InferenceGenerateRequest,
+            _: Option<&str>,
+        ) -> Response {
+            unreachable!()
+        }
+        async fn route_chat(
+            &self,
+            _: Option<&HeaderMap>,
+            _: &ChatCompletionRequest,
+            _: Option<&str>,
+        ) -> Response {
+            unreachable!()
+        }
+        async fn route_completion(
+            &self,
+            headers: Option<&HeaderMap>,
+            body: &CompletionRequest,
+            model_id: Option<&str>,
+        ) -> Response {
+            assert!(std::ptr::eq(body, self.request.as_ref()));
+            assert_eq!(headers.unwrap()["x-legacy-test"], "preserved");
+            assert_eq!(model_id, Some("legacy"));
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            StatusCode::ACCEPTED.into_response()
+        }
+        async fn route_responses(
+            &self,
+            _: Option<&HeaderMap>,
+            _: &ResponsesRequest,
+            _: Option<&str>,
+        ) -> Response {
+            unreachable!()
+        }
+        async fn get_response(&self, _: Option<&HeaderMap>, _: &str) -> Response {
+            unreachable!()
+        }
+        async fn cancel_response(&self, _: Option<&HeaderMap>, _: &str) -> Response {
+            unreachable!()
+        }
+        async fn route_embeddings(
+            &self,
+            _: Option<&HeaderMap>,
+            _: &EmbeddingRequest,
+            _: Option<&str>,
+        ) -> Response {
+            unreachable!()
+        }
+        async fn route_rerank(
+            &self,
+            _: Option<&HeaderMap>,
+            _: &RerankRequest,
+            _: Option<&str>,
+        ) -> Response {
+            unreachable!()
+        }
+        async fn flush_cache(&self) -> Response {
+            unreachable!()
+        }
+        async fn get_worker_loads(&self) -> Response {
+            unreachable!()
+        }
+        fn router_type(&self) -> &'static str {
+            "legacy"
+        }
+        fn readiness(&self) -> Response {
+            unreachable!()
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_completion_trait_accepts_borrowed_and_owned_raw_dispatch() {
+        let raw = axum::body::Bytes::from_static(br#"{ "model": "legacy", "prompt": "hello" }"#);
+        let request: Arc<CompletionRequest> = Arc::new(serde_json::from_slice(&raw).unwrap());
+        let legacy = Arc::new(LegacyRouter {
+            request: request.clone(),
+            calls: AtomicUsize::new(0),
+        });
+        let router: Arc<dyn RouterTrait> = legacy.clone();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-legacy-test", "preserved".parse().unwrap());
+        assert_eq!(
+            router
+                .route_completion(Some(&headers), request.as_ref(), Some("legacy"))
+                .await
+                .status(),
+            StatusCode::ACCEPTED
+        );
+        assert_eq!(
+            router
+                .route_completion_raw(Some(&headers), request.clone(), raw.clone(), Some("legacy"))
+                .await
+                .status(),
+            StatusCode::ACCEPTED
+        );
+
+        let manager = router_manager::RouterManager::new(
+            crate::config::RouterConfig::default(),
+            reqwest::Client::new(),
+            Arc::new(crate::core::WorkerRegistry::new()),
+            Arc::new(crate::policies::PolicyRegistry::new(
+                crate::config::PolicyConfig::RoundRobin,
+            )),
+        );
+        manager.register_router(router_manager::RouterId::new("legacy".into()), router);
+        assert_eq!(
+            manager
+                .route_completion_raw(Some(&headers), request, raw, None)
+                .await
+                .status(),
+            StatusCode::ACCEPTED
+        );
+        assert_eq!(legacy.calls.load(Ordering::Relaxed), 3);
     }
 }

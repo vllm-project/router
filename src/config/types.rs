@@ -129,11 +129,82 @@ fn default_intra_node_data_parallel_size() -> usize {
 /// This is intentionally separate from request-level `PolicyConfig`. The
 /// binding policy is evaluated once for a new Program generation; admission
 /// and resume remain ProgramScheduler decisions.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PredictionMode {
+    /// Disable workflow-profile prediction and online collection.
+    Off,
+    /// Collect and evaluate predictions without changing scheduling decisions.
+    #[default]
+    Shadow,
+}
+
+/// Shared configuration for workflow-profile shadow predictors.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PredictionProfileConfig {
+    #[serde(default)]
+    pub mode: PredictionMode,
+    /// Optional versioned offline seed consumed at Router startup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_path: Option<String>,
+    /// Optional path used for periodic online-overlay snapshots.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_path: Option<String>,
+    #[serde(default = "default_prediction_snapshot_interval_seconds")]
+    pub snapshot_interval_seconds: f64,
+    #[serde(default = "default_prediction_prior_weight")]
+    pub prior_weight: f64,
+    #[serde(default = "default_prediction_max_keys")]
+    pub max_keys: usize,
+    #[serde(default = "default_return_time_bucket_bounds_seconds")]
+    pub return_time_bucket_bounds_seconds: Vec<f64>,
+    #[serde(default = "default_return_time_min_support")]
+    pub return_time_min_support: usize,
+    #[serde(default = "default_return_time_horizon_seconds")]
+    pub return_time_horizon_seconds: f64,
+    #[serde(default = "default_prediction_step_bucket_size")]
+    pub step_bucket_size: u64,
+    #[serde(default = "default_output_length_bucket_bounds_tokens")]
+    pub output_length_bucket_bounds_tokens: Vec<usize>,
+    #[serde(default = "default_output_length_quantile")]
+    pub output_length_quantile: f64,
+    #[serde(default = "default_output_length_min_support")]
+    pub output_length_min_support: usize,
+    #[serde(default = "default_output_length_tail_samples")]
+    pub output_length_tail_samples: usize,
+    #[serde(default = "default_prediction_stability_window_size")]
+    pub stability_window_size: usize,
+    #[serde(default = "default_prediction_stability_tolerance")]
+    pub stability_tolerance: f64,
+}
+
+impl Default for PredictionProfileConfig {
+    fn default() -> Self {
+        Self {
+            mode: PredictionMode::Shadow,
+            profile_path: None,
+            snapshot_path: None,
+            snapshot_interval_seconds: default_prediction_snapshot_interval_seconds(),
+            prior_weight: default_prediction_prior_weight(),
+            max_keys: default_prediction_max_keys(),
+            return_time_bucket_bounds_seconds: default_return_time_bucket_bounds_seconds(),
+            return_time_min_support: default_return_time_min_support(),
+            return_time_horizon_seconds: default_return_time_horizon_seconds(),
+            step_bucket_size: default_prediction_step_bucket_size(),
+            output_length_bucket_bounds_tokens: default_output_length_bucket_bounds_tokens(),
+            output_length_quantile: default_output_length_quantile(),
+            output_length_min_support: default_output_length_min_support(),
+            output_length_tail_samples: default_output_length_tail_samples(),
+            stability_window_size: default_prediction_stability_window_size(),
+            stability_tolerance: default_prediction_stability_tolerance(),
+        }
+    }
+}
+
 /// First rollout of RFC-PD-PROGRAM-SCHEDULING: one-way remote execution.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct PdProgramSchedulingConfig {
-    pub enabled: bool,
     /// Event residency is advisory and never authorizes a warm transfer.
     pub kv_events: bool,
     pub kv_hash_mode: String,
@@ -151,12 +222,64 @@ pub struct PdProgramSchedulingConfig {
     pub prefill_kv_high_watermark: f64,
     /// P KV-cache sampling window in seconds for the guard above.
     pub prefill_kv_window_seconds: f64,
+
+    // Warm remote KV reuse (PD disaggregation): a Program turn may read the
+    // source KV that its previous turn left on the same decode engine instead
+    // of recomputing it on P.
+    /// Engine feedback protocol spoken by the warm-read path.
+    pub protocol_revision: String,
+    /// Route a returning turn through the warm remote read when a verified
+    /// candidate exists.
+    pub warm_remote: bool,
+    /// Keep the decode engine local when the source already holds the prefix.
+    pub local_append: bool,
+    /// Only report warm when P KV usage is at least this value (0 = always).
+    pub warm_min_p_kv_usage: f64,
+    /// Only report warm when P running requests are at most this value.
+    pub warm_max_p_running: usize,
+    /// Total prompt-prefix tokens retained across all candidates.
+    pub max_candidate_tokens: usize,
+    /// Candidate-count bound.
+    pub max_candidates: usize,
+    /// Router-side capability identity cache. 0 disables it; a restart at the
+    /// same URL is otherwise re-probed within this window.
+    pub capability_cache_seconds: f64,
+    /// Largest verified prefix that may be published or pulled.
+    pub max_prefix_tokens: usize,
+    /// Bound on the `kv_transfer_params` metadata inspected per message.
+    pub max_metadata_bytes: usize,
+    /// Bound on a buffered non-streaming response body (text, token IDs,
+    /// logprobs). Forwarded bodies are otherwise unbounded; this only limits
+    /// what the Router must hold to inspect a completed response.
+    pub max_response_bytes: usize,
+    /// Safety margin before the source lease expires.
+    pub lease_margin_seconds: f64,
+    /// Local decode requests per target.
+    pub max_local_requests_per_target: usize,
+    /// Local decode miss budget per request.
+    pub local_execution_budget_tokens: usize,
+
+    // Automatic Acting TTL for the retained seat across tool gaps.
+    /// Enable the automatic Acting TTL.
+    pub automatic_ttl: bool,
+    /// Fit the automatic TTL from online rank statistics when no versioned
+    /// calibration table is supplied. Never exceeds the verified source lease.
+    pub ttl_online: bool,
+    /// Wait-cost weight in the TTL solver.
+    pub ttl_gamma: f64,
+    /// Interval samples required before the solver may return a positive TTL.
+    pub ttl_min_samples: usize,
+    /// Minimum utility for a positive TTL.
+    pub ttl_min_gain_seconds: f64,
+    /// Use measured residency probability in TTL keep/drop.
+    pub feedback: bool,
+    /// Offline-calibrated PD cost table (optional).
+    pub calibration: Option<crate::program_scheduling::pd_cost::PdCalibration>,
 }
 
 impl Default for PdProgramSchedulingConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
             kv_events: false,
             kv_hash_mode: "sha256".to_string(),
             max_prefill_requests_per_target: 1,
@@ -164,7 +287,88 @@ impl Default for PdProgramSchedulingConfig {
             exclusive_capacity_accounting: true,
             prefill_kv_high_watermark: 0.85,
             prefill_kv_window_seconds: 10.0,
+            protocol_revision: "vllm-0.28.0-pd-feedback-v1".into(),
+            warm_remote: false,
+            local_append: false,
+            warm_min_p_kv_usage: 0.0,
+            warm_max_p_running: usize::MAX,
+            max_candidate_tokens: 2_097_152,
+            max_candidates: 4096,
+            capability_cache_seconds: 15.0,
+            max_prefix_tokens: 32768,
+            max_metadata_bytes: 262144,
+            max_response_bytes: 8_388_608,
+            lease_margin_seconds: 1.0,
+            max_local_requests_per_target: 1,
+            local_execution_budget_tokens: 512,
+            automatic_ttl: false,
+            ttl_online: false,
+            ttl_gamma: 1.0,
+            ttl_min_samples: 16,
+            ttl_min_gain_seconds: 0.001,
+            feedback: false,
+            calibration: None,
         }
+    }
+}
+
+impl PdProgramSchedulingConfig {
+    /// True when a warm-read or automatic-TTL *master* switch is on.
+    ///
+    /// `feedback` and `ttl_online` are sub-knobs: on their own they must not
+    /// enable the warm-remote executor, because it changes how every token-id
+    /// Program completion is dispatched while the sub-knob itself has no effect.
+    pub fn warm_remote_enabled(&self) -> bool {
+        self.warm_remote || self.local_append || self.automatic_ttl
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self.protocol_revision != "vllm-0.28.0-pd-feedback-v1"
+            || !(1..=65536).contains(&self.max_candidates)
+            || !(1..=1048576).contains(&self.max_prefix_tokens)
+            || !(1024..=1048576).contains(&self.max_metadata_bytes)
+            || self.max_response_bytes < self.max_metadata_bytes
+            || self.max_response_bytes > 268_435_456
+            || !(1..=128).contains(&self.max_local_requests_per_target)
+            || self.local_execution_budget_tokens == 0
+            || !(2..=10000).contains(&self.ttl_min_samples)
+            || self.max_candidate_tokens < self.max_prefix_tokens
+            || self.max_candidate_tokens > 67_108_864
+            || !self.capability_cache_seconds.is_finite()
+            || !(0.0..=600.0).contains(&self.capability_cache_seconds)
+            || !self.warm_min_p_kv_usage.is_finite()
+            || !(0.0..=1.0).contains(&self.warm_min_p_kv_usage)
+        {
+            return Err("Invalid bounded PD warm-remote configuration or unknown protocol".into());
+        }
+        if !self.lease_margin_seconds.is_finite()
+            || self.lease_margin_seconds < 0.0
+            || self.lease_margin_seconds > 86400.0
+            || !self.ttl_gamma.is_finite()
+            || self.ttl_gamma <= 0.0
+            || !self.ttl_min_gain_seconds.is_finite()
+            || self.ttl_min_gain_seconds < 0.0
+        {
+            return Err("PD warm-remote TTL/lease parameters must be finite".into());
+        }
+        if self.local_append && self.calibration.is_none() {
+            return Err("LocalAppend requires a versioned PD calibration".into());
+        }
+        if self.automatic_ttl && self.calibration.is_none() && !self.ttl_online {
+            return Err("automatic TTL requires a versioned PD calibration or ttl_online".into());
+        }
+        if let Some(c) = &self.calibration {
+            c.validate()?;
+        }
+        if (self.feedback || self.ttl_online)
+            && !(self.automatic_ttl || self.warm_remote || self.local_append)
+        {
+            return Err(
+                "feedback/ttl_online are sub-knobs and require warm_remote, local_append or automatic_ttl"
+                    .into(),
+            );
+        }
+        Ok(())
     }
 }
 
@@ -223,6 +427,9 @@ pub struct ProgramSchedulingConfig {
     pub stats_window_size: usize,
     #[serde(default = "default_program_enable_batch_gain_admission")]
     pub enable_batch_gain_admission: bool,
+    /// Offline-seeded, online-updated workflow prediction in off/shadow mode.
+    #[serde(default)]
+    pub prediction_profile: PredictionProfileConfig,
     /// Offline-calibrated cold-prefill cost and mixed-batch decode impact.
     #[serde(default)]
     pub prefill_cost_model: PrefillCostModel,
@@ -341,6 +548,7 @@ impl Default for ProgramSchedulingConfig {
             max_segment_rounds: default_program_max_segment_rounds(),
             stats_window_size: default_program_stats_window_size(),
             enable_batch_gain_admission: default_program_enable_batch_gain_admission(),
+            prediction_profile: PredictionProfileConfig::default(),
             prefill_cost_model: PrefillCostModel::default(),
             decode_throughput_model: DecodeThroughputModel::default(),
             explicit_calibration_fields: ExplicitCalibrationFields::default(),
@@ -402,6 +610,8 @@ struct ProgramSchedulingConfigInput {
     stats_window_size: usize,
     #[serde(default = "default_program_enable_batch_gain_admission")]
     enable_batch_gain_admission: bool,
+    #[serde(default)]
+    prediction_profile: PredictionProfileConfig,
     #[serde(default)]
     prefill_cost_model: PrefillCostModelInput,
     #[serde(default)]
@@ -512,6 +722,7 @@ impl<'de> Deserialize<'de> for ProgramSchedulingConfig {
             max_segment_rounds: input.max_segment_rounds,
             stats_window_size: input.stats_window_size,
             enable_batch_gain_admission: input.enable_batch_gain_admission,
+            prediction_profile: input.prediction_profile,
             prefill_cost_model,
             decode_throughput_model,
             explicit_calibration_fields: ExplicitCalibrationFields(explicit_calibration_fields),
@@ -591,6 +802,58 @@ fn default_program_stats_window_size() -> usize {
 
 fn default_program_enable_batch_gain_admission() -> bool {
     true
+}
+
+fn default_prediction_snapshot_interval_seconds() -> f64 {
+    60.0
+}
+
+fn default_prediction_prior_weight() -> f64 {
+    1.0
+}
+
+fn default_prediction_max_keys() -> usize {
+    4096
+}
+
+fn default_return_time_bucket_bounds_seconds() -> Vec<f64> {
+    vec![1.0, 2.0, 5.0, 10.0]
+}
+
+fn default_return_time_min_support() -> usize {
+    20
+}
+
+fn default_return_time_horizon_seconds() -> f64 {
+    5.0
+}
+
+fn default_prediction_step_bucket_size() -> u64 {
+    4
+}
+
+fn default_output_length_bucket_bounds_tokens() -> Vec<usize> {
+    vec![32, 64, 128, 256, 512, 1024, 2048, 4096, 8192]
+}
+
+fn default_output_length_quantile() -> f64 {
+    0.95
+}
+
+fn default_output_length_min_support() -> usize {
+    100
+}
+
+fn default_output_length_tail_samples() -> usize {
+    5
+}
+
+fn default_prediction_stability_window_size() -> usize {
+    100
+}
+
+fn default_prediction_stability_tolerance() -> f64 {
+    0.15
 }
 
 /// History backend configuration
@@ -794,6 +1057,10 @@ pub enum PolicyConfig {
 }
 
 /// Manually configured KV event publishers for one regular-mode worker.
+///
+/// Rust struct literals must supply `topic: String::new()` to retain the
+/// previous empty subscription topic. Serde defaults preserve old JSON
+/// configurations, but do not provide Rust source compatibility.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct StaticKvEventSources {
     /// One externally reachable ZMQ PUB endpoint per DP rank.
@@ -801,6 +1068,9 @@ pub struct StaticKvEventSources {
     /// Optional replay ROUTER endpoint per DP rank for loss recovery.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replay_endpoints: Option<Vec<String>>,
+    /// Exact ZMQ subscription topic shared by these ranks.
+    #[serde(default)]
+    pub topic: String,
     /// KV cache block size used to calculate prefix placement.
     pub block_size: u32,
     /// Shared model identity across workers that serve the same model.
@@ -1151,9 +1421,7 @@ mod tests {
         assert_eq!(default.pd.prefill_kv_window_seconds, 10.0);
 
         let parsed: ProgramSchedulingConfig =
-            serde_json::from_str(r#"{"pd":{"enabled":true,"exclusive_capacity_accounting":true}}"#)
-                .unwrap();
-        assert!(parsed.pd.enabled);
+            serde_json::from_str(r#"{"pd":{"exclusive_capacity_accounting":true}}"#).unwrap();
         assert!(parsed.pd.exclusive_capacity_accounting);
     }
 

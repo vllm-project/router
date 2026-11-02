@@ -68,7 +68,7 @@ steps:
 
   # After the CPU build, copy target/release/vllm-router into the image.
   # Steps that depend only on "build" start without waiting for this.
-  # Ready smoke and nightly GSM8K depend on this key.
+  # Ready smoke, nightly GSM8K, and nightly gRPC perf depend on this key.
   - label: ":docker: Build NVIDIA CI image"
     key: "image-build"
     depends_on: "build"
@@ -93,7 +93,8 @@ steps:
       queue: "medium_cpu_queue_premerge"
 
   # Uploads wait for the build group, not for image-build, and not for each other.
-  # Uploaded jobs depend on their upload step. NVIDIA P/D jobs also wait for image-build.
+  # Uploaded jobs depend on their upload step. NVIDIA P/D jobs and the L3
+  # gRPC perf job also wait for image-build.
   # L1: same gate as Omni READY_LABEL_IF. ROCM_ONLY stays on the smoke job.
   - label: ":pipeline: Upload L1 ready"
     key: "upload-ready-pipeline"

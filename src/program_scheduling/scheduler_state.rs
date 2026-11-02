@@ -4,10 +4,14 @@
 //! They are decision facts, not an additional Program lifecycle state machine.
 
 use super::lineage::ProgramLineage;
+use super::output_length::PendingOutputPrediction;
+use super::prediction_profile::PredictionProfileStore;
+use super::return_time::PendingReturnPrediction;
 use super::{
     ProgramBindingStrategy, ProgramBindings, ProgramRef, ProgramRuntime,
     ProgramSchedulingEnableKey, ProgramTarget, ProgressTtlConfig, ProgressTtlFactors,
 };
+use crate::config::types::PredictionProfileConfig;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -69,6 +73,8 @@ pub struct ProgramSchedulerConfig {
     pub shared_prefix_freshness_kv_turnovers: f64,
     /// Rank-local Progress-TTL formulas and calibration.
     pub progress_ttl: ProgressTtlConfig,
+    /// Optional offline-seeded shadow predictors.
+    pub prediction_profile: PredictionProfileConfig,
 }
 
 impl Default for ProgramSchedulerConfig {
@@ -96,6 +102,7 @@ impl Default for ProgramSchedulerConfig {
             shared_prefix_freshness_warmup: Duration::from_secs(100),
             shared_prefix_freshness_kv_turnovers: 2.0,
             progress_ttl: ProgressTtlConfig::default(),
+            prediction_profile: PredictionProfileConfig::default(),
         }
     }
 }
@@ -114,10 +121,20 @@ pub(crate) fn resolve_auto_limit(configured: usize, prefill_permits: usize) -> u
 
 impl From<&crate::config::types::ProgramSchedulingConfig> for ProgramSchedulerConfig {
     fn from(config: &crate::config::types::ProgramSchedulingConfig) -> Self {
+        Self::from_program_config(config, false)
+    }
+}
+
+impl ProgramSchedulerConfig {
+    /// Build the scheduler config for one routing mode. PD mode comes from the
+    /// active `--vllm-pd-disaggregation` route, not from a second config flag.
+    pub fn from_program_config(
+        config: &crate::config::types::ProgramSchedulingConfig,
+        pd_mode: bool,
+    ) -> Self {
         // Auto sizing is a PD-mode concept. A regular-mode config that omitted
         // the fields deserializes the zero defaults; keep the historical
         // 64-Program cap and 1-request overload gate for those deployments.
-        let pd_mode = config.pd.enabled;
         let permits = config.pd.max_prefill_requests_per_target;
         let max_active_programs_per_target = if config.max_active_programs_per_target > 0 {
             config.max_active_programs_per_target
@@ -135,7 +152,7 @@ impl From<&crate::config::types::ProgramSchedulingConfig> for ProgramSchedulerCo
             1
         };
         Self {
-            pd_mode: config.pd.enabled,
+            pd_mode,
             pd_explicit_ttl: config.pd.explicit_ttl,
             pd_exclusive_capacity_accounting: config.pd.exclusive_capacity_accounting,
             pd_prefill_permits: config.pd.max_prefill_requests_per_target.max(1),
@@ -170,6 +187,7 @@ impl From<&crate::config::types::ProgramSchedulingConfig> for ProgramSchedulerCo
                 prefill: config.prefill_cost_model,
                 decode: config.decode_throughput_model,
             },
+            prediction_profile: config.prediction_profile.clone(),
         }
     }
 }
@@ -206,8 +224,11 @@ pub(crate) struct ProgramDecisionState {
     pub(crate) agent_id: Option<String>,
     pub(crate) parent_program_id: Option<String>,
     pub(crate) blocks_parent: bool,
+    pub(crate) expected_resume: bool,
     pub(crate) agent_role: Option<String>,
     pub(crate) spawn_reason: Option<String>,
+    pub(crate) workflow_profile_id: Option<String>,
+    pub(crate) profile_version: Option<String>,
     pub(crate) step_id: u64,
     pub(crate) home_target: Option<String>,
     pub(crate) last_target: Option<String>,
@@ -241,6 +262,10 @@ pub(crate) struct ProgramDecisionState {
     pub(crate) last_pause_reason: Option<ProgramPauseReason>,
     pub(crate) pause_when_idle: bool,
     pub(crate) terminate_when_idle: bool,
+    pub(crate) pending_return_prediction: Option<PendingReturnPrediction>,
+    pub(crate) latest_output_prediction: Option<PendingOutputPrediction>,
+    pub(crate) last_return_actual_seconds: Option<f64>,
+    pub(crate) last_output_actual_tokens: Option<usize>,
 }
 
 impl ProgramDecisionState {
@@ -259,8 +284,11 @@ impl ProgramDecisionState {
             agent_id: None,
             parent_program_id: None,
             blocks_parent: false,
+            expected_resume: true,
             agent_role: None,
             spawn_reason: None,
+            workflow_profile_id: None,
+            profile_version: None,
             step_id: 0,
             last_target: home_target.clone(),
             home_target,
@@ -294,6 +322,10 @@ impl ProgramDecisionState {
             last_pause_reason: None,
             pause_when_idle: false,
             terminate_when_idle: false,
+            pending_return_prediction: None,
+            latest_output_prediction: None,
+            last_return_actual_seconds: None,
+            last_output_actual_tokens: None,
         }
     }
 
@@ -396,15 +428,27 @@ pub(crate) struct ProgramSchedulerState {
     pub(crate) global_queues: HashMap<String, VecDeque<ProgramRef>>,
     pub(crate) observations: HashMap<String, RankObservationState>,
     pub(crate) rank_factors: HashMap<String, ProgressTtlFactors>,
+    pub(crate) prediction_profiles: PredictionProfileStore,
+    pub(crate) next_prediction_snapshot_at: Instant,
     pub(crate) lineage: ProgramLineage,
     /// Most recent P-side KV-cache pressure sample.
     pub(crate) prefill_pressure: Option<PrefillPressure>,
+    /// Per-P-target metrics samples, keyed by base URL.
+    pub(crate) prefill_targets: HashMap<String, PrefillTargetObservation>,
 }
 
 /// P KV-cache usage as seen from the prefill engines.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct PrefillPressure {
     pub(crate) kv_usage: f64,
+    pub(crate) observed_at: Instant,
+}
+
+/// One prefill target's metrics sample, used by the warm-read pressure gates.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PrefillTargetObservation {
+    pub(crate) kv_usage: Option<f64>,
+    pub(crate) running_requests: Option<usize>,
     pub(crate) observed_at: Instant,
 }
 
@@ -422,8 +466,23 @@ impl ProgramSchedulerState {
             global_queues: HashMap::new(),
             observations: HashMap::new(),
             rank_factors: HashMap::new(),
+            prediction_profiles: PredictionProfileStore::empty(
+                config
+                    .prediction_profile
+                    .return_time_bucket_bounds_seconds
+                    .clone(),
+                config
+                    .prediction_profile
+                    .output_length_bucket_bounds_tokens
+                    .clone(),
+                config.prediction_profile.max_keys,
+                config.prediction_profile.stability_window_size,
+            ),
+            next_prediction_snapshot_at: Instant::now()
+                + Duration::from_secs_f64(config.prediction_profile.snapshot_interval_seconds),
             lineage: ProgramLineage::default(),
             prefill_pressure: None,
+            prefill_targets: HashMap::new(),
         }
     }
 }
@@ -456,9 +515,8 @@ mod tests {
         assert_eq!(resolve_auto_limit(96, 4), 96);
 
         let parsed: crate::config::types::ProgramSchedulingConfig =
-            serde_json::from_str(r#"{"pd":{"enabled":true,"max_prefill_requests_per_target":4}}"#)
-                .unwrap();
-        let runtime = ProgramSchedulerConfig::from(&parsed);
+            serde_json::from_str(r#"{"pd":{"max_prefill_requests_per_target":4}}"#).unwrap();
+        let runtime = ProgramSchedulerConfig::from_program_config(&parsed, true);
         assert_eq!(runtime.max_active_programs_per_target, 8);
         assert_eq!(runtime.admission_waiting_request_threshold, 8);
         assert!(runtime.pd_exclusive_capacity_accounting);

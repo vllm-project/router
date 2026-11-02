@@ -43,8 +43,8 @@ pub use completion::{
     CompletionPreparationError,
 };
 pub use control::{
-    get_grpc_model_info, get_grpc_server_info, model_info_json, openai_models_json,
-    server_info_json,
+    get_grpc_model_info, get_grpc_server_info, grpc_engine_version_older_than_0_30,
+    model_info_json, openai_models_json, server_info_json, warn_old_grpc_pd_workers,
 };
 pub use convert::prepare_grpc_completion;
 pub use detect::{
@@ -121,6 +121,24 @@ pub(crate) mod stream_output {
             if tx.send(Ok(chunk)).is_err() {
                 return false;
             }
+            self.emitted = next;
+            true
+        }
+    }
+
+    impl OutputFrameProducer {
+        /// Reserve capacity before publishing the output frame marker.
+        pub(crate) async fn send_bounded<T>(
+            &mut self, tx: &tokio::sync::mpsc::Sender<T>, chunk: T, has_generated_output: bool,
+        ) -> bool {
+            let Ok(permit) = tx.reserve().await else { return false; };
+            let next = self.emitted.saturating_add(1);
+            if has_generated_output {
+                let _ = self.first_output.compare_exchange(
+                    0, next, Ordering::Release, Ordering::Relaxed,
+                );
+            }
+            permit.send(chunk);
             self.emitted = next;
             true
         }
