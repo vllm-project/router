@@ -14,10 +14,10 @@
 //!   consistent hashing (rendezvous / highest-random-weight) so that, given the
 //!   same set of least-loaded replicas, a session is always assigned to the same
 //!   replica.
-//! - Sessions expire after a configurable TTL (default 2 hours, overridable via
-//!   the `VLLM_ROUTER_SLL_SESSION_EXPIRATION_IN_S` environment variable). This
-//!   protects against leaked sessions when a `finish_session` call is never
-//!   received (e.g. a cancelled trajectory).
+//! - Sessions expire after a configurable TTL (`PolicyConfig::StickyLeastLoaded`
+//!   `session_ttl_secs`, default 2 hours). This protects against leaked
+//!   sessions when a `finish_session` call is never received (e.g. a cancelled
+//!   trajectory).
 //! - Sessions can be released explicitly via [`finish_session`].
 //!
 //! The router resolves the session id with
@@ -30,7 +30,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use super::get_healthy_worker_indices;
 use super::ConsistentHashPolicy;
@@ -38,12 +38,6 @@ use super::LoadBalancingPolicy;
 use super::RequestHeaders;
 use crate::core::Worker;
 use crate::metrics::RouterMetrics;
-
-/// Default session expiration (2 hours), per the design spec.
-pub const DEFAULT_SESSION_EXPIRATION_SECS: u64 = 7200;
-
-/// Environment variable to override the session expiration (in seconds).
-pub const SESSION_EXPIRATION_ENV: &str = "VLLM_ROUTER_SLL_SESSION_EXPIRATION_IN_S";
 
 /// Minimum interval between full expiration sweeps to bound per-request cost.
 const SWEEP_INTERVAL_SECS: u64 = 60;
@@ -75,10 +69,12 @@ pub struct StickyLeastLoadedPolicy {
 }
 
 impl StickyLeastLoadedPolicy {
-    /// Create a new policy, reading the session expiration from the environment
-    /// (falling back to [`DEFAULT_SESSION_EXPIRATION_SECS`]).
+    /// Default session TTL (2 hours).
+    pub const DEFAULT_SESSION_TTL_SECS: u64 = 7200;
+
+    /// Create a new policy with the default session TTL.
     pub fn new() -> Self {
-        Self::with_expiration_secs(Self::expiration_secs_from_env())
+        Self::with_expiration_secs(Self::DEFAULT_SESSION_TTL_SECS)
     }
 
     /// Create a new policy with an explicit session expiration (in seconds).
@@ -90,22 +86,6 @@ impl StickyLeastLoadedPolicy {
                 last_sweep: Instant::now(),
             }),
             session_expiration: Duration::from_secs(secs),
-        }
-    }
-
-    fn expiration_secs_from_env() -> u64 {
-        match std::env::var(SESSION_EXPIRATION_ENV) {
-            Ok(val) => match val.trim().parse::<u64>() {
-                Ok(secs) => secs,
-                Err(_) => {
-                    warn!(
-                        "Invalid {} value '{}', using default {}s",
-                        SESSION_EXPIRATION_ENV, val, DEFAULT_SESSION_EXPIRATION_SECS
-                    );
-                    DEFAULT_SESSION_EXPIRATION_SECS
-                }
-            },
-            Err(_) => DEFAULT_SESSION_EXPIRATION_SECS,
         }
     }
 

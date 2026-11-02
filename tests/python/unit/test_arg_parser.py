@@ -69,6 +69,36 @@ class TestKvLauncherArgs:
         assert router._router is native_router.return_value
 
 
+class TestStickyLeastLoadedArgs:
+    def test_session_ttl_default(self):
+        assert parse_router_args([]).sticky_least_loaded_session_ttl_secs == 7200
+
+    @pytest.mark.parametrize("use_prefix", [False, True])
+    def test_session_ttl_reaches_native_router(self, use_prefix):
+        prefix = "router-" if use_prefix else ""
+        parser = argparse.ArgumentParser()
+        RouterArgs.add_cli_args(parser, use_router_prefix=use_prefix)
+        namespace = parser.parse_args(
+            [
+                f"--{prefix}policy",
+                "sticky_least_loaded",
+                f"--{prefix}sticky-least-loaded-session-ttl-secs",
+                "600",
+            ]
+        )
+        args = RouterArgs.from_cli_args(namespace, use_router_prefix=use_prefix)
+        with patch("vllm_router.router._Router") as native_router:
+            Router.from_args(args)
+        kwargs = native_router.call_args.kwargs
+        assert kwargs["sticky_least_loaded_session_ttl_secs"] == 600
+        assert kwargs["policy"] == policy_from_str("sticky_least_loaded")
+
+    @pytest.mark.parametrize("ttl", [0, 31_536_001])
+    def test_session_ttl_is_bounded(self, ttl):
+        with pytest.raises(ValueError, match="sticky_least_loaded_session_ttl_secs"):
+            RouterArgs(sticky_least_loaded_session_ttl_secs=ttl)._validate_router_args()
+
+
 class TestRouterArgs:
     """Test RouterArgs dataclass and its methods."""
 

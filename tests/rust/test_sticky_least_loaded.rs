@@ -16,9 +16,18 @@
 
 mod common;
 
+use vllm_router_rs::config::PolicyConfig;
+use vllm_router_rs::policies::StickyLeastLoadedPolicy;
+
+fn sticky_policy() -> PolicyConfig {
+    PolicyConfig::StickyLeastLoaded {
+        session_ttl_secs: StickyLeastLoadedPolicy::DEFAULT_SESSION_TTL_SECS,
+    }
+}
+
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod sticky_least_loaded_pd_tests {
-    use super::common;
+    use super::{common, sticky_policy};
     use axum::body::Body;
     use axum::extract::Request;
     use axum::Router;
@@ -30,7 +39,7 @@ mod sticky_least_loaded_pd_tests {
     use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
     use tower::ServiceExt;
-    use vllm_router_rs::config::{PolicyConfig, RouterConfig, RoutingMode};
+    use vllm_router_rs::config::{RouterConfig, RoutingMode};
     use vllm_router_rs::policies::{LoadBalancingPolicy, StickyLeastLoadedPolicy};
     use vllm_router_rs::routers::RouterFactory;
     use vllm_router_rs::server::AppContext;
@@ -43,11 +52,11 @@ mod sticky_least_loaded_pd_tests {
             mode: RoutingMode::VllmPrefillDecode {
                 prefill_urls,
                 decode_urls,
-                prefill_policy: Some(PolicyConfig::StickyLeastLoaded),
-                decode_policy: Some(PolicyConfig::StickyLeastLoaded),
+                prefill_policy: Some(sticky_policy()),
+                decode_policy: Some(sticky_policy()),
                 discovery_address: None,
             },
-            policy: PolicyConfig::StickyLeastLoaded,
+            policy: sticky_policy(),
             port: 0,
             request_timeout_secs: 10,
             worker_startup_timeout_secs: 5,
@@ -272,7 +281,7 @@ mod sticky_least_loaded_pd_tests {
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod sticky_least_loaded_regular_tests {
-    use super::common;
+    use super::{common, sticky_policy};
     use axum::body::Body;
     use axum::extract::Request;
     use axum::Router;
@@ -283,7 +292,7 @@ mod sticky_least_loaded_regular_tests {
     use serde_json::{json, Value};
     use std::sync::Arc;
     use tower::ServiceExt;
-    use vllm_router_rs::config::{PolicyConfig, RouterConfig, RoutingMode};
+    use vllm_router_rs::config::{RouterConfig, RoutingMode};
     use vllm_router_rs::policies::StickyLeastLoadedPolicy;
     use vllm_router_rs::routers::RouterFactory;
     use vllm_router_rs::server::AppContext;
@@ -322,7 +331,7 @@ mod sticky_least_loaded_regular_tests {
                 mode: RoutingMode::Regular {
                     worker_urls: urls.clone(),
                 },
-                policy: PolicyConfig::StickyLeastLoaded,
+                policy: sticky_policy(),
                 port: 0,
                 request_timeout_secs: 10,
                 worker_startup_timeout_secs: 5,

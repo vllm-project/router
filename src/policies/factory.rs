@@ -70,7 +70,9 @@ impl PolicyFactory {
                 // The consistent hash policy uses a hardcoded value for now
                 Arc::new(ConsistentHashPolicy::new())
             }
-            PolicyConfig::StickyLeastLoaded => Arc::new(StickyLeastLoadedPolicy::new()),
+            PolicyConfig::StickyLeastLoaded { session_ttl_secs } => Arc::new(
+                StickyLeastLoadedPolicy::with_expiration_secs(*session_ttl_secs),
+            ),
             PolicyConfig::RendezvousHash => Arc::new(RendezvousHashPolicy::new()),
         }
     }
@@ -153,7 +155,12 @@ mod tests {
         assert_eq!(policy.name(), "rendezvous_hash");
 
         // Test StickyLeastLoaded
-        let policy = PolicyFactory::create_from_config(&PolicyConfig::StickyLeastLoaded, None);
+        let policy = PolicyFactory::create_from_config(
+            &PolicyConfig::StickyLeastLoaded {
+                session_ttl_secs: 60,
+            },
+            None,
+        );
         assert_eq!(policy.name(), "sticky_least_loaded");
     }
 
