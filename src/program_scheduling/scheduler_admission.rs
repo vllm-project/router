@@ -1585,6 +1585,7 @@ mod tests {
             assert!(scheduler.commit_admission(&mut state, handle.program(), "rank-0", plan, now));
             handle
         };
+        pd_observe(&scheduler, 0.0);
         let first_dispatch = scheduler
             .claim_dispatch(&first_handle)
             .expect("first turn dispatches");
@@ -1666,6 +1667,7 @@ mod tests {
             );
             (first_handle, second_handle)
         };
+        pd_observe(&scheduler, 0.0);
         let first_dispatch = scheduler
             .claim_dispatch(&first_handle)
             .expect("first turn dispatches");

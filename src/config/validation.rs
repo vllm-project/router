@@ -1527,7 +1527,6 @@ mod tests {
     #[test]
     fn test_grpc_pd_workers_reject_program_scheduling() {
         let program: ProgramSchedulingConfig = serde_json::from_value(serde_json::json!({
-            "pd": {"enabled": true},
             "token_capacity_per_dp_rank": 100000,
             "enable_batch_gain_admission": false,
         }))
