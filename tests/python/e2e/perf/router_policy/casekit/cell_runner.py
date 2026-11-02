@@ -526,11 +526,14 @@ def engine_command(i):
         "replay_endpoint": "tcp://*:0",
         "buffer_steps": 10000,
     }
+    cpu_bytes = int(pw.get("cpu_kv_bytes", 17179869184))
+    # GiB for --kv-offloading-size. That flag registers vllm:kv_offload_cpu_*.
+    offload_gib = cpu_bytes / (1024**3)
     transfer = {
         "kv_connector": "OffloadingConnector",
         "kv_role": "kv_both",
         "kv_connector_extra_config": {
-            "cpu_bytes_to_use": int(pw.get("cpu_kv_bytes", 17179869184)),
+            "cpu_bytes_to_use": cpu_bytes,
             "self_describing_kv_events": True,
         },
     }
@@ -583,6 +586,10 @@ def engine_command(i):
         ),
         "--kv-cache-memory-bytes",
         str(pw.get("kv_cache_memory_bytes", 107374182400)),
+        "--kv-offloading-backend",
+        "native",
+        "--kv-offloading-size",
+        f"{offload_gib:g}",
         "--safetensors-load-strategy",
         "prefetch",
         "--kv-events-config",
