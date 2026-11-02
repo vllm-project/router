@@ -124,10 +124,10 @@ if [[ ! -x "$VLLM_RS" ]]; then
 fi
 RS_VERSION="$("$VLLM_RS" --version | awk '{print $NF}')"
 # Do not pip-install a newer vllm here. A worker older than 0.30 cannot run
-# this gRPC path, so the job fails instead of upgrading the image venv.
+# this gRPC path. Exit 75 so the pytest skips until the CI image is new enough.
 if ! version_at_least "$RS_VERSION" "0.30.0"; then
-  echo "gRPC P/D needs vllm-rs >= 0.30.0, found ${RS_VERSION}" >&2
-  exit 1
+  echo "SKIP: gRPC P/D needs vllm-rs >= 0.30.0, found ${RS_VERSION}" >&2
+  exit 75
 fi
 echo "vllm-rs ${RS_VERSION} at ${VLLM_RS}"
 

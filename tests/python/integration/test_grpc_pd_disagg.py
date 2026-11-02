@@ -29,4 +29,8 @@ def test_grpc_pd_disagg_accuracy():
         env=os.environ.copy(),
         check=False,
     )
+    if completed.returncode == 75:
+        pytest.skip(
+            "vllm-rs >= 0.30.0 is required; the CI image still ships vllm 0.29.0"
+        )
     assert completed.returncode == 0, completed.returncode
