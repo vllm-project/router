@@ -121,7 +121,8 @@ steps:
         reason: "GPU tests can be flaky - retry if needed"
     mirror_hardwares: l4_4
     # vLLM, NIXL, lm-eval, and vllm-router are on PATH in the CI image. The
-    # script exits early when vllm-rs is older than 0.30.0.
+    # shared image caches an unpinned vllm. This script installs vllm>=0.30
+    # into that venv when its vllm-rs is older, and does not rebuild the image.
     command: |
       bash <<'BASH'
       set -euo pipefail
