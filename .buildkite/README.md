@@ -97,6 +97,7 @@ the same GSM8K check as the HTTP job. It follows the HTTP split: a `ready`
 label runs the chat check only from `test-ready.yml` (`RUN_LM_EVAL=0`, 4
 non-streaming and 1 streaming request), and full GSM8K stays in
 `test-nightly.yml`. Both use the `l4_4` image and wait for `image-build`.
+The shared NVIDIA CI image pins `vllm==0.30.0` to satisfy the worker minimum.
 `ROCM_ONLY=1` skips them along with the HTTP steps.
 
 The pytest wrapper is `tests/python/integration/test_grpc_pd_disagg.py`.
