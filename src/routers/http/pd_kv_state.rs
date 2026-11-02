@@ -806,7 +806,7 @@ mod kv_input_tests {
                 assert_eq!(provider.find_tiered_matches(&query).len(), 1);
                 assert!(state.bindings.lock().await[&base].info.is_none());
                 let fallback = state
-                    .prepare(&workers, &policy, &request, "/v1/completions", None)
+                    .prepare(&workers, &policy, &request, "/v1/completions", None, None)
                     .await;
                 assert_eq!(fallback[&base].work_by_rank[&None].new_prefill_tokens, 33);
                 assert!(!fallback[&base].work_by_rank[&None].placement_verified);
