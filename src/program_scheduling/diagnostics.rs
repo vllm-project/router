@@ -344,47 +344,47 @@ impl ProgramScheduler {
                         .map(|prediction| prediction.source.as_str()),
                     last_return_actual_seconds: decision.last_return_actual_seconds,
                     predicted_output_tokens: decision
-                        .pending_output_prediction
+                        .latest_output_prediction
                         .as_ref()
                         .and_then(|pending| pending.prediction.as_ref())
                         .map(|prediction| prediction.tokens),
                     predicted_output_p50: decision
-                        .pending_output_prediction
+                        .latest_output_prediction
                         .as_ref()
                         .and_then(|pending| pending.prediction.as_ref())
                         .map(|prediction| prediction.p50),
                     predicted_output_p95: decision
-                        .pending_output_prediction
+                        .latest_output_prediction
                         .as_ref()
                         .and_then(|pending| pending.prediction.as_ref())
                         .map(|prediction| prediction.p95),
                     predicted_output_p99: decision
-                        .pending_output_prediction
+                        .latest_output_prediction
                         .as_ref()
                         .and_then(|pending| pending.prediction.as_ref())
                         .map(|prediction| prediction.p99),
                     output_prediction_support: decision
-                        .pending_output_prediction
+                        .latest_output_prediction
                         .as_ref()
                         .and_then(|pending| pending.prediction.as_ref())
                         .map(|prediction| prediction.support),
                     output_prediction_online_support: decision
-                        .pending_output_prediction
+                        .latest_output_prediction
                         .as_ref()
                         .and_then(|pending| pending.prediction.as_ref())
                         .map(|prediction| prediction.online_support),
                     output_prediction_backoff_level: decision
-                        .pending_output_prediction
+                        .latest_output_prediction
                         .as_ref()
                         .and_then(|pending| pending.prediction.as_ref())
                         .map(|prediction| prediction.backoff_level),
                     output_prediction_source: decision
-                        .pending_output_prediction
+                        .latest_output_prediction
                         .as_ref()
                         .and_then(|pending| pending.prediction.as_ref())
                         .map(|prediction| prediction.source.as_str()),
                     output_prediction_mature: decision
-                        .pending_output_prediction
+                        .latest_output_prediction
                         .as_ref()
                         .and_then(|pending| pending.prediction.as_ref())
                         .map(|prediction| prediction.mature),

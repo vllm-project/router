@@ -175,7 +175,15 @@ impl ProgramScheduler {
         }
 
         let mut request_sample = None;
-        let mut output_observation = None;
+        let actual_output_tokens = if success {
+            usage.completion_tokens
+        } else {
+            None
+        };
+        let output_observation = dispatch
+            .pending_output_prediction()
+            .cloned()
+            .zip(actual_output_tokens);
         if let Some(decision) = state.decisions.get_mut(dispatch.program()) {
             let previous_context = decision.last_context_tokens;
             let context_growth_tokens = previous_context.and_then(|previous| {
@@ -225,11 +233,10 @@ impl ProgramScheduler {
                     }
                 }
                 let completion_tokens = usage.completion_tokens.unwrap_or(0);
-                if let (Some(actual_tokens), Some(pending)) = (
-                    usage.completion_tokens,
-                    decision.pending_output_prediction.take(),
-                ) {
-                    output_observation = Some((pending, actual_tokens));
+                if let Some(actual_tokens) = usage
+                    .completion_tokens
+                    .filter(|_| dispatch.pending_output_prediction().is_some())
+                {
                     decision.last_output_actual_tokens = Some(actual_tokens);
                 }
                 decision.completed_requests = decision.completed_requests.saturating_add(1);

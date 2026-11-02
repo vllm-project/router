@@ -70,7 +70,8 @@ impl ProgramScheduler {
             return Err(ScheduleError::NoTargets);
         }
         let arrived_at = Instant::now();
-        let handle = {
+        let expected_resume = identity.expected_resume();
+        let (handle, pending_output_prediction) = {
             let mut state = self.state.lock();
             let handle = state.runtime.retain_request(
                 &identity,
@@ -171,6 +172,7 @@ impl ProgramScheduler {
                 arrived_at,
                 routing_text.as_deref(),
             );
+            let mut pending_output_prediction = None;
             if self.config.prediction_profile.mode != PredictionMode::Off {
                 let keys = output_length::keys_for_request(&identity);
                 let prediction = state.prediction_profiles.predict_output(
@@ -211,10 +213,11 @@ impl ProgramScheduler {
                         prediction.backoff_level,
                     );
                 }
+                let pending = output_length::PendingOutputPrediction { keys, prediction };
                 if let Some(decision) = state.decisions.get_mut(&reference) {
-                    decision.pending_output_prediction =
-                        Some(output_length::PendingOutputPrediction { keys, prediction });
+                    decision.latest_output_prediction = Some(pending.clone());
                 }
+                pending_output_prediction = Some(pending);
             }
             let current_tokens = state.decisions[&reference]
                 .private_tokens(self.config.progress_ttl.decode_buffer_tokens);
@@ -260,14 +263,17 @@ impl ProgramScheduler {
             } else {
                 self.run_request_arrival_decisions(&mut state, arrived_at);
             }
-            handle
+            (handle, pending_output_prediction)
         };
         let mut guard = AdmissionGuard::new(self, handle);
+        let mut pending_output_prediction = pending_output_prediction;
         let deadline = arrived_at + self.config.queue_timeout;
         loop {
             let wait_handle = guard.handle().clone();
             let notified = wait_handle.notified();
-            if let Some(dispatch) = self.claim_dispatch(guard.handle()) {
+            if let Some(mut dispatch) = self.claim_dispatch(guard.handle()) {
+                dispatch
+                    .attach_prediction_context(expected_resume, pending_output_prediction.take());
                 guard.disarm();
                 return Ok(dispatch);
             }
@@ -1037,7 +1043,7 @@ impl Drop for AdmissionGuard<'_> {
 mod tests {
     use super::*;
     use crate::program_scheduling::scheduler_state::RankObservationState;
-    use crate::program_scheduling::ProgramSchedulerConfig;
+    use crate::program_scheduling::{ProgramSchedulerConfig, ProgramUsageObservation};
     use serde_json::json;
     use std::time::Duration;
 
@@ -1076,6 +1082,23 @@ mod tests {
                 "task_id":null,
                 "expected_resume":true,
                 "expected_output_length":output_tokens
+            }}})),
+            Some("model"),
+        )
+        .unwrap()
+        .unwrap()
+    }
+
+    fn identity_with_profile_role(program: &str, role: &str) -> ProgramIdentity {
+        ProgramIdentity::from_request(
+            None,
+            Some(&json!({"vllm_xargs":{"agentic_context":{
+                "program_id":program,
+                "task_id":null,
+                "expected_resume":true,
+                "workflow_profile_id":"workflow",
+                "profile_version":"1",
+                "spawn_reason":role
             }}})),
             Some("model"),
         )
@@ -1189,7 +1212,7 @@ mod tests {
         let state = scheduler.state.lock();
         let decision = &state.decisions[dispatch.program()];
         let prediction = decision
-            .pending_output_prediction
+            .latest_output_prediction
             .as_ref()
             .and_then(|pending| pending.prediction.as_ref())
             .unwrap();
@@ -1200,6 +1223,79 @@ mod tests {
             decision.private_tokens(scheduler.config.progress_ttl.decode_buffer_tokens),
             200.0
         );
+    }
+
+    #[tokio::test]
+    async fn overlapping_requests_keep_output_observations_scoped_to_dispatch() {
+        let scheduler = ProgramScheduler::new(ProgramSchedulerConfig::default());
+        let target = target();
+        let first = scheduler
+            .acquire(
+                identity_with_profile_role("overlap", "engineer"),
+                100,
+                std::slice::from_ref(&target),
+                None,
+            )
+            .await
+            .unwrap();
+        let second = scheduler
+            .acquire(
+                identity_with_profile_role("overlap", "reviewer"),
+                100,
+                std::slice::from_ref(&target),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            first.pending_output_prediction().unwrap().keys[0]
+                .profile_role
+                .as_deref(),
+            Some("engineer")
+        );
+        assert_eq!(
+            second.pending_output_prediction().unwrap().keys[0]
+                .profile_role
+                .as_deref(),
+            Some("reviewer")
+        );
+
+        scheduler.complete(
+            &second,
+            true,
+            false,
+            ProgramUsageObservation {
+                completion_tokens: Some(200),
+                ..ProgramUsageObservation::default()
+            },
+            None,
+        );
+        scheduler.complete(
+            &first,
+            true,
+            true,
+            ProgramUsageObservation {
+                completion_tokens: Some(100),
+                ..ProgramUsageObservation::default()
+            },
+            None,
+        );
+
+        let state = scheduler.state.lock();
+        let (_, snapshot) = state.prediction_profiles.snapshot().unwrap();
+        let maximum_for = |role: &str| {
+            snapshot
+                .output_length_profiles
+                .iter()
+                .find(|entry| {
+                    entry.key.workflow_profile_id.as_deref() == Some("workflow")
+                        && entry.key.profile_role.as_deref() == Some(role)
+                })
+                .map(|entry| entry.max_observed_tokens)
+        };
+        assert_eq!(maximum_for("engineer"), Some(100.0));
+        assert_eq!(maximum_for("reviewer"), Some(200.0));
     }
 
     #[test]

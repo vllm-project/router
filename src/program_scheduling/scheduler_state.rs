@@ -253,7 +253,7 @@ pub(crate) struct ProgramDecisionState {
     pub(crate) pause_when_idle: bool,
     pub(crate) terminate_when_idle: bool,
     pub(crate) pending_return_prediction: Option<PendingReturnPrediction>,
-    pub(crate) pending_output_prediction: Option<PendingOutputPrediction>,
+    pub(crate) latest_output_prediction: Option<PendingOutputPrediction>,
     pub(crate) last_return_actual_seconds: Option<f64>,
     pub(crate) last_output_actual_tokens: Option<usize>,
 }
@@ -313,7 +313,7 @@ impl ProgramDecisionState {
             pause_when_idle: false,
             terminate_when_idle: false,
             pending_return_prediction: None,
-            pending_output_prediction: None,
+            latest_output_prediction: None,
             last_return_actual_seconds: None,
             last_output_actual_tokens: None,
         }
