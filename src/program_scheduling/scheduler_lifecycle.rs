@@ -390,7 +390,13 @@ impl ProgramScheduler {
                 );
                 if completion_action == Some(CompletionAction::Terminate) {
                     state.prediction_profiles.observe_no_return(&keys);
-                } else if success && completion_action == Some(CompletionAction::StartActingTtl) {
+                } else if success
+                    && matches!(
+                        completion_action,
+                        Some(CompletionAction::StartActingTtl)
+                            | Some(CompletionAction::Pause(ProgramPauseReason::CapacityRepair))
+                    )
+                {
                     let prediction = state.prediction_profiles.predict_return(
                         &keys,
                         0.0,
@@ -932,6 +938,56 @@ mod tests {
             .return_time_profiles
             .iter()
             .any(|entry| entry.no_return_count >= 1.0));
+    }
+
+    #[tokio::test]
+    async fn capacity_repair_pause_preserves_return_observation() {
+        let scheduler = ProgramScheduler::new(ProgramSchedulerConfig::default());
+        let target = ProgramTarget {
+            id: "rank-0".into(),
+            base_url: "http://rank-0".into(),
+            dp_rank: Some(0),
+        };
+        let dispatch = scheduler
+            .acquire(
+                identity("capacity-pause-return"),
+                100,
+                std::slice::from_ref(&target),
+                None,
+            )
+            .await
+            .unwrap();
+        scheduler
+            .state
+            .lock()
+            .decisions
+            .get_mut(dispatch.program())
+            .unwrap()
+            .pause_when_idle = true;
+
+        scheduler.complete(&dispatch, true, false, None, None);
+        {
+            let state = scheduler.state.lock();
+            let decision = &state.decisions[dispatch.program()];
+            assert_eq!(
+                decision.last_pause_reason,
+                Some(ProgramPauseReason::CapacityRepair)
+            );
+            assert!(decision.pending_return_prediction.is_some());
+        }
+
+        scheduler
+            .acquire(
+                identity("capacity-pause-return"),
+                100,
+                std::slice::from_ref(&target),
+                None,
+            )
+            .await
+            .unwrap();
+        let state = scheduler.state.lock();
+        let (_, snapshot) = state.prediction_profiles.snapshot().unwrap();
+        assert!(!snapshot.return_time_profiles.is_empty());
     }
 
     #[tokio::test]

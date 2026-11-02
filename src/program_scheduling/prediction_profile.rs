@@ -72,7 +72,8 @@ struct Histogram {
     online: Vec<u64>,
     offline_no_return: f64,
     online_no_return: u64,
-    max_observed: f64,
+    offline_max_observed: f64,
+    online_max_observed: f64,
     recent: VecDeque<f64>,
 }
 
@@ -83,7 +84,8 @@ impl Histogram {
             online: vec![0; bucket_count],
             offline_no_return: 0.0,
             online_no_return: 0,
-            max_observed: 0.0,
+            offline_max_observed: 0.0,
+            online_max_observed: 0.0,
             recent: VecDeque::new(),
         }
     }
@@ -110,7 +112,8 @@ impl Histogram {
             online: vec![0; bucket_count],
             offline_no_return: no_return,
             online_no_return: 0,
-            max_observed: max_observed.max(0.0),
+            offline_max_observed: max_observed.max(0.0),
+            online_max_observed: 0.0,
             recent: VecDeque::new(),
         })
     }
@@ -121,7 +124,7 @@ impl Histogram {
             .position(|upper| value <= *upper)
             .unwrap_or(bounds.len());
         self.online[index] = self.online[index].saturating_add(1);
-        self.max_observed = self.max_observed.max(value);
+        self.online_max_observed = self.online_max_observed.max(value);
         self.recent.push_back(value);
         while self.recent.len() > recent_limit {
             self.recent.pop_front();
@@ -157,13 +160,24 @@ impl Histogram {
         self.online.iter().sum::<u64>() as usize + self.online_no_return as usize
     }
 
-    fn source(&self) -> PredictionSource {
-        match (self.offline_support() > 0.0, self.online_support() > 0) {
+    fn source(&self, prior_weight: f64) -> PredictionSource {
+        let has_offline = prior_weight > 0.0 && self.offline_support() > 0.0;
+        let has_online = self.online_support() > 0;
+        match (has_offline, has_online) {
             (true, true) => PredictionSource::Blended,
             (true, false) => PredictionSource::Offline,
             (false, true) => PredictionSource::Online,
             (false, false) => PredictionSource::None,
         }
+    }
+
+    fn effective_max_observed(&self, prior_weight: f64) -> f64 {
+        let offline = if prior_weight > 0.0 {
+            self.offline_max_observed
+        } else {
+            0.0
+        };
+        offline.max(self.online_max_observed)
     }
 
     fn quantile(&self, bounds: &[f64], quantile: f64, prior_weight: f64) -> Option<f64> {
@@ -178,20 +192,20 @@ impl Histogram {
             cumulative += count;
             if cumulative >= target {
                 return Some(
-                    bounds
-                        .get(index)
-                        .copied()
-                        .unwrap_or(self.max_observed.max(*bounds.last().unwrap_or(&1.0))),
+                    bounds.get(index).copied().unwrap_or(
+                        self.effective_max_observed(prior_weight)
+                            .max(*bounds.last().unwrap_or(&1.0)),
+                    ),
                 );
             }
         }
-        Some(self.max_observed.max(*bounds.last().unwrap_or(&1.0)))
+        Some(
+            self.effective_max_observed(prior_weight)
+                .max(*bounds.last().unwrap_or(&1.0)),
+        )
     }
 
     fn recent_stable(&self, quantile: f64, window: usize, tolerance: f64) -> bool {
-        if self.offline_support() > 0.0 && self.recent.len() < window {
-            return true;
-        }
         if self.recent.len() < window || window < 2 {
             return false;
         }
@@ -330,10 +344,23 @@ impl PredictionProfileStore {
         {
             return Err("prediction profile bucket bounds do not match Router config".to_string());
         }
+        if profile.return_time_profiles.len() > self.max_keys {
+            return Err(format!(
+                "return-time profile contains {} entries, exceeding max_keys {}",
+                profile.return_time_profiles.len(),
+                self.max_keys
+            ));
+        }
+        if profile.output_length_profiles.len() > self.max_keys {
+            return Err(format!(
+                "output-length profile contains {} entries, exceeding max_keys {}",
+                profile.output_length_profiles.len(),
+                self.max_keys
+            ));
+        }
+
+        let mut return_time = HashMap::with_capacity(profile.return_time_profiles.len());
         for entry in profile.return_time_profiles {
-            if self.return_time.len() >= self.max_keys {
-                break;
-            }
             let histogram = Histogram::from_seed(
                 &entry.bucket_counts,
                 entry.no_return_count,
@@ -341,12 +368,13 @@ impl PredictionProfileStore {
                 self.return_time_bounds.len() + 1,
             )
             .ok_or_else(|| "invalid return-time profile entry".to_string())?;
-            self.return_time.insert(entry.key, histogram);
-        }
-        for entry in profile.output_length_profiles {
-            if self.output_length.len() >= self.max_keys {
-                break;
+            if return_time.insert(entry.key, histogram).is_some() {
+                return Err("duplicate return-time profile key".to_string());
             }
+        }
+
+        let mut output_length = HashMap::with_capacity(profile.output_length_profiles.len());
+        for entry in profile.output_length_profiles {
             let histogram = Histogram::from_seed(
                 &entry.bucket_counts,
                 0.0,
@@ -354,8 +382,12 @@ impl PredictionProfileStore {
                 self.output_length_bounds.len() + 1,
             )
             .ok_or_else(|| "invalid output-length profile entry".to_string())?;
-            self.output_length.insert(entry.key, histogram);
+            if output_length.insert(entry.key, histogram).is_some() {
+                return Err("duplicate output-length profile key".to_string());
+            }
         }
+        self.return_time = return_time;
+        self.output_length = output_length;
         Ok(())
     }
 
@@ -435,6 +467,7 @@ impl PredictionProfileStore {
                 &self.return_time_bounds,
                 cache_miss_cost,
                 max_ttl,
+                histogram.effective_max_observed(prior_weight),
             );
             return Some(ReturnPrediction {
                 probability,
@@ -442,7 +475,7 @@ impl PredictionProfileStore {
                 support,
                 online_support: histogram.online_support(),
                 backoff_level,
-                source: histogram.source(),
+                source: histogram.source(prior_weight),
             });
         }
         None
@@ -505,7 +538,7 @@ impl PredictionProfileStore {
                 support,
                 online_support: histogram.online_support(),
                 backoff_level,
-                source: histogram.source(),
+                source: histogram.source(prior_weight),
                 mature,
             });
         }
@@ -535,7 +568,7 @@ impl PredictionProfileStore {
                         key: key.clone(),
                         bucket_counts: histogram.online.iter().map(|value| *value as f64).collect(),
                         no_return_count: histogram.online_no_return as f64,
-                        max_observed_seconds: histogram.max_observed,
+                        max_observed_seconds: histogram.online_max_observed,
                     })
                     .collect(),
                 output_length_profiles: self
@@ -545,7 +578,7 @@ impl PredictionProfileStore {
                     .map(|(key, histogram)| OutputLengthProfileEntry {
                         key: key.clone(),
                         bucket_counts: histogram.online.iter().map(|value| *value as f64).collect(),
-                        max_observed_tokens: histogram.max_observed,
+                        max_observed_tokens: histogram.online_max_observed,
                     })
                     .collect(),
             },
@@ -571,12 +604,19 @@ fn best_ttl(
     bounds: &[f64],
     cache_miss_cost: f64,
     max_ttl: f64,
+    max_observed: f64,
 ) -> f64 {
     let total = counts.iter().sum::<f64>() + no_return;
     if total <= 0.0 || cache_miss_cost <= 0.0 || max_ttl <= 0.0 {
         return 0.0;
     }
     let mut best = (0.0, 0.0);
+    let last_bound = bounds.last().copied().unwrap_or(0.0);
+    let overflow_upper = if max_observed > last_bound {
+        max_observed
+    } else {
+        f64::INFINITY
+    };
     for candidate in std::iter::once(0.0).chain(
         bounds
             .iter()
@@ -587,7 +627,7 @@ fn best_ttl(
         let mut hit_probability = 0.0;
         let mut retained_cost = no_return / total * candidate;
         for (index, count) in counts.iter().enumerate() {
-            let upper = bounds.get(index).copied().unwrap_or(max_ttl.max(candidate));
+            let upper = bounds.get(index).copied().unwrap_or(overflow_upper);
             let probability = count / total;
             if upper <= candidate {
                 hit_probability += probability;
@@ -668,6 +708,11 @@ mod tests {
     }
 
     #[test]
+    fn overflow_returns_are_not_hits_at_the_final_ttl_boundary() {
+        assert_eq!(best_ttl(&[0.0, 1.0], 0.0, &[10.0], 100.0, 10.0, 20.0), 0.0);
+    }
+
+    #[test]
     fn offline_seed_and_online_overlay_are_blended_without_mutating_seed() {
         let key = output_key();
         let profile = PredictionProfileFile {
@@ -692,6 +737,138 @@ mod tests {
         assert_eq!(prediction.online_support, 1);
         assert_eq!(prediction.support, 11);
         assert_eq!(prediction.p50, 64);
+    }
+
+    #[test]
+    fn online_snapshot_excludes_offline_maximum() {
+        let key = output_key();
+        let profile = PredictionProfileFile {
+            schema_version: PROFILE_SCHEMA_VERSION.to_string(),
+            generated_at: None,
+            return_time_bucket_bounds_seconds: vec![1.0],
+            output_length_bucket_bounds_tokens: vec![64],
+            return_time_profiles: Vec::new(),
+            output_length_profiles: vec![OutputLengthProfileEntry {
+                key: key.clone(),
+                bucket_counts: vec![1.0, 1.0],
+                max_observed_tokens: 1_000.0,
+            }],
+        };
+        let mut store = PredictionProfileStore::empty(vec![1.0], vec![64], 16, 4);
+        store.load_profile(profile).unwrap();
+        store.observe_output(&[key], 200);
+
+        let (_, snapshot) = store.snapshot().unwrap();
+        assert_eq!(
+            snapshot.output_length_profiles[0].max_observed_tokens,
+            200.0
+        );
+    }
+
+    #[test]
+    fn offline_seed_is_available_but_immature_until_online_window_is_stable() {
+        let key = output_key();
+        let profile = PredictionProfileFile {
+            schema_version: PROFILE_SCHEMA_VERSION.to_string(),
+            generated_at: None,
+            return_time_bucket_bounds_seconds: vec![1.0],
+            output_length_bucket_bounds_tokens: vec![64, 128, 256],
+            return_time_profiles: Vec::new(),
+            output_length_profiles: vec![OutputLengthProfileEntry {
+                key: key.clone(),
+                bucket_counts: vec![100.0, 0.0, 0.0, 0.0],
+                max_observed_tokens: 64.0,
+            }],
+        };
+        let mut store = PredictionProfileStore::empty(vec![1.0], vec![64, 128, 256], 16, 4);
+        store.load_profile(profile).unwrap();
+
+        let cold_start = store
+            .predict_output(std::slice::from_ref(&key), 0.95, 1, 1, 1.0, 4, 0.15)
+            .unwrap();
+        assert_eq!(cold_start.source, PredictionSource::Offline);
+        assert_eq!(cold_start.online_support, 0);
+        assert!(!cold_start.mature);
+
+        for _ in 0..4 {
+            store.observe_output(std::slice::from_ref(&key), 60);
+        }
+        let stable = store
+            .predict_output(&[key], 0.95, 1, 1, 1.0, 4, 0.15)
+            .unwrap();
+        assert!(stable.mature);
+    }
+
+    #[test]
+    fn zero_prior_weight_reports_online_source() {
+        let key = output_key();
+        let profile = PredictionProfileFile {
+            schema_version: PROFILE_SCHEMA_VERSION.to_string(),
+            generated_at: None,
+            return_time_bucket_bounds_seconds: vec![1.0],
+            output_length_bucket_bounds_tokens: vec![64, 128, 256],
+            return_time_profiles: Vec::new(),
+            output_length_profiles: vec![OutputLengthProfileEntry {
+                key: key.clone(),
+                bucket_counts: vec![10.0, 0.0, 0.0, 0.0],
+                max_observed_tokens: 64.0,
+            }],
+        };
+        let mut store = PredictionProfileStore::empty(vec![1.0], vec![64, 128, 256], 16, 2);
+        store.load_profile(profile).unwrap();
+        store.observe_output(std::slice::from_ref(&key), 200);
+        store.observe_output(std::slice::from_ref(&key), 200);
+
+        let prediction = store
+            .predict_output(&[key], 0.5, 1, 1, 0.0, 2, 0.15)
+            .unwrap();
+        assert_eq!(prediction.source, PredictionSource::Online);
+        assert_eq!(prediction.support, 2);
+        assert_eq!(prediction.tokens, 256);
+    }
+
+    #[test]
+    fn oversized_profile_is_rejected_during_validation() {
+        let first = OutputLengthProfileEntry {
+            key: output_key(),
+            bucket_counts: vec![1.0, 0.0],
+            max_observed_tokens: 64.0,
+        };
+        let mut second = first.clone();
+        second.key.profile_role = Some("reviewer".into());
+        let profile = PredictionProfileFile {
+            schema_version: PROFILE_SCHEMA_VERSION.to_string(),
+            generated_at: None,
+            return_time_bucket_bounds_seconds: vec![1.0],
+            output_length_bucket_bounds_tokens: vec![64],
+            return_time_profiles: Vec::new(),
+            output_length_profiles: vec![first, second],
+        };
+        let raw = serde_json::to_string(&profile).unwrap();
+
+        let error = validate_profile_json(&raw, &[1.0], &[64], 1).unwrap_err();
+        assert!(error.contains("exceeding max_keys"));
+    }
+
+    #[test]
+    fn duplicate_profile_keys_are_rejected_during_validation() {
+        let entry = OutputLengthProfileEntry {
+            key: output_key(),
+            bucket_counts: vec![1.0, 0.0],
+            max_observed_tokens: 64.0,
+        };
+        let profile = PredictionProfileFile {
+            schema_version: PROFILE_SCHEMA_VERSION.to_string(),
+            generated_at: None,
+            return_time_bucket_bounds_seconds: vec![1.0],
+            output_length_bucket_bounds_tokens: vec![64],
+            return_time_profiles: Vec::new(),
+            output_length_profiles: vec![entry.clone(), entry],
+        };
+        let raw = serde_json::to_string(&profile).unwrap();
+
+        let error = validate_profile_json(&raw, &[1.0], &[64], 2).unwrap_err();
+        assert!(error.contains("duplicate output-length profile key"));
     }
 
     #[test]

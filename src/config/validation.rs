@@ -227,20 +227,23 @@ impl ConfigValidator {
                         .to_string(),
             });
         }
-        if let Some(path) = prediction.profile_path.as_deref() {
-            let raw =
-                std::fs::read_to_string(path).map_err(|error| ConfigError::ValidationFailed {
-                    reason: format!("Unable to read prediction profile '{path}': {error}"),
+        if prediction.mode != PredictionMode::Off {
+            if let Some(path) = prediction.profile_path.as_deref() {
+                let raw = std::fs::read_to_string(path).map_err(|error| {
+                    ConfigError::ValidationFailed {
+                        reason: format!("Unable to read prediction profile '{path}': {error}"),
+                    }
                 })?;
-            crate::program_scheduling::prediction_profile::validate_profile_json(
-                &raw,
-                &prediction.return_time_bucket_bounds_seconds,
-                &prediction.output_length_bucket_bounds_tokens,
-                prediction.max_keys,
-            )
-            .map_err(|error| ConfigError::ValidationFailed {
-                reason: format!("Invalid prediction profile '{path}': {error}"),
-            })?;
+                crate::program_scheduling::prediction_profile::validate_profile_json(
+                    &raw,
+                    &prediction.return_time_bucket_bounds_seconds,
+                    &prediction.output_length_bucket_bounds_tokens,
+                    prediction.max_keys,
+                )
+                .map_err(|error| ConfigError::ValidationFailed {
+                    reason: format!("Invalid prediction profile '{path}': {error}"),
+                })?;
+            }
         }
         Ok(())
     }
@@ -1095,6 +1098,16 @@ mod tests {
         for config in invalid {
             assert!(ConfigValidator::validate_program_scheduling(&config).is_err());
         }
+    }
+
+    #[test]
+    fn prediction_off_skips_unused_profile_file_validation() {
+        let mut config = ProgramSchedulingConfig::default();
+        config.prediction_profile.mode = PredictionMode::Off;
+        config.prediction_profile.profile_path =
+            Some("/definitely/missing/prediction-profile.json".to_string());
+
+        assert!(ConfigValidator::validate_program_scheduling(&config).is_ok());
     }
 
     #[test]
