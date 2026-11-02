@@ -254,7 +254,9 @@ impl PolicyRegistry {
             ),
             PolicyConfig::PowerOfTwo { .. } => Arc::new(PowerOfTwoPolicy::new()),
             PolicyConfig::ConsistentHash { .. } => Arc::new(ConsistentHashPolicy::new()),
-            PolicyConfig::StickyLeastLoaded => Arc::new(StickyLeastLoadedPolicy::new()),
+            PolicyConfig::StickyLeastLoaded { session_ttl_secs } => Arc::new(
+                StickyLeastLoadedPolicy::with_expiration_secs(*session_ttl_secs),
+            ),
             PolicyConfig::RendezvousHash => Arc::new(RendezvousHashPolicy::new()),
         }
     }
