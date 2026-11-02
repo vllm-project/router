@@ -163,7 +163,7 @@ in clap's option list in `--help`.
 | `--program-scheduling-config-json` | `string` | `unset` | `string` | `unset` | JSON object overriding Program scheduling defaults; requires `--enable-program-scheduling`. |
 
 For JSON fields, defaults and request opt-in behavior, see
-[Program scheduling](program_scheduling.md). The JSON option configures the
+[Program scheduling](program_scheduling/program-scheduling.md). The JSON option configures the
 feature; it does not enable it on its own.
 
 ## Kubernetes service discovery

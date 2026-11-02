@@ -7448,6 +7448,7 @@ dependencies = [
  "opentelemetry_sdk",
  "parking_lot",
  "portpicker",
+ "prost-types",
  "pyo3",
  "rand 0.9.5",
  "regex",

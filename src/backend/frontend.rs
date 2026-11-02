@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use axum::response::Response;
 
-use super::grpc::{FirstOutputCallback, GrpcEngineBackend};
+use super::grpc::{FirstOutputCallback, GrpcEngineBackend, KvHandoff};
 use super::l1_encode_cache::{L1CacheConfig, L1CacheStats};
 use super::preprocess::{tokenize_chat_request_timed, FrontendHandle, TokenizeOut, TokenizerCache};
 use crate::protocols::spec::ChatCompletionRequest;
@@ -214,12 +214,44 @@ impl EngineFrontend {
         on_first_output: Option<FirstOutputCallback>,
     ) -> Response {
         self.grpc
-            .dispatch_prepared(worker_url, prepared, on_first_output)
+            .dispatch_prepared(worker_url, prepared, on_first_output, KvHandoff::default())
             .await
     }
 
     pub fn remove_worker(&self, worker_url: &str) {
         self.grpc.remove_client(worker_url);
+    }
+
+    /// P/D prefill leg: one sampled token on `worker_url`. Returns the
+    /// engine's `kv_transfer_params` for the decode leg, if it sent any.
+    pub async fn prefill(
+        &self,
+        worker_url: &str,
+        prepared: &PreparedRequest,
+        engine_request_id: String,
+        kv_transfer_params: &serde_json::Value,
+    ) -> Result<Option<serde_json::Value>, Response> {
+        self.grpc
+            .prefill_prepared(worker_url, prepared, engine_request_id, kv_transfer_params)
+            .await
+    }
+
+    /// P/D decode leg: the client's chat on `worker_url`, reading prompt KV
+    /// through `kv_transfer_params`.
+    pub async fn dispatch_decode(
+        &self,
+        worker_url: &str,
+        prepared: PreparedRequest,
+        engine_request_id: String,
+        kv_transfer_params: Option<serde_json::Value>,
+    ) -> Response {
+        let handoff = KvHandoff {
+            engine_request_id: Some(engine_request_id),
+            kv_transfer_params,
+        };
+        self.grpc
+            .dispatch_prepared(worker_url, prepared, None, handoff)
+            .await
     }
 }
 

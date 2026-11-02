@@ -86,6 +86,24 @@ Full GSM8K stays in `test-nightly.yml`. Both include forks.
 - Automatic retry (up to 2 attempts) for flaky failures
 - Manual retry option available
 
+### gRPC P/D coverage
+
+`run_grpc_pd_accuracy_test.sh` is the Rust gRPC counterpart, with the same
+layout as the HTTP job: one prefill and one decode, each at data-parallel size
+2, on four L4s. Workers are `vllm-rs serve --grpc-port`, and the router runs
+`--prefill grpc://… --decode grpc://… --intra-node-data-parallel-size 2`.
+Workers must be vLLM ≥ 0.30.0. The client uses `/v1/chat/completions`, then
+the same GSM8K check as the HTTP job. It follows the HTTP split: a `ready`
+label runs the chat check only from `test-ready.yml` (`RUN_LM_EVAL=0`, 4
+non-streaming and 1 streaming request), and full GSM8K stays in
+`test-nightly.yml`. Both use the `l4_4` image and wait for `image-build`.
+`ROCM_ONLY=1` skips them along with the HTTP steps.
+
+The pytest wrapper is `tests/python/integration/test_grpc_pd_disagg.py`.
+Its #447 marks are level `ready` and `hardware_test(res={"cuda": "L4"}, num_cards=4)`,
+which attaches `L4`, `cuda`, `gpu`, and `cards_4`. The CPU job selects
+`ready and cpu`, so this test stays on the GPU step.
+
 ### ROCm MoRI coverage
 
 The dedicated `router_rocm_mi300_2` queue covers two MoRI lanes:

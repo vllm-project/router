@@ -203,6 +203,29 @@ pub(crate) fn max_prometheus_gauge(text: &str, family: &str) -> Option<f64> {
     maximum
 }
 
+/// Sum one gauge family across its series (per-engine request counts).
+pub(crate) fn sum_prometheus_gauge(text: &str, family: &str) -> Option<u64> {
+    let mut total: Option<u64> = None;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((series, value)) = split_series_value(line) else {
+            continue;
+        };
+        let (name, _labels) = parse_series(series);
+        if name != family {
+            continue;
+        }
+        if let Ok(value) = value.parse::<f64>() {
+            let value = value.max(0.0).round() as u64;
+            total = Some(total.unwrap_or(0).saturating_add(value));
+        }
+    }
+    total
+}
+
 fn split_series_value(line: &str) -> Option<(&str, &str)> {
     let split = line.rfind(char::is_whitespace)?;
     Some((line[..split].trim(), line[split..].trim()))
