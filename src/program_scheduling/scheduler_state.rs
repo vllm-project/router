@@ -114,10 +114,20 @@ pub(crate) fn resolve_auto_limit(configured: usize, prefill_permits: usize) -> u
 
 impl From<&crate::config::types::ProgramSchedulingConfig> for ProgramSchedulerConfig {
     fn from(config: &crate::config::types::ProgramSchedulingConfig) -> Self {
+        Self::from_program_config(config, false)
+    }
+}
+
+impl ProgramSchedulerConfig {
+    /// Build the scheduler config for one routing mode. PD mode comes from the
+    /// active `--vllm-pd-disaggregation` route, not from a second config flag.
+    pub fn from_program_config(
+        config: &crate::config::types::ProgramSchedulingConfig,
+        pd_mode: bool,
+    ) -> Self {
         // Auto sizing is a PD-mode concept. A regular-mode config that omitted
         // the fields deserializes the zero defaults; keep the historical
         // 64-Program cap and 1-request overload gate for those deployments.
-        let pd_mode = config.pd.enabled;
         let permits = config.pd.max_prefill_requests_per_target;
         let max_active_programs_per_target = if config.max_active_programs_per_target > 0 {
             config.max_active_programs_per_target
@@ -135,7 +145,7 @@ impl From<&crate::config::types::ProgramSchedulingConfig> for ProgramSchedulerCo
             1
         };
         Self {
-            pd_mode: config.pd.enabled,
+            pd_mode,
             pd_explicit_ttl: config.pd.explicit_ttl,
             pd_exclusive_capacity_accounting: config.pd.exclusive_capacity_accounting,
             pd_prefill_permits: config.pd.max_prefill_requests_per_target.max(1),
@@ -399,12 +409,22 @@ pub(crate) struct ProgramSchedulerState {
     pub(crate) lineage: ProgramLineage,
     /// Most recent P-side KV-cache pressure sample.
     pub(crate) prefill_pressure: Option<PrefillPressure>,
+    /// Per-P-target metrics samples, keyed by base URL.
+    pub(crate) prefill_targets: HashMap<String, PrefillTargetObservation>,
 }
 
 /// P KV-cache usage as seen from the prefill engines.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct PrefillPressure {
     pub(crate) kv_usage: f64,
+    pub(crate) observed_at: Instant,
+}
+
+/// One prefill target's metrics sample, used by the warm-read pressure gates.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PrefillTargetObservation {
+    pub(crate) kv_usage: Option<f64>,
+    pub(crate) running_requests: Option<usize>,
     pub(crate) observed_at: Instant,
 }
 
@@ -424,6 +444,7 @@ impl ProgramSchedulerState {
             rank_factors: HashMap::new(),
             lineage: ProgramLineage::default(),
             prefill_pressure: None,
+            prefill_targets: HashMap::new(),
         }
     }
 }
@@ -456,9 +477,8 @@ mod tests {
         assert_eq!(resolve_auto_limit(96, 4), 96);
 
         let parsed: crate::config::types::ProgramSchedulingConfig =
-            serde_json::from_str(r#"{"pd":{"enabled":true,"max_prefill_requests_per_target":4}}"#)
-                .unwrap();
-        let runtime = ProgramSchedulerConfig::from(&parsed);
+            serde_json::from_str(r#"{"pd":{"max_prefill_requests_per_target":4}}"#).unwrap();
+        let runtime = ProgramSchedulerConfig::from_program_config(&parsed, true);
         assert_eq!(runtime.max_active_programs_per_target, 8);
         assert_eq!(runtime.admission_waiting_request_threshold, 8);
         assert!(runtime.pd_exclusive_capacity_accounting);

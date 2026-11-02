@@ -134,6 +134,46 @@ impl ProgramRuntime {
         ))
     }
 
+    /// Replace a failed pre-output transport attempt without opening a successor's
+    /// serial slot. The scheduler independently rechecks the existing reservation.
+    pub(crate) fn restart_attempt(
+        &mut self,
+        old: &ProgramDispatch,
+        now: Instant,
+    ) -> Option<ProgramDispatch> {
+        if !self.is_live_attempt(old) {
+            return None;
+        }
+        self.next_attempt_id = self.next_attempt_id.checked_add(1)?;
+        let program = self.programs.get_mut(&RuntimeKey::from(old.program()))?;
+        program.active_attempts.remove(&old.attempt_id());
+        program.active_attempts.insert(self.next_attempt_id);
+        Some(ProgramDispatch::new(
+            self.next_attempt_id,
+            old.program().clone(),
+            old.target_id.clone(),
+            old.placement_epoch(),
+            old.request_arrived_at(),
+            now,
+            old.estimated_context_tokens(),
+            old.placement_start_request(),
+            old.routing_text().map(str::to_string),
+            old.request_hints().clone(),
+        ))
+    }
+
+    /// Test an exact live attempt before accepting PD metadata.
+    pub fn is_live_attempt(&self, dispatch: &ProgramDispatch) -> bool {
+        self.programs
+            .get(&RuntimeKey::from(dispatch.program()))
+            .is_some_and(|p| {
+                p.reference == *dispatch.program()
+                    && p.placement.as_deref() == Some(dispatch.target_id.as_str())
+                    && p.placement_epoch == dispatch.placement_epoch()
+                    && p.active_attempts.contains(&dispatch.attempt_id())
+            })
+    }
+
     /// Record one request completion if its generation and placement are current.
     pub fn complete_request(
         &mut self,

@@ -38,6 +38,76 @@ impl ProgramScheduler {
         }
     }
 
+    /// Immutable, bounded rank factors used by the PD keep/drop solver.
+    pub fn pd_ttl_factors(&self, target: &str) -> (Vec<f64>, usize, f64) {
+        let state = self.state.lock();
+        let factors = state.rank_factors.get(target);
+        (
+            factors
+                .map(|f| f.continuity_samples().map(|s| s.interval_seconds).collect())
+                .unwrap_or_default(),
+            factors.map_or(0, |f| f.average_context_growth_tokens().ceil() as usize),
+            self.config.progress_ttl.max_acting_ttl.as_secs_f64(),
+        )
+    }
+
+    pub fn pd_explicit_ttl_enabled(&self) -> bool {
+        self.config.pd_explicit_ttl
+    }
+
+    /// Exact attempt fence shared with the PD response/candidate adapter.
+    pub fn dispatch_is_current(&self, dispatch: &super::ProgramDispatch) -> bool {
+        self.state.lock().runtime.is_live_attempt(dispatch)
+    }
+
+    /// Fresh rank load for a calibrated PD decision; never grants capacity.
+    pub fn pd_rank_load(&self, target: &str) -> Option<usize> {
+        let state = self.state.lock();
+        let observation = state.observations.get(target)?;
+        if observation.observed_at?.elapsed()
+            > self
+                .config
+                .metrics_interval
+                .saturating_mul(5)
+                .max(Duration::from_secs(1))
+        {
+            return None;
+        }
+        observation.running_requests
+    }
+
+    pub fn pd_rank_kv_usage(&self, target: &str) -> Option<f64> {
+        let state = self.state.lock();
+        let observation = state.observations.get(target)?;
+        if observation.observed_at?.elapsed()
+            > self
+                .config
+                .metrics_interval
+                .saturating_mul(5)
+                .max(Duration::from_secs(1))
+        {
+            return None;
+        }
+        observation.kv_cache_usage
+    }
+
+    /// Online acting-TTL fallback for automatic PD TTL without a static
+    /// calibration: fit the keep/drop window from the rank's observed
+    /// inter-turn intervals and the estimated cold-prefill cost.
+    ///
+    /// The window is bounded by `max_acting_ttl`; callers must still clamp it to
+    /// the verified PD source lease. Returns `None` while the interval window is
+    /// incomplete or the fitted utility is not positive.
+    pub fn pd_fitted_ttl(&self, target: &str, uncached_prompt_tokens: usize) -> Option<Duration> {
+        let state = self.state.lock();
+        let factors = state.rank_factors.get(target)?;
+        let impact = self
+            .policy
+            .cache_miss_impact_seconds(uncached_prompt_tokens);
+        let ttl = self.policy.fitted_acting_ttl(factors, impact);
+        (!ttl.is_zero()).then_some(ttl)
+    }
+
     /// Backend observation and periodic scheduling interval.
     pub fn metrics_interval(&self) -> Duration {
         self.config.metrics_interval
@@ -711,6 +781,66 @@ impl ProgramScheduler {
                     .estimated_active_program_tokens
                     .map(|tokens| (tokens + observation.active_program_token_delta).max(0.0))
             })
+    }
+
+    /// Feed one prefill target's metrics sample (base URL keyed).
+    ///
+    /// Distinct P endpoints have no rank observation, so the warm-read gates
+    /// read these per-target samples instead.
+    pub fn observe_prefill_target(
+        &self,
+        target: &str,
+        kv_usage: Option<f64>,
+        running_requests: Option<usize>,
+    ) {
+        if !self.config.pd_mode {
+            return;
+        }
+        let freshness = self
+            .config
+            .pd_prefill_kv_window
+            .saturating_mul(3)
+            .max(Duration::from_secs(3));
+        let mut state = self.state.lock();
+        // Drop samples of prefill targets that left the pool, so the map keeps
+        // one entry per live P endpoint.
+        state
+            .prefill_targets
+            .retain(|_, observation| observation.observed_at.elapsed() <= freshness);
+        state.prefill_targets.insert(
+            target.trim_end_matches('/').to_string(),
+            super::scheduler_state::PrefillTargetObservation {
+                kv_usage: kv_usage
+                    .filter(|v| v.is_finite())
+                    .map(|v| v.clamp(0.0, 1.0)),
+                running_requests,
+                observed_at: Instant::now(),
+            },
+        );
+    }
+
+    fn fresh_prefill_target(
+        &self,
+        target: &str,
+    ) -> Option<super::scheduler_state::PrefillTargetObservation> {
+        let state = self.state.lock();
+        let observation = *state.prefill_targets.get(target.trim_end_matches('/'))?;
+        let freshness = self
+            .config
+            .pd_prefill_kv_window
+            .saturating_mul(3)
+            .max(Duration::from_secs(3));
+        (observation.observed_at.elapsed() <= freshness).then_some(observation)
+    }
+
+    /// Fresh P-target KV usage for the warm-read gate.
+    pub fn pd_prefill_kv_usage(&self, target: &str) -> Option<f64> {
+        self.fresh_prefill_target(target)?.kv_usage
+    }
+
+    /// Fresh P-target running requests for the warm-read gate.
+    pub fn pd_prefill_load(&self, target: &str) -> Option<usize> {
+        self.fresh_prefill_target(target)?.running_requests
     }
 
     /// Feed the current P KV-cache usage sample (maximum across P engines).
