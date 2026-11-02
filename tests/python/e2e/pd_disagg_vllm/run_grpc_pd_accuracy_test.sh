@@ -117,28 +117,14 @@ wait_for_tcp() {
   echo "${label} TCP ${port} is ready"
 }
 
-read_vllm_rs_version() {
-  VLLM_RS="$(resolve_vllm_rs)"
-  if [[ ! -x "$VLLM_RS" ]]; then
-    echo "vllm-rs is not executable at ${VLLM_RS}" >&2
-    exit 1
-  fi
-  RS_VERSION="$("$VLLM_RS" --version | awk '{print $NF}')"
-}
-
-read_vllm_rs_version
-if ! version_at_least "$RS_VERSION" "0.30.0"; then
-  # The shared CI image installs unpinned vllm and caches that layer, so this
-  # job can still see vllm-rs 0.29. Upgrade only this process's venv.
-  echo "vllm-rs ${RS_VERSION} is older than 0.30.0; installing vllm>=0.30 for this job" >&2
-  if command -v uv >/dev/null 2>&1; then
-    uv pip install 'vllm>=0.30'
-  else
-    python3 -m pip install 'vllm>=0.30'
-  fi
-  hash -r
-  read_vllm_rs_version
+VLLM_RS="$(resolve_vllm_rs)"
+if [[ ! -x "$VLLM_RS" ]]; then
+  echo "vllm-rs is not executable at ${VLLM_RS}" >&2
+  exit 1
 fi
+RS_VERSION="$("$VLLM_RS" --version | awk '{print $NF}')"
+# Do not pip-install a newer vllm here. A worker older than 0.30 cannot run
+# this gRPC path, so the job fails instead of upgrading the image venv.
 if ! version_at_least "$RS_VERSION" "0.30.0"; then
   echo "gRPC P/D needs vllm-rs >= 0.30.0, found ${RS_VERSION}" >&2
   exit 1
