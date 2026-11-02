@@ -1282,22 +1282,6 @@ impl Router {
         }
     }
 
-    /// Convert axum HeaderMap to policy RequestHeaders (HashMap<String, String>)
-    fn headers_to_request_headers(
-        headers: Option<&HeaderMap>,
-    ) -> Option<crate::policies::RequestHeaders> {
-        headers.map(|h| {
-            h.iter()
-                .filter_map(|(name, value)| {
-                    value
-                        .to_str()
-                        .ok()
-                        .map(|v| (name.as_str().to_lowercase(), v.to_string()))
-                })
-                .collect()
-        })
-    }
-
     fn policy_for_model(&self, model_id: Option<&str>) -> Arc<dyn LoadBalancingPolicy> {
         match model_id {
             Some(model) => self.policy_registry.get_policy_or_default(model),
@@ -1339,7 +1323,7 @@ impl Router {
         let policy = self.policy_for_model(model_id);
 
         // Convert headers for policies that need them (e.g., consistent_hash)
-        let request_headers = Self::headers_to_request_headers(headers);
+        let request_headers = header_utils::to_policy_headers(headers);
 
         if let Some(kv_aware) = kv_aware_ops(policy.as_ref()) {
             // The policy sees the full list: a retry exclusion must not
@@ -3143,7 +3127,7 @@ impl RouterTrait for Router {
         } else {
             let cache_key = (policy.needs_cache_routing_key())
                 .then(|| crate::protocols::spec::cache_routing::for_route(&body, path));
-            let request_headers = Self::headers_to_request_headers(headers);
+            let request_headers = header_utils::to_policy_headers(headers);
             let session_id = policy
                 .needs_session_id()
                 .then(|| resolve_session_key(headers, IdentityFields::from_body(&body)))
@@ -6867,46 +6851,12 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_headers_to_request_headers_basic() {
-        // Test that headers_to_request_headers correctly converts HeaderMap to HashMap
-        let mut header_map = HeaderMap::new();
-        header_map.insert("x-session-id", HeaderValue::from_static("session-123"));
-        header_map.insert("content-type", HeaderValue::from_static("application/json"));
-        header_map.insert("X-Custom-Header", HeaderValue::from_static("custom-value"));
-
-        let result = Router::headers_to_request_headers(Some(&header_map));
-        assert!(result.is_some());
-        let headers = result.unwrap();
-
-        // All keys should be lowercased
-        assert_eq!(headers.get("x-session-id").unwrap(), "session-123");
-        assert_eq!(headers.get("content-type").unwrap(), "application/json");
-        assert_eq!(headers.get("x-custom-header").unwrap(), "custom-value");
-    }
-
-    #[test]
-    fn test_headers_to_request_headers_none() {
-        // Test that None headers produce None output
-        let result = Router::headers_to_request_headers(None);
-        assert!(result.is_none());
-    }
-
     #[tokio::test]
     async fn program_target_unavailable_has_distinct_retryable_response() {
         let response = Router::program_target_unavailable_response("/v1/chat/completions");
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         assert_eq!(body, "Program-bound worker is unavailable");
-    }
-
-    #[test]
-    fn test_headers_to_request_headers_empty() {
-        // Test that empty HeaderMap produces empty HashMap
-        let header_map = HeaderMap::new();
-        let result = Router::headers_to_request_headers(Some(&header_map));
-        assert!(result.is_some());
-        assert!(result.unwrap().is_empty());
     }
 
     #[test]
@@ -7076,35 +7026,6 @@ mod tests {
             worker_urls_seen.len() >= 2,
             "Expected distribution across workers, only used: {:?}",
             worker_urls_seen
-        );
-    }
-
-    #[test]
-    fn test_inline_header_conversion_matches_headers_to_request_headers() {
-        // Verify that the inline header conversion pattern used in vllm_pd_router
-        // produces the same result as Router::headers_to_request_headers.
-        let mut header_map = HeaderMap::new();
-        header_map.insert("X-Session-Id", HeaderValue::from_static("session-abc"));
-        header_map.insert("Content-Type", HeaderValue::from_static("application/json"));
-        header_map.insert("x-user-id", HeaderValue::from_static("user-42"));
-
-        // Method 1: Router::headers_to_request_headers (used in router.rs)
-        let method1 = Router::headers_to_request_headers(Some(&header_map)).unwrap();
-
-        // Method 2: Inline conversion (used in vllm_pd_router.rs)
-        let method2: HashMap<String, String> = header_map
-            .iter()
-            .filter_map(|(name, value)| {
-                value
-                    .to_str()
-                    .ok()
-                    .map(|v| (name.as_str().to_lowercase(), v.to_string()))
-            })
-            .collect();
-
-        assert_eq!(
-            method1, method2,
-            "Both header conversion methods should produce identical results"
         );
     }
 
