@@ -234,6 +234,7 @@ The router supports multiple load balancing policies:
 | `round_robin` | Sequential distribution across workers | No | General purpose, even distribution |
 | `random` | Uniform random selection | No | Simple deployments |
 | `consistent_hash` | Routes same session/user to same worker | Yes | Multi-turn chat, KV cache reuse |
+| `sticky_least_loaded` | Keeps a session on one worker; new sessions go to the worker with the fewest active sessions | Yes | Many concurrent multi-turn sessions, async RL |
 | `power_of_two` | Picks least loaded of two random workers | No | Load-sensitive workloads |
 | `cache_aware` | Optimizes for prefix cache hits | Yes | Repeated prompts, few-shot |
 
