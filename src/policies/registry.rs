@@ -279,21 +279,21 @@ impl PolicyRegistry {
     /// the replica capacity held by the session; all other policies ignore it.
     /// This fans out to the default policy, every per-model policy, and the
     /// prefill/decode policies (for PD mode), since we don't know which policy
-    /// instance is tracking the session.
+    /// instance is tracking the session. Registry locks are released before
+    /// calling into the policies.
     pub fn finish_session(&self, session_id: &str) {
+        let mut policies: Vec<Arc<dyn LoadBalancingPolicy>> = self
+            .model_policies
+            .read()
+            .unwrap()
+            .values()
+            .cloned()
+            .collect();
+        policies.extend(self.prefill_policy.read().unwrap().clone());
+        policies.extend(self.decode_policy.read().unwrap().clone());
+
         self.default_policy.finish_session(session_id);
-
-        {
-            let policies = self.model_policies.read().unwrap();
-            for policy in policies.values() {
-                policy.finish_session(session_id);
-            }
-        }
-
-        if let Some(policy) = self.prefill_policy.read().unwrap().as_ref() {
-            policy.finish_session(session_id);
-        }
-        if let Some(policy) = self.decode_policy.read().unwrap().as_ref() {
+        for policy in policies {
             policy.finish_session(session_id);
         }
     }

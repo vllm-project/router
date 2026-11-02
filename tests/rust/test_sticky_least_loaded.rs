@@ -298,6 +298,10 @@ mod sticky_least_loaded_regular_tests {
 
     impl RegularFixture {
         async fn start() -> Self {
+            Self::start_with_validation_urls(vec![]).await
+        }
+
+        async fn start_with_validation_urls(api_key_validation_urls: Vec<String>) -> Self {
             let mut workers = Vec::new();
             let mut urls = Vec::new();
             for _ in 0..2 {
@@ -325,6 +329,7 @@ mod sticky_least_loaded_regular_tests {
                 worker_startup_check_interval_secs: 1,
                 max_concurrent_requests: 64,
                 queue_size: 0,
+                api_key_validation_urls,
                 ..RouterConfig::default()
             };
             let context = common::create_test_context(config.clone());
@@ -350,6 +355,16 @@ mod sticky_least_loaded_regular_tests {
                 .downcast_ref::<StickyLeastLoadedPolicy>()
                 .expect("sticky_least_loaded policy")
                 .active_session_count()
+        }
+
+        async fn status(&self, method: &str, uri: &str) -> u16 {
+            let request = Request::builder()
+                .method(method)
+                .uri(uri)
+                .body(Body::empty())
+                .unwrap();
+            let response = self.app.clone().oneshot(request).await.unwrap();
+            response.status().as_u16()
         }
 
         /// Send one request and return the worker port that served it.
@@ -422,6 +437,13 @@ mod sticky_least_loaded_regular_tests {
         assert!(served.windows(2).all(|w| w[0] == w[1]), "{served:?}");
         assert_eq!(fx.active_sessions(), 1);
 
+        // The session is released by the id the client sent.
+        assert_eq!(
+            fx.status("POST", "/finish_session?session_id=traj-1").await,
+            200
+        );
+        assert_eq!(fx.active_sessions(), 0);
+
         fx.stop().await;
     }
 
@@ -443,6 +465,22 @@ mod sticky_least_loaded_regular_tests {
         }
         assert_eq!(fx.active_sessions(), 0);
 
+        fx.stop().await;
+    }
+
+    #[tokio::test]
+    async fn test_finish_session_rejects_bad_requests() {
+        let fx = RegularFixture::start().await;
+        assert_eq!(fx.status("POST", "/finish_session").await, 400);
+        assert_eq!(fx.status("GET", "/finish_session?session_id=s").await, 405);
+        fx.stop().await;
+
+        // With API-key validation on, a request without a bearer token is
+        // rejected before any validation request is made.
+        let fx =
+            RegularFixture::start_with_validation_urls(vec!["http://127.0.0.1:9/validate".into()])
+                .await;
+        assert_eq!(fx.status("POST", "/finish_session?session_id=s").await, 401);
         fx.stop().await;
     }
 }

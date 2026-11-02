@@ -288,6 +288,9 @@ mod tests {
         use axum::http::HeaderValue;
 
         assert!(to_policy_headers(None).is_none());
+        assert!(to_policy_headers(Some(&HeaderMap::new()))
+            .unwrap()
+            .is_empty());
 
         let mut headers = HeaderMap::new();
         headers.insert("X-Session-ID", HeaderValue::from_static("abc"));
