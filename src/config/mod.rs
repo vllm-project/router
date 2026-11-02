@@ -51,6 +51,7 @@ pub fn parse_static_kv_event_sources(
         let source = StaticKvEventSources {
             endpoints,
             replay_endpoints: None,
+            topic: String::new(),
             block_size,
             model: model.to_owned(),
         };
@@ -130,7 +131,7 @@ fn parse_event_source_spec<'a>(spec: &'a str, flag: &str) -> ConfigResult<(&'a s
 }
 
 impl StaticKvEventSources {
-    pub(super) fn validate(&self, worker: &str) -> ConfigResult<()> {
+    pub(crate) fn validate(&self, worker: &str) -> ConfigResult<()> {
         if worker.trim().is_empty() || self.model.trim().is_empty() {
             return Err(ConfigError::ValidationFailed {
                 reason: "static KV event sources require worker URLs and model identity"
@@ -160,13 +161,8 @@ impl StaticKvEventSources {
             .iter()
             .chain(self.replay_endpoints.iter().flatten())
         {
-            if !is_reachable_tcp_endpoint(endpoint) {
-                return Err(ConfigError::ValidationFailed {
-                    reason: format!(
-                        "static KV event endpoint must be reachable tcp://HOST:PORT: '{endpoint}'"
-                    ),
-                });
-            }
+            crate::kv_index::canonical_endpoint(endpoint)
+                .map_err(|reason| ConfigError::ValidationFailed { reason })?;
         }
         Ok(())
     }
@@ -240,6 +236,40 @@ mod static_kv_event_source_tests {
         ] {
             let specs = vec![format!("http://worker:8000={endpoint}")];
             assert!(parse_static_kv_event_sources(&specs, &[], 16, Some("model")).is_err());
+        }
+        for (field, value, reason) in [
+            ("block_size", serde_json::json!(0), "nonzero block size"),
+            ("endpoints", serde_json::json!([]), "at least one endpoint"),
+            (
+                "replay_endpoints",
+                serde_json::json!([]),
+                "replay endpoint count",
+            ),
+        ] {
+            let mut value_with_invalid_field = serde_json::json!({
+                "endpoints": ["tcp://127.0.0.1:5557"], "block_size": 16, "model": "model"
+            });
+            value_with_invalid_field[field] = value;
+            let source: StaticKvEventSources =
+                serde_json::from_value(value_with_invalid_field).unwrap();
+            let error = source
+                .validate("http://worker:8000")
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(reason), "{field}: {error}");
+        }
+    }
+
+    #[test]
+    fn generic_static_sources_keep_json_defaults_and_multirank_transports() {
+        let source: StaticKvEventSources = serde_json::from_value(serde_json::json!({
+            "endpoints": ["tcp://127.0.0.1:5557", "tcp://127.0.0.1:5559"],
+            "block_size": 32, "model": "model", "future_generic_field": true
+        }))
+        .unwrap();
+        assert!(source.topic.is_empty());
+        for worker in ["grpc://worker:50051", "http://worker:8000/engine"] {
+            source.validate(worker).unwrap();
         }
     }
 }

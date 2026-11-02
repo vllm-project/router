@@ -1334,7 +1334,7 @@ async fn report_boundary_verdicts() {
                 continue;
             }
         };
-        let files = ResolvedModelFiles::new(model).await.unwrap();
+        let files = ResolvedModelFiles::new(model, None).await.unwrap();
         let TokenizerSource::HuggingFace(path) = files.tokenizer else {
             unreachable!()
         };
@@ -1376,7 +1376,7 @@ async fn randomized_prompts_match_real_tokenizers() {
                 continue;
             }
         };
-        let files = ResolvedModelFiles::new(dir).await.unwrap();
+        let files = ResolvedModelFiles::new(dir, None).await.unwrap();
         let TokenizerSource::HuggingFace(path) = files.tokenizer else {
             unreachable!()
         };

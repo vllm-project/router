@@ -247,7 +247,9 @@ curl -X POST http://router:8000/v1/chat/completions \
 
 For detailed configuration options, hash key priorities, and usage examples, see [Load Balancing Documentation](docs/load_balancing/README.md).
 
-For the optional agent metadata contract, scheduling enablement, request-scoped hints, and engine KV-control boundary, see [Program Scheduling](docs/program_scheduling.md).
+For the optional agent metadata contract, scheduling enablement, request-scoped hints, and engine KV-control boundary, see [Program Scheduling](docs/program_scheduling/program-scheduling.md).
+
+For Program-scoped PD scheduling (D-rank affinity, admission, bounded prefill permits) and warm remote KV reuse with automatic TTL, see [PD Program Scheduling](docs/program_scheduling/pd-program-scheduling.md).
 
 ## Advanced Features
 

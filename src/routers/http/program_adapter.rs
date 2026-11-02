@@ -25,6 +25,8 @@ struct ProgramCompletionInner {
     token_estimator: Arc<MomentumTokenEstimator>,
     token_estimate_calibration: TokenEstimateCalibration,
     finished: AtomicBool,
+    pd_ttl: Mutex<Option<std::time::Duration>>,
+    replacement_dispatch: Mutex<Option<ProgramDispatch>>,
 }
 
 impl ProgramCompletion {
@@ -43,6 +45,8 @@ impl ProgramCompletion {
                 token_estimator,
                 token_estimate_calibration,
                 finished: AtomicBool::new(false),
+                pd_ttl: Mutex::new(None),
+                replacement_dispatch: Mutex::new(None),
             }),
         }
     }
@@ -60,6 +64,18 @@ impl ProgramCompletion {
             let _ = self.inner.first_stream_output_at.set(Instant::now());
         }
         self.inner.usage.lock().observe_sse_chunk(chunk);
+    }
+
+    pub(super) fn restart_pd_attempt(&self) -> Option<ProgramDispatch> {
+        let mut replacement = self.inner.replacement_dispatch.lock();
+        let current = replacement.as_ref().unwrap_or(&self.inner.dispatch);
+        let next = self.inner.scheduler.restart_pd_attempt(current)?;
+        *replacement = Some(next.clone());
+        Some(next)
+    }
+
+    pub(super) fn set_pd_ttl(&self, ttl: std::time::Duration) {
+        *self.inner.pd_ttl.lock() = Some(ttl);
     }
 
     pub(super) fn finish(&self, success: bool) {
@@ -86,8 +102,19 @@ impl ProgramCompletionInner {
                 .saturating_duration_since(*first_output)
                 .as_secs_f64()
         });
-        self.scheduler
-            .complete(&self.dispatch, success, false, usage, decode_seconds);
+        let replacement = self.replacement_dispatch.lock();
+        let dispatch = replacement.as_ref().unwrap_or(&self.dispatch);
+        // V0 no-return labeling depends on upstream honoring the existing contract:
+        // `expected_resume=false` means no later model request is expected after this round.
+        let terminate = !dispatch.expected_resume();
+        self.scheduler.complete_with_pd_ttl(
+            dispatch,
+            success,
+            terminate,
+            usage,
+            decode_seconds,
+            *self.pd_ttl.lock(),
+        );
     }
 }
 
@@ -306,5 +333,45 @@ mod tests {
         assert_eq!(snapshot.ranks[0].programs[0].in_flight_requests, 0);
         assert_eq!(snapshot.ranks[0].programs[0].waiting_requests, 0);
         assert_eq!(snapshot.ranks[0].router_in_flight_requests, 0);
+    }
+
+    #[tokio::test]
+    async fn expected_resume_false_marks_http_completion_terminal() {
+        let scheduler = Arc::new(ProgramScheduler::new(ProgramSchedulerConfig::default()));
+        let target = ProgramTarget {
+            id: "rank-0".into(),
+            base_url: "http://worker".into(),
+            dp_rank: None,
+        };
+        let identity = ProgramIdentity::from_request(
+            None,
+            Some(&serde_json::json!({"vllm_xargs":{"agentic_context":{
+                "program_id":"terminal","task_id":null,"expected_resume":false
+            }}})),
+            Some("model"),
+        )
+        .unwrap()
+        .unwrap();
+        let dispatch = scheduler
+            .acquire(identity, 100, &[target], None)
+            .await
+            .unwrap();
+        assert!(!dispatch.expected_resume());
+
+        let estimator = Arc::new(MomentumTokenEstimator::default());
+        let (_, calibration) = estimator.estimate(
+            TokenEstimateScope::new("model", "/v1/chat/completions"),
+            "terminal",
+        );
+        let completion =
+            ProgramCompletion::new(scheduler.clone(), dispatch, estimator, calibration);
+        completion.finish(true);
+
+        let state = scheduler.state.lock();
+        let (_, snapshot) = state.prediction_profiles.snapshot().unwrap();
+        assert!(snapshot
+            .return_time_profiles
+            .iter()
+            .any(|entry| entry.no_return_count >= 1.0));
     }
 }

@@ -1,7 +1,7 @@
 //! P/D prefill KV discovery, refresh, and request-input preparation.
 
 use super::pd_types::PdPrefillInput;
-use crate::backend::preprocess::prepare_http_token_inputs;
+use crate::backend::preprocess::{prepare_http_token_inputs, router_token_inputs};
 use crate::core::Worker;
 use crate::kv_index::discovery::{worker_get, WorkerDiscovery};
 use crate::kv_index::{HashMode, KvIndexSupervisor, WorkerKvInfo};
@@ -310,7 +310,6 @@ impl PdKvState {
                     // The subscriber handshake runs without the map locks; a
                     // concurrent prepare() sees no binding and denies credit
                     // until the rebuild completes.
-                    self.supervisor.on_worker_removed(&base);
                     let snapshot = discovery.expect("successful discovery probe");
                     let info = self
                         .supervisor
@@ -370,6 +369,22 @@ impl PdKvState {
         let mut sources: Vec<_> = sources.iter().collect();
         sources.sort_by(|left, right| left.0.cmp(right.0));
         let signature = format!("{info:?}:{sources:?}");
+        // gRPC workers serve no HTTP /v1/models; Control.GetModelInfo names
+        // the served model, including for statically configured sources.
+        if crate::backend::is_grpc_url(base) {
+            let base_models = crate::backend::control::get_grpc_model_info(base, CONTROL_TIMEOUT)
+                .await
+                .ok()
+                .map(|info| info.model_id)
+                .filter(|model| !model.trim().is_empty())
+                .into_iter()
+                .collect();
+            return Ok(Discovery {
+                signature,
+                base_models,
+                worker,
+            });
+        }
         let models_request = worker_get(
             &self.client,
             &format!("{}/v1/models", base.trim_end_matches('/')),
@@ -395,6 +410,8 @@ impl PdKvState {
         })
     }
 
+    /// `router_prompts` are the router's own token ids for `grpc://` pools;
+    /// HTTP pools pass `None` and render through each backend.
     pub(super) async fn prepare(
         &self,
         workers: &[Arc<dyn Worker>],
@@ -402,6 +419,7 @@ impl PdKvState {
         request: &Value,
         route: &str,
         headers: Option<&HeaderMap>,
+        router_prompts: Option<&Arc<[Vec<u32>]>>,
     ) -> HashMap<String, PdPrefillInput> {
         let started = Instant::now();
         *self.refresh_inputs.lock().await = RefreshInputs {
@@ -430,16 +448,21 @@ impl PdKvState {
                 (base.clone(), allowed)
             })
             .collect();
-        let results = prepare_http_token_inputs(
-            &self.client,
-            bases,
-            request,
-            route,
-            headers,
-            self.api_key.as_deref(),
-            Duration::from_secs(1),
-        )
-        .await;
+        let results = match router_prompts {
+            Some(prompts) => router_token_inputs(bases, request, prompts),
+            None => {
+                prepare_http_token_inputs(
+                    &self.client,
+                    bases,
+                    request,
+                    route,
+                    headers,
+                    self.api_key.as_deref(),
+                    Duration::from_secs(1),
+                )
+                .await
+            }
+        };
         let mut prepared = HashMap::new();
         for (base, result) in results {
             let fallback = KvAwarePolicy::credit_fallback(
@@ -548,7 +571,7 @@ mod kv_input_tests {
             ),
         ] {
             let prepared = state
-                .prepare(&workers, &policy, &request, route, None)
+                .prepare(&workers, &policy, &request, route, None, None)
                 .await;
             let input = &prepared[&base];
             assert!(input.prompts.is_none());
@@ -627,6 +650,7 @@ mod kv_input_tests {
                     &json!({"model":"m","prompt":"hello"}),
                     "/v1/completions",
                     Some(&headers),
+                    None,
                 )
                 .await;
             assert_eq!(
@@ -654,6 +678,9 @@ mod kv_input_tests {
             let publisher = publisher_context.socket(zmq::PUB).unwrap();
             publisher.bind("tcp://127.0.0.1:*").unwrap();
             let endpoint = publisher.get_last_endpoint().unwrap().unwrap();
+            let source_metadata = Arc::new(parking_lot::Mutex::new(json!({"0": {
+                "publisher": "zmq", "endpoint": endpoint, "enable_kv_cache_events": true
+            }})));
             let mut app = Router::new().route(
                 "/v1/models",
                 get(|| async { Json(json!({"data":[{"id":"m", "parent":null}]})) }),
@@ -664,10 +691,10 @@ mod kv_input_tests {
             async move { probes.fetch_add(1, Ordering::Relaxed);
                 Json(json!({"vllm_config":{"model_config":{"model":"engine-model"},"cache_config":{"block_size":16}}}))
             }}))
-            .route("/kv_event_sources", get({ let endpoint = endpoint.clone(); move || {
-                let endpoint = endpoint.clone();
+            .route("/kv_event_sources", get({ let sources = source_metadata.clone(); move || {
+                let sources = sources.lock().clone();
                 let probes = source_probes.clone();
-                async move { probes.fetch_add(1, Ordering::Relaxed); Json(json!({"0":{"publisher":"zmq", "endpoint":endpoint, "enable_kv_cache_events":true}})) }
+                async move { probes.fetch_add(1, Ordering::Relaxed); Json(sources) }
             }}));
             }
             let app = app.layer(axum::middleware::from_fn(
@@ -719,7 +746,7 @@ mod kv_input_tests {
                 if static_source { 0 } else { 2 }
             );
             let initial = state
-                .prepare(&workers, &policy, &request, "/v1/completions", None)
+                .prepare(&workers, &policy, &request, "/v1/completions", None, None)
                 .await;
             assert_eq!(initial[&base].work_by_rank[&None].new_prefill_tokens, 33);
             assert!(initial[&base].work_by_rank[&None].placement_verified);
@@ -753,10 +780,38 @@ mod kv_input_tests {
             .await
             .expect("subscriber should ingest the warm prefix");
             let warm = state
-                .prepare(&workers, &policy, &request, "/v1/completions", None)
+                .prepare(&workers, &policy, &request, "/v1/completions", None, None)
                 .await;
             assert_eq!(warm[&base].work_by_rank[&None].new_prefill_tokens, 1);
             assert!(warm[&base].work_by_rank[&None].placement_verified);
+            if !static_source {
+                use crate::kv_index::{MatchQuery, StorageTier};
+
+                let provider = state.supervisor.match_provider_for_worker(&base).unwrap();
+                let query = MatchQuery {
+                    group_idx: 0,
+                    local_hashes: crate::kv_index::local_block_hash_strings(&tokens, 16, None),
+                    tiers_of_interest: vec![StorageTier::Device],
+                };
+                assert_eq!(provider.find_tiered_matches(&query).len(), 1);
+                let valid = source_metadata.lock()["0"].clone();
+                *source_metadata.lock() = json!({"not-a-rank": valid});
+                state.bindings.lock().await.get_mut(&base).unwrap().checked =
+                    Instant::now() - REFRESH_INTERVAL;
+                state.bind(&workers, ops).await;
+                // Installation rejects the complete new snapshot before
+                // retiring the old subscriber, but the changed PD binding
+                // itself falls back without granting that old credit.
+                assert!(state.supervisor.match_provider_for_worker(&base).is_some());
+                assert_eq!(provider.find_tiered_matches(&query).len(), 1);
+                assert!(state.bindings.lock().await[&base].info.is_none());
+                let fallback = state
+                    .prepare(&workers, &policy, &request, "/v1/completions", None, None)
+                    .await;
+                assert_eq!(fallback[&base].work_by_rank[&None].new_prefill_tokens, 33);
+                assert!(!fallback[&base].work_by_rank[&None].placement_verified);
+                assert_eq!(probes.load(Ordering::Relaxed), 4);
+            }
             drop(state);
             task.abort();
         }
@@ -860,7 +915,7 @@ mod kv_input_tests {
         // First bind: discovery succeeds and installs a binding with info.
         state.bind(&workers, ops).await;
         let inputs = state
-            .prepare(&workers, &policy, &request, "/v1/completions", None)
+            .prepare(&workers, &policy, &request, "/v1/completions", None, None)
             .await;
         assert!(inputs[&base].allow_credit);
         {
@@ -876,7 +931,7 @@ mod kv_input_tests {
             rewind(&state, &base).await;
             state.bind(&workers, ops).await;
             let inputs = state
-                .prepare(&workers, &policy, &request, "/v1/completions", None)
+                .prepare(&workers, &policy, &request, "/v1/completions", None, None)
                 .await;
             assert!(
                 inputs[&base].allow_credit,
@@ -895,7 +950,7 @@ mod kv_input_tests {
         rewind(&state, &base).await;
         state.bind(&workers, ops).await;
         let inputs = state
-            .prepare(&workers, &policy, &request, "/v1/completions", None)
+            .prepare(&workers, &policy, &request, "/v1/completions", None, None)
             .await;
         assert!(!inputs[&base].allow_credit);
         let bindings = state.bindings.lock().await;
