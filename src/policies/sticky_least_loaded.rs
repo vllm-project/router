@@ -230,6 +230,14 @@ impl LoadBalancingPolicy for StickyLeastLoadedPolicy {
             .map(|&idx| (idx, workers[idx].url().to_string()))
             .collect();
 
+        // The request text can be large, so hash it once before taking the
+        // lock instead of once per candidate inside it.
+        let stateless_tie_break = session_id.is_none().then(|| {
+            format!(
+                "{:016x}",
+                ConsistentHashPolicy::fbi_hash(request_text.unwrap_or(""))
+            )
+        });
         let now = Instant::now();
 
         let mut state = self.state.lock().unwrap();
@@ -239,7 +247,7 @@ impl LoadBalancingPolicy for StickyLeastLoadedPolicy {
         let session_id = match session_id {
             Some(id) => id.to_owned(),
             None => {
-                let tie_break = request_text.unwrap_or("");
+                let tie_break = stateless_tie_break.as_deref().unwrap_or_default();
                 let idx = Self::select_least_loaded(&state.active_counts, &candidates, tie_break);
                 drop(state);
                 self.record_selection(&workers[idx]);
