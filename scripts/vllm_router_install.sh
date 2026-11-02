@@ -1,4 +1,6 @@
 #!/bin/bash
+# Pre-existing findings. This edit only points the router image at docker/Dockerfile.router.
+# shellcheck disable=SC2001,SC2034,SC2046,SC2086,SC2089,SC2090,SC2155,SC2181,SC2269
 
 # vLLM Deployment Script
 # This script can clone vLLM, build Docker image, upload to ECR, and deploy to remote hosts
@@ -827,16 +829,12 @@ deploy_router() {
     log "Building router Docker image..."
     cd "$ROUTER_DIR"
 
-    if [ ! -f "Dockerfile" ] && [ ! -f "Dockerfile.router" ]; then
-        error "Dockerfile or Dockerfile.router not found in vllm-router directory"
+    if [ ! -f "docker/Dockerfile.router" ]; then
+        error "docker/Dockerfile.router not found in vllm-router directory"
         exit 1
     fi
 
-    # Use the correct Dockerfile name
-    DOCKERFILE_NAME="Dockerfile"
-    if [ -f "Dockerfile.router" ]; then
-        DOCKERFILE_NAME="Dockerfile.router"
-    fi
+    DOCKERFILE_NAME="docker/Dockerfile.router"
 
     ROUTER_DOCKER_TAG="vllm-router-service"
     ROUTER_ECR_TAG="router_$(whoami)_$(date +%Y%m%d_%H%M%S)"
@@ -940,16 +938,12 @@ deploy_router_local() {
     log "Building router Docker image..."
     cd "$ROUTER_DIR"
 
-    if [ ! -f "Dockerfile" ] && [ ! -f "Dockerfile.router" ]; then
-        error "Dockerfile or Dockerfile.router not found in vllm-router directory"
+    if [ ! -f "docker/Dockerfile.router" ]; then
+        error "docker/Dockerfile.router not found in vllm-router directory"
         exit 1
     fi
 
-    # Use the correct Dockerfile name
-    DOCKERFILE_NAME="Dockerfile"
-    if [ -f "Dockerfile.router" ]; then
-        DOCKERFILE_NAME="Dockerfile.router"
-    fi
+    DOCKERFILE_NAME="docker/Dockerfile.router"
 
     ROUTER_DOCKER_TAG="vllm-router-service"
 

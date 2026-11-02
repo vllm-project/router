@@ -103,7 +103,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -114,7 +114,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -402,43 +402,6 @@ name = "atomic-waker"
 version = "1.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
-
-[[package]]
-name = "audio-core"
-version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f93ebbf82d06013f4c41fe71303feb980cddd78496d904d06be627972de51a24"
-
-[[package]]
-name = "audioadapter"
-version = "3.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "91f87b70b051c5866680ad79f6743a42ccab264c009d1a71f4d33a3872ae60c8"
-dependencies = [
- "audio-core",
- "num-traits",
-]
-
-[[package]]
-name = "audioadapter-buffers"
-version = "3.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9097d67933fb083d382ce980430afdb758aada60846010aee6be068c06cef0ca"
-dependencies = [
- "audioadapter",
- "audioadapter-sample",
- "num-traits",
-]
-
-[[package]]
-name = "audioadapter-sample"
-version = "3.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "34ab94f2bc04a14e1f49ee5f222f66460e8a1b51627bdfedf34eed394d747938"
-dependencies = [
- "audio-core",
- "num-traits",
-]
 
 [[package]]
 name = "auto_impl"
@@ -1727,7 +1690,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -1899,7 +1862,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -2498,12 +2461,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "hound"
-version = "3.5.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "62adaabb884c94955b19907d60019f4e145d091c75345379e70d1ee696f7854f"
-
-[[package]]
 name = "http"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2652,7 +2609,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "system-configuration",
  "tokio",
  "tower-service",
@@ -2929,7 +2886,7 @@ checksum = "3640c1c38b8e4e43584d8df18be5fc6b0aa314ce6ebf51b53313d4306cca8e46"
 dependencies = [
  "hermit-abi",
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -3338,7 +3295,7 @@ checksum = "11d3d7f243d5c5a8b9bb5d6dd2b1602c0cb0b9db1621bafc7ed66e35ff9fe092"
 [[package]]
 name = "llm-multimodal"
 version = "1.7.1"
-source = "git+https://github.com/smg-project/llm-multimodal?rev=15adba5e025d8636ba4a334fb379b1371f6196a1#15adba5e025d8636ba4a334fb379b1371f6196a1"
+source = "git+https://github.com/smg-project/llm-multimodal?rev=24c676dd49d73f05cb4068aade2e60397a5c0afe#24c676dd49d73f05cb4068aade2e60397a5c0afe"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -3349,7 +3306,7 @@ dependencies = [
  "hf-hub 0.5.0",
  "image",
  "libloading",
- "ndarray 0.17.2",
+ "ndarray",
  "once_cell",
  "pkg-config",
  "rayon",
@@ -3774,21 +3731,6 @@ dependencies = [
 
 [[package]]
 name = "ndarray"
-version = "0.16.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "882ed72dce9365842bf196bdeedf5055305f11fc8c03dee7bb0194a6cad34841"
-dependencies = [
- "matrixmultiply",
- "num-complex",
- "num-integer",
- "num-traits",
- "portable-atomic",
- "portable-atomic-util",
- "rawpointer",
-]
-
-[[package]]
-name = "ndarray"
 version = "0.17.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "520080814a7a6b4a6e9070823bb24b4531daac8c4627e08ba5de8c5ef2f2752d"
@@ -3819,7 +3761,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -4479,7 +4421,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "03da047801ff44bb6a4d407d4860c05fd70bb81714e6b2f3812603d5b145b042"
 dependencies = [
  "heck",
- "itertools 0.14.0",
+ "itertools 0.10.5",
  "log",
  "multimap",
  "petgraph",
@@ -4500,7 +4442,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a56d757972c98b346a9b766e3f02746cde6dd1cd1d1d563472929fdd74bec4d"
 dependencies = [
  "anyhow",
- "itertools 0.14.0",
+ "itertools 0.10.5",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
@@ -4513,7 +4455,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
 dependencies = [
  "anyhow",
- "itertools 0.14.0",
+ "itertools 0.10.5",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
@@ -4711,7 +4653,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash 2.1.3",
  "rustls",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "thiserror 2.0.20",
  "tokio",
  "tracing",
@@ -4750,9 +4692,9 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -5170,22 +5112,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rubato"
-version = "3.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d4be9c88e3d722d3d36939e41941f6b6f52810c1235bf19998a7d4535b402892"
-dependencies = [
- "audioadapter",
- "audioadapter-buffers",
- "num-complex",
- "num-integer",
- "num-traits",
- "realfft",
- "visibility",
- "windowfunctions",
-]
-
-[[package]]
 name = "rustc-hash"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5243,7 +5169,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -5312,7 +5238,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -5810,7 +5736,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -6249,21 +6175,17 @@ dependencies = [
 ]
 
 [[package]]
-name = "tekken-rs"
-version = "0.1.2"
+name = "tekken"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5ca0370459b347364f95683575afc18fe0aa6fc32a082de65fca5a229ce098be"
+checksum = "1d1481e6bbb98c7e1b04124420b6e7c367c87fc897aae340edcdeb4e91b639d2"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
  "env_logger",
- "hound",
  "log",
- "ndarray 0.16.1",
  "regex",
- "rubato",
  "rustc-hash 1.1.0",
- "rustfft",
  "serde",
  "serde_json",
  "thiserror 2.0.20",
@@ -6280,7 +6202,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.5",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -7224,20 +7146,9 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
-name = "visibility"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d674d135b4a8c1d7e813e2f8d1c9a58308aee4a680323066025e53132218bd91"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.119",
-]
-
-[[package]]
 name = "vllm-chat"
 version = "0.1.0"
-source = "git+https://github.com/vllm-project/vllm?tag=v0.29.0#98dff2a81d747d1dba01a47f939f48c3526d4206"
+source = "git+https://github.com/vllm-project/vllm?tag=v0.30.0#ced6857afa0ea7b2e3f0846a62e1394e90f15607"
 dependencies = [
  "anyhow",
  "asynk-strim-attr",
@@ -7248,7 +7159,7 @@ dependencies = [
  "llm-multimodal",
  "minijinja",
  "minijinja-contrib",
- "ndarray 0.17.2",
+ "ndarray",
  "oss-harmony",
  "reqwest 0.13.5",
  "serde",
@@ -7275,7 +7186,7 @@ dependencies = [
 [[package]]
 name = "vllm-engine-core-client"
 version = "0.1.0"
-source = "git+https://github.com/vllm-project/vllm?tag=v0.29.0#98dff2a81d747d1dba01a47f939f48c3526d4206"
+source = "git+https://github.com/vllm-project/vllm?tag=v0.30.0#ced6857afa0ea7b2e3f0846a62e1394e90f15607"
 dependencies = [
  "arc-swap",
  "bytemuck",
@@ -7309,7 +7220,7 @@ dependencies = [
 [[package]]
 name = "vllm-llm"
 version = "0.1.0"
-source = "git+https://github.com/vllm-project/vllm?tag=v0.29.0#98dff2a81d747d1dba01a47f939f48c3526d4206"
+source = "git+https://github.com/vllm-project/vllm?tag=v0.30.0#ced6857afa0ea7b2e3f0846a62e1394e90f15607"
 dependencies = [
  "easy-ext",
  "enum-as-inner",
@@ -7329,7 +7240,7 @@ dependencies = [
 [[package]]
 name = "vllm-metrics"
 version = "0.1.0"
-source = "git+https://github.com/vllm-project/vllm?tag=v0.29.0#98dff2a81d747d1dba01a47f939f48c3526d4206"
+source = "git+https://github.com/vllm-project/vllm?tag=v0.30.0#ced6857afa0ea7b2e3f0846a62e1394e90f15607"
 dependencies = [
  "itertools 0.14.0",
  "prometheus-client",
@@ -7338,7 +7249,7 @@ dependencies = [
 [[package]]
 name = "vllm-parser"
 version = "0.1.0"
-source = "git+https://github.com/vllm-project/vllm?tag=v0.29.0#98dff2a81d747d1dba01a47f939f48c3526d4206"
+source = "git+https://github.com/vllm-project/vllm?tag=v0.30.0#ced6857afa0ea7b2e3f0846a62e1394e90f15607"
 dependencies = [
  "easy-ext",
  "serde",
@@ -7367,7 +7278,7 @@ dependencies = [
 [[package]]
 name = "vllm-text"
 version = "0.1.0"
-source = "git+https://github.com/vllm-project/vllm?tag=v0.29.0#98dff2a81d747d1dba01a47f939f48c3526d4206"
+source = "git+https://github.com/vllm-project/vllm?tag=v0.30.0#ced6857afa0ea7b2e3f0846a62e1394e90f15607"
 dependencies = [
  "anyhow",
  "asynk-strim-attr",
@@ -7392,7 +7303,7 @@ dependencies = [
 [[package]]
 name = "vllm-tokenizer"
 version = "0.1.0"
-source = "git+https://github.com/vllm-project/vllm?tag=v0.29.0#98dff2a81d747d1dba01a47f939f48c3526d4206"
+source = "git+https://github.com/vllm-project/vllm?tag=v0.30.0#ced6857afa0ea7b2e3f0846a62e1394e90f15607"
 dependencies = [
  "base64 0.22.1",
  "fastokens",
@@ -7400,7 +7311,8 @@ dependencies = [
  "rustc-hash 1.1.0",
  "serde",
  "serde_json",
- "tekken-rs",
+ "smallvec",
+ "tekken",
  "thiserror 2.0.20",
  "thiserror-ext",
  "tiktoken-rs 0.9.1",
@@ -8055,7 +7967,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -8082,15 +7994,6 @@ dependencies = [
  "wasmtime-environ",
  "wasmtime-internal-cranelift",
  "wasmtime-internal-math",
-]
-
-[[package]]
-name = "windowfunctions"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "90628d739333b7c5d2ee0b70210b97b8cddc38440c682c96fd9e2c24c2db5f3a"
-dependencies = [
- "num-traits",
 ]
 
 [[package]]

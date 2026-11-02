@@ -19,11 +19,11 @@ ENV VIRTUAL_ENV=/opt/vllm-router-ci/.venv
 ENV PATH="/opt/vllm-router-ci/.venv/bin:/root/.local/bin:${PATH}"
 
 # Same packages the P/D jobs used to install on every run. L1 skips lm-eval
-# at runtime. vllm is pinned to 0.29.0, the same release as the vLLM git tag
+# at runtime. vllm is pinned to 0.30.0, the same release as the vLLM git tag
 # in Cargo.toml. An unpinned install stays cached until this file changes and
 # can still resolve a CUDA 12 torch wheel. The import below fails the image
 # build unless torch reports CUDA 13 and nixl loaded the cu13 extension.
-RUN uv pip install 'vllm==0.29.0' --torch-backend=cu130 \
+RUN uv pip install 'vllm==0.30.0' --torch-backend=cu130 \
     && uv pip install nixl-cu13 \
     && uv pip install nixl --no-deps \
     && uv pip install requests pytest openai hf_transfer 'lm-eval[api]==0.4.12' \
