@@ -103,10 +103,14 @@ impl ProgramCompletionInner {
                 .as_secs_f64()
         });
         let replacement = self.replacement_dispatch.lock();
+        let dispatch = replacement.as_ref().unwrap_or(&self.dispatch);
+        // V0 no-return labeling depends on upstream honoring the existing contract:
+        // `expected_resume=false` means no later model request is expected after this round.
+        let terminate = !dispatch.expected_resume();
         self.scheduler.complete_with_pd_ttl(
-            replacement.as_ref().unwrap_or(&self.dispatch),
+            dispatch,
             success,
-            false,
+            terminate,
             usage,
             decode_seconds,
             *self.pd_ttl.lock(),
@@ -329,5 +333,45 @@ mod tests {
         assert_eq!(snapshot.ranks[0].programs[0].in_flight_requests, 0);
         assert_eq!(snapshot.ranks[0].programs[0].waiting_requests, 0);
         assert_eq!(snapshot.ranks[0].router_in_flight_requests, 0);
+    }
+
+    #[tokio::test]
+    async fn expected_resume_false_marks_http_completion_terminal() {
+        let scheduler = Arc::new(ProgramScheduler::new(ProgramSchedulerConfig::default()));
+        let target = ProgramTarget {
+            id: "rank-0".into(),
+            base_url: "http://worker".into(),
+            dp_rank: None,
+        };
+        let identity = ProgramIdentity::from_request(
+            None,
+            Some(&serde_json::json!({"vllm_xargs":{"agentic_context":{
+                "program_id":"terminal","task_id":null,"expected_resume":false
+            }}})),
+            Some("model"),
+        )
+        .unwrap()
+        .unwrap();
+        let dispatch = scheduler
+            .acquire(identity, 100, &[target], None)
+            .await
+            .unwrap();
+        assert!(!dispatch.expected_resume());
+
+        let estimator = Arc::new(MomentumTokenEstimator::default());
+        let (_, calibration) = estimator.estimate(
+            TokenEstimateScope::new("model", "/v1/chat/completions"),
+            "terminal",
+        );
+        let completion =
+            ProgramCompletion::new(scheduler.clone(), dispatch, estimator, calibration);
+        completion.finish(true);
+
+        let state = scheduler.state.lock();
+        let (_, snapshot) = state.prediction_profiles.snapshot().unwrap();
+        assert!(snapshot
+            .return_time_profiles
+            .iter()
+            .any(|entry| entry.no_return_count >= 1.0));
     }
 }
