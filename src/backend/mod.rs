@@ -129,13 +129,21 @@ pub(crate) mod stream_output {
     impl OutputFrameProducer {
         /// Reserve capacity before publishing the output frame marker.
         pub(crate) async fn send_bounded<T>(
-            &mut self, tx: &tokio::sync::mpsc::Sender<T>, chunk: T, has_generated_output: bool,
+            &mut self,
+            tx: &tokio::sync::mpsc::Sender<T>,
+            chunk: T,
+            has_generated_output: bool,
         ) -> bool {
-            let Ok(permit) = tx.reserve().await else { return false; };
+            let Ok(permit) = tx.reserve().await else {
+                return false;
+            };
             let next = self.emitted.saturating_add(1);
             if has_generated_output {
                 let _ = self.first_output.compare_exchange(
-                    0, next, Ordering::Release, Ordering::Relaxed,
+                    0,
+                    next,
+                    Ordering::Release,
+                    Ordering::Relaxed,
                 );
             }
             permit.send(chunk);

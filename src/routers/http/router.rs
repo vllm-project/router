@@ -52,7 +52,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
-use tokio_stream::wrappers::{ReceiverStream, UnboundedReceiverStream};
+use tokio_stream::wrappers::ReceiverStream;
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
+use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, error, info, warn};
 
 /// Number of upstream body chunks the Router is willing to hold on behalf of a
@@ -107,7 +109,12 @@ impl SseForward {
     pub(crate) async fn send(&self, chunk: bytes::Bytes) -> bool {
         self.tx.send(chunk).await.is_ok()
     }
-    pub(crate) async fn send_with_output(&self, chunk: bytes::Bytes, output_frame: Option<&mut OutputFrameProducer>, has_output: bool) -> bool {
+    pub(crate) async fn send_with_output(
+        &self,
+        chunk: bytes::Bytes,
+        output_frame: Option<&mut OutputFrameProducer>,
+        has_output: bool,
+    ) -> bool {
         match output_frame {
             Some(frame) => frame.send_bounded(&self.tx, chunk, has_output).await,
             None => self.send(chunk).await,
@@ -191,7 +198,8 @@ fn http_stages_json(http_ttfb_ms: f64, first_sse_ms: f64) -> serde_json::Value {
 }
 
 async fn emit_http_first_sse(
-    forward: &SseForward, stages: &serde_json::Value,
+    forward: &SseForward,
+    stages: &serde_json::Value,
     output_frame: Option<&mut OutputFrameProducer>,
 ) -> bool {
     let comment = bytes::Bytes::from(format!(": router-stages {stages}\n\n"));
@@ -2204,7 +2212,9 @@ impl Router {
                                         &forward,
                                         &stages,
                                         producer_output_frame.as_mut(),
-                                    ).await && completion_echo.is_some()
+                                    )
+                                    .await
+                                        && completion_echo.is_some()
                                     {
                                         stream_succeeded = false;
                                         break;
@@ -2226,7 +2236,9 @@ impl Router {
                             let has_output = completion_output
                                 .as_mut()
                                 .is_some_and(|observer| observer.observe(&bytes));
-                            let sent = forward.send_with_output(bytes, producer_output_frame.as_mut(), has_output).await;
+                            let sent = forward
+                                .send_with_output(bytes, producer_output_frame.as_mut(), has_output)
+                                .await;
                             if !sent {
                                 stream_succeeded = false;
                                 break;
@@ -6204,16 +6216,16 @@ mod tests {
         let load = admitted_kv_load(worker.clone(), manager.clone(), target.clone());
         let (mut producer, consumer) = crate::backend::stream_output::output_frame_tracking();
         let (forward, body_stream) = sse_forward_channel();
-        assert!(emit_http_first_sse(
-            &forward,
-            &serde_json::json!({}),
-            Some(&mut producer)
-        ).await);
-        assert!(producer.send_bounded(
-            &forward.tx,
-            bytes::Bytes::from_static(b"data: {\"choices\":[{\"text\":\"output\"}]}\n\n"),
-            true
-        ).await);
+        assert!(emit_http_first_sse(&forward, &serde_json::json!({}), Some(&mut producer)).await);
+        assert!(
+            producer
+                .send_bounded(
+                    &forward.tx,
+                    bytes::Bytes::from_static(b"data: {\"choices\":[{\"text\":\"output\"}]}\n\n"),
+                    true
+                )
+                .await
+        );
         let response = hold_request_load_with_output_frame(
             Response::new(Body::from_stream(body_stream)),
             load,
@@ -7607,6 +7619,4 @@ mod tests {
 
         worker.server.abort();
     }
-
-
 }
