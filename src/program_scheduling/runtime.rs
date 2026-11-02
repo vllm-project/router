@@ -148,7 +148,7 @@ impl ProgramRuntime {
         let program = self.programs.get_mut(&RuntimeKey::from(old.program()))?;
         program.active_attempts.remove(&old.attempt_id());
         program.active_attempts.insert(self.next_attempt_id);
-        Some(ProgramDispatch::new(
+        let mut replacement = ProgramDispatch::new(
             self.next_attempt_id,
             old.program().clone(),
             old.target_id.clone(),
@@ -159,7 +159,12 @@ impl ProgramRuntime {
             old.placement_start_request(),
             old.routing_text().map(str::to_string),
             old.request_hints().clone(),
-        ))
+        );
+        replacement.attach_prediction_context(
+            old.expected_resume(),
+            old.pending_output_prediction().cloned(),
+        );
+        Some(replacement)
     }
 
     /// Test an exact live attempt before accepting PD metadata.
