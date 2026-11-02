@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use axum::response::Response;
 
-use super::grpc::{FirstOutputCallback, GrpcEngineBackend, KvHandoff};
+use super::grpc::{FirstOutputCallback, GrpcEngineBackend, KvHandoff, PrefillProgressCallback};
 use super::l1_encode_cache::{L1CacheConfig, L1CacheStats};
 use super::preprocess::{tokenize_chat_request_timed, FrontendHandle, TokenizeOut, TokenizerCache};
 use crate::protocols::spec::ChatCompletionRequest;
@@ -82,6 +82,15 @@ impl EngineFrontend {
             tokenizer: Arc::new(TokenizerCache::new()),
             grpc: GrpcEngineBackend::with_timeouts(Duration::from_secs(10), request_timeout),
         }
+    }
+
+    /// Opt in to worker progress and retain last-known work when updates become stale.
+    pub(crate) fn with_prefill_progress_stale_after(
+        mut self,
+        stale_after: Option<Duration>,
+    ) -> Self {
+        self.grpc.prefill_progress_stale_after = stale_after;
+        self
     }
 
     /// Enable L0 with a shared budget across models.
@@ -203,7 +212,7 @@ impl EngineFrontend {
 
     /// Convert + GenerateStream + detok on the selected worker URL.
     pub async fn dispatch(&self, worker_url: &str, prepared: PreparedRequest) -> Response {
-        self.dispatch_with_first_output(worker_url, prepared, None)
+        self.dispatch_with_first_output(worker_url, prepared, None, None)
             .await
     }
 
@@ -212,9 +221,16 @@ impl EngineFrontend {
         worker_url: &str,
         prepared: PreparedRequest,
         on_first_output: Option<FirstOutputCallback>,
+        on_prefill_progress: Option<PrefillProgressCallback>,
     ) -> Response {
         self.grpc
-            .dispatch_prepared(worker_url, prepared, on_first_output, KvHandoff::default())
+            .dispatch_prepared(
+                worker_url,
+                prepared,
+                on_first_output,
+                on_prefill_progress,
+                KvHandoff::default(),
+            )
             .await
     }
 
@@ -224,15 +240,23 @@ impl EngineFrontend {
 
     /// P/D prefill leg: one sampled token on `worker_url`. Returns the
     /// engine's `kv_transfer_params` for the decode leg, if it sent any.
-    pub async fn prefill(
+    /// `on_prefill_progress` receives worker progress when it is enabled.
+    pub(crate) async fn prefill(
         &self,
         worker_url: &str,
         prepared: &PreparedRequest,
         engine_request_id: String,
         kv_transfer_params: &serde_json::Value,
+        on_prefill_progress: Option<PrefillProgressCallback>,
     ) -> Result<Option<serde_json::Value>, Response> {
         self.grpc
-            .prefill_prepared(worker_url, prepared, engine_request_id, kv_transfer_params)
+            .prefill_prepared(
+                worker_url,
+                prepared,
+                engine_request_id,
+                kv_transfer_params,
+                on_prefill_progress,
+            )
             .await
     }
 
@@ -250,7 +274,7 @@ impl EngineFrontend {
             kv_transfer_params,
         };
         self.grpc
-            .dispatch_prepared(worker_url, prepared, None, handoff)
+            .dispatch_prepared(worker_url, prepared, None, None, handoff)
             .await
     }
 }

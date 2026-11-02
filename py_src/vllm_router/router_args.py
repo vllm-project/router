@@ -74,6 +74,7 @@ class RouterArgs:
     request_id_headers: Optional[List[str]] = None
     # Request timeout in seconds
     request_timeout_secs: int = 1800
+    prefill_progress_stale_after_secs: Optional[int] = None
     # Max concurrent requests for rate limiting
     max_concurrent_requests: int = 32768
     # Queue size for pending requests when max concurrent limit reached
@@ -477,6 +478,13 @@ class RouterArgs:
             default=RouterArgs.request_timeout_secs,
             help="Request timeout in seconds",
         )
+        parser.add_argument(
+            f"--{prefix}prefill-progress-stale-after-secs",
+            type=int,
+            default=RouterArgs.prefill_progress_stale_after_secs,
+            help="Enable KV-aware gRPC progress and mark stale updates after this interval (seconds).",
+        )
+
         # Retry configuration
         parser.add_argument(
             f"--{prefix}retry-max-retries",

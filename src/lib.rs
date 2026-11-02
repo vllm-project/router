@@ -80,6 +80,7 @@ struct Router {
     prometheus_port: Option<u16>,
     prometheus_host: Option<String>,
     request_timeout_secs: u64,
+    prefill_progress_stale_after_secs: Option<u64>,
     request_id_headers: Option<Vec<String>>,
     vllm_pd_disaggregation: bool,
     vllm_discovery_address: Option<String>,
@@ -234,6 +235,7 @@ impl Router {
             max_payload_size: self.max_payload_size,
             request_timeout_secs: self.request_timeout_secs,
             worker_startup_timeout_secs: self.worker_startup_timeout_secs,
+            prefill_progress_stale_after_secs: self.prefill_progress_stale_after_secs,
             worker_startup_check_interval_secs: self.worker_startup_check_interval,
             intra_node_data_parallel_size: self.intra_node_data_parallel_size,
             api_key: self.api_key.clone(),
@@ -380,6 +382,7 @@ impl Router {
         kv_event_replay_source = vec![],
         kv_event_block_size = 16,
         kv_event_model = None,
+        prefill_progress_stale_after_secs = None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -457,6 +460,7 @@ impl Router {
         kv_event_replay_source: Vec<String>,
         kv_event_block_size: u32,
         kv_event_model: Option<String>,
+        prefill_progress_stale_after_secs: Option<u64>,
     ) -> PyResult<Self> {
         if wasm_middleware_sha256
             .as_deref()
@@ -516,6 +520,7 @@ impl Router {
             prometheus_host,
             request_timeout_secs,
             request_id_headers,
+            prefill_progress_stale_after_secs,
             vllm_pd_disaggregation,
             vllm_discovery_address,
             prefill_urls,

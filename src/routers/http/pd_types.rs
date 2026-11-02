@@ -224,11 +224,14 @@ impl PdLoadManager {
             decode: selection.decode.endpoint.clone(),
             prefill_worker: Mutex::new(None),
             decode_worker: Mutex::new(None),
-            prefill_tokens: selection.prefill.new_prefill_tokens,
             affinity: selection.decode.affinity.clone(),
             state: Mutex::new(AttemptState {
                 prefill: true,
                 decode: DecodeState::Pending,
+                prefill_tokens: selection.prefill.new_prefill_tokens,
+                progress_sequence: 0,
+                admitted_prefill_known: selection.prefill.new_prefill_tokens.is_some(),
+                retaining_initial_queue: false,
             }),
         }));
         Some((selection, attempt))
@@ -264,11 +267,14 @@ impl PdLoadManager {
             decode,
             prefill_worker: Mutex::new(None),
             decode_worker: Mutex::new(None),
-            prefill_tokens: None,
             affinity: None,
             state: Mutex::new(AttemptState {
                 prefill: true,
                 decode: DecodeState::Pending,
+                prefill_tokens: None,
+                progress_sequence: 0,
+                admitted_prefill_known: false,
+                retaining_initial_queue: false,
             }),
         }));
         attempt.attach_workers(prefill_worker, decode_worker);
@@ -287,6 +293,13 @@ enum DecodeState {
 struct AttemptState {
     prefill: bool,
     decode: DecodeState,
+    /// This attempt's share of `active_prefill_tokens`; `None` counts it in
+    /// `unknown_prefill_requests` instead.
+    prefill_tokens: Option<u64>,
+    /// Last accepted worker progress snapshot.
+    progress_sequence: u64,
+    admitted_prefill_known: bool,
+    retaining_initial_queue: bool,
 }
 
 struct AttemptInner {
@@ -296,7 +309,6 @@ struct AttemptInner {
     decode: PdEndpoint,
     prefill_worker: Mutex<Option<Arc<dyn Worker>>>,
     decode_worker: Mutex<Option<Arc<dyn Worker>>>,
-    prefill_tokens: Option<u64>,
     /// Decode binding held alive until this attempt finishes.
     affinity: Option<Arc<AffinityRecord>>,
     state: Mutex<AttemptState>,
@@ -312,7 +324,7 @@ impl AttemptInner {
         let key = (Stage::Prefill, self.prefill.clone());
         if let Some(load) = loads.get_mut(&key) {
             load.prefill_requests -= 1;
-            if let Some(tokens) = self.prefill_tokens {
+            if let Some(tokens) = state.prefill_tokens {
                 load.active_prefill_tokens -= tokens;
             } else {
                 load.unknown_prefill_requests -= 1;
@@ -326,6 +338,54 @@ impl AttemptInner {
             worker.decrement_load();
         }
         state.prefill = false;
+    }
+
+    /// Replace this attempt's prefill work with a newer worker snapshot.
+    /// Unknown admission work becomes known; nothing changes once P is done.
+    fn update_prefill_progress(
+        &self,
+        sequence: u64,
+        remaining_tokens: u64,
+        kind: crate::backend::grpc::PrefillProgressKind,
+    ) {
+        use crate::backend::grpc::PrefillProgressKind;
+        let mut state = self.state.lock();
+        if !state.prefill {
+            return;
+        }
+        if kind == PrefillProgressKind::StaleInitialQueue {
+            if sequence != state.progress_sequence || !state.retaining_initial_queue {
+                return;
+            }
+        } else {
+            if sequence <= state.progress_sequence {
+                return;
+            }
+            let contiguous_initial_queue = kind == PrefillProgressKind::InitialUnconfirmedQueue
+                && state.admitted_prefill_known
+                && state
+                    .prefill_tokens
+                    .is_some_and(|estimate| remaining_tokens > estimate)
+                && ((state.progress_sequence == 0 && sequence == 1)
+                    || (state.retaining_initial_queue
+                        && sequence == state.progress_sequence.saturating_add(1)));
+            state.progress_sequence = sequence;
+            if contiguous_initial_queue {
+                state.retaining_initial_queue = true;
+                return;
+            }
+        }
+        state.retaining_initial_queue = false;
+        let mut loads = self.loads.lock();
+        let Some(load) = loads.get_mut(&(Stage::Prefill, self.prefill.clone())) else {
+            return;
+        };
+        match state.prefill_tokens.replace(remaining_tokens) {
+            Some(previous) => load.active_prefill_tokens -= previous,
+            None => load.unknown_prefill_requests -= 1,
+        }
+        load.active_prefill_tokens += remaining_tokens;
+        load.publish(Stage::Prefill, &self.prefill);
     }
 
     fn begin_decode(&self) {
@@ -426,6 +486,22 @@ impl PdAttempt {
     pub fn finish_prefill(&self) {
         self.0.finish_prefill();
     }
+    pub fn update_prefill_progress(&self, sequence: u64, remaining_tokens: u64) {
+        self.0.update_prefill_progress(
+            sequence,
+            remaining_tokens,
+            crate::backend::grpc::PrefillProgressKind::Snapshot,
+        );
+    }
+    pub(crate) fn update_prefill_progress_with_kind(
+        &self,
+        sequence: u64,
+        remaining_tokens: u64,
+        kind: crate::backend::grpc::PrefillProgressKind,
+    ) {
+        self.0
+            .update_prefill_progress(sequence, remaining_tokens, kind);
+    }
     pub fn begin_decode(&self) {
         self.0.begin_decode();
     }
@@ -472,7 +548,50 @@ impl PdAttempt {
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use super::*;
+    use crate::core::{BasicWorker, WorkerType};
     use std::fmt;
+
+    #[test]
+    fn bound_attempt_reconciles_unknown_prefill_and_releases_both_workers() {
+        let manager = PdLoadManager::default();
+        let prefill: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+            "http://prefill".to_owned(),
+            WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+        ));
+        let decode: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+            "http://decode".to_owned(),
+            WorkerType::Decode,
+        ));
+        let p_key = (Stage::Prefill, PdEndpoint::for_worker(prefill.as_ref()));
+        let d_key = (Stage::Decode, PdEndpoint::for_worker(decode.as_ref()));
+        let attempt = manager.admit_bound(prefill.clone(), decode.clone());
+
+        let loads = manager.snapshot();
+        assert_eq!(loads[&p_key].prefill_requests, 1);
+        assert_eq!(loads[&p_key].unknown_prefill_requests, 1);
+        assert_eq!(loads[&p_key].active_prefill_tokens, 0);
+        assert_eq!(loads[&d_key].pending_decode_requests, 1);
+        assert_eq!((prefill.load(), decode.load()), (1, 1));
+
+        attempt.update_prefill_progress(1, 7);
+        attempt.update_prefill_progress(1, 12); // duplicate sequence is ignored
+        let loads = manager.snapshot();
+        assert_eq!(loads[&p_key].unknown_prefill_requests, 0);
+        assert_eq!(loads[&p_key].active_prefill_tokens, 7);
+
+        attempt.finish_prefill();
+        attempt.begin_decode();
+        let loads = manager.snapshot();
+        assert!(!loads.contains_key(&p_key));
+        assert_eq!(loads[&d_key].pending_decode_requests, 0);
+        assert_eq!(loads[&d_key].active_decode_requests, 1);
+        assert_eq!((prefill.load(), decode.load()), (0, 1));
+        drop(attempt);
+        assert!(manager.snapshot().is_empty());
+        assert_eq!((prefill.load(), decode.load()), (0, 0));
+    }
 
     // Simple custom error for testing error chains
     #[derive(Debug)]

@@ -89,7 +89,7 @@ fn emit_http_first_sse<E>(
     let comment = bytes::Bytes::from(format!(": router-stages {stages}\n\n"));
     info!(%stages, "http proxy stages");
     match output_frame {
-        Some(output_frame) => output_frame.send(tx, comment, false),
+        Some(output_frame) => output_frame.send_unbounded(tx, comment, false),
         None => tx.send(Ok(comment)).is_ok(),
     }
 }
@@ -155,6 +155,21 @@ impl RequestLoadGuard {
         if let Some(slot) = &self.state.kv_slot {
             slot.begin_decode();
         }
+    }
+
+    fn update_prefill_progress(&self, sequence: u64, remaining_tokens: u64) {
+        if let Some(slot) = &self.state.kv_slot {
+            slot.update_prefill_progress(sequence, remaining_tokens);
+        }
+    }
+
+    fn prefill_progress_callback(&self) -> crate::backend::grpc::PrefillProgressCallback {
+        let load = self.clone();
+        Arc::new(move |sequence, remaining, kind| {
+            if kind != crate::backend::grpc::PrefillProgressKind::StaleInitialQueue {
+                load.update_prefill_progress(sequence, remaining);
+            }
+        })
     }
 
     fn release(&self) {
@@ -331,6 +346,14 @@ impl Router {
 
         // All-http or all-grpc. Mixed schemes fail here (not a silent fallback).
         let pool_kind = crate::backend::classify_worker_urls(&worker_urls)?;
+        if ctx
+            .router_config
+            .prefill_progress_stale_after_secs
+            .is_some()
+            && pool_kind == Some(crate::backend::WorkerPoolKind::Http)
+        {
+            return Err("Prefill progress requires a gRPC worker pool".into());
+        }
         let default_policy = ctx.policy_registry.get_default_policy();
         let pending_kv_supervisor = if kv_aware_ops(default_policy.as_ref()).is_some() {
             let (mut supervisor, signals) =
@@ -358,7 +381,13 @@ impl Router {
         } else {
             crate::backend::EngineFrontend::from_env(request_timeout)
                 .map_err(|error| format!("tokenizer cache: {error}"))?
-        };
+        }
+        .with_prefill_progress_stale_after(
+            ctx.router_config
+                .prefill_progress_stale_after_secs
+                .map(Duration::from_secs),
+        );
+
         // Wait for workers to be healthy (skip if empty - for service discovery mode)
         if !worker_urls.is_empty() {
             Self::wait_for_healthy_workers(
@@ -1895,16 +1924,24 @@ impl Router {
                 )
                     .into_response();
             };
-            let on_first_output = if is_stream {
-                None
-            } else {
+            let on_first_output = {
                 let load = load.clone();
                 Some(Arc::new(move || load.begin_decode())
                     as crate::backend::grpc::FirstOutputCallback)
             };
+            let on_prefill_progress = if load.state.kv_slot.is_some() {
+                Some(load.prefill_progress_callback())
+            } else {
+                None
+            };
             let mut response = self
                 .frontend
-                .dispatch_with_first_output(worker_url, prepared, on_first_output)
+                .dispatch_with_first_output(
+                    worker_url,
+                    prepared,
+                    on_first_output,
+                    on_prefill_progress,
+                )
                 .await;
             if is_stream && response.status().is_success() {
                 response = hold_request_load_until_body_done(response, load);
@@ -2122,7 +2159,9 @@ impl Router {
                                 .as_mut()
                                 .is_some_and(|observer| observer.observe(&bytes));
                             let sent = match producer_output_frame.as_mut() {
-                                Some(output_frame) => output_frame.send(&tx, bytes, has_output),
+                                Some(output_frame) => {
+                                    output_frame.send_unbounded(&tx, bytes, has_output)
+                                }
                                 None => tx.send(Ok(bytes)).is_ok(),
                             };
                             if !sent {
@@ -3409,6 +3448,30 @@ impl RouterTrait for Router {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn colocated_progress_uses_worker_snapshot_and_ignores_initial_queue_stale_signal() {
+        use crate::backend::grpc::PrefillProgressKind;
+        use crate::policies::{LoadProvider, SlotManager};
+
+        let manager = Arc::new(crate::policies::InMemorySlotManager::new());
+        let target = crate::kv_index::RoutableTarget {
+            instance_id: Arc::from("worker"),
+            dp_rank: 0,
+        };
+        manager.begin_prefill(&target, 16);
+        let slot = KvRequestSlot::new(manager.clone(), target.clone(), 16, None);
+        let load = RequestLoadGuard::new(None, Some(slot));
+        let callback = load.prefill_progress_callback();
+        callback(1, 100, PrefillProgressKind::InitialUnconfirmedQueue);
+        assert_eq!(manager.sample(&target).active_prefill_tokens, 100);
+        callback(1, 999, PrefillProgressKind::StaleInitialQueue);
+        assert_eq!(manager.sample(&target).active_prefill_tokens, 100);
+        callback(2, 8, PrefillProgressKind::Snapshot);
+        assert_eq!(manager.sample(&target).active_prefill_tokens, 8);
+        load.release();
+        assert_eq!(manager.sample(&target).active_prefill_tokens, 0);
+    }
 
     struct CompletionResponseFixture {
         router: Arc<Router>,
@@ -6110,7 +6173,7 @@ mod tests {
             &serde_json::json!({}),
             Some(&mut producer)
         ));
-        assert!(producer.send(
+        assert!(producer.send_unbounded(
             &tx,
             bytes::Bytes::from_static(b"data: {\"choices\":[{\"text\":\"output\"}]}\n\n"),
             true
@@ -6452,28 +6515,38 @@ mod tests {
         let (mut producer_output_frame, output_frame) =
             crate::backend::stream_output::output_frame_tracking();
         let (body_tx, body_rx) =
-            tokio::sync::mpsc::unbounded_channel::<Result<bytes::Bytes, std::io::Error>>();
+            tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(2);
         let (queued_tx, queued_rx) = tokio::sync::oneshot::channel();
         let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
         let producer = tokio::spawn(async move {
-            assert!(producer_output_frame.send(
-                &body_tx,
-                bytes::Bytes::from_static(b"data: prompt_info_only\n\n"),
-                false,
-            ));
+            assert!(
+                producer_output_frame
+                    .send(
+                        &body_tx,
+                        bytes::Bytes::from_static(b"data: prompt_info_only\n\n"),
+                        false,
+                    )
+                    .await
+            );
             // Model the gRPC producer getting ahead of the client: by the
             // time the first body frame is polled, it has already queued the
             // generated-output frame too.
-            assert!(producer_output_frame.send(
-                &body_tx,
-                bytes::Bytes::from_static(b"data: generated_token\n\n"),
-                true,
-            ));
+            assert!(
+                producer_output_frame
+                    .send(
+                        &body_tx,
+                        bytes::Bytes::from_static(b"data: generated_token\n\n"),
+                        true,
+                    )
+                    .await
+            );
             queued_tx.send(()).unwrap();
             let _ = finish_rx.await;
         });
         queued_rx.await.unwrap();
-        let mut response = Response::new(Body::from_stream(UnboundedReceiverStream::new(body_rx)));
+        let mut response = Response::new(Body::from_stream(
+            tokio_stream::wrappers::ReceiverStream::new(body_rx),
+        ));
         response
             .extensions_mut()
             .insert(crate::backend::grpc::GrpcStreamTask::with_output_frame(
@@ -6531,6 +6604,15 @@ mod tests {
         worker.increment_load();
         for cancel in [false, true] {
             let load = admitted_kv_load(worker.clone(), manager.clone(), target.clone());
+            load.update_prefill_progress(1, 40);
+            load.begin_decode();
+            load.update_prefill_progress(2, 32);
+            let slot = load.state.kv_slot.as_ref().unwrap().clone();
+            assert_eq!(
+                crate::policies::LoadProvider::sample(manager.as_ref(), &target)
+                    .active_prefill_tokens,
+                39,
+            );
             let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
             let producer = tokio::spawn(async move {
                 let _ = finish_rx.await;
@@ -6556,6 +6638,7 @@ mod tests {
                 .unwrap();
                 drop(response);
             }
+            slot.update_prefill_progress(3, 64);
             assert_eq!(worker.load(), 1);
             assert_eq!(
                 crate::policies::LoadProvider::sample(manager.as_ref(), &target),
