@@ -53,7 +53,7 @@ Before replay, the cell runner **removes `result/`** if reusing the same `AGENTX
 
 Optional **`export AGENTX_STREAM_LOGS=1`**: stream **worker + router** logs to stderr in real time (prefix `[engineN]` / `[router]`); replay stays file-only. Use **pytest `-sv`** so stderr is visible.
 
-At the end of a cell, the runner **stops workers/router first** (so live streams do not bury the footer), then prints **`STATS`**, **`ARTIFACTS`** (includes **`results_summary.json`** when pytest sets `AGENTX_RESULTS_SUMMARY`), **`PORTS`**, and **`LOG_SUMMARY`** (error scan + last N lines of every engine/router/replay log; `AGENTX_LOG_TAIL`, default 50). With **`AGENTX_STREAM_LOGS=1`**, a `--- cell summary ---` banner marks this block.
+When replay exits, the runner appends **`--- cell summary ---`**, **`STATS`**, **`ARTIFACTS`** (includes **`results_summary.json`** when pytest sets `AGENTX_RESULTS_SUMMARY`), **`PORTS`**, and **`LOG_SUMMARY`** to **`replay.log`** immediately after agentinfer's `Replay result` line, and prints the same block on stdout. Workers and the router are stopped after that. `LOG_SUMMARY` is an error scan plus the last N lines of every engine/router/replay log (`AGENTX_LOG_TAIL`, default 50).
 
 Layout matches **`perf/grpc`**: case JSON + [`casekit/case_config.py`](casekit/case_config.py) + stack runner (no separate `scripts/` tree).
 

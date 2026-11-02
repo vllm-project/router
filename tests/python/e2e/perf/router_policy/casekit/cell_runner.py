@@ -17,6 +17,7 @@ Configuration: ``AGENTX_CASE_FILE`` points to one self-contained case JSON
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import re
@@ -28,6 +29,8 @@ import subprocess
 import sys
 import threading
 import time
+from contextlib import redirect_stdout
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -411,6 +414,30 @@ def _write_results_summary_from_calibration(out: Path) -> list[tuple[str, Path]]
     return [("results_summary.json", dest)]
 
 
+def _flush_log_handles() -> None:
+    for handle in handles:
+        try:
+            handle.flush()
+        except (OSError, ValueError):
+            pass
+
+
+def _publish_beside_replay_result(out: Path, text: str) -> None:
+    """Append the cell summary to replay.log, right after agentinfer's Replay result."""
+
+    _flush_log_handles()
+    replay_log = out / "replay.log"
+    if replay_log.is_file():
+        with replay_log.open("a", encoding="utf-8") as fp:
+            if text and not text.startswith("\n"):
+                fp.write("\n")
+            fp.write(text)
+            if text and not text.endswith("\n"):
+                fp.write("\n")
+            fp.flush()
+    print(text, end="" if text.endswith("\n") else "\n", flush=True)
+
+
 def _emit_run_summary(
     out: Path,
     workers: int,
@@ -419,27 +446,33 @@ def _emit_run_summary(
     replay_rc: int | None,
     stalled: bool,
 ) -> None:
-    """Print STATS / ARTIFACTS / LOG_SUMMARY after stopping workers (quiet streams)."""
+    """Print STATS / ARTIFACTS / LOG_SUMMARY next to the replay process result."""
 
-    cleanup()
-    if _stream_logs_enabled():
-        print("\n--- cell summary (worker/router streams stopped) ---", flush=True)
+    _flush_log_handles()
     summary_extra = _write_results_summary_from_calibration(out)
-    print("STATS " + json.dumps(stats), flush=True)
-    print_artifacts(out, workers, extras=summary_extra)
-    fail_tail = max(_log_tail_lines(), 80)
-    if replay_rc not in (0, None):
-        print(f"DIAGNOSTIC replay failed (exit {replay_rc})", flush=True)
-        print_log_summary(out, workers, tail_lines=fail_tail)
+    failed = False
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        print("\n--- cell summary ---", flush=True)
+        print("STATS " + json.dumps(stats), flush=True)
+        print_artifacts(out, workers, extras=summary_extra)
+        fail_tail = max(_log_tail_lines(), 80)
+        if replay_rc not in (0, None):
+            print(f"DIAGNOSTIC replay failed (exit {replay_rc})", flush=True)
+            print_log_summary(out, workers, tail_lines=fail_tail)
+            failed = True
+        elif stalled or stats["success"] != stats["requests"]:
+            print(
+                "DIAGNOSTIC stalled or non-success rows in requests.jsonl",
+                flush=True,
+            )
+            print_log_summary(out, workers, tail_lines=fail_tail)
+            failed = True
+        else:
+            print_log_summary(out, workers)
+    _publish_beside_replay_result(out, buf.getvalue())
+    if failed:
         raise SystemExit(1)
-    if stalled or stats["success"] != stats["requests"]:
-        print(
-            "DIAGNOSTIC stalled or non-success rows in requests.jsonl",
-            flush=True,
-        )
-        print_log_summary(out, workers, tail_lines=fail_tail)
-        raise SystemExit(1)
-    print_log_summary(out, workers)
 
 
 def print_failure_diagnostics(out: Path, workers: int, *, hint: str = "") -> None:
@@ -666,6 +699,124 @@ def pct(values, p):
     return ordered[lo] + (ordered[hi] - ordered[lo]) * (rank - lo)
 
 
+def _makespan_seconds(ok_rows: list[dict[str, Any]]) -> float | None:
+    """Replay window: max(finished_at) - min(started_at) over successful requests."""
+
+    starts: list[datetime] = []
+    ends: list[datetime] = []
+    for row in ok_rows:
+        started = row.get("started_at")
+        finished = row.get("finished_at")
+        if not started or not finished:
+            continue
+        starts.append(datetime.fromisoformat(str(started)))
+        ends.append(datetime.fromisoformat(str(finished)))
+    if not starts:
+        return None
+    span = (max(ends) - min(starts)).total_seconds()
+    if span <= 0:
+        return None
+    return span
+
+
+def _quantiles(values: list[float]) -> dict[str, Any]:
+    """Linear-interpolation mean / p50 / p95 / p99, same as the orig128 report."""
+
+    return {
+        "n": len(values),
+        "mean": statistics.fmean(values) if values else None,
+        "p50": pct(values, 50),
+        "p95": pct(values, 95),
+        "p99": pct(values, 99),
+    }
+
+
+def _is_number(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _collect_duration_samples(node: Any, found: list[float]) -> None:
+    """Collect numeric ``duration_seconds`` fields. Skip percentile objects."""
+
+    if isinstance(node, list):
+        for item in node:
+            _collect_duration_samples(item, found)
+        return
+    if not isinstance(node, dict):
+        return
+    duration = node.get("duration_seconds")
+    if _is_number(duration):
+        status = str(node.get("status") or "success").lower()
+        if status in {"success", "completed", "ok"}:
+            found.append(float(duration))
+    for key, child in node.items():
+        if key == "duration_seconds":
+            continue
+        _collect_duration_samples(child, found)
+
+
+def _precomputed_duration(node: Any) -> dict[str, Any] | None:
+    if isinstance(node, dict):
+        duration = node.get("duration_seconds")
+        if isinstance(duration, dict) and any(
+            key in duration for key in ("mean", "p50", "p95", "p99")
+        ):
+            return duration
+        for child in node.values():
+            found = _precomputed_duration(child)
+            if found is not None:
+                return found
+        return None
+    if isinstance(node, list):
+        for child in node:
+            found = _precomputed_duration(child)
+            if found is not None:
+                return found
+    return None
+
+
+def _jct_quantiles(result_dir: Path, ok_rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """JCT is ``duration_seconds`` (session summary, else per-request field)."""
+
+    summary_path = result_dir / "summary.json"
+    samples: list[float] = []
+    precomputed: dict[str, Any] | None = None
+    if summary_path.is_file():
+        try:
+            summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            summary = None
+        if summary is not None:
+            _collect_duration_samples(summary, samples)
+            precomputed = _precomputed_duration(summary)
+    if not samples:
+        samples = [
+            float(row["duration_seconds"])
+            for row in ok_rows
+            if _is_number(row.get("duration_seconds"))
+        ]
+    if samples:
+        return _quantiles(samples)
+    if precomputed is None:
+        return _quantiles([])
+
+    def pick(*keys: str) -> float | None:
+        for key in keys:
+            value = precomputed.get(key)
+            if _is_number(value):
+                return float(value)
+        return None
+
+    count = precomputed.get("n", precomputed.get("count"))
+    return {
+        "n": int(count) if _is_number(count) else None,
+        "mean": pick("mean"),
+        "p50": pick("p50", "median"),
+        "p95": pick("p95"),
+        "p99": pick("p99"),
+    }
+
+
 def run_router_policy_cell(
     case_file: Path,
     *,
@@ -873,26 +1024,44 @@ raise SystemExit(main(["vllm", *sys.argv[1:]]))
             if req_path.is_file()
             else []
         )
-        ttft = [r["ttft_seconds"] for r in rows if r.get("ttft_seconds") is not None]
+        ok = [r for r in rows if r.get("status") == "success"]
+        ttft = [
+            float(r["ttft_seconds"]) for r in ok if r.get("ttft_seconds") is not None
+        ]
         lat = [
             r["latency_seconds"] for r in rows if r.get("latency_seconds") is not None
         ]
+        # TPOT ms/token: 1000 * (latency - ttft) / (output_tokens - 1); drop out <= 1.
+        tpot_ms = [
+            1000.0
+            * (float(r["latency_seconds"]) - float(r["ttft_seconds"]))
+            / (int(r["output_tokens"]) - 1)
+            for r in ok
+            if r.get("ttft_seconds") is not None
+            and r.get("latency_seconds") is not None
+            and (r.get("output_tokens") or 0) > 1
+        ]
+        output_tokens = sum(r.get("output_tokens") or 0 for r in ok)
+        makespan = _makespan_seconds(ok)
         stats = {
             "router_policy": ROUTER_POLICY,
             "arm": ROUTER_POLICY,
             "returncode": replay_rc,
             "wall_seconds": wall,
+            "makespan_seconds": makespan,
+            "throughput_tok_s": (output_tokens / makespan) if makespan else None,
             "stalled": stalled,
             "requests": len(rows),
-            "success": sum(1 for r in rows if r.get("status") == "success"),
+            "success": len(ok),
             "input_tokens": sum(r.get("input_tokens") or 0 for r in rows),
             "output_tokens": sum(r.get("output_tokens") or 0 for r in rows),
             "ttft_s": {
-                "mean": statistics.mean(ttft) if ttft else None,
-                "p50": pct(ttft, 50),
+                **_quantiles(ttft),
                 "p90": pct(ttft, 90),
                 "max": max(ttft) if ttft else None,
             },
+            "tpot_ms": _quantiles(tpot_ms),
+            "jct_s": _jct_quantiles(result, ok),
             "latency_s": {
                 "mean": statistics.mean(lat) if lat else None,
                 "p50": pct(lat, 50),
