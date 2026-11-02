@@ -152,6 +152,8 @@ pub struct PdRequestContext<'a> {
     /// Resolved at request entry, only when the affinity switch is on;
     /// `None` selects per request on both stages.
     pub affinity_key: Option<AffinityKey>,
+    /// Session id for policies whose `needs_session_id` is true.
+    pub session_id: Option<&'a str>,
     /// Request cache salt scoping the binding digest.
     pub cache_salt: Option<&'a str>,
     pub route: &'a str,

@@ -1039,6 +1039,14 @@ impl VllmPDRouter {
                 })
         });
         let affinity_key = Self::extract_affinity_key(decode_policy.as_ref(), headers, request);
+        let session_id = (prefill_policy.needs_session_id() || decode_policy.needs_session_id())
+            .then(|| {
+                crate::request_identity::resolve_session_key(
+                    headers,
+                    crate::request_identity::IdentityFields::from_body(request),
+                )
+            })
+            .flatten();
         let context = PdRequestContext {
             prefill_inputs: prefill_inputs.as_ref(),
             model_id,
@@ -1047,6 +1055,7 @@ impl VllmPDRouter {
             decode_cache: decode_cache.as_ref(),
             headers: policy_headers.as_ref(),
             affinity_key,
+            session_id: session_id.as_deref(),
             cache_salt,
             route: path,
         };
@@ -1309,10 +1318,20 @@ impl VllmPDRouter {
         let policy_headers = policy
             .needs_headers()
             .then(|| header_utils::to_policy_headers(headers).unwrap_or_default());
-        let index = policy.select_worker_with_headers(
+        let session_id = policy
+            .needs_session_id()
+            .then(|| {
+                crate::request_identity::resolve_session_key(
+                    headers,
+                    crate::request_identity::IdentityFields::from_body(request),
+                )
+            })
+            .flatten();
+        let index = policy.select_worker_for_session(
             &workers,
             request_text.as_deref(),
             policy_headers.as_ref(),
+            session_id.as_deref(),
         )?;
         Some(candidates[index].clone())
     }
