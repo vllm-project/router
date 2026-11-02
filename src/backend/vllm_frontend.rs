@@ -219,7 +219,7 @@ pub fn emit_detok(
     for &id in token_ids {
         decoder.push_token(id)?;
         if let Some(chunk) = decoder.next_chunk() {
-            out.push_str(&chunk);
+            out.push_str(&chunk.text);
         }
     }
     Ok(out)
