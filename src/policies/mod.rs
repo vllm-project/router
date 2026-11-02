@@ -83,6 +83,19 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
         headers: Option<&RequestHeaders>,
     ) -> Option<usize>;
 
+    /// Select a worker for a request whose session id the router resolved with
+    /// [`crate::request_identity::resolve_session_key`]. The router resolves
+    /// it only for policies whose [`Self::needs_session_id`] is true.
+    fn select_worker_for_session(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        request_text: Option<&str>,
+        headers: Option<&RequestHeaders>,
+        _session_id: Option<&str>,
+    ) -> Option<usize> {
+        self.select_worker_with_headers(workers, request_text, headers)
+    }
+
     /// Select a worker and reserve its local load before another admission
     /// through this context can make a load-based decision.
     ///
@@ -168,6 +181,12 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
     /// Check if this policy needs HTTP headers for routing decisions
     fn needs_headers(&self) -> bool {
         false // Default: most policies don't need headers
+    }
+
+    /// Whether the router must resolve the request's session id and select
+    /// through [`Self::select_worker_for_session`].
+    fn needs_session_id(&self) -> bool {
+        false
     }
 
     /// Update worker load information

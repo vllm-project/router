@@ -28,7 +28,7 @@ use crate::protocols::spec::{
     GrpcRequestRef, InferenceGenerateRequest, RerankRequest, RerankResponse, RerankResult,
     ResponsesRequest,
 };
-use crate::request_identity::{resolve_affinity_identity, IdentityFields};
+use crate::request_identity::{resolve_affinity_identity, resolve_session_key, IdentityFields};
 use crate::routers::header_utils;
 use crate::routers::http::dp_utils;
 use crate::routers::{RouterTrait, WorkerManagement};
@@ -1339,6 +1339,7 @@ impl Router {
         lora_name: Option<&str>,
         cache_salt: Option<&str>,
         affinity_key: Option<&AffinityKey>,
+        session_id: Option<&str>,
         excluded_workers: &[String],
     ) -> Option<SelectedWorker> {
         if available.is_empty() {
@@ -1376,7 +1377,12 @@ impl Router {
                 available, token_ids, model_id, lora_name, cache_salt, "regular",
             )?
         } else {
-            policy.select_worker_with_headers(available, text, request_headers.as_ref())?
+            policy.select_worker_for_session(
+                available,
+                text,
+                request_headers.as_ref(),
+                session_id,
+            )?
         };
         Some(SelectedWorker {
             worker: available.get(idx)?.clone(),
@@ -1529,9 +1535,16 @@ impl Router {
                     })
             });
 
+        let session_id = self
+            .policy_for_model(model_id)
+            .needs_session_id()
+            .then(|| resolve_session_key(headers, typed_req.affinity_identity()))
+            .flatten();
+
         let http_inputs = &http_inputs;
         let failed_workers = &failed_workers;
         let affinity_key = &affinity_key;
+        let session_id = &session_id;
         let response = RetryExecutor::execute_response_with_retry(
             &self.retry_config,
             // operation per attempt
@@ -1662,6 +1675,7 @@ impl Router {
                         lora_name,
                         cache_salt,
                         affinity_key.as_ref(),
+                        session_id.as_deref(),
                         &excluded_workers,
                     )
                 };
@@ -3140,11 +3154,16 @@ impl RouterTrait for Router {
             let cache_key = (policy.needs_cache_routing_key())
                 .then(|| crate::protocols::spec::cache_routing::for_route(&body, path));
             let request_headers = Self::headers_to_request_headers(headers);
+            let session_id = policy
+                .needs_session_id()
+                .then(|| resolve_session_key(headers, IdentityFields::from_body(&body)))
+                .flatten();
             policy
-                .select_worker_with_headers(
+                .select_worker_for_session(
                     &workers,
                     cache_key.as_deref().or(request_text.as_deref()),
                     request_headers.as_ref(),
+                    session_id.as_deref(),
                 )
                 .and_then(|index| workers.get(index).cloned())
                 .map(|worker| SelectedWorker {
@@ -6937,6 +6956,7 @@ mod tests {
                     None,
                     None,
                     None,
+                    None,
                     &[],
                 )
                 .expect("Should select a worker");
@@ -6978,6 +6998,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
                 &[],
             )
             .expect("Should select the remaining healthy worker");
@@ -7010,6 +7031,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &[],
         );
         assert!(
@@ -7029,6 +7051,7 @@ mod tests {
                     Some(r#"{"prompt": "test"}"#),
                     None,
                     KvRequestTokens::Shared(None),
+                    None,
                     None,
                     None,
                     None,
@@ -7061,6 +7084,7 @@ mod tests {
                 Some(r#"{"prompt": "test"}"#),
                 Some(&header_map),
                 KvRequestTokens::Shared(None),
+                None,
                 None,
                 None,
                 None,
