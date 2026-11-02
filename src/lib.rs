@@ -49,6 +49,7 @@ struct Router {
     kv_penalty_external: f64,
     kv_penalty_disk: f64,
     kv_aware_session_affinity_ttl_secs: Option<u64>,
+    sticky_least_loaded_session_ttl_secs: u64,
     pd_kv_events: Vec<String>,
     kv_event_source: Vec<String>,
     kv_event_replay_source: Vec<String>,
@@ -156,7 +157,9 @@ impl Router {
                 PolicyType::ConsistentHash => ConfigPolicyConfig::ConsistentHash {
                     virtual_nodes: 160, // Default value
                 },
-                PolicyType::StickyLeastLoaded => ConfigPolicyConfig::StickyLeastLoaded,
+                PolicyType::StickyLeastLoaded => ConfigPolicyConfig::StickyLeastLoaded {
+                    session_ttl_secs: self.sticky_least_loaded_session_ttl_secs,
+                },
             }
         };
 
@@ -377,6 +380,7 @@ impl Router {
         kv_penalty_external = 0.6,
         kv_penalty_disk = 0.3,
         kv_aware_session_affinity_ttl_secs = None,
+        sticky_least_loaded_session_ttl_secs = 7200,
         pd_kv_events = vec![],
         kv_event_source = vec![],
         kv_event_replay_source = vec![],
@@ -454,6 +458,7 @@ impl Router {
         kv_penalty_external: f64,
         kv_penalty_disk: f64,
         kv_aware_session_affinity_ttl_secs: Option<u64>,
+        sticky_least_loaded_session_ttl_secs: u64,
         pd_kv_events: Vec<String>,
         kv_event_source: Vec<String>,
         kv_event_replay_source: Vec<String>,
@@ -485,6 +490,7 @@ impl Router {
             kv_penalty_external,
             kv_penalty_disk,
             kv_aware_session_affinity_ttl_secs,
+            sticky_least_loaded_session_ttl_secs,
             pd_kv_events,
             kv_event_source,
             kv_event_replay_source,

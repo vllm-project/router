@@ -505,9 +505,14 @@ impl ConfigValidator {
                     });
                 }
             }
-            PolicyConfig::StickyLeastLoaded => {
-                // Session expiration is sourced from the environment; no
-                // structured config to validate here.
+            PolicyConfig::StickyLeastLoaded { session_ttl_secs } => {
+                if !(1..=31_536_000).contains(session_ttl_secs) {
+                    return Err(ConfigError::InvalidValue {
+                        field: "session_ttl_secs".to_string(),
+                        value: session_ttl_secs.to_string(),
+                        reason: "Must be between 1 and 31536000 seconds".to_string(),
+                    });
+                }
             }
             PolicyConfig::RendezvousHash => {
                 // No specific validation needed
@@ -1055,6 +1060,22 @@ mod tests {
         for ttl in [0, 31_536_001] {
             config.kv_aware_session_affinity_ttl_secs = Some(ttl);
             assert!(ConfigValidator::validate(&config).is_err());
+        }
+    }
+
+    #[test]
+    fn sticky_session_ttl_is_bounded() {
+        let config_with = |session_ttl_secs| {
+            RouterConfig::new(
+                RoutingMode::Regular {
+                    worker_urls: vec!["http://worker:8000".to_string()],
+                },
+                PolicyConfig::StickyLeastLoaded { session_ttl_secs },
+            )
+        };
+        assert!(ConfigValidator::validate(&config_with(300)).is_ok());
+        for ttl in [0, 31_536_001] {
+            assert!(ConfigValidator::validate(&config_with(ttl)).is_err());
         }
     }
 

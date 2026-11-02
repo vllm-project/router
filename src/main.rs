@@ -203,6 +203,14 @@ struct CliArgs {
     /// Omit to disable session affinity while keeping KV-aware routing enabled.
     #[arg(long, value_parser = clap::value_parser!(u64).range(1..=31_536_000))]
     kv_aware_session_affinity_ttl_secs: Option<u64>,
+    /// Seconds without a request after which sticky_least_loaded releases a
+    /// session.
+    #[arg(
+        long,
+        default_value_t = 7200,
+        value_parser = clap::value_parser!(u64).range(1..=31_536_000)
+    )]
+    sticky_least_loaded_session_ttl_secs: u64,
     /// Static KV event publishers for regular kv_aware workers.
     #[arg(long = "kv-event-source", action = ArgAction::Append, value_name = "WORKER_URL=ENDPOINT[,ENDPOINT...]")]
     kv_event_source: Vec<String>,
@@ -462,7 +470,9 @@ impl CliArgs {
             "consistent_hash" => PolicyConfig::ConsistentHash {
                 virtual_nodes: 160, // Default value
             },
-            "sticky_least_loaded" => PolicyConfig::StickyLeastLoaded,
+            "sticky_least_loaded" => PolicyConfig::StickyLeastLoaded {
+                session_ttl_secs: self.sticky_least_loaded_session_ttl_secs,
+            },
             "rendezvous_hash" => PolicyConfig::RendezvousHash,
             _ => PolicyConfig::RoundRobin, // Fallback
         }
@@ -866,6 +876,26 @@ mod tests {
         assert_eq!(args.prefill_policy.as_deref(), Some("kv_aware"));
         assert_eq!(args.decode_policy.as_deref(), Some("kv_aware"));
         assert_eq!(args.kv_aware_session_affinity_ttl_secs, Some(1800));
+    }
+
+    #[test]
+    fn parses_sticky_least_loaded_session_ttl() {
+        let ttl_of = |args: &[&str]| {
+            let args = CliArgs::try_parse_from(args).unwrap();
+            match args.parse_policy("sticky_least_loaded") {
+                PolicyConfig::StickyLeastLoaded { session_ttl_secs } => session_ttl_secs,
+                other => panic!("unexpected policy {other:?}"),
+            }
+        };
+        assert_eq!(ttl_of(&["vllm-router"]), 7200);
+        assert_eq!(
+            ttl_of(&[
+                "vllm-router",
+                "--sticky-least-loaded-session-ttl-secs",
+                "600"
+            ]),
+            600
+        );
     }
 
     #[test]

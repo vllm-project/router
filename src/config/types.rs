@@ -1056,10 +1056,13 @@ pub enum PolicyConfig {
     /// Session-aware routing that combines session stickiness with load
     /// balancing: existing sessions stick to their assigned replica, new
     /// sessions are routed to the least-loaded replica (ties broken by
-    /// consistent hashing). Session expiry is configured via the
-    /// `VLLM_ROUTER_SLL_SESSION_EXPIRATION_IN_S` environment variable.
+    /// consistent hashing).
     #[serde(rename = "sticky_least_loaded")]
-    StickyLeastLoaded,
+    StickyLeastLoaded {
+        /// Seconds without a request after which a session is released.
+        #[serde(default = "default_sticky_session_ttl_secs")]
+        session_ttl_secs: u64,
+    },
 
     #[serde(rename = "rendezvous_hash")]
     RendezvousHash,
@@ -1095,10 +1098,14 @@ impl PolicyConfig {
             PolicyConfig::KvAware { .. } => "kv_aware",
             PolicyConfig::PowerOfTwo { .. } => "power_of_two",
             PolicyConfig::ConsistentHash { .. } => "consistent_hash",
-            PolicyConfig::StickyLeastLoaded => "sticky_least_loaded",
+            PolicyConfig::StickyLeastLoaded { .. } => "sticky_least_loaded",
             PolicyConfig::RendezvousHash => "rendezvous_hash",
         }
     }
+}
+
+fn default_sticky_session_ttl_secs() -> u64 {
+    crate::policies::StickyLeastLoadedPolicy::DEFAULT_SESSION_TTL_SECS
 }
 
 fn default_kv_penalty_host() -> f64 {
@@ -1810,6 +1817,18 @@ mod tests {
         let json = serde_json::to_string(&power_of_two).unwrap();
         assert!(json.contains("\"type\":\"power_of_two\""));
         assert!(json.contains("\"load_check_interval_secs\":60"));
+    }
+
+    #[test]
+    fn test_sticky_least_loaded_session_ttl_defaults_when_omitted() {
+        let policy: PolicyConfig =
+            serde_json::from_str(r#"{"type":"sticky_least_loaded"}"#).unwrap();
+        assert!(matches!(
+            policy,
+            PolicyConfig::StickyLeastLoaded {
+                session_ttl_secs: 7200
+            }
+        ));
     }
 
     #[test]
