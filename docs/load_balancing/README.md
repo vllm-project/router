@@ -15,6 +15,7 @@ the policy is the same for `grpc://host:port`.
 | `power_of_two` | Load-sensitive workloads | No | Yes |
 | `cache_aware` | Prefix caching optimization | Yes (cache-based) | Yes |
 | `kv_aware` | KV reuse and stage-aware load scoring | No | Yes |
+| `sticky_least_loaded` | Many concurrent multi-turn sessions, async RL | Yes | Yes (active sessions) |
 
 ---
 
@@ -136,15 +137,30 @@ In P/D mode, use it as `--prefill-policy` and/or `--decode-policy`; prefill and 
 
 ### Session lifecycle
 
-- **Session id**: the router resolves it from the request's stable identity, the same one `kv_aware` session affinity uses: the `X-Session-ID` header (or `x-claude-code-session-id` / Codex `session-id`), `agent_hint.session_id`, `vllm_xargs.agentic_context`, or body `session_params.session_id` / `session_id`. `user`, `X-User-ID`, `X-Request-ID` and `X-Trace-ID` do not create sessions.
+- **Session id**: resolved from the request's stable identity, the same one `kv_aware` session affinity uses. The first source present wins:
+
+  | Source | Session id |
+  |---|---|
+  | Body `vllm_xargs.agentic_context` | its `task_id`, else its `session_id`, else its `program_id` (all agents of a task share the session) |
+  | Body `agent_hint.session_id` | that value |
+  | Header `x-claude-code-session-id`, `session-id` (Codex) or `X-Session-ID` | the header value |
+  | Body `session_params.session_id`, then `session_id` | that value |
+
+  Values are trimmed. Header, `agent_hint` and `agentic_context` ids are limited to 256 bytes. An invalid identity (an empty id, an id that is neither a string nor an integer, an over-long id, or a malformed `session_params`, `agent_hint` or `agentic_context`) means the request has no session. `user`, `user_id`, `X-User-ID`, `X-Request-ID` and `X-Trace-ID` do not create sessions.
 - **New session**: assigned to the worker with the fewest active sessions; ties are broken by rendezvous hashing.
 - **Existing session**: routed to its worker. If that worker is unhealthy or removed, the session is reassigned.
-- **Finish**: `POST /finish_session?session_id=<id>` releases the session. Sessions without a request for `--sticky-least-loaded-session-ttl-secs` (default 2 hours) are released automatically.
+- **Finish**: `POST /finish_session` with the same identity headers or body fields as the session's requests releases it. Sessions without a request for `--sticky-least-loaded-session-ttl-secs` (default 2 hours) are released automatically.
 - **No session id**: the request goes to the least-loaded worker and is not tracked.
 
 ```bash
-curl -X POST "http://router:8000/finish_session?session_id=traj-42"
+curl -X POST http://router:8000/finish_session -H "X-Session-ID: traj-42"
+
+curl -X POST http://router:8000/finish_session -H "Content-Type: application/json" \
+  -d '{"vllm_xargs": {"agentic_context": {"task_id": "traj-42"}}}'
+# {"status":"ok","session_id":"traj-42","released":true}
 ```
+
+`released` is `false` when no policy held the session. A request without an identity, or with an invalid one or a body that is not JSON, gets a 400.
 
 Session state lives in the router process, so it is lost on restart, and multiple router replicas need ingress stickiness.
 

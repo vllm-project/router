@@ -18,6 +18,7 @@ use crate::policies::{
     kv_aware_ops, AffinityKey, LoadBalancingPolicy, PolicyRegistry, WorkerTokenInputs,
 };
 use crate::program_scheduling::ProgramIdentity;
+use crate::request_identity::{routing_session_key, IdentityFields};
 use crate::routers::{header_utils, RouterTrait, WorkerManagement};
 use async_trait::async_trait;
 use axum::{
@@ -1184,14 +1185,11 @@ impl VllmPDRouter {
         // The prepared selection gates deferral; token inputs are retained so
         // cache matches can be recomputed against the tree at dispatch.
         let decode_cache = decode_cache.map(Arc::new);
-        let session_id = (prefill_policy.needs_session_id() || decode_policy.needs_session_id())
-            .then(|| {
-                crate::request_identity::resolve_session_key(
-                    headers,
-                    crate::request_identity::IdentityFields::from_body(request),
-                )
-            })
-            .flatten();
+        let session_id = routing_session_key(
+            prefill_policy.needs_session_id() || decode_policy.needs_session_id(),
+            headers,
+            IdentityFields::from_body(request),
+        );
         let context = PdRequestContext {
             prefill_inputs: prefill_inputs.as_ref(),
             model_id,
@@ -1703,15 +1701,11 @@ impl VllmPDRouter {
         let policy_headers = policy
             .needs_headers()
             .then(|| header_utils::to_policy_headers(headers).unwrap_or_default());
-        let session_id = policy
-            .needs_session_id()
-            .then(|| {
-                crate::request_identity::resolve_session_key(
-                    headers,
-                    crate::request_identity::IdentityFields::from_body(request),
-                )
-            })
-            .flatten();
+        let session_id = routing_session_key(
+            policy.needs_session_id(),
+            headers,
+            IdentityFields::from_body(request),
+        );
         // Both callers index the worker slice with this value. A policy that
         // returns an out-of-range index is a policy bug, but it must degrade to
         // the same "no feasible P" 503 as an empty pool instead of panicking the

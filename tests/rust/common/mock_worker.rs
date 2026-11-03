@@ -555,9 +555,13 @@ async fn completions_handler(
 
 async fn responses_handler(
     State(config): State<Arc<RwLock<MockWorkerConfig>>>,
+    headers: axum::http::HeaderMap,
     Json(payload): Json<serde_json::Value>,
 ) -> Response {
     let config = config.read().await;
+
+    // Capture request for test inspection
+    capture_request(config.port, "/v1/responses", &headers);
 
     if should_fail(&config).await {
         return (
