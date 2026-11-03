@@ -352,3 +352,7 @@ codegen-units = 1
 [profile.dev-opt]
 inherits = "dev"
 opt-level = 1
+
+[[test]]
+name = "test_concurrency_limit"
+path = "tests/rust/test_concurrency_limit.rs"
