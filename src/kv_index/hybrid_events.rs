@@ -1024,4 +1024,78 @@ mod tests {
         assert_eq!(empty_checkpoints.apply_batch(1, &batch(6, 1)), Ok(()));
         assert_eq!(empty_checkpoints.reusable_tokens(&tokens, usize::MAX), 1920);
     }
+
+    #[test]
+    fn qwen35_checkpoint_groups_may_omit_hashes_on_a_reused_chunk() {
+        // Captured from Qwen3.5-4B on vLLM 0.33 (block size 576): re-running a
+        // cached prompt emits a stored event whose Mamba groups carry zero
+        // hashes and a parent, while full attention carries one hash.
+        let tokens: Vec<u32> = (0..2048).map(|i| 100 + i % 100).collect();
+        let keys = BlockKeyGenerator::new(576, 0).generate_block_keys(&tokens);
+        let groups: Vec<HybridEventGroup> = (0..4)
+            .map(|group_idx| HybridEventGroup {
+                group_idx,
+                block_size: 576,
+                kind: if group_idx == 3 {
+                    HybridGroupKind::FullAttention
+                } else {
+                    HybridGroupKind::Checkpoint
+                },
+            })
+            .collect();
+        let store = |group_idx: u32, hashes: Vec<ExternalBlockHash>, tokens_len: usize| {
+            let n = hashes.len();
+            KVEvent::BlockStored(BlockStored {
+                block_hashes: hashes,
+                parent_block_hash: None,
+                token_ids: tokens[..tokens_len].to_vec(),
+                block_size: 576,
+                lora_id: None,
+                medium: Some("GPU".into()),
+                lora_name: None,
+                extra_keys: Some(vec![rmpv::Value::Nil; n]),
+                group_idx: Some(group_idx),
+                kv_cache_spec_kind: Some(
+                    if group_idx == 3 {
+                        "full_attention"
+                    } else {
+                        "mamba"
+                    }
+                    .into(),
+                ),
+                kv_cache_spec_sliding_window: None,
+                locality: None,
+                ownership: None,
+                session_id: None,
+            })
+        };
+        let h = |i: usize| ExternalBlockHash::Bytes(keys[i].to_vec());
+        let index = HybridEventIndex::new(target(), groups, 576, 0, 64).unwrap();
+        index.begin_empty(0);
+        let first = KVEventBatch {
+            ts: 1.0,
+            data_parallel_rank: Some(0),
+            events: vec![
+                store(0, vec![h(2)], 1728),
+                store(1, vec![h(2)], 1728),
+                store(2, vec![h(2)], 1728),
+                store(3, vec![h(0), h(1), h(2)], 1728),
+            ],
+        };
+        assert_eq!(index.apply_batch(0, &first), Ok(()));
+        assert_eq!(index.reusable_tokens(&tokens, usize::MAX), 1728);
+        // Re-run of the same prompt: checkpoints publish nothing new.
+        let rerun = KVEventBatch {
+            ts: 2.0,
+            data_parallel_rank: Some(0),
+            events: vec![
+                store(0, vec![], 576),
+                store(1, vec![], 576),
+                store(2, vec![], 576),
+                store(3, vec![h(0)], 576),
+            ],
+        };
+        assert_eq!(index.apply_batch(1, &rerun), Ok(()));
+        assert_eq!(index.reusable_tokens(&tokens, usize::MAX), 1728);
+    }
 }

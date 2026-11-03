@@ -156,6 +156,11 @@ pub(super) fn validate_full_attention_batch(
                     || s.lora_name.as_ref().is_some_and(|name| name.is_empty())
                 {
                     Some(FullAttentionRejectionReason::Adapter)
+                } else if s.block_hashes.is_empty() {
+                    // Dense attention stores one hash per block, so an empty
+                    // list is meaningless here. Only a sparse checkpoint group
+                    // may legitimately publish none.
+                    Some(FullAttentionRejectionReason::TokenCountMismatch)
                 } else if s.block_size == 0 {
                     Some(FullAttentionRejectionReason::ZeroBlockSize)
                 } else if s.block_size != expected_block_size {
@@ -171,6 +176,8 @@ pub(super) fn validate_full_attention_batch(
             KVEvent::BlockRemoved(r) => {
                 if r.group_idx.is_some_and(|group| group != 0) {
                     Some(FullAttentionRejectionReason::Layout)
+                } else if r.block_hashes.is_empty() {
+                    Some(FullAttentionRejectionReason::TokenCountMismatch)
                 } else {
                     (!is_supported_residency(
                         r.medium.as_deref(),
@@ -356,5 +363,33 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn legacy_path_rejects_empty_hash_lists() {
+        let batch = crate::kv_index::wire::KVEventBatch {
+            ts: 0.0,
+            events: vec![crate::kv_index::wire::KVEvent::BlockStored(
+                crate::kv_index::wire::BlockStored {
+                    block_hashes: vec![],
+                    parent_block_hash: None,
+                    token_ids: vec![1, 2],
+                    block_size: 2,
+                    medium: Some("GPU".into()),
+                    locality: Some("LOCAL".into()),
+                    ownership: None,
+                    lora_id: None,
+                    lora_name: None,
+                    extra_keys: None,
+                    group_idx: Some(0),
+                    kv_cache_spec_kind: Some("full_attention".into()),
+                    kv_cache_spec_sliding_window: None,
+                    session_id: None,
+                },
+            )],
+            data_parallel_rank: None,
+        };
+        let r = validate_full_attention_batch(&batch, 2);
+        assert!(r.is_err(), "{r:?}");
     }
 }
