@@ -13,14 +13,14 @@ pip install pre-commit && pre-commit install
 ## Pipeline Files
 
 `pipeline.yml` builds the release binary and wheel, pushes the NVIDIA CI image, then uploads L1, L2, and L3.
-Those uploads depend on the build step, not on each other. Jobs in each uploaded file depend on that upload step. The L1 and L3 NVIDIA P/D jobs also wait for `image-build`. `NIGHTLY=1` on this test pipeline selects tests. `NIGHTLY=1`
+Those uploads depend on the build step, not on each other. Jobs in each uploaded file depend on that upload step. The L1 and L3 NVIDIA P/D jobs, and the L3 gRPC perf job, also wait for `image-build`. `NIGHTLY=1` on this test pipeline selects tests. `NIGHTLY=1`
 on `release-pipeline.yml` (the `router-release` pipeline) publishes images.
 
 | File | Level | When it is uploaded | What runs |
 | --- | --- | --- | --- |
-| `test-ready.yml` | L1 ready | non-default branch labeled `ready` | Rust and Python unit/integration tests, one NVIDIA P/D completion (`ROCM_ONLY != 1` on that job) |
+| `test-ready.yml` | L1 ready | non-default branch labeled `ready` | Rust and Python unit/integration tests, one NVIDIA P/D completion, and kv_aware e2e on 2× L4 (`ROCM_ONLY != 1` on the GPU jobs) |
 | `test-merge.yml` | L2 merge | default branch (except `NIGHTLY=1`), its merge queue, or any other branch labeled `merge-test` | one-mode xGMI smoke and RDMA `SMOKE_ONLY` |
-| `test-nightly.yml` | L3 nightly | default branch with `NIGHTLY=1`, or any other branch labeled `nightly-test` | Rust and Python unit/integration tests (skipped when the PR also has `ready`), full NVIDIA GSM8K (`ROCM_ONLY != 1`), full xGMI matrix, full RDMA |
+| `test-nightly.yml` | L3 nightly | default branch with `NIGHTLY=1`, or any other branch labeled `nightly-test` | Rust and Python unit/integration tests (skipped when the PR also has `ready`), full NVIDIA GSM8K (`ROCM_ONLY != 1`), gRPC prefix-KV perf on 2× H100 (`ROCM_ONLY != 1`), full xGMI matrix, full RDMA |
 | `release-pipeline.yml` | release | tag / release pipeline | wheels and images only |
 
 A pull request labeled `ready` uploads `test-ready.yml`, including forks.
@@ -28,11 +28,15 @@ A pull request labeled `ready` uploads `test-ready.yml`, including forks.
 
 GPU machine presets are in [`ci_mirror_hardwares.yml`](ci_mirror_hardwares.yml).
 A step names one with `mirror_hardwares`. `scripts/upload_pipeline.py` expands
-that name into `agents` and `plugins` before Buildkite upload.
+that name into `agents` and `plugins` before Buildkite upload. A preset that
+injects `VLLM_CI_HF_TOKEN` also exports that value as `HF_TOKEN` in the job
+shell. A build-level `HF_TOKEN` would override a pod env entry of the same name.
 
 | Name | Machine |
 | --- | --- |
+| `l4_2` | EKS `l4-k8s`, same `l4x4` pool, pod requests 2× L4, same CI image |
 | `l4_4` | EKS `l4-k8s`, 4× L4, image `public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:router-$BUILDKITE_COMMIT` |
+| `h100_2` | `mithril-h100-pool`, 2× H100 SXM, us-west-2 pull-through cache of the router CI image, GPU limit 2 |
 | `mi300_2` | `router_rocm_mi300_2`, same-host xGMI Docker devices |
 | `mi300_rdma` | `router_rocm_mi300_2` coordinator, no Docker plugin |
 
@@ -83,6 +87,25 @@ Full GSM8K stays in `test-nightly.yml`. Both include forks.
 - Automatic retry (up to 2 attempts) for flaky failures
 - Manual retry option available
 
+### gRPC P/D coverage
+
+`run_grpc_pd_accuracy_test.sh` is the Rust gRPC counterpart, with the same
+layout as the HTTP job: one prefill and one decode, each at data-parallel size
+2, on four L4s. Workers are `vllm-rs serve --grpc-port`, and the router runs
+`--prefill grpc://… --decode grpc://… --intra-node-data-parallel-size 2`.
+Workers must be vLLM ≥ 0.30.0. The client uses `/v1/chat/completions`, then
+the same GSM8K check as the HTTP job. It follows the HTTP split: a `ready`
+label runs the chat check only from `test-ready.yml` (`RUN_LM_EVAL=0`, 4
+non-streaming and 1 streaming request), and full GSM8K stays in
+`test-nightly.yml`. Both use the `l4_4` image and wait for `image-build`.
+The shared NVIDIA CI image pins `vllm==0.30.0` to satisfy the worker minimum.
+`ROCM_ONLY=1` skips them along with the HTTP steps.
+
+The pytest wrapper is `tests/python/integration/test_grpc_pd_disagg.py`.
+Its #447 marks are level `ready` and `hardware_test(res={"cuda": "L4"}, num_cards=4)`,
+which attaches `L4`, `cuda`, `gpu`, and `cards_4`. The CPU job selects
+`ready and cpu`, so this test stays on the GPU step.
+
 ### ROCm MoRI coverage
 
 The dedicated `router_rocm_mi300_2` queue covers two MoRI lanes:
@@ -105,8 +128,8 @@ scheduled `NIGHTLY=1`, a pull request labeled `nightly-test`, or a manual/API
 build with `RUN_ROCM_RDMA=1`.
 
 ROCm-only scheduled builds should set both `NIGHTLY=1` and `ROCM_ONLY=1`.
-`ROCM_ONLY=1` skips the NVIDIA four-GPU step while retaining the CPU build
-that supplies the router artifact to the ROCm jobs.
+`ROCM_ONLY=1` skips the NVIDIA four-GPU step and the H100 gRPC perf job
+while retaining the CPU build that supplies the router artifact to the ROCm jobs.
 
 The L3 matrices use a digest-pinned ROCm vLLM image and run health, sanity,
 and 500-example GSM8K accuracy checks. The RDMA job is coordinator-owned and
@@ -193,6 +216,7 @@ Builds Docker image for the router.
 
 - `medium_cpu_queue_premerge`: CPU-only tasks (builds, lints, unit tests)
 - `l4-k8s`: NVIDIA L4 GPU tests on EKS (4-GPU P/D disaggregation)
+- `mithril-h100-pool`: NVIDIA H100 SXM tests (2-GPU gRPC prefix-KV perf)
 - `router_rocm_mi300_2`: dedicated two-node MI300X MoRI tests (`spawn=1`)
 - `default`: General purpose queue
 
