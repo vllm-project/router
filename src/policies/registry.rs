@@ -282,8 +282,8 @@ impl PolicyRegistry {
     /// This fans out to the default policy, every per-model policy, and the
     /// prefill/decode policies (for PD mode), since we don't know which policy
     /// instance is tracking the session. Registry locks are released before
-    /// calling into the policies.
-    pub fn finish_session(&self, session_id: &str) {
+    /// calling into the policies. Returns whether any policy held the session.
+    pub fn finish_session(&self, session_id: &str) -> bool {
         let mut policies: Vec<Arc<dyn LoadBalancingPolicy>> = self
             .model_policies
             .read()
@@ -294,10 +294,11 @@ impl PolicyRegistry {
         policies.extend(self.prefill_policy.read().unwrap().clone());
         policies.extend(self.decode_policy.read().unwrap().clone());
 
-        self.default_policy.finish_session(session_id);
+        let mut released = self.default_policy.finish_session(session_id);
         for policy in policies {
-            policy.finish_session(session_id);
+            released |= policy.finish_session(session_id);
         }
+        released
     }
 
     /// Clear all policies (useful for testing). Policy rebuilds also drop

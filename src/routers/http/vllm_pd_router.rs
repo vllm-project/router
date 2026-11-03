@@ -18,6 +18,7 @@ use crate::policies::{
     PolicyRegistry, WorkerTokenInputs,
 };
 use crate::program_scheduling::ProgramIdentity;
+use crate::request_identity::{routing_session_key, IdentityFields};
 use crate::routers::{header_utils, RouterTrait, WorkerManagement};
 use async_trait::async_trait;
 use axum::{
@@ -1039,14 +1040,11 @@ impl VllmPDRouter {
                 })
         });
         let affinity_key = Self::extract_affinity_key(decode_policy.as_ref(), headers, request);
-        let session_id = (prefill_policy.needs_session_id() || decode_policy.needs_session_id())
-            .then(|| {
-                crate::request_identity::resolve_session_key(
-                    headers,
-                    crate::request_identity::IdentityFields::from_body(request),
-                )
-            })
-            .flatten();
+        let session_id = routing_session_key(
+            prefill_policy.needs_session_id() || decode_policy.needs_session_id(),
+            headers,
+            IdentityFields::from_body(request),
+        );
         let context = PdRequestContext {
             prefill_inputs: prefill_inputs.as_ref(),
             model_id,
@@ -1318,15 +1316,11 @@ impl VllmPDRouter {
         let policy_headers = policy
             .needs_headers()
             .then(|| header_utils::to_policy_headers(headers).unwrap_or_default());
-        let session_id = policy
-            .needs_session_id()
-            .then(|| {
-                crate::request_identity::resolve_session_key(
-                    headers,
-                    crate::request_identity::IdentityFields::from_body(request),
-                )
-            })
-            .flatten();
+        let session_id = routing_session_key(
+            policy.needs_session_id(),
+            headers,
+            IdentityFields::from_body(request),
+        );
         let index = policy.select_worker_for_session(
             &workers,
             request_text.as_deref(),

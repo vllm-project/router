@@ -28,7 +28,7 @@ use crate::protocols::spec::{
     GrpcRequestRef, InferenceGenerateRequest, RerankRequest, RerankResponse, RerankResult,
     ResponsesRequest,
 };
-use crate::request_identity::{resolve_affinity_identity, resolve_session_key, IdentityFields};
+use crate::request_identity::{resolve_affinity_identity, routing_session_key, IdentityFields};
 use crate::routers::header_utils;
 use crate::routers::http::dp_utils;
 use crate::routers::{RouterTrait, WorkerManagement};
@@ -1509,11 +1509,11 @@ impl Router {
                     })
             });
 
-        let session_id = self
-            .policy_for_model(model_id)
-            .needs_session_id()
-            .then(|| resolve_session_key(headers, typed_req.affinity_identity()))
-            .flatten();
+        let session_id = routing_session_key(
+            self.policy_for_model(model_id).needs_session_id(),
+            headers,
+            typed_req.affinity_identity(),
+        );
 
         let http_inputs = &http_inputs;
         let failed_workers = &failed_workers;
@@ -3128,10 +3128,11 @@ impl RouterTrait for Router {
             let cache_key = (policy.needs_cache_routing_key())
                 .then(|| crate::protocols::spec::cache_routing::for_route(&body, path));
             let request_headers = header_utils::to_policy_headers(headers);
-            let session_id = policy
-                .needs_session_id()
-                .then(|| resolve_session_key(headers, IdentityFields::from_body(&body)))
-                .flatten();
+            let session_id = routing_session_key(
+                policy.needs_session_id(),
+                headers,
+                IdentityFields::from_body(&body),
+            );
             policy
                 .select_worker_for_session(
                     &workers,

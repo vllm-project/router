@@ -13,6 +13,7 @@ use crate::{
         },
         worker_spec::{WorkerApiResponse, WorkerConfigRequest, WorkerErrorResponse},
     },
+    request_identity::{resolve_session_key, IdentityFields},
     routers::{
         router_manager::{RouterId, RouterManager},
         RouterFactory, RouterTrait,
@@ -616,29 +617,51 @@ async fn scheduling_diagnostics(
     }
 }
 
-#[derive(Deserialize)]
-struct FinishSessionQuery {
-    session_id: String,
-}
-
-/// POST /finish_session?session_id=<id>
+/// POST /finish_session
 ///
 /// Marks a session (e.g. an RL trajectory) as finished so that session-aware
-/// routing policies (e.g. `sticky_least_loaded`) can release the
-/// replica capacity held by the session. For policies that don't track
-/// sessions, this is a no-op. Unknown session ids are ignored.
+/// routing policies (e.g. `sticky_least_loaded`) can release the replica
+/// capacity held by the session. The session is named with the same identity
+/// fields as a request: session headers, and `session_params`, `session_id`,
+/// `agent_hint` or `vllm_xargs.agentic_context` in an optional JSON body.
+/// `released` reports whether any policy held the session.
 async fn finish_session(
     State(state): State<Arc<AppState>>,
-    Query(FinishSessionQuery { session_id }): Query<FinishSessionQuery>,
     headers: http::HeaderMap,
+    body: axum::body::Bytes,
 ) -> Response {
     if let Err(response) = authorize_request(&state, &headers).await {
         return response;
     }
 
-    state.context.policy_registry.finish_session(&session_id);
+    let body = if body.is_empty() {
+        serde_json::Value::Null
+    } else {
+        match serde_json::from_slice(&body) {
+            Ok(body) => body,
+            Err(error) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    format!("Invalid JSON body: {error}"),
+                )
+                    .into_response()
+            }
+        }
+    };
+    let session_id = match resolve_session_key(Some(&headers), IdentityFields::from_body(&body)) {
+        Ok(Some(session_id)) => session_id,
+        Ok(None) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "No session identity in the request headers or body",
+            )
+                .into_response()
+        }
+        Err(error) => return (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+    };
 
-    Json(json!({ "status": "ok", "session_id": session_id })).into_response()
+    let released = state.context.policy_registry.finish_session(&session_id);
+    Json(json!({ "status": "ok", "session_id": session_id, "released": released })).into_response()
 }
 
 // ---------- Worker management endpoints (RESTful) ----------
