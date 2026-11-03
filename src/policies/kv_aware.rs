@@ -1319,7 +1319,11 @@ impl KvAwarePolicy {
 
             let (worker_index, new_prefill_tokens, decision) =
                 self.decision_for_position(&plan, &candidates, &costs, &components, position);
-            let outcome = if used_binding {
+            let outcome = if used_binding && !plan.has_tokens {
+                // Without exact tokens the binding is only advisory: it chose
+                // the worker, but nothing proves the cache is there.
+                "sticky_hit_untokenized"
+            } else if used_binding {
                 "sticky_hit"
             } else if !plan.has_tokens {
                 "missing_tokens"
@@ -3209,6 +3213,50 @@ mod tests {
         record.state.lock().idle_deadline = None;
         policy.register_target(worker.url(), record.target.clone());
         assert!(!policy.has_affinity(&workers, None, None, &key));
+    }
+
+    #[test]
+    fn untokenized_binding_is_advisory_and_never_credits_prefill() {
+        let policy = KvAwarePolicy::default();
+        let workers = registered_worker_pair(&policy);
+        let key = affinity_key("tools-session");
+
+        // First turn has no exact tokens: it binds, but with no credit.
+        let first = policy
+            .select_worker_with_receipt(&workers, None, None, None, Some(&key), &[])
+            .unwrap();
+        assert_eq!(first.new_prefill_tokens, 0);
+        release_receipt(&workers, &first);
+
+        // Later turns reuse the worker, still without any prefill reduction.
+        workers[first.worker_index].increment_load();
+        let second = policy
+            .select_worker_with_receipt(&workers, None, None, None, Some(&key), &[])
+            .unwrap();
+        assert_eq!(second.worker_index, first.worker_index);
+        assert_eq!(second.new_prefill_tokens, 0);
+        release_receipt(&workers, &second);
+
+        // Identity isolation: a LoRA or salt changes the binding scope.
+        let adapter = policy
+            .select_worker_with_receipt(&workers, None, Some("adapter"), None, Some(&key), &[])
+            .unwrap();
+        assert!(policy
+            .affinity
+            .get(&key.scoped_digest(Some("adapter"), None))
+            .is_some());
+        release_receipt(&workers, &adapter);
+        workers[first.worker_index].decrement_load();
+
+        // With exact tokens but no verified cache, the same binding must still
+        // charge the full input: affinity picks the worker, never the credit.
+        let prompt: Vec<u32> = (0..64).collect();
+        let tokenized = policy
+            .select_worker_with_receipt(&workers, Some(&prompt), None, None, Some(&key), &[])
+            .unwrap();
+        assert_eq!(tokenized.worker_index, first.worker_index);
+        assert_eq!(tokenized.new_prefill_tokens, prompt.len() as u64);
+        release_receipt(&workers, &tokenized);
     }
 
     #[test]
