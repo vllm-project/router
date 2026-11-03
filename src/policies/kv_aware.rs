@@ -24,12 +24,15 @@ pub trait TieredMatchProvider: Send + Sync {
     /// Providers with group-dependent restore rules can match the original
     /// prompt instead of the dense index's independent local block hashes.
     /// `None` selects the existing dense-index path; `Some`, including an
-    /// empty result, must never fall back to a single group.
+    /// empty result, must never fall back to a single group. `dp_rank` is the
+    /// instance that will serve the request: hybrid state, ownership and
+    /// history are bound to that rank, so another rank's hit is not evidence.
     fn find_token_matches(
         &self,
         _tokens: &[u32],
         _block_size: u32,
         _lora_name: Option<&str>,
+        _dp_rank: u32,
     ) -> Option<Vec<TierMatch>> {
         None
     }
@@ -496,6 +499,11 @@ const KV_AFFINITY_MAX_RECORDS: usize = 10_000;
 
 const AFFINITY_DIGEST_DOMAIN: &str = "kv_affinity.v1";
 
+/// Advisory bindings are kept in their own namespace. A request without exact
+/// token evidence can follow multi-turn affinity, but the binding it creates
+/// must never be mistaken for a cache hit by a later tokenized request.
+const ADVISORY_DIGEST_DOMAIN: &str = "kv_advisory_affinity.v1";
+
 /// Stable identity extracted at request entry for KV session affinity.
 ///
 /// Reuses the shared stable identity parsing (canonical context, agent_hint,
@@ -519,7 +527,15 @@ impl AffinityKey {
     }
 
     pub fn scoped_digest(&self, lora_name: Option<&str>, cache_salt: Option<&str>) -> [u8; 32] {
-        self.digest_fields(None, lora_name, cache_salt)
+        self.digest_fields(AFFINITY_DIGEST_DOMAIN, None, lora_name, cache_salt)
+    }
+
+    /// Advisory digest for requests whose exact tokens are unavailable, such
+    /// as tool-calling or reasoning requests that a backend cannot render.
+    /// Bindings in this namespace influence selection only: they never carry
+    /// KV credit, and a tokenized request never resolves to one.
+    pub fn advisory_digest(&self, lora_name: Option<&str>, cache_salt: Option<&str>) -> [u8; 32] {
+        self.digest_fields(ADVISORY_DIGEST_DOMAIN, Some("regular"), lora_name, cache_salt)
     }
 
     /// Stage-scoped digest for P/D binding: the same session identity never
@@ -530,18 +546,19 @@ impl AffinityKey {
         lora_name: Option<&str>,
         cache_salt: Option<&str>,
     ) -> [u8; 32] {
-        self.digest_fields(Some(stage), lora_name, cache_salt)
+        self.digest_fields(AFFINITY_DIGEST_DOMAIN, Some(stage), lora_name, cache_salt)
     }
 
     fn digest_fields(
         &self,
+        domain: &str,
         stage: Option<&str>,
         lora_name: Option<&str>,
         cache_salt: Option<&str>,
     ) -> [u8; 32] {
         let mut hasher = Sha256::new();
         for field in [
-            AFFINITY_DIGEST_DOMAIN.as_bytes(),
+            domain.as_bytes(),
             self.model_scope.as_bytes(),
             self.source.as_bytes(),
             self.identity.as_bytes(),
@@ -1108,9 +1125,12 @@ impl KvAwarePolicy {
     ) -> Vec<TierMatch> {
         if enabled {
             if let Some(hits) = token_ids.and_then(|ids| {
-                binding
-                    .matches
-                    .find_token_matches(ids, binding.block_size, lora_name)
+                binding.matches.find_token_matches(
+                    ids,
+                    binding.block_size,
+                    lora_name,
+                    binding.target.dp_rank,
+                )
             }) {
                 return hits;
             }
@@ -1234,6 +1254,7 @@ impl KvAwarePolicy {
         excluded_workers: &[String],
     ) -> Option<KvSelectionReceipt> {
         let digest = affinity_key.map(|key| key.scoped_digest(lora_name, cache_salt));
+        let advisory_digest = affinity_key.map(|key| key.advisory_digest(lora_name, cache_salt));
         // Re-query at most three times under registration churn. The final
         // attempt snapshots current targets and reserves using live load only.
         for attempt in 0..=3 {
@@ -1279,10 +1300,26 @@ impl KvAwarePolicy {
             let candidates = self.candidate_views(workers, &plan);
             let (costs, components) = self.score_candidates(&plan, &candidates)?;
 
-            // Recheck the table inside the critical section.
-            let acquired = digest
+            // Recheck the table inside the critical section. A request without
+            // exact tokens may follow an existing exact binding, but a binding
+            // it creates lives in the advisory namespace and never becomes
+            // cache evidence.
+            let exact = digest
                 .as_ref()
                 .and_then(|digest| self.affinity.acquire(digest));
+            let (acquired, from_advisory) = match exact {
+                Some(record) => (Some(record), false),
+                // Multi-turn affinity survives a turn that had no exact
+                // tokens (tools, reasoning, a backend that cannot render):
+                // a later turn may follow that advisory binding, but the
+                // binding itself still contributes no cache credit.
+                None => (
+                    advisory_digest
+                        .as_ref()
+                        .and_then(|digest| self.affinity.acquire(digest)),
+                    true,
+                ),
+            };
             let used_binding = acquired
                 .as_ref()
                 .and_then(|record| self.affinity_position(&plan, record))
@@ -1306,7 +1343,12 @@ impl KvAwarePolicy {
                     let binding = &plan.bindings[position];
                     // Retry exclusions preserve a valid binding; unregistered
                     // targets cannot establish one without a generation.
-                    let record = digest
+                    let bind_digest = if plan.has_tokens {
+                        digest
+                    } else {
+                        advisory_digest
+                    };
+                    let record = bind_digest
                         .filter(|_| valid.is_none() && binding.generation != 0)
                         .and_then(|digest| {
                             self.affinity
@@ -1316,15 +1358,20 @@ impl KvAwarePolicy {
                 }
             };
             let target = plan.bindings[position].target.clone();
+            let advisory_bind = !plan.has_tokens && record.is_some();
 
             let (worker_index, new_prefill_tokens, decision) =
                 self.decision_for_position(&plan, &candidates, &costs, &components, position);
-            let outcome = if used_binding && !plan.has_tokens {
-                // Without exact tokens the binding is only advisory: it chose
-                // the worker, but nothing proves the cache is there.
+            let outcome = if used_binding && from_advisory {
+                "advisory_hit"
+            } else if used_binding && !plan.has_tokens {
+                // An exact binding chosen by a tokenized request still gives no
+                // cache evidence to a request without tokens.
                 "sticky_hit_untokenized"
             } else if used_binding {
                 "sticky_hit"
+            } else if advisory_bind {
+                "advisory_bind"
             } else if !plan.has_tokens {
                 "missing_tokens"
             } else if let Some(reason) = Self::credit_fallback(cache_salt, true) {
@@ -1468,9 +1515,12 @@ impl KvAwarePolicy {
                     let token_matches = credit_fallback
                         .is_none()
                         .then(|| {
-                            binding
-                                .matches
-                                .find_token_matches(ids, binding.block_size, lora_name)
+                            binding.matches.find_token_matches(
+                                ids,
+                                binding.block_size,
+                                lora_name,
+                                binding.target.dp_rank,
+                            )
                         })
                         .flatten();
                     let hits = if let Some(hits) = token_matches {
@@ -1754,7 +1804,12 @@ impl KvAwareOps for KvAwarePolicy {
     ) -> bool {
         let _guard = self.selection_lock.lock();
         let records = self.affinity.records.lock();
-        let Some(record) = records.peek(&affinity_key.scoped_digest(lora_name, cache_salt)) else {
+        // A tools/reasoning turn only ever creates an advisory binding; it is
+        // still a usable multi-turn affinity signal for the next turn.
+        let record = records
+            .peek(&affinity_key.scoped_digest(lora_name, cache_salt))
+            .or_else(|| records.peek(&affinity_key.advisory_digest(lora_name, cache_salt)));
+        let Some(record) = record else {
             return false;
         };
         !record.is_expired(Instant::now())
@@ -1803,11 +1858,12 @@ impl KvAwareOps for KvAwarePolicy {
                 let mut new_prefill_tokens = 0u64;
                 for tokens in prompts {
                     let hits = if verified {
-                        if let Some(hits) =
-                            binding
-                                .matches
-                                .find_token_matches(tokens, binding.block_size, None)
-                        {
+                        if let Some(hits) = binding.matches.find_token_matches(
+                            tokens,
+                            binding.block_size,
+                            None,
+                            binding.target.dp_rank,
+                        ) {
                             hits
                         } else {
                             query_cache
@@ -2146,7 +2202,7 @@ mod tests {
         assert_eq!(estimates[0].new_prefill_tokens, 1024);
         assert_eq!(estimates[1].new_prefill_tokens, 496);
         assert!(indexes[1]
-            .find_token_matches(&prompt, 528, Some("adapter"))
+            .find_token_matches(&prompt, 528, Some("adapter"), 0)
             .unwrap()
             .is_empty());
         indexes[1].invalidate();
@@ -3207,7 +3263,7 @@ mod tests {
         worker.set_healthy(false);
         assert!(!policy.has_affinity(&workers, None, None, &key));
         worker.set_healthy(true);
-        let record = policy.affinity.get(&key.scoped_digest(None, None)).unwrap();
+        let record = policy.affinity.get(&key.advisory_digest(None, None)).unwrap();
         record.state.lock().idle_deadline = Some(Instant::now());
         assert!(!policy.has_affinity(&workers, None, None, &key));
         record.state.lock().idle_deadline = None;
@@ -3237,14 +3293,19 @@ mod tests {
         assert_eq!(second.new_prefill_tokens, 0);
         release_receipt(&workers, &second);
 
-        // Identity isolation: a LoRA or salt changes the binding scope.
+        // Identity isolation: a LoRA or salt changes the binding scope. An
+        // untokenized turn binds in the advisory namespace, never the exact one.
         let adapter = policy
             .select_worker_with_receipt(&workers, None, Some("adapter"), None, Some(&key), &[])
             .unwrap();
         assert!(policy
             .affinity
-            .get(&key.scoped_digest(Some("adapter"), None))
+            .get(&key.advisory_digest(Some("adapter"), None))
             .is_some());
+        assert!(policy
+            .affinity
+            .get(&key.scoped_digest(Some("adapter"), None))
+            .is_none());
         release_receipt(&workers, &adapter);
         workers[first.worker_index].decrement_load();
 
@@ -3423,7 +3484,7 @@ mod tests {
             .unwrap();
         release_receipt(&workers, &first);
 
-        assert!(table.get(&key.scoped_digest(None, None)).is_none());
+        assert!(table.get(&key.advisory_digest(None, None)).is_none());
     }
 
     #[test]
@@ -3442,7 +3503,7 @@ mod tests {
         release_receipt(&workers, &first);
 
         let record = table
-            .get(&key.scoped_digest(None, None))
+            .get(&key.advisory_digest(None, None))
             .expect("registered target binds");
         assert_eq!(record.state.lock().in_flight, 0);
     }
@@ -3847,7 +3908,10 @@ mod tests {
                 &[],
             )
             .unwrap();
-        let original = policy.affinity.get(&key.scoped_digest(None, None)).unwrap();
+        let original = policy
+            .affinity
+            .get(&key.advisory_digest(None, None))
+            .unwrap();
         release_receipt(std::slice::from_ref(&worker), &initial);
         ops.unregister_worker(worker.url());
         assert!(policy.affinity.is_empty());

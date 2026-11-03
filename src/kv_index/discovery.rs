@@ -97,7 +97,9 @@ struct WorkerSubs {
 }
 
 struct HybridWorkerProvider {
-    indexes: Vec<Arc<HybridEventIndex>>,
+    /// One index per admitted DP rank. Ranks are independent instances: a
+    /// lookup for one rank must never see another rank's claims.
+    indexes: HashMap<u32, Arc<HybridEventIndex>>,
     active: Arc<AtomicBool>,
     verified_at: Mutex<Instant>,
     capability: HybridCapabilities,
@@ -113,25 +115,28 @@ impl crate::policies::TieredMatchProvider for HybridWorkerProvider {
         tokens: &[u32],
         block_size: u32,
         lora: Option<&str>,
+        dp_rank: u32,
     ) -> Option<Vec<super::TierMatch>> {
         if !self.active.load(Ordering::Acquire)
             || self.verified_at.lock().elapsed() > Duration::from_secs(5)
         {
             return Some(Vec::new());
         }
+        // An unadmitted rank is a miss for that rank, never a fallback to a
+        // sibling rank's state or to the legacy single-group index.
         let hits = self
             .indexes
-            .iter()
-            .flat_map(|index| {
+            .get(&dp_rank)
+            .and_then(|index| {
                 crate::policies::TieredMatchProvider::find_token_matches(
                     index.as_ref(),
                     tokens,
                     block_size,
                     lora,
+                    dp_rank,
                 )
-                .unwrap_or_default()
             })
-            .collect();
+            .unwrap_or_default();
         if !self.active.load(Ordering::Acquire)
             || self.verified_at.lock().elapsed() > Duration::from_secs(5)
         {
@@ -479,22 +484,45 @@ impl KvIndexSupervisor {
         }
 
         let hybrid_indexes = if let Some(capability) = &hybrid_capability {
-            if event_sources.is_empty()
-                || event_sources.len() != capability.ranks.len()
-                || capability.ranks.iter().any(|rank| rank.model != model_id)
-            {
-                return Err("hybrid capability does not cover the worker's event sources".into());
+            if event_sources.is_empty() {
+                return Err("hybrid capability has no event sources".into());
             }
-            let mut indexes = Vec::with_capacity(event_sources.len());
+            // Admit each rank on its own evidence. A rank whose topic, model or
+            // group layout does not match is that rank's miss; it must not
+            // revoke credit from its siblings or be reported as a deployment
+            // layout change.
+            let mut indexes: HashMap<u32, Arc<HybridEventIndex>> = HashMap::new();
             for source in &event_sources {
+                let Some(rank_capability) = capability.rank_capability(source.dp_rank) else {
+                    warn!(
+                        "kv_index {}: no hybrid capability for rank {}; rank will receive no cache credit",
+                        worker_url, source.dp_rank
+                    );
+                    continue;
+                };
+                if rank_capability.model != model_id {
+                    warn!(
+                        "kv_index {}: hybrid rank {} was captured for model {} but this worker serves {}; rank will receive no cache credit",
+                        worker_url, source.dp_rank, rank_capability.model, model_id
+                    );
+                    continue;
+                }
                 let target = super::RoutableTarget {
                     instance_id: source_id.clone(),
                     dp_rank: source.dp_rank,
                 };
-                let index = capability
-                    .index_for_source(source, target, 1_000_000)
-                    .map_err(str::to_owned)?;
-                indexes.push(Arc::new(index));
+                match capability.index_for_rank(source.dp_rank, source, target, 1_000_000) {
+                    Ok(index) => {
+                        indexes.insert(source.dp_rank, Arc::new(index));
+                    }
+                    Err(reason) => warn!(
+                        "kv_index {}: hybrid rank {} not admitted: {reason}; rank will receive no cache credit",
+                        worker_url, source.dp_rank
+                    ),
+                }
+            }
+            if indexes.is_empty() {
+                return Err("no hybrid rank has a verified layout".into());
             }
             Some(indexes)
         } else {
@@ -613,13 +641,18 @@ impl KvIndexSupervisor {
         let mut ranks = Vec::with_capacity(event_sources.len());
         let mut handles = Vec::with_capacity(event_sources.len());
         let mut hybrid_handles = Vec::new();
-        for (position, (ev, live)) in event_sources.into_iter().zip(&live_sources).enumerate() {
+        for (ev, live) in event_sources.into_iter().zip(&live_sources) {
             let rank = ev.dp_rank;
             if let Some(indexes) = &hybrid_indexes {
-                let stream = Arc::new(HybridEventStream::new(indexes[position].clone()));
-                let handle = super::hybrid_stream::spawn_zmq(ev, stream, self.ctx.clone())
-                    .expect("hybrid source was validated before registration");
-                hybrid_handles.push(Arc::new(handle));
+                // A hybrid-configured rank without an admitted index gets no
+                // subscriber at all: the legacy single-group index must not
+                // credit an unmodeled hybrid layout.
+                if let Some(index) = indexes.get(&rank) {
+                    let stream = Arc::new(HybridEventStream::new(index.clone()));
+                    let handle = super::hybrid_stream::spawn_zmq(ev, stream, self.ctx.clone())
+                        .expect("hybrid source was validated before registration");
+                    hybrid_handles.push(Arc::new(handle));
+                }
             } else {
                 let handle = crate::kv_index::subscriber::spawn_bound(
                     ev,
@@ -1900,7 +1933,7 @@ mod tests {
         let prompt: Vec<u32> = (0..1024).map(|i| 100 + i % 100).collect();
         tokio::time::timeout(Duration::from_secs(3), async {
             while provider
-                .find_token_matches(&prompt, 528, None)
+                .find_token_matches(&prompt, 528, None, 0)
                 .unwrap()
                 .is_empty()
             {
@@ -1921,7 +1954,7 @@ mod tests {
         sources.write().await["0"]["topic"] = serde_json::json!("hybrid/epoch-2");
         tokio::time::timeout(Duration::from_secs(5), async {
             while !provider
-                .find_token_matches(&prompt, 528, None)
+                .find_token_matches(&prompt, 528, None, 0)
                 .unwrap()
                 .is_empty()
             {
