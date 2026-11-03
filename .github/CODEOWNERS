@@ -7,3 +7,10 @@
 
 # Default owners (fallback reviewers for all files)
 * @hsliuustc0106 @wuhang2014
+
+# KV indexing and KV-aware routing
+/src/kv_index/ @KaisennHu
+/src/policies/kv_aware.rs @KaisennHu
+
+# Rust gRPC backend
+/src/backend/ @herotai214
