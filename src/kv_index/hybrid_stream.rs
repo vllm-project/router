@@ -203,6 +203,13 @@ pub fn spawn_zmq(
             }
             sub.set_subscribe(source.topic.as_bytes()).map_err(|_| ())?;
             sub.connect(&source.pub_endpoint).map_err(|_| ())?;
+            tracing::debug!(
+                endpoint = %source.pub_endpoint,
+                replay = %replay_endpoint,
+                topic = %source.topic,
+                rank = source.dp_rank,
+                "hybrid subscriber connecting"
+            );
             // A SUB socket can connect before its subscription reaches the
             // publisher. Do not expose a replay until a live event proves the
             // subscription is active and replay reaches at least that event.
@@ -232,6 +239,12 @@ pub fn spawn_zmq(
                     Err(_) => return Err(()),
                 }
             };
+            tracing::debug!(
+                endpoint = %source.pub_endpoint,
+                rank = source.dp_rank,
+                required_through,
+                "hybrid subscription barrier reached"
+            );
             loop {
                 if stopped(&shutdown_rx) || !stream.is_active(lease) {
                     return Ok(());
@@ -248,10 +261,12 @@ pub fn spawn_zmq(
                 )
                 .await;
                 let Some(mut next) = next else {
+                    tracing::debug!("hybrid replay produced no usable history");
                     stream.invalidate_replay(lease).map_err(|_| ())?;
                     tokio::time::sleep(Duration::from_millis(100)).await;
                     continue;
                 };
+                tracing::debug!(next, "hybrid replay complete");
                 let mut replaying = true;
                 loop {
                     if stopped(&shutdown_rx) || !stream.is_active(lease) {
@@ -291,6 +306,7 @@ pub fn spawn_zmq(
                                 required_through = seq;
                                 break;
                             }
+                            tracing::debug!(seq, rank = source.dp_rank, "hybrid live batch applied");
                             next = next.checked_add(1).ok_or(())?;
                         }
                         Ok(_) => return Err(()),

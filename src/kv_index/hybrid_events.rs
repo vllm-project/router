@@ -487,6 +487,16 @@ mod tests {
     use super::*;
     use crate::kv_index::wire::{BlockRemoved, BlockStored};
 
+    fn hex_root(value: &str) -> [u8; 32] {
+        assert_eq!(value.len(), 64);
+        let mut root = [0; 32];
+        for (out, pair) in root.iter_mut().zip(value.as_bytes().chunks_exact(2)) {
+            let nibble = |byte: u8| (byte as char).to_digit(16).unwrap() as u8;
+            *out = (nibble(pair[0]) << 4) | nibble(pair[1]);
+        }
+        root
+    }
+
     fn target() -> RoutableTarget {
         RoutableTarget {
             instance_id: Arc::from("w"),
@@ -634,6 +644,64 @@ mod tests {
         let payload = rmp_serde::to_vec_named(&batch.events[0]).unwrap();
         other.apply_payload(0, &payload).unwrap();
         assert_eq!(other.reusable_tokens(&prompt(), usize::MAX), 0);
+    }
+
+    /// Captured from vLLM 0.29 with `VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES=0`:
+    /// four `BlockStored` events (three mamba groups plus full attention) with
+    /// 32-byte block hashes and `data_parallel_rank: 0`.
+    ///
+    /// This engine ran its default `--prefix-caching-hash` (`sha256`, which
+    /// pickles the tuple) while the declared layout says `sha256_cbor`. Both
+    /// produce 32-byte digests, so only recomputing the digest exposes the
+    /// disagreement: the batch is a valid hybrid layout with a foreign hash
+    /// contract and must credit nothing.
+    #[test]
+    fn foreign_hash_contract_is_credited_as_nothing() {
+        let payload = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/rust/fixtures/kv_cbor/qwen35_vllm029.msgpack"
+        ));
+        let prompt: Vec<u32> = serde_json::from_slice(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/rust/fixtures/kv_cbor/qwen35_vllm029_prompt.json"
+        )))
+        .unwrap();
+        assert_eq!(prompt.len(), 601);
+        let root = hex_root("9bd96a485ad84efdafb72ee48a1d7a69bcead0f8f0433173941b276b9581eef0");
+        let index = HybridEventIndex::new_with_root_hash(target(), groups(), 528, root, 8).unwrap();
+        index.begin_empty(0);
+        index
+            .apply_payload(0, payload)
+            .expect("the batch is structurally valid");
+        assert_eq!(index.reusable_tokens(&prompt, usize::MAX), 0);
+    }
+
+    /// Captured from vLLM 0.29 with `--prefix-caching-hash sha256_cbor` and
+    /// `VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES=0`. The engine's `NONE_HASH` is
+    /// `sha256_cbor("vllm-none-hash")`, so the layout must declare that root:
+    /// the seed-zero digest is a different, incompatible sequence.
+    #[test]
+    fn cbor_hashed_engine_credits_the_replayed_prefix() {
+        let payload = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/rust/fixtures/kv_cbor/qwen35_vllm029_cbor.msgpack"
+        ));
+        let prompt: Vec<u32> = serde_json::from_slice(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/rust/fixtures/kv_cbor/qwen35_vllm029_prompt.json"
+        )))
+        .unwrap();
+        let root = hex_root("9bd96a485ad84efdafb72ee48a1d7a69bcead0f8f0433173941b276b9581eef0");
+        let index = HybridEventIndex::new_with_root_hash(target(), groups(), 528, root, 8).unwrap();
+        index.begin_empty(0);
+        index.apply_payload(0, payload).expect("captured batch applies");
+        assert_eq!(index.reusable_tokens(&prompt, usize::MAX), 528);
+        // A wrong root is a different sequence, not a cosmetic field.
+        let wrong =
+            HybridEventIndex::new_with_root_hash(target(), groups(), 528, [0; 32], 8).unwrap();
+        wrong.begin_empty(0);
+        wrong.apply_payload(0, payload).unwrap();
+        assert_eq!(wrong.reusable_tokens(&prompt, usize::MAX), 0);
     }
 
     #[test]

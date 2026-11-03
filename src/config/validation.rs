@@ -891,9 +891,12 @@ impl ConfigValidator {
         if config.intra_node_data_parallel_size == 1 {
             if let RoutingMode::Regular { worker_urls } = &config.mode {
                 if let Some(url) = worker_urls.iter().find(|url| {
-                    url.rsplit_once('@').is_some_and(|(base, rank)| {
-                        !base.is_empty() && !rank.is_empty() && rank.parse::<u32>().is_ok()
-                    })
+                    // gRPC worker URLs use the same suffix for a pinned rank.
+                    let is_http = url.starts_with("http://") || url.starts_with("https://");
+                    is_http
+                        && url.rsplit_once('@').is_some_and(|(base, rank)| {
+                            !base.is_empty() && !rank.is_empty() && rank.parse::<u32>().is_ok()
+                        })
                 }) {
                     return Err(ConfigError::ValidationFailed {
                         reason: format!(
