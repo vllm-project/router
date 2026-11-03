@@ -4,7 +4,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use parking_lot::Mutex;
@@ -13,6 +13,9 @@ use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use crate::config::StaticKvEventSources;
+use crate::kv_index::hybrid_capability::HybridCapabilities;
+use crate::kv_index::hybrid_events::HybridEventIndex;
+use crate::kv_index::hybrid_stream::{HybridEventStream, HybridSubscriberHandle};
 use crate::kv_index::indexer::KvBlockIndexer;
 use crate::kv_index::subscriber::{EventSource, SubscriberHandle};
 use crate::kv_index::{HashMode, IngestionSignal, SourceId};
@@ -75,6 +78,7 @@ pub(crate) struct WorkerDiscovery {
     /// gRPC has a separate GetModelInfo RPC; preserve its failure instead of
     /// silently turning the worker URL into a cache identity.
     model_id: Result<Option<String>, String>,
+    pub(crate) hybrid: Option<HybridCapabilities>,
 }
 
 /// Per-worker subscriber state retained for removal-time cleanup.
@@ -88,6 +92,53 @@ struct WorkerSubs {
     ranks: Vec<u32>,
     indexer: Arc<KvBlockIndexer>,
     handles: Vec<SubscriberHandle>,
+    hybrid: Option<Arc<HybridWorkerProvider>>,
+    hybrid_handles: Vec<Arc<HybridSubscriberHandle>>,
+}
+
+struct HybridWorkerProvider {
+    indexes: Vec<Arc<HybridEventIndex>>,
+    active: Arc<AtomicBool>,
+    verified_at: Mutex<Instant>,
+    capability: HybridCapabilities,
+}
+
+impl crate::policies::TieredMatchProvider for HybridWorkerProvider {
+    fn find_tiered_matches(&self, _query: &super::MatchQuery) -> Vec<super::TierMatch> {
+        Vec::new()
+    }
+
+    fn find_token_matches(
+        &self,
+        tokens: &[u32],
+        block_size: u32,
+        lora: Option<&str>,
+    ) -> Option<Vec<super::TierMatch>> {
+        if !self.active.load(Ordering::Acquire)
+            || self.verified_at.lock().elapsed() > Duration::from_secs(5)
+        {
+            return Some(Vec::new());
+        }
+        let hits = self
+            .indexes
+            .iter()
+            .flat_map(|index| {
+                crate::policies::TieredMatchProvider::find_token_matches(
+                    index.as_ref(),
+                    tokens,
+                    block_size,
+                    lora,
+                )
+                .unwrap_or_default()
+            })
+            .collect();
+        if !self.active.load(Ordering::Acquire)
+            || self.verified_at.lock().elapsed() > Duration::from_secs(5)
+        {
+            return Some(Vec::new());
+        }
+        Some(hits)
+    }
 }
 
 struct LiveSource {
@@ -230,6 +281,19 @@ impl KvIndexSupervisor {
             return match self.static_pd_sources.get(worker_url) {
                 Some(config) => static_pd_discovery(worker_url, config),
                 None => {
+                    if !crate::backend::is_grpc_url(worker_url) {
+                        match discover_opt_in_hybrid(
+                            &self.client,
+                            worker_url,
+                            self.api_key.as_deref(),
+                        )
+                        .await
+                        {
+                            Ok(Some(discovery)) => return discovery,
+                            Err(error) => return failed_hybrid_discovery(error),
+                            Ok(None) => {}
+                        }
+                    }
                     discover_worker(&self.client, worker_url, true, self.api_key.as_deref()).await
                 }
             };
@@ -249,6 +313,13 @@ impl KvIndexSupervisor {
                 static_worker_discovery(worker_url, config)
             }
             None if full_attention_http => {
+                match discover_opt_in_hybrid(&self.client, worker_url, self.api_key.as_deref())
+                    .await
+                {
+                    Ok(Some(discovery)) => return discovery,
+                    Err(error) => return failed_hybrid_discovery(error),
+                    Ok(None) => {}
+                }
                 discover_full_attention_http_worker(
                     &self.client,
                     worker_url,
@@ -279,6 +350,7 @@ impl KvIndexSupervisor {
         discovery: WorkerDiscovery,
         observed: Option<Arc<AtomicBool>>,
     ) -> Result<WorkerKvInfo, String> {
+        let hybrid_capability = discovery.hybrid;
         let grpc = crate::backend::is_grpc_url(worker_url);
         let full_attention_http =
             !grpc && self.full_attention_http && !self.static_sources.contains_key(worker_url);
@@ -391,6 +463,32 @@ impl KvIndexSupervisor {
             event_sources.push(ev);
         }
 
+        let hybrid_indexes = if let Some(capability) = &hybrid_capability {
+            if event_sources.is_empty()
+                || event_sources.len() != capability.ranks.len()
+                || capability
+                    .ranks
+                    .iter()
+                    .any(|rank| rank.model != model_id || rank.hash_block_size != Some(block_size))
+            {
+                return Err("hybrid capability does not cover the worker's event sources".into());
+            }
+            let mut indexes = Vec::with_capacity(event_sources.len());
+            for source in &event_sources {
+                let target = super::RoutableTarget {
+                    instance_id: source_id.clone(),
+                    dp_rank: source.dp_rank,
+                };
+                let index = capability
+                    .index_for_source(source, target, 1_000_000)
+                    .map_err(str::to_owned)?;
+                indexes.push(Arc::new(index));
+            }
+            Some(indexes)
+        } else {
+            None
+        };
+
         // Full-attention HTTP bindings require plain origins. Generic discovery retains
         // its backend-specific URI scope, including HTTP base paths.
         let worker_origin = if full_attention_http {
@@ -502,22 +600,82 @@ impl KvIndexSupervisor {
         let indexer = self.acquire_identity(&key);
         let mut ranks = Vec::with_capacity(event_sources.len());
         let mut handles = Vec::with_capacity(event_sources.len());
-        for (ev, live) in event_sources.into_iter().zip(&live_sources) {
+        let mut hybrid_handles = Vec::new();
+        for (position, (ev, live)) in event_sources.into_iter().zip(&live_sources).enumerate() {
             let rank = ev.dp_rank;
-            let handle = crate::kv_index::subscriber::spawn_bound(
-                ev,
-                indexer.clone(),
-                Some(self.signal_tx.clone()),
-                self.ctx.clone(),
-                full_attention.then_some(key.block_size),
-                live.lease.clone(),
-            );
+            if let Some(indexes) = &hybrid_indexes {
+                let stream = Arc::new(HybridEventStream::new(indexes[position].clone()));
+                let handle = super::hybrid_stream::spawn_zmq(ev, stream, self.ctx.clone())
+                    .expect("hybrid source was validated before registration");
+                hybrid_handles.push(Arc::new(handle));
+            } else {
+                let handle = crate::kv_index::subscriber::spawn_bound(
+                    ev,
+                    indexer.clone(),
+                    Some(self.signal_tx.clone()),
+                    self.ctx.clone(),
+                    full_attention.then_some(key.block_size),
+                    live.lease.clone(),
+                );
+                handles.push(handle);
+            }
             info!(
                 "kv_index {}: spawned subscriber rank{} (instance {})",
                 worker_url, rank, instance_id
             );
-            handles.push(handle);
             ranks.push(rank);
+        }
+
+        let hybrid = hybrid_indexes.map(|indexes| {
+            Arc::new(HybridWorkerProvider {
+                indexes,
+                active: active.clone(),
+                verified_at: Mutex::new(Instant::now()),
+                capability: hybrid_capability
+                    .as_ref()
+                    .expect("hybrid indexes require capabilities")
+                    .clone(),
+            })
+        });
+        if let (Some(provider), Some(expected)) = (&hybrid, hybrid_capability) {
+            let provider = Arc::downgrade(provider);
+            let handles = hybrid_handles.clone();
+            let client = self.client.clone();
+            let worker = worker_url.to_owned();
+            let api_key = self.api_key.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    let Some(provider) = provider.upgrade() else {
+                        break;
+                    };
+                    if !provider.active.load(Ordering::Acquire) {
+                        break;
+                    }
+                    if provider.verified_at.lock().elapsed() > Duration::from_secs(5) {
+                        provider.active.store(false, Ordering::Release);
+                        for handle in &handles {
+                            handle.shutdown();
+                        }
+                        break;
+                    }
+                    if query_hybrid_capabilities(&client, &worker, api_key.as_deref())
+                        .await
+                        .ok()
+                        .flatten()
+                        .as_ref()
+                        != Some(&expected)
+                        || provider.verified_at.lock().elapsed() > Duration::from_secs(5)
+                    {
+                        provider.active.store(false, Ordering::Release);
+                        for handle in &handles {
+                            handle.shutdown();
+                        }
+                        break;
+                    }
+                    *provider.verified_at.lock() = Instant::now();
+                }
+            });
         }
 
         workers.insert(
@@ -532,6 +690,8 @@ impl KvIndexSupervisor {
                 ranks: ranks.clone(),
                 indexer,
                 handles,
+                hybrid,
+                hybrid_handles,
             },
         );
         self.check_block_size(worker_url, Some(block_size));
@@ -556,6 +716,9 @@ impl KvIndexSupervisor {
     fn retire_worker(&self, subs: WorkerSubs) {
         subs.active.store(false, Ordering::Release);
         for handle in &subs.handles {
+            handle.shutdown();
+        }
+        for handle in &subs.hybrid_handles {
             handle.shutdown();
         }
         for live in &subs.live_sources {
@@ -583,7 +746,28 @@ impl KvIndexSupervisor {
         self.workers
             .lock()
             .get(worker_url)
-            .map(|worker| worker.indexer.clone() as Arc<dyn crate::policies::TieredMatchProvider>)
+            .map(|worker| match &worker.hybrid {
+                Some(provider) => provider.clone() as Arc<dyn crate::policies::TieredMatchProvider>,
+                None => worker.indexer.clone() as Arc<dyn crate::policies::TieredMatchProvider>,
+            })
+    }
+
+    pub(crate) fn is_hybrid_worker(&self, worker_url: &str) -> bool {
+        self.workers
+            .lock()
+            .get(worker_url)
+            .is_some_and(|worker| worker.hybrid.is_some())
+    }
+
+    pub(crate) fn trusted_hybrid_capability(&self, worker_url: &str) -> Option<HybridCapabilities> {
+        let workers = self.workers.lock();
+        let provider = workers.get(worker_url)?.hybrid.as_ref()?;
+        if !provider.active.load(Ordering::Acquire)
+            || provider.verified_at.lock().elapsed() > Duration::from_secs(5)
+        {
+            return None;
+        }
+        Some(provider.capability.clone())
     }
 
     /// Ref-count an identity; on first acquisition create its indexer.
@@ -630,6 +814,71 @@ impl KvIndexSupervisor {
     }
 }
 
+fn failed_hybrid_discovery(error: String) -> WorkerDiscovery {
+    WorkerDiscovery {
+        server_info: Err(error.clone()),
+        sources: Err(error.clone()),
+        model_id: Err(error),
+        hybrid: None,
+    }
+}
+
+async fn discover_opt_in_hybrid(
+    client: &reqwest::Client,
+    worker_url: &str,
+    api_key: Option<&str>,
+) -> Result<Option<WorkerDiscovery>, String> {
+    let Some(capability) = query_hybrid_capabilities(client, worker_url, api_key).await? else {
+        return Ok(None);
+    };
+    if !capability.ranks.iter().any(|rank| rank.instance_topic) {
+        return Ok(None);
+    }
+    let first = &capability.ranks[0];
+    let model = first.model.clone();
+    let block_size = first.hash_block_size;
+    Ok(Some(WorkerDiscovery {
+        server_info: Ok(ServerInfo {
+            instance_id: Some(worker_url.to_owned()),
+            model_id: Some(model.clone()),
+            kv_block_size: block_size,
+            ..Default::default()
+        }),
+        sources: query_pd_kv_event_sources(client, worker_url, api_key).await,
+        model_id: Ok(Some(model)),
+        hybrid: Some(capability),
+    }))
+}
+
+pub(crate) async fn query_hybrid_capabilities(
+    client: &reqwest::Client,
+    worker_url: &str,
+    api_key: Option<&str>,
+) -> Result<Option<HybridCapabilities>, String> {
+    let url = format!(
+        "{}/kv_routing_capabilities",
+        worker_url.trim_end_matches('/')
+    );
+    let response = tokio::time::timeout(
+        Duration::from_secs(2),
+        worker_get(client, &url, api_key).send(),
+    )
+    .await
+    .map_err(|_| "hybrid capability request timed out".to_string())?
+    .map_err(|error| format!("hybrid capability request: {error}"))?;
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    if !response.status().is_success() {
+        return Err(format!("hybrid capability status {}", response.status()));
+    }
+    let capability = tokio::time::timeout(Duration::from_secs(2), response.json())
+        .await
+        .map_err(|_| "hybrid capability response timed out".to_string())?
+        .map_err(|error| format!("hybrid capability parse: {error}"))?;
+    Ok(Some(capability))
+}
+
 impl Drop for KvIndexSupervisor {
     fn drop(&mut self) {
         self.shutdown();
@@ -666,6 +915,7 @@ async fn discover_worker(
             server_info,
             sources,
             model_id: model,
+            hybrid: None,
         };
     }
     if !http_pd {
@@ -676,6 +926,7 @@ async fn discover_worker(
             ),
             sources: query_kv_event_sources(client, worker_url).await,
             model_id: Ok(Some(worker_url.to_string())),
+            hybrid: None,
         };
     }
     let server_info = query_pd_server_info(client, worker_url, api_key).await;
@@ -691,6 +942,7 @@ async fn discover_worker(
             query_kv_event_sources(client, worker_url).await
         },
         model_id,
+        hybrid: None,
     }
 }
 
@@ -732,6 +984,7 @@ fn static_worker_discovery(worker_url: &str, config: &StaticKvEventSources) -> W
         server_info: Ok(server_info),
         sources: Ok(sources),
         model_id: Ok(Some(model)),
+        hybrid: None,
     }
 }
 // Only the full-attention HTTP adapter uses this optional control-metadata contract.
@@ -752,6 +1005,7 @@ async fn discover_full_attention_http_worker(
         server_info,
         sources: query_worker_json(client, worker_url, "kv_event_sources", true, api_key).await,
         model_id,
+        hybrid: None,
     }
 }
 
@@ -1385,6 +1639,156 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hybrid_discovery_routes_from_live_events_and_retires_changed_capability() {
+        use crate::policies::{KvAwareOps, KvAwarePolicy};
+        use axum::{routing::get, Json, Router};
+
+        let group = |idx, kind, spec, mode| {
+            serde_json::json!({
+                "group_idx":idx, "kind":kind, "spec_type":spec, "block_size":528,
+                "sliding_window":null, "prefix_cacheable":true,
+                "prefix_replay_tokens":0, "mamba_cache_mode":mode,
+                "prefill_checkpoint_alignment": if kind == "mamba" { Some(528) } else { None }
+            })
+        };
+        let capability = Arc::new(tokio::sync::RwLock::new(serde_json::json!({
+            "schema_version":1,"ranks":[{
+                "rank":0,"model":"qwen","weight_version":"default",
+                "publisher_topic":"hybrid/epoch-1","instance_topic":true,
+                "hash_algorithm":"sha256_cbor","full_hashes":true,
+                "root_hash":"4e1195df020de59e0d65a33a4279f1183e7ae4e5d980e309f8b55adff2e61c3e",
+                "hash_block_size":528,"hash_lookahead_tokens":0,"speculative_tokens":0,
+                "prefix_caching":true,"groups":[
+                    group(0,"mamba","MambaSpec",Some("align")),
+                    group(1,"mamba","MambaSpec",Some("align")),
+                    group(2,"mamba","MambaSpec",Some("align")),
+                    group(3,"full_attention","FullAttentionSpec",None)
+                ]
+            }]
+        })));
+        let sources = serde_json::json!({"0":{
+            "endpoint":"inproc://hybrid-discovery-pub", "replay_endpoint":"inproc://hybrid-discovery-replay",
+            "topic":"hybrid/epoch-1", "publisher":"zmq", "enable_kv_cache_events":true
+        }});
+        let app = Router::new()
+            .route(
+                "/kv_routing_capabilities",
+                get({
+                    let capability = capability.clone();
+                    move || {
+                        let capability = capability.clone();
+                        async move { Json(capability.read().await.clone()) }
+                    }
+                }),
+            )
+            .route(
+                "/kv_event_sources",
+                get(move || {
+                    let sources = sources.clone();
+                    async move { Json(sources) }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let worker_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let (supervisor, _signals) =
+            KvIndexSupervisor::new_http_full_attention(reqwest::Client::new(), HashMode::Sha256);
+        let publisher = supervisor.ctx.socket(zmq::XPUB).unwrap();
+        let replay = supervisor.ctx.socket(zmq::ROUTER).unwrap();
+        publisher.set_linger(0).unwrap();
+        replay.set_linger(0).unwrap();
+        publisher.bind("inproc://hybrid-discovery-pub").unwrap();
+        replay.bind("inproc://hybrid-discovery-replay").unwrap();
+        let info = supervisor.on_worker_added(&worker_url).await.unwrap();
+        let provider = supervisor.match_provider_for_worker(&worker_url).unwrap();
+        boundary_subscription(&publisher, "hybrid/epoch-1", false).await;
+        let payload = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/rust/fixtures/kv_cbor/qwen35_vllm028.msgpack"
+        ));
+        publisher
+            .send_multipart(
+                [
+                    b"hybrid/epoch-1".as_slice(),
+                    &0_i64.to_be_bytes(),
+                    payload.as_slice(),
+                ],
+                0,
+            )
+            .unwrap();
+        let request = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                match replay.recv_multipart(zmq::DONTWAIT) {
+                    Ok(frames) => break frames,
+                    Err(zmq::Error::EAGAIN) => tokio::time::sleep(Duration::from_millis(1)).await,
+                    Err(error) => panic!("replay: {error}"),
+                }
+            }
+        })
+        .await
+        .unwrap();
+        replay
+            .send_multipart(
+                [
+                    request[0].as_slice(),
+                    &[],
+                    b"hybrid/epoch-1",
+                    &0_i64.to_be_bytes(),
+                    payload.as_slice(),
+                ],
+                0,
+            )
+            .unwrap();
+        replay
+            .send_multipart(
+                [
+                    request[0].as_slice(),
+                    &[],
+                    &[],
+                    &(-1_i64).to_be_bytes(),
+                    &[],
+                ],
+                0,
+            )
+            .unwrap();
+        let prompt: Vec<u32> = (0..1024).map(|i| 100 + i % 100).collect();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while provider
+                .find_token_matches(&prompt, 528, None)
+                .unwrap()
+                .is_empty()
+            {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let worker: Arc<dyn crate::core::Worker> = Arc::new(crate::core::BasicWorker::new(
+            worker_url.clone(),
+            crate::core::WorkerType::Regular,
+        ));
+        let policy = KvAwarePolicy::default();
+        policy.register_worker(worker.as_ref(), Some(&info), Some(provider.clone()));
+        let estimate =
+            policy.estimate_prefill_work(&[(worker.as_ref(), std::slice::from_ref(&prompt), true)]);
+        assert_eq!(estimate[0].new_prefill_tokens, 496);
+        capability.write().await["ranks"][0]["weight_version"] = serde_json::json!("new");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !provider
+                .find_token_matches(&prompt, 528, None)
+                .unwrap()
+                .is_empty()
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        supervisor.shutdown();
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn source_installation_preserves_topic_rank_and_cache_identity_boundaries() {
         for (case, (topic_b, rank_b, model_b, same_publisher, accepted)) in [
             ("kv/other", 0u32, "boundary-model", true, true),
@@ -1402,6 +1806,7 @@ mod tests {
             let discovery =
                 |model: &str, instance: &str, endpoint: &str, topic: &str, rank: u32| {
                     WorkerDiscovery {
+                        hybrid: None,
                         server_info: Ok(ServerInfo {
                             instance_id: Some(instance.into()),
                             kv_block_size: Some(8),
@@ -1526,6 +1931,7 @@ mod tests {
             .install_worker(
                 "http://worker:8000",
                 WorkerDiscovery {
+                    hybrid: None,
                     server_info: Ok(ServerInfo {
                         instance_id: Some("duplicate-rank".into()),
                         kv_block_size: Some(8),

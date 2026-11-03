@@ -1,9 +1,10 @@
 //! P/D prefill KV discovery, refresh, and request-input preparation.
 
-use super::pd_types::PdPrefillInput;
+use super::pd_types::{PdEndpoint, PdPrefillInput};
 use crate::backend::preprocess::{prepare_http_token_inputs, router_token_inputs};
 use crate::core::Worker;
-use crate::kv_index::discovery::{worker_get, WorkerDiscovery};
+use crate::kv_index::discovery::{query_hybrid_capabilities, worker_get, WorkerDiscovery};
+use crate::kv_index::hybrid_capability::HybridCapabilities;
 use crate::kv_index::{HashMode, KvIndexSupervisor, WorkerKvInfo};
 use crate::policies::{kv_aware_ops, KvAwareOps, KvAwarePolicy, LoadBalancingPolicy};
 use axum::http::HeaderMap;
@@ -45,7 +46,14 @@ struct Discovery {
 #[derive(Clone, Default)]
 struct RefreshInputs {
     workers: Arc<[Arc<dyn Worker>]>,
+    decode_workers: Arc<[Arc<dyn Worker>]>,
     policy: Option<Arc<dyn LoadBalancingPolicy>>,
+}
+
+#[derive(Clone)]
+struct HybridProbe {
+    checked: Instant,
+    capability: Result<Option<HybridCapabilities>, ()>,
 }
 
 /// Consecutive failed probes before a previously healthy binding is treated as
@@ -66,10 +74,14 @@ enum ProbeOutcome {
     Evict,
 }
 
-fn probe_outcome(existing: Option<&Binding>, signature: Option<&str>) -> ProbeOutcome {
+fn probe_outcome(
+    existing: Option<&Binding>,
+    signature: Option<&str>,
+    inactive_hybrid: bool,
+) -> ProbeOutcome {
     match (existing, signature) {
         (Some(binding), Some(signature))
-            if binding.info.is_some() && binding.signature == signature =>
+            if binding.info.is_some() && binding.signature == signature && !inactive_hybrid =>
         {
             ProbeOutcome::Unchanged
         }
@@ -102,6 +114,7 @@ pub(super) struct PdKvState {
     bind_lock: Mutex<()>,
     // The background refresh loop's latest view of the P pool and policy.
     refresh_inputs: Mutex<RefreshInputs>,
+    hybrid_probes: Mutex<HashMap<String, HybridProbe>>,
     signals: tokio::task::JoinHandle<()>,
 }
 
@@ -119,6 +132,7 @@ impl PdKvState {
         api_key: Option<String>,
         sources: HashMap<String, crate::config::types::PdKvEventSources>,
         workers: Vec<Arc<dyn Worker>>,
+        decode_workers: Vec<Arc<dyn Worker>>,
         policy: Arc<dyn LoadBalancingPolicy>,
     ) -> Arc<Self> {
         let mut state = Self::new_with_statics(client, sources);
@@ -126,6 +140,7 @@ impl PdKvState {
         state.supervisor.set_api_key(state.api_key.clone());
         state.refresh_inputs = Mutex::new(RefreshInputs {
             workers: workers.iter().cloned().collect(),
+            decode_workers: decode_workers.iter().cloned().collect(),
             policy: Some(policy.clone()),
         });
         let state = Arc::new(state);
@@ -141,6 +156,11 @@ impl PdKvState {
                 );
             }
         }
+        let _ = tokio::time::timeout(
+            CONTROL_TIMEOUT,
+            state.refresh_hybrid_probes(&workers, &decode_workers),
+        )
+        .await;
         state.spawn_refresh();
         state
     }
@@ -166,9 +186,135 @@ impl PdKvState {
             targets: Mutex::new(HashMap::new()),
             bind_lock: Mutex::new(()),
             refresh_inputs: Mutex::new(RefreshInputs::default()),
+            hybrid_probes: Mutex::new(HashMap::new()),
             // Subscribers enforce trust by suspending/clearing affected sources.
             signals: tokio::spawn(async move { while signals.recv().await.is_some() {} }),
         }
+    }
+
+    async fn refresh_hybrid_probes(&self, prefill: &[Arc<dyn Worker>], decode: &[Arc<dyn Worker>]) {
+        let bases: HashSet<_> = prefill
+            .iter()
+            .chain(decode)
+            .map(|worker| worker.base_url().to_owned())
+            .collect();
+        let pending: Vec<_> = {
+            let mut probes = self.hybrid_probes.lock().await;
+            probes.retain(|base, _| bases.contains(base));
+            bases
+                .into_iter()
+                .filter(|base| {
+                    probes
+                        .get(base)
+                        .is_none_or(|probe| probe.checked.elapsed() >= Duration::from_secs(2))
+                })
+                .collect()
+        };
+        let results = stream::iter(pending)
+            .map(|base| async move {
+                let result = if crate::backend::is_grpc_url(&base) {
+                    Ok(None)
+                } else {
+                    query_hybrid_capabilities(&self.client, &base, self.api_key.as_deref())
+                        .await
+                        .map_err(|_| ())
+                };
+                (
+                    base,
+                    HybridProbe {
+                        checked: Instant::now(),
+                        capability: result,
+                    },
+                )
+            })
+            .buffer_unordered(16)
+            .collect::<Vec<_>>()
+            .await;
+        let mut probes = self.hybrid_probes.lock().await;
+        probes.extend(results);
+    }
+
+    /// Return a pair whitelist only when an opt-in hybrid worker is present.
+    /// Unknown or stale metadata cannot establish a compatible pair.
+    pub(super) async fn compatible_hybrid_pairs(
+        &self,
+        prefill: &[Arc<dyn Worker>],
+        decode: &[Arc<dyn Worker>],
+    ) -> Option<HashSet<(PdEndpoint, PdEndpoint)>> {
+        {
+            let mut inputs = self.refresh_inputs.lock().await;
+            inputs.workers = prefill.iter().cloned().collect();
+            inputs.decode_workers = decode.iter().cloned().collect();
+        }
+        let probes = self.hybrid_probes.lock().await.clone();
+        // The hybrid capability protocol is HTTP-only. Preserve the existing
+        // gRPC P/D path, which cannot advertise this opt-in capability.
+        let grpc_legacy = None;
+        let capability = |worker: &dyn Worker| {
+            if crate::backend::is_grpc_url(worker.base_url()) {
+                return Some(&grpc_legacy);
+            }
+            probes
+                .get(worker.base_url())
+                .filter(|probe| probe.checked.elapsed() <= Duration::from_secs(5))
+                .and_then(|probe| probe.capability.as_ref().ok())
+        };
+        let opted = |cap: &HybridCapabilities| cap.ranks.iter().any(|rank| rank.instance_topic);
+        let any_hybrid = prefill.iter().chain(decode).any(|worker| {
+            capability(worker.as_ref())
+                .and_then(Option::as_ref)
+                .is_some_and(&opted)
+                || self.supervisor.is_hybrid_worker(worker.base_url())
+        });
+        // A missing, failed, or expired probe is not evidence that a worker is
+        // legacy. Wait for discovery rather than admitting an unverified pair.
+        let unknown = prefill
+            .iter()
+            .chain(decode)
+            .any(|worker| capability(worker.as_ref()).is_none());
+        if !any_hybrid && !unknown {
+            return None;
+        }
+        let rank = |worker: &dyn Worker, cap: &HybridCapabilities| -> Option<u32> {
+            match worker.dp_rank() {
+                Some(rank) => u32::try_from(rank).ok(),
+                None if cap.ranks.len() == 1 => Some(cap.ranks[0].rank),
+                None => None,
+            }
+        };
+        let mut pairs = HashSet::new();
+        for p in prefill {
+            for d in decode {
+                let (Some(p_cap), Some(d_cap)) = (capability(p.as_ref()), capability(d.as_ref()))
+                else {
+                    continue;
+                };
+                let valid = match (p_cap.as_ref(), d_cap.as_ref()) {
+                    (Some(p_cap), Some(d_cap)) if opted(p_cap) && opted(d_cap) => {
+                        self.supervisor
+                            .trusted_hybrid_capability(p.base_url())
+                            .as_ref()
+                            == Some(p_cap)
+                            && rank(p.as_ref(), p_cap)
+                                .zip(rank(d.as_ref(), d_cap))
+                                .is_some_and(|(p_rank, d_rank)| {
+                                    p_cap.compatible_pd_rank(p_rank, d_cap, d_rank)
+                                })
+                    }
+                    (p_cap, d_cap) if !p_cap.is_some_and(&opted) && !d_cap.is_some_and(&opted) => {
+                        true
+                    }
+                    _ => false,
+                };
+                if valid {
+                    pairs.insert((
+                        PdEndpoint::for_worker(p.as_ref()),
+                        PdEndpoint::for_worker(d.as_ref()),
+                    ));
+                }
+            }
+        }
+        Some(pairs)
     }
 
     /// Reconcile bindings off the request path. Requests only record their
@@ -192,6 +338,9 @@ impl PdKvState {
                 if !inputs.workers.is_empty() {
                     state.bind(&inputs.workers, kv).await;
                 }
+                state
+                    .refresh_hybrid_probes(&inputs.workers, &inputs.decode_workers)
+                    .await;
             }
         });
     }
@@ -221,7 +370,10 @@ impl PdKvState {
                 .filter(|base| {
                     bindings.get(*base).is_none_or(|binding| {
                         binding.checked.elapsed()
-                            >= if binding.info.is_some() {
+                            >= if binding.info.is_some()
+                                && !(self.supervisor.is_hybrid_worker(base)
+                                    && self.supervisor.trusted_hybrid_capability(base).is_none())
+                            {
                                 REFRESH_INTERVAL
                             } else {
                                 CONTROL_TIMEOUT
@@ -267,6 +419,8 @@ impl PdKvState {
                 discovery
                     .as_ref()
                     .map(|snapshot| snapshot.signature.as_str()),
+                self.supervisor.is_hybrid_worker(&base)
+                    && self.supervisor.trusted_hybrid_capability(&base).is_none(),
             );
             match outcome {
                 ProbeOutcome::Unchanged => {
@@ -306,6 +460,14 @@ impl PdKvState {
                     {
                         let mut bindings = self.bindings.lock().await;
                         bindings.remove(&base);
+                    }
+                    // The replacement provider may have the same metadata but
+                    // a different subscriber lifetime. Force policy rebinding.
+                    {
+                        let mut targets = self.targets.lock().await;
+                        for worker in workers.iter().filter(|worker| worker.base_url() == base) {
+                            targets.remove(worker.url());
+                        }
                     }
                     // The subscriber handshake runs without the map locks; a
                     // concurrent prepare() sees no binding and denies credit
@@ -368,7 +530,7 @@ impl PdKvState {
         let sources = worker.sources.as_ref().map_err(Clone::clone)?;
         let mut sources: Vec<_> = sources.iter().collect();
         sources.sort_by(|left, right| left.0.cmp(right.0));
-        let signature = format!("{info:?}:{sources:?}");
+        let signature = format!("{info:?}:{sources:?}:{:?}", worker.hybrid);
         // gRPC workers serve no HTTP /v1/models; Control.GetModelInfo names
         // the served model, including for statically configured sources.
         if crate::backend::is_grpc_url(base) {
@@ -422,10 +584,11 @@ impl PdKvState {
         router_prompts: Option<&Arc<[Vec<u32>]>>,
     ) -> HashMap<String, PdPrefillInput> {
         let started = Instant::now();
-        *self.refresh_inputs.lock().await = RefreshInputs {
-            workers: workers.iter().cloned().collect(),
-            policy: Some(policy.clone()),
-        };
+        {
+            let mut inputs = self.refresh_inputs.lock().await;
+            inputs.workers = workers.iter().cloned().collect();
+            inputs.policy = Some(policy.clone());
+        }
         let bases: Vec<_> = workers
             .iter()
             .map(|worker| worker.base_url().to_owned())
@@ -534,6 +697,74 @@ mod kv_input_tests {
     use axum::response::IntoResponse;
     use reqwest::Client;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn grpc_pd_keeps_legacy_selection_without_http_capability_probes() {
+        let state = PdKvState::new(Client::new());
+        let prefill: Vec<Arc<dyn Worker>> = vec![Arc::new(BasicWorker::new(
+            "grpc://prefill:50051".to_owned(),
+            WorkerType::Regular,
+        ))];
+        let decode: Vec<Arc<dyn Worker>> = vec![Arc::new(BasicWorker::new(
+            "grpc://decode:50051".to_owned(),
+            WorkerType::Regular,
+        ))];
+        assert!(state
+            .compatible_hybrid_pairs(&prefill, &decode)
+            .await
+            .is_none());
+        state.refresh_hybrid_probes(&prefill, &decode).await;
+        assert!(state
+            .compatible_hybrid_pairs(&prefill, &decode)
+            .await
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn unknown_pd_capabilities_cannot_bypass_pair_validation() {
+        let state = PdKvState::new(Client::new());
+        let prefill: Vec<Arc<dyn Worker>> = vec![Arc::new(BasicWorker::new(
+            "http://prefill".to_owned(),
+            WorkerType::Regular,
+        ))];
+        let decode: Vec<Arc<dyn Worker>> = vec![Arc::new(BasicWorker::new(
+            "http://decode".to_owned(),
+            WorkerType::Regular,
+        ))];
+        assert!(state
+            .compatible_hybrid_pairs(&prefill, &decode)
+            .await
+            .unwrap()
+            .is_empty());
+        {
+            let mut probes = state.hybrid_probes.lock().await;
+            for base in ["http://prefill", "http://decode"] {
+                probes.insert(
+                    base.to_owned(),
+                    HybridProbe {
+                        checked: Instant::now(),
+                        capability: Ok(None),
+                    },
+                );
+            }
+        }
+        assert!(state
+            .compatible_hybrid_pairs(&prefill, &decode)
+            .await
+            .is_none());
+        state
+            .hybrid_probes
+            .lock()
+            .await
+            .get_mut("http://decode")
+            .unwrap()
+            .capability = Err(());
+        assert!(state
+            .compatible_hybrid_pairs(&prefill, &decode)
+            .await
+            .unwrap()
+            .is_empty());
+    }
 
     #[tokio::test]
     async fn unsupported_inputs_fall_back_without_control_or_tokenization_requests() {
@@ -844,12 +1075,23 @@ mod kv_input_tests {
             (None, Some("sig"), ProbeOutcome::Rebuild),
             (None, None, ProbeOutcome::Keep),
         ] {
-            assert_eq!(probe_outcome(binding, signature), expected);
+            assert_eq!(probe_outcome(binding, signature, false), expected);
         }
         for failures in 0..MAX_PROBE_FAILURES - 1 {
             let binding = healthy_binding("sig", failures);
-            assert_eq!(probe_outcome(Some(&binding), None), ProbeOutcome::Keep);
+            assert_eq!(
+                probe_outcome(Some(&binding), None, false),
+                ProbeOutcome::Keep
+            );
         }
+        assert_eq!(
+            probe_outcome(Some(&healthy), Some("sig"), true),
+            ProbeOutcome::Rebuild
+        );
+        assert_eq!(
+            probe_outcome(Some(&healthy), None, true),
+            ProbeOutcome::Keep
+        );
     }
 
     #[tokio::test]

@@ -82,8 +82,15 @@ pub(super) fn select_pd_pair(
             .map(|(index, _)| index)
             .collect::<Vec<_>>()
     };
-    let prefill_indices = eligible_indices(Stage::Prefill, prefill_workers, &prefill_endpoints);
-    let decode_indices = eligible_indices(Stage::Decode, decode_workers, &decode_endpoints);
+    let mut prefill_indices = eligible_indices(Stage::Prefill, prefill_workers, &prefill_endpoints);
+    let mut decode_indices = eligible_indices(Stage::Decode, decode_workers, &decode_endpoints);
+    if let Some(pairs) = context.hybrid_pairs {
+        prefill_indices.retain(|&p| {
+            decode_indices.iter().any(|&d| {
+                pairs.contains(&(prefill_endpoints[p].clone(), decode_endpoints[d].clone()))
+            })
+        });
+    }
     if prefill_indices.is_empty() || decode_indices.is_empty() {
         return None;
     }
@@ -96,6 +103,10 @@ pub(super) fn select_pd_pair(
         prefill_policy,
         context,
     )?;
+    if let Some(pairs) = context.hybrid_pairs {
+        decode_indices
+            .retain(|&d| pairs.contains(&(prefill.endpoint.clone(), decode_endpoints[d].clone())));
+    }
     let decode = select_stage(
         loads,
         Stage::Decode,
@@ -1141,6 +1152,7 @@ impl PdRouterBase {
                     ctx.router_config.api_key.clone(),
                     ctx.router_config.pd_kv_event_sources.clone(),
                     ctx.worker_registry.get_prefill_workers(),
+                    ctx.worker_registry.get_decode_workers(),
                     prefill_policy.clone(),
                 )
                 .await,
@@ -1342,6 +1354,7 @@ impl PdRouterBase {
         decode_workers: &[Arc<dyn Worker>],
     ) -> Response {
         let context = PdRequestContext {
+            hybrid_pairs: None,
             prefill_inputs: None,
             model_id: None,
             legacy_policy_input: None,
@@ -1871,6 +1884,7 @@ mod tests {
         let prefill_workers = router.worker_registry.get_prefill_workers();
         let decode_workers = router.worker_registry.get_decode_workers();
         let context = PdRequestContext {
+            hybrid_pairs: None,
             prefill_inputs: None,
             model_id: None,
             legacy_policy_input: None,
@@ -1899,6 +1913,7 @@ mod tests {
 
         let empty: Vec<Arc<dyn Worker>> = Vec::new();
         let context = PdRequestContext {
+            hybrid_pairs: None,
             prefill_inputs: None,
             model_id: None,
             legacy_policy_input: None,
@@ -2663,6 +2678,7 @@ mod admission_tests {
 
     fn context() -> PdRequestContext<'static> {
         PdRequestContext {
+            hybrid_pairs: None,
             prefill_inputs: None,
             model_id: None,
             legacy_policy_input: Some("original request"),
@@ -2673,6 +2689,26 @@ mod admission_tests {
             cache_salt: None,
             route: "/v1/completions",
         }
+    }
+
+    #[test]
+    fn hybrid_pair_whitelist_restricts_both_stages() {
+        let p = pool("p", 2);
+        let d = pool("d", 2);
+        let allowed = HashSet::from([(
+            PdEndpoint::for_worker(p[1].as_ref()),
+            PdEndpoint::for_worker(d[0].as_ref()),
+        )]);
+        let mut context = context();
+        context.hybrid_pairs = Some(&allowed);
+        let policy = KvAwarePolicy::default();
+        let selected = select_pd_pair(&Loads::new(), &p, &d, &policy, &policy, &context).unwrap();
+        assert_eq!(selected.prefill.worker_index, 1);
+        assert_eq!(selected.decode.worker_index, 0);
+
+        let empty = HashSet::new();
+        context.hybrid_pairs = Some(&empty);
+        assert!(select_pd_pair(&Loads::new(), &p, &d, &policy, &policy, &context).is_none());
     }
 
     fn admit(
@@ -2688,6 +2724,7 @@ mod admission_tests {
 
     fn context_with_session(session: &str) -> PdRequestContext<'static> {
         PdRequestContext {
+            hybrid_pairs: None,
             prefill_inputs: None,
             model_id: None,
             legacy_policy_input: Some("original request"),
@@ -3242,6 +3279,7 @@ mod admission_tests {
         };
         fn ctx(model: &str) -> PdRequestContext<'_> {
             PdRequestContext {
+                hybrid_pairs: None,
                 prefill_inputs: None,
                 model_id: Some(model),
                 legacy_policy_input: Some("original request"),
