@@ -160,7 +160,7 @@ steps:
         allowed: true
         reason: "GPU tests can be flaky - retry if needed"
     mirror_hardwares: l4_4
-    # pytest skips while the CI image's vllm-rs is older than 0.30.0.
+    # vLLM 0.30.0, NIXL, lm-eval, and vllm-router are in the CI image.
     command: |
       bash <<'BASH'
       set -euo pipefail
