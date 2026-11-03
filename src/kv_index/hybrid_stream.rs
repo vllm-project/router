@@ -271,7 +271,16 @@ pub fn spawn_zmq(
                             }
                             let seq = seq as u64;
                             if seq < next {
-                                continue;
+                                // Frames queued during the replay/live overlap
+                                // are harmless duplicates. Once the replay is
+                                // published, a lower sequence can only come
+                                // from a restarted publisher reusing the topic,
+                                // so the whole view belongs to a dead epoch.
+                                if replaying {
+                                    continue;
+                                }
+                                required_through = seq;
+                                break;
                             }
                             if seq != next || stream.apply_payload(lease, seq, &frames[2]).is_err()
                             {
@@ -719,6 +728,32 @@ mod tests {
         }
         replay
             .send_multipart([complete[0].as_slice(), &[], &[], &end, &[]], 0)
+            .unwrap();
+        wait_for(&index, &prompt, 528).await;
+        // A restarted publisher that reuses the topic restarts at sequence 0.
+        // Treating that as a stale duplicate would keep the dead epoch's cache
+        // visible, so credit must be revoked until a new replay is verified.
+        publisher
+            .send_multipart([b"epoch-1".as_slice(), &0_i64.to_be_bytes(), &clear], 0)
+            .unwrap();
+        wait_for(&index, &prompt, 0).await;
+        let restarted = recv(&replay).await;
+        assert_eq!(restarted.len(), 3);
+        replay
+            .send_multipart([restarted[0].as_slice(), &[], b"epoch-1", &seq0, &clear], 0)
+            .unwrap();
+        replay
+            .send_multipart([restarted[0].as_slice(), &[], &[], &end, &[]], 0)
+            .unwrap();
+        publisher
+            .send_multipart(
+                [
+                    b"epoch-1".as_slice(),
+                    &1_i64.to_be_bytes(),
+                    payload.as_slice(),
+                ],
+                0,
+            )
             .unwrap();
         wait_for(&index, &prompt, 528).await;
         handle.shutdown();
