@@ -20,7 +20,7 @@ from tests.python.e2e.perf.l1_encode.case_loader import (
     bench_timeout,
     bench_tokens,
 )
-from tests.python.e2e.perf.l1_encode.scenario import (
+from tests.python.e2e.perf.l1_encode.check import (
     check_encode_reuse,
     check_l1_startup_log,
     format_scenario_result,

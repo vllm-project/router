@@ -1,4 +1,4 @@
-"""Ids, checks, printed stats, and result JSON for one L1 scenario."""
+"""Checks, scenario ids, printed stats, and result JSON for one L1 wave."""
 
 from __future__ import annotations
 

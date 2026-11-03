@@ -21,7 +21,6 @@ _TEMPLATE_HEADROOM = 4096
 
 @dataclass(frozen=True)
 class WaveSpec:
-    hit_rate: float
     concurrency: int
     requests: int
 
@@ -43,7 +42,9 @@ class L1Case:
     bench_max_tokens: int
     bench_timeout: float
     turns: int
+    hit_rates: tuple[float, ...]
     waves: tuple[WaveSpec, ...]
+    l1: tuple[bool, ...]
 
 
 def _apply_tp_override(cli: tuple[str, ...]) -> tuple[str, ...]:
@@ -128,18 +129,52 @@ def check_limits(case: L1Case) -> None:
         )
 
 
+def _parse_hit_rates(raw: Any, *, where: str) -> tuple[float, ...]:
+    if not isinstance(raw, list) or not raw:
+        raise ValueError(f"{where}: bench.hit_rates must be a non-empty array")
+    rates: list[float] = []
+    for item in raw:
+        try:
+            hit_rate = float(item)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"invalid hit rate in {where}: {item!r}") from exc
+        if not 0.0 <= hit_rate <= 1.0:
+            raise ValueError(f"invalid hit rate in {where}: {item!r}")
+        rates.append(hit_rate)
+    return tuple(rates)
+
+
+def _parse_l1(raw: Any, *, where: str) -> tuple[bool, ...]:
+    if not isinstance(raw, list) or not raw:
+        raise ValueError(f"{where}: router.l1 must be a non-empty array of 'on'/'off'")
+    modes: list[bool] = []
+    for item in raw:
+        text = str(item).strip().lower()
+        if text == "on":
+            modes.append(True)
+        elif text == "off":
+            modes.append(False)
+        else:
+            raise ValueError(f"invalid router.l1 value in {where}: {item!r}")
+    return tuple(modes)
+
+
 def _parse_wave(raw: dict[str, Any], *, where: str) -> WaveSpec:
     try:
-        hit_rate = float(raw["hit_rate"])
         concurrency = int(raw["concurrency"])
         requests = int(raw["requests"])
     except (KeyError, TypeError, ValueError) as exc:
         raise ValueError(f"invalid wave in {where}: {raw!r}") from exc
     if concurrency < 1 or requests < 1:
         raise ValueError(f"invalid wave in {where}: {raw!r}")
-    if not 0.0 <= hit_rate <= 1.0:
-        raise ValueError(f"invalid hit_rate in {where}: {raw!r}")
-    return WaveSpec(hit_rate=hit_rate, concurrency=concurrency, requests=requests)
+    return WaveSpec(concurrency=concurrency, requests=requests)
+
+
+def _section(data: dict[str, Any], name: str, case_path: Path) -> dict[str, Any]:
+    raw = data.get(name)
+    if not isinstance(raw, dict):
+        raise ValueError(f"{case_path}: {name} must be an object")
+    return raw
 
 
 def load_case(path: Path | None = None) -> L1Case:
@@ -147,9 +182,10 @@ def load_case(path: Path | None = None) -> L1Case:
     data = json.loads(case_path.read_text(encoding="utf-8"))
     if not isinstance(data, dict):
         raise ValueError(f"{case_path}: root must be an object")
-    stack = data.get("stack") if isinstance(data.get("stack"), dict) else {}
-    worker = data.get("worker") if isinstance(data.get("worker"), dict) else {}
-    bench = data.get("bench") if isinstance(data.get("bench"), dict) else {}
+    env = _section(data, "env", case_path)
+    router = _section(data, "router", case_path)
+    worker = _section(data, "worker", case_path)
+    bench = _section(data, "bench", case_path)
     cli = worker.get("cli")
     if not isinstance(cli, list) or not cli or not all(isinstance(x, str) for x in cli):
         raise ValueError(f"{case_path}: worker.cli must be a non-empty string array")
@@ -158,9 +194,9 @@ def load_case(path: Path | None = None) -> L1Case:
         raise ValueError(
             f"{case_path}: L1 encode perf requires bench.shape 'turns', got {shape!r}"
         )
-    waves_raw = data.get("waves")
+    waves_raw = bench.get("waves")
     if not isinstance(waves_raw, list) or not waves_raw:
-        raise ValueError(f"{case_path}: missing 'waves' array")
+        raise ValueError(f"{case_path}: bench.waves must be a non-empty array")
     model = (
         os.environ.get("MODEL", "").strip()
         or _optional_str(data.get("model"))
@@ -169,20 +205,23 @@ def load_case(path: Path | None = None) -> L1Case:
     return L1Case(
         path=case_path,
         model=model,
-        host=str(stack.get("host", "127.0.0.1")),
-        router_port=int(stack.get("router_port", 30000)),
-        worker_http_port=int(stack.get("worker_http_port", 8000)),
-        worker_grpc_port=int(stack.get("worker_grpc_port", 50051)),
-        prometheus_port=int(stack.get("prometheus_port", 29000)),
-        cuda_visible_devices=str(stack.get("cuda_visible_devices", "0")),
-        router_bin=_optional_str(stack.get("router_bin")),
-        vllm_rs_bin=_optional_str(stack.get("vllm_rs_bin")),
+        host=str(env.get("host", "127.0.0.1")),
+        router_port=int(router.get("port", 30000)),
+        worker_http_port=int(worker.get("http_port", 8000)),
+        worker_grpc_port=int(worker.get("grpc_port", 50051)),
+        prometheus_port=int(router.get("prometheus_port", 29000)),
+        cuda_visible_devices=str(env.get("cuda_visible_devices", "0")),
+        router_bin=_optional_str(router.get("bin")),
+        vllm_rs_bin=_optional_str(worker.get("bin")),
         worker_cli=_apply_tp_override(tuple(cli)),
         bench_tokens=int(bench.get("tokens", 16384)),
         bench_max_tokens=int(bench.get("max_tokens", 64)),
         bench_timeout=float(bench.get("timeout", 1800)),
         turns=int(bench.get("turns", 8)),
+        hit_rates=_parse_hit_rates(bench.get("hit_rates"), where=f"{case_path.name}"),
         waves=tuple(
-            _parse_wave(item, where=f"{case_path.name}:waves") for item in waves_raw
+            _parse_wave(item, where=f"{case_path.name}:bench.waves")
+            for item in waves_raw
         ),
+        l1=_parse_l1(router.get("l1"), where=f"{case_path.name}"),
     )

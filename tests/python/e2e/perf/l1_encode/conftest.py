@@ -11,8 +11,8 @@ from pathlib import Path
 import pytest
 
 from tests.python.e2e.perf.l1_encode.case_loader import load_case
-from tests.python.e2e.perf.l1_encode.scenario import wave_id
-from tests.python.e2e.perf.l1_encode.stack import L1Stack
+from tests.python.e2e.perf.l1_encode.check import wave_id
+from tests.python.e2e.perf.l1_encode.stack_launcher import L1Stack
 
 _DIR = Path(__file__).resolve().parent
 
@@ -45,10 +45,11 @@ def pytest_generate_tests(metafunc):
     case = load_case()
     params = []
     ids = []
-    for l1_on in (True, False):
-        for wave in case.waves:
-            params.append((l1_on, wave.hit_rate, wave.concurrency, wave.requests))
-            ids.append(wave_id(l1_on, wave.hit_rate, wave.concurrency, wave.requests))
+    for l1_on in case.l1:
+        for hit_rate in case.hit_rates:
+            for wave in case.waves:
+                params.append((l1_on, hit_rate, wave.concurrency, wave.requests))
+                ids.append(wave_id(l1_on, hit_rate, wave.concurrency, wave.requests))
     metafunc.parametrize("l1_on,hit_rate,concurrency,requests", params, ids=ids)
 
 

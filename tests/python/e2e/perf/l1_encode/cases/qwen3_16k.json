@@ -1,15 +1,18 @@
 {
   "model": "Qwen/Qwen3-0.6B",
-  "stack": {
-    "router_bin": "target/release/vllm-router",
+  "env": {
     "host": "127.0.0.1",
-    "router_port": 30000,
-    "worker_http_port": 8000,
-    "worker_grpc_port": 50051,
-    "prometheus_port": 29000,
     "cuda_visible_devices": "0"
   },
+  "router": {
+    "bin": "target/release/vllm-router",
+    "port": 30000,
+    "prometheus_port": 29000,
+    "l1": ["on", "off"]
+  },
   "worker": {
+    "http_port": 8000,
+    "grpc_port": 50051,
     "cli": [
       "--tensor-parallel-size", "1",
       "--max-model-len", "32768",
@@ -25,20 +28,13 @@
     "max_tokens": 64,
     "timeout": 1800,
     "shape": "turns",
-    "turns": 8
-  },
-  "waves": [
-    {"hit_rate": 0.0, "concurrency": 1, "requests": 2},
-    {"hit_rate": 0.0, "concurrency": 4, "requests": 8},
-    {"hit_rate": 0.0, "concurrency": 8, "requests": 16},
-    {"hit_rate": 0.0, "concurrency": 16, "requests": 32},
-    {"hit_rate": 0.30, "concurrency": 1, "requests": 2},
-    {"hit_rate": 0.30, "concurrency": 4, "requests": 8},
-    {"hit_rate": 0.30, "concurrency": 8, "requests": 16},
-    {"hit_rate": 0.30, "concurrency": 16, "requests": 32},
-    {"hit_rate": 0.99999, "concurrency": 1, "requests": 2},
-    {"hit_rate": 0.99999, "concurrency": 4, "requests": 8},
-    {"hit_rate": 0.99999, "concurrency": 8, "requests": 16},
-    {"hit_rate": 0.99999, "concurrency": 16, "requests": 32}
-  ]
+    "turns": 8,
+    "hit_rates": [0.0, 0.30, 0.99999],
+    "waves": [
+      {"concurrency": 1, "requests": 2},
+      {"concurrency": 4, "requests": 8},
+      {"concurrency": 8, "requests": 16},
+      {"concurrency": 16, "requests": 32}
+    ]
+  }
 }
