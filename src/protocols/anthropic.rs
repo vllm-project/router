@@ -251,14 +251,15 @@ impl GenerationRequest for MessagesRequest {
 /// Anthropic error `type` for a router generated status code.
 pub fn anthropic_error_type(status: u16) -> &'static str {
     match status {
-        400 | 422 => "invalid_request_error",
+        400 => "invalid_request_error",
         401 => "authentication_error",
         403 => "permission_error",
         404 => "not_found_error",
         413 => "request_too_large",
         429 => "rate_limit_error",
         503 | 529 => "overloaded_error",
-        _ => "api_error",
+        status if status >= 500 => "api_error",
+        _ => "invalid_request_error",
     }
 }
 
@@ -438,6 +439,7 @@ mod tests {
         assert_eq!(anthropic_error_type(401), "authentication_error");
         assert_eq!(anthropic_error_type(404), "not_found_error");
         assert_eq!(anthropic_error_type(500), "api_error");
+        assert_eq!(anthropic_error_type(408), "invalid_request_error");
     }
 
     #[test]
