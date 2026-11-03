@@ -173,7 +173,7 @@ steps:
         agents:
           queue: cpu_queue_release
         commands:
-          - "DOCKER_BUILDKIT=1 docker build --tag vllm/vllm-router:nightly-x86_64 --progress plain -f Dockerfile.router ."
+          - "DOCKER_BUILDKIT=1 docker build --tag vllm/vllm-router:nightly-x86_64 --progress plain -f docker/Dockerfile.router ."
           - "docker push vllm/vllm-router:nightly-x86_64"
         plugins:
           - docker-login#v3.0.0:
@@ -188,7 +188,7 @@ steps:
         agents:
           queue: arm64_cpu_queue_release
         commands:
-          - "DOCKER_BUILDKIT=1 docker build --tag vllm/vllm-router:nightly-aarch64 --progress plain -f Dockerfile.router ."
+          - "DOCKER_BUILDKIT=1 docker build --tag vllm/vllm-router:nightly-aarch64 --progress plain -f docker/Dockerfile.router ."
           - "docker push vllm/vllm-router:nightly-aarch64"
         plugins:
           - docker-login#v3.0.0:
@@ -260,7 +260,7 @@ steps:
           DOCKER_BUILDKIT=1 docker build \
             --tag "vllm/vllm-router:v$${RELEASE_VERSION}-x86_64" \
             --progress plain \
-            -f Dockerfile.router .
+            -f docker/Dockerfile.router .
           docker push "vllm/vllm-router:v$${RELEASE_VERSION}-x86_64"
         plugins:
           - docker-login#v3.0.0:
@@ -285,7 +285,7 @@ steps:
           DOCKER_BUILDKIT=1 docker build \
             --tag "vllm/vllm-router:v$${RELEASE_VERSION}-aarch64" \
             --progress plain \
-            -f Dockerfile.router .
+            -f docker/Dockerfile.router .
           docker push "vllm/vllm-router:v$${RELEASE_VERSION}-aarch64"
         plugins:
           - docker-login#v3.0.0:
