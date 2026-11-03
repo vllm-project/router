@@ -1,9 +1,15 @@
 //! Conservative common-prefix calculation for hybrid cache groups.
 //!
-//! This module is not wired into routing. The caller must first establish the
-//! cache identity, complete group layout, restore semantics, and one consistent
-//! snapshot for the target and its current incarnation. A placement event is
-//! not a reservation: the engine must still validate reuse at dispatch time.
+//! The caller must first establish the cache identity, complete group layout,
+//! restore semantics, and one consistent snapshot for the target and its
+//! current incarnation. A placement event is not a reservation: the engine must
+//! still validate reuse at dispatch time.
+//!
+//! A hit in one group is never evidence for another. Every indexed group must
+//! accept the same, block-aligned boundary, and the credited prefix is that
+//! boundary minus the largest restore-time recomputation window the layout
+//! declares (vLLM's `prefix_replay_tokens`). Replay windows belong to the
+//! layout, not to a group that may publish no events at all.
 
 use std::collections::HashSet;
 
@@ -32,6 +38,17 @@ pub struct HybridGroupView<'a> {
     pub block_size: u32,
     pub kind: HybridGroupKind,
     pub matches: &'a [TierMatch],
+}
+
+/// Round `tokens` down to `block_size`.
+///
+/// Restore-time replay is charged in whole blocks, matching the engine's own
+/// `hit_tokens -= hit_tokens % block_size` rewind.
+pub fn align_down(tokens: u64, block_size: u32) -> u64 {
+    if block_size == 0 {
+        return 0;
+    }
+    tokens - tokens % u64::from(block_size)
 }
 
 /// Return the latest jointly restorable boundary, or zero when none is proven.

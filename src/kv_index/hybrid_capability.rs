@@ -49,18 +49,31 @@ pub struct HybridGroupCapability {
 }
 
 impl HybridCapabilities {
-    /// Construct an index only for the verified full-attention + aligned
-    /// Mamba contract. Unknown layouts remain ineligible for cache credit.
-    pub fn index_for_source(
+    /// The capability declared for one DP rank. Ranks are independent
+    /// instances: a rank that is absent here simply gets no hybrid credit and
+    /// must not invalidate the other ranks of the same worker.
+    pub fn rank_capability(&self, rank: u32) -> Option<&HybridRankCapability> {
+        self.ranks.iter().find(|entry| entry.rank == rank)
+    }
+
+    /// Construct an index for one rank and its event source.
+    ///
+    /// Unknown or unverifiable group layouts remain ineligible for cache
+    /// credit. Callers admit each rank separately: one rank's unsupported
+    /// layout, missing topic or stale model is that rank's miss, not proof
+    /// that the deployment's layout changed.
+    pub fn index_for_rank(
         &self,
+        rank: u32,
         source: &EventSource,
         target: RoutableTarget,
         max_entries: usize,
     ) -> Result<HybridEventIndex, &'static str> {
         let mut ranks = HashSet::new();
         if self.schema_version != 1
-            || self.ranks.iter().any(|rank| !ranks.insert(rank.rank))
+            || self.ranks.iter().any(|entry| !ranks.insert(entry.rank))
             || target.dp_rank != source.dp_rank
+            || rank != source.dp_rank
             || target.instance_id != source.source
             || source.topic.is_empty()
             || source.replay_endpoint.as_deref().is_none_or(str::is_empty)
@@ -68,9 +81,7 @@ impl HybridCapabilities {
             return Err("invalid capability or source binding");
         }
         let rank = self
-            .ranks
-            .iter()
-            .find(|rank| rank.rank == source.dp_rank)
+            .rank_capability(rank)
             .ok_or("missing rank capability")?;
         if rank.model.is_empty()
             || rank.weight_version.is_empty()
@@ -91,14 +102,46 @@ impl HybridCapabilities {
             .ok_or("invalid root hash")?;
         let hash_block_size = rank.hash_block_size.ok_or("missing hash block size")?;
         let mut groups = Vec::with_capacity(rank.groups.len());
+        let mut replay_tokens = 0;
         for group in &rank.groups {
-            if group.prefix_replay_tokens != 0 || group.sliding_window.is_some() {
-                return Err("unsupported group restore contract");
+            // vLLM rewinds a hit by one replay window shared by every replay
+            // group. Disagreeing windows have no single restore point, and a
+            // replay window only exists for sliding-window layouts.
+            if group.prefix_replay_tokens > 0 {
+                if !matches!(
+                    group.kind.as_str(),
+                    "sliding_window" | "sliding_window_mla"
+                ) {
+                    return Err("unsupported group restore contract");
+                }
+                if replay_tokens != 0 && replay_tokens != group.prefix_replay_tokens {
+                    return Err("unsupported group restore contract");
+                }
+                replay_tokens = group.prefix_replay_tokens;
             }
             // Scratch groups such as the Qwen4 QSA key ring hold per-request
             // state, never shareable state, and emit no block events. They are
             // excluded from the index only when their shape proves that.
             if !group.prefix_cacheable {
+                if group.prefix_replay_tokens > 0
+                    && matches!(
+                        (group.kind.as_str(), group.spec_type.as_str()),
+                        ("sliding_window", "SlidingWindowSpec")
+                            | ("sliding_window_mla", "SlidingWindowMLASpec")
+                            | ("mla_attention", "MLAAttentionSpec")
+                    )
+                {
+                    // Bounded replay: the engine rebuilds this group's trailing
+                    // window from the other groups' state. Its own blocks are
+                    // not required to be resident, but the window must still be
+                    // charged to the layout.
+                    if group.sliding_window.is_none_or(|window| {
+                        window == 0 || u64::from(window) != u64::from(group.prefix_replay_tokens)
+                    }) {
+                        return Err("unsupported bounded replay group");
+                    }
+                    continue;
+                }
                 if group.spec_type != "CircularBufferSpec"
                     || group.tokens_per_state.as_deref() != Some("1")
                     || group.block_size == 0
@@ -108,12 +151,15 @@ impl HybridCapabilities {
                 continue;
             }
             let kind = match (group.kind.as_str(), group.spec_type.as_str()) {
-                ("full_attention", "FullAttentionSpec") => HybridGroupKind::FullAttention,
+                ("full_attention", "FullAttentionSpec") if group.sliding_window.is_none() => {
+                    HybridGroupKind::FullAttention
+                }
                 ("mla_attention", "MLAAttentionSpec")
-                    if group
-                        .cache_role
-                        .as_deref()
-                        .is_none_or(|role| role == "sparse") =>
+                    if group.sliding_window.is_none()
+                        && group
+                            .cache_role
+                            .as_deref()
+                            .is_none_or(|role| role == "sparse") =>
                 {
                     let tokens_per_state = group
                         .tokens_per_state
@@ -122,6 +168,16 @@ impl HybridCapabilities {
                         .filter(|value| *value > 0 && group.block_size.is_multiple_of(*value))
                         .ok_or("unsupported compressed attention group")?;
                     HybridGroupKind::CompressedFullAttention { tokens_per_state }
+                }
+                ("sliding_window", "SlidingWindowSpec")
+                | ("sliding_window_mla", "SlidingWindowMLASpec") => {
+                    let window = group
+                        .sliding_window
+                        .filter(|window| *window > 0)
+                        .ok_or("unsupported sliding window group")?;
+                    HybridGroupKind::SlidingWindow {
+                        window_tokens: u64::from(window),
+                    }
                 }
                 ("mamba", "MambaSpec")
                     if group.mamba_cache_mode.as_deref() == Some("align")
@@ -139,22 +195,45 @@ impl HybridCapabilities {
                 kind,
             });
         }
-        if groups.len() < 2
-            || !groups.iter().any(|group| {
-                matches!(
-                    group.kind,
-                    HybridGroupKind::FullAttention
-                        | HybridGroupKind::CompressedFullAttention { .. }
-                )
-            })
-            || !groups
-                .iter()
-                .any(|group| group.kind == HybridGroupKind::Checkpoint)
+        // The declared layout, not just the indexed subset, must describe a
+        // hybrid cache: several groups, at least one attention group, and some
+        // state that a single attention hit cannot prove (a checkpoint group,
+        // a sliding-window group, or a declared replay window).
+        let has_attention = groups.iter().any(|group| {
+            matches!(
+                group.kind,
+                HybridGroupKind::FullAttention
+                    | HybridGroupKind::CompressedFullAttention { .. }
+                    | HybridGroupKind::SlidingWindow { .. }
+            )
+        });
+        let has_state = groups.iter().any(|group| {
+            matches!(
+                group.kind,
+                HybridGroupKind::Checkpoint | HybridGroupKind::SlidingWindow { .. }
+            )
+        });
+        if rank.groups.len() < 2
+            || groups.is_empty()
+            || !has_attention
+            || !(has_state || replay_tokens > 0)
         {
             return Err("not a supported mixed layout");
         }
         HybridEventIndex::new_with_root_hash(target, groups, hash_block_size, root, max_entries)
+            .map_err(|_| "invalid group layout")?
+            .with_replay_tokens(replay_tokens)
             .map_err(|_| "invalid group layout")
+    }
+
+    /// Bind one event source to its rank's verified layout.
+    pub fn index_for_source(
+        &self,
+        source: &EventSource,
+        target: RoutableTarget,
+        max_entries: usize,
+    ) -> Result<HybridEventIndex, &'static str> {
+        self.index_for_rank(source.dp_rank, source, target, max_entries)
     }
 }
 

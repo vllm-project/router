@@ -9,7 +9,7 @@ use std::collections::HashSet;
 
 use parking_lot::RwLock;
 
-use super::hybrid::{common_reusable_tokens, HybridGroupKind, HybridGroupView};
+use super::hybrid::{align_down, common_reusable_tokens, HybridGroupKind, HybridGroupView};
 use super::wire::{BlockStored, ExternalBlockHash};
 use super::{KVEvent, KVEventBatch, Locality, RoutableTarget, StorageTier, TierMatch};
 use crate::kv_hash::{BlockKeyGenerator, SequenceHash};
@@ -45,6 +45,10 @@ pub struct HybridEventIndex {
     target: RoutableTarget,
     groups: Vec<HybridEventGroup>,
     keys: BlockKeyGenerator,
+    /// Layout-declared restore-time recomputation window (vLLM
+    /// `prefix_replay_tokens`). It applies to the whole layout: a group that
+    /// publishes no events can still make this window mandatory.
+    replay_tokens: u32,
     max_entries: usize,
     state: RwLock<State>,
 }
@@ -103,10 +107,10 @@ impl HybridEventIndex {
                 group.block_size == 0
                     || !(group.block_size as usize).is_multiple_of(keys.block_size())
                     || !ids.insert(group.group_idx)
-                    // Sliding and compressed layouts require a separately
-                    // verified event and restore contract.
+                    // Compressed state covers `tokens_per_state` tokens, so the
+                    // group boundary has to be a multiple of that ratio.
                     || match group.kind {
-                        HybridGroupKind::SlidingWindow { .. } => true,
+                        HybridGroupKind::SlidingWindow { window_tokens } => window_tokens == 0,
                         HybridGroupKind::CompressedFullAttention { tokens_per_state } => {
                             tokens_per_state == 0
                                 || !group.block_size.is_multiple_of(tokens_per_state)
@@ -121,6 +125,7 @@ impl HybridEventIndex {
             target,
             groups,
             keys,
+            replay_tokens: 0,
             max_entries,
             state: RwLock::new(State {
                 next_seq: None,
@@ -128,6 +133,29 @@ impl HybridEventIndex {
                 claims: HashSet::new(),
             }),
         })
+    }
+
+    /// Declare the layout's restore-time recomputation window.
+    ///
+    /// vLLM rewinds a prefix hit by this many tokens (rounded down to a block)
+    /// before prefilling the rest, and requires every replay group to agree on
+    /// one window. A non-zero window therefore reduces the credited prefix for
+    /// the complete layout, including groups that never emit block events.
+    pub fn with_replay_tokens(mut self, replay_tokens: u32) -> Result<Self, HybridEventError> {
+        let hash_block_size = self.keys.block_size();
+        if replay_tokens > 0 && (hash_block_size == 0 || replay_tokens > u32::MAX / 2) {
+            return Err(HybridEventError::InvalidLayout);
+        }
+        self.replay_tokens = replay_tokens;
+        Ok(self)
+    }
+
+    pub fn replay_tokens(&self) -> u32 {
+        self.replay_tokens
+    }
+
+    pub fn target(&self) -> &RoutableTarget {
+        &self.target
     }
 
     /// Begin tracking from an externally established empty-cache barrier.
@@ -204,15 +232,7 @@ impl HybridEventIndex {
                     let group = self.groups.iter().find(|group| {
                         store.group_idx == Some(group.group_idx)
                             && store.block_size == group.block_size
-                            && store.kv_cache_spec_kind.as_deref()
-                                == Some(match group.kind {
-                                    HybridGroupKind::FullAttention => "full_attention",
-                                    HybridGroupKind::CompressedFullAttention { .. } => {
-                                        "mla_attention"
-                                    }
-                                    HybridGroupKind::Checkpoint => "mamba",
-                                    HybridGroupKind::SlidingWindow { .. } => unreachable!(),
-                                })
+                            && event_kind_matches(group.kind, store)
                     });
                     if group.is_none()
                         || store.medium.as_deref() != Some("GPU")
@@ -220,7 +240,6 @@ impl HybridEventIndex {
                         || store.ownership.is_some()
                         || store.lora_id.is_some()
                         || store.lora_name.is_some()
-                        || store.kv_cache_spec_sliding_window.is_some()
                         || !group.is_some_and(|group| stored_shape_matches(group.kind, store))
                         || store.extra_keys.as_ref().is_some_and(|keys| {
                             keys.len() != store.block_hashes.len()
@@ -336,11 +355,16 @@ impl HybridEventIndex {
                 matches,
             })
             .collect();
-        common_reusable_tokens(
+        let boundary = common_reusable_tokens(
             &self.target,
             &views,
             tokens.len().saturating_sub(1).min(max_reusable_tokens) as u64,
-        )
+        );
+        // The engine replays the layout's trailing window before prefilling the
+        // rest, and rounds the remaining hit down to a block. Charging the same
+        // way keeps Router's estimate from exceeding the engine's own cache hit.
+        let credited = boundary.saturating_sub(u64::from(self.replay_tokens));
+        align_down(credited, self.keys.block_size() as u32)
     }
 
     fn fail<T>(state: &mut State, error: HybridEventError) -> Result<T, HybridEventError> {
@@ -355,6 +379,28 @@ fn sequence_hash(hash: &ExternalBlockHash) -> Option<SequenceHash> {
     match hash {
         ExternalBlockHash::Bytes(bytes) => bytes.as_slice().try_into().ok(),
         ExternalBlockHash::Int(_) => None,
+    }
+}
+
+/// A group accepts only the event shape its verified restore rule describes.
+/// The sliding-window size is part of the identity: the same model served with
+/// a different window is a different layout.
+fn event_kind_matches(kind: HybridGroupKind, store: &BlockStored) -> bool {
+    let spec = store.kv_cache_spec_kind.as_deref();
+    match kind {
+        HybridGroupKind::FullAttention => {
+            spec == Some("full_attention") && store.kv_cache_spec_sliding_window.is_none()
+        }
+        HybridGroupKind::CompressedFullAttention { .. } => {
+            spec == Some("mla_attention") && store.kv_cache_spec_sliding_window.is_none()
+        }
+        HybridGroupKind::Checkpoint => {
+            spec == Some("mamba") && store.kv_cache_spec_sliding_window.is_none()
+        }
+        HybridGroupKind::SlidingWindow { window_tokens } => {
+            matches!(spec, Some("sliding_window" | "sliding_window_mla"))
+                && store.kv_cache_spec_sliding_window.map(u64::from) == Some(window_tokens)
+        }
     }
 }
 
@@ -388,8 +434,11 @@ impl crate::policies::TieredMatchProvider for HybridEventIndex {
         tokens: &[u32],
         block_size: u32,
         lora_name: Option<&str>,
+        dp_rank: u32,
     ) -> Option<Vec<TierMatch>> {
-        if lora_name.is_some() || block_size == 0 {
+        // Events, ownership and history are bound to one rank. A hit computed
+        // from another rank's stream is never evidence for this one.
+        if lora_name.is_some() || block_size == 0 || dp_rank != self.target.dp_rank {
             return Some(Vec::new());
         }
         let tokens = self.reusable_tokens(tokens, usize::MAX);
@@ -744,7 +793,7 @@ mod tests {
             Err(HybridEventError::InvalidLayout)
         ));
         let mut wrong = groups();
-        wrong[0].kind = HybridGroupKind::SlidingWindow { window_tokens: 64 };
+        wrong[0].kind = HybridGroupKind::SlidingWindow { window_tokens: 0 };
         assert!(matches!(
             HybridEventIndex::new(target(), wrong, 16, 0, 8),
             Err(HybridEventError::InvalidLayout)
@@ -1097,5 +1146,179 @@ mod tests {
         };
         assert_eq!(index.apply_batch(1, &rerun), Ok(()));
         assert_eq!(index.reusable_tokens(&tokens, usize::MAX), 1728);
+    }
+
+    /// One block per published hash, with the event shape the verified group
+    /// kind requires.
+    fn blocks(
+        group: HybridEventGroup,
+        spec: &str,
+        window: Option<u32>,
+        keys: &[SequenceHash],
+        block: usize,
+        tokens: &[u32],
+        from: usize,
+        to: usize,
+    ) -> KVEvent {
+        KVEvent::BlockStored(BlockStored {
+            block_hashes: keys[from..to]
+                .iter()
+                .map(|key| ExternalBlockHash::Bytes(key.to_vec()))
+                .collect(),
+            parent_block_hash: None,
+            token_ids: tokens[from * block..to * block].to_vec(),
+            block_size: block as u32,
+            lora_id: None,
+            medium: Some("GPU".into()),
+            lora_name: None,
+            extra_keys: Some(vec![rmpv::Value::Nil; to - from]),
+            group_idx: Some(group.group_idx),
+            kv_cache_spec_kind: Some(spec.into()),
+            kv_cache_spec_sliding_window: window,
+            locality: None,
+            ownership: None,
+            session_id: None,
+        })
+    }
+
+    #[test]
+    fn layout_replay_window_rounds_the_credited_prefix_down() {
+        // vLLM rewinds a prefix hit by the layout's replay window and then
+        // rounds to a block. The window belongs to the layout, so it reduces
+        // credit even though no group event mentions it.
+        let tokens: Vec<u32> = (0..1024).map(|i| 100 + i % 100).collect();
+        let keys = BlockKeyGenerator::new(64, 0).generate_block_keys(&tokens);
+        let groups = vec![
+            HybridEventGroup {
+                group_idx: 0,
+                block_size: 64,
+                kind: HybridGroupKind::FullAttention,
+            },
+            HybridEventGroup {
+                group_idx: 1,
+                block_size: 64,
+                kind: HybridGroupKind::SlidingWindow { window_tokens: 32 },
+            },
+        ];
+        let batch = KVEventBatch {
+            ts: 1.0,
+            data_parallel_rank: Some(0),
+            events: vec![
+                blocks(groups[0], "full_attention", None, &keys, 64, &tokens, 0, keys.len()),
+                blocks(
+                    groups[1],
+                    "sliding_window_mla",
+                    Some(32),
+                    &keys,
+                    64,
+                    &tokens,
+                    0,
+                    keys.len(),
+                ),
+            ],
+        };
+        let replay = HybridEventIndex::new(target(), groups.clone(), 64, 0, 64)
+            .unwrap()
+            .with_replay_tokens(128)
+            .unwrap();
+        replay.begin_empty(0);
+        assert_eq!(replay.apply_batch(0, &batch), Ok(()));
+        // 1023 tokens bound the hit to block 15 (960); a 128-token replay
+        // leaves 832, already block aligned.
+        assert_eq!(replay.reusable_tokens(&tokens, usize::MAX), 832);
+        assert_eq!(replay.replay_tokens(), 128);
+
+        let plain = HybridEventIndex::new(target(), groups, 64, 0, 64).unwrap();
+        plain.begin_empty(0);
+        assert_eq!(plain.apply_batch(0, &batch), Ok(()));
+        assert_eq!(plain.reusable_tokens(&tokens, usize::MAX), 960);
+    }
+
+    #[test]
+    fn sliding_group_needs_its_window_not_the_whole_prefix() {
+        // A bounded-replay sliding group keeps only the trailing window, so a
+        // hit must not require its earlier blocks, and a hit must not exceed
+        // what the full-attention group can restore.
+        let tokens: Vec<u32> = (0..1024).map(|i| 100 + i % 100).collect();
+        let keys = BlockKeyGenerator::new(64, 0).generate_block_keys(&tokens);
+        let groups = vec![
+            HybridEventGroup {
+                group_idx: 0,
+                block_size: 64,
+                kind: HybridGroupKind::FullAttention,
+            },
+            HybridEventGroup {
+                group_idx: 1,
+                block_size: 64,
+                kind: HybridGroupKind::SlidingWindow { window_tokens: 64 },
+            },
+        ];
+        let index = HybridEventIndex::new(target(), groups.clone(), 64, 0, 64).unwrap();
+        index.begin_empty(0);
+        let window_only = KVEventBatch {
+            ts: 1.0,
+            data_parallel_rank: Some(0),
+            events: vec![
+                blocks(groups[0], "full_attention", None, &keys, 64, &tokens, 0, 8),
+                blocks(groups[1], "sliding_window_mla", Some(64), &keys, 64, &tokens, 7, 8),
+            ],
+        };
+        assert_eq!(index.apply_batch(0, &window_only), Ok(()));
+        assert_eq!(index.reusable_tokens(&tokens, usize::MAX), 512);
+
+        // Without the block the window covers, the hit retreats to the last
+        // boundary whose window is complete instead of claiming the prefix.
+        let gap = HybridEventIndex::new(target(), groups.clone(), 64, 0, 64).unwrap();
+        gap.begin_empty(0);
+        let missing_window = KVEventBatch {
+            ts: 1.0,
+            data_parallel_rank: Some(0),
+            events: vec![
+                blocks(groups[0], "full_attention", None, &keys, 64, &tokens, 0, 8),
+                blocks(groups[1], "sliding_window_mla", Some(64), &keys, 64, &tokens, 0, 6),
+            ],
+        };
+        assert_eq!(gap.apply_batch(0, &missing_window), Ok(()));
+        assert_eq!(gap.reusable_tokens(&tokens, usize::MAX), 384);
+
+        // A sliding window of another size is another layout, not a hit.
+        let wrong = HybridEventIndex::new(target(), groups.clone(), 64, 0, 64).unwrap();
+        wrong.begin_empty(0);
+        let other_window = KVEventBatch {
+            ts: 1.0,
+            data_parallel_rank: Some(0),
+            events: vec![
+                blocks(groups[0], "full_attention", None, &keys, 64, &tokens, 0, 8),
+                blocks(groups[1], "sliding_window_mla", Some(32), &keys, 64, &tokens, 7, 8),
+            ],
+        };
+        assert_eq!(
+            wrong.apply_batch(0, &other_window),
+            Err(HybridEventError::InvalidBatch)
+        );
+        assert_eq!(wrong.reusable_tokens(&tokens, usize::MAX), 0);
+    }
+
+    #[test]
+    fn another_dp_rank_never_answers_for_this_rank() {
+        use crate::policies::TieredMatchProvider;
+
+        let index = index(8);
+        index.begin_empty(0);
+        index.apply_payload(0, include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/rust/fixtures/kv_cbor/qwen35_vllm028.msgpack"
+        )))
+        .unwrap();
+        // Each rank serves independently; its events, ownership and history
+        // belong to that rank only.
+        assert!(!TieredMatchProvider::find_token_matches(&index, &prompt(), 528, None, 0)
+            .unwrap()
+            .is_empty());
+        assert!(
+            TieredMatchProvider::find_token_matches(&index, &prompt(), 528, None, 1)
+                .unwrap()
+                .is_empty()
+        );
     }
 }
