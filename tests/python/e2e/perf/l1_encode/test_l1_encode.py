@@ -73,18 +73,7 @@ def _bind_case(case):
             row_id = wave_id(l1_on, hit_rate, concurrency, requests)
             summary = (payload.get("wave") or {}).get("summary") or {}
             metrics = l1_stack.l1_metrics_text()
-            artifact = write_result(
-                l1_output_dir,
-                row_id,
-                {
-                    "id": row_id,
-                    "l1": "on" if l1_on else "off",
-                    "tokens": settings["tokens"],
-                    "turns": l1_case.turns,
-                    "metrics_l1": metrics,
-                    **payload,
-                },
-            )
+            artifact = write_result(l1_output_dir, row_id, payload)
             print(
                 format_scenario_result(
                     scenario_id=row_id,

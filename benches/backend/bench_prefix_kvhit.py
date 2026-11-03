@@ -618,15 +618,7 @@ def maybe_write_result(
         f"_c{concurrency}_r{requests}.json"
     )
     path = out_dir / name
-    envelope = {
-        "backend_label": settings["backend_label"],
-        "run_idx": run_idx,
-        "hit_rate": hit_rate,
-        "concurrency": concurrency,
-        "requests": requests,
-        **payload,
-    }
-    path.write_text(json.dumps(envelope, indent=2), encoding="utf-8")
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     return path
 
 
