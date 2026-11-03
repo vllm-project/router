@@ -432,26 +432,37 @@ mod sticky_least_loaded_regular_tests {
     async fn test_regular_body_session_is_sticky() {
         let fx = RegularFixture::start().await;
 
-        // Typed chat routing does not pass the request body to policies, so
-        // the session id must come from the resolved identity.
-        let mut served = Vec::new();
-        for turn in 0..4 {
-            let body = json!({
-                "model": "mock-model",
-                "messages": [{"role": "user", "content": format!("turn {turn}")}],
-                "session_params": {"session_id": "traj-1"},
-            });
-            served.push(fx.send("/v1/chat/completions", &[], body).await);
-        }
-        assert!(served.windows(2).all(|w| w[0] == w[1]), "{served:?}");
-        assert_eq!(fx.active_sessions(), 1);
+        // Typed routes pass the prompt (completions) or the bare session id
+        // (chat) to policies, not the body, so the session id must come from
+        // the resolved identity.
+        for (path, session) in [
+            ("/v1/chat/completions", "traj-1"),
+            ("/v1/completions", "traj-2"),
+        ] {
+            let mut served = Vec::new();
+            for turn in 0..4 {
+                let mut body = if path == "/v1/completions" {
+                    json!({"model": "mock-model", "prompt": format!("turn {turn}"), "max_tokens": 4})
+                } else {
+                    json!({
+                        "model": "mock-model",
+                        "messages": [{"role": "user", "content": format!("turn {turn}")}],
+                    })
+                };
+                body["session_params"] = json!({"session_id": session});
+                served.push(fx.send(path, &[], body).await);
+            }
+            assert!(
+                served.windows(2).all(|w| w[0] == w[1]),
+                "{path}: {served:?}"
+            );
+            assert_eq!(fx.active_sessions(), 1, "{path}");
 
-        // The session is released by the id the client sent.
-        assert_eq!(
-            fx.status("POST", "/finish_session?session_id=traj-1").await,
-            200
-        );
-        assert_eq!(fx.active_sessions(), 0);
+            // The session is released by the id the client sent.
+            let finish = format!("/finish_session?session_id={session}");
+            assert_eq!(fx.status("POST", &finish).await, 200);
+            assert_eq!(fx.active_sessions(), 0, "{path}");
+        }
 
         fx.stop().await;
     }
