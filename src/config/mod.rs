@@ -98,6 +98,8 @@ pub fn parse_pd_kv_events(
                     replay_endpoints: None,
                     block_size: 16,
                     model: None,
+                    hybrid: None,
+                    compatible_decode_urls: Vec::new(),
                 },
             )
             .is_some()

@@ -914,6 +914,12 @@ pub struct PdKvEventSources {
     /// served-model check then relies on `/v1/models`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Router-managed cache layout for this prefill worker.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hybrid: Option<crate::kv_index::hybrid_capability::HybridCapabilities>,
+    /// Decode base URLs explicitly verified for this hybrid prefill worker.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub compatible_decode_urls: Vec<String>,
 }
 
 fn default_pd_kv_block_size() -> u32 {
@@ -1477,6 +1483,8 @@ mod tests {
                 replay_endpoints: Some(vec!["tcp://prefill:5558".to_string()]),
                 block_size: 32,
                 model: Some("m".to_string()),
+                hybrid: None,
+                compatible_decode_urls: Vec::new(),
             },
         );
         let json = serde_json::to_string(&config).unwrap();
