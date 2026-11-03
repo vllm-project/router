@@ -48,6 +48,10 @@ pub struct CapturedGrpcGenerate {
 pub struct MockVllmRs {
     pub captured: Arc<Mutex<Vec<CapturedGrpcGenerate>>>,
     pub reply_text: String,
+    /// Model a worker without capability discovery.
+    pub server_info_unimplemented: bool,
+    /// Optional externally driven stream for lifecycle and progress tests.
+    pub scripted_stream: Arc<Mutex<Option<ResponseStream>>>,
     /// `(text, token_ids)` per streamed frame; the last one carries
     /// `finish_info`. `None` sends a single frame: `reply_text` + `[7, 8, 9]`.
     /// Empty text with non-empty ids reproduces a buffered decoder fragment.
@@ -79,6 +83,8 @@ impl Default for MockVllmRs {
         Self {
             captured: Arc::new(Mutex::new(Vec::new())),
             reply_text: "hello from worker".to_string(),
+            server_info_unimplemented: false,
+            scripted_stream: Arc::new(Mutex::new(None)),
             frames: None,
             capture_limit: usize::MAX,
             failures_remaining: Arc::new(AtomicUsize::new(0)),
@@ -145,7 +151,7 @@ impl MockVllmRsServer {
     }
 }
 
-type ResponseStream = Pin<Box<dyn Stream<Item = Result<GenerateResponse, Status>> + Send>>;
+pub type ResponseStream = Pin<Box<dyn Stream<Item = Result<GenerateResponse, Status>> + Send>>;
 
 #[tonic::async_trait]
 impl Inference for MockVllmRs {
@@ -245,6 +251,10 @@ impl Inference for MockVllmRs {
             .is_ok()
         {
             return Err(Status::unavailable("retry test"));
+        }
+
+        if let Some(stream) = self.scripted_stream.lock().unwrap().take() {
+            return Ok(Response::new(stream));
         }
 
         let (tx, rx) = mpsc::channel(4);
@@ -380,6 +390,9 @@ macro_rules! mock_control {
                 &self,
                 _request: Request<pb::GetServerInfoRequest>,
             ) -> Result<Response<pb::ServerInfo>, Status> {
+                if self.server_info_unimplemented {
+                    return Err(Status::unimplemented("GetServerInfo"));
+                }
                 Ok(Response::new(pb::ServerInfo {
                     engine_version: "mock".into(),
                     supports_prefill_progress: self.supports_prefill_progress,

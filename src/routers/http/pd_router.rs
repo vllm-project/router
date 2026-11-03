@@ -2981,7 +2981,7 @@ mod admission_tests {
     }
 
     #[test]
-    fn initial_unconfirmed_queue_retains_only_known_admission_until_resolution_or_stale() {
+    fn initial_unconfirmed_queue_retains_known_admission_until_resolution() {
         use crate::backend::grpc::PrefillProgressKind;
 
         let p = pool("p", 1);
@@ -3009,29 +3009,19 @@ mod admission_tests {
             PrefillProgressKind::InitialUnconfirmedQueue,
         );
         assert_eq!(tokens_on(), 64);
-        // Stale notification for the latest accepted sequence restores the
-        // conservative worker snapshot; a duplicate cannot double-charge.
-        attempt.update_prefill_progress_with_kind(2, 100, PrefillProgressKind::StaleInitialQueue);
-        attempt.update_prefill_progress_with_kind(2, 100, PrefillProgressKind::StaleInitialQueue);
-        assert_eq!(tokens_on(), 100);
-        // Once restored, the initial-queue heuristic cannot restart.
         attempt.update_prefill_progress_with_kind(
-            3,
+            4,
             100,
             PrefillProgressKind::InitialUnconfirmedQueue,
         );
-        assert_eq!(tokens_on(), 100);
-        attempt.update_prefill_progress_with_kind(4, 16, PrefillProgressKind::Snapshot);
-        assert_eq!(tokens_on(), 16);
-        // A delayed stale notification cannot overwrite a newer snapshot.
-        attempt.update_prefill_progress_with_kind(2, 100, PrefillProgressKind::StaleInitialQueue);
+        assert_eq!(tokens_on(), 64);
+        attempt.update_prefill_progress_with_kind(5, 16, PrefillProgressKind::Snapshot);
         assert_eq!(tokens_on(), 16);
         // A later re-prefill or invalidation can increase real work.
-        attempt.update_prefill_progress_with_kind(5, 80, PrefillProgressKind::Snapshot);
+        attempt.update_prefill_progress_with_kind(6, 80, PrefillProgressKind::Snapshot);
         assert_eq!(tokens_on(), 80);
         attempt.finish_prefill();
-        attempt.update_prefill_progress_with_kind(5, 100, PrefillProgressKind::StaleInitialQueue);
-        attempt.update_prefill_progress_with_kind(6, 100, PrefillProgressKind::Snapshot);
+        attempt.update_prefill_progress_with_kind(7, 100, PrefillProgressKind::Snapshot);
         assert_eq!(tokens_on(), 0);
         drop(attempt);
         assert!(manager.snapshot().is_empty());
@@ -3069,7 +3059,7 @@ mod admission_tests {
     }
 
     #[test]
-    fn initial_unconfirmed_queue_does_not_retain_a_higher_admission() {
+    fn initial_unconfirmed_queue_retains_a_higher_admission() {
         use crate::backend::grpc::PrefillProgressKind;
 
         let p = pool("p", 1);
@@ -3091,15 +3081,15 @@ mod admission_tests {
             50,
             PrefillProgressKind::InitialUnconfirmedQueue,
         );
-        assert_eq!(tokens_on(), 50);
-        // Once the worker snapshot has been adopted, the initial heuristic
-        // cannot start later, even if a malformed caller supplies the kind.
+        assert_eq!(tokens_on(), 64);
         attempt.update_prefill_progress_with_kind(
             2,
             100,
             PrefillProgressKind::InitialUnconfirmedQueue,
         );
-        assert_eq!(tokens_on(), 100);
+        assert_eq!(tokens_on(), 64);
+        attempt.update_prefill_progress_with_kind(3, 20, PrefillProgressKind::Snapshot);
+        assert_eq!(tokens_on(), 20);
         attempt.finish_prefill();
         drop(attempt);
         assert!(manager.snapshot().is_empty());

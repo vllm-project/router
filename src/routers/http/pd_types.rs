@@ -230,8 +230,6 @@ impl PdLoadManager {
                 decode: DecodeState::Pending,
                 prefill_tokens: selection.prefill.new_prefill_tokens,
                 progress_sequence: 0,
-                admitted_prefill_known: selection.prefill.new_prefill_tokens.is_some(),
-                retaining_initial_queue: false,
             }),
         }));
         Some((selection, attempt))
@@ -273,8 +271,6 @@ impl PdLoadManager {
                 decode: DecodeState::Pending,
                 prefill_tokens: None,
                 progress_sequence: 0,
-                admitted_prefill_known: false,
-                retaining_initial_queue: false,
             }),
         }));
         attempt.attach_workers(prefill_worker, decode_worker);
@@ -298,8 +294,6 @@ struct AttemptState {
     prefill_tokens: Option<u64>,
     /// Last accepted worker progress snapshot.
     progress_sequence: u64,
-    admitted_prefill_known: bool,
-    retaining_initial_queue: bool,
 }
 
 struct AttemptInner {
@@ -353,29 +347,13 @@ impl AttemptInner {
         if !state.prefill {
             return;
         }
-        if kind == PrefillProgressKind::StaleInitialQueue {
-            if sequence != state.progress_sequence || !state.retaining_initial_queue {
-                return;
-            }
-        } else {
-            if sequence <= state.progress_sequence {
-                return;
-            }
-            let contiguous_initial_queue = kind == PrefillProgressKind::InitialUnconfirmedQueue
-                && state.admitted_prefill_known
-                && state
-                    .prefill_tokens
-                    .is_some_and(|estimate| remaining_tokens > estimate)
-                && ((state.progress_sequence == 0 && sequence == 1)
-                    || (state.retaining_initial_queue
-                        && sequence == state.progress_sequence.saturating_add(1)));
-            state.progress_sequence = sequence;
-            if contiguous_initial_queue {
-                state.retaining_initial_queue = true;
-                return;
-            }
+        if sequence <= state.progress_sequence {
+            return;
         }
-        state.retaining_initial_queue = false;
+        state.progress_sequence = sequence;
+        if kind == PrefillProgressKind::InitialUnconfirmedQueue && state.prefill_tokens.is_some() {
+            return;
+        }
         let mut loads = self.loads.lock();
         let Some(load) = loads.get_mut(&(Stage::Prefill, self.prefill.clone())) else {
             return;
