@@ -137,12 +137,9 @@ steps:
         reason: "GPU tests can be flaky - retry if needed"
     mirror_hardwares: l4_2
     command: |
-      bash <<'BASH'
-      set -euo pipefail
       pytest tests/python/e2e/function/kv_aware/test_kv_aware_prefix_cache.py \
         --confcutdir=tests/python/e2e/function/kv_aware \
         -m e2e -v -s
-      BASH
     depends_on:
       - "upload-ready-pipeline"
       - "image-build"
