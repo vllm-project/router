@@ -1104,7 +1104,7 @@ impl PolicyConfig {
 }
 
 fn default_sticky_session_ttl_secs() -> u64 {
-    crate::policies::StickyLeastLoadedPolicy::DEFAULT_SESSION_TTL_SECS
+    7200
 }
 
 fn default_kv_penalty_host() -> f64 {
