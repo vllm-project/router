@@ -118,6 +118,115 @@ const CHAT_BODY: &str = r#"{
     "stream": false
 }"#;
 
+#[tokio::test]
+async fn grpc_kv_reservations_survive_disabled_or_unsupported_progress() {
+    use std::time::Duration;
+    use vllm_router_rs::policies::{KvAwarePolicy, LoadSample};
+    use vllm_router_rs::protocols::spec::ChatCompletionRequest;
+
+    for (case, progress_after, supported, stream, cancel) in [
+        ("disabled-stream", None, true, true, false),
+        ("disabled-collected", None, true, false, false),
+        ("disabled-stream-cancel", None, true, true, true),
+        ("unsupported-stream", Some(5), false, true, false),
+        ("unsupported-collected", Some(5), false, false, false),
+        ("unsupported-cancel", Some(5), false, false, true),
+        ("enabled-stream", Some(5), true, true, false),
+        ("enabled-collected", Some(5), true, false, false),
+    ] {
+        let grpc = MockVllmRsServer::spawn_with_state(MockVllmRs {
+            supports_prefill_progress: supported,
+            prefill_progress: vec![2],
+            reply_delay: Duration::from_secs(2),
+            ..Default::default()
+        })
+        .await;
+        let mut config = test_config(vec![grpc.grpc_url.clone()]);
+        config.policy = PolicyConfig::KvAware {
+            router_temperature: 0.0,
+            kv_penalty_host: 0.8,
+            kv_penalty_external: 0.6,
+            kv_penalty_disk: 0.3,
+            static_kv_event_sources: Default::default(),
+        };
+        config.prefill_progress_stale_after_secs = progress_after;
+        let ctx = create_test_context(config);
+        let router = Arc::new(
+            Router::new(vec![grpc.grpc_url.clone()], &ctx)
+                .await
+                .unwrap(),
+        );
+        router.pin_test_token_ids(vec![1, 2, 3, 4, 5]);
+        let worker = ctx.worker_registry.get_by_url(&grpc.grpc_url).unwrap();
+        let policy = ctx.policy_registry.get_default_policy();
+        let kv = policy.as_any().downcast_ref::<KvAwarePolicy>().unwrap();
+        let manager = kv.slot_manager().unwrap();
+        let target = kv.target_for_worker(worker.as_ref());
+        let mut body: serde_json::Value = serde_json::from_str(CHAT_BODY).unwrap();
+        body["stream"] = json!(stream);
+        let request: ChatCompletionRequest = serde_json::from_value(body).unwrap();
+        let dispatch = tokio::spawn(async move {
+            let response = router
+                .route_typed_request(None, &request, "/v1/chat/completions", None)
+                .await;
+            let status = response.status();
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            (status, body)
+        });
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while grpc.captured().is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("worker must receive the request");
+        let progress_expected = progress_after.is_some() && supported;
+        if progress_expected {
+            tokio::time::timeout(Duration::from_millis(1500), async {
+                while manager.sample(&target).active_prefill_tokens != 2 {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("worker progress must update the reservation");
+        }
+        assert_eq!(
+            grpc.captured()[0].include_prefill_progress,
+            progress_expected,
+            "{case}"
+        );
+        assert_eq!(worker.load(), 1, "{case}: request must remain admitted");
+        assert_eq!(
+            manager.sample(&target),
+            LoadSample {
+                active_prefill_tokens: if progress_expected { 2 } else { 5 },
+                active_requests: 1,
+            },
+            "{case}: prefill work must remain reserved"
+        );
+
+        if cancel {
+            dispatch.abort();
+            assert!(dispatch.await.unwrap_err().is_cancelled(), "{case}");
+        } else {
+            let (status, body) = tokio::time::timeout(Duration::from_secs(5), dispatch)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                status.is_success(),
+                "{case}: {status}: {}",
+                String::from_utf8_lossy(&body)
+            );
+        }
+        assert_eq!(worker.load(), 0, "{case}: worker load must be released");
+        assert_eq!(manager.sample(&target), LoadSample::default(), "{case}");
+    }
+}
+
 #[test]
 fn worker_factory_auto_detects_grpc_scheme() {
     let grpc = WorkerFactory::create_regular("grpc://127.0.0.1:50051".into());
