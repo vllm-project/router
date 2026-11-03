@@ -45,30 +45,36 @@ Status: **draft, not production-ready**. The design is in the [English RFC](hybr
 
 ## Live checks on the H20 cluster
 
-Run on `h20` with vLLM 0.28.0, Qwen3.5-4B, `--data-parallel-size 2`,
-`--block-size 528`, ZMQ KV events, and a router started with
+Run on `h20` with vLLM 0.29.0, Qwen3.5-4B, `--data-parallel-size 2`,
+`--block-size 528`, `VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES=0`,
+`--prefix-caching-hash sha256_cbor`, ZMQ KV events, and a router started with
 `--worker-urls http://127.0.0.1:8000 --intra-node-data-parallel-size 2`,
-one static per-rank source per rank, and a four-group layout.
+one static per-rank source per rank, and a four-group layout (three mamba
+groups plus full attention, all block 528, root
+`9bd96a48…`, the engine's `sha256_cbor("vllm-none-hash")`).
 
-- Discovery admitted both ranks and spawned one subscriber per rank; requests
-  were routed with `input_tokens=601` (the router tokenized through the
-  worker's `/tokenize` fallback) and returned 200.
-- The engine reported `vllm:prefix_cache_hits_total 2640` (5 x 528) for the
-  repeated prompt, so the prompt was genuinely cached.
-- Router credit stayed 0 and the subscriber logged rejected batches. The
-  engine in this environment publishes 64-bit tuple block hashes
-  (`block_hashes: [1862206544370044968]`), while the layout declares the
-  32-byte full-hash contract (`full_hashes`, `root_hash`). The router refuses
-  to credit an opaque hash it cannot reproduce, which is the intended
-  fail-closed behavior, but it means prefix credit cannot be observed on this
-  engine build: it needs an engine that publishes full block hashes.
+- Both ranks were admitted, one subscriber per rank was spawned, and requests
+  were dispatched with `X-data-parallel-rank` so the engine pinning is real:
+  the engine's per-rank series show `prefix_cache_queries_total` on the rank
+  the router chose and zero on the other.
+- The first request for a 601-token prompt credited 0 and the next five
+  credited 528 (5 x 528), leaving `new_prefill_tokens=73`; the engine reported
+  `vllm:prefix_cache_hits_total 2640` on the same rank. This is the first
+  end-to-end confirmation that router credit equals engine cache hits for a
+  hybrid engine.
+- **The hash contract must match.** The same engine on its default
+  `--prefix-caching-hash` (`sha256`, which pickles the tuple) publishes
+  32-byte digests that a `sha256_cbor` layout cannot reproduce, and the router
+  credited 0 while the engine still reported 2640 cached tokens. Both are
+  32 bytes, so only recomputing the digest distinguishes them; the captured
+  batch is checked in as a fixture that must credit nothing.
+- vLLM 0.28 cannot exercise this path at all: it publishes 64-bit integer
+  block hashes (`block_hashes: [1862206544370044968]`) and has no
+  `full_hashes`/`root_hash` contract.
 - A per-rank URL in `--worker-urls` without `--intra-node-data-parallel-size`
   is not a DP declaration. `base@rank` parses as URL userinfo, so the router
   forwards to `http://0.0.0.0/...`; configuration now rejects that combination
   instead of failing at request time.
-
-The result is recorded here rather than in a passing assertion because the
-available engine cannot exercise the 32-byte hash path end to end.
 
 ## Remaining work and acceptance criteria
 
