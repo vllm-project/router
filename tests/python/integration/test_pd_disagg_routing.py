@@ -12,7 +12,7 @@ pytestmark = [pytest.mark.ready, pytest.mark.cpu]
 # PD program scheduling must name an explicit per-rank capacity and turn off
 # batch-gain admission; those are the settings the router accepts in vLLM PD mode.
 _PROGRAM_SCHEDULING_CONFIG = (
-    '{"pd":{"enabled":true},"token_capacity_per_dp_rank":100000,'
+    '{"pd":{},"token_capacity_per_dp_rank":100000,'
     '"enable_batch_gain_admission":false,"decode_buffer_tokens":8,'
     '"metrics_interval_seconds":0.02,"queue_timeout_seconds":5,'
     '"force_resume_timeout_seconds":1,'
