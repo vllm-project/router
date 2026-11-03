@@ -884,6 +884,27 @@ impl ConfigValidator {
         // DP-aware routing is now automatically enabled when data_parallel_size > 1
         // and is compatible with service discovery
 
+        // `base@rank` in --worker-urls is a per-rank address, not a URL: a
+        // worker is created per rank only by intra-node DP. Treating it as a
+        // plain URL silently requests `http://0.0.0.0/...` because `@rank`
+        // parses as URL userinfo, so refuse it instead.
+        if config.intra_node_data_parallel_size == 1 {
+            if let RoutingMode::Regular { worker_urls } = &config.mode {
+                if let Some(url) = worker_urls.iter().find(|url| {
+                    url.rsplit_once('@').is_some_and(|(base, rank)| {
+                        !base.is_empty() && !rank.is_empty() && rank.parse::<u32>().is_ok()
+                    })
+                }) {
+                    return Err(ConfigError::ValidationFailed {
+                        reason: format!(
+                            "worker URL '{url}' pins a data-parallel rank; declare the base URL \
+                             and set --intra-node-data-parallel-size to the number of ranks"
+                        ),
+                    });
+                }
+            }
+        }
+
         // MoRI-IO requires service discovery: ZMQ addresses are obtained via instance
         // registration and are not available in direct URL mode.
         if config.kv_connector == KvConnector::MoriIO && !has_vllm_discovery {
@@ -1148,6 +1169,27 @@ mod tests {
             config.kv_aware_session_affinity_ttl_secs = Some(ttl);
             assert!(ConfigValidator::validate(&config).is_err());
         }
+    }
+
+    #[test]
+    fn rank_pinned_worker_url_requires_data_parallel_size() {
+        let mut config = RouterConfig::new(
+            RoutingMode::Regular {
+                worker_urls: vec!["http://worker:8000@1".to_string()],
+            },
+            PolicyConfig::Random,
+        );
+        let error = ConfigValidator::validate(&config).unwrap_err();
+        assert!(
+            error.to_string().contains("pins a data-parallel rank"),
+            "{error}"
+        );
+
+        config.intra_node_data_parallel_size = 2;
+        config.mode = RoutingMode::Regular {
+            worker_urls: vec!["http://worker:8000".to_string()],
+        };
+        assert!(ConfigValidator::validate(&config).is_ok());
     }
 
     #[test]

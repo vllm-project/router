@@ -43,6 +43,33 @@ Status: **draft, not production-ready**. The design is in the [English RFC](hybr
   drops the cached NIXL push identity so a retry performs a fresh handshake
   instead of reusing stale transfer state.
 
+## Live checks on the H20 cluster
+
+Run on `h20` with vLLM 0.28.0, Qwen3.5-4B, `--data-parallel-size 2`,
+`--block-size 528`, ZMQ KV events, and a router started with
+`--worker-urls http://127.0.0.1:8000 --intra-node-data-parallel-size 2`,
+one static per-rank source per rank, and a four-group layout.
+
+- Discovery admitted both ranks and spawned one subscriber per rank; requests
+  were routed with `input_tokens=601` (the router tokenized through the
+  worker's `/tokenize` fallback) and returned 200.
+- The engine reported `vllm:prefix_cache_hits_total 2640` (5 x 528) for the
+  repeated prompt, so the prompt was genuinely cached.
+- Router credit stayed 0 and the subscriber logged rejected batches. The
+  engine in this environment publishes 64-bit tuple block hashes
+  (`block_hashes: [1862206544370044968]`), while the layout declares the
+  32-byte full-hash contract (`full_hashes`, `root_hash`). The router refuses
+  to credit an opaque hash it cannot reproduce, which is the intended
+  fail-closed behavior, but it means prefix credit cannot be observed on this
+  engine build: it needs an engine that publishes full block hashes.
+- A per-rank URL in `--worker-urls` without `--intra-node-data-parallel-size`
+  is not a DP declaration. `base@rank` parses as URL userinfo, so the router
+  forwards to `http://0.0.0.0/...`; configuration now rejects that combination
+  instead of failing at request time.
+
+The result is recorded here rather than in a passing assertion because the
+available engine cannot exercise the 32-byte hash path end to end.
+
 ## Remaining work and acceptance criteria
 
 1. **P/D:** Automate the observed matching and mismatched-layout assertions and verify a fully built upstream main with real weights. Enabling P/D changed the Qwen4Exp Mamba/attention block size from 320 to 288 in the test; verify each deployment's effective layout. Compare outputs against a direct reference, and exercise nonmatching pairs and multiple DP ranks. Handoff validation and post-handoff decode failures now fail closed; an automated P-fails and P-succeeds/D-fails pair test is still required.
