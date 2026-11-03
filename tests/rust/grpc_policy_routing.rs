@@ -150,15 +150,27 @@ async fn wait_for_hit(servers: &[MockVllmRsServer], before: &[usize]) {
 }
 
 #[tokio::test]
-async fn round_robin_spreads_across_grpc_workers() {
+async fn round_robin_cycles_grpc_workers() {
+    // The regular pool is iterated from a DashMap, so its order is not the
+    // spawn order. The cursor still starts at the first listed worker and
+    // repeats that list.
     let servers = workers(3, Duration::ZERO).await;
     let router = start_router(&servers, PolicyConfig::RoundRobin).await;
-    let mut counts = [0usize; 3];
-    for i in 0..30 {
-        let index = complete(&router, &servers, prompt(&[i], json!({}))).await;
-        counts[index] += 1;
+    let mut seen = Vec::new();
+    for i in 0..servers.len() * 10 {
+        seen.push(complete(&router, &servers, prompt(&[i as i32], json!({}))).await);
     }
-    assert_eq!(counts, [10, 10, 10], "hits={:?}", hits(&servers));
+    let cycle = &seen[..servers.len()];
+    assert_eq!(
+        cycle.iter().collect::<std::collections::HashSet<_>>().len(),
+        servers.len(),
+        "one cycle should visit every worker once: {cycle:?}"
+    );
+    let mut expected = Vec::new();
+    for _ in 0..10 {
+        expected.extend_from_slice(cycle);
+    }
+    assert_eq!(seen, expected, "hits={:?}", hits(&servers));
 }
 
 #[tokio::test]
@@ -187,40 +199,82 @@ async fn consistent_hash_sticks_to_session() {
         PolicyConfig::ConsistentHash { virtual_nodes: 160 },
     )
     .await;
-    for session in ["alpha", "beta", "gamma", "delta"] {
-        let mut workers_for_session = Vec::new();
-        for turn in 0..8 {
-            workers_for_session.push(
-                complete(
-                    &router,
-                    &servers,
-                    prompt(&[turn], json!({"session_params": {"session_id": session}})),
-                )
-                .await,
-            );
+
+    // The ring depends on worker URLs, so probe distinct session ids until
+    // every worker is chosen. A later turn with a different prompt must stay.
+    let mut placed = std::collections::HashMap::new();
+    for session in 0..64 {
+        let index = complete(
+            &router,
+            &servers,
+            prompt(
+                &[session],
+                json!({"session_params": {"session_id": format!("session-{session}")}}),
+            ),
+        )
+        .await;
+        placed.insert(session, index);
+        if placed
+            .values()
+            .collect::<std::collections::HashSet<_>>()
+            .len()
+            == servers.len()
+        {
+            break;
         }
-        assert_eq!(
-            workers_for_session
-                .iter()
-                .collect::<std::collections::HashSet<_>>()
-                .len(),
-            1,
-            "{session}: {workers_for_session:?}"
-        );
+    }
+    let covered: std::collections::HashSet<_> = placed.values().copied().collect();
+    assert_eq!(
+        covered.len(),
+        servers.len(),
+        "distinct sessions did not cover every worker: {placed:?}"
+    );
+
+    let mut representative = std::collections::HashMap::new();
+    for (session, index) in &placed {
+        representative.entry(*index).or_insert(*session);
+    }
+    for (index, session) in representative {
+        let again = complete(
+            &router,
+            &servers,
+            prompt(
+                &[99],
+                json!({"session_params": {"session_id": format!("session-{session}")}}),
+            ),
+        )
+        .await;
+        assert_eq!(again, index, "session-{session} left its worker");
     }
 }
 
 #[tokio::test]
 async fn cache_aware_prefix_overrides_load() {
-    let servers = workers(2, Duration::from_millis(800)).await;
-    let router = start_router(&servers, cache_aware()).await;
+    use common::mock_vllm_rs::HoldGate;
+
+    // The first request on each worker returns. Later requests stay in flight
+    // until release, so replay is admitted while the cached worker is still busy.
+    // A least-loaded policy would send that replay to the idle worker.
+    let mut gates = Vec::new();
+    let mut servers = Vec::new();
+    for _ in 0..2 {
+        let gate = HoldGate::new(1);
+        servers.push(
+            MockVllmRsServer::spawn_with_state(MockVllmRs {
+                hold: Some(gate.clone()),
+                ..MockVllmRs::default()
+            })
+            .await,
+        );
+        gates.push(gate);
+    }
+    let router = Arc::new(start_router(&servers, cache_aware()).await);
     let cached_prompt = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
     let cached = complete(&router, &servers, prompt(&cached_prompt, json!({}))).await;
 
     let before = hits(&servers);
-    let router_for_holder = Arc::new(router);
     let holder = {
-        let router = Arc::clone(&router_for_holder);
+        let router = Arc::clone(&router);
         let body = prompt(
             &[100, 101, 102, 103, 104, 105, 106, 107, 108, 109],
             json!({}),
@@ -238,7 +292,7 @@ async fn cache_aware_prefix_overrides_load() {
     let busy = grew(&before, &hits(&servers));
 
     let diverted = complete(
-        &router_for_holder,
+        &router,
         &servers,
         prompt(
             &[200, 201, 202, 203, 204, 205, 206, 207, 208, 209],
@@ -246,20 +300,46 @@ async fn cache_aware_prefix_overrides_load() {
         ),
     )
     .await;
-    let replay = complete(
-        &router_for_holder,
-        &servers,
-        prompt(&cached_prompt, json!({})),
-    )
+
+    let before_replay = hits(&servers);
+    let replay = {
+        let router = Arc::clone(&router);
+        let body = prompt(&cached_prompt, json!({}));
+        tokio::spawn(async move {
+            let request: CompletionRequest = serde_json::from_value(body).unwrap();
+            let response = router.route_completion(None, &request, None).await;
+            assert!(response.status().is_success());
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+        })
+    };
+    let admitted = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if hits(&servers)[cached] > before_replay[cached] {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
     .await;
+    for gate in &gates {
+        gate.release();
+    }
     holder.await.unwrap();
+    replay.await.unwrap();
 
     assert_eq!(busy, cached, "holder should occupy the cached worker");
     assert_ne!(
         diverted, cached,
         "unrelated prompt should avoid the busy worker"
     );
-    assert_eq!(replay, cached, "cached prefix should stay despite the load");
+    admitted.expect("cached prefix was not admitted while its worker stayed busy");
+    assert_eq!(
+        grew(&before_replay, &hits(&servers)),
+        cached,
+        "cached prefix should stay despite the load"
+    );
 }
 
 #[tokio::test]
@@ -387,6 +467,26 @@ async fn program_scheduling_sticks_to_program() {
         "{beta:?}"
     );
     assert_ne!(alpha[0], beta[0], "alpha={alpha:?} beta={beta:?}");
+}
+
+#[tokio::test]
+async fn power_of_two_spreads_across_idle_grpc_workers() {
+    let servers = workers(3, Duration::ZERO).await;
+    let router = start_router(
+        &servers,
+        PolicyConfig::PowerOfTwo {
+            load_check_interval_secs: 30,
+        },
+    )
+    .await;
+    let mut seen = std::collections::HashSet::new();
+    for i in 0..30 {
+        seen.insert(complete(&router, &servers, prompt(&[i], json!({}))).await);
+    }
+    assert!(
+        seen.len() >= 2,
+        "idle power-of-two should use more than one worker: {seen:?}"
+    );
 }
 
 #[tokio::test]

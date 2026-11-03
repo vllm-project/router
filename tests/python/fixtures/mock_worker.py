@@ -28,6 +28,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 # Global state (per-process)
 _inflight = 0
 _failures_seen = 0
+_requests_seen = 0
 
 
 def _parse_args() -> argparse.Namespace:
@@ -36,6 +37,8 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--port", type=int, required=True)
     p.add_argument("--worker-id", default=None)
     p.add_argument("--latency-ms", type=int, default=0)
+    p.add_argument("--hold-after", type=int, default=0)
+    p.add_argument("--release-file", default=None)
     p.add_argument("--timeout", action="store_true")
     p.add_argument("--status-code", type=int, default=200)
     p.add_argument("--fail-first-n", type=int, default=0)
@@ -66,6 +69,17 @@ def create_app(args: argparse.Namespace) -> FastAPI:
     async def maybe_delay():
         if args.latency_ms > 0:
             await asyncio.sleep(args.latency_ms / 1000.0)
+
+    async def maybe_hold():
+        global _requests_seen
+        _requests_seen += 1
+        if (
+            args.hold_after > 0
+            and args.release_file
+            and _requests_seen > args.hold_after
+        ):
+            while not os.path.exists(args.release_file):
+                await asyncio.sleep(0.02)
 
     def should_fail() -> Optional[int]:
         global _failures_seen
@@ -175,6 +189,10 @@ def create_app(args: argparse.Namespace) -> FastAPI:
         # Optional timeout (simulate hang)
         if args.timeout:
             await asyncio.sleep(3600)
+
+        # Hold later requests until the test publishes the release file.
+        # The in-flight counter already includes this request.
+        await maybe_hold()
 
         # Optional latency
         await maybe_delay()
