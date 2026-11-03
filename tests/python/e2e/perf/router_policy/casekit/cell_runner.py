@@ -533,7 +533,9 @@ def engine_command(i):
         "kv_connector": "OffloadingConnector",
         "kv_role": "kv_both",
         "kv_connector_extra_config": {
+            "spec_name": "CPUOffloadingSpec",
             "cpu_bytes_to_use": cpu_bytes,
+            "blocks_per_chunk": 16,
             "self_describing_kv_events": True,
         },
     }
