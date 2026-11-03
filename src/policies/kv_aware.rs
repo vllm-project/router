@@ -535,7 +535,12 @@ impl AffinityKey {
     /// Bindings in this namespace influence selection only: they never carry
     /// KV credit, and a tokenized request never resolves to one.
     pub fn advisory_digest(&self, lora_name: Option<&str>, cache_salt: Option<&str>) -> [u8; 32] {
-        self.digest_fields(ADVISORY_DIGEST_DOMAIN, Some("regular"), lora_name, cache_salt)
+        self.digest_fields(
+            ADVISORY_DIGEST_DOMAIN,
+            Some("regular"),
+            lora_name,
+            cache_salt,
+        )
     }
 
     /// Stage-scoped digest for P/D binding: the same session identity never
@@ -3263,7 +3268,10 @@ mod tests {
         worker.set_healthy(false);
         assert!(!policy.has_affinity(&workers, None, None, &key));
         worker.set_healthy(true);
-        let record = policy.affinity.get(&key.advisory_digest(None, None)).unwrap();
+        let record = policy
+            .affinity
+            .get(&key.advisory_digest(None, None))
+            .unwrap();
         record.state.lock().idle_deadline = Some(Instant::now());
         assert!(!policy.has_affinity(&workers, None, None, &key));
         record.state.lock().idle_deadline = None;
