@@ -100,6 +100,10 @@ impl HybridEventStream {
             return Err(HybridStreamError::InvalidState);
         }
         if let Err(error) = self.index.apply_payload(seq, payload) {
+            // A rejected batch means the publisher's layout and the declared
+            // one disagree; naming the reason is the only way to fix a layout
+            // from a live system.
+            tracing::warn!(seq, error = ?error, "hybrid event batch rejected");
             source.phase = Phase::Replaying;
             return Err(HybridStreamError::Index(error));
         }
