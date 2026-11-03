@@ -19,7 +19,7 @@ jobs:
 
       - name: Build an image from Dockerfile
         run: |
-          docker build --no-cache --output=type=docker -t test/router:latest -f ./Dockerfile.router .
+          docker build --no-cache --output=type=docker -t test/router:latest -f ./docker/Dockerfile.router .
 
       - name: Run Trivy vulnerability scanner
         uses: aquasecurity/trivy-action@master

@@ -106,9 +106,9 @@ prost-types = "0.14"
 # Rust crates in the vLLM tree (not pip). Unpublished on crates.io; Cargo
 # finds the package by name under rust/src/. Override with a path patch
 # to a local checkout if you already have the rust workspace.
-vllm-chat = { git = "https://github.com/vllm-project/vllm", tag = "v0.29.0" }
-vllm-tokenizer = { git = "https://github.com/vllm-project/vllm", tag = "v0.29.0" }
-vllm-text = { git = "https://github.com/vllm-project/vllm", tag = "v0.29.0" }
+vllm-chat = { git = "https://github.com/vllm-project/vllm", tag = "v0.30.0" }
+vllm-tokenizer = { git = "https://github.com/vllm-project/vllm", tag = "v0.30.0" }
+vllm-text = { git = "https://github.com/vllm-project/vllm", tag = "v0.30.0" }
 
 [features]
 # Every Rust test file is gated on these. `cargo test` compiles a group
@@ -304,6 +304,10 @@ path = "tests/rust/test_pd_routing.rs"
 [[test]]
 name = "test_prompt_input"
 path = "tests/rust/test_prompt_input.rs"
+
+[[test]]
+name = "test_sticky_least_loaded_pd"
+path = "tests/rust/test_sticky_least_loaded_pd.rs"
 
 [[test]]
 name = "test_transparent_proxy_routing"
