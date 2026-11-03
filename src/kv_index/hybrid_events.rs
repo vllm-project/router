@@ -206,7 +206,7 @@ impl HybridEventIndex {
     pub fn apply_payload(&self, seq: u64, payload: &[u8]) -> Result<(), HybridEventError> {
         let batch = match crate::kv_index::decode_batch(payload) {
             Ok(batch) => batch,
-            Err(_) => match crate::kv_index::decode_event_payload(payload) {
+            Err(batch_error) => match crate::kv_index::decode_event_payload(payload) {
                 Ok(event) => KVEventBatch {
                     ts: std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
@@ -215,7 +215,15 @@ impl HybridEventIndex {
                     events: vec![event],
                     data_parallel_rank: Some(self.target.dp_rank),
                 },
-                Err(_) => {
+                Err(event_error) => {
+                    // The two shapes fail for different reasons; naming both is
+                    // the only way to diagnose a publisher contract change.
+                    tracing::warn!(
+                        batch_error,
+                        event_error,
+                        bytes = payload.len(),
+                        "hybrid payload did not decode"
+                    );
                     self.invalidate();
                     return Err(HybridEventError::InvalidBatch);
                 }
