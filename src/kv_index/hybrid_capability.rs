@@ -1,0 +1,338 @@
+//! Narrow admission of worker-advertised hybrid cache layouts.
+
+use std::collections::HashSet;
+
+use serde::Deserialize;
+
+use super::hybrid::HybridGroupKind;
+use super::hybrid_events::{HybridEventGroup, HybridEventIndex};
+use super::subscriber::EventSource;
+use super::RoutableTarget;
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct HybridCapabilities {
+    pub schema_version: u32,
+    pub ranks: Vec<HybridRankCapability>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct HybridRankCapability {
+    pub rank: u32,
+    pub model: String,
+    pub weight_version: String,
+    pub weight_identity: Option<String>,
+    pub publisher_topic: Option<String>,
+    pub instance_topic: bool,
+    pub hash_algorithm: String,
+    pub root_hash: Option<String>,
+    pub full_hashes: bool,
+    pub hash_block_size: Option<u32>,
+    pub hash_lookahead_tokens: u32,
+    pub speculative_tokens: u32,
+    pub prefix_caching: bool,
+    pub groups: Vec<HybridGroupCapability>,
+    pub transfer: Option<HybridTransferCapability>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct HybridTransferCapability {
+    pub connector: Option<String>,
+    pub role: Option<String>,
+    pub supports_hma: bool,
+    pub group_ids: Vec<u32>,
+    pub tensor_parallel_size: u32,
+    pub pipeline_parallel_size: u32,
+    #[serde(default)]
+    pub compatibility_hashes: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct HybridGroupCapability {
+    pub group_idx: u32,
+    pub kind: String,
+    pub spec_type: String,
+    pub block_size: u32,
+    pub sliding_window: Option<u32>,
+    pub prefix_cacheable: bool,
+    pub prefix_replay_tokens: u32,
+    pub mamba_cache_mode: Option<String>,
+    pub prefill_checkpoint_alignment: Option<u32>,
+    pub tokens_per_state: Option<String>,
+    pub cache_role: Option<String>,
+}
+
+impl HybridCapabilities {
+    /// Admit only the verified 1P1D NIXL contract. The engine's runtime
+    /// handshake still validates its full transfer metadata.
+    pub fn compatible_pd_rank(&self, prefill_rank: u32, decode: &Self, decode_rank: u32) -> bool {
+        let Some(p) = self.supported_rank(prefill_rank) else {
+            return false;
+        };
+        let Some(d) = decode.supported_rank(decode_rank) else {
+            return false;
+        };
+        let (Some(p_transfer), Some(d_transfer)) = (&p.transfer, &d.transfer) else {
+            return false;
+        };
+        if p.model != d.model
+            || p.weight_version != d.weight_version
+            || p.weight_identity
+                .as_deref()
+                .is_none_or(|id| id.trim().is_empty())
+            || p.weight_identity != d.weight_identity
+            || p.hash_algorithm != d.hash_algorithm
+            || p.root_hash != d.root_hash
+            || p.hash_block_size != d.hash_block_size
+            || p_transfer.connector.as_deref() != Some("NixlConnector")
+            || d_transfer.connector.as_deref() != Some("NixlConnector")
+            || p_transfer.role.as_deref() != Some("kv_producer")
+            || d_transfer.role.as_deref() != Some("kv_consumer")
+            || !p_transfer.supports_hma
+            || !d_transfer.supports_hma
+            || p_transfer.tensor_parallel_size != 1
+            || d_transfer.tensor_parallel_size != 1
+            || p_transfer.pipeline_parallel_size != 1
+            || d_transfer.pipeline_parallel_size != 1
+            || p_transfer.compatibility_hashes.is_empty()
+            || p_transfer.compatibility_hashes != d_transfer.compatibility_hashes
+        {
+            return false;
+        }
+        let mut p_groups = p.groups.clone();
+        let mut d_groups = d.groups.clone();
+        p_groups.sort_by_key(|group| group.group_idx);
+        d_groups.sort_by_key(|group| group.group_idx);
+        let required: Vec<_> = p_groups.iter().map(|group| group.group_idx).collect();
+        let mut p_ids = p_transfer.group_ids.clone();
+        let mut d_ids = d_transfer.group_ids.clone();
+        p_ids.sort_unstable();
+        d_ids.sort_unstable();
+        p_groups == d_groups && p_ids == required && d_ids == required
+    }
+
+    fn supported_rank(&self, rank: u32) -> Option<&HybridRankCapability> {
+        use std::sync::Arc;
+        let item = self.ranks.iter().find(|item| item.rank == rank)?;
+        let source = EventSource {
+            source: Arc::from("compatibility-check"),
+            dp_rank: rank,
+            pub_endpoint: "inproc://capability".into(),
+            replay_endpoint: Some("inproc://capability-replay".into()),
+            topic: item.publisher_topic.clone()?,
+            hwm: None,
+        };
+        let target = RoutableTarget {
+            instance_id: source.source.clone(),
+            dp_rank: rank,
+        };
+        self.index_for_source(&source, target, 1).ok()?;
+        Some(item)
+    }
+
+    /// Construct an index only for the verified full-attention + aligned
+    /// Mamba contract. Unknown layouts remain ineligible for cache credit.
+    pub fn index_for_source(
+        &self,
+        source: &EventSource,
+        target: RoutableTarget,
+        max_entries: usize,
+    ) -> Result<HybridEventIndex, &'static str> {
+        let mut ranks = HashSet::new();
+        if self.schema_version != 1
+            || self.ranks.iter().any(|rank| !ranks.insert(rank.rank))
+            || target.dp_rank != source.dp_rank
+            || target.instance_id != source.source
+            || source.topic.is_empty()
+            || source.replay_endpoint.as_deref().is_none_or(str::is_empty)
+        {
+            return Err("invalid capability or source binding");
+        }
+        let rank = self
+            .ranks
+            .iter()
+            .find(|rank| rank.rank == source.dp_rank)
+            .ok_or("missing rank capability")?;
+        if rank.model.is_empty()
+            || rank.weight_version.is_empty()
+            || !rank.instance_topic
+            || rank.publisher_topic.as_deref() != Some(source.topic.as_str())
+            || rank.hash_algorithm != "sha256_cbor"
+            || !rank.full_hashes
+            || !rank.prefix_caching
+            || rank.hash_lookahead_tokens != 0
+            || rank.speculative_tokens != 0
+        {
+            return Err("unsupported engine identity or hash contract");
+        }
+        let root = rank
+            .root_hash
+            .as_deref()
+            .and_then(parse_hash)
+            .ok_or("invalid root hash")?;
+        let hash_block_size = rank.hash_block_size.ok_or("missing hash block size")?;
+        let mut groups = Vec::with_capacity(rank.groups.len());
+        for group in &rank.groups {
+            if !group.prefix_cacheable
+                || group.prefix_replay_tokens != 0
+                || group.sliding_window.is_some()
+            {
+                return Err("unsupported group restore contract");
+            }
+            let kind = match (group.kind.as_str(), group.spec_type.as_str()) {
+                ("full_attention", "FullAttentionSpec") => HybridGroupKind::FullAttention,
+                ("mamba", "MambaSpec")
+                    if group.mamba_cache_mode.as_deref() == Some("align")
+                        && group.prefill_checkpoint_alignment.is_none_or(|alignment| {
+                            alignment > 0 && group.block_size.is_multiple_of(alignment)
+                        }) =>
+                {
+                    HybridGroupKind::Checkpoint
+                }
+                _ => return Err("unsupported group kind"),
+            };
+            groups.push(HybridEventGroup {
+                group_idx: group.group_idx,
+                block_size: group.block_size,
+                kind,
+            });
+        }
+        if groups.len() < 2
+            || !groups
+                .iter()
+                .any(|group| group.kind == HybridGroupKind::FullAttention)
+            || !groups
+                .iter()
+                .any(|group| group.kind == HybridGroupKind::Checkpoint)
+        {
+            return Err("not a supported mixed layout");
+        }
+        HybridEventIndex::new_with_root_hash(target, groups, hash_block_size, root, max_entries)
+            .map_err(|_| "invalid group layout")
+    }
+}
+
+fn parse_hash(value: &str) -> Option<[u8; 32]> {
+    if value.len() != 64 {
+        return None;
+    }
+    fn nibble(value: u8) -> Option<u8> {
+        match value {
+            b'0'..=b'9' => Some(value - b'0'),
+            b'a'..=b'f' => Some(value - b'a' + 10),
+            b'A'..=b'F' => Some(value - b'A' + 10),
+            _ => None,
+        }
+    }
+    let mut root = [0; 32];
+    for (out, pair) in root.iter_mut().zip(value.as_bytes().chunks_exact(2)) {
+        *out = (nibble(pair[0])? << 4) | nibble(pair[1])?;
+    }
+    Some(root)
+}
+
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    #[test]
+    fn capability_requires_complete_supported_layout_and_same_publisher() {
+        let group = |idx, kind, spec, mode| {
+            serde_json::json!({
+                "group_idx": idx, "kind": kind, "spec_type": spec, "block_size": 528,
+                "sliding_window": null, "prefix_cacheable": true,
+                "prefix_replay_tokens": 0, "mamba_cache_mode": mode,
+                "prefill_checkpoint_alignment": if kind == "mamba" { Some(528) } else { None },
+            })
+        };
+        let mut value = serde_json::json!({"schema_version": 1, "ranks": [{
+            "rank": 0, "model": "qwen", "weight_version": "default", "weight_identity": "model-sha256",
+            "publisher_topic": "epoch-1", "instance_topic": true,
+            "hash_algorithm": "sha256_cbor", "full_hashes": true,
+            "root_hash": "4e1195df020de59e0d65a33a4279f1183e7ae4e5d980e309f8b55adff2e61c3e",
+            "hash_block_size": 528, "hash_lookahead_tokens": 0,
+            "speculative_tokens": 0, "prefix_caching": true,
+            "groups": [group(0, "mamba", "MambaSpec", Some("align")),
+                group(1, "mamba", "MambaSpec", Some("align")),
+                group(2, "mamba", "MambaSpec", Some("align")),
+                group(3, "full_attention", "FullAttentionSpec", None)]
+        }]});
+        let source = EventSource {
+            source: Arc::from("worker"),
+            dp_rank: 0,
+            pub_endpoint: "inproc://publisher".into(),
+            replay_endpoint: Some("inproc://replay".into()),
+            topic: "epoch-1".into(),
+            hwm: None,
+        };
+        let target = RoutableTarget {
+            instance_id: Arc::from("worker"),
+            dp_rank: 0,
+        };
+        let make = |value: &serde_json::Value| {
+            serde_json::from_value::<HybridCapabilities>(value.clone()).unwrap()
+        };
+        let index = make(&value)
+            .index_for_source(&source, target.clone(), 8)
+            .unwrap();
+        index.begin_empty(0);
+        index
+            .apply_payload(
+                0,
+                include_bytes!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/tests/rust/fixtures/kv_cbor/qwen35_vllm028.msgpack"
+                )),
+            )
+            .unwrap();
+        let prompt: Vec<u32> = (0..1024).map(|i| 100 + i % 100).collect();
+        assert_eq!(index.reusable_tokens(&prompt, usize::MAX), 528);
+        value["ranks"][0]["groups"][0]["prefill_checkpoint_alignment"] = serde_json::Value::Null;
+        assert!(make(&value)
+            .index_for_source(&source, target.clone(), 8)
+            .is_ok());
+        value["ranks"][0]["groups"][0]["prefill_checkpoint_alignment"] = serde_json::json!(7);
+        assert!(make(&value)
+            .index_for_source(&source, target.clone(), 8)
+            .is_err());
+        value["ranks"][0]["groups"][0]["prefill_checkpoint_alignment"] = serde_json::json!(528);
+        for (field, invalid) in [
+            ("publisher_topic", serde_json::json!("other")),
+            ("full_hashes", serde_json::json!(false)),
+            ("speculative_tokens", serde_json::json!(1)),
+            ("root_hash", serde_json::json!("bad")),
+        ] {
+            let saved = value["ranks"][0][field].clone();
+            value["ranks"][0][field] = invalid;
+            assert!(
+                make(&value)
+                    .index_for_source(&source, target.clone(), 8)
+                    .is_err(),
+                "{field}"
+            );
+            value["ranks"][0][field] = saved;
+        }
+        value["ranks"][0]["transfer"] = serde_json::json!({
+            "connector": "NixlConnector", "role": "kv_producer", "supports_hma": true,
+            "group_ids": [0, 1, 2, 3], "tensor_parallel_size": 1,
+            "pipeline_parallel_size": 1, "compatibility_hashes": ["nixl-hash"]
+        });
+        let before = make(&value);
+        value["ranks"][0]["transfer"]["role"] = serde_json::json!("kv_consumer");
+        let decode = make(&value);
+        assert_ne!(before, decode);
+        assert!(before.compatible_pd_rank(0, &decode, 0));
+        value["ranks"][0]["weight_identity"] = serde_json::json!("different-weights");
+        assert!(!before.compatible_pd_rank(0, &make(&value), 0));
+        value["ranks"][0]["weight_identity"] = serde_json::Value::Null;
+        assert!(!before.compatible_pd_rank(0, &make(&value), 0));
+        value["ranks"][0]["weight_identity"] = serde_json::json!("model-sha256");
+        value["ranks"][0]["transfer"]["compatibility_hashes"] = serde_json::json!(["other"]);
+        assert!(!before.compatible_pd_rank(0, &make(&value), 0));
+        value["ranks"][0]["transfer"]["compatibility_hashes"] = serde_json::json!(["nixl-hash"]);
+        value["ranks"][0]["transfer"]["group_ids"] = serde_json::json!([0, 1, 3]);
+        assert!(!before.compatible_pd_rank(0, &make(&value), 0));
+        value["ranks"][0]["groups"][0]["prefix_replay_tokens"] = serde_json::json!(128);
+        assert!(make(&value).index_for_source(&source, target, 8).is_err());
+    }
+}

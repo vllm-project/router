@@ -20,6 +20,19 @@ use crate::request_identity::StableIdentity;
 /// Read-only placement port owned by its policy consumer.
 pub trait TieredMatchProvider: Send + Sync {
     fn find_tiered_matches(&self, query: &MatchQuery) -> Vec<TierMatch>;
+
+    /// Providers with group-dependent restore rules can match the original
+    /// prompt instead of the dense index's independent local block hashes.
+    /// `None` selects the existing dense-index path; `Some`, including an
+    /// empty result, must never fall back to a single group.
+    fn find_token_matches(
+        &self,
+        _tokens: &[u32],
+        _block_size: u32,
+        _lora_name: Option<&str>,
+    ) -> Option<Vec<TierMatch>> {
+        None
+    }
 }
 
 /// Exact prompt sequences rendered by each HTTP backend. DP ranks share their
@@ -1093,6 +1106,15 @@ impl KvAwarePolicy {
         lora_name: Option<&str>,
         enabled: bool,
     ) -> Vec<TierMatch> {
+        if enabled {
+            if let Some(hits) = token_ids.and_then(|ids| {
+                binding
+                    .matches
+                    .find_token_matches(ids, binding.block_size, lora_name)
+            }) {
+                return hits;
+            }
+        }
         let local_hashes = if enabled {
             token_ids
                 .map(|ids| Self::local_hashes_with_lora(ids, binding.block_size, lora_name))
@@ -1439,34 +1461,52 @@ impl KvAwarePolicy {
                         total_prefill = total_prefill.saturating_add(ids.len() as u64);
                         continue;
                     }
-                    let hits = query_cache
-                        .entry((binding.cache_key.clone(), ids))
-                        .or_insert_with(|| {
-                            if let Some(reason) = credit_fallback {
-                                crate::metrics::RouterMetrics::record_kv_placement_lookup(reason);
-                                return Vec::new();
-                            }
-                            let local_hashes =
-                                Self::local_hashes_with_lora(ids, binding.block_size, lora_name);
-                            if local_hashes.is_empty() {
-                                return Vec::new();
-                            }
-                            let hits = binding.matches.find_tiered_matches(&MatchQuery {
-                                group_idx: 0,
-                                local_hashes,
-                                tiers_of_interest: Self::tiers_of_interest(),
-                            });
-                            crate::metrics::RouterMetrics::record_kv_placement_lookup(
-                                if binding.cache_key.is_none() {
-                                    "index_unavailable"
-                                } else if hits.is_empty() {
-                                    "miss"
-                                } else {
-                                    "hit"
-                                },
-                            );
-                            hits
-                        });
+                    let token_matches = credit_fallback
+                        .is_none()
+                        .then(|| {
+                            binding
+                                .matches
+                                .find_token_matches(ids, binding.block_size, lora_name)
+                        })
+                        .flatten();
+                    let hits = if let Some(hits) = token_matches {
+                        hits
+                    } else {
+                        query_cache
+                            .entry((binding.cache_key.clone(), ids))
+                            .or_insert_with(|| {
+                                if let Some(reason) = credit_fallback {
+                                    crate::metrics::RouterMetrics::record_kv_placement_lookup(
+                                        reason,
+                                    );
+                                    return Vec::new();
+                                }
+                                let local_hashes = Self::local_hashes_with_lora(
+                                    ids,
+                                    binding.block_size,
+                                    lora_name,
+                                );
+                                if local_hashes.is_empty() {
+                                    return Vec::new();
+                                }
+                                let hits = binding.matches.find_tiered_matches(&MatchQuery {
+                                    group_idx: 0,
+                                    local_hashes,
+                                    tiers_of_interest: Self::tiers_of_interest(),
+                                });
+                                crate::metrics::RouterMetrics::record_kv_placement_lookup(
+                                    if binding.cache_key.is_none() {
+                                        "index_unavailable"
+                                    } else if hits.is_empty() {
+                                        "miss"
+                                    } else {
+                                        "hit"
+                                    },
+                                );
+                                hits
+                            })
+                            .clone()
+                    };
                     let matches: Vec<_> = hits
                         .iter()
                         .filter(|hit| hit.target == binding.target)
@@ -1759,14 +1799,22 @@ impl KvAwareOps for KvAwarePolicy {
                 let mut new_prefill_tokens = 0u64;
                 for tokens in prompts {
                     let hits = if verified {
-                        query_cache
-                            .entry((binding.cache_key.clone(), tokens.as_slice()))
-                            .or_insert_with(|| {
-                                Self::placement_matches(&binding, Some(tokens), None, true)
-                            })
-                            .as_slice()
+                        if let Some(hits) =
+                            binding
+                                .matches
+                                .find_token_matches(tokens, binding.block_size, None)
+                        {
+                            hits
+                        } else {
+                            query_cache
+                                .entry((binding.cache_key.clone(), tokens.as_slice()))
+                                .or_insert_with(|| {
+                                    Self::placement_matches(&binding, Some(tokens), None, true)
+                                })
+                                .clone()
+                        }
                     } else {
-                        &[]
+                        Vec::new()
                     };
                     let matches: Vec<_> = hits
                         .iter()
@@ -2031,6 +2079,78 @@ mod tests {
             Arc::new(TemperaturePicker::new(params.router_temperature)),
             params,
         )
+    }
+
+    #[test]
+    fn hybrid_token_matches_are_scored_per_target_for_regular_and_prefill() {
+        use crate::kv_index::hybrid::HybridGroupKind;
+        use crate::kv_index::hybrid_events::{HybridEventGroup, HybridEventIndex};
+
+        let workers: Vec<Arc<dyn Worker>> = (0..2)
+            .map(|i| {
+                Arc::new(BasicWorker::new(
+                    format!("http://worker-{i}"),
+                    WorkerType::Regular,
+                )) as Arc<dyn Worker>
+            })
+            .collect();
+        let policy = KvAwarePolicy::default();
+        let mut indexes = Vec::new();
+        for worker in &workers {
+            let target = target(worker.url(), 0);
+            let groups = (0..4)
+                .map(|group_idx| HybridEventGroup {
+                    group_idx,
+                    block_size: 528,
+                    kind: if group_idx == 3 {
+                        HybridGroupKind::FullAttention
+                    } else {
+                        HybridGroupKind::Checkpoint
+                    },
+                })
+                .collect();
+            let index = Arc::new(HybridEventIndex::new(target.clone(), groups, 528, 0, 8).unwrap());
+            index.begin_empty(0);
+            policy.register_target_with_cache_identity(
+                worker.url(),
+                target,
+                CacheKey {
+                    model: Arc::from("qwen"),
+                    hash_mode: crate::kv_index::HashMode::Sha256,
+                    block_size: 528,
+                },
+                index.clone(),
+            );
+            indexes.push(index);
+        }
+        let payload = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/rust/fixtures/kv_cbor/qwen35_vllm028.msgpack"
+        ));
+        indexes[1].apply_payload(0, payload).unwrap();
+        let prompt: Vec<u32> = (0..1024).map(|i| 100 + i % 100).collect();
+        assert_eq!(
+            policy.select_worker_with_token_ids(&workers, Some(&prompt)),
+            Some(1)
+        );
+
+        let prompts = [prompt.clone()];
+        let estimates = policy.estimate_prefill_work(&[
+            (workers[0].as_ref(), &prompts, true),
+            (workers[1].as_ref(), &prompts, true),
+        ]);
+        assert_eq!(estimates[0].new_prefill_tokens, 1024);
+        assert_eq!(estimates[1].new_prefill_tokens, 496);
+        assert!(indexes[1]
+            .find_token_matches(&prompt, 528, Some("adapter"))
+            .unwrap()
+            .is_empty());
+        indexes[1].invalidate();
+        assert_eq!(
+            policy.estimate_prefill_work(&[(workers[1].as_ref(), &prompts, true)])[0]
+                .new_prefill_tokens,
+            1024
+        );
     }
 
     #[test]
