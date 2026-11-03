@@ -281,19 +281,6 @@ impl KvIndexSupervisor {
             return match self.static_pd_sources.get(worker_url) {
                 Some(config) => static_pd_discovery(worker_url, config),
                 None => {
-                    if !crate::backend::is_grpc_url(worker_url) {
-                        match discover_opt_in_hybrid(
-                            &self.client,
-                            worker_url,
-                            self.api_key.as_deref(),
-                        )
-                        .await
-                        {
-                            Ok(Some(discovery)) => return discovery,
-                            Err(error) => return failed_hybrid_discovery(error),
-                            Ok(None) => {}
-                        }
-                    }
                     discover_worker(&self.client, worker_url, true, self.api_key.as_deref()).await
                 }
             };
@@ -310,16 +297,22 @@ impl KvIndexSupervisor {
                     ranks = config.endpoints.len(),
                     "using configured static KV event sources"
                 );
+                if config.hybrid.is_some()
+                    && !static_hybrid_sources_match(
+                        &self.client,
+                        worker_url,
+                        self.api_key.as_deref(),
+                        config,
+                    )
+                    .await
+                {
+                    return failed_hybrid_discovery(
+                        "configured hybrid event sources do not match worker".into(),
+                    );
+                }
                 static_worker_discovery(worker_url, config)
             }
             None if full_attention_http => {
-                match discover_opt_in_hybrid(&self.client, worker_url, self.api_key.as_deref())
-                    .await
-                {
-                    Ok(Some(discovery)) => return discovery,
-                    Err(error) => return failed_hybrid_discovery(error),
-                    Ok(None) => {}
-                }
                 discover_full_attention_http_worker(
                     &self.client,
                     worker_url,
@@ -466,10 +459,7 @@ impl KvIndexSupervisor {
         let hybrid_indexes = if let Some(capability) = &hybrid_capability {
             if event_sources.is_empty()
                 || event_sources.len() != capability.ranks.len()
-                || capability
-                    .ranks
-                    .iter()
-                    .any(|rank| rank.model != model_id || rank.hash_block_size != Some(block_size))
+                || capability.ranks.iter().any(|rank| rank.model != model_id)
             {
                 return Err("hybrid capability does not cover the worker's event sources".into());
             }
@@ -637,12 +627,13 @@ impl KvIndexSupervisor {
                     .clone(),
             })
         });
-        if let (Some(provider), Some(expected)) = (&hybrid, hybrid_capability) {
+        if let Some(provider) = &hybrid {
             let provider = Arc::downgrade(provider);
             let handles = hybrid_handles.clone();
             let client = self.client.clone();
             let worker = worker_url.to_owned();
             let api_key = self.api_key.clone();
+            let static_config = self.static_sources.get(worker_url).cloned();
             tokio::spawn(async move {
                 loop {
                     tokio::time::sleep(Duration::from_secs(2)).await;
@@ -659,14 +650,13 @@ impl KvIndexSupervisor {
                         }
                         break;
                     }
-                    if query_hybrid_capabilities(&client, &worker, api_key.as_deref())
-                        .await
-                        .ok()
-                        .flatten()
-                        .as_ref()
-                        != Some(&expected)
-                        || provider.verified_at.lock().elapsed() > Duration::from_secs(5)
-                    {
+                    let valid = if let Some(config) = &static_config {
+                        static_hybrid_sources_match(&client, &worker, api_key.as_deref(), config)
+                            .await
+                    } else {
+                        false
+                    };
+                    if !valid || provider.verified_at.lock().elapsed() > Duration::from_secs(5) {
                         provider.active.store(false, Ordering::Release);
                         for handle in &handles {
                             handle.shutdown();
@@ -823,62 +813,6 @@ fn failed_hybrid_discovery(error: String) -> WorkerDiscovery {
     }
 }
 
-async fn discover_opt_in_hybrid(
-    client: &reqwest::Client,
-    worker_url: &str,
-    api_key: Option<&str>,
-) -> Result<Option<WorkerDiscovery>, String> {
-    let Some(capability) = query_hybrid_capabilities(client, worker_url, api_key).await? else {
-        return Ok(None);
-    };
-    if !capability.ranks.iter().any(|rank| rank.instance_topic) {
-        return Ok(None);
-    }
-    let first = &capability.ranks[0];
-    let model = first.model.clone();
-    let block_size = first.hash_block_size;
-    Ok(Some(WorkerDiscovery {
-        server_info: Ok(ServerInfo {
-            instance_id: Some(worker_url.to_owned()),
-            model_id: Some(model.clone()),
-            kv_block_size: block_size,
-            ..Default::default()
-        }),
-        sources: query_pd_kv_event_sources(client, worker_url, api_key).await,
-        model_id: Ok(Some(model)),
-        hybrid: Some(capability),
-    }))
-}
-
-pub(crate) async fn query_hybrid_capabilities(
-    client: &reqwest::Client,
-    worker_url: &str,
-    api_key: Option<&str>,
-) -> Result<Option<HybridCapabilities>, String> {
-    let url = format!(
-        "{}/kv_routing_capabilities",
-        worker_url.trim_end_matches('/')
-    );
-    let response = tokio::time::timeout(
-        Duration::from_secs(2),
-        worker_get(client, &url, api_key).send(),
-    )
-    .await
-    .map_err(|_| "hybrid capability request timed out".to_string())?
-    .map_err(|error| format!("hybrid capability request: {error}"))?;
-    if response.status() == reqwest::StatusCode::NOT_FOUND {
-        return Ok(None);
-    }
-    if !response.status().is_success() {
-        return Err(format!("hybrid capability status {}", response.status()));
-    }
-    let capability = tokio::time::timeout(Duration::from_secs(2), response.json())
-        .await
-        .map_err(|_| "hybrid capability response timed out".to_string())?
-        .map_err(|error| format!("hybrid capability parse: {error}"))?;
-    Ok(Some(capability))
-}
-
 impl Drop for KvIndexSupervisor {
     fn drop(&mut self) {
         self.shutdown();
@@ -968,7 +902,14 @@ fn static_worker_discovery(worker_url: &str, config: &StaticKvEventSources) -> W
                         .replay_endpoints
                         .as_ref()
                         .and_then(|replay| replay.get(rank).cloned()),
-                    topic: config.topic.clone(),
+                    topic: config
+                        .hybrid
+                        .as_ref()
+                        .and_then(|layout| {
+                            layout.ranks.iter().find(|item| item.rank == rank as u32)
+                        })
+                        .and_then(|item| item.publisher_topic.clone())
+                        .unwrap_or_else(|| config.topic.clone()),
                     hwm: None,
                     // Protocol constants are adapter assumptions, not observations.
                     publisher: Some("zmq".to_owned()),
@@ -984,8 +925,52 @@ fn static_worker_discovery(worker_url: &str, config: &StaticKvEventSources) -> W
         server_info: Ok(server_info),
         sources: Ok(sources),
         model_id: Ok(Some(model)),
-        hybrid: None,
+        hybrid: config.hybrid.clone(),
     }
+}
+
+async fn static_hybrid_sources_match(
+    client: &reqwest::Client,
+    worker_url: &str,
+    api_key: Option<&str>,
+    config: &StaticKvEventSources,
+) -> bool {
+    let Ok(Ok(observed)) = tokio::time::timeout(
+        Duration::from_secs(2),
+        query_pd_kv_event_sources(client, worker_url, api_key),
+    )
+    .await
+    else {
+        return false;
+    };
+    let Ok(expected) = static_worker_discovery(worker_url, config).sources else {
+        return false;
+    };
+    let Some(host) = worker_host(worker_url) else {
+        return false;
+    };
+    if observed.len() != expected.len() {
+        return false;
+    }
+    expected.iter().all(|(rank, expected)| {
+        let Some(actual) = observed.get(rank) else {
+            return false;
+        };
+        let endpoints_match = |actual: &str, expected: &str| {
+            resolve_endpoint(actual, &host)
+                .ok()
+                .zip(resolve_endpoint(expected, &host).ok())
+                .is_some_and(|(actual, expected)| actual == expected)
+        };
+        events_enabled(actual)
+            && actual.topic == expected.topic
+            && endpoints_match(&actual.endpoint, &expected.endpoint)
+            && actual
+                .replay_endpoint
+                .as_deref()
+                .zip(expected.replay_endpoint.as_deref())
+                .is_some_and(|(actual, expected)| endpoints_match(actual, expected))
+    })
 }
 // Only the full-attention HTTP adapter uses this optional control-metadata contract.
 // Generic discovery retains main's behavior and does not assume stock vLLM
@@ -1028,6 +1013,7 @@ fn static_pd_discovery(
             endpoints: config.endpoints.clone(),
             replay_endpoints: config.replay_endpoints.clone(),
             topic: String::new(),
+            hybrid: None,
         },
     )
 }
@@ -1274,6 +1260,7 @@ mod tests {
                 block_size: 32,
                 model: "shared-model".into(),
                 topic: "kv/generic".into(),
+                hybrid: None,
             };
             let sources = HashMap::from([(worker_url.to_string(), source)]);
             // An explicit static entry must remain generic when
@@ -1639,7 +1626,109 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hybrid_discovery_routes_from_live_events_and_retires_changed_capability() {
+    async fn static_hybrid_sources_require_matching_rank_and_generation_topic() {
+        use axum::{routing::get, Json, Router};
+
+        let sources = Arc::new(tokio::sync::RwLock::new(serde_json::json!({
+            "0": {"endpoint":"tcp://*:5557", "replay_endpoint":"tcp://*:5558", "topic":"boot-1-rank-0", "publisher":"zmq"},
+            "1": {"endpoint":"tcp://*:5559", "replay_endpoint":"tcp://*:5560", "topic":"boot-1-rank-1", "publisher":"zmq"}
+        })));
+        let app = Router::new().route(
+            "/kv_event_sources",
+            get({
+                let sources = sources.clone();
+                move || {
+                    let sources = sources.clone();
+                    async move { Json(sources.read().await.clone()) }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let worker = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let rank = |rank| {
+            serde_json::json!({
+                "rank":rank,"model":"model","weight_version":"v1",
+                "publisher_topic":format!("boot-1-rank-{rank}"),"instance_topic":true,
+                "hash_algorithm":"sha256_cbor","full_hashes":true,
+                "root_hash":null,"hash_block_size":16,"hash_lookahead_tokens":0,
+                "speculative_tokens":0,"prefix_caching":true,"groups":[]
+            })
+        };
+        let config = StaticKvEventSources {
+            endpoints: vec!["tcp://127.0.0.1:5557".into(), "tcp://127.0.0.1:5559".into()],
+            replay_endpoints: Some(vec![
+                "tcp://127.0.0.1:5558".into(),
+                "tcp://127.0.0.1:5560".into(),
+            ]),
+            topic: String::new(),
+            block_size: 16,
+            model: "model".into(),
+            hybrid: Some(
+                serde_json::from_value(
+                    serde_json::json!({"schema_version":1,"ranks":[rank(0),rank(1)]}),
+                )
+                .unwrap(),
+            ),
+        };
+        let client = reqwest::Client::new();
+        assert!(static_hybrid_sources_match(&client, &worker, None, &config).await);
+        sources.write().await["1"]["topic"] = serde_json::json!("boot-2-rank-1");
+        assert!(!static_hybrid_sources_match(&client, &worker, None, &config).await);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn hybrid_discovery_accepts_rank_specific_hash_block_sizes() {
+        let rank = |rank: u32, block_size: u32| {
+            serde_json::json!({
+                "rank":rank,"model":"qwen","weight_version":"default",
+                "publisher_topic":format!("rank-{rank}"),"instance_topic":true,
+                "hash_algorithm":"sha256_cbor","full_hashes":true,
+                "root_hash":"4e1195df020de59e0d65a33a4279f1183e7ae4e5d980e309f8b55adff2e61c3e",
+                "hash_block_size":block_size,"hash_lookahead_tokens":0,"speculative_tokens":0,
+                "prefix_caching":true,"groups":[
+                    {"group_idx":0,"kind":"mamba","spec_type":"MambaSpec","block_size":block_size,
+                     "sliding_window":null,"prefix_cacheable":true,"prefix_replay_tokens":0,
+                     "mamba_cache_mode":"align","prefill_checkpoint_alignment":block_size},
+                    {"group_idx":1,"kind":"full_attention","spec_type":"FullAttentionSpec","block_size":block_size,
+                     "sliding_window":null,"prefix_cacheable":true,"prefix_replay_tokens":0}
+                ]
+            })
+        };
+        let capability = serde_json::from_value(serde_json::json!({
+            "schema_version":1, "ranks":[rank(0, 16), rank(1, 32)]
+        }))
+        .unwrap();
+        let sources = serde_json::from_value(serde_json::json!({
+            "0":{"publisher":"zmq","encoding":"msgpack","schema_version":1,
+                 "endpoint":"inproc://rank0-pub","replay_endpoint":"inproc://rank0-replay","topic":"rank-0"},
+            "1":{"publisher":"zmq","encoding":"msgpack","schema_version":1,
+                 "endpoint":"inproc://rank1-pub","replay_endpoint":"inproc://rank1-replay","topic":"rank-1"}
+        })).unwrap();
+        let discovery = WorkerDiscovery {
+            server_info: Ok(ServerInfo {
+                instance_id: Some("worker".into()),
+                model_id: Some("qwen".into()),
+                kv_block_size: Some(16),
+                ..Default::default()
+            }),
+            sources: Ok(sources),
+            model_id: Ok(Some("qwen".into())),
+            hybrid: Some(capability),
+        };
+        let (supervisor, _signals) =
+            KvIndexSupervisor::new_http_full_attention(reqwest::Client::new(), HashMode::Sha256);
+        let mut ranks = supervisor
+            .install_worker("http://127.0.0.1:8080", discovery)
+            .unwrap()
+            .ranks;
+        ranks.sort_unstable();
+        assert_eq!(ranks, [0, 1]);
+    }
+
+    #[tokio::test]
+    async fn static_hybrid_routes_from_live_events_and_retires_changed_source() {
         use crate::policies::{KvAwareOps, KvAwarePolicy};
         use axum::{routing::get, Json, Router};
 
@@ -1666,33 +1755,35 @@ mod tests {
                 ]
             }]
         })));
-        let sources = serde_json::json!({"0":{
+        let sources = Arc::new(tokio::sync::RwLock::new(serde_json::json!({"0":{
             "endpoint":"inproc://hybrid-discovery-pub", "replay_endpoint":"inproc://hybrid-discovery-replay",
             "topic":"hybrid/epoch-1", "publisher":"zmq", "enable_kv_cache_events":true
-        }});
-        let app = Router::new()
-            .route(
-                "/kv_routing_capabilities",
-                get({
-                    let capability = capability.clone();
-                    move || {
-                        let capability = capability.clone();
-                        async move { Json(capability.read().await.clone()) }
-                    }
-                }),
-            )
-            .route(
-                "/kv_event_sources",
-                get(move || {
+        }})));
+        let app = Router::new().route(
+            "/kv_event_sources",
+            get({
+                let sources = sources.clone();
+                move || {
                     let sources = sources.clone();
-                    async move { Json(sources) }
-                }),
-            );
+                    async move { Json(sources.read().await.clone()) }
+                }
+            }),
+        );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let worker_url = format!("http://{}", listener.local_addr().unwrap());
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let (supervisor, _signals) =
             KvIndexSupervisor::new_http_full_attention(reqwest::Client::new(), HashMode::Sha256);
+        let config = StaticKvEventSources {
+            endpoints: vec!["inproc://hybrid-discovery-pub".into()],
+            replay_endpoints: Some(vec!["inproc://hybrid-discovery-replay".into()]),
+            topic: String::new(),
+            block_size: 528,
+            model: "qwen".into(),
+            hybrid: Some(serde_json::from_value(capability.read().await.clone()).unwrap()),
+        };
+        let supervisor =
+            supervisor.with_static_sources(HashMap::from([(worker_url.clone(), config)]));
         let publisher = supervisor.ctx.socket(zmq::XPUB).unwrap();
         let replay = supervisor.ctx.socket(zmq::ROUTER).unwrap();
         publisher.set_linger(0).unwrap();
@@ -1772,7 +1863,7 @@ mod tests {
         let estimate =
             policy.estimate_prefill_work(&[(worker.as_ref(), std::slice::from_ref(&prompt), true)]);
         assert_eq!(estimate[0].new_prefill_tokens, 496);
-        capability.write().await["ranks"][0]["weight_version"] = serde_json::json!("new");
+        sources.write().await["0"]["topic"] = serde_json::json!("hybrid/epoch-2");
         tokio::time::timeout(Duration::from_secs(5), async {
             while !provider
                 .find_token_matches(&prompt, 528, None)
@@ -2697,6 +2788,7 @@ mod tests {
                 block_size: 8,
                 model: "prefixed-model".into(),
                 topic: "kv/boundary".into(),
+                hybrid: None,
             },
         )]));
         let result = generic.on_worker_added(&prefixed).await;

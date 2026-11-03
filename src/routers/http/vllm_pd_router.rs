@@ -1007,16 +1007,6 @@ impl VllmPDRouter {
                 router_prompts
             ),
         );
-        // Check after preparing the cache inputs so a newly registered hybrid
-        // provider cannot receive credit before its P/D pair is validated.
-        let hybrid_pairs = match &self.pd_router.kv_state {
-            Some(state) => {
-                state
-                    .compatible_hybrid_pairs(prefill_workers, decode_workers)
-                    .await
-            }
-            None => None,
-        };
         let model_id = request.get("model").and_then(Value::as_str);
         let cache_salt = request
             .get("cache_salt")
@@ -1055,7 +1045,6 @@ impl VllmPDRouter {
         let affinity_key = Self::extract_affinity_key(decode_policy.as_ref(), headers, request);
         let context = PdRequestContext {
             prefill_inputs: prefill_inputs.as_ref(),
-            hybrid_pairs: hybrid_pairs.as_ref(),
             model_id,
             legacy_policy_input: text.as_deref(),
             prefill_cache: prefill_cache.as_ref(),
@@ -1065,7 +1054,6 @@ impl VllmPDRouter {
             cache_salt,
             route: path,
         };
-        // Hybrid pairs require separately verified connector and group metadata.
         self.pd_router
             .select_and_admit(prefill_workers, decode_workers, &context)
     }
