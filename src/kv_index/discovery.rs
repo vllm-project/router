@@ -230,6 +230,11 @@ impl KvIndexSupervisor {
     ) -> (Self, mpsc::Receiver<IngestionSignal>) {
         let (mut supervisor, signals) = Self::new(client, hash_mode);
         supervisor.http_pd = true;
+        supervisor.static_sources = static_pd_sources
+            .iter()
+            .filter(|(_, config)| config.hybrid.is_some())
+            .map(|(worker, config)| (worker.clone(), pd_static_source(worker, config)))
+            .collect();
         supervisor.static_pd_sources = static_pd_sources;
         (supervisor, signals)
     }
@@ -279,7 +284,24 @@ impl KvIndexSupervisor {
     pub(crate) async fn discover(&self, worker_url: &str) -> WorkerDiscovery {
         if self.http_pd {
             return match self.static_pd_sources.get(worker_url) {
-                Some(config) => static_pd_discovery(worker_url, config),
+                Some(config) => {
+                    let source = pd_static_source(worker_url, config);
+                    if source.hybrid.is_some()
+                        && !static_hybrid_sources_match(
+                            &self.client,
+                            worker_url,
+                            self.api_key.as_deref(),
+                            &source,
+                        )
+                        .await
+                    {
+                        failed_hybrid_discovery(
+                            "configured hybrid event sources do not match worker".into(),
+                        )
+                    } else {
+                        static_pd_discovery(worker_url, config)
+                    }
+                }
                 None => {
                     discover_worker(&self.client, worker_url, true, self.api_key.as_deref()).await
                 }
@@ -1000,22 +1022,26 @@ fn static_pd_discovery(
     worker_url: &str,
     config: &crate::config::types::PdKvEventSources,
 ) -> WorkerDiscovery {
-    static_worker_discovery(
-        worker_url,
-        &StaticKvEventSources {
-            model: config
-                .model
-                .as_deref()
-                .filter(|model| !model.trim().is_empty())
-                .unwrap_or(worker_url)
-                .to_owned(),
-            block_size: config.block_size,
-            endpoints: config.endpoints.clone(),
-            replay_endpoints: config.replay_endpoints.clone(),
-            topic: String::new(),
-            hybrid: None,
-        },
-    )
+    static_worker_discovery(worker_url, &pd_static_source(worker_url, config))
+}
+
+fn pd_static_source(
+    worker_url: &str,
+    config: &crate::config::types::PdKvEventSources,
+) -> StaticKvEventSources {
+    StaticKvEventSources {
+        model: config
+            .model
+            .as_deref()
+            .filter(|model| !model.trim().is_empty())
+            .unwrap_or(worker_url)
+            .to_owned(),
+        block_size: config.block_size,
+        endpoints: config.endpoints.clone(),
+        replay_endpoints: config.replay_endpoints.clone(),
+        topic: String::new(),
+        hybrid: config.hybrid.clone(),
+    }
 }
 
 fn grpc_kv_event_source_entries(
@@ -1729,6 +1755,15 @@ mod tests {
 
     #[tokio::test]
     async fn static_hybrid_routes_from_live_events_and_retires_changed_source() {
+        exercise_static_hybrid(false).await;
+    }
+
+    #[tokio::test]
+    async fn pd_static_hybrid_routes_from_live_events_and_retires_changed_source() {
+        exercise_static_hybrid(true).await;
+    }
+
+    async fn exercise_static_hybrid(pd: bool) {
         use crate::policies::{KvAwareOps, KvAwarePolicy};
         use axum::{routing::get, Json, Router};
 
@@ -1772,8 +1807,6 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let worker_url = format!("http://{}", listener.local_addr().unwrap());
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let (supervisor, _signals) =
-            KvIndexSupervisor::new_http_full_attention(reqwest::Client::new(), HashMode::Sha256);
         let config = StaticKvEventSources {
             endpoints: vec!["inproc://hybrid-discovery-pub".into()],
             replay_endpoints: Some(vec!["inproc://hybrid-discovery-replay".into()]),
@@ -1782,8 +1815,30 @@ mod tests {
             model: "qwen".into(),
             hybrid: Some(serde_json::from_value(capability.read().await.clone()).unwrap()),
         };
-        let supervisor =
-            supervisor.with_static_sources(HashMap::from([(worker_url.clone(), config)]));
+        let (supervisor, _signals) = if pd {
+            let source = crate::config::PdKvEventSources {
+                endpoints: config.endpoints,
+                replay_endpoints: config.replay_endpoints,
+                block_size: config.block_size,
+                model: Some(config.model),
+                hybrid: config.hybrid,
+                compatible_decode_urls: vec!["http://decode".into()],
+            };
+            KvIndexSupervisor::new_pd(
+                reqwest::Client::new(),
+                HashMode::Sha256,
+                HashMap::from([(worker_url.clone(), source)]),
+            )
+        } else {
+            let (supervisor, signals) = KvIndexSupervisor::new_http_full_attention(
+                reqwest::Client::new(),
+                HashMode::Sha256,
+            );
+            (
+                supervisor.with_static_sources(HashMap::from([(worker_url.clone(), config)])),
+                signals,
+            )
+        };
         let publisher = supervisor.ctx.socket(zmq::XPUB).unwrap();
         let replay = supervisor.ctx.socket(zmq::ROUTER).unwrap();
         publisher.set_linger(0).unwrap();
@@ -3042,6 +3097,8 @@ mod tests {
             replay_endpoints: Some(vec!["tcp://10.0.0.5:5558".into()]),
             block_size: 32,
             model: Some("m".into()),
+            hybrid: None,
+            compatible_decode_urls: Vec::new(),
         };
         let discovery = static_pd_discovery("http://10.0.0.5:8000", &config);
 
@@ -3075,6 +3132,8 @@ mod tests {
             replay_endpoints: None,
             block_size: 16,
             model: None,
+            hybrid: None,
+            compatible_decode_urls: Vec::new(),
         };
         let discovery = static_pd_discovery("http://127.0.0.1:8000", &config);
         assert_eq!(discovery.model_id, Ok(Some("http://127.0.0.1:8000".into())));
@@ -3105,6 +3164,8 @@ mod tests {
                 replay_endpoints: None,
                 block_size: 16,
                 model: None,
+                hybrid: None,
+                compatible_decode_urls: Vec::new(),
             },
         ))
         .collect();
@@ -3139,6 +3200,8 @@ mod tests {
                     replay_endpoints: None,
                     block_size: 8,
                     model: Some("pd-model".into()),
+                    hybrid: None,
+                    compatible_decode_urls: Vec::new(),
                 },
             )]),
         );

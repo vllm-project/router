@@ -157,6 +157,9 @@ struct CliArgs {
         value_name = "URL=ENDPOINT[,ENDPOINT...]"
     )]
     pd_kv_events: Vec<String>,
+    /// JSON map of prefill URLs to hybrid event sources and verified decode URLs.
+    #[arg(long)]
+    pd_hybrid_config: Option<std::path::PathBuf>,
 
     /// Specific policy for prefill nodes in PD mode. kv_aware uses the prefill load profile.
     #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "kv_aware", "power_of_two", "consistent_hash", "sticky_least_loaded", "rendezvous_hash"])]
@@ -638,7 +641,23 @@ impl CliArgs {
             self.program_scheduling_config_json.as_deref(),
         )?;
 
-        let pd_kv_event_sources = Self::parse_pd_kv_events(&self.pd_kv_events)?;
+        let mut pd_kv_event_sources = Self::parse_pd_kv_events(&self.pd_kv_events)?;
+        if let Some(path) = &self.pd_hybrid_config {
+            let data = std::fs::read(path).map_err(|error| ConfigError::ValidationFailed {
+                reason: format!("cannot read PD hybrid config {}: {error}", path.display()),
+            })?;
+            let configured: HashMap<String, PdKvEventSources> = serde_json::from_slice(&data)
+                .map_err(|error| ConfigError::ValidationFailed {
+                    reason: format!("invalid PD hybrid config {}: {error}", path.display()),
+                })?;
+            for (worker, source) in configured {
+                if pd_kv_event_sources.insert(worker.clone(), source).is_some() {
+                    return Err(ConfigError::ValidationFailed {
+                        reason: format!("duplicate PD KV event source for '{worker}'"),
+                    });
+                }
+            }
+        }
 
         // Build RouterConfig
         Ok(RouterConfig {

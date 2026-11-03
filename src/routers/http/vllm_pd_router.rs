@@ -1040,6 +1040,7 @@ impl VllmPDRouter {
         });
         let affinity_key = Self::extract_affinity_key(decode_policy.as_ref(), headers, request);
         let context = PdRequestContext {
+            hybrid_pairs: None,
             prefill_inputs: prefill_inputs.as_ref(),
             model_id,
             legacy_policy_input: text.as_deref(),

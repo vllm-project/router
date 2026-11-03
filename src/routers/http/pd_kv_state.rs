@@ -1,6 +1,6 @@
 //! P/D prefill KV discovery, refresh, and request-input preparation.
 
-use super::pd_types::PdPrefillInput;
+use super::pd_types::{PdEndpoint, PdPrefillInput};
 use crate::backend::preprocess::{prepare_http_token_inputs, router_token_inputs};
 use crate::core::Worker;
 use crate::kv_index::discovery::{worker_get, WorkerDiscovery};
@@ -106,6 +106,7 @@ pub(super) struct PdKvState {
     bind_lock: Mutex<()>,
     // The background refresh loop's latest view of the P pool and policy.
     refresh_inputs: Mutex<RefreshInputs>,
+    hybrid_pairs: Option<HashMap<String, HashSet<String>>>,
     signals: tokio::task::JoinHandle<()>,
 }
 
@@ -161,6 +162,16 @@ impl PdKvState {
         client: reqwest::Client,
         static_sources: HashMap<String, crate::config::types::PdKvEventSources>,
     ) -> Self {
+        let pairs: HashMap<_, _> = static_sources
+            .iter()
+            .filter(|(_, source)| source.hybrid.is_some())
+            .map(|(prefill, source)| {
+                (
+                    prefill.clone(),
+                    source.compatible_decode_urls.iter().cloned().collect(),
+                )
+            })
+            .collect();
         let (supervisor, mut signals) =
             KvIndexSupervisor::new_pd(client.clone(), HashMode::Sha256, static_sources);
         Self {
@@ -171,9 +182,33 @@ impl PdKvState {
             targets: Mutex::new(HashMap::new()),
             bind_lock: Mutex::new(()),
             refresh_inputs: Mutex::new(RefreshInputs::default()),
+            hybrid_pairs: (!pairs.is_empty()).then_some(pairs),
             // Subscribers enforce trust by suspending/clearing affected sources.
             signals: tokio::spawn(async move { while signals.recv().await.is_some() {} }),
         }
+    }
+
+    /// Once hybrid PD is configured, admit only deployment-verified pairs.
+    pub(super) fn compatible_hybrid_pairs(
+        &self,
+        prefill: &[Arc<dyn Worker>],
+        decode: &[Arc<dyn Worker>],
+    ) -> Option<HashSet<(PdEndpoint, PdEndpoint)>> {
+        let configured = self.hybrid_pairs.as_ref()?;
+        let mut allowed = HashSet::new();
+        for p in prefill {
+            if let Some(decodes) = configured.get(p.base_url()) {
+                for d in decode {
+                    if decodes.contains(d.base_url()) {
+                        allowed.insert((
+                            PdEndpoint::for_worker(p.as_ref()),
+                            PdEndpoint::for_worker(d.as_ref()),
+                        ));
+                    }
+                }
+            }
+        }
+        Some(allowed)
     }
 
     /// Reconcile bindings off the request path. Requests only record their
@@ -555,6 +590,45 @@ mod kv_input_tests {
     use serde_json::json;
 
     #[tokio::test]
+    async fn configured_hybrid_pairs_exclude_unlisted_workers() {
+        let source = crate::config::PdKvEventSources {
+            endpoints: vec!["tcp://127.0.0.1:5557".into()],
+            replay_endpoints: Some(vec!["tcp://127.0.0.1:5558".into()]),
+            block_size: 16,
+            model: Some("model".into()),
+            hybrid: Some(crate::kv_index::hybrid_capability::HybridCapabilities {
+                schema_version: 1,
+                ranks: vec![],
+            }),
+            compatible_decode_urls: vec!["http://d0".into()],
+        };
+        let state = PdKvState::new_with_statics(
+            Client::new(),
+            HashMap::from([("http://p0".into(), source)]),
+        );
+        let workers = |prefix: &str| -> Vec<Arc<dyn Worker>> {
+            (0..2)
+                .map(|i| {
+                    Arc::new(BasicWorker::new(
+                        format!("http://{prefix}{i}"),
+                        WorkerType::Regular,
+                    )) as Arc<dyn Worker>
+                })
+                .collect()
+        };
+        let p = workers("p");
+        let d = workers("d");
+        let pairs = state.compatible_hybrid_pairs(&p, &d).unwrap();
+        assert_eq!(
+            pairs,
+            HashSet::from([(
+                PdEndpoint::for_worker(p[0].as_ref()),
+                PdEndpoint::for_worker(d[0].as_ref())
+            )])
+        );
+    }
+
+    #[tokio::test]
     async fn unsupported_inputs_fall_back_without_control_or_tokenization_requests() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let calls = Arc::new(AtomicUsize::new(0));
@@ -742,6 +816,8 @@ mod kv_input_tests {
                         replay_endpoints: None,
                         block_size: 16,
                         model: None,
+                        hybrid: None,
+                        compatible_decode_urls: Vec::new(),
                     },
                 ))
                 .collect()
