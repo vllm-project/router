@@ -18,7 +18,14 @@ from tests.python.e2e.perf.binaries import (
 from tests.python.e2e.perf.binaries import (
     vllm_rs_bin as _shared_vllm_rs_bin,
 )
-from tests.python.e2e.perf.process import RunningProc, launch_router, launch_worker
+from tests.python.e2e.perf.process import (
+    RunningProc,
+    launch_router,
+    launch_worker,
+    router_cmd,
+    vllm_rs_serve_cmd,
+    vllm_serve_cmd,
+)
 
 if TYPE_CHECKING:
     from case_loader import BackendCaseFile
@@ -88,66 +95,39 @@ def launch_stack(case: BackendCaseFile, model: str) -> PerfStack:
     if backend == "rust_grpc":
         gp = case.stack.worker_grpc_port
         if gp is None:
-            raise ValueError(f"{case.path}: rust_grpc requires stack.worker_grpc_port")
-        worker_cmd = [
+            raise ValueError(f"{case.path}: rust_grpc requires worker.grpc_port")
+        worker_cmd = vllm_rs_serve_cmd(
             _vllm_rs_bin(case),
-            "serve",
             model,
-            "--host",
-            host,
-            "--port",
-            str(wp),
-            "--grpc-port",
-            str(gp),
-            *cli,
-        ]
+            host=host,
+            port=wp,
+            grpc_port=gp,
+            cli=cli,
+        )
         worker_label = "vllm-rs"
         worker_env = None
         worker_url = f"grpc://{host}:{gp}"
     elif backend == "rust_http":
-        worker_cmd = [
-            _vllm_cli(),
-            "serve",
-            model,
-            "--host",
-            host,
-            "--port",
-            str(wp),
-            *cli,
-        ]
+        worker_cmd = vllm_serve_cmd(_vllm_cli(), model, host=host, port=wp, cli=cli)
         worker_label = "vllm-rust-http"
         worker_env = {"VLLM_USE_RUST_FRONTEND": "1"}
         worker_url = f"http://{host}:{wp}"
     elif backend == "python_http":
-        worker_cmd = [
-            _vllm_cli(),
-            "serve",
-            model,
-            "--host",
-            host,
-            "--port",
-            str(wp),
-            *cli,
-        ]
+        worker_cmd = vllm_serve_cmd(_vllm_cli(), model, host=host, port=wp, cli=cli)
         worker_label = "vllm-python-http"
         worker_env = {"VLLM_USE_RUST_FRONTEND": "0"}
         worker_url = f"http://{host}:{wp}"
     else:
         raise ValueError(f"unknown backend {backend!r} in {case.path}")
 
-    router_cmd = [
+    router_argv = router_cmd(
         router_bin,
-        "--host",
-        host,
-        "--port",
-        str(rp),
-        "--worker-urls",
-        worker_url,
-        "--worker-startup-timeout-secs",
-        str(worker_startup_timeout),
-    ]
-    if case.stack.prometheus_port is not None:
-        router_cmd.extend(["--prometheus-port", str(case.stack.prometheus_port)])
+        host=host,
+        port=rp,
+        worker_urls=worker_url,
+        worker_startup_timeout_secs=worker_startup_timeout,
+        prometheus_port=case.stack.prometheus_port,
+    )
 
     router_url = f"http://{host}:{rp}"
     _progress("starting worker (model load may take 10–30+ min)")
@@ -162,7 +142,7 @@ def launch_stack(case: BackendCaseFile, model: str) -> PerfStack:
     try:
         _progress("starting router")
         router = launch_router(
-            router_cmd,
+            router_argv,
             router_url=router_url,
             env=_router_env(model),
             timeout=timeout,

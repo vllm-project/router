@@ -41,7 +41,7 @@ def router_bin(case_router_bin: str | None = None) -> str:
         tried.insert(0, case_router_bin)
     raise FileNotFoundError(
         f"vllm-router not found (repo root={REPO_ROOT}, tried {tried!r}); "
-        "set ROUTER_BIN, stack.router_bin in case JSON, or build target/release/vllm-router"
+        "set ROUTER_BIN, router.bin in case JSON, or build target/release/vllm-router"
     )
 
 

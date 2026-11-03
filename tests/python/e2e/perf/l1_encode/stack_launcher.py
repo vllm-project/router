@@ -11,7 +11,13 @@ from tests.python.e2e.perf.binaries import preflight_router_bin as _preflight_ro
 from tests.python.e2e.perf.binaries import router_bin as _shared_router_bin
 from tests.python.e2e.perf.binaries import vllm_rs_bin as _shared_vllm_rs_bin
 from tests.python.e2e.perf.l1_encode.case_loader import L1Case, check_limits
-from tests.python.e2e.perf.process import RunningProc, launch_router, launch_worker
+from tests.python.e2e.perf.process import (
+    RunningProc,
+    launch_router,
+    launch_worker,
+    router_cmd,
+    vllm_rs_serve_cmd,
+)
 
 
 def _progress(msg: str) -> None:
@@ -84,26 +90,23 @@ class L1Stack:
 
     def _worker_cmd(self) -> tuple[list[str], dict[str, str] | None]:
         case = self.case
-        cmd = [
-            _shared_vllm_rs_bin(case.vllm_rs_bin),
-            "serve",
-            self.model,
-            "--host",
-            case.host,
-            "--port",
-            str(case.worker_http_port),
-            "--grpc-port",
-            str(case.worker_grpc_port),
-            *case.worker_cli,
-            "--served-model-name",
-            self.model,
-        ]
+        extra: list[str] = []
         if os.environ.get("L1_LANGUAGE_MODEL_ONLY", "").strip().lower() in (
             "1",
             "true",
             "yes",
         ):
-            cmd.append("--language-model-only")
+            extra.append("--language-model-only")
+        cmd = vllm_rs_serve_cmd(
+            _shared_vllm_rs_bin(case.vllm_rs_bin),
+            self.model,
+            host=case.host,
+            port=case.worker_http_port,
+            grpc_port=case.worker_grpc_port,
+            cli=case.worker_cli,
+            served_model_name=self.model,
+            extra_args=extra,
+        )
         env = None
         if "CUDA_VISIBLE_DEVICES" not in os.environ and case.cuda_visible_devices:
             env = {"CUDA_VISIBLE_DEVICES": case.cuda_visible_devices}
@@ -118,21 +121,15 @@ class L1Stack:
 
     def _router_cmd(self) -> list[str]:
         case = self.case
-        return [
+        return router_cmd(
             self._router_bin,
-            "--host",
-            case.host,
-            "--port",
-            str(case.router_port),
-            "--worker-urls",
-            f"grpc://{case.host}:{case.worker_grpc_port}",
-            "--prometheus-host",
-            case.host,
-            "--prometheus-port",
-            str(case.prometheus_port),
-            "--worker-startup-timeout-secs",
-            str(int(self._timeout())),
-        ]
+            host=case.host,
+            port=case.router_port,
+            worker_urls=f"grpc://{case.host}:{case.worker_grpc_port}",
+            worker_startup_timeout_secs=int(self._timeout()),
+            prometheus_host=case.host,
+            prometheus_port=case.prometheus_port,
+        )
 
     def _launch(self, l1_on: bool) -> None:
         worker_cmd, worker_env = self._worker_cmd()

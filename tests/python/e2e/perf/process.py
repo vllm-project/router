@@ -1,7 +1,8 @@
-"""Start and stop a worker process, or a router process.
+"""Worker argv and process start/stop for the perf suites.
 
-Callers decide the order. gRPC starts both for every scenario. L1 starts both
-once per L1 mode and keeps that pair until the mode changes.
+``vllm_rs_serve_cmd``, ``vllm_serve_cmd``, and ``router_cmd`` build argv.
+``launch_worker`` and ``launch_router`` start the processes. Callers decide
+when to start them.
 """
 
 from __future__ import annotations
@@ -14,6 +15,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 
 logger = logging.getLogger(__name__)
@@ -151,6 +153,85 @@ class RunningProc:
             self.label,
             prefix=self.log_prefix,
         )
+
+
+def vllm_rs_serve_cmd(
+    binary: str,
+    model: str,
+    *,
+    host: str,
+    port: int,
+    grpc_port: int,
+    cli: Sequence[str] = (),
+    served_model_name: str | None = None,
+    extra_args: Sequence[str] = (),
+) -> list[str]:
+    """``vllm-rs serve`` argv. Callers append their own extra flags."""
+    cmd = [
+        binary,
+        "serve",
+        model,
+        "--host",
+        host,
+        "--port",
+        str(port),
+        "--grpc-port",
+        str(grpc_port),
+        *cli,
+    ]
+    if served_model_name:
+        cmd.extend(["--served-model-name", served_model_name])
+    cmd.extend(extra_args)
+    return cmd
+
+
+def vllm_serve_cmd(
+    binary: str,
+    model: str,
+    *,
+    host: str,
+    port: int,
+    cli: Sequence[str] = (),
+) -> list[str]:
+    """``vllm serve`` argv."""
+    return [
+        binary,
+        "serve",
+        model,
+        "--host",
+        host,
+        "--port",
+        str(port),
+        *cli,
+    ]
+
+
+def router_cmd(
+    binary: str,
+    *,
+    host: str,
+    port: int,
+    worker_urls: str,
+    worker_startup_timeout_secs: int,
+    prometheus_host: str | None = None,
+    prometheus_port: int | None = None,
+) -> list[str]:
+    """``vllm-router`` argv. Prometheus flags are omitted when unset."""
+    cmd = [
+        binary,
+        "--host",
+        host,
+        "--port",
+        str(port),
+        "--worker-urls",
+        worker_urls,
+    ]
+    if prometheus_host:
+        cmd.extend(["--prometheus-host", prometheus_host])
+    if prometheus_port is not None:
+        cmd.extend(["--prometheus-port", str(prometheus_port)])
+    cmd.extend(["--worker-startup-timeout-secs", str(int(worker_startup_timeout_secs))])
+    return cmd
 
 
 def launch_worker(
