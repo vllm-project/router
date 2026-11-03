@@ -204,7 +204,7 @@ steps:
       export PERF_STACK_TIMEOUT=1800
       export PERF_WORKER_STARTUP_TIMEOUT=1800
 
-      python -m pytest -sv tests/python/e2e/perf/l1_encode/test_l1_encode.py::test_l1_encode
+      python -m pytest -sv tests/python/e2e/perf/l1_encode/test_l1_encode.py
 
       BASH
     artifact_paths:

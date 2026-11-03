@@ -1,9 +1,11 @@
 # L1 prefix encoding cache (16k)
 
-GPU perf for the router **L1 prefix encoding cache**. The `vllm-rs` worker
-stays up through **L1 on**. Before **L1 off**, the worker and the router both
-cold-start, so the off arm does not keep the on arm's KV cache. L0 stays off.
-`--enable-prefix-caching` stays on inside each arm.
+GPU perf for the router **L1 prefix encoding cache**. `qwen3_16k.json` is an
+array of two tests, `test_qwen3_16k_l1on` and `test_qwen3_16k_l1off`. Each
+item has its own `model`, `env`, `router`, `worker`, and `bench`. Each name is
+one pytest class: it starts one worker and one router and keeps that pair for
+every hit rate and concurrency in the test. L0 stays off.
+`--enable-prefix-caching` stays on inside each test.
 
 The number to compare is `wave.summary.encode_ms.p50` and
 `wave.summary.encode_reuse.p50`. `ttft_ms` and `e2e_ms` include GPU prefill
@@ -27,15 +29,15 @@ export VLLM_RS=/path/to/vllm-rs
 # export MODEL=/path/to/Qwen3-0.6B
 # optional: export ROUTER_BIN=$PWD/target/release/vllm-router
 
-python -m pytest -sv tests/python/e2e/perf/l1_encode/test_l1_encode.py::test_l1_encode \
-  -k "l1on and hit0.30 and c4"
+python -m pytest -sv tests/python/e2e/perf/l1_encode/test_l1_encode.py::test_qwen3_16k_l1on \
+  -k "hit0.30 and c4"
 ```
 
-Omit `-k` for the full matrix (L1 on, then L1 off).
+Omit the `::test_name` to run both tests. `::test_qwen3_16k_l1off` runs the other one.
 
 | `-k` | Selects |
 |------|---------|
-| `l1on` / `l1off` | router arm |
+| `test_qwen3_16k_l1on` / `test_qwen3_16k_l1off` | one test block |
 | `hit0.30` | hit rate 0.30 |
 | `hit0.99999` | hit rate 0.99999 |
 | `hit0-` | hit rate 0 (`hit0` also matches `hit0.30` and `hit0.99999`) |
@@ -44,21 +46,20 @@ Omit `-k` for the full matrix (L1 on, then L1 off).
 Examples:
 
 ```bash
-python -m pytest -sv tests/python/e2e/perf/l1_encode/test_l1_encode.py::test_l1_encode \
-  -k "l1off and hit0.99999 and c1"
+python -m pytest -sv tests/python/e2e/perf/l1_encode/test_l1_encode.py::test_qwen3_16k_l1off \
+  -k "hit0.99999 and c1"
 
-python -m pytest -sv tests/python/e2e/perf/l1_encode/test_l1_encode.py::test_l1_encode \
+python -m pytest -sv tests/python/e2e/perf/l1_encode/test_l1_encode.py::test_qwen3_16k_l1on \
   -k "hit0- and c4"
 ```
 
-Node ids look like `l1on-hit0.30-c4-r8`.
+Node ids look like `test_qwen3_16k_l1on::test_l1_encode[hit0.30-c4-r8]`.
 
 ## What one session does
 
-1. Start `vllm-rs` on GPU 0 (TP1, `--max-model-len 32768`, prefix caching on) and wait for `/v1/models`.
-2. **L1 on:** start the router once (`VLLM_ROUTER_L1_CACHE=1`, `VLLM_ROUTER_L0_CACHE=0`, `VLLM_ROUTER_STAGES=1`). Every on-arm hit rate and concurrency shares that worker and router.
-3. **L1 off:** cold-start the worker and the router (`VLLM_ROUTER_L1_CACHE=0`). Every off-arm hit rate and concurrency shares that worker and router.
-4. Each wave is `benches/backend/bench_prefix_kvhit.py` with `--shape turns --turns 8 --tokens 16384 --max-tokens 64 --warmup`.
+1. **`test_qwen3_16k_l1on`:** start `vllm-rs` on GPU 0 (TP1, `--max-model-len 32768`, prefix caching on), wait for `/v1/models`, then start the router (`VLLM_ROUTER_L1_CACHE=1`, `VLLM_ROUTER_L0_CACHE=0`, `VLLM_ROUTER_STAGES=1`). Every hit rate and concurrency in this test shares that pair.
+2. **`test_qwen3_16k_l1off`:** start a new worker and router (`VLLM_ROUTER_L1_CACHE=0`). Every hit rate and concurrency in this test shares that pair.
+3. Each wave is `benches/backend/bench_prefix_kvhit.py` with `--shape turns --turns 8 --tokens 16384 --max-tokens 64 --warmup`.
 
 Hit rates `0`, `0.30`, and `0.99999`. Concurrency `1`, `4`, `8`, and `16` (requests are twice the concurrency: 2, 8, 16, 32). `--max-num-seqs` is 16 because that is the highest concurrency. `0.99999` uses the same shape as any rate ≥ 0.99: the whole paragraph is shared turns, and only the last-turn tag changes.
 

@@ -1,10 +1,9 @@
-"""One vllm-rs worker and one router for each L1 mode. Both restart before L1 off."""
+"""Start one vllm-rs worker and one router for a single L1 mode."""
 
 from __future__ import annotations
 
 import os
 import sys
-import time
 import urllib.error
 import urllib.request
 
@@ -20,14 +19,13 @@ def _progress(msg: str) -> None:
 
 
 class L1Stack:
-    """Worker and router stay up for one L1 mode. Crossing to L1 off restarts both."""
+    """One worker and one router. L1 on or off is fixed for this stack."""
 
     def __init__(self, case: L1Case, model: str) -> None:
         self.case = case
         self.model = model
         self.router_url = f"http://{case.host}:{case.router_port}"
         self.prometheus_url = f"http://{case.host}:{case.prometheus_port}/metrics"
-        self.arm_key: tuple | None = None
         self._worker: RunningProc | None = None
         self._router: RunningProc | None = None
         self._router_bin = ""
@@ -36,34 +34,14 @@ class L1Stack:
         check_limits(self.case)
         self._router_bin = _shared_router_bin(self.case.router_bin)
         _preflight_router_bin(self._router_bin)
+        mode = "on" if self.case.l1_on else "off"
         _progress(
-            "worker and router stay up through one L1 mode. "
-            "Before L1 off, worker and router both cold-start. "
+            f"L1 {mode}: worker and router start once for this test. "
             "Logs are prefixed [vllm-rs] and [vllm-router]."
         )
 
-    def ensure_router(self, l1_on: bool, hit_rate: float) -> None:
-        key = ("on",) if l1_on else ("off",)
-        if self.arm_key == key and self._alive():
-            _progress(
-                f"reuse worker and router L1 cache {'on' if l1_on else 'off'} "
-                f"hit_rate={hit_rate:g}"
-            )
-            return
-        mode = "on" if l1_on else "off"
-        if self._worker is not None or self._router is not None:
-            previous_mode = self.arm_key[0] if self.arm_key else None
-            if previous_mode is not None and previous_mode != mode:
-                _progress(
-                    f"cold start between L1 {previous_mode} and L1 {mode}: "
-                    "restart worker and router"
-                )
-            self._stop_pair()
-            pause = float(os.environ.get("PERF_STACK_STOP_SLEEP", "2"))
-            if pause > 0:
-                time.sleep(pause)
-        self._launch(l1_on)
-        self.arm_key = key
+    def start(self) -> None:
+        self._launch(self.case.l1_on)
 
     def router_log_text(self) -> str:
         router = self._router
@@ -88,14 +66,6 @@ class L1Stack:
     def stop(self) -> None:
         self._stop_pair()
 
-    def _alive(self) -> bool:
-        return (
-            self._worker is not None
-            and self._router is not None
-            and self._worker.alive()
-            and self._router.alive()
-        )
-
     def _stop_pair(self) -> None:
         if self._router is not None:
             self._router.stop()
@@ -103,7 +73,6 @@ class L1Stack:
         if self._worker is not None:
             self._worker.stop()
             self._worker = None
-        self.arm_key = None
 
     def _timeout(self) -> float:
         raw = (

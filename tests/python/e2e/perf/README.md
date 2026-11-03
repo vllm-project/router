@@ -16,11 +16,11 @@ export MODEL=/path/to/model
 python -m pytest -sv tests/python/e2e/perf/grpc --perf-case=rust_grpc
 ```
 
-L1 prefix encoding cache (16k, `--shape turns`). The worker stays up through L1 on. Before L1 off, the worker and the router both cold-start. `-s` streams `[vllm-rs]` and `[vllm-router]` logs. Each scenario prints its wave `ttft_ms`, `e2e_ms`, `encode_ms`, `frontend_ms`, and JSON path.
+L1 prefix encoding cache (16k, `--shape turns`). `test_qwen3_16k_l1on` and `test_qwen3_16k_l1off` are separate tests. Each starts one worker and one router and keeps them for that test's hit rates and concurrencies. `-s` streams `[vllm-rs]` and `[vllm-router]` logs. Each scenario prints its wave `ttft_ms`, `e2e_ms`, `encode_ms`, `frontend_ms`, and JSON path.
 
 ```bash
 # MODEL defaults to Qwen/Qwen3-0.6B; set it to a local directory to override
-python -m pytest -sv tests/python/e2e/perf/l1_encode/test_l1_encode.py::test_l1_encode -k "l1on and hit0.30 and c4"
+python -m pytest -sv tests/python/e2e/perf/l1_encode/test_l1_encode.py::test_qwen3_16k_l1on -k "hit0.30 and c4"
 ```
 
 Additional perf suites can be added as siblings of `grpc/` without sharing fixtures.

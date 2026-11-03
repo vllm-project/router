@@ -44,7 +44,8 @@ class L1Case:
     turns: int
     hit_rates: tuple[float, ...]
     waves: tuple[WaveSpec, ...]
-    l1: tuple[bool, ...]
+    test_name: str
+    l1_on: bool
 
 
 def _apply_tp_override(cli: tuple[str, ...]) -> tuple[str, ...]:
@@ -144,19 +145,13 @@ def _parse_hit_rates(raw: Any, *, where: str) -> tuple[float, ...]:
     return tuple(rates)
 
 
-def _parse_l1(raw: Any, *, where: str) -> tuple[bool, ...]:
-    if not isinstance(raw, list) or not raw:
-        raise ValueError(f"{where}: router.l1 must be a non-empty array of 'on'/'off'")
-    modes: list[bool] = []
-    for item in raw:
-        text = str(item).strip().lower()
-        if text == "on":
-            modes.append(True)
-        elif text == "off":
-            modes.append(False)
-        else:
-            raise ValueError(f"invalid router.l1 value in {where}: {item!r}")
-    return tuple(modes)
+def _parse_l1_mode(raw: Any, *, where: str) -> bool:
+    text = str(raw).strip().lower() if raw is not None else ""
+    if text == "on":
+        return True
+    if text == "off":
+        return False
+    raise ValueError(f"{where}: router.l1 must be 'on' or 'off', got {raw!r}")
 
 
 def _parse_wave(raw: dict[str, Any], *, where: str) -> WaveSpec:
@@ -170,36 +165,39 @@ def _parse_wave(raw: dict[str, Any], *, where: str) -> WaveSpec:
     return WaveSpec(concurrency=concurrency, requests=requests)
 
 
-def _section(data: dict[str, Any], name: str, case_path: Path) -> dict[str, Any]:
+def _section(data: dict[str, Any], name: str, where: str) -> dict[str, Any]:
     raw = data.get(name)
     if not isinstance(raw, dict):
-        raise ValueError(f"{case_path}: {name} must be an object")
+        raise ValueError(f"{where}: {name} must be an object")
     return raw
 
 
-def load_case(path: Path | None = None) -> L1Case:
-    case_path = path or CASE_FILE
-    data = json.loads(case_path.read_text(encoding="utf-8"))
-    if not isinstance(data, dict):
-        raise ValueError(f"{case_path}: root must be an object")
-    env = _section(data, "env", case_path)
-    router = _section(data, "router", case_path)
-    worker = _section(data, "worker", case_path)
-    bench = _section(data, "bench", case_path)
+def _parse_case(item: dict[str, Any], case_path: Path, index: int) -> L1Case:
+    where = f"{case_path.name}[{index}]"
+    test_name = str(item.get("test_name", "")).strip()
+    if not test_name.isidentifier() or not test_name.startswith("test_"):
+        raise ValueError(
+            f"{where}: test_name must be an identifier starting with 'test_', "
+            f"got {test_name!r}"
+        )
+    env = _section(item, "env", where)
+    router = _section(item, "router", where)
+    worker = _section(item, "worker", where)
+    bench = _section(item, "bench", where)
     cli = worker.get("cli")
     if not isinstance(cli, list) or not cli or not all(isinstance(x, str) for x in cli):
-        raise ValueError(f"{case_path}: worker.cli must be a non-empty string array")
+        raise ValueError(f"{where}: worker.cli must be a non-empty string array")
     shape = str(bench.get("shape", "turns"))
     if shape != "turns":
         raise ValueError(
-            f"{case_path}: L1 encode perf requires bench.shape 'turns', got {shape!r}"
+            f"{where}: L1 encode perf requires bench.shape 'turns', got {shape!r}"
         )
     waves_raw = bench.get("waves")
     if not isinstance(waves_raw, list) or not waves_raw:
-        raise ValueError(f"{case_path}: bench.waves must be a non-empty array")
+        raise ValueError(f"{where}: bench.waves must be a non-empty array")
     model = (
         os.environ.get("MODEL", "").strip()
-        or _optional_str(data.get("model"))
+        or _optional_str(item.get("model"))
         or DEFAULT_MODEL
     )
     return L1Case(
@@ -218,10 +216,29 @@ def load_case(path: Path | None = None) -> L1Case:
         bench_max_tokens=int(bench.get("max_tokens", 64)),
         bench_timeout=float(bench.get("timeout", 1800)),
         turns=int(bench.get("turns", 8)),
-        hit_rates=_parse_hit_rates(bench.get("hit_rates"), where=f"{case_path.name}"),
-        waves=tuple(
-            _parse_wave(item, where=f"{case_path.name}:bench.waves")
-            for item in waves_raw
-        ),
-        l1=_parse_l1(router.get("l1"), where=f"{case_path.name}"),
+        hit_rates=_parse_hit_rates(bench.get("hit_rates"), where=where),
+        waves=tuple(_parse_wave(wave, where=f"{where}:bench.waves") for wave in waves_raw),
+        test_name=test_name,
+        l1_on=_parse_l1_mode(router.get("l1"), where=where),
     )
+
+
+def load_cases(path: Path | None = None) -> tuple[L1Case, ...]:
+    """One case per top-level ``test_name``. Each test fixes L1 on or off."""
+    case_path = path or CASE_FILE
+    data = json.loads(case_path.read_text(encoding="utf-8"))
+    if not isinstance(data, list) or not data:
+        raise ValueError(f"{case_path}: root must be a non-empty array")
+    cases: list[L1Case] = []
+    seen: set[str] = set()
+    for index, item in enumerate(data):
+        if not isinstance(item, dict):
+            raise ValueError(f"{case_path.name}[{index}] must be an object")
+        case = _parse_case(item, case_path, index)
+        if case.test_name in seen:
+            raise ValueError(
+                f"{case_path.name}[{index}]: duplicate test_name {case.test_name!r}"
+            )
+        seen.add(case.test_name)
+        cases.append(case)
+    return tuple(cases)

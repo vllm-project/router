@@ -10,8 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.python.e2e.perf.l1_encode.case_loader import load_case
-from tests.python.e2e.perf.l1_encode.check import wave_id
+from tests.python.e2e.perf.l1_encode.check import hit_tag
 from tests.python.e2e.perf.l1_encode.stack_launcher import L1Stack
 
 _DIR = Path(__file__).resolve().parent
@@ -40,17 +39,18 @@ def load_bench_module():
 def pytest_generate_tests(metafunc):
     if metafunc.definition.name != "test_l1_encode":
         return
-    if "l1_on" not in metafunc.fixturenames:
+    if "hit_rate" not in metafunc.fixturenames:
         return
-    case = load_case()
+    case = getattr(metafunc.cls, "l1_case", None)
+    if case is None:
+        return
     params = []
     ids = []
-    for l1_on in case.l1:
-        for hit_rate in case.hit_rates:
-            for wave in case.waves:
-                params.append((l1_on, hit_rate, wave.concurrency, wave.requests))
-                ids.append(wave_id(l1_on, hit_rate, wave.concurrency, wave.requests))
-    metafunc.parametrize("l1_on,hit_rate,concurrency,requests", params, ids=ids)
+    for hit_rate in case.hit_rates:
+        for wave in case.waves:
+            params.append((hit_rate, wave.concurrency, wave.requests))
+            ids.append(f"hit{hit_tag(hit_rate)}-c{wave.concurrency}-r{wave.requests}")
+    metafunc.parametrize("hit_rate,concurrency,requests", params, ids=ids)
 
 
 @pytest.fixture(scope="session")
@@ -58,9 +58,16 @@ def bench_mod():
     return load_bench_module()
 
 
-@pytest.fixture(scope="session")
-def l1_case():
-    case = load_case()
+def pytest_pycollect_makeitem(collector, name, obj):
+    """Collect ``test_name`` classes from the case JSON. Pytest's default only keeps ``Test*``."""
+    if not isinstance(obj, type) or getattr(obj, "l1_case", None) is None:
+        return None
+    return pytest.Class.from_parent(collector, name=name)
+
+
+@pytest.fixture(scope="class")
+def l1_case(request):
+    case = request.cls.l1_case
     if not case.model:
         pytest.skip("MODEL is empty and the case has no Hugging Face model id")
     os.environ["MODEL"] = case.model
@@ -68,7 +75,7 @@ def l1_case():
 
 
 @pytest.fixture(scope="session")
-def l1_output_dir(l1_case):  # noqa: ARG001
+def l1_output_dir():
     if not _save_results():
         yield None
         return
@@ -83,11 +90,12 @@ def l1_output_dir(l1_case):  # noqa: ARG001
     yield path
 
 
-@pytest.fixture(scope="session")
+@pytest.fixture(scope="class")
 def l1_stack(l1_case, l1_output_dir):  # noqa: ARG001
     stack = L1Stack(l1_case, l1_case.model)
     stack.prepare()
     try:
+        stack.start()
         yield stack
     finally:
         stack.stop()
