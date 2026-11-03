@@ -88,18 +88,22 @@ impl TokenBucket {
     /// because this method does not mutate the bucket.
     pub async fn wait_until_available(&self, tokens: f64) {
         loop {
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+
             if self.available_tokens().await >= tokens {
                 return;
             }
 
             let wait_time = {
-                let inner = self.inner.lock().await;
+                let inner = self.inner.lock();
                 let tokens_needed = (tokens - inner.tokens).max(0.0);
                 Duration::from_secs_f64((tokens_needed / self.refill_rate).max(0.0))
             };
 
             tokio::select! {
-                _ = self.notify.notified() => {},
+                _ = &mut notified => {},
                 _ = tokio::time::sleep(wait_time) => {},
             }
         }
