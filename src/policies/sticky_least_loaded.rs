@@ -297,17 +297,18 @@ impl LoadBalancingPolicy for StickyLeastLoadedPolicy {
         Some(idx)
     }
 
-    fn finish_session(&self, session_id: &str) {
+    fn finish_session(&self, session_id: &str) -> bool {
         let mut state = self.state.lock().unwrap();
-        if let Some(entry) = state.sessions.remove(session_id) {
-            Self::decrement_count(&mut state.active_counts, &entry.worker_url);
-            info!(
-                "SLL: finished session '{}' on replica '{}'",
-                session_id, entry.worker_url
-            );
-        } else {
+        let Some(entry) = state.sessions.remove(session_id) else {
             debug!("SLL: finish_session for unknown session '{}'", session_id);
-        }
+            return false;
+        };
+        Self::decrement_count(&mut state.active_counts, &entry.worker_url);
+        info!(
+            "SLL: finished session '{}' on replica '{}'",
+            session_id, entry.worker_url
+        );
+        true
     }
 
     fn name(&self) -> &'static str {

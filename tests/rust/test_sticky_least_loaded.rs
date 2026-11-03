@@ -186,13 +186,21 @@ mod sticky_least_loaded_pd_tests {
             (served(&self.prefill_ports), served(&self.decode_ports))
         }
 
+        /// Finish a session with the same `X-Session-ID` its requests sent.
         async fn finish_session(&self, session_id: &str) {
             let request = Request::builder()
                 .method("POST")
-                .uri(format!("/finish_session?session_id={}", session_id))
+                .uri("/finish_session")
+                .header("x-session-id", session_id)
                 .body(Body::empty())
                 .unwrap();
-            assert_eq!(self.send(request).await, 200);
+            let response = self.app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status().as_u16(), 200);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["released"], true, "{session_id}: {body}");
         }
 
         fn served_counts(&self) -> HashMap<u16, usize> {
@@ -376,6 +384,22 @@ mod sticky_least_loaded_regular_tests {
             response.status().as_u16()
         }
 
+        /// POST /finish_session; returns the status and the JSON body (Null
+        /// for a non-JSON error body).
+        async fn finish_session(&self, headers: &[(&str, &str)], body: &str) -> (u16, Value) {
+            let mut request = Request::builder().method("POST").uri("/finish_session");
+            for (name, value) in headers {
+                request = request.header(*name, *value);
+            }
+            let request = request.body(Body::from(body.to_owned())).unwrap();
+            let response = self.app.clone().oneshot(request).await.unwrap();
+            let status = response.status().as_u16();
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            (status, serde_json::from_slice(&body).unwrap_or(Value::Null))
+        }
+
         /// Send one request and return the worker port that served it.
         async fn send(&self, path: &str, headers: &[(&str, &str)], body: Value) -> u16 {
             let before = self.served_counts(path);
@@ -428,41 +452,76 @@ mod sticky_least_loaded_regular_tests {
         url.rsplit(':').next().unwrap().parse().unwrap()
     }
 
+    /// A request body for `path` carrying the `identity` fields.
+    fn request_body(path: &str, turn: usize, identity: &Value) -> Value {
+        let mut body = match path {
+            "/v1/completions" => {
+                json!({"model": "mock-model", "prompt": format!("turn {turn}"), "max_tokens": 4})
+            }
+            "/v1/responses" => json!({"model": "mock-model", "input": format!("turn {turn}")}),
+            _ => json!({
+                "model": "mock-model",
+                "messages": [{"role": "user", "content": format!("turn {turn}")}],
+            }),
+        };
+        for (field, value) in identity.as_object().unwrap() {
+            body[field] = value.clone();
+        }
+        body
+    }
+
     #[tokio::test]
-    async fn test_regular_body_session_is_sticky() {
+    async fn test_regular_sessions_stick_and_release() {
         let fx = RegularFixture::start().await;
 
         // Typed routes pass the prompt (completions) or the bare session id
-        // (chat) to policies, not the body, so the session id must come from
-        // the resolved identity.
-        for (path, session) in [
-            ("/v1/chat/completions", "traj-1"),
-            ("/v1/completions", "traj-2"),
-        ] {
+        // (chat) to policies, not the body, and /v1/responses takes the
+        // transparent path, so the session id must come from the resolved
+        // identity. /finish_session gets the same identity fields.
+        let cases = [
+            (
+                "/v1/chat/completions",
+                None,
+                json!({"session_params": {"session_id": "traj-1"}}),
+            ),
+            (
+                "/v1/completions",
+                None,
+                json!({"session_params": {"session_id": "traj-2"}}),
+            ),
+            (
+                "/v1/chat/completions",
+                None,
+                json!({"vllm_xargs": {"agentic_context": {"session_id": "s3", "task_id": "traj-3"}}}),
+            ),
+            ("/v1/responses", Some("traj-4"), json!({})),
+        ];
+        for (path, header, identity) in cases {
+            let headers: Vec<(&str, &str)> =
+                header.map(|h| ("x-session-id", h)).into_iter().collect();
             let mut served = Vec::new();
             for turn in 0..4 {
-                let mut body = if path == "/v1/completions" {
-                    json!({"model": "mock-model", "prompt": format!("turn {turn}"), "max_tokens": 4})
-                } else {
-                    json!({
-                        "model": "mock-model",
-                        "messages": [{"role": "user", "content": format!("turn {turn}")}],
-                    })
-                };
-                body["session_params"] = json!({"session_id": session});
-                served.push(fx.send(path, &[], body).await);
+                served.push(
+                    fx.send(path, &headers, request_body(path, turn, &identity))
+                        .await,
+                );
             }
             assert!(
                 served.windows(2).all(|w| w[0] == w[1]),
                 "{path}: {served:?}"
             );
-            assert_eq!(fx.active_sessions(), 1, "{path}");
+            assert_eq!(fx.active_sessions(), 1, "{path} {identity}");
 
-            // The session is released by the id the client sent.
-            let finish = format!("/finish_session?session_id={session}");
-            assert_eq!(fx.status("POST", &finish).await, 200);
-            assert_eq!(fx.active_sessions(), 0, "{path}");
+            let (status, response) = fx.finish_session(&headers, &identity.to_string()).await;
+            assert_eq!(status, 200, "{path} {identity}");
+            assert_eq!(response["released"], true, "{path} {identity}: {response}");
+            assert_eq!(fx.active_sessions(), 0, "{path} {identity}");
         }
+
+        let (status, response) = fx.finish_session(&[("x-session-id", "unknown")], "").await;
+        assert_eq!(status, 200);
+        assert_eq!(response["session_id"], "unknown");
+        assert_eq!(response["released"], false);
 
         fx.stop().await;
     }
@@ -491,8 +550,11 @@ mod sticky_least_loaded_regular_tests {
     #[tokio::test]
     async fn test_finish_session_rejects_bad_requests() {
         let fx = RegularFixture::start().await;
-        assert_eq!(fx.status("POST", "/finish_session").await, 400);
-        assert_eq!(fx.status("GET", "/finish_session?session_id=s").await, 405);
+        // No identity, a body that is not JSON, and invalid identity metadata.
+        for body in ["", "{}", "not json", r#"{"agent_hint": "x"}"#] {
+            assert_eq!(fx.finish_session(&[], body).await.0, 400, "{body}");
+        }
+        assert_eq!(fx.status("GET", "/finish_session").await, 405);
         fx.stop().await;
 
         // With API-key validation on, a request without a bearer token is
@@ -500,7 +562,7 @@ mod sticky_least_loaded_regular_tests {
         let fx =
             RegularFixture::start_with_validation_urls(vec!["http://127.0.0.1:9/validate".into()])
                 .await;
-        assert_eq!(fx.status("POST", "/finish_session?session_id=s").await, 401);
+        assert_eq!(fx.finish_session(&[("x-session-id", "s")], "").await.0, 401);
         fx.stop().await;
     }
 }

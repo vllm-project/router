@@ -155,9 +155,10 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
     ///
     /// Session-aware policies (e.g. `sticky_least_loaded`) use this to
     /// release the replica capacity held by the session. Stateless policies, and
-    /// policies that don't track sessions, ignore this.
-    fn finish_session(&self, _session_id: &str) {
-        // Default: no-op for policies that don't track sessions
+    /// policies that don't track sessions, ignore this. Returns whether this
+    /// policy held the session.
+    fn finish_session(&self, _session_id: &str) -> bool {
+        false
     }
 
     /// Get policy name for metrics and debugging
