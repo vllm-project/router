@@ -61,7 +61,7 @@ async fn workers(n: usize, delay: Duration) -> Vec<MockVllmRsServer> {
     for _ in 0..n {
         servers.push(
             MockVllmRsServer::spawn_with_state(MockVllmRs {
-                response_delay: delay,
+                reply_delay: delay,
                 ..MockVllmRs::default()
             })
             .await,
@@ -492,7 +492,7 @@ async fn power_of_two_spreads_across_idle_grpc_workers() {
 #[tokio::test]
 async fn power_of_two_prefers_the_less_loaded_worker() {
     let slow = MockVllmRsServer::spawn_with_state(MockVllmRs {
-        response_delay: Duration::from_secs(3),
+        reply_delay: Duration::from_secs(3),
         ..MockVllmRs::default()
     })
     .await;

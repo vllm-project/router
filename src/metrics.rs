@@ -785,6 +785,19 @@ impl RouterMetrics {
         .set(if fresh { 1.0 } else { 0.0 });
     }
 
+    pub fn set_workflow_prediction_profile_keys(return_time: usize, output_length: usize) {
+        gauge!(
+            "vllm_router_workflow_prediction_profile_keys",
+            "predictor" => "return_time"
+        )
+        .set(return_time as f64);
+        gauge!(
+            "vllm_router_workflow_prediction_profile_keys",
+            "predictor" => "output_length"
+        )
+        .set(output_length as f64);
+    }
+
     pub fn record_agent_aware_cache_miss_impact(target: &str, seconds: f64) {
         histogram!(
             "vllm_router_agent_aware_cache_miss_impact_seconds",
@@ -808,6 +821,138 @@ impl RouterMetrics {
             "source" => source
         )
         .record(ttl.as_secs_f64());
+    }
+
+    pub fn record_workflow_return_prediction(
+        target: &str,
+        source: &'static str,
+        probability: f64,
+        ttl_seconds: f64,
+        support: usize,
+        backoff_level: usize,
+    ) {
+        histogram!(
+            "vllm_router_workflow_return_probability",
+            "target" => target.to_string(),
+            "source" => source
+        )
+        .record(probability);
+        histogram!(
+            "vllm_router_workflow_predicted_ttl_seconds",
+            "target" => target.to_string(),
+            "source" => source
+        )
+        .record(ttl_seconds);
+        histogram!(
+            "vllm_router_workflow_return_prediction_support",
+            "target" => target.to_string(),
+            "source" => source
+        )
+        .record(support as f64);
+        counter!(
+            "vllm_router_workflow_return_prediction_total",
+            "target" => target.to_string(),
+            "source" => source,
+            "backoff_level" => backoff_level.to_string()
+        )
+        .increment(1);
+    }
+
+    pub fn record_workflow_return_observation(
+        target: &str,
+        actual_seconds: f64,
+        probability: Option<f64>,
+        horizon_seconds: f64,
+    ) {
+        histogram!(
+            "vllm_router_workflow_return_actual_seconds",
+            "target" => target.to_string()
+        )
+        .record(actual_seconds);
+        if let Some(probability) = probability {
+            let outcome = if actual_seconds <= horizon_seconds {
+                1.0
+            } else {
+                0.0
+            };
+            let calibrated = probability.clamp(1e-9, 1.0 - 1e-9);
+            histogram!(
+                "vllm_router_workflow_return_brier_score",
+                "target" => target.to_string()
+            )
+            .record((probability - outcome).powi(2));
+            histogram!(
+                "vllm_router_workflow_return_nll",
+                "target" => target.to_string()
+            )
+            .record(if outcome > 0.0 {
+                -calibrated.ln()
+            } else {
+                -(1.0 - calibrated).ln()
+            });
+        }
+    }
+
+    pub fn record_workflow_output_prediction(
+        target: &str,
+        source: &'static str,
+        tokens: usize,
+        support: usize,
+        mature: bool,
+        backoff_level: usize,
+    ) {
+        histogram!(
+            "vllm_router_workflow_predicted_output_tokens",
+            "target" => target.to_string(),
+            "source" => source,
+            "mature" => if mature { "true" } else { "false" }
+        )
+        .record(tokens as f64);
+        histogram!(
+            "vllm_router_workflow_output_prediction_support",
+            "target" => target.to_string(),
+            "source" => source
+        )
+        .record(support as f64);
+        counter!(
+            "vllm_router_workflow_output_prediction_total",
+            "target" => target.to_string(),
+            "source" => source,
+            "backoff_level" => backoff_level.to_string()
+        )
+        .increment(1);
+    }
+
+    pub fn record_workflow_output_observation(
+        target: &str,
+        actual_tokens: usize,
+        p95: Option<usize>,
+        p99: Option<usize>,
+    ) {
+        histogram!(
+            "vllm_router_workflow_output_actual_tokens",
+            "target" => target.to_string()
+        )
+        .record(actual_tokens as f64);
+        for (quantile, predicted) in [("p95", p95), ("p99", p99)] {
+            if let Some(predicted) = predicted {
+                let covered = actual_tokens <= predicted;
+                counter!(
+                    "vllm_router_workflow_output_coverage_total",
+                    "target" => target.to_string(),
+                    "quantile" => quantile,
+                    "covered" => if covered { "true" } else { "false" }
+                )
+                .increment(1);
+                histogram!(
+                    "vllm_router_workflow_output_reservation_error_tokens",
+                    "target" => target.to_string(),
+                    "quantile" => quantile,
+                    "direction" => if covered { "over_reserved" } else { "under_reserved" }
+                )
+                .record(predicted.abs_diff(actual_tokens) as f64);
+            }
+        }
     }
 
     pub fn record_agent_aware_shared_prefix_observation(target: &str, tokens: usize) {
