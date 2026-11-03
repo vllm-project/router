@@ -200,6 +200,10 @@ name = "grpc_pd_routing"
 path = "tests/rust/grpc_pd_routing.rs"
 
 [[test]]
+name = "grpc_policy_routing"
+path = "tests/rust/grpc_policy_routing.rs"
+
+[[test]]
 name = "grpc_vs_http_e2e"
 path = "tests/rust/grpc_vs_http_e2e.rs"
 

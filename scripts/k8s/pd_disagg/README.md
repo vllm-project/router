@@ -16,7 +16,7 @@ Kubernetes deployment manifests and scripts for deploying vLLM Router with Prefi
 1. Docker image built and pushed to ECR:
    ```bash
    cd ~/router
-   docker build -f Dockerfile.router -t vllm-router:dp-fallback .
+   docker build -f docker/Dockerfile.router -t vllm-router:dp-fallback .
    docker tag vllm-router:dp-fallback 584868043064.dkr.ecr.us-west-2.amazonaws.com/dev-vllm-repo:router-dp-fallback
    docker push 584868043064.dkr.ecr.us-west-2.amazonaws.com/dev-vllm-repo:router-dp-fallback
    ```
