@@ -14,6 +14,10 @@ use super::{Locality, RoutableTarget, StorageTier, TierMatch};
 pub enum HybridGroupKind {
     /// Every block from the start of the prompt through the boundary is needed.
     FullAttention,
+    /// Every compressed state from the start of the prompt through the
+    /// boundary is needed. One stored state covers `tokens_per_state` tokens,
+    /// so a boundary is only restorable when it divides evenly by that ratio.
+    CompressedFullAttention { tokens_per_state: u32 },
     /// Only a checkpoint block ending at the boundary is needed.
     Checkpoint,
     /// All blocks intersecting the preceding `window_tokens` are needed.
@@ -99,6 +103,12 @@ fn supports(group: &HybridGroupView<'_>, target: &RoutableTarget, boundary: u64)
     let end = boundary / size;
     let start = match group.kind {
         HybridGroupKind::FullAttention => 0,
+        HybridGroupKind::CompressedFullAttention { tokens_per_state } => {
+            if tokens_per_state == 0 || !boundary.is_multiple_of(u64::from(tokens_per_state)) {
+                return false;
+            }
+            0
+        }
         HybridGroupKind::Checkpoint => end - 1,
         HybridGroupKind::SlidingWindow { window_tokens } => {
             boundary.saturating_sub(window_tokens) / size

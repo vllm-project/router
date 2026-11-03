@@ -105,7 +105,14 @@ impl HybridEventIndex {
                     || !ids.insert(group.group_idx)
                     // Sliding and compressed layouts require a separately
                     // verified event and restore contract.
-                    || matches!(group.kind, HybridGroupKind::SlidingWindow { .. })
+                    || match group.kind {
+                        HybridGroupKind::SlidingWindow { .. } => true,
+                        HybridGroupKind::CompressedFullAttention { tokens_per_state } => {
+                            tokens_per_state == 0
+                                || !group.block_size.is_multiple_of(tokens_per_state)
+                        }
+                        _ => false,
+                    }
             })
         {
             return Err(HybridEventError::InvalidLayout);
@@ -200,6 +207,9 @@ impl HybridEventIndex {
                             && store.kv_cache_spec_kind.as_deref()
                                 == Some(match group.kind {
                                     HybridGroupKind::FullAttention => "full_attention",
+                                    HybridGroupKind::CompressedFullAttention { .. } => {
+                                        "mla_attention"
+                                    }
                                     HybridGroupKind::Checkpoint => "mamba",
                                     HybridGroupKind::SlidingWindow { .. } => unreachable!(),
                                 })
@@ -843,5 +853,87 @@ mod tests {
             assert_eq!(index.apply_batch(seq, &replacement), Ok(()));
         }
         reader.join().unwrap();
+    }
+
+    fn qwen4_groups() -> Vec<HybridEventGroup> {
+        let mut groups: Vec<_> = (0..3)
+            .map(|group_idx| HybridEventGroup {
+                group_idx,
+                block_size: 320,
+                kind: HybridGroupKind::Checkpoint,
+            })
+            .collect();
+        groups.push(HybridEventGroup {
+            group_idx: 3,
+            block_size: 320,
+            kind: HybridGroupKind::CompressedFullAttention {
+                tokens_per_state: 4,
+            },
+        });
+        groups
+    }
+
+    fn qwen4_batch(kind_override: Option<&str>) -> KVEventBatch {
+        let tokens = prompt();
+        let hash = BlockKeyGenerator::new(320, 0).generate_block_keys(&tokens)[0];
+        let events = qwen4_groups()
+            .iter()
+            .map(|group| {
+                let compressed =
+                    matches!(group.kind, HybridGroupKind::CompressedFullAttention { .. });
+                KVEvent::BlockStored(BlockStored {
+                    block_hashes: vec![ExternalBlockHash::Bytes(hash.to_vec())],
+                    parent_block_hash: None,
+                    token_ids: tokens[..320].to_vec(),
+                    block_size: 320,
+                    lora_id: None,
+                    medium: Some("GPU".into()),
+                    lora_name: None,
+                    extra_keys: Some(vec![rmpv::Value::Nil]),
+                    group_idx: Some(group.group_idx),
+                    kv_cache_spec_kind: Some(
+                        kind_override
+                            .unwrap_or(if compressed { "mla_attention" } else { "mamba" })
+                            .into(),
+                    ),
+                    kv_cache_spec_sliding_window: None,
+                    locality: None,
+                    ownership: None,
+                    session_id: None,
+                })
+            })
+            .collect();
+        KVEventBatch {
+            ts: 1.0,
+            events,
+            data_parallel_rank: Some(0),
+        }
+    }
+
+    #[test]
+    fn qwen4_compressed_group_accepts_mla_events_and_rejects_other_specs() {
+        let index = HybridEventIndex::new(target(), qwen4_groups(), 320, 0, 8).unwrap();
+        index.begin_empty(0);
+        assert_eq!(index.apply_batch(0, &qwen4_batch(None)), Ok(()));
+        assert_eq!(index.reusable_tokens(&prompt(), usize::MAX), 320);
+
+        let wrong = HybridEventIndex::new(target(), qwen4_groups(), 320, 0, 8).unwrap();
+        wrong.begin_empty(0);
+        assert_eq!(
+            wrong.apply_batch(0, &qwen4_batch(Some("full_attention"))),
+            Err(HybridEventError::InvalidBatch)
+        );
+    }
+
+    #[test]
+    fn compressed_group_must_align_with_its_block_size() {
+        let mut groups = qwen4_groups();
+        groups[3].kind = HybridGroupKind::CompressedFullAttention {
+            tokens_per_state: 7,
+        };
+        assert!(matches!(
+            HybridEventIndex::new(target(), groups, 320, 0, 8),
+            Err(HybridEventError::InvalidLayout)
+        ));
     }
 }
