@@ -804,7 +804,20 @@ impl ConfigValidator {
                     .is_some_and(|discovery| discovery.enabled)
                 {
                     for worker in static_kv_event_sources.keys() {
-                        if !worker_urls.contains(worker) {
+                        // A DP-aware worker is configured as `base@rank`, while
+                        // one event-source entry covers every rank of that
+                        // base URL. Accept either the exact URL, the base of a
+                        // rank-pinned key, or a rank-pinned entry of this base.
+                        let known = worker_urls.iter().any(|url| {
+                            url == worker
+                                || url
+                                    .strip_prefix(worker.as_str())
+                                    .is_some_and(|suffix| suffix.starts_with('@'))
+                                || worker
+                                    .strip_prefix(url.as_str())
+                                    .is_some_and(|suffix| suffix.starts_with('@'))
+                        });
+                        if !known {
                             return Err(ConfigError::ValidationFailed {
                                 reason: format!(
                                     "static KV event source worker '{worker}' is not in --worker-urls"
