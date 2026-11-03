@@ -54,6 +54,7 @@ pub fn parse_static_kv_event_sources(
             topic: String::new(),
             block_size,
             model: model.to_owned(),
+            hybrid: None,
         };
         if sources.insert(worker_url.to_owned(), source).is_some() {
             return Err(ConfigError::ValidationFailed {

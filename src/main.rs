@@ -215,6 +215,9 @@ struct CliArgs {
     /// Shared model identity for workers using static event publishers.
     #[arg(long)]
     kv_event_model: Option<String>,
+    /// JSON map from worker URL to Router-managed hybrid cache layout.
+    #[arg(long)]
+    kv_hybrid_layout: Option<std::path::PathBuf>,
     /// Transfer credit for host-resident KV blocks.
     #[arg(long, default_value_t = 0.8)]
     kv_penalty_host: f64,
@@ -477,12 +480,31 @@ impl CliArgs {
         &self,
         prefill_urls: Vec<(String, Option<u16>)>,
     ) -> ConfigResult<RouterConfig> {
-        let static_kv_event_sources = vllm_router_rs::config::parse_static_kv_event_sources(
+        let mut static_kv_event_sources = vllm_router_rs::config::parse_static_kv_event_sources(
             &self.kv_event_source,
             &self.kv_event_replay_source,
             self.kv_event_block_size,
             self.kv_event_model.as_deref(),
         )?;
+        if let Some(path) = &self.kv_hybrid_layout {
+            let data = std::fs::read(path).map_err(|error| ConfigError::ValidationFailed {
+                reason: format!("cannot read hybrid layout {}: {error}", path.display()),
+            })?;
+            let layouts: HashMap<
+                String,
+                vllm_router_rs::kv_index::hybrid_capability::HybridCapabilities,
+            > = serde_json::from_slice(&data).map_err(|error| ConfigError::ValidationFailed {
+                reason: format!("invalid hybrid layout {}: {error}", path.display()),
+            })?;
+            for (worker, layout) in layouts {
+                let source = static_kv_event_sources.get_mut(&worker).ok_or_else(|| {
+                    ConfigError::ValidationFailed {
+                        reason: format!("hybrid layout for '{worker}' requires --kv-event-source"),
+                    }
+                })?;
+                source.hybrid = Some(layout);
+            }
+        }
         // Determine routing mode
         let mode = if self.enable_igw {
             // IGW mode - routing mode is not used in IGW, but we need to provide a placeholder

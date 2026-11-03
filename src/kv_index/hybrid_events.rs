@@ -10,7 +10,7 @@ use std::collections::HashSet;
 use parking_lot::RwLock;
 
 use super::hybrid::{common_reusable_tokens, HybridGroupKind, HybridGroupView};
-use super::wire::ExternalBlockHash;
+use super::wire::{BlockStored, ExternalBlockHash};
 use super::{KVEvent, KVEventBatch, Locality, RoutableTarget, StorageTier, TierMatch};
 use crate::kv_hash::{BlockKeyGenerator, SequenceHash};
 
@@ -221,12 +221,7 @@ impl HybridEventIndex {
                         || store.lora_id.is_some()
                         || store.lora_name.is_some()
                         || store.kv_cache_spec_sliding_window.is_some()
-                        || store.block_hashes.is_empty()
-                        || store
-                            .block_hashes
-                            .len()
-                            .checked_mul(store.block_size as usize)
-                            != Some(store.token_ids.len())
+                        || !group.is_some_and(|group| stored_shape_matches(group.kind, store))
                         || store.extra_keys.as_ref().is_some_and(|keys| {
                             keys.len() != store.block_hashes.len()
                                 || keys.iter().any(|key| !key.is_nil())
@@ -360,6 +355,23 @@ fn sequence_hash(hash: &ExternalBlockHash) -> Option<SequenceHash> {
     match hash {
         ExternalBlockHash::Bytes(bytes) => bytes.as_slice().try_into().ok(),
         ExternalBlockHash::Int(_) => None,
+    }
+}
+
+/// A checkpoint event may describe a whole cached chunk while publishing only
+/// the states that survived sparse retention, so its hash count is bounded by
+/// the token range instead of equal to it. Attention groups publish one hash
+/// per block.
+fn stored_shape_matches(kind: HybridGroupKind, store: &BlockStored) -> bool {
+    let block_size = store.block_size as usize;
+    if block_size == 0 || store.token_ids.is_empty() {
+        return false;
+    }
+    if kind == HybridGroupKind::Checkpoint {
+        store.token_ids.len().is_multiple_of(block_size)
+            && store.block_hashes.len() <= store.token_ids.len() / block_size
+    } else {
+        store.block_hashes.len().checked_mul(block_size) == Some(store.token_ids.len())
     }
 }
 
@@ -935,5 +947,81 @@ mod tests {
             HybridEventIndex::new(target(), groups, 320, 0, 8),
             Err(HybridEventError::InvalidLayout)
         ));
+    }
+
+    #[test]
+    fn checkpoint_event_may_cover_the_whole_cached_chunk() {
+        let tokens: Vec<u32> = (0..2048).map(|i| 100 + i % 100).collect();
+        let keys = BlockKeyGenerator::new(320, 0).generate_block_keys(&tokens);
+        // Captured from vLLM 0.33: a Mamba group publishes only the retained
+        // checkpoint hash while token_ids spans the whole cached chunk. The
+        // QSA attention group still publishes one hash per block.
+        let batch = |attention_hashes: usize, checkpoint_hashes: usize| {
+            let events = qwen4_groups()
+                .iter()
+                .map(|group| {
+                    let attention =
+                        matches!(group.kind, HybridGroupKind::CompressedFullAttention { .. });
+                    let count = if attention {
+                        attention_hashes
+                    } else {
+                        checkpoint_hashes
+                    };
+                    KVEvent::BlockStored(BlockStored {
+                        block_hashes: (if attention {
+                            &keys[..count]
+                        } else {
+                            &keys[6 - count..6]
+                        })
+                        .iter()
+                        .map(|hash| ExternalBlockHash::Bytes(hash.to_vec()))
+                        .collect(),
+                        parent_block_hash: None,
+                        token_ids: tokens[..1920].to_vec(),
+                        block_size: 320,
+                        lora_id: None,
+                        medium: Some("GPU".into()),
+                        lora_name: None,
+                        extra_keys: Some(vec![rmpv::Value::Nil; count]),
+                        group_idx: Some(group.group_idx),
+                        kv_cache_spec_kind: Some(
+                            if attention { "mla_attention" } else { "mamba" }.into(),
+                        ),
+                        kv_cache_spec_sliding_window: None,
+                        locality: None,
+                        ownership: None,
+                        session_id: None,
+                    })
+                })
+                .collect();
+            KVEventBatch {
+                ts: 1.0,
+                events,
+                data_parallel_rank: Some(0),
+            }
+        };
+        let index = HybridEventIndex::new(target(), qwen4_groups(), 320, 0, 16).unwrap();
+        index.begin_empty(0);
+        assert_eq!(index.apply_batch(0, &batch(6, 1)), Ok(()));
+        assert_eq!(index.reusable_tokens(&tokens, usize::MAX), 1920);
+
+        let sparse_attention = HybridEventIndex::new(target(), qwen4_groups(), 320, 0, 16).unwrap();
+        sparse_attention.begin_empty(0);
+        assert_eq!(
+            sparse_attention.apply_batch(0, &batch(1, 1)),
+            Err(HybridEventError::InvalidBatch)
+        );
+        assert_eq!(sparse_attention.reusable_tokens(&tokens, usize::MAX), 0);
+
+        // vLLM can emit a checkpoint group with an empty hash list when all
+        // blocks in the chunk are null. The stream stays valid, but that group
+        // has no residency and cannot complete a hit.
+        let empty_checkpoints =
+            HybridEventIndex::new(target(), qwen4_groups(), 320, 0, 16).unwrap();
+        empty_checkpoints.begin_empty(0);
+        assert_eq!(empty_checkpoints.apply_batch(0, &batch(6, 0)), Ok(()));
+        assert_eq!(empty_checkpoints.reusable_tokens(&tokens, usize::MAX), 0);
+        assert_eq!(empty_checkpoints.apply_batch(1, &batch(6, 1)), Ok(()));
+        assert_eq!(empty_checkpoints.reusable_tokens(&tokens, usize::MAX), 1920);
     }
 }

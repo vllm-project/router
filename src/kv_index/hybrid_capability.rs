@@ -1,21 +1,21 @@
-//! Narrow admission of worker-advertised hybrid cache layouts.
+//! Admission of Router-configured hybrid cache layouts.
 
 use std::collections::HashSet;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use super::hybrid::HybridGroupKind;
 use super::hybrid_events::{HybridEventGroup, HybridEventIndex};
 use super::subscriber::EventSource;
 use super::RoutableTarget;
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct HybridCapabilities {
     pub schema_version: u32,
     pub ranks: Vec<HybridRankCapability>,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct HybridRankCapability {
     pub rank: u32,
     pub model: String,
@@ -31,22 +31,9 @@ pub struct HybridRankCapability {
     pub speculative_tokens: u32,
     pub prefix_caching: bool,
     pub groups: Vec<HybridGroupCapability>,
-    pub transfer: Option<HybridTransferCapability>,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
-pub struct HybridTransferCapability {
-    pub connector: Option<String>,
-    pub role: Option<String>,
-    pub supports_hma: bool,
-    pub group_ids: Vec<u32>,
-    pub tensor_parallel_size: u32,
-    pub pipeline_parallel_size: u32,
-    #[serde(default)]
-    pub compatibility_hashes: Vec<String>,
-}
-
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct HybridGroupCapability {
     pub group_idx: u32,
     pub kind: String,
@@ -62,73 +49,6 @@ pub struct HybridGroupCapability {
 }
 
 impl HybridCapabilities {
-    /// Admit only the verified 1P1D NIXL contract. The engine's runtime
-    /// handshake still validates its full transfer metadata.
-    pub fn compatible_pd_rank(&self, prefill_rank: u32, decode: &Self, decode_rank: u32) -> bool {
-        let Some(p) = self.supported_rank(prefill_rank) else {
-            return false;
-        };
-        let Some(d) = decode.supported_rank(decode_rank) else {
-            return false;
-        };
-        let (Some(p_transfer), Some(d_transfer)) = (&p.transfer, &d.transfer) else {
-            return false;
-        };
-        if p.model != d.model
-            || p.weight_version != d.weight_version
-            || p.weight_identity
-                .as_deref()
-                .is_none_or(|id| id.trim().is_empty())
-            || p.weight_identity != d.weight_identity
-            || p.hash_algorithm != d.hash_algorithm
-            || p.root_hash != d.root_hash
-            || p.hash_block_size != d.hash_block_size
-            || p_transfer.connector.as_deref() != Some("NixlConnector")
-            || d_transfer.connector.as_deref() != Some("NixlConnector")
-            || p_transfer.role.as_deref() != Some("kv_producer")
-            || d_transfer.role.as_deref() != Some("kv_consumer")
-            || !p_transfer.supports_hma
-            || !d_transfer.supports_hma
-            || p_transfer.tensor_parallel_size != 1
-            || d_transfer.tensor_parallel_size != 1
-            || p_transfer.pipeline_parallel_size != 1
-            || d_transfer.pipeline_parallel_size != 1
-            || p_transfer.compatibility_hashes.is_empty()
-            || p_transfer.compatibility_hashes != d_transfer.compatibility_hashes
-        {
-            return false;
-        }
-        let mut p_groups = p.groups.clone();
-        let mut d_groups = d.groups.clone();
-        p_groups.sort_by_key(|group| group.group_idx);
-        d_groups.sort_by_key(|group| group.group_idx);
-        let required: Vec<_> = p_groups.iter().map(|group| group.group_idx).collect();
-        let mut p_ids = p_transfer.group_ids.clone();
-        let mut d_ids = d_transfer.group_ids.clone();
-        p_ids.sort_unstable();
-        d_ids.sort_unstable();
-        p_groups == d_groups && p_ids == required && d_ids == required
-    }
-
-    fn supported_rank(&self, rank: u32) -> Option<&HybridRankCapability> {
-        use std::sync::Arc;
-        let item = self.ranks.iter().find(|item| item.rank == rank)?;
-        let source = EventSource {
-            source: Arc::from("compatibility-check"),
-            dp_rank: rank,
-            pub_endpoint: "inproc://capability".into(),
-            replay_endpoint: Some("inproc://capability-replay".into()),
-            topic: item.publisher_topic.clone()?,
-            hwm: None,
-        };
-        let target = RoutableTarget {
-            instance_id: source.source.clone(),
-            dp_rank: rank,
-        };
-        self.index_for_source(&source, target, 1).ok()?;
-        Some(item)
-    }
-
     /// Construct an index only for the verified full-attention + aligned
     /// Mamba contract. Unknown layouts remain ineligible for cache credit.
     pub fn index_for_source(
@@ -339,26 +259,6 @@ mod tests {
             );
             value["ranks"][0][field] = saved;
         }
-        value["ranks"][0]["transfer"] = serde_json::json!({
-            "connector": "NixlConnector", "role": "kv_producer", "supports_hma": true,
-            "group_ids": [0, 1, 2, 3], "tensor_parallel_size": 1,
-            "pipeline_parallel_size": 1, "compatibility_hashes": ["nixl-hash"]
-        });
-        let before = make(&value);
-        value["ranks"][0]["transfer"]["role"] = serde_json::json!("kv_consumer");
-        let decode = make(&value);
-        assert_ne!(before, decode);
-        assert!(before.compatible_pd_rank(0, &decode, 0));
-        value["ranks"][0]["weight_identity"] = serde_json::json!("different-weights");
-        assert!(!before.compatible_pd_rank(0, &make(&value), 0));
-        value["ranks"][0]["weight_identity"] = serde_json::Value::Null;
-        assert!(!before.compatible_pd_rank(0, &make(&value), 0));
-        value["ranks"][0]["weight_identity"] = serde_json::json!("model-sha256");
-        value["ranks"][0]["transfer"]["compatibility_hashes"] = serde_json::json!(["other"]);
-        assert!(!before.compatible_pd_rank(0, &make(&value), 0));
-        value["ranks"][0]["transfer"]["compatibility_hashes"] = serde_json::json!(["nixl-hash"]);
-        value["ranks"][0]["transfer"]["group_ids"] = serde_json::json!([0, 1, 3]);
-        assert!(!before.compatible_pd_rank(0, &make(&value), 0));
         value["ranks"][0]["groups"][0]["prefix_replay_tokens"] = serde_json::json!(128);
         assert!(make(&value).index_for_source(&source, target, 8).is_err());
     }

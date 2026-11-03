@@ -3512,13 +3512,15 @@ mod tests {
         }
         server.abort();
         let requests = requests.lock();
-        assert_eq!(requests.len(), 1, "metadata requests: {requests:?}");
-        assert!(
-            requests.iter().any(|(actual_path, authorization)| {
-                actual_path == "/kv_routing_capabilities" && authorization.is_none()
-            }),
-            "missing unauthenticated /kv_routing_capabilities: {requests:?}"
-        );
+        assert_eq!(requests.len(), 2, "metadata requests: {requests:?}");
+        for path in ["/get_server_info", "/kv_event_sources"] {
+            assert!(
+                requests.iter().any(|(actual_path, authorization)| {
+                    actual_path == path && authorization.is_none()
+                }),
+                "missing unauthenticated {path}: {requests:?}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -3719,12 +3721,8 @@ mod tests {
             let provider = supervisor.match_provider_for_worker(&worker).unwrap();
             {
                 let requests = requests.lock();
-                assert_eq!(requests.len(), 3, "metadata requests: {requests:?}");
-                for path in [
-                    "/kv_routing_capabilities",
-                    "/get_server_info",
-                    "/kv_event_sources",
-                ] {
+                assert_eq!(requests.len(), 2, "metadata requests: {requests:?}");
+                for path in ["/get_server_info", "/kv_event_sources"] {
                     assert!(
                         requests.iter().any(|(actual_path, authorization)| {
                             actual_path == path
