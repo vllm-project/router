@@ -5,7 +5,6 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
-import time
 from pathlib import Path
 
 # File is tests/python/e2e/perf/binaries.py → repo root is parents[4].
@@ -87,14 +86,3 @@ def vllm_rs_bin(case_vllm_rs_bin: str | None = None) -> str:
         if candidate.exists():
             return str(candidate)
     raise FileNotFoundError("vllm-rs not found; set VLLM_RS (vLLM 0.29 rust wheel)")
-
-
-def graceful_stop(proc: subprocess.Popen, timeout: float = 120.0) -> None:
-    if proc.poll() is not None:
-        return
-    proc.terminate()
-    start = time.monotonic()
-    while proc.poll() is None and time.monotonic() - start < timeout:
-        time.sleep(1)
-    if proc.poll() is None:
-        proc.kill()

@@ -1,7 +1,7 @@
 """L1 prefix encoding cache perf: Qwen3-0.6B, 16k, shape turns.
 
-The worker stays up through L1 on (fresh router per hit rate). Before L1 off,
-the worker and the router both cold-start.
+The worker and the router stay up through L1 on, including hit-rate changes.
+Before L1 off, the worker and the router both cold-start.
 
     export VLLM_RS=/path/to/vllm-rs
     # optional local snapshot; default is Qwen/Qwen3-0.6B
@@ -12,31 +12,22 @@ the worker and the router both cold-start.
 
 from __future__ import annotations
 
-import json
 import os
 import sys
-from pathlib import Path
 
 from tests.python.e2e.perf.l1_encode.case_loader import (
     bench_max_tokens,
     bench_timeout,
     bench_tokens,
 )
-from tests.python.e2e.perf.l1_encode.report import (
+from tests.python.e2e.perf.l1_encode.scenario import (
     check_encode_reuse,
     check_l1_startup_log,
     format_scenario_result,
     l1_bypass_lines,
     wave_id,
+    write_result,
 )
-
-
-def _write_result(out_dir: Path | None, name: str, body: dict) -> str | None:
-    if out_dir is None:
-        return None
-    path = Path(out_dir) / f"{name}.json"
-    path.write_text(json.dumps(body, indent=2), encoding="utf-8")
-    return str(path.resolve())
 
 
 def test_l1_encode(
@@ -77,7 +68,7 @@ def test_l1_encode(
     row_id = wave_id(l1_on, hit_rate, concurrency, requests)
     summary = (payload.get("wave") or {}).get("summary") or {}
     metrics = l1_stack.l1_metrics_text()
-    artifact = _write_result(
+    artifact = write_result(
         l1_output_dir,
         row_id,
         {
@@ -101,8 +92,6 @@ def test_l1_encode(
 
     bench_mod.assert_wave_summary(payload["wave"], requests)
     check_encode_reuse(summary, l1_on=l1_on, hit_rate=hit_rate)
-    if not l1_stack.managed:
-        return
     check_l1_startup_log(l1_stack.router_log_text(), l1_on=l1_on)
     if l1_on:
         bad = l1_bypass_lines(metrics)

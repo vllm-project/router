@@ -1,7 +1,9 @@
-"""Pure helpers for one L1 encode perf scenario. No processes."""
+"""Ids, checks, printed stats, and result JSON for one L1 scenario."""
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from typing import Any
 
 
@@ -98,6 +100,15 @@ def l1_bypass_lines(metrics_text: str) -> list[str]:
         if value > 0:
             bad.append(line)
     return bad
+
+
+def write_result(out_dir: Path | None, name: str, body: dict) -> str | None:
+    """Write one scenario JSON. Returns the path, or None when saving is off."""
+    if out_dir is None:
+        return None
+    path = Path(out_dir) / f"{name}.json"
+    path.write_text(json.dumps(body, indent=2), encoding="utf-8")
+    return str(path.resolve())
 
 
 def _fmt_summary_block(block: Any) -> str:

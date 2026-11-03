@@ -11,8 +11,8 @@ from pathlib import Path
 import pytest
 
 from tests.python.e2e.perf.l1_encode.case_loader import load_case
-from tests.python.e2e.perf.l1_encode.report import wave_id
-from tests.python.e2e.perf.l1_encode.stack import ExternalStack, L1Stack
+from tests.python.e2e.perf.l1_encode.scenario import wave_id
+from tests.python.e2e.perf.l1_encode.stack import L1Stack
 
 _DIR = Path(__file__).resolve().parent
 
@@ -26,10 +26,6 @@ def _progress(msg: str) -> None:
 def _save_results() -> bool:
     raw = os.environ.get("PERF_SAVE_RESULTS", "").strip().lower()
     return raw not in ("0", "false", "no")
-
-
-def _external() -> bool:
-    return os.environ.get("PERF_EXTERNAL", "").strip().lower() in ("1", "true", "yes")
 
 
 def load_bench_module():
@@ -88,15 +84,9 @@ def l1_output_dir(l1_case):  # noqa: ARG001
 
 @pytest.fixture(scope="session")
 def l1_stack(l1_case, l1_output_dir):  # noqa: ARG001
-    if _external():
-        url = os.environ.get("ROUTER_URL", "").strip()
-        if not url:
-            pytest.skip("PERF_EXTERNAL=1 requires ROUTER_URL")
-        yield ExternalStack(url)
-        return
     stack = L1Stack(l1_case, l1_case.model)
+    stack.prepare()
     try:
-        stack.start_worker()
         yield stack
     finally:
         stack.stop()

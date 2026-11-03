@@ -56,7 +56,7 @@ Node ids look like `l1on-hit0.30-c4-r8`.
 ## What one session does
 
 1. Start `vllm-rs` on GPU 0 (TP1, `--max-model-len 32768`, prefix caching on) and wait for `/v1/models`.
-2. **L1 on:** for each hit rate, cold-start the router (`VLLM_ROUTER_L1_CACHE=1`, `VLLM_ROUTER_L0_CACHE=0`, `VLLM_ROUTER_STAGES=1`), then run that rate's concurrencies on the same router. The next hit rate gets a new router so the tree from one rate is not already warm. The worker stays up.
+2. **L1 on:** start the router once (`VLLM_ROUTER_L1_CACHE=1`, `VLLM_ROUTER_L0_CACHE=0`, `VLLM_ROUTER_STAGES=1`). Every on-arm hit rate and concurrency shares that worker and router.
 3. **L1 off:** cold-start the worker and the router (`VLLM_ROUTER_L1_CACHE=0`). Every off-arm hit rate and concurrency shares that worker and router.
 4. Each wave is `benches/backend/bench_prefix_kvhit.py` with `--shape turns --turns 8 --tokens 16384 --max-tokens 64 --warmup`.
 
@@ -78,7 +78,7 @@ After the prompt is rendered, read `prompt_tokens` in the summary. If the worker
 
 JSON is written under `tests/python/e2e/perf/l1_encode/results/<timestamp>/` (one object per wave, not the bench CLI's two-document stdout). `PERF_SAVE_RESULTS=0` skips the files. `PERF_OUTPUT_DIR` overrides the directory.
 
-`PERF_TOKENS`, `PERF_MAX_TOKENS`, and `PERF_TIMEOUT` override the case JSON for both the worker preflight and the wave. The worker flags still have to cover `tokens + max_tokens + template`. `PERF_EXTERNAL=1` plus `ROUTER_URL` skips launch and does **not** switch L1; select one arm with `-k`.
+`PERF_TOKENS`, `PERF_MAX_TOKENS`, and `PERF_TIMEOUT` override the case JSON for both the worker preflight and the wave. The worker flags still have to cover `tokens + max_tokens + template`.
 
 ## Ports
 
