@@ -37,7 +37,9 @@ Status: **draft, not production-ready**. The design is in the [English RFC](hybr
   reduces estimated prefill work and is never treated as a cache hit.
 - **P/D handoff checks.** Before the decode leg is dispatched, the decode
   transfer parameters must exist, echo the request's `transfer_id`, and carry a
-  connector identity for the chosen engine. A decode failure after a successful
+  connector identity for the chosen engine. A rejected handoff answers `502`
+  without dispatching to decode, so the decode engine never starts cold work
+  for a transfer that did not happen. A decode failure after a successful
   prefill handoff is counted separately
   (`vllm_router_pd_handoff_failures_total`), logged with both endpoints, and
   drops the cached NIXL push identity so a retry performs a fresh handshake
@@ -76,12 +78,52 @@ groups plus full attention, all block 528, root
   forwards to `http://0.0.0.0/...`; configuration now rejects that combination
   instead of failing at request time.
 
+### Advisory affinity, without a model
+
+Two stub backends answered `/v1/completions` but returned 404 for `/render` and
+`/tokenize`, which is the tools/reasoning shape: no exact tokens exist for the
+request. With `--policy kv_aware --kv-aware-session-affinity-ttl-secs 300` and
+three requests carrying the same `session_id`:
+
+```
+outcome="advisory_bind" worker="http://127.0.0.1:9101" input_tokens=0 credited_prefix_tokens=0 used_binding=false
+outcome="advisory_hit"  worker="http://127.0.0.1:9101" input_tokens=0 credited_prefix_tokens=0 used_binding=true
+outcome="advisory_hit"  worker="http://127.0.0.1:9101" input_tokens=0 credited_prefix_tokens=0 used_binding=true
+```
+
+The first turn binds an advisory digest, the next two follow it to the same
+worker, and every turn reports zero credited prefix tokens: the affinity is
+carried, the cache claim is not. Without
+`--kv-aware-session-affinity-ttl-secs` the same requests stay
+`outcome="missing_tokens"`, which is the opt-in boundary for session affinity.
+
+### P/D handoff, without a model
+
+One stub prefill and one stub decode in direct-URL mode
+(`--vllm-pd-disaggregation --prefill … --decode … --kv-connector nixl`,
+no `--vllm-discovery-address`, which would switch the router to pure discovery
+and ignore the static URLs). Four requests, with the stub decode reporting how
+many times it was called:
+
+| case | prefill reply | client | prefill calls | decode calls | evidence |
+| --- | --- | --- | --- | --- | --- |
+| `ok-d` | `kv_transfer_params.remote_block_ids` | 200 | 1 | 1 | normal handoff |
+| `fail-d` | same as above | 500 | 2 | 2 | `WARN … reason="500"`, `vllm_router_pd_handoff_failures_total` |
+| `no-handoff` | no `kv_transfer_params` | 502 | 3 | 2 | `WARN … handoff validation failed before decode dispatch`, reason `missing_decode_transfer_params` |
+| `mismatch-id` | echoed `remote_block_ids` | 200 | 4 | 3 | NIXL pull mode has no router-side transfer id to compare |
+
+The second row is the reported DeepSeek failure: prefill really handed off, then
+decode failed. The router keeps the request's 500, counts the handoff failure
+with both endpoints and the reason, and drops the cached push identity. The
+third row is the fail-closed case: decode's call count does not move, so a
+missing handoff can never be served as a normal P/D request.
+
 ## Remaining work and acceptance criteria
 
-1. **P/D:** Automate the observed matching and mismatched-layout assertions and verify a fully built upstream main with real weights. Enabling P/D changed the Qwen4Exp Mamba/attention block size from 320 to 288 in the test; verify each deployment's effective layout. Compare outputs against a direct reference, and exercise nonmatching pairs and multiple DP ranks. Handoff validation and post-handoff decode failures now fail closed; an automated P-fails and P-succeeds/D-fails pair test is still required.
+1. **P/D:** Automate the observed matching and mismatched-layout assertions and verify a fully built upstream main with real weights. Enabling P/D changed the Qwen4Exp Mamba/attention block size from 320 to 288 in the test; verify each deployment's effective layout. Compare outputs against a direct reference, and exercise nonmatching pairs and multiple DP ranks. Handoff validation, the pre-dispatch 502 and post-handoff decode failures are covered against stub backends; a real NIXL P/D pair still needs the same four cases.
 2. **Lifecycle and unknown layouts:** Integrate trusted deployment generation changes and automatic rebinding. A static topic and periodic HTTP checks cannot establish that a worker has not restarted with the same topic. Ensure unknown hybrid models cannot obtain legacy group-0 credit, while retaining existing full-attention behavior.
 3. **Model layouts:** Capture stock-vLLM event and restore behavior for Qwen3.5/3.6/3.8/4 and DeepSeek V4/V4.1. The sliding-window/bounded-replay path now models one agreed layout window and rejects disagreeing groups, but the DeepSeek V4 compressed/shared-state layout still needs captured events from a real deployment before it can be enabled. Do not enable unknown groups or infer completeness from observed events.
-4. **Advisory affinity:** The advisory namespace exists and never credits; bounding history by worker/rank/generation and tenant, and documenting the tools/reasoning entry points, still need end-to-end coverage.
-5. **Production checks:** Test feature-off and existing full-attention/gRPC paths, worker restart and replay truncation, DP isolation, recovery, races, capacity, multi-worker routing, actual engine hit counts and output equivalence. Run full Rust tests, strict Clippy and performance tests; document the supported version/model/connector matrix.
+4. **Advisory affinity:** The advisory namespace binds, follows and never credits on stub backends. Bounding history by worker/rank/generation and tenant still needs tests, and the tools/reasoning entry points need documenting per framework.
+5. **Production checks:** Test feature-off and existing full-attention/gRPC paths, worker restart and replay truncation, DP isolation, recovery, races, capacity, multi-worker routing, actual engine hit counts and output equivalence. Run full Rust tests, strict Clippy and performance tests; document the supported version/model/connector matrix. Also reconcile the startup message "Using hybrid mode" with discovery mode actually ignoring static P/D URLs.
 
 The currently checked-in static layouts are operator assertions. They are not automatic verification of model weights, complete groups or publisher generation. Do not deploy an unverified combination as a production feature.

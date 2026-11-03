@@ -1955,18 +1955,29 @@ impl VllmPDRouter {
         if let Err(reason) =
             self.validate_handoff(&prefill_response_json, transfer_id.as_deref(), handoff_params.as_ref())
         {
+            // Prefill itself succeeded; the handoff contract did not. Reply
+            // 502 (as the gRPC path does) and never dispatch to decode, so a
+            // cold decode is not reported as a normal P/D request.
             let duration = start_time.elapsed();
-            RouterMetrics::record_pd_prefill_error(&prefill_base_url);
             RouterMetrics::record_pd_handoff_failure(self.connector_label(), reason);
+            RouterMetrics::record_pd_prefill_request(&prefill_base_url);
             RouterMetrics::record_pd_request(path);
             RouterMetrics::record_pd_request_duration(path, duration);
-            return Err(PDRouterError::NetworkError {
-                message: format!(
+            warn!(
+                prefill = %prefill_base_url,
+                decode = %decode_worker.base_url(),
+                reason,
+                "handoff validation failed before decode dispatch"
+            );
+            return Ok((
+                StatusCode::BAD_GATEWAY,
+                format!(
                     "Handoff validation failed for prefill {} -> decode {}: {reason}",
                     prefill_base_url,
                     decode_worker.base_url()
                 ),
-            });
+            )
+                .into_response());
         }
         if let Some(params) = handoff_params {
             decode_request["kv_transfer_params"] = params;
