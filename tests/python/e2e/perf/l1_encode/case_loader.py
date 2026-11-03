@@ -217,7 +217,9 @@ def _parse_case(item: dict[str, Any], case_path: Path, index: int) -> L1Case:
         bench_timeout=float(bench.get("timeout", 1800)),
         turns=int(bench.get("turns", 8)),
         hit_rates=_parse_hit_rates(bench.get("hit_rates"), where=where),
-        waves=tuple(_parse_wave(wave, where=f"{where}:bench.waves") for wave in waves_raw),
+        waves=tuple(
+            _parse_wave(wave, where=f"{where}:bench.waves") for wave in waves_raw
+        ),
         test_name=test_name,
         l1_on=_parse_l1_mode(router.get("l1"), where=where),
     )
