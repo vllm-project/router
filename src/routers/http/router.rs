@@ -167,7 +167,7 @@ impl RequestLoadGuard {
         // when progress is disabled). Only the request guard releases load.
         let slot = self.state.kv_slot.clone()?;
         Some(Arc::new(move |sequence, remaining, kind| {
-            if kind != crate::backend::grpc::PrefillProgressKind::StaleInitialQueue {
+            if kind != crate::backend::grpc::PrefillProgressKind::InitialUnconfirmedQueue {
                 slot.update_prefill_progress(sequence, remaining);
             }
         }))
@@ -3443,7 +3443,7 @@ mod tests {
     use std::collections::HashMap;
 
     #[test]
-    fn colocated_progress_uses_worker_snapshot_and_ignores_initial_queue_stale_signal() {
+    fn colocated_progress_retains_estimate_until_queue_is_reconciled() {
         use crate::backend::grpc::PrefillProgressKind;
         use crate::policies::{LoadProvider, SlotManager};
 
@@ -3457,11 +3457,13 @@ mod tests {
         let load = RequestLoadGuard::new(None, Some(slot));
         let callback = load.prefill_progress_callback().unwrap();
         callback(1, 100, PrefillProgressKind::InitialUnconfirmedQueue);
-        assert_eq!(manager.sample(&target).active_prefill_tokens, 100);
-        callback(1, 999, PrefillProgressKind::StaleInitialQueue);
-        assert_eq!(manager.sample(&target).active_prefill_tokens, 100);
-        callback(2, 8, PrefillProgressKind::Snapshot);
+        assert_eq!(manager.sample(&target).active_prefill_tokens, 16);
+        callback(4, 100, PrefillProgressKind::InitialUnconfirmedQueue);
+        assert_eq!(manager.sample(&target).active_prefill_tokens, 16);
+        callback(5, 8, PrefillProgressKind::Snapshot);
         assert_eq!(manager.sample(&target).active_prefill_tokens, 8);
+        callback(6, 80, PrefillProgressKind::Snapshot);
+        assert_eq!(manager.sample(&target).active_prefill_tokens, 80);
         load.release();
         assert_eq!(manager.sample(&target).active_prefill_tokens, 0);
     }

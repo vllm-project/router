@@ -24,8 +24,11 @@ mod prefill_progress_regressions {
         finish_info, FinishInfo, GenerateResponse, PrefillProgress, SequenceOutput,
     };
     use vllm_router_rs::core::Worker;
-    use vllm_router_rs::kv_index::{CacheKey, HashMode, KvBlockIndexer, RoutableTarget};
-    use vllm_router_rs::policies::{KvAwarePolicy, LoadSample, SlotManager};
+    use vllm_router_rs::kv_index::{
+        CacheKey, HashMode, KvBlockIndexer, Locality, MatchQuery, RoutableTarget, StorageTier,
+        TierMatch,
+    };
+    use vllm_router_rs::policies::{KvAwarePolicy, LoadSample, SlotManager, TieredMatchProvider};
     use vllm_router_rs::protocols::spec::ChatCompletionRequest;
 
     struct Harness {
@@ -35,6 +38,19 @@ mod prefill_progress_regressions {
         slots: Arc<dyn SlotManager>,
         target: RoutableTarget,
         tx: mpsc::Sender<Result<GenerateResponse, tonic::Status>>,
+    }
+
+    struct CachedPrefix(RoutableTarget);
+
+    impl TieredMatchProvider for CachedPrefix {
+        fn find_tiered_matches(&self, _: &MatchQuery) -> Vec<TierMatch> {
+            vec![TierMatch {
+                target: self.0.clone(),
+                tier: StorageTier::Device,
+                segments: vec![(0, 40)],
+                locality: Locality::Local,
+            }]
+        }
     }
 
     async fn wait_until(mut condition: impl FnMut() -> bool) {
@@ -49,6 +65,15 @@ mod prefill_progress_regressions {
 
     impl Harness {
         async fn new(enabled: bool, supported: Option<bool>) -> Self {
+            Self::with_cached_prefix(enabled, supported, false, 10).await
+        }
+
+        async fn with_cached_prefix(
+            enabled: bool,
+            supported: Option<bool>,
+            cached_prefix: bool,
+            stale_after_secs: u64,
+        ) -> Self {
             let (tx, rx) = mpsc::channel(8);
             let state = MockVllmRs {
                 supports_prefill_progress: supported.unwrap_or(false),
@@ -65,7 +90,7 @@ mod prefill_progress_regressions {
                 kv_penalty_disk: 0.3,
                 static_kv_event_sources: Default::default(),
             };
-            config.prefill_progress_stale_after_secs = enabled.then_some(10);
+            config.prefill_progress_stale_after_secs = enabled.then_some(stale_after_secs);
             vllm_router_rs::config::ConfigValidator::validate(&config).unwrap();
             let ctx = create_test_context(config);
             let router = Router::new(vec![server.grpc_url.clone()], &ctx)
@@ -78,15 +103,20 @@ mod prefill_progress_regressions {
                 instance_id: Arc::from("progress-worker"),
                 dp_rank: 0,
             };
+            let matches: Arc<dyn TieredMatchProvider> = if cached_prefix {
+                Arc::new(CachedPrefix(target.clone()))
+            } else {
+                Arc::new(KvBlockIndexer::new())
+            };
             policy.register_target_with_cache_identity(
                 &server.grpc_url,
                 target.clone(),
                 CacheKey {
-                    model: Arc::from("model"),
+                    model: Arc::from("test-model"),
                     hash_mode: HashMode::Sha256,
                     block_size: 2,
                 },
-                Arc::new(KvBlockIndexer::new()),
+                matches,
             );
             Self {
                 router: Arc::new(router),
@@ -267,6 +297,67 @@ mod prefill_progress_regressions {
             wait_until(|| h.worker.load() == 0).await;
             assert_eq!(h.slots.sample(&h.target), LoadSample::default());
         }
+    }
+
+    #[tokio::test]
+    async fn grpc_progress_keeps_cached_admission_while_unconfirmed_queue_is_stale() {
+        let h = Harness::with_cached_prefix(true, Some(true), true, 2).await;
+        let task = h.dispatch(true).await;
+        let response = task.await.unwrap();
+        assert!(response.status().is_success());
+        h.assert_load(20, 1);
+
+        let mut queued = PrefillProgress {
+            request_id: h.server.captured()[0].request_id.clone(),
+            sequence: 1,
+            phase: vllm_router_rs::backend::pb::PrefillPhase::Queued as i32,
+            prompt_tokens: 100,
+            total_compute_tokens: 100,
+            remaining_compute_tokens: 100,
+            ..Default::default()
+        };
+        h.tx.send(Ok(GenerateResponse {
+            prefill_progress: Some(queued.clone()),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(2200)).await;
+        h.assert_load(20, 1);
+
+        queued.sequence = 4;
+        queued.local_cached_tokens = 10;
+        queued.total_compute_tokens = 90;
+        queued.remaining_compute_tokens = 90;
+        h.tx.send(Ok(GenerateResponse {
+            prefill_progress: Some(queued.clone()),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        h.assert_load(20, 1);
+
+        queued.sequence = 5;
+        queued.phase = vllm_router_rs::backend::pb::PrefillPhase::Prefill as i32;
+        queued.cache_accounting_final = true;
+        queued.local_cached_tokens = 80;
+        queued.total_compute_tokens = 20;
+        queued.remaining_compute_tokens = 8;
+        h.tx.send(Ok(GenerateResponse {
+            prefill_progress: Some(queued),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+        wait_until(|| h.slots.sample(&h.target).active_prefill_tokens == 8).await;
+        h.output("done", true).await;
+        drop(h.tx);
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        wait_until(|| h.worker.load() == 0).await;
+        assert_eq!(h.slots.sample(&h.target), LoadSample::default());
     }
 
     #[tokio::test]
