@@ -1069,8 +1069,7 @@ async fn static_hybrid_sources_match(
         query_pd_kv_event_sources(client, http_url, api_key),
     )
     .await
-    .unwrap_or_else(|_| Err("timeout".into()))
-    else {
+    .unwrap_or_else(|_| Err("timeout".into())) else {
         // A declared layout is authoritative when the engine cannot answer;
         // refusing it would make static configuration unusable on engines
         // without the control endpoint.
@@ -3340,7 +3339,10 @@ mod tests {
         let sources = discovery.sources.unwrap();
         let entry = sources.get("1").expect("rank comes from the URL suffix");
         assert_eq!(entry.endpoint, "tcp://127.0.0.1:5558");
-        assert_eq!(entry.replay_endpoint.as_deref(), Some("tcp://127.0.0.1:5561"));
+        assert_eq!(
+            entry.replay_endpoint.as_deref(),
+            Some("tcp://127.0.0.1:5561")
+        );
         assert_eq!(entry.topic, "kv-rank-1");
         let hybrid = discovery.hybrid.expect("layout is attached");
         assert_eq!(hybrid.ranks.len(), 1);

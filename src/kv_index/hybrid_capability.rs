@@ -108,10 +108,7 @@ impl HybridCapabilities {
             // group. Disagreeing windows have no single restore point, and a
             // replay window only exists for sliding-window layouts.
             if group.prefix_replay_tokens > 0 {
-                if !matches!(
-                    group.kind.as_str(),
-                    "sliding_window" | "sliding_window_mla"
-                ) {
+                if !matches!(group.kind.as_str(), "sliding_window" | "sliding_window_mla") {
                     return Err("unsupported group restore contract");
                 }
                 if replay_tokens != 0 && replay_tokens != group.prefix_replay_tokens {

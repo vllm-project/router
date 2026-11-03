@@ -622,7 +622,8 @@ impl VllmPDRouter {
             .and_then(|params| params.get("transfer_id"))
             .and_then(Value::as_str)
             .filter(|value| !value.is_empty());
-        if let (Some(expected), Some(returned)) = (transfer_id.filter(|id| !id.is_empty()), returned)
+        if let (Some(expected), Some(returned)) =
+            (transfer_id.filter(|id| !id.is_empty()), returned)
         {
             if expected != returned {
                 return Err("transfer_id_mismatch");
@@ -639,7 +640,9 @@ impl VllmPDRouter {
                 // Push mode hands the decode engine a remote engine identity;
                 // pull mode hands it the prefill's block ids. Neither may be
                 // empty when the response claims a handoff.
-                if decode_params.get("remote_engine_id").is_some_and(Value::is_null)
+                if decode_params
+                    .get("remote_engine_id")
+                    .is_some_and(Value::is_null)
                     && decode_params
                         .get("remote_block_ids")
                         .is_some_and(Value::is_null)
@@ -663,7 +666,8 @@ impl VllmPDRouter {
             self.evict_nixl_info(prefill);
         }
         warn!(
-            prefill, decode, reason, "prefill handoff succeeded but the decode leg failed"
+            prefill,
+            decode, reason, "prefill handoff succeeded but the decode leg failed"
         );
     }
 
@@ -1951,9 +1955,11 @@ impl VllmPDRouter {
                 Some(&request_id),
             )
             .await;
-        if let Err(reason) =
-            self.validate_handoff(&prefill_response_json, transfer_id.as_deref(), handoff_params.as_ref())
-        {
+        if let Err(reason) = self.validate_handoff(
+            &prefill_response_json,
+            transfer_id.as_deref(),
+            handoff_params.as_ref(),
+        ) {
             // Prefill itself succeeded; the handoff contract did not. Reply
             // 502 (as the gRPC path does) and never dispatch to decode, so a
             // cold decode is not reported as a normal P/D request.
@@ -2199,7 +2205,12 @@ impl VllmPDRouter {
         attempt.begin_decode();
         let response = self
             .grpc_frontend
-            .dispatch_decode(decode_worker.url(), prepared, request_id, Some(decode_params))
+            .dispatch_decode(
+                decode_worker.url(),
+                prepared,
+                request_id,
+                Some(decode_params),
+            )
             .await;
         let decode_outcome = grpc_decode_outcome(&response);
         let response = own_grpc_decode(response, attempt);

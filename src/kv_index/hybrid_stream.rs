@@ -306,7 +306,11 @@ pub fn spawn_zmq(
                                 required_through = seq;
                                 break;
                             }
-                            tracing::debug!(seq, rank = source.dp_rank, "hybrid live batch applied");
+                            tracing::debug!(
+                                seq,
+                                rank = source.dp_rank,
+                                "hybrid live batch applied"
+                            );
                             next = next.checked_add(1).ok_or(())?;
                         }
                         Ok(_) => return Err(()),

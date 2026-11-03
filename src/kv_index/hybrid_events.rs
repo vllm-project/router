@@ -694,7 +694,9 @@ mod tests {
         let root = hex_root("9bd96a485ad84efdafb72ee48a1d7a69bcead0f8f0433173941b276b9581eef0");
         let index = HybridEventIndex::new_with_root_hash(target(), groups(), 528, root, 8).unwrap();
         index.begin_empty(0);
-        index.apply_payload(0, payload).expect("captured batch applies");
+        index
+            .apply_payload(0, payload)
+            .expect("captured batch applies");
         assert_eq!(index.reusable_tokens(&prompt, usize::MAX), 528);
         // A wrong root is a different sequence, not a cosmetic field.
         let wrong =
@@ -1327,7 +1329,16 @@ mod tests {
             ts: 1.0,
             data_parallel_rank: Some(0),
             events: vec![
-                blocks(groups[0], "full_attention", None, &keys, 64, &tokens, 0, keys.len()),
+                blocks(
+                    groups[0],
+                    "full_attention",
+                    None,
+                    &keys,
+                    64,
+                    &tokens,
+                    0,
+                    keys.len(),
+                ),
                 blocks(
                     groups[1],
                     "sliding_window_mla",
@@ -1383,7 +1394,16 @@ mod tests {
             data_parallel_rank: Some(0),
             events: vec![
                 blocks(groups[0], "full_attention", None, &keys, 64, &tokens, 0, 8),
-                blocks(groups[1], "sliding_window_mla", Some(64), &keys, 64, &tokens, 7, 8),
+                blocks(
+                    groups[1],
+                    "sliding_window_mla",
+                    Some(64),
+                    &keys,
+                    64,
+                    &tokens,
+                    7,
+                    8,
+                ),
             ],
         };
         assert_eq!(index.apply_batch(0, &window_only), Ok(()));
@@ -1398,7 +1418,16 @@ mod tests {
             data_parallel_rank: Some(0),
             events: vec![
                 blocks(groups[0], "full_attention", None, &keys, 64, &tokens, 0, 8),
-                blocks(groups[1], "sliding_window_mla", Some(64), &keys, 64, &tokens, 0, 6),
+                blocks(
+                    groups[1],
+                    "sliding_window_mla",
+                    Some(64),
+                    &keys,
+                    64,
+                    &tokens,
+                    0,
+                    6,
+                ),
             ],
         };
         assert_eq!(gap.apply_batch(0, &missing_window), Ok(()));
@@ -1412,7 +1441,16 @@ mod tests {
             data_parallel_rank: Some(0),
             events: vec![
                 blocks(groups[0], "full_attention", None, &keys, 64, &tokens, 0, 8),
-                blocks(groups[1], "sliding_window_mla", Some(32), &keys, 64, &tokens, 7, 8),
+                blocks(
+                    groups[1],
+                    "sliding_window_mla",
+                    Some(32),
+                    &keys,
+                    64,
+                    &tokens,
+                    7,
+                    8,
+                ),
             ],
         };
         assert_eq!(
@@ -1428,16 +1466,22 @@ mod tests {
 
         let index = index(8);
         index.begin_empty(0);
-        index.apply_payload(0, include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/rust/fixtures/kv_cbor/qwen35_vllm028.msgpack"
-        )))
-        .unwrap();
+        index
+            .apply_payload(
+                0,
+                include_bytes!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/tests/rust/fixtures/kv_cbor/qwen35_vllm028.msgpack"
+                )),
+            )
+            .unwrap();
         // Each rank serves independently; its events, ownership and history
         // belong to that rank only.
-        assert!(!TieredMatchProvider::find_token_matches(&index, &prompt(), 528, None, 0)
-            .unwrap()
-            .is_empty());
+        assert!(
+            !TieredMatchProvider::find_token_matches(&index, &prompt(), 528, None, 0)
+                .unwrap()
+                .is_empty()
+        );
         assert!(
             TieredMatchProvider::find_token_matches(&index, &prompt(), 528, None, 1)
                 .unwrap()
