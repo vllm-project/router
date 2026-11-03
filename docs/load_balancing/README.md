@@ -271,6 +271,11 @@ Configure the engines' P/D connector and enable prefix caching and KV events on 
 
 If event discovery is unavailable, add `--pd-kv-events http://prefill:8000=tcp://prefill:5557` for each prefill worker.
 
+### Prefill progress
+
+For a `kv_aware` gRPC P/D prefill pool, add `--prefill-progress-stale-after-secs 5`
+to enable worker progress updates. See [setup and constraints](../backend/grpc.md#pd-disaggregation).
+
 ### Session affinity
 
 Affinity is off by default. Add `--kv-aware-session-affinity-ttl-secs 1800` to retain bindings for 30 minutes of inactivity.
