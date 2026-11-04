@@ -7321,7 +7321,7 @@ dependencies = [
 
 [[package]]
 name = "vllm_router_rs"
-version = "0.1.16"
+version = "0.1.17"
 dependencies = [
  "aho-corasick",
  "anyhow",

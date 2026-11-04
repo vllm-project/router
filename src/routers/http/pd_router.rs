@@ -120,8 +120,10 @@ fn select_stage(
 ) -> Option<StageDecision> {
     let policy_input = context.legacy_policy_input;
     let kv_aware = kv_aware_ops(policy).is_some();
-    let mut selected_indices = indices.to_vec();
-    selected_indices.sort_by(|&left, &right| endpoints[left].cmp(&endpoints[right]));
+    // Keep the caller slice order. Static pools pass registry registration
+    // order, which is the --prefill / --decode order. Sorting by endpoint URL
+    // made round-robin follow port text instead of that order.
+    let selected_indices = indices.to_vec();
     let projected: Vec<Arc<dyn Worker>> = selected_indices
         .iter()
         .map(|&index| {
@@ -3170,15 +3172,20 @@ mod admission_tests {
     }
 
     #[test]
-    fn equal_load_uses_endpoint_order_not_hashmap_enumeration() {
+    fn equal_load_follows_caller_order() {
         let manager = Arc::new(PdLoadManager::default());
         let mut p = pool("p", 2);
         let mut d = pool("d", 2);
         p.reverse();
         d.reverse();
         let (selection, _) = admit(&manager, &p, &d);
-        assert_eq!(selection.prefill.worker_index, 1);
-        assert_eq!(selection.decode.worker_index, 1);
+        // Tie-break is the slice order. Static callers pass registration
+        // order, so a reversed slice stays reversed instead of being
+        // rewritten into URL order.
+        assert_eq!(selection.prefill.worker_index, 0);
+        assert_eq!(selection.decode.worker_index, 0);
+        assert_eq!(selection.prefill.endpoint.http_url, "http://p1");
+        assert_eq!(selection.decode.endpoint.http_url, "http://d1");
     }
 
     #[test]
@@ -3338,6 +3345,47 @@ mod admission_tests {
         assert_eq!(second.prefill.score, None);
         drop((a, b));
         assert!(manager.snapshot().is_empty());
+    }
+
+    #[test]
+    fn round_robin_follows_registration_order_not_url_order() {
+        let manager = Arc::new(PdLoadManager::default());
+        let prefill = pool("p", 1);
+        let decode = |url: &str| {
+            Arc::new(BasicWorker::new(url.to_string(), WorkerType::Decode)) as Arc<dyn Worker>
+        };
+        // Port text sorts as 35151, 60629, 60773. Registration order is the reverse.
+        let decode_workers = vec![
+            decode("http://127.0.0.1:60773"),
+            decode("http://127.0.0.1:35151"),
+            decode("http://127.0.0.1:60629"),
+        ];
+        let prefill_policy = RoundRobinPolicy::new();
+        let decode_policy = RoundRobinPolicy::new();
+        let cycle = [
+            "http://127.0.0.1:60773",
+            "http://127.0.0.1:35151",
+            "http://127.0.0.1:60629",
+        ];
+        let seen: Vec<String> = (0..6)
+            .map(|_| {
+                let (selection, attempt) = manager
+                    .admit(|loads| {
+                        select_pd_pair(
+                            loads,
+                            &prefill,
+                            &decode_workers,
+                            &prefill_policy,
+                            &decode_policy,
+                            &context(),
+                        )
+                    })
+                    .unwrap();
+                drop(attempt);
+                selection.decode.endpoint.http_url
+            })
+            .collect();
+        assert_eq!(seen, [cycle.as_slice(), cycle.as_slice()].concat());
     }
 
     #[test]

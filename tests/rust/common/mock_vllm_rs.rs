@@ -12,6 +12,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use tokio::sync::watch;
+
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::Stream;
@@ -76,6 +78,47 @@ pub struct MockVllmRs {
     /// Remaining-work snapshots sent, in order, before `reply_delay` on
     /// streams that opted into prefill progress.
     pub prefill_progress: Vec<u32>,
+    /// After `hold_after` recorded requests, wait until [`HoldGate::release`].
+    pub hold: Option<HoldGate>,
+}
+
+/// Blocks requests after the first `hold_after` ones until [`HoldGate::release`].
+///
+/// The request is recorded before the wait, so a test can see the admission
+/// while the worker is still occupied.
+#[derive(Clone)]
+pub struct HoldGate {
+    hold_after: usize,
+    seen: Arc<AtomicUsize>,
+    released: Arc<watch::Sender<bool>>,
+}
+
+impl HoldGate {
+    pub fn new(hold_after: usize) -> Self {
+        let (released, _) = watch::channel(false);
+        Self {
+            hold_after,
+            seen: Arc::new(AtomicUsize::new(0)),
+            released: Arc::new(released),
+        }
+    }
+
+    pub fn release(&self) {
+        let _ = self.released.send(true);
+    }
+
+    pub async fn wait(&self) {
+        let seen = self.seen.fetch_add(1, Ordering::SeqCst);
+        if self.hold_after == 0 || seen < self.hold_after {
+            return;
+        }
+        let mut released = self.released.subscribe();
+        while !*released.borrow() {
+            if released.changed().await.is_err() {
+                return;
+            }
+        }
+    }
 }
 
 impl Default for MockVllmRs {
@@ -96,6 +139,7 @@ impl Default for MockVllmRs {
             aborts: Arc::new(Mutex::new(Vec::new())),
             supports_prefill_progress: false,
             prefill_progress: Vec::new(),
+            hold: None,
         }
     }
 }
@@ -251,6 +295,9 @@ impl Inference for MockVllmRs {
             .is_ok()
         {
             return Err(Status::unavailable("retry test"));
+        }
+        if let Some(hold) = &self.hold {
+            hold.wait().await;
         }
 
         if let Some(stream) = self.scripted_stream.lock().unwrap().take() {

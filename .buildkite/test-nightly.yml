@@ -120,8 +120,7 @@ steps:
         allowed: true
         reason: "GPU tests can be flaky - retry if needed"
     mirror_hardwares: l4_4
-    # vLLM, NIXL, lm-eval, and vllm-router are on PATH in the CI image. The
-    # pytest skips while vllm-rs is older than 0.30.0. The script does not install vllm.
+    # vLLM 0.30.0, NIXL, lm-eval, and vllm-router are in the CI image.
     command: |
       bash <<'BASH'
       set -euo pipefail
@@ -136,7 +135,8 @@ steps:
       - "/tmp/vllm-router-grpc-pd/*.log"
 
   # ============================================================================
-  # L3 gRPC prefix-KV perf — rust_grpc + python_http (c16-r32), H100×2.
+  # L3 gRPC prefix-KV perf — rust_grpc + python_http, H100×2.
+  # c16-r32 (hit 0 and 0.99) plus hit 0.99 at c4-r8 and c64-r128.
   # Pulls the router CI image from image-build (vLLM + vllm-router on PATH).
   # ============================================================================
   - label: ":python: grpc perf test case"
@@ -164,12 +164,52 @@ steps:
       export PERF_STACK_TIMEOUT=1800
       export PERF_WORKER_STARTUP_TIMEOUT=1800
 
-      python -m pytest -sv tests/python/e2e/perf/grpc -k c16-r32 --perf-case=rust_grpc
-      python -m pytest -sv tests/python/e2e/perf/grpc -k c16-r32 --perf-case=python_http
+      python -m pytest -sv tests/python/e2e/perf/grpc -k "c16-r32 or hit99-c4 or hit99-c64" --perf-case=rust_grpc
+      python -m pytest -sv tests/python/e2e/perf/grpc -k "c16-r32 or hit99-c4 or hit99-c64" --perf-case=python_http
 
       BASH
     artifact_paths:
       - "tests/python/e2e/perf/grpc/results/**/*.json"
+
+  # ============================================================================
+  # L3 L1 prefix-encoding perf — hit 0.30 and 0.99999 at c4 and c16, 1× L4.
+  # Same router CI image as the other NVIDIA jobs (vLLM + vllm-router on PATH).
+  # Case default is Qwen/Qwen3-0.6B, TP1, GPU 0. One pytest session: worker
+  # stays up through L1 on, then worker and router cold-start before L1 off.
+  # Both L1 on and L1 off; 8 waves (2 hit rates × c4/c16 × 2 arms).
+  # ============================================================================
+  - label: ":python: l1 encode perf test case"
+    key: "l1-encode-perf-e2e"
+    # image-build is skipped when ROCM_ONLY=1. A skipped dependency is treated
+    # as satisfied, so this job must use the same condition.
+    if: build.env("ROCM_ONLY") != "1"
+    timeout_in_minutes: 120
+    retry:
+      automatic:
+        - exit_status: "*"
+          limit: 1
+      manual:
+        allowed: true
+        reason: "GPU perf cold starts can be flaky — retry after checking logs"
+    mirror_hardwares: l4_1
+    depends_on:
+      - "upload-nightly-pipeline"
+      - "image-build"
+    command: |
+      bash <<'BASH'
+      set -euo pipefail
+
+      export MODEL="Qwen/Qwen3-0.6B"
+      export CUDA_VISIBLE_DEVICES=0
+      export PERF_TENSOR_PARALLEL_SIZE=1
+      export PERF_STACK_TIMEOUT=1800
+      export PERF_WORKER_STARTUP_TIMEOUT=1800
+
+      python -m pytest -sv tests/python/e2e/perf/l1_encode/test_l1_encode.py -k "(hit0.30 or hit0.99999) and (c4 or c16)"
+
+      BASH
+    artifact_paths:
+      - "tests/python/e2e/perf/l1_encode/results/**/*.json"
 
   # This queue is intentionally separate from the shared amd_mi300_* queues.
   # Those agents run --no-plugins, while this lane needs the Docker plugin

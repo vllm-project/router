@@ -5,7 +5,7 @@ use super::logprobs_merge;
 use super::pd_cached_tokens;
 use super::pd_program_adapter::{self, PdProgramRuntime};
 use super::pd_router::PdRouterBase;
-use super::pd_types::{error_chain, PDRouterError, PdAttempt, PdRequestContext};
+use super::pd_types::{error_chain, PDRouterError, PdAttempt, PdEndpoint, PdRequestContext};
 use super::router::{hold_request_load_until_body_done, prepare_error_status, RequestLoadGuard};
 use super::usage_merge;
 use super::vllm_service_discovery::{MoriIOTransferMode, ServiceRegistry, ServiceType};
@@ -912,6 +912,12 @@ impl VllmPDRouter {
                 workers.push(worker);
             }
         }
+        // Instances live in a HashMap. Endpoint order keeps a round-robin
+        // cursor stable when the map rehashes. Static pools do not come
+        // through here; admission leaves their registration order alone.
+        workers.sort_by(|left, right| {
+            PdEndpoint::for_worker(left.as_ref()).cmp(&PdEndpoint::for_worker(right.as_ref()))
+        });
         workers
     }
 
