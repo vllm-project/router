@@ -231,6 +231,10 @@ A model family is expressible when its engine publishes one hash chain per group
 
 For the first two families the layout is a direct description of what the engine maintains. V4-class engines need a hash granularity that divides every page size, which is why the layout declares `hash_block_size` 4 for a 4/8/64/256 layout: group hashes are then the chain hash at each group block's end, exactly the view the engine publishes. Their sliding groups publish only the tail blocks they keep, and one group index also publishes smaller pages next to the declared ones; both are handled by the event contract in §6, and the per-group hits in §8 are what makes the credit match the engine's own count.
 
+V4.1 keeps pages of 32, 32, 32, 32, 32, 128 and 8, but only the 128-token compressed group is prefix cacheable: the sliding groups run bounded replay, publish nothing, and are excluded from the index. The granularity is therefore the smallest *publishing* page — 128, not 8 — and the layout declares that. Its hit ratio follows the same shape as the other V4 engines, `align_down(tokens - 1, hash_block_size)`, with the declared replay window subtracted from the credit because the engine recomputes that window even though it counts it as cached.
+
+One chain per layout is enough, and deliberately so. Because every declared group's page is a multiple of `hash_block_size`, the chain at that granularity already passes through every group boundary; a per-group chain would be the same sequence read at a different stride, and the per-group hit in §8 is what turns it into per-group residency. The store's `parent_block_hash` is authenticated as a well-formed digest and is not required to be resident, so a bounded tail publication indexes correctly even when the engine has already evicted the blocks in front of it.
+
 ## 12. Compatibility and failure behaviour
 
 | Situation | Behaviour |
