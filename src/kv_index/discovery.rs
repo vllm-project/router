@@ -1570,10 +1570,17 @@ async fn query_worker_json<T: serde::de::DeserializeOwned>(
 
 /// A rank emits events only for the one wire format the subscriber decodes.
 fn events_enabled(entry: &KvEventSourceEntry) -> bool {
-    if entry.publisher.as_deref() != Some("zmq")
-        || entry.encoding.as_deref() != Some("msgpack")
-        || entry.schema_version != Some(1)
-    {
+    if entry.publisher.as_deref() != Some("zmq") {
+        return false;
+    }
+    // vLLM 0.31+ answers /kv_event_sources without `encoding` or
+    // `schema_version`: a "zmq" publisher already means the msgpack wire format
+    // and schema 1 there. An entry that names another encoding or schema is a
+    // different contract and is rejected.
+    if !matches!(entry.encoding.as_deref(), None | Some("msgpack")) {
+        return false;
+    }
+    if !matches!(entry.schema_version, None | Some(1)) {
         return false;
     }
     if matches!(entry.enable_kv_cache_events, Some(false)) {
@@ -1897,9 +1904,10 @@ mod tests {
         assert!(!events_enabled(&e)); // empty endpoint
         e.endpoint = "tcp://*:5557".into();
         e.publisher = Some("zmq".into());
-        assert!(!events_enabled(&e)); // Legacy discovery requires explicit wire metadata.
+        // vLLM 0.33 omits the optional wire metadata; "zmq" alone is enough.
+        assert!(events_enabled(&e));
         e.encoding = Some("msgpack".into());
-        assert!(!events_enabled(&e)); // Reject a partial explicit declaration.
+        assert!(events_enabled(&e));
         e.schema_version = Some(1);
         assert!(events_enabled(&e));
         e.publisher = Some("null".into());
