@@ -256,15 +256,15 @@ impl PdLoadManager {
             admitted_at: now,
             loads: self.loads.clone(),
             prefill: selection.prefill.endpoint.clone(),
-            decode: Mutex::new(decode_endpoint),
             prefill_worker: Mutex::new(None),
             decode_worker: Mutex::new(None),
             prefill_tokens: selection.prefill.new_prefill_tokens,
-            affinity: Mutex::new(affinity),
-            pending_since: Mutex::new(pending_since),
             state: Mutex::new(AttemptState {
                 prefill: true,
                 decode: decode_state,
+                decode_endpoint,
+                affinity,
+                pending_since,
             }),
         }));
         Some((selection, attempt))
@@ -294,9 +294,9 @@ impl PdLoadManager {
             .or_default();
         d.pending_decode_requests += 1;
         d.publish(Stage::Decode, &decision.endpoint);
-        *inner.decode.lock() = Some(decision.endpoint.clone());
-        *inner.affinity.lock() = decision.affinity.clone();
-        *inner.pending_since.lock() = Some(std::time::Instant::now());
+        state.decode_endpoint = Some(decision.endpoint.clone());
+        state.affinity = decision.affinity.clone();
+        state.pending_since = Some(std::time::Instant::now());
         state.decode = DecodeState::Pending;
         metrics::histogram!("vllm_router_pd_decode_selection_gap_seconds")
             .record(inner.admitted_at.elapsed().as_secs_f64());
@@ -330,15 +330,15 @@ impl PdLoadManager {
             admitted_at: std::time::Instant::now(),
             loads: self.loads.clone(),
             prefill,
-            decode: Mutex::new(Some(decode)),
             prefill_worker: Mutex::new(None),
             decode_worker: Mutex::new(None),
             prefill_tokens: None,
-            affinity: Mutex::new(None),
-            pending_since: Mutex::new(Some(std::time::Instant::now())),
             state: Mutex::new(AttemptState {
                 prefill: true,
                 decode: DecodeState::Pending,
+                decode_endpoint: Some(decode),
+                affinity: None,
+                pending_since: Some(std::time::Instant::now()),
             }),
         }));
         attempt.attach_workers(prefill_worker, decode_worker);
@@ -359,21 +359,23 @@ enum DecodeState {
 struct AttemptState {
     prefill: bool,
     decode: DecodeState,
+    /// Committed decode endpoint; `None` while the commitment is deferred.
+    decode_endpoint: Option<PdEndpoint>,
+    /// Decode binding held alive until this attempt finishes.
+    affinity: Option<Arc<AffinityRecord>>,
+    /// When the decode slot was charged, for the pending histogram.
+    pending_since: Option<std::time::Instant>,
 }
 
 struct AttemptInner {
     admitted_at: std::time::Instant,
     loads: Arc<Mutex<Loads>>,
     prefill: PdEndpoint,
-    /// Committed decode endpoint; `None` while the commitment is deferred.
-    decode: Mutex<Option<PdEndpoint>>,
     prefill_worker: Mutex<Option<Arc<dyn Worker>>>,
     decode_worker: Mutex<Option<Arc<dyn Worker>>>,
     prefill_tokens: Option<u64>,
-    /// Decode binding held alive until this attempt finishes.
-    affinity: Mutex<Option<Arc<AffinityRecord>>>,
-    /// When the decode slot was charged, for the pending histogram.
-    pending_since: Mutex<Option<std::time::Instant>>,
+    /// Guards every stage transition and the decode fields below, so a commit
+    /// and a release cannot interleave halfway through.
     state: Mutex<AttemptState>,
 }
 
@@ -408,7 +410,7 @@ impl AttemptInner {
         if state.decode != DecodeState::Pending {
             return;
         }
-        let Some(endpoint) = self.decode.lock().clone() else {
+        let Some(endpoint) = state.decode_endpoint.clone() else {
             return;
         };
         let mut loads = self.loads.lock();
@@ -418,7 +420,7 @@ impl AttemptInner {
         load.pending_decode_requests -= 1;
         load.active_decode_requests += 1;
         load.publish(Stage::Decode, &endpoint);
-        if let Some(since) = *self.pending_since.lock() {
+        if let Some(since) = state.pending_since {
             metrics::histogram!("vllm_router_pd_decode_pending_seconds")
                 .record(since.elapsed().as_secs_f64());
         }
@@ -437,7 +439,7 @@ impl AttemptInner {
             }
             DecodeState::Pending | DecodeState::Active => {}
         }
-        let Some(endpoint) = self.decode.lock().clone() else {
+        let Some(endpoint) = state.decode_endpoint.clone() else {
             state.decode = DecodeState::Finished;
             return;
         };
@@ -457,7 +459,7 @@ impl AttemptInner {
         if let Some(worker) = self.decode_worker.lock().as_ref() {
             worker.decrement_load();
         }
-        *self.pending_since.lock() = None;
+        state.pending_since = None;
         state.decode = DecodeState::Finished;
     }
 }
@@ -467,7 +469,7 @@ impl Drop for AttemptInner {
         self.finish_prefill();
         self.finish_decode();
         // Restart the binding's idle clock after this attempt finishes.
-        if let Some(record) = self.affinity.lock().take() {
+        if let Some(record) = self.state.lock().affinity.take() {
             record.release_ref();
         }
     }
@@ -481,7 +483,6 @@ impl std::fmt::Debug for AttemptInner {
         formatter
             .debug_struct("AttemptInner")
             .field("prefill", &self.prefill)
-            .field("decode", &self.decode)
             .field("state", &self.state)
             .finish()
     }
@@ -533,7 +534,7 @@ impl PdAttempt {
     /// Committed decode endpoint, or `None` while the commitment is deferred.
     #[cfg(test)]
     pub(super) fn decode_endpoint(&self) -> Option<PdEndpoint> {
-        self.0.decode.lock().clone()
+        self.0.state.lock().decode_endpoint.clone()
     }
     pub fn finish_prefill(&self) {
         self.0.finish_prefill();

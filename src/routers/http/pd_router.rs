@@ -50,13 +50,68 @@ fn decode_policy_can_defer(
                 .is_some())
 }
 
+/// Stage eligibility shared by admission and the deferred commitment.
+///
+/// Admission must not switch an endpoint between aggregate and per-rank
+/// accounting while requests are live, so existing granularities are indexed
+/// once instead of rescanning every load key for every candidate. Both entry
+/// points filter through this type, so the two cannot drift apart.
+struct Eligibility<'a, 'b> {
+    active_granularities: HashSet<(Stage, &'a str, bool)>,
+    context: &'a PdRequestContext<'b>,
+}
+
+impl<'a, 'b> Eligibility<'a, 'b> {
+    fn new(loads: &'a Loads, context: &'a PdRequestContext<'b>) -> Self {
+        let active_granularities = loads
+            .keys()
+            .map(|(stage, endpoint)| {
+                (
+                    *stage,
+                    endpoint.http_url.as_str(),
+                    endpoint.dp_rank.is_some(),
+                )
+            })
+            .collect();
+        Self {
+            active_granularities,
+            context,
+        }
+    }
+
+    fn is_eligible(&self, stage: Stage, worker: &dyn Worker, endpoint: &PdEndpoint) -> bool {
+        let granularity_matches = !self.active_granularities.contains(&(
+            stage,
+            endpoint.http_url.as_str(),
+            endpoint.dp_rank.is_none(),
+        ));
+        worker.is_available()
+            && granularity_matches
+            && self
+                .context
+                .model_id
+                .is_none_or(|model| worker.model_id() == "unknown" || worker.model_id() == model)
+    }
+
+    /// Eligible worker indices for `stage`, with their endpoints in pool order.
+    fn pool(&self, stage: Stage, workers: &[Arc<dyn Worker>]) -> (Vec<PdEndpoint>, Vec<usize>) {
+        let endpoints: Vec<_> = workers
+            .iter()
+            .map(|worker| PdEndpoint::for_worker(worker.as_ref()))
+            .collect();
+        let indices = workers
+            .iter()
+            .zip(&endpoints)
+            .enumerate()
+            .filter(|(_, (worker, endpoint))| self.is_eligible(stage, worker.as_ref(), endpoint))
+            .map(|(index, _)| index)
+            .collect();
+        (endpoints, indices)
+    }
+}
+
 /// Admission decision over the supplied load snapshot. Legacy policies
 /// retain their own selection semantics and text/header inputs.
-///
-/// `bind_decode` is false when the decode commitment is deferred: the decode
-/// pickup is then provisional, so it neither takes a session binding nor
-/// advances the policy's tie cursor. Both are decided by the commitment.
-#[allow(clippy::too_many_arguments)]
 pub(super) fn select_pd_pair(
     loads: &Loads,
     prefill_workers: &[Arc<dyn Worker>],
@@ -66,50 +121,9 @@ pub(super) fn select_pd_pair(
     context: &PdRequestContext<'_>,
     bind_decode: bool,
 ) -> Option<PdSelection> {
-    // Admission must not switch an endpoint between aggregate and per-rank
-    // accounting while requests are live. Index existing granularities once
-    // instead of rescanning every load key for every candidate.
-    let active_granularities: HashSet<(Stage, &str, bool)> = loads
-        .keys()
-        .map(|(stage, endpoint)| {
-            (
-                *stage,
-                endpoint.http_url.as_str(),
-                endpoint.dp_rank.is_some(),
-            )
-        })
-        .collect();
-    let eligible = |stage: Stage, worker: &dyn Worker, endpoint: &PdEndpoint| {
-        let granularity_matches = !active_granularities.contains(&(
-            stage,
-            endpoint.http_url.as_str(),
-            endpoint.dp_rank.is_none(),
-        ));
-        worker.is_available()
-            && granularity_matches
-            && context
-                .model_id
-                .is_none_or(|model| worker.model_id() == "unknown" || worker.model_id() == model)
-    };
-    let prefill_endpoints: Vec<_> = prefill_workers
-        .iter()
-        .map(|worker| PdEndpoint::for_worker(worker.as_ref()))
-        .collect();
-    let decode_endpoints: Vec<_> = decode_workers
-        .iter()
-        .map(|worker| PdEndpoint::for_worker(worker.as_ref()))
-        .collect();
-    let eligible_indices = |stage, workers: &[Arc<dyn Worker>], endpoints: &[PdEndpoint]| {
-        workers
-            .iter()
-            .zip(endpoints)
-            .enumerate()
-            .filter(|(_, (worker, endpoint))| eligible(stage, worker.as_ref(), endpoint))
-            .map(|(index, _)| index)
-            .collect::<Vec<_>>()
-    };
-    let prefill_indices = eligible_indices(Stage::Prefill, prefill_workers, &prefill_endpoints);
-    let decode_indices = eligible_indices(Stage::Decode, decode_workers, &decode_endpoints);
+    let eligibility = Eligibility::new(loads, context);
+    let (prefill_endpoints, prefill_indices) = eligibility.pool(Stage::Prefill, prefill_workers);
+    let (decode_endpoints, decode_indices) = eligibility.pool(Stage::Decode, decode_workers);
     if prefill_indices.is_empty() || decode_indices.is_empty() {
         return None;
     }
@@ -178,46 +192,14 @@ fn provisional_decode(
 ///
 /// Used by the deferred commitment: the request has already been admitted for
 /// Prefill, and the decode target is chosen when the decode request is about to
-/// be sent. Eligibility mirrors [`select_pd_pair`]; no Prefill inputs or cache
-/// selections are needed because only the kv_aware decode policy defers.
+/// be sent.
 pub(super) fn select_decode_stage(
     loads: &Loads,
     decode_workers: &[Arc<dyn Worker>],
     decode_policy: &dyn LoadBalancingPolicy,
     context: &PdRequestContext<'_>,
 ) -> Option<StageDecision> {
-    let active_granularities: HashSet<(Stage, &str, bool)> = loads
-        .keys()
-        .map(|(stage, endpoint)| {
-            (
-                *stage,
-                endpoint.http_url.as_str(),
-                endpoint.dp_rank.is_some(),
-            )
-        })
-        .collect();
-    let endpoints: Vec<_> = decode_workers
-        .iter()
-        .map(|worker| PdEndpoint::for_worker(worker.as_ref()))
-        .collect();
-    let indices: Vec<usize> = decode_workers
-        .iter()
-        .zip(&endpoints)
-        .enumerate()
-        .filter(|(_, (worker, endpoint))| {
-            let granularity_matches = !active_granularities.contains(&(
-                Stage::Decode,
-                endpoint.http_url.as_str(),
-                endpoint.dp_rank.is_none(),
-            ));
-            worker.as_ref().is_available()
-                && granularity_matches
-                && context.model_id.is_none_or(|model| {
-                    worker.model_id() == "unknown" || worker.model_id() == model
-                })
-        })
-        .map(|(index, _)| index)
-        .collect();
+    let (endpoints, indices) = Eligibility::new(loads, context).pool(Stage::Decode, decode_workers);
     if indices.is_empty() {
         return None;
     }

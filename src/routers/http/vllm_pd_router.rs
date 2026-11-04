@@ -126,6 +126,38 @@ pub(super) struct DecodeCommitInput {
     pub route: String,
 }
 
+impl DecodeCommitInput {
+    /// Commitment inputs for one request. The policy inputs come from the same
+    /// header and body the admission scored, so every path reads them the same
+    /// way.
+    fn for_request(
+        pool: DecodePoolSource,
+        provisional_endpoint: PdEndpoint,
+        decode_cache: Option<Arc<PreparedCacheSelection>>,
+        decode_policy: &dyn LoadBalancingPolicy,
+        headers: Option<&HeaderMap>,
+        request: &Value,
+        route: &str,
+    ) -> Self {
+        Self {
+            pool,
+            provisional_endpoint,
+            decode_cache,
+            affinity_key: VllmPDRouter::extract_affinity_key(decode_policy, headers, request),
+            cache_salt: request
+                .get("cache_salt")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned),
+            model_id: request
+                .get("model")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            route: route.to_string(),
+        }
+    }
+}
+
 /// Where a deferred commitment refreshes its decode candidates from.
 #[derive(Clone, Copy)]
 pub(super) enum DecodePoolSource {
@@ -1581,25 +1613,16 @@ impl VllmPDRouter {
         };
         // The admission-time decode pick is provisional when the commitment is
         // deferred: it seeds the request id and the Prefill parameters only.
-        let commit = attempt.decode_pending_commit().then(|| DecodeCommitInput {
-            pool: DecodePoolSource::Discovery,
-            provisional_endpoint: PdEndpoint::for_worker(decode_worker.as_ref()),
-            decode_cache,
-            affinity_key: Self::extract_affinity_key(
+        let commit = attempt.decode_pending_commit().then(|| {
+            DecodeCommitInput::for_request(
+                DecodePoolSource::Discovery,
+                PdEndpoint::for_worker(decode_worker.as_ref()),
+                decode_cache,
                 self.policy_registry.get_decode_policy().as_ref(),
                 headers,
                 &request,
-            ),
-            cache_salt: request
-                .get("cache_salt")
-                .and_then(Value::as_str)
-                .filter(|value| !value.is_empty())
-                .map(str::to_owned),
-            model_id: request
-                .get("model")
-                .and_then(Value::as_str)
-                .map(str::to_owned),
-            route: path.to_string(),
+                path,
+            )
         });
         match self
             .process_vllm_two_stage_request(
@@ -1801,25 +1824,16 @@ impl VllmPDRouter {
         );
         // The gRPC handshake carries the same connector JSON as HTTP, so a
         // connector that tolerates a late decode choice gets one here too.
-        let commit = attempt.decode_pending_commit().then(|| DecodeCommitInput {
-            pool: DecodePoolSource::Registry,
-            provisional_endpoint: selection.decode.endpoint.clone(),
-            decode_cache,
-            affinity_key: Self::extract_affinity_key(
+        let commit = attempt.decode_pending_commit().then(|| {
+            DecodeCommitInput::for_request(
+                DecodePoolSource::Registry,
+                selection.decode.endpoint.clone(),
+                decode_cache,
                 self.policy_registry.get_decode_policy().as_ref(),
                 headers,
                 &request_json,
-            ),
-            cache_salt: request_json
-                .get("cache_salt")
-                .and_then(Value::as_str)
-                .filter(|value| !value.is_empty())
-                .map(str::to_owned),
-            model_id: request_json
-                .get("model")
-                .and_then(Value::as_str)
-                .map(str::to_owned),
-            route: path.to_string(),
+                path,
+            )
         });
         let response = self
             .process_grpc_two_stage_chat(
@@ -3329,25 +3343,16 @@ impl RouterTrait for VllmPDRouter {
 
             // Mirrors the discovery path: a deferred commitment re-selects the
             // decode target once the Prefill response is in.
-            let commit = attempt.decode_pending_commit().then(|| DecodeCommitInput {
-                pool: DecodePoolSource::Registry,
-                provisional_endpoint: selection.decode.endpoint.clone(),
-                decode_cache,
-                affinity_key: Self::extract_affinity_key(
+            let commit = attempt.decode_pending_commit().then(|| {
+                DecodeCommitInput::for_request(
+                    DecodePoolSource::Registry,
+                    selection.decode.endpoint.clone(),
+                    decode_cache,
                     self.policy_registry.get_decode_policy().as_ref(),
                     headers,
                     &request_json,
-                ),
-                cache_salt: request_json
-                    .get("cache_salt")
-                    .and_then(Value::as_str)
-                    .filter(|value| !value.is_empty())
-                    .map(str::to_owned),
-                model_id: request_json
-                    .get("model")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned),
-                route: path.to_string(),
+                    path,
+                )
             });
 
             debug!(
