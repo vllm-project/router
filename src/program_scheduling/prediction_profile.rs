@@ -610,6 +610,7 @@ fn best_ttl(
     if total <= 0.0 || cache_miss_cost <= 0.0 || max_ttl <= 0.0 {
         return 0.0;
     }
+    let max_ttl = max_ttl.min(cache_miss_cost);
     let mut best = (0.0, 0.0);
     let last_bound = bounds.last().copied().unwrap_or(0.0);
     let overflow_upper = if max_observed > last_bound {

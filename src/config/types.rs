@@ -137,9 +137,13 @@ pub enum PredictionMode {
     /// Collect and evaluate predictions without changing scheduling decisions.
     #[default]
     Shadow,
+    /// Use mature return-time predictions for regular-HTTP acting TTL decisions.
+    ///
+    /// Output-length prediction remains observational in this mode.
+    Active,
 }
 
-/// Shared configuration for workflow-profile shadow predictors.
+/// Shared configuration for workflow-profile predictors.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PredictionProfileConfig {
     #[serde(default)]
