@@ -52,20 +52,55 @@ pub async fn get_grpc_server_info(
         .map(|response| response.into_inner())
 }
 
+/// Why the optional `GetKvEventSources` RPC failed.
+///
+/// `Unimplemented` is a deployment fact, not a fault: the peer serves the
+/// Control service but predates this RPC (or keeps KV events off), so probing
+/// again cannot help and discovery records the worker as unsupported instead
+/// of warning on every pass.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KvEventSourcesError {
+    /// The peer does not implement the `GetKvEventSources` RPC.
+    Unimplemented,
+    /// Transport, auth, or other failure; retrying may succeed.
+    Other(String),
+}
+
+impl KvEventSourcesError {
+    pub fn detail(&self) -> &str {
+        match self {
+            Self::Unimplemented => "grpc GetKvEventSources: Unimplemented",
+            Self::Other(detail) => detail,
+        }
+    }
+}
+
 pub async fn get_grpc_kv_event_sources(
     worker_url: &str,
     timeout: Duration,
-) -> Result<GetKvEventSourcesResponse, String> {
-    let uri = grpc_connect_uri(worker_url)?;
-    let mut client = control_client(worker_url, timeout).await?;
-    tokio::time::timeout(
+) -> Result<GetKvEventSourcesResponse, KvEventSourcesError> {
+    let uri = grpc_connect_uri(worker_url)
+        .map_err(|error| KvEventSourcesError::Other(error.to_string()))?;
+    let mut client = control_client(worker_url, timeout)
+        .await
+        .map_err(KvEventSourcesError::Other)?;
+    match tokio::time::timeout(
         timeout,
         client.get_kv_event_sources(GetKvEventSourcesRequest {}),
     )
     .await
-    .map_err(|_| format!("grpc GetKvEventSources timeout {uri}"))?
-    .map_err(|e| format!("grpc GetKvEventSources {uri}: {e}"))
-    .map(|response| response.into_inner())
+    {
+        Err(_) => Err(KvEventSourcesError::Other(format!(
+            "grpc GetKvEventSources timeout {uri}"
+        ))),
+        Ok(Err(status)) if status.code() == tonic::Code::Unimplemented => {
+            Err(KvEventSourcesError::Unimplemented)
+        }
+        Ok(Err(status)) => Err(KvEventSourcesError::Other(format!(
+            "grpc GetKvEventSources {uri}: {status}"
+        ))),
+        Ok(Ok(response)) => Ok(response.into_inner()),
+    }
 }
 
 pub fn model_info_json(info: &ModelInfo) -> Value {

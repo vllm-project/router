@@ -35,6 +35,18 @@ Status: **draft, not production-ready**. The design is in the [English RFC](hybr
   The advisory branch can follow and create multi-turn affinity, and a later
   tokenized turn may follow an advisory binding, but an advisory binding never
   reduces estimated prefill work and is never treated as a cache hit.
+- **Discovery is not a prerequisite.** KV event sources reach the router through
+  the operator's declaration (`--kv-event-source`, `--kv-event-replay-source`,
+  and `--pd-kv-event-source` for P/D) or through the gRPC Control RPC
+  `GetKvEventSources`. Upstream vLLM serves **no HTTP `/kv_event_sources`
+  route**: v0.29.0, v0.30.0 and v0.33.0 all lack it, and the installed 0.29.0
+  package contains no such string. That probe is therefore a non-upstream
+  extension some frontends mirror: a 404/405 is recorded once per worker, logged
+  at `debug`, and never re-probed, while a transport failure still warns and
+  retries. A declared static layout stays authoritative either way. Removing a
+  worker clears the verdict, so a restart (or `--vllm-discovery-address`
+  re-registration) probes again; enabling the extension on a worker that is
+  never removed is not detected until it is.
 - **P/D handoff checks.** Before the decode leg is dispatched, the decode
   transfer parameters must exist, echo the request's `transfer_id`, and carry a
   connector identity for the chosen engine. A rejected handoff answers `502`
