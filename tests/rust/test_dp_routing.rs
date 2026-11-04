@@ -345,6 +345,143 @@ mod dp_e2e_tests {
     // -----------------------------------------------------------------
 
     #[tokio::test]
+    async fn test_epd_dp2_keeps_encoder_destination_and_consumer_rank_aligned() {
+        use axum::{
+            extract::State,
+            http::{HeaderMap, Method, StatusCode, Uri},
+            routing::{get, post},
+            Json, Router,
+        };
+        use serde_json::Value;
+        use std::sync::Mutex;
+        use vllm_router_rs::config::{ConfigValidator, EpdConfig};
+
+        type Seen = Arc<Mutex<Vec<(String, HeaderMap, Value)>>>;
+        async fn backend(
+            State(seen): State<Seen>,
+            uri: Uri,
+            headers: HeaderMap,
+            Json(body): Json<Value>,
+        ) -> Json<Value> {
+            seen.lock()
+                .unwrap()
+                .push((uri.path().into(), headers, body.clone()));
+            if uri.path().starts_with("/e/") {
+                let uuid = body["messages"][0]["content"][0]["uuid"].as_str().unwrap();
+                Json(json!({"ec_transfer_params": {(uuid): {
+                    "metadata": {"image_grid_thw": [[1, 2, 3]]},
+                    "destination": body["ec_transfer_params"]["consumer_zmq"],
+                }}}))
+            } else if uri.path().starts_with("/p/") {
+                Json(json!({"kv_transfer_params": {
+                    "do_remote_prefill": true, "remote_engine_id": "P"
+                }}))
+            } else {
+                Json(json!({"choices": [{"message": {"content": "A"}}]}))
+            }
+        }
+
+        for separate_pd in [false, true] {
+            for push in [false, true] {
+                let seen: Seen = Arc::new(Mutex::new(Vec::new()));
+                let mut app = Router::new();
+                for role in ["e", "p", "d", "pd"] {
+                    app = app
+                        .route(&format!("/{role}/health"), get(|| async { "ok" }))
+                        .route(&format!("/{role}/v1/chat/completions"), post(backend))
+                        .route(&format!("/{role}/metrics"), get(|| async {
+                            "vllm:num_requests_running{engine=\"0\"} 0\nvllm:num_requests_running{engine=\"1\"} 0\n"
+                        }));
+                }
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let base = format!("http://{}", listener.local_addr().unwrap());
+                let app = app.with_state(seen.clone());
+                let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+                let consumer = format!("{base}/{}", if separate_pd { "p" } else { "pd" });
+                let addresses: std::collections::HashMap<_, _> = if push {
+                    (0..2)
+                        .map(|rank| {
+                            (
+                                format!("{consumer}@{rank}"),
+                                format!("tcp://127.0.0.1:{}", 19000 + rank),
+                            )
+                        })
+                        .collect()
+                } else {
+                    Default::default()
+                };
+                let mut config = if separate_pd {
+                    make_pd_config(vec![(consumer.clone(), None)], vec![format!("{base}/d")], 2)
+                } else {
+                    make_regular_config(vec![consumer.clone()], 2)
+                };
+                config.port = 8000;
+                config.epd = Some(EpdConfig {
+                    encoder_urls: vec![format!("{base}/e")],
+                    consumer_zmq_addrs: addresses.clone(),
+                });
+                ConfigValidator::validate(&config).unwrap();
+                if push {
+                    let mut incomplete = config.clone();
+                    incomplete
+                        .epd
+                        .as_mut()
+                        .unwrap()
+                        .consumer_zmq_addrs
+                        .remove(&format!("{consumer}@1"));
+                    assert!(ConfigValidator::validate(&incomplete).is_err());
+                }
+                let context = common::create_test_context(config);
+                let router = RouterFactory::create_router(&context).await.unwrap();
+                let mut headers = HeaderMap::new();
+                headers.insert("x-data-parallel-rank", "99".parse().unwrap());
+                for _ in 0..4 {
+                    let response = router.route_transparent(Some(&headers), "/v1/chat/completions", &Method::POST, json!({
+                        "model": "mock-model",
+                        "messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}}]}]
+                    })).await;
+                    assert_eq!(response.status(), StatusCode::OK);
+                    axum::body::to_bytes(response.into_body(), 4096)
+                        .await
+                        .unwrap();
+                }
+                let seen = seen.lock().unwrap();
+                let mut ranks = Vec::new();
+                for (path, headers, body) in seen.iter() {
+                    if path.starts_with("/e/") {
+                        assert!(!headers.contains_key("x-data-parallel-rank"));
+                        continue;
+                    }
+                    assert_eq!(headers.get_all("x-data-parallel-rank").iter().count(), 1);
+                    let rank = headers["x-data-parallel-rank"]
+                        .to_str()
+                        .unwrap()
+                        .parse::<usize>()
+                        .unwrap();
+                    assert!(rank < 2);
+                    if path.starts_with("/d/") {
+                        assert!(body.get("ec_transfer_params").is_none());
+                        continue;
+                    }
+                    ranks.push(rank);
+                    let uuid = body["messages"][0]["content"][0]["uuid"].as_str().unwrap();
+                    assert_eq!(body["messages"][0]["content"][0]["type"], "image_embeds");
+                    if push {
+                        assert_eq!(
+                            body["ec_transfer_params"][uuid]["destination"],
+                            addresses[&format!("{consumer}@{rank}")]
+                        );
+                    }
+                }
+                ranks.sort();
+                assert_eq!(ranks, [0, 0, 1, 1]);
+                assert_eq!(seen.len(), if separate_pd { 12 } else { 8 });
+                server.abort();
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn test_regular_router_dp2_transparent_proxy_reaches_backend() {
         // Start a mock worker
         let mut worker = MockWorker::new(MockWorkerConfig {

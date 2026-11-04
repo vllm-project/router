@@ -265,9 +265,9 @@ impl ConfigValidator {
                 })
             }
         };
-        if config.intra_node_data_parallel_size != 1 || config.enable_igw {
+        if config.enable_igw {
             return Err(ConfigError::ValidationFailed {
-                reason: "EPD currently requires DP=1 and proxy mode".into(),
+                reason: "EPD currently requires proxy mode".into(),
             });
         }
         if epd.encoder_urls.is_empty() {
@@ -286,15 +286,30 @@ impl ConfigValidator {
             }
         }
         if !epd.consumer_zmq_addrs.is_empty() {
-            if worker_urls.is_empty()
-                || epd.consumer_zmq_addrs.len() != worker_urls.len()
-                || worker_urls
+            let consumer_urls: Vec<String> = worker_urls
+                .iter()
+                .flat_map(|url| {
+                    let (base, rank) = crate::routers::http::dp_utils::parse_worker_url(url);
+                    crate::routers::http::dp_utils::expand_dp_ranks(
+                        rank,
+                        config.intra_node_data_parallel_size,
+                    )
+                    .into_iter()
+                    .map(move |rank| match rank {
+                        Some(rank) => format!("{base}@{rank}"),
+                        None => base.clone(),
+                    })
+                })
+                .collect();
+            if consumer_urls.is_empty()
+                || epd.consumer_zmq_addrs.len() != consumer_urls.len()
+                || consumer_urls
                     .iter()
-                    .any(|url| !epd.consumer_zmq_addrs.contains_key(*url))
+                    .any(|url| !epd.consumer_zmq_addrs.contains_key(url))
             {
                 return Err(ConfigError::ValidationFailed {
                     reason:
-                        "EPD consumer_zmq_addrs must map every embedding consumer URL exactly once"
+                        "EPD consumer_zmq_addrs must map every embedding consumer URL (including @rank for DP) exactly once"
                             .into(),
                 });
             }

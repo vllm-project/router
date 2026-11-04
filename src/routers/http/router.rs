@@ -3229,6 +3229,7 @@ impl RouterTrait for Router {
                     // reqwest derives these from the body and URL it sends.
                     if name == http::header::CONTENT_LENGTH
                         || name == http::header::CONTENT_TYPE
+                        || (worker.dp_rank().is_some() && name == "x-data-parallel-rank")
                         || header_utils::TRACE_HEADER_NAMES.contains(&name.as_str())
                     {
                         continue;

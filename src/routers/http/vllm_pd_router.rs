@@ -1647,7 +1647,7 @@ impl VllmPDRouter {
                     .prepare(
                         &self.http_client,
                         original_request,
-                        prefill_worker.base_url(),
+                        prefill_worker.url(),
                         headers,
                         std::env::var("OPENAI_API_KEY").ok().as_deref(),
                     )
