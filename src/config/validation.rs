@@ -26,10 +26,9 @@ impl ConfigValidator {
                 }
             );
 
-        let mut progress_supported = false;
         Self::validate_mode(&config.mode, has_service_discovery)?;
         Self::validate_policy(&config.policy)?;
-        progress_supported |= match &config.mode {
+        let progress_supported = match &config.mode {
             RoutingMode::VllmPrefillDecode { prefill_urls, .. } => {
                 matches!(
                     config.mode.get_prefill_policy(&config.policy),

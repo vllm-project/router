@@ -20,12 +20,9 @@ use tonic::transport::Channel;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-// Used by legacy paths until both regular and P/D progress are enabled.
-#[allow(unused_imports)]
-use super::convert::chat_to_generate_request;
 use super::convert::{
-    chat_to_generate_request_with_progress, limit_to_prefill, proto_struct_to_json,
-    requires_worker_output_text, set_kv_transfer_params,
+    chat_to_generate_request, chat_to_generate_request_with_progress, limit_to_prefill,
+    proto_struct_to_json, requires_worker_output_text, set_kv_transfer_params,
 };
 use super::detect::{grpc_connect_uri, parse_dp_rank};
 use super::frontend::{PreparedRequest, ResponseShape};
@@ -43,6 +40,8 @@ use crate::protocols::spec::Usage;
 
 const DP_RANK_METADATA: &str = "x-data-parallel-rank";
 const ENGINE_ABORT_RETRY_DELAY: Duration = Duration::from_millis(500);
+// A worker can be upgraded or replaced without changing its URI.
+const PREFILL_CAPABILITY_TTL: Duration = Duration::from_secs(60);
 
 pub(crate) type FirstOutputCallback = Arc<dyn Fn() + Send + Sync + 'static>;
 /// The first QUEUED snapshot may be only a conservative upper bound: the
@@ -55,8 +54,8 @@ pub(crate) enum PrefillProgressKind {
 
 pub(crate) type PrefillProgressCallback =
     Arc<dyn Fn(u64, u64, PrefillProgressKind) + Send + Sync + 'static>;
-type PrefillProgressCapabilityCache =
-    Arc<DashMap<String, Arc<tokio::sync::OnceCell<Result<bool, String>>>>>;
+type CapabilityCell = Arc<tokio::sync::OnceCell<Result<(bool, tokio::time::Instant), String>>>;
+type PrefillProgressCapabilityCache = Arc<DashMap<String, CapabilityCell>>;
 
 /// P/D fields layered on a prepared chat. Default is a colocated request.
 #[derive(Clone, Debug, Default)]
@@ -1188,7 +1187,7 @@ fn apply_prefill_progress_capability(
 }
 
 async fn cached_prefill_progress_capability<F, Fut>(
-    cache: &DashMap<String, Arc<tokio::sync::OnceCell<Result<bool, String>>>>,
+    cache: &DashMap<String, CapabilityCell>,
     uri: String,
     probe: F,
 ) -> Result<bool, String>
@@ -1196,11 +1195,27 @@ where
     F: FnOnce() -> Fut,
     Fut: Future<Output = Result<bool, String>>,
 {
-    let cell = cache
-        .entry(uri.clone())
-        .or_insert_with(|| Arc::new(tokio::sync::OnceCell::new()))
+    let cell = {
+        let mut entry = cache
+            .entry(uri.clone())
+            .or_insert_with(|| Arc::new(tokio::sync::OnceCell::new()));
+        if entry.get().is_some_and(|result| {
+            result
+                .as_ref()
+                .is_ok_and(|(_, checked)| checked.elapsed() >= PREFILL_CAPABILITY_TTL)
+        }) {
+            *entry = Arc::new(tokio::sync::OnceCell::new());
+        }
+        entry.clone()
+    };
+    let result = cell
+        .get_or_init(|| async {
+            probe()
+                .await
+                .map(|supported| (supported, tokio::time::Instant::now()))
+        })
+        .await
         .clone();
-    let result = cell.get_or_init(probe).await.clone();
 
     if result.is_err() {
         if let dashmap::mapref::entry::Entry::Occupied(entry) = cache.entry(uri) {
@@ -1210,7 +1225,7 @@ where
         }
     }
 
-    result
+    result.map(|(supported, _)| supported)
 }
 
 fn has_generated_output(msg: &super::pb::GenerateResponse, text: &str) -> bool {
@@ -1519,31 +1534,15 @@ mod pd_progress_tests {
     }
 
     #[test]
-    fn unsupported_worker_keeps_the_admission_estimate_path() {
-        let mut request = crate::backend::pb::GenerateRequest {
-            include_prefill_progress: true,
-            ..Default::default()
-        };
-
-        apply_prefill_progress_capability(&mut request, Ok(false), "worker");
-
-        assert!(!request.include_prefill_progress);
-    }
-
-    #[test]
-    fn capability_probe_error_keeps_the_admission_estimate_path() {
-        let mut request = crate::backend::pb::GenerateRequest {
-            include_prefill_progress: true,
-            ..Default::default()
-        };
-
-        apply_prefill_progress_capability(
-            &mut request,
-            Err("control service unavailable".to_owned()),
-            "worker",
-        );
-
-        assert!(!request.include_prefill_progress);
+    fn unsupported_or_unreachable_worker_keeps_admission_estimate() {
+        for capability in [Ok(false), Err("control service unavailable".to_owned())] {
+            let mut request = crate::backend::pb::GenerateRequest {
+                include_prefill_progress: true,
+                ..Default::default()
+            };
+            apply_prefill_progress_capability(&mut request, capability, "worker");
+            assert!(!request.include_prefill_progress);
+        }
     }
 
     #[tokio::test]
@@ -1581,5 +1580,40 @@ mod pd_progress_tests {
             Ok(true)
         );
         assert_eq!(probe_count.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn capability_is_refreshed_after_worker_replacement() {
+        let cache = DashMap::new();
+        let probe_count = AtomicUsize::new(0);
+        let probe = |supported| {
+            probe_count.fetch_add(1, Ordering::Relaxed);
+            async move { Ok(supported) }
+        };
+
+        assert!(
+            !cached_prefill_progress_capability(&cache, "worker".into(), || probe(false))
+                .await
+                .unwrap()
+        );
+        assert!(
+            !cached_prefill_progress_capability(&cache, "worker".into(), || probe(true))
+                .await
+                .unwrap()
+        );
+        assert_eq!(probe_count.load(Ordering::Relaxed), 1);
+        tokio::time::advance(PREFILL_CAPABILITY_TTL).await;
+        assert!(
+            cached_prefill_progress_capability(&cache, "worker".into(), || probe(true))
+                .await
+                .unwrap()
+        );
+        assert_eq!(probe_count.load(Ordering::Relaxed), 2);
+        tokio::time::advance(PREFILL_CAPABILITY_TTL).await;
+        assert!(
+            !cached_prefill_progress_capability(&cache, "worker".into(), || probe(false))
+                .await
+                .unwrap()
+        );
     }
 }

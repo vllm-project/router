@@ -3160,6 +3160,7 @@ impl WorkerManagement for VllmPDRouter {
 
     fn remove_worker(&self, worker_url: &str) {
         self.evict_nixl_info(worker_url);
+        self.grpc_frontend.remove_worker(worker_url);
         self.pd_router.remove_worker(worker_url);
     }
 
