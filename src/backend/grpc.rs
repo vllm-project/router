@@ -46,6 +46,7 @@ const STREAM_BUFFER_CAPACITY: usize = 32;
 const ENGINE_ABORT_RETRY_DELAY: Duration = Duration::from_millis(500);
 
 pub(crate) type FirstOutputCallback = Arc<dyn Fn() + Send + Sync + 'static>;
+pub(crate) type GeneratedTokensCallback = Arc<dyn Fn(Option<u64>) + Send + Sync + 'static>;
 /// The first QUEUED snapshot may be only a conservative upper bound: the
 /// worker has not yet confirmed the request's prefix cache.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -386,6 +387,7 @@ impl GrpcEngineBackend {
         worker_url: &str,
         prepared: PreparedRequest,
         on_first_output: Option<FirstOutputCallback>,
+        on_generated_tokens: Option<GeneratedTokensCallback>,
         on_prefill_progress: Option<PrefillProgressCallback>,
         handoff: KvHandoff,
     ) -> Response {
@@ -546,6 +548,7 @@ impl GrpcEngineBackend {
             stages,
             t_req,
             on_first_output,
+            on_generated_tokens,
             prefill_progress,
             fail_on_abort: abort_request_id.is_some(),
             abort,
@@ -577,6 +580,7 @@ struct ChatReply {
     stages: serde_json::Value,
     t_req: Instant,
     on_first_output: Option<FirstOutputCallback>,
+    on_generated_tokens: Option<GeneratedTokensCallback>,
     prefill_progress: PrefillProgressState,
     /// A P/D decode leg reports an `abort` finish as an error, so the push
     /// path can cancel P instead of returning an aborted reply as success.
@@ -736,6 +740,7 @@ async fn stream_openai(
         mut stages,
         t_req,
         on_first_output,
+        on_generated_tokens,
         mut prefill_progress,
         fail_on_abort: _,
         abort,
@@ -809,6 +814,7 @@ async fn stream_openai(
                             on_first_output.as_ref(),
                         );
                     }
+                    notify_generated_tokens(&msg, &text, on_generated_tokens.as_ref());
                     if !first_token_logged && !text.is_empty() {
                         stages["first_token_ms"] =
                             serde_json::json!(t_req.elapsed().as_secs_f64() * 1000.0);
@@ -968,6 +974,7 @@ async fn collect_openai(
         mut stages,
         t_req,
         on_first_output,
+        on_generated_tokens,
         mut prefill_progress,
         fail_on_abort,
         abort,
@@ -1015,6 +1022,7 @@ async fn collect_openai(
                     &mut first_output_seen,
                     on_first_output.as_ref(),
                 );
+                notify_generated_tokens(&msg, &delta, on_generated_tokens.as_ref());
                 if stages.get("first_token_ms").is_none() && !delta.is_empty() {
                     stages["first_token_ms"] =
                         serde_json::json!(t_req.elapsed().as_secs_f64() * 1000.0);
@@ -1097,6 +1105,29 @@ fn notify_first_output(
             callback();
         }
     }
+}
+
+fn notify_generated_tokens(
+    msg: &super::pb::GenerateResponse,
+    text: &str,
+    callback: Option<&GeneratedTokensCallback>,
+) {
+    let Some(callback) = callback else {
+        return;
+    };
+    if !has_generated_output(msg, text) {
+        return;
+    }
+    let tokens = msg.outputs.as_ref().and_then(|outputs| {
+        if outputs.num_tokens > 0 {
+            Some(u64::from(outputs.num_tokens))
+        } else if !outputs.token_ids.is_empty() {
+            Some(outputs.token_ids.len() as u64)
+        } else {
+            None
+        }
+    });
+    callback(tokens);
 }
 
 fn output_text_and_finish(
@@ -1223,7 +1254,7 @@ mod tests {
             dp_rank: 0,
         };
         manager.begin_prefill(&target, 100);
-        let slot = KvRequestSlot::new(manager.clone(), target.clone(), 100, None);
+        let slot = KvRequestSlot::new(manager.clone(), target.clone(), 100, None, None);
         (manager, slot, target)
     }
 
@@ -1546,6 +1577,7 @@ mod tests {
                 stages: serde_json::json!({}),
                 t_req: Instant::now(),
                 on_first_output: Some(Arc::new(move || output_slot.begin_decode())),
+                on_generated_tokens: None,
                 prefill_progress: PrefillProgressState::new(
                     "request".into(),
                     Some(Arc::new(move |sequence, remaining, _| {
@@ -1722,6 +1754,67 @@ mod tests {
         notify_first_output(&output, "", &mut first_output_seen, Some(&callback));
         notify_first_output(&output, "", &mut first_output_seen, Some(&callback));
         assert_eq!(decode_started.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn generated_token_callback_uses_stream_deltas_and_marks_unknown_counts() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let callback: GeneratedTokensCallback =
+            Arc::new(move |count| sink.lock().unwrap().push(count));
+        let prompt = GenerateResponse {
+            prompt_info: Some(PromptInfo {
+                num_prompt_tokens: 32,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        notify_generated_tokens(&prompt, "", Some(&callback));
+        let mut output = GenerateResponse {
+            outputs: Some(SequenceOutput {
+                num_tokens: 2,
+                token_ids: vec![1, 2],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        notify_generated_tokens(&output, "", Some(&callback));
+        output.outputs.as_mut().unwrap().num_tokens = 0;
+        notify_generated_tokens(&output, "", Some(&callback));
+        output.outputs.as_mut().unwrap().token_ids.clear();
+        notify_generated_tokens(&output, "text", Some(&callback));
+        assert_eq!(*seen.lock().unwrap(), vec![Some(2), Some(2), None]);
+    }
+
+    #[test]
+    fn generated_output_updates_live_context_without_prefill_progress() {
+        let manager = Arc::new(InMemorySlotManager::new());
+        let worker = crate::kv_index::RoutableTarget {
+            instance_id: Arc::from("grpc://worker:50051"),
+            dp_rank: 0,
+        };
+        manager.begin_prefill(&worker, 40);
+        let slot = KvRequestSlot::new(manager.clone(), worker.clone(), 40, Some(100), None);
+        let output_slot = slot.clone();
+        let callback: GeneratedTokensCallback =
+            Arc::new(move |tokens| output_slot.record_generated_tokens(tokens));
+        let output = GenerateResponse {
+            outputs: Some(SequenceOutput {
+                num_tokens: 3,
+                token_ids: vec![1, 2, 3],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        notify_generated_tokens(&output, "", Some(&callback));
+        assert_eq!(manager.decode_context_tokens(&worker), Some(103));
+        // The body-consumption path still controls the original P ledger.
+        assert_eq!(manager.sample(&worker).active_prefill_tokens, 40);
+        slot.begin_decode();
+        assert_eq!(manager.sample(&worker).active_prefill_tokens, 0);
+        slot.release();
+        notify_generated_tokens(&output, "", Some(&callback));
+        assert_eq!(manager.decode_context_tokens(&worker), Some(0));
     }
 
     #[tokio::test]

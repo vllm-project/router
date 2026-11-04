@@ -198,6 +198,40 @@ mod prefill_progress_regressions {
     }
 
     #[tokio::test]
+    async fn grpc_decode_context_tracks_stream_and_cleans_up_with_or_without_progress() {
+        for stream in [false, true] {
+            for (enabled, supported) in
+                [(false, Some(true)), (true, Some(false)), (true, Some(true))]
+            {
+                let h = Harness::new(enabled, supported).await;
+                let mut task = Some(h.dispatch(stream).await);
+                let response = if stream {
+                    Some(task.take().unwrap().await.unwrap())
+                } else {
+                    None
+                };
+                assert_eq!(h.slots.decode_context_tokens(&h.target), Some(0));
+                h.output("hello", false).await;
+                wait_until(|| h.slots.decode_context_tokens(&h.target) == Some(101)).await;
+                h.output(" world", false).await;
+                wait_until(|| h.slots.decode_context_tokens(&h.target) == Some(102)).await;
+
+                if let Some(response) = response {
+                    drop(response); // Client cancellation aborts the producer.
+                } else {
+                    h.output("!", true).await;
+                    drop(h.tx); // A finished gRPC response also closes its stream.
+                    let response = task.take().unwrap().await.unwrap();
+                    assert!(response.status().is_success());
+                }
+                wait_until(|| h.worker.load() == 0).await;
+                assert_eq!(h.slots.decode_context_tokens(&h.target), Some(0));
+                assert_eq!(h.slots.sample(&h.target), LoadSample::default());
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn grpc_progress_fallback_retains_admission_until_output() {
         use http_body_util::BodyExt;
         for stream in [false, true] {

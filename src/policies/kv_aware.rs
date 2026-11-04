@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -202,6 +202,8 @@ pub struct KvRequestSlot {
 
 struct KvSlotAccounting {
     prefill_tokens: u64,
+    context_tokens: Option<u64>,
+    decode_context: DecodeContext,
     /// Affinity binding reference acquired with this reservation, if any.
     affinity: Option<Arc<AffinityRecord>>,
     sequence: u64,
@@ -214,6 +216,7 @@ impl KvRequestSlot {
         manager: Arc<dyn SlotManager>,
         target: RoutableTarget,
         prefill_tokens: u64,
+        context_tokens: Option<u64>,
         affinity: Option<Arc<AffinityRecord>>,
     ) -> Self {
         Self {
@@ -221,6 +224,8 @@ impl KvRequestSlot {
             target,
             accounting: Arc::new(Mutex::new(KvSlotAccounting {
                 prefill_tokens,
+                context_tokens,
+                decode_context: DecodeContext::Inactive,
                 affinity,
                 sequence: 0,
                 state: 0,
@@ -239,6 +244,14 @@ impl KvRequestSlot {
         accounting.sequence = sequence;
         self.manager
             .adjust_prefill(&self.target, previous, remaining_tokens);
+        if accounting.state == 1 && remaining_tokens > 0 {
+            self.manager.adjust_decode_context(
+                &self.target,
+                accounting.decode_context,
+                DecodeContext::Inactive,
+            );
+            accounting.decode_context = DecodeContext::Inactive;
+        }
         self.trace_ledger("progress", previous, remaining_tokens);
     }
 
@@ -247,10 +260,46 @@ impl KvRequestSlot {
         if accounting.state == 0 {
             accounting.state = 1;
             let prefill_tokens = std::mem::take(&mut accounting.prefill_tokens);
-            self.manager
-                .begin_decode(&self.target, &self.target, prefill_tokens);
+            let context = if accounting.decode_context == DecodeContext::Inactive {
+                DecodeContext::from_length(accounting.context_tokens)
+            } else {
+                DecodeContext::Inactive
+            };
+            self.manager.begin_decode_with_context(
+                &self.target,
+                &self.target,
+                prefill_tokens,
+                context,
+            );
+            if context != DecodeContext::Inactive {
+                accounting.decode_context = context;
+            }
             self.trace_ledger("first_output", prefill_tokens, 0);
         }
+    }
+
+    /// Account for generated tokens observed on the worker stream.
+    pub fn record_generated_tokens(&self, tokens: Option<u64>) {
+        let mut accounting = self.accounting.lock();
+        if accounting.state == 2 {
+            return;
+        }
+        accounting.context_tokens = accounting
+            .context_tokens
+            .zip(tokens)
+            .and_then(|(length, tokens)| length.checked_add(tokens));
+        let context = DecodeContext::from_length(accounting.context_tokens);
+        self.manager
+            .adjust_decode_context(&self.target, accounting.decode_context, context);
+        accounting.decode_context = context;
+        tracing::trace!(
+            target: "kv_ledger",
+            instance = %self.target.instance_id,
+            dp_rank = self.target.dp_rank,
+            generated_tokens = ?tokens,
+            decode_context = ?context,
+            "decode context updated"
+        );
     }
 
     pub fn release(&self) {
@@ -259,6 +308,12 @@ impl KvRequestSlot {
             accounting.state = 2;
             let prefill_tokens = std::mem::take(&mut accounting.prefill_tokens);
             self.manager.adjust_prefill(&self.target, prefill_tokens, 0);
+            self.manager.adjust_decode_context(
+                &self.target,
+                accounting.decode_context,
+                DecodeContext::Inactive,
+            );
+            accounting.decode_context = DecodeContext::Inactive;
             self.manager.free(&self.target);
             if let Some(record) = &accounting.affinity {
                 record.release_ref();
@@ -307,6 +362,25 @@ pub struct LoadSample {
 
 pub trait LoadProvider: Send + Sync {
     fn sample(&self, target: &RoutableTarget) -> LoadSample;
+
+    /// Sum of live decode context lengths, or `None` if any length is unknown.
+    fn decode_context_tokens(&self, _target: &RoutableTarget) -> Option<u64> {
+        None
+    }
+}
+
+/// One request's contribution to a worker's decode context total.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecodeContext {
+    Inactive,
+    Unknown,
+    Known(u64),
+}
+
+impl DecodeContext {
+    fn from_length(length: Option<u64>) -> Self {
+        length.map_or(Self::Unknown, Self::Known)
+    }
 }
 
 pub trait SlotManager: LoadProvider {
@@ -318,6 +392,23 @@ pub trait SlotManager: LoadProvider {
         decode_target: &RoutableTarget,
         prefill_tokens: u64,
     );
+    fn begin_decode_with_context(
+        &self,
+        prefill_target: &RoutableTarget,
+        decode_target: &RoutableTarget,
+        prefill_tokens: u64,
+        context: DecodeContext,
+    ) {
+        self.begin_decode(prefill_target, decode_target, prefill_tokens);
+        self.adjust_decode_context(decode_target, DecodeContext::Inactive, context);
+    }
+    fn adjust_decode_context(
+        &self,
+        _target: &RoutableTarget,
+        _old: DecodeContext,
+        _new: DecodeContext,
+    ) {
+    }
     fn free(&self, target: &RoutableTarget);
 
     /// Drop idle state for a target that is no longer registered. Implementers
@@ -329,6 +420,11 @@ pub trait SlotManager: LoadProvider {
 struct SlotCounters {
     active_prefill_tokens: AtomicU64,
     active_requests: AtomicUsize,
+    decode_context_tokens: AtomicU64,
+    unknown_decode_contexts: AtomicUsize,
+    // Legacy callers cannot supply a decode length. Until the target drains,
+    // retain this conservative marker rather than treating the length as zero.
+    legacy_decode_unknown: AtomicBool,
 }
 
 /// Router-local, bracket-based load view keyed at the index's `(worker, rank)`
@@ -356,6 +452,8 @@ impl InMemorySlotManager {
             let slot = entry.get();
             if slot.active_requests.load(Ordering::Acquire) == 0
                 && slot.active_prefill_tokens.load(Ordering::Acquire) == 0
+                && slot.decode_context_tokens.load(Ordering::Acquire) == 0
+                && slot.unknown_decode_contexts.load(Ordering::Acquire) == 0
             {
                 // The occupied entry keeps the shard locked between checking
                 // the counters and removal, so a concurrent begin cannot be
@@ -388,6 +486,38 @@ impl LoadProvider for InMemorySlotManager {
             active_requests: slot.active_requests.load(Ordering::Acquire),
         }
     }
+
+    fn decode_context_tokens(&self, target: &RoutableTarget) -> Option<u64> {
+        let Some(slot) = self.slots.get(target) else {
+            return Some(0);
+        };
+        (slot.unknown_decode_contexts.load(Ordering::Acquire) == 0
+            && !slot.legacy_decode_unknown.load(Ordering::Acquire))
+        .then(|| slot.decode_context_tokens.load(Ordering::Acquire))
+    }
+}
+
+fn replace_decode_context(slot: &SlotCounters, old: DecodeContext, new: DecodeContext) {
+    if old == new {
+        return;
+    }
+    match old {
+        DecodeContext::Inactive => {}
+        DecodeContext::Unknown => atomic_saturating_sub_usize(&slot.unknown_decode_contexts, 1),
+        DecodeContext::Known(tokens) => {
+            atomic_saturating_sub_u64(&slot.decode_context_tokens, tokens)
+        }
+    }
+    match new {
+        DecodeContext::Inactive => {}
+        DecodeContext::Unknown => {
+            slot.unknown_decode_contexts.fetch_add(1, Ordering::AcqRel);
+        }
+        DecodeContext::Known(tokens) => {
+            slot.decode_context_tokens
+                .fetch_add(tokens, Ordering::AcqRel);
+        }
+    }
 }
 
 impl SlotManager for InMemorySlotManager {
@@ -417,8 +547,34 @@ impl SlotManager for InMemorySlotManager {
         prefill_tokens: u64,
     ) {
         if prefill_target == decode_target {
+            self.update_or_insert(prefill_target, |slot| {
+                atomic_saturating_sub_u64(&slot.active_prefill_tokens, prefill_tokens);
+                slot.legacy_decode_unknown.store(true, Ordering::Release);
+            });
+        } else {
+            self.update_or_insert(prefill_target, |slot| {
+                atomic_saturating_sub_u64(&slot.active_prefill_tokens, prefill_tokens);
+                atomic_saturating_sub_usize(&slot.active_requests, 1);
+            });
+            self.update_or_insert(decode_target, |slot| {
+                slot.active_requests.fetch_add(1, Ordering::AcqRel);
+                slot.legacy_decode_unknown.store(true, Ordering::Release);
+            });
+            self.prune_if_idle(prefill_target);
+        }
+    }
+
+    fn begin_decode_with_context(
+        &self,
+        prefill_target: &RoutableTarget,
+        decode_target: &RoutableTarget,
+        prefill_tokens: u64,
+        context: DecodeContext,
+    ) {
+        if prefill_target == decode_target {
             self.update_or_insert(prefill_target, |prefill| {
                 atomic_saturating_sub_u64(&prefill.active_prefill_tokens, prefill_tokens);
+                replace_decode_context(prefill, DecodeContext::Inactive, context);
             });
         } else {
             self.update_or_insert(prefill_target, |prefill| {
@@ -427,8 +583,20 @@ impl SlotManager for InMemorySlotManager {
             });
             self.update_or_insert(decode_target, |decode| {
                 decode.active_requests.fetch_add(1, Ordering::AcqRel);
+                replace_decode_context(decode, DecodeContext::Inactive, context);
             });
             self.prune_if_idle(prefill_target);
+        }
+    }
+
+    fn adjust_decode_context(
+        &self,
+        target: &RoutableTarget,
+        old: DecodeContext,
+        new: DecodeContext,
+    ) {
+        if old != new {
+            self.update_or_insert(target, |slot| replace_decode_context(slot, old, new));
         }
     }
 
@@ -513,6 +681,26 @@ pub struct CostComponents {
     pub ptoken: u64,
     /// Current active request count (max of the slot-manager sample and worker load).
     pub batchsize: usize,
+}
+
+fn choose_decode_context_tie<R: Rng + ?Sized>(
+    candidates: &[(usize, u64)],
+    rng: &mut R,
+) -> Option<(usize, &'static str)> {
+    let minimum = candidates.iter().map(|(_, context)| *context).min()?;
+    let eligible: Vec<usize> = candidates
+        .iter()
+        .filter(|(_, context)| *context == minimum)
+        .map(|(position, _)| *position)
+        .collect();
+    let outcome = if eligible.len() == candidates.len() {
+        "random"
+    } else if eligible.len() > 1 {
+        "context_random"
+    } else {
+        "context"
+    };
+    Some((eligible[rng.random_range(0..eligible.len())], outcome))
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1204,7 +1392,7 @@ impl KvAwarePolicy {
         )?;
         let candidates = self.candidate_views(workers, &plan);
         let (costs, components) = self.score_candidates(&plan, &candidates)?;
-        let position = self.pick_position(plan.has_tokens, &costs, &components, None)?;
+        let position = self.pick_position(&costs, &candidates, None)?;
         let (worker_index, _, decision) =
             self.decision_for_position(&plan, &candidates, &costs, &components, position);
         Some((worker_index, decision))
@@ -1329,12 +1517,7 @@ impl KvAwarePolicy {
                         record.release_ref();
                     }
                     let eligible = Self::eligible_positions(workers, &plan, excluded_workers);
-                    let position = self.pick_position(
-                        plan.has_tokens,
-                        &costs,
-                        &components,
-                        eligible.as_deref(),
-                    )?;
+                    let position = self.pick_position(&costs, &candidates, eligible.as_deref())?;
                     let binding = &plan.bindings[position];
                     // Retry exclusions preserve a valid binding; unregistered
                     // targets cannot establish one without a generation.
@@ -1378,7 +1561,16 @@ impl KvAwarePolicy {
             // Reserve the actual target's slot and worker load before unlocking.
             let slot = self.slot_manager.as_ref().map(|manager| {
                 manager.begin_prefill(&target, new_prefill_tokens);
-                KvRequestSlot::new(manager.clone(), target, new_prefill_tokens, record.take())
+                let context = (plan.has_tokens
+                    && crate::backend::is_grpc_url(workers[worker_index].url()))
+                .then_some(plan.input_tokens[position] as u64);
+                KvRequestSlot::new(
+                    manager.clone(),
+                    target,
+                    new_prefill_tokens,
+                    context,
+                    record.take(),
+                )
             });
             // No slot guard will run; release the reference inline.
             if slot.is_none() {
@@ -1651,46 +1843,63 @@ impl KvAwarePolicy {
 
     fn pick_position(
         &self,
-        has_tokens: bool,
         costs: &[f64],
-        components: &[CostComponents],
+        candidates: &[CandidateView<'_>],
         eligible: Option<&[usize]>,
     ) -> Option<usize> {
-        let Some(eligible) = eligible else {
-            return self.pick_among(has_tokens, costs, components);
-        };
-        let eligible_costs: Vec<f64> = eligible.iter().map(|&index| costs[index]).collect();
-        let eligible_components: Vec<CostComponents> =
-            eligible.iter().map(|&index| components[index]).collect();
-        let offset = self.pick_among(has_tokens, &eligible_costs, &eligible_components)?;
-        eligible.get(offset).copied()
-    }
-
-    fn pick_among(
-        &self,
-        has_tokens: bool,
-        costs: &[f64],
-        components: &[CostComponents],
-    ) -> Option<usize> {
-        // Zero work remains possible for token-less requests.
-        // Preserve KV preference, breaking equal-work ties by projected load.
-        if costs.iter().all(|cost| *cost == 0.0)
-            || (self.params.router_temperature <= 0.0 && costs.contains(&0.0))
-        {
-            components
-                .iter()
-                .enumerate()
-                .filter(|(index, _)| costs[*index] == 0.0)
-                .min_by_key(|(_, component)| {
-                    (
-                        if has_tokens { component.ptoken } else { 0 },
-                        component.batchsize,
-                    )
-                })
-                .map(|(index, _)| index)
-        } else {
-            self.picker.pick(costs)
+        let positions: Vec<usize> =
+            eligible.map_or_else(|| (0..costs.len()).collect(), |indices| indices.to_vec());
+        let eligible_costs: Vec<f64> = positions.iter().map(|&index| costs[index]).collect();
+        let selected = self.picker.pick(&eligible_costs)?;
+        let chosen_cost = *eligible_costs.get(selected)?;
+        let first_choice = *positions.get(selected)?;
+        let tied: Vec<usize> = positions
+            .into_iter()
+            .filter(|&position| costs[position] == chosen_cost)
+            .collect();
+        if tied.len() == 1 {
+            return tied.first().copied();
         }
+
+        let contexts: Vec<(usize, Option<u64>)> = tied
+            .iter()
+            .copied()
+            .map(|position| {
+                let candidate = &candidates[position];
+                let tracked = self.load.sample(candidate.target).active_requests;
+                let context = if candidate.load.active_requests == 0 {
+                    Some(0)
+                } else if tracked < candidate.load.active_requests {
+                    None
+                } else {
+                    self.load.decode_context_tokens(candidate.target)
+                };
+                (position, context)
+            })
+            .collect();
+        if contexts.iter().any(|(_, context)| context.is_none()) {
+            metrics::counter!("vllm_router_kv_aware_decode_tie_break_total", "outcome" => "unknown")
+                .increment(1);
+            // Do not treat a missing context as zero or penalize a legacy
+            // worker. Keep the previous picker when values cannot be compared.
+            if chosen_cost == 0.0
+                && (self.params.router_temperature <= 0.0
+                    || eligible_costs.iter().all(|cost| *cost == 0.0))
+            {
+                return tied
+                    .into_iter()
+                    .min_by_key(|&position| candidates[position].load.active_requests);
+            }
+            return Some(first_choice);
+        }
+        let contexts: Vec<(usize, u64)> = contexts
+            .into_iter()
+            .filter_map(|(position, context)| context.map(|context| (position, context)))
+            .collect();
+        let (position, outcome) = choose_decode_context_tie(&contexts, &mut rand::rng())?;
+        metrics::counter!("vllm_router_kv_aware_decode_tie_break_total", "outcome" => outcome)
+            .increment(1);
+        Some(position)
     }
 
     fn decision_for_position(
@@ -2023,6 +2232,7 @@ mod tests {
     use super::*;
     use crate::request_identity::{resolve_affinity_identity, IdentityFields};
     use http::HeaderMap;
+    use rand::{rngs::StdRng, SeedableRng};
     use serde_json::Value as JsonValue;
 
     fn affinity_from_request(
@@ -2161,7 +2371,10 @@ mod tests {
                     .unwrap_or_else(|| panic!("{case}: no worker selected for {mask:?}"))
             };
             let receipt = select(&mask, &[]);
-            assert_eq!(receipt.worker_index, 0, "{case}");
+            assert!(
+                receipt.worker_index < count.saturating_sub(1).max(1),
+                "{case}: an eligible cache hit should win"
+            );
             assert_eq!(receipt.new_prefill_tokens, 1, "{case}");
             assert_eq!(provider.queries.load(Ordering::Relaxed), 1, "{case}");
             assert_eq!(provider.blocks.load(Ordering::Relaxed), 3, "{case}");
@@ -2312,12 +2525,156 @@ mod tests {
     }
 
     #[test]
+    fn legacy_decode_context_stays_unknown_until_the_target_drains() {
+        let slots = InMemorySlotManager::new();
+        let worker = target("worker", 0);
+        slots.begin_prefill(&worker, 10);
+        slots.begin_prefill(&worker, 20);
+        slots.begin_decode(&worker, &worker, 10);
+        assert_eq!(slots.decode_context_tokens(&worker), None);
+        slots.free(&worker);
+        assert_eq!(slots.decode_context_tokens(&worker), None);
+        slots.adjust_prefill(&worker, 20, 0);
+        slots.free(&worker);
+        assert_eq!(slots.decode_context_tokens(&worker), Some(0));
+    }
+
+    #[test]
+    fn decode_context_tracks_output_reprefill_and_cleanup() {
+        let manager = Arc::new(InMemorySlotManager::new());
+        let worker = target("worker", 0);
+        manager.begin_prefill(&worker, 64);
+        let slot = KvRequestSlot::new(manager.clone(), worker.clone(), 64, Some(1000), None);
+        assert_eq!(manager.decode_context_tokens(&worker), Some(0));
+
+        slot.record_generated_tokens(Some(1));
+        slot.begin_decode(); // The consumer can also observe the first frame.
+        slot.record_generated_tokens(Some(3));
+        assert_eq!(manager.decode_context_tokens(&worker), Some(1004));
+        assert_eq!(manager.sample(&worker).active_prefill_tokens, 0);
+
+        slot.update_prefill_progress(1, 20);
+        assert_eq!(manager.decode_context_tokens(&worker), Some(0));
+        assert_eq!(manager.sample(&worker).active_prefill_tokens, 20);
+        slot.record_generated_tokens(Some(2));
+        assert_eq!(manager.decode_context_tokens(&worker), Some(1006));
+        assert_eq!(manager.sample(&worker).active_prefill_tokens, 20);
+        slot.update_prefill_progress(2, 0);
+        assert_eq!(manager.sample(&worker).active_prefill_tokens, 0);
+
+        slot.release();
+        slot.release();
+        slot.record_generated_tokens(Some(4));
+        assert_eq!(manager.decode_context_tokens(&worker), Some(0));
+        assert_eq!(manager.sample(&worker), LoadSample::default());
+    }
+
+    #[test]
+    fn unknown_decode_context_does_not_hide_known_requests() {
+        let manager = Arc::new(InMemorySlotManager::new());
+        let worker = target("worker", 0);
+        manager.begin_prefill(&worker, 8);
+        manager.begin_prefill(&worker, 16);
+        let known = KvRequestSlot::new(manager.clone(), worker.clone(), 8, Some(80), None);
+        let unknown = KvRequestSlot::new(manager.clone(), worker.clone(), 16, None, None);
+        known.record_generated_tokens(Some(2));
+        unknown.record_generated_tokens(Some(1));
+        assert_eq!(manager.decode_context_tokens(&worker), None);
+        unknown.release();
+        assert_eq!(manager.decode_context_tokens(&worker), Some(82));
+        known.record_generated_tokens(None);
+        assert_eq!(manager.decode_context_tokens(&worker), None);
+        known.release();
+        assert_eq!(manager.decode_context_tokens(&worker), Some(0));
+    }
+
+    #[test]
+    fn concurrent_output_updates_and_release_do_not_leak_context() {
+        let manager = Arc::new(InMemorySlotManager::new());
+        let worker = target("worker", 0);
+        manager.begin_prefill(&worker, 8);
+        let slot = KvRequestSlot::new(manager.clone(), worker.clone(), 8, Some(80), None);
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                let slot = slot.clone();
+                scope.spawn(move || {
+                    for _ in 0..100 {
+                        slot.record_generated_tokens(Some(1));
+                    }
+                });
+            }
+        });
+        assert_eq!(manager.decode_context_tokens(&worker), Some(480));
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                let slot = slot.clone();
+                scope.spawn(move || {
+                    slot.release();
+                    slot.record_generated_tokens(Some(1));
+                });
+            }
+        });
+        assert_eq!(manager.decode_context_tokens(&worker), Some(0));
+        assert_eq!(manager.sample(&worker), LoadSample::default());
+    }
+
+    #[test]
+    fn equal_score_tie_prefers_smaller_context_and_randomizes_equal_contexts() {
+        let mut rng = StdRng::seed_from_u64(123);
+        let candidates = [(0, 500), (1, 100), (2, 100)];
+        let mut counts = [0; 3];
+        for _ in 0..100 {
+            let (selected, outcome) = choose_decode_context_tie(&candidates, &mut rng).unwrap();
+            assert_eq!(outcome, "context_random");
+            counts[selected] += 1;
+        }
+        assert_eq!(counts[0], 0);
+        assert!(counts[1] > 0 && counts[2] > 0);
+    }
+
+    #[test]
+    fn decode_context_is_only_a_tie_breaker_for_the_primary_score() {
+        let policy = KvAwarePolicy::new(CostParams::default());
+        let manager = policy.slot_manager().unwrap();
+        let first = target("first", 0);
+        let second = target("second", 0);
+        for (worker, context) in [(&first, 500), (&second, 100)] {
+            manager.begin_prefill(worker, 1);
+            manager.begin_decode_with_context(worker, worker, 1, DecodeContext::Known(context));
+        }
+        let candidates = [&first, &second].map(|worker| CandidateView {
+            target: worker,
+            matches: &[],
+            load: manager.sample(worker),
+            input_tokens: 1,
+            prefill_tokens: None,
+        });
+        assert_eq!(
+            policy.pick_position(&[1.0, 1.0], &candidates, None),
+            Some(1)
+        );
+        assert_eq!(
+            policy.pick_position(&[1.0, 2.0], &candidates, None),
+            Some(0)
+        );
+        assert_eq!(
+            policy.pick_position(&[1.0, 1.0], &candidates, Some(&[0])),
+            Some(0)
+        );
+        manager.adjust_decode_context(&second, DecodeContext::Known(100), DecodeContext::Unknown);
+        assert_eq!(
+            policy.pick_position(&[1.0, 1.0], &candidates, None),
+            Some(0)
+        );
+    }
+
+    #[test]
     fn request_slot_tracks_reprefill_after_first_output_until_release() {
         let manager = Arc::new(InMemorySlotManager::new());
         let target = target("worker", 0);
         manager.begin_prefill(&target, 100);
         manager.begin_prefill(&target, 50);
-        let slot = KvRequestSlot::new(manager.clone(), target.clone(), 100, None);
+        let slot = KvRequestSlot::new(manager.clone(), target.clone(), 100, None, None);
 
         slot.update_prefill_progress(1, 60);
         slot.begin_decode();
@@ -2345,7 +2702,7 @@ mod tests {
         let manager = Arc::new(InMemorySlotManager::new());
         let target = target("worker", 0);
         manager.begin_prefill(&target, 100);
-        let slot = KvRequestSlot::new(manager.clone(), target.clone(), 100, None);
+        let slot = KvRequestSlot::new(manager.clone(), target.clone(), 100, None, None);
 
         slot.update_prefill_progress(2, 60);
         slot.update_prefill_progress(1, 90);
@@ -2520,7 +2877,7 @@ mod tests {
         let slots = policy.slot_manager().unwrap();
         let decode = policy.target_for_worker(workers[0].as_ref());
         slots.begin_prefill(&decode, 8);
-        slots.begin_decode(&decode, &decode, 8);
+        slots.begin_decode_with_context(&decode, &decode, 8, DecodeContext::Known(100));
         assert_eq!(
             policy.select_worker_with_token_ids(&workers[..2], None),
             Some(1)
@@ -3275,11 +3632,13 @@ mod tests {
         let key = affinity_key("session-a");
 
         // First placement binds to the idle worker a.
+        workers[1].increment_load();
         let bound = policy
             .select_worker_with_receipt(&workers, None, None, None, Some(&key), &[])
             .unwrap();
         assert_eq!(bound.decision.target, first_target);
         release_receipt(&workers, &bound);
+        workers[1].decrement_load();
 
         // Removal invalidates the binding; under load the next request rebinds.
         workers[0].increment_load();
