@@ -1770,11 +1770,11 @@ impl VllmPDRouter {
             }
         };
         let router_prompts: Arc<[Vec<u32>]> = Arc::from([prepared.tokenized.token_ids.to_vec()]);
-        let Admission {
+        let Some(Admission {
             selection,
             attempt,
             decode_cache,
-        } = self
+        }) = self
             .admit_pair_with_tokens(
                 &prefill_workers,
                 &decode_workers,
