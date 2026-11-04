@@ -252,18 +252,37 @@ impl HybridEventIndex {
         for event in &batch.events {
             let result = match event {
                 KVEvent::BlockStored(store) => {
-                    let group = self.groups.iter().find(|group| {
-                        store.group_idx == Some(group.group_idx)
-                            && store.block_size == group.block_size
-                            && event_kind_matches(group.kind, store)
-                    });
-                    if group.is_none()
-                        || store.medium.as_deref() != Some("GPU")
-                        || store.locality.as_deref().is_some_and(|s| s != "LOCAL")
+                    // An engine may publish several page sizes for one group
+                    // index (V4-class compressors store 4-token pages next to
+                    // the group's own pages). Only the declared granularity is
+                    // addressable by the layout; the other pages cover the same
+                    // tokens and add no boundary information.
+                    let Some(group) = self
+                        .groups
+                        .iter()
+                        .find(|group| store.group_idx == Some(group.group_idx))
+                    else {
+                        return Self::fail(&mut state, HybridEventError::InvalidBatch);
+                    };
+                    if store.block_size != group.block_size {
+                        tracing::debug!(
+                            group_idx = group.group_idx,
+                            declared = group.block_size,
+                            published = store.block_size,
+                            "hybrid group published a secondary page size"
+                        );
+                        continue;
+                    }
+                    if store.medium.as_deref() != Some("GPU")
+                        || store
+                            .locality
+                            .as_deref()
+                            .is_some_and(|s| s != "LOCAL")
                         || store.ownership.is_some()
                         || store.lora_id.is_some()
                         || store.lora_name.is_some()
-                        || !group.is_some_and(|group| stored_shape_matches(group.kind, store))
+                        || !event_kind_matches(group.kind, store)
+                        || !stored_shape_matches(group.kind, store)
                         || store.extra_keys.as_ref().is_some_and(|keys| {
                             keys.len() != store.block_hashes.len()
                                 || keys.iter().any(|key| !key.is_nil())
@@ -275,7 +294,7 @@ impl HybridEventIndex {
                     {
                         Err(HybridEventError::InvalidBatch)
                     } else {
-                        let group_idx = store.group_idx.expect("validated group");
+                        let group_idx = group.group_idx;
                         for hash in &store.block_hashes {
                             let Some(hash) = sequence_hash(hash) else {
                                 return Self::fail(&mut state, HybridEventError::InvalidBatch);
@@ -429,18 +448,24 @@ fn event_kind_matches(kind: HybridGroupKind, store: &BlockStored) -> bool {
 
 /// A checkpoint event may describe a whole cached chunk while publishing only
 /// the states that survived sparse retention, so its hash count is bounded by
-/// the token range instead of equal to it. Attention groups publish one hash
-/// per block.
+/// the token range instead of equal to it. A sliding-window group keeps only
+/// its resident tail and publishes just those blocks, which is why its hash
+/// count is also bounded by the range. Full attention and compressed attention
+/// publish one hash per block.
 fn stored_shape_matches(kind: HybridGroupKind, store: &BlockStored) -> bool {
     let block_size = store.block_size as usize;
     if block_size == 0 || store.token_ids.is_empty() {
         return false;
     }
-    if kind == HybridGroupKind::Checkpoint {
-        store.token_ids.len().is_multiple_of(block_size)
-            && store.block_hashes.len() <= store.token_ids.len() / block_size
-    } else {
-        store.block_hashes.len().checked_mul(block_size) == Some(store.token_ids.len())
+    if !store.token_ids.len().is_multiple_of(block_size) {
+        return false;
+    }
+    let blocks = store.token_ids.len() / block_size;
+    match kind {
+        HybridGroupKind::Checkpoint | HybridGroupKind::SlidingWindow { .. } => {
+            store.block_hashes.len() <= blocks
+        }
+        _ => store.block_hashes.len() == blocks,
     }
 }
 
@@ -1459,6 +1484,133 @@ mod tests {
             Err(HybridEventError::InvalidBatch)
         );
         assert_eq!(wrong.reusable_tokens(&tokens, usize::MAX), 0);
+    }
+
+    /// The event shape a DeepSeek V4 layout publishes: sliding groups keep only
+    /// their resident tail, one group publishes 4-token pages next to its own
+    /// 256-token blocks, and the groups use different block sizes that share
+    /// one hash chain at the layout's 4-token granularity.
+    #[test]
+    fn tail_window_events_credit_the_engine_boundary() {
+        let tokens: Vec<u32> = (0..1024).map(|i| 100 + i % 100).collect();
+        let keys = BlockKeyGenerator::new(4, 0).generate_block_keys(&tokens);
+        let view = |block: usize| -> Vec<SequenceHash> {
+            let stride = block / 4;
+            keys.iter()
+                .skip(stride - 1)
+                .step_by(stride)
+                .copied()
+                .collect()
+        };
+        let tail = |block: usize, hold: usize| -> Vec<SequenceHash> {
+            let hashes = view(block);
+            hashes[hashes.len() - hold..].to_vec()
+        };
+        let groups = vec![
+            HybridEventGroup {
+                group_idx: 0,
+                block_size: 64,
+                kind: HybridGroupKind::SlidingWindow { window_tokens: 128 },
+            },
+            HybridEventGroup {
+                group_idx: 1,
+                block_size: 64,
+                kind: HybridGroupKind::SlidingWindow { window_tokens: 128 },
+            },
+            HybridEventGroup {
+                group_idx: 2,
+                block_size: 256,
+                kind: HybridGroupKind::CompressedFullAttention {
+                    tokens_per_state: 4,
+                },
+            },
+            HybridEventGroup {
+                group_idx: 3,
+                block_size: 4,
+                kind: HybridGroupKind::SlidingWindow { window_tokens: 8 },
+            },
+            HybridEventGroup {
+                group_idx: 4,
+                block_size: 8,
+                kind: HybridGroupKind::SlidingWindow { window_tokens: 128 },
+            },
+        ];
+        let store = |group: HybridEventGroup,
+                     spec: &str,
+                     window: Option<u32>,
+                     hashes: Vec<SequenceHash>,
+                     block: usize,
+                     span: usize| {
+            KVEvent::BlockStored(BlockStored {
+                block_hashes: hashes
+                    .into_iter()
+                    .map(|hash| ExternalBlockHash::Bytes(hash.to_vec()))
+                    .collect(),
+                parent_block_hash: None,
+                token_ids: tokens[..span].to_vec(),
+                block_size: block as u32,
+                lora_id: None,
+                medium: Some("GPU".into()),
+                lora_name: None,
+                extra_keys: None,
+                group_idx: Some(group.group_idx),
+                kv_cache_spec_kind: Some(spec.into()),
+                kv_cache_spec_sliding_window: window,
+                locality: None,
+                ownership: None,
+                session_id: None,
+            })
+        };
+        let index = HybridEventIndex::new(target(), groups.clone(), 4, 0, 4096).unwrap();
+        index.begin_empty(0);
+        let batch = KVEventBatch {
+            ts: 1.0,
+            data_parallel_rank: Some(0),
+            events: vec![
+                store(
+                    groups[0],
+                    "sliding_window_mla",
+                    Some(128),
+                    tail(64, 2),
+                    64,
+                    1024,
+                ),
+                store(
+                    groups[1],
+                    "sliding_window_mla",
+                    Some(128),
+                    tail(64, 2),
+                    64,
+                    1024,
+                ),
+                store(groups[2], "mla_attention", None, view(256), 256, 1024),
+                // The same group also publishes compressor pages it stores on
+                // their own; they carry no boundary the group does not already
+                // report.
+                store(groups[2], "mla_attention", None, vec![keys[0]], 4, 4),
+                store(
+                    groups[3],
+                    "sliding_window_mla",
+                    Some(8),
+                    tail(4, 2),
+                    4,
+                    1024,
+                ),
+                store(
+                    groups[4],
+                    "sliding_window_mla",
+                    Some(128),
+                    tail(8, 16),
+                    8,
+                    1024,
+                ),
+            ],
+        };
+        assert_eq!(index.apply_batch(0, &batch), Ok(()));
+        // The compressed group restores three 256-token blocks below the
+        // last-token bound, and the engine keeps that smallest hit even though
+        // the sliding tails sit at the end of the prefix.
+        assert_eq!(index.reusable_tokens(&tokens, usize::MAX), 768);
     }
 
     #[test]
