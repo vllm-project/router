@@ -421,6 +421,40 @@ impl KvIndexSupervisor {
         let static_source = self.static_sources.get(worker_url);
         let full_attention_http = !grpc && self.full_attention_http;
         match static_source {
+            // A layout entry without endpoints: the declaration carries the
+            // identity and groups, the engine reports the publishers.
+            Some(config) if layout_only(config) => {
+                let discovery = discover_worker(
+                    &self.client,
+                    worker_url,
+                    false,
+                    self.api_key.as_deref(),
+                    probe,
+                )
+                .await;
+                match discovery.sources {
+                    Ok(sources) if !sources.is_empty() => {
+                        match layout_topic_mismatch(config, &sources) {
+                            Some(reason) => failed_hybrid_discovery(reason),
+                            None => static_worker_discovery_with_sources(
+                                worker_url,
+                                config,
+                                Ok(sources),
+                            ),
+                        }
+                    }
+                    Ok(_) => failed_hybrid_discovery(format!(
+                        "engine reports no KV event sources for the declared hybrid layout \
+                         ({worker_url}); declare --kv-event-source"
+                    )),
+                    Err(unavailable) => {
+                        // No endpoints to fall back to, so this worker gets no
+                        // KV subscribers; the reason is already logged.
+                        log_static_layout_trusted(worker_url, unavailable.probe);
+                        static_worker_discovery_with_sources(worker_url, config, Err(unavailable))
+                    }
+                }
+            }
             Some(config) => {
                 info!(
                     worker_url,
@@ -1201,6 +1235,57 @@ fn static_worker_discovery(worker_url: &str, config: &StaticKvEventSources) -> W
         model_id: Ok(Some(model)),
         hybrid: config.hybrid.clone(),
     }
+}
+
+/// A declared hybrid layout whose publishers are discovered instead of declared.
+///
+/// The layout carries the cache identity, the groups and the hash block size;
+/// the engine reports the per-rank endpoints (gRPC `GetKvEventSources`, or the
+/// HTTP `/kv_event_sources` route since vLLM 0.31.0).
+fn layout_only(config: &StaticKvEventSources) -> bool {
+    config.hybrid.is_some() && config.endpoints.is_empty()
+}
+
+/// Same identity as [`static_worker_discovery`], with endpoints from the engine.
+fn static_worker_discovery_with_sources(
+    worker_url: &str,
+    config: &StaticKvEventSources,
+    sources: Result<KvEventSourcesResponse, SourcesUnavailable>,
+) -> WorkerDiscovery {
+    let mut discovery = static_worker_discovery(worker_url, config);
+    discovery.sources = sources;
+    discovery
+}
+
+/// The layout names the publisher topic each rank must use. A discovered
+/// publisher that advertises another topic belongs to a different boot, so
+/// subscribing to it would index the wrong stream.
+fn layout_topic_mismatch(
+    config: &StaticKvEventSources,
+    sources: &KvEventSourcesResponse,
+) -> Option<String> {
+    let layout = config.hybrid.as_ref()?;
+    for (rank, entry) in sources {
+        let Ok(rank) = rank.parse::<u32>() else {
+            continue;
+        };
+        let declared = layout
+            .ranks
+            .iter()
+            .find(|item| item.rank == rank)
+            .and_then(|item| item.publisher_topic.as_deref())
+            .filter(|topic| !topic.is_empty());
+        if let Some(declared) = declared {
+            if entry.topic != declared {
+                return Some(format!(
+                    "discovered KV event topic for rank {rank} is '{}', layout declares \
+                     '{declared}'",
+                    entry.topic
+                ));
+            }
+        }
+    }
+    None
 }
 
 /// Outcome of reconciling a declared static hybrid layout with the engine.
@@ -3655,6 +3740,124 @@ mod tests {
         assert_eq!(hybrid.ranks[0].rank, 1);
         assert!(dp_rank_suffix("http://127.0.0.1:8000@1").is_some());
         assert!(dp_rank_suffix("http://127.0.0.1:8000").is_none());
+    }
+
+    /// A layout without declared endpoints is legal on engines that report
+    /// their own publishers (gRPC `GetKvEventSources`, or the HTTP route vLLM
+    /// serves since 0.31.0). The declaration still supplies identity, groups
+    /// and the hash block size.
+    #[tokio::test]
+    async fn layout_without_endpoints_discovers_publishers() {
+        let (endpoint, replay_endpoint, _publisher, _replay) = layout_endpoints();
+        let (worker, task) = layout_worker(endpoint, replay_endpoint, "kv-hybrid").await;
+        let config = layout_only_sources("kv-hybrid", 8, "layout-only");
+        let (supervisor, _signals) =
+            KvIndexSupervisor::new(reqwest::Client::new(), HashMode::Sha256);
+        let supervisor = supervisor.with_static_sources(HashMap::from([(worker.clone(), config)]));
+
+        let info = supervisor.on_worker_added(&worker).await.unwrap();
+        assert_eq!(info.block_size, Some(8));
+        assert_eq!(info.ranks, vec![0]);
+        assert_eq!(info.cache_key.unwrap().model.as_ref(), "layout-only");
+        assert!(supervisor.match_provider_for_worker(&worker).is_some());
+        task.abort();
+    }
+
+    /// A publisher advertising another topic belongs to a different boot: the
+    /// declared layout must not subscribe to it.
+    #[tokio::test]
+    async fn layout_rejects_a_publisher_with_another_topic() {
+        let (endpoint, replay_endpoint, _publisher, _replay) = layout_endpoints();
+        let (worker, task) = layout_worker(endpoint, replay_endpoint, "kv-rebooted").await;
+
+        let config = layout_only_sources("kv-hybrid", 8, "layout-only");
+        let (supervisor, _signals) =
+            KvIndexSupervisor::new(reqwest::Client::new(), HashMode::Sha256);
+        let supervisor = supervisor.with_static_sources(HashMap::from([(worker.clone(), config)]));
+
+        let info = supervisor.on_worker_added(&worker).await;
+        assert!(info.map(|info| info.ranks.is_empty()).unwrap_or(true));
+        task.abort();
+    }
+
+    /// Engine stub that reports one publisher for rank 0 under `topic`.
+    async fn layout_worker(
+        endpoint: String,
+        replay_endpoint: String,
+        topic: &'static str,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        use axum::{routing::get, Json, Router};
+
+        let app = Router::new().route(
+            "/kv_event_sources",
+            get(move || {
+                let endpoint = endpoint.clone();
+                let replay_endpoint = replay_endpoint.clone();
+                async move {
+                    Json(serde_json::json!({
+                        "0": {"endpoint": endpoint, "replay_endpoint": replay_endpoint,
+                              "topic": topic, "publisher": "zmq", "encoding": "msgpack",
+                              "schema_version": 1, "enable_kv_cache_events": true}
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let worker = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (worker, task)
+    }
+
+    /// One PUB and one ROUTER endpoint, like a real rank's ZMQ pair.
+    fn layout_endpoints() -> (String, String, zmq::Socket, zmq::Socket) {
+        let context = zmq::Context::new();
+        let publisher = context.socket(zmq::PUB).unwrap();
+        publisher.bind("tcp://127.0.0.1:*").unwrap();
+        let replay = context.socket(zmq::ROUTER).unwrap();
+        replay.bind("tcp://127.0.0.1:*").unwrap();
+        (
+            publisher.get_last_endpoint().unwrap().unwrap(),
+            replay.get_last_endpoint().unwrap().unwrap(),
+            publisher,
+            replay,
+        )
+    }
+
+    fn layout_only_sources(
+        topic: &str,
+        block_size: u32,
+        model: &str,
+    ) -> crate::config::types::StaticKvEventSources {
+        let layout: crate::kv_index::hybrid_capability::HybridCapabilities =
+            serde_json::from_value(serde_json::json!({
+                "schema_version": 1,
+                "ranks": [{
+                    "rank": 0, "model": model, "weight_version": "v1",
+                    "publisher_topic": topic, "instance_topic": true,
+                    "hash_algorithm": "sha256_cbor",
+                    "root_hash": "4e1195df020de59e0d65a33a4279f1183e7ae4e5d980e309f8b55adff2e61c3e",
+                    "full_hashes": true, "hash_block_size": block_size,
+                    "hash_lookahead_tokens": 0, "speculative_tokens": 0,
+                    "prefix_caching": true,
+                    "groups": [
+                        {"group_idx": 0, "kind": "mamba", "spec_type": "MambaSpec",
+                         "block_size": block_size, "prefix_cacheable": true,
+                         "prefix_replay_tokens": 0, "mamba_cache_mode": "align"},
+                        {"group_idx": 1, "kind": "full_attention",
+                         "spec_type": "FullAttentionSpec", "block_size": block_size,
+                         "prefix_cacheable": true, "prefix_replay_tokens": 0}
+                    ]
+                }]
+            }))
+            .unwrap();
+        crate::config::types::StaticKvEventSources {
+            endpoints: Vec::new(),
+            replay_endpoints: None,
+            topic: topic.to_owned(),
+            block_size,
+            model: model.to_owned(),
+            hybrid: Some(layout),
+        }
     }
 
     #[tokio::test]

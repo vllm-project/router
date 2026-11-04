@@ -3,7 +3,8 @@ use std::collections::HashMap;
 use vllm_router_rs::config::{
     CircuitBreakerConfig, ConfigError, ConfigResult, ConnectionMode, DiscoveryConfig,
     HealthCheckConfig, HistoryBackend, KvConnector, MetricsConfig, PdKvEventSources, PolicyConfig,
-    ProgramSchedulingConfig, RetryConfig, RouterConfig, RoutingMode, TraceConfig,
+    ProgramSchedulingConfig, RetryConfig, RouterConfig, RoutingMode, StaticKvEventSources,
+    TraceConfig,
 };
 use vllm_router_rs::metrics::PrometheusConfig;
 use vllm_router_rs::server::{self, ServerConfig};
@@ -500,11 +501,25 @@ impl CliArgs {
                 reason: format!("invalid hybrid layout {}: {error}", path.display()),
             })?;
             for (worker, layout) in layouts {
-                let source = static_kv_event_sources.get_mut(&worker).ok_or_else(|| {
-                    ConfigError::ValidationFailed {
-                        reason: format!("hybrid layout for '{worker}' requires --kv-event-source"),
-                    }
-                })?;
+                // A layout without declared endpoints is legal: the engine can
+                // report its own publishers (gRPC GetKvEventSources, or the HTTP
+                // /kv_event_sources route since vLLM 0.31.0). Identity and the
+                // hash block size then come from the layout itself.
+                let source = static_kv_event_sources
+                    .entry(worker.clone())
+                    .or_insert_with(|| {
+                        let rank = layout.ranks.first();
+                        StaticKvEventSources {
+                            endpoints: Vec::new(),
+                            replay_endpoints: None,
+                            topic: rank
+                                .and_then(|rank| rank.publisher_topic.clone())
+                                .unwrap_or_default(),
+                            block_size: rank.and_then(|rank| rank.hash_block_size).unwrap_or(16),
+                            model: rank.map_or_else(|| worker.clone(), |rank| rank.model.clone()),
+                            hybrid: None,
+                        }
+                    });
                 source.hybrid = Some(layout);
             }
         }
