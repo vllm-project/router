@@ -113,6 +113,7 @@ a whole node is requested.
 | Qwen3.8-27B | real weights | 832 | 0-2 mamba, 3 full | 2496 | 4992 (2 repeats) | equal |
 | Qwen4Exp | dummy weights, real config | 192 | 0-2 mamba, 3 scratch ring (no events), 4 compressed MLA | 576 | 1152 (2 repeats) | equal |
 | DeepSeek-V4-Flash | real weights, TP=2 | 256 | 0,1,4 sliding-window MLA (64), 2 compressed MLA (256), 3 sliding-window MLA (4) | 768 | 1536 (2 repeats) | equal |
+| DeepSeek-V4-Pro | real weights, TP=8 on B300 | 256 | 0,1,3,4 sliding-window MLA (64, 64, 8, 4), 2 compressed MLA (256) | 768 | 768 per repeat | equal |
 
 The four Qwen3.x runs used a layout with declared endpoints. The Qwen4Exp and
 V4 runs used a layout with **no** endpoints, so the router discovered the
@@ -184,16 +185,28 @@ first attempt (the sliding tail does not cover 704) and 512 on its own repeat
 (1,280 and 1,792 per repeat), so the engine keeps each group's own hit and does
 not re-check the window at a shorter boundary.
 
-**DeepSeek-V4-Pro shares the V4-Flash code path but not its layout.**
-`deepseek-ai/DeepSeek-V4-Pro` reports `model_type: deepseek_v4` and runs
-`vllm/models/deepseek_v4/`, the same package as V4-Flash, so the group
-mechanism is identical; only the shapes move: 61 layers instead of 43, hidden
-7168 instead of 4096, 128 attention heads instead of 64, 384 routed experts
-instead of 256, `index_topk` 1024 instead of 512, `o_groups` 16 instead of 8,
-and 864.7 GB of weights in 64 shards instead of 159.6 GB in 46. Its
-`compress_ratios` also begins `128, 128, 4, ...` where V4-Flash begins
-`0, 0, 4, 128, ...`, so the layer-to-group schedule differs and the layout has
-to be captured on Pro itself rather than copied from Flash.
+**DeepSeek-V4-Pro is the same shape as V4-Flash with different numbers.**
+`deepseek-ai/DeepSeek-V4-Pro` is `model_type: deepseek_v4` and runs the same
+`vllm/models/deepseek_v4/` package, so the group mechanism is identical; the
+shapes move to 61 layers, hidden 7168, 128 attention heads, 384 routed experts,
+`index_topk` 1024, `o_groups` 16 and 864.7 GB of weights in 64 shards. Captured
+on the real model (eight B300 cards, vLLM 0.33) the layout is five groups, all
+publishing:
+
+| group | kind | block | window | publication for a 1,024-token store |
+| --- | --- | --- | --- | --- |
+| 0, 1 | sliding_window_mla | 64 | 128 | 2 hashes (the resident tail) |
+| 2 | mla_attention | 256 | - | 4 hashes (the whole store), plus 4-token secondary pages |
+| 3 | sliding_window_mla | 8 | 128 | 16 hashes (the resident tail) |
+| 4 | sliding_window_mla | 4 | 8 | 2 hashes |
+
+Neither `compress_ratios` difference reaches the cache: the pages are the same
+`64, 64, 256, 8, 4` family as V4-Flash, the chain runs at 4 tokens (re-computing
+it with vLLM's own `sha256_cbor` matched the compressed group's four hashes at
+granularity 4 and none at 8 or above), and the engine's hit is
+`align_down(tokens - 1, 256)`: a 1,024-token prompt reports 768. With
+`hash_block_size` 4 the router credits 768 on the repeat, equal to the engine's
+own count, and 0 on the first attempt before the events arrive.
 
 **DeepSeek-V4.1-Flash is a third shape: bounded replay with one publishing
 group.** It runs on the same vLLM 0.33 from eight B300 SXM6 cards (510.3 GB in
