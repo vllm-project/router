@@ -40,7 +40,7 @@ steps:
           bash -euo pipefail <<'BASH'
           export MORIIO_READ_MODE=true
           export LM_EVAL_LIMIT=20
-          export LM_EVAL_BASELINE=0.35
+          export LM_EVAL_BASELINE=0.38
           export MORIIO_BACKEND=xgmi
           export MODEL_NAMES=Qwen/Qwen3-0.6B
           export ROUTER_BIN=/workdir/target/release/vllm-router
