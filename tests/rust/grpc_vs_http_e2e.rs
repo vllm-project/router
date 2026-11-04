@@ -210,7 +210,7 @@ mod prefill_progress_regressions {
                 } else {
                     None
                 };
-                assert_eq!(h.slots.decode_context_tokens(&h.target), Some(0));
+                assert_eq!(h.slots.decode_context_tokens(&h.target), None);
                 h.output("hello", false).await;
                 wait_until(|| h.slots.decode_context_tokens(&h.target) == Some(101)).await;
                 h.output(" world", false).await;
@@ -228,6 +228,64 @@ mod prefill_progress_regressions {
                 assert_eq!(h.slots.decode_context_tokens(&h.target), Some(0));
                 assert_eq!(h.slots.sample(&h.target), LoadSample::default());
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn grpc_progress_capability_refreshes_after_upgrade_and_downgrade() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let capability = Arc::new(AtomicBool::new(false));
+        let server = MockVllmRsServer::spawn_with_state(MockVllmRs {
+            progress_capability_override: Some(capability.clone()),
+            ..Default::default()
+        })
+        .await;
+        let mut config = test_config(vec![server.grpc_url.clone()]);
+        config.policy = PolicyConfig::KvAware {
+            router_temperature: 0.0,
+            kv_penalty_host: 0.8,
+            kv_penalty_external: 0.6,
+            kv_penalty_disk: 0.3,
+            static_kv_event_sources: Default::default(),
+        };
+        config.prefill_progress_stale_after_secs = Some(5);
+        let ctx = create_test_context(config);
+        let router = Router::new(vec![server.grpc_url.clone()], &ctx)
+            .await
+            .unwrap();
+        router.pin_test_token_ids(vec![1; 100]);
+        let request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 8,
+        }))
+        .unwrap();
+
+        for (supported, expire, expected) in [
+            (false, false, false),
+            (true, false, false),
+            (true, true, true),
+            (false, false, true),
+            (false, true, false),
+        ] {
+            capability.store(supported, Ordering::Relaxed);
+            if expire {
+                tokio::time::pause();
+                tokio::time::advance(Duration::from_secs(31)).await;
+                tokio::time::resume();
+            }
+            let response = router
+                .route_typed_request(None, &request, "/v1/chat/completions", None)
+                .await;
+            assert!(response.status().is_success());
+            let _ = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert_eq!(
+                server.captured().last().unwrap().include_prefill_progress,
+                expected
+            );
         }
     }
 

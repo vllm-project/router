@@ -8,7 +8,7 @@
 #![allow(dead_code)]
 
 use std::pin::Pin;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -73,6 +73,8 @@ pub struct MockVllmRs {
     pub aborts: Arc<Mutex<Vec<String>>>,
     /// `ServerInfo.supports_prefill_progress`.
     pub supports_prefill_progress: bool,
+    /// Optional mutable capability for worker upgrade/downgrade tests.
+    pub progress_capability_override: Option<Arc<AtomicBool>>,
     /// Remaining-work snapshots sent, in order, before `reply_delay` on
     /// streams that opted into prefill progress.
     pub prefill_progress: Vec<u32>,
@@ -136,6 +138,7 @@ impl Default for MockVllmRs {
             aborted_finishes_remaining: Arc::new(AtomicUsize::new(0)),
             aborts: Arc::new(Mutex::new(Vec::new())),
             supports_prefill_progress: false,
+            progress_capability_override: None,
             prefill_progress: Vec::new(),
             hold: None,
         }
@@ -440,7 +443,10 @@ macro_rules! mock_control {
                 }
                 Ok(Response::new(pb::ServerInfo {
                     engine_version: "mock".into(),
-                    supports_prefill_progress: self.supports_prefill_progress,
+                    supports_prefill_progress: self.progress_capability_override.as_ref().map_or(
+                        self.supports_prefill_progress,
+                        |supported| supported.load(Ordering::Relaxed),
+                    ),
                     ..Default::default()
                 }))
             }

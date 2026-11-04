@@ -26,6 +26,8 @@ vllm-router --worker-urls grpc://worker:50051 \
 
 - Supported for regular gRPC pools.
 - Disabled by default. Workers without progress support continue using estimated load.
+- Worker support is rechecked on the first request after 30 seconds, so in-place
+  upgrades and downgrades are detected.
 - Set the stale threshold to at least 2 seconds and below `--request-timeout-secs`.
   This is a freshness threshold, not the worker's reporting interval.
 

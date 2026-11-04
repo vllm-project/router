@@ -44,6 +44,7 @@ use crate::protocols::spec::Usage;
 const DP_RANK_METADATA: &str = "x-data-parallel-rank";
 const STREAM_BUFFER_CAPACITY: usize = 32;
 const ENGINE_ABORT_RETRY_DELAY: Duration = Duration::from_millis(500);
+const PREFILL_PROGRESS_CAPABILITY_TTL: Duration = Duration::from_secs(30);
 
 pub(crate) type FirstOutputCallback = Arc<dyn Fn() + Send + Sync + 'static>;
 pub(crate) type GeneratedTokensCallback = Arc<dyn Fn(Option<u64>) + Send + Sync + 'static>;
@@ -57,8 +58,15 @@ pub(crate) enum PrefillProgressKind {
 
 pub(crate) type PrefillProgressCallback =
     Arc<dyn Fn(u64, u64, PrefillProgressKind) + Send + Sync + 'static>;
+
+#[derive(Clone)]
+struct PrefillProgressCapability {
+    supported: bool,
+    expires_at: tokio::time::Instant,
+}
+
 type PrefillProgressCapabilityCache =
-    Arc<DashMap<String, Arc<tokio::sync::OnceCell<Result<bool, String>>>>>;
+    Arc<DashMap<String, Arc<tokio::sync::OnceCell<Result<PrefillProgressCapability, String>>>>>;
 
 /// P/D fields layered on a prepared chat. Default is a colocated request.
 #[derive(Clone, Debug, Default)]
@@ -279,19 +287,16 @@ impl GrpcEngineBackend {
         Ok(channel)
     }
 
-    async fn supports_prefill_progress(&self, worker_url: &str) -> Result<bool, String> {
+    async fn supports_prefill_progress(
+        &self,
+        worker_url: &str,
+        channel: Channel,
+    ) -> Result<bool, String> {
         let uri = grpc_connect_uri(worker_url)?;
-        let connect_timeout = self.connect_timeout;
         cached_prefill_progress_capability(
             &self.prefill_progress_capabilities,
             uri.clone(),
             || async move {
-                let channel = Channel::from_shared(uri.clone())
-                    .map_err(|e| format!("invalid grpc uri {uri}: {e}"))?
-                    .connect_timeout(connect_timeout)
-                    .connect()
-                    .await
-                    .map_err(|e| format!("grpc control connect {uri}: {e}"))?;
                 let mut client = ControlClient::new(channel);
                 let mut request = tonic::Request::new(super::pb::GetServerInfoRequest {});
                 request.set_timeout(Duration::from_secs(5));
@@ -443,22 +448,6 @@ impl GrpcEngineBackend {
             }
         }
 
-        if include_prefill_progress {
-            let supported =
-                tokio::time::timeout_at(deadline, self.supports_prefill_progress(worker_url))
-                    .await
-                    .unwrap_or_else(
-                        |_| Err("prefill progress capability deadline exceeded".into()),
-                    );
-            apply_prefill_progress_capability(&mut proto, supported, worker_url);
-        }
-
-        let prefill_progress = PrefillProgressState::new(
-            engine_request_id,
-            on_prefill_progress.filter(|_| proto.include_prefill_progress),
-            self.prefill_progress_stale_after,
-        );
-
         let t_connect = Instant::now();
         let channel = match tokio::time::timeout_at(deadline, self.channel_for(worker_url)).await {
             Ok(Ok(c)) => c,
@@ -474,10 +463,27 @@ impl GrpcEngineBackend {
                     .into_response();
             }
         };
+        let grpc_connect_ms = t_connect.elapsed().as_secs_f64() * 1000.0;
+
+        if include_prefill_progress {
+            let supported = tokio::time::timeout_at(
+                deadline,
+                self.supports_prefill_progress(worker_url, channel.clone()),
+            )
+            .await
+            .unwrap_or_else(|_| Err("prefill progress capability deadline exceeded".into()));
+            apply_prefill_progress_capability(&mut proto, supported, worker_url);
+        }
+
+        let prefill_progress = PrefillProgressState::new(
+            engine_request_id,
+            on_prefill_progress.filter(|_| proto.include_prefill_progress),
+            self.prefill_progress_stale_after,
+        );
+
         let mut abort =
             EngineAbortGuard::new(&channel, abort_request_id.as_deref(), self.connect_timeout);
         let mut client = InferenceClient::new(channel);
-        let grpc_connect_ms = t_connect.elapsed().as_secs_f64() * 1000.0;
 
         let mut tonic_req = tonic::Request::new(proto);
         tonic_req.set_timeout(deadline.saturating_duration_since(tokio::time::Instant::now()));
@@ -1192,7 +1198,7 @@ fn apply_prefill_progress_capability(
 }
 
 async fn cached_prefill_progress_capability<F, Fut>(
-    cache: &DashMap<String, Arc<tokio::sync::OnceCell<Result<bool, String>>>>,
+    cache: &DashMap<String, Arc<tokio::sync::OnceCell<Result<PrefillProgressCapability, String>>>>,
     uri: String,
     probe: F,
 ) -> Result<bool, String>
@@ -1200,11 +1206,28 @@ where
     F: FnOnce() -> Fut,
     Fut: Future<Output = Result<bool, String>>,
 {
-    let cell = cache
-        .entry(uri.clone())
-        .or_insert_with(|| Arc::new(tokio::sync::OnceCell::new()))
+    let cell = {
+        let mut entry = cache
+            .entry(uri.clone())
+            .or_insert_with(|| Arc::new(tokio::sync::OnceCell::new()));
+        if entry.value().get().is_some_and(|result| {
+            result
+                .as_ref()
+                .is_ok_and(|snapshot| snapshot.expires_at <= tokio::time::Instant::now())
+        }) {
+            *entry = Arc::new(tokio::sync::OnceCell::new());
+        }
+        Arc::clone(entry.value())
+    };
+    let result = cell
+        .get_or_init(|| async {
+            probe().await.map(|supported| PrefillProgressCapability {
+                supported,
+                expires_at: tokio::time::Instant::now() + PREFILL_PROGRESS_CAPABILITY_TTL,
+            })
+        })
+        .await
         .clone();
-    let result = cell.get_or_init(probe).await.clone();
 
     if result.is_err() {
         if let dashmap::mapref::entry::Entry::Occupied(entry) = cache.entry(uri) {
@@ -1214,7 +1237,7 @@ where
         }
     }
 
-    result
+    result.map(|snapshot| snapshot.supported)
 }
 
 fn has_generated_output(msg: &super::pb::GenerateResponse, text: &str) -> bool {
@@ -1228,7 +1251,7 @@ mod tests {
     use super::*;
     use crate::backend::pb::{GenerateResponse, PromptInfo, SequenceOutput};
     use crate::policies::{InMemorySlotManager, KvRequestSlot, LoadProvider, SlotManager};
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     fn progress(sequence: u64, remaining: u32) -> GenerateResponse {
         GenerateResponse {
@@ -1718,6 +1741,111 @@ mod tests {
             Ok(true)
         );
         assert_eq!(probe_count.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn capability_cache_refreshes_after_worker_upgrades_and_downgrades() {
+        let cache = DashMap::new();
+        let supported = AtomicBool::new(false);
+        let probes = AtomicUsize::new(0);
+        let probe = || async {
+            probes.fetch_add(1, Ordering::Relaxed);
+            Ok(supported.load(Ordering::Relaxed))
+        };
+
+        assert!(
+            !cached_prefill_progress_capability(&cache, "worker".into(), probe)
+                .await
+                .unwrap()
+        );
+        supported.store(true, Ordering::Relaxed);
+        tokio::time::advance(PREFILL_PROGRESS_CAPABILITY_TTL - Duration::from_millis(1)).await;
+        assert!(
+            !cached_prefill_progress_capability(&cache, "worker".into(), probe)
+                .await
+                .unwrap()
+        );
+        assert_eq!(probes.load(Ordering::Relaxed), 1);
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert!(
+            cached_prefill_progress_capability(&cache, "worker".into(), probe)
+                .await
+                .unwrap()
+        );
+        supported.store(false, Ordering::Relaxed);
+        assert!(
+            cached_prefill_progress_capability(&cache, "worker".into(), probe)
+                .await
+                .unwrap()
+        );
+        tokio::time::advance(PREFILL_PROGRESS_CAPABILITY_TTL).await;
+        assert!(
+            !cached_prefill_progress_capability(&cache, "worker".into(), probe)
+                .await
+                .unwrap()
+        );
+        assert_eq!(probes.load(Ordering::Relaxed), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn concurrent_expired_capability_probes_share_one_refresh() {
+        let cache = Arc::new(DashMap::new());
+        assert!(
+            !cached_prefill_progress_capability(&cache, "worker".into(), || async { Ok(false) })
+                .await
+                .unwrap()
+        );
+        tokio::time::advance(PREFILL_PROGRESS_CAPABILITY_TTL).await;
+        let probes = Arc::new(AtomicUsize::new(0));
+        let mut requests = Vec::new();
+        for _ in 0..16 {
+            let cache = cache.clone();
+            let probes = probes.clone();
+            requests.push(tokio::spawn(async move {
+                cached_prefill_progress_capability(&cache, "worker".into(), || async move {
+                    probes.fetch_add(1, Ordering::Relaxed);
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    Ok(true)
+                })
+                .await
+            }));
+        }
+        for request in requests {
+            assert_eq!(request.await.unwrap(), Ok(true));
+        }
+        assert_eq!(probes.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn failed_old_probe_does_not_remove_a_replacement_capability() {
+        let cache = Arc::new(DashMap::new());
+        let (started_tx, started_rx) = oneshot::channel();
+        let (finish_tx, finish_rx) = oneshot::channel();
+        let old_cache = cache.clone();
+        let old_probe = tokio::spawn(async move {
+            cached_prefill_progress_capability(&old_cache, "worker".into(), || async {
+                started_tx.send(()).unwrap();
+                finish_rx.await.unwrap();
+                Err("unavailable".into())
+            })
+            .await
+        });
+        started_rx.await.unwrap();
+        cache.remove("worker");
+        assert!(
+            cached_prefill_progress_capability(&cache, "worker".into(), || async { Ok(true) })
+                .await
+                .unwrap()
+        );
+        finish_tx.send(()).unwrap();
+        assert_eq!(old_probe.await.unwrap(), Err("unavailable".into()));
+        assert!(
+            cached_prefill_progress_capability(&cache, "worker".into(), || async {
+                panic!("a replacement capability must remain cached")
+            })
+            .await
+            .unwrap()
+        );
     }
 
     #[test]

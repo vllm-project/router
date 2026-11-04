@@ -363,7 +363,7 @@ pub struct LoadSample {
 pub trait LoadProvider: Send + Sync {
     fn sample(&self, target: &RoutableTarget) -> LoadSample;
 
-    /// Sum of live decode context lengths, or `None` if any length is unknown.
+    /// Sum of live decode context lengths, or `None` if they are unknown.
     fn decode_context_tokens(&self, _target: &RoutableTarget) -> Option<u64> {
         None
     }
@@ -421,6 +421,7 @@ struct SlotCounters {
     active_prefill_tokens: AtomicU64,
     active_requests: AtomicUsize,
     decode_context_tokens: AtomicU64,
+    known_decode_contexts: AtomicUsize,
     unknown_decode_contexts: AtomicUsize,
     // Legacy callers cannot supply a decode length. Until the target drains,
     // retain this conservative marker rather than treating the length as zero.
@@ -453,6 +454,7 @@ impl InMemorySlotManager {
             if slot.active_requests.load(Ordering::Acquire) == 0
                 && slot.active_prefill_tokens.load(Ordering::Acquire) == 0
                 && slot.decode_context_tokens.load(Ordering::Acquire) == 0
+                && slot.known_decode_contexts.load(Ordering::Acquire) == 0
                 && slot.unknown_decode_contexts.load(Ordering::Acquire) == 0
             {
                 // The occupied entry keeps the shard locked between checking
@@ -491,9 +493,13 @@ impl LoadProvider for InMemorySlotManager {
         let Some(slot) = self.slots.get(target) else {
             return Some(0);
         };
+        // Active requests that have not produced output have no reported
+        // decode context yet, rather than a known context of zero.
         (slot.unknown_decode_contexts.load(Ordering::Acquire) == 0
-            && !slot.legacy_decode_unknown.load(Ordering::Acquire))
-        .then(|| slot.decode_context_tokens.load(Ordering::Acquire))
+            && !slot.legacy_decode_unknown.load(Ordering::Acquire)
+            && (slot.active_requests.load(Ordering::Acquire) == 0
+                || slot.known_decode_contexts.load(Ordering::Acquire) > 0))
+            .then(|| slot.decode_context_tokens.load(Ordering::Acquire))
     }
 }
 
@@ -505,7 +511,8 @@ fn replace_decode_context(slot: &SlotCounters, old: DecodeContext, new: DecodeCo
         DecodeContext::Inactive => {}
         DecodeContext::Unknown => atomic_saturating_sub_usize(&slot.unknown_decode_contexts, 1),
         DecodeContext::Known(tokens) => {
-            atomic_saturating_sub_u64(&slot.decode_context_tokens, tokens)
+            atomic_saturating_sub_u64(&slot.decode_context_tokens, tokens);
+            atomic_saturating_sub_usize(&slot.known_decode_contexts, 1);
         }
     }
     match new {
@@ -514,6 +521,7 @@ fn replace_decode_context(slot: &SlotCounters, old: DecodeContext, new: DecodeCo
             slot.unknown_decode_contexts.fetch_add(1, Ordering::AcqRel);
         }
         DecodeContext::Known(tokens) => {
+            slot.known_decode_contexts.fetch_add(1, Ordering::AcqRel);
             slot.decode_context_tokens
                 .fetch_add(tokens, Ordering::AcqRel);
         }
@@ -1877,11 +1885,14 @@ impl KvAwarePolicy {
                 (position, context)
             })
             .collect();
-        if contexts.iter().any(|(_, context)| context.is_none()) {
+        let any_known_active = contexts.iter().any(|(position, context)| {
+            candidates[*position].load.active_requests > 0 && context.is_some()
+        });
+        if !any_known_active || contexts.iter().any(|(_, context)| context.is_none()) {
             metrics::counter!("vllm_router_kv_aware_decode_tie_break_total", "outcome" => "unknown")
                 .increment(1);
-            // Do not treat a missing context as zero or penalize a legacy
-            // worker. Keep the previous picker when values cannot be compared.
+            // Keep the previous picker until active workers have reported
+            // comparable contexts, including for legacy HTTP workers.
             if chosen_cost == 0.0
                 && (self.params.router_temperature <= 0.0
                     || eligible_costs.iter().all(|cost| *cost == 0.0))
@@ -2545,7 +2556,7 @@ mod tests {
         let worker = target("worker", 0);
         manager.begin_prefill(&worker, 64);
         let slot = KvRequestSlot::new(manager.clone(), worker.clone(), 64, Some(1000), None);
-        assert_eq!(manager.decode_context_tokens(&worker), Some(0));
+        assert_eq!(manager.decode_context_tokens(&worker), None);
 
         slot.record_generated_tokens(Some(1));
         slot.begin_decode(); // The consumer can also observe the first frame.
@@ -2554,7 +2565,7 @@ mod tests {
         assert_eq!(manager.sample(&worker).active_prefill_tokens, 0);
 
         slot.update_prefill_progress(1, 20);
-        assert_eq!(manager.decode_context_tokens(&worker), Some(0));
+        assert_eq!(manager.decode_context_tokens(&worker), None);
         assert_eq!(manager.sample(&worker).active_prefill_tokens, 20);
         slot.record_generated_tokens(Some(2));
         assert_eq!(manager.decode_context_tokens(&worker), Some(1006));
@@ -2666,6 +2677,65 @@ mod tests {
             policy.pick_position(&[1.0, 1.0], &candidates, None),
             Some(0)
         );
+    }
+
+    #[test]
+    fn equal_scores_preserve_the_previous_picker_until_decode_is_observed() {
+        let policy = KvAwarePolicy::new(CostParams::default());
+        let manager = policy.slot_manager().unwrap();
+        let first = target("first", 0);
+        let second = target("second", 0);
+        let views = || {
+            [&first, &second].map(|worker| CandidateView {
+                target: worker,
+                matches: &[],
+                load: manager.sample(worker),
+                input_tokens: 0,
+                prefill_tokens: None,
+            })
+        };
+
+        // Even an all-idle zero-cost tie keeps the former deterministic pick.
+        for _ in 0..32 {
+            assert_eq!(policy.pick_position(&[0.0, 0.0], &views(), None), Some(0));
+        }
+
+        // Both a gRPC request with a prompt length and a legacy HTTP request
+        // lack a decode observation before their first output.
+        manager.begin_prefill(&first, 0);
+        manager.begin_prefill(&first, 0);
+        manager.begin_prefill(&second, 0);
+        let grpc = KvRequestSlot::new(manager.clone(), first.clone(), 0, Some(100), None);
+        let http = KvRequestSlot::new(manager.clone(), second.clone(), 0, None, None);
+        assert_eq!(manager.decode_context_tokens(&first), None);
+        assert_eq!(manager.decode_context_tokens(&second), None);
+        for _ in 0..32 {
+            assert_eq!(policy.pick_position(&[0.0, 0.0], &views(), None), Some(1));
+        }
+
+        // An observed context cannot be compared to an unknown HTTP context.
+        grpc.record_generated_tokens(Some(1));
+        assert_eq!(manager.decode_context_tokens(&first), Some(101));
+        assert_eq!(policy.pick_position(&[0.0, 0.0], &views(), None), Some(1));
+
+        grpc.release();
+        http.release();
+        manager.free(&first);
+        assert_eq!(manager.decode_context_tokens(&first), Some(0));
+        assert_eq!(manager.decode_context_tokens(&second), Some(0));
+    }
+
+    #[test]
+    fn reported_zero_decode_context_is_known() {
+        let manager = Arc::new(InMemorySlotManager::new());
+        let worker = target("worker", 0);
+        manager.begin_prefill(&worker, 0);
+        let slot = KvRequestSlot::new(manager.clone(), worker.clone(), 0, Some(0), None);
+        assert_eq!(manager.decode_context_tokens(&worker), None);
+        slot.begin_decode();
+        assert_eq!(manager.decode_context_tokens(&worker), Some(0));
+        slot.release();
+        assert_eq!(manager.decode_context_tokens(&worker), Some(0));
     }
 
     #[test]
