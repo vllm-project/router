@@ -11,13 +11,14 @@ Status: **draft, not production-ready**. The design is in the [English RFC](hybr
 
 ### This revision
 
-- **Group-complete credit.** Credit is the boundary that every declared group
-  can restore, so one group with a non-empty hash namespace cannot carry the
-  prefix alone. A checkpoint group that publishes an empty hash list for a
-  reused chunk keeps the stream valid but contributes no residency. Sliding
-  groups only have to cover the window that ends at the boundary, and each
-  group's own block size and checkpoint alignment are applied before the
-  boundary is rounded to the hash block.
+- **Group-complete credit.** Credit is the smallest hit any declared group
+  reports, so one group with a non-empty hash namespace cannot carry the prefix
+  alone, and a group that proves nothing drops the credit to zero. A checkpoint
+  group that publishes an empty hash list for a reused chunk keeps the stream
+  valid but contributes no residency. Sliding groups cover the window that ends
+  at their own hit, each group's own block size and checkpoint alignment are
+  applied to its hit, and the smallest hit is then pulled down by the cumulative
+  groups' granularity before the replay window is subtracted.
 - **Layout replay window.** `prefix_replay_tokens` is a property of the whole
   layout, not of one group. All bounded-replay sliding/MLA groups must declare
   the same window or the rank is rejected; groups that are not prefix-cacheable
@@ -111,7 +112,7 @@ a whole node is requested.
 | Qwen3.6-35B-A3B | real weights | 1088 | 0-2 mamba, 3 full | 2176 | 4352 (2 repeats) | equal |
 | Qwen3.8-27B | real weights | 832 | 0-2 mamba, 3 full | 1664 | 3328 (2 repeats) | equal |
 | Qwen4Exp | dummy weights, real config | 192 | 0-2 mamba, 3 scratch ring (no events), 4 compressed MLA | 576 | 1152 (2 repeats) | equal |
-| DeepSeek-V4-Flash | real weights, TP=2 | 256 | 0,1,4 sliding-window MLA (64), 2 compressed MLA (256), 3 sliding-window MLA (4) | 0 | 1536 (2 repeats) | rejected, see below |
+| DeepSeek-V4-Flash | real weights, TP=2 | 256 | 0,1,4 sliding-window MLA (64), 2 compressed MLA (256), 3 sliding-window MLA (4) | 768 | 1536 (2 repeats) | equal |
 
 The four Qwen3.x runs used a layout with declared endpoints. The Qwen4Exp and
 V4 runs used a layout with **no** endpoints, so the router discovered the
@@ -126,40 +127,50 @@ work at all on 0.33:
   filtered out and the worker fell back to load-only scoring with
   `error=hybrid capability has no event sources`.
 
-**DeepSeek-V4-Flash is not yet representable.** Its engine does serve the same
-contract (five groups, prefix reuse of 768 tokens per repeat) but two layout
-properties break the single-hash-chain model this PR implements:
+**DeepSeek-V4-Flash needed a different credit rule, not a different
+chain.** Its engine serves the same `sha256_cbor` contract and reuses 768 tokens
+per repeat, but three properties broke the first implementation:
 
-- Page sizes are per group (`64, 64, 256, 4, 8`) and three of them are below
-  the engine's own 256-token hash block. A layout is only admitted when one
-  `hash_block_size` divides every group block, which here forces
-  `hash_block_size=4`. With the natural `256` the rank is rejected with
-  `invalid group layout`.
-- Replay windows differ per group (`128` for the sparse-attention and compressor
-  groups, `8` for the indexer group). The layout contract allows one replay
-  window shared by every replay group, so declaring the real windows is
-  rejected with `unsupported group restore contract`.
+- Page sizes are per group (`64, 64, 256, 4, 8`) and three are below the
+  engine's own 256-token request block. A layout is only admitted when one
+  `hash_block_size` divides every group block, which forces
+  `hash_block_size=4`; with the natural `256` the rank is rejected with
+  `invalid group layout`. Four is the engine's real chain granularity: every
+  published hash equals the chain hash at the end of the group's block, which a
+  re-computation with vLLM's own `sha256_cbor` confirmed for all five groups.
+- Sliding groups publish only the blocks they keep. A 1,024-token store
+  publishes 2 hashes for the 64-token groups, 2 for the 8-token-window group and
+  16 for the 8-token-block group, next to events with none at all, so the shape
+  rule `len(block_hashes) * block_size == len(token_ids)` refused every batch
+  with `error=InvalidBatch`.
+- One group index publishes two page sizes: group 2 stores its 256-token blocks
+  and also 4-token compressor pages.
 
-Forcing `hash_block_size=4` and zero replay windows admits the rank, and then
-the events are refused: every batch is dropped with `error=InvalidBatch`. A ZMQ
-capture of the same engine shows why the shape is different, not just the
-sizes:
+Accepting the tail shape and ignoring the secondary pages made the events apply.
+Credit was still 0, and the calibration runs show why: the router required one
+boundary that every group accepts, while the engine measures each group on its
+own and keeps the smallest. With 1,024-token prompts the sliding tails only
+cover the window that ends at 1,024, so a shared boundary of 768 (what the
+256-token group restores) was rejected by the router and credited 0, while the
+engine reported 768 per repeat. The prefix-subset runs pin the rule down: after a
+1,024-token prompt is cached, a 704-token prefix of it hits 0 on its first
+attempt (the sliding tail does not cover 704) and then 512 on its own repeat
+(the 256-token group's granularity), so the engine keeps each group's own hit
+and does not re-check the window at a shorter boundary.
 
-| group | kind | window | block | published hashes for a 1024-token store |
-| --- | --- | --- | --- | --- |
-| 0, 1 | sliding_window_mla | 128 | 64 | 2 (the resident window), plus one event with 0 hashes |
-| 2 | mla_attention | - | 256 | 4 (the whole store) |
-| 2 | mla_attention | - | 4 | 1 (a 4-token compressed page, same group index) |
-| 3 | sliding_window_mla | 8 | 4 | 2 (the resident window), plus one event with 0 hashes |
-| 4 | sliding_window_mla | 128 | 8 | 16 (the resident window) |
+`common_reusable_tokens` now does the same: each group reports the longest
+prefix its own rule accepts, rounded to its own block; the credit is the
+smallest of those, capped at `len(tokens) - 1`, pulled down by the cumulative
+groups' granularity, and reduced by the replay window. The same rule reproduces
+the engine on every V4 length tried, and leaves the Qwen rows above unchanged:
 
-So a sliding-window group publishes `window/block` hashes, not one hash per
-block of the token range, and the same group index can publish two page sizes
-(`256` and `4`). The event carries `parent_block_hash`, which is what a
-bounded publication would have to anchor on: the chain does not start at the
-root, and this implementation only derives keys from the root. The router
-therefore credits 0 while the engine reports 1536 cached tokens: fail-closed,
-no false hits, but no reuse either.
+| prompt | first attempt | repeat | engine hits per repeat |
+| --- | --- | --- | --- |
+| 769 | 0 | 768 | 768 |
+| 1,024 | 0 | 768 | 768 |
+| 1,536 | 768 | 1,280 | 1,280 |
+| 2,048 | 1,280 | 1,792 | 1,792 |
+| 704 (prefix of a cached 1,024) | 0 | 512 | 512 |
 
 **DeepSeek-V4-Pro shares the V4-Flash code path but not its layout.**
 `deepseek-ai/DeepSeek-V4-Pro` reports `model_type: deepseek_v4` and runs

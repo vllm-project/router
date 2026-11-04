@@ -158,7 +158,9 @@ Router consumes the existing ZMQ stream: a MessagePack payload `[timestamp, [eve
 |---|---|
 | Attention (full or compressed) | `len(block_hashes) * block_size == len(token_ids)` |
 | Mamba checkpoint | `len(block_hashes) * block_size <= len(token_ids)`, including zero |
-| Sliding window | Event window equals the declared window; hashes cover the stored range |
+| Sliding window | Event window equals the declared window; hashes cover at most the stored range |
+
+A sliding-window group keeps only its resident tail, so its events name the whole stored range and publish just the blocks that survived (`len(block_hashes) * block_size <= len(token_ids)`, including zero when nothing new is stored). One group index may also publish several page sizes; the layout indexes the declared one and treats the smaller pages as the same group's sub-block detail rather than a second group.
 
 Events are applied per batch and atomically: one malformed or contradictory event rejects the batch, and the rank's credit is revoked until a clean replay succeeds. Events for undeclared groups are not evidence and cannot contribute; events for a group whose declared block size does not divide the hash block are rejected as a layout error, not a data error.
 
@@ -177,12 +179,15 @@ Batches containing many prompts are evaluated independently: each prompt's bound
 
 For request tokens on a candidate `(worker, rank)`:
 
-1. For each declared group, find the longest resident prefix of the request's token hashes.
-2. Take the minimum across groups: beyond that offset at least one group is missing.
+1. For each declared group, find the longest prefix that group's own restore rule accepts, and round it down to that group's block size.
+2. Take the minimum across groups: that is the hit each group is measured against.
 3. Cap at `len(tokens) - 1`, because the engine recomputes the final token.
-4. Subtract `prefix_replay_tokens`, then align down to `hash_block_size`.
+4. Pull the result down to what cumulative groups (dense, compressed, checkpointed) can still restore from their oldest state; a sliding-window group is not re-checked, because its resident blocks are anchored at the hit it reported.
+5. Subtract `prefix_replay_tokens`, then align down to `hash_block_size`.
 
 Worked example: 2,048 tokens, `hash_block_size` 576, all groups resident to 1,728, replay window 0. Credit is 1,728 (three blocks); estimated prefill is 320 tokens. With a 576-token replay window the same boundary credits 1,152.
+
+A layout with unequal block sizes shows why step 1 is per group: on a 1,024-token prompt DeepSeek-V4 keeps 64-token sliding tails at 896–1,024, 8-token tails at 1,016–1,024 and 256-token compressed blocks from the root. The sliding groups report 1,024, the compressed group reports 1,024, the last-token cap makes it 1,023, and the compressed group's 256-token granularity pulls the credit to 768 — which is what the engine restores and reports as its hit.
 
 The result is returned as one local-GPU match `segments: [(0, blocks)]`, and existing scoring computes `new_prefill_tokens = input_tokens - blocks * hash_block_size`. The cost model is unchanged by design: only the credited-token input moves, so hybrid routing composes with load, reservation and retry exactly as the full-attention path does, and no second accounting path exists to drift.
 
@@ -221,9 +226,10 @@ A model family is expressible when its engine publishes one hash chain per group
 |---|---|---|
 | Qwen3.5 / Qwen3.6 / Qwen3.8 | 3 Mamba checkpoints + full attention, one block size | Yes |
 | Qwen4 (QSA) | 3 Mamba + compressed MLA + per-request scratch ring | Yes; the ring is declared non-cacheable and excluded |
-| DeepSeek V4-class | Sparse-attention sliding windows with per-group page sizes (4, 8, 64, 256), bounded publication of the resident window anchored at `parent_block_hash` | No; see the note below |
+| DeepSeek V4 | Sparse-attention sliding windows with per-group page sizes (4, 8, 64, 256) and window-anchored publication | Yes at `hash_block_size` 4 |
+| DeepSeek V4.1 | The same pages plus a bounded replay window on every sliding group | Yes; the replay window is charged to the layout |
 
-For the first two families the layout is a direct description of what the engine maintains. For V4-class engines two published properties are outside the model: pages smaller than the hash block (one chain per rank cannot carry them) and a publication bounded to the resident window rather than the stored range. Expressing them requires per-group chains and anchoring on `parent_block_hash`, which is future work (§15), not a layout the operator can write today.
+For the first two families the layout is a direct description of what the engine maintains. V4-class engines need a hash granularity that divides every page size, which is why the layout declares `hash_block_size` 4 for a 4/8/64/256 layout: group hashes are then the chain hash at each group block's end, exactly the view the engine publishes. Their sliding groups publish only the tail blocks they keep, and one group index also publishes smaller pages next to the declared ones; both are handled by the event contract in §6, and the per-group hits in §8 are what makes the credit match the engine's own count.
 
 ## 12. Compatibility and failure behaviour
 
@@ -231,7 +237,7 @@ For the first two families the layout is a direct description of what the engine
 |---|---|
 | Feature off, or no layout | Existing routing; nonzero-group events are rejected, so a hybrid model cannot inherit group-0 credit |
 | Full-attention model | Existing KV-aware path, byte-for-byte unchanged |
-| Declared layout, trusted stream | Multi-group common boundary |
+| Declared layout, trusted stream | Smallest per-group hit, minus the replay window |
 | Unknown layout, missing group, untrusted stream, unsupported hash | Zero hybrid credit, load-based routing |
 | Layout/topic/root-hash mismatch | Source rejected, credit zero, reason logged |
 | P/D pair not declared compatible | Hybrid credit disabled for that pair |
@@ -245,8 +251,8 @@ Rollout is by configuration: the layout flag turns the feature on per worker, so
 | Credit from attention groups only, with a penalty for hybrid models | Over-credits by construction; the failure (recomputation) is invisible in router metrics |
 | Infer the layout from observed events | Events prove presence, never completeness; a missing group would be silently treated as not required |
 | Trust engine-reported hit counts | Reported after execution; routing needs a per-candidate estimate before dispatch |
-| Force one small hash block to fit every group | Does not fix bounded or window-anchored publication; inflates hash work and index size for the common case |
-| Per-group hash chains now | Only V4-class engines need them, and their publication is bounded by the window, so chains alone would not make the events representable |
+| Force one small hash block to fit every group | Rejected in the first version: it does not fix window-anchored publication, and it inflates hash work and index size. A window layout does need a granularity that divides every page size, which is why V4 declares 4 rather than reusing its request block |
+| Per-group hash chains | Not needed: one chain at the finest granularity already carries every group's view, and the engine computes the same view |
 
 ## 14. Validation
 
@@ -262,7 +268,6 @@ The design is validated against an invariant rather than a proxy: for a request 
 
 ## 15. Future work
 
-- **Per-group hash chains.** Accept per-group page sizes and publications anchored at `parent_block_hash`, which is what V4-class engines need before their layouts become expressible.
 - **Generation fencing.** Bind residency to a process lifetime from a deployment-supplied identity instead of inferring it from topics and sequences.
 - **Cross-worker and cross-tier composition.** Credit a prefix assembled from several holders, once transfer cost can be modelled.
 - **Snapshot recovery.** Repair a truncated replay from a later snapshot instead of revoking a source until a clean replay succeeds.
