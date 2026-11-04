@@ -1610,6 +1610,55 @@ mod tests {
         assert_eq!(index.reusable_tokens(&tokens, usize::MAX), 768);
     }
 
+    /// The event shape a DeepSeek V4.1 layout publishes: one 128-token
+    /// compressed group carries the whole prefix and the sliding groups publish
+    /// nothing, so the layout charges their shared replay window instead.
+    #[test]
+    fn bounded_replay_credits_one_window_below_the_engine() {
+        let tokens: Vec<u32> = (0..1024).map(|i| 100 + i % 100).collect();
+        let keys = BlockKeyGenerator::new(128, 0).generate_block_keys(&tokens);
+        let groups = vec![HybridEventGroup {
+            group_idx: 5,
+            block_size: 128,
+            kind: HybridGroupKind::CompressedFullAttention {
+                tokens_per_state: 1,
+            },
+        }];
+        let index = HybridEventIndex::new(target(), groups, 128, 0, 4096)
+            .unwrap()
+            .with_replay_tokens(128)
+            .unwrap();
+        index.begin_empty(0);
+        let batch = KVEventBatch {
+            ts: 1.0,
+            data_parallel_rank: Some(0),
+            events: vec![KVEvent::BlockStored(BlockStored {
+                block_hashes: keys
+                    .iter()
+                    .map(|hash| ExternalBlockHash::Bytes(hash.to_vec()))
+                    .collect(),
+                parent_block_hash: None,
+                token_ids: tokens.clone(),
+                block_size: 128,
+                lora_id: None,
+                medium: Some("GPU".into()),
+                lora_name: None,
+                extra_keys: None,
+                group_idx: Some(5),
+                kv_cache_spec_kind: Some("mla_attention".into()),
+                kv_cache_spec_sliding_window: None,
+                locality: None,
+                ownership: None,
+                session_id: None,
+            })],
+        };
+        assert_eq!(index.apply_batch(0, &batch), Ok(()));
+        // The engine reports 896 for a 1,024-token repeat (the last whole block
+        // under the last-token bound) and replays the trailing window on top of
+        // it, so the reusable amount is one window lower.
+        assert_eq!(index.reusable_tokens(&tokens, usize::MAX), 768);
+    }
+
     #[test]
     fn another_dp_rank_never_answers_for_this_rank() {
         use crate::policies::TieredMatchProvider;
