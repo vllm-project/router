@@ -107,10 +107,10 @@ a whole node is requested.
 
 | model | how it ran | block | group layout (idx: kind) | credit/repeat | engine hits | verdict |
 | --- | --- | --- | --- | --- | --- | --- |
-| Qwen3.5-4B | 2x DP, real weights | 576 | 0-2 mamba, 3 full | 1152 | 3456 (3 repeats) | equal per repeat; the first request credited 0 before events arrived |
-| Qwen3.5-35B-A3B | real weights | 1088 | 0-2 mamba, 3 full | 2176 | 4352 (2 repeats) | equal |
+| Qwen3.5-4B | real weights, TP1 | 576 | 0-2 mamba, 3 full | 1728 | 3456 (2 repeats) | equal per repeat; the first request credited 0 before events arrived |
+| Qwen3.5-35B-A3B | real weights | 1088 | 0-2 mamba, 3 full | 3264 | 6528 (2 repeats) | equal |
 | Qwen3.6-35B-A3B | real weights | 1088 | 0-2 mamba, 3 full | 2176 | 4352 (2 repeats) | equal |
-| Qwen3.8-27B | real weights | 832 | 0-2 mamba, 3 full | 1664 | 3328 (2 repeats) | equal |
+| Qwen3.8-27B | real weights | 832 | 0-2 mamba, 3 full | 2496 | 4992 (2 repeats) | equal |
 | Qwen4Exp | dummy weights, real config | 192 | 0-2 mamba, 3 scratch ring (no events), 4 compressed MLA | 576 | 1152 (2 repeats) | equal |
 | DeepSeek-V4-Flash | real weights, TP=2 | 256 | 0,1,4 sliding-window MLA (64), 2 compressed MLA (256), 3 sliding-window MLA (4) | 768 | 1536 (2 repeats) | equal |
 
@@ -161,16 +161,28 @@ and does not re-check the window at a shorter boundary.
 `common_reusable_tokens` now does the same: each group reports the longest
 prefix its own rule accepts, rounded to its own block; the credit is the
 smallest of those, capped at `len(tokens) - 1`, pulled down by the cumulative
-groups' granularity, and reduced by the replay window. The same rule reproduces
-the engine on every V4 length tried, and leaves the Qwen rows above unchanged:
+groups' granularity, and reduced by the replay window. Driving the router with
+three lengths, three attempts each and comparing the engine's per-request hit
+delta with `credited_prefix_tokens` gives equality on all nine requests, and the
+same rule leaves the Qwen rows above unchanged:
 
-| prompt | first attempt | repeat | engine hits per repeat |
+| prompt | attempt 1 | attempt 2 | attempt 3 |
 | --- | --- | --- | --- |
-| 769 | 0 | 768 | 768 |
-| 1,024 | 0 | 768 | 768 |
-| 1,536 | 768 | 1,280 | 1,280 |
-| 2,048 | 1,280 | 1,792 | 1,792 |
-| 704 (prefix of a cached 1,024) | 0 | 512 | 512 |
+| 769 | 0 / 0 | 768 / 768 | 768 / 768 |
+| 1,025 | 768 / 768 | 1,024 / 1,024 | 1,024 / 1,024 |
+| 1,537 | 1,024 / 1,024 | 1,536 / 1,536 | 1,536 / 1,536 |
+
+Each cell is the engine's hit delta over the router's credit for that request.
+The overlapping prefixes are why attempt 1 is not always zero: a 1,025-token
+request finds the 768 tokens the previous 769-token prompt stored, and a
+1,537-token request finds the 1,024 the 1,025 one stored.
+
+A separate engine-only calibration pins the rule where the two models disagree:
+after a 1,024-token prompt is cached, a 704-token prefix of it hits 0 on its
+first attempt (the sliding tail does not cover 704) and 512 on its own repeat
+(the 256-token group's granularity). Lengths 1,536 and 2,048 behave the same way
+(1,280 and 1,792 per repeat), so the engine keeps each group's own hit and does
+not re-check the window at a shorter boundary.
 
 **DeepSeek-V4-Pro shares the V4-Flash code path but not its layout.**
 `deepseek-ai/DeepSeek-V4-Pro` reports `model_type: deepseek_v4` and runs
