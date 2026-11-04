@@ -896,9 +896,12 @@ pub enum ConnectionMode {
     Grpc,
 }
 
-/// Statically configured KV event sources for one prefill worker, used when
-/// the engine's HTTP control plane does not serve `/server_info` or
-/// `/kv_event_sources` (e.g. the `vllm-rs serve` frontend).
+/// Statically configured KV event sources for one prefill worker.
+///
+/// This is the authoritative source for stock vLLM: upstream serves KV event
+/// sources only over the gRPC Control RPC (`GetKvEventSources`), so the HTTP
+/// `/kv_event_sources` route that discovery probes is a non-upstream extension
+/// some frontends add. Declaring sources here removes the guesswork.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PdKvEventSources {
     /// ZMQ PUB endpoints, one per data-parallel rank (index = rank).

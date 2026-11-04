@@ -418,7 +418,14 @@ impl PdKvState {
     async fn probe_base(&self, base: &str) -> Result<Discovery, String> {
         let worker = self.supervisor.discover(base).await;
         let info = worker.server_info.as_ref().map_err(Clone::clone)?;
-        let sources = worker.sources.as_ref().map_err(Clone::clone)?;
+        let sources = match worker.sources.as_ref() {
+            Ok(sources) => sources.clone(),
+            // A worker that does not implement the optional control route
+            // publishes no KV sources; that is a stable fingerprint, not a
+            // failed refresh.
+            Err(unavailable) if !unavailable.probe.retryable() => Default::default(),
+            Err(unavailable) => return Err(unavailable.detail.clone()),
+        };
         let mut sources: Vec<_> = sources.iter().collect();
         sources.sort_by(|left, right| left.0.cmp(right.0));
         let signature = format!("{info:?}:{sources:?}:{:?}", worker.hybrid);
