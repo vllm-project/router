@@ -200,7 +200,7 @@ mod sticky_least_loaded_pd_tests {
                 .await
                 .unwrap();
             let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
-            assert_eq!(body["released"], true, "{session_id}: {body}");
+            assert_eq!(body["released"], true, "{body}");
         }
 
         fn served_counts(&self) -> HashMap<u16, usize> {
