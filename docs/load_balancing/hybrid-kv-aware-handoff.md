@@ -163,8 +163,13 @@ publishes 510.3 GB of weights in 48 shards (`DeepSeek-V4-Flash`, the model that
 does fit, is 159.6 GB in 46 shards), so it needs at least six H20-3e cards
 before any KV cache is allocated. vLLM 0.33 does ship the config class
 (`vllm.transformers_utils.configs.deepseek_v41.DeepseekV41Config`, model type
-`deepseek_v41`), so the layout can be written against it, but no engine-side
-evidence is possible on a two-card node.
+`deepseek_v41`), and a reduced dummy config reaches cache configuration with
+the same backend family as V4-Flash
+(`FLASHMLA_SPARSE_DSV41/DEEPSEEK_SPARSE_SWA/DEEPSEEK_V41_INDEXER/CompressorBackend`,
+block 64 for that shape), so the layout work is the same as for V4-Flash. A
+dummy cannot stand in for the real model here: its engram tables are sized from
+the tokenizer (`engram_compressed_vocab_size` must match), and the remaining
+assertions are about that table geometry, not about attention.
 
 ### Advisory affinity, without a model
 
