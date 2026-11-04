@@ -195,23 +195,36 @@ and 864.7 GB of weights in 64 shards instead of 159.6 GB in 46. Its
 `0, 0, 4, 128, ...`, so the layer-to-group schedule differs and the layout has
 to be captured on Pro itself rather than copied from Flash.
 
-**DeepSeek-V4.1-Flash is a different family and was not attempted.** The
-repository publishes 510.3 GB of weights in 48 shards. At 143.8 GB per H20-3e
-that is four cards for the weights alone, six to eight with KV cache, so it
-needs a larger allocation than the two-card jobs used here; V4-Pro at 864.7 GB
-needs seven to eight. vLLM 0.33 ships a separate implementation
-(`vllm/models/deepseek_v41/`, config
-`vllm.transformers_utils.configs.deepseek_v41.DeepseekV41Config`, model type
-`deepseek_v41`) whose cache assignment follows `kv_source_layer_ids` and adds
-engram and vision components, so its layout is not the V4-Flash layout with
-larger numbers. A reduced dummy config reaches cache configuration with the
-same backend family as V4-Flash
-(`FLASHMLA_SPARSE_DSV41/DEEPSEEK_SPARSE_SWA/DEEPSEEK_V41_INDEXER/CompressorBackend`,
-block 64 for that shape), so the group kinds are expected to match even though
-the layer assignment does not; what it publishes to ZMQ has not been captured.
-A dummy cannot stand in for the real model here: its engram tables are sized
-from the tokenizer (`engram_compressed_vocab_size` must match), and the
-remaining assertions are about that table geometry, not about attention.
+**DeepSeek-V4.1-Flash is a third shape: bounded replay with one publishing
+group.** It runs on the same vLLM 0.33 from eight B300 SXM6 cards (510.3 GB in
+48 shards, real weights). The engine reports seven cache groups —
+`kv cache group sizes (32, 32, 32, 32, 32, 128, 8)`, `kv lcm block sizes 128` —
+and publishes events for **one** of them:
+
+| group | kind | block | prefix cacheable | publishes |
+| --- | --- | --- | --- | --- |
+| 0-4 | sliding_window_mla | 32 | no (bounded replay, window 128) | nothing |
+| 5 | mla_attention | 128 | yes | 8 hashes for 1,024 tokens, then 1 hash per 128-token store with `parent_block_hash` |
+| 6 | sliding_window_mla | 8 | no | nothing |
+
+Two measurements pin the contract:
+
+- The hash chain runs at **128 tokens**, not at the smallest page. Re-computing
+  the chain with vLLM's own `sha256_cbor` from `sha256_cbor("vllm-none-hash")`
+  matched all eight published hashes at granularity 128 and none at 4, 8, 16, 32
+  or 64, because only the cacheable group takes part in hashing.
+- The engine's hit is `align_down(tokens - 1, 128)`: 1,024 tokens report 896 and
+  1,537 report 1,536, which is the same rule as V4-Flash with a coarser block.
+
+With `hash_block_size` 128, groups 0-4 declared as bounded-replay (window 128,
+`prefix_replay_tokens` 128, not cacheable) and group 5 as a compressed attention
+group with one token per state, the layout is admitted and the events apply. The
+router then credits 768 for a 1,024-token repeat where the engine counts 896:
+the 128-token difference is exactly the replay window, which the engine counts
+as cached but recomputes. That is the bounded-replay contract this PR documents
+— credit is deliberately the smaller number — and it is the first end-to-end
+check of that branch.
+
 
 ### Advisory affinity, without a model
 
