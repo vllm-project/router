@@ -274,10 +274,7 @@ impl HybridEventIndex {
                         continue;
                     }
                     if store.medium.as_deref() != Some("GPU")
-                        || store
-                            .locality
-                            .as_deref()
-                            .is_some_and(|s| s != "LOCAL")
+                        || store.locality.as_deref().is_some_and(|s| s != "LOCAL")
                         || store.ownership.is_some()
                         || store.lora_id.is_some()
                         || store.lora_name.is_some()
