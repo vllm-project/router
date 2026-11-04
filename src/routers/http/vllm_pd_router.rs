@@ -15,7 +15,7 @@ use crate::metrics::RouterMetrics;
 use crate::otel_http::{self, ClientRequestOptions};
 use crate::policies::{
     kv_aware_ops, AffinityKey, CacheAwarePolicy, KvRequestTokens, LoadBalancingPolicy,
-    PolicyRegistry, PreparedCacheSelection, WorkerTokenInputs,
+    PolicyRegistry, WorkerTokenInputs,
 };
 use crate::program_scheduling::ProgramIdentity;
 use crate::routers::{header_utils, RouterTrait, WorkerManagement};
@@ -117,9 +117,11 @@ pub(super) struct DecodeCommitInput {
     pub pool: DecodePoolSource,
     /// Admission-time provisional pick, used only for the changed counter.
     pub provisional_endpoint: PdEndpoint,
-    /// Prefix selection the admission computed for the decode pool. cache_aware
-    /// needs it to score again at dispatch; kv_aware ignores it.
-    pub decode_cache: Option<Arc<PreparedCacheSelection>>,
+    /// Admission-time token inputs, reused to refresh cache matches at dispatch.
+    pub decode_tokens: Option<WorkerTokenInputs>,
+    pub request: Value,
+    pub headers: Option<HeaderMap>,
+    pub router_prompts: Option<Arc<[Vec<u32>]>>,
     pub affinity_key: Option<AffinityKey>,
     pub cache_salt: Option<String>,
     pub model_id: Option<String>,
@@ -130,19 +132,24 @@ impl DecodeCommitInput {
     /// Commitment inputs for one request. The policy inputs come from the same
     /// header and body the admission scored, so every path reads them the same
     /// way.
+    #[allow(clippy::too_many_arguments)]
     fn for_request(
         pool: DecodePoolSource,
         provisional_endpoint: PdEndpoint,
-        decode_cache: Option<Arc<PreparedCacheSelection>>,
+        decode_tokens: Option<WorkerTokenInputs>,
         decode_policy: &dyn LoadBalancingPolicy,
         headers: Option<&HeaderMap>,
         request: &Value,
         route: &str,
+        router_prompts: Option<Arc<[Vec<u32>]>>,
     ) -> Self {
         Self {
             pool,
             provisional_endpoint,
-            decode_cache,
+            decode_tokens,
+            request: request.clone(),
+            headers: headers.cloned(),
+            router_prompts,
             affinity_key: VllmPDRouter::extract_affinity_key(decode_policy, headers, request),
             cache_salt: request
                 .get("cache_salt")
@@ -173,15 +180,15 @@ struct AdmittedPair {
     prefill: Arc<dyn Worker>,
     decode: Arc<dyn Worker>,
     attempt: PdAttempt,
-    /// Prefix selection the admission prepared for the decode pool.
-    decode_cache: Option<Arc<PreparedCacheSelection>>,
+    /// Admission-time token inputs for the decode pool.
+    decode_tokens: Option<WorkerTokenInputs>,
 }
 
 /// Admission result, carrying what a deferred commitment needs to re-decide.
 struct Admission {
     selection: super::pd_types::PdSelection,
     attempt: PdAttempt,
-    decode_cache: Option<Arc<PreparedCacheSelection>>,
+    decode_tokens: Option<WorkerTokenInputs>,
 }
 
 /// Transfer ID prefix used by MoRI-IO to correlate prefill and decode legs.
@@ -1131,8 +1138,8 @@ impl VllmPDRouter {
                 })
         });
         let affinity_key = Self::extract_affinity_key(decode_policy.as_ref(), headers, request);
-        // Kept past admission: cache_aware scores the decode pool again at
-        // dispatch from the same prepared prefix selection.
+        // The prepared selection gates deferral; token inputs are retained so
+        // cache matches can be recomputed against the tree at dispatch.
         let decode_cache = decode_cache.map(Arc::new);
         let context = PdRequestContext {
             prefill_inputs: prefill_inputs.as_ref(),
@@ -1157,7 +1164,7 @@ impl VllmPDRouter {
         Some(Admission {
             selection,
             attempt,
-            decode_cache,
+            decode_tokens: decode_cache.map(|_| decode_tokens),
         })
     }
 
@@ -1188,7 +1195,7 @@ impl VllmPDRouter {
     /// request is built, so the decision sees the state that will serve it.
     /// A missing candidate is reported before any decode dispatch, and the
     /// attempt then releases only the Prefill charge.
-    fn commit_decode(
+    async fn commit_decode(
         &self,
         attempt: &PdAttempt,
         input: &DecodeCommitInput,
@@ -1198,12 +1205,51 @@ impl VllmPDRouter {
         // reports its last availability on the admission-time handle, and a
         // replacement registered in the meantime is invisible from it.
         let candidates = self.live_decode_candidates(input.pool);
+        // Tokenize only new endpoints; refresh prefix hits for every live
+        // candidate immediately before selecting against the current loads.
+        let mut tokens = input.decode_tokens.clone();
+        if let Some(tokens) = tokens.as_mut() {
+            let missing: Vec<_> = candidates
+                .iter()
+                .filter(|worker| !tokens.contains_key(worker.base_url()))
+                .cloned()
+                .collect();
+            if !missing.is_empty() {
+                if let Some(new_tokens) = self
+                    .pd_router
+                    .prepare_decode_inputs(
+                        &missing,
+                        &input.request,
+                        &input.route,
+                        input.headers.as_ref(),
+                        input.router_prompts.as_ref(),
+                    )
+                    .await
+                {
+                    tokens.extend(new_tokens);
+                }
+            }
+        }
+        let decode_cache = tokens.as_ref().and_then(|tokens| {
+            decode_policy
+                .as_any()
+                .downcast_ref::<CacheAwarePolicy>()
+                .and_then(|cache| {
+                    cache.prepare_selection(
+                        &candidates,
+                        KvRequestTokens::PerWorker(tokens),
+                        input.model_id.as_deref(),
+                        None,
+                        input.cache_salt.as_deref(),
+                    )
+                })
+        });
         let context = PdRequestContext {
             prefill_inputs: None,
             model_id: input.model_id.as_deref(),
             legacy_policy_input: None,
             prefill_cache: None,
-            decode_cache: input.decode_cache.as_deref(),
+            decode_cache: decode_cache.as_ref(),
             headers: None,
             affinity_key: input.affinity_key.clone(),
             cache_salt: input.cache_salt.as_deref(),
@@ -1574,7 +1620,7 @@ impl VllmPDRouter {
         let Admission {
             selection,
             attempt,
-            decode_cache,
+            decode_tokens,
         } = self
             .admit_pair(
                 &prefill_workers,
@@ -1590,7 +1636,7 @@ impl VllmPDRouter {
             prefill: prefill_workers[selection.prefill.worker_index].clone(),
             decode: decode_workers[selection.decode.worker_index].clone(),
             attempt,
-            decode_cache,
+            decode_tokens,
         })
     }
 
@@ -1605,7 +1651,7 @@ impl VllmPDRouter {
             prefill: prefill_worker,
             decode: decode_worker,
             attempt,
-            decode_cache,
+            decode_tokens,
         }) = self.admit_discovered_pair(&request, path, headers).await
         else {
             RouterMetrics::record_pd_error("server_selection");
@@ -1617,11 +1663,12 @@ impl VllmPDRouter {
             DecodeCommitInput::for_request(
                 DecodePoolSource::Discovery,
                 PdEndpoint::for_worker(decode_worker.as_ref()),
-                decode_cache,
+                decode_tokens,
                 self.policy_registry.get_decode_policy().as_ref(),
                 headers,
                 &request,
                 path,
+                None,
             )
         });
         match self
@@ -1796,7 +1843,7 @@ impl VllmPDRouter {
         let Some(Admission {
             selection,
             attempt,
-            decode_cache,
+            decode_tokens,
         }) = self
             .admit_pair_with_tokens(
                 &prefill_workers,
@@ -1828,11 +1875,12 @@ impl VllmPDRouter {
             DecodeCommitInput::for_request(
                 DecodePoolSource::Registry,
                 selection.decode.endpoint.clone(),
-                decode_cache,
+                decode_tokens,
                 self.policy_registry.get_decode_policy().as_ref(),
                 headers,
                 &request_json,
                 path,
+                Some(router_prompts),
             )
         });
         let response = self
@@ -2106,7 +2154,7 @@ impl VllmPDRouter {
         // target can be chosen against live state without delaying dispatch:
         // the decode request body is built from this same response.
         if let Some(commit) = commit {
-            match self.commit_decode(&attempt, commit) {
+            match self.commit_decode(&attempt, commit).await {
                 Ok(worker) => decode_worker = worker,
                 Err((status, message)) => return Ok((status, message).into_response()),
             }
@@ -2328,7 +2376,7 @@ impl VllmPDRouter {
         // the request id keeps the provisional decode address it was built
         // with, exactly as on the HTTP path.
         let decode_worker = match commit {
-            Some(input) => match self.commit_decode(attempt, input) {
+            Some(input) => match self.commit_decode(attempt, input).await {
                 Ok(worker) => worker,
                 Err((status, message)) => {
                     attempt.release();
@@ -3315,7 +3363,7 @@ impl RouterTrait for VllmPDRouter {
             let Admission {
                 selection,
                 attempt,
-                decode_cache,
+                decode_tokens,
             } = match self
                 .admit_pair(
                     &prefill_workers,
@@ -3347,11 +3395,12 @@ impl RouterTrait for VllmPDRouter {
                 DecodeCommitInput::for_request(
                     DecodePoolSource::Registry,
                     selection.decode.endpoint.clone(),
-                    decode_cache,
+                    decode_tokens,
                     self.policy_registry.get_decode_policy().as_ref(),
                     headers,
                     &request_json,
                     path,
+                    None,
                 )
             });
 
