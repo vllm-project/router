@@ -466,6 +466,13 @@ mod sticky_least_loaded_regular_tests {
         for body in ["", r#"{"agent_hint": "x"}"#, "not json"] {
             assert_eq!(fx.post("/finish_session", &[], body).await.0, 400, "{body}");
         }
+        let get = Request::builder()
+            .method("GET")
+            .uri("/finish_session")
+            .body(Body::empty())
+            .unwrap();
+        let status = fx.app.clone().oneshot(get).await.unwrap().status();
+        assert_eq!(status.as_u16(), 405);
         fx.stop().await;
 
         // With API-key validation on, a request without a bearer token is
