@@ -82,6 +82,50 @@ pub fn model_info_json(info: &ModelInfo) -> Value {
     })
 }
 
+/// True when `version` is a dotted release older than 0.30.0.
+/// Values that are not a release, such as the test mock's `"mock"`, are false.
+pub fn grpc_engine_version_older_than_0_30(version: &str) -> bool {
+    let raw = version.trim().trim_start_matches(['v', 'V']);
+    if !raw.starts_with(|c: char| c.is_ascii_digit()) {
+        return false;
+    }
+    let mut numbers = raw
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|part| !part.is_empty())
+        .map(|part| part.parse::<u64>().unwrap_or(0));
+    let major = numbers.next().unwrap_or(0);
+    let minor = numbers.next().unwrap_or(0);
+    let patch = numbers.next().unwrap_or(0);
+    (major, minor, patch) < (0, 30, 0)
+}
+
+/// Log when a gRPC P/D worker will abort every decode. Health checks pass on
+/// vLLM 0.29.x; the float-port failure only shows up on the first request.
+pub async fn warn_old_grpc_pd_workers<'a>(urls: impl IntoIterator<Item = &'a str>) {
+    for url in urls {
+        if !crate::backend::is_grpc_url(url) {
+            continue;
+        }
+        match get_grpc_server_info(url, Duration::from_secs(2)).await {
+            Ok(info) if grpc_engine_version_older_than_0_30(&info.engine_version) => {
+                tracing::warn!(
+                    worker = %url,
+                    engine_version = %info.engine_version,
+                    "gRPC P/D worker is older than vLLM 0.30.0; every decode aborts because connector ports and block ids arrive as floats. Upgrade the worker. Upgrading the router does not fix this."
+                );
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(
+                    worker = %url,
+                    %error,
+                    "could not read the gRPC P/D worker engine version"
+                );
+            }
+        }
+    }
+}
+
 pub fn server_info_json(info: &ServerInfo) -> Value {
     json!({
         "engine_version": info.engine_version,
@@ -208,5 +252,16 @@ mod tests {
         assert_eq!(server_json["parallelism"]["tensor_parallel_size"], 2);
         assert_eq!(server_json["rl_capabilities"]["sleep_mode_enabled"], true);
         assert_eq!(server_json["effective_attention_block_size"], 128);
+    }
+
+    #[test]
+    fn old_grpc_engine_versions_are_the_ones_before_0_30() {
+        assert!(grpc_engine_version_older_than_0_30("0.29.0"));
+        assert!(grpc_engine_version_older_than_0_30("v0.29.1"));
+        assert!(grpc_engine_version_older_than_0_30("0.29.0+cu129"));
+        assert!(!grpc_engine_version_older_than_0_30("0.30.0"));
+        assert!(!grpc_engine_version_older_than_0_30("0.32.0"));
+        assert!(!grpc_engine_version_older_than_0_30("mock"));
+        assert!(!grpc_engine_version_older_than_0_30(""));
     }
 }

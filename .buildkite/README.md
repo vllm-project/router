@@ -18,9 +18,9 @@ on `release-pipeline.yml` (the `router-release` pipeline) publishes images.
 
 | File | Level | When it is uploaded | What runs |
 | --- | --- | --- | --- |
-| `test-ready.yml` | L1 ready | non-default branch labeled `ready` | Rust and Python unit/integration tests, one NVIDIA P/D completion (`ROCM_ONLY != 1` on that job) |
+| `test-ready.yml` | L1 ready | non-default branch labeled `ready` | Rust and Python unit/integration tests, one NVIDIA P/D completion, and kv_aware e2e on 2× L4 (`ROCM_ONLY != 1` on the GPU jobs) |
 | `test-merge.yml` | L2 merge | default branch (except `NIGHTLY=1`), its merge queue, or any other branch labeled `merge-test` | one-mode xGMI smoke and RDMA `SMOKE_ONLY` |
-| `test-nightly.yml` | L3 nightly | default branch with `NIGHTLY=1`, or any other branch labeled `nightly-test` | Rust and Python unit/integration tests (skipped when the PR also has `ready`), full NVIDIA GSM8K (`ROCM_ONLY != 1`), gRPC prefix-KV perf on 2× H100 (`ROCM_ONLY != 1`), full xGMI matrix, full RDMA |
+| `test-nightly.yml` | L3 nightly | default branch with `NIGHTLY=1`, or any other branch labeled `nightly-test` | Rust and Python unit/integration tests (skipped when the PR also has `ready`), full NVIDIA GSM8K (`ROCM_ONLY != 1`), gRPC prefix-KV perf on 2× H100 (`ROCM_ONLY != 1`), L1 prefix-encoding perf on 1× L4 with Qwen3-0.6B (`ROCM_ONLY != 1`, 24 waves), full xGMI matrix, full RDMA |
 | `release-pipeline.yml` | release | tag / release pipeline | wheels and images only |
 
 A pull request labeled `ready` uploads `test-ready.yml`, including forks.
@@ -34,7 +34,9 @@ shell. A build-level `HF_TOKEN` would override a pod env entry of the same name.
 
 | Name | Machine |
 | --- | --- |
+| `l4_2` | EKS `l4-k8s`, same `l4x4` pool, pod requests 2× L4, same CI image |
 | `l4_4` | EKS `l4-k8s`, 4× L4, image `public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:router-$BUILDKITE_COMMIT` |
+| `l4_1` | Same L4 pool and image, 1× L4 |
 | `h100_2` | `mithril-h100-pool`, 2× H100 SXM, us-west-2 pull-through cache of the router CI image, GPU limit 2 |
 | `mi300_2` | `router_rocm_mi300_2`, same-host xGMI Docker devices |
 | `mi300_rdma` | `router_rocm_mi300_2` coordinator, no Docker plugin |
@@ -85,6 +87,25 @@ Full GSM8K stays in `test-nightly.yml`. Both include forks.
 - 60 minute timeout
 - Automatic retry (up to 2 attempts) for flaky failures
 - Manual retry option available
+
+### gRPC P/D coverage
+
+`run_grpc_pd_accuracy_test.sh` is the Rust gRPC counterpart, with the same
+layout as the HTTP job: one prefill and one decode, each at data-parallel size
+2, on four L4s. Workers are `vllm-rs serve --grpc-port`, and the router runs
+`--prefill grpc://… --decode grpc://… --intra-node-data-parallel-size 2`.
+Workers must be vLLM ≥ 0.30.0. The client uses `/v1/chat/completions`, then
+the same GSM8K check as the HTTP job. It follows the HTTP split: a `ready`
+label runs the chat check only from `test-ready.yml` (`RUN_LM_EVAL=0`, 4
+non-streaming and 1 streaming request), and full GSM8K stays in
+`test-nightly.yml`. Both use the `l4_4` image and wait for `image-build`.
+The shared NVIDIA CI image pins `vllm==0.30.0` to satisfy the worker minimum.
+`ROCM_ONLY=1` skips them along with the HTTP steps.
+
+The pytest wrapper is `tests/python/integration/test_grpc_pd_disagg.py`.
+Its #447 marks are level `ready` and `hardware_test(res={"cuda": "L4"}, num_cards=4)`,
+which attaches `L4`, `cuda`, `gpu`, and `cards_4`. The CPU job selects
+`ready and cpu`, so this test stays on the GPU step.
 
 ### ROCm MoRI coverage
 

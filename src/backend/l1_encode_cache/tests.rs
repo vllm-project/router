@@ -199,7 +199,7 @@ fn added_tokens_merge_config_and_default_normalized() {
 
 #[test]
 fn decoder_ids_that_do_not_fit_in_u32_are_not_boundaries() {
-    // vllm-tokenizer 0.29 parses the key as u32 and skips a parse failure.
+    // vllm-tokenizer 0.30 parses the key as u32 and skips a parse failure.
     // "4294967296" is 2^32. Admitting its content would cut where the
     // tokenizer still sees ordinary BPE.
     let tokens = added_tokens(
@@ -1334,7 +1334,7 @@ async fn report_boundary_verdicts() {
                 continue;
             }
         };
-        let files = ResolvedModelFiles::new(model).await.unwrap();
+        let files = ResolvedModelFiles::new(model, None).await.unwrap();
         let TokenizerSource::HuggingFace(path) = files.tokenizer else {
             unreachable!()
         };
@@ -1376,7 +1376,7 @@ async fn randomized_prompts_match_real_tokenizers() {
                 continue;
             }
         };
-        let files = ResolvedModelFiles::new(dir).await.unwrap();
+        let files = ResolvedModelFiles::new(dir, None).await.unwrap();
         let TokenizerSource::HuggingFace(path) = files.tokenizer else {
             unreachable!()
         };

@@ -152,9 +152,28 @@ fn http_kv_input(body: &serde_json::Value, route: &str) -> Result<HttpKvInput, &
 }
 
 /// Backend-effective prompts, shared by colocated and PD routing policies.
+#[derive(Clone)]
 pub(crate) struct HttpTokenInput {
     pub prompts: Arc<[Vec<u32>]>,
     pub source: &'static str,
+}
+
+/// The router's own token ids for `grpc://` pools, which take token ids and
+/// serve no `/tokenize`. Every backend gets the same ids it will be sent.
+pub(crate) fn router_token_inputs(
+    urls: impl IntoIterator<Item = String>,
+    body: &serde_json::Value,
+    prompts: &Arc<[Vec<u32>]>,
+) -> std::collections::HashMap<String, Result<HttpTokenInput, &'static str>> {
+    let checked = match body.as_object() {
+        Some(fields) => http_cache_identity(fields),
+        None => Ok(()),
+    };
+    let input = checked.map(|()| HttpTokenInput {
+        prompts: prompts.clone(),
+        source: "prepared",
+    });
+    urls.into_iter().map(|url| (url, input.clone())).collect()
 }
 
 pub(crate) async fn prepare_http_token_inputs(
@@ -938,6 +957,31 @@ fn user_content_text(content: &UserMessageContent) -> Result<String> {
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
+    #[test]
+    fn router_tokens_refuse_adapter_cache_identities() {
+        use super::router_token_inputs;
+        use serde_json::json;
+        let prompts: std::sync::Arc<[Vec<u32>]> = std::sync::Arc::from([vec![1, 2, 3]]);
+        let urls = || ["grpc://p0:50051".to_string(), "grpc://p1:50051".to_string()];
+        let base = json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]});
+        let inputs = router_token_inputs(urls(), &base, &prompts);
+        assert_eq!(inputs.len(), 2);
+        for input in inputs.values() {
+            let input = input.as_ref().unwrap();
+            assert_eq!((&*input.prompts, input.source), (&*prompts, "prepared"));
+        }
+        let mut lora = base.clone();
+        lora["lora_name"] = json!("adapter");
+        for input in router_token_inputs(urls(), &lora, &prompts).values() {
+            assert_eq!(input.as_ref().err(), Some(&"unsupported_cache_identity"));
+        }
+        let mut image = base;
+        image["messages"][0]["content"] = json!([{"type": "image_url"}]);
+        for input in router_token_inputs(urls(), &image, &prompts).values() {
+            assert_eq!(input.as_ref().err(), Some(&"multimodal_input"));
+        }
+    }
+
     #[tokio::test]
     async fn shared_http_preparation_retains_good_workers_and_exact_tool_payloads() {
         use super::prepare_http_token_inputs;

@@ -114,10 +114,10 @@ cross-backend SLOs.
 
 | Section | Content |
 |---------|---------|
-| `stack` | router **16002**, worker **18002**, gRPC **15002**, prom **29002/29001/29003** |
-| `worker.cli` | **required** serve flags (Qwen3.8-27B example: TP=2, **`--max-num-seqs 128`**, prefix caching) |
-| `bench` | **tokens 131072**, **max_tokens 64**, **timeout 1800**, warmup via `PERF_WARMUP` |
-| `waves` | table above |
+| `env` | host **127.0.0.1** |
+| `router` | port **16002**, Prometheus **29002/29001/29003** |
+| `worker` | HTTP **18002**, gRPC **15002** on `rust_grpc`, required `cli` (Qwen3.8-27B example: TP=2, **`--max-num-seqs 128`**, prefix caching) |
+| `bench` | **tokens 131072**, **max_tokens 64**, **timeout 1800**, `hit_rates` **0** and **0.99**, `waves` are concurrency and requests only. Warmup via `PERF_WARMUP` |
 
 Override bench via env: `PERF_TOKENS`, `PERF_MAX_TOKENS`, `PERF_TIMEOUT`.
 

@@ -55,7 +55,7 @@ use std::time::{Duration, Instant};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, error, info, warn};
 
-fn prepare_error_status(error: &PrepareError) -> StatusCode {
+pub(super) fn prepare_error_status(error: &PrepareError) -> StatusCode {
     match error {
         PrepareError::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
         PrepareError::Invalid(_) => StatusCode::BAD_REQUEST,
@@ -114,12 +114,12 @@ struct RequestLoadState {
 /// Owns an admitted attempt across dispatch and response consumption. Any
 /// cancellation or completion releases the shared counters exactly once.
 #[derive(Clone)]
-struct RequestLoadGuard {
+pub(super) struct RequestLoadGuard {
     state: Arc<RequestLoadState>,
 }
 
 impl RequestLoadGuard {
-    fn new(worker: Option<Arc<dyn Worker>>, kv_slot: Option<KvRequestSlot>) -> Self {
+    pub(super) fn new(worker: Option<Arc<dyn Worker>>, kv_slot: Option<KvRequestSlot>) -> Self {
         Self {
             state: Arc::new(RequestLoadState {
                 worker,
@@ -223,7 +223,12 @@ fn hold_load_until_body_done(
     hold_request_load_until_body_done(response, RequestLoadGuard::new(Some(worker), kv_slot))
 }
 
-fn hold_request_load_until_body_done(mut response: Response, load: RequestLoadGuard) -> Response {
+/// Keeps `load` until the body ends or is dropped. A dropped body also aborts
+/// the gRPC producer, which cancels the RPC instead of waiting for its next output.
+pub(super) fn hold_request_load_until_body_done(
+    mut response: Response,
+    load: RequestLoadGuard,
+) -> Response {
     let task = response
         .extensions_mut()
         .remove::<crate::backend::grpc::GrpcStreamTask>();
@@ -537,6 +542,55 @@ impl Router {
                     }
                     scheduler.apply_observations(epoch, observations);
                     scheduler.tick();
+                    if let Some((path, revision, snapshot)) =
+                        scheduler.take_prediction_profile_snapshot()
+                    {
+                        match serde_json::to_vec_pretty(&snapshot) {
+                            Ok(bytes) => {
+                                let destination = std::path::PathBuf::from(&path);
+                                let temporary = destination.with_extension("tmp");
+                                if let Some(parent) = destination
+                                    .parent()
+                                    .filter(|parent| !parent.as_os_str().is_empty())
+                                {
+                                    if let Err(error) = tokio::fs::create_dir_all(parent).await {
+                                        warn!(
+                                            event = "prediction_profile_snapshot_failed",
+                                            path,
+                                            %error,
+                                            "Failed to create prediction snapshot directory"
+                                        );
+                                        continue;
+                                    }
+                                }
+                                if let Err(error) = tokio::fs::write(&temporary, bytes).await {
+                                    warn!(
+                                        event = "prediction_profile_snapshot_failed",
+                                        path,
+                                        %error,
+                                        "Failed to write prediction profile snapshot"
+                                    );
+                                } else if let Err(error) =
+                                    tokio::fs::rename(&temporary, &destination).await
+                                {
+                                    warn!(
+                                        event = "prediction_profile_snapshot_failed",
+                                        path,
+                                        %error,
+                                        "Failed to atomically replace prediction profile snapshot"
+                                    );
+                                } else {
+                                    scheduler.mark_prediction_profile_snapshotted(revision);
+                                }
+                            }
+                            Err(error) => warn!(
+                                event = "prediction_profile_snapshot_failed",
+                                path,
+                                %error,
+                                "Failed to serialize prediction profile snapshot"
+                            ),
+                        }
+                    }
                 }
             }))
         });
@@ -657,7 +711,7 @@ impl Router {
             reference_decode_context_tokens_per_request = REFERENCE_DECODE_CONTEXT_TOKENS_PER_REQUEST as u64,
             reference_decode_context_tokens = REFERENCE_DECODE_CONTEXT_TOKENS as u64,
             reference_decode_throughput_tokens_per_second,
-            calibration_docs = "docs/program_scheduling.md#offline-calibration-models",
+            calibration_docs = "docs/program_scheduling/program-scheduling.md#offline-calibration-models",
             "Program scheduling is using one or more reference calibration coefficients; deployment-specific performance differences may degrade scheduling decisions"
         );
     }
