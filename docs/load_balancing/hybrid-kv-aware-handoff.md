@@ -91,6 +91,69 @@ groups plus full attention, all block 528, root
   forwards to `http://0.0.0.0/...`; configuration now rejects that combination
   instead of failing at request time.
 
+### vLLM 0.33 model matrix
+
+The same check ran on vLLM 0.33.0 (torch 2.14.0+cu130) with
+`--prefix-caching-hash sha256_cbor` and `VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES=0`:
+without that variable the engine publishes 64-bit integer block hashes, which
+no CBOR layout can reproduce, and the router credits 0 while the engine still
+reports hits. Each run sends one prompt three times and then one unrelated
+prompt; "credit/repeat" is what the router subtracted from `new_prefill_tokens`
+on a repeat, "engine hits" is `vllm:prefix_cache_hits_total` at the end.
+
+| model | how it ran | block | group layout (idx: kind) | credit/repeat | engine hits | verdict |
+| --- | --- | --- | --- | --- | --- | --- |
+| Qwen3.5-4B | 2x DP, real weights | 576 | 0-2 mamba, 3 full | 1152 | 3456 (3 repeats) | equal per repeat; the first request credited 0 before events arrived |
+| Qwen3.5-35B-A3B | real weights | 1088 | 0-2 mamba, 3 full | 2176 | 4352 (2 repeats) | equal |
+| Qwen3.6-35B-A3B | real weights | 1088 | 0-2 mamba, 3 full | 2176 | 4352 (2 repeats) | equal |
+| Qwen3.8-27B | real weights | 832 | 0-2 mamba, 3 full | 1664 | 3328 (2 repeats) | equal |
+| Qwen4Exp | dummy weights, real config | 192 | 0-2 mamba, 3 scratch ring (no events), 4 compressed MLA | 576 | 1152 (2 repeats) | equal |
+| DeepSeek-V4-Flash | real weights, TP=2 | 256 | 0,1,4 sliding-window MLA (64), 2 compressed MLA (256), 3 sliding-window MLA (4) | 0 | 1536 (2 repeats) | rejected, see below |
+
+The four Qwen3.x runs used a layout with declared endpoints. The Qwen4Exp and
+V4 runs used a layout with **no** endpoints, so the router discovered the
+publishers from the engine itself; two defects had to be fixed for that path to
+work at all on 0.33:
+
+- `StaticKvEventSources::validate` rejected the empty endpoint list the
+  layout-only configuration produces (`fix(config)`, `cf5de3a`), so the router
+  refused to start.
+- `/kv_event_sources` on 0.33 answers without the optional `encoding` and
+  `schema_version` fields (`fix(kv-index)`, `491a9d9`), so every rank was
+  filtered out and the worker fell back to load-only scoring with
+  `error=hybrid capability has no event sources`.
+
+**DeepSeek-V4-Flash is not yet representable.** Its engine does serve the same
+contract (five groups, prefix reuse of 768 tokens per repeat) but two layout
+properties break the single-hash-chain model this PR implements:
+
+- Page sizes are per group (`64, 64, 256, 4, 8`) and three of them are below
+  the engine's own 256-token hash block. A layout is only admitted when one
+  `hash_block_size` divides every group block, which here forces
+  `hash_block_size=4`. With the natural `256` the rank is rejected with
+  `invalid group layout`.
+- Replay windows differ per group (`128` for the sparse-attention and compressor
+  groups, `8` for the indexer group). The layout contract allows one replay
+  window shared by every replay group, so declaring the real windows is
+  rejected with `unsupported group restore contract`.
+
+Forcing `hash_block_size=4` and zero replay windows admits the rank, and then
+the events themselves are refused: every batch is dropped with
+`error=InvalidBatch` because a `BlockStored` publishes fewer hashes than the
+token range it describes (1024 `token_ids` with two hashes at `block_size 64`).
+The router therefore credits 0 while the engine reports 1536 cached tokens:
+fail-closed, no false hits, but also no reuse. Supporting this model needs a
+per-group hash chain and incremental-event handling, which is a follow-up
+rather than a layout fix.
+
+**DeepSeek-V4.1-Flash is not runnable on this hardware.** The repository
+publishes 510.3 GB of weights in 48 shards (`DeepSeek-V4-Flash`, the model that
+does fit, is 159.6 GB in 46 shards), so it needs at least six H20-3e cards
+before any KV cache is allocated. vLLM 0.33 does ship the config class
+(`vllm.transformers_utils.configs.deepseek_v41.DeepseekV41Config`, model type
+`deepseek_v41`), so the layout can be written against it, but no engine-side
+evidence is possible on a two-card node.
+
 ### Advisory affinity, without a model
 
 Two stub backends answered `/v1/completions` but returned 404 for `/render` and
