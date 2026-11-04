@@ -2,9 +2,8 @@ use clap::{ArgAction, Parser, ValueEnum};
 use std::collections::HashMap;
 use vllm_router_rs::config::{
     CircuitBreakerConfig, ConfigError, ConfigResult, ConnectionMode, DiscoveryConfig,
-    HealthCheckConfig, HistoryBackend, KvConnector, MetricsConfig,
-    PdKvEventSources, PolicyConfig, ProgramSchedulingConfig, RetryConfig, RouterConfig,
-    RoutingMode, TraceConfig,
+    HealthCheckConfig, HistoryBackend, KvConnector, MetricsConfig, PdKvEventSources, PolicyConfig,
+    ProgramSchedulingConfig, RetryConfig, RouterConfig, RoutingMode, TraceConfig,
 };
 use vllm_router_rs::metrics::PrometheusConfig;
 use vllm_router_rs::server::{self, ServerConfig};

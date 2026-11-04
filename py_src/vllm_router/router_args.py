@@ -455,7 +455,6 @@ class RouterArgs:
             "(queries each prefill node's bootstrap server for engine_id per DP rank); "
             "'moriio' uses the MoRI-IO connector (either READ or WRITE modes).",
         )
-        parser.add_argument(
         # Prometheus configuration
         parser.add_argument(
             f"--{prefix}prometheus-port",

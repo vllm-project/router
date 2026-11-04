@@ -2774,7 +2774,7 @@ impl VllmPDRouter {
                 mooncake_prefill_info: Arc::new(Mutex::new(HashMap::new())),
                 nixl_prefill_info: RwLock::new(HashMap::new()),
                 grpc_frontend: crate::backend::EngineFrontend::new(),
-                })
+            })
         } else {
             // Direct URL mode (same as PdRouterBase)
             info!(
@@ -2894,7 +2894,7 @@ impl VllmPDRouter {
                 mooncake_prefill_info,
                 nixl_prefill_info: RwLock::new(HashMap::new()),
                 grpc_frontend,
-                })
+            })
         }
     }
 
@@ -4732,13 +4732,24 @@ mod tests {
                 assert_eq!(first, "P");
             }
             let snapshot = router.pd_router.pd_load.snapshot();
-            let d_load = snapshot
-                .iter()
-                .find(|((stage, _), _)| *stage == Stage::Decode)
-                .unwrap()
-                .1;
-            assert_eq!(d_load.pending_decode_requests, usize::from(!concurrent));
-            assert_eq!(d_load.active_decode_requests, usize::from(concurrent));
+            // A deployment whose handshake allows a late Decode choice holds
+            // nothing on the Decode pool until Prefill returns.
+            let deferred = router
+                .decode_commit_can_defer(&router.pd_router.worker_registry.get_prefill_workers());
+            if deferred {
+                assert!(
+                    snapshot.keys().all(|(stage, _)| *stage != Stage::Decode),
+                    "deferred admission must not charge Decode"
+                );
+            } else {
+                let d_load = snapshot
+                    .iter()
+                    .find(|((stage, _), _)| *stage == Stage::Decode)
+                    .unwrap()
+                    .1;
+                assert_eq!(d_load.pending_decode_requests, usize::from(!concurrent));
+                assert_eq!(d_load.active_decode_requests, usize::from(concurrent));
+            }
             assert_eq!(
                 snapshot
                     .iter()
