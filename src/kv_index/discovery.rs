@@ -39,10 +39,11 @@ pub struct CacheKey {
 /// One per-DP-rank entry from the KV event source control probe. Mirrors
 /// vLLM's KVEventsConfig.
 ///
-/// Upstream vLLM exposes these sources only through the gRPC Control RPC
-/// (`GetKvEventSources` in `vllm-proto`). The HTTP `/kv_event_sources` route is
-/// a **non-upstream extension** that some frontends mirror; discovery probes it
-/// opportunistically and never treats its absence as an engine fault.
+/// KV event sources are published through the gRPC Control RPC
+/// (`GetKvEventSources` in `vllm-proto`) and, since vLLM 0.31.0, over the HTTP
+/// `/kv_event_sources` route. v0.29.0 and v0.30.0 serve no such route, so
+/// discovery probes it opportunistically and never treats its absence as an
+/// engine fault.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct KvEventSourceEntry {
     #[serde(default)]
@@ -90,10 +91,10 @@ pub(crate) struct WorkerDiscovery {
 
 /// What the optional KV event source control probe found.
 ///
-/// Upstream vLLM exposes KV event sources only through the gRPC
-/// `GetKvEventSources` RPC. The HTTP `/kv_event_sources` route is a
-/// non-upstream extension some frontends add, so a 404/405 means "this engine
-/// keeps the extension off", not "this engine is broken".
+/// KV event sources are exposed by the gRPC `GetKvEventSources` RPC and, since
+/// vLLM 0.31.0, by the HTTP `/kv_event_sources` route. v0.29.0/v0.30.0 serve no
+/// such route, so a 404/405 means "this engine cannot report sources", not
+/// "this engine is broken".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SourcesProbe {
     /// The worker does not implement the extension; re-probing cannot help.
@@ -326,8 +327,8 @@ impl KvIndexSupervisor {
 
     /// Explain the discovery prerequisites once per process.
     ///
-    /// Upstream vLLM serves no HTTP `/kv_event_sources` route, so a deployment
-    /// that wants KV-aware routing on stock engines must declare its sources.
+    /// Upstream vLLM serves `/kv_event_sources` since 0.31.0 only; a deployment
+    /// that wants KV-aware routing on 0.29/0.30 must declare its sources.
     /// Saying that once is actionable; repeating it per worker per pass is not.
     fn note_discovery_prerequisites(&self) {
         if !self.static_sources.is_empty() || !self.static_pd_sources.is_empty() {
@@ -339,9 +340,9 @@ impl KvIndexSupervisor {
         }
         *hinted = true;
         info!(
-            "kv_aware: no static KV event sources configured; probing the non-upstream \
-             /kv_event_sources HTTP extension and falling back to load-only scoring where it is \
-             absent. Declare --kv-event-source to make KV-aware routing authoritative."
+            "kv_aware: no static KV event sources configured; probing the \
+             /kv_event_sources HTTP route (vLLM >= 0.31) and falling back to load-only scoring \
+             where it is absent. Declare --kv-event-source to make KV-aware routing authoritative."
         );
     }
 
@@ -360,7 +361,7 @@ impl KvIndexSupervisor {
 
     /// Query both endpoints for `worker_url`, spawn one subscriber per rank into
     /// this worker's identity's indexer. A 404 on the optional KV event source
-    /// control route (engine without the non-upstream extension) is a soft skip
+    /// control route (vLLM 0.29/0.30, or a frontend without it) is a soft skip
     /// that discovery remembers for the worker's lifetime.
     pub async fn on_worker_added(&self, worker_url: &str) -> Result<WorkerKvInfo, String> {
         self.note_discovery_prerequisites();
@@ -540,7 +541,7 @@ impl KvIndexSupervisor {
             }
             Err(unavailable) => {
                 match unavailable.probe {
-                    // The engine keeps the non-upstream extension off: remember
+                    // The engine serves no such route (vLLM 0.29/0.30): remember
                     // it, stay quiet, and let the deployment declare sources.
                     SourcesProbe::Unsupported => {
                         let first = self
@@ -549,9 +550,9 @@ impl KvIndexSupervisor {
                             .insert(worker_url.to_string());
                         if first {
                             debug!(
-                                "kv_index {}: engine does not expose /kv_event_sources (upstream \
-                                 vLLM serves KV event sources only over gRPC); no KV subscribers \
-                                 for this worker. Declare --kv-event-source to make it KV-aware.",
+                                "kv_index {}: engine does not expose /kv_event_sources (added in \
+                                 vLLM 0.31.0); no KV subscribers for this worker. Declare \
+                                 --kv-event-source to make it KV-aware.",
                                 worker_url
                             );
                         }
@@ -1034,7 +1035,7 @@ fn log_static_layout_trusted(worker_url: &str, probe: SourcesProbe) {
         // Stock vLLM serves no HTTP route, so this is the expected answer.
         SourcesProbe::Unsupported => debug!(
             worker_url,
-            "engine does not expose /kv_event_sources (non-upstream extension); \
+            "engine does not expose /kv_event_sources (added in vLLM 0.31.0); \
              trusting the configured hybrid layout"
         ),
         SourcesProbe::Failed => warn!(
@@ -1388,11 +1389,12 @@ fn grpc_model_id(
     })
 }
 
-/// Fetch the optional HTTP KV event source route.
+/// Fetch the HTTP KV event source route.
 ///
-/// Upstream vLLM serves no such route: KV event sources are exposed through the
-/// gRPC Control RPC only. A 404/405 therefore reports [`SourcesProbe::Unsupported`]
-/// (a deployment without the extension) rather than a transport failure.
+/// vLLM serves it since 0.31.0 (`entrypoints/serve/instrumentator/basic.py`);
+/// v0.29.0 and v0.30.0 do not. A 404/405 therefore reports
+/// [`SourcesProbe::Unsupported`] (an engine that cannot answer) rather than a
+/// transport failure.
 async fn fetch_kv_event_sources(
     client: &reqwest::Client,
     worker_url: &str,
@@ -1410,7 +1412,7 @@ async fn fetch_kv_event_sources(
     if matches!(status.as_u16(), 404 | 405) {
         return Err(SourcesUnavailable {
             probe: SourcesProbe::Unsupported,
-            detail: format!("kv_event_sources {url}: {status} (non-upstream extension)"),
+            detail: format!("kv_event_sources {url}: {status} (route added in vLLM 0.31.0)"),
         });
     }
     if !status.is_success() {
