@@ -1923,6 +1923,7 @@ mod tests {
         };
         manager.begin_prefill(&worker, 40);
         let slot = KvRequestSlot::new(manager.clone(), worker.clone(), 40, Some(100), None);
+        assert_eq!(manager.inflight_context_tokens(&worker), Some(100));
         let output_slot = slot.clone();
         let callback: GeneratedTokensCallback =
             Arc::new(move |tokens| output_slot.record_generated_tokens(tokens));
@@ -1935,14 +1936,14 @@ mod tests {
             ..Default::default()
         };
         notify_generated_tokens(&output, "", Some(&callback));
-        assert_eq!(manager.decode_context_tokens(&worker), Some(103));
+        assert_eq!(manager.inflight_context_tokens(&worker), Some(103));
         // The body-consumption path still controls the original P ledger.
         assert_eq!(manager.sample(&worker).active_prefill_tokens, 40);
         slot.begin_decode();
         assert_eq!(manager.sample(&worker).active_prefill_tokens, 0);
         slot.release();
         notify_generated_tokens(&output, "", Some(&callback));
-        assert_eq!(manager.decode_context_tokens(&worker), Some(0));
+        assert_eq!(manager.inflight_context_tokens(&worker), Some(0));
     }
 
     #[tokio::test]

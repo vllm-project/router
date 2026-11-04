@@ -29,7 +29,7 @@ pub use factory::PolicyFactory;
 pub(crate) use kv_aware::kv_aware_policy;
 pub use kv_aware::{
     cost_components, kv_aware_ops, AffinityKey, AffinityRecord, CandidateView, CostComponents,
-    CostDecision, CostParams, DecodeContext, InMemorySlotManager, KvAffinityTable, KvAwareOps,
+    CostDecision, CostParams, InMemorySlotManager, InflightContext, KvAffinityTable, KvAwareOps,
     KvAwarePolicy, KvRequestSlot, KvRequestTokens, KvSelectionReceipt, LoadProvider, LoadSample,
     MultiplicativeScorer, Picker, PrefillWorkEstimate, Scorer, SelectionError, SlotManager,
     StagePick, TemperaturePicker, TieredMatchProvider, TransferCredits, WorkerTokenInputs,
