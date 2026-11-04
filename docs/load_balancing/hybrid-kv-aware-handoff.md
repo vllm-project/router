@@ -138,13 +138,25 @@ properties break the single-hash-chain model this PR implements:
   rejected with `unsupported group restore contract`.
 
 Forcing `hash_block_size=4` and zero replay windows admits the rank, and then
-the events themselves are refused: every batch is dropped with
-`error=InvalidBatch` because a `BlockStored` publishes fewer hashes than the
-token range it describes (1024 `token_ids` with two hashes at `block_size 64`).
-The router therefore credits 0 while the engine reports 1536 cached tokens:
-fail-closed, no false hits, but also no reuse. Supporting this model needs a
-per-group hash chain and incremental-event handling, which is a follow-up
-rather than a layout fix.
+the events are refused: every batch is dropped with `error=InvalidBatch`. A ZMQ
+capture of the same engine shows why the shape is different, not just the
+sizes:
+
+| group | kind | window | block | published hashes for a 1024-token store |
+| --- | --- | --- | --- | --- |
+| 0, 1 | sliding_window_mla | 128 | 64 | 2 (the resident window), plus one event with 0 hashes |
+| 2 | mla_attention | - | 256 | 4 (the whole store) |
+| 2 | mla_attention | - | 4 | 1 (a 4-token compressed page, same group index) |
+| 3 | sliding_window_mla | 8 | 4 | 2 (the resident window), plus one event with 0 hashes |
+| 4 | sliding_window_mla | 128 | 8 | 16 (the resident window) |
+
+So a sliding-window group publishes `window/block` hashes, not one hash per
+block of the token range, and the same group index can publish two page sizes
+(`256` and `4`). The event carries `parent_block_hash`, which is what a
+bounded publication would have to anchor on: the chain does not start at the
+root, and this implementation only derives keys from the root. The router
+therefore credits 0 while the engine reports 1536 cached tokens: fail-closed,
+no false hits, but no reuse either.
 
 **DeepSeek-V4.1-Flash is not runnable on this hardware.** The repository
 publishes 510.3 GB of weights in 48 shards (`DeepSeek-V4-Flash`, the model that
@@ -198,7 +210,7 @@ missing handoff can never be served as a normal P/D request.
 
 1. **P/D:** Automate the observed matching and mismatched-layout assertions and verify a fully built upstream main with real weights. Enabling P/D changed the Qwen4Exp Mamba/attention block size from 320 to 288 in the test; verify each deployment's effective layout. Compare outputs against a direct reference, and exercise nonmatching pairs and multiple DP ranks. Handoff validation, the pre-dispatch 502 and post-handoff decode failures are covered against stub backends; a real NIXL P/D pair still needs the same four cases.
 2. **Lifecycle and unknown layouts:** Integrate trusted deployment generation changes and automatic rebinding. A static topic and periodic HTTP checks cannot establish that a worker has not restarted with the same topic. Ensure unknown hybrid models cannot obtain legacy group-0 credit, while retaining existing full-attention behavior.
-3. **Model layouts:** Capture stock-vLLM event and restore behavior for Qwen3.5/3.6/3.8/4 and DeepSeek V4/V4.1. The sliding-window/bounded-replay path now models one agreed layout window and rejects disagreeing groups, but the DeepSeek V4 compressed/shared-state layout still needs captured events from a real deployment before it can be enabled. Do not enable unknown groups or infer completeness from observed events. Concretely, enabling DeepSeek-V4-Flash needs two changes beyond a layout file: a hash chain per group block size (its groups are 4/8/64/256 while the engine hashes at 256) and an event decoder that accepts a `BlockStored` whose hash list is shorter than its token range (1024 tokens, block 64, two hashes). Qwen4Exp only needs the layout that is now recorded: three `mamba` groups, one compressed-MLA group, and the scratch ring excluded.
+3. **Model layouts:** Capture stock-vLLM event and restore behavior for Qwen3.5/3.6/3.8/4 and DeepSeek V4/V4.1. The sliding-window/bounded-replay path now models one agreed layout window and rejects disagreeing groups, but the DeepSeek V4 compressed/shared-state layout still needs captured events from a real deployment before it can be enabled. Do not enable unknown groups or infer completeness from observed events. Concretely, enabling DeepSeek-V4-Flash needs three changes beyond a layout file: a hash chain per group page size (its groups publish 4, 8, 64 and 256-token pages while the engine hashes at 256), acceptance of a bounded publication that anchors on `parent_block_hash` instead of the root (a sliding-window group publishes only `window/block` hashes, and 0-hash stores occur), and tolerance for one group index publishing two page sizes. Qwen4Exp only needs the layout that is now recorded: three `mamba` groups, one compressed-MLA group, and the scratch ring excluded.
 4. **Advisory affinity:** The advisory namespace binds, follows and never credits on stub backends. Bounding history by worker/rank/generation and tenant still needs tests, and the tools/reasoning entry points need documenting per framework.
 5. **Production checks:** Test feature-off and existing full-attention/gRPC paths, worker restart and replay truncation, DP isolation, recovery, races, capacity, multi-worker routing, actual engine hit counts and output equivalence. Run full Rust tests, strict Clippy and performance tests; document the supported version/model/connector matrix. Also reconcile the startup message "Using hybrid mode" with discovery mode actually ignoring static P/D URLs.
 
