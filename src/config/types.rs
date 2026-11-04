@@ -898,10 +898,10 @@ pub enum ConnectionMode {
 
 /// Statically configured KV event sources for one prefill worker.
 ///
-/// This is the authoritative source for stock vLLM: upstream serves KV event
-/// sources only over the gRPC Control RPC (`GetKvEventSources`), so the HTTP
-/// `/kv_event_sources` route that discovery probes is a non-upstream extension
-/// some frontends add. Declaring sources here removes the guesswork.
+/// This is authoritative for engines that cannot report their own sources:
+/// the HTTP `/kv_event_sources` route exists only since vLLM 0.31.0, and
+/// OpenAI-compatible frontends never serve it. On v0.29/v0.30 a deployment
+/// must declare its sources here (or use the gRPC Control RPC).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PdKvEventSources {
     /// ZMQ PUB endpoints, one per data-parallel rank (index = rank).
