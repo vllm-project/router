@@ -99,7 +99,10 @@ without that variable the engine publishes 64-bit integer block hashes, which
 no CBOR layout can reproduce, and the router credits 0 while the engine still
 reports hits. Each run sends one prompt three times and then one unrelated
 prompt; "credit/repeat" is what the router subtracted from `new_prefill_tokens`
-on a repeat, "engine hits" is `vllm:prefix_cache_hits_total` at the end.
+on a repeat, "engine hits" is `vllm:prefix_cache_hits_total` at the end. Every
+run used a two-card allocation; the partition itself is six nodes of eight
+H20-3e (143.8 GB each, 48 cards), so the larger V4 models fit on one node when
+a whole node is requested.
 
 | model | how it ran | block | group layout (idx: kind) | credit/repeat | engine hits | verdict |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -158,18 +161,34 @@ root, and this implementation only derives keys from the root. The router
 therefore credits 0 while the engine reports 1536 cached tokens: fail-closed,
 no false hits, but no reuse either.
 
-**DeepSeek-V4.1-Flash is not runnable on this hardware.** The repository
-publishes 510.3 GB of weights in 48 shards (`DeepSeek-V4-Flash`, the model that
-does fit, is 159.6 GB in 46 shards), so it needs at least six H20-3e cards
-before any KV cache is allocated. vLLM 0.33 does ship the config class
-(`vllm.transformers_utils.configs.deepseek_v41.DeepseekV41Config`, model type
-`deepseek_v41`), and a reduced dummy config reaches cache configuration with
-the same backend family as V4-Flash
+**DeepSeek-V4-Pro shares the V4-Flash code path but not its layout.**
+`deepseek-ai/DeepSeek-V4-Pro` reports `model_type: deepseek_v4` and runs
+`vllm/models/deepseek_v4/`, the same package as V4-Flash, so the group
+mechanism is identical; only the shapes move: 61 layers instead of 43, hidden
+7168 instead of 4096, 128 attention heads instead of 64, 384 routed experts
+instead of 256, `index_topk` 1024 instead of 512, `o_groups` 16 instead of 8,
+and 864.7 GB of weights in 64 shards instead of 159.6 GB in 46. Its
+`compress_ratios` also begins `128, 128, 4, ...` where V4-Flash begins
+`0, 0, 4, 128, ...`, so the layer-to-group schedule differs and the layout has
+to be captured on Pro itself rather than copied from Flash.
+
+**DeepSeek-V4.1-Flash is a different family and was not attempted.** The
+repository publishes 510.3 GB of weights in 48 shards. At 143.8 GB per H20-3e
+that is four cards for the weights alone, six to eight with KV cache, so it
+needs a larger allocation than the two-card jobs used here; V4-Pro at 864.7 GB
+needs seven to eight. vLLM 0.33 ships a separate implementation
+(`vllm/models/deepseek_v41/`, config
+`vllm.transformers_utils.configs.deepseek_v41.DeepseekV41Config`, model type
+`deepseek_v41`) whose cache assignment follows `kv_source_layer_ids` and adds
+engram and vision components, so its layout is not the V4-Flash layout with
+larger numbers. A reduced dummy config reaches cache configuration with the
+same backend family as V4-Flash
 (`FLASHMLA_SPARSE_DSV41/DEEPSEEK_SPARSE_SWA/DEEPSEEK_V41_INDEXER/CompressorBackend`,
-block 64 for that shape), so the layout work is the same as for V4-Flash. A
-dummy cannot stand in for the real model here: its engram tables are sized from
-the tokenizer (`engram_compressed_vocab_size` must match), and the remaining
-assertions are about that table geometry, not about attention.
+block 64 for that shape), so the group kinds are expected to match even though
+the layer assignment does not; what it publishes to ZMQ has not been captured.
+A dummy cannot stand in for the real model here: its engram tables are sized
+from the tokenizer (`engram_compressed_vocab_size` must match), and the
+remaining assertions are about that table geometry, not about attention.
 
 ### Advisory affinity, without a model
 
