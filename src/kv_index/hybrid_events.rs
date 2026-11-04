@@ -1275,6 +1275,7 @@ mod tests {
 
     /// One block per published hash, with the event shape the verified group
     /// kind requires.
+    #[allow(clippy::too_many_arguments)]
     fn blocks(
         group: HybridEventGroup,
         spec: &str,
