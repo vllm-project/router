@@ -1,15 +1,24 @@
-//! Conservative common-prefix calculation for hybrid cache groups.
+//! Common-prefix calculation for hybrid cache groups.
 //!
 //! The caller must first establish the cache identity, complete group layout,
 //! restore semantics, and one consistent snapshot for the target and its
 //! current incarnation. A placement event is not a reservation: the engine must
 //! still validate reuse at dispatch time.
 //!
-//! A hit in one group is never evidence for another. Every indexed group must
-//! accept the same, block-aligned boundary, and the credited prefix is that
-//! boundary minus the largest restore-time recomputation window the layout
-//! declares (vLLM's `prefix_replay_tokens`). Replay windows belong to the
-//! layout, not to a group that may publish no events at all.
+//! A hit in one group is never evidence for another. vLLM measures every
+//! group's hit on its own and keeps the smallest, so this module reports the
+//! same number: each group's longest restorable prefix, rounded to its own
+//! block, and the credited prefix is the smallest of those minus the
+//! restore-time recomputation window the layout declares (vLLM's
+//! `prefix_replay_tokens`). Replay windows belong to the layout, not to a group
+//! that may publish no events at all.
+//!
+//! Cumulative groups (dense, compressed, and checkpointed state) can be
+//! shortened afterwards without losing the rest of their state: the engine
+//! recomputes the missing tail from the oldest state they still hold. A
+//! sliding-window group cannot be shortened, because its resident blocks sit at
+//! its own hit boundary; the engine keeps the smaller hit anyway and does not
+//! re-check the window there.
 
 use std::collections::HashSet;
 
@@ -54,11 +63,12 @@ pub fn align_down(tokens: u64, block_size: u32) -> u64 {
 /// Return the latest jointly restorable boundary, or zero when none is proven.
 ///
 /// `max_reusable_tokens` is the engine-confirmed upper bound, including any
-/// last-token recomputation constraint. The boundary is never truncated: all
-/// groups must accept the same, block-aligned position. Only local GPU claims
-/// on `target` count. Unknown group rules must not be converted into these
-/// supported variants; a caller unable to describe every required group must
-/// not invoke this function to grant credit.
+/// last-token recomputation constraint. Each group contributes the longest
+/// prefix it can restore on its own, rounded down to its block size; the
+/// result is the smallest contribution. Only local GPU claims on `target`
+/// count. Unknown group rules must not be converted into these supported
+/// variants; a caller unable to describe every required group must not invoke
+/// this function to grant credit.
 pub fn common_reusable_tokens(
     target: &RoutableTarget,
     groups: &[HybridGroupView<'_>],
@@ -79,69 +89,98 @@ pub fn common_reusable_tokens(
         return 0;
     }
 
-    // Every legal boundary is a multiple of the first group's block size.
-    // Iterate only that group's actually held blocks, newest first. Other
-    // groups can have different block sizes or sparse checkpoint positions.
-    let first = &groups[0];
-    let block_size = u64::from(first.block_size);
-    let max_blocks = max_reusable_tokens / block_size;
-    let mut best = 0;
-    for hit in first.matches.iter().filter(|hit| eligible(hit, target)) {
-        for &(start, end) in &hit.segments {
-            if start >= end {
+    // Every group reports its own hit; the smallest one is what the engine
+    // restores. A group that proves nothing drops the whole prefix, because the
+    // engine takes the minimum across all groups.
+    let mut boundary = max_reusable_tokens;
+    for group in groups {
+        let available = longest_supported(group, target, u64::MAX);
+        let hit = align_down(available.min(max_reusable_tokens), group.block_size);
+        if hit == 0 {
+            return 0;
+        }
+        boundary = boundary.min(hit);
+    }
+
+    // Cumulative groups restore whole blocks from their oldest retained state,
+    // so a coarser checkpoint layout pulls the shared boundary down to its own
+    // granularity. Sliding-window groups are left alone: their window is only
+    // proven at the hit they reported.
+    loop {
+        let mut next = boundary;
+        for group in groups {
+            if matches!(group.kind, HybridGroupKind::SlidingWindow { .. }) {
                 continue;
             }
-            let mut block = u64::from(end).min(max_blocks);
-            while block > u64::from(start) {
-                let boundary = block * block_size;
-                if boundary <= best {
-                    break;
-                }
-                if groups.iter().all(|group| supports(group, target, boundary)) {
-                    best = boundary;
-                    break;
-                }
-                block -= 1;
-            }
+            next = next.min(longest_supported(group, target, boundary));
         }
+        if next == 0 {
+            return 0;
+        }
+        if next == boundary {
+            return boundary;
+        }
+        boundary = next;
     }
-    best
 }
 
 fn eligible(hit: &TierMatch, target: &RoutableTarget) -> bool {
     hit.target == *target && hit.tier == StorageTier::Device && hit.locality == Locality::Local
 }
 
-fn supports(group: &HybridGroupView<'_>, target: &RoutableTarget, boundary: u64) -> bool {
+/// The longest boundary at most `cap` that one group's own restore rule
+/// accepts, in tokens, over the segments this snapshot holds.
+fn longest_supported(group: &HybridGroupView<'_>, target: &RoutableTarget, cap: u64) -> u64 {
     let size = u64::from(group.block_size);
-    if boundary == 0 || !boundary.is_multiple_of(size) {
-        return false;
+    if size == 0 {
+        return 0;
     }
-    let end = boundary / size;
-    let start = match group.kind {
-        HybridGroupKind::FullAttention => 0,
-        HybridGroupKind::CompressedFullAttention { tokens_per_state } => {
-            if tokens_per_state == 0 || !boundary.is_multiple_of(u64::from(tokens_per_state)) {
-                return false;
+    let cap_blocks = cap / size;
+    let mut best = 0;
+    for hit in group.matches.iter().filter(|hit| eligible(hit, target)) {
+        for &(start, end) in &hit.segments {
+            if start >= end {
+                continue;
             }
-            0
+            let (start, end) = (u64::from(start), u64::from(end).min(cap_blocks));
+            if end <= start {
+                continue;
+            }
+            let candidate = match group.kind {
+                // Dense and compressed state cover every block from the root.
+                HybridGroupKind::FullAttention => {
+                    if start == 0 {
+                        end
+                    } else {
+                        0
+                    }
+                }
+                HybridGroupKind::CompressedFullAttention { tokens_per_state } => {
+                    if start != 0
+                        || tokens_per_state == 0
+                        || !group.block_size.is_multiple_of(tokens_per_state)
+                    {
+                        0
+                    } else {
+                        end
+                    }
+                }
+                // A checkpoint is restorable on its own.
+                HybridGroupKind::Checkpoint => end,
+                // The window that ends at the boundary has to fit inside the
+                // blocks this segment proves.
+                HybridGroupKind::SlidingWindow { window_tokens } => {
+                    if end * size < start * size + window_tokens {
+                        0
+                    } else {
+                        end
+                    }
+                }
+            };
+            best = best.max(candidate * size);
         }
-        HybridGroupKind::Checkpoint => end - 1,
-        HybridGroupKind::SlidingWindow { window_tokens } => {
-            boundary.saturating_sub(window_tokens) / size
-        }
-    };
-    group
-        .matches
-        .iter()
-        .filter(|hit| eligible(hit, target))
-        .any(|hit| {
-            hit.segments.iter().any(|&(segment_start, segment_end)| {
-                segment_start < segment_end
-                    && u64::from(segment_start) <= start
-                    && u64::from(segment_end) >= end
-            })
-        })
+    }
+    best
 }
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
@@ -222,7 +261,11 @@ mod tests {
             ),
         ];
         assert_eq!(common_reusable_tokens(&worker, &groups, 128), 128);
-        assert_eq!(common_reusable_tokens(&worker, &groups, 127), 0);
+        // The last token cannot be reused, so both groups report 7 blocks. The
+        // engine keeps the smaller hit without re-checking the window at that
+        // shorter boundary: the window is only proven where the group reports
+        // it, and everything after the hit is prefilled again.
+        assert_eq!(common_reusable_tokens(&worker, &groups, 127), 112);
     }
 
     #[test]
