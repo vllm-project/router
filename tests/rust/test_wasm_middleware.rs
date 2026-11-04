@@ -70,6 +70,7 @@ async fn wasm_middleware_modify_reject_and_path_isolation() {
     mock_worker::clear_captured_requests(worker_port);
 
     let config = RouterConfig {
+        pd_decode_selection: vllm_router_rs::config::PdDecodeSelection::Admission,
         mode: RoutingMode::Regular {
             worker_urls: vec![worker_url],
         },

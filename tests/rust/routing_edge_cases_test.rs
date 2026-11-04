@@ -152,6 +152,7 @@ async fn body_at_the_payload_limit_is_routed_and_one_byte_more_is_rejected() {
     const LIMIT: usize = 1024 * 1024;
     let mut worker = BenchMockWorker::start().await;
     let config = RouterConfig {
+        pd_decode_selection: vllm_router_rs::config::PdDecodeSelection::Admission,
         mode: RoutingMode::Regular {
             worker_urls: vec![worker.url().to_string()],
         },

@@ -9,7 +9,7 @@ use super::pd_types::{error_chain, PDRouterError, PdAttempt, PdEndpoint, PdReque
 use super::router::{hold_request_load_until_body_done, prepare_error_status, RequestLoadGuard};
 use super::usage_merge;
 use super::vllm_service_discovery::{MoriIOTransferMode, ServiceRegistry, ServiceType};
-use crate::config::KvConnector;
+use crate::config::{KvConnector, PdDecodeSelection};
 use crate::core::{BasicWorker, DPAwareWorker, Worker, WorkerType};
 use crate::metrics::RouterMetrics;
 use crate::otel_http::{self, ClientRequestOptions};
@@ -106,6 +106,40 @@ pub struct VllmPDRouter {
     nixl_prefill_info: RwLock<HashMap<String, HashMap<usize, Value>>>,
     /// Tokenizer and tonic clients for `grpc://` prefill and decode pools.
     grpc_frontend: crate::backend::EngineFrontend,
+    /// When the decode stage is committed for sequential P/D dispatch.
+    pd_decode_selection: PdDecodeSelection,
+}
+
+/// Everything the deferred decode commitment needs at dispatch time.
+///
+/// Owned so it can outlive the admission borrows. The candidate pool is not
+/// carried: admission-time handles are snapshots, so the commitment rebuilds
+/// the pool to see removals and replacements that happened during Prefill.
+pub(super) struct DecodeCommitInput {
+    pub pool: DecodePoolSource,
+    /// Admission-time provisional pick, used only for the changed counter.
+    pub provisional_endpoint: PdEndpoint,
+    pub affinity_key: Option<AffinityKey>,
+    pub cache_salt: Option<String>,
+    pub model_id: Option<String>,
+    pub route: String,
+}
+
+/// Where a deferred commitment refreshes its decode candidates from.
+#[derive(Clone, Copy)]
+pub(super) enum DecodePoolSource {
+    /// Decode URLs held by the worker registry (`--decode`).
+    Registry,
+    /// Decode instances published through service discovery.
+    Discovery,
+}
+
+/// One admitted pair. The decode handle is the provisional pickup; a deferred
+/// commitment replaces it once the Prefill response is in.
+struct AdmittedPair {
+    prefill: Arc<dyn Worker>,
+    decode: Arc<dyn Worker>,
+    attempt: PdAttempt,
 }
 
 /// Transfer ID prefix used by MoRI-IO to correlate prefill and decode legs.
@@ -863,6 +897,18 @@ impl VllmPDRouter {
         request
     }
 
+    /// Decode candidates as they stand now, from the same source admission used.
+    fn live_decode_candidates(&self, source: DecodePoolSource) -> Vec<Arc<dyn Worker>> {
+        match source {
+            DecodePoolSource::Registry => self.pd_router.worker_registry.get_decode_workers(),
+            DecodePoolSource::Discovery => self.discovery_candidates(
+                self.service_registry
+                    .get_instance_snapshots(ServiceType::Decode),
+                ServiceType::Decode,
+            ),
+        }
+    }
+
     fn discovery_candidates(
         &self,
         instances: Vec<(String, String, Option<usize>)>,
@@ -943,6 +989,7 @@ impl VllmPDRouter {
         .map(|identity| AffinityKey::from_identity(identity, model_scope))
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn admit_pair(
         &self,
         prefill_workers: &[Arc<dyn Worker>],
@@ -951,6 +998,7 @@ impl VllmPDRouter {
         path: &str,
         headers: Option<&HeaderMap>,
         forward_policy_headers: bool,
+        defer_decode: bool,
     ) -> Option<(super::pd_types::PdSelection, PdAttempt)> {
         self.admit_pair_with_tokens(
             prefill_workers,
@@ -960,6 +1008,7 @@ impl VllmPDRouter {
             headers,
             forward_policy_headers,
             None,
+            defer_decode,
         )
         .await
     }
@@ -976,6 +1025,7 @@ impl VllmPDRouter {
         headers: Option<&HeaderMap>,
         forward_policy_headers: bool,
         router_prompts: Option<&Arc<[Vec<u32>]>>,
+        defer_decode: bool,
     ) -> Option<(super::pd_types::PdSelection, PdAttempt)> {
         let prefill_policy = self.policy_registry.get_prefill_policy();
         let decode_policy = self.policy_registry.get_decode_policy();
@@ -1053,8 +1103,105 @@ impl VllmPDRouter {
         // Existing deployments configure a common connector. Discovery parses
         // registrations with that connector; no new pair compatibility is
         // inferred from KV overlap or DP rank equality.
-        self.pd_router
-            .select_and_admit(prefill_workers, decode_workers, &context)
+        self.pd_router.select_and_admit_with(
+            prefill_workers,
+            decode_workers,
+            &context,
+            defer_decode,
+        )
+    }
+
+    /// Whether this deployment can defer the decode commitment.
+    ///
+    /// Deferral needs a sequential dispatch: the Prefill request must not carry
+    /// the decode target. That holds for Mooncake and for NIXL in pull mode; it
+    /// does not hold once a NIXL push identity is cached for any prefill
+    /// endpoint, nor for MoRI-IO, whose Prefill parameters embed the decode
+    /// DP size. gRPC pools keep the admission-time commitment.
+    fn decode_commit_can_defer(&self, prefill_workers: &[Arc<dyn Worker>]) -> bool {
+        if self.pd_decode_selection != PdDecodeSelection::Dispatch {
+            return false;
+        }
+        if self.uses_grpc_pools() {
+            return false;
+        }
+        match self.kv_connector {
+            KvConnector::Nixl => prefill_workers.iter().all(|worker| {
+                self.get_nixl_push_identity(worker.base_url(), worker.dp_rank())
+                    .is_none()
+            }),
+            KvConnector::Mooncake => true,
+            KvConnector::MoriIO => false,
+        }
+    }
+
+    /// Charge the decode stage chosen against live occupancy.
+    ///
+    /// Runs after the Prefill response has been parsed and before the decode
+    /// request is built, so the decision sees the state that will serve it.
+    /// A missing candidate is reported before any decode dispatch, and the
+    /// attempt then releases only the Prefill charge.
+    fn commit_decode(
+        &self,
+        attempt: &PdAttempt,
+        input: &DecodeCommitInput,
+    ) -> Result<Arc<dyn Worker>, (StatusCode, String)> {
+        let decode_policy = self.policy_registry.get_decode_policy();
+        // Rebuild the candidates: a worker removed while Prefill ran still
+        // reports its last availability on the admission-time handle, and a
+        // replacement registered in the meantime is invisible from it.
+        let candidates = self.live_decode_candidates(input.pool);
+        let context = PdRequestContext {
+            prefill_inputs: None,
+            model_id: input.model_id.as_deref(),
+            legacy_policy_input: None,
+            prefill_cache: None,
+            decode_cache: None,
+            headers: None,
+            affinity_key: input.affinity_key.clone(),
+            cache_salt: input.cache_salt.as_deref(),
+            route: &input.route,
+        };
+        let committed = self.pd_router.pd_load.commit_decode(attempt, |loads| {
+            super::pd_router::select_decode_stage(
+                loads,
+                &candidates,
+                decode_policy.as_ref(),
+                &context,
+            )
+        });
+        let Some(decision) = committed else {
+            RouterMetrics::record_pd_decode_commit("empty");
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "No eligible decode worker at dispatch".to_owned(),
+            ));
+        };
+        let outcome = if decision.endpoint == input.provisional_endpoint {
+            "same"
+        } else {
+            "changed"
+        };
+        RouterMetrics::record_pd_decode_commit(outcome);
+        if let Some(affinity) = decision.affinity_outcome {
+            RouterMetrics::record_pd_affinity_decision("decode", affinity);
+        }
+        let Some(worker) = candidates.get(decision.worker_index).cloned() else {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Committed decode worker left the pool".to_owned(),
+            ));
+        };
+        attempt.attach_decode_worker(worker.clone());
+        debug!(
+            version = 1,
+            decode = %worker.url(),
+            outcome,
+            provisional = ?input.provisional_endpoint,
+            committed = ?decision.endpoint,
+            "P/D decode committed at dispatch"
+        );
+        Ok(worker)
     }
 
     /// Cheap opt-in gate: only Program-capable requests are serialized twice.
@@ -1219,6 +1366,7 @@ impl VllmPDRouter {
                 headers,
                 attempt.clone(),
                 Some(permit),
+                None,
             )
             .await;
         Some(match result {
@@ -1365,7 +1513,7 @@ impl VllmPDRouter {
         request: &Value,
         path: &str,
         headers: Option<&HeaderMap>,
-    ) -> Option<(Arc<dyn Worker>, Arc<dyn Worker>, PdAttempt)> {
+    ) -> Option<AdmittedPair> {
         let prefill_workers = self.discovery_candidates(
             self.service_registry
                 .get_instance_snapshots(ServiceType::Prefill),
@@ -1384,13 +1532,14 @@ impl VllmPDRouter {
                 path,
                 headers,
                 true,
+                self.decode_commit_can_defer(&prefill_workers),
             )
             .await?;
-        Some((
-            prefill_workers[selection.prefill.worker_index].clone(),
-            decode_workers[selection.decode.worker_index].clone(),
+        Some(AdmittedPair {
+            prefill: prefill_workers[selection.prefill.worker_index].clone(),
+            decode: decode_workers[selection.decode.worker_index].clone(),
             attempt,
-        ))
+        })
     }
 
     /// Discovery supplies candidates; admission and dispatch are shared with static pools.
@@ -1400,12 +1549,36 @@ impl VllmPDRouter {
         path: &str,
         headers: Option<&HeaderMap>,
     ) -> Response {
-        let Some((prefill_worker, decode_worker, attempt)) =
-            self.admit_discovered_pair(&request, path, headers).await
+        let Some(AdmittedPair {
+            prefill: prefill_worker,
+            decode: decode_worker,
+            attempt,
+        }) = self.admit_discovered_pair(&request, path, headers).await
         else {
             RouterMetrics::record_pd_error("server_selection");
             return (StatusCode::SERVICE_UNAVAILABLE, "No eligible P/D pair").into_response();
         };
+        // The admission-time decode pick is provisional when the commitment is
+        // deferred: it seeds the request id and the Prefill parameters only.
+        let commit = attempt.decode_pending_commit().then(|| DecodeCommitInput {
+            pool: DecodePoolSource::Discovery,
+            provisional_endpoint: PdEndpoint::for_worker(decode_worker.as_ref()),
+            affinity_key: Self::extract_affinity_key(
+                self.policy_registry.get_decode_policy().as_ref(),
+                headers,
+                &request,
+            ),
+            cache_salt: request
+                .get("cache_salt")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned),
+            model_id: request
+                .get("model")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            route: path.to_string(),
+        });
         match self
             .process_vllm_two_stage_request(
                 request,
@@ -1415,6 +1588,7 @@ impl VllmPDRouter {
                 headers,
                 attempt.clone(),
                 None,
+                commit.as_ref(),
             )
             .await
         {
@@ -1583,6 +1757,7 @@ impl VllmPDRouter {
                 headers,
                 true,
                 Some(&router_prompts),
+                false,
             )
             .await
         else {
@@ -1614,11 +1789,12 @@ impl VllmPDRouter {
         &self,
         original_request: Value,
         prefill_worker: Arc<dyn Worker>,
-        decode_worker: Arc<dyn Worker>,
+        mut decode_worker: Arc<dyn Worker>,
         path: &str,
         headers: Option<&HeaderMap>,
         attempt: PdAttempt,
         prefill_permit: Option<OwnedSemaphorePermit>,
+        commit: Option<&DecodeCommitInput>,
     ) -> Result<Response, PDRouterError> {
         debug!("ENTERED process_vllm_two_stage_request method");
         let start_time = Instant::now();
@@ -1663,27 +1839,37 @@ impl VllmPDRouter {
             (original_request, None)
         };
 
-        if let Some((prefill_request, decode_request, request_id)) = self
-            .try_build_concurrent_requests(&original_request, &prefill_worker, &decode_worker, path)
-            .await
-        {
-            return self
-                .process_concurrent_two_stage(
-                    ConcurrentDispatch {
-                        prefill_request,
-                        decode_request,
-                        prefill_worker,
-                        decode_worker,
-                        request_id,
-                    },
+        // A deferred commitment owns the decode target, so it must stay on the
+        // sequential path: the concurrent plan is built from the provisional
+        // handle before any commit, and would dispatch an uncharged decode.
+        if commit.is_none() {
+            if let Some((prefill_request, decode_request, request_id)) = self
+                .try_build_concurrent_requests(
+                    &original_request,
+                    &prefill_worker,
+                    &decode_worker,
                     path,
-                    headers,
-                    start_time,
-                    ec_transfers,
-                    attempt,
-                    prefill_permit,
                 )
-                .await;
+                .await
+            {
+                return self
+                    .process_concurrent_two_stage(
+                        ConcurrentDispatch {
+                            prefill_request,
+                            decode_request,
+                            prefill_worker,
+                            decode_worker,
+                            request_id,
+                        },
+                        path,
+                        headers,
+                        start_time,
+                        ec_transfers,
+                        attempt,
+                        prefill_permit,
+                    )
+                    .await;
+            }
         }
 
         debug!(
@@ -1846,6 +2032,16 @@ impl VllmPDRouter {
                     "Prefill returned no KV transfer parameters; refusing metadata-only decode"
                         .into(),
             });
+        }
+
+        // The Prefill response is the first point where a deferred decode
+        // target can be chosen against live state without delaying dispatch:
+        // the decode request body is built from this same response.
+        if let Some(commit) = commit {
+            match self.commit_decode(&attempt, commit) {
+                Ok(worker) => decode_worker = worker,
+                Err((status, message)) => return Ok((status, message).into_response()),
+            }
         }
 
         // Prefill succeeded and consumed the embeddings; the pending EC
@@ -2503,6 +2699,7 @@ impl VllmPDRouter {
                 mooncake_prefill_info: Arc::new(Mutex::new(HashMap::new())),
                 nixl_prefill_info: RwLock::new(HashMap::new()),
                 grpc_frontend: crate::backend::EngineFrontend::new(),
+                pd_decode_selection: ctx.router_config.pd_decode_selection,
             })
         } else {
             // Direct URL mode (same as PdRouterBase)
@@ -2623,6 +2820,7 @@ impl VllmPDRouter {
                 mooncake_prefill_info,
                 nixl_prefill_info: RwLock::new(HashMap::new()),
                 grpc_frontend,
+                pd_decode_selection: ctx.router_config.pd_decode_selection,
             })
         }
     }
@@ -3035,6 +3233,7 @@ impl RouterTrait for VllmPDRouter {
                     path,
                     headers,
                     true,
+                    self.decode_commit_can_defer(&prefill_workers),
                 )
                 .await
             {
@@ -3051,10 +3250,33 @@ impl RouterTrait for VllmPDRouter {
             let prefill_worker = &prefill_workers[prefill_idx];
             let decode_worker = &decode_workers[decode_idx];
 
+            // Mirrors the discovery path: a deferred commitment re-selects the
+            // decode target once the Prefill response is in.
+            let commit = attempt.decode_pending_commit().then(|| DecodeCommitInput {
+                pool: DecodePoolSource::Registry,
+                provisional_endpoint: selection.decode.endpoint.clone(),
+                affinity_key: Self::extract_affinity_key(
+                    self.policy_registry.get_decode_policy().as_ref(),
+                    headers,
+                    &request_json,
+                ),
+                cache_salt: request_json
+                    .get("cache_salt")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_owned),
+                model_id: request_json
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                route: path.to_string(),
+            });
+
             debug!(
-                "Transparent proxy: prefill={}, decode={}",
+                "Transparent proxy: prefill={}, decode={}, deferred={}",
                 prefill_worker.url(),
-                decode_worker.url()
+                decode_worker.url(),
+                commit.is_some()
             );
 
             // Execute two-stage processing
@@ -3067,6 +3289,7 @@ impl RouterTrait for VllmPDRouter {
                     headers,
                     attempt.clone(),
                     None,
+                    commit.as_ref(),
                 )
                 .await
             {
@@ -3248,6 +3471,7 @@ mod tests {
                     "/v1/completions",
                     None,
                     false,
+                    false,
                 )
                 .await
                 .unwrap();
@@ -3338,6 +3562,7 @@ mod tests {
                     "/v1/chat/completions",
                     None,
                     false,
+                    false,
                 )
                 .await
                 .unwrap();
@@ -3404,6 +3629,7 @@ mod tests {
                     &request,
                     "/v1/chat/completions",
                     None,
+                    false,
                     false,
                 )
                 .await
@@ -4567,11 +4793,11 @@ mod tests {
             let mut pairs = std::collections::HashSet::new();
             for turn in 0..3 {
                 let request = json!({"model": "m", "prompt": format!("turn {turn}")});
-                let (prefill, decode, _attempt) = router
+                let pair = router
                     .admit_discovered_pair(&request, "/v1/completions", Some(&headers))
                     .await
                     .expect("a P/D pair should be admitted");
-                pairs.insert((prefill.url().to_owned(), decode.url().to_owned()));
+                pairs.insert((pair.prefill.url().to_owned(), pair.decode.url().to_owned()));
             }
             assert_eq!(pairs.len(), 1, "session-{session} moved: {pairs:?}");
         }

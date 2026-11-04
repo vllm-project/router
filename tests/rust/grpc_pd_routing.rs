@@ -93,6 +93,7 @@ async fn pd_router_with_kv_sources(
         .map(|prefill| (prefill.grpc_url.clone(), None))
         .collect();
     let config = RouterConfig {
+        pd_decode_selection: vllm_router_rs::config::PdDecodeSelection::Admission,
         mode: RoutingMode::VllmPrefillDecode {
             prefill_urls: prefill_urls.clone(),
             decode_urls: vec![decode.grpc_url.clone()],

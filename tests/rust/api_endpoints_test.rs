@@ -30,6 +30,7 @@ impl TestContext {
     async fn new(worker_configs: Vec<MockWorkerConfig>) -> Self {
         // Create default router config
         let config = RouterConfig {
+            pd_decode_selection: vllm_router_rs::config::PdDecodeSelection::Admission,
             mode: RoutingMode::Regular {
                 worker_urls: vec![],
             },
@@ -482,6 +483,7 @@ mod generation_tests {
     #[tokio::test]
     async fn test_program_request_is_tracked_without_changing_response() {
         let config = RouterConfig {
+            pd_decode_selection: vllm_router_rs::config::PdDecodeSelection::Admission,
             policy: PolicyConfig::RoundRobin,
             program_scheduling: Some(ProgramSchedulingConfig::default()),
             ..Default::default()
@@ -537,6 +539,7 @@ mod generation_tests {
     async fn test_program_retry_completes_each_route_attempt_without_occupancy_leak() {
         let (backend_url, attempts, backend_handle) = start_retry_once_chat_backend().await;
         let config = RouterConfig {
+            pd_decode_selection: vllm_router_rs::config::PdDecodeSelection::Admission,
             mode: RoutingMode::Regular {
                 worker_urls: vec![backend_url],
             },
@@ -1201,6 +1204,7 @@ mod responses_endpoint_tests {
     #[tokio::test]
     async fn test_v1_responses_program_request_is_tracked() {
         let config = RouterConfig {
+            pd_decode_selection: vllm_router_rs::config::PdDecodeSelection::Admission,
             policy: PolicyConfig::RoundRobin,
             program_scheduling: Some(ProgramSchedulingConfig::default()),
             ..Default::default()
@@ -1577,6 +1581,7 @@ mod error_tests {
     async fn test_payload_too_large() {
         // Create context with small payload limit
         let config = RouterConfig {
+            pd_decode_selection: vllm_router_rs::config::PdDecodeSelection::Admission,
             mode: RoutingMode::Regular {
                 worker_urls: vec![],
             },
@@ -1939,6 +1944,7 @@ mod pd_mode_tests {
             .unwrap_or(9000);
 
         let config = RouterConfig {
+            pd_decode_selection: vllm_router_rs::config::PdDecodeSelection::Admission,
             mode: RoutingMode::VllmPrefillDecode {
                 prefill_urls: vec![(prefill_url, Some(prefill_port))],
                 decode_urls: vec![decode_url],
@@ -2112,6 +2118,7 @@ mod request_id_tests {
     async fn test_request_id_with_custom_headers() {
         // Create config with custom request ID headers
         let config = RouterConfig {
+            pd_decode_selection: vllm_router_rs::config::PdDecodeSelection::Admission,
             mode: RoutingMode::Regular {
                 worker_urls: vec![],
             },

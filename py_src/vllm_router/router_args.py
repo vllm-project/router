@@ -64,6 +64,8 @@ class RouterArgs:
     vllm_discovery_address: Optional[str] = None
     # KV connector for PD disaggregation (nixl pull-based or mooncake push-based)
     kv_connector: str = "nixl"
+    # When the Decode stage is committed for sequential P/D dispatch.
+    pd_decode_selection: str = "admission"
     # Explicit Program-level scheduling switch and optional JSON overrides.
     enable_program_scheduling: bool = False
     program_scheduling_config_json: Optional[str] = None
@@ -454,6 +456,17 @@ class RouterArgs:
             "pull-based KV transfer; 'mooncake' uses Mooncake's push-based protocol "
             "(queries each prefill node's bootstrap server for engine_id per DP rank); "
             "'moriio' uses the MoRI-IO connector (either READ or WRITE modes).",
+        )
+        parser.add_argument(
+            f"--{prefix}pd-decode-selection",
+            type=str,
+            default=RouterArgs.pd_decode_selection,
+            choices=["admission", "dispatch"],
+            help="When to commit the Decode worker for P/D disaggregation: 'admission' "
+            "(default) chooses and charges Decode before Prefill is dispatched; "
+            "'dispatch' leaves Decode uncommitted until the Prefill response returns, "
+            "then selects against live occupancy. 'dispatch' only applies to the "
+            "kv_aware decode policy and sequential connectors.",
         )
         # Prometheus configuration
         parser.add_argument(

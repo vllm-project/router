@@ -63,6 +63,7 @@ mod test_pd_routing {
             axum::serve(listener, app).await.unwrap();
         });
         let config = RouterConfig {
+            pd_decode_selection: vllm_router_rs::config::PdDecodeSelection::Admission,
             mode: RoutingMode::VllmPrefillDecode {
                 prefill_urls: vec![(format!("{base}/p"), None)],
                 decode_urls: vec![format!("{base}/d")],
@@ -338,6 +339,7 @@ mod test_pd_routing {
             axum::serve(listener, app).await.unwrap();
         });
         let mut config = RouterConfig {
+            pd_decode_selection: vllm_router_rs::config::PdDecodeSelection::Admission,
             mode: RoutingMode::VllmPrefillDecode {
                 prefill_urls: vec![(format!("{base}/p"), None)],
                 decode_urls: vec![format!("{base}/d")],
@@ -545,6 +547,7 @@ mod test_pd_routing {
             axum::serve(listener, app).await.unwrap();
         });
         let config = RouterConfig {
+            pd_decode_selection: vllm_router_rs::config::PdDecodeSelection::Admission,
             mode: RoutingMode::VllmPrefillDecode {
                 prefill_urls: vec![(format!("{base}/p"), None)],
                 decode_urls: vec![format!("{base}/d")],
@@ -780,6 +783,7 @@ mod test_pd_routing {
 
         for (mode, policy) in test_cases {
             let config = RouterConfig {
+                pd_decode_selection: vllm_router_rs::config::PdDecodeSelection::Admission,
                 mode,
                 pd_kv_event_sources: Default::default(),
                 policy,

@@ -19,6 +19,7 @@ struct TestContext {
 impl TestContext {
     async fn new(worker_configs: Vec<MockWorkerConfig>) -> Self {
         let mut config = RouterConfig {
+            pd_decode_selection: vllm_router_rs::config::PdDecodeSelection::Admission,
             mode: RoutingMode::Regular {
                 worker_urls: vec![],
             },

@@ -70,6 +70,10 @@ def rust_options():
         "KvConnector": rust_enum(
             (ROOT / "src/config/types.rs").read_text(encoding="utf-8"), "KvConnector"
         ),
+        "PdDecodeSelection": rust_enum(
+            (ROOT / "src/config/types.rs").read_text(encoding="utf-8"),
+            "PdDecodeSelection",
+        ),
     }
     fields = re.findall(
         r"#\[arg\((.*?)\)\][^\n]*\n\s*(\w+): ([^\n]+),", body, re.DOTALL

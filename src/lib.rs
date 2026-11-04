@@ -119,6 +119,8 @@ struct Router {
     otlp_traces_endpoint: Option<String>,
     // KV connector for PD disaggregation ("nixl" or "mooncake")
     kv_connector: String,
+    // When the Decode stage is committed for sequential P/D dispatch.
+    pd_decode_selection: String,
     // Explicit Program-level scheduling feature switch and optional overrides.
     enable_program_scheduling: bool,
     program_scheduling_config_json: Option<String>,
@@ -294,6 +296,18 @@ impl Router {
                 self.enable_program_scheduling,
                 self.program_scheduling_config_json.as_deref(),
             )?,
+            pd_decode_selection: match self.pd_decode_selection.to_ascii_lowercase().as_str() {
+                "admission" => config::PdDecodeSelection::Admission,
+                "dispatch" => config::PdDecodeSelection::Dispatch,
+                other => {
+                    return Err(config::ConfigError::ValidationFailed {
+                        reason: format!(
+                            "Invalid pd_decode_selection '{}': expected 'admission' or 'dispatch'",
+                            other
+                        ),
+                    });
+                }
+            },
         })
     }
 }
@@ -367,6 +381,7 @@ impl Router {
         otlp_traces_endpoint = None,
         // KV connector default (PD disaggregation)
         kv_connector = String::from("nixl"),
+        pd_decode_selection = String::from("admission"),
         wasm_middleware = None,
         wasm_middleware_sha256 = None,
         wasm_middleware_routes = vec![],
@@ -444,6 +459,7 @@ impl Router {
         enable_trace: bool,
         otlp_traces_endpoint: Option<String>,
         kv_connector: String,
+        pd_decode_selection: String,
         wasm_middleware: Option<String>,
         wasm_middleware_sha256: Option<String>,
         wasm_middleware_routes: Vec<String>,
@@ -549,6 +565,7 @@ impl Router {
             enable_trace,
             otlp_traces_endpoint,
             kv_connector,
+            pd_decode_selection,
             program_scheduling_config_json,
         })
     }

@@ -24,6 +24,7 @@ use vllm_router_rs::routers::RouterTrait;
 
 fn config(urls: Vec<String>, policy: PolicyConfig) -> RouterConfig {
     RouterConfig {
+        pd_decode_selection: vllm_router_rs::config::PdDecodeSelection::Admission,
         mode: RoutingMode::Regular { worker_urls: urls },
         policy,
         connection_mode: vllm_router_rs::config::ConnectionMode::Grpc,

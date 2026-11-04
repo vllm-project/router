@@ -52,6 +52,7 @@ fn setup_otel_harness() -> (
 
 fn test_router_config(worker_url: &str) -> RouterConfig {
     RouterConfig {
+        pd_decode_selection: vllm_router_rs::config::PdDecodeSelection::Admission,
         mode: RoutingMode::Regular {
             worker_urls: vec![worker_url.to_string()],
         },
