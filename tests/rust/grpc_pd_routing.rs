@@ -110,7 +110,7 @@ async fn pd_router_with_pools(
     dp_size: usize,
     prefill_policy: PolicyConfig,
 ) -> VllmPDRouter {
-    pd_router_with_progress(prefills, decode, dp_size, prefill_policy, None).await
+    pd_router_with_progress(prefills, decode, dp_size, prefill_policy, false).await
 }
 
 async fn pd_router_with_progress(
@@ -118,14 +118,14 @@ async fn pd_router_with_progress(
     decode: &MockVllmRsServer,
     dp_size: usize,
     prefill_policy: PolicyConfig,
-    prefill_progress_stale_after_secs: Option<u64>,
+    enable_prefill_progress: bool,
 ) -> VllmPDRouter {
     pd_router_with_progress_and_kv_sources(
         prefills,
         decode,
         dp_size,
         prefill_policy,
-        prefill_progress_stale_after_secs,
+        enable_prefill_progress,
         HashMap::new(),
     )
     .await
@@ -143,7 +143,7 @@ async fn pd_router_with_kv_sources(
         decode,
         dp_size,
         prefill_policy,
-        None,
+        false,
         pd_kv_event_sources,
     )
     .await
@@ -154,7 +154,7 @@ async fn pd_router_with_progress_and_kv_sources(
     decode: &MockVllmRsServer,
     dp_size: usize,
     prefill_policy: PolicyConfig,
-    prefill_progress_stale_after_secs: Option<u64>,
+    enable_prefill_progress: bool,
     pd_kv_event_sources: HashMap<String, PdKvEventSources>,
 ) -> VllmPDRouter {
     metrics();
@@ -175,7 +175,7 @@ async fn pd_router_with_progress_and_kv_sources(
         kv_connector: KvConnector::Nixl,
         worker_startup_timeout_secs: 5,
         intra_node_data_parallel_size: dp_size,
-        prefill_progress_stale_after_secs,
+        enable_prefill_progress,
         ..RouterConfig::default()
     };
     vllm_router_rs::config::ConfigValidator::validate(&config).unwrap();
@@ -1337,7 +1337,7 @@ async fn grpc_pd_kv_aware_admits_prefill_by_router_tokens() {
     .await;
     let decode = MockVllmRsServer::spawn().await;
     let router = std::sync::Arc::new(
-        pd_router_with_progress(&[&prefill], &decode, 1, kv_aware(), None).await,
+        pd_router_with_progress(&[&prefill], &decode, 1, kv_aware(), false).await,
     );
     router.pin_test_token_ids(vec![1, 2, 3, 4, 5]);
 
@@ -1372,7 +1372,7 @@ async fn grpc_pd_prefill_progress_replaces_admitted_work() {
     .await;
     let decode = MockVllmRsServer::spawn().await;
     let router = std::sync::Arc::new(
-        pd_router_with_progress(&[&prefill], &decode, 1, kv_aware(), Some(5)).await,
+        pd_router_with_progress(&[&prefill], &decode, 1, kv_aware(), true).await,
     );
     router.pin_test_token_ids(vec![1, 2, 3, 4, 5]);
 
@@ -1400,7 +1400,7 @@ async fn grpc_pd_prefill_progress_replaces_admitted_work() {
 }
 
 #[tokio::test]
-async fn grpc_pd_progress_retains_cached_admission_through_stale_unconfirmed_queue() {
+async fn grpc_pd_progress_retains_cached_admission_while_queue_unconfirmed() {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
     use tokio::sync::mpsc;
@@ -1429,15 +1429,8 @@ async fn grpc_pd_progress_retains_cached_admission_through_stale_unconfirmed_que
         },
     )]);
     let router = Arc::new(
-        pd_router_with_progress_and_kv_sources(
-            &[&prefill],
-            &decode,
-            1,
-            kv_aware(),
-            Some(2),
-            sources,
-        )
-        .await,
+        pd_router_with_progress_and_kv_sources(&[&prefill], &decode, 1, kv_aware(), true, sources)
+            .await,
     );
     let prompt: Vec<u32> = (0..33).collect();
     router.pin_test_token_ids(prompt.clone());
@@ -1478,7 +1471,7 @@ async fn grpc_pd_progress_retains_cached_admission_through_stale_unconfirmed_que
     }))
     .await
     .unwrap();
-    tokio::time::sleep(Duration::from_millis(2200)).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(
         worker_gauge("vllm_router_pd_active_prefill_tokens", url),
         1.0
@@ -1545,7 +1538,7 @@ async fn grpc_pd_prefill_progress_falls_back_for_unsupported_workers() {
     })
     .await;
     let decode = MockVllmRsServer::spawn().await;
-    let router = pd_router_with_progress(&[&prefill], &decode, 1, kv_aware(), Some(5)).await;
+    let router = pd_router_with_progress(&[&prefill], &decode, 1, kv_aware(), true).await;
     router.pin_test_token_ids(vec![1, 2, 3]);
 
     let response = router.route_chat(None, &chat(false), None).await;

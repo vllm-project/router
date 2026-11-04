@@ -324,9 +324,9 @@ struct CliArgs {
     #[arg(long, default_value_t = 1800)]
     request_timeout_secs: u64,
 
-    /// Enable KV-aware gRPC progress; retain stale work after this many seconds.
+    /// Enable worker-reported prefill progress for KV-aware gRPC P/D routing.
     #[arg(long)]
-    prefill_progress_stale_after_secs: Option<u64>,
+    enable_prefill_progress: bool,
 
     /// Idle timeout in seconds for pooled backend HTTP connections. Should be
     /// lower than the backend's keep-alive timeout (vLLM defaults to 5s); 0
@@ -641,7 +641,7 @@ impl CliArgs {
             max_payload_size: self.max_payload_size,
             request_timeout_secs: self.request_timeout_secs,
             worker_startup_timeout_secs: self.worker_startup_timeout_secs,
-            prefill_progress_stale_after_secs: self.prefill_progress_stale_after_secs,
+            enable_prefill_progress: self.enable_prefill_progress,
             worker_startup_check_interval_secs: self.worker_startup_check_interval,
             intra_node_data_parallel_size: self.intra_node_data_parallel_size,
             api_key: self.api_key.clone(),

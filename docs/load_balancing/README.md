@@ -273,7 +273,7 @@ If event discovery is unavailable, add `--pd-kv-events http://prefill:8000=tcp:/
 
 ### Prefill progress
 
-For a `kv_aware` gRPC P/D prefill pool, add `--prefill-progress-stale-after-secs 5`
+For a `kv_aware` gRPC P/D prefill pool, add `--enable-prefill-progress`
 to enable worker progress updates. See [setup and constraints](../backend/grpc.md#pd-disaggregation).
 
 ### Session affinity

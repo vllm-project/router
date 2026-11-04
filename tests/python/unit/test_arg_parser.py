@@ -79,13 +79,13 @@ class TestRouterArgs:
         disabled = RouterArgs.from_cli_args(
             parser.parse_args([]), use_router_prefix=use_router_prefix
         )
-        assert disabled.prefill_progress_stale_after_secs is None
+        assert disabled.enable_prefill_progress is False
         prefix = "router-" if use_router_prefix else ""
         enabled = RouterArgs.from_cli_args(
-            parser.parse_args([f"--{prefix}prefill-progress-stale-after-secs", "5"]),
+            parser.parse_args([f"--{prefix}enable-prefill-progress"]),
             use_router_prefix=use_router_prefix,
         )
-        assert enabled.prefill_progress_stale_after_secs == 5
+        assert enabled.enable_prefill_progress is True
 
     def test_default_values(self):
         """Test that RouterArgs has correct default values."""

@@ -2574,11 +2574,7 @@ impl VllmPDRouter {
             {
                 crate::backend::EngineFrontend::from_env(request_timeout)
                     .map_err(|error| format!("tokenizer cache: {error}"))?
-                    .with_prefill_progress_stale_after(
-                        ctx.router_config
-                            .prefill_progress_stale_after_secs
-                            .map(std::time::Duration::from_secs),
-                    )
+                    .with_prefill_progress(ctx.router_config.enable_prefill_progress)
             } else {
                 crate::backend::EngineFrontend::with_request_timeout(request_timeout)
             };

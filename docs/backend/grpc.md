@@ -213,11 +213,10 @@ vllm-router --vllm-pd-disaggregation \
   --decode grpc://decode:50051 \
   --prefill-policy kv_aware --decode-policy kv_aware \
   --kv-connector nixl \
-  --prefill-progress-stale-after-secs 5
+  --enable-prefill-progress
 ```
 
-Progress is disabled by default. Its stale threshold must be at least 2 seconds
-and below `--request-timeout-secs`. Workers without
+Progress is disabled by default. Workers without
 [prefill progress support](https://github.com/vllm-project/vllm/pull/63160)
 use the admission estimate.
 

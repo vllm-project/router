@@ -41,19 +41,10 @@ impl ConfigValidator {
             _ => false,
         };
         Self::validate_server_settings(config)?;
-        if let Some(stale_after) = config.prefill_progress_stale_after_secs {
-            if stale_after < 2 || stale_after >= config.request_timeout_secs {
-                return Err(ConfigError::InvalidValue {
-                    field: "prefill_progress_stale_after_secs".into(),
-                    value: stale_after.to_string(),
-                    reason: "Must be at least 2 seconds and less than request_timeout_secs".into(),
-                });
-            }
-            if !progress_supported {
-                return Err(ConfigError::IncompatibleConfig {
-                    reason: "Prefill progress requires kv_aware gRPC routing".into(),
-                });
-            }
+        if config.enable_prefill_progress && !progress_supported {
+            return Err(ConfigError::IncompatibleConfig {
+                reason: "Prefill progress requires kv_aware gRPC routing".into(),
+            });
         }
         if let Some(program_scheduling) = &config.program_scheduling {
             Self::validate_program_scheduling(program_scheduling)?;
@@ -1811,25 +1802,19 @@ mod pd_progress_tests {
     }
 
     #[test]
-    fn test_prefill_progress_stale_threshold_is_opt_in_and_bounded() {
+    fn test_prefill_progress_is_opt_in() {
         let mut config = kv_aware_pd_config();
         assert!(ConfigValidator::validate(&config).is_ok());
 
-        config.prefill_progress_stale_after_secs = Some(10);
+        config.enable_prefill_progress = true;
         assert!(ConfigValidator::validate(&config).is_ok());
-
-        config.prefill_progress_stale_after_secs = Some(1);
-        assert!(ConfigValidator::validate(&config).is_err());
-
-        config.prefill_progress_stale_after_secs = Some(config.request_timeout_secs);
-        assert!(ConfigValidator::validate(&config).is_err());
     }
 
     #[test]
     fn test_prefill_progress_requires_kv_aware_prefill_routing() {
         let mut config = kv_aware_pd_config();
         config.policy = PolicyConfig::Random;
-        config.prefill_progress_stale_after_secs = Some(10);
+        config.enable_prefill_progress = true;
         assert!(ConfigValidator::validate(&config).is_err());
     }
 
@@ -1846,7 +1831,7 @@ mod pd_progress_tests {
                 },
                 PolicyConfig::RoundRobin,
             );
-            config.prefill_progress_stale_after_secs = Some(10);
+            config.enable_prefill_progress = true;
             config
         };
         let kv_aware = || PolicyConfig::KvAware {

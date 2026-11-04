@@ -225,7 +225,7 @@ pub struct GrpcEngineBackend {
     prefill_progress_capabilities: PrefillProgressCapabilityCache,
     connect_timeout: Duration,
     request_timeout: Duration,
-    pub(super) prefill_progress_stale_after: Option<Duration>,
+    pub(super) enable_prefill_progress: bool,
 }
 
 impl std::fmt::Debug for GrpcEngineBackend {
@@ -257,7 +257,7 @@ impl GrpcEngineBackend {
             prefill_progress_capabilities: Arc::new(DashMap::new()),
             connect_timeout,
             request_timeout,
-            prefill_progress_stale_after: None,
+            enable_prefill_progress: false,
         }
     }
 
@@ -330,7 +330,7 @@ impl GrpcEngineBackend {
                 .request_timeout
                 .saturating_sub(prepared.t_req.elapsed());
         let include_prefill_progress =
-            self.prefill_progress_stale_after.is_some() && on_prefill_progress.is_some();
+            self.enable_prefill_progress && on_prefill_progress.is_some();
         let mut proto = chat_to_generate_request_with_progress(
             prepared.request.as_ref(),
             prepared.tokenized.token_ids.as_ref().to_vec(),
@@ -353,7 +353,6 @@ impl GrpcEngineBackend {
         let mut progress = PrefillProgressState::new(
             engine_request_id.clone(),
             on_prefill_progress.filter(|_| proto.include_prefill_progress),
-            self.prefill_progress_stale_after,
         );
         let streaming = proto.include_prefill_progress;
         let rpc = if streaming {
@@ -417,8 +416,11 @@ impl GrpcEngineBackend {
             let mut finish = None;
             // A dropped stream (timeout, cancelled leg) leaves `abort` armed.
             loop {
-                match next_response(&mut stream, deadline, &mut progress).await {
+                match tokio::time::timeout_at(deadline, stream.next()).await {
                     Ok(Some(Ok(message))) => {
+                        if let Some(snapshot) = &message.prefill_progress {
+                            progress.observe(snapshot);
+                        }
                         if let Some(info) = message.outputs.and_then(|outputs| outputs.finish_info)
                         {
                             finish = Some(info);
@@ -644,29 +646,19 @@ struct ChatReply {
 struct PrefillProgressState {
     request_id: String,
     callback: Option<PrefillProgressCallback>,
-    stale_after: Option<Duration>,
     last_received: tokio::time::Instant,
     sequence: u64,
     initial_queued_prompt: Option<u32>,
-    pending: bool,
-    stale: bool,
 }
 
 impl PrefillProgressState {
-    fn new(
-        request_id: String,
-        callback: Option<PrefillProgressCallback>,
-        stale_after: Option<Duration>,
-    ) -> Self {
+    fn new(request_id: String, callback: Option<PrefillProgressCallback>) -> Self {
         Self {
             request_id,
-            pending: callback.is_some(),
             callback,
-            stale_after,
             last_received: tokio::time::Instant::now(),
             sequence: 0,
             initial_queued_prompt: None,
-            stale: false,
         }
     }
 
@@ -700,8 +692,6 @@ impl PrefillProgressState {
         self.initial_queued_prompt = initial_queue.then_some(progress.prompt_tokens);
         self.sequence = progress.sequence;
         self.last_received = tokio::time::Instant::now();
-        self.pending = progress.remaining_compute_tokens != 0;
-        self.stale = false;
         callback(
             progress.sequence,
             u64::from(progress.remaining_compute_tokens),
@@ -711,44 +701,6 @@ impl PrefillProgressState {
                 PrefillProgressKind::Snapshot
             },
         );
-    }
-
-    fn next_deadline(&self, deadline: tokio::time::Instant) -> tokio::time::Instant {
-        if self.pending && !self.stale {
-            if let Some(stale_after) = self.stale_after {
-                return deadline.min(self.last_received + stale_after);
-            }
-        }
-        deadline
-    }
-
-    fn mark_stale(&mut self) {
-        self.stale = true;
-        metrics::counter!("vllm_router_prefill_progress_stale_total").increment(1);
-        warn!("prefill progress is stale; retaining last-known remaining work");
-    }
-}
-
-async fn next_response<S>(
-    stream: &mut S,
-    deadline: tokio::time::Instant,
-    progress: &mut PrefillProgressState,
-) -> Result<Option<Result<super::pb::GenerateResponse, tonic::Status>>, tokio::time::error::Elapsed>
-where
-    S: futures_util::Stream<Item = Result<super::pb::GenerateResponse, tonic::Status>> + Unpin,
-{
-    loop {
-        let next_deadline = progress.next_deadline(deadline);
-        match tokio::time::timeout_at(next_deadline, stream.next()).await {
-            Err(_) if next_deadline < deadline => progress.mark_stale(),
-            Ok(Some(Ok(message))) => {
-                if let Some(snapshot) = &message.prefill_progress {
-                    progress.observe(snapshot);
-                }
-                return Ok(Some(Ok(message)));
-            }
-            result => return result,
-        }
     }
 }
 
@@ -1333,7 +1285,7 @@ mod pd_progress_tests {
         let callback = Arc::new(move |sequence, remaining, kind| {
             sink.lock().unwrap().push((sequence, remaining, kind));
         });
-        let mut state = PrefillProgressState::new("request".into(), Some(callback), None);
+        let mut state = PrefillProgressState::new("request".into(), Some(callback));
         let mut queued = progress(2, 100).prefill_progress.unwrap();
         queued.phase = super::super::pb::PrefillPhase::Queued as i32;
         queued.total_compute_tokens = 100;
@@ -1356,89 +1308,22 @@ mod pd_progress_tests {
         );
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn stale_initial_queue_remains_unconfirmed_until_worker_reconciles() {
-        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let sink = seen.clone();
-        let callback = Arc::new(move |sequence, remaining, kind| {
-            sink.lock().unwrap().push((sequence, remaining, kind));
+    #[test]
+    fn progress_ignores_other_requests_and_old_snapshots() {
+        let remaining = Arc::new(AtomicUsize::new(100));
+        let sink = remaining.clone();
+        let callback: PrefillProgressCallback = Arc::new(move |_, tokens, _| {
+            sink.store(tokens as usize, Ordering::SeqCst);
         });
-        let mut state = PrefillProgressState::new(
-            "request".into(),
-            Some(callback),
-            Some(Duration::from_secs(2)),
-        );
-        let mut queued = progress(1, 100).prefill_progress.unwrap();
-        queued.phase = super::super::pb::PrefillPhase::Queued as i32;
-        queued.total_compute_tokens = 100;
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-        let (tx, rx) = mpsc::channel(2);
-        let mut stream = tokio_stream::wrappers::ReceiverStream::new(rx);
-        tx.send(Ok(GenerateResponse {
-            prefill_progress: Some(queued.clone()),
-            ..Default::default()
-        }))
-        .await
-        .unwrap();
-        next_response(&mut stream, deadline, &mut state)
-            .await
-            .unwrap();
-        tokio::select! {
-            _ = tokio::time::sleep(Duration::from_secs(3)) => {},
-            _ = next_response(&mut stream, deadline, &mut state) => panic!("stream ended before the observation"),
-        }
-        assert!(state.stale);
-        assert_eq!(
-            *seen.lock().unwrap(),
-            vec![(1, 100, PrefillProgressKind::InitialUnconfirmedQueue)]
-        );
-        queued.sequence = 4;
-        queued.local_cached_tokens = 10;
-        queued.total_compute_tokens = 90;
-        queued.remaining_compute_tokens = 90;
-        tx.send(Ok(GenerateResponse {
-            prefill_progress: Some(queued.clone()),
-            ..Default::default()
-        }))
-        .await
-        .unwrap();
-        next_response(&mut stream, deadline, &mut state)
-            .await
-            .unwrap();
-        queued.sequence = 5;
-        queued.cache_accounting_final = true;
-        queued.remaining_compute_tokens = 16;
-        tx.send(Ok(GenerateResponse {
-            prefill_progress: Some(queued.clone()),
-            ..Default::default()
-        }))
-        .await
-        .unwrap();
-        next_response(&mut stream, deadline, &mut state)
-            .await
-            .unwrap();
-        queued.sequence = 6;
-        queued.phase = super::super::pb::PrefillPhase::Preempted as i32;
-        queued.cache_accounting_final = false;
-        queued.remaining_compute_tokens = 100;
-        tx.send(Ok(GenerateResponse {
-            prefill_progress: Some(queued),
-            ..Default::default()
-        }))
-        .await
-        .unwrap();
-        next_response(&mut stream, deadline, &mut state)
-            .await
-            .unwrap();
-        assert_eq!(
-            *seen.lock().unwrap(),
-            vec![
-                (1, 100, PrefillProgressKind::InitialUnconfirmedQueue),
-                (4, 90, PrefillProgressKind::InitialUnconfirmedQueue),
-                (5, 16, PrefillProgressKind::Snapshot),
-                (6, 100, PrefillProgressKind::Snapshot),
-            ]
-        );
+        let mut state = PrefillProgressState::new("request".into(), Some(callback));
+        state.observe(&progress(2, 40).prefill_progress.unwrap());
+        let mut other = progress(3, 90).prefill_progress.unwrap();
+        other.request_id = "other-request".into();
+        state.observe(&other);
+        state.observe(&progress(2, 10).prefill_progress.unwrap());
+        assert_eq!(remaining.load(Ordering::SeqCst), 40);
+        state.observe(&progress(3, 20).prefill_progress.unwrap());
+        assert_eq!(remaining.load(Ordering::SeqCst), 20);
     }
 
     #[test]
@@ -1482,7 +1367,7 @@ mod pd_progress_tests {
             let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
             let sink = seen.clone();
             let callback = Arc::new(move |_, _, kind| sink.lock().unwrap().push(kind));
-            let mut state = PrefillProgressState::new("request".into(), Some(callback), None);
+            let mut state = PrefillProgressState::new("request".into(), Some(callback));
             let mut queued = progress(1, 100).prefill_progress.unwrap();
             queued.phase = super::super::pb::PrefillPhase::Queued as i32;
             queued.total_compute_tokens = 100;
@@ -1490,47 +1375,6 @@ mod pd_progress_tests {
             state.observe(&queued);
             assert_eq!(*seen.lock().unwrap(), vec![expected]);
         }
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn stale_progress_retains_work_until_the_absolute_deadline() {
-        let remaining = Arc::new(AtomicUsize::new(100));
-        let callback_remaining = remaining.clone();
-        let callback: PrefillProgressCallback = Arc::new(move |_, tokens, _| {
-            callback_remaining.store(tokens as usize, Ordering::SeqCst);
-        });
-        let mut state = PrefillProgressState::new(
-            "request".into(),
-            Some(callback),
-            Some(Duration::from_secs(2)),
-        );
-        let start = tokio::time::Instant::now();
-        let deadline = start + Duration::from_secs(5);
-        let (tx, rx) = mpsc::channel(2);
-        let mut stream = tokio_stream::wrappers::ReceiverStream::new(rx);
-        tx.send(Ok(progress(2, 40))).await.unwrap();
-        next_response(&mut stream, deadline, &mut state)
-            .await
-            .unwrap();
-        tokio::time::advance(Duration::from_secs(1)).await;
-        let mut wrong_attempt = progress(3, 90);
-        wrong_attempt.prefill_progress.as_mut().unwrap().request_id = "other-request".into();
-        tx.send(Ok(wrong_attempt)).await.unwrap();
-        next_response(&mut stream, deadline, &mut state)
-            .await
-            .unwrap();
-        assert_eq!(state.sequence, 2);
-        assert_eq!(remaining.load(Ordering::SeqCst), 40);
-        assert_eq!(
-            state.next_deadline(deadline),
-            start + Duration::from_secs(2)
-        );
-        assert!(next_response(&mut stream, deadline, &mut state)
-            .await
-            .is_err());
-        assert!(state.stale);
-        assert_eq!(tokio::time::Instant::now(), deadline);
-        assert_eq!(remaining.load(Ordering::SeqCst), 40);
     }
 
     #[test]

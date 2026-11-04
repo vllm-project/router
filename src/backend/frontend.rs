@@ -84,12 +84,9 @@ impl EngineFrontend {
         }
     }
 
-    /// Opt in to worker progress and retain last-known work when updates become stale.
-    pub(crate) fn with_prefill_progress_stale_after(
-        mut self,
-        stale_after: Option<Duration>,
-    ) -> Self {
-        self.grpc.prefill_progress_stale_after = stale_after;
+    /// Opt in to worker-reported prefill progress.
+    pub(crate) fn with_prefill_progress(mut self, enabled: bool) -> Self {
+        self.grpc.enable_prefill_progress = enabled;
         self
     }
 
