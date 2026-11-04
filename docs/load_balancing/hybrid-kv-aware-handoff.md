@@ -233,10 +233,14 @@ With `hash_block_size` 128, groups 0-4 declared as bounded-replay (window 128,
 `prefix_replay_tokens` 128, not cacheable) and group 5 as a compressed attention
 group with one token per state, the layout is admitted and the events apply. The
 router then credits 768 for a 1,024-token repeat where the engine counts 896:
-the 128-token difference is exactly the replay window, which the engine counts
-as cached but recomputes. That is the bounded-replay contract this PR documents
-— credit is deliberately the smaller number — and it is the first end-to-end
-check of that branch.
+the 128-token difference is exactly the replay window. The scheduler computes
+`num_replay_tokens = min(prefix_replay_tokens, num_hit_tokens)`, sets
+`Request.replay_start` to the hit minus that window, and the worker rebuilds the
+sliding-window KV for those tokens while leaving their cached KV alone — so the
+window is prefilled again even though `prefix_cache_hits_total` counts it. Credit
+is deliberately the smaller, real number, and the same scheduler asserts one
+window for all groups (`Prefix replay windows should agree`), which is why the
+layout carries a single `prefix_replay_tokens` rather than one per group.
 
 
 ### Advisory affinity, without a model
