@@ -23,7 +23,6 @@ async fn grpc_prefix_selection_uses_the_ids_actually_dispatched() {
     let warm = common::mock_vllm_rs::MockVllmRsServer::spawn().await;
     let cold = common::mock_vllm_rs::MockVllmRsServer::spawn().await;
     let config = RouterConfig {
-        pd_decode_selection: vllm_router_rs::config::PdDecodeSelection::Admission,
         policy: PolicyConfig::KvAware {
             router_temperature: 0.0,
             kv_penalty_host: 0.8,

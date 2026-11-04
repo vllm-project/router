@@ -30,6 +30,26 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
 
+/// Whether a decode policy can be re-run at dispatch and still produce a
+/// meaningful answer.
+///
+/// kv_aware reads occupancy, KV events and affinity, none of which are frozen
+/// at admission. cache_aware re-runs from the prepared prefix selection, which
+/// the caller carries into the commitment. Everything else consumes the
+/// admission-time request text or a per-pool counter whose order the caller
+/// already acted on, so those keep their admission decision.
+fn decode_policy_can_defer(
+    policy: &dyn LoadBalancingPolicy,
+    context: &PdRequestContext<'_>,
+) -> bool {
+    kv_aware_ops(policy).is_some()
+        || (context.decode_cache.is_some()
+            && policy
+                .as_any()
+                .downcast_ref::<crate::policies::CacheAwarePolicy>()
+                .is_some())
+}
+
 /// Admission decision over the supplied load snapshot. Legacy policies
 /// retain their own selection semantics and text/header inputs.
 ///
@@ -672,12 +692,15 @@ impl PdRouterBase {
         self.select_and_admit_with(prefill_workers, decode_workers, context, false)
     }
 
-    /// Admission with an opt-in deferred decode commitment.
+    /// Admission with a deferred decode commitment.
     ///
-    /// `defer_decode` is the caller's request; the deferral only takes effect
-    /// for the kv_aware decode policy, whose selector reads occupancy and
-    /// affinity and therefore can run again at dispatch without re-rendering
-    /// token inputs. Every other policy keeps the admission-time commitment.
+    /// `defer_decode` says the deployment can defer (see
+    /// `VllmPDRouter::decode_commit_can_defer`); the policy then decides whether
+    /// a dispatch-time re-selection is still meaningful. kv_aware reads live
+    /// occupancy and affinity, and cache_aware re-runs from the prepared prefix
+    /// selection, so both can decide at dispatch without re-rendering token
+    /// inputs. Policies that need the admission-time request text keep the
+    /// commitment they made.
     pub(super) fn select_and_admit_with(
         &self,
         prefill_workers: &[Arc<dyn Worker>],
@@ -687,7 +710,7 @@ impl PdRouterBase {
     ) -> Option<(PdSelection, PdAttempt)> {
         let prefill_policy = self.policy_registry.get_prefill_policy();
         let decode_policy = self.policy_registry.get_decode_policy();
-        let defer = defer_decode && kv_aware_ops(decode_policy.as_ref()).is_some();
+        let defer = defer_decode && decode_policy_can_defer(decode_policy.as_ref(), context);
         let select = |loads: &Loads| {
             if let Some(kv) =
                 kv_aware_ops(decode_policy.as_ref()).filter(|kv| kv.session_affinity_enabled())
@@ -2819,6 +2842,45 @@ mod admission_tests {
         manager
             .admit(|loads| select_pd_pair(loads, p, d, &policy, &policy, &context(), true))
             .unwrap()
+    }
+
+    /// Deferral is a claim about the policy, not a user switch: only a policy
+    /// that can re-decide from live state gets to commit at dispatch.
+    #[test]
+    fn deferral_requires_a_policy_that_can_redecide_at_dispatch() {
+        use crate::policies::{CacheAwarePolicy, KvRequestTokens, WorkerTokenInputs};
+
+        let decode_pool = pool("d", 2);
+        let kv = KvAwarePolicy::default();
+        assert!(decode_policy_can_defer(&kv, &context()));
+
+        let cache = CacheAwarePolicy::new();
+        // Without the prepared prefix selection a dispatch-time cache_aware
+        // decision would silently degrade to load, so admission keeps its pick.
+        assert!(!decode_policy_can_defer(&cache, &context()));
+        let tokens: WorkerTokenInputs = [(
+            decode_pool[0].base_url().to_string(),
+            Arc::from([vec![1u32, 2, 3, 4]]),
+        )]
+        .into_iter()
+        .collect();
+        let prepared = cache
+            .prepare_selection(
+                &decode_pool,
+                KvRequestTokens::PerWorker(&tokens),
+                None,
+                None,
+                None,
+            )
+            .expect("prefix selection");
+        let prepared_context = PdRequestContext {
+            decode_cache: Some(&prepared),
+            ..context()
+        };
+        assert!(decode_policy_can_defer(&cache, &prepared_context));
+
+        let round_robin = RoundRobinPolicy::default();
+        assert!(!decode_policy_can_defer(&round_robin, &context()));
     }
 
     fn context_with_session(session: &str) -> PdRequestContext<'static> {

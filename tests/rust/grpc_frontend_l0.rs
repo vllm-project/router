@@ -187,7 +187,6 @@ async fn grpc_frontend_cache_parity_metrics_streaming_and_retries() {
     // Retries must reuse prepared tokens.
     std::env::set_var("VLLM_ROUTER_L0_CACHE", "1");
     let config = RouterConfig {
-        pd_decode_selection: vllm_router_rs::config::PdDecodeSelection::Admission,
         mode: RoutingMode::Regular {
             worker_urls: vec![worker.grpc_url.clone()],
         },
@@ -302,7 +301,6 @@ async fn grpc_kv_routing_keeps_unavailable_control_a_legal_fallback(
     // with unavailable metadata, not successful gRPC KV-event ingestion.
     for empty_start in [false, true] {
         let config = RouterConfig {
-            pd_decode_selection: vllm_router_rs::config::PdDecodeSelection::Admission,
             policy: PolicyConfig::KvAware {
                 router_temperature: 0.0,
                 kv_penalty_host: 0.8,
@@ -372,7 +370,6 @@ async fn http_ignores_l0_config(request: &vllm_router_rs::protocols::spec::ChatC
     std::env::set_var("VLLM_ROUTER_L0_CACHE", "1");
     std::env::set_var("VLLM_ROUTER_L0_MAX_BYTES", "invalid");
     let config = RouterConfig {
-        pd_decode_selection: vllm_router_rs::config::PdDecodeSelection::Admission,
         mode: RoutingMode::Regular {
             worker_urls: vec![url.clone()],
         },

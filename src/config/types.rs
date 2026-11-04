@@ -8,22 +8,6 @@ use crate::program_scheduling::{
     ProgramSchedulingEnableKey,
 };
 
-/// When the Decode stage of a P/D request is committed.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq, clap::ValueEnum)]
-#[serde(rename_all = "lowercase")]
-pub enum PdDecodeSelection {
-    /// Choose and charge Decode at admission, before Prefill is dispatched.
-    #[default]
-    #[serde(rename = "admission")]
-    #[value(name = "admission")]
-    Admission,
-    /// Leave Decode uncommitted until the Prefill response returns, then
-    /// select against live occupancy and charge it at dispatch.
-    #[serde(rename = "dispatch")]
-    #[value(name = "dispatch")]
-    Dispatch,
-}
-
 /// Main router configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RouterConfig {
@@ -113,11 +97,6 @@ pub struct RouterConfig {
     /// KV connector type for PD disaggregation
     #[serde(default)]
     pub kv_connector: KvConnector,
-    /// Decode commitment point for sequential P/D dispatch. `admission` keeps
-    /// the historical behaviour; `dispatch` defers the commitment to the
-    /// point where the Decode request is sent.
-    #[serde(default)]
-    pub pd_decode_selection: PdDecodeSelection,
     /// Optional Program-level admission and continuity scheduling.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub program_scheduling: Option<ProgramSchedulingConfig>,
@@ -1354,7 +1333,6 @@ impl Default for RouterConfig {
             profile_timeout_secs: default_profile_timeout_secs(),
             epd: None,
             kv_connector: KvConnector::default(),
-            pd_decode_selection: PdDecodeSelection::default(),
             program_scheduling: None,
         }
     }
@@ -2145,7 +2123,6 @@ mod tests {
             epd: None,
             kv_connector: KvConnector::default(),
             program_scheduling: None,
-            pd_decode_selection: PdDecodeSelection::Admission,
         };
 
         assert!(config.mode.is_pd_mode());
@@ -2216,7 +2193,6 @@ mod tests {
             epd: None,
             kv_connector: KvConnector::default(),
             program_scheduling: None,
-            pd_decode_selection: PdDecodeSelection::Admission,
         };
 
         assert!(!config.mode.is_pd_mode());
@@ -2283,7 +2259,6 @@ mod tests {
             epd: None,
             kv_connector: KvConnector::default(),
             program_scheduling: None,
-            pd_decode_selection: PdDecodeSelection::Admission,
         };
 
         assert!(config.has_service_discovery());

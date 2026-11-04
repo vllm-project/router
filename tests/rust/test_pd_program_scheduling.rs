@@ -204,7 +204,6 @@ async fn router_with_capacity(
     capacity: usize,
 ) -> VllmPDRouter {
     let mut config = RouterConfig {
-        pd_decode_selection: vllm_router_rs::config::PdDecodeSelection::Admission,
         mode: RoutingMode::VllmPrefillDecode {
             prefill_urls: vec![(p.url.clone(), None)],
             decode_urls: vec![d.url.clone()],
@@ -378,7 +377,6 @@ async fn no_identity_and_disabled_feature_keep_native_round_robin() {
 fn pd_requires_explicit_capacity_and_rejects_unverified_modes() {
     let valid: ProgramSchedulingConfig = serde_json::from_value(json!({"pd":{}})).unwrap();
     let mut config = RouterConfig {
-        pd_decode_selection: vllm_router_rs::config::PdDecodeSelection::Admission,
         mode: RoutingMode::VllmPrefillDecode {
             prefill_urls: vec![("http://p:8000".into(), None)],
             decode_urls: vec!["http://d:8000".into()],

@@ -166,7 +166,6 @@ async fn router_with_warm_remote(
     pd_extra: serde_json::Value,
 ) -> VllmPDRouter {
     let mut cfg = RouterConfig {
-        pd_decode_selection: vllm_router_rs::config::PdDecodeSelection::Admission,
         mode: RoutingMode::VllmPrefillDecode {
             prefill_urls: vec![(p.url.clone(), None)],
             decode_urls: vec![d.url.clone()],

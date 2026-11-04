@@ -2,7 +2,7 @@ use clap::{ArgAction, Parser, ValueEnum};
 use std::collections::HashMap;
 use vllm_router_rs::config::{
     CircuitBreakerConfig, ConfigError, ConfigResult, ConnectionMode, DiscoveryConfig,
-    HealthCheckConfig, HistoryBackend, KvConnector, MetricsConfig, PdDecodeSelection,
+    HealthCheckConfig, HistoryBackend, KvConnector, MetricsConfig,
     PdKvEventSources, PolicyConfig, ProgramSchedulingConfig, RetryConfig, RouterConfig,
     RoutingMode, TraceConfig,
 };
@@ -422,13 +422,6 @@ struct CliArgs {
     /// KV connector type for PD disaggregation (nixl or mooncake)
     #[arg(long, value_enum, default_value_t = KvConnector::Nixl)]
     kv_connector: KvConnector,
-
-    /// When to commit the Decode worker for PD disaggregation: at admission
-    /// (default) or at dispatch, after the Prefill response returns. The
-    /// dispatch mode only applies to sequential connectors and the kv_aware
-    /// decode policy.
-    #[arg(long, value_enum, default_value_t = PdDecodeSelection::Admission)]
-    pd_decode_selection: PdDecodeSelection,
 }
 
 impl CliArgs {
@@ -694,7 +687,6 @@ impl CliArgs {
             enable_profiling: self.profile,
             profile_timeout_secs: 10, // Default profiling timeout
             kv_connector: self.kv_connector,
-            pd_decode_selection: self.pd_decode_selection,
             program_scheduling,
         })
     }

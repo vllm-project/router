@@ -36,7 +36,6 @@ mod sticky_least_loaded_pd_tests {
         decode_urls: Vec<String>,
     ) -> RouterConfig {
         RouterConfig {
-            pd_decode_selection: vllm_router_rs::config::PdDecodeSelection::Admission,
             mode: RoutingMode::VllmPrefillDecode {
                 prefill_urls,
                 decode_urls,
