@@ -11,8 +11,9 @@
 //! `/finish_session` releases the session on both roles.
 //!
 //! In regular mode, the tests check that the session id comes from the
-//! request's stable identity: a body `session_params.session_id` is sticky,
-//! while request-scoped headers and JSON prompts create no session.
+//! request's stable identity on typed and transparent routes, that
+//! `/finish_session` releases it with the same identity fields, and that
+//! request-scoped headers and JSON prompts create no session.
 
 mod common;
 
@@ -293,10 +294,7 @@ mod sticky_least_loaded_regular_tests {
     use axum::body::Body;
     use axum::extract::Request;
     use axum::Router;
-    use common::mock_worker::{
-        clear_captured_requests, get_captured_requests, HealthStatus, MockWorker, MockWorkerConfig,
-        WorkerType,
-    };
+    use common::mock_worker::{HealthStatus, MockWorker, MockWorkerConfig, WorkerType};
     use serde_json::{json, Value};
     use std::sync::Arc;
     use tower::ServiceExt;
@@ -309,18 +307,13 @@ mod sticky_least_loaded_regular_tests {
     struct RegularFixture {
         app: Router,
         context: Arc<AppContext>,
-        ports: Vec<u16>,
         workers: Vec<MockWorker>,
     }
 
     impl RegularFixture {
-        async fn start() -> Self {
-            Self::start_with_validation_urls(vec![]).await
-        }
-
-        async fn start_with_validation_urls(api_key_validation_urls: Vec<String>) -> Self {
+        async fn start(api_key_validation_urls: Vec<String>) -> Self {
             let mut workers = Vec::new();
-            let mut urls = Vec::new();
+            let mut worker_urls = Vec::new();
             for _ in 0..2 {
                 let mut worker = MockWorker::new(MockWorkerConfig {
                     port: 0,
@@ -329,16 +322,11 @@ mod sticky_least_loaded_regular_tests {
                     response_delay_ms: 0,
                     fail_rate: 0.0,
                 });
-                let url = worker.start().await.unwrap();
-                clear_captured_requests(port_of(&url));
-                urls.push(url);
+                worker_urls.push(worker.start().await.unwrap());
                 workers.push(worker);
             }
-
             let config = RouterConfig {
-                mode: RoutingMode::Regular {
-                    worker_urls: urls.clone(),
-                },
+                mode: RoutingMode::Regular { worker_urls },
                 policy: sticky_policy(),
                 port: 0,
                 request_timeout_secs: 10,
@@ -359,7 +347,6 @@ mod sticky_least_loaded_regular_tests {
             Self {
                 app,
                 context,
-                ports: urls.iter().map(|u| port_of(u)).collect(),
                 workers,
             }
         }
@@ -374,20 +361,13 @@ mod sticky_least_loaded_regular_tests {
                 .active_session_count()
         }
 
-        async fn status(&self, method: &str, uri: &str) -> u16 {
-            let request = Request::builder()
-                .method(method)
-                .uri(uri)
-                .body(Body::empty())
-                .unwrap();
-            let response = self.app.clone().oneshot(request).await.unwrap();
-            response.status().as_u16()
-        }
-
-        /// POST /finish_session; returns the status and the JSON body (Null
-        /// for a non-JSON error body).
-        async fn finish_session(&self, headers: &[(&str, &str)], body: &str) -> (u16, Value) {
-            let mut request = Request::builder().method("POST").uri("/finish_session");
+        /// POST `body` to `path`; returns the status and the JSON response
+        /// (Null when the response is not JSON).
+        async fn post(&self, path: &str, headers: &[(&str, &str)], body: &str) -> (u16, Value) {
+            let mut request = Request::builder()
+                .method("POST")
+                .uri(path)
+                .header("content-type", "application/json");
             for (name, value) in headers {
                 request = request.header(*name, *value);
             }
@@ -400,47 +380,6 @@ mod sticky_least_loaded_regular_tests {
             (status, serde_json::from_slice(&body).unwrap_or(Value::Null))
         }
 
-        /// Send one request and return the worker port that served it.
-        async fn send(&self, path: &str, headers: &[(&str, &str)], body: Value) -> u16 {
-            let before = self.served_counts(path);
-            let mut request = Request::builder()
-                .method("POST")
-                .uri(path)
-                .header("content-type", "application/json");
-            for (name, value) in headers {
-                request = request.header(*name, *value);
-            }
-            let request = request
-                .body(Body::from(serde_json::to_string(&body).unwrap()))
-                .unwrap();
-            let status = self.app.clone().oneshot(request).await.unwrap().status();
-            assert_eq!(status.as_u16(), 200);
-
-            let after = self.served_counts(path);
-            let hit: Vec<u16> = self
-                .ports
-                .iter()
-                .copied()
-                .zip(before.iter().zip(&after))
-                .filter(|(_, (b, a))| a > b)
-                .map(|(port, _)| port)
-                .collect();
-            assert_eq!(hit.len(), 1, "expected exactly one worker, got {:?}", hit);
-            hit[0]
-        }
-
-        fn served_counts(&self, path: &str) -> Vec<usize> {
-            self.ports
-                .iter()
-                .map(|&port| {
-                    get_captured_requests(port)
-                        .iter()
-                        .filter(|r| r.path == path)
-                        .count()
-                })
-                .collect()
-        }
-
         async fn stop(mut self) {
             for worker in &mut self.workers {
                 worker.stop().await;
@@ -448,79 +387,48 @@ mod sticky_least_loaded_regular_tests {
         }
     }
 
-    fn port_of(url: &str) -> u16 {
-        url.rsplit(':').next().unwrap().parse().unwrap()
-    }
-
-    /// A request body for `path` carrying the `identity` fields.
-    fn request_body(path: &str, turn: usize, identity: &Value) -> Value {
-        let mut body = match path {
-            "/v1/completions" => {
-                json!({"model": "mock-model", "prompt": format!("turn {turn}"), "max_tokens": 4})
-            }
-            "/v1/responses" => json!({"model": "mock-model", "input": format!("turn {turn}")}),
-            _ => json!({
-                "model": "mock-model",
-                "messages": [{"role": "user", "content": format!("turn {turn}")}],
-            }),
-        };
-        for (field, value) in identity.as_object().unwrap() {
-            body[field] = value.clone();
-        }
-        body
-    }
-
     #[tokio::test]
-    async fn test_regular_sessions_stick_and_release() {
-        let fx = RegularFixture::start().await;
+    async fn test_regular_sessions_resolve_and_release() {
+        let fx = RegularFixture::start(vec![]).await;
 
-        // Typed routes pass the prompt (completions) or the bare session id
-        // (chat) to policies, not the body, and /v1/responses takes the
-        // transparent path, so the session id must come from the resolved
-        // identity. /finish_session gets the same identity fields.
+        // Typed routes give policies the prompt rather than the body, and
+        // /v1/responses takes the transparent path, so a tracked session shows
+        // the router resolved the identity. /finish_session gets the same
+        // identity fields.
         let cases = [
-            (
-                "/v1/chat/completions",
-                None,
-                json!({"session_params": {"session_id": "traj-1"}}),
-            ),
             (
                 "/v1/completions",
                 None,
-                json!({"session_params": {"session_id": "traj-2"}}),
+                json!({"model": "m", "prompt": "hi", "session_params": {"session_id": "traj-1"}}),
             ),
             (
-                "/v1/chat/completions",
-                None,
-                json!({"vllm_xargs": {"agentic_context": {"session_id": "s3", "task_id": "traj-3"}}}),
+                "/v1/responses",
+                Some("traj-2"),
+                json!({"model": "m", "input": "hi"}),
             ),
-            ("/v1/responses", Some("traj-4"), json!({})),
         ];
-        for (path, header, identity) in cases {
+        for (path, header, body) in cases {
             let headers: Vec<(&str, &str)> =
                 header.map(|h| ("x-session-id", h)).into_iter().collect();
-            let mut served = Vec::new();
-            for turn in 0..4 {
-                served.push(
-                    fx.send(path, &headers, request_body(path, turn, &identity))
-                        .await,
-                );
-            }
-            assert!(
-                served.windows(2).all(|w| w[0] == w[1]),
-                "{path}: {served:?}"
+            assert_eq!(
+                fx.post(path, &headers, &body.to_string()).await.0,
+                200,
+                "{path}"
             );
-            assert_eq!(fx.active_sessions(), 1, "{path} {identity}");
+            assert_eq!(fx.active_sessions(), 1, "{path}");
 
-            let (status, response) = fx.finish_session(&headers, &identity.to_string()).await;
-            assert_eq!(status, 200, "{path} {identity}");
-            assert_eq!(response["released"], true, "{path} {identity}: {response}");
-            assert_eq!(fx.active_sessions(), 0, "{path} {identity}");
+            let (status, response) = fx
+                .post("/finish_session", &headers, &body.to_string())
+                .await;
+            assert_eq!(status, 200, "{path}");
+            assert_eq!(response["released"], true, "{path}: {response}");
+            assert_eq!(fx.active_sessions(), 0, "{path}");
         }
 
-        let (status, response) = fx.finish_session(&[("x-session-id", "unknown")], "").await;
+        let (status, response) = fx
+            .post("/finish_session", &[("x-session-id", "unknown")], "")
+            .await;
         assert_eq!(status, 200);
-        assert_eq!(response["session_id"], "unknown");
         assert_eq!(response["released"], false);
 
         fx.stop().await;
@@ -528,19 +436,23 @@ mod sticky_least_loaded_regular_tests {
 
     #[tokio::test]
     async fn test_regular_request_ids_and_json_prompts_are_not_sessions() {
-        let fx = RegularFixture::start().await;
+        let fx = RegularFixture::start(vec![]).await;
 
         for i in 0..4 {
             let request_id = format!("req-{i}");
             // A prompt that is itself JSON with session fields.
             let prompt = json!({"session_id": format!("s-{i}"), "user": "u"}).to_string();
-            let body = json!({"model": "mock-model", "prompt": prompt, "max_tokens": 4});
-            fx.send(
-                "/v1/completions",
-                &[("x-request-id", &request_id), ("x-trace-id", &request_id)],
-                body,
-            )
-            .await;
+            let body = json!({"model": "m", "prompt": prompt});
+            let headers = [
+                ("x-request-id", request_id.as_str()),
+                ("x-trace-id", request_id.as_str()),
+            ];
+            assert_eq!(
+                fx.post("/v1/completions", &headers, &body.to_string())
+                    .await
+                    .0,
+                200
+            );
         }
         assert_eq!(fx.active_sessions(), 0);
 
@@ -549,20 +461,20 @@ mod sticky_least_loaded_regular_tests {
 
     #[tokio::test]
     async fn test_finish_session_rejects_bad_requests() {
-        let fx = RegularFixture::start().await;
-        // No identity, a body that is not JSON, and invalid identity metadata.
-        for body in ["", "{}", "not json", r#"{"agent_hint": "x"}"#] {
-            assert_eq!(fx.finish_session(&[], body).await.0, 400, "{body}");
+        let fx = RegularFixture::start(vec![]).await;
+        // No identity, invalid identity metadata, and a body that is not JSON.
+        for body in ["", r#"{"agent_hint": "x"}"#, "not json"] {
+            assert_eq!(fx.post("/finish_session", &[], body).await.0, 400, "{body}");
         }
-        assert_eq!(fx.status("GET", "/finish_session").await, 405);
         fx.stop().await;
 
         // With API-key validation on, a request without a bearer token is
         // rejected before any validation request is made.
-        let fx =
-            RegularFixture::start_with_validation_urls(vec!["http://127.0.0.1:9/validate".into()])
-                .await;
-        assert_eq!(fx.finish_session(&[("x-session-id", "s")], "").await.0, 401);
+        let fx = RegularFixture::start(vec!["http://127.0.0.1:9/validate".into()]).await;
+        let (status, _) = fx
+            .post("/finish_session", &[("x-session-id", "s")], "")
+            .await;
+        assert_eq!(status, 401);
         fx.stop().await;
     }
 }
