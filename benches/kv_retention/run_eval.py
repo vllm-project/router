@@ -59,6 +59,7 @@ ARMS = {
     "off-1x": Arm(5),
     "cpu-1x": Arm(5, ("cpu",)),
     "both-1x": Arm(5, ("gpu", "cpu"), gpu_ttl=30.0, gpu_share=0.5),
+    "cpu30-1x": Arm(5, ("cpu",), cpu_ttl=30.0, cpu_share=0.9),
     # vLLM's own connector and LRU: a control on the prototype, which an arm without hints must match.
     "stock-4x": Arm(20, stock=True),
 }

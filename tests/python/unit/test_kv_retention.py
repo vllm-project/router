@@ -698,6 +698,37 @@ class TestReport:
         assert receipts["cpu_evictions_per_s"] == 4.2
         assert receipts["leased_chunks_evicted"] == 7
 
+    def test_restored_tokens_are_binned_by_pause_and_prompt_size(self, run_dir):
+        rows = [
+            {
+                "event": "request",
+                "t": 21.1,
+                "cpu_hit_tokens": 300,
+                "prompt_tokens": 1200,
+            },
+            {
+                "event": "request",
+                "t": 12.4,
+                "cpu_hit_tokens": 100,
+                "prompt_tokens": 1100,
+            },
+            {"event": "request", "t": 1.0, "cpu_hit_tokens": 999, "prompt_tokens": 400},
+            {
+                "event": "request",
+                "t": 500.0,
+                "cpu_hit_tokens": 7,
+                "prompt_tokens": 1000,
+            },
+        ]
+        (run_dir / "receipts.jsonl").write_text(
+            "\n".join(json.dumps(row) for row in rows)
+        )
+        profile = report.restore_profile(run_dir)
+        # 1200 tokens paused 7.5 s and 1100 tokens 0.5 s. The 400 has no earlier turn, so no pause to bin,
+        # and the 1000's finish is too far from any turn's to be one.
+        assert profile["by_pause"] == [100.0, 0.0, 300.0, 0.0, 0.0, 0.0]
+        assert profile["by_size"] == [400.0, 0.0, 0.0]
+
     def test_a_stock_run_has_no_receipts(self, run_dir):
         (run_dir / "receipts.jsonl").unlink()
         assert report.receipts(run_dir, 10.0)["gpu_accepted"] == 0

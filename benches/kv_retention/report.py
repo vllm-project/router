@@ -278,6 +278,55 @@ def receipts(run: Path, seconds: float) -> dict[str, Any]:
     }
 
 
+PAUSE_EDGES = (1.0, 5.0, 10.0, 30.0, 120.0, float("inf"))
+SIZE_EDGES = (0.25, 0.5, float("inf"))
+"""Prompt size as a share of the pool: what a hold's budget has to fit."""
+MATCH_SECONDS = 5.0
+"""How far apart the connector's and the client's clocks of one turn's finish may be."""
+
+
+def restore_profile(run: Path) -> dict[str, list[float]] | None:
+    """Which restored tokens a hold could have protected: the tokens by the pause before the turn and by the size of
+    its prompt. The receipts say what was restored, AIPerf's export says when; a turn is its prompt length and
+    finish time, which works on every arm, with or without hints."""
+    path = run / "receipts.jsonl"
+    if not path.exists():
+        return None
+    finished: dict[int, list[tuple[float, int]]] = defaultdict(list)
+    for line in path.read_text().splitlines():
+        row = json.loads(line)
+        if row["event"] == "request":
+            finished[row["prompt_tokens"]].append((row["t"], row["cpu_hit_tokens"]))
+    with (run / "aiperf" / "profile_export.jsonl").open() as lines:
+        records = sorted(
+            (json.loads(line) for line in lines),
+            key=lambda record: record["metadata"]["request_start_ns"],
+        )
+    ended_at: dict[str, int] = {}
+    by_pause = [0.0] * len(PAUSE_EDGES)
+    by_size = [0.0] * len(SIZE_EDGES)
+    for record in records:
+        metadata = record["metadata"]
+        session = metadata["x_correlation_id"]
+        prompt = record["metrics"].get("input_sequence_length", {}).get("value")
+        end = metadata["request_end_ns"] / 1e9
+        candidates = finished.get(prompt, [])
+        match = min(candidates, key=lambda row: abs(row[0] - end), default=None)
+        if match is not None and abs(match[0] - end) <= MATCH_SECONDS:
+            candidates.remove(match)
+            if session in ended_at and match[1]:
+                pause = (metadata["request_start_ns"] - ended_at[session]) / 1e9
+                by_pause[next(i for i, e in enumerate(PAUSE_EDGES) if pause <= e)] += (
+                    match[1]
+                )
+                share = prompt / POOL_TOKENS
+                by_size[next(i for i, e in enumerate(SIZE_EDGES) if share <= e)] += (
+                    match[1]
+                )
+        ended_at[session] = metadata["request_end_ns"]
+    return {"by_pause": by_pause, "by_size": by_size}
+
+
 def summarize(run: Path) -> dict[str, Any]:
     client = client_side(run)
     return {
@@ -285,6 +334,7 @@ def summarize(run: Path) -> dict[str, Any]:
         **engine_side(run, client["seconds"]),
         **sampled(run),
         **receipts(run, client["seconds"]),
+        "restore_profile": restore_profile(run),
         **json.loads((run / "run.json").read_text()),
     }
 
@@ -365,6 +415,7 @@ def main() -> None:
         "gpu30-4x",
         "off-1x",
         "cpu-1x",
+        "cpu30-1x",
         "both-1x",
     ]
     arms = {
@@ -440,12 +491,47 @@ def main() -> None:
             ],
         )
     )
+    profiled = {
+        arm: [
+            {
+                **{
+                    f"pause_{i}": value
+                    for i, value in enumerate(run["restore_profile"]["by_pause"])
+                },
+                **{
+                    f"size_{i}": value
+                    for i, value in enumerate(run["restore_profile"]["by_size"])
+                },
+            }
+            for run in runs
+            if run["restore_profile"]
+        ]
+        for arm, runs in arms.items()
+    }
+    print(
+        table(
+            "Restored tokens, by the pause before the turn and by the prompt's share of the pool",
+            {arm: runs for arm, runs in profiled.items() if runs},
+            [
+                ("<=1 s", "pause_0", 0, 1),
+                ("<=5 s", "pause_1", 0, 1),
+                ("<=10 s", "pause_2", 0, 1),
+                ("<=30 s", "pause_3", 0, 1),
+                ("<=120 s", "pause_4", 0, 1),
+                (">120 s", "pause_5", 0, 1),
+                ("Prompt <=25%", "size_0", 0, 1),
+                ("<=50%", "size_1", 0, 1),
+                (">50%", "size_2", 0, 1),
+            ],
+        )
+    )
     keys = ["resume_p50", "resume_p90", "ttft_p90", "tokens_per_second"]
     for arm, baseline in (
         ("off-4x", "stock-4x"),
         ("gpu10-4x", "off-4x"),
         ("gpu30-4x", "off-4x"),
         ("cpu-1x", "off-1x"),
+        ("cpu30-1x", "off-1x"),
         ("both-1x", "off-1x"),
     ):
         if line := paired(arms, arm, baseline, keys):
