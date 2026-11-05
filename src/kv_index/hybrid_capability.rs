@@ -56,12 +56,8 @@ impl HybridCapabilities {
         self.ranks.iter().find(|entry| entry.rank == rank)
     }
 
-    /// Construct an index for one rank and its event source.
-    ///
-    /// Unknown or unverifiable group layouts remain ineligible for cache
-    /// credit. Callers admit each rank separately: one rank's unsupported
-    /// layout, missing topic or stale model is that rank's miss, not proof
-    /// that the deployment's layout changed.
+    /// Construct an index for one rank and its event source. Unknown layouts
+    /// get no credit.
     pub fn index_for_rank(
         &self,
         rank: u32,
@@ -300,13 +296,7 @@ mod tests {
             .unwrap();
         index.begin_empty(0);
         index
-            .apply_payload(
-                0,
-                include_bytes!(concat!(
-                    env!("CARGO_MANIFEST_DIR"),
-                    "/tests/rust/fixtures/kv_cbor/qwen35_vllm028.msgpack"
-                )),
-            )
+            .apply_payload(0, &crate::kv_index::hybrid_events::tests::qwen35_payload())
             .unwrap();
         let prompt: Vec<u32> = (0..1024).map(|i| 100 + i % 100).collect();
         assert_eq!(index.reusable_tokens(&prompt, usize::MAX), 528);
