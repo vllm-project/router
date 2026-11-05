@@ -106,15 +106,15 @@ class LeasePolicy(CachePolicy):
     def on_request_finished(
         self, key_groups, insertion_only_keys, reused_keys, req_context
     ):
-        """The turn ended, so the lease's clock restarts."""
+        """The turn ended, so the lease's clock restarts, before anything can expire it."""
+        if (hint := _retain_hint(req_context)) is not None:
+            self.book.turn_ended(hint)
         keys = [
             key
             for key in order_request_keys(key_groups, req_context)
             if key in self._bucket_of
         ]
         self._cover(req_context, keys)
-        if (hint := _retain_hint(req_context)) is not None:
-            self.book.touch(hint.key)
         self.touch(keys, req_context)
 
     def evict(self, n, protected):

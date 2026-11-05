@@ -246,8 +246,7 @@ class RetentionLedger:
         now = self._clock()
         ttl = min(hint.ttl_seconds, self.max_ttl_seconds)
         hold = self._holds.get(hint.key)
-        last = self._generations.get(hint.key)
-        if last == (hint.generation, hint.hint_id):
+        if self._last_seen(hint.key) == (hint.generation, hint.hint_id):
             if hold is None or hold.hint_id != hint.hint_id:
                 return self._ack(hint, REJECTED, "already_ended")
             hold.deadline = now + ttl
@@ -339,13 +338,20 @@ class RetentionLedger:
             return "stale_worker_generation"
         if hint.ttl_seconds <= 0:
             return "bad_ttl"
-        last = self._generations.get(hint.key)
+        last = self._last_seen(hint.key)
         if last is not None:
             if hint.generation < last[0]:
                 return "stale_generation"
             if hint.generation == last[0] and hint.hint_id != last[1]:
                 return "generation_conflict"
         return None
+
+    def _last_seen(self, key: SessionKey) -> tuple[int, str] | None:
+        """The session's newest generation and hint. Memory of ended sessions is bounded: a live hold is its own."""
+        hold = self._holds.get(key)
+        if hold is not None:
+            return hold.generation, hold.hint_id
+        return self._generations.get(key)
 
     def _remember(self, hint: RetentionHint) -> None:
         self._generations[hint.key] = (hint.generation, hint.hint_id)
@@ -440,12 +446,18 @@ class LeaseBook:
         return len(self._sessions_of)
 
     def open(self, hint: RetentionHint) -> Ack:
-        """Acknowledge a retain. The lease covers keys as they reach ``tag``; its clock restarts at ``touch``."""
+        """Acknowledge a retain. The lease covers keys as they reach ``tag``; its clock restarts at ``turn_ended``."""
         if hint.worker_generation not in (None, self.worker_generation):
             return self._ack(hint, REJECTED, "stale_worker_generation")
         if hint.ttl_seconds <= 0:
             return self._ack(hint, REJECTED, "bad_ttl")
-        last = self._generations.get(hint.key)
+        lease = self._leases.get(hint.key)
+        # Memory of ended sessions is bounded: a live lease is its own.
+        last = (
+            (lease.generation, lease.hint_id)
+            if lease is not None
+            else self._generations.get(hint.key)
+        )
         if last is not None and last != (hint.generation, hint.hint_id):
             if hint.generation < last[0]:
                 return self._ack(hint, REJECTED, "stale_generation")
@@ -453,7 +465,6 @@ class LeaseBook:
                 return self._ack(hint, REJECTED, "generation_conflict")
         ttl = min(hint.ttl_seconds, self.max_ttl_seconds)
         now = self._clock()
-        lease = self._leases.get(hint.key)
         rank = 1 + min(max(hint.priority, 0), self.RANKS - 1)
         if lease is None:
             self._leases[hint.key] = _Lease(
@@ -490,9 +501,11 @@ class LeaseBook:
             covered.append(chunk)
         return covered
 
-    def touch(self, key: SessionKey) -> None:
-        """The turn ended: the session's TTL counts from now."""
-        if (lease := self._leases.get(key)) is not None:
+    def turn_ended(self, hint: RetentionHint) -> None:
+        """The session's TTL counts from now. A turn longer than the TTL has outlived the lease its hint opened, so
+        the hint opens it again; a newer generation's lease stays that generation's, and only its clock restarts."""
+        self.open(hint)
+        if (lease := self._leases.get(hint.key)) is not None:
             lease.expires_at = self._clock() + lease.ttl
 
     def release(self, hint: RetentionHint) -> tuple[Ack, list[Hashable]]:

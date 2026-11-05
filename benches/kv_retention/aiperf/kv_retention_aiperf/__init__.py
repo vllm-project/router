@@ -24,11 +24,12 @@ class RetentionChatEndpoint(FlatshareChatEndpoint):
 
     def format_payload(self, request_info: RequestInfo) -> dict[str, Any]:
         payload = super().format_payload(request_info)
-        if self.tiers and not request_info.is_final_turn:
+        if self.tiers:
+            # A last turn asks for nothing, and still names its session: it ends the previous turn's hold.
             hint = hint_body(
                 request_info.x_correlation_id,
                 request_info.turn_index,
-                self.tiers,
+                [] if request_info.is_final_turn else self.tiers,
                 self.ttl_seconds,
                 tenant="replay",
             )

@@ -313,22 +313,24 @@ def receipts(run: Path, seconds: float) -> dict[str, Any]:
 PAUSE_EDGES = (1.0, 5.0, 10.0, 30.0, 120.0, float("inf"))
 SIZE_EDGES = (0.25, 0.5, float("inf"))
 """Prompt size as a share of the pool: what a hold's budget has to fit."""
-MATCH_SECONDS = 5.0
-"""How far apart the connector's and the client's clocks of one turn's finish may be."""
+
+
+def client_request_id(request_id: str) -> str:
+    """The client's ``X-Request-ID`` in vLLM's request id, which adds a prefix and a suffix of its own."""
+    return request_id.removeprefix("chatcmpl-").rpartition("-")[0]
 
 
 def restore_profile(run: Path) -> dict[str, list[float]] | None:
     """Which restored tokens a hold could have protected: the tokens by the pause before the turn and by the size of
-    its prompt. The receipts say what was restored, AIPerf's export says when; a turn is its prompt length and
-    finish time, which works on every arm, with or without hints."""
+    its prompt. The receipts say what was restored and AIPerf's export says when, joined by request id."""
     path = run / "receipts.jsonl"
     if not path.exists():
         return None
-    finished: dict[int, list[tuple[float, int]]] = defaultdict(list)
+    restored: dict[str, int] = {}
     for line in path.read_text().splitlines():
         row = json.loads(line)
         if row["event"] == "request":
-            finished[row["prompt_tokens"]].append((row["t"], row["cpu_hit_tokens"]))
+            restored[client_request_id(row["request_id"])] = row["cpu_hit_tokens"]
     with (run / "aiperf" / "profile_export.jsonl").open() as lines:
         records = sorted(
             (json.loads(line) for line in lines),
@@ -341,20 +343,12 @@ def restore_profile(run: Path) -> dict[str, list[float]] | None:
         metadata = record["metadata"]
         session = metadata["x_correlation_id"]
         prompt = record["metrics"].get("input_sequence_length", {}).get("value")
-        end = metadata["request_end_ns"] / 1e9
-        candidates = finished.get(prompt, [])
-        match = min(candidates, key=lambda row: abs(row[0] - end), default=None)
-        if match is not None and abs(match[0] - end) <= MATCH_SECONDS:
-            candidates.remove(match)
-            if session in ended_at and match[1]:
-                pause = (metadata["request_start_ns"] - ended_at[session]) / 1e9
-                by_pause[next(i for i, e in enumerate(PAUSE_EDGES) if pause <= e)] += (
-                    match[1]
-                )
-                share = prompt / POOL_TOKENS
-                by_size[next(i for i, e in enumerate(SIZE_EDGES) if share <= e)] += (
-                    match[1]
-                )
+        tokens = restored.get(metadata["x_request_id"])
+        if tokens and prompt and session in ended_at:
+            pause = (metadata["request_start_ns"] - ended_at[session]) / 1e9
+            by_pause[next(i for i, e in enumerate(PAUSE_EDGES) if pause <= e)] += tokens
+            share = prompt / POOL_TOKENS
+            by_size[next(i for i, e in enumerate(SIZE_EDGES) if share <= e)] += tokens
         ended_at[session] = metadata["request_end_ns"]
     return {"by_pause": by_pause, "by_size": by_size}
 
@@ -405,9 +399,11 @@ def table(
 
 
 def change(run: dict[str, Any], baseline: dict[str, Any], key: str) -> str:
-    """Points for a share, percent for anything else."""
+    """Points for a share, percent for anything else. A percent of nothing, or of no value, is not a number."""
     if key.endswith("_share"):
         return f"{(run[key] - baseline[key]) * 100:+.1f}"
+    if not baseline[key] or run[key] is None:
+        return "—"
     return f"{(run[key] / baseline[key] - 1) * 100:+.0f}%"
 
 

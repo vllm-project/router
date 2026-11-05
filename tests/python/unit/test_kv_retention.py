@@ -261,6 +261,28 @@ class TestHold:
         ledger.release(make_hint("big", op="release"))
         assert ledger.retain(hint, "r1-again", 10, 160).state == "accepted"
 
+    def test_a_live_hold_outranks_a_forgotten_generation(self, ledger, monkeypatch):
+        monkeypatch.setattr(lifecycle, "MAX_REMEMBERED_SESSIONS", 1)
+        ledger.retain(make_hint("target", 5), "r0", 10, 160)
+        ledger.retain(make_hint("filler", 0), "r1", 10, 160)
+        stale = ledger.retain(make_hint("target", 4), "r2", 10, 160)
+        assert (stale.state, stale.reason) == ("rejected", "stale_generation")
+        conflict = ledger.retain(make_hint("target", 5, hint_id="other"), "r3", 10, 160)
+        assert (conflict.state, conflict.reason) == ("rejected", "generation_conflict")
+        assert ledger.take_ended() == []
+        renewed = ledger.retain(make_hint("target", 5), "r0", 10, 160)
+        assert (renewed.state, renewed.reason) == ("accepted", "renewed")
+
+    def test_a_last_turn_with_no_tiers_still_ends_the_hold(self, ledger):
+        ledger.retain(make_hint(generation=1), "r0", 10, 160)
+        last, ignored = lifecycle.parse_hint(
+            {lifecycle.HINT_KEY: lifecycle.hint_body("s", 2, [], 60.0, tenant="t")}
+        )
+        assert ignored is None
+        assert last.tiers == frozenset()
+        ledger.on_next_turn(last.key, last.generation, 160)
+        assert outcomes(ledger) == [("s:1", "used", None)]
+
     def test_next_turn_ends_the_hold_as_used(self, ledger):
         ledger.retain(make_hint(generation=0), "r0", 100, 1600)
         ledger.on_next_turn(("t", "default", "s"), 1, 1600)
@@ -427,7 +449,7 @@ class TestLease:
         book.open(hint)
         book.tag(hint.key, ["c0"])
         clock.now += 100.0
-        book.touch(hint.key)
+        book.turn_ended(hint)
         clock.now += 100.0
         assert book.expire() == []
         clock.now += 20.0
@@ -435,6 +457,32 @@ class TestLease:
         assert book.rank("c0") == 0
         ended = book.take_ended()
         assert [(end.outcome, end.tokens) for end in ended] == [("expired", 16)]
+
+    def test_a_turn_longer_than_the_ttl_opens_its_lease_again(self, book, clock):
+        hint = make_hint(tiers=["cpu"], ttl_seconds=30.0)
+        book.open(hint)
+        clock.now += 40.0
+        assert book.expire() == []
+        book.turn_ended(hint)
+        book.tag(hint.key, ["c0"])
+        assert book.rank("c0") == 1
+        clock.now += 20.0
+        assert book.expire() == []
+        clock.now += 15.0
+        assert book.expire() == ["c0"]
+
+    def test_an_older_turn_ending_leaves_a_newer_lease_its_generation(self, book):
+        older = make_hint(generation=1, tiers=["cpu"], ttl_seconds=30.0)
+        newer = make_hint(generation=2, tiers=["cpu"], ttl_seconds=60.0)
+        book.open(older)
+        book.open(newer)
+        book.turn_ended(older)
+        stale = book.open(make_hint(generation=1, tiers=["cpu"]))
+        assert (stale.state, stale.reason) == ("rejected", "stale_generation")
+        assert (
+            book.release(make_hint(generation=2, op="release", tiers=["cpu"]))[0].state
+            == "released"
+        )
 
     def test_a_chunk_two_sessions_share_outlives_one_lease(self, book):
         a, b = (
@@ -474,6 +522,15 @@ class TestLease:
             book.release(make_hint(generation=4, op="release", tiers=["cpu"]))[0].reason
             == "stale_generation"
         )
+
+    def test_a_live_lease_outranks_a_forgotten_generation(self, book, monkeypatch):
+        monkeypatch.setattr(lifecycle, "MAX_REMEMBERED_SESSIONS", 1)
+        book.open(make_hint("target", 5, tiers=["cpu"]))
+        book.open(make_hint("filler", 0, tiers=["cpu"]))
+        stale = book.open(make_hint("target", 4, tiers=["cpu"]))
+        assert (stale.state, stale.reason) == ("rejected", "stale_generation")
+        conflict = book.open(make_hint("target", 5, tiers=["cpu"], hint_id="other"))
+        assert (conflict.state, conflict.reason) == ("rejected", "generation_conflict")
 
     def test_the_same_hint_again_is_a_renewal(self, book, clock):
         hint = make_hint(tiers=["cpu"], ttl_seconds=120.0)
@@ -554,6 +611,7 @@ def turn(session, index, start, end, isl, osl, cached, ttft, phase="profiling"):
     return {
         "metadata": {
             "x_correlation_id": session,
+            "x_request_id": f"{session}-{index}",
             "turn_index": index,
             "request_start_ns": int(start * 1e9),
             "request_end_ns": int(end * 1e9),
@@ -646,6 +704,7 @@ def run_dir(tmp_path):
         },
         {
             "event": "request",
+            "request_id": "chatcmpl-a-3-0f0f0f0f",
             "t": 21.1,
             "prompt_tokens": 1200,
             "gpu_hit_tokens": 900,
@@ -712,32 +771,50 @@ class TestReport:
         rows = [
             {
                 "event": "request",
-                "t": 21.1,
-                "cpu_hit_tokens": 300,
-                "prompt_tokens": 1200,
-            },
-            {
-                "event": "request",
-                "t": 12.4,
-                "cpu_hit_tokens": 100,
-                "prompt_tokens": 1100,
-            },
-            {"event": "request", "t": 1.0, "cpu_hit_tokens": 999, "prompt_tokens": 400},
-            {
-                "event": "request",
-                "t": 500.0,
-                "cpu_hit_tokens": 7,
-                "prompt_tokens": 1000,
-            },
+                "request_id": f"chatcmpl-{turn_id}-0f0f0f0f",
+                "cpu_hit_tokens": tokens,
+            }
+            for turn_id, tokens in (
+                ("a-3", 300),
+                ("a-2", 100),
+                ("b-0", 999),
+                ("other-9", 7),
+            )
         ]
         (run_dir / "receipts.jsonl").write_text(
             "\n".join(json.dumps(row) for row in rows)
         )
         profile = report.restore_profile(run_dir)
         # 1200 tokens paused 7.5 s and 1100 tokens 0.5 s. The 400 has no earlier turn, so no pause to bin,
-        # and the 1000's finish is too far from any turn's to be one.
+        # and no turn of this run has the last receipt's id.
         assert profile["by_pause"] == [100.0, 0.0, 300.0, 0.0, 0.0, 0.0]
         assert profile["by_size"] == [400.0, 0.0, 0.0]
+
+    def test_equal_prompts_finishing_together_keep_their_own_restores(self, run_dir):
+        records = [
+            turn("a", 0, 0.0, 1.0, 500, 10, 0, 50.0),
+            turn("b", 0, 0.0, 9.0, 500, 10, 0, 50.0),
+            turn("a", 1, 10.0, 11.0, 2000, 10, 0, 50.0),  # paused 9 s
+            turn("b", 1, 10.0, 11.1, 2000, 10, 0, 50.0),  # paused 1 s
+        ]
+        (run_dir / "aiperf" / "profile_export.jsonl").write_text(
+            "\n".join(json.dumps(record) for record in records)
+        )
+        rows = [
+            {
+                "event": "request",
+                "request_id": f"chatcmpl-{turn_id}-0f0f0f0f",
+                "t": at,
+                "cpu_hit_tokens": tokens,
+                "prompt_tokens": 2000,
+            }
+            for turn_id, at, tokens in (("a-1", 10.8, 200), ("b-1", 10.9, 700))
+        ]
+        (run_dir / "receipts.jsonl").write_text(
+            "\n".join(json.dumps(row) for row in rows)
+        )
+        profile = report.restore_profile(run_dir)
+        assert profile["by_pause"] == [700.0, 0.0, 200.0, 0.0, 0.0, 0.0]
 
     def test_a_stock_run_has_no_receipts_and_no_false_zeros(self, run_dir):
         (run_dir / "receipts.jsonl").unlink()
@@ -783,6 +860,23 @@ class TestReport:
         )
         assert "| +0.0 / -10.0 |" in row, "seeds in order, in points"
         assert "| +0% / -50% |" in row, "seeds in order, in percent"
+
+    def test_a_percent_of_nothing_is_not_a_number(self):
+        assert (
+            report.change({"resume_p90": 1.0}, {"resume_p90": 0.0}, "resume_p90") == "—"
+        )
+        assert (
+            report.change({"resume_p90": None}, {"resume_p90": 2.0}, "resume_p90")
+            == "—"
+        )
+        assert (
+            report.change({"resume_p90": 1.0}, {"resume_p90": None}, "resume_p90")
+            == "—"
+        )
+        assert (
+            report.change({"resume_p90": 1.0}, {"resume_p90": 2.0}, "resume_p90")
+            == "-50%"
+        )
 
     def test_every_table_renders_without_receipts_too(self, run_dir):
         run = report.summarize(run_dir)

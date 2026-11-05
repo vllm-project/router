@@ -302,6 +302,18 @@ Against reading it as settled:
 So these runs support a lead, not a result to act on. Interleaved repeats of `off-1x` and `cpu30-1x` on the same seeds would
 measure the spread they lack.
 
+## Defects in these runs
+
+Review found two defects after these runs. Both are fixed in the code here, which has not yet run on a GPU. Both count
+against retention, so neither inflates a gain, though either could hide a small one.
+
+- **A conversation's last turn did not end the previous turn's hold.** It carried no hint, so the connector could not tie
+  it to its session. Those holds, 17 to 26 per run of 352 to 675, stayed until their TTL or demand. They
+  count as expired or evicted, not used, and kept 1.2% to 13.2% of the run's held token-seconds past that last turn's arrival.
+- **A turn longer than a lease's TTL lost its lease before it ended**, so the pause after it had no coverage. That reached
+  1, 13 and 4 turns of 682 to 708 in `cpu30-1x` (at most 3.3% of a run's prompt tokens) and
+  0, 2 and 0 in `cpu30-4x`. No turn outlasted a 120 s lease.
+
 ## What this does not show
 
 - One GPU, one small model and one trace family, on a 5 GiB pool. Another card moves every ratio here.
