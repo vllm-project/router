@@ -685,4 +685,138 @@ pub(crate) mod tests {
                 .is_empty()
         );
     }
+
+    fn qwen4_groups() -> Vec<HybridEventGroup> {
+        let mut groups: Vec<_> = (0..3)
+            .map(|group_idx| HybridEventGroup {
+                group_idx,
+                block_size: 320,
+                kind: HybridGroupKind::Checkpoint,
+            })
+            .collect();
+        groups.push(HybridEventGroup {
+            group_idx: 3,
+            block_size: 320,
+            kind: HybridGroupKind::CompressedFullAttention {
+                tokens_per_state: 4,
+            },
+        });
+        groups
+    }
+
+    fn qwen4_batch(kind_override: Option<&str>) -> KVEventBatch {
+        let tokens = prompt();
+        let hash = BlockKeyGenerator::new(320, 0).generate_block_keys(&tokens)[0];
+        let events = qwen4_groups()
+            .iter()
+            .map(|group| {
+                let compressed =
+                    matches!(group.kind, HybridGroupKind::CompressedFullAttention { .. });
+                let default = if compressed { "mla_attention" } else { "mamba" };
+                let spec = kind_override.unwrap_or(default);
+                KVEvent::BlockStored(gpu_store(
+                    group.group_idx,
+                    spec,
+                    320,
+                    &tokens[..320],
+                    &[hash],
+                ))
+            })
+            .collect();
+        KVEventBatch {
+            ts: 1.0,
+            events,
+            data_parallel_rank: Some(0),
+        }
+    }
+
+    #[test]
+    fn qwen4_compressed_group_accepts_mla_events_and_rejects_other_specs() {
+        let index = HybridEventIndex::new(target(), qwen4_groups(), 320, 0, 8).unwrap();
+        index.begin_empty(0);
+        assert_eq!(index.apply_batch(0, &qwen4_batch(None)), Ok(()));
+        assert_eq!(index.reusable_tokens(&prompt(), usize::MAX), 320);
+
+        let wrong = HybridEventIndex::new(target(), qwen4_groups(), 320, 0, 8).unwrap();
+        wrong.begin_empty(0);
+        assert_eq!(
+            wrong.apply_batch(0, &qwen4_batch(Some("full_attention"))),
+            Err(HybridEventError::InvalidBatch)
+        );
+    }
+
+    #[test]
+    fn compressed_group_must_align_with_its_block_size() {
+        let mut groups = qwen4_groups();
+        groups[3].kind = HybridGroupKind::CompressedFullAttention {
+            tokens_per_state: 7,
+        };
+        assert!(matches!(
+            HybridEventIndex::new(target(), groups, 320, 0, 8),
+            Err(HybridEventError::InvalidLayout)
+        ));
+    }
+
+    #[test]
+    fn checkpoint_event_may_cover_the_whole_cached_chunk() {
+        let tokens: Vec<u32> = (0..2048).map(|i| 100 + i % 100).collect();
+        let keys = BlockKeyGenerator::new(320, 0).generate_block_keys(&tokens);
+        // Captured from vLLM 0.33: a Mamba group publishes only the retained
+        // checkpoint hash while token_ids spans the whole cached chunk. The
+        // QSA attention group still publishes one hash per block.
+        let batch = |attention_hashes: usize, checkpoint_hashes: usize| {
+            let events = qwen4_groups()
+                .iter()
+                .map(|group| {
+                    let attention =
+                        matches!(group.kind, HybridGroupKind::CompressedFullAttention { .. });
+                    let count = if attention {
+                        attention_hashes
+                    } else {
+                        checkpoint_hashes
+                    };
+                    let (spec, hashes) = if attention {
+                        ("mla_attention", &keys[..count])
+                    } else {
+                        ("mamba", &keys[6 - count..6])
+                    };
+                    KVEvent::BlockStored(gpu_store(
+                        group.group_idx,
+                        spec,
+                        320,
+                        &tokens[..1920],
+                        hashes,
+                    ))
+                })
+                .collect();
+            KVEventBatch {
+                ts: 1.0,
+                events,
+                data_parallel_rank: Some(0),
+            }
+        };
+        let index = HybridEventIndex::new(target(), qwen4_groups(), 320, 0, 16).unwrap();
+        index.begin_empty(0);
+        assert_eq!(index.apply_batch(0, &batch(6, 1)), Ok(()));
+        assert_eq!(index.reusable_tokens(&tokens, usize::MAX), 1920);
+
+        let sparse_attention = HybridEventIndex::new(target(), qwen4_groups(), 320, 0, 16).unwrap();
+        sparse_attention.begin_empty(0);
+        assert_eq!(
+            sparse_attention.apply_batch(0, &batch(1, 1)),
+            Err(HybridEventError::InvalidBatch)
+        );
+        assert_eq!(sparse_attention.reusable_tokens(&tokens, usize::MAX), 0);
+
+        // vLLM can emit a checkpoint group with an empty hash list when all
+        // blocks in the chunk are null. The stream stays valid, but that group
+        // has no residency and cannot complete a hit.
+        let empty_checkpoints =
+            HybridEventIndex::new(target(), qwen4_groups(), 320, 0, 16).unwrap();
+        empty_checkpoints.begin_empty(0);
+        assert_eq!(empty_checkpoints.apply_batch(0, &batch(6, 0)), Ok(()));
+        assert_eq!(empty_checkpoints.reusable_tokens(&tokens, usize::MAX), 0);
+        assert_eq!(empty_checkpoints.apply_batch(1, &batch(6, 1)), Ok(()));
+        assert_eq!(empty_checkpoints.reusable_tokens(&tokens, usize::MAX), 1920);
+    }
 }

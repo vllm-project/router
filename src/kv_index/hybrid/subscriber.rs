@@ -288,6 +288,15 @@ pub fn spawn_zmq(
                                 // is a restarted publisher reusing the topic, so
                                 // the whole view belongs to a dead epoch and the
                                 // replay has to start over.
+                                // A publisher that restarts reuses the topic
+                                // and begins again at sequence zero. That is a
+                                // new epoch even when the bytes match an old
+                                // frame, so the old epoch's claims must not
+                                // survive it: start the replay over.
+                                if seq == 0 && next > 0 {
+                                    required_through = seq;
+                                    break;
+                                }
                                 let duplicate = replaying
                                     && window.replayed.get(&seq).is_some_and(|known| {
                                         *known == payload_fingerprint(&frames[2])

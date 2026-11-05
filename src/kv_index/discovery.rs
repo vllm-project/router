@@ -296,6 +296,59 @@ impl KvIndexSupervisor {
         self
     }
 
+    /// Resolve a worker's declared sources, folding per-rank declarations
+    /// (`base@0`, `base@1`) into the base entry. Regular startup discovers the
+    /// base URL and fans it out to its DP ranks afterwards, so a declaration
+    /// keyed by rank has to be merged here or it is never applied.
+    fn resolved_static_source(&self, worker_url: &str) -> Option<StaticKvEventSources> {
+        let exact = self.static_sources.get(worker_url).cloned();
+        if worker_url.contains('@') {
+            return exact;
+        }
+        let prefix = format!("{worker_url}@");
+        let mut per_rank: Vec<(u32, &StaticKvEventSources)> = Vec::new();
+        for (key, source) in &self.static_sources {
+            if let Some(rank) = key
+                .strip_prefix(prefix.as_str())
+                .and_then(|suffix| suffix.parse::<u32>().ok())
+            {
+                per_rank.push((rank, source));
+            }
+        }
+        if per_rank.is_empty() {
+            return exact;
+        }
+        per_rank.sort_by_key(|(rank, _)| *rank);
+        let mut merged = exact
+            .or_else(|| per_rank.first().map(|(_, source)| (*source).clone()))
+            .expect("per-rank declarations are non-empty");
+        for (rank, source) in per_rank {
+            if merged.endpoints.is_empty() {
+                merged.endpoints = source.endpoints.clone();
+            }
+            if merged.replay_endpoints.is_none() {
+                merged.replay_endpoints = source.replay_endpoints.clone();
+            }
+            if merged.topic.is_empty() {
+                merged.topic = source.topic.clone();
+            }
+            if merged.model.is_empty() {
+                merged.model = source.model.clone();
+            }
+            match (&mut merged.hybrid, &source.hybrid) {
+                (Some(base), Some(overlay)) => merge_hybrid_layout(base, overlay),
+                (None, Some(overlay)) => merged.hybrid = Some(overlay.clone()),
+                _ => {}
+            }
+            tracing::debug!(
+                worker_url,
+                rank,
+                "merged a rank-pinned hybrid declaration into its base worker"
+            );
+        }
+        Some(merged)
+    }
+
     /// Query both endpoints for `worker_url`, spawn one subscriber per rank into
     /// this worker's identity's indexer. A missing source route is a soft skip.
     pub async fn on_worker_added(&self, worker_url: &str) -> Result<WorkerKvInfo, String> {
@@ -345,9 +398,9 @@ impl KvIndexSupervisor {
             };
         }
         let grpc = crate::backend::is_grpc_url(worker_url);
-        let static_source = self.static_sources.get(worker_url);
+        let static_source = self.resolved_static_source(worker_url);
         let full_attention_http = !grpc && self.full_attention_http;
-        match static_source {
+        match &static_source {
             // A layout entry without endpoints: the declaration carries the
             // identity and groups, the engine reports the publishers.
             Some(config) if layout_only(config) => {
@@ -441,7 +494,7 @@ impl KvIndexSupervisor {
         let hybrid_capability = discovery.hybrid;
         let grpc = crate::backend::is_grpc_url(worker_url);
         let full_attention_http =
-            !grpc && self.full_attention_http && !self.static_sources.contains_key(worker_url);
+            !grpc && self.full_attention_http && self.resolved_static_source(worker_url).is_none();
         let full_attention = full_attention_http || (self.http_pd && !grpc);
         let server_info = discovery.server_info.unwrap_or_else(|e| {
             warn!(
@@ -739,6 +792,19 @@ impl KvIndexSupervisor {
                 // subscriber at all: the legacy single-group index must not
                 // credit an unmodeled hybrid layout.
                 if let Some(index) = indexes.get(&rank) {
+                    // Two ranks on one publisher and one topic cannot be told
+                    // apart when a batch omits its rank, and the hybrid
+                    // subscriber has no rank fence to apply: give the rank no
+                    // subscriber instead of crediting the other rank's cache.
+                    if *live.lease.strict_rank.lock() {
+                        tracing::warn!(
+                            "kv_index {}: rank{} shares a publisher and topic with another rank; no hybrid subscriber",
+                            worker_url,
+                            rank
+                        );
+                        ranks.push(rank);
+                        continue;
+                    }
                     let stream = Arc::new(HybridEventStream::new(index.clone()));
                     let handle = super::hybrid::spawn_zmq(ev, stream, self.ctx.clone())
                         .expect("hybrid source was validated before registration");
@@ -779,7 +845,7 @@ impl KvIndexSupervisor {
             let client = self.client.clone();
             let worker = worker_url.to_owned();
             let api_key = self.api_key.clone();
-            let static_config = self.static_sources.get(worker_url).cloned();
+            let static_config = self.resolved_static_source(worker_url);
             let bound = bound_sources.clone();
             tokio::spawn(async move {
                 loop {
@@ -957,6 +1023,35 @@ impl KvIndexSupervisor {
                 );
             }
             _ => {}
+        }
+    }
+}
+
+/// Overlay one declaration's ranks and adapters onto another. A rank-pinned
+/// declaration replaces the base entry of the same rank; other ranks are
+/// untouched.
+fn merge_hybrid_layout(
+    base: &mut crate::kv_index::hybrid::HybridCapabilities,
+    overlay: &crate::kv_index::hybrid::HybridCapabilities,
+) {
+    for rank in &overlay.ranks {
+        match base
+            .ranks
+            .iter_mut()
+            .find(|existing| existing.rank == rank.rank)
+        {
+            Some(existing) => *existing = rank.clone(),
+            None => base.ranks.push(rank.clone()),
+        }
+    }
+    base.ranks.sort_by_key(|rank| rank.rank);
+    for adapter in &overlay.adapters {
+        if !base
+            .adapters
+            .iter()
+            .any(|existing| existing.name == adapter.name)
+        {
+            base.adapters.push(adapter.clone());
         }
     }
 }
@@ -4399,5 +4494,53 @@ vllm:cache_config_info{block_size=\"16\",effective_attention_block_size=\"16\",e
         assert!(error.contains("server_info"), "{error}");
         assert!(error.contains("metrics"), "{error}");
         server.abort();
+    }
+}
+
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
+mod rank_merge_tests {
+    use super::*;
+
+    #[test]
+    fn rank_pinned_declarations_fold_into_their_base_worker() {
+        let base = "http://worker:8000";
+        let rank = |rank: u32, model: &str| {
+            serde_json::json!({
+                "rank": rank, "model": model, "weight_version": "default",
+                "weight_identity": null, "publisher_topic": format!("topic-{rank}"),
+                "instance_topic": true, "hash_algorithm": "sha256_cbor",
+                "root_hash": "9bd96a485ad84efdafb72ee48a1d7a69bcead0f8f0433173941b276b9581eef0",
+                "full_hashes": true, "hash_block_size": 16, "hash_lookahead_tokens": 0,
+                "speculative_tokens": 0, "prefix_caching": true, "groups": [],
+            })
+        };
+        let mut sources = serde_json::Map::new();
+        sources.insert(
+            base.to_string(),
+            serde_json::json!({
+                "endpoints": [], "topic": "topic-0", "block_size": 16, "model": "m0",
+                "hybrid": {"schema_version": 1, "ranks": [rank(0, "m0")]},
+            }),
+        );
+        sources.insert(
+            format!("{base}@1"),
+            serde_json::json!({
+                "endpoints": [], "topic": "topic-1", "block_size": 16, "model": "m1",
+                "hybrid": {"schema_version": 1, "ranks": [rank(1, "m1")]},
+            }),
+        );
+        let (mut supervisor, _signals) =
+            KvIndexSupervisor::new(reqwest::Client::new(), crate::kv_index::HashMode::Sha256);
+        supervisor.static_sources =
+            serde_json::from_value(serde_json::Value::Object(sources)).expect("sources");
+        let resolved = supervisor
+            .resolved_static_source(base)
+            .expect("base resolves with its rank declarations");
+        let hybrid = resolved.hybrid.expect("hybrid layout");
+        assert_eq!(hybrid.ranks.len(), 2);
+        assert_eq!(hybrid.ranks[0].rank, 0);
+        assert_eq!(hybrid.ranks[0].model, "m0");
+        assert_eq!(hybrid.ranks[1].rank, 1);
+        assert_eq!(hybrid.ranks[1].model, "m1");
     }
 }

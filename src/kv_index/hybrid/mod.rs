@@ -93,6 +93,15 @@ impl HybridEventIndex {
                 group.block_size == 0
                     || !(group.block_size as usize).is_multiple_of(keys.block_size())
                     || !ids.insert(group.group_idx)
+                    // Compressed state covers `tokens_per_state` tokens, so
+                    // the group boundary has to be a multiple of that ratio.
+                    || match group.kind {
+                        HybridGroupKind::CompressedFullAttention { tokens_per_state } => {
+                            tokens_per_state == 0
+                                || !group.block_size.is_multiple_of(tokens_per_state)
+                        }
+                        _ => false,
+                    }
             })
         {
             return Err(HybridEventError::InvalidLayout);
