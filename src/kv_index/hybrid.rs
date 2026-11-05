@@ -208,12 +208,15 @@ fn longest_supported(group: &HybridGroupView<'_>, target: &RoutableTarget, cap: 
                 // A checkpoint is restorable on its own.
                 HybridGroupKind::Checkpoint => end,
                 // The window that ends at the boundary has to fit inside the
-                // blocks this segment proves.
+                // resident run, except below block zero: a run anchored at the
+                // root has no earlier state the window could be missing, so the
+                // engine restores it even when it is shorter than the window.
                 HybridGroupKind::SlidingWindow { window_tokens } => {
-                    if end * size < start * size + window_tokens {
-                        0
-                    } else {
+                    let needed = window_tokens.saturating_sub(1).div_ceil(size);
+                    if start == 0 || end - start >= needed {
                         end
+                    } else {
+                        0
                     }
                 }
             };
@@ -325,6 +328,28 @@ mod tests {
             ),
         ];
         assert_eq!(common_reusable_tokens(&worker, &groups, 143), 0);
+    }
+
+    /// A sliding group whose resident run starts at the root has no earlier
+    /// state the window could be missing, so a prefix shorter than the window is
+    /// still reusable: the engine restores the whole run.
+    #[test]
+    fn a_root_anchored_prefix_shorter_than_the_window_is_reusable() {
+        let worker = target("w", 0);
+        let full = [hit(&worker, &[(0, 1)])];
+        let window = [hit(&worker, &[(0, 1)])];
+        let groups = [
+            group(0, 64, HybridGroupKind::FullAttention, &full),
+            group(
+                1,
+                64,
+                HybridGroupKind::SlidingWindow { window_tokens: 128 },
+                &window,
+            ),
+        ];
+        // A 65-token request keeps one 64-token block, well inside the window.
+        assert_eq!(common_reusable_tokens(&worker, &groups, 64), 64);
+        assert_eq!(common_reusable_tokens(&worker, &groups, 128), 64);
     }
 
     /// A sliding group whose run sits below the boundary still supports it,

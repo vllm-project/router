@@ -438,18 +438,22 @@ impl HybridEventIndex {
             Some(hash) => sequence_hash(hash).ok_or(())?,
         };
         let expanded = self.keys.keys_after(parent, &store.token_ids);
-        if published.is_empty() {
-            return Ok(expanded);
-        }
-        let stride = group.block_size as usize / self.keys.block_size();
+        // Only the group's own page boundaries are addressable: `reusable_tokens`
+        // looks up nothing else and the engine's removals name nothing else, so
+        // claiming the intermediate chain steps would leave entries behind on
+        // every store/evict cycle until the capacity limit revoked the rank.
+        let stride = (group.block_size as usize / self.keys.block_size()).max(1);
         let boundaries: Vec<SequenceHash> = expanded
             .iter()
-            .skip(stride.saturating_sub(1))
-            .step_by(stride.max(1))
+            .skip(stride - 1)
+            .step_by(stride)
             .copied()
             .collect();
+        if published.is_empty() {
+            return Ok(boundaries);
+        }
         if boundaries.ends_with(&published) {
-            Ok(expanded)
+            Ok(boundaries)
         } else {
             Ok(published)
         }
@@ -1657,6 +1661,56 @@ mod tests {
         // last-token bound, and the engine keeps that smallest hit even though
         // the sliding tails sit at the end of the prefix.
         assert_eq!(index.reusable_tokens(&tokens, usize::MAX), 768);
+    }
+
+    /// A sliding claim must stay inside what the engine can later remove. The
+    /// store spans 1,024 tokens at a 64-token group page, so the chain has 256
+    /// four-token steps but only 16 of them are page boundaries: querying and
+    /// removing address nothing else, and retaining the intermediates would
+    /// exhaust the capacity limit over repeated store/evict cycles.
+    #[test]
+    fn sliding_claims_only_the_page_boundaries_its_removals_name() {
+        let tokens: Vec<u32> = (0..1024).map(|i| 100 + i % 100).collect();
+        let keys = BlockKeyGenerator::new(4, 0).generate_block_keys(&tokens);
+        let group = HybridEventGroup {
+            group_idx: 0,
+            block_size: 64,
+            kind: HybridGroupKind::SlidingWindow { window_tokens: 128 },
+        };
+        let tail: Vec<ExternalBlockHash> = keys
+            .iter()
+            .skip(15)
+            .step_by(16)
+            .rev()
+            .take(2)
+            .rev()
+            .map(|hash| ExternalBlockHash::Bytes(hash.to_vec()))
+            .collect();
+        let batch = KVEventBatch {
+            ts: 1.0,
+            data_parallel_rank: Some(0),
+            events: vec![KVEvent::BlockStored(BlockStored {
+                block_hashes: tail,
+                parent_block_hash: None,
+                token_ids: tokens[..1024].to_vec(),
+                block_size: 64,
+                lora_id: None,
+                medium: Some("GPU".into()),
+                lora_name: None,
+                extra_keys: None,
+                group_idx: Some(0),
+                kv_cache_spec_kind: Some("sliding_window_mla".into()),
+                kv_cache_spec_sliding_window: Some(128),
+                locality: None,
+                ownership: None,
+                session_id: None,
+            })],
+        };
+        for (capacity, expected) in [(16, Ok(())), (15, Err(HybridEventError::Capacity))] {
+            let index = HybridEventIndex::new(target(), vec![group], 4, 0, capacity).unwrap();
+            index.begin_empty(0);
+            assert_eq!(index.apply_batch(0, &batch), expected);
+        }
     }
 
     /// The event shape a DeepSeek V4.1 layout publishes: one 128-token
