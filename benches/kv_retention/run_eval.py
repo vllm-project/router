@@ -32,6 +32,7 @@ PORT = 8123
 GIB = 1024**3
 POOL_TOKENS = 36_400
 MAX_ATTEMPTS = 3
+LONG_TURN_TTL = 30.0
 BY_SOURCE = "vllm:prompt_tokens_by_source_total"
 SAMPLED = (
     "vllm:kv_cache_usage_perc",
@@ -347,16 +348,26 @@ def probe_gpu_hold(engine: Engine, receipts: Path) -> dict[str, Any]:
     first = probe.send(on_prompt, hint_body("gpu-probe", 0, ["gpu"], 300.0))
     probe.fill(int(POOL_TOKENS * 1.5))
     on = probe.send(on_prompt, hint_body("gpu-probe", 1, ["gpu"], 300.0))
-    probe.send(probe.prompt(16), hint_body("gpu-probe", 2, ["gpu"], 300.0, op=RELEASE))
+    # A conversation's last turn asks for nothing, and still ends the hold the turn before it left.
+    last_turn = probe.send(on_prompt, hint_body("gpu-probe", 2, [], 300.0))
+    ended = [
+        row["outcome"]
+        for row in receipts_of(receipts, "end")
+        if row["hint_id"] == "gpu-probe:1"
+    ]
+    probe.send(probe.prompt(16), hint_body("gpu-probe", 3, ["gpu"], 300.0, op=RELEASE))
     return {
         "off": off,
         "ack": first["ack"],
         "on": on,
         "control_holds_with_hint_off": holds_after_off,
+        "last_turn": last_turn,
+        "last_turn_ended": ended,
         "passed": share(off, "external_kv_transfer", tokens) > 0.9
         and share(on, "local_cache_hit", tokens) > 0.9
         and share(on, "external_kv_transfer", tokens) < 0.1
-        and holds_after_off == 0,
+        and holds_after_off == 0
+        and ended == ["used"],
     }
 
 
@@ -416,6 +427,33 @@ def probe_cpu_lease(engine: Engine) -> dict[str, Any]:
         "on": on,
         "passed": share(off, "local_compute", tokens) > 0.9
         and share(on, "external_kv_transfer", tokens) > 0.9,
+    }
+
+
+def probe_cpu_long_turn(engine: Engine) -> dict[str, Any]:
+    """A turn longer than the lease's TTL still leaves its prompt leased for the pause after it. Run with a TTL shorter
+    than the turn and longer than the filler."""
+    probe = Probe(engine)
+    tokens = 8_000
+    prompt = probe.prompt(tokens)
+    turn = probe.send(
+        prompt,
+        hint_body("long-turn", 0, ["cpu"], 300.0),
+        max_tokens=3_000,
+        ignore_eos=True,
+    )
+    started = time.perf_counter()
+    probe.fill(POOL_TOKENS * 3)
+    filled = time.perf_counter() - started
+    after = probe.send(prompt, hint_body("long-turn", 1, ["cpu"], 300.0))
+    return {
+        "ack": turn["ack"],
+        "turn_seconds": turn["seconds"],
+        "filler_seconds": round(filled, 3),
+        "after": after,
+        "passed": turn["seconds"] > LONG_TURN_TTL
+        and filled < LONG_TURN_TTL
+        and share(after, "external_kv_transfer", tokens) > 0.9,
     }
 
 
@@ -490,7 +528,14 @@ def probe(args: argparse.Namespace) -> None:
         (out / "probes.json").write_text(json.dumps(results, indent=1))
         print(name, "PASS" if results[name]["passed"] else "FAIL", flush=True)
 
-    selected = args.only or ["gpu_hold", "refusals", "expiry", "cpu_lease", "overload"]
+    selected = args.only or [
+        "gpu_hold",
+        "refusals",
+        "expiry",
+        "cpu_lease",
+        "cpu_long_turn",
+        "overload",
+    ]
     hold_ttl = {"retention_gpu_max_ttl_seconds": 300.0}
     if "gpu_hold" in selected:
         on_engine("gpu_hold", 20, probe_gpu_hold, **hold_ttl)
@@ -504,6 +549,13 @@ def probe(args: argparse.Namespace) -> None:
             5,
             lambda engine, _: probe_cpu_lease(engine),
             retention_cpu_max_ttl_seconds=300.0,
+        )
+    if "cpu_long_turn" in selected:
+        on_engine(
+            "cpu_long_turn",
+            5,
+            lambda engine, _: probe_cpu_long_turn(engine),
+            retention_cpu_max_ttl_seconds=LONG_TURN_TTL,
         )
     if "overload" in selected:
         on_engine("overload", 20, probe_overload, retention_gpu_share=0.9, **hold_ttl)
