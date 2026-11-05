@@ -264,6 +264,10 @@ struct CliArgs {
     #[arg(long, default_value = "info", value_parser = ["debug", "info", "warn", "error"])]
     log_level: String,
 
+    /// Log user text from chat completion requests (may contain sensitive data)
+    #[arg(long, default_value_t = false, action = ArgAction::Set)]
+    log_user_prompts: bool,
+
     /// Enable OpenTelemetry tracing
     #[arg(
         long,
@@ -645,6 +649,7 @@ impl CliArgs {
             metrics,
             log_dir: self.log_dir.clone(),
             log_level: Some(self.log_level.clone()),
+            log_user_prompts: self.log_user_prompts,
             request_id_headers: if self.request_id_headers.is_empty() {
                 None
             } else {
@@ -850,6 +855,34 @@ Provide --worker-urls or PD flags as usual.",
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_explicit_user_prompt_logging_switch() {
+        assert!(
+            !CliArgs::try_parse_from(["vllm-router"])
+                .unwrap()
+                .log_user_prompts
+        );
+        for (argument, expected) in [
+            ("--log-user-prompts=true", true),
+            ("--log-user-prompts=false", false),
+        ] {
+            let args = CliArgs::try_parse_from([
+                "vllm-router",
+                "--worker-urls",
+                "http://127.0.0.1:8000",
+                argument,
+            ])
+            .unwrap();
+            assert_eq!(args.log_user_prompts, expected);
+            assert_eq!(
+                args.to_router_config(vec![]).unwrap().log_user_prompts,
+                expected
+            );
+        }
+        assert!(CliArgs::try_parse_from(["vllm-router", "--log-user-prompts=invalid"]).is_err());
+        assert!(CliArgs::try_parse_from(["vllm-router", "--log-user-prompts"]).is_err());
+    }
 
     #[test]
     fn parses_pd_kv_aware_with_affinity_ttl() {

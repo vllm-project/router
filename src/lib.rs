@@ -71,6 +71,7 @@ struct Router {
     log_dir: Option<String>,
 
     log_level: Option<String>,
+    log_user_prompts: bool,
     service_discovery: bool,
     selector: HashMap<String, String>,
     service_discovery_port: u16,
@@ -244,6 +245,7 @@ impl Router {
             metrics,
             log_dir: self.log_dir.clone(),
             log_level: self.log_level.clone(),
+            log_user_prompts: self.log_user_prompts,
             request_id_headers: self.request_id_headers.clone(),
             max_concurrent_requests: self.max_concurrent_requests,
             queue_size: self.queue_size,
@@ -382,6 +384,7 @@ impl Router {
         kv_event_replay_source = vec![],
         kv_event_block_size = 16,
         kv_event_model = None,
+        log_user_prompts = false,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -459,6 +462,7 @@ impl Router {
         kv_event_replay_source: Vec<String>,
         kv_event_block_size: u32,
         kv_event_model: Option<String>,
+        log_user_prompts: bool,
     ) -> PyResult<Self> {
         if wasm_middleware_sha256
             .as_deref()
@@ -507,6 +511,7 @@ impl Router {
             api_key_validation_urls,
             log_dir,
             log_level,
+            log_user_prompts,
             service_discovery,
             selector,
             service_discovery_port,

@@ -26,7 +26,7 @@ use axum::{
     routing::{delete, get, post},
     serve,
     serve::{Listener, ListenerExt},
-    Json, Router,
+    Extension, Json, Router,
 };
 use reqwest::Client;
 use serde::Deserialize;
@@ -265,6 +265,7 @@ async fn inference_generate(
 
 async fn v1_chat_completions(
     State(state): State<Arc<AppState>>,
+    Extension(request_id): Extension<middleware::RequestId>,
     headers: http::HeaderMap,
     Json(body): Json<ChatCompletionRequest>,
 ) -> Response {
@@ -272,17 +273,27 @@ async fn v1_chat_completions(
         return response;
     }
 
+    if state.context.router_config.log_user_prompts {
+        logging::log_chat_user_prompts(&request_id.0, &body);
+    }
+
     state.router.route_chat(Some(&headers), &body, None).await
 }
 
 async fn epd_chat_completions(
     State(state): State<Arc<AppState>>,
+    Extension(request_id): Extension<middleware::RequestId>,
     headers: http::HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Response {
     if let Err(response) = authorize_request(&state, &headers).await {
         return response;
     }
+
+    if state.context.router_config.log_user_prompts {
+        logging::log_raw_chat_user_prompts(&request_id.0, &body);
+    }
+
     state
         .router
         .route_transparent(

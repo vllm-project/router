@@ -218,6 +218,7 @@ The bootstrap port annotation is fixed to `vllm.ai/bootstrap-port`.
 | Option | Rust value | Rust default | Python value | Python default | Description |
 | --- | --- | --- | --- | --- | --- |
 | `--log-dir` | `string` | `unset` | `string` | `unset` | Log file directory; unset logs only to the console. |
+| `--log-user-prompts` | `true, false` | `false` | `true, false` | `false` | Log text from all user messages after the chat request authorization check at INFO level. |
 | `--log-level` | `debug, info, warn, error` | `info` | `debug, info, warning, error, critical` | `info` | Log severity; Rust accepts `warn`, while Python accepts `warning` and `critical`. |
 | `--prometheus-port` | `u16` | `29000` | `integer` | `29000` | Prometheus listener port. Both CLI parsers enable metrics on `29000` by default. |
 | `--prometheus-host` | `string` | `127.0.0.1` | `string` | `127.0.0.1` | Prometheus listener bind address. |
@@ -228,6 +229,37 @@ The common request ID headers are `x-request-id`, `x-correlation-id`,
 list is empty; Python distinguishes an omitted list from an explicit empty
 list. The Python CLI's metrics defaults differ from `RouterArgs()`, whose
 Prometheus host and port start unset.
+
+### Optional user prompt logging
+
+Both the Rust binary and the Python launcher accept
+`--log-user-prompts=true` or `--log-user-prompts=false`. The default is `false`;
+raising `--log-level` to `debug` does not enable it. This option applies to the
+Rust router, including the raw-JSON EPD chat handler, not Python `--mini-lb`.
+
+When enabled, `/v1/chat/completions` requests that pass the authorization check
+produce one INFO event on the `vllm_router_rs::prompt` target before routing. The event includes
+the request ID, model, streaming flag, and text from every `role=user` message
+in request order. String contents and `type=text` content parts are included;
+other roles and non-text parts are excluded. Newlines are escaped and user
+message/text-part boundaries are preserved. Streaming requests log once,
+before the response stream starts.
+
+These are the texts received by the handler, after any configured WASM
+OnRequest modification, rather than a rendered model chat template. Text is
+not truncated or redacted and can contain sensitive data; enable logging only
+when appropriate for the deployment. Disabled requests skip prompt extraction.
+The normal INFO filtering still applies, including `RUST_LOG` overrides.
+For example, `RUST_LOG=vllm_router_rs=info,vllm_router_rs::prompt=off` suppresses
+these events even when the switch is enabled.
+
+```bash
+vllm-router --worker-urls http://localhost:8000 --log-user-prompts=true
+```
+
+Logs use the existing console output and, if configured, `--log-dir` file
+output. See the [Compose example](../examples/compose/README.md) for Docker
+Compose and Podman Compose usage with a locally built image.
 
 ## OpenTelemetry tracing (Rust)
 
