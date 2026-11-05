@@ -2940,6 +2940,192 @@ mod admission_tests {
     }
 
     #[test]
+    fn worker_progress_replaces_admitted_prefill_work() {
+        let p = pool("p", 1);
+        let d = pool("d", 1);
+        let tokens: Vec<u32> = (0..64).collect();
+        let policy = KvAwarePolicy::default();
+        let inputs = token_inputs(&p, &tokens, &policy);
+        let mut context = context();
+        context.prefill_inputs = Some(&inputs);
+        let manager = Arc::new(PdLoadManager::default());
+        let (selection, attempt) = manager
+            .admit(|loads| select_pd_pair(loads, &p, &d, &policy, &policy, &context))
+            .unwrap();
+        let tokens_on = |manager: &PdLoadManager| {
+            sample(manager, Stage::Prefill, &selection.prefill.endpoint).active_prefill_tokens
+        };
+        assert_eq!(tokens_on(&manager), 64);
+
+        attempt.update_prefill_progress(1, 40);
+        assert_eq!(tokens_on(&manager), 40);
+        // Stale or repeated snapshots are ignored.
+        attempt.update_prefill_progress(1, 10);
+        assert_eq!(tokens_on(&manager), 40);
+        // Recomputation can raise remaining work.
+        attempt.update_prefill_progress(2, 50);
+        assert_eq!(tokens_on(&manager), 50);
+        attempt.update_prefill_progress(3, 0);
+        assert_eq!(tokens_on(&manager), 0);
+        assert_eq!(
+            sample(&manager, Stage::Prefill, &selection.prefill.endpoint).prefill_requests,
+            1
+        );
+
+        attempt.update_prefill_progress(4, 30);
+        attempt.finish_prefill();
+        assert_eq!(tokens_on(&manager), 0);
+        // Late snapshots after P finished cannot re-charge it.
+        attempt.update_prefill_progress(5, 30);
+        assert_eq!(tokens_on(&manager), 0);
+        drop(attempt);
+        assert!(manager.snapshot().is_empty());
+    }
+
+    #[test]
+    fn initial_unconfirmed_queue_retains_known_admission_until_resolution() {
+        use crate::backend::grpc::PrefillProgressKind;
+
+        let p = pool("p", 1);
+        let d = pool("d", 1);
+        let tokens: Vec<u32> = (0..64).collect();
+        let policy = KvAwarePolicy::default();
+        let inputs = token_inputs(&p, &tokens, &policy);
+        let mut context = context();
+        context.prefill_inputs = Some(&inputs);
+        let manager = Arc::new(PdLoadManager::default());
+        let (selection, attempt) = manager
+            .admit(|loads| select_pd_pair(loads, &p, &d, &policy, &policy, &context))
+            .unwrap();
+        let tokens_on =
+            || sample(&manager, Stage::Prefill, &selection.prefill.endpoint).active_prefill_tokens;
+        assert_eq!(tokens_on(), 64);
+        attempt.update_prefill_progress_with_kind(
+            1,
+            100,
+            PrefillProgressKind::InitialUnconfirmedQueue,
+        );
+        attempt.update_prefill_progress_with_kind(
+            2,
+            100,
+            PrefillProgressKind::InitialUnconfirmedQueue,
+        );
+        assert_eq!(tokens_on(), 64);
+        attempt.update_prefill_progress_with_kind(
+            4,
+            100,
+            PrefillProgressKind::InitialUnconfirmedQueue,
+        );
+        assert_eq!(tokens_on(), 64);
+        attempt.update_prefill_progress_with_kind(5, 16, PrefillProgressKind::Snapshot);
+        assert_eq!(tokens_on(), 16);
+        // A later re-prefill or invalidation can increase real work.
+        attempt.update_prefill_progress_with_kind(6, 80, PrefillProgressKind::Snapshot);
+        assert_eq!(tokens_on(), 80);
+        attempt.finish_prefill();
+        attempt.update_prefill_progress_with_kind(7, 100, PrefillProgressKind::Snapshot);
+        assert_eq!(tokens_on(), 0);
+        drop(attempt);
+        assert!(manager.snapshot().is_empty());
+    }
+
+    #[test]
+    fn initial_unconfirmed_queue_makes_unknown_admission_known() {
+        use crate::backend::grpc::PrefillProgressKind;
+
+        let manager = Arc::new(PdLoadManager::default());
+        let (selection, attempt) = admit(&manager, &pool("p", 1), &pool("d", 1));
+        let load = || sample(&manager, Stage::Prefill, &selection.prefill.endpoint);
+        assert_eq!(
+            (
+                load().unknown_prefill_requests,
+                load().active_prefill_tokens
+            ),
+            (1, 0)
+        );
+        attempt.update_prefill_progress_with_kind(
+            1,
+            100,
+            PrefillProgressKind::InitialUnconfirmedQueue,
+        );
+        assert_eq!(
+            (
+                load().unknown_prefill_requests,
+                load().active_prefill_tokens
+            ),
+            (0, 100)
+        );
+        attempt.finish_prefill();
+        drop(attempt);
+        assert!(manager.snapshot().is_empty());
+    }
+
+    #[test]
+    fn initial_unconfirmed_queue_retains_a_higher_admission() {
+        use crate::backend::grpc::PrefillProgressKind;
+
+        let p = pool("p", 1);
+        let d = pool("d", 1);
+        let tokens: Vec<u32> = (0..64).collect();
+        let policy = KvAwarePolicy::default();
+        let inputs = token_inputs(&p, &tokens, &policy);
+        let mut context = context();
+        context.prefill_inputs = Some(&inputs);
+        let manager = Arc::new(PdLoadManager::default());
+        let (selection, attempt) = manager
+            .admit(|loads| select_pd_pair(loads, &p, &d, &policy, &policy, &context))
+            .unwrap();
+        let tokens_on =
+            || sample(&manager, Stage::Prefill, &selection.prefill.endpoint).active_prefill_tokens;
+        assert_eq!(tokens_on(), 64);
+        attempt.update_prefill_progress_with_kind(
+            1,
+            50,
+            PrefillProgressKind::InitialUnconfirmedQueue,
+        );
+        assert_eq!(tokens_on(), 64);
+        attempt.update_prefill_progress_with_kind(
+            2,
+            100,
+            PrefillProgressKind::InitialUnconfirmedQueue,
+        );
+        assert_eq!(tokens_on(), 64);
+        attempt.update_prefill_progress_with_kind(3, 20, PrefillProgressKind::Snapshot);
+        assert_eq!(tokens_on(), 20);
+        attempt.finish_prefill();
+        drop(attempt);
+        assert!(manager.snapshot().is_empty());
+    }
+
+    #[test]
+    fn worker_progress_makes_unknown_prefill_work_known() {
+        let manager = Arc::new(PdLoadManager::default());
+        let (selection, attempt) = admit(&manager, &pool("p", 1), &pool("d", 1));
+        assert_eq!(selection.prefill.new_prefill_tokens, None);
+        let load = || sample(&manager, Stage::Prefill, &selection.prefill.endpoint);
+        assert_eq!(load().unknown_prefill_requests, 1);
+
+        attempt.update_prefill_progress(1, 25);
+        assert_eq!(
+            (
+                load().unknown_prefill_requests,
+                load().active_prefill_tokens
+            ),
+            (0, 25)
+        );
+        attempt.finish_prefill();
+        assert_eq!(
+            (
+                load().unknown_prefill_requests,
+                load().active_prefill_tokens
+            ),
+            (0, 0)
+        );
+        drop(attempt);
+        assert!(manager.snapshot().is_empty());
+    }
+
+    #[test]
     fn finishing_prefill_retains_decode_and_drop_releases_pending() {
         let manager = Arc::new(PdLoadManager::default());
         let (selection, attempt) = admit(&manager, &pool("p", 1), &pool("d", 1));

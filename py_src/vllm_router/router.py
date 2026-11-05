@@ -93,6 +93,8 @@ class Router:
         bootstrap_port_annotation: Kubernetes annotation name for bootstrap port (PD mode).
             Default: 'vllm.ai/bootstrap-port'
         request_timeout_secs: Request timeout in seconds. Default: 600
+        enable_prefill_progress: Enable worker-reported prefill progress for
+            kv_aware gRPC P/D routing. Default: False.
         max_concurrent_requests: Maximum number of concurrent requests allowed for rate limiting. Default: 256
         queue_size: Queue size for pending requests when max concurrent limit reached (0 = no queue, return 429 immediately). Default: 100
         queue_timeout_secs: Maximum time (in seconds) a request can wait in queue before timing out. Default: 60

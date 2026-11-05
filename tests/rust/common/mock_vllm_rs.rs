@@ -41,6 +41,8 @@ pub struct CapturedGrpcGenerate {
     pub unary: bool,
     /// `x-data-parallel-rank` request metadata.
     pub dp_rank: Option<String>,
+    /// `GenerateRequest.include_prefill_progress`.
+    pub include_prefill_progress: bool,
     pub received_at: Option<Instant>,
 }
 
@@ -48,6 +50,10 @@ pub struct CapturedGrpcGenerate {
 pub struct MockVllmRs {
     pub captured: Arc<Mutex<Vec<CapturedGrpcGenerate>>>,
     pub reply_text: String,
+    /// Model a worker without capability discovery.
+    pub server_info_unimplemented: bool,
+    /// Optional externally driven stream for lifecycle and progress tests.
+    pub scripted_stream: Arc<Mutex<Option<ResponseStream>>>,
     /// `(text, token_ids)` per streamed frame; the last one carries
     /// `finish_info`. `None` sends a single frame: `reply_text` + `[7, 8, 9]`.
     /// Empty text with non-empty ids reproduces a buffered decoder fragment.
@@ -67,6 +73,11 @@ pub struct MockVllmRs {
     pub aborted_finishes_remaining: Arc<AtomicUsize>,
     /// Request ids received by `Control.Abort`.
     pub aborts: Arc<Mutex<Vec<String>>>,
+    /// `ServerInfo.supports_prefill_progress`.
+    pub supports_prefill_progress: bool,
+    /// Remaining-work snapshots sent, in order, before `reply_delay` on
+    /// streams that opted into prefill progress.
+    pub prefill_progress: Vec<u32>,
     /// After `hold_after` recorded requests, wait until [`HoldGate::release`].
     pub hold: Option<HoldGate>,
 }
@@ -115,6 +126,8 @@ impl Default for MockVllmRs {
         Self {
             captured: Arc::new(Mutex::new(Vec::new())),
             reply_text: "hello from worker".to_string(),
+            server_info_unimplemented: false,
+            scripted_stream: Arc::new(Mutex::new(None)),
             frames: None,
             capture_limit: usize::MAX,
             failures_remaining: Arc::new(AtomicUsize::new(0)),
@@ -124,6 +137,8 @@ impl Default for MockVllmRs {
             stream_failures_remaining: Arc::new(AtomicUsize::new(0)),
             aborted_finishes_remaining: Arc::new(AtomicUsize::new(0)),
             aborts: Arc::new(Mutex::new(Vec::new())),
+            supports_prefill_progress: false,
+            prefill_progress: Vec::new(),
             hold: None,
         }
     }
@@ -180,7 +195,7 @@ impl MockVllmRsServer {
     }
 }
 
-type ResponseStream = Pin<Box<dyn Stream<Item = Result<GenerateResponse, Status>> + Send>>;
+pub type ResponseStream = Pin<Box<dyn Stream<Item = Result<GenerateResponse, Status>> + Send>>;
 
 #[tonic::async_trait]
 impl Inference for MockVllmRs {
@@ -190,6 +205,12 @@ impl Inference for MockVllmRs {
         &self,
         request: Request<GenerateRequest>,
     ) -> Result<Response<GenerateResponse>, Status> {
+        // vLLM accepts progress opt-in only on GenerateStream.
+        if request.get_ref().include_prefill_progress {
+            return Err(Status::invalid_argument(
+                "include_prefill_progress requires GenerateStream",
+            ));
+        }
         let mut stream = self.generate_stream(request).await?.into_inner();
         if let Some(last) = self.captured.lock().unwrap().last_mut() {
             last.unary = true;
@@ -219,6 +240,7 @@ impl Inference for MockVllmRs {
                 finish_info: finish,
                 ..Default::default()
             }),
+            prefill_progress: None,
         }))
     }
 
@@ -232,6 +254,8 @@ impl Inference for MockVllmRs {
             .and_then(|value| value.to_str().ok())
             .map(str::to_string);
         let req = request.into_inner();
+        let include_prefill_progress = req.include_prefill_progress;
+        let progress_request_id = req.request_id.clone();
         let (token_ids, had_text_prompt) = match req.prompt {
             Some(generate_request::Prompt::TokenIds(TokenIds { ids })) => (ids, false),
             Some(generate_request::Prompt::Text(_)) => (Vec::new(), true),
@@ -259,6 +283,7 @@ impl Inference for MockVllmRs {
                         .map(|params| proto_struct_to_json(&params)),
                     unary: false,
                     dp_rank,
+                    include_prefill_progress,
                     received_at: Some(Instant::now()),
                 });
             }
@@ -275,6 +300,10 @@ impl Inference for MockVllmRs {
             hold.wait().await;
         }
 
+        if let Some(stream) = self.scripted_stream.lock().unwrap().take() {
+            return Ok(Response::new(stream));
+        }
+
         let (tx, rx) = mpsc::channel(4);
         let frames = self
             .frames
@@ -287,6 +316,11 @@ impl Inference for MockVllmRs {
             .map(|params| json_to_proto_struct(params).expect("JSON object"));
         let reply_delay = self.reply_delay;
         let cancelled = self.cancelled.clone();
+        let progress = if include_prefill_progress {
+            self.prefill_progress.clone()
+        } else {
+            Vec::new()
+        };
         let fail_stream = self
             .stream_failures_remaining
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
@@ -301,6 +335,21 @@ impl Inference for MockVllmRs {
             finish_info::FinishReason::Stop
         };
         tokio::spawn(async move {
+            for (index, remaining) in progress.into_iter().enumerate() {
+                let snapshot = GenerateResponse {
+                    prefill_progress: Some(pb::PrefillProgress {
+                        request_id: progress_request_id.clone(),
+                        sequence: index as u64 + 1,
+                        prompt_tokens: n_prompt,
+                        remaining_compute_tokens: remaining,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                };
+                if tx.send(Ok(snapshot)).await.is_err() {
+                    return;
+                }
+            }
             tokio::select! {
                 _ = tokio::time::sleep(reply_delay) => {}
                 _ = tx.closed() => {
@@ -315,6 +364,7 @@ impl Inference for MockVllmRs {
                         ..Default::default()
                     }),
                     outputs: None,
+                    prefill_progress: None,
                 }))
                 .await;
             if fail_stream {
@@ -342,6 +392,7 @@ impl Inference for MockVllmRs {
                             finish_info,
                             ..Default::default()
                         }),
+                        prefill_progress: None,
                     }))
                     .await;
                 if sent.is_err() {
@@ -376,6 +427,7 @@ macro_rules! mock_control {
             ) -> Result<Response<pb::ModelInfo>, Status> {
                 Ok(Response::new(pb::ModelInfo {
                     model_id: "mock-model".into(),
+                    served_model_name: "mock-model".into(),
                     supports_token_ids_input: true,
                     ..Default::default()
                 }))
@@ -385,8 +437,12 @@ macro_rules! mock_control {
                 &self,
                 _request: Request<pb::GetServerInfoRequest>,
             ) -> Result<Response<pb::ServerInfo>, Status> {
+                if self.server_info_unimplemented {
+                    return Err(Status::unimplemented("GetServerInfo"));
+                }
                 Ok(Response::new(pb::ServerInfo {
                     engine_version: "mock".into(),
+                    supports_prefill_progress: self.supports_prefill_progress,
                     ..Default::default()
                 }))
             }
@@ -404,6 +460,7 @@ macro_rules! mock_control {
 }
 
 mock_control! {
+    shutdown(ShutdownRequest) -> ShutdownResponse;
     load_lora(LoadLoraRequest) -> LoadLoraResponse;
     unload_lora(UnloadLoraRequest) -> UnloadLoraResponse;
     list_loras(ListLorasRequest) -> ListLorasResponse;

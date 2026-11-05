@@ -3,6 +3,7 @@
 //! Tokenize on the router, send `token_ids`, detok the returned ids.
 //! Channel cache is per connect URI.
 
+use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -20,8 +21,8 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use super::convert::{
-    chat_to_generate_request, limit_to_prefill, proto_struct_to_json, requires_worker_output_text,
-    set_kv_transfer_params,
+    chat_to_generate_request, chat_to_generate_request_with_progress, limit_to_prefill,
+    proto_struct_to_json, requires_worker_output_text, set_kv_transfer_params,
 };
 use super::detect::{grpc_connect_uri, parse_dp_rank};
 use super::frontend::{PreparedRequest, ResponseShape};
@@ -39,8 +40,22 @@ use crate::protocols::spec::Usage;
 
 const DP_RANK_METADATA: &str = "x-data-parallel-rank";
 const ENGINE_ABORT_RETRY_DELAY: Duration = Duration::from_millis(500);
+// A worker can be upgraded or replaced without changing its URI.
+const PREFILL_CAPABILITY_TTL: Duration = Duration::from_secs(60);
 
 pub(crate) type FirstOutputCallback = Arc<dyn Fn() + Send + Sync + 'static>;
+/// The first QUEUED snapshot may be only a conservative upper bound: the
+/// worker has not yet confirmed the request's prefix cache.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PrefillProgressKind {
+    Snapshot,
+    InitialUnconfirmedQueue,
+}
+
+pub(crate) type PrefillProgressCallback =
+    Arc<dyn Fn(u64, u64, PrefillProgressKind) + Send + Sync + 'static>;
+type CapabilityCell = Arc<tokio::sync::OnceCell<Result<(bool, tokio::time::Instant), String>>>;
+type PrefillProgressCapabilityCache = Arc<DashMap<String, CapabilityCell>>;
 
 /// P/D fields layered on a prepared chat. Default is a colocated request.
 #[derive(Clone, Debug, Default)]
@@ -207,8 +222,10 @@ fn grpc_status_code(status: &tonic::Status) -> StatusCode {
 #[derive(Clone)]
 pub struct GrpcEngineBackend {
     clients: Arc<DashMap<String, Channel>>,
+    prefill_progress_capabilities: PrefillProgressCapabilityCache,
     connect_timeout: Duration,
     request_timeout: Duration,
+    pub(super) enable_prefill_progress: bool,
 }
 
 impl std::fmt::Debug for GrpcEngineBackend {
@@ -237,8 +254,10 @@ impl GrpcEngineBackend {
     pub fn with_timeouts(connect_timeout: Duration, request_timeout: Duration) -> Self {
         Self {
             clients: Arc::new(DashMap::new()),
+            prefill_progress_capabilities: Arc::new(DashMap::new()),
             connect_timeout,
             request_timeout,
+            enable_prefill_progress: false,
         }
     }
 
@@ -257,75 +276,196 @@ impl GrpcEngineBackend {
         Ok(channel)
     }
 
+    async fn supports_prefill_progress(&self, worker_url: &str) -> Result<bool, String> {
+        let uri = grpc_connect_uri(worker_url)?;
+        let connect_timeout = self.connect_timeout;
+        cached_prefill_progress_capability(
+            &self.prefill_progress_capabilities,
+            uri.clone(),
+            || async move {
+                let channel = Channel::from_shared(uri.clone())
+                    .map_err(|e| format!("invalid grpc uri {uri}: {e}"))?
+                    .connect_timeout(connect_timeout)
+                    .connect()
+                    .await
+                    .map_err(|e| format!("grpc control connect {uri}: {e}"))?;
+                let mut client = ControlClient::new(channel);
+                let mut request = tonic::Request::new(super::pb::GetServerInfoRequest {});
+                request.set_timeout(Duration::from_secs(5));
+                let info = client
+                    .get_server_info(request)
+                    .await
+                    .map_err(|e| format!("grpc GetServerInfo {uri}: {e}"))?
+                    .into_inner();
+                Ok(info.supports_prefill_progress)
+            },
+        )
+        .await
+    }
+
     pub fn remove_client(&self, worker_url: &str) {
         if let Ok(uri) = grpc_connect_uri(worker_url) {
             self.clients.remove(&uri);
+            self.prefill_progress_capabilities.remove(&uri);
         }
     }
 
-    /// P/D prefill leg as unary `Generate`. Returns the engine's
+    /// P/D prefill leg: one sampled token. Returns the engine's
     /// `FinishInfo.kv_transfer_params`, which the decode leg consumes.
+    ///
+    /// With `on_prefill_progress` and a progress-capable worker it streams,
+    /// so remaining-work snapshots replace the admission estimate while P
+    /// runs. Otherwise it stays unary `Generate`, as progress opt-in is
+    /// rejected there.
     pub(crate) async fn prefill_prepared(
         &self,
         worker_url: &str,
         prepared: &PreparedRequest,
         engine_request_id: String,
         kv_transfer_params: &serde_json::Value,
+        on_prefill_progress: Option<PrefillProgressCallback>,
     ) -> Result<Option<serde_json::Value>, Response> {
-        let mut proto = chat_to_generate_request(
+        let deadline = tokio::time::Instant::now()
+            + self
+                .request_timeout
+                .saturating_sub(prepared.t_req.elapsed());
+        let include_prefill_progress =
+            self.enable_prefill_progress && on_prefill_progress.is_some();
+        let mut proto = chat_to_generate_request_with_progress(
             prepared.request.as_ref(),
             prepared.tokenized.token_ids.as_ref().to_vec(),
             engine_request_id.clone(),
+            include_prefill_progress,
         )
         .map_err(|error| (StatusCode::BAD_REQUEST, error).into_response())?;
         limit_to_prefill(&mut proto);
         set_kv_transfer_params(&mut proto, kv_transfer_params)
             .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error).into_response())?;
+        if include_prefill_progress {
+            let supported =
+                tokio::time::timeout_at(deadline, self.supports_prefill_progress(worker_url))
+                    .await
+                    .unwrap_or_else(
+                        |_| Err("prefill progress capability deadline exceeded".into()),
+                    );
+            apply_prefill_progress_capability(&mut proto, supported, worker_url);
+        }
+        let mut progress = PrefillProgressState::new(
+            engine_request_id.clone(),
+            on_prefill_progress.filter(|_| proto.include_prefill_progress),
+        );
+        let streaming = proto.include_prefill_progress;
+        let rpc = if streaming {
+            "GenerateStream"
+        } else {
+            "Generate"
+        };
 
-        let channel = self.channel_for(worker_url).await.map_err(|error| {
-            error!(error = %error, "grpc prefill connect failed");
-            (StatusCode::BAD_GATEWAY, error).into_response()
-        })?;
-        let abort = EngineAbortGuard::new(&channel, Some(&engine_request_id), self.connect_timeout);
+        let channel = match tokio::time::timeout_at(deadline, self.channel_for(worker_url)).await {
+            Ok(Ok(channel)) => channel,
+            Ok(Err(error)) => {
+                error!(error = %error, "grpc prefill connect failed");
+                return Err((StatusCode::BAD_GATEWAY, error).into_response());
+            }
+            Err(_) => {
+                return Err((
+                    StatusCode::GATEWAY_TIMEOUT,
+                    "gRPC request deadline exceeded",
+                )
+                    .into_response());
+            }
+        };
+        let mut abort =
+            EngineAbortGuard::new(&channel, Some(&engine_request_id), self.connect_timeout);
         let mut client = InferenceClient::new(channel);
         let mut tonic_req = tonic::Request::new(proto);
-        tonic_req.set_timeout(self.request_timeout);
+        tonic_req.set_timeout(deadline.saturating_duration_since(tokio::time::Instant::now()));
         if let Some(rank) = parse_dp_rank(worker_url) {
             tonic_req
                 .metadata_mut()
                 .insert(DP_RANK_METADATA, rank.to_string().parse().unwrap());
         }
-        let response = match tokio::time::timeout(self.request_timeout, client.generate(tonic_req))
-            .await
-        {
-            Ok(Ok(response)) => {
-                abort.disarm();
-                response.into_inner()
+        let failed = |status: tonic::Status| {
+            warn!(code = ?status.code(), msg = %status.message(), "prefill {rpc} failed");
+            (
+                grpc_status_code(&status),
+                format!("grpc {rpc}: {}", status.message()),
+            )
+                .into_response()
+        };
+        let timed_out = || {
+            (
+                StatusCode::GATEWAY_TIMEOUT,
+                format!("grpc {rpc} exceeded request timeout"),
+            )
+                .into_response()
+        };
+        let finish = if streaming {
+            let mut stream =
+                match tokio::time::timeout_at(deadline, client.generate_stream(tonic_req)).await {
+                    Ok(Ok(stream)) => {
+                        abort.answered();
+                        stream.into_inner()
+                    }
+                    Ok(Err(status)) => {
+                        abort.disarm();
+                        return Err(failed(status));
+                    }
+                    Err(_) => return Err(timed_out()),
+                };
+            let mut finish = None;
+            // A dropped stream (timeout, cancelled leg) leaves `abort` armed.
+            loop {
+                match tokio::time::timeout_at(deadline, stream.next()).await {
+                    Ok(Some(Ok(message))) => {
+                        if let Some(snapshot) = &message.prefill_progress {
+                            progress.observe(snapshot);
+                        }
+                        if let Some(info) = message.outputs.and_then(|outputs| outputs.finish_info)
+                        {
+                            finish = Some(info);
+                        }
+                    }
+                    Ok(Some(Err(status))) => return Err(failed(status)),
+                    Ok(None) => break,
+                    Err(_) => return Err(timed_out()),
+                }
             }
-            Ok(Err(status)) => {
-                abort.disarm();
-                warn!(code = ?status.code(), msg = %status.message(), "prefill Generate failed");
+            if finish.is_none() {
                 return Err((
-                    grpc_status_code(&status),
-                    format!("grpc Generate: {}", status.message()),
+                    StatusCode::BAD_GATEWAY,
+                    "grpc GenerateStream: prefill closed before finish_info",
                 )
                     .into_response());
             }
-            Err(_) => {
-                return Err((
-                    StatusCode::GATEWAY_TIMEOUT,
-                    "grpc Generate exceeded request timeout",
-                )
-                    .into_response());
+            abort.disarm();
+            finish
+        } else {
+            match tokio::time::timeout_at(deadline, client.generate(tonic_req)).await {
+                Ok(Ok(response)) => {
+                    abort.disarm();
+                    response
+                        .into_inner()
+                        .outputs
+                        .and_then(|outputs| outputs.finish_info)
+                }
+                Ok(Err(status)) => {
+                    abort.disarm();
+                    return Err(failed(status));
+                }
+                Err(_) => return Err(timed_out()),
             }
         };
-        let finish = response.outputs.and_then(|outputs| outputs.finish_info);
         if finish
             .as_ref()
             .is_some_and(|finish| finish.finish_reason == FinishReason::Aborted as i32)
         {
-            warn!(%engine_request_id, "prefill Generate finished aborted");
-            return Err((StatusCode::BAD_GATEWAY, "grpc Generate: prefill aborted").into_response());
+            warn!(%engine_request_id, "prefill {rpc} finished aborted");
+            return Err((
+                StatusCode::BAD_GATEWAY,
+                format!("grpc {rpc}: prefill aborted"),
+            )
+                .into_response());
         }
         Ok(finish
             .and_then(|finish| finish.kv_transfer_params)
@@ -501,6 +641,67 @@ struct ChatReply {
     /// path can cancel P instead of returning an aborted reply as success.
     fail_on_abort: bool,
     abort: EngineAbortGuard,
+}
+
+struct PrefillProgressState {
+    request_id: String,
+    callback: Option<PrefillProgressCallback>,
+    last_received: tokio::time::Instant,
+    sequence: u64,
+    initial_queued_prompt: Option<u32>,
+}
+
+impl PrefillProgressState {
+    fn new(request_id: String, callback: Option<PrefillProgressCallback>) -> Self {
+        Self {
+            request_id,
+            callback,
+            last_received: tokio::time::Instant::now(),
+            sequence: 0,
+            initial_queued_prompt: None,
+        }
+    }
+
+    fn observe(&mut self, progress: &super::pb::PrefillProgress) {
+        let Some(callback) = &self.callback else {
+            return;
+        };
+        let outcome = if progress.request_id != self.request_id {
+            "ignored_identity"
+        } else if progress.sequence <= self.sequence {
+            "ignored_sequence"
+        } else {
+            "accepted"
+        };
+        metrics::counter!("vllm_router_prefill_progress_updates_total", "outcome" => outcome)
+            .increment(1);
+        if outcome != "accepted" {
+            return;
+        }
+        if self.sequence != 0 {
+            metrics::histogram!("vllm_router_prefill_progress_update_gap_seconds")
+                .record(self.last_received.elapsed().as_secs_f64());
+        }
+        // An unchanged initial queue has not confirmed the prefix cache, even
+        // after a delayed or coalesced update. A real phase change ends it.
+        let first_or_unchanged =
+            self.sequence == 0 || self.initial_queued_prompt == Some(progress.prompt_tokens);
+        let initial_queue = first_or_unchanged
+            && progress.phase == super::pb::PrefillPhase::Queued as i32
+            && !progress.cache_accounting_final;
+        self.initial_queued_prompt = initial_queue.then_some(progress.prompt_tokens);
+        self.sequence = progress.sequence;
+        self.last_received = tokio::time::Instant::now();
+        callback(
+            progress.sequence,
+            u64::from(progress.remaining_compute_tokens),
+            if initial_queue {
+                PrefillProgressKind::InitialUnconfirmedQueue
+            } else {
+                PrefillProgressKind::Snapshot
+            },
+        );
+    }
 }
 
 fn fill_engine_ms(stages: &mut serde_json::Value) {
@@ -920,6 +1121,65 @@ fn output_text_and_finish(
     Ok((text, finish))
 }
 
+fn apply_prefill_progress_capability(
+    request: &mut super::pb::GenerateRequest,
+    supported: Result<bool, String>,
+    worker_url: &str,
+) {
+    let supported = match supported {
+        Ok(supported) => supported,
+        Err(error) => {
+            warn!(worker_url, %error, "worker prefill progress probe failed; continuing without progress");
+            false
+        }
+    };
+    if !supported {
+        request.include_prefill_progress = false;
+    }
+}
+
+async fn cached_prefill_progress_capability<F, Fut>(
+    cache: &DashMap<String, CapabilityCell>,
+    uri: String,
+    probe: F,
+) -> Result<bool, String>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<bool, String>>,
+{
+    let cell = {
+        let mut entry = cache
+            .entry(uri.clone())
+            .or_insert_with(|| Arc::new(tokio::sync::OnceCell::new()));
+        if entry.get().is_some_and(|result| {
+            result
+                .as_ref()
+                .is_ok_and(|(_, checked)| checked.elapsed() >= PREFILL_CAPABILITY_TTL)
+        }) {
+            *entry = Arc::new(tokio::sync::OnceCell::new());
+        }
+        entry.clone()
+    };
+    let result = cell
+        .get_or_init(|| async {
+            probe()
+                .await
+                .map(|supported| (supported, tokio::time::Instant::now()))
+        })
+        .await
+        .clone();
+
+    if result.is_err() {
+        if let dashmap::mapref::entry::Entry::Occupied(entry) = cache.entry(uri) {
+            if Arc::ptr_eq(entry.get(), &cell) {
+                entry.remove();
+            }
+        }
+    }
+
+    result.map(|(supported, _)| supported)
+}
+
 fn has_generated_output(msg: &super::pb::GenerateResponse, text: &str) -> bool {
     msg.outputs.as_ref().is_some_and(|outputs| {
         outputs.num_tokens > 0 || !outputs.token_ids.is_empty() || !text.is_empty()
@@ -940,6 +1200,7 @@ mod tests {
                 ..Default::default()
             }),
             outputs: None,
+            prefill_progress: None,
         };
         assert!(!has_generated_output(&prompt_info, ""));
 
@@ -959,6 +1220,7 @@ mod tests {
                 token_ids: vec![42],
                 ..Default::default()
             }),
+            prefill_progress: None,
         };
         assert!(has_generated_output(&output, ""));
         notify_first_output(&output, "", &mut first_output_seen, Some(&callback));
@@ -994,5 +1256,208 @@ mod tests {
             true,
         ));
         assert!(consumer.on_frame());
+    }
+}
+
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
+mod pd_progress_tests {
+    use super::*;
+    use crate::backend::pb::GenerateResponse;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn progress(sequence: u64, remaining: u32) -> GenerateResponse {
+        GenerateResponse {
+            prefill_progress: Some(super::super::pb::PrefillProgress {
+                request_id: "request".into(),
+                sequence,
+                prompt_tokens: 100,
+                remaining_compute_tokens: remaining,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn initial_queued_progress_stays_unconfirmed_across_sequence_gaps() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let callback = Arc::new(move |sequence, remaining, kind| {
+            sink.lock().unwrap().push((sequence, remaining, kind));
+        });
+        let mut state = PrefillProgressState::new("request".into(), Some(callback));
+        let mut queued = progress(2, 100).prefill_progress.unwrap();
+        queued.phase = super::super::pb::PrefillPhase::Queued as i32;
+        queued.total_compute_tokens = 100;
+        state.observe(&queued);
+        queued.sequence = 3;
+        state.observe(&queued);
+        // A sequence gap alone does not confirm prefix-cache accounting.
+        queued.sequence = 5;
+        state.observe(&queued);
+        queued.sequence = 6;
+        state.observe(&queued);
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![
+                (2, 100, PrefillProgressKind::InitialUnconfirmedQueue),
+                (3, 100, PrefillProgressKind::InitialUnconfirmedQueue),
+                (5, 100, PrefillProgressKind::InitialUnconfirmedQueue),
+                (6, 100, PrefillProgressKind::InitialUnconfirmedQueue),
+            ]
+        );
+    }
+
+    #[test]
+    fn progress_ignores_other_requests_and_old_snapshots() {
+        let remaining = Arc::new(AtomicUsize::new(100));
+        let sink = remaining.clone();
+        let callback: PrefillProgressCallback = Arc::new(move |_, tokens, _| {
+            sink.store(tokens as usize, Ordering::SeqCst);
+        });
+        let mut state = PrefillProgressState::new("request".into(), Some(callback));
+        state.observe(&progress(2, 40).prefill_progress.unwrap());
+        let mut other = progress(3, 90).prefill_progress.unwrap();
+        other.request_id = "other-request".into();
+        state.observe(&other);
+        state.observe(&progress(2, 10).prefill_progress.unwrap());
+        assert_eq!(remaining.load(Ordering::SeqCst), 40);
+        state.observe(&progress(3, 20).prefill_progress.unwrap());
+        assert_eq!(remaining.load(Ordering::SeqCst), 20);
+    }
+
+    #[test]
+    fn initial_queue_requires_final_accounting_or_a_phase_change() {
+        type Mutation = fn(&mut super::super::pb::PrefillProgress);
+        let cases: Vec<(Mutation, PrefillProgressKind)> = vec![
+            (
+                |p| p.phase = super::super::pb::PrefillPhase::Preempted as i32,
+                PrefillProgressKind::Snapshot,
+            ),
+            (
+                |p| p.cache_accounting_final = true,
+                PrefillProgressKind::Snapshot,
+            ),
+            (
+                |p| p.local_cached_tokens = 1,
+                PrefillProgressKind::InitialUnconfirmedQueue,
+            ),
+            (
+                |p| p.external_cached_tokens = 1,
+                PrefillProgressKind::InitialUnconfirmedQueue,
+            ),
+            (
+                |p| p.pending_kv_transfer_tokens = 1,
+                PrefillProgressKind::InitialUnconfirmedQueue,
+            ),
+            (
+                |p| p.completed_compute_tokens = 1,
+                PrefillProgressKind::InitialUnconfirmedQueue,
+            ),
+            (
+                |p| p.total_compute_tokens = 99,
+                PrefillProgressKind::InitialUnconfirmedQueue,
+            ),
+            (
+                |p| p.remaining_compute_tokens = 99,
+                PrefillProgressKind::InitialUnconfirmedQueue,
+            ),
+        ];
+        for (change, expected) in cases {
+            let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let sink = seen.clone();
+            let callback = Arc::new(move |_, _, kind| sink.lock().unwrap().push(kind));
+            let mut state = PrefillProgressState::new("request".into(), Some(callback));
+            let mut queued = progress(1, 100).prefill_progress.unwrap();
+            queued.phase = super::super::pb::PrefillPhase::Queued as i32;
+            queued.total_compute_tokens = 100;
+            change(&mut queued);
+            state.observe(&queued);
+            assert_eq!(*seen.lock().unwrap(), vec![expected]);
+        }
+    }
+
+    #[test]
+    fn unsupported_or_unreachable_worker_keeps_admission_estimate() {
+        for capability in [Ok(false), Err("control service unavailable".to_owned())] {
+            let mut request = crate::backend::pb::GenerateRequest {
+                include_prefill_progress: true,
+                ..Default::default()
+            };
+            apply_prefill_progress_capability(&mut request, capability, "worker");
+            assert!(!request.include_prefill_progress);
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_capability_probes_are_coalesced_and_failures_can_retry() {
+        let cache = Arc::new(DashMap::new());
+        let probe_count = Arc::new(AtomicUsize::new(0));
+        let mut requests = Vec::new();
+
+        for _ in 0..16 {
+            let cache = cache.clone();
+            let probe_count = probe_count.clone();
+            requests.push(tokio::spawn(async move {
+                cached_prefill_progress_capability(&cache, "worker".to_owned(), || async move {
+                    probe_count.fetch_add(1, Ordering::Relaxed);
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    Err("control service unavailable".to_owned())
+                })
+                .await
+            }));
+        }
+
+        for request in requests {
+            assert_eq!(
+                request.await.unwrap(),
+                Err("control service unavailable".to_owned())
+            );
+        }
+        assert_eq!(probe_count.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            cached_prefill_progress_capability(&cache, "worker".to_owned(), || async {
+                probe_count.fetch_add(1, Ordering::Relaxed);
+                Ok(true)
+            })
+            .await,
+            Ok(true)
+        );
+        assert_eq!(probe_count.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn capability_is_refreshed_after_worker_replacement() {
+        let cache = DashMap::new();
+        let probe_count = AtomicUsize::new(0);
+        let probe = |supported| {
+            probe_count.fetch_add(1, Ordering::Relaxed);
+            async move { Ok(supported) }
+        };
+
+        assert!(
+            !cached_prefill_progress_capability(&cache, "worker".into(), || probe(false))
+                .await
+                .unwrap()
+        );
+        assert!(
+            !cached_prefill_progress_capability(&cache, "worker".into(), || probe(true))
+                .await
+                .unwrap()
+        );
+        assert_eq!(probe_count.load(Ordering::Relaxed), 1);
+        tokio::time::advance(PREFILL_CAPABILITY_TTL).await;
+        assert!(
+            cached_prefill_progress_capability(&cache, "worker".into(), || probe(true))
+                .await
+                .unwrap()
+        );
+        assert_eq!(probe_count.load(Ordering::Relaxed), 2);
+        tokio::time::advance(PREFILL_CAPABILITY_TTL).await;
+        assert!(
+            !cached_prefill_progress_capability(&cache, "worker".into(), || probe(false))
+                .await
+                .unwrap()
+        );
     }
 }

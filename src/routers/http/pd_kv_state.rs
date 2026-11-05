@@ -369,40 +369,7 @@ impl PdKvState {
         let mut sources: Vec<_> = sources.iter().collect();
         sources.sort_by(|left, right| left.0.cmp(right.0));
         let signature = format!("{info:?}:{sources:?}");
-        // gRPC workers serve no HTTP /v1/models; Control.GetModelInfo names
-        // the served model, including for statically configured sources.
-        if crate::backend::is_grpc_url(base) {
-            let base_models = crate::backend::control::get_grpc_model_info(base, CONTROL_TIMEOUT)
-                .await
-                .ok()
-                .map(|info| info.model_id)
-                .filter(|model| !model.trim().is_empty())
-                .into_iter()
-                .collect();
-            return Ok(Discovery {
-                signature,
-                base_models,
-                worker,
-            });
-        }
-        let models_request = worker_get(
-            &self.client,
-            &format!("{}/v1/models", base.trim_end_matches('/')),
-            self.api_key.as_deref(),
-        );
-        let models = match models_request.send().await {
-            Ok(response) if response.status().is_success() => response.json::<Value>().await.ok(),
-            _ => None,
-        };
-        let base_models: HashSet<String> = models
-            .as_ref()
-            .and_then(|models| models.get("data"))
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter(|model| model.get("parent").is_none_or(Value::is_null))
-            .filter_map(|model| model.get("id").and_then(Value::as_str).map(str::to_owned))
-            .collect();
+        let base_models = served_base_models(&self.client, base, self.api_key.as_deref()).await;
         Ok(Discovery {
             signature,
             base_models,
@@ -517,6 +484,57 @@ impl PdKvState {
     }
 }
 
+/// Model names a `Control.GetModelInfo` reply says this worker serves.
+///
+/// `model_id` is the backend model path (`/models/Qwen3-4B-...`), not the name
+/// clients send; the served name and its aliases are what `request.model`
+/// carries, and they are what an upstream `/v1/models` card would list.
+fn grpc_served_models(model: Result<crate::backend::pb::ModelInfo, String>) -> HashSet<String> {
+    let Ok(info) = model else {
+        return HashSet::new();
+    };
+    std::iter::once(info.served_model_name)
+        .chain(info.served_model_aliases)
+        .filter(|name| !name.trim().is_empty())
+        .collect()
+}
+
+/// Base model ids a worker serves.
+///
+/// A `grpc://` base has no HTTP `/v1/models`. Leaving the set empty there makes
+/// the policy deny every prefix credit as `unverified_model`, which collapses
+/// `kv_aware` P selection to occupancy, so gRPC reads the same identity from
+/// `Control.GetModelInfo` instead.
+async fn served_base_models(
+    client: &reqwest::Client,
+    base: &str,
+    api_key: Option<&str>,
+) -> HashSet<String> {
+    if crate::backend::is_grpc_url(base) {
+        return grpc_served_models(
+            crate::backend::get_grpc_model_info(base, CONTROL_TIMEOUT).await,
+        );
+    }
+    let models_request = worker_get(
+        client,
+        &format!("{}/v1/models", base.trim_end_matches('/')),
+        api_key,
+    );
+    let models = match models_request.send().await {
+        Ok(response) if response.status().is_success() => response.json::<Value>().await.ok(),
+        _ => None,
+    };
+    models
+        .as_ref()
+        .and_then(|models| models.get("data"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|model| model.get("parent").is_none_or(Value::is_null))
+        .filter_map(|model| model.get("id").and_then(Value::as_str).map(str::to_owned))
+        .collect()
+}
+
 impl Drop for PdKvState {
     fn drop(&mut self) {
         self.supervisor.shutdown();
@@ -534,6 +552,32 @@ mod kv_input_tests {
     use axum::response::IntoResponse;
     use reqwest::Client;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn grpc_model_info_becomes_the_served_model_set() {
+        // Request `model` carries the served name, not the backend path that
+        // GetModelInfo reports as `model_id`. Reading model_id left every P
+        // classified `unverified_model`, so no prefix was ever credited.
+        let served = grpc_served_models(Ok(crate::backend::pb::ModelInfo {
+            model_id: "/models/Qwen3-4B-Instruct-2507".into(),
+            served_model_name: "Qwen3-4B-Instruct-2507".into(),
+            served_model_aliases: vec!["qwen-chat".into()],
+            ..Default::default()
+        }));
+        assert!(served.contains("Qwen3-4B-Instruct-2507"), "{served:?}");
+        assert!(served.contains("qwen-chat"), "{served:?}");
+        assert!(
+            !served.contains("/models/Qwen3-4B-Instruct-2507"),
+            "the backend path is not a request model name: {served:?}"
+        );
+        // A failed or empty reply still means "unknown", not "serves ''".
+        assert!(grpc_served_models(Err("unavailable".into())).is_empty());
+        assert!(grpc_served_models(Ok(crate::backend::pb::ModelInfo {
+            served_model_name: "  ".into(),
+            ..Default::default()
+        }))
+        .is_empty());
+    }
 
     #[tokio::test]
     async fn unsupported_inputs_fall_back_without_control_or_tokenization_requests() {
