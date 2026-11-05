@@ -199,3 +199,25 @@ Buildkite provides these built-in variables:
 - [vLLM Documentation](https://docs.vllm.ai/)
 - [Project README](../README.md)
 - [Example P/D Setup Scripts](../scripts/llama3.1/)
+
+## Docker Hub release credentials
+
+Docker publishing and nightly cleanup use the Buildkite secret
+`ROUTER_DOCKERHUB_TOKEN`, mapped to `RELEASE_DOCKERHUB_TOKEN` only on Docker jobs.
+Agents must support step-level secrets (Buildkite agent 3.106.0 or newer).
+Configure an organization access token for `vllm/vllm-router` and use `vllm`
+as the Docker Hub username. Image Push grants image pull/push; Tag Admin
+grants tag listing/deletion for nightly cleanup. Do not grant access to
+other repositories or organization management.
+
+Restrict the secret's access policy to the immutable `router-release` pipeline
+ID, main or an approved version ref, and the CPU and ARM release queues. A job's `secrets` entry
+controls injection; the access policy controls whether other jobs may
+retrieve the secret. Protect release refs and pipeline settings as well.
+
+The cleanup script uses Docker Hub's `/v2/auth/token` exchange and
+namespace-scoped tag API. Shell tracing stays disabled to avoid exposing
+credentials or bearer tokens. The legacy S3 `DOCKERHUB_TOKEN` variable is
+not used by these Docker jobs. After validating the replacement, remove
+obsolete S3 copies and revoke shared tokens only after all consumers have
+migrated. Never commit token values to this repository.
