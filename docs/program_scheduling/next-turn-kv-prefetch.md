@@ -111,25 +111,26 @@ Prediction never earns KV credit, and neither does a pending transfer. Only the 
 | State | Placement index | KV credit in scoring | Capacity accounting | Effect on routing |
 |---|---|---|---|---|
 | Planned, submitted | Unchanged | None | Prefetch budget only | None |
-| Accepted (in flight) | Unchanged | None | Prefetch budget. Not logical usage, so a speculative load cannot pause a Program or hold back a turn. | None directly: the destination does not attract other requests. The engine's reservation does show in observed KV usage, which is one reason the budget stays small. |
-| Applied | Changes when `BlockStored(GPU)` arrives, not on the ack | From the event | Released | Ordinary device credit from the event |
+| Accepted (in flight) | Unchanged | None | Prefetch budget. The Router subtracts these tokens from observed KV usage before its capacity checks, because the engine's reservation shows there. | None: the destination does not attract other requests, and a reservation cannot hold back a turn or pause a Program. |
+| Applied | Changes when `BlockStored(GPU)` arrives, not on the ack | From the event | Prefetch budget, until the next turn arrives, the validity window ends, or events show the blocks evicted. | Ordinary device credit from the event |
+| Already available | Unchanged: no transfer and no event follow | From existing events | Released | None. The wait returns to evaluation. |
 | Deferred, missing, unsupported | Unchanged | None | Released | None. The wait may retry a deferred plan on a later tick. |
 | Failed, expired, cancelled | Unchanged | None | Released | None. The next turn uses its normal path. |
 
-The ack and the event are two independent facts, and neither stands in for the other. An `applied` without an event earns nothing and counts as an ack/event mismatch. An event without an ack earns its normal credit, because the event is evidence of residency, and the operation ends as `expired` for accounting. In-flight blocks are never in the index, so a resident block and an in-flight block cannot both be credited. A route receipt reports `prefetch: none | pending | applied` so a decision stays explainable.
+The ack and the event are two independent facts, and neither stands in for the other. An `applied` (a finished transfer, not `already_available`) without an event earns nothing and counts as an ack/event mismatch. An event without an ack earns its normal credit, because the event is evidence of residency, and the operation ends as `expired` for accounting. In-flight blocks are never in the index, so a resident block and an in-flight block cannot both be credited. A route receipt reports `prefetch: none | pending | applied` so a decision stays explainable.
 
 The Router's lifecycle uses the words the [boundary](program-scheduling.md#engine-kv-control-boundary) already defines, mapped to the [vLLM #58198](https://github.com/vllm-project/vllm/pull/58198) primitive. That primitive is an open draft, so this mapping follows it if it changes:
 
-| Router state | #58198 result | Meaning |
-|---|---|---|
-| `accepted` | `ACCEPTED` | Destination reserved and load submitted; not readable yet. |
-| `rejected` (retryable) | `DEFERRED` | Not feasible now; nothing reserved. |
-| `rejected` | `MISSING` | No loadable copy. |
-| `applied`, with no transfer | `ALREADY_AVAILABLE` | Every block verified on the device. |
-| `unsupported` | `UNSUPPORTED` | The Router stops planning for this target until the capability changes. |
-| `applied` | `COMPLETED` | Blocks published as reusable residency. |
-| `failed` | `CANCELLED` | The engine abandoned the load. |
-| `expired` | None yet: the deadline passed | The contract needs a deadline on each operation. |
+| When | Router state | #58198 result | Meaning |
+|---|---|---|---|
+| On submit | `accepted` | `ACCEPTED` | Destination reserved and load submitted; not readable yet. |
+| On submit | `rejected`, retryable | `DEFERRED` | Not feasible now; nothing reserved. |
+| On submit | `rejected` | `MISSING` | No loadable copy. |
+| On submit | `already_available` | `ALREADY_AVAILABLE` | Every block verified on the device. Nothing was transferred, so the wait returns to evaluation. |
+| On submit | `unsupported` | `UNSUPPORTED` | The Router stops planning for this target until the capability changes. |
+| Eventually | `applied` | `COMPLETED` | Blocks published as reusable residency. |
+| Eventually | `failed` | `CANCELLED` | The engine abandoned the load. |
+| Eventually | `expired` | None yet: the deadline passed | The contract needs a deadline on each operation. |
 
 A result may cover only part of the prefix. Its block counts (requested, already available, to load, unresolved) travel with it, and only the blocks it reports count.
 
@@ -137,9 +138,11 @@ A result may cover only part of the prefix. Its block counts (requested, already
 
 A prefetch is not a request. It never enters the RequestPool, never takes a Program slot or a prefill permit, and does not appear in `active_prefill_tokens`. Its budget is separate and operator-defined:
 
-- **Per target:** tokens in flight, and one modeled load stream, so queued loads push their own finish time later and are judged on that.
+- **Per target:** speculative tokens. A plan holds its charge from submission until the next turn arrives, the validity window ends, or events show its blocks evicted, so completed loads that nobody has used still count, and back-to-back loads cannot churn the idle cache past the budget. There is also one modeled load stream, so queued loads push their own finish time later and are judged on that.
 - **Per tenant or model pool:** a share of the target budget, so one workflow cannot crowd out the rest.
 - **Per engine:** the engine's feasibility rule stays authoritative. The Router's checks only avoid pointless operations, and a `deferred` is normal.
+
+A reservation must not reach the Router's own capacity checks. `apply_observations` builds its estimate from observed KV usage, and `rank_admission_plan` and `repair_capacity` read that estimate, so the Router subtracts its accepted, in-flight tokens first. Without that, a speculative load could hold back a turn in the Router's queue, where the engine's reclaim (layer 2 below) cannot help it.
 
 Refusal is cheap: the wait stays open, and the next tick evaluates it again. Under overload the Router stops planning, because the gates fail. It does not queue speculative work for later. A hint is untrusted client input: it can make a plan more or less likely, and the budget bounds what that costs. Each Router replica budgets alone until multi-Router state exists ([#429](https://github.com/vllm-project/router/issues/429)), and the engine's rule remains the bound.
 
@@ -149,7 +152,7 @@ Refusal is cheap: the wait stays open, and the next tick evaluates it again. Und
 |---|---|
 | Next turn arrives before the load finishes | Cancel if not started. If started, demand should join it instead of loading twice, which no merged primitive offers yet. Score `late`. |
 | Next turn fails, is cancelled, or runs on another target after the load finished | Nothing to cancel. Score `unused`: the load served nothing. |
-| Program terminates or is released | Cancel. Score `cancelled` before the load would have finished, `unused` after. |
+| Program terminates or is released | Cancel. Before the load would have finished, score `cancelled` and count what it already moved as waste. After, score `unused`. |
 | Validity window passes with no return | Nothing to cancel. Score `expired`; the blocks are ordinary evictable cache. |
 | Target removed, unhealthy, or new worker generation | Drop the operation and any ack carrying the old generation. |
 | `AllBlocksCleared` | Treat in-flight operations for that owner as failed. |
@@ -195,7 +198,7 @@ Every comparison uses the same model, hardware, trace, and pressure, following [
 | Precision | `in_time` and `unverified` over all settled plans except `cancelled` | Stage 1 |
 | Missed opportunities | Waits skipped for a forecast reason where a plan would have landed in time | Stage 1 |
 | Useful-prefetch rate | Plans whose blocks served the next turn, over all waits that restored | Stage 3; bounded by Stage 1 |
-| Wasted bytes and compute | Tokens in `late`, `expired`, and `unused` plans, times bytes per token; load seconds | Stage 1 (modeled), Stage 3 (actual) |
+| Wasted bytes and compute | Tokens in `late`, `expired`, and `unused` plans, plus what `cancelled` plans had already moved, times bytes per token; load seconds | Stage 1 (modeled), Stage 3 (actual) |
 | Tool-return latency | Resume TTFT p50 and p90, and restored tokens per resume | Stage 3 |
 | KV pressure | Referenced KV usage at plan time; evictions, displaced tokens, idle-before-evict, decode ITL, queue time | Stage 1 (usage), Stage 3 (all) |
 | Router overhead | Tick time and memory with the shadow on | Stage 1 |
@@ -213,7 +216,7 @@ Every comparison uses the same model, hardware, trace, and pressure, following [
 `in_time` says a load would have landed in time, not that the prefix had left the GPU, so Stage 1 discounts it by how much the target actually restores. Over one replay or window, for one forecast source:
 
 - `useful` = `in_time` and `unverified` tokens × the target's restored share, where that share is `external_kv_transfer` over `external_kv_transfer` + `local_cache_hit` in `vllm:prompt_tokens_by_source_total`.
-- `wasted` = `late` + `expired` + `unused` tokens.
+- `wasted` = `late` + `expired` + `unused` tokens, plus what `cancelled` plans had already moved.
 - Pass when `useful` exceeds `wasted`, and `useful` reaches at least 10% of the tokens the target restored.
 
 The first condition says loads save more than they spend, valuing a token moved on the critical path the same as a token moved off it. The second says enough is at stake: a smaller share cannot move resume latency beyond run-to-run noise. Both thresholds are starting points for review. With tokens and `kv_aware`, the share can become per-prefix evidence.
