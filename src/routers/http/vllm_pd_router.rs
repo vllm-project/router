@@ -1530,7 +1530,7 @@ impl VllmPDRouter {
             .await
         {
             Ok(response) => attempt.track_response(response),
-            Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+            Err(error) => (error.status_code(), error.to_string()).into_response(),
         }
     }
 
@@ -3230,7 +3230,7 @@ impl RouterTrait for VllmPDRouter {
                         e
                     );
                     (
-                        StatusCode::INTERNAL_SERVER_ERROR,
+                        e.status_code(),
                         format!("Transparent proxy request failed: {}", e),
                     )
                         .into_response()

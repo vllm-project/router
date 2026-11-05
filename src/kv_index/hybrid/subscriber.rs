@@ -37,6 +37,7 @@ impl HybridEventStream {
             source: Mutex::new(SourceState {
                 generation: 0,
                 phase: Phase::Retired,
+                reported_int_hashes: false,
             }),
         }
     }
@@ -50,6 +51,7 @@ impl HybridEventStream {
             .checked_add(1)
             .expect("source generation exhausted");
         source.phase = Phase::Replaying;
+        source.reported_int_hashes = false;
         self.index.begin_replay(0);
         HybridSourceLease(source.generation)
     }
@@ -91,7 +93,22 @@ impl HybridEventStream {
             // A rejected batch means the publisher's layout and the declared
             // one disagree; naming the reason is the only way to fix a layout
             // from a live system.
-            tracing::warn!(seq, error = ?error, "hybrid event batch rejected");
+            match error {
+                HybridEventError::IntBlockHashes => {
+                    // The engine's default event encoding, so the fix belongs to
+                    // the engine invocation and the operator has to be told once.
+                    if !source.reported_int_hashes {
+                        source.reported_int_hashes = true;
+                        tracing::error!(
+                            seq,
+                            "hybrid event source publishes integer block hashes, which the sha256 \
+                             index cannot address; no prefix will be credited for this engine. \
+                             Start it with VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES=0."
+                        );
+                    }
+                }
+                _ => tracing::warn!(seq, error = ?error, "hybrid event batch rejected"),
+            }
             source.phase = Phase::Replaying;
             return Err(HybridStreamError::Index(error));
         }

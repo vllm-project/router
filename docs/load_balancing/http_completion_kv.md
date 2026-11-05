@@ -24,7 +24,7 @@ Session binding skips optional preparation RPCs, not known token accounting.
 
 ## Hybrid attention models
 
-Models such as Qwen3.5 and Qwen4Exp cache more than attention KV. To route
+Models such as Qwen3.5 and DeepSeek V4 cache more than attention KV. To route
 them by prefix, pass `--kv-hybrid-layout` a JSON file keyed by worker URL that
 describes each rank's cache groups. Start vLLM with
 `--prefix-caching-hash sha256_cbor` and `VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES=0`.

@@ -2,7 +2,7 @@
 
 use super::super::wire::ExternalBlockHash;
 use super::super::{KVEvent, KVEventBatch};
-use super::layout::{event_kind_matches, stored_shape_matches};
+use super::layout::{event_kind_matches, stored_shape_matches, HybridGroupKind};
 use super::residency::State;
 use super::HybridEventIndex;
 use crate::kv_hash::SequenceHash;
@@ -14,6 +14,9 @@ pub enum HybridEventError {
     Untrusted,
     Sequence,
     InvalidBatch,
+    /// The source publishes integer block hashes, which the sha256 index cannot
+    /// address; no batch from it can ever be applied.
+    IntBlockHashes,
     Capacity,
 }
 
@@ -54,54 +57,43 @@ impl HybridEventIndex {
         {
             return Self::fail(&mut state, HybridEventError::InvalidBatch);
         }
+        // vLLM can encode block hashes as integers instead of 32-byte digests
+        // (VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES, which is on by default). The
+        // hybrid index is built on the sha256 chain, so such a source can never
+        // be indexed; naming the cause keeps an unindexable engine from looking
+        // like an ordinary layout mismatch.
+        if batch.events.iter().any(publishes_int_hash) {
+            return Self::fail(&mut state, HybridEventError::IntBlockHashes);
+        }
         for event in &batch.events {
             let result = match event {
                 KVEvent::BlockStored(store) => {
-                    // An adapter caches its pages under its own chain, seeded
-                    // by `(name, path)`. Index them under that identity and
-                    // never as evidence for the base chain; a page this layout
-                    // cannot address is skipped rather than revoking claims it
-                    // cannot speak for.
+                    // An adapter caches its pages under its own hash chain,
+                    // seeded by the adapter identity. Index them under that
+                    // identity and never as evidence for the base chain; an
+                    // adapter store this layout cannot address is skipped
+                    // rather than revoking claims it cannot speak for.
                     let namespace = store.lora_name.clone();
-                    let adapter_path = match namespace.as_deref() {
-                        None => None,
-                        Some(name) => match self.adapter_path(name) {
-                            Some(path) => Some(path),
-                            None => continue,
-                        },
-                    };
-                    let adapter = adapter_path.is_some();
-                    // An engine may publish several page sizes for one group
-                    // index. Only the declared granularity is addressable by
-                    // the layout; the other pages cover the same tokens and
-                    // add no boundary information.
-                    let Some(group) = self
-                        .groups
-                        .iter()
-                        .find(|group| store.group_idx == Some(group.group_idx))
-                    else {
-                        if adapter {
-                            continue;
+                    let adapter = match namespace.as_deref() {
+                        None => false,
+                        Some(name) => {
+                            if self.adapter_path(name).is_none() {
+                                continue;
+                            }
+                            true
                         }
-                        return Self::fail(&mut state, HybridEventError::InvalidBatch);
                     };
-                    if store.block_size != group.block_size {
-                        tracing::debug!(
-                            group_idx = group.group_idx,
-                            declared = group.block_size,
-                            published = store.block_size,
-                            "hybrid group published a secondary page size"
-                        );
-                        continue;
-                    }
-                    // Extra keys are the adapter identity; a base store must
-                    // not carry any, while an adapter store addresses its own
-                    // chain by namespace.
+                    // Identity and shape guards run before the page-size skip:
+                    // a foreign cache identity must fail the whole batch even
+                    // when it publishes a page size this layout does not
+                    // address.
+                    // `session_id` annotates a request without changing the
+                    // block hash, and an adapter store carries its own identity
+                    // as extra keys: neither makes the page foreign. A base
+                    // store must carry no extra keys at all.
                     if store.medium.as_deref() != Some("GPU")
                         || store.locality.as_deref().is_some_and(|s| s != "LOCAL")
                         || store.ownership.is_some()
-                        || !event_kind_matches(group.kind, store)
-                        || !stored_shape_matches(group.kind, store)
                         || (namespace.is_none()
                             && !extra_keys_match(
                                 store.extra_keys.as_ref(),
@@ -118,18 +110,63 @@ impl HybridEventIndex {
                         }
                         return Self::fail(&mut state, HybridEventError::InvalidBatch);
                     }
-                    let Some(keys) = store
-                        .block_hashes
+                    // An engine may publish several page sizes for one group
+                    // index (V4-class compressors store 4-token pages next to
+                    // the group's own pages). Only the declared granularity is
+                    // addressable by the layout; the other pages cover the same
+                    // tokens and add no boundary information.
+                    let Some(group) = self
+                        .groups
                         .iter()
-                        .map(sequence_hash)
-                        .collect::<Option<Vec<_>>>()
+                        .find(|group| store.group_idx == Some(group.group_idx))
                     else {
                         if adapter {
                             continue;
                         }
                         return Self::fail(&mut state, HybridEventError::InvalidBatch);
                     };
+                    if !event_kind_matches(group.kind, store) {
+                        if adapter {
+                            continue;
+                        }
+                        return Self::fail(&mut state, HybridEventError::InvalidBatch);
+                    }
+                    if store.block_size != group.block_size {
+                        tracing::debug!(
+                            group_idx = group.group_idx,
+                            declared = group.block_size,
+                            published = store.block_size,
+                            "hybrid group published a secondary page size"
+                        );
+                        continue;
+                    }
+                    if !stored_shape_matches(group.kind, store) {
+                        if adapter {
+                            continue;
+                        }
+                        return Self::fail(&mut state, HybridEventError::InvalidBatch);
+                    }
+                    let Ok(keys) = self.stored_keys(group, store) else {
+                        if adapter {
+                            continue;
+                        }
+                        return Self::fail(&mut state, HybridEventError::InvalidBatch);
+                    };
                     let group_idx = group.group_idx;
+                    // A checkpoint or compressed group publishes every page it
+                    // holds, so an empty list means it holds none and must bound
+                    // the prefix at zero. A sliding group in a V4-class layout
+                    // publishes no pages at all; its state is tracked by the
+                    // compressed group, so a key-only store is not evidence.
+                    if !keys.is_empty()
+                        || !matches!(group.kind, HybridGroupKind::SlidingWindow { .. })
+                    {
+                        state
+                            .page_evidence
+                            .entry(namespace.clone())
+                            .or_default()
+                            .insert(group_idx);
+                    }
                     for hash in keys {
                         if !state.insert_claim(
                             namespace.as_deref(),
@@ -169,6 +206,8 @@ impl HybridEventIndex {
                     }
                 }
                 KVEvent::AllBlocksCleared(_) => {
+                    // The clear is about claims: a group that has published
+                    // pages still cannot bound a prefix, so its evidence stays.
                     state.claims.clear();
                     Ok(())
                 }
@@ -192,9 +231,27 @@ impl HybridEventIndex {
     }
 }
 
-fn sequence_hash(hash: &ExternalBlockHash) -> Option<SequenceHash> {
+pub(super) fn sequence_hash(hash: &ExternalBlockHash) -> Option<SequenceHash> {
     match hash {
         ExternalBlockHash::Bytes(bytes) => bytes.as_slice().try_into().ok(),
         ExternalBlockHash::Int(_) => None,
+    }
+}
+
+fn publishes_int_hash(event: &KVEvent) -> bool {
+    fn any_int<'a>(hashes: impl Iterator<Item = &'a ExternalBlockHash>) -> bool {
+        hashes
+            .into_iter()
+            .any(|hash| matches!(hash, ExternalBlockHash::Int(_)))
+    }
+    match event {
+        KVEvent::BlockStored(store) => any_int(
+            store
+                .block_hashes
+                .iter()
+                .chain(store.parent_block_hash.iter()),
+        ),
+        KVEvent::BlockRemoved(remove) => any_int(remove.block_hashes.iter()),
+        KVEvent::AllBlocksCleared(_) => false,
     }
 }

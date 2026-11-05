@@ -2226,4 +2226,7 @@ pub(crate) enum Phase {
 pub(crate) struct SourceState {
     pub(crate) generation: u64,
     pub(crate) phase: Phase,
+    /// Whether this generation already reported that the publisher's hash
+    /// encoding cannot be indexed.
+    pub(crate) reported_int_hashes: bool,
 }

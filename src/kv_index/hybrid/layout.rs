@@ -1,4 +1,4 @@
-//! Common-prefix calculation for hybrid cache groups.
+//! Cache groups, their restore rules, and the declared hybrid layout.
 //!
 //! Like vLLM, each group's hit is measured on its own and the smallest one is
 //! credited. A hit in one group is never evidence for another.
@@ -7,6 +7,15 @@ use std::collections::HashSet;
 
 use super::super::wire::BlockStored;
 use super::super::{Locality, RoutableTarget, StorageTier, TierMatch};
+use super::HybridEventIndex;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HybridEventGroup {
+    pub group_idx: u32,
+    /// The verified cache block size in tokens, not the hash granularity.
+    pub block_size: u32,
+    pub kind: HybridGroupKind,
+}
 
 /// The verified restore rule for a cache group.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -19,6 +28,8 @@ pub enum HybridGroupKind {
     CompressedFullAttention { tokens_per_state: u32 },
     /// Only a checkpoint block ending at the boundary is needed.
     Checkpoint,
+    /// All blocks intersecting the preceding `window_tokens` are needed.
+    SlidingWindow { window_tokens: u64 },
 }
 
 /// One required group's placement in a single trusted snapshot.
@@ -29,6 +40,10 @@ pub struct HybridGroupView<'a> {
     pub block_size: u32,
     pub kind: HybridGroupKind,
     pub matches: &'a [TierMatch],
+    /// Whether the engine ever published pages for this group. A group that
+    /// publishes key-only stores reports no addressable page, so it cannot
+    /// constrain the boundary; the layout's other groups do.
+    pub page_evidence: bool,
 }
 
 /// Round `tokens` down to `block_size`.
@@ -54,41 +69,89 @@ pub fn common_reusable_tokens(
         return 0;
     }
     let mut group_ids = HashSet::with_capacity(groups.len());
-    if groups
-        .iter()
-        .any(|group| group.block_size == 0 || !group_ids.insert(group.group_idx))
-    {
+    if groups.iter().any(|group| {
+        group.block_size == 0
+            || !group_ids.insert(group.group_idx)
+            || matches!(
+                group.kind,
+                HybridGroupKind::SlidingWindow { window_tokens: 0 }
+            )
+    }) {
         return 0;
     }
 
-    // Every group reports its own hit; the smallest one is what the engine
-    // restores. A group that proves nothing drops the whole prefix, because the
-    // engine takes the minimum across all groups.
-    let mut boundary = max_reusable_tokens;
-    for group in groups {
-        let available = longest_supported(group, target, u64::MAX);
-        let hit = align_down(available.min(max_reusable_tokens), group.block_size);
-        if hit == 0 {
-            return 0;
-        }
-        boundary = boundary.min(hit);
+    // A group that never published pages cannot contradict another group's
+    // evidence: V4-class layouts store sliding state only as key-only events
+    // next to the compressed group that names the pages.
+    let constraining: Vec<&HybridGroupView<'_>> =
+        groups.iter().filter(|group| group.page_evidence).collect();
+    if constraining.is_empty() {
+        return 0;
     }
 
-    // Re-check every group at the reduced boundary until it stops moving, as
-    // the engine's coordinator does.
+    // Reproduce the engine's coordinator: every group reports the longest
+    // boundary it can restore under the current cap, the smallest one wins, and
+    // the loop repeats because that smaller cap can invalidate a sliding
+    // group's window.
+    let mut boundary = max_reusable_tokens;
+    let unit = constraining
+        .iter()
+        .map(|group| group.block_size)
+        .min()
+        .unwrap_or(1);
     loop {
         let mut next = boundary;
-        for group in groups {
-            next = next.min(longest_supported(group, target, boundary));
+        for group in &constraining {
+            next = next.min(align_down(
+                supported_at(group, target, boundary),
+                group.block_size,
+            ));
         }
         if next == 0 {
             return 0;
         }
         if next == boundary {
-            return boundary;
+            return align_down(boundary, unit);
         }
         boundary = next;
     }
+}
+
+/// The largest boundary at or below `boundary` this group can still restore.
+///
+/// Dense and compressed groups restore a prefix from the root, so the cap is
+/// their only limit. A sliding group does not: it can only restore a boundary
+/// whose trailing window is resident, and the credit never exceeds the end of
+/// the run that covers it.
+fn supported_at(group: &HybridGroupView<'_>, target: &RoutableTarget, boundary: u64) -> u64 {
+    let size = u64::from(group.block_size);
+    if size == 0 {
+        return 0;
+    }
+    let HybridGroupKind::SlidingWindow { window_tokens } = group.kind else {
+        return longest_supported(group, target, boundary);
+    };
+    let cap_blocks = boundary / size;
+    let needed = window_tokens.saturating_sub(1).div_ceil(size);
+    let mut best = 0;
+    for hit in group.matches.iter().filter(|hit| eligible(hit, target)) {
+        for &(start, end) in &hit.segments {
+            if start >= end {
+                continue;
+            }
+            let (start, end) = (u64::from(start), u64::from(end).min(cap_blocks));
+            if end <= start {
+                continue;
+            }
+            // A run anchored at the root has no earlier state the window could
+            // be missing, so any boundary up to its end is restorable. A run
+            // below the root has to cover the window that ends there.
+            if start == 0 || end - start >= needed {
+                best = best.max(end * size);
+            }
+        }
+    }
+    best
 }
 
 fn eligible(hit: &TierMatch, target: &RoutableTarget) -> bool {
@@ -114,77 +177,53 @@ fn longest_supported(group: &HybridGroupView<'_>, target: &RoutableTarget, cap: 
                 continue;
             }
             let candidate = match group.kind {
-                // Dense attention covers every block from the root.
+                // Dense and compressed state cover every block from the root.
                 HybridGroupKind::FullAttention => {
                     if start == 0 {
-                        end
+                        end * size
                     } else {
                         0
                     }
                 }
                 HybridGroupKind::CompressedFullAttention { tokens_per_state } => {
-                    if start != 0
-                        || tokens_per_state == 0
-                        || !group.block_size.is_multiple_of(tokens_per_state)
-                    {
+                    if start != 0 || tokens_per_state == 0 {
                         0
                     } else {
-                        end
+                        // A compressed group restores whole states. When the
+                        // page size is not a state multiple the state-aligned
+                        // prefix is still restorable, so align the boundary
+                        // down instead of dropping the group's evidence.
+                        align_down(end * size, tokens_per_state)
                     }
                 }
                 // A checkpoint is restorable on its own.
-                HybridGroupKind::Checkpoint => end,
+                HybridGroupKind::Checkpoint => end * size,
+                // The window that ends at the boundary has to fit inside the
+                // resident run, except below block zero: a run anchored at the
+                // root has no earlier state the window could be missing, so the
+                // engine restores it even when it is shorter than the window.
+                // Credit stops at the run's end: the engine trims to the run,
+                // never to the requested boundary.
+                HybridGroupKind::SlidingWindow { window_tokens } => {
+                    let needed = window_tokens.saturating_sub(1).div_ceil(size);
+                    if start == 0 || end - start >= needed {
+                        end * size
+                    } else {
+                        0
+                    }
+                }
             };
-            best = best.max(candidate * size);
+            best = best.max(candidate);
         }
     }
     best
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct HybridEventGroup {
-    pub group_idx: u32,
-    /// The verified cache block size in tokens, not the hash granularity.
-    pub block_size: u32,
-    pub kind: HybridGroupKind,
-}
-
-pub(super) fn event_kind_matches(kind: HybridGroupKind, store: &BlockStored) -> bool {
-    let spec = store.kv_cache_spec_kind.as_deref();
-    match kind {
-        HybridGroupKind::FullAttention => {
-            spec == Some("full_attention") && store.kv_cache_spec_sliding_window.is_none()
-        }
-        HybridGroupKind::CompressedFullAttention { .. } => {
-            spec == Some("mla_attention") && store.kv_cache_spec_sliding_window.is_none()
-        }
-        HybridGroupKind::Checkpoint => {
-            spec == Some("mamba") && store.kv_cache_spec_sliding_window.is_none()
-        }
-    }
-}
-
-pub(super) fn stored_shape_matches(kind: HybridGroupKind, store: &BlockStored) -> bool {
-    let block_size = store.block_size as usize;
-    if block_size == 0 || store.token_ids.is_empty() {
-        return false;
-    }
-    if !store.token_ids.len().is_multiple_of(block_size) {
-        return false;
-    }
-    let blocks = store.token_ids.len() / block_size;
-    match kind {
-        HybridGroupKind::Checkpoint => store.block_hashes.len() <= blocks,
-        _ => store.block_hashes.len() == blocks,
-    }
-}
-
-// ---- Layout declaration (from `--kv-hybrid-layout`) ----
+// ---- Declared layout (`--kv-hybrid-layout`) ----
 
 use serde::{Deserialize, Serialize};
 
 use super::super::subscriber::EventSource;
-use super::HybridEventIndex;
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct HybridCapabilities {
@@ -201,8 +240,8 @@ pub struct HybridCapabilities {
 pub struct HybridAdapterCapability {
     pub name: String,
     /// The path exactly as passed to the engine's `--lora-modules`: the engine
-    /// hashes the verbatim string, so an equivalent but different spelling is
-    /// a different chain and credits nothing.
+    /// hashes the verbatim string, so an equivalent but different spelling is a
+    /// different chain and credits nothing.
     pub path: String,
 }
 
@@ -316,16 +355,43 @@ impl HybridCapabilities {
             .ok_or("invalid root hash")?;
         let hash_block_size = rank.hash_block_size.ok_or("missing hash block size")?;
         let mut groups = Vec::with_capacity(rank.groups.len());
+        let mut replay_tokens = 0;
         for group in &rank.groups {
-            // A restore-time replay window is not modeled: such a layout gets no
-            // credit rather than one the engine cannot honor.
+            // vLLM rewinds a hit by one replay window shared by every replay
+            // group. Disagreeing windows have no single restore point, and a
+            // replay window only exists for sliding-window layouts.
             if group.prefix_replay_tokens > 0 {
-                return Err("unsupported group restore contract");
+                if !matches!(group.kind.as_str(), "sliding_window" | "sliding_window_mla") {
+                    return Err("unsupported group restore contract");
+                }
+                if replay_tokens != 0 && replay_tokens != group.prefix_replay_tokens {
+                    return Err("unsupported group restore contract");
+                }
+                replay_tokens = group.prefix_replay_tokens;
             }
             // Scratch groups such as the Qwen4 QSA key ring hold per-request
             // state, never shareable state, and emit no block events. They are
             // excluded from the index only when their shape proves that.
             if !group.prefix_cacheable {
+                if group.prefix_replay_tokens > 0
+                    && matches!(
+                        (group.kind.as_str(), group.spec_type.as_str()),
+                        ("sliding_window", "SlidingWindowSpec")
+                            | ("sliding_window_mla", "SlidingWindowMLASpec")
+                            | ("mla_attention", "MLAAttentionSpec")
+                    )
+                {
+                    // Bounded replay: the engine rebuilds this group's trailing
+                    // window from the other groups' state. Its own blocks are
+                    // not required to be resident, but the window must still be
+                    // charged to the layout.
+                    if group.sliding_window.is_none_or(|window| {
+                        window == 0 || u64::from(window) != u64::from(group.prefix_replay_tokens)
+                    }) {
+                        return Err("unsupported bounded replay group");
+                    }
+                    continue;
+                }
                 if group.spec_type != "CircularBufferSpec"
                     || group.tokens_per_state.as_deref() != Some("1")
                     || group.block_size == 0
@@ -345,13 +411,36 @@ impl HybridCapabilities {
                             .as_deref()
                             .is_none_or(|role| role == "sparse") =>
                 {
-                    let tokens_per_state = group
-                        .tokens_per_state
-                        .as_deref()
-                        .and_then(|value| value.parse::<u32>().ok())
-                        .filter(|value| *value > 0 && group.block_size.is_multiple_of(*value))
-                        .ok_or("unsupported compressed attention group")?;
-                    HybridGroupKind::CompressedFullAttention { tokens_per_state }
+                    // A compressed group names the tokens one state covers.
+                    // Without that declaration (DeepSeek V4's MLA pages) the
+                    // page restores from the root like a full-attention block,
+                    // so it is modeled as one instead of being rejected.
+                    match group.tokens_per_state.as_deref() {
+                        // Declared but malformed: the engine would not honor
+                        // this shape, so the layout is refused.
+                        Some(declared) => {
+                            let tokens_per_state = declared
+                                .parse::<u32>()
+                                .ok()
+                                .filter(|value| {
+                                    *value > 0 && group.block_size.is_multiple_of(*value)
+                                })
+                                .ok_or("unsupported compressed attention group")?;
+                            HybridGroupKind::CompressedFullAttention { tokens_per_state }
+                        }
+                        // No declaration: the page restores from the root.
+                        None => HybridGroupKind::FullAttention,
+                    }
+                }
+                ("sliding_window", "SlidingWindowSpec")
+                | ("sliding_window_mla", "SlidingWindowMLASpec") => {
+                    let window = group
+                        .sliding_window
+                        .filter(|window| *window > 0)
+                        .ok_or("unsupported sliding window group")?;
+                    HybridGroupKind::SlidingWindow {
+                        window_tokens: u64::from(window),
+                    }
                 }
                 ("mamba", "MambaSpec")
                     if group.mamba_cache_mode.as_deref() == Some("align")
@@ -370,30 +459,68 @@ impl HybridCapabilities {
             });
         }
         // The declared layout, not just the indexed subset, must describe a
-        // The declared layout, not just the indexed subset, must describe a
-        // hybrid cache: at least one attention group, and some state a single
-        // attention hit cannot prove (a checkpoint group or a replay window).
-        // One attention group is enough when the layout says it is the whole
-        // layout: a model whose sparse state never publishes block events (V4.1)
-        // has no group whose checkpoint the credit could contradict.
+        // hybrid cache: several groups, at least one attention group, and some
+        // state that a single attention hit cannot prove (a checkpoint group,
+        // a sliding-window group, or a declared replay window). One attention
+        // group is enough when the layout says it is the whole layout: a model
+        // whose sparse state never publishes block events (V4.1) has no group
+        // whose checkpoint the credit could contradict.
         let has_attention = groups.iter().any(|group| {
             matches!(
                 group.kind,
-                HybridGroupKind::FullAttention | HybridGroupKind::CompressedFullAttention { .. }
+                HybridGroupKind::FullAttention
+                    | HybridGroupKind::CompressedFullAttention { .. }
+                    | HybridGroupKind::SlidingWindow { .. }
             )
         });
+        let has_state = groups.iter().any(|group| {
+            matches!(
+                group.kind,
+                HybridGroupKind::Checkpoint | HybridGroupKind::SlidingWindow { .. }
+            )
+        });
+        let declared_single_attention =
+            groups.len() == 1 && rank.declared_groups == Some(1) && has_attention;
+        if groups.is_empty()
+            || !has_attention
+            || !(has_state || replay_tokens > 0 || declared_single_attention)
+        {
+        let has_attention = groups.iter().any(|group| {
+            matches!(
+                group.kind,
+                HybridGroupKind::FullAttention
+                    | HybridGroupKind::CompressedFullAttention { .. }
+                    | HybridGroupKind::SlidingWindow { .. }
+            )
+        });
+<<<<<<< HEAD
         let has_state = groups
             .iter()
             .any(|group| matches!(group.kind, HybridGroupKind::Checkpoint));
         let declared_single_attention =
             groups.len() == 1 && rank.declared_groups == Some(1) && has_attention;
         if groups.is_empty() || !has_attention || !(has_state || declared_single_attention) {
+=======
+        let has_state = groups.iter().any(|group| {
+            matches!(
+                group.kind,
+                HybridGroupKind::Checkpoint | HybridGroupKind::SlidingWindow { .. }
+            )
+        });
+        if rank.groups.len() < 2
+            || groups.is_empty()
+            || !has_attention
+            || !(has_state || replay_tokens > 0)
+        {
+>>>>>>> 15cb2f6 (feat(kv-index): sliding window and replay window for DeepSeek V4)
             return Err("not a supported mixed layout");
         }
         let adapters = validate_adapters(&self.adapters)?;
         HybridEventIndex::new_with_root_hash(target, groups, hash_block_size, root, max_entries)
-            .map(|index| index.with_adapters(adapters))
+            .map_err(|_| "invalid group layout")?
+            .with_replay_tokens(replay_tokens)
             .map_err(|_| "invalid group layout")
+            .map(|index| index.with_adapters(adapters))
     }
 
     /// Bind one event source to its rank's verified layout.
@@ -429,7 +556,6 @@ fn parse_hash(value: &str) -> Option<[u8; 32]> {
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
-
     use std::sync::Arc;
 
     use super::*;
@@ -462,6 +588,7 @@ mod tests {
             block_size,
             kind,
             matches,
+            page_evidence: true,
         }
     }
 
@@ -492,6 +619,89 @@ mod tests {
     }
 
     #[test]
+    fn sliding_window_needs_only_the_required_local_interval() {
+        let worker = target("w", 0);
+        let full = [hit(&worker, &[(0, 8)])];
+        let window = [hit(&worker, &[(5, 8)])];
+        let groups = [
+            group(0, 16, HybridGroupKind::FullAttention, &full),
+            group(
+                1,
+                16,
+                HybridGroupKind::SlidingWindow { window_tokens: 33 },
+                &window,
+            ),
+        ];
+        assert_eq!(common_reusable_tokens(&worker, &groups, 128), 128);
+        // The last token cannot be reused, so both groups report 7 blocks. The
+        // sliding group still holds two contiguous blocks below that boundary,
+        // which is what its window needs, so the reduced boundary stands.
+        assert_eq!(common_reusable_tokens(&worker, &groups, 127), 112);
+    }
+
+    /// The sliding group's retained tail can sit entirely above a boundary
+    /// another group pulled down. The window that ends at that boundary is then
+    /// absent, so there is no shared restore point and no credit.
+    #[test]
+    fn a_reduced_boundary_that_loses_the_sliding_window_credits_nothing() {
+        let worker = target("w", 0);
+        let full = [hit(&worker, &[(0, 4)])]; // 0..64
+        let window = [hit(&worker, &[(6, 8)])]; // 96..128, a 32-token window
+        let groups = [
+            group(0, 16, HybridGroupKind::FullAttention, &full),
+            group(
+                1,
+                16,
+                HybridGroupKind::SlidingWindow { window_tokens: 32 },
+                &window,
+            ),
+        ];
+        assert_eq!(common_reusable_tokens(&worker, &groups, 143), 0);
+    }
+
+    /// A sliding group whose resident run starts at the root has no earlier
+    /// state the window could be missing, so a prefix shorter than the window is
+    /// still reusable: the engine restores the whole run.
+    #[test]
+    fn a_root_anchored_prefix_shorter_than_the_window_is_reusable() {
+        let worker = target("w", 0);
+        let full = [hit(&worker, &[(0, 1)])];
+        let window = [hit(&worker, &[(0, 1)])];
+        let groups = [
+            group(0, 64, HybridGroupKind::FullAttention, &full),
+            group(
+                1,
+                64,
+                HybridGroupKind::SlidingWindow { window_tokens: 128 },
+                &window,
+            ),
+        ];
+        // A 65-token request keeps one 64-token block, well inside the window.
+        assert_eq!(common_reusable_tokens(&worker, &groups, 64), 64);
+        assert_eq!(common_reusable_tokens(&worker, &groups, 128), 64);
+    }
+
+    /// A sliding group whose run sits below the boundary still supports it,
+    /// because the engine's lookup accepts any run of the window's blocks under
+    /// the candidate length.
+    #[test]
+    fn a_sliding_run_below_the_boundary_keeps_the_credit() {
+        let worker = target("w", 0);
+        let full = [hit(&worker, &[(0, 6)])]; // 0..96
+        let window = [hit(&worker, &[(4, 8)])]; // 64..128, a 32-token window
+        let groups = [
+            group(0, 16, HybridGroupKind::FullAttention, &full),
+            group(
+                1,
+                16,
+                HybridGroupKind::SlidingWindow { window_tokens: 32 },
+                &window,
+            ),
+        ];
+        assert_eq!(common_reusable_tokens(&worker, &groups, 143), 96);
+    }
+
+    #[test]
     fn state_on_another_rank_or_tier_cannot_complete_a_hit() {
         let worker = target("w", 0);
         let full = [hit(&worker, &[(0, 4)])];
@@ -516,9 +726,16 @@ mod tests {
             group(0, 16, HybridGroupKind::FullAttention, &hits),
             group(0, 16, HybridGroupKind::Checkpoint, &hits),
         ];
+        let empty_window = [group(
+            1,
+            16,
+            HybridGroupKind::SlidingWindow { window_tokens: 0 },
+            &hits,
+        )];
         assert_eq!(common_reusable_tokens(&worker, &[], 64), 0);
         assert_eq!(common_reusable_tokens(&worker, &invalid, 64), 0);
         assert_eq!(common_reusable_tokens(&worker, &duplicate, 64), 0);
+        assert_eq!(common_reusable_tokens(&worker, &empty_window, 64), 0);
     }
 
     #[test]
@@ -559,7 +776,7 @@ mod tests {
     }
 
     mod declarations {
-        use super::super::*;
+        use super::*;
         use std::sync::Arc;
 
         #[test]
@@ -691,6 +908,52 @@ mod tests {
             value["ranks"][0]["groups"][0]["prefix_replay_tokens"] = serde_json::json!(128);
             assert!(make(&value).index_for_source(&source, target, 8).is_err());
         }
+
+        /// DeepSeek V4 publishes MLA pages (no `tokens_per_state`) next to
+        /// sliding-window groups on a 4-token hash chain; that layout has to bind.
+        #[test]
+        fn deepseek_v4_layout_binds_without_a_checkpoint_group() {
+            let group = |idx, kind, spec, block, window: Option<u32>| {
+                serde_json::json!({
+                    "group_idx": idx, "kind": kind, "spec_type": spec, "block_size": block,
+                    "sliding_window": window, "prefix_cacheable": true,
+                    "prefix_replay_tokens": 0, "mamba_cache_mode": null,
+                    "prefill_checkpoint_alignment": null,
+                })
+            };
+            let value = serde_json::json!({"schema_version": 1, "ranks": [{
+                "rank": 0, "model": "deepseek-v4", "weight_version": "default",
+                "weight_identity": null, "publisher_topic": "ds4", "instance_topic": true,
+                "hash_algorithm": "sha256_cbor", "root_hash":
+                    "9bd96a485ad84efdafb72ee48a1d7a69bcead0f8f0433173941b276b9581eef0",
+                "full_hashes": true, "hash_block_size": 4, "hash_lookahead_tokens": 0,
+                "speculative_tokens": 0, "prefix_caching": true,
+                "groups": [
+                    group(0, "sliding_window_mla", "SlidingWindowMLASpec", 64, Some(128)),
+                    group(1, "sliding_window_mla", "SlidingWindowMLASpec", 64, Some(128)),
+                    group(2, "mla_attention", "MLAAttentionSpec", 256, None),
+                    group(3, "sliding_window_mla", "SlidingWindowMLASpec", 4, Some(8)),
+                    group(4, "sliding_window_mla", "SlidingWindowMLASpec", 8, Some(128)),
+                ]
+            }]});
+            let capabilities: HybridCapabilities = serde_json::from_value(value).expect("layout");
+            let source = EventSource {
+                source: Arc::from("http://worker"),
+                dp_rank: 0,
+                pub_endpoint: "tcp://127.0.0.1:1".into(),
+                replay_endpoint: Some("tcp://127.0.0.1:2".into()),
+                topic: "ds4".into(),
+                hwm: None,
+            };
+            let target = RoutableTarget {
+                instance_id: Arc::from("http://worker"),
+                dp_rank: 0,
+            };
+            capabilities
+                .index_for_source(&source, target, 16)
+                .expect("deepseek v4 layout must bind");
+        }
+
         #[test]
         fn qwen4_layout_admits_compressed_group_and_skips_the_scratch_ring() {
             let group = |idx, kind, spec, extra: serde_json::Value| {
@@ -776,6 +1039,46 @@ mod tests {
             value["ranks"][0]["groups"][3]["spec_type"] = serde_json::json!("CircularBufferSpec");
             value["ranks"][0]["groups"][4]["kind"] = serde_json::json!("full_attention");
             assert!(make(&value).index_for_source(&source, target, 16).is_err());
+        }
+    }
+}
+
+pub(super) fn stored_shape_matches(kind: HybridGroupKind, store: &BlockStored) -> bool {
+    let block_size = store.block_size as usize;
+    if block_size == 0 || store.token_ids.is_empty() {
+        return false;
+    }
+    if !store.token_ids.len().is_multiple_of(block_size) {
+        return false;
+    }
+    let blocks = store.token_ids.len() / block_size;
+    match kind {
+        HybridGroupKind::Checkpoint | HybridGroupKind::SlidingWindow { .. } => {
+            store.block_hashes.len() <= blocks
+        }
+        _ => store.block_hashes.len() == blocks,
+    }
+}
+
+pub(super) fn event_kind_matches(kind: HybridGroupKind, store: &BlockStored) -> bool {
+    let spec = store.kv_cache_spec_kind.as_deref();
+    match kind {
+        // An MLA page without a state ratio restores from the root exactly like
+        // a full-attention block, and DeepSeek V4 publishes it as
+        // `mla_attention`.
+        HybridGroupKind::FullAttention => {
+            matches!(spec, Some("full_attention") | Some("mla_attention"))
+                && store.kv_cache_spec_sliding_window.is_none()
+        }
+        HybridGroupKind::CompressedFullAttention { .. } => {
+            spec == Some("mla_attention") && store.kv_cache_spec_sliding_window.is_none()
+        }
+        HybridGroupKind::Checkpoint => {
+            spec == Some("mamba") && store.kv_cache_spec_sliding_window.is_none()
+        }
+        HybridGroupKind::SlidingWindow { window_tokens } => {
+            matches!(spec, Some("sliding_window" | "sliding_window_mla"))
+                && store.kv_cache_spec_sliding_window.map(u64::from) == Some(window_tokens)
         }
     }
 }

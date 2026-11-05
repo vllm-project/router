@@ -1,4 +1,7 @@
 //! Hybrid attention prefix index.
+//!
+//! `HybridIndex` owns the residency lock and is the only type callers see.
+//! Event interpretation lives in `ingest`, cache-group rules in `layout`.
 
 mod ingest;
 mod layout;
@@ -9,7 +12,9 @@ use std::collections::{HashMap, HashSet};
 
 use parking_lot::RwLock;
 
+use self::ingest::sequence_hash;
 pub use self::ingest::HybridEventError;
+use self::layout::align_down;
 pub use self::layout::{
     common_reusable_tokens, HybridAdapterCapability, HybridCapabilities, HybridEventGroup,
     HybridGroupCapability, HybridGroupKind, HybridGroupView, HybridRankCapability,
@@ -22,6 +27,7 @@ pub use crate::kv_index::subscriber::HybridSourceLease;
 
 #[allow(unused_imports)]
 use self::ingest::HybridEventError as _;
+use super::wire::BlockStored;
 use super::{Locality, RoutableTarget, StorageTier, TierMatch};
 use crate::kv_hash::{BlockKeyGenerator, SequenceHash};
 
@@ -31,6 +37,10 @@ pub struct HybridEventIndex {
     pub(super) target: RoutableTarget,
     pub(super) groups: Vec<HybridEventGroup>,
     pub(super) keys: BlockKeyGenerator,
+    /// Layout-declared restore-time recomputation window (vLLM
+    /// `prefix_replay_tokens`). It applies to the whole layout: a group that
+    /// publishes no events can still make this window mandatory.
+    pub(super) replay_tokens: u32,
     /// LoRA adapters this worker serves, as `(name, path)`. The engine seeds an
     /// adapter's chain with both, so a layout that does not declare an adapter
     /// cannot credit it, and one that declares the wrong path credits nothing.
@@ -93,9 +103,10 @@ impl HybridEventIndex {
                 group.block_size == 0
                     || !(group.block_size as usize).is_multiple_of(keys.block_size())
                     || !ids.insert(group.group_idx)
-                    // Compressed state covers `tokens_per_state` tokens, so
-                    // the group boundary has to be a multiple of that ratio.
+                    // Compressed state covers `tokens_per_state` tokens, so the
+                    // group boundary has to be a multiple of that ratio.
                     || match group.kind {
+                        HybridGroupKind::SlidingWindow { window_tokens } => window_tokens == 0,
                         HybridGroupKind::CompressedFullAttention { tokens_per_state } => {
                             tokens_per_state == 0
                                 || !group.block_size.is_multiple_of(tokens_per_state)
@@ -110,14 +121,27 @@ impl HybridEventIndex {
             target,
             groups,
             keys,
+            replay_tokens: 0,
             adapters: Vec::new(),
             max_entries,
             state: RwLock::new(State {
                 next_seq: None,
                 visible: false,
                 claims: HashMap::new(),
+                page_evidence: HashMap::new(),
             }),
         })
+    }
+
+    /// Declare the layout's restore-time recomputation window
+    /// (`prefix_replay_tokens`); it lowers the credit for the whole layout.
+    pub fn with_replay_tokens(mut self, replay_tokens: u32) -> Result<Self, HybridEventError> {
+        let hash_block_size = self.keys.block_size();
+        if replay_tokens > 0 && (hash_block_size == 0 || replay_tokens > u32::MAX / 2) {
+            return Err(HybridEventError::InvalidLayout);
+        }
+        self.replay_tokens = replay_tokens;
+        Ok(self)
     }
 
     pub fn target(&self) -> &RoutableTarget {
@@ -177,20 +201,32 @@ impl HybridEventIndex {
         state.visible = false;
     }
 
+    /// Decode a wire payload before applying it. Corrupt payloads invalidate
+    /// all groups, including claims from previously accepted batches.
+    ///
+
     /// Calculate one consistent local snapshot. Zero means a miss or an
     /// untrusted source.
     pub fn reusable_tokens(&self, tokens: &[u32], max_reusable_tokens: usize) -> u64 {
         self.reusable_tokens_in(None, tokens, max_reusable_tokens)
     }
 
-    /// The same snapshot for one chain: `None` is the base model, a name is a
-    /// declared adapter.
+    /// The same snapshot for one cache identity: `None` is the base model's
+    /// chain, a name is that adapter's chain.
     fn reusable_tokens_in(
         &self,
         namespace: Option<&str>,
         tokens: &[u32],
         max_reusable_tokens: usize,
     ) -> u64 {
+        // A never-begun, invalidated or replay-hidden view can never credit a
+        // prefix, so refuse before paying for the whole prompt's hash chain.
+        {
+            let state = self.state.read();
+            if state.next_seq.is_none() || !state.visible {
+                return 0;
+            }
+        }
         let hashes = match namespace {
             None => self.keys.generate_block_keys(tokens),
             Some(name) => match self.adapter_path(name) {
@@ -207,6 +243,7 @@ impl HybridEventIndex {
         let Some(claims) = state.claims_in(namespace) else {
             return 0;
         };
+        let page_evidence = state.page_evidence_in(namespace);
         let matches: Vec<Vec<TierMatch>> = self
             .groups
             .iter()
@@ -245,13 +282,39 @@ impl HybridEventIndex {
                 block_size: group.block_size,
                 kind: group.kind,
                 matches,
+                page_evidence: page_evidence
+                    .is_some_and(|evidence| evidence.contains(&group.group_idx)),
             })
             .collect();
-        common_reusable_tokens(
+        let boundary = common_reusable_tokens(
             &self.target,
             &views,
             tokens.len().saturating_sub(1).min(max_reusable_tokens) as u64,
-        )
+        );
+        // The engine replays the layout's trailing window before prefilling the
+        // rest, and rounds the remaining hit down to a block. Charging the same
+        // way keeps Router's estimate from exceeding the engine's own cache hit.
+        let credited = boundary.saturating_sub(u64::from(self.replay_tokens));
+        align_down(credited, self.keys.block_size() as u32)
+    }
+
+    /// Every block a store proves. A sliding group publishes only its tail;
+    /// the chain from the parent digest recovers the rest, and is used only
+    /// when its tail matches the published hashes.
+    fn stored_keys(
+        &self,
+        _group: &HybridEventGroup,
+        store: &BlockStored,
+    ) -> Result<Vec<SequenceHash>, ()> {
+        // Only published digests are residency evidence. vLLM publishes the
+        // hashes of the pages it actually holds (it skips null or masked pages
+        // while `token_ids` still spans the whole range), so rebuilding the
+        // chain from the token ids would claim pages the engine never stored.
+        store
+            .block_hashes
+            .iter()
+            .map(|hash| sequence_hash(hash).ok_or(()))
+            .collect()
     }
 }
 
@@ -270,13 +333,17 @@ impl crate::policies::TieredMatchProvider for HybridEventIndex {
     ) -> Option<Vec<TierMatch>> {
         // Events, ownership and history are bound to one rank. A hit computed
         // from another rank's stream is never evidence for this one.
-        // Events, ownership and history are bound to one rank. A hit computed
-        // from another rank's stream is never evidence for this one.
         if block_size == 0 || dp_rank != self.target.dp_rank {
             return Some(Vec::new());
         }
-        let tokens = self.reusable_tokens_in(lora_name, tokens, usize::MAX);
-        if tokens == 0 || !tokens.is_multiple_of(u64::from(block_size)) {
+        // The policy's page size can be coarser than the hash granularity: the
+        // engine restores the aligned prefix, so round down instead of dropping
+        // a recoverable hit.
+        let tokens = align_down(
+            self.reusable_tokens_in(lora_name, tokens, usize::MAX),
+            block_size,
+        );
+        if tokens == 0 {
             return Some(Vec::new());
         }
         let Ok(blocks) = u32::try_from(tokens / u64::from(block_size)) else {
