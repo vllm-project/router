@@ -158,7 +158,7 @@ struct CliArgs {
         value_name = "URL=ENDPOINT[,ENDPOINT...]"
     )]
     pd_kv_events: Vec<String>,
-    /// JSON map of prefill URLs to hybrid event sources and verified decode URLs.
+    /// Experimental P/D version of `--kv-hybrid-layout`, keyed by prefill URL.
     #[arg(long)]
     pd_hybrid_config: Option<std::path::PathBuf>,
 
@@ -219,7 +219,7 @@ struct CliArgs {
     /// Shared model identity for workers using static event publishers.
     #[arg(long)]
     kv_event_model: Option<String>,
-    /// JSON map from worker URL to Router-managed hybrid cache layout.
+    /// Cache layout JSON for hybrid attention models, keyed by worker URL.
     #[arg(long)]
     kv_hybrid_layout: Option<std::path::PathBuf>,
     /// Transfer credit for host-resident KV blocks.
