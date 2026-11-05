@@ -193,9 +193,33 @@ impl PdLoadManager {
 
     /// The router supplies selection; this manager owns only admission and
     /// lifecycle state. No policy, worker registry, or connector lives here.
+    ///
+    /// Both stages are charged here. Callers that dispatch Decode only after
+    /// Prefill completes use [`Self::admit_deferred`] instead.
     pub(super) fn admit(
         &self,
         select: impl FnOnce(&Loads) -> Option<PdSelection>,
+    ) -> Option<(PdSelection, PdAttempt)> {
+        self.admit_inner(select, false)
+    }
+
+    /// Admit the Prefill stage only and leave the Decode commitment open.
+    ///
+    /// The supplied selection still carries a Decode decision, but it is
+    /// provisional: it takes no affinity binding and nothing is charged for it
+    /// until [`Self::commit_decode`] runs. A provisional pick must therefore
+    /// never be dispatched.
+    pub(super) fn admit_deferred(
+        &self,
+        select: impl FnOnce(&Loads) -> Option<PdSelection>,
+    ) -> Option<(PdSelection, PdAttempt)> {
+        self.admit_inner(select, true)
+    }
+
+    fn admit_inner(
+        &self,
+        select: impl FnOnce(&Loads) -> Option<PdSelection>,
+        defer_decode: bool,
     ) -> Option<(PdSelection, PdAttempt)> {
         let mut loads = self.loads.lock();
         let selection = select(&loads)?;
@@ -212,26 +236,71 @@ impl PdLoadManager {
             p.unknown_prefill_requests += 1;
         }
         p.publish(Stage::Prefill, &prefill.endpoint);
-        let d = loads
-            .entry((Stage::Decode, decode.endpoint.clone()))
-            .or_default();
-        d.pending_decode_requests += 1;
-        d.publish(Stage::Decode, &decode.endpoint);
+        let now = std::time::Instant::now();
+        let (decode_endpoint, affinity, decode_state, pending_since) = if defer_decode {
+            (None, None, DecodeState::Unbound, None)
+        } else {
+            let d = loads
+                .entry((Stage::Decode, decode.endpoint.clone()))
+                .or_default();
+            d.pending_decode_requests += 1;
+            d.publish(Stage::Decode, &decode.endpoint);
+            (
+                Some(decode.endpoint.clone()),
+                decode.affinity.clone(),
+                DecodeState::Pending,
+                Some(now),
+            )
+        };
         let attempt = PdAttempt(Arc::new(AttemptInner {
-            admitted_at: std::time::Instant::now(),
+            admitted_at: now,
             loads: self.loads.clone(),
             prefill: selection.prefill.endpoint.clone(),
-            decode: selection.decode.endpoint.clone(),
             prefill_worker: Mutex::new(None),
             decode_worker: Mutex::new(None),
             prefill_tokens: selection.prefill.new_prefill_tokens,
-            affinity: selection.decode.affinity.clone(),
             state: Mutex::new(AttemptState {
                 prefill: true,
-                decode: DecodeState::Pending,
+                decode: decode_state,
+                decode_endpoint,
+                affinity,
+                pending_since,
             }),
         }));
         Some((selection, attempt))
+    }
+
+    /// Charge and bind the Decode stage chosen at dispatch time.
+    ///
+    /// The attempt state lock serializes this against the release paths: a
+    /// concurrent drop either finishes first, so this finds a non-`Unbound`
+    /// state and charges nothing, or it waits and then releases what was
+    /// charged. Returns `None` when the attempt already left `Unbound` or the
+    /// selector refused every candidate.
+    pub(super) fn commit_decode(
+        &self,
+        attempt: &PdAttempt,
+        select: impl FnOnce(&Loads) -> Option<StageDecision>,
+    ) -> Option<StageDecision> {
+        let inner = &attempt.0;
+        let mut state = inner.state.lock();
+        if state.decode != DecodeState::Unbound {
+            return None;
+        }
+        let mut loads = self.loads.lock();
+        let decision = select(&loads)?;
+        let d = loads
+            .entry((Stage::Decode, decision.endpoint.clone()))
+            .or_default();
+        d.pending_decode_requests += 1;
+        d.publish(Stage::Decode, &decision.endpoint);
+        state.decode_endpoint = Some(decision.endpoint.clone());
+        state.affinity = decision.affinity.clone();
+        state.pending_since = Some(std::time::Instant::now());
+        state.decode = DecodeState::Pending;
+        metrics::histogram!("vllm_router_pd_decode_selection_gap_seconds")
+            .record(inner.admitted_at.elapsed().as_secs_f64());
+        Some(decision)
     }
 
     /// Charge a P/D pair the caller already bound.
@@ -261,14 +330,15 @@ impl PdLoadManager {
             admitted_at: std::time::Instant::now(),
             loads: self.loads.clone(),
             prefill,
-            decode,
             prefill_worker: Mutex::new(None),
             decode_worker: Mutex::new(None),
             prefill_tokens: None,
-            affinity: None,
             state: Mutex::new(AttemptState {
                 prefill: true,
                 decode: DecodeState::Pending,
+                decode_endpoint: Some(decode),
+                affinity: None,
+                pending_since: Some(std::time::Instant::now()),
             }),
         }));
         attempt.attach_workers(prefill_worker, decode_worker);
@@ -278,6 +348,8 @@ impl PdLoadManager {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DecodeState {
+    /// Admitted without a decode commitment; nothing charged.
+    Unbound,
     Pending,
     Active,
     Finished,
@@ -287,18 +359,23 @@ enum DecodeState {
 struct AttemptState {
     prefill: bool,
     decode: DecodeState,
+    /// Committed decode endpoint; `None` while the commitment is deferred.
+    decode_endpoint: Option<PdEndpoint>,
+    /// Decode binding held alive until this attempt finishes.
+    affinity: Option<Arc<AffinityRecord>>,
+    /// When the decode slot was charged, for the pending histogram.
+    pending_since: Option<std::time::Instant>,
 }
 
 struct AttemptInner {
     admitted_at: std::time::Instant,
     loads: Arc<Mutex<Loads>>,
     prefill: PdEndpoint,
-    decode: PdEndpoint,
     prefill_worker: Mutex<Option<Arc<dyn Worker>>>,
     decode_worker: Mutex<Option<Arc<dyn Worker>>>,
     prefill_tokens: Option<u64>,
-    /// Decode binding held alive until this attempt finishes.
-    affinity: Option<Arc<AffinityRecord>>,
+    /// Guards every stage transition and the decode fields below, so a commit
+    /// and a release cannot interleave halfway through.
     state: Mutex<AttemptState>,
 }
 
@@ -333,32 +410,48 @@ impl AttemptInner {
         if state.decode != DecodeState::Pending {
             return;
         }
+        let Some(endpoint) = state.decode_endpoint.clone() else {
+            return;
+        };
         let mut loads = self.loads.lock();
         let load = loads
-            .get_mut(&(Stage::Decode, self.decode.clone()))
+            .get_mut(&(Stage::Decode, endpoint.clone()))
             .expect("admitted decode");
         load.pending_decode_requests -= 1;
         load.active_decode_requests += 1;
-        load.publish(Stage::Decode, &self.decode);
-        metrics::histogram!("vllm_router_pd_decode_pending_seconds")
-            .record(self.admitted_at.elapsed().as_secs_f64());
+        load.publish(Stage::Decode, &endpoint);
+        if let Some(since) = state.pending_since {
+            metrics::histogram!("vllm_router_pd_decode_pending_seconds")
+                .record(since.elapsed().as_secs_f64());
+        }
         state.decode = DecodeState::Active;
     }
 
     fn finish_decode(&self) {
         let mut state = self.state.lock();
-        if state.decode == DecodeState::Finished {
-            return;
+        match state.decode {
+            DecodeState::Finished => return,
+            // Nothing was charged, and closing the state here is what makes a
+            // later commit fail instead of leaking a charge.
+            DecodeState::Unbound => {
+                state.decode = DecodeState::Finished;
+                return;
+            }
+            DecodeState::Pending | DecodeState::Active => {}
         }
+        let Some(endpoint) = state.decode_endpoint.clone() else {
+            state.decode = DecodeState::Finished;
+            return;
+        };
         let mut loads = self.loads.lock();
-        let key = (Stage::Decode, self.decode.clone());
+        let key = (Stage::Decode, endpoint.clone());
         if let Some(load) = loads.get_mut(&key) {
             match state.decode {
                 DecodeState::Pending => load.pending_decode_requests -= 1,
                 DecodeState::Active => load.active_decode_requests -= 1,
-                DecodeState::Finished => unreachable!(),
+                DecodeState::Unbound | DecodeState::Finished => unreachable!(),
             }
-            load.publish(Stage::Decode, &self.decode);
+            load.publish(Stage::Decode, &endpoint);
             if load.idle() {
                 loads.remove(&key);
             }
@@ -366,6 +459,7 @@ impl AttemptInner {
         if let Some(worker) = self.decode_worker.lock().as_ref() {
             worker.decrement_load();
         }
+        state.pending_since = None;
         state.decode = DecodeState::Finished;
     }
 }
@@ -375,7 +469,7 @@ impl Drop for AttemptInner {
         self.finish_prefill();
         self.finish_decode();
         // Restart the binding's idle clock after this attempt finishes.
-        if let Some(record) = &self.affinity {
+        if let Some(record) = self.state.lock().affinity.take() {
             record.release_ref();
         }
     }
@@ -389,7 +483,6 @@ impl std::fmt::Debug for AttemptInner {
         formatter
             .debug_struct("AttemptInner")
             .field("prefill", &self.prefill)
-            .field("decode", &self.decode)
             .field("state", &self.state)
             .finish()
     }
@@ -417,12 +510,32 @@ impl PdAttempt {
         prefill_worker: Arc<dyn Worker>,
         decode_worker: Arc<dyn Worker>,
     ) {
+        self.attach_prefill_worker(prefill_worker);
+        self.attach_decode_worker(decode_worker);
+    }
+
+    pub(super) fn attach_prefill_worker(&self, prefill_worker: Arc<dyn Worker>) {
         prefill_worker.increment_load();
-        decode_worker.increment_load();
         *self.0.prefill_worker.lock() = Some(prefill_worker);
+    }
+
+    /// Register the decode worker once it is known. Deferred commitments learn
+    /// it at dispatch time instead of at admission.
+    pub(super) fn attach_decode_worker(&self, decode_worker: Arc<dyn Worker>) {
+        decode_worker.increment_load();
         *self.0.decode_worker.lock() = Some(decode_worker);
     }
 
+    /// True until the decode stage is charged, i.e. for a deferred commitment.
+    pub(super) fn decode_pending_commit(&self) -> bool {
+        self.0.state.lock().decode == DecodeState::Unbound
+    }
+
+    /// Committed decode endpoint, or `None` while the commitment is deferred.
+    #[cfg(test)]
+    pub(super) fn decode_endpoint(&self) -> Option<PdEndpoint> {
+        self.0.state.lock().decode_endpoint.clone()
+    }
     pub fn finish_prefill(&self) {
         self.0.finish_prefill();
     }
