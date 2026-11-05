@@ -61,26 +61,6 @@ pub fn decode_batch(payload: &[u8]) -> Result<KVEventBatch, String> {
     })
 }
 
-/// Decode one bare event, as published by engines that emit one event per
-/// message instead of a `(ts, events, rank)` batch. The caller attributes the
-/// event to the rank whose endpoint carried it.
-pub fn decode_event_payload(payload: &[u8]) -> Result<KVEvent, String> {
-    if payload.len() > MAX_PAYLOAD_BYTES {
-        return Err("KV event payload exceeds 16 MiB".into());
-    }
-    let mut syntax = rmp_serde::Deserializer::new(Cursor::new(payload));
-    syntax.set_max_depth(16);
-    serde::de::IgnoredAny::deserialize(&mut syntax)
-        .map_err(|error| format!("invalid MessagePack: {error}"))?;
-    let mut cursor = Cursor::new(payload);
-    let value = rmpv::decode::read_value_with_max_depth(&mut cursor, 16)
-        .map_err(|error| format!("invalid MessagePack: {error}"))?;
-    if cursor.position() as usize != payload.len() {
-        return Err("trailing bytes after KV event".into());
-    }
-    decode_event(value)
-}
-
 fn decode_event(event: Value) -> Result<KVEvent, String> {
     let pairs = event.as_map().ok_or("KV event must be a tagged map")?;
     let mut keys = HashSet::new();

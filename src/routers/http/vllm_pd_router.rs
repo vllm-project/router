@@ -671,6 +671,31 @@ impl VllmPDRouter {
         );
     }
 
+    /// Prefill succeeded but its handoff did not validate: answer 502 without
+    /// dispatching decode, so a cold decode is never reported as P/D.
+    fn reject_handoff(
+        &self,
+        path: &str,
+        start_time: Instant,
+        prefill: &str,
+        decode: &str,
+        reason: &str,
+    ) -> Response {
+        RouterMetrics::record_pd_handoff_failure(self.connector_label(), reason);
+        RouterMetrics::record_pd_prefill_request(prefill);
+        RouterMetrics::record_pd_request(path);
+        RouterMetrics::record_pd_request_duration(path, start_time.elapsed());
+        warn!(
+            prefill,
+            decode, reason, "handoff validation failed before decode dispatch"
+        );
+        (
+            StatusCode::BAD_GATEWAY,
+            format!("Handoff validation failed for prefill {prefill} -> decode {decode}: {reason}"),
+        )
+            .into_response()
+    }
+
     fn connector_label(&self) -> &'static str {
         match self.kv_connector {
             KvConnector::Nixl => "nixl",
@@ -1134,6 +1159,9 @@ impl VllmPDRouter {
             cache_salt,
             route: path,
         };
+        // Existing deployments configure a common connector. Discovery parses
+        // registrations with that connector; no new pair compatibility is
+        // inferred from KV overlap or DP rank equality.
         self.pd_router
             .select_and_admit(prefill_workers, decode_workers, &context)
     }
@@ -1960,29 +1988,13 @@ impl VllmPDRouter {
             transfer_id.as_deref(),
             handoff_params.as_ref(),
         ) {
-            // Prefill itself succeeded; the handoff contract did not. Reply
-            // 502 (as the gRPC path does) and never dispatch to decode, so a
-            // cold decode is not reported as a normal P/D request.
-            let duration = start_time.elapsed();
-            RouterMetrics::record_pd_handoff_failure(self.connector_label(), reason);
-            RouterMetrics::record_pd_prefill_request(&prefill_base_url);
-            RouterMetrics::record_pd_request(path);
-            RouterMetrics::record_pd_request_duration(path, duration);
-            warn!(
-                prefill = %prefill_base_url,
-                decode = %decode_worker.base_url(),
+            return Ok(self.reject_handoff(
+                path,
+                start_time,
+                &prefill_base_url,
+                decode_worker.base_url(),
                 reason,
-                "handoff validation failed before decode dispatch"
-            );
-            return Ok((
-                StatusCode::BAD_GATEWAY,
-                format!(
-                    "Handoff validation failed for prefill {} -> decode {}: {reason}",
-                    prefill_base_url,
-                    decode_worker.base_url()
-                ),
-            )
-                .into_response());
+            ));
         }
         if let Some(params) = handoff_params {
             decode_request["kv_transfer_params"] = params;
@@ -2185,18 +2197,13 @@ impl VllmPDRouter {
             decode_params.as_ref(),
         ) {
             attempt.release();
-            RouterMetrics::record_pd_handoff_failure(self.connector_label(), reason);
-            RouterMetrics::record_pd_prefill_request(&prefill_base_url);
-            RouterMetrics::record_pd_request(path);
-            RouterMetrics::record_pd_request_duration(path, start_time.elapsed());
-            return (
-                StatusCode::BAD_GATEWAY,
-                format!(
-                    "Handoff validation failed for prefill {} -> decode {}: {reason}",
-                    prefill_base_url, decode_base_url
-                ),
-            )
-                .into_response();
+            return self.reject_handoff(
+                path,
+                start_time,
+                &prefill_base_url,
+                &decode_base_url,
+                reason,
+            );
         }
         let Some(decode_params) = decode_params else {
             unreachable!("validate_handoff rejects a missing decode handoff");

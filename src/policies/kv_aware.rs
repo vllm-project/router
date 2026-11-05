@@ -1369,10 +1369,6 @@ impl KvAwarePolicy {
                 self.decision_for_position(&plan, &candidates, &costs, &components, position);
             let outcome = if used_binding && from_advisory {
                 "advisory_hit"
-            } else if used_binding && !plan.has_tokens {
-                // An exact binding chosen by a tokenized request still gives no
-                // cache evidence to a request without tokens.
-                "sticky_hit_untokenized"
             } else if used_binding {
                 "sticky_hit"
             } else if advisory_bind {

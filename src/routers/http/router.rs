@@ -1983,12 +1983,6 @@ impl Router {
         if let Some(dp_rank) = extracted_dp_rank {
             request_builder = request_builder.header("X-data-parallel-rank", dp_rank.to_string());
         }
-        debug!(
-            dp_rank = ?extracted_dp_rank,
-            worker = %worker_url,
-            url = %request_url,
-            "dispatching request"
-        );
 
         // Opt-in: VLLM_ROUTER_STAGES=1. HTTP remains a transparent proxy; the
         // stage split reports worker header wait and first SSE byte only.
