@@ -870,8 +870,11 @@ mod tests {
         );
     }
 
+    /// A 404 means the engine does not implement the optional control route, so
+    /// a refresh remembers the verdict instead of re-probing on every pass.
+    /// Removing the worker re-arms the probe.
     #[tokio::test]
-    async fn kv_observer_retries_soft_skipped_discovery() {
+    async fn kv_observer_remembers_missing_control_route() {
         use axum::{routing::get, Json, Router};
 
         let attempts = Arc::new(AtomicUsize::new(0));
@@ -902,12 +905,16 @@ mod tests {
 
         refresh_kv_workers(&supervisor, &mut previous, &mut subscribed, urls.clone()).await;
         refresh_kv_workers(&supervisor, &mut previous, &mut subscribed, urls.clone()).await;
-        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
         assert!(subscribed.is_empty());
         assert_eq!(previous, urls);
 
         refresh_kv_workers(&supervisor, &mut previous, &mut subscribed, BTreeSet::new()).await;
         assert!(previous.is_empty());
+        // Re-adding the worker re-arms discovery, so a restarted engine is
+        // never skipped on stale evidence.
+        refresh_kv_workers(&supervisor, &mut previous, &mut subscribed, urls.clone()).await;
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
         server.abort();
     }
 
