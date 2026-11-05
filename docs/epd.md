@@ -40,7 +40,11 @@ re-preprocesses into the same mm_hash and can still reuse the published
 embedding. Repeated images keep their original positions and independent
 transfer IDs.
 Other request fields, including sampling options, pass through unchanged.
-Text-only and existing embeds inputs do not call the encoders. PD responses,
+Text-only and existing embeds inputs do not call the encoders. Mooncake consumers
+with rank-qualified URLs reject caller-provided nonempty `ec_transfer_params`
+with HTTP 400: those handles may belong to a different consumer. Send raw media
+through the router instead. Unranked DP=1 and address-map-free NIXL/Example inputs
+retain their existing behavior. PD responses,
 including SSE streams, use the existing transparent forwarding path.
 
 Encoder failures are returned without submitting a partially prepared PD
@@ -94,7 +98,9 @@ Dynamic P/D discovery is not supported with EPD yet.
 
 ## Data-parallel consumers
 
-Set `--intra-node-data-parallel-size` to the P/PD server's DP size. The router
+For combined PD, set `--intra-node-data-parallel-size` to the server's DP size.
+For separate P/D, each endpoint's DP size is discovered from `/metrics`; the flag
+is only a fallback when metrics are unavailable. The router
 selects a replica before encoding and pins the HTTP request to that replica
 using `X-data-parallel-rank`. Encoders remain separate instances; this flag does
 not expand encoder URLs or override the EC backend's producer constraints.
@@ -115,7 +121,10 @@ target/release/vllm-router --host 0.0.0.0 --port 8000 \
 
 Mooncake assigns replica `r` the control port `ec_port + r * TP`; list each
 replica's first TP shard. The example above assumes TP=1. With separate P/D,
-the map references P replicas, not D. Missing rank mappings fail before encoder
+the map references P replicas, not D, including all discovered ranks when P
+endpoints have different DP sizes. With DP>1, URLs explicitly ending in `@rank`
+remain pinned to that replica rather than being expanded again. The map is
+checked against the resolved workers at startup. Missing rank mappings fail before encoder
 dispatch rather than sending embeddings to another replica. NIXL PULL and
 ECExampleConnector need no address map. DP=1 keeps the unsuffixed keys shown above.
 

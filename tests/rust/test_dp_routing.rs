@@ -344,21 +344,20 @@ mod dp_e2e_tests {
     // Regular Router + DP > 1: transparent proxy
     // -----------------------------------------------------------------
 
-    #[tokio::test]
-    async fn test_epd_dp2_keeps_encoder_destination_and_consumer_rank_aligned() {
+    type EpdRequests =
+        Arc<std::sync::Mutex<Vec<(String, axum::http::HeaderMap, serde_json::Value)>>>;
+
+    async fn epd_server() -> (String, EpdRequests, tokio::task::JoinHandle<()>) {
         use axum::{
             extract::State,
-            http::{HeaderMap, Method, StatusCode, Uri},
+            http::{HeaderMap, Uri},
             routing::{get, post},
             Json, Router,
         };
         use serde_json::Value;
         use std::sync::Mutex;
-        use vllm_router_rs::config::{ConfigValidator, EpdConfig};
-
-        type Seen = Arc<Mutex<Vec<(String, HeaderMap, Value)>>>;
         async fn backend(
-            State(seen): State<Seen>,
+            State(seen): State<EpdRequests>,
             uri: Uri,
             headers: HeaderMap,
             Json(body): Json<Value>,
@@ -372,7 +371,7 @@ mod dp_e2e_tests {
                     "metadata": {"image_grid_thw": [[1, 2, 3]]},
                     "destination": body["ec_transfer_params"]["consumer_zmq"],
                 }}}))
-            } else if uri.path().starts_with("/p/") {
+            } else if ["p", "p0", "p1"].contains(&uri.path().split('/').nth(1).unwrap()) {
                 Json(json!({"kv_transfer_params": {
                     "do_remote_prefill": true, "remote_engine_id": "P"
                 }}))
@@ -381,22 +380,45 @@ mod dp_e2e_tests {
             }
         }
 
+        let seen: EpdRequests = Arc::new(Mutex::new(Vec::new()));
+        let mut app = Router::new();
+        for (role, dp_size) in [
+            ("e", 2),
+            ("p", 2),
+            ("d", 2),
+            ("pd", 2),
+            ("p0", 2),
+            ("p1", 4),
+        ] {
+            let metrics: String = (0..dp_size)
+                .map(|rank| format!("vllm:num_requests_running{{engine=\"{rank}\"}} 0\n"))
+                .collect();
+            app = app
+                .route(&format!("/{role}/health"), get(|| async { "ok" }))
+                .route(&format!("/{role}/v1/chat/completions"), post(backend))
+                .route(
+                    &format!("/{role}/metrics"),
+                    get(move || {
+                        let metrics = metrics.clone();
+                        async move { metrics }
+                    }),
+                );
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let app = app.with_state(seen.clone());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (base, seen, server)
+    }
+
+    #[tokio::test]
+    async fn test_epd_dp2_keeps_encoder_destination_and_consumer_rank_aligned() {
+        use axum::http::{HeaderMap, Method, StatusCode};
+        use vllm_router_rs::config::{ConfigValidator, EpdConfig};
+
         for separate_pd in [false, true] {
             for push in [false, true] {
-                let seen: Seen = Arc::new(Mutex::new(Vec::new()));
-                let mut app = Router::new();
-                for role in ["e", "p", "d", "pd"] {
-                    app = app
-                        .route(&format!("/{role}/health"), get(|| async { "ok" }))
-                        .route(&format!("/{role}/v1/chat/completions"), post(backend))
-                        .route(&format!("/{role}/metrics"), get(|| async {
-                            "vllm:num_requests_running{engine=\"0\"} 0\nvllm:num_requests_running{engine=\"1\"} 0\n"
-                        }));
-                }
-                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-                let base = format!("http://{}", listener.local_addr().unwrap());
-                let app = app.with_state(seen.clone());
-                let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+                let (base, seen, server) = epd_server().await;
                 let consumer = format!("{base}/{}", if separate_pd { "p" } else { "pd" });
                 let addresses: std::collections::HashMap<_, _> = if push {
                     (0..2)
@@ -429,7 +451,10 @@ mod dp_e2e_tests {
                         .unwrap()
                         .consumer_zmq_addrs
                         .remove(&format!("{consumer}@1"));
-                    assert!(ConfigValidator::validate(&incomplete).is_err());
+                    ConfigValidator::validate(&incomplete).unwrap();
+                    let context = common::create_test_context(incomplete);
+                    let error = RouterFactory::create_router(&context).await.err().unwrap();
+                    assert!(error.contains("consumer_zmq_addrs"), "{error}");
                 }
                 let context = common::create_test_context(config);
                 let router = RouterFactory::create_router(&context).await.unwrap();
@@ -478,6 +503,156 @@ mod dp_e2e_tests {
                 assert_eq!(seen.len(), if separate_pd { 12 } else { 8 });
                 server.abort();
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_epd_regular_preserves_a_pinned_consumer() {
+        use axum::http::{Method, StatusCode};
+        use vllm_router_rs::config::{ConfigValidator, EpdConfig};
+
+        let (base, seen, server) = epd_server().await;
+        let consumer = format!("{base}/pd@1");
+        let mut config = make_regular_config(vec![consumer.clone()], 2);
+        config.port = 8000;
+        config.epd = Some(EpdConfig {
+            encoder_urls: vec![format!("{base}/e")],
+            consumer_zmq_addrs: [(consumer, "tcp://127.0.0.1:19001".into())].into(),
+        });
+        ConfigValidator::validate(&config).unwrap();
+        let context = common::create_test_context(config);
+        let router = RouterFactory::create_router(&context).await.unwrap();
+        assert_eq!(context.worker_registry.get_all().len(), 1);
+        let response = router.route_transparent(None, "/v1/chat/completions", &Method::POST, json!({
+            "messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}}]}]
+        })).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[1].0, "/pd/v1/chat/completions");
+        assert_eq!(seen[1].1["x-data-parallel-rank"], "1");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_epd_address_map_matches_discovered_prefill_ranks() {
+        use vllm_router_rs::config::{ConfigValidator, EpdConfig};
+
+        let (base, _, server) = epd_server().await;
+        let prefill = vec![(format!("{base}/p0"), None), (format!("{base}/p1"), None)];
+        let mut config = make_pd_config(prefill, vec![format!("{base}/d")], 2);
+        config.port = 8000;
+        config.epd = Some(EpdConfig {
+            encoder_urls: vec![format!("{base}/e")],
+            consumer_zmq_addrs: [("p0", 2), ("p1", 4)]
+                .into_iter()
+                .flat_map(|(role, size)| {
+                    let base = &base;
+                    (0..size).map(move |rank| {
+                        (
+                            format!("{base}/{role}@{rank}"),
+                            format!("tcp://127.0.0.1:{}", 19000 + rank),
+                        )
+                    })
+                })
+                .collect(),
+        });
+        ConfigValidator::validate(&config).unwrap();
+        let context = common::create_test_context(config.clone());
+        let _router = RouterFactory::create_router(&context).await.unwrap();
+        assert_eq!(context.worker_registry.get_prefill_workers().len(), 6);
+
+        for rank in [2, 3] {
+            config
+                .epd
+                .as_mut()
+                .unwrap()
+                .consumer_zmq_addrs
+                .remove(&format!("{base}/p1@{rank}"));
+        }
+        ConfigValidator::validate(&config).unwrap();
+        let context = common::create_test_context(config);
+        let error = RouterFactory::create_router(&context).await.err().unwrap();
+        assert!(error.contains("consumer_zmq_addrs"), "{error}");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_epd_rejects_rank_bound_push_handles_before_dispatch() {
+        use axum::http::{HeaderMap, Method, StatusCode};
+        use vllm_router_rs::config::{ConfigValidator, EpdConfig};
+
+        for (separate_pd, dp_size, push) in [
+            (false, 2, true),
+            (true, 2, true),
+            (false, 1, true),
+            (false, 2, false),
+        ] {
+            let (base, seen, server) = epd_server().await;
+            let consumer = format!("{base}/{}", if separate_pd { "p" } else { "pd" });
+            let mut config = if separate_pd {
+                make_pd_config(
+                    vec![(consumer.clone(), None)],
+                    vec![format!("{base}/d")],
+                    dp_size,
+                )
+            } else {
+                make_regular_config(vec![consumer.clone()], dp_size)
+            };
+            config.port = 8000;
+            config.epd = Some(EpdConfig {
+                encoder_urls: vec![format!("{base}/e")],
+                consumer_zmq_addrs: if push {
+                    (0..dp_size)
+                        .map(|rank| {
+                            let url = if dp_size == 1 {
+                                consumer.clone()
+                            } else {
+                                format!("{consumer}@{rank}")
+                            };
+                            (url, format!("tcp://127.0.0.1:{}", 19000 + rank))
+                        })
+                        .collect()
+                } else {
+                    Default::default()
+                },
+            });
+            ConfigValidator::validate(&config).unwrap();
+            let context = common::create_test_context(config);
+            let router = RouterFactory::create_router(&context).await.unwrap();
+            let mut headers = HeaderMap::new();
+            headers.insert("x-data-parallel-rank", "1".parse().unwrap());
+            for mixed in [false, true] {
+                let mut content = vec![
+                    json!({"type": "image_embeds", "image_embeds": {"image_grid_thw": [1, 2, 3]}, "uuid": "cached"}),
+                ];
+                if mixed {
+                    content.push(json!({"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}}));
+                }
+                let response = router.route_transparent(if dp_size > 1 { Some(&headers) } else { None }, "/v1/chat/completions", &Method::POST, json!({
+                    "messages": [{"role": "user", "content": content}],
+                    "ec_transfer_params": {"cached": {"transfer_id": "old"}, "ec_items": [{"mm_hash": "cached", "transfer_id": "old"}]}
+                })).await;
+                let rejected = push && dp_size > 1;
+                assert_eq!(
+                    response.status(),
+                    if rejected {
+                        StatusCode::BAD_REQUEST
+                    } else {
+                        StatusCode::OK
+                    }
+                );
+                axum::body::to_bytes(response.into_body(), 4096)
+                    .await
+                    .unwrap();
+                if rejected {
+                    assert!(seen.lock().unwrap().is_empty());
+                }
+            }
+            server.abort();
         }
     }
 

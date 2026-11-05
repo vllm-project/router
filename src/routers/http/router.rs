@@ -479,6 +479,16 @@ impl Router {
             }
         }
 
+        if let Some(config) = &ctx.router_config.epd {
+            super::epd::EncoderStage::validate_consumers(
+                config,
+                ctx.worker_registry
+                    .get_by_type(&WorkerType::Regular)
+                    .iter()
+                    .map(|worker| worker.url()),
+            )?;
+        }
+
         // Setup load monitoring for PowerOfTwo policy
         let (tx, rx) = tokio::sync::watch::channel(HashMap::new());
         let worker_loads = Arc::new(rx);

@@ -1082,6 +1082,16 @@ impl PdRouterBase {
             }
         }
 
+        if let Some(config) = &ctx.router_config.epd {
+            super::epd::EncoderStage::validate_consumers(
+                config,
+                ctx.worker_registry
+                    .get_prefill_workers()
+                    .iter()
+                    .map(|worker| worker.url()),
+            )?;
+        }
+
         // Get all workers from registry for load monitoring
         let all_workers = ctx.worker_registry.get_all();
         let all_urls: Vec<String> = all_workers

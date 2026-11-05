@@ -286,33 +286,6 @@ impl ConfigValidator {
             }
         }
         if !epd.consumer_zmq_addrs.is_empty() {
-            let consumer_urls: Vec<String> = worker_urls
-                .iter()
-                .flat_map(|url| {
-                    let (base, rank) = crate::routers::http::dp_utils::parse_worker_url(url);
-                    crate::routers::http::dp_utils::expand_dp_ranks(
-                        rank,
-                        config.intra_node_data_parallel_size,
-                    )
-                    .into_iter()
-                    .map(move |rank| match rank {
-                        Some(rank) => format!("{base}@{rank}"),
-                        None => base.clone(),
-                    })
-                })
-                .collect();
-            if consumer_urls.is_empty()
-                || epd.consumer_zmq_addrs.len() != consumer_urls.len()
-                || consumer_urls
-                    .iter()
-                    .any(|url| !epd.consumer_zmq_addrs.contains_key(url))
-            {
-                return Err(ConfigError::ValidationFailed {
-                    reason:
-                        "EPD consumer_zmq_addrs must map every embedding consumer URL (including @rank for DP) exactly once"
-                            .into(),
-                });
-            }
             for addr in epd.consumer_zmq_addrs.values() {
                 let parsed = url::Url::parse(addr).map_err(|e| ConfigError::ValidationFailed {
                     reason: format!("Invalid EC address: {e}"),
