@@ -7,6 +7,7 @@
 
 use super::identity::{NextTurnHint, NextTurnHintInput};
 use super::prediction_profile::ReturnTimeKey;
+use super::request_pool::ProgramRequestHandle;
 use super::return_time;
 use super::scheduler_state::ProgramSchedulerState;
 use super::{ProgramDispatch, ProgramRef, ProgramScheduler, ProgramState};
@@ -245,9 +246,9 @@ impl PrefetchPlan {
 enum WaitPhase {
     Undecided(PrefetchSkip),
     Planned(PrefetchPlan),
-    /// The next turn arrived in the plan's window, this long after the load would
-    /// have finished. Its completion settles the plan.
-    AwaitingTurn(PrefetchPlan, Duration),
+    /// The request that arrived at this instant ended the wait, inside the plan's
+    /// window. Only that request settles the plan: a Program's requests can overlap.
+    AwaitingTurn(PrefetchPlan, Instant),
 }
 
 /// One Program's wait between a finished turn and the next one's arrival.
@@ -402,15 +403,14 @@ impl ProgramScheduler {
                 Self::record_outcome(state, &wait.target_id, plan, PrefetchOutcome::Expired);
             }
             WaitPhase::Planned(plan) => {
-                let margin = arrived_at.saturating_duration_since(plan.finish_at);
-                wait.phase = WaitPhase::AwaitingTurn(plan, margin);
+                wait.phase = WaitPhase::AwaitingTurn(plan, arrived_at);
                 decision.next_turn_wait = Some(wait);
             }
             WaitPhase::AwaitingTurn(..) => decision.next_turn_wait = Some(wait),
         }
     }
 
-    /// The first completion after an in-time arrival knows the target that served
+    /// The completion of the request that ended the wait knows the target that served
     /// the turn and how much of its prompt came from a cache tier.
     pub(crate) fn settle_next_turn(
         &self,
@@ -425,15 +425,17 @@ impl ProgramScheduler {
         let Some(wait) = decision.next_turn_wait.take() else {
             return;
         };
-        let WaitPhase::AwaitingTurn(plan, margin) = &wait.phase else {
-            decision.next_turn_wait = Some(wait);
-            return;
+        let (plan, turn_arrived_at) = match &wait.phase {
+            WaitPhase::AwaitingTurn(plan, turn) if *turn == dispatch.request_arrived_at() => {
+                (plan, *turn)
+            }
+            _ => {
+                decision.next_turn_wait = Some(wait);
+                return;
+            }
         };
         let min_prefix = self.config.next_turn_prefetch.min_prefix_tokens;
-        let (outcome, tokens) = if dispatch.request_arrived_at() > plan.expires_at {
-            // The turn that reached the window was cancelled and this is a later one.
-            (PrefetchOutcome::Expired, plan.tokens)
-        } else if !success || dispatch.target_id != wait.target_id {
+        let (outcome, tokens) = if !success || dispatch.target_id != wait.target_id {
             (PrefetchOutcome::Unused, plan.tokens)
         } else {
             let outcome = match cached_prompt_tokens {
@@ -444,7 +446,7 @@ impl ProgramScheduler {
             RouterMetrics::record_next_turn_prefetch_margin(
                 &wait.target_id,
                 outcome.0.as_str(),
-                *margin,
+                turn_arrived_at.saturating_duration_since(plan.finish_at),
             );
             outcome
         };
@@ -455,22 +457,16 @@ impl ProgramScheduler {
     pub(crate) fn next_turn_cancelled(
         &self,
         state: &mut ProgramSchedulerState,
-        program: &ProgramRef,
+        handle: &ProgramRequestHandle,
     ) {
-        let idle = state.runtime.view(program).is_some_and(|runtime| {
-            runtime.in_flight_requests == 0 && runtime.waiting_requests == 0
-        });
-        if !idle {
-            return;
-        }
-        let Some(decision) = state.decisions.get_mut(program) else {
+        let Some(decision) = state.decisions.get_mut(handle.program()) else {
             return;
         };
         let Some(wait) = decision.next_turn_wait.take() else {
             return;
         };
         match &wait.phase {
-            WaitPhase::AwaitingTurn(plan, _) => {
+            WaitPhase::AwaitingTurn(plan, turn) if *turn == handle.arrived_at() => {
                 Self::record_outcome(state, &wait.target_id, plan, PrefetchOutcome::Unused);
             }
             _ => decision.next_turn_wait = Some(wait),
@@ -1053,23 +1049,39 @@ mod tests {
         (dispatch, planned_at)
     }
 
-    async fn arrived_in_time(scheduler: &ProgramScheduler) -> ProgramDispatch {
-        let (dispatch, planned_at) = planned(scheduler).await;
+    /// Move a plan back in time, so its load finished a second ago.
+    fn load_finished(scheduler: &ProgramScheduler, program: &ProgramRef) {
         let mut state = scheduler.state.lock();
-        scheduler.next_turn_arrived(
-            &mut state,
-            dispatch.program(),
-            planned_at + Duration::from_secs(3),
-        );
-        dispatch
+        let wait = state
+            .decisions
+            .get_mut(program)
+            .unwrap()
+            .next_turn_wait
+            .as_mut()
+            .unwrap();
+        let WaitPhase::Planned(plan) = &mut wait.phase else {
+            panic!("not planned");
+        };
+        let shift =
+            plan.finish_at.saturating_duration_since(Instant::now()) + Duration::from_secs(1);
+        plan.start_at -= shift;
+        plan.finish_at -= shift;
+        plan.expires_at -= shift;
     }
 
-    async fn next_turn_completes(scheduler: &ProgramScheduler, cached: Option<usize>) {
-        let next = scheduler
+    async fn next_turn(scheduler: &ProgramScheduler) -> ProgramDispatch {
+        scheduler
             .acquire(identity(json!({})), TOKENS, &[target()], None)
             .await
-            .unwrap();
-        scheduler.complete(&next, true, false, usage(cached), None);
+            .unwrap()
+    }
+
+    /// A planned wait whose load has finished, and the request that then ended it, still running.
+    async fn arrived_in_time(scheduler: &ProgramScheduler) -> (ProgramDispatch, ProgramDispatch) {
+        let (dispatch, _) = planned(scheduler).await;
+        load_finished(scheduler, dispatch.program());
+        let turn = next_turn(scheduler).await;
+        (dispatch, turn)
     }
 
     #[tokio::test]
@@ -1192,16 +1204,47 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_in_time_arrival_settles_on_the_next_completion() {
+    async fn an_in_time_arrival_settles_on_its_own_completion() {
         let scheduler = profile_scheduler();
-        let dispatch = arrived_in_time(&scheduler).await;
+        let (dispatch, turn) = arrived_in_time(&scheduler).await;
         assert!(matches!(
             phase(&scheduler, dispatch.program()),
             Some(WaitPhase::AwaitingTurn(..))
         ));
         assert!(outcomes(&scheduler).is_empty(), "settled by the completion");
-        next_turn_completes(&scheduler, Some(TOKENS)).await;
+        scheduler.complete(&turn, true, false, usage(Some(TOKENS)), None);
         assert_eq!(outcomes(&scheduler).get("in_time"), Some(&1));
+    }
+
+    #[tokio::test]
+    async fn only_the_request_that_ended_the_wait_settles_its_plan() {
+        let scheduler = profile_scheduler();
+        let (dispatch, turn) = arrived_in_time(&scheduler).await;
+        {
+            // The window closes while that request runs, and a later one finishes first.
+            let mut state = scheduler.state.lock();
+            let wait = state
+                .decisions
+                .get_mut(dispatch.program())
+                .unwrap()
+                .next_turn_wait
+                .as_mut()
+                .unwrap();
+            let WaitPhase::AwaitingTurn(plan, _) = &mut wait.phase else {
+                panic!("not awaiting");
+            };
+            plan.expires_at = Instant::now() - Duration::from_millis(1);
+        }
+        let later = next_turn(&scheduler).await;
+        scheduler.complete(&later, true, false, usage(Some(TOKENS)), None);
+        assert!(outcomes(&scheduler).is_empty());
+        assert!(matches!(
+            phase(&scheduler, dispatch.program()),
+            Some(WaitPhase::AwaitingTurn(..))
+        ));
+        scheduler.complete(&turn, true, false, usage(Some(TOKENS)), None);
+        assert_eq!(outcomes(&scheduler).get("in_time"), Some(&1));
+        assert_eq!(outcomes(&scheduler).len(), 1);
     }
 
     #[tokio::test]
@@ -1214,8 +1257,8 @@ mod tests {
             (None, "unverified", TOKENS as u64),
         ] {
             let scheduler = profile_scheduler();
-            arrived_in_time(&scheduler).await;
-            next_turn_completes(&scheduler, cached).await;
+            let (_, turn) = arrived_in_time(&scheduler).await;
+            scheduler.complete(&turn, true, false, usage(cached), None);
             let state = scheduler.state.lock();
             let ledger = &state.next_turn_prefetch["rank-0"];
             assert_eq!(ledger.outcomes.get(outcome), Some(&1), "{cached:?}");
@@ -1226,13 +1269,9 @@ mod tests {
     #[tokio::test]
     async fn a_failed_next_turn_leaves_the_load_unused() {
         let scheduler = profile_scheduler();
-        arrived_in_time(&scheduler).await;
-        let next = scheduler
-            .acquire(identity(json!({})), TOKENS, &[target()], None)
-            .await
-            .unwrap();
+        let (_, turn) = arrived_in_time(&scheduler).await;
         scheduler.complete(
-            &next,
+            &turn,
             false,
             false,
             ProgramUsageObservation::default(),
@@ -1244,7 +1283,7 @@ mod tests {
     #[tokio::test]
     async fn a_next_turn_on_another_target_leaves_the_load_unused() {
         let scheduler = profile_scheduler();
-        let dispatch = arrived_in_time(&scheduler).await;
+        let (dispatch, turn) = arrived_in_time(&scheduler).await;
         {
             let mut state = scheduler.state.lock();
             let wait = state
@@ -1256,7 +1295,7 @@ mod tests {
                 .unwrap();
             wait.target_id = "rank-1".to_string();
         }
-        next_turn_completes(&scheduler, Some(TOKENS)).await;
+        scheduler.complete(&turn, true, false, usage(Some(TOKENS)), None);
         let state = scheduler.state.lock();
         assert_eq!(
             state.next_turn_prefetch["rank-1"].outcomes.get("unused"),
@@ -1290,53 +1329,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_cancelled_turn_with_another_retained_keeps_the_plan_open() {
+    async fn only_cancelling_the_request_that_ended_the_wait_settles_its_plan() {
         let scheduler = profile_scheduler();
         let (dispatch, planned_at) = planned(&scheduler).await;
         let identity = identity(json!({}));
-        let (first, _second) = {
+        let (turn_at, later_at) = (
+            planned_at + Duration::from_secs(3),
+            planned_at + Duration::from_secs(4),
+        );
+        let (turn, later) = {
             let mut state = scheduler.state.lock();
-            let first = state
+            let turn = state
                 .runtime
-                .retain_request(&identity, TOKENS, None, planned_at);
-            let second = state
+                .retain_request(&identity, TOKENS, None, turn_at);
+            scheduler.next_turn_arrived(&mut state, dispatch.program(), turn_at);
+            let later = state
                 .runtime
-                .retain_request(&identity, TOKENS, None, planned_at);
-            scheduler.next_turn_arrived(
-                &mut state,
-                dispatch.program(),
-                planned_at + Duration::from_secs(3),
-            );
-            (first, second)
+                .retain_request(&identity, TOKENS, None, later_at);
+            scheduler.next_turn_arrived(&mut state, dispatch.program(), later_at);
+            (turn, later)
         };
-        scheduler.cancel_retained_request(&first);
+        scheduler.cancel_retained_request(&later);
         assert!(outcomes(&scheduler).is_empty());
         assert!(matches!(
             phase(&scheduler, dispatch.program()),
             Some(WaitPhase::AwaitingTurn(..))
         ));
-    }
-
-    #[tokio::test]
-    async fn a_later_turn_cannot_claim_an_expired_window() {
-        let scheduler = profile_scheduler();
-        let dispatch = arrived_in_time(&scheduler).await;
-        {
-            let mut state = scheduler.state.lock();
-            let wait = state
-                .decisions
-                .get_mut(dispatch.program())
-                .unwrap()
-                .next_turn_wait
-                .as_mut()
-                .unwrap();
-            let WaitPhase::AwaitingTurn(plan, _) = &mut wait.phase else {
-                panic!("not awaiting");
-            };
-            plan.expires_at = Instant::now() - Duration::from_millis(1);
-        }
-        next_turn_completes(&scheduler, Some(TOKENS)).await;
-        assert_eq!(outcomes(&scheduler).get("expired"), Some(&1));
+        scheduler.cancel_retained_request(&turn);
+        assert_eq!(outcomes(&scheduler).get("unused"), Some(&1));
+        assert_eq!(phase(&scheduler, dispatch.program()), None);
     }
 
     #[tokio::test]
@@ -1394,16 +1415,10 @@ mod tests {
             scheduler.evaluate_next_turn_waits(&mut state, planned_at + Duration::from_secs(5));
         }
         assert_eq!(charged(&scheduler), TOKENS);
-        {
-            let mut state = scheduler.state.lock();
-            scheduler.next_turn_arrived(
-                &mut state,
-                dispatch.program(),
-                planned_at + Duration::from_secs(6),
-            );
-        }
+        load_finished(&scheduler, dispatch.program());
+        let turn = next_turn(&scheduler).await;
         assert_eq!(charged(&scheduler), TOKENS, "the turn has not finished yet");
-        next_turn_completes(&scheduler, Some(TOKENS)).await;
+        scheduler.complete(&turn, true, false, usage(Some(TOKENS)), None);
         assert_eq!(charged(&scheduler), 0);
     }
 

@@ -469,7 +469,7 @@ impl ProgramScheduler {
         if !state.runtime.cancel_request(handle) {
             return;
         }
-        self.next_turn_cancelled(&mut state, handle.program());
+        self.next_turn_cancelled(&mut state, handle);
         let after = state.runtime.view(handle.program());
         if self.config.pd_mode
             && after
