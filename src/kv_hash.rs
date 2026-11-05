@@ -5,6 +5,7 @@
 //! `PYTHONHASHSEED` in `0..=u32::MAX`, supplied as an unsigned integer. The
 //! Worker environment must use its canonical decimal spelling (e.g. `42`,
 //! not `00042`): vLLM hashes the verbatim seed string for the initial parent.
+//! Alternatively, callers can provide the engine's verified root digest.
 //! This utility then hashes the canonical CBOR
 //! value `(parent_hash, tuple(token_ids), None)` for each complete block.
 
@@ -39,6 +40,15 @@ impl BlockKeyGenerator {
         Self {
             block_size,
             none_hash: digest(&encoded_seed),
+        }
+    }
+
+    /// Use the engine's authenticated root digest without exposing its seed.
+    pub fn from_root_hash(block_size: usize, root_hash: SequenceHash) -> Self {
+        assert!(block_size > 0, "block_size must be greater than zero");
+        Self {
+            block_size,
+            none_hash: root_hash,
         }
     }
 

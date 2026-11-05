@@ -227,6 +227,10 @@ pub fn init_metrics() {
         "Total decode server errors"
     );
     describe_counter!(
+        "vllm_router_pd_handoff_failures_total",
+        "Prefill handoff succeeded but the decode leg failed, by connector and reason"
+    );
+    describe_counter!(
         "vllm_router_pd_stream_errors_total",
         "Total streaming errors per worker"
     );
@@ -1062,6 +1066,17 @@ impl RouterMetrics {
     pub fn record_pd_decode_error(worker: &str) {
         counter!("vllm_router_pd_decode_errors_total",
             "worker" => worker.to_string()
+        )
+        .increment(1);
+    }
+
+    /// The prefill leg reported a handoff, but the decode leg failed. This is
+    /// not a cold decode error: the connector may still hold transfer state,
+    /// so it is counted and labelled separately.
+    pub fn record_pd_handoff_failure(connector: &str, reason: &str) {
+        counter!("vllm_router_pd_handoff_failures_total",
+            "connector" => connector.to_string(),
+            "reason" => reason.to_string()
         )
         .increment(1);
     }
