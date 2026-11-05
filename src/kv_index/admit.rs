@@ -140,6 +140,10 @@ pub(super) fn validate_full_attention_batch(
                     .as_deref()
                     .is_some_and(|kind| kind != "full_attention")
                     || s.kv_cache_spec_sliding_window.is_some()
+                    // The legacy index answers queries from group 0 only. A
+                    // second group means the engine holds state this path
+                    // cannot see, so group-0 credit would overstate reuse.
+                    || s.group_idx.is_some_and(|group| group != 0)
                 {
                     Some(FullAttentionRejectionReason::Layout)
                 } else if !is_supported_residency(
@@ -152,6 +156,11 @@ pub(super) fn validate_full_attention_batch(
                     || s.lora_name.as_ref().is_some_and(|name| name.is_empty())
                 {
                     Some(FullAttentionRejectionReason::Adapter)
+                } else if s.block_hashes.is_empty() {
+                    // Dense attention stores one hash per block, so an empty
+                    // list is meaningless here. Only a sparse checkpoint group
+                    // may legitimately publish none.
+                    Some(FullAttentionRejectionReason::TokenCountMismatch)
                 } else if s.block_size == 0 {
                     Some(FullAttentionRejectionReason::ZeroBlockSize)
                 } else if s.block_size != expected_block_size {
@@ -164,12 +173,20 @@ pub(super) fn validate_full_attention_batch(
                     None
                 }
             }
-            KVEvent::BlockRemoved(r) => (!is_supported_residency(
-                r.medium.as_deref(),
-                r.locality.as_deref(),
-                r.ownership.as_deref(),
-            ))
-            .then_some(FullAttentionRejectionReason::Residency),
+            KVEvent::BlockRemoved(r) => {
+                if r.group_idx.is_some_and(|group| group != 0) {
+                    Some(FullAttentionRejectionReason::Layout)
+                } else if r.block_hashes.is_empty() {
+                    Some(FullAttentionRejectionReason::TokenCountMismatch)
+                } else {
+                    (!is_supported_residency(
+                        r.medium.as_deref(),
+                        r.locality.as_deref(),
+                        r.ownership.as_deref(),
+                    ))
+                    .then_some(FullAttentionRejectionReason::Residency)
+                }
+            }
             KVEvent::AllBlocksCleared(_) => None,
         };
         if let Some(reason) = reason {
@@ -255,6 +272,52 @@ mod tests {
     }
 
     #[test]
+    fn legacy_path_rejects_events_from_a_second_cache_group() {
+        let stored = |group: Option<u32>| {
+            let mut event: BlockStored = serde_json::from_value(serde_json::json!({
+                "block_hashes": [1], "parent_block_hash": null,
+                "token_ids": [1, 2, 3, 4], "block_size": 4, "medium": "GPU",
+                "lora_id": null, "lora_name": null
+            }))
+            .unwrap();
+            event.group_idx = group;
+            KVEvent::BlockStored(event)
+        };
+        let removed = |group: Option<u32>| {
+            KVEvent::BlockRemoved(crate::kv_index::wire::BlockRemoved {
+                block_hashes: vec![ExternalBlockHash::Int(1)],
+                medium: Some("GPU".into()),
+                group_idx: group,
+                locality: None,
+                ownership: None,
+            })
+        };
+        let batch = |event| KVEventBatch {
+            ts: 0.0,
+            events: vec![event],
+            data_parallel_rank: Some(0),
+        };
+        // Single-group engines emit group 0 or omit it; both stay compatible.
+        for event in [
+            stored(None),
+            stored(Some(0)),
+            removed(None),
+            removed(Some(0)),
+        ] {
+            assert_eq!(validate_full_attention_batch(&batch(event), 4), Ok(()));
+        }
+        for event in [stored(Some(1)), removed(Some(3))] {
+            assert_eq!(
+                validate_full_attention_batch(&batch(event), 4),
+                Err(FullAttentionBatchRejection {
+                    reason: FullAttentionRejectionReason::Layout,
+                    event_index: 0,
+                })
+            );
+        }
+    }
+
+    #[test]
     fn full_attention_block_size_matrix_preserves_rejection_reason_and_event_index() {
         for expected in [8, 16, 32] {
             for actual in [0, 8, 16, 32] {
@@ -300,5 +363,33 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn legacy_path_rejects_empty_hash_lists() {
+        let batch = crate::kv_index::wire::KVEventBatch {
+            ts: 0.0,
+            events: vec![crate::kv_index::wire::KVEvent::BlockStored(
+                crate::kv_index::wire::BlockStored {
+                    block_hashes: vec![],
+                    parent_block_hash: None,
+                    token_ids: vec![1, 2],
+                    block_size: 2,
+                    medium: Some("GPU".into()),
+                    locality: Some("LOCAL".into()),
+                    ownership: None,
+                    lora_id: None,
+                    lora_name: None,
+                    extra_keys: None,
+                    group_idx: Some(0),
+                    kv_cache_spec_kind: Some("full_attention".into()),
+                    kv_cache_spec_sliding_window: None,
+                    session_id: None,
+                },
+            )],
+            data_parallel_rank: None,
+        };
+        let r = validate_full_attention_batch(&batch, 2);
+        assert!(r.is_err(), "{r:?}");
     }
 }
