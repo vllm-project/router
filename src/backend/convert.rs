@@ -332,6 +332,17 @@ pub fn set_kv_transfer_params(
     Ok(())
 }
 
+pub fn set_ec_transfer_params(
+    proto: &mut pb::GenerateRequest,
+    params: &serde_json::Value,
+) -> Result<(), String> {
+    proto
+        .kv
+        .get_or_insert_with(Default::default)
+        .ec_transfer_params = Some(json_to_proto_struct(params)?);
+    Ok(())
+}
+
 /// protobuf `Struct` numbers are `f64`; integers above 2^53 lose precision.
 pub fn json_to_proto_struct(value: &serde_json::Value) -> Result<prost_types::Struct, String> {
     match json_to_proto_value(value).kind {
