@@ -291,11 +291,11 @@ impl HybridEventIndex {
                     {
                         Err(HybridEventError::InvalidBatch)
                     } else {
+                        let Ok(keys) = self.stored_keys(group, store) else {
+                            return Self::fail(&mut state, HybridEventError::InvalidBatch);
+                        };
                         let group_idx = group.group_idx;
-                        for hash in &store.block_hashes {
-                            let Some(hash) = sequence_hash(hash) else {
-                                return Self::fail(&mut state, HybridEventError::InvalidBatch);
-                            };
+                        for hash in keys {
                             let key = (group_idx, hash);
                             if !state.claims.contains(&key)
                                 && state.claims.len() >= self.max_entries
@@ -404,6 +404,55 @@ impl HybridEventIndex {
         // way keeps Router's estimate from exceeding the engine's own cache hit.
         let credited = boundary.saturating_sub(u64::from(self.replay_tokens));
         align_down(credited, self.keys.block_size() as u32)
+    }
+
+    /// Every block a store proves, not only the tail a sliding group publishes.
+    ///
+    /// A sliding-window group stores every block it keeps in the block pool but
+    /// publishes just the retained tail, together with the tokens it stored and
+    /// the parent digest. Extending the chain from that parent recovers the
+    /// blocks in between; the published hashes must be the tail of that chain's
+    /// block boundaries or the store falls back to what it published, so a store
+    /// that was not produced by this hash contract cannot widen a claim.
+    fn stored_keys(
+        &self,
+        group: &HybridEventGroup,
+        store: &BlockStored,
+    ) -> Result<Vec<SequenceHash>, ()> {
+        let published = store
+            .block_hashes
+            .iter()
+            .map(|hash| sequence_hash(hash).ok_or(()))
+            .collect::<Result<Vec<_>, ()>>()?;
+        if !matches!(group.kind, HybridGroupKind::SlidingWindow { .. })
+            || store.token_ids.is_empty()
+            || !store
+                .token_ids
+                .len()
+                .is_multiple_of(group.block_size as usize)
+        {
+            return Ok(published);
+        }
+        let parent = match store.parent_block_hash.as_ref() {
+            None => self.keys.none_hash(),
+            Some(hash) => sequence_hash(hash).ok_or(())?,
+        };
+        let expanded = self.keys.keys_after(parent, &store.token_ids);
+        if published.is_empty() {
+            return Ok(expanded);
+        }
+        let stride = group.block_size as usize / self.keys.block_size();
+        let boundaries: Vec<SequenceHash> = expanded
+            .iter()
+            .skip(stride.saturating_sub(1))
+            .step_by(stride.max(1))
+            .copied()
+            .collect();
+        if boundaries.ends_with(&published) {
+            Ok(expanded)
+        } else {
+            Ok(published)
+        }
     }
 
     fn fail<T>(state: &mut State, error: HybridEventError) -> Result<T, HybridEventError> {

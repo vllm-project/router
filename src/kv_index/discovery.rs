@@ -1332,6 +1332,33 @@ async fn static_hybrid_sources_match(
     let Some(host) = worker_host(http_url) else {
         return StaticHybridMatch::Differs;
     };
+    // A layout-only binding declares no endpoints: the engine is authoritative
+    // for the publishers, so the layout and the sources this worker was bound to
+    // are what the observation is checked against. Without this an empty
+    // `expected` map would accept every answer, and a restarted engine that
+    // advertises a new topic (or no sources at all) would keep refreshing the
+    // providers the router subscribed to for the previous boot.
+    if expected.is_empty() {
+        if observed.is_empty() {
+            return StaticHybridMatch::Differs;
+        }
+        if layout_topic_mismatch(config, &observed).is_some() {
+            return StaticHybridMatch::Differs;
+        }
+        let missing_rank = config.hybrid.as_ref().is_some_and(|layout| {
+            layout.ranks.iter().any(|rank| {
+                rank.publisher_topic
+                    .as_deref()
+                    .is_some_and(|topic| !topic.is_empty())
+                    && !observed.contains_key(&rank.rank.to_string())
+            })
+        });
+        return if missing_rank {
+            StaticHybridMatch::Differs
+        } else {
+            StaticHybridMatch::Matches
+        };
+    }
     // A rank-pinned source declares one rank out of the engine's full set, so
     // only the declared ranks have to match.
     let matches = expected.iter().all(|(rank, expected)| {
@@ -2216,6 +2243,66 @@ mod tests {
             StaticHybridMatch::Matches
         );
         sources.write().await["1"]["topic"] = serde_json::json!("boot-2-rank-1");
+        assert_eq!(
+            static_hybrid_sources_match(&client, &worker, None, &config).await,
+            StaticHybridMatch::Differs
+        );
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn layout_only_sources_retire_when_the_engine_changes_its_topic() {
+        use axum::{routing::get, Json, Router};
+
+        let sources = Arc::new(tokio::sync::RwLock::new(serde_json::json!({
+            "0": {"endpoint":"tcp://*:5557", "replay_endpoint":"tcp://*:5558", "topic":"kv-hybrid", "publisher":"zmq"}
+        })));
+        let app = Router::new().route(
+            "/kv_event_sources",
+            get({
+                let sources = sources.clone();
+                move || {
+                    let sources = sources.clone();
+                    async move { Json(sources.read().await.clone()) }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let worker = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let layout = serde_json::from_value(serde_json::json!({
+            "schema_version":1,
+            "ranks":[{
+                "rank":0,"model":"model","weight_version":"v1",
+                "publisher_topic":"kv-hybrid","instance_topic":true,
+                "hash_algorithm":"sha256_cbor","full_hashes":true,
+                "root_hash":null,"hash_block_size":16,"hash_lookahead_tokens":0,
+                "speculative_tokens":0,"prefix_caching":true,"groups":[]
+            }]
+        }))
+        .unwrap();
+        // A layout-only binding declares no endpoints; the engine names them.
+        let config = StaticKvEventSources {
+            endpoints: Vec::new(),
+            replay_endpoints: None,
+            topic: String::new(),
+            block_size: 16,
+            model: "model".into(),
+            hybrid: Some(layout),
+        };
+        let client = reqwest::Client::new();
+        assert_eq!(
+            static_hybrid_sources_match(&client, &worker, None, &config).await,
+            StaticHybridMatch::Matches
+        );
+        // A restarted engine that advertises a new topic belongs to another boot.
+        sources.write().await["0"]["topic"] = serde_json::json!("kv-hybrid-boot-2");
+        assert_eq!(
+            static_hybrid_sources_match(&client, &worker, None, &config).await,
+            StaticHybridMatch::Differs
+        );
+        // An engine that advertises nothing cannot keep the old binding alive.
+        *sources.write().await = serde_json::json!({});
         assert_eq!(
             static_hybrid_sources_match(&client, &worker, None, &config).await,
             StaticHybridMatch::Differs
