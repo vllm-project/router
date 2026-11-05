@@ -99,15 +99,41 @@ impl HybridCapabilities {
         let hash_block_size = rank.hash_block_size.ok_or("missing hash block size")?;
         let mut groups = Vec::with_capacity(rank.groups.len());
         for group in &rank.groups {
-            // A replay window or a group without shareable state is not
-            // modeled: such a layout gets no credit rather than one the engine
-            // cannot honor.
-            if group.prefix_replay_tokens > 0 || !group.prefix_cacheable {
+            // A restore-time replay window is not modeled: such a layout gets no
+            // credit rather than one the engine cannot honor.
+            if group.prefix_replay_tokens > 0 {
                 return Err("unsupported group restore contract");
+            }
+            // Scratch groups such as the Qwen4 QSA key ring hold per-request
+            // state, never shareable state, and emit no block events. They are
+            // excluded from the index only when their shape proves that.
+            if !group.prefix_cacheable {
+                if group.spec_type != "CircularBufferSpec"
+                    || group.tokens_per_state.as_deref() != Some("1")
+                    || group.block_size == 0
+                {
+                    return Err("unsupported scratch group");
+                }
+                continue;
             }
             let kind = match (group.kind.as_str(), group.spec_type.as_str()) {
                 ("full_attention", "FullAttentionSpec") if group.sliding_window.is_none() => {
                     HybridGroupKind::FullAttention
+                }
+                ("mla_attention", "MLAAttentionSpec")
+                    if group.sliding_window.is_none()
+                        && group
+                            .cache_role
+                            .as_deref()
+                            .is_none_or(|role| role == "sparse") =>
+                {
+                    let tokens_per_state = group
+                        .tokens_per_state
+                        .as_deref()
+                        .and_then(|value| value.parse::<u32>().ok())
+                        .filter(|value| *value > 0 && group.block_size.is_multiple_of(*value))
+                        .ok_or("unsupported compressed attention group")?;
+                    HybridGroupKind::CompressedFullAttention { tokens_per_state }
                 }
                 ("mamba", "MambaSpec")
                     if group.mamba_cache_mode.as_deref() == Some("align")
@@ -128,9 +154,12 @@ impl HybridCapabilities {
         // The declared layout, not just the indexed subset, must describe a
         // hybrid cache: several groups, at least one attention group, and a
         // checkpoint group that a single attention hit cannot prove.
-        let has_attention = groups
-            .iter()
-            .any(|group| matches!(group.kind, HybridGroupKind::FullAttention));
+        let has_attention = groups.iter().any(|group| {
+            matches!(
+                group.kind,
+                HybridGroupKind::FullAttention | HybridGroupKind::CompressedFullAttention { .. }
+            )
+        });
         let has_state = groups
             .iter()
             .any(|group| matches!(group.kind, HybridGroupKind::Checkpoint));
@@ -249,5 +278,92 @@ mod tests {
         }
         value["ranks"][0]["groups"][0]["prefix_replay_tokens"] = serde_json::json!(128);
         assert!(make(&value).index_for_source(&source, target, 8).is_err());
+    }
+
+    #[test]
+    fn qwen4_layout_admits_compressed_group_and_skips_the_scratch_ring() {
+        let group = |idx, kind, spec, extra: serde_json::Value| {
+            let mut value = serde_json::json!({
+                "group_idx": idx, "kind": kind, "spec_type": spec, "block_size": 320,
+                "sliding_window": null, "prefix_cacheable": true,
+                "prefix_replay_tokens": 0, "mamba_cache_mode": null,
+                "prefill_checkpoint_alignment": null, "tokens_per_state": "1",
+                "cache_role": null,
+            });
+            value
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            value
+        };
+        let mamba = || {
+            group(
+                0,
+                "mamba",
+                "MambaSpec",
+                serde_json::json!({"mamba_cache_mode": "align", "prefill_checkpoint_alignment": 320, "tokens_per_state": "-1", "block_size": 320}),
+            )
+        };
+        // Captured from a Qwen4Exp (QSA) vLLM 0.33.0 probe: three GDN groups,
+        // one per-request key ring that emits no block events, and one
+        // compressed MLA group whose states cover four tokens each.
+        let mut value = serde_json::json!({"schema_version": 1, "ranks": [{
+            "rank": 0, "model": "qwen4", "weight_version": "default",
+            "weight_identity": "qwen4-sha256",
+            "publisher_topic": "kv-events", "instance_topic": true,
+            "hash_algorithm": "sha256_cbor", "full_hashes": true,
+            "root_hash": "4e1195df020de59e0d65a33a4279f1183e7ae4e5d980e309f8b55adff2e61c3e",
+            "hash_block_size": 320, "hash_lookahead_tokens": 0,
+            "speculative_tokens": 0, "prefix_caching": true,
+            "groups": [
+                mamba(),
+                group(1, "mamba", "MambaSpec", serde_json::json!({"mamba_cache_mode": "align", "prefill_checkpoint_alignment": 320, "tokens_per_state": "-1"})),
+                group(2, "mamba", "MambaSpec", serde_json::json!({"mamba_cache_mode": "align", "prefill_checkpoint_alignment": 320, "tokens_per_state": "-1"})),
+                group(3, "unknown", "CircularBufferSpec", serde_json::json!({"prefix_cacheable": false, "block_size": 4})),
+                group(4, "mla_attention", "MLAAttentionSpec", serde_json::json!({"tokens_per_state": "4", "cache_role": "sparse"}))
+            ]
+        }]});
+        let source = EventSource {
+            source: Arc::from("worker"),
+            dp_rank: 0,
+            pub_endpoint: "inproc://publisher".into(),
+            replay_endpoint: Some("inproc://replay".into()),
+            topic: "kv-events".into(),
+            hwm: None,
+        };
+        let target = RoutableTarget {
+            instance_id: Arc::from("worker"),
+            dp_rank: 0,
+        };
+        let make = |value: &serde_json::Value| {
+            serde_json::from_value::<HybridCapabilities>(value.clone()).unwrap()
+        };
+        assert!(make(&value)
+            .index_for_source(&source, target.clone(), 16)
+            .is_ok());
+
+        for (path, invalid) in [(4, serde_json::json!("3")), (4, serde_json::json!("field"))] {
+            let saved = value["ranks"][0]["groups"][path]["tokens_per_state"].clone();
+            value["ranks"][0]["groups"][path]["tokens_per_state"] = invalid;
+            assert!(
+                make(&value)
+                    .index_for_source(&source, target.clone(), 16)
+                    .is_err(),
+                "{path}"
+            );
+            value["ranks"][0]["groups"][path]["tokens_per_state"] = saved;
+        }
+        value["ranks"][0]["groups"][4]["cache_role"] = serde_json::json!("indexer");
+        assert!(make(&value)
+            .index_for_source(&source, target.clone(), 16)
+            .is_err());
+        value["ranks"][0]["groups"][4]["cache_role"] = serde_json::json!("sparse");
+        value["ranks"][0]["groups"][3]["spec_type"] = serde_json::json!("FullAttentionSpec");
+        assert!(make(&value)
+            .index_for_source(&source, target.clone(), 16)
+            .is_err());
+        value["ranks"][0]["groups"][3]["spec_type"] = serde_json::json!("CircularBufferSpec");
+        value["ranks"][0]["groups"][4]["kind"] = serde_json::json!("full_attention");
+        assert!(make(&value).index_for_source(&source, target, 16).is_err());
     }
 }

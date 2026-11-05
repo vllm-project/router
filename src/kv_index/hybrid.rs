@@ -12,6 +12,10 @@ use super::{Locality, RoutableTarget, StorageTier, TierMatch};
 pub enum HybridGroupKind {
     /// Every block from the start of the prompt through the boundary is needed.
     FullAttention,
+    /// Every compressed state from the start of the prompt through the
+    /// boundary is needed. One stored state covers `tokens_per_state` tokens,
+    /// so a boundary is only restorable when it divides evenly by that ratio.
+    CompressedFullAttention { tokens_per_state: u32 },
     /// Only a checkpoint block ending at the boundary is needed.
     Checkpoint,
 }
@@ -109,12 +113,22 @@ fn longest_supported(group: &HybridGroupView<'_>, target: &RoutableTarget, cap: 
                 continue;
             }
             let candidate = match group.kind {
-                // Dense attention covers every block from the root.
+                // Dense and compressed state cover every block from the root.
                 HybridGroupKind::FullAttention => {
                     if start == 0 {
                         end
                     } else {
                         0
+                    }
+                }
+                HybridGroupKind::CompressedFullAttention { tokens_per_state } => {
+                    if start != 0
+                        || tokens_per_state == 0
+                        || !group.block_size.is_multiple_of(tokens_per_state)
+                    {
+                        0
+                    } else {
+                        end
                     }
                 }
                 // A checkpoint is restorable on its own.
