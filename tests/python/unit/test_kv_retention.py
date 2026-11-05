@@ -644,10 +644,17 @@ def run_dir(tmp_path):
             "held_seconds": 1.0,
             "hit_tokens": 0,
         },
-        {"event": "request", "gpu_hit_tokens": 900, "cpu_hit_tokens": 16},
+        {
+            "event": "request",
+            "t": 21.1,
+            "prompt_tokens": 1200,
+            "gpu_hit_tokens": 900,
+            "cpu_hit_tokens": 16,
+        },
         {
             "event": "cpu_tier",
             "chunks_evicted": 42,
+            "leased_chunks": 5,
             "leased_chunks_evicted": 7,
             "chunks_clipped": 3,
         },
@@ -697,6 +704,9 @@ class TestReport:
         )
         assert receipts["cpu_evictions_per_s"] == 4.2
         assert receipts["leased_chunks_evicted"] == 7
+        assert receipts["leased_chunks_mean"] == 5
+        assert receipts["used_held_p50"] == 2.1
+        assert receipts["used_hit_tokens"] == 900
 
     def test_restored_tokens_are_binned_by_pause_and_prompt_size(self, run_dir):
         rows = [
@@ -729,9 +739,64 @@ class TestReport:
         assert profile["by_pause"] == [100.0, 0.0, 300.0, 0.0, 0.0, 0.0]
         assert profile["by_size"] == [400.0, 0.0, 0.0]
 
-    def test_a_stock_run_has_no_receipts(self, run_dir):
+    def test_a_stock_run_has_no_receipts_and_no_false_zeros(self, run_dir):
         (run_dir / "receipts.jsonl").unlink()
-        assert report.receipts(run_dir, 10.0)["gpu_accepted"] == 0
+        assert report.receipts(run_dir, 10.0) == {}
+        assert report.restore_profile(run_dir) is None
+
+    def test_a_counter_the_engine_did_not_declare_is_not_a_zero(self, run_dir):
+        assert report.engine_side(run_dir, 21.0)["cpu_store_failures"] is None
+        end = run_dir / "metrics_end.txt"
+        declared = f"\n# TYPE {report.STORE_FAILURES} counter\n"
+        end.write_text(end.read_text() + declared)
+        assert report.engine_side(run_dir, 21.0)["cpu_store_failures"] == 0
+        end.write_text(end.read_text() + f'{report.STORE_FAILURES}{{engine="0"}} 2\n')
+        assert report.engine_side(run_dir, 21.0)["cpu_store_failures"] == 2
+
+    def test_an_invalid_run_is_left_out(self, run_dir):
+        root = run_dir.parents[1]
+        assert [run["seed"] for run in report.load_arms(root)["gpu10-4x"]] == [11]
+        (run_dir / "run.json").write_text(json.dumps({"seed": 11, "valid": False}))
+        assert report.load_arms(root) == {}
+
+    def test_paired_changes_are_points_for_shares_and_percent_otherwise(self):
+        run = {
+            "gpu_share": 0.5,
+            "cpu_share": 0.3,
+            "computed_share": 0.2,
+            "resume_p50": 100.0,
+            "resume_p90": 200.0,
+            "ttft_p90": 300.0,
+            "tokens_per_second": 40.0,
+        }
+        arms = {
+            "off-1x": [{"seed": 11, **run}, {"seed": 12, **run}],
+            "cpu30-1x": [
+                {"seed": 12, **run, "computed_share": 0.1, "resume_p90": 100.0},
+                {"seed": 11, **run},
+            ],
+        }
+        row = next(
+            line
+            for line in report.paired_table(arms).splitlines()
+            if line.startswith("| `cpu30-1x`")
+        )
+        assert "| +0.0 / -10.0 |" in row, "seeds in order, in points"
+        assert "| +0% / -50% |" in row, "seeds in order, in percent"
+
+    def test_every_table_renders_without_receipts_too(self, run_dir):
+        run = report.summarize(run_dir)
+        (run_dir / "receipts.jsonl").unlink()
+        stock = report.summarize(run_dir)
+        rendered = report.tables({"stock-4x": [stock], "gpu10-4x": [run]})
+        stock_cost = next(
+            line
+            for line in rendered["cost"].splitlines()
+            if line.startswith("| `stock-4x`")
+        )
+        assert " — " in stock_cost, "no receipts, so no CPU evictions to report"
+        assert "stock-4x" not in rendered["holds"]
+        assert "gpu10-4x" in rendered["holds"]
 
     def test_a_cell_is_the_median_and_the_range(self):
         assert report.cell([1.0, 2.0, 9.0]) == "2 (1–9)"

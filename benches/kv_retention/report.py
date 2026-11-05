@@ -21,6 +21,36 @@ PAUSE_SECONDS = 1.0
 POOL_TOKENS = 36_400
 SAMPLE_RATE = 0.05
 """--kv-cache-metrics-sample: vLLM's KV lifecycle histograms see this share of blocks."""
+STORE_FAILURES = "vllm:kv_offload_allocation_failure_total"
+ORDER = (
+    "stock-4x",
+    "off-4x",
+    "gpu10-4x",
+    "gpu30-4x",
+    "cpu30-4x",
+    "off-1x",
+    "cpu-1x",
+    "cpu30-1x",
+    "both-1x",
+)
+PAIRS = (
+    ("off-4x", "stock-4x"),
+    ("gpu10-4x", "off-4x"),
+    ("gpu30-4x", "off-4x"),
+    ("cpu30-4x", "off-4x"),
+    ("cpu-1x", "off-1x"),
+    ("cpu30-1x", "off-1x"),
+    ("both-1x", "off-1x"),
+)
+PAIRED_COLUMNS = (
+    ("GPU hits, points", "gpu_share"),
+    ("CPU restores, points", "cpu_share"),
+    ("Computed, points", "computed_share"),
+    ("Resume p50", "resume_p50"),
+    ("Resume p90", "resume_p90"),
+    ("All p90", "ttft_p90"),
+    ("Output tokens/s", "tokens_per_second"),
+)
 
 
 def percentile(values: list[float], q: float) -> float | None:
@@ -154,7 +184,8 @@ def client_side(run: Path) -> dict[str, Any]:
 def engine_side(run: Path, seconds: float) -> dict[str, Any]:
     """Where prompt tokens came from and what eviction looked like, from the engine's counters over the run."""
     start = parse_samples((run / "metrics_start.txt").read_text())
-    end = parse_samples((run / "metrics_end.txt").read_text())
+    end_text = (run / "metrics_end.txt").read_text()
+    end = parse_samples(end_text)
     by_source = "vllm:prompt_tokens_by_source_total"
     gpu = delta(start, end, by_source, 'source="local_cache_hit"')
     cpu = delta(start, end, by_source, 'source="external_kv_transfer"')
@@ -176,9 +207,10 @@ def engine_side(run: Path, seconds: float) -> dict[str, Any]:
         if seconds
         else 0.0,
         "idle_before_evict_p50": histogram_quantile(start, end, idle, 0.5),
-        "cpu_store_failures": delta(
-            start, end, "vllm:kv_offload_allocation_failure_total"
-        ),
+        # vLLM creates this counter's labels at its first failure: declared with no sample means it counted none.
+        "cpu_store_failures": delta(start, end, STORE_FAILURES)
+        if f"# TYPE {STORE_FAILURES} " in end_text
+        else None,
         "load_gib": delta(start, end, "vllm:kv_offload_load_bytes_total") / 2**30,
         "store_gib": delta(start, end, "vllm:kv_offload_store_bytes_total") / 2**30,
         "queue_seconds_mean": queue_sum / queue_count if queue_count else 0.0,
@@ -199,81 +231,81 @@ def sampled(run: Path) -> dict[str, Any]:
 
 
 def receipts(run: Path, seconds: float) -> dict[str, Any]:
-    """What was asked for, acknowledged and observed, from the connector's receipts."""
+    """What was asked for, acknowledged and observed, from the connector's receipts. A run of vLLM's own connector has
+    none, and nothing from them reads as a zero there."""
     path = run / "receipts.jsonl"
-    rows = (
-        [json.loads(line) for line in path.read_text().splitlines()]
-        if path.exists()
-        else []
-    )
+    if not path.exists():
+        return {}
     acks: Counter[tuple[str, str, str | None]] = Counter()
     ends: Counter[tuple[str, str]] = Counter()
     held_token_seconds = 0.0
     held_tokens = 0
     used_tokens = 0
-    hit_tokens = 0
-    cpu_tier: dict[str, Any] = {}
+    used_hit_tokens = 0
+    used_held: list[float] = []
+    empty_leases = 0
+    tier_rows: list[dict[str, Any]] = []
     observed_gpu = 0
     observed_cpu = 0
-    for row in rows:
+    for row in map(json.loads, path.read_text().splitlines()):
         event = row["event"]
         if event == "ack":
             acks[(row["tier"], row["state"], row["reason"])] += 1
         elif event == "end":
             ends[(row["tier"], row["outcome"])] += 1
-            if row["tier"] == "gpu":
+            if row["tier"] == "cpu":
+                empty_leases += row["tokens"] == 0
+            else:
                 held_token_seconds += row["tokens"] * row["held_seconds"]
                 held_tokens += row["tokens"]
                 if row["outcome"] == "used":
                     used_tokens += row["tokens"]
-                    hit_tokens += row["hit_tokens"]
+                    used_hit_tokens += row["hit_tokens"]
+                    used_held.append(row["held_seconds"])
         elif event == "cpu_tier":
-            cpu_tier = row
+            tier_rows.append(row)
         elif event == "request":
             observed_gpu += row["gpu_hit_tokens"]
             observed_cpu += row["cpu_hit_tokens"]
-    gpu_ended = sum(count for (tier, _), count in ends.items() if tier == "gpu")
+
+    def count(tier: str, state: str) -> int:
+        return sum(n for (t, s, _), n in acks.items() if t == tier and s == state)
+
+    holds_ended = sum(n for (tier, _), n in ends.items() if tier == "gpu")
+    leases_ended = sum(n for (tier, _), n in ends.items() if tier == "cpu")
+    last = tier_rows[-1] if tier_rows else {}
     return {
-        "gpu_accepted": sum(
-            count
-            for (tier, state, _), count in acks.items()
-            if tier == "gpu" and state == "accepted"
-        ),
-        "gpu_refused": sum(
-            count
-            for (tier, state, _), count in acks.items()
-            if tier == "gpu" and state == "rejected"
-        ),
+        "gpu_accepted": count("gpu", "accepted"),
+        "gpu_refused": count("gpu", "rejected"),
         "gpu_used": ends[("gpu", "used")],
         "gpu_expired": ends[("gpu", "expired")],
         "gpu_evicted": ends[("gpu", "evicted")],
         "gpu_released": ends[("gpu", "released")],
-        "gpu_used_share": ends[("gpu", "used")] / gpu_ended if gpu_ended else None,
+        "gpu_used_share": ends[("gpu", "used")] / holds_ended if holds_ended else None,
         "gpu_used_token_share": used_tokens / held_tokens if held_tokens else None,
+        "used_hit_tokens": used_hit_tokens,
+        "used_held_p50": percentile(used_held, 0.5),
         "held_pool_share": held_token_seconds / seconds / POOL_TOKENS
         if seconds
         else 0.0,
-        "cpu_accepted": sum(
-            count
-            for (tier, state, _), count in acks.items()
-            if tier == "cpu" and state == "accepted"
-        ),
-        "cpu_refused": sum(
-            count
-            for (tier, state, _), count in acks.items()
-            if tier == "cpu" and state == "rejected"
-        ),
+        "cpu_accepted": count("cpu", "accepted"),
+        "cpu_refused": count("cpu", "rejected"),
         "cpu_expired": ends[("cpu", "expired")],
-        "cpu_evictions_per_s": cpu_tier.get("chunks_evicted", 0) / seconds
+        "empty_lease_share": empty_leases / leases_ended if leases_ended else None,
+        "leased_chunks_mean": statistics.fmean(
+            row["leased_chunks"] for row in tier_rows
+        )
+        if tier_rows
+        else None,
+        "cpu_evictions_per_s": last.get("chunks_evicted", 0) / seconds
         if seconds
         else 0.0,
-        "leased_chunks_evicted": cpu_tier.get("leased_chunks_evicted", 0),
-        "chunks_clipped": cpu_tier.get("chunks_clipped", 0),
+        "leased_chunks_evicted": last.get("leased_chunks_evicted", 0),
+        "chunks_clipped": last.get("chunks_clipped", 0),
         "observed_gpu_tokens": observed_gpu,
         "observed_cpu_tokens": observed_cpu,
         "reasons": {
-            f"{tier}:{state}:{reason}": count
-            for (tier, state, reason), count in acks.items()
+            f"{tier}:{state}:{reason}": n for (tier, state, reason), n in acks.items()
         },
     }
 
@@ -368,130 +400,53 @@ def table(
             cell([run.get(key) for run in runs], digits, scale)
             for _, key, digits, scale in columns
         ]
-        lines.append(f"| {arm} | {len(runs)} | " + " | ".join(cells) + " |")
+        lines.append(f"| `{arm}` | {len(runs)} | " + " | ".join(cells) + " |")
     return "\n".join(lines) + "\n"
 
 
-def paired(
-    arms: dict[str, list[dict[str, Any]]], arm: str, baseline: str, keys: list[str]
-) -> str:
-    """Each seed's relative change against its baseline run on the same seed: seeds are paired by construction."""
-    if arm not in arms or baseline not in arms:
-        return ""
-    base = {run["seed"]: run for run in arms[baseline]}
-    parts = []
-    for key in keys:
-        changes = []
-        for run in sorted(arms[arm], key=lambda run: run["seed"]):
-            other = base.get(run["seed"], {}).get(key)
-            if other and run.get(key) is not None:
-                changes.append(f"{(run[key] / other - 1) * 100:+.0f}%")
-        parts.append(f"{key} {' '.join(changes)}")
-    return f"- {arm} against {baseline}, seed by seed: " + "; ".join(parts)
+def change(run: dict[str, Any], baseline: dict[str, Any], key: str) -> str:
+    """Points for a share, percent for anything else."""
+    if key.endswith("_share"):
+        return f"{(run[key] - baseline[key]) * 100:+.1f}"
+    return f"{(run[key] / baseline[key] - 1) * 100:+.0f}%"
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
-    )
-    parser.add_argument("root", type=Path)
-    parser.add_argument("--json", type=Path, help="also write every run's numbers here")
-    args = parser.parse_args()
-    arms: dict[str, list[dict[str, Any]]] = {}
-    for arm_dir in sorted(path for path in args.root.iterdir() if path.is_dir()):
-        runs = [
-            summarize(run_dir)
-            for run_dir in sorted(arm_dir.iterdir())
-            if (run_dir / "run.json").exists()
-            and json.loads((run_dir / "run.json").read_text()).get("valid", True)
-            and (run_dir / "aiperf" / "profile_export.jsonl").exists()
-        ]
-        if runs:
-            arms[arm_dir.name] = runs
-    order = [
-        "stock-4x",
-        "off-4x",
-        "gpu10-4x",
-        "gpu30-4x",
-        "off-1x",
-        "cpu-1x",
-        "cpu30-1x",
-        "both-1x",
+def paired_table(arms: dict[str, list[dict[str, Any]]]) -> str:
+    """Each seed's change against its baseline on that seed, which replays the same sample of the traces: seeds in
+    order, 11 / 12 / 13."""
+    lines = [
+        "### Seed by seed, against the baseline",
+        "",
+        "| Arm | Baseline | " + " | ".join(name for name, _ in PAIRED_COLUMNS) + " |",
+        "|---|---|" + "---:|" * len(PAIRED_COLUMNS),
     ]
-    arms = {
-        arm: arms[arm]
-        for arm in [*order, *sorted(set(arms) - set(order))]
-        if arm in arms
+    for arm, baseline in PAIRS:
+        if arm in arms and baseline in arms:
+            base = {run["seed"]: run for run in arms[baseline]}
+            runs = sorted(
+                (run for run in arms[arm] if run["seed"] in base),
+                key=lambda run: run["seed"],
+            )
+            cells = [
+                " / ".join(change(run, base[run["seed"]], key) for run in runs)
+                for _, key in PAIRED_COLUMNS
+            ]
+            lines.append(f"| `{arm}` | `{baseline}` | " + " | ".join(cells) + " |")
+    return "\n".join(lines) + "\n"
+
+
+def tables(arms: dict[str, list[dict[str, Any]]]) -> dict[str, str]:
+    holds = {
+        arm: runs
+        for arm, runs in arms.items()
+        if any(run.get("gpu_accepted") for run in runs)
     }
-    if args.json:
-        args.json.write_text(json.dumps(arms, indent=1))
-    print(
-        table(
-            "Where prompt tokens came from",
-            arms,
-            [
-                ("GPU hit %", "gpu_share", 1, 100),
-                ("CPU restore %", "cpu_share", 1, 100),
-                ("Computed %", "computed_share", 1, 100),
-                ("Recomputed tokens", "recomputed_tokens", 0, 1),
-                ("New tokens", "new_tokens", 0, 1),
-                ("Cold tokens", "cold_tokens", 0, 1),
-            ],
-        )
-    )
-    print(
-        table(
-            "Time to first token (ms)",
-            arms,
-            [
-                ("Resume p50", "resume_p50", 0, 1),
-                ("Resume p90", "resume_p90", 0, 1),
-                ("All p50", "ttft_p50", 0, 1),
-                ("All p90", "ttft_p90", 0, 1),
-                ("All p99", "ttft_p99", 0, 1),
-                ("Resumes", "resumes", 0, 1),
-                ("Requests", "requests", 0, 1),
-            ],
-        )
-    )
-    print(
-        table(
-            "Retention",
-            arms,
-            [
-                ("Holds accepted", "gpu_accepted", 0, 1),
-                ("Refused", "gpu_refused", 0, 1),
-                ("Used", "gpu_used", 0, 1),
-                ("Expired", "gpu_expired", 0, 1),
-                ("Evicted", "gpu_evicted", 0, 1),
-                ("Used, by tokens %", "gpu_used_token_share", 0, 100),
-                ("Pool held, mean %", "held_pool_share", 1, 100),
-                ("Leases accepted", "cpu_accepted", 0, 1),
-                ("Leased chunks evicted", "leased_chunks_evicted", 0, 1),
-                ("Chunks clipped", "chunks_clipped", 0, 1),
-            ],
-        )
-    )
-    print(
-        table(
-            "Eviction pressure and cost",
-            arms,
-            [
-                ("GPU evictions/s", "gpu_evictions_per_s", 0, 1),
-                ("Idle before evict p50 (s)", "idle_before_evict_p50", 1, 1),
-                ("CPU chunks evicted/s", "cpu_evictions_per_s", 0, 1),
-                ("CPU store failures", "cpu_store_failures", 0, 1),
-                ("Restored GiB", "load_gib", 1, 1),
-                ("Stored GiB", "store_gib", 1, 1),
-                ("KV usage mean %", "kv_usage_mean", 0, 100),
-                ("Waiting mean", "waiting_mean", 1, 1),
-                ("Queue mean (s)", "queue_seconds_mean", 2, 1),
-                ("Preemptions", "preemptions", 0, 1),
-                ("Tokens/s", "tokens_per_second", 0, 1),
-            ],
-        )
-    )
-    profiled = {
+    leases = {
+        arm: runs
+        for arm, runs in arms.items()
+        if any(run.get("cpu_accepted") for run in runs)
+    }
+    restored = {
         arm: [
             {
                 **{
@@ -508,34 +463,129 @@ def main() -> None:
         ]
         for arm, runs in arms.items()
     }
-    print(
-        table(
-            "Restored tokens, by the pause before the turn and by the prompt's share of the pool",
-            {arm: runs for arm, runs in profiled.items() if runs},
+    restored = {arm: runs for arm, runs in restored.items() if runs}
+    return {
+        "tokens": table(
+            "Where prompt tokens came from",
+            arms,
             [
-                ("<=1 s", "pause_0", 0, 1),
-                ("<=5 s", "pause_1", 0, 1),
-                ("<=10 s", "pause_2", 0, 1),
-                ("<=30 s", "pause_3", 0, 1),
-                ("<=120 s", "pause_4", 0, 1),
-                (">120 s", "pause_5", 0, 1),
-                ("Prompt <=25%", "size_0", 0, 1),
-                ("<=50%", "size_1", 0, 1),
-                (">50%", "size_2", 0, 1),
+                ("GPU hit %", "gpu_share", 1, 100),
+                ("CPU restore %", "cpu_share", 1, 100),
+                ("Computed %", "computed_share", 1, 100),
+                ("Recomputed tokens", "recomputed_tokens", 0, 1),
             ],
-        )
+        ),
+        "ttft": table(
+            "Time to first token (ms)",
+            arms,
+            [
+                ("Resume p50", "resume_p50", 0, 1),
+                ("Resume p90", "resume_p90", 0, 1),
+                ("All p50", "ttft_p50", 0, 1),
+                ("All p90", "ttft_p90", 0, 1),
+                ("All p99", "ttft_p99", 0, 1),
+                ("Requests", "requests", 0, 1),
+            ],
+        ),
+        "paired": paired_table(arms),
+        "holds": table(
+            "GPU holds",
+            holds,
+            [
+                ("Accepted", "gpu_accepted", 0, 1),
+                ("Refused", "gpu_refused", 0, 1),
+                ("Used", "gpu_used", 0, 1),
+                ("Expired", "gpu_expired", 0, 1),
+                ("Evicted", "gpu_evicted", 0, 1),
+                ("Used, % of tokens held", "gpu_used_token_share", 0, 100),
+                ("Held when used, p50 (s)", "used_held_p50", 1, 1),
+                ("Pool held, mean %", "held_pool_share", 1, 100),
+            ],
+        ),
+        "leases": table(
+            "CPU leases",
+            leases,
+            [
+                ("Accepted", "cpu_accepted", 0, 1),
+                ("Leased chunks, mean", "leased_chunks_mean", 0, 1),
+                ("Chunks over budget", "chunks_clipped", 0, 1),
+                ("Leased chunks evicted", "leased_chunks_evicted", 0, 1),
+                ("Ended leases covering nothing, %", "empty_lease_share", 0, 100),
+            ],
+        ),
+        "cost": table(
+            "Eviction pressure and cost",
+            arms,
+            [
+                ("GPU blocks evicted/s", "gpu_evictions_per_s", 0, 1),
+                ("Idle before evict, p50 bucket (s)", "idle_before_evict_p50", 1, 1),
+                ("CPU chunks evicted/s", "cpu_evictions_per_s", 0, 1),
+                ("CPU store failures", "cpu_store_failures", 0, 1),
+                ("Restored GiB", "load_gib", 0, 1),
+                ("Stored GiB", "store_gib", 0, 1),
+                ("KV in use, mean %", "kv_usage_mean", 0, 100),
+                ("Waiting, mean", "waiting_mean", 1, 1),
+                ("Queue, mean (s)", "queue_seconds_mean", 2, 1),
+                ("Preemptions", "preemptions", 0, 1),
+                ("Output tokens/s", "tokens_per_second", 0, 1),
+            ],
+        ),
+        "restored_pause": table(
+            "Restored tokens by the pause before the turn (thousands)",
+            restored,
+            [
+                ("Up to 1 s", "pause_0", 0, 0.001),
+                ("1-5 s", "pause_1", 0, 0.001),
+                ("5-10 s", "pause_2", 0, 0.001),
+                ("10-30 s", "pause_3", 0, 0.001),
+                ("30-120 s", "pause_4", 0, 0.001),
+                ("Over 120 s", "pause_5", 0, 0.001),
+            ],
+        ),
+        "restored_size": table(
+            "Restored tokens by the prompt's share of the pool (thousands)",
+            restored,
+            [
+                ("Up to 25%", "size_0", 0, 0.001),
+                ("25-50%", "size_1", 0, 0.001),
+                ("Over 50%", "size_2", 0, 0.001),
+            ],
+        ),
+    }
+
+
+def load_arms(root: Path) -> dict[str, list[dict[str, Any]]]:
+    """Every valid run under ``root``, by arm, in the order of the tables."""
+    arms: dict[str, list[dict[str, Any]]] = {}
+    for arm_dir in sorted(path for path in root.iterdir() if path.is_dir()):
+        runs = [
+            summarize(run_dir)
+            for run_dir in sorted(arm_dir.iterdir())
+            if (run_dir / "run.json").exists()
+            and json.loads((run_dir / "run.json").read_text()).get("valid", True)
+            and (run_dir / "aiperf" / "profile_export.jsonl").exists()
+        ]
+        if runs:
+            arms[arm_dir.name] = runs
+    return {
+        arm: arms[arm]
+        for arm in [*ORDER, *sorted(set(arms) - set(ORDER))]
+        if arm in arms
+    }
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    keys = ["resume_p50", "resume_p90", "ttft_p90", "tokens_per_second"]
-    for arm, baseline in (
-        ("off-4x", "stock-4x"),
-        ("gpu10-4x", "off-4x"),
-        ("gpu30-4x", "off-4x"),
-        ("cpu-1x", "off-1x"),
-        ("cpu30-1x", "off-1x"),
-        ("both-1x", "off-1x"),
-    ):
-        if line := paired(arms, arm, baseline, keys):
-            print(line)
+    parser.add_argument("root", type=Path)
+    parser.add_argument("--json", type=Path, help="also write every run's numbers here")
+    args = parser.parse_args()
+    arms = load_arms(args.root)
+    if args.json:
+        args.json.write_text(json.dumps(arms, indent=1))
+    for text in tables(arms).values():
+        print(text)
 
 
 if __name__ == "__main__":
