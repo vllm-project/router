@@ -12,6 +12,7 @@ mod endpoints;
 pub mod hybrid;
 pub mod hybrid_capability;
 pub mod hybrid_events;
+pub mod hybrid_stream;
 pub mod indexer;
 pub mod subscriber;
 pub mod types;
