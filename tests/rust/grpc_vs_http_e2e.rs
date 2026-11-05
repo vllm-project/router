@@ -15,6 +15,463 @@
 
 mod common;
 
+mod prefill_progress_regressions {
+    use super::*;
+    use std::time::Duration;
+    use tokio::sync::mpsc;
+    use tokio_stream::wrappers::ReceiverStream;
+    use vllm_router_rs::backend::pb::{
+        finish_info, FinishInfo, GenerateResponse, PrefillProgress, SequenceOutput,
+    };
+    use vllm_router_rs::core::Worker;
+    use vllm_router_rs::kv_index::{
+        CacheKey, HashMode, KvBlockIndexer, Locality, MatchQuery, RoutableTarget, StorageTier,
+        TierMatch,
+    };
+    use vllm_router_rs::policies::{KvAwarePolicy, LoadSample, SlotManager, TieredMatchProvider};
+    use vllm_router_rs::protocols::spec::ChatCompletionRequest;
+
+    struct Harness {
+        router: Arc<Router>,
+        server: MockVllmRsServer,
+        worker: Arc<dyn Worker>,
+        slots: Arc<dyn SlotManager>,
+        target: RoutableTarget,
+        tx: mpsc::Sender<Result<GenerateResponse, tonic::Status>>,
+    }
+
+    struct CachedPrefix(RoutableTarget);
+
+    impl TieredMatchProvider for CachedPrefix {
+        fn find_tiered_matches(&self, _: &MatchQuery) -> Vec<TierMatch> {
+            vec![TierMatch {
+                target: self.0.clone(),
+                tier: StorageTier::Device,
+                segments: vec![(0, 40)],
+                locality: Locality::Local,
+            }]
+        }
+    }
+
+    async fn wait_until(mut condition: impl FnMut() -> bool) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !condition() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("gRPC dispatch/accounting did not reach the expected state");
+    }
+
+    impl Harness {
+        async fn new(enabled: bool, supported: Option<bool>) -> Self {
+            Self::with_cached_prefix(enabled, supported, false, 10).await
+        }
+
+        async fn with_cached_prefix(
+            enabled: bool,
+            supported: Option<bool>,
+            cached_prefix: bool,
+            stale_after_secs: u64,
+        ) -> Self {
+            let (tx, rx) = mpsc::channel(8);
+            let state = MockVllmRs {
+                supports_prefill_progress: supported.unwrap_or(false),
+                server_info_unimplemented: supported.is_none(),
+                scripted_stream: Arc::new(Mutex::new(Some(Box::pin(ReceiverStream::new(rx))))),
+                ..Default::default()
+            };
+            let server = MockVllmRsServer::spawn_with_state(state).await;
+            let mut config = test_config(vec![server.grpc_url.clone()]);
+            config.policy = PolicyConfig::KvAware {
+                router_temperature: 0.0,
+                kv_penalty_host: 0.8,
+                kv_penalty_external: 0.6,
+                kv_penalty_disk: 0.3,
+                static_kv_event_sources: Default::default(),
+            };
+            config.prefill_progress_stale_after_secs = enabled.then_some(stale_after_secs);
+            vllm_router_rs::config::ConfigValidator::validate(&config).unwrap();
+            let ctx = create_test_context(config);
+            let router = Router::new(vec![server.grpc_url.clone()], &ctx)
+                .await
+                .unwrap();
+            router.pin_test_token_ids(vec![1; 100]);
+            let policy = ctx.policy_registry.get_default_policy();
+            let policy = policy.as_any().downcast_ref::<KvAwarePolicy>().unwrap();
+            let target = RoutableTarget {
+                instance_id: Arc::from("progress-worker"),
+                dp_rank: 0,
+            };
+            let matches: Arc<dyn TieredMatchProvider> = if cached_prefix {
+                Arc::new(CachedPrefix(target.clone()))
+            } else {
+                Arc::new(KvBlockIndexer::new())
+            };
+            policy.register_target_with_cache_identity(
+                &server.grpc_url,
+                target.clone(),
+                CacheKey {
+                    model: Arc::from("test-model"),
+                    hash_mode: HashMode::Sha256,
+                    block_size: 2,
+                },
+                matches,
+            );
+            Self {
+                router: Arc::new(router),
+                worker: ctx.worker_registry.get_by_url(&server.grpc_url).unwrap(),
+                slots: policy.slot_manager().unwrap(),
+                target,
+                server,
+                tx,
+            }
+        }
+
+        async fn dispatch(
+            &self,
+            stream: bool,
+        ) -> tokio::task::JoinHandle<axum::response::Response> {
+            let router = self.router.clone();
+            let request: ChatCompletionRequest = serde_json::from_value(json!({
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": stream,
+                "stream_options": {"include_usage": true},
+                "max_tokens": 8,
+            }))
+            .unwrap();
+            let task = tokio::spawn(async move {
+                router
+                    .route_typed_request(None, &request, "/v1/chat/completions", None)
+                    .await
+            });
+            wait_until(|| !self.server.captured().is_empty()).await;
+            task
+        }
+
+        fn assert_load(&self, remaining: u64, requests: usize) {
+            assert_eq!(self.worker.load(), requests);
+            assert_eq!(
+                self.slots.sample(&self.target),
+                LoadSample {
+                    active_prefill_tokens: remaining,
+                    active_requests: requests,
+                }
+            );
+        }
+
+        async fn progress(&self, sequence: u64, remaining: u32) {
+            self.tx
+                .send(Ok(GenerateResponse {
+                    prefill_progress: Some(PrefillProgress {
+                        request_id: self.server.captured()[0].request_id.clone(),
+                        sequence,
+                        prompt_tokens: 100,
+                        remaining_compute_tokens: remaining,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }))
+                .await
+                .unwrap();
+        }
+
+        async fn output(&self, text: &str, finished: bool) {
+            self.tx
+                .send(Ok(GenerateResponse {
+                    outputs: Some(SequenceOutput {
+                        text: text.into(),
+                        num_tokens: 1,
+                        finish_info: finished.then_some(FinishInfo {
+                            num_output_tokens: 2,
+                            finish_reason: finish_info::FinishReason::Stop as i32,
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }))
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn grpc_inflight_context_tracks_stream_and_cleans_up_with_or_without_progress() {
+        for stream in [false, true] {
+            for (enabled, supported) in
+                [(false, Some(true)), (true, Some(false)), (true, Some(true))]
+            {
+                let h = Harness::new(enabled, supported).await;
+                let mut task = Some(h.dispatch(stream).await);
+                let response = if stream {
+                    Some(task.take().unwrap().await.unwrap())
+                } else {
+                    None
+                };
+                assert_eq!(h.slots.inflight_context_tokens(&h.target), Some(100));
+                h.output("hello", false).await;
+                wait_until(|| h.slots.inflight_context_tokens(&h.target) == Some(101)).await;
+                h.output(" world", false).await;
+                wait_until(|| h.slots.inflight_context_tokens(&h.target) == Some(102)).await;
+
+                if let Some(response) = response {
+                    drop(response); // Client cancellation aborts the producer.
+                } else {
+                    h.output("!", true).await;
+                    drop(h.tx); // A finished gRPC response also closes its stream.
+                    let response = task.take().unwrap().await.unwrap();
+                    assert!(response.status().is_success());
+                }
+                wait_until(|| h.worker.load() == 0).await;
+                assert_eq!(h.slots.inflight_context_tokens(&h.target), Some(0));
+                assert_eq!(h.slots.sample(&h.target), LoadSample::default());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn grpc_progress_capability_refreshes_after_upgrade_and_downgrade() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let capability = Arc::new(AtomicBool::new(false));
+        let server = MockVllmRsServer::spawn_with_state(MockVllmRs {
+            progress_capability_override: Some(capability.clone()),
+            ..Default::default()
+        })
+        .await;
+        let mut config = test_config(vec![server.grpc_url.clone()]);
+        config.policy = PolicyConfig::KvAware {
+            router_temperature: 0.0,
+            kv_penalty_host: 0.8,
+            kv_penalty_external: 0.6,
+            kv_penalty_disk: 0.3,
+            static_kv_event_sources: Default::default(),
+        };
+        config.prefill_progress_stale_after_secs = Some(5);
+        let ctx = create_test_context(config);
+        let router = Router::new(vec![server.grpc_url.clone()], &ctx)
+            .await
+            .unwrap();
+        router.pin_test_token_ids(vec![1; 100]);
+        let request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 8,
+        }))
+        .unwrap();
+
+        for (supported, expire, expected) in [
+            (false, false, false),
+            (true, false, false),
+            (true, true, true),
+            (false, false, true),
+            (false, true, false),
+        ] {
+            capability.store(supported, Ordering::Relaxed);
+            if expire {
+                tokio::time::pause();
+                tokio::time::advance(Duration::from_secs(31)).await;
+                tokio::time::resume();
+            }
+            let response = router
+                .route_typed_request(None, &request, "/v1/chat/completions", None)
+                .await;
+            assert!(response.status().is_success());
+            let _ = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert_eq!(
+                server.captured().last().unwrap().include_prefill_progress,
+                expected
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn grpc_progress_fallback_retains_admission_until_output() {
+        use http_body_util::BodyExt;
+        for stream in [false, true] {
+            for (enabled, supported) in [(false, Some(true)), (true, Some(false)), (true, None)] {
+                let h = Harness::new(enabled, supported).await;
+                let mut task = Some(h.dispatch(stream).await);
+                assert!(!h.server.captured()[0].include_prefill_progress);
+                h.assert_load(100, 1);
+                let mut response = if stream {
+                    Some(task.take().unwrap().await.unwrap())
+                } else {
+                    None
+                };
+                h.output("hello", false).await;
+                if let Some(response) = &mut response {
+                    response.body_mut().frame().await.unwrap().unwrap();
+                }
+                wait_until(|| h.slots.sample(&h.target).active_prefill_tokens == 0).await;
+                h.assert_load(0, 1);
+                h.output(" world", true).await;
+                drop(h.tx);
+                let response = match response {
+                    Some(response) => response,
+                    None => task.take().unwrap().await.unwrap(),
+                };
+                assert!(response.status().is_success());
+                axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                wait_until(|| h.worker.load() == 0).await;
+                assert_eq!(h.slots.sample(&h.target), LoadSample::default());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn grpc_progress_consumers_track_reprefill_and_hide_progress_frames() {
+        use http_body_util::BodyExt;
+        for stream in [false, true] {
+            let h = Harness::new(true, Some(true)).await;
+            let mut task = Some(h.dispatch(stream).await);
+            assert!(h.server.captured()[0].include_prefill_progress);
+            h.progress(2, 40).await;
+            wait_until(|| h.slots.sample(&h.target).active_prefill_tokens == 40).await;
+            h.assert_load(40, 1);
+            h.progress(1, 90).await; // An older snapshot must not replace seq 2.
+            let mut response = if stream {
+                let mut response = task.take().unwrap().await.unwrap();
+                assert!(response.status().is_success());
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(50), response.body_mut().frame())
+                        .await
+                        .is_err(),
+                    "progress-only frames must not produce SSE chunks"
+                );
+                Some(response)
+            } else {
+                None
+            };
+            h.output("hello", false).await;
+            wait_until(|| h.slots.sample(&h.target).active_prefill_tokens == 0).await;
+            h.assert_load(0, 1);
+            h.progress(3, 25).await;
+            wait_until(|| h.slots.sample(&h.target).active_prefill_tokens == 25).await;
+            h.assert_load(25, 1);
+            h.output(" world", true).await;
+            drop(h.tx);
+            let response = match response.take() {
+                Some(response) => response,
+                None => task.take().unwrap().await.unwrap(),
+            };
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let text = std::str::from_utf8(&bytes).unwrap();
+            assert!(!text.contains("prefill_progress"));
+            if stream {
+                let events: Vec<serde_json::Value> = text
+                    .lines()
+                    .filter_map(|line| line.strip_prefix("data: "))
+                    .filter(|line| *line != "[DONE]")
+                    .map(|line| serde_json::from_str(line).unwrap())
+                    .collect();
+                assert_eq!(
+                    events.len(),
+                    3,
+                    "only two output chunks and usage are expected: {text}"
+                );
+                assert_eq!(events[0]["choices"][0]["delta"]["content"], "hello");
+                assert_eq!(events[1]["choices"][0]["delta"]["content"], " world");
+                assert_eq!(events[2]["usage"]["prompt_tokens"], 100);
+            } else {
+                let reply: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(reply["choices"][0]["message"]["content"], "hello world");
+                assert_eq!(reply["usage"]["prompt_tokens"], 100);
+            }
+            wait_until(|| h.worker.load() == 0).await;
+            assert_eq!(h.slots.sample(&h.target), LoadSample::default());
+        }
+    }
+
+    #[tokio::test]
+    async fn grpc_progress_keeps_cached_admission_while_unconfirmed_queue_is_stale() {
+        let h = Harness::with_cached_prefix(true, Some(true), true, 2).await;
+        let task = h.dispatch(true).await;
+        let response = task.await.unwrap();
+        assert!(response.status().is_success());
+        h.assert_load(20, 1);
+
+        let mut queued = PrefillProgress {
+            request_id: h.server.captured()[0].request_id.clone(),
+            sequence: 1,
+            phase: vllm_router_rs::backend::pb::PrefillPhase::Queued as i32,
+            prompt_tokens: 100,
+            total_compute_tokens: 100,
+            remaining_compute_tokens: 100,
+            ..Default::default()
+        };
+        h.tx.send(Ok(GenerateResponse {
+            prefill_progress: Some(queued.clone()),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(2200)).await;
+        h.assert_load(20, 1);
+
+        queued.sequence = 4;
+        queued.local_cached_tokens = 10;
+        queued.total_compute_tokens = 90;
+        queued.remaining_compute_tokens = 90;
+        h.tx.send(Ok(GenerateResponse {
+            prefill_progress: Some(queued.clone()),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        h.assert_load(20, 1);
+
+        queued.sequence = 5;
+        queued.phase = vllm_router_rs::backend::pb::PrefillPhase::Prefill as i32;
+        queued.cache_accounting_final = true;
+        queued.local_cached_tokens = 80;
+        queued.total_compute_tokens = 20;
+        queued.remaining_compute_tokens = 8;
+        h.tx.send(Ok(GenerateResponse {
+            prefill_progress: Some(queued),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+        wait_until(|| h.slots.sample(&h.target).active_prefill_tokens == 8).await;
+        h.output("done", true).await;
+        drop(h.tx);
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        wait_until(|| h.worker.load() == 0).await;
+        assert_eq!(h.slots.sample(&h.target), LoadSample::default());
+    }
+
+    #[tokio::test]
+    async fn grpc_progress_cancellation_releases_latest_balance() {
+        for stream in [false, true] {
+            let h = Harness::new(true, Some(true)).await;
+            let task = h.dispatch(stream).await;
+            h.progress(2, 40).await;
+            wait_until(|| h.slots.sample(&h.target).active_prefill_tokens == 40).await;
+            h.assert_load(40, 1);
+            if stream {
+                drop(task.await.unwrap());
+            } else {
+                task.abort();
+                assert!(task.await.unwrap_err().is_cancelled());
+            }
+            wait_until(|| h.worker.load() == 0).await;
+            assert_eq!(h.slots.sample(&h.target), LoadSample::default());
+        }
+    }
+}
+
 use std::sync::{Arc, Mutex};
 
 use axum::{extract::Json, routing::get, routing::post, Router as AxumRouter};
@@ -41,6 +498,7 @@ fn test_config(worker_urls: Vec<String>) -> RouterConfig {
         port: 3002,
         max_payload_size: 16 * 1024 * 1024,
         request_timeout_secs: 30,
+        prefill_progress_stale_after_secs: None,
         worker_startup_timeout_secs: 5,
         worker_startup_check_interval_secs: 1,
         intra_node_data_parallel_size: 1,
@@ -129,6 +587,116 @@ fn worker_factory_auto_detects_grpc_scheme() {
         http.connection_mode(),
         vllm_router_rs::core::ConnectionMode::Http
     );
+}
+
+#[tokio::test]
+async fn grpc_kv_reservations_survive_disabled_or_unsupported_progress() {
+    use std::time::Duration;
+    use vllm_router_rs::policies::{KvAwarePolicy, LoadSample};
+    use vllm_router_rs::protocols::spec::ChatCompletionRequest;
+
+    for (case, progress_after, supported, stream, cancel) in [
+        ("disabled-stream", None, true, true, false),
+        ("disabled-collected", None, true, false, false),
+        ("disabled-stream-cancel", None, true, true, true),
+        ("unsupported-stream", Some(5), false, true, false),
+        ("unsupported-collected", Some(5), false, false, false),
+        ("unsupported-cancel", Some(5), false, false, true),
+        ("enabled-stream", Some(5), true, true, false),
+        ("enabled-collected", Some(5), true, false, false),
+    ] {
+        let grpc = MockVllmRsServer::spawn_with_state(MockVllmRs {
+            supports_prefill_progress: supported,
+            prefill_progress: vec![2],
+            reply_delay: Duration::from_secs(2),
+            ..Default::default()
+        })
+        .await;
+        let mut config = test_config(vec![grpc.grpc_url.clone()]);
+        config.policy = PolicyConfig::KvAware {
+            router_temperature: 0.0,
+            kv_penalty_host: 0.8,
+            kv_penalty_external: 0.6,
+            kv_penalty_disk: 0.3,
+            static_kv_event_sources: Default::default(),
+        };
+        config.prefill_progress_stale_after_secs = progress_after;
+        vllm_router_rs::config::ConfigValidator::validate(&config).unwrap();
+        let ctx = create_test_context(config);
+        let router = Arc::new(
+            Router::new(vec![grpc.grpc_url.clone()], &ctx)
+                .await
+                .unwrap(),
+        );
+        router.pin_test_token_ids(vec![1, 2, 3, 4, 5]);
+        let worker = ctx.worker_registry.get_by_url(&grpc.grpc_url).unwrap();
+        let policy = ctx.policy_registry.get_default_policy();
+        let kv = policy.as_any().downcast_ref::<KvAwarePolicy>().unwrap();
+        let manager = kv.slot_manager().unwrap();
+        let target = kv.target_for_worker(worker.as_ref());
+        let mut body: serde_json::Value = serde_json::from_str(CHAT_BODY).unwrap();
+        body["stream"] = json!(stream);
+        let request: ChatCompletionRequest = serde_json::from_value(body).unwrap();
+        let dispatch = tokio::spawn(async move {
+            let response = router
+                .route_typed_request(None, &request, "/v1/chat/completions", None)
+                .await;
+            let status = response.status();
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            (status, body)
+        });
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while grpc.captured().is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("worker must receive the request");
+        let progress_expected = progress_after.is_some() && supported;
+        if progress_expected {
+            tokio::time::timeout(Duration::from_millis(1500), async {
+                while manager.sample(&target).active_prefill_tokens != 2 {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("worker progress must update the reservation");
+        }
+        assert_eq!(
+            grpc.captured()[0].include_prefill_progress,
+            progress_expected,
+            "{case}"
+        );
+        assert_eq!(worker.load(), 1, "{case}: request must remain admitted");
+        assert_eq!(
+            manager.sample(&target),
+            LoadSample {
+                active_prefill_tokens: if progress_expected { 2 } else { 5 },
+                active_requests: 1,
+            },
+            "{case}: prefill work must remain reserved"
+        );
+
+        if cancel {
+            dispatch.abort();
+            assert!(dispatch.await.unwrap_err().is_cancelled(), "{case}");
+        } else {
+            let (status, body) = tokio::time::timeout(Duration::from_secs(5), dispatch)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                status.is_success(),
+                "{case}: {status}: {}",
+                String::from_utf8_lossy(&body)
+            );
+        }
+        assert_eq!(worker.load(), 0, "{case}: worker load must be released");
+        assert_eq!(manager.sample(&target), LoadSample::default(), "{case}");
+    }
 }
 
 #[tokio::test]

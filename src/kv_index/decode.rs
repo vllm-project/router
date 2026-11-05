@@ -6,6 +6,8 @@ use rmpv::Value;
 use serde::Deserialize;
 
 const MAX_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
+// CPU offload can emit thousands of individual storage events in one batch.
+const MAX_EVENTS: usize = 65_536;
 
 /// Decode atomically without conflating structural validity with device admission.
 /// The payload byte cap is checked before parsing; nesting depth is limited
@@ -47,7 +49,7 @@ pub fn decode_batch(payload: &[u8]) -> Result<KVEventBatch, String> {
     let Value::Array(events) = batch.remove(1) else {
         return Err("KV events must be an array".into());
     };
-    if events.len() > 4096 {
+    if events.len() > MAX_EVENTS {
         return Err("KV event batch exceeds the event limit".into());
     }
     let events = events
@@ -450,7 +452,14 @@ mod tests {
     fn bounded_messagepack_and_trailing_bytes() {
         assert!(decode_batch(&vec![0; MAX_PAYLOAD_BYTES + 1]).is_err());
         let clear = Value::Map(vec![("type".into(), "AllBlocksCleared".into())]);
-        assert!(decode_batch(&encode(vec![clear; 4097], 0.into())).is_err());
+        assert_eq!(
+            decode_batch(&encode(vec![clear.clone(); MAX_EVENTS], 0.into()))
+                .unwrap()
+                .events
+                .len(),
+            MAX_EVENTS
+        );
+        assert!(decode_batch(&encode(vec![clear; MAX_EVENTS + 1], 0.into())).is_err());
         let mut payload = encode(vec![stored()], 0.into());
         payload.push(0);
         assert!(decode_batch(&payload).is_err());
@@ -461,6 +470,14 @@ mod tests {
         let mut event = stored();
         change(&mut event, "extra_keys", deep);
         assert!(decode_batch(&encode(vec![event], 0.into())).is_err());
+    }
+
+    #[test]
+    fn accepts_large_cpu_store_batch() {
+        let mut event = stored();
+        change(&mut event, "medium", "CPU".into());
+        let batch = decode_batch(&encode(vec![event; 6_120], 0.into())).unwrap();
+        assert_eq!(batch.events.len(), 6_120);
     }
 
     #[test]
