@@ -1311,20 +1311,40 @@ async fn static_hybrid_sources_match(
     let http_url = dp_rank_suffix(worker_url)
         .and_then(|_| worker_url.rsplit_once('@').map(|(base, _)| base))
         .unwrap_or(worker_url);
-    let observed = match tokio::time::timeout(
-        Duration::from_secs(2),
-        query_pd_kv_event_sources(client, http_url, api_key),
-    )
-    .await
-    {
-        Ok(Ok(sources)) => sources,
-        Ok(Err(unavailable)) => {
-            // A declared layout is authoritative when the engine cannot answer;
-            // refusing it would make static configuration unusable on engines
-            // without the control endpoint.
-            return StaticHybridMatch::Unavailable(unavailable.probe);
+    // A gRPC worker serves its sources over the Control RPC, not over HTTP, so
+    // revalidating it must use the same probe the initial discovery used.
+    // Otherwise every pass failed against the HTTP route, the freshness task
+    // accepted that as `Unavailable`, and a worker that restarted in place onto a
+    // new topic kept its pre-restart subscription and claims alive.
+    let observed = if crate::backend::is_grpc_url(worker_url) {
+        match tokio::time::timeout(
+            Duration::from_secs(2),
+            crate::backend::control::get_grpc_kv_event_sources(worker_url, Duration::from_secs(2)),
+        )
+        .await
+        {
+            Ok(Ok(response)) => grpc_kv_event_source_entries(worker_url, response.sources),
+            Ok(Err(crate::backend::control::KvEventSourcesError::Unimplemented)) => {
+                return StaticHybridMatch::Unavailable(SourcesProbe::Unsupported);
+            }
+            Ok(Err(_)) | Err(_) => return StaticHybridMatch::Unavailable(SourcesProbe::Failed),
         }
-        Err(_) => return StaticHybridMatch::Unavailable(SourcesProbe::Failed),
+    } else {
+        match tokio::time::timeout(
+            Duration::from_secs(2),
+            query_pd_kv_event_sources(client, http_url, api_key),
+        )
+        .await
+        {
+            Ok(Ok(sources)) => sources,
+            Ok(Err(unavailable)) => {
+                // A declared layout is authoritative when the engine cannot answer;
+                // refusing it would make static configuration unusable on engines
+                // without the control endpoint.
+                return StaticHybridMatch::Unavailable(unavailable.probe);
+            }
+            Err(_) => return StaticHybridMatch::Unavailable(SourcesProbe::Failed),
+        }
     };
     let Ok(expected) = static_worker_discovery(worker_url, config).sources else {
         return StaticHybridMatch::Differs;
