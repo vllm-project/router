@@ -884,6 +884,9 @@ impl TieredMatchProvider for EmptyMatchProvider {
     }
 }
 
+/// Index lookup identity: cache key plus the prompt token ids.
+type QueryKey<'a> = (Option<CacheKey>, &'a [u32]);
+
 #[derive(Clone)]
 struct TargetBinding {
     target: RoutableTarget,
@@ -902,6 +905,11 @@ struct SelectionPlan {
     grouped: Vec<Vec<TierMatch>>,
     input_tokens: Vec<usize>,
     prefill_tokens: Vec<Option<u64>>,
+    /// Unfiltered index hits (all targets) from each candidate's own prompt
+    /// lookup, aligned by position. `Some` only when a transfer planner is set,
+    /// the candidate has exactly one prompt, and its lookup was allowed to
+    /// credit; `None` means the candidate's prompt residency is unknown.
+    peer_hits: Vec<Option<Arc<[TierMatch]>>>,
     has_tokens: bool,
 }
 
@@ -1260,6 +1268,7 @@ impl KvAwarePolicy {
                     grouped: vec![Vec::new(); count],
                     input_tokens: vec![0; count],
                     prefill_tokens: vec![None; count],
+                    peer_hits: vec![None; count],
                     has_tokens: false,
                 }
             } else {
@@ -1441,6 +1450,7 @@ impl KvAwarePolicy {
                 capabilities: &capability_refs,
                 excluded: &excluded,
                 picked: position,
+                destination_hits: plan.peer_hits[position].as_deref(),
             })
         };
         match result {
@@ -1543,14 +1553,17 @@ impl KvAwarePolicy {
         if !has_tokens {
             crate::metrics::RouterMetrics::record_kv_placement_lookup("missing_tokens");
         }
-        let mut query_cache: HashMap<(Option<CacheKey>, &[u32]), Vec<TierMatch>> = HashMap::new();
+        let mut query_cache: HashMap<QueryKey<'_>, Arc<[TierMatch]>> = HashMap::new();
+        let keep_peer_hits = self.transfer_planner.is_some();
         let mut grouped = Vec::with_capacity(bindings.len());
         let mut input_tokens = Vec::with_capacity(bindings.len());
         let mut prefill_tokens = Vec::with_capacity(bindings.len());
+        let mut peer_hits = Vec::with_capacity(bindings.len());
         for ((binding, prompts), &worker_index) in bindings.iter().zip(prompts).zip(&healthy) {
             let mut total_input = 0usize;
             let mut total_prefill = 0u64;
             let mut single_matches = Vec::new();
+            let mut single_hits = None;
             if has_tokens {
                 for ids in &prompts {
                     if !input.allows_credit(worker_index, workers.len()) {
@@ -1563,12 +1576,12 @@ impl KvAwarePolicy {
                         .or_insert_with(|| {
                             if let Some(reason) = credit_fallback {
                                 crate::metrics::RouterMetrics::record_kv_placement_lookup(reason);
-                                return Vec::new();
+                                return Arc::from(Vec::new());
                             }
                             let local_hashes =
                                 Self::local_hashes_with_lora(ids, binding.block_size, lora_name);
                             if local_hashes.is_empty() {
-                                return Vec::new();
+                                return Arc::from(Vec::new());
                             }
                             let hits = binding.matches.find_tiered_matches(&MatchQuery {
                                 group_idx: 0,
@@ -1584,8 +1597,9 @@ impl KvAwarePolicy {
                                     "hit"
                                 },
                             );
-                            hits
+                            Arc::from(hits)
                         });
+                    let hits = Arc::clone(hits);
                     let matches: Vec<_> = hits
                         .iter()
                         .filter(|hit| hit.target == binding.target)
@@ -1608,6 +1622,11 @@ impl KvAwarePolicy {
                     total_input = total_input.saturating_add(ids.len());
                     if prompts.len() == 1 {
                         single_matches = matches;
+                        // With a credit fallback no lookup ran, so residency is
+                        // unknown rather than empty.
+                        if keep_peer_hits && credit_fallback.is_none() {
+                            single_hits = Some(hits);
+                        }
                     }
                 }
             }
@@ -1615,6 +1634,7 @@ impl KvAwarePolicy {
                 total_input = known_input_tokens;
             }
             grouped.push(single_matches);
+            peer_hits.push(single_hits);
             input_tokens.push(total_input);
             prefill_tokens.push((has_tokens && prompts.len() > 1).then_some(total_prefill));
         }
@@ -1624,6 +1644,7 @@ impl KvAwarePolicy {
             grouped,
             input_tokens,
             prefill_tokens,
+            peer_hits,
             has_tokens,
         })
     }
@@ -4144,6 +4165,146 @@ mod tests {
             .select_worker_with_receipt(&workers, Some(&ids), None, None, None, &[])
             .unwrap();
         assert_eq!(again.transfer.unwrap().plan_id, 2);
+    }
+
+    /// Busy worker `a` holds all of `a_prompt` in a real index; idle `b` holds
+    /// nothing. Each worker is asked about its own entry in `inputs`.
+    fn per_worker_transfer_fixture(
+        a_prompt: &[u32],
+    ) -> (KvAwarePolicy, Vec<Arc<dyn Worker>>, Vec<RoutableTarget>) {
+        let workers: Vec<Arc<dyn Worker>> = ["http://a", "http://b"]
+            .iter()
+            .map(|url| {
+                Arc::new(BasicWorker::new((*url).into(), WorkerType::Regular)) as Arc<dyn Worker>
+            })
+            .collect();
+        let targets: Vec<_> = workers.iter().map(|w| target(w.url(), 0)).collect();
+        let load = FixedLoad(HashMap::from([(
+            targets[0].clone(),
+            LoadSample {
+                active_prefill_tokens: 100_000,
+                active_requests: 8,
+            },
+        )]));
+        let index = Arc::new(crate::kv_index::KvBlockIndexer::new());
+        let policy = KvAwarePolicy::with_components(
+            index.clone(),
+            Arc::new(load),
+            vec![Arc::new(MultiplicativeScorer)],
+            Arc::new(TemperaturePicker::new(0.0)),
+            CostParams {
+                block_size: 2,
+                ..CostParams::default()
+            },
+        )
+        .with_transfer_planner(Arc::new(crate::policies::CostRuleTransferPlanner {
+            policy: transfer_policy(),
+        }));
+        let blocks: Vec<_> = KvAwarePolicy::local_hashes(a_prompt, 2)
+            .into_iter()
+            .enumerate()
+            .map(|(i, hash)| (Arc::from(format!("a-{i}")), hash))
+            .collect();
+        index.store(
+            0,
+            crate::kv_index::ResidencyOwner::Worker {
+                source: targets[0].instance_id.clone(),
+                dp_rank: 0,
+                incarnation: 0,
+            },
+            StorageTier::Device,
+            None,
+            &blocks,
+        );
+        for (worker, target) in workers.iter().zip(&targets) {
+            policy.register_target_with_cache_identity(
+                worker.url(),
+                target.clone(),
+                CacheKey {
+                    model: Arc::from("m"),
+                    hash_mode: crate::kv_index::HashMode::Sha256,
+                    block_size: 2,
+                },
+                index.clone(),
+            );
+        }
+        (policy, workers, targets)
+    }
+
+    /// 40-token prompt that shares its first `shared_tokens` tokens with
+    /// `transfer_ids()` and diverges afterwards.
+    fn diverging_ids(shared_tokens: usize) -> Vec<u32> {
+        (0..40u32)
+            .map(|i| {
+                if (i as usize) < shared_tokens {
+                    i
+                } else {
+                    1000 + i
+                }
+            })
+            .collect()
+    }
+
+    fn per_worker_transfer(
+        a_prompt: Vec<u32>,
+        b_prompt: Option<Vec<u32>>,
+    ) -> (KvSelectionReceipt, Vec<RoutableTarget>) {
+        let (policy, workers, targets) = per_worker_transfer_fixture(&a_prompt);
+        let mut inputs = WorkerTokenInputs::new();
+        inputs.insert(workers[0].base_url().into(), Arc::from(vec![a_prompt]));
+        if let Some(prompt) = b_prompt {
+            inputs.insert(workers[1].base_url().into(), Arc::from(vec![prompt]));
+        }
+        let receipt = policy
+            .select_worker_with_inputs(
+                &workers,
+                KvRequestTokens::PerWorker(&inputs),
+                None,
+                None,
+                None,
+                &[],
+            )
+            .unwrap();
+        (receipt, targets)
+    }
+
+    #[test]
+    fn per_worker_plan_credits_only_the_shared_part_of_the_destination_prompt() {
+        // `a` caches its whole 20-block prompt; `b`'s prompt shares 6 blocks.
+        let (receipt, targets) = per_worker_transfer(transfer_ids(), Some(diverging_ids(12)));
+        assert_eq!(receipt.worker_index, 1);
+        let plan = receipt.transfer.as_ref().expect("shared part is planned");
+        assert_eq!(plan.source, targets[0]);
+        assert_eq!(plan.destination, targets[1]);
+        assert_eq!(plan.blocks, (0, 6));
+        assert_eq!(plan.credited_tokens, 12);
+
+        // Only 3 shared blocks: below `min_prefix_blocks`, so no plan.
+        let (receipt, _) = per_worker_transfer(transfer_ids(), Some(diverging_ids(6)));
+        assert_eq!(receipt.worker_index, 1);
+        assert!(receipt.transfer.is_none());
+
+        // Fully disjoint prompts: nothing to fetch.
+        let (receipt, _) = per_worker_transfer(transfer_ids(), Some(diverging_ids(0)));
+        assert_eq!(receipt.worker_index, 1);
+        assert!(receipt.transfer.is_none());
+    }
+
+    #[test]
+    fn per_worker_identical_prompts_plan_like_shared_tokens() {
+        let (receipt, targets) = per_worker_transfer(transfer_ids(), Some(transfer_ids()));
+        assert_eq!(receipt.worker_index, 1);
+        let plan = receipt.transfer.as_ref().expect("plan");
+        assert_eq!(plan.source, targets[0]);
+        assert_eq!(plan.blocks, (0, 20));
+        assert_eq!(plan.credited_tokens, 39);
+    }
+
+    #[test]
+    fn per_worker_destination_without_a_prompt_gets_no_plan() {
+        let (receipt, _) = per_worker_transfer(transfer_ids(), None);
+        assert_eq!(receipt.worker_index, 1);
+        assert!(receipt.transfer.is_none());
     }
 
     #[test]

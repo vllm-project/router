@@ -4,6 +4,12 @@
 //! prefix from a busier peer with the same cache identity would have beaten
 //! recomputing it. The answer is only reported: nothing moves and routing does
 //! not change. The planner is a pure function of its input.
+//!
+//! Every peer's residency is measured from the destination's own prompt lookup
+//! (`TransferPlannerInput::destination_hits`), so a peer's prefix always
+//! describes tokens the destination prompt actually contains. A candidate's own
+//! `matches` (computed from its own prompt) only describe the cost of routing
+//! there.
 
 use std::sync::Arc;
 
@@ -111,6 +117,9 @@ pub enum TransferSkip {
     NoPeer,
     /// The destination's cache key is unknown.
     UnverifiedIdentity,
+    /// The destination's own prompt lookup is unavailable (no tokens for it, a
+    /// multi-prompt request, or no credit), so peer residency cannot be measured.
+    UnknownDestinationInput,
     PickedHoldsLongestPrefix,
     PrefixTooShort,
     SourceNotBusy,
@@ -129,6 +138,7 @@ impl TransferSkip {
             Self::Disabled => "disabled",
             Self::NoPeer => "no_peer",
             Self::UnverifiedIdentity => "unverified_identity",
+            Self::UnknownDestinationInput => "unknown_destination_input",
             Self::PickedHoldsLongestPrefix => "picked_holds_longest_prefix",
             Self::PrefixTooShort => "prefix_too_short",
             Self::SourceNotBusy => "source_not_busy",
@@ -150,6 +160,10 @@ pub struct TransferPlannerInput<'a> {
     pub capabilities: &'a [Option<&'a TransferCapability>],
     pub excluded: &'a [bool],
     pub picked: usize,
+    /// Unfiltered index hits (all targets) from the destination's own prompt
+    /// lookup; every peer's residency is measured from these. `None` when that
+    /// lookup is unavailable.
+    pub destination_hits: Option<&'a [TierMatch]>,
 }
 
 pub trait TransferPlanner: Send + Sync + std::fmt::Debug {
@@ -171,8 +185,12 @@ impl TransferPlanner for CostRuleTransferPlanner {
 /// continued by `HostPinned` segments that start at or before the current end.
 /// `Disk`, `External` and segments not reachable from block 0 are ignored.
 fn transferable_prefix_blocks(matches: &[TierMatch]) -> u32 {
+    prefix_blocks(matches.iter())
+}
+
+fn prefix_blocks<'a>(matches: impl Iterator<Item = &'a TierMatch> + Clone) -> u32 {
     let mut end = matches
-        .iter()
+        .clone()
         .filter(|hit| hit.tier == StorageTier::Device)
         .flat_map(|hit| hit.segments.iter().copied())
         .filter(|(start, _)| *start == 0)
@@ -181,7 +199,7 @@ fn transferable_prefix_blocks(matches: &[TierMatch]) -> u32 {
         .unwrap_or(0);
     loop {
         let next = matches
-            .iter()
+            .clone()
             .filter(|hit| hit.tier == StorageTier::HostPinned)
             .flat_map(|hit| hit.segments.iter().copied())
             .filter(|&(start, seg_end)| start <= end && seg_end > end)
@@ -221,10 +239,14 @@ pub fn plan_transfer(
     if block_size == 0 {
         return Err(TransferSkip::UnverifiedIdentity);
     }
+    let Some(destination_hits) = input.destination_hits else {
+        return Err(TransferSkip::UnknownDestinationInput);
+    };
     let dest_prefix = transferable_prefix_blocks(input.candidates[dest].matches);
 
-    // Largest prefix wins; ties go to the less loaded peer, then the lower
-    // position (strict comparison keeps the first one seen).
+    // Largest prefix of the destination's prompt wins; ties go to the less
+    // loaded peer, then the lower position (strict comparison keeps the first
+    // one seen).
     let mut best: Option<(usize, u32)> = None;
     for pos in 0..input.candidates.len() {
         if pos == dest
@@ -233,7 +255,12 @@ pub fn plan_transfer(
         {
             continue;
         }
-        let prefix = transferable_prefix_blocks(input.candidates[pos].matches);
+        let peer_target = input.candidates[pos].target;
+        let prefix = prefix_blocks(
+            destination_hits
+                .iter()
+                .filter(|hit| hit.target == *peer_target),
+        );
         let better = match best {
             None => true,
             Some((best_pos, best_prefix)) => {
@@ -293,7 +320,7 @@ pub fn plan_transfer(
         .saturating_sub(dest_cached)
         .saturating_sub(credited);
     let rem_src = (source.input_tokens as u64)
-        .saturating_sub(u64::from(src_prefix) * bs)
+        .saturating_sub(u64::from(transferable_prefix_blocks(source.matches)) * bs)
         .max(1);
     let saved_ms = prefill_ms(credited);
     let fetch_beats_waiting =
@@ -357,6 +384,11 @@ mod tests {
         }
     }
 
+    /// Natural destination lookup: every candidate's matches together.
+    fn concat(matches: &[Vec<TierMatch>]) -> Vec<TierMatch> {
+        matches.iter().flatten().cloned().collect()
+    }
+
     fn enabled() -> TransferPolicy {
         TransferPolicy {
             enabled: true,
@@ -393,6 +425,8 @@ mod tests {
         block_sizes: [u32; 2],
         caps: [Option<TransferCapability>; 2],
         excluded: [bool; 2],
+        /// Overrides the default destination lookup (all matches concatenated).
+        dest_hits: Option<Option<Vec<TierMatch>>>,
     }
 
     impl Pair {
@@ -412,6 +446,7 @@ mod tests {
                 block_sizes: [16, 16],
                 caps: [None, None],
                 excluded: [false, false],
+                dest_hits: None,
             }
         }
 
@@ -432,6 +467,10 @@ mod tests {
             ];
             let keys = [self.keys[0].as_ref(), self.keys[1].as_ref()];
             let caps = [self.caps[0].as_ref(), self.caps[1].as_ref()];
+            let hits = match &self.dest_hits {
+                Some(over) => over.clone(),
+                None => Some(concat(&self.matches)),
+            };
             plan_transfer(
                 &TransferPlannerInput {
                     candidates: &candidates,
@@ -440,10 +479,61 @@ mod tests {
                     capabilities: &caps,
                     excluded: &self.excluded,
                     picked: 0,
+                    destination_hits: hits.as_deref(),
                 },
                 policy,
             )
         }
+    }
+
+    #[test]
+    fn own_prompt_prefix_is_not_credited_when_destination_lookup_shows_little() {
+        // The source holds 100 blocks of its OWN prompt, but the destination's
+        // lookup shows it holds only 10 blocks of the destination prompt.
+        let mut pair = Pair::new(0, 100);
+        pair.dest_hits = Some(Some(vec![hit(
+            &pair.targets[1],
+            StorageTier::Device,
+            &[(0, 10)],
+        )]));
+        assert_eq!(pair.plan(&enabled()), Err(TransferSkip::PrefixTooShort));
+
+        // Nothing at all on the destination prompt: the picked worker is as good.
+        pair.dest_hits = Some(Some(vec![]));
+        assert_eq!(
+            pair.plan(&enabled()),
+            Err(TransferSkip::PickedHoldsLongestPrefix)
+        );
+    }
+
+    #[test]
+    fn partial_overlap_bounds_the_credited_blocks() {
+        let mut pair = Pair::new(0, 100);
+        pair.dest_hits = Some(Some(vec![hit(
+            &pair.targets[1],
+            StorageTier::Device,
+            &[(0, 70)],
+        )]));
+        let plan = pair.plan(&enabled()).unwrap();
+        assert_eq!(plan.blocks, (0, 70));
+        assert_eq!(plan.credited_tokens, 70 * 16);
+    }
+
+    #[test]
+    fn unknown_destination_input_is_skipped() {
+        let mut pair = Pair::new(0, 100);
+        pair.dest_hits = Some(None);
+        assert_eq!(
+            pair.plan(&enabled()),
+            Err(TransferSkip::UnknownDestinationInput)
+        );
+        // Identity and policy checks still come first.
+        pair.keys[0] = None;
+        assert_eq!(pair.plan(&enabled()), Err(TransferSkip::UnverifiedIdentity));
+        assert_eq!(
+            pair.plan(&TransferPolicy::default()),
+            Err(TransferSkip::Disabled)
+        );
     }
 
     #[test]
@@ -469,6 +559,7 @@ mod tests {
                     capabilities: &caps,
                     excluded,
                     picked,
+                    destination_hits: Some(&[]),
                 },
                 &enabled(),
             )
@@ -748,6 +839,7 @@ mod tests {
                 capabilities: &[None, None],
                 excluded: &pair.excluded,
                 picked: 0,
+                destination_hits: Some(&concat(&pair.matches)),
             },
             &policy,
         );
@@ -809,6 +901,7 @@ mod tests {
                     capabilities: &caps,
                     excluded: &[false; 4],
                     picked: 0,
+                    destination_hits: Some(&concat(&matches)),
                 },
                 &enabled(),
             )
@@ -846,6 +939,7 @@ mod tests {
                 capabilities: &[None; 3],
                 excluded: &[false; 3],
                 picked: 0,
+                destination_hits: Some(&concat(&matches)),
             },
             &enabled(),
         )
@@ -902,6 +996,7 @@ mod tests {
             view(&pair.targets[1], &pair.matches[1], 4, 10_000),
         ];
         let keys = [pair.keys[0].as_ref(), pair.keys[1].as_ref()];
+        let hits = concat(&pair.matches);
         let input = TransferPlannerInput {
             candidates: &candidates,
             cache_keys: &keys,
@@ -909,6 +1004,7 @@ mod tests {
             capabilities: &[None, None],
             excluded: &pair.excluded,
             picked: 0,
+            destination_hits: Some(&hits),
         };
         assert_eq!(planner.plan(&input), plan_transfer(&input, &enabled()));
         let off = CostRuleTransferPlanner {
@@ -923,6 +1019,7 @@ mod tests {
             TransferSkip::Disabled,
             TransferSkip::NoPeer,
             TransferSkip::UnverifiedIdentity,
+            TransferSkip::UnknownDestinationInput,
             TransferSkip::PickedHoldsLongestPrefix,
             TransferSkip::PrefixTooShort,
             TransferSkip::SourceNotBusy,
@@ -935,5 +1032,9 @@ mod tests {
         let labels: std::collections::HashSet<_> = all.iter().map(|s| s.label()).collect();
         assert_eq!(labels.len(), all.len());
         assert_eq!(TransferSkip::CostRule.label(), "cost_rule");
+        assert_eq!(
+            TransferSkip::UnknownDestinationInput.label(),
+            "unknown_destination_input"
+        );
     }
 }
