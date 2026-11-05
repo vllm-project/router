@@ -58,6 +58,12 @@ format only:
 }
 ```
 
+For P/D (experimental), pass `--pd-hybrid-config` a JSON file keyed by prefill
+URL. Each entry holds `endpoints`, `replay_endpoints`, `block_size`, `model`,
+`hybrid` (the layout above) and `compatible_decode_urls`, the decode workers
+that prefill worker may hand off to. Only the listed pairs are used. Program
+scheduling is not supported in this mode.
+
 The Router does not load Completion tokenizer assets or validate IDs against a
 local model vocabulary. The selected Worker retains input validation and serving
 errors. Per-worker preparation may use render/tokenize RPCs; direct ID evidence
