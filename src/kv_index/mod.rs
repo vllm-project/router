@@ -10,6 +10,7 @@ use sha2::{Digest, Sha256};
 pub mod discovery;
 mod endpoints;
 pub mod hybrid;
+pub mod hybrid_capability;
 pub mod hybrid_events;
 pub mod indexer;
 pub mod subscriber;
