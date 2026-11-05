@@ -93,6 +93,13 @@ pub(crate) enum SourcesProbe {
     Failed,
 }
 
+impl SourcesProbe {
+    /// Whether another probe could plausibly succeed.
+    pub(crate) fn retryable(self) -> bool {
+        matches!(self, Self::Failed)
+    }
+}
+
 /// A failed control probe plus whether retrying could ever help.
 #[derive(Debug, Clone)]
 pub(crate) struct SourcesUnavailable {
@@ -121,6 +128,7 @@ struct HybridWorkerProvider {
     indexes: HashMap<u32, Arc<HybridEventIndex>>,
     active: Arc<AtomicBool>,
     verified_at: Mutex<Instant>,
+    capability: HybridCapabilities,
 }
 
 impl crate::policies::TieredMatchProvider for HybridWorkerProvider {
@@ -253,6 +261,11 @@ impl KvIndexSupervisor {
     ) -> (Self, mpsc::Receiver<IngestionSignal>) {
         let (mut supervisor, signals) = Self::new(client, hash_mode);
         supervisor.http_pd = true;
+        supervisor.static_sources = static_pd_sources
+            .iter()
+            .filter(|(_, config)| config.hybrid.is_some())
+            .map(|(worker, config)| (worker.clone(), pd_static_source(worker, config)))
+            .collect();
         supervisor.static_pd_sources = static_pd_sources;
         (supervisor, signals)
     }
@@ -301,7 +314,30 @@ impl KvIndexSupervisor {
     pub(crate) async fn discover(&self, worker_url: &str) -> WorkerDiscovery {
         if self.http_pd {
             return match self.static_pd_sources.get(worker_url) {
-                Some(config) => static_pd_discovery(worker_url, config),
+                Some(config) => {
+                    let source = pd_static_source(worker_url, config);
+                    if source.hybrid.is_none() {
+                        static_pd_discovery(worker_url, config)
+                    } else {
+                        match static_hybrid_sources_match(
+                            &self.client,
+                            worker_url,
+                            self.api_key.as_deref(),
+                            &source,
+                        )
+                        .await
+                        {
+                            StaticHybridMatch::Differs => failed_hybrid_discovery(
+                                "configured hybrid event sources do not match worker".into(),
+                            ),
+                            StaticHybridMatch::Unavailable(probe) => {
+                                log_static_layout_trusted(worker_url, probe);
+                                static_pd_discovery(worker_url, config)
+                            }
+                            StaticHybridMatch::Matches => static_pd_discovery(worker_url, config),
+                        }
+                    }
+                }
                 None => {
                     discover_worker(&self.client, worker_url, true, self.api_key.as_deref()).await
                 }
@@ -710,6 +746,10 @@ impl KvIndexSupervisor {
                 indexes,
                 active: active.clone(),
                 verified_at: Mutex::new(Instant::now()),
+                capability: hybrid_capability
+                    .as_ref()
+                    .expect("hybrid indexes require capabilities")
+                    .clone(),
             })
         });
         if let Some(provider) = &hybrid {
@@ -836,6 +876,24 @@ impl KvIndexSupervisor {
                 Some(provider) => provider.clone() as Arc<dyn crate::policies::TieredMatchProvider>,
                 None => worker.indexer.clone() as Arc<dyn crate::policies::TieredMatchProvider>,
             })
+    }
+
+    pub(crate) fn is_hybrid_worker(&self, worker_url: &str) -> bool {
+        self.workers
+            .lock()
+            .get(worker_url)
+            .is_some_and(|worker| worker.hybrid.is_some())
+    }
+
+    pub(crate) fn trusted_hybrid_capability(&self, worker_url: &str) -> Option<HybridCapabilities> {
+        let workers = self.workers.lock();
+        let provider = workers.get(worker_url)?.hybrid.as_ref()?;
+        if !provider.active.load(Ordering::Acquire)
+            || provider.verified_at.lock().elapsed() > Duration::from_secs(5)
+        {
+            return None;
+        }
+        Some(provider.capability.clone())
     }
 
     /// Ref-count an identity; on first acquisition create its indexer.
@@ -1235,22 +1293,26 @@ fn static_pd_discovery(
     worker_url: &str,
     config: &crate::config::types::PdKvEventSources,
 ) -> WorkerDiscovery {
-    static_worker_discovery(
-        worker_url,
-        &StaticKvEventSources {
-            model: config
-                .model
-                .as_deref()
-                .filter(|model| !model.trim().is_empty())
-                .unwrap_or(worker_url)
-                .to_owned(),
-            block_size: config.block_size,
-            endpoints: config.endpoints.clone(),
-            replay_endpoints: config.replay_endpoints.clone(),
-            topic: String::new(),
-            hybrid: None,
-        },
-    )
+    static_worker_discovery(worker_url, &pd_static_source(worker_url, config))
+}
+
+fn pd_static_source(
+    worker_url: &str,
+    config: &crate::config::types::PdKvEventSources,
+) -> StaticKvEventSources {
+    StaticKvEventSources {
+        model: config
+            .model
+            .as_deref()
+            .filter(|model| !model.trim().is_empty())
+            .unwrap_or(worker_url)
+            .to_owned(),
+        block_size: config.block_size,
+        endpoints: config.endpoints.clone(),
+        replay_endpoints: config.replay_endpoints.clone(),
+        topic: String::new(),
+        hybrid: config.hybrid.clone(),
+    }
 }
 
 fn grpc_kv_event_source_entries(
@@ -2084,10 +2146,15 @@ mod tests {
 
     #[tokio::test]
     async fn static_hybrid_routes_from_live_events_and_retires_changed_source() {
-        exercise_static_hybrid().await;
+        exercise_static_hybrid(false).await;
     }
 
-    async fn exercise_static_hybrid() {
+    #[tokio::test]
+    async fn pd_static_hybrid_routes_from_live_events_and_retires_changed_source() {
+        exercise_static_hybrid(true).await;
+    }
+
+    async fn exercise_static_hybrid(pd: bool) {
         use crate::policies::{KvAwareOps, KvAwarePolicy};
         use axum::{routing::get, Json, Router};
 
@@ -2139,10 +2206,30 @@ mod tests {
             model: "qwen".into(),
             hybrid: Some(serde_json::from_value(capability.read().await.clone()).unwrap()),
         };
-        let (supervisor, _signals) =
-            KvIndexSupervisor::new_http_full_attention(reqwest::Client::new(), HashMode::Sha256);
-        let supervisor =
-            supervisor.with_static_sources(HashMap::from([(worker_url.clone(), config)]));
+        let (supervisor, _signals) = if pd {
+            let source = crate::config::PdKvEventSources {
+                endpoints: config.endpoints,
+                replay_endpoints: config.replay_endpoints,
+                block_size: config.block_size,
+                model: Some(config.model),
+                hybrid: config.hybrid,
+                compatible_decode_urls: vec!["http://decode".into()],
+            };
+            KvIndexSupervisor::new_pd(
+                reqwest::Client::new(),
+                HashMode::Sha256,
+                HashMap::from([(worker_url.clone(), source)]),
+            )
+        } else {
+            let (supervisor, signals) = KvIndexSupervisor::new_http_full_attention(
+                reqwest::Client::new(),
+                HashMode::Sha256,
+            );
+            (
+                supervisor.with_static_sources(HashMap::from([(worker_url.clone(), config)])),
+                signals,
+            )
+        };
         let publisher = supervisor.ctx.socket(zmq::XPUB).unwrap();
         let replay = supervisor.ctx.socket(zmq::ROUTER).unwrap();
         publisher.set_linger(0).unwrap();
@@ -3398,6 +3485,8 @@ mod tests {
             replay_endpoints: Some(vec!["tcp://10.0.0.5:5558".into()]),
             block_size: 32,
             model: Some("m".into()),
+            hybrid: None,
+            compatible_decode_urls: Vec::new(),
         };
         let discovery = static_pd_discovery("http://10.0.0.5:8000", &config);
 
@@ -3431,6 +3520,8 @@ mod tests {
             replay_endpoints: None,
             block_size: 16,
             model: None,
+            hybrid: None,
+            compatible_decode_urls: Vec::new(),
         };
         let discovery = static_pd_discovery("http://127.0.0.1:8000", &config);
         assert_eq!(discovery.model_id, Ok(Some("http://127.0.0.1:8000".into())));
@@ -3461,6 +3552,8 @@ mod tests {
                 replay_endpoints: None,
                 block_size: 16,
                 model: None,
+                hybrid: None,
+                compatible_decode_urls: Vec::new(),
             },
         ))
         .collect();
@@ -3663,6 +3756,8 @@ mod tests {
                     replay_endpoints: None,
                     block_size: 8,
                     model: Some("pd-model".into()),
+                    hybrid: None,
+                    compatible_decode_urls: Vec::new(),
                 },
             )]),
         );

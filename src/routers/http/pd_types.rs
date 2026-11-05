@@ -3,7 +3,7 @@ use crate::policies::{AffinityKey, AffinityRecord, RequestHeaders};
 use axum::body::Body;
 use futures_util::StreamExt;
 use parking_lot::Mutex;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 // Custom error type for PD router operations
@@ -141,7 +141,9 @@ pub struct PdPrefillInput {
 
 /// Token inputs are keyed by the P base URL: each backend renders its own
 /// effective input, so different tokenizer/template configurations never mix.
+#[derive(Clone)]
 pub struct PdRequestContext<'a> {
+    pub hybrid_pairs: Option<&'a HashSet<(PdEndpoint, PdEndpoint)>>,
     pub prefill_inputs: Option<&'a HashMap<String, PdPrefillInput>>,
     pub model_id: Option<&'a str>,
     pub legacy_policy_input: Option<&'a str>,

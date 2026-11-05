@@ -136,6 +136,7 @@ PD stage using an explicit power-of-two policy needs two workers for that stage.
 | `--vllm-discovery-address` | `string` | `unset` | `string` | `unset` | ZMQ registration address for vLLM workers, e.g. `0.0.0.0:30001`. |
 | `--kv-connector` | `nixl, mooncake, moriio` | `nixl` | `nixl, mooncake, moriio` | `nixl` | PD KV transfer connector: NIXL, Mooncake or MoRI-IO. MoRI-IO requires vLLM ZMQ discovery. |
 | `--pd-kv-events` | `string (repeatable)` | `[]` | `string (repeatable)` | `[]` | Static prefill KV publishers as URL=ENDPOINT[,ENDPOINT...]; requires kv_aware prefill. Endpoints follow DP-rank order; block size is 16. |
+| `--pd-hybrid-config` | `std::path::PathBuf` | `unset` | — | — | Experimental P/D version of `--kv-hybrid-layout`, keyed by prefill URL. See [hybrid attention models](load_balancing/http_completion_kv.md#hybrid-attention-models). |
 
 PD workers can come from static URLs, vLLM ZMQ discovery, or Kubernetes
 discovery. For static configuration, provide both prefill and decode workers:

@@ -460,6 +460,8 @@ async fn grpc_pd_kv_aware_prefers_the_prefill_holding_the_prefix() {
                         replay_endpoints: None,
                         block_size: 16,
                         model: None,
+                        hybrid: None,
+                        compatible_decode_urls: Vec::new(),
                     },
                 )
             })

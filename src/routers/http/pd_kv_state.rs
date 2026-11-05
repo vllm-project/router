@@ -1,6 +1,6 @@
 //! P/D prefill KV discovery, refresh, and request-input preparation.
 
-use super::pd_types::PdPrefillInput;
+use super::pd_types::{PdEndpoint, PdPrefillInput};
 use crate::backend::preprocess::{prepare_http_token_inputs, router_token_inputs};
 use crate::core::Worker;
 use crate::kv_index::discovery::{worker_get, WorkerDiscovery};
@@ -66,10 +66,14 @@ enum ProbeOutcome {
     Evict,
 }
 
-fn probe_outcome(existing: Option<&Binding>, signature: Option<&str>) -> ProbeOutcome {
+fn probe_outcome(
+    existing: Option<&Binding>,
+    signature: Option<&str>,
+    inactive_hybrid: bool,
+) -> ProbeOutcome {
     match (existing, signature) {
         (Some(binding), Some(signature))
-            if binding.info.is_some() && binding.signature == signature =>
+            if binding.info.is_some() && binding.signature == signature && !inactive_hybrid =>
         {
             ProbeOutcome::Unchanged
         }
@@ -102,6 +106,7 @@ pub(super) struct PdKvState {
     bind_lock: Mutex<()>,
     // The background refresh loop's latest view of the P pool and policy.
     refresh_inputs: Mutex<RefreshInputs>,
+    hybrid_pairs: Option<HashMap<String, HashSet<String>>>,
     signals: tokio::task::JoinHandle<()>,
 }
 
@@ -119,6 +124,7 @@ impl PdKvState {
         api_key: Option<String>,
         sources: HashMap<String, crate::config::types::PdKvEventSources>,
         workers: Vec<Arc<dyn Worker>>,
+        _decode_workers: Vec<Arc<dyn Worker>>,
         policy: Arc<dyn LoadBalancingPolicy>,
     ) -> Arc<Self> {
         let mut state = Self::new_with_statics(client, sources);
@@ -156,6 +162,16 @@ impl PdKvState {
         client: reqwest::Client,
         static_sources: HashMap<String, crate::config::types::PdKvEventSources>,
     ) -> Self {
+        let pairs: HashMap<_, _> = static_sources
+            .iter()
+            .filter(|(_, source)| source.hybrid.is_some())
+            .map(|(prefill, source)| {
+                (
+                    prefill.clone(),
+                    source.compatible_decode_urls.iter().cloned().collect(),
+                )
+            })
+            .collect();
         let (supervisor, mut signals) =
             KvIndexSupervisor::new_pd(client.clone(), HashMode::Sha256, static_sources);
         Self {
@@ -166,9 +182,33 @@ impl PdKvState {
             targets: Mutex::new(HashMap::new()),
             bind_lock: Mutex::new(()),
             refresh_inputs: Mutex::new(RefreshInputs::default()),
+            hybrid_pairs: (!pairs.is_empty()).then_some(pairs),
             // Subscribers enforce trust by suspending/clearing affected sources.
             signals: tokio::spawn(async move { while signals.recv().await.is_some() {} }),
         }
+    }
+
+    /// Once hybrid PD is configured, admit only deployment-verified pairs.
+    pub(super) fn compatible_hybrid_pairs(
+        &self,
+        prefill: &[Arc<dyn Worker>],
+        decode: &[Arc<dyn Worker>],
+    ) -> Option<HashSet<(PdEndpoint, PdEndpoint)>> {
+        let configured = self.hybrid_pairs.as_ref()?;
+        let mut allowed = HashSet::new();
+        for p in prefill {
+            if let Some(decodes) = configured.get(p.base_url()) {
+                for d in decode {
+                    if decodes.contains(d.base_url()) {
+                        allowed.insert((
+                            PdEndpoint::for_worker(p.as_ref()),
+                            PdEndpoint::for_worker(d.as_ref()),
+                        ));
+                    }
+                }
+            }
+        }
+        Some(allowed)
     }
 
     /// Reconcile bindings off the request path. Requests only record their
@@ -221,7 +261,10 @@ impl PdKvState {
                 .filter(|base| {
                     bindings.get(*base).is_none_or(|binding| {
                         binding.checked.elapsed()
-                            >= if binding.info.is_some() {
+                            >= if binding.info.is_some()
+                                && !(self.supervisor.is_hybrid_worker(base)
+                                    && self.supervisor.trusted_hybrid_capability(base).is_none())
+                            {
                                 REFRESH_INTERVAL
                             } else {
                                 CONTROL_TIMEOUT
@@ -267,6 +310,8 @@ impl PdKvState {
                 discovery
                     .as_ref()
                     .map(|snapshot| snapshot.signature.as_str()),
+                self.supervisor.is_hybrid_worker(&base)
+                    && self.supervisor.trusted_hybrid_capability(&base).is_none(),
             );
             match outcome {
                 ProbeOutcome::Unchanged => {
@@ -306,6 +351,14 @@ impl PdKvState {
                     {
                         let mut bindings = self.bindings.lock().await;
                         bindings.remove(&base);
+                    }
+                    // The replacement provider may have the same metadata but
+                    // a different subscriber lifetime. Force policy rebinding.
+                    {
+                        let mut targets = self.targets.lock().await;
+                        for worker in workers.iter().filter(|worker| worker.base_url() == base) {
+                            targets.remove(worker.url());
+                        }
                     }
                     // The subscriber handshake runs without the map locks; a
                     // concurrent prepare() sees no binding and denies credit
@@ -365,13 +418,17 @@ impl PdKvState {
     async fn probe_base(&self, base: &str) -> Result<Discovery, String> {
         let worker = self.supervisor.discover(base).await;
         let info = worker.server_info.as_ref().map_err(Clone::clone)?;
-        let sources = worker
-            .sources
-            .as_ref()
-            .map_err(|unavailable| unavailable.detail.clone())?;
+        let sources = match worker.sources.as_ref() {
+            Ok(sources) => sources.clone(),
+            // A worker that does not implement the optional control route
+            // publishes no KV sources; that is a stable fingerprint, not a
+            // failed refresh.
+            Err(unavailable) if !unavailable.probe.retryable() => Default::default(),
+            Err(unavailable) => return Err(unavailable.detail.clone()),
+        };
         let mut sources: Vec<_> = sources.iter().collect();
         sources.sort_by(|left, right| left.0.cmp(right.0));
-        let signature = format!("{info:?}:{sources:?}");
+        let signature = format!("{info:?}:{sources:?}:{:?}", worker.hybrid);
         // gRPC workers serve no HTTP /v1/models; Control.GetModelInfo names
         // the served model, including for statically configured sources.
         if crate::backend::is_grpc_url(base) {
@@ -425,10 +482,11 @@ impl PdKvState {
         router_prompts: Option<&Arc<[Vec<u32>]>>,
     ) -> HashMap<String, PdPrefillInput> {
         let started = Instant::now();
-        *self.refresh_inputs.lock().await = RefreshInputs {
-            workers: workers.iter().cloned().collect(),
-            policy: Some(policy.clone()),
-        };
+        {
+            let mut inputs = self.refresh_inputs.lock().await;
+            inputs.workers = workers.iter().cloned().collect();
+            inputs.policy = Some(policy.clone());
+        }
         let bases: Vec<_> = workers
             .iter()
             .map(|worker| worker.base_url().to_owned())
@@ -537,6 +595,45 @@ mod kv_input_tests {
     use axum::response::IntoResponse;
     use reqwest::Client;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn configured_hybrid_pairs_exclude_unlisted_workers() {
+        let source = crate::config::PdKvEventSources {
+            endpoints: vec!["tcp://127.0.0.1:5557".into()],
+            replay_endpoints: Some(vec!["tcp://127.0.0.1:5558".into()]),
+            block_size: 16,
+            model: Some("model".into()),
+            hybrid: Some(crate::kv_index::hybrid_capability::HybridCapabilities {
+                schema_version: 1,
+                ranks: vec![],
+            }),
+            compatible_decode_urls: vec!["http://d0".into()],
+        };
+        let state = PdKvState::new_with_statics(
+            Client::new(),
+            HashMap::from([("http://p0".into(), source)]),
+        );
+        let workers = |prefix: &str| -> Vec<Arc<dyn Worker>> {
+            (0..2)
+                .map(|i| {
+                    Arc::new(BasicWorker::new(
+                        format!("http://{prefix}{i}"),
+                        WorkerType::Regular,
+                    )) as Arc<dyn Worker>
+                })
+                .collect()
+        };
+        let p = workers("p");
+        let d = workers("d");
+        let pairs = state.compatible_hybrid_pairs(&p, &d).unwrap();
+        assert_eq!(
+            pairs,
+            HashSet::from([(
+                PdEndpoint::for_worker(p[0].as_ref()),
+                PdEndpoint::for_worker(d[0].as_ref())
+            )])
+        );
+    }
 
     #[tokio::test]
     async fn unsupported_inputs_fall_back_without_control_or_tokenization_requests() {
@@ -726,6 +823,8 @@ mod kv_input_tests {
                         replay_endpoints: None,
                         block_size: 16,
                         model: None,
+                        hybrid: None,
+                        compatible_decode_urls: Vec::new(),
                     },
                 ))
                 .collect()
@@ -847,12 +946,23 @@ mod kv_input_tests {
             (None, Some("sig"), ProbeOutcome::Rebuild),
             (None, None, ProbeOutcome::Keep),
         ] {
-            assert_eq!(probe_outcome(binding, signature), expected);
+            assert_eq!(probe_outcome(binding, signature, false), expected);
         }
         for failures in 0..MAX_PROBE_FAILURES - 1 {
             let binding = healthy_binding("sig", failures);
-            assert_eq!(probe_outcome(Some(&binding), None), ProbeOutcome::Keep);
+            assert_eq!(
+                probe_outcome(Some(&binding), None, false),
+                ProbeOutcome::Keep
+            );
         }
+        assert_eq!(
+            probe_outcome(Some(&healthy), Some("sig"), true),
+            ProbeOutcome::Rebuild
+        );
+        assert_eq!(
+            probe_outcome(Some(&healthy), None, true),
+            ProbeOutcome::Keep
+        );
     }
 
     #[tokio::test]
