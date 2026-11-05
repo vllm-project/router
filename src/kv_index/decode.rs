@@ -61,6 +61,26 @@ pub fn decode_batch(payload: &[u8]) -> Result<KVEventBatch, String> {
     })
 }
 
+/// Decode one bare event, as published by engines that emit one event per
+/// message instead of a `(ts, events, rank)` batch. The caller attributes the
+/// event to the rank whose endpoint carried it.
+pub fn decode_event_payload(payload: &[u8]) -> Result<KVEvent, String> {
+    if payload.len() > MAX_PAYLOAD_BYTES {
+        return Err("KV event payload exceeds 16 MiB".into());
+    }
+    let mut syntax = rmp_serde::Deserializer::new(Cursor::new(payload));
+    syntax.set_max_depth(16);
+    serde::de::IgnoredAny::deserialize(&mut syntax)
+        .map_err(|error| format!("invalid MessagePack: {error}"))?;
+    let mut cursor = Cursor::new(payload);
+    let value = rmpv::decode::read_value_with_max_depth(&mut cursor, 16)
+        .map_err(|error| format!("invalid MessagePack: {error}"))?;
+    if cursor.position() as usize != payload.len() {
+        return Err("trailing bytes after KV event".into());
+    }
+    decode_event(value)
+}
+
 fn decode_event(event: Value) -> Result<KVEvent, String> {
     let pairs = event.as_map().ok_or("KV event must be a tagged map")?;
     let mut keys = HashSet::new();
@@ -127,10 +147,11 @@ fn decode_event(event: Value) -> Result<KVEvent, String> {
     for (key, value) in pairs {
         match key.as_str() {
             Some("block_hashes") => {
-                let hashes = value
-                    .as_array()
-                    .filter(|hashes| !hashes.is_empty())
-                    .ok_or("KV event hashes must be a nonempty array")?;
+                // Structure only. vLLM emits an empty list for a Mamba checkpoint
+                // group whose states in a chunk were all skipped, so whether an
+                // empty list is acceptable depends on the group and is decided by
+                // each consumer, not by the shared decoder.
+                let hashes = value.as_array().ok_or("KV event hashes must be an array")?;
                 for hash in hashes {
                     validate_wire_hash(hash)?;
                 }
@@ -543,5 +564,18 @@ mod tests {
             nested.extend_from_slice(&payload);
             assert!(decode_batch(&nested).is_err(), "nested marker {marker:#x}");
         }
+    }
+
+    #[test]
+    fn empty_hash_list_decodes_for_consumers_to_judge() {
+        let mut event = stored();
+        change(&mut event, "block_hashes", Value::Array(vec![]));
+        change(&mut event, "extra_keys", Value::Nil);
+        let batch = decode_batch(&encode(vec![event], 0.into())).unwrap();
+        assert_eq!(batch.events.len(), 1);
+        // Non-array hashes are still structurally invalid.
+        let mut bad = stored();
+        change(&mut bad, "block_hashes", Value::Nil);
+        assert!(decode_batch(&encode(vec![bad], 0.into())).is_err());
     }
 }

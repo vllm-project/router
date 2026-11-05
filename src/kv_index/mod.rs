@@ -10,6 +10,7 @@ use sha2::{Digest, Sha256};
 pub mod discovery;
 mod endpoints;
 pub mod hybrid;
+pub mod hybrid_events;
 pub mod indexer;
 pub mod subscriber;
 pub mod types;
@@ -17,6 +18,7 @@ pub mod wire;
 
 pub use admit::validate_device_batch;
 pub use decode::decode_batch;
+pub use decode::decode_event_payload;
 pub use discovery::{
     CacheKey, KvEventSourceEntry, KvEventSourcesResponse, KvIndexSupervisor, WorkerKvInfo,
 };
