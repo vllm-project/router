@@ -182,7 +182,7 @@ For request tokens on a candidate `(worker, rank)`:
 1. For each declared group, find the longest prefix that group's own restore rule accepts, and round it down to that group's block size.
 2. Take the minimum across groups: that is the hit each group is measured against.
 3. Cap at `len(tokens) - 1`, because the engine recomputes the final token.
-4. Re-check every group at that boundary, sliding windows included. A cumulative group must still restore it from its oldest retained state; a sliding group supports it when a run of `ceil((window - 1) / block_size)` contiguous resident blocks sits below it, and when no such run exists only the resident run anchored at block zero counts. A group that cannot support the reduced boundary drops the credit to zero, and the pass repeats until the boundary stops moving.
+4. Re-check every group at that boundary, sliding windows included. A cumulative group must still restore it from its oldest retained state; a sliding group supports it when a run of `ceil((window - 1) / block_size)` contiguous resident blocks sits below it, and when no such run exists only the resident run anchored at block zero counts, however short it is. A group that cannot support the reduced boundary drops the credit to zero, and the pass repeats until the boundary stops moving.
 5. Subtract `prefix_replay_tokens`, then align down to `hash_block_size`.
 
 Worked example: 2,048 tokens, `hash_block_size` 576, all groups resident to 1,728, replay window 0. Credit is 1,728 (three blocks); estimated prefill is 320 tokens. With a 576-token replay window the same boundary credits 1,152.
