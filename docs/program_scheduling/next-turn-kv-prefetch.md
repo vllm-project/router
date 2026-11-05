@@ -219,6 +219,8 @@ Every comparison uses the same model, hardware, trace, and pressure, following [
 - `wasted` = `late` + `expired` + `unused` tokens, plus what `cancelled` plans had already moved.
 - Pass when `useful` exceeds `wasted`, and `useful` reaches at least 10% of the tokens the target restored.
 
-The first condition says loads save more than they spend, valuing a token moved on the critical path the same as a token moved off it. The second says enough is at stake: a smaller share cannot move resume latency beyond run-to-run noise. Both thresholds are starting points for review. With tokens and `kv_aware`, the share can become per-prefix evidence.
+The first condition says loads save more than they spend, valuing a token moved on the critical path the same as a token moved off it. The second says enough is at stake: a smaller share cannot move resume latency beyond run-to-run noise. Both thresholds are starting points for review.
 
-On current evidence a history-based forecast may stop here, and that would be a useful answer. The post-response forecast is then the path forward.
+`wasted` is an upper bound. A real load fires only for a prefix that has left the GPU, but the shadow cannot see which ones had, so every plan counts at full size. The same share does not discount it, because a plan that expires has waited longest and is more likely than most to have left. With tokens and `kv_aware`, the share can become per-prefix evidence on both sides of the rule.
+
+A history-based forecast may stop here, and that would be a useful answer. In the first replay on a real engine ([#524](https://github.com/vllm-project/router/pull/524)), the return-time profile fails at all three load points, narrowly at one. The post-response forecast and per-prefix evidence are the paths forward.
