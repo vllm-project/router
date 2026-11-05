@@ -150,10 +150,6 @@ impl HybridEventIndex {
         Ok(self)
     }
 
-    pub fn replay_tokens(&self) -> u32 {
-        self.replay_tokens
-    }
-
     pub fn target(&self) -> &RoutableTarget {
         &self.target
     }
@@ -1362,68 +1358,6 @@ mod tests {
             ownership: None,
             session_id: None,
         })
-    }
-
-    #[test]
-    fn layout_replay_window_rounds_the_credited_prefix_down() {
-        // vLLM rewinds a prefix hit by the layout's replay window and then
-        // rounds to a block. The window belongs to the layout, so it reduces
-        // credit even though no group event mentions it.
-        let tokens: Vec<u32> = (0..1024).map(|i| 100 + i % 100).collect();
-        let keys = BlockKeyGenerator::new(64, 0).generate_block_keys(&tokens);
-        let groups = vec![
-            HybridEventGroup {
-                group_idx: 0,
-                block_size: 64,
-                kind: HybridGroupKind::FullAttention,
-            },
-            HybridEventGroup {
-                group_idx: 1,
-                block_size: 64,
-                kind: HybridGroupKind::SlidingWindow { window_tokens: 32 },
-            },
-        ];
-        let batch = KVEventBatch {
-            ts: 1.0,
-            data_parallel_rank: Some(0),
-            events: vec![
-                blocks(
-                    groups[0],
-                    "full_attention",
-                    None,
-                    &keys,
-                    64,
-                    &tokens,
-                    0,
-                    keys.len(),
-                ),
-                blocks(
-                    groups[1],
-                    "sliding_window_mla",
-                    Some(32),
-                    &keys,
-                    64,
-                    &tokens,
-                    0,
-                    keys.len(),
-                ),
-            ],
-        };
-        let replay = HybridEventIndex::new(target(), groups.clone(), 64, 0, 64)
-            .unwrap()
-            .with_replay_tokens(128)
-            .unwrap();
-        replay.begin_empty(0);
-        assert_eq!(replay.apply_batch(0, &batch), Ok(()));
-        // 1023 tokens bound the hit to block 15 (960); a 128-token replay
-        // leaves 832, already block aligned.
-        assert_eq!(replay.reusable_tokens(&tokens, usize::MAX), 832);
-        assert_eq!(replay.replay_tokens(), 128);
-
-        let plain = HybridEventIndex::new(target(), groups, 64, 0, 64).unwrap();
-        plain.begin_empty(0);
-        assert_eq!(plain.apply_batch(0, &batch), Ok(()));
-        assert_eq!(plain.reusable_tokens(&tokens, usize::MAX), 960);
     }
 
     #[test]

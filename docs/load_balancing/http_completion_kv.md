@@ -22,25 +22,18 @@ cache salt, adapters and other unmodeled identities remain routable without
 cache credit; known input tokens still contribute their full input cost.
 Session binding skips optional preparation RPCs, not known token accounting.
 
-## Hybrid layouts
+## Hybrid attention models
 
-For regular HTTP routing, `--kv-hybrid-layout` points to a JSON object keyed by
-worker URL. The matching `--kv-event-source` and `--kv-event-replay-source`
-entries list publisher and replay endpoints in DP-rank order. The Router checks
-them against the worker's existing `/kv_event_sources` response.
+Models such as Qwen3.5 and DeepSeek V4 cache more than attention KV. To route
+them by prefix, pass `--kv-hybrid-layout` a JSON file keyed by worker URL that
+describes each rank's cache groups. Start vLLM with
+`--prefix-caching-hash sha256_cbor` and `VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES=0`.
+Event endpoints may be omitted; the Router then asks the worker for them.
 
-Each layout must describe **every** cache group and rank for the exact model and
-engine configuration. The deployment must assign a new nonempty topic to each
-publisher on every worker restart and update this configuration before routing
-traffic. Reusing a topic across restarts does not prove the publisher identity.
-The hash root, block sizes and group configuration must match the engine; a
-guess can produce incorrect routing estimates. A configured hybrid worker with
-an unsupported layout or mismatched sources receives no hybrid credit. Do not
-use the legacy full-attention index for a hybrid worker without a verified
-layout: partial events alone cannot prove that all groups are present.
-
-The following illustrates the JSON shape; its block sizes and groups are not a
-model configuration to copy:
+Copy every value from the running engine. A layout that does not match it gives
+that worker no cache credit, and the worker is still routed by load. Give each
+publisher a new topic on every worker restart. The example below shows the
+format only:
 
 ```json
 {
@@ -65,14 +58,11 @@ model configuration to copy:
 }
 ```
 
-Experimental P/D configuration is supplied with `--pd-hybrid-config`: its JSON
-maps each prefill base URL to `endpoints`, `replay_endpoints`, `block_size`,
-`model`, `hybrid` (the layout above), and `compatible_decode_urls`. Each listed
-pair must be verified by the operator for model/weights, engine version,
-connector, and parallel configuration. Once enabled, only explicitly listed P/D
-pairs are admitted. Program scheduling is not supported with hybrid P/D. The
-connector remains responsible for KV transfer; end-to-end validation is in
-progress.
+For P/D (experimental), pass `--pd-hybrid-config` a JSON file keyed by prefill
+URL. Each entry holds `endpoints`, `replay_endpoints`, `block_size`, `model`,
+`hybrid` (the layout above) and `compatible_decode_urls`, the decode workers
+that prefill worker may hand off to. Only the listed pairs are used. Program
+scheduling is not supported in this mode.
 
 The Router does not load Completion tokenizer assets or validate IDs against a
 local model vocabulary. The selected Worker retains input validation and serving
