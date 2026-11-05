@@ -929,6 +929,13 @@ impl VllmPDRouter {
         if !affinity_on {
             return None;
         }
+        // Adapter identity is not modeled by the session binding key.
+        if ["lora_name", "lora_path"]
+            .iter()
+            .any(|field| request.get(*field).is_some_and(|value| !value.is_null()))
+        {
+            return None;
+        }
         let model_scope = request
             .get("model")
             .and_then(Value::as_str)
@@ -4243,7 +4250,25 @@ mod tests {
         let enabled = KvAwarePolicy::default().with_shared_affinity(Arc::new(
             KvAffinityTable::with_ttl(Some(Duration::from_secs(1800))),
         ));
-        assert!(VllmPDRouter::extract_affinity_key(&enabled, None, &request).is_some());
+        for field in ["lora_name", "lora_path"] {
+            for (case, value, eligible) in [
+                ("absent", None, true),
+                ("null", Some(Value::Null), true),
+                ("name", Some(json!("adapter-a")), false),
+                ("empty", Some(json!("")), false),
+                ("nonstring", Some(json!(false)), false),
+            ] {
+                let mut request = request.clone();
+                if let Some(value) = value {
+                    request[field] = value;
+                }
+                assert_eq!(
+                    VllmPDRouter::extract_affinity_key(&enabled, None, &request).is_some(),
+                    eligible,
+                    "{field}: {case}",
+                );
+            }
+        }
         assert!(
             VllmPDRouter::extract_affinity_key(&KvAwarePolicy::default(), None, &request,)
                 .is_none()
@@ -4251,6 +4276,202 @@ mod tests {
         assert!(
             VllmPDRouter::extract_affinity_key(&RoundRobinPolicy::new(), None, &request).is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn pd_adapter_admission_preserves_plain_binding_and_forwarding() {
+        use super::super::pd_types::Stage;
+        use crate::config::{PolicyConfig, RouterConfig};
+        use axum::{extract::State, routing::post, Json, Router};
+        use tokio::sync::{mpsc, Semaphore};
+
+        type Capture = (mpsc::UnboundedSender<(&'static str, Value)>, Arc<Semaphore>);
+        async fn decode_request(
+            State((sent, release)): State<Capture>,
+            Json(body): Json<Value>,
+        ) -> Json<Value> {
+            sent.send(("D", body)).unwrap();
+            release.acquire().await.unwrap().forget();
+            Json(json!({"choices": []}))
+        }
+
+        let (sent, mut received) = mpsc::unbounded_channel();
+        let release = Arc::new(Semaphore::new(0));
+        let app = Router::new()
+            .route(
+                "/p/v1/completions",
+                post(
+                    |State((sent, _)): State<Capture>, Json(body): Json<Value>| async move {
+                        sent.send(("P", body)).unwrap();
+                        Json(json!({"kv_transfer_params": {}}))
+                    },
+                ),
+            )
+            .route("/d/v1/completions", post(decode_request))
+            .route("/other-d/v1/completions", post(decode_request))
+            .with_state((sent, release.clone()));
+        let base = spawn_test_server(app).await;
+        let prefill = [Arc::new(BasicWorker::new(
+            format!("{base}/p"),
+            WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+        )) as Arc<dyn Worker>];
+        let decode = [
+            Arc::new(BasicWorker::new(format!("{base}/d"), WorkerType::Decode)) as Arc<dyn Worker>,
+            Arc::new(BasicWorker::new(
+                format!("{base}/other-d"),
+                WorkerType::Decode,
+            )) as Arc<dyn Worker>,
+        ];
+        let config = RouterConfig {
+            policy: PolicyConfig::KvAware {
+                router_temperature: 0.0,
+                kv_penalty_host: 0.8,
+                kv_penalty_external: 0.6,
+                kv_penalty_disk: 0.3,
+                static_kv_event_sources: Default::default(),
+            },
+            kv_aware_session_affinity_ttl_secs: Some(1800),
+            ..Default::default()
+        };
+        let ctx = Arc::new(
+            crate::server::AppContext::new(config, reqwest::Client::new(), 64, None, vec![])
+                .unwrap(),
+        );
+        let router = VllmPDRouter::new(vec![], vec![], None, &ctx).await.unwrap();
+        let plain = json!({"model": "test", "session_id": "plain-session", "prompt": vec![1u32; 33], "stream": false});
+        let (selection, attempt) = router
+            .admit_pair(&prefill, &decode, &plain, "/v1/completions", None, false)
+            .await
+            .unwrap();
+        assert_eq!(selection.prefill.new_prefill_tokens, Some(33));
+        assert_eq!(selection.prefill.credited_prefix_tokens, Some(0));
+        assert_eq!(selection.decode.affinity_outcome, Some("bind"));
+        let binding = selection.decode.affinity.unwrap();
+        let generation = binding.generation();
+        let plain_endpoint = selection.decode.endpoint;
+        assert_eq!(binding.in_flight(), 1);
+        drop(attempt);
+        assert_eq!(binding.in_flight(), 0);
+        assert!(router.pd_router.pd_load.snapshot().is_empty());
+
+        for field in ["lora_name", "lora_path"] {
+            let mut adapter = plain.clone();
+            adapter[field] = json!("adapter-a");
+            let (selection, attempt) = router
+                .admit_pair(&prefill, &decode, &adapter, "/v1/completions", None, false)
+                .await
+                .unwrap();
+            assert_eq!(
+                selection.prefill.fallback_reason,
+                Some("unsupported_cache_identity")
+            );
+            assert_eq!(selection.prefill.new_prefill_tokens, None);
+            assert_eq!(selection.prefill.credited_prefix_tokens, None);
+            assert!(selection.decode.affinity.is_none(), "{field}");
+            assert_eq!(selection.decode.affinity_outcome, None, "{field}");
+            assert_eq!(
+                binding.in_flight(),
+                0,
+                "adapter must not acquire the plain record"
+            );
+            assert_eq!(binding.generation(), generation);
+            let selected_decode = decode[selection.decode.worker_index].clone();
+            let snapshot = router.pd_router.pd_load.snapshot();
+            assert_eq!(
+                snapshot[&(Stage::Decode, selection.decode.endpoint.clone())]
+                    .pending_decode_requests,
+                1
+            );
+            assert_eq!(prefill[0].load(), 1);
+            assert_eq!(selected_decode.load(), 1);
+
+            let dispatch = router.process_vllm_two_stage_request(
+                adapter.clone(),
+                prefill[0].clone(),
+                selected_decode.clone(),
+                "/v1/completions",
+                None,
+                attempt.clone(),
+                None,
+            );
+            let inspect = async {
+                for expected_stage in ["P", "D"] {
+                    let (stage, body) =
+                        tokio::time::timeout(std::time::Duration::from_secs(5), received.recv())
+                            .await
+                            .unwrap()
+                            .unwrap();
+                    assert_eq!(stage, expected_stage);
+                    assert_eq!(body[field], adapter[field]);
+                }
+                let snapshot = router.pd_router.pd_load.snapshot();
+                assert!(
+                    !snapshot.contains_key(&(Stage::Prefill, selection.prefill.endpoint.clone()))
+                );
+                let d = snapshot[&(Stage::Decode, selection.decode.endpoint.clone())];
+                assert_eq!(d.pending_decode_requests, 0);
+                assert_eq!(d.active_decode_requests, 1);
+                assert_eq!(prefill[0].load(), 0);
+                assert_eq!(selected_decode.load(), 1);
+                assert_eq!(binding.in_flight(), 0);
+                release.add_permits(1);
+            };
+            let (response, ()) = tokio::join!(dispatch, inspect);
+            let response = attempt.clone().track_response(response.unwrap());
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap();
+            assert_eq!(
+                serde_json::from_slice::<Value>(&body).unwrap(),
+                json!({"choices": []})
+            );
+            drop(attempt);
+            assert!(router.pd_router.pd_load.snapshot().is_empty());
+            assert!(prefill
+                .iter()
+                .chain(decode.iter())
+                .all(|worker| worker.load() == 0));
+            assert_eq!(binding.in_flight(), 0);
+
+            for (case, value) in [("null", Some(Value::Null)), ("missing", None)] {
+                let mut request = plain.clone();
+                if let Some(value) = value {
+                    request[field] = value;
+                }
+                let (selection, attempt) = router
+                    .admit_pair(&prefill, &decode, &request, "/v1/completions", None, false)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    selection.prefill.new_prefill_tokens,
+                    Some(33),
+                    "{field}: {case}"
+                );
+                assert_eq!(selection.prefill.credited_prefix_tokens, Some(0));
+                assert_eq!(
+                    selection.decode.affinity_outcome,
+                    Some("sticky_hit"),
+                    "{field}: {case}"
+                );
+                assert_eq!(selection.decode.endpoint, plain_endpoint);
+                assert!(Arc::ptr_eq(
+                    selection.decode.affinity.as_ref().unwrap(),
+                    &binding
+                ));
+                assert_eq!(binding.generation(), generation);
+                assert_eq!(binding.in_flight(), 1);
+                drop(attempt);
+                assert_eq!(binding.in_flight(), 0);
+                assert!(router.pd_router.pd_load.snapshot().is_empty());
+                assert!(prefill
+                    .iter()
+                    .chain(decode.iter())
+                    .all(|worker| worker.load() == 0));
+            }
+        }
     }
 
     #[tokio::test]
