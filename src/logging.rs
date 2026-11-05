@@ -55,7 +55,8 @@ fn raw_user_prompt_texts(request: &serde_json::Value) -> Vec<Vec<&str>> {
         .map(|message| match message.get("content") {
             Some(serde_json::Value::String(text)) => vec![text.as_str()],
             Some(serde_json::Value::Array(parts)) => part_texts(parts),
-            _ => Vec::new(),
+            // Match ChatMessage deserialization for missing or invalid content.
+            _ => vec![""],
         })
         .collect()
 }
@@ -310,9 +311,58 @@ mod tests {
             {"role": "user", "content": null},
             {"role": "user", "content": [{"type": "text", "text": 42}]}
         ]});
-        assert_eq!(
-            raw_user_prompt_texts(&raw),
-            vec![Vec::<&str>::new(), vec![]]
-        );
+        assert_eq!(raw_user_prompt_texts(&raw), vec![vec![""], vec![]]);
+    }
+
+    #[test]
+    fn typed_and_raw_user_prompts_match_for_empty_or_invalid_content() {
+        let cases = [
+            ("null", json!({"role": "user", "content": null}), vec![""]),
+            ("missing", json!({"role": "user"}), vec![""]),
+            ("number", json!({"role": "user", "content": 42}), vec![""]),
+            (
+                "boolean",
+                json!({"role": "user", "content": false}),
+                vec![""],
+            ),
+            ("object", json!({"role": "user", "content": {}}), vec![""]),
+            (
+                "empty string",
+                json!({"role": "user", "content": ""}),
+                vec![""],
+            ),
+            (
+                "empty array",
+                json!({"role": "user", "content": []}),
+                vec![],
+            ),
+            (
+                "non-string text part",
+                json!({"role": "user", "content": [{"type": "text", "text": 42}]}),
+                vec![],
+            ),
+            (
+                "media only",
+                json!({"role": "user", "content": [
+                    {"type": "image_url", "image_url": {"url": "image-secret"}}
+                ]}),
+                vec![],
+            ),
+        ];
+
+        for (case, message, expected) in cases {
+            let raw = json!({"messages": [message]});
+            let request: ChatCompletionRequest = serde_json::from_value(raw.clone()).unwrap();
+            let typed_texts = user_prompt_texts(&request.messages);
+            let raw_texts = raw_user_prompt_texts(&raw);
+
+            assert_eq!(typed_texts, vec![expected], "typed content: {case}");
+            assert_eq!(raw_texts, typed_texts, "raw/typed parity: {case}");
+            assert_eq!(
+                format!("{raw_texts:?}"),
+                format!("{typed_texts:?}"),
+                "log payload parity: {case}"
+            );
+        }
     }
 }
