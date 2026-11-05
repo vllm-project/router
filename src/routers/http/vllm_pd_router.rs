@@ -5,7 +5,8 @@ use super::logprobs_merge;
 use super::pd_cached_tokens;
 use super::pd_program_adapter::{self, PdProgramRuntime};
 use super::pd_router::PdRouterBase;
-use super::pd_types::{error_chain, PDRouterError, PdAttempt, PdRequestContext};
+use super::pd_types::{error_chain, PDRouterError, PdAttempt, PdEndpoint, PdRequestContext};
+use super::router::{hold_request_load_until_body_done, prepare_error_status, RequestLoadGuard};
 use super::usage_merge;
 use super::vllm_service_discovery::{MoriIOTransferMode, ServiceRegistry, ServiceType};
 use crate::config::KvConnector;
@@ -104,6 +105,8 @@ pub struct VllmPDRouter {
     mooncake_prefill_info: Arc<Mutex<HashMap<String, MooncakePrefillInfo>>>,
     /// NIXL push identity per prefill base_url and dp_rank; never held across an await.
     nixl_prefill_info: RwLock<HashMap<String, HashMap<usize, Value>>>,
+    /// Tokenizer and tonic clients for `grpc://` prefill and decode pools.
+    grpc_frontend: crate::backend::EngineFrontend,
 }
 
 /// Transfer ID prefix used by MoRI-IO to correlate prefill and decode legs.
@@ -411,6 +414,50 @@ async fn read_response_body(
         buffered.extend_from_slice(&chunk);
     }
     Ok(ResponseBody::Buffered(Bytes::from(buffered)))
+}
+
+/// D stays admitted while a gRPC decode stream is open, and dropping that
+/// body aborts the producer so the RPC is cancelled. `attempt` owns the
+/// occupancy. A collected reply or an error is complete, so D is released
+/// before the client reads it.
+fn own_grpc_decode(response: Response, attempt: &PdAttempt) -> Response {
+    if response
+        .extensions()
+        .get::<crate::backend::grpc::GrpcStreamTask>()
+        .is_some()
+    {
+        hold_request_load_until_body_done(response, RequestLoadGuard::new(None, None))
+    } else {
+        attempt.finish_decode();
+        response
+    }
+}
+
+/// Read before the response body moves on, which takes the stream task.
+fn grpc_decode_outcome(
+    response: &Response,
+) -> Option<impl std::future::Future<Output = bool> + Send + 'static> {
+    response
+        .extensions()
+        .get::<crate::backend::grpc::GrpcStreamTask>()
+        .map(crate::backend::grpc::GrpcStreamTask::outcome)
+}
+
+/// A gRPC decode stream answers 200 when it opens, so a failure after that,
+/// including an `abort` finish, is counted once the producer stops.
+fn record_grpc_decode_stream_failure(
+    outcome: Option<impl std::future::Future<Output = bool> + Send + 'static>,
+    decode_base_url: &str,
+) {
+    let Some(outcome) = outcome else {
+        return;
+    };
+    let decode_base_url = decode_base_url.to_string();
+    tokio::spawn(async move {
+        if outcome.await {
+            RouterMetrics::record_pd_decode_error(&decode_base_url);
+        }
+    });
 }
 
 fn response_with_body(
@@ -1094,6 +1141,12 @@ impl VllmPDRouter {
                 workers.push(worker);
             }
         }
+        // Instances live in a HashMap. Endpoint order keeps a round-robin
+        // cursor stable when the map rehashes. Static pools do not come
+        // through here; admission leaves their registration order alone.
+        workers.sort_by(|left, right| {
+            PdEndpoint::for_worker(left.as_ref()).cmp(&PdEndpoint::for_worker(right.as_ref()))
+        });
         workers
     }
 
@@ -1136,6 +1189,31 @@ impl VllmPDRouter {
         headers: Option<&HeaderMap>,
         forward_policy_headers: bool,
     ) -> Option<(super::pd_types::PdSelection, PdAttempt)> {
+        self.admit_pair_with_tokens(
+            prefill_workers,
+            decode_workers,
+            request,
+            path,
+            headers,
+            forward_policy_headers,
+            None,
+        )
+        .await
+    }
+
+    /// `router_prompts` replaces backend rendering with the router's own
+    /// token ids, which is what `grpc://` workers receive.
+    #[allow(clippy::too_many_arguments)]
+    async fn admit_pair_with_tokens(
+        &self,
+        prefill_workers: &[Arc<dyn Worker>],
+        decode_workers: &[Arc<dyn Worker>],
+        request: &Value,
+        path: &str,
+        headers: Option<&HeaderMap>,
+        forward_policy_headers: bool,
+        router_prompts: Option<&Arc<[Vec<u32>]>>,
+    ) -> Option<(super::pd_types::PdSelection, PdAttempt)> {
         let prefill_policy = self.policy_registry.get_prefill_policy();
         let decode_policy = self.policy_registry.get_decode_policy();
         let text = [prefill_policy.as_ref(), decode_policy.as_ref()]
@@ -1145,22 +1223,22 @@ impl VllmPDRouter {
             .flatten();
         let needs_headers = forward_policy_headers
             && (prefill_policy.needs_headers() || decode_policy.needs_headers());
-        let policy_headers = headers.filter(|_| needs_headers).map(|headers| {
-            headers
-                .iter()
-                .filter_map(|(name, value)| {
-                    value
-                        .to_str()
-                        .ok()
-                        .map(|value| (name.as_str().to_lowercase(), value.to_owned()))
-                })
-                .collect()
-        });
+        let policy_headers = header_utils::to_policy_headers(headers.filter(|_| needs_headers));
         let (prefill_inputs, decode_inputs) = tokio::join!(
-            self.pd_router
-                .prepare_prefill_inputs(prefill_workers, request, path, headers),
-            self.pd_router
-                .prepare_decode_inputs(decode_workers, request, path, headers),
+            self.pd_router.prepare_prefill_inputs(
+                prefill_workers,
+                request,
+                path,
+                headers,
+                router_prompts
+            ),
+            self.pd_router.prepare_decode_inputs(
+                decode_workers,
+                request,
+                path,
+                headers,
+                router_prompts
+            ),
         );
         let model_id = request.get("model").and_then(Value::as_str);
         let cache_salt = request
@@ -1281,6 +1359,65 @@ impl VllmPDRouter {
                 "Program decode target left the pool",
             ));
         };
+        if let Some(warm_remote) = &runtime.warm_remote {
+            // The warm-remote protocol has no discovery incarnation fence, and
+            // execute() rejects discovery; keep discovery on the native PD path.
+            if !self.use_discovery && matches!(self.kv_connector, KvConnector::Nixl) {
+                let prefill_workers = self
+                    .pd_router
+                    .worker_registry
+                    .get_prefill_workers()
+                    .into_iter()
+                    .filter(|w| w.is_available())
+                    .collect::<Vec<_>>();
+                let prefills = prefill_workers
+                    .iter()
+                    .map(pd_program_adapter::worker_target)
+                    .collect::<Vec<_>>();
+                let selection = self
+                    .policy_registry
+                    .get_prefill_policy()
+                    .select_worker(&prefill_workers, None);
+                if let Some(index) = selection {
+                    let started = Instant::now();
+                    if let Some(result) = super::pd_warm_remote::execute(
+                        runtime,
+                        warm_remote.clone(),
+                        &self.pd_router.client,
+                        &completion,
+                        &request,
+                        path,
+                        headers,
+                        &prefills,
+                        &decode_targets,
+                        index,
+                        &self.pd_router.pd_load,
+                        prefill_workers[index].clone(),
+                        decode_worker.clone(),
+                    )
+                    .await
+                    {
+                        RouterMetrics::record_pd_request(path);
+                        RouterMetrics::record_pd_request_duration(path, started.elapsed());
+                        return Some(match result {
+                            Ok((response, Some(context))) => {
+                                pd_program_adapter::track_warm_remote_response(
+                                    response, completion, streaming, context,
+                                )
+                            }
+                            Ok((response, None)) => pd_program_adapter::track_forwarded_response(
+                                response, completion, streaming,
+                            ),
+                            Err(error) => {
+                                RouterMetrics::record_pd_error("program_warm_remote");
+                                completion.finish(false);
+                                (StatusCode::SERVICE_UNAVAILABLE, error).into_response()
+                            }
+                        });
+                    }
+                }
+            }
+        }
         let prefill_candidates = self.program_prefill_candidates();
         let selected = self.select_program_prefill(&prefill_candidates, &request, path, headers);
         let Some((prefill_id, prefill_worker)) = selected else {
@@ -1406,21 +1543,9 @@ impl VllmPDRouter {
         } else {
             None
         };
-        let policy_headers = policy.needs_headers().then(|| {
-            headers
-                .map(|headers| {
-                    headers
-                        .iter()
-                        .filter_map(|(name, value)| {
-                            value
-                                .to_str()
-                                .ok()
-                                .map(|value| (name.as_str().to_lowercase(), value.to_owned()))
-                        })
-                        .collect::<HashMap<String, String>>()
-                })
-                .unwrap_or_default()
-        });
+        let policy_headers = policy
+            .needs_headers()
+            .then(|| header_utils::to_policy_headers(headers).unwrap_or_default());
         let index = policy.select_worker_with_headers(
             &workers,
             request_text.as_deref(),
@@ -1470,13 +1595,14 @@ impl VllmPDRouter {
         }
     }
 
-    /// Discovery supplies candidates; admission and dispatch are shared with static pools.
-    async fn process_vllm_request(
+    /// Select a P/D pair among the discovered instances. Request headers reach
+    /// the policies, so session-aware policies behave as in direct-URL mode.
+    async fn admit_discovered_pair(
         &self,
-        request: Value,
+        request: &Value,
         path: &str,
         headers: Option<&HeaderMap>,
-    ) -> Response {
+    ) -> Option<(Arc<dyn Worker>, Arc<dyn Worker>, PdAttempt)> {
         let prefill_workers = self.discovery_candidates(
             self.service_registry
                 .get_instance_snapshots(ServiceType::Prefill),
@@ -1487,16 +1613,32 @@ impl VllmPDRouter {
                 .get_instance_snapshots(ServiceType::Decode),
             ServiceType::Decode,
         );
-        let Some((selection, attempt)) = self
+        let (selection, attempt) = self
             .admit_pair(
                 &prefill_workers,
                 &decode_workers,
-                &request,
+                request,
                 path,
                 headers,
-                false,
+                true,
             )
-            .await
+            .await?;
+        Some((
+            prefill_workers[selection.prefill.worker_index].clone(),
+            decode_workers[selection.decode.worker_index].clone(),
+            attempt,
+        ))
+    }
+
+    /// Discovery supplies candidates; admission and dispatch are shared with static pools.
+    async fn process_vllm_request(
+        &self,
+        request: Value,
+        path: &str,
+        headers: Option<&HeaderMap>,
+    ) -> Response {
+        let Some((prefill_worker, decode_worker, attempt)) =
+            self.admit_discovered_pair(&request, path, headers).await
         else {
             RouterMetrics::record_pd_error("server_selection");
             return (StatusCode::SERVICE_UNAVAILABLE, "No eligible P/D pair").into_response();
@@ -1504,8 +1646,8 @@ impl VllmPDRouter {
         match self
             .process_vllm_two_stage_request(
                 request,
-                prefill_workers[selection.prefill.worker_index].clone(),
-                decode_workers[selection.decode.worker_index].clone(),
+                prefill_worker,
+                decode_worker,
                 path,
                 headers,
                 attempt.clone(),
@@ -1606,6 +1748,99 @@ impl VllmPDRouter {
         }
     }
 
+    /// Static P/D pools use one transport; config validation rejects mixed
+    /// `grpc://` and `http://` pools.
+    fn uses_grpc_pools(&self) -> bool {
+        self.pd_router
+            .worker_registry
+            .get_prefill_workers()
+            .first()
+            .is_some_and(|worker| crate::backend::is_grpc_url(worker.url()))
+    }
+
+    /// Chat on static `grpc://` pools: tokenize once, admit the pair through
+    /// the shared P/D admission, then run both legs over gRPC with those ids.
+    async fn route_grpc_chat(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &crate::protocols::spec::ChatCompletionRequest,
+    ) -> Response {
+        let path = "/v1/chat/completions";
+        let prefill_workers: Vec<Arc<dyn Worker>> = self
+            .pd_router
+            .worker_registry
+            .get_prefill_workers()
+            .into_iter()
+            .filter(|worker| worker.is_available())
+            .collect();
+        let decode_workers: Vec<Arc<dyn Worker>> = self
+            .pd_router
+            .worker_registry
+            .get_decode_workers()
+            .into_iter()
+            .filter(|worker| worker.is_available())
+            .collect();
+        if prefill_workers.is_empty() || decode_workers.is_empty() {
+            RouterMetrics::record_pd_error("server_selection");
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!(
+                    "No available workers: {} prefill, {} decode",
+                    prefill_workers.len(),
+                    decode_workers.len()
+                ),
+            )
+                .into_response();
+        }
+        let request_json = match serde_json::to_value(body) {
+            Ok(value) => value,
+            Err(error) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Serialization error: {error}"),
+                )
+                    .into_response();
+            }
+        };
+        // Tokenize before admission so kv_aware and cache_aware score the
+        // exact ids P will prefill.
+        let prepared = match self.grpc_frontend.prepare(body.clone()).await {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                return (prepare_error_status(&error), error.to_string()).into_response();
+            }
+        };
+        let router_prompts: Arc<[Vec<u32>]> = Arc::from([prepared.tokenized.token_ids.to_vec()]);
+        let Some((selection, attempt)) = self
+            .admit_pair_with_tokens(
+                &prefill_workers,
+                &decode_workers,
+                &request_json,
+                path,
+                headers,
+                true,
+                Some(&router_prompts),
+            )
+            .await
+        else {
+            RouterMetrics::record_pd_error("server_selection");
+            return (StatusCode::SERVICE_UNAVAILABLE, "No eligible P/D pair").into_response();
+        };
+        let prefill_worker = prefill_workers[selection.prefill.worker_index].clone();
+        let decode_worker = decode_workers[selection.decode.worker_index].clone();
+        info!(
+            "Chat: Selected prefill={} [policy:{}], decode={} [policy:{}]",
+            prefill_worker.url(),
+            self.policy_registry.get_prefill_policy().name(),
+            decode_worker.url(),
+            self.policy_registry.get_decode_policy().name()
+        );
+        let response = self
+            .process_grpc_two_stage_chat(prepared, prefill_worker, decode_worker, &attempt)
+            .await;
+        attempt.track_response(response)
+    }
+
     /// Two-stage request processing for vLLM disaggregated mode
     ///
     /// Admission already reserved P and pending D. Dispatch drives independent
@@ -1624,6 +1859,13 @@ impl VllmPDRouter {
     ) -> Result<Response, PDRouterError> {
         debug!("ENTERED process_vllm_two_stage_request method");
         let start_time = Instant::now();
+        if crate::backend::is_grpc_url(prefill_worker.url()) {
+            return Ok((
+                StatusCode::BAD_REQUEST,
+                format!("gRPC P/D workers currently support /v1/chat/completions, not {path}"),
+            )
+                .into_response());
+        }
         if !original_request.is_object() {
             return Ok((
                 StatusCode::BAD_REQUEST,
@@ -2110,6 +2352,238 @@ impl VllmPDRouter {
         .map_err(|message| PDRouterError::NetworkError { message })
     }
 
+    /// P/D chat on `grpc://` pools. The connector JSON is the same as on the
+    /// HTTP path; it travels in `GenerateRequest.kv.kv_transfer_params` and
+    /// comes back in `FinishInfo.kv_transfer_params`. P finishes before D
+    /// starts, except in NIXL push mode once P's push identity is cached.
+    /// Admission already reserved both legs in `attempt`.
+    async fn process_grpc_two_stage_chat(
+        &self,
+        prepared: crate::backend::PreparedRequest,
+        prefill_worker: Arc<dyn Worker>,
+        decode_worker: Arc<dyn Worker>,
+        attempt: &PdAttempt,
+    ) -> Response {
+        let path = "/v1/chat/completions";
+        let start_time = Instant::now();
+        let prefill_base_url = prefill_worker.base_url().to_string();
+        let prefill_dp_rank = prefill_worker.dp_rank();
+        let decode_base_url = decode_worker.base_url().to_string();
+        let request_id = Self::generate_vllm_request_id(
+            &self.get_zmq_address(prefill_worker.as_ref(), ServiceType::Prefill),
+            &self.get_zmq_address(decode_worker.as_ref(), ServiceType::Decode),
+        );
+        let transfer_id = self.generate_transfer_id();
+        let prefill_params = match self.build_prefill_kv_transfer_params(
+            transfer_id.as_deref(),
+            Some(&decode_base_url),
+            decode_worker.dp_size(),
+            decode_worker.dp_rank(),
+        ) {
+            Ok(params) => params,
+            Err(reason) => {
+                attempt.release();
+                return (StatusCode::INTERNAL_SERVER_ERROR, reason).into_response();
+            }
+        };
+
+        if matches!(self.kv_connector, KvConnector::Nixl) {
+            if let Some(identity) = self.get_nixl_push_identity(&prefill_base_url, prefill_dp_rank)
+            {
+                let decode_params = Self::build_nixl_push_decode_params(&identity, &request_id);
+                return self
+                    .process_grpc_concurrent_chat(
+                        prepared,
+                        prefill_worker,
+                        decode_worker,
+                        request_id,
+                        prefill_params,
+                        decode_params,
+                        start_time,
+                        attempt,
+                    )
+                    .await;
+            }
+        }
+
+        let prefill_result = self
+            .grpc_frontend
+            .prefill(
+                prefill_worker.url(),
+                &prepared,
+                request_id.clone(),
+                &prefill_params,
+            )
+            .await;
+        attempt.finish_prefill();
+        let prefill_kv = match prefill_result {
+            Ok(kv) => kv,
+            Err(response) => {
+                attempt.release();
+                RouterMetrics::record_pd_prefill_error(&prefill_base_url);
+                RouterMetrics::record_pd_request(path);
+                RouterMetrics::record_pd_request_duration(path, start_time.elapsed());
+                return response;
+            }
+        };
+        // Same shape as an HTTP prefill body, so the connector helpers apply.
+        let prefill_response_json = match prefill_kv {
+            Some(kv) => json!({ "kv_transfer_params": kv }),
+            None => json!({}),
+        };
+
+        let decode_params = self
+            .build_decode_kv_transfer_params(
+                &prefill_base_url,
+                Some(&prefill_response_json),
+                transfer_id.as_deref(),
+                prefill_worker.dp_size(),
+                prefill_dp_rank.map(|rank| rank as u32),
+                Some(&request_id),
+            )
+            .await;
+        if decode_params.is_none() {
+            warn!(
+                "No kv_transfer_params for prefill {}, decode will proceed without them",
+                prefill_base_url
+            );
+        }
+
+        attempt.begin_decode();
+        let response = self
+            .grpc_frontend
+            .dispatch_decode(decode_worker.url(), prepared, request_id, decode_params)
+            .await;
+        let decode_outcome = grpc_decode_outcome(&response);
+        let response = own_grpc_decode(response, attempt);
+
+        RouterMetrics::record_pd_request(path);
+        RouterMetrics::record_pd_request_duration(path, start_time.elapsed());
+        RouterMetrics::record_pd_prefill_request(&prefill_base_url);
+        RouterMetrics::record_pd_decode_request(&decode_base_url);
+        if response.status().is_success() {
+            record_grpc_decode_stream_failure(decode_outcome, &decode_base_url);
+        } else {
+            RouterMetrics::record_pd_decode_error(&decode_base_url);
+        }
+        response
+    }
+
+    /// NIXL push over gRPC: P and D start together, and P writes KV into the
+    /// blocks D allocates for `request_id`. A failed leg cancels the other,
+    /// so neither worker waits for a transfer that never comes.
+    #[allow(clippy::too_many_arguments)]
+    async fn process_grpc_concurrent_chat(
+        &self,
+        prepared: crate::backend::PreparedRequest,
+        prefill_worker: Arc<dyn Worker>,
+        decode_worker: Arc<dyn Worker>,
+        request_id: String,
+        prefill_params: Value,
+        decode_params: Value,
+        start_time: Instant,
+        attempt: &PdAttempt,
+    ) -> Response {
+        let path = "/v1/chat/completions";
+        let prefill_base_url = prefill_worker.base_url().to_string();
+        let decode_base_url = decode_worker.base_url().to_string();
+        let fail = |response: Response, prefill_failed: bool| {
+            attempt.release();
+            if prefill_failed {
+                RouterMetrics::record_pd_prefill_error(&prefill_base_url);
+            } else {
+                RouterMetrics::record_pd_decode_error(&decode_base_url);
+            }
+            RouterMetrics::record_pd_request(path);
+            RouterMetrics::record_pd_request_duration(path, start_time.elapsed());
+            response
+        };
+
+        attempt.begin_decode();
+        let prefill = self.grpc_frontend.prefill(
+            prefill_worker.url(),
+            &prepared,
+            request_id.clone(),
+            &prefill_params,
+        );
+        // Dropping a held response, e.g. when P fails after D's stream opened,
+        // aborts D's stream.
+        let decode = async {
+            let response = self
+                .grpc_frontend
+                .dispatch_decode(
+                    decode_worker.url(),
+                    prepared.clone(),
+                    request_id,
+                    Some(decode_params),
+                )
+                .await;
+            let decode_failed = response
+                .extensions()
+                .get::<crate::backend::grpc::GrpcStreamTask>()
+                .map(crate::backend::grpc::GrpcStreamTask::failure);
+            let decode_outcome = grpc_decode_outcome(&response);
+            (
+                own_grpc_decode(response, attempt),
+                decode_failed,
+                decode_outcome,
+            )
+        };
+        tokio::pin!(prefill, decode);
+
+        let (prefill_kv, response, decode_outcome) = tokio::select! {
+            prefill_result = &mut prefill => {
+                attempt.finish_prefill();
+                match prefill_result {
+                    Ok(kv) => {
+                        let (response, _, decode_outcome) = decode.await;
+                        (kv, response, decode_outcome)
+                    }
+                    Err(response) => return fail(response, true),
+                }
+            }
+            (response, decode_failed, decode_outcome) = &mut decode => {
+                if !response.status().is_success() {
+                    return fail(response, false);
+                }
+                // D's stream can fail after it opened, while P is still
+                // running. Its error frame is already queued in `response`.
+                let decode_failed = async {
+                    match decode_failed {
+                        Some(failed) => failed.await,
+                        None => std::future::pending().await,
+                    }
+                };
+                let prefill_result = tokio::select! {
+                    prefill_result = &mut prefill => prefill_result,
+                    () = decode_failed => return fail(response, false),
+                };
+                attempt.finish_prefill();
+                match prefill_result {
+                    Ok(kv) => (kv, response, decode_outcome),
+                    Err(prefill_response) => return fail(prefill_response, true),
+                }
+            }
+        };
+        if let Some(kv) = prefill_kv {
+            self.maybe_cache_nixl_push_identity(
+                &prefill_base_url,
+                prefill_worker.dp_rank(),
+                &json!({ "kv_transfer_params": kv }),
+            );
+        }
+        RouterMetrics::record_pd_request(path);
+        RouterMetrics::record_pd_request_duration(path, start_time.elapsed());
+        RouterMetrics::record_pd_prefill_request(&prefill_base_url);
+        RouterMetrics::record_pd_decode_request(&decode_base_url);
+        if response.status().is_success() {
+            record_grpc_decode_stream_failure(decode_outcome, &decode_base_url);
+        } else {
+            RouterMetrics::record_pd_decode_error(&decode_base_url);
+        }
+        response
+    }
+
     async fn try_build_concurrent_requests(
         &self,
         original_request: &Value,
@@ -2403,6 +2877,7 @@ impl VllmPDRouter {
                 kv_connector,
                 mooncake_prefill_info: Arc::new(Mutex::new(HashMap::new())),
                 nixl_prefill_info: RwLock::new(HashMap::new()),
+                grpc_frontend: crate::backend::EngineFrontend::new(),
             })
         } else {
             // Direct URL mode (same as PdRouterBase)
@@ -2412,7 +2887,25 @@ impl VllmPDRouter {
                 decode_urls.len()
             );
 
+            let request_timeout =
+                std::time::Duration::from_secs(ctx.router_config.request_timeout_secs);
+            let grpc_frontend = if prefill_urls
+                .iter()
+                .any(|(url, _)| crate::backend::is_grpc_url(url))
+            {
+                crate::backend::EngineFrontend::from_env(request_timeout)
+                    .map_err(|error| format!("tokenizer cache: {error}"))?
+            } else {
+                crate::backend::EngineFrontend::with_request_timeout(request_timeout)
+            };
+
             // Create underlying PD router with provided worker lists
+            let grpc_workers: Vec<String> = prefill_urls
+                .iter()
+                .map(|(url, _)| url.clone())
+                .chain(decode_urls.iter().cloned())
+                .filter(|url| crate::backend::is_grpc_url(url))
+                .collect();
             let pd_router = PdRouterBase::new(prefill_urls.clone(), decode_urls, ctx).await?;
 
             // No service discovery in direct URL mode
@@ -2480,6 +2973,11 @@ impl VllmPDRouter {
                 info!("Mooncake bootstrap query complete for all prefill nodes");
             }
 
+            if !grpc_workers.is_empty() {
+                crate::backend::warn_old_grpc_pd_workers(grpc_workers.iter().map(String::as_str))
+                    .await;
+            }
+
             Ok(Self {
                 epd: ctx
                     .router_config
@@ -2499,6 +2997,7 @@ impl VllmPDRouter {
                 kv_connector,
                 mooncake_prefill_info,
                 nixl_prefill_info: RwLock::new(HashMap::new()),
+                grpc_frontend,
             })
         }
     }
@@ -2524,12 +3023,14 @@ impl VllmPDRouter {
     /// Delegates to the underlying PdRouterBase
     pub async fn remove_prefill_server(&self, url: &str) -> Result<String, PDRouterError> {
         self.evict_nixl_info(url);
+        self.grpc_frontend.remove_worker(url);
         self.pd_router.remove_prefill_server(url).await
     }
 
     /// Remove a decode server from the router
     /// Delegates to the underlying PdRouterBase
     pub async fn remove_decode_server(&self, url: &str) -> Result<String, PDRouterError> {
+        self.grpc_frontend.remove_worker(url);
         self.pd_router.remove_decode_server(url).await
     }
 
@@ -2537,6 +3038,24 @@ impl VllmPDRouter {
     /// This allows access to worker information for refresh operations
     pub fn worker_registry(&self) -> &crate::core::WorkerRegistry {
         &self.pd_router.worker_registry
+    }
+
+    /// Test hook: pin token ids so gRPC P/D tests do not load a model.
+    pub fn pin_test_token_ids(&self, token_ids: Vec<u32>) {
+        self.grpc_frontend.pin_test_token_ids(token_ids);
+    }
+
+    /// Test hook: L0 and L1 stats. Each is `None` when that cache is off.
+    pub fn test_encoding_cache_stats(
+        &self,
+    ) -> (
+        Option<crate::tokenizer::TokenizerCacheStats>,
+        Option<crate::backend::L1CacheStats>,
+    ) {
+        (
+            self.grpc_frontend.tokenizer_cache_stats(),
+            self.grpc_frontend.l1_cache_stats(),
+        )
     }
 }
 
@@ -2655,6 +3174,9 @@ impl RouterTrait for VllmPDRouter {
         body: &crate::protocols::spec::ChatCompletionRequest,
         _model_id: Option<&str>,
     ) -> Response {
+        if !self.use_discovery && self.uses_grpc_pools() {
+            return self.route_grpc_chat(headers, body).await;
+        }
         if self.program_turn_enabled(headers, &body.other) {
             let request = match serde_json::to_value(body) {
                 Ok(request) => request,
@@ -2795,14 +3317,18 @@ impl RouterTrait for VllmPDRouter {
             Err(_) => return Response::from_parts(parts, Body::from(bytes)),
         };
         if let Some(object) = value.as_object_mut() {
-            object.insert(
-                "program_scheduling".into(),
-                json!({
-                    "path": "cold_remote",
-                    "warm_enabled": false,
-                    "scheduler": runtime.scheduler.diagnostics(),
-                }),
-            );
+            let mut program = json!({
+                "path": "program_pd",
+                "warm_enabled": runtime
+                    .warm_remote
+                    .as_ref()
+                    .is_some_and(|a| a.config.warm_remote),
+                "scheduler": runtime.scheduler.diagnostics(),
+            });
+            if let Some(warm_remote) = runtime.warm_remote.as_ref() {
+                program["warm_remote"] = warm_remote.diagnostics();
+            }
+            object.insert("program_scheduling".into(), program);
         }
         parts.headers.remove(axum::http::header::CONTENT_LENGTH);
         match serde_json::to_vec(&value) {
@@ -4372,6 +4898,69 @@ mod tests {
             assert!(cancelled.await.unwrap_err().is_cancelled());
             assert!(router.pd_router.pd_load.snapshot().is_empty());
             server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn test_discovery_sticky_least_loaded_pins_sessions_on_both_roles() {
+        use crate::policies::StickyLeastLoadedPolicy;
+
+        let ctx = Arc::new(
+            crate::server::AppContext::new(
+                crate::config::RouterConfig::default(),
+                reqwest::Client::new(),
+                64,
+                None,
+                vec![],
+            )
+            .unwrap(),
+        );
+        let prefill_policy = Arc::new(StickyLeastLoadedPolicy::new());
+        let decode_policy = Arc::new(StickyLeastLoadedPolicy::new());
+        ctx.policy_registry
+            .set_prefill_policy(prefill_policy.clone());
+        ctx.policy_registry.set_decode_policy(decode_policy.clone());
+        let router = VllmPDRouter::new(vec![], vec![], None, &ctx).await.unwrap();
+        for (role, service) in [
+            ("prefill", ServiceType::Prefill),
+            ("decode", ServiceType::Decode),
+        ] {
+            for i in 0..2 {
+                router.service_registry.register_service(
+                    format!("{role}-{i}:8000"),
+                    format!("tcp://{role}-{i}:5557"),
+                    service.clone(),
+                );
+            }
+        }
+
+        for session in 0..4 {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                "x-session-id",
+                format!("session-{session}").parse().unwrap(),
+            );
+            let mut pairs = std::collections::HashSet::new();
+            for turn in 0..3 {
+                let request = json!({"model": "m", "prompt": format!("turn {turn}")});
+                let (prefill, decode, _attempt) = router
+                    .admit_discovered_pair(&request, "/v1/completions", Some(&headers))
+                    .await
+                    .expect("a P/D pair should be admitted");
+                pairs.insert((prefill.url().to_owned(), decode.url().to_owned()));
+            }
+            assert_eq!(pairs.len(), 1, "session-{session} moved: {pairs:?}");
+        }
+
+        // New sessions go to the least-loaded instance: 2/2 on each role.
+        for (policy, role) in [(&prefill_policy, "prefill"), (&decode_policy, "decode")] {
+            assert_eq!(policy.active_session_count(), 4);
+            for i in 0..2 {
+                assert_eq!(
+                    policy.active_count_for(&format!("http://{role}-{i}:8000")),
+                    2
+                );
+            }
         }
     }
 

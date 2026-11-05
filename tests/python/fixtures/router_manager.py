@@ -1,4 +1,5 @@
 import subprocess
+import sys
 import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional
@@ -50,7 +51,7 @@ class RouterManager:
             ]
         else:
             cmd = [
-                "python3",
+                sys.executable,
                 "-m",
                 "vllm_router.launch_router",
                 "--host",
@@ -98,6 +99,11 @@ class RouterManager:
                 "cache_threshold": "--cache-threshold",
                 "balance_abs_threshold": "--balance-abs-threshold",
                 "balance_rel_threshold": "--balance-rel-threshold",
+                # kv_aware decode session affinity
+                "kv_aware_session_affinity_ttl_secs": "--kv-aware-session-affinity-ttl-secs",
+                # Program scheduling
+                "enable_program_scheduling": "--enable-program-scheduling",
+                "program_scheduling_config_json": "--program-scheduling-config-json",
                 # Retry
                 "retry_max_retries": "--retry-max-retries",
                 "retry_initial_backoff_ms": "--retry-initial-backoff-ms",
