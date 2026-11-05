@@ -107,16 +107,6 @@ pub(crate) struct SourcesUnavailable {
     pub(crate) detail: String,
 }
 
-/// Whether discovery may issue the HTTP control probe for a worker.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ProbePolicy {
-    /// Probe the worker's control plane.
-    Allowed,
-    /// A previous probe answered 404/405 (or gRPC `Unimplemented`): report the
-    /// cached verdict without touching the network.
-    KnownUnsupported,
-}
-
 /// Per-worker subscriber state retained for removal-time cleanup.
 struct WorkerSubs {
     active: Arc<AtomicBool>,
@@ -212,11 +202,6 @@ pub struct KvIndexSupervisor {
     signal_tx: mpsc::Sender<IngestionSignal>,
     /// Per-worker subscriber state.
     workers: Mutex<HashMap<String, WorkerSubs>>,
-    /// Workers that do not serve the source probe; cleared when the worker is
-    /// removed.
-    unsupported_sources: Mutex<HashSet<String>>,
-    /// One-shot explanation of the discovery prerequisites.
-    discovery_hint: Mutex<bool>,
     /// First-seen block_size, for cross-worker mismatch warning.
     first_block_size: Mutex<Option<u32>>,
 }
@@ -253,8 +238,6 @@ impl KvIndexSupervisor {
             identity_refs: Mutex::new(HashMap::new()),
             signal_tx,
             workers: Mutex::new(HashMap::new()),
-            unsupported_sources: Mutex::new(HashSet::new()),
-            discovery_hint: Mutex::new(false),
             first_block_size: Mutex::new(None),
         };
         (supervisor, signal_rx)
@@ -313,40 +296,9 @@ impl KvIndexSupervisor {
         self
     }
 
-    /// Explain the discovery prerequisites once per process.
-    fn note_discovery_prerequisites(&self) {
-        if !self.static_sources.is_empty() || !self.static_pd_sources.is_empty() {
-            return;
-        }
-        let mut hinted = self.discovery_hint.lock();
-        if *hinted {
-            return;
-        }
-        *hinted = true;
-        info!(
-            "kv_aware: no static KV event sources configured; probing the \
-             /kv_event_sources HTTP route (vLLM >= 0.31) and falling back to load-only scoring \
-             where it is absent. Declare --kv-event-source to make KV-aware routing authoritative."
-        );
-    }
-
-    /// Whether this worker already proved it does not implement the extension.
-    fn probe_policy(&self, worker_url: &str) -> ProbePolicy {
-        if self.static_sources.contains_key(worker_url)
-            || self.static_pd_sources.contains_key(worker_url)
-        {
-            return ProbePolicy::Allowed;
-        }
-        if self.unsupported_sources.lock().contains(worker_url) {
-            return ProbePolicy::KnownUnsupported;
-        }
-        ProbePolicy::Allowed
-    }
-
     /// Query both endpoints for `worker_url`, spawn one subscriber per rank into
     /// this worker's identity's indexer. A missing source route is a soft skip.
     pub async fn on_worker_added(&self, worker_url: &str) -> Result<WorkerKvInfo, String> {
-        self.note_discovery_prerequisites();
         // Discovery awaits without the owner lock. A failed/stale re-add must
         // leave the prior registration and its observed placement intact.
         let observed = self
@@ -360,7 +312,6 @@ impl KvIndexSupervisor {
 
     /// Prepare metadata once; P/D refresh fingerprints and installs this same snapshot.
     pub(crate) async fn discover(&self, worker_url: &str) -> WorkerDiscovery {
-        let probe = self.probe_policy(worker_url);
         if self.http_pd {
             return match self.static_pd_sources.get(worker_url) {
                 Some(config) => {
@@ -388,14 +339,7 @@ impl KvIndexSupervisor {
                     }
                 }
                 None => {
-                    discover_worker(
-                        &self.client,
-                        worker_url,
-                        true,
-                        self.api_key.as_deref(),
-                        probe,
-                    )
-                    .await
+                    discover_worker(&self.client, worker_url, true, self.api_key.as_deref()).await
                 }
             };
         }
@@ -406,14 +350,8 @@ impl KvIndexSupervisor {
             // A layout entry without endpoints: the declaration carries the
             // identity and groups, the engine reports the publishers.
             Some(config) if layout_only(config) => {
-                let discovery = discover_worker(
-                    &self.client,
-                    worker_url,
-                    false,
-                    self.api_key.as_deref(),
-                    probe,
-                )
-                .await;
+                let discovery =
+                    discover_worker(&self.client, worker_url, false, self.api_key.as_deref()).await;
                 match discovery.sources {
                     Ok(sources) if !sources.is_empty() => {
                         match layout_topic_mismatch(config, &sources) {
@@ -472,20 +410,10 @@ impl KvIndexSupervisor {
                     &self.client,
                     worker_url,
                     self.api_key.as_deref(),
-                    probe,
                 )
                 .await
             }
-            None => {
-                discover_worker(
-                    &self.client,
-                    worker_url,
-                    false,
-                    self.api_key.as_deref(),
-                    probe,
-                )
-                .await
-            }
+            None => discover_worker(&self.client, worker_url, false, self.api_key.as_deref()).await,
         }
     }
 
@@ -549,30 +477,13 @@ impl KvIndexSupervisor {
         };
 
         let sources = match discovery.sources {
-            Ok(s) => {
-                // A worker that answers again leaves the unsupported set, so a
-                // rediscovered engine is never skipped on stale evidence.
-                self.unsupported_sources.lock().remove(worker_url);
-                s
-            }
+            Ok(s) => s,
             Err(unavailable) => {
                 match unavailable.probe {
-                    // The engine serves no such route (vLLM 0.29/0.30): remember
-                    // it, stay quiet, and let the deployment declare sources.
-                    SourcesProbe::Unsupported => {
-                        let first = self
-                            .unsupported_sources
-                            .lock()
-                            .insert(worker_url.to_string());
-                        if first {
-                            debug!(
-                                "kv_index {}: engine does not expose /kv_event_sources (added in \
-                                 vLLM 0.31.0); no KV subscribers for this worker. Declare \
-                                 --kv-event-source to make it KV-aware.",
-                                worker_url
-                            );
-                        }
-                    }
+                    SourcesProbe::Unsupported => debug!(
+                        "kv_index {}: engine does not expose KV event sources; no subscribers",
+                        worker_url
+                    ),
                     SourcesProbe::Failed => warn!(
                         "kv_index {}: /kv_event_sources probe failed: {} — will retry",
                         worker_url, unavailable.detail
@@ -921,7 +832,6 @@ impl KvIndexSupervisor {
     /// Shut down this worker's subscribers, clear its residency, release its
     /// identity ref.
     pub fn on_worker_removed(&self, worker_url: &str) {
-        self.unsupported_sources.lock().remove(worker_url);
         let mut workers = self.workers.lock();
         if let Some(subs) = workers.remove(worker_url) {
             self.retire_worker(subs);
@@ -1071,24 +981,15 @@ async fn discover_worker(
     worker_url: &str,
     http_pd: bool,
     api_key: Option<&str>,
-    probe: ProbePolicy,
 ) -> WorkerDiscovery {
     if crate::backend::is_grpc_url(worker_url) {
         let timeout = Duration::from_secs(10);
         let server = crate::backend::control::get_grpc_server_info(worker_url, timeout).await;
         let model =
             grpc_model_id(crate::backend::control::get_grpc_model_info(worker_url, timeout).await);
-        let sources = match probe {
-            ProbePolicy::KnownUnsupported => Err(SourcesUnavailable {
-                probe: SourcesProbe::Unsupported,
-                detail: "grpc GetKvEventSources: Unimplemented (cached)".to_owned(),
-            }),
-            ProbePolicy::Allowed => {
-                crate::backend::control::get_grpc_kv_event_sources(worker_url, timeout)
-                    .await
-                    .map_err(SourcesUnavailable::from)
-            }
-        };
+        let sources = crate::backend::control::get_grpc_kv_event_sources(worker_url, timeout)
+            .await
+            .map_err(SourcesUnavailable::from);
         let server_info = server.map(|server| {
             let model_id = model.as_ref().ok().and_then(|model| model.clone());
             ServerInfo {
@@ -1116,7 +1017,7 @@ async fn discover_worker(
                 "HTTP worker model and block-size metadata must be configured statically"
                     .to_string(),
             ),
-            sources: probe_http_sources(client, worker_url, probe).await,
+            sources: query_kv_event_sources(client, worker_url).await,
             model_id: Ok(Some(worker_url.to_string())),
             hybrid: None,
         };
@@ -1128,13 +1029,7 @@ async fn discover_worker(
         .map_err(|error| error.clone());
     WorkerDiscovery {
         server_info,
-        sources: match probe {
-            ProbePolicy::Allowed => query_pd_kv_event_sources(client, worker_url, api_key).await,
-            ProbePolicy::KnownUnsupported => Err(SourcesUnavailable {
-                probe: SourcesProbe::Unsupported,
-                detail: format!("kv_event_sources {worker_url}: 404 (cached)"),
-            }),
-        },
+        sources: query_pd_kv_event_sources(client, worker_url, api_key).await,
         model_id,
         hybrid: None,
     }
@@ -1377,7 +1272,6 @@ async fn discover_full_attention_http_worker(
     client: &reqwest::Client,
     worker_url: &str,
     api_key: Option<&str>,
-    probe: ProbePolicy,
 ) -> WorkerDiscovery {
     let server_info =
         query_worker_json::<ServerInfo>(client, worker_url, "get_server_info", true, api_key).await;
@@ -1387,13 +1281,7 @@ async fn discover_full_attention_http_worker(
         .map_err(Clone::clone);
     WorkerDiscovery {
         server_info,
-        sources: match probe {
-            ProbePolicy::Allowed => fetch_kv_event_sources(client, worker_url, api_key).await,
-            ProbePolicy::KnownUnsupported => Err(SourcesUnavailable {
-                probe: SourcesProbe::Unsupported,
-                detail: format!("kv_event_sources {worker_url}: 404 (cached)"),
-            }),
-        },
+        sources: fetch_kv_event_sources(client, worker_url, api_key).await,
         model_id,
         hybrid: None,
     }
@@ -1504,7 +1392,7 @@ async fn fetch_kv_event_sources(
     if matches!(status.as_u16(), 404 | 405) {
         return Err(SourcesUnavailable {
             probe: SourcesProbe::Unsupported,
-            detail: format!("kv_event_sources {url}: {status} (route added in vLLM 0.31.0)"),
+            detail: format!("kv_event_sources {url}: {status}"),
         });
     }
     if !status.is_success() {
@@ -1519,19 +1407,11 @@ async fn fetch_kv_event_sources(
     })
 }
 
-/// Probe policy gate: a worker that already answered 404/405 is not asked again.
-async fn probe_http_sources(
+async fn query_kv_event_sources(
     client: &reqwest::Client,
     worker_url: &str,
-    probe: ProbePolicy,
 ) -> Result<KvEventSourcesResponse, SourcesUnavailable> {
-    match probe {
-        ProbePolicy::Allowed => fetch_kv_event_sources(client, worker_url, None).await,
-        ProbePolicy::KnownUnsupported => Err(SourcesUnavailable {
-            probe: SourcesProbe::Unsupported,
-            detail: format!("kv_event_sources {worker_url}: 404 (cached)"),
-        }),
-    }
+    fetch_kv_event_sources(client, worker_url, None).await
 }
 
 impl From<crate::backend::control::KvEventSourcesError> for SourcesUnavailable {
@@ -1752,79 +1632,6 @@ mod tests {
                 .is_none());
             supervisor.on_worker_removed(worker_url);
         }
-    }
-
-    /// Stock vLLM serves no HTTP KV event source route: the first 404 is the
-    /// whole answer, so later discovery passes must not re-probe the worker.
-    #[tokio::test]
-    async fn missing_http_control_route_is_probed_once() {
-        use std::sync::atomic::AtomicUsize;
-
-        use axum::{http::StatusCode, routing::get, Router};
-
-        let hits = Arc::new(AtomicUsize::new(0));
-        let app = Router::new().route(
-            "/kv_event_sources",
-            get({
-                let hits = hits.clone();
-                move || {
-                    hits.fetch_add(1, Ordering::Relaxed);
-                    async { StatusCode::NOT_FOUND }
-                }
-            }),
-        );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let worker = format!("http://{}", listener.local_addr().unwrap());
-        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-
-        let (supervisor, _signals) =
-            KvIndexSupervisor::new(reqwest::Client::new(), HashMode::Sha256);
-        for _ in 0..3 {
-            let info = supervisor.on_worker_added(&worker).await.unwrap();
-            assert!(info.ranks.is_empty());
-            assert!(info.cache_key.is_none());
-        }
-        assert_eq!(hits.load(Ordering::Relaxed), 1);
-        assert!(supervisor.unsupported_sources.lock().contains(&worker));
-
-        // A removed worker forgets the verdict, so a restarted engine (now
-        // with the extension enabled) is probed again.
-        supervisor.on_worker_removed(&worker);
-        supervisor.on_worker_added(&worker).await.unwrap();
-        assert_eq!(hits.load(Ordering::Relaxed), 2);
-        task.abort();
-    }
-
-    /// Transport/server failures are not verdicts: the next pass retries.
-    #[tokio::test]
-    async fn failed_http_control_probe_is_retried() {
-        use std::sync::atomic::AtomicUsize;
-
-        use axum::{http::StatusCode, routing::get, Router};
-
-        let hits = Arc::new(AtomicUsize::new(0));
-        let app = Router::new().route(
-            "/kv_event_sources",
-            get({
-                let hits = hits.clone();
-                move || {
-                    hits.fetch_add(1, Ordering::Relaxed);
-                    async { StatusCode::INTERNAL_SERVER_ERROR }
-                }
-            }),
-        );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let worker = format!("http://{}", listener.local_addr().unwrap());
-        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-
-        let (supervisor, _signals) =
-            KvIndexSupervisor::new(reqwest::Client::new(), HashMode::Sha256);
-        for _ in 0..2 {
-            supervisor.on_worker_added(&worker).await.unwrap();
-        }
-        assert_eq!(hits.load(Ordering::Relaxed), 2);
-        assert!(!supervisor.unsupported_sources.lock().contains(&worker));
-        task.abort();
     }
 
     #[test]
