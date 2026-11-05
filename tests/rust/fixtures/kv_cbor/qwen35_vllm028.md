@@ -9,21 +9,3 @@ The engine used `sha256_cbor`, `PYTHONHASHSEED=0`, and
 `VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES=0`. Prefix caching was enabled and no
 adapter, multimodal input, cache salt, or speculative decoding was used.
 On the second identical request the engine reported 528 cached tokens.
-
-The fixture does not establish support for other vLLM versions, model
-configurations, event formats, or deployment topologies.
-
-The ignored `qwen35_live_engine_events_reach_policy` Rust test can also consume
-live events from `qwen35_live_engine.py`. Start that script with a vLLM GPU
-environment and `HYBRID_PROBE_DIR` set to an empty directory, with
-`PYTHONHASHSEED=0` and `VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES=0`. After it writes
-`ready` and `endpoints.json`, set `HYBRID_PROBE_PUB` and `HYBRID_PROBE_REPLAY`
-to the corresponding local TCP endpoints and run:
-
-```sh
-cargo test --locked --features cpu,ready --lib qwen35_live_engine_events_reach_policy -- --ignored
-```
-
-This controlled probe manually supplies the observed group layout. It does not
-exercise HTTP Router discovery or prove that the publisher meets a production
-replay/live handoff contract.

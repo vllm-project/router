@@ -65,13 +65,12 @@ model configuration to copy:
 }
 ```
 
-The hybrid adapter currently rejects sliding-window groups. Experimental P/D
-configuration is supplied with `--pd-hybrid-config`: its JSON maps each
-prefill base URL to `endpoints`, `replay_endpoints`, `block_size`, `model`,
-`hybrid` (the layout above), and `compatible_decode_urls`. Each listed pair
-must be verified by the operator for model/weights, engine version, connector,
-and parallel configuration. Once enabled, only explicitly listed P/D pairs
-are admitted. Program scheduling is not supported with hybrid P/D. The
+Experimental P/D configuration is supplied with `--pd-hybrid-config`: its JSON
+maps each prefill base URL to `endpoints`, `replay_endpoints`, `block_size`,
+`model`, `hybrid` (the layout above), and `compatible_decode_urls`. Each listed
+pair must be verified by the operator for model/weights, engine version,
+connector, and parallel configuration. Once enabled, only explicitly listed P/D
+pairs are admitted. Program scheduling is not supported with hybrid P/D. The
 connector remains responsible for KV transfer; end-to-end validation is in
 progress.
 

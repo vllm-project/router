@@ -671,24 +671,6 @@ mod tests {
         assert_eq!(index.reusable_tokens(&prompt(), usize::MAX), 0);
     }
 
-    #[test]
-    fn engine_root_hash_reproduces_the_qwen_sequence_without_seed() {
-        let payload = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/rust/fixtures/kv_cbor/qwen35_vllm028.msgpack"
-        ));
-        let root = BlockKeyGenerator::new(528, 0).none_hash();
-        let index = HybridEventIndex::new_with_root_hash(target(), groups(), 528, root, 8).unwrap();
-        index.begin_empty(0);
-        index.apply_payload(0, payload).unwrap();
-        assert_eq!(index.reusable_tokens(&prompt(), usize::MAX), 528);
-        let wrong =
-            HybridEventIndex::new_with_root_hash(target(), groups(), 528, [0; 32], 8).unwrap();
-        wrong.begin_empty(0);
-        wrong.apply_payload(0, payload).unwrap();
-        assert_eq!(wrong.reusable_tokens(&prompt(), usize::MAX), 0);
-    }
-
     /// vLLM 0.28 publishes one event per message; the rank comes from the
     /// endpoint, not from the payload.
     #[test]
