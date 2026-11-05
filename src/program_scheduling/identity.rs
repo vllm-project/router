@@ -37,6 +37,34 @@ pub enum ProgramSchedulingEnableKey {
     Auto,
 }
 
+/// Next-turn hint versions this Router understands.
+const NEXT_TURN_HINT_VERSION: &str = "1";
+
+/// One request's forecast of when its Program sends the next turn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NextTurnHint {
+    /// Who produced the forecast. Logged, never a metric label.
+    pub provenance: Option<String>,
+    /// Time from this request's completion to the next turn's arrival.
+    pub expected_return: Duration,
+    /// Producer's confidence in thousandths; 1000 when it states none.
+    pub confidence_permille: u16,
+    /// Samples behind the forecast, when the producer has them.
+    pub support: Option<u64>,
+    /// Time after this request's completion at which the forecast goes stale.
+    pub valid_for: Option<Duration>,
+}
+
+/// A hint never fails its request: one the Router cannot use is only counted.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum NextTurnHintInput {
+    #[default]
+    Absent,
+    Usable(NextTurnHint),
+    /// Bounded reason, suitable as a metric label.
+    Ignored(&'static str),
+}
+
 /// Scheduling hints whose lifetime is exactly one retained request.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ProgramRequestHints {
@@ -50,6 +78,8 @@ pub struct ProgramRequestHints {
     pub expected_output_tokens: Option<usize>,
     /// Optional replacement for the TTL computed after this request completes.
     pub kv_retention_ttl: Option<Duration>,
+    /// Optional forecast evaluated by next-turn prefetch shadow scoring.
+    pub next_turn_hint: NextTurnHintInput,
 }
 
 /// Stable scheduling identity for one Program generation.
@@ -466,8 +496,65 @@ fn apply_canonical_scheduling(
             context,
             &["kv_retention_ttl", "kv_retention_ttl_seconds"],
         )?,
+        next_turn_hint: next_turn_hint(context),
     };
     Ok(())
+}
+
+fn next_turn_hint(context: &JsonMap<String, JsonValue>) -> NextTurnHintInput {
+    const MALFORMED: NextTurnHintInput = NextTurnHintInput::Ignored("malformed");
+    let raw = match context.get("next_turn_hint") {
+        None | Some(JsonValue::Null) => return NextTurnHintInput::Absent,
+        Some(JsonValue::Object(raw)) => raw,
+        Some(_) => return MALFORMED,
+    };
+    match raw.get("version").and_then(JsonValue::as_str) {
+        Some(NEXT_TURN_HINT_VERSION) => {}
+        Some(_) => return NextTurnHintInput::Ignored("unsupported_version"),
+        None => return MALFORMED,
+    }
+    let seconds = |key: &str| match raw.get(key) {
+        None | Some(JsonValue::Null) => Ok(None),
+        Some(value) => value
+            .as_f64()
+            .and_then(|seconds| Duration::try_from_secs_f64(seconds).ok())
+            .map(Some)
+            .ok_or(()),
+    };
+    let (Ok(Some(expected_return)), Ok(valid_for)) = (
+        seconds("expected_return_seconds"),
+        seconds("valid_for_seconds"),
+    ) else {
+        return MALFORMED;
+    };
+    let confidence = match raw.get("confidence") {
+        None | Some(JsonValue::Null) => 1.0,
+        Some(value) => match value.as_f64() {
+            Some(confidence) if (0.0..=1.0).contains(&confidence) => confidence,
+            _ => return MALFORMED,
+        },
+    };
+    let support = match raw.get("support") {
+        None | Some(JsonValue::Null) => None,
+        Some(value) => match value.as_u64() {
+            Some(support) => Some(support),
+            None => return MALFORMED,
+        },
+    };
+    let provenance = match raw.get("provenance") {
+        None | Some(JsonValue::Null) => None,
+        Some(JsonValue::String(provenance)) if provenance.len() <= MAX_IDENTITY_COMPONENT_BYTES => {
+            Some(provenance.clone())
+        }
+        Some(_) => return MALFORMED,
+    };
+    NextTurnHintInput::Usable(NextTurnHint {
+        provenance,
+        expected_return,
+        confidence_permille: (confidence * 1000.0).round() as u16,
+        support,
+        valid_for,
+    })
 }
 
 fn related_program_id(
@@ -712,6 +799,85 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    fn hint_of(hint: serde_json::Value) -> NextTurnHintInput {
+        let request = serde_json::json!({
+            "vllm_xargs": {"agentic_context": {"program_id": "p", "next_turn_hint": hint}}
+        });
+        ProgramIdentity::from_request(None, Some(&request), Some("model"))
+            .unwrap()
+            .unwrap()
+            .request_hints()
+            .next_turn_hint
+            .clone()
+    }
+
+    #[test]
+    fn next_turn_hint_keeps_its_provenance_confidence_and_expiry() {
+        assert_eq!(
+            hint_of(serde_json::json!({
+                "version": "1",
+                "provenance": "harness",
+                "expected_return_seconds": 2.5,
+                "confidence": 0.8,
+                "support": 40,
+                "valid_for_seconds": 30
+            })),
+            NextTurnHintInput::Usable(NextTurnHint {
+                provenance: Some("harness".to_string()),
+                expected_return: Duration::from_millis(2500),
+                confidence_permille: 800,
+                support: Some(40),
+                valid_for: Some(Duration::from_secs(30)),
+            })
+        );
+    }
+
+    #[test]
+    fn next_turn_hint_defaults_to_full_confidence_without_expiry() {
+        assert_eq!(
+            hint_of(serde_json::json!({"version": "1", "expected_return_seconds": 1})),
+            NextTurnHintInput::Usable(NextTurnHint {
+                provenance: None,
+                expected_return: Duration::from_secs(1),
+                confidence_permille: 1000,
+                support: None,
+                valid_for: None,
+            })
+        );
+    }
+
+    #[test]
+    fn unusable_next_turn_hint_never_fails_the_request() {
+        assert_eq!(hint_of(serde_json::Value::Null), NextTurnHintInput::Absent);
+        assert_eq!(
+            hint_of(serde_json::json!({"version": "2", "expected_return_seconds": 1})),
+            NextTurnHintInput::Ignored("unsupported_version")
+        );
+        for malformed in [
+            serde_json::json!("soon"),
+            serde_json::json!({"expected_return_seconds": 1}),
+            serde_json::json!({"version": 1, "expected_return_seconds": 1}),
+            serde_json::json!({"version": "1"}),
+            serde_json::json!({"version": "1", "expected_return_seconds": -1}),
+            serde_json::json!({"version": "1", "expected_return_seconds": "1"}),
+            serde_json::json!({"version": "1", "expected_return_seconds": 1, "confidence": 1.5}),
+            serde_json::json!({"version": "1", "expected_return_seconds": 1, "support": -1}),
+            serde_json::json!({"version": "1", "expected_return_seconds": 1, "valid_for_seconds": -1}),
+            serde_json::json!({"version": "1", "expected_return_seconds": 1, "provenance": 7}),
+            serde_json::json!({
+                "version": "1",
+                "expected_return_seconds": 1,
+                "provenance": "x".repeat(MAX_IDENTITY_COMPONENT_BYTES + 1)
+            }),
+        ] {
+            assert_eq!(
+                hint_of(malformed.clone()),
+                NextTurnHintInput::Ignored("malformed"),
+                "{malformed}"
+            );
+        }
     }
 
     #[test]

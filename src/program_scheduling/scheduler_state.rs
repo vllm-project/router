@@ -4,6 +4,7 @@
 //! They are decision facts, not an additional Program lifecycle state machine.
 
 use super::lineage::ProgramLineage;
+use super::next_turn_prefetch::{NextTurnPrefetchLedger, NextTurnWait};
 use super::output_length::PendingOutputPrediction;
 use super::prediction_profile::PredictionProfileStore;
 use super::return_time::PendingReturnPrediction;
@@ -11,7 +12,7 @@ use super::{
     ProgramBindingStrategy, ProgramBindings, ProgramRef, ProgramRuntime,
     ProgramSchedulingEnableKey, ProgramTarget, ProgressTtlConfig, ProgressTtlFactors,
 };
-use crate::config::types::PredictionProfileConfig;
+use crate::config::types::{NextTurnPrefetchConfig, PredictionProfileConfig};
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -75,6 +76,8 @@ pub struct ProgramSchedulerConfig {
     pub progress_ttl: ProgressTtlConfig,
     /// Optional offline-seeded shadow predictors.
     pub prediction_profile: PredictionProfileConfig,
+    /// Read-only evaluation of next-turn KV prefetch.
+    pub next_turn_prefetch: NextTurnPrefetchConfig,
 }
 
 impl Default for ProgramSchedulerConfig {
@@ -103,6 +106,7 @@ impl Default for ProgramSchedulerConfig {
             shared_prefix_freshness_kv_turnovers: 2.0,
             progress_ttl: ProgressTtlConfig::default(),
             prediction_profile: PredictionProfileConfig::default(),
+            next_turn_prefetch: NextTurnPrefetchConfig::default(),
         }
     }
 }
@@ -188,6 +192,7 @@ impl ProgramSchedulerConfig {
                 decode: config.decode_throughput_model,
             },
             prediction_profile: config.prediction_profile.clone(),
+            next_turn_prefetch: config.next_turn_prefetch.clone(),
         }
     }
 }
@@ -266,6 +271,7 @@ pub(crate) struct ProgramDecisionState {
     pub(crate) latest_output_prediction: Option<PendingOutputPrediction>,
     pub(crate) last_return_actual_seconds: Option<f64>,
     pub(crate) last_output_actual_tokens: Option<usize>,
+    pub(crate) next_turn_wait: Option<NextTurnWait>,
 }
 
 impl ProgramDecisionState {
@@ -326,6 +332,7 @@ impl ProgramDecisionState {
             latest_output_prediction: None,
             last_return_actual_seconds: None,
             last_output_actual_tokens: None,
+            next_turn_wait: None,
         }
     }
 
@@ -385,6 +392,9 @@ pub(crate) struct RankObservationState {
     pub(crate) kv_cache_usage: Option<f64>,
     pub(crate) running_requests: Option<usize>,
     pub(crate) waiting_requests: Option<usize>,
+    pub(crate) external_kv_prompt_tokens_total: Option<f64>,
+    /// Latest observation at which the engine had loaded more external KV.
+    pub(crate) last_restore_at: Option<Instant>,
     pub(crate) router_active_reasoning_programs: usize,
     pub(crate) router_active_reasoning_requests: usize,
     pub(crate) estimated_active_reasoning_tokens: Option<f64>,
@@ -430,6 +440,8 @@ pub(crate) struct ProgramSchedulerState {
     pub(crate) rank_factors: HashMap<String, ProgressTtlFactors>,
     pub(crate) prediction_profiles: PredictionProfileStore,
     pub(crate) next_prediction_snapshot_at: Instant,
+    /// Per-target next-turn prefetch shadow ledgers.
+    pub(crate) next_turn_prefetch: HashMap<String, NextTurnPrefetchLedger>,
     pub(crate) lineage: ProgramLineage,
     /// Most recent P-side KV-cache pressure sample.
     pub(crate) prefill_pressure: Option<PrefillPressure>,
@@ -480,6 +492,7 @@ impl ProgramSchedulerState {
             ),
             next_prediction_snapshot_at: Instant::now()
                 + Duration::from_secs_f64(config.prediction_profile.snapshot_interval_seconds),
+            next_turn_prefetch: HashMap::new(),
             lineage: ProgramLineage::default(),
             prefill_pressure: None,
             prefill_targets: HashMap::new(),

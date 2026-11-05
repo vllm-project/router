@@ -148,6 +148,7 @@ impl ProgramScheduler {
         if !state.runtime.complete_request(dispatch, usage) {
             return;
         }
+        self.settle_next_turn(&mut state, dispatch, success, usage.cached_prompt_tokens);
         let runtime_after = state.runtime.view(dispatch.program());
         let next_output_reservation = state
             .runtime
@@ -471,6 +472,15 @@ impl ProgramScheduler {
                 }
             }
         }
+        if success
+            && matches!(
+                completion_action,
+                Some(CompletionAction::StartActingTtl)
+                    | Some(CompletionAction::Pause(ProgramPauseReason::CapacityRepair))
+            )
+        {
+            self.begin_next_turn_wait(&mut state, dispatch, observed_prompt_tokens, now);
+        }
         if state
             .runtime
             .view(dispatch.program())
@@ -508,6 +518,7 @@ impl ProgramScheduler {
         let now = Instant::now();
         let mut state = self.state.lock();
         self.run_periodic_decisions(&mut state, now);
+        self.evaluate_next_turn_waits(&mut state, now);
         self.report_capacity_accounting_transitions(&mut state, now);
         self.publish_metrics(&state);
     }
@@ -639,6 +650,7 @@ impl ProgramScheduler {
             if let Some((target_id, tokens)) = active_relief {
                 Self::adjust_usage(state, &target_id, -tokens);
             }
+            self.release_next_turn_wait(state, program, now);
             state.decisions.remove(program);
             state.bindings.release_program(program);
         }
