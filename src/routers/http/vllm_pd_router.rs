@@ -30,10 +30,11 @@ use bytes::Bytes;
 use futures_util::StreamExt;
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 use tokio::sync::{Mutex, OwnedSemaphorePermit};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, warn, Instrument};
 use uuid::Uuid;
 
 /// Mooncake prefill bootstrap info (engine_id per dp_rank)
@@ -123,6 +124,242 @@ fn discovery_is_ready(prefill_count: usize, decode_count: usize) -> bool {
 /// Prefill control responses must fit in memory to extract transfer metadata.
 const PD_BUFFERED_BODY_LIMIT_BYTES: usize = 64 * 1024 * 1024;
 const MAX_JSON_REWRITE_BYTES: usize = 8 * 1024 * 1024;
+
+/// Default companion endpoint on the decode worker for notifying pre-admission KV rejection.
+const DEFAULT_KV_TRANSFER_REJECT_ENDPOINT: &str = "/v1/kv_transfer/reject";
+const FALLBACK_KV_TRANSFER_REJECT_ENDPOINT: &str = "/kv_transfer/reject";
+
+/// Extract `kv_transfer_params` from the prefill response JSON if remote prefill KV was pinned.
+fn extract_remote_kv_params(prefill_json: &Value) -> Option<Value> {
+    let params = prefill_json.get("kv_transfer_params")?;
+    if !params.is_object() {
+        return None;
+    }
+    if params.get("do_remote_prefill").and_then(Value::as_bool) == Some(false) {
+        return None;
+    }
+    if params.get("do_remote_prefill").and_then(Value::as_bool) == Some(true)
+        || params.get("remote_engine_id").is_some()
+        || params.get("remote_block_ids").is_some()
+        || params.get("remote_host").is_some()
+        || params.get("transfer_id").is_some()
+    {
+        Some(params.clone())
+    } else {
+        None
+    }
+}
+
+/// Send an explicit rejection notification to the decode worker companion endpoint
+/// to trigger prompt KV block release on the prefill node.
+async fn send_kv_transfer_rejection(
+    client: &reqwest::Client,
+    decode_worker: &dyn Worker,
+    request_id: &str,
+    kv_transfer_params: &Value,
+) {
+    let base_url = decode_worker.base_url();
+    let dp_rank = decode_worker.dp_rank();
+    let auth = format!(
+        "Bearer {}",
+        std::env::var("OPENAI_API_KEY").unwrap_or_default()
+    );
+
+    let endpoint = std::env::var("VLLM_KV_TRANSFER_REJECT_ENDPOINT")
+        .unwrap_or_else(|_| DEFAULT_KV_TRANSFER_REJECT_ENDPOINT.to_string());
+    let endpoint = if endpoint.starts_with('/') {
+        endpoint
+    } else {
+        format!("/{endpoint}")
+    };
+
+    let payload = json!({
+        "request_id": request_id,
+        "kv_transfer_params": kv_transfer_params,
+    });
+
+    let send_to_path = |route: &str| {
+        let url = decode_worker.endpoint_url(route);
+        let mut builder = client
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .header("Authorization", auth.as_str())
+            .header("X-Request-Id", request_id);
+        builder = dp_utils::add_dp_rank_header(builder, dp_rank);
+        builder.json(&payload)
+    };
+
+    debug!(
+        "Sending KV transfer rejection for request {} to {}{}",
+        request_id, base_url, endpoint
+    );
+
+    let resp = match send_to_path(&endpoint).send().await {
+        Ok(resp) => resp,
+        Err(err) => {
+            warn!(
+                %err,
+                request_id,
+                base_url,
+                "Failed to send KV transfer rejection notification"
+            );
+            return;
+        }
+    };
+
+    let status = resp.status();
+    if status == StatusCode::ACCEPTED || status.is_success() {
+        info!(
+            request_id,
+            base_url,
+            status = status.as_u16(),
+            "KV transfer rejection accepted by decode backend"
+        );
+    } else if status == StatusCode::NOT_FOUND && endpoint == DEFAULT_KV_TRANSFER_REJECT_ENDPOINT {
+        debug!(
+            request_id,
+            base_url,
+            "Rejection endpoint {endpoint} returned 404, trying fallback {FALLBACK_KV_TRANSFER_REJECT_ENDPOINT}"
+        );
+        match send_to_path(FALLBACK_KV_TRANSFER_REJECT_ENDPOINT)
+            .send()
+            .await
+        {
+            Ok(fallback_resp) => {
+                let fb_status = fallback_resp.status();
+                if fb_status == StatusCode::ACCEPTED || fb_status.is_success() {
+                    info!(
+                        request_id,
+                        base_url,
+                        status = fb_status.as_u16(),
+                        "KV transfer rejection accepted by fallback endpoint"
+                    );
+                } else {
+                    warn!(
+                        request_id,
+                        base_url,
+                        status = fb_status.as_u16(),
+                        "Fallback KV transfer rejection returned non-success status"
+                    );
+                }
+            }
+            Err(err) => {
+                warn!(
+                    %err,
+                    request_id,
+                    base_url,
+                    "Failed to send fallback KV transfer rejection"
+                );
+            }
+        }
+    } else {
+        warn!(
+            request_id,
+            base_url,
+            status = status.as_u16(),
+            "KV transfer rejection returned unexpected status"
+        );
+    }
+}
+
+/// RAII guard that holds responsibility for unsubmitted KV transfer parameters.
+///
+/// If dropped while armed (e.g. client disconnects or times out before Decode submission),
+/// it immediately fires an asynchronous rejection notification to release stranded KV blocks.
+pub(crate) struct KvTransferGuard {
+    client: reqwest::Client,
+    decode_worker: Arc<dyn Worker>,
+    request_id: String,
+    kv_transfer_params: Option<Value>,
+    armed: AtomicBool,
+}
+
+impl KvTransferGuard {
+    pub(crate) fn new(
+        client: reqwest::Client,
+        decode_worker: Arc<dyn Worker>,
+        request_id: String,
+        kv_transfer_params: Value,
+    ) -> Self {
+        Self {
+            client,
+            decode_worker,
+            request_id,
+            kv_transfer_params: Some(kv_transfer_params),
+            armed: AtomicBool::new(true),
+        }
+    }
+
+    /// Update with final decode kv_transfer_params if transformed during stage preparation.
+    pub(crate) fn update_params(&mut self, params: Value) {
+        self.kv_transfer_params = Some(params);
+    }
+
+    /// Relinquish cleanup responsibility once Decode submission begins.
+    /// After submission, Decode's own request lifecycle manages cancellation.
+    pub(crate) fn disarm(&mut self) {
+        self.armed.store(false, Ordering::Release);
+    }
+}
+
+impl Drop for KvTransferGuard {
+    fn drop(&mut self) {
+        if self.armed.swap(false, Ordering::AcqRel) {
+            if let Some(params) = self.kv_transfer_params.take() {
+                let client = self.client.clone();
+                let decode_worker = self.decode_worker.clone();
+                let request_id = self.request_id.clone();
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    handle.spawn(async move {
+                        send_kv_transfer_rejection(
+                            &client,
+                            decode_worker.as_ref(),
+                            &request_id,
+                            &params,
+                        )
+                        .await;
+                    });
+                } else {
+                    warn!(
+                        request_id = %request_id,
+                        "No active Tokio runtime available to send KV transfer rejection"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// RAII guard that holds decode reservation during prefill and stage-2 preparation.
+///
+/// If dropped before being disarmed (e.g. client cancellation while waiting for prefill
+/// or during profiling), it immediately releases the decode worker's pending reservation,
+/// preventing decode capacity leaks when prefill hangs or takes a long time to timeout.
+struct DecodePendingGuard {
+    attempt: PdAttempt,
+    active: bool,
+}
+
+impl DecodePendingGuard {
+    fn new(attempt: &PdAttempt) -> Self {
+        Self {
+            attempt: attempt.clone(),
+            active: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.active = false;
+    }
+}
+
+impl Drop for DecodePendingGuard {
+    fn drop(&mut self) {
+        if self.active {
+            self.attempt.finish_decode();
+        }
+    }
+}
 
 /// Prefill control metadata must fit in the buffer; Decode may stream the rest.
 async fn read_prefill_body(response: reqwest::Response, url: &str) -> Result<Bytes, PDRouterError> {
@@ -1686,6 +1923,8 @@ impl VllmPDRouter {
                 .await;
         }
 
+        let mut decode_pending_guard = DecodePendingGuard::new(&attempt);
+
         debug!(
             "Prefill worker: {}, Decode worker: {}, Path: {}",
             prefill_worker.url(),
@@ -1772,29 +2011,122 @@ impl VllmPDRouter {
         prefill_request_builder =
             dp_utils::add_dp_rank_header(prefill_request_builder, prefill_dp_rank);
 
-        let prefill_response = otel_http::send_client_request(
-            prefill_request_builder.json(&prefill_request),
-            headers,
-            ClientRequestOptions {
-                method: "POST",
-                url: &prefill_url,
-                route: Some(path),
-                request_phase: Some("prefill"),
-            },
-        )
-        .await;
-        let finished_prefill = self
-            .finish_prefill_response(prefill_response, &prefill_base_url, &attempt)
-            .await
-            .inspect_err(|_| {
-                RouterMetrics::record_pd_prefill_error(&prefill_base_url);
-                RouterMetrics::record_pd_request(path);
-                RouterMetrics::record_pd_request_duration(path, start_time.elapsed());
-            });
-        // The whole P body has been consumed (or never started): do not hold P
-        // admission capacity while D generates the response.
-        drop(prefill_permit);
-        let (status, content_type, prefill_bytes) = finished_prefill?;
+        let attempt_for_p_task = attempt.clone();
+        let (cancel_tx, mut cancel_rx) = tokio::sync::oneshot::channel::<()>();
+        let client_for_p_rejection = self.pd_router.client.clone();
+        let decode_worker_for_p_rejection = decode_worker.clone();
+        let request_id_for_p_rejection = request_id.clone();
+        let prefill_base_for_p_rejection = prefill_base_url.clone();
+        let transfer_id_for_p_rejection = transfer_id.clone();
+        let headers_owned = headers.cloned();
+        let path_owned = path.to_string();
+        let prefill_url_owned = prefill_url.clone();
+
+        // Retain bounded P-response collection through cancellation so unsubmitted transfers
+        // are rejected and released promptly if the downstream client cancels during Prefill.
+        let p_collection_task = tokio::spawn(
+            async move {
+                let prefill_response = otel_http::send_client_request(
+                    prefill_request_builder.json(&prefill_request),
+                    headers_owned.as_ref(),
+                    ClientRequestOptions {
+                        method: "POST",
+                        url: &prefill_url_owned,
+                        route: Some(&path_owned),
+                        request_phase: Some("prefill"),
+                    },
+                )
+                .await;
+
+                let result = async {
+                    let response =
+                        prefill_response.map_err(|error| PDRouterError::NetworkError {
+                            message: format!(
+                                "Prefill request to {prefill_base_for_p_rejection} failed: {}",
+                                error_chain(&error)
+                            ),
+                        })?;
+                    let status = response.status();
+                    let content_type = response.headers().get(http::header::CONTENT_TYPE).cloned();
+                    let bytes = read_prefill_body(response, &prefill_base_for_p_rejection).await?;
+                    Ok::<_, PDRouterError>((status, content_type, bytes))
+                }
+                .await;
+
+                // Retain prefill admission / attempt load until collection completes
+                attempt_for_p_task.finish_prefill();
+                drop(prefill_permit);
+
+                let mut kv_guard = None;
+                if let Ok((status, _, ref bytes)) = result {
+                    if status.is_success() {
+                        let json = serde_json::from_slice::<Value>(bytes).ok();
+                        let params =
+                            json.as_ref()
+                                .and_then(extract_remote_kv_params)
+                                .or_else(|| {
+                                    transfer_id_for_p_rejection.as_ref().map(|tid| {
+                                        json!({
+                                            "do_remote_prefill": true,
+                                            "transfer_id": tid,
+                                        })
+                                    })
+                                });
+                        if let Some(params) = params {
+                            if matches!(
+                                cancel_rx.try_recv(),
+                                Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+                            ) {
+                                debug!(
+                                "Downstream disconnected during prefill; sending rejection for {}",
+                                request_id_for_p_rejection
+                            );
+                                send_kv_transfer_rejection(
+                                    &client_for_p_rejection,
+                                    decode_worker_for_p_rejection.as_ref(),
+                                    &request_id_for_p_rejection,
+                                    &params,
+                                )
+                                .await;
+                            } else {
+                                // Client still connected: transfer armed guard in task output
+                                // to bridge cleanup ownership across the profiling gap.
+                                kv_guard = Some(KvTransferGuard::new(
+                                    client_for_p_rejection,
+                                    decode_worker_for_p_rejection,
+                                    request_id_for_p_rejection,
+                                    params,
+                                ));
+                            }
+                        }
+                    }
+                }
+
+                (result, kv_guard)
+            }
+            .in_current_span(),
+        );
+
+        let (finished_prefill, mut kv_guard) = match p_collection_task.await {
+            Ok((res, guard)) => {
+                attempt.finish_prefill();
+                self.stop_profiling(&prefill_base_url).await;
+                (res, guard)
+            }
+            Err(err) => {
+                attempt.finish_prefill();
+                self.stop_profiling(&prefill_base_url).await;
+                return Err(PDRouterError::NetworkError {
+                    message: format!("Prefill collection task failed: {err}"),
+                });
+            }
+        };
+        drop(cancel_tx);
+        let (status, content_type, prefill_bytes) = finished_prefill.inspect_err(|_| {
+            RouterMetrics::record_pd_prefill_error(&prefill_base_url);
+            RouterMetrics::record_pd_request(path);
+            RouterMetrics::record_pd_request_duration(path, start_time.elapsed());
+        })?;
         if !status.is_success() {
             RouterMetrics::record_pd_prefill_error(&prefill_base_url);
             RouterMetrics::record_pd_request(path);
@@ -1857,6 +2189,27 @@ impl VllmPDRouter {
 
         // Stop profiling on prefill server after its work is done
 
+        // Retain responsibility for the unsubmitted transfer until Decode submission begins.
+        if kv_guard.is_none() {
+            kv_guard = extract_remote_kv_params(&prefill_response_json)
+                .or_else(|| {
+                    transfer_id.as_ref().map(|tid| {
+                        json!({
+                            "do_remote_prefill": true,
+                            "transfer_id": tid,
+                        })
+                    })
+                })
+                .map(|params| {
+                    KvTransferGuard::new(
+                        self.pd_router.client.clone(),
+                        decode_worker.clone(),
+                        request_id.clone(),
+                        params,
+                    )
+                });
+        }
+
         // P work is complete. D remains pending until its HTTP dispatch.
 
         debug!("✅ vLLM Stage 1 completed, starting Stage 2 - Decode");
@@ -1880,6 +2233,16 @@ impl VllmPDRouter {
             )
             .await
         {
+            if let Some(guard) = kv_guard.as_mut() {
+                guard.update_params(params.clone());
+            } else {
+                kv_guard = Some(KvTransferGuard::new(
+                    self.pd_router.client.clone(),
+                    decode_worker.clone(),
+                    request_id.clone(),
+                    params.clone(),
+                ));
+            }
             decode_request["kv_transfer_params"] = params;
         } else {
             warn!(
@@ -1932,6 +2295,7 @@ impl VllmPDRouter {
         decode_request_builder =
             dp_utils::add_dp_rank_header(decode_request_builder, decode_dp_rank);
 
+        decode_pending_guard.disarm();
         attempt.begin_decode();
         let decode_response = match otel_http::send_client_request(
             decode_request_builder.json(&decode_request),
@@ -1945,7 +2309,17 @@ impl VllmPDRouter {
         )
         .await
         {
-            Ok(resp) => resp,
+            Ok(resp) => {
+                // Relinquish responsibility only when Decode successfully accepts the request (2xx).
+                // On HTTP rejection (e.g. 429 Too Many Requests, 503 Service Unavailable), the guard
+                // remains armed so dropping it releases stranded prefill KV blocks.
+                if resp.status().is_success() {
+                    if let Some(guard) = kv_guard.as_mut() {
+                        guard.disarm();
+                    }
+                }
+                resp
+            }
             Err(e) => {
                 attempt.finish_decode();
                 let full_error = error_chain(&e);
@@ -1954,6 +2328,7 @@ impl VllmPDRouter {
                 RouterMetrics::record_pd_request(path);
                 RouterMetrics::record_pd_request_duration(path, duration);
                 RouterMetrics::record_pd_prefill_request(&prefill_base_url);
+                // kv_guard remains armed and will fire send_kv_transfer_rejection upon drop
                 return Err(PDRouterError::NetworkError {
                     message: format!("Decode request failed to {}: {}", decode_url, full_error),
                 });
@@ -3157,6 +3532,7 @@ mod tests {
         url
     }
 
+    use super::super::pd_types::PdLoadManager;
     use super::*;
 
     #[tokio::test]
@@ -5341,5 +5717,485 @@ mod tests {
                 decode.decrement_load();
             }
         }
+    }
+
+    static REJECTION_TEST_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    #[test]
+    fn test_armed_drop_outside_tokio_runtime_no_panic() {
+        let result = std::thread::spawn(|| {
+            let client = reqwest::Client::new();
+            let decode_worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+                "http://127.0.0.1:8000".to_string(),
+                WorkerType::Decode,
+            ));
+            let guard = KvTransferGuard::new(
+                client,
+                decode_worker,
+                "req-no-runtime".to_string(),
+                json!({"do_remote_prefill": true}),
+            );
+            // Explicitly drop outside any Tokio runtime: must not panic
+            drop(guard);
+        })
+        .join();
+        assert!(
+            result.is_ok(),
+            "Dropping KvTransferGuard outside Tokio runtime should not panic"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cancellation_before_decode_dispatch_guard_fires() {
+        let _serial_guard = REJECTION_TEST_MUTEX.lock().await;
+        let rejections = Arc::new(tokio::sync::Mutex::new(Vec::<Value>::new()));
+        let rejections_clone = rejections.clone();
+
+        async fn reject_handler(
+            axum::extract::State(rejections): axum::extract::State<
+                Arc<tokio::sync::Mutex<Vec<Value>>>,
+            >,
+            axum::Json(body): axum::Json<Value>,
+        ) -> StatusCode {
+            rejections.lock().await.push(body);
+            StatusCode::ACCEPTED
+        }
+
+        let app = axum::Router::new().route(
+            "/v1/kv_transfer/reject",
+            axum::routing::post(reject_handler).with_state(rejections_clone),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(base, WorkerType::Decode));
+        let guard = KvTransferGuard::new(
+            reqwest::Client::new(),
+            worker,
+            "test-req-453".to_string(),
+            json!({
+                "do_remote_prefill": true,
+                "remote_engine_id": "producer-p",
+                "remote_block_ids": [101, 102]
+            }),
+        );
+
+        // Dropping guard without disarming simulates client cancellation before decode submission
+        drop(guard);
+
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+        let recorded = rejections.lock().await;
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0]["request_id"], "test-req-453");
+        assert_eq!(
+            recorded[0]["kv_transfer_params"]["remote_engine_id"],
+            "producer-p"
+        );
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_normal_request_disarms_guard_no_rejection() {
+        let _serial_guard = REJECTION_TEST_MUTEX.lock().await;
+        let rejections = Arc::new(tokio::sync::Mutex::new(Vec::<Value>::new()));
+        let rejections_clone = rejections.clone();
+
+        async fn reject_handler(
+            axum::extract::State(rejections): axum::extract::State<
+                Arc<tokio::sync::Mutex<Vec<Value>>>,
+            >,
+            axum::Json(body): axum::Json<Value>,
+        ) -> StatusCode {
+            rejections.lock().await.push(body);
+            StatusCode::ACCEPTED
+        }
+
+        let app = axum::Router::new().route(
+            "/v1/kv_transfer/reject",
+            axum::routing::post(reject_handler).with_state(rejections_clone),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(base, WorkerType::Decode));
+        let mut guard = KvTransferGuard::new(
+            reqwest::Client::new(),
+            worker,
+            "test-req-normal".to_string(),
+            json!({"do_remote_prefill": true}),
+        );
+
+        // Normal request disarms the guard once decode accepts the request
+        guard.disarm();
+        drop(guard);
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let recorded = rejections.lock().await;
+        assert_eq!(
+            recorded.len(),
+            0,
+            "No rejection should be sent when guard is disarmed"
+        );
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_decode_send_failure_keeps_guard_armed_and_fires_rejection() {
+        let _serial_guard = REJECTION_TEST_MUTEX.lock().await;
+        let rejections = Arc::new(tokio::sync::Mutex::new(Vec::<Value>::new()));
+        let rejections_clone = rejections.clone();
+
+        async fn reject_handler(
+            axum::extract::State(rejections): axum::extract::State<
+                Arc<tokio::sync::Mutex<Vec<Value>>>,
+            >,
+            axum::Json(body): axum::Json<Value>,
+        ) -> StatusCode {
+            rejections.lock().await.push(body);
+            StatusCode::ACCEPTED
+        }
+
+        let app = axum::Router::new().route(
+            "/v1/kv_transfer/reject",
+            axum::routing::post(reject_handler).with_state(rejections_clone),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let companion_addr = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let worker: Arc<dyn Worker> =
+            Arc::new(BasicWorker::new(companion_addr.clone(), WorkerType::Decode));
+        let guard = KvTransferGuard::new(
+            reqwest::Client::new(),
+            worker,
+            "req-decode-send-failure".to_string(),
+            json!({
+                "do_remote_prefill": true,
+                "remote_engine_id": "producer-p",
+                "remote_block_ids": [301, 302]
+            }),
+        );
+
+        // Simulate sending to an unreachable decode endpoint which returns Err
+        let unreachable_url = "http://127.0.0.1:1/nonexistent";
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_millis(100))
+            .build()
+            .unwrap();
+        let send_res = client.post(unreachable_url).send().await;
+        assert!(
+            send_res.is_err(),
+            "Decode request to unreachable url must fail"
+        );
+
+        // When decode send fails with Err, the guard is NOT disarmed.
+        // Dropping the guard fires rejection to the decode companion endpoint.
+        drop(guard);
+
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+        let recorded = rejections.lock().await;
+        assert_eq!(
+            recorded.len(),
+            1,
+            "Rejection must be fired when decode send fails"
+        );
+        assert_eq!(recorded[0]["request_id"], "req-decode-send-failure");
+        assert_eq!(
+            recorded[0]["kv_transfer_params"]["remote_engine_id"],
+            "producer-p"
+        );
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_rejection_companion_fallback_on_404() {
+        let _serial_guard = REJECTION_TEST_MUTEX.lock().await;
+        let fallback_rejections = Arc::new(tokio::sync::Mutex::new(Vec::<Value>::new()));
+        let fallback_clone = fallback_rejections.clone();
+
+        async fn fallback_reject_handler(
+            axum::extract::State(rejections): axum::extract::State<
+                Arc<tokio::sync::Mutex<Vec<Value>>>,
+            >,
+            axum::Json(body): axum::Json<Value>,
+        ) -> StatusCode {
+            rejections.lock().await.push(body);
+            StatusCode::ACCEPTED
+        }
+
+        // Backend only exposes the legacy /kv_transfer/reject endpoint (no /v1)
+        let app = axum::Router::new().route(
+            "/kv_transfer/reject",
+            axum::routing::post(fallback_reject_handler).with_state(fallback_clone),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(base, WorkerType::Decode));
+        let guard = KvTransferGuard::new(
+            reqwest::Client::new(),
+            worker,
+            "test-req-fallback".to_string(),
+            json!({
+                "do_remote_prefill": true,
+                "remote_engine_id": "producer-fallback"
+            }),
+        );
+
+        // Dropping armed guard triggers default /v1/kv_transfer/reject -> 404 -> fallback to /kv_transfer/reject
+        drop(guard);
+
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+
+        let recorded = fallback_rejections.lock().await;
+        assert_eq!(
+            recorded.len(),
+            1,
+            "Expected fallback endpoint to receive the rejection notification"
+        );
+        assert_eq!(recorded[0]["request_id"], "test-req-fallback");
+        assert_eq!(
+            recorded[0]["kv_transfer_params"]["remote_engine_id"],
+            "producer-fallback"
+        );
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_rejection_env_endpoint_override() {
+        let _serial_guard = REJECTION_TEST_MUTEX.lock().await;
+
+        struct EnvGuard(&'static str);
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                std::env::remove_var(self.0);
+            }
+        }
+
+        let custom_rejections = Arc::new(tokio::sync::Mutex::new(Vec::<Value>::new()));
+        let custom_clone = custom_rejections.clone();
+
+        async fn custom_reject_handler(
+            axum::extract::State(rejections): axum::extract::State<
+                Arc<tokio::sync::Mutex<Vec<Value>>>,
+            >,
+            axum::Json(body): axum::Json<Value>,
+        ) -> StatusCode {
+            rejections.lock().await.push(body);
+            StatusCode::ACCEPTED
+        }
+
+        // Custom endpoint configured via env var
+        let app = axum::Router::new().route(
+            "/custom/kv/reject",
+            axum::routing::post(custom_reject_handler).with_state(custom_clone),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        std::env::set_var("VLLM_KV_TRANSFER_REJECT_ENDPOINT", "/custom/kv/reject");
+        let _env_guard = EnvGuard("VLLM_KV_TRANSFER_REJECT_ENDPOINT");
+
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(base, WorkerType::Decode));
+        let guard = KvTransferGuard::new(
+            reqwest::Client::new(),
+            worker,
+            "test-req-override".to_string(),
+            json!({
+                "do_remote_prefill": true,
+                "remote_engine_id": "producer-custom"
+            }),
+        );
+
+        drop(guard);
+
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+        let recorded = custom_rejections.lock().await;
+        assert_eq!(
+            recorded.len(),
+            1,
+            "Expected custom overridden endpoint to receive rejection"
+        );
+        assert_eq!(recorded[0]["request_id"], "test-req-override");
+
+        server.abort();
+    }
+
+    #[test]
+    fn test_guard_atomic_lifecycle_and_idempotency() {
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+            "http://127.0.0.1:8000".to_string(),
+            WorkerType::Decode,
+        ));
+        let mut guard = KvTransferGuard::new(
+            reqwest::Client::new(),
+            worker,
+            "req-atomic-1".to_string(),
+            json!({"do_remote_prefill": true, "version": 1}),
+        );
+
+        // Update params
+        guard.update_params(json!({"do_remote_prefill": true, "version": 2}));
+
+        // Multiple disarm calls must be idempotent and never panic
+        guard.disarm();
+        guard.disarm();
+        guard.disarm();
+
+        // Dropping a disarmed guard must be a clean no-op
+        drop(guard);
+    }
+
+    #[tokio::test]
+    async fn test_decode_non_2xx_keeps_guard_armed_and_fires_rejection() {
+        let _serial_guard = REJECTION_TEST_MUTEX.lock().await;
+        let rejections = Arc::new(tokio::sync::Mutex::new(Vec::<Value>::new()));
+        let rejections_clone = rejections.clone();
+
+        async fn reject_handler(
+            axum::extract::State(rejections): axum::extract::State<
+                Arc<tokio::sync::Mutex<Vec<Value>>>,
+            >,
+            axum::Json(body): axum::Json<Value>,
+        ) -> StatusCode {
+            rejections.lock().await.push(body);
+            StatusCode::ACCEPTED
+        }
+
+        let app = axum::Router::new().route(
+            "/v1/kv_transfer/reject",
+            axum::routing::post(reject_handler).with_state(rejections_clone),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let companion_addr = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let worker: Arc<dyn Worker> =
+            Arc::new(BasicWorker::new(companion_addr.clone(), WorkerType::Decode));
+        let mut guard = KvTransferGuard::new(
+            reqwest::Client::new(),
+            worker,
+            "req-decode-429-rejection".to_string(),
+            json!({
+                "do_remote_prefill": true,
+                "remote_engine_id": "producer-p",
+                "remote_block_ids": [401, 402]
+            }),
+        );
+
+        // When decode returns HTTP 429 Too Many Requests (or 503), status is not success
+        let status = StatusCode::TOO_MANY_REQUESTS;
+        if status.is_success() {
+            guard.disarm();
+        }
+
+        // Dropping armed guard fires rejection to release prefill KV blocks
+        drop(guard);
+
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+        let recorded = rejections.lock().await;
+        assert_eq!(
+            recorded.len(),
+            1,
+            "Rejection must be fired when decode returns non-2xx"
+        );
+        assert_eq!(recorded[0]["request_id"], "req-decode-429-rejection");
+        assert_eq!(
+            recorded[0]["kv_transfer_params"]["remote_engine_id"],
+            "producer-p"
+        );
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_decode_pending_guard_releases_reservation_on_drop() {
+        let decode: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+            "http://127.0.0.1:8001".to_string(),
+            WorkerType::Decode,
+        ));
+        let prefill: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+            "http://127.0.0.1:8000".to_string(),
+            WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+        ));
+        let load_manager = PdLoadManager::default();
+        let attempt = load_manager.admit_bound(prefill.clone(), decode.clone());
+        assert_eq!(decode.load(), 1, "Decode must be reserved upon admission");
+
+        // Guard created during prefill stage
+        let guard = DecodePendingGuard::new(&attempt);
+
+        // Abort / drop during prefill before decode dispatch
+        drop(guard);
+
+        assert_eq!(
+            decode.load(),
+            0,
+            "Decode reservation must be immediately released when guard is dropped without disarm"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_decode_pending_guard_disarm_preserves_reservation() {
+        let decode: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+            "http://127.0.0.1:8001".to_string(),
+            WorkerType::Decode,
+        ));
+        let prefill: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+            "http://127.0.0.1:8000".to_string(),
+            WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+        ));
+        let load_manager = PdLoadManager::default();
+        let attempt = load_manager.admit_bound(prefill.clone(), decode.clone());
+        assert_eq!(decode.load(), 1, "Decode must be reserved upon admission");
+
+        let mut guard = DecodePendingGuard::new(&attempt);
+        // Stage 2 disarms guard before beginning decode
+        guard.disarm();
+        drop(guard);
+
+        assert_eq!(
+            decode.load(),
+            1,
+            "Disarmed guard must not release decode reservation"
+        );
+
+        attempt.finish_decode();
+        assert_eq!(decode.load(), 0);
     }
 }
