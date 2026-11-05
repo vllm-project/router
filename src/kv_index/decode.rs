@@ -127,10 +127,11 @@ fn decode_event(event: Value) -> Result<KVEvent, String> {
     for (key, value) in pairs {
         match key.as_str() {
             Some("block_hashes") => {
-                let hashes = value
-                    .as_array()
-                    .filter(|hashes| !hashes.is_empty())
-                    .ok_or("KV event hashes must be a nonempty array")?;
+                // Structure only. vLLM emits an empty list for a Mamba checkpoint
+                // group whose states in a chunk were all skipped, so whether an
+                // empty list is acceptable depends on the group and is decided by
+                // each consumer, not by the shared decoder.
+                let hashes = value.as_array().ok_or("KV event hashes must be an array")?;
                 for hash in hashes {
                     validate_wire_hash(hash)?;
                 }
@@ -543,5 +544,18 @@ mod tests {
             nested.extend_from_slice(&payload);
             assert!(decode_batch(&nested).is_err(), "nested marker {marker:#x}");
         }
+    }
+
+    #[test]
+    fn empty_hash_list_decodes_for_consumers_to_judge() {
+        let mut event = stored();
+        change(&mut event, "block_hashes", Value::Array(vec![]));
+        change(&mut event, "extra_keys", Value::Nil);
+        let batch = decode_batch(&encode(vec![event], 0.into())).unwrap();
+        assert_eq!(batch.events.len(), 1);
+        // Non-array hashes are still structurally invalid.
+        let mut bad = stored();
+        change(&mut bad, "block_hashes", Value::Nil);
+        assert!(decode_batch(&encode(vec![bad], 0.into())).is_err());
     }
 }
