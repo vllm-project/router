@@ -139,7 +139,7 @@ pub struct OpenAiChatRequest {
 }
 
 pub fn chat_request_from_openai(input: OpenAiChatRequest) -> Result<ChatRequest> {
-    // Keep this lowering aligned with vLLM 0.29
+    // Keep this lowering aligned with vLLM 0.30
     // server/routes/openai/chat_completions/convert.rs::prepare_chat_request.
     // That function is pub(super) and route-owned, so importing it would
     // require vllm-server. Replace this adapter if upstream exposes a public,
