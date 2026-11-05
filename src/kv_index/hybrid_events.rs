@@ -195,35 +195,18 @@ impl HybridEventIndex {
     /// Decode a wire payload before applying it. Corrupt payloads invalidate
     /// all groups, including claims from previously accepted batches.
     ///
-    /// Two wire shapes are accepted: a `(ts, events, rank)` batch, and a bare
-    /// single event as published by engines that encode one event per message.
-    /// A bare event carries no rank, so it is attributed to the rank whose
-    /// endpoint delivered it — never to whichever rank happens to be first.
     pub fn apply_payload(&self, seq: u64, payload: &[u8]) -> Result<(), HybridEventError> {
         let batch = match crate::kv_index::decode_batch(payload) {
             Ok(batch) => batch,
-            Err(batch_error) => match crate::kv_index::decode_event_payload(payload) {
-                Ok(event) => KVEventBatch {
-                    ts: std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|elapsed| elapsed.as_secs_f64())
-                        .unwrap_or(0.0),
-                    events: vec![event],
-                    data_parallel_rank: Some(self.target.dp_rank),
-                },
-                Err(event_error) => {
-                    // The two shapes fail for different reasons; naming both is
-                    // the only way to diagnose a publisher contract change.
-                    tracing::warn!(
-                        batch_error,
-                        event_error,
-                        bytes = payload.len(),
-                        "hybrid payload did not decode"
-                    );
-                    self.invalidate();
-                    return Err(HybridEventError::InvalidBatch);
-                }
-            },
+            Err(error) => {
+                tracing::warn!(
+                    error,
+                    bytes = payload.len(),
+                    "hybrid payload did not decode"
+                );
+                self.invalidate();
+                return Err(HybridEventError::InvalidBatch);
+            }
         };
         self.apply_batch(seq, &batch)
     }
@@ -665,38 +648,6 @@ mod tests {
             Err(HybridEventError::InvalidBatch)
         );
         assert_eq!(index.reusable_tokens(&prompt(), usize::MAX), 0);
-    }
-
-    /// vLLM 0.28 publishes one event per message; the rank comes from the
-    /// endpoint, not from the payload.
-    #[test]
-    fn bare_event_payload_is_credited_to_the_bound_rank() {
-        let batch = qwen_batch();
-        let mut credited = 0;
-        let index = index(8);
-        index.begin_empty(0);
-        for (seq, event) in batch.events.iter().enumerate() {
-            let payload = rmp_serde::to_vec_named(event).unwrap();
-            index.apply_payload(seq as u64, &payload).unwrap();
-            credited = index.reusable_tokens(&prompt(), usize::MAX);
-        }
-        assert_eq!(credited, 528);
-        // The same bytes on a rank-1 index are that rank's events, not rank 0's.
-        let other = HybridEventIndex::new(
-            RoutableTarget {
-                dp_rank: 1,
-                ..target()
-            },
-            groups(),
-            528,
-            0,
-            8,
-        )
-        .unwrap();
-        other.begin_empty(0);
-        let payload = rmp_serde::to_vec_named(&batch.events[0]).unwrap();
-        other.apply_payload(0, &payload).unwrap();
-        assert_eq!(other.reusable_tokens(&prompt(), usize::MAX), 0);
     }
 
     /// Captured from vLLM 0.29 with `VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES=0`:
