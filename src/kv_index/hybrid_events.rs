@@ -519,7 +519,6 @@ pub(crate) mod tests {
     use super::*;
     use crate::kv_index::wire::{BlockRemoved, BlockStored};
 
-
     fn target() -> RoutableTarget {
         RoutableTarget {
             instance_id: Arc::from("w"),
@@ -582,8 +581,18 @@ pub(crate) mod tests {
         let events = groups()
             .iter()
             .map(|group| {
-                let spec = if group.group_idx == 3 { "full_attention" } else { "mamba" };
-                KVEvent::BlockStored(gpu_store(group.group_idx, spec, 528, &tokens[..528], &[hash]))
+                let spec = if group.group_idx == 3 {
+                    "full_attention"
+                } else {
+                    "mamba"
+                };
+                KVEvent::BlockStored(gpu_store(
+                    group.group_idx,
+                    spec,
+                    528,
+                    &tokens[..528],
+                    &[hash],
+                ))
             })
             .collect();
         KVEventBatch {
@@ -933,9 +942,15 @@ pub(crate) mod tests {
             .map(|group| {
                 let compressed =
                     matches!(group.kind, HybridGroupKind::CompressedFullAttention { .. });
-                let spec =
-                    kind_override.unwrap_or(if compressed { "mla_attention" } else { "mamba" });
-                KVEvent::BlockStored(gpu_store(group.group_idx, spec, 320, &tokens[..320], &[hash]))
+                let default = if compressed { "mla_attention" } else { "mamba" };
+                let spec = kind_override.unwrap_or(default);
+                KVEvent::BlockStored(gpu_store(
+                    group.group_idx,
+                    spec,
+                    320,
+                    &tokens[..320],
+                    &[hash],
+                ))
             })
             .collect();
         KVEventBatch {
@@ -1054,8 +1069,18 @@ pub(crate) mod tests {
             })
             .collect();
         let store = |group_idx: u32, hashes: &[SequenceHash], tokens_len: usize| {
-            let spec = if group_idx == 3 { "full_attention" } else { "mamba" };
-            KVEvent::BlockStored(gpu_store(group_idx, spec, 576, &tokens[..tokens_len], hashes))
+            let spec = if group_idx == 3 {
+                "full_attention"
+            } else {
+                "mamba"
+            };
+            KVEvent::BlockStored(gpu_store(
+                group_idx,
+                spec,
+                576,
+                &tokens[..tokens_len],
+                hashes,
+            ))
         };
         let index = HybridEventIndex::new(target(), groups, 576, 0, 64).unwrap();
         index.begin_empty(0);
@@ -1257,7 +1282,13 @@ pub(crate) mod tests {
                      hashes: Vec<SequenceHash>,
                      block: usize,
                      span: usize| {
-            let mut store = gpu_store(group.group_idx, spec, block as u32, &tokens[..span], &hashes);
+            let mut store = gpu_store(
+                group.group_idx,
+                spec,
+                block as u32,
+                &tokens[..span],
+                &hashes,
+            );
             store.kv_cache_spec_sliding_window = window;
             KVEvent::BlockStored(store)
         };
@@ -1386,9 +1417,7 @@ pub(crate) mod tests {
 
         let index = index(8);
         index.begin_empty(0);
-        index
-            .apply_payload(0, &qwen35_payload())
-            .unwrap();
+        index.apply_payload(0, &qwen35_payload()).unwrap();
         // Each rank serves independently; its events, ownership and history
         // belong to that rank only.
         assert!(
