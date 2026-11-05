@@ -1,0 +1,16 @@
+schema_version: "1.0"
+
+endpoint:
+  retention_chat:
+    class: kv_retention_aiperf:RetentionChatEndpoint
+    description: |
+      Flatshare's chat endpoint plus the #427 retention hint on every turn that is not a conversation's last.
+      Configured by KV_RETENTION_TIERS and KV_RETENTION_TTL_SECONDS.
+    metadata:
+      endpoint_path: /v1/chat/completions
+      supports_streaming: true
+      produces_tokens: true
+      tokenizes_input: true
+      consumes_system_message: true
+      supports_cache_bust: true
+      metrics_title: LLM Metrics
