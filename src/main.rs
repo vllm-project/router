@@ -3,7 +3,8 @@ use std::collections::HashMap;
 use vllm_router_rs::config::{
     CircuitBreakerConfig, ConfigError, ConfigResult, ConnectionMode, DiscoveryConfig,
     HealthCheckConfig, HistoryBackend, KvConnector, MetricsConfig, PdKvEventSources, PolicyConfig,
-    ProgramSchedulingConfig, RetryConfig, RouterConfig, RoutingMode, TraceConfig,
+    ProgramSchedulingConfig, RetryConfig, RouterConfig, RoutingMode, StaticKvEventSources,
+    TraceConfig,
 };
 use vllm_router_rs::metrics::PrometheusConfig;
 use vllm_router_rs::server::{self, ServerConfig};
@@ -215,6 +216,9 @@ struct CliArgs {
     /// Shared model identity for workers using static event publishers.
     #[arg(long)]
     kv_event_model: Option<String>,
+    /// Cache layout JSON for hybrid attention models, keyed by worker URL.
+    #[arg(long)]
+    kv_hybrid_layout: Option<std::path::PathBuf>,
     /// Transfer credit for host-resident KV blocks.
     #[arg(long, default_value_t = 0.8)]
     kv_penalty_host: f64,
@@ -476,12 +480,45 @@ impl CliArgs {
         &self,
         prefill_urls: Vec<(String, Option<u16>)>,
     ) -> ConfigResult<RouterConfig> {
-        let static_kv_event_sources = vllm_router_rs::config::parse_static_kv_event_sources(
+        let mut static_kv_event_sources = vllm_router_rs::config::parse_static_kv_event_sources(
             &self.kv_event_source,
             &self.kv_event_replay_source,
             self.kv_event_block_size,
             self.kv_event_model.as_deref(),
         )?;
+        if let Some(path) = &self.kv_hybrid_layout {
+            let data = std::fs::read(path).map_err(|error| ConfigError::ValidationFailed {
+                reason: format!("cannot read hybrid layout {}: {error}", path.display()),
+            })?;
+            let layouts: HashMap<
+                String,
+                vllm_router_rs::kv_index::hybrid_capability::HybridCapabilities,
+            > = serde_json::from_slice(&data).map_err(|error| ConfigError::ValidationFailed {
+                reason: format!("invalid hybrid layout {}: {error}", path.display()),
+            })?;
+            for (worker, layout) in layouts {
+                // A layout without declared endpoints is legal: the engine can
+                // report its own publishers (gRPC GetKvEventSources, or the HTTP
+                // /kv_event_sources route since vLLM 0.31.0). Identity and the
+                // hash block size then come from the layout itself.
+                let source = static_kv_event_sources
+                    .entry(worker.clone())
+                    .or_insert_with(|| {
+                        let rank = layout.ranks.first();
+                        StaticKvEventSources {
+                            endpoints: Vec::new(),
+                            replay_endpoints: None,
+                            topic: rank
+                                .and_then(|rank| rank.publisher_topic.clone())
+                                .unwrap_or_default(),
+                            block_size: rank.and_then(|rank| rank.hash_block_size).unwrap_or(16),
+                            model: rank.map_or_else(|| worker.clone(), |rank| rank.model.clone()),
+                            hybrid: None,
+                        }
+                    });
+                source.hybrid = Some(layout);
+            }
+        }
         // Determine routing mode
         let mode = if self.enable_igw {
             // IGW mode - routing mode is not used in IGW, but we need to provide a placeholder

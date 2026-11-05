@@ -1075,6 +1075,9 @@ pub struct StaticKvEventSources {
     pub block_size: u32,
     /// Shared model identity across workers that serve the same model.
     pub model: String,
+    /// Router-managed hybrid layout and per-rank publisher identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hybrid: Option<crate::kv_index::hybrid_capability::HybridCapabilities>,
 }
 
 impl PolicyConfig {
