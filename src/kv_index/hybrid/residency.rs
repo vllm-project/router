@@ -12,6 +12,42 @@ pub(super) struct State {
     pub(super) claims: HashSet<(u32, SequenceHash)>,
 }
 
+// Install this provider only when the engine contract verifies that recomputing
+// the last token is a sufficient bound (no unmodeled lookahead/replay rules).
+impl crate::policies::TieredMatchProvider for HybridEventIndex {
+    fn find_tiered_matches(&self, _query: &super::MatchQuery) -> Vec<TierMatch> {
+        // A single group's dense lookup is never sufficient for a hybrid hit.
+        Vec::new()
+    }
+
+    fn find_token_matches(
+        &self,
+        tokens: &[u32],
+        block_size: u32,
+        lora_name: Option<&str>,
+        dp_rank: u32,
+    ) -> Option<Vec<TierMatch>> {
+        // Events, ownership and history are bound to one rank. A hit computed
+        // from another rank's stream is never evidence for this one.
+        if lora_name.is_some() || block_size == 0 || dp_rank != self.target.dp_rank {
+            return Some(Vec::new());
+        }
+        let tokens = self.reusable_tokens(tokens, usize::MAX);
+        if tokens == 0 || !tokens.is_multiple_of(u64::from(block_size)) {
+            return Some(Vec::new());
+        }
+        let Ok(blocks) = u32::try_from(tokens / u64::from(block_size)) else {
+            return Some(Vec::new());
+        };
+        Some(vec![TierMatch {
+            target: self.target.clone(),
+            tier: StorageTier::Device,
+            locality: Locality::Local,
+            segments: vec![(0, blocks)],
+        }])
+    }
+}
+
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
 pub(crate) mod tests {
     use std::sync::Arc;
@@ -476,5 +512,26 @@ pub(crate) mod tests {
         };
         assert_eq!(index.apply_batch(1, &rerun), Ok(()));
         assert_eq!(index.reusable_tokens(&tokens, usize::MAX), 1728);
+    }
+
+    #[test]
+    fn another_dp_rank_never_answers_for_this_rank() {
+        use crate::policies::TieredMatchProvider;
+
+        let index = index(8);
+        index.begin_empty(0);
+        index.apply_payload(0, &qwen35_payload()).unwrap();
+        // Each rank serves independently; its events, ownership and history
+        // belong to that rank only.
+        assert!(
+            !TieredMatchProvider::find_token_matches(&index, &prompt(), 528, None, 0)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            TieredMatchProvider::find_token_matches(&index, &prompt(), 528, None, 1)
+                .unwrap()
+                .is_empty()
+        );
     }
 }

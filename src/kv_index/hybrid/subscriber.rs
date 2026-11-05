@@ -569,6 +569,39 @@ mod tests {
             .unwrap();
         }
         wait_for(&index, &prompt, 528).await;
+        let workers: Vec<Arc<dyn crate::core::Worker>> = (0..2)
+            .map(|i| {
+                Arc::new(crate::core::BasicWorker::new(
+                    format!("http://worker-{i}"),
+                    crate::core::WorkerType::Regular,
+                )) as Arc<dyn crate::core::Worker>
+            })
+            .collect();
+        let policy = crate::policies::KvAwarePolicy::default();
+        policy.register_target(
+            workers[0].url(),
+            RoutableTarget {
+                instance_id: Arc::from("cold"),
+                dp_rank: 0,
+            },
+        );
+        policy.register_target_with_cache_identity(
+            workers[1].url(),
+            RoutableTarget {
+                instance_id: Arc::from("worker"),
+                dp_rank: 0,
+            },
+            crate::kv_index::CacheKey {
+                model: Arc::from("qwen"),
+                hash_mode: crate::kv_index::HashMode::Sha256,
+                block_size: 528,
+            },
+            index.clone(),
+        );
+        assert_eq!(
+            policy.select_worker_with_token_ids(&workers, Some(&prompt)),
+            Some(1)
+        );
         let clear = rmp_serde::to_vec_named(&(
             2.0_f64,
             vec![KVEvent::AllBlocksCleared(AllBlocksCleared::default())],
@@ -579,6 +612,10 @@ mod tests {
             .send_multipart([b"epoch-1".as_slice(), &1_i64.to_be_bytes(), &clear], 0)
             .unwrap();
         wait_for(&index, &prompt, 0).await;
+        assert_eq!(
+            policy.select_worker_with_token_ids(&workers, Some(&prompt)),
+            Some(0)
+        );
         publisher
             .send_multipart(
                 [
