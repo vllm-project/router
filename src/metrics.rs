@@ -84,6 +84,10 @@ pub fn init_metrics() {
         "KV-aware placement lookups and reasons for skipping them"
     );
     describe_counter!(
+        "vllm_router_kv_transfer_plans_total",
+        "Shadow-mode KV transfer planner outcomes (planned or the reason no plan was made)"
+    );
+    describe_counter!(
         "vllm_router_policy_decisions_total",
         "Total routing policy decisions by policy and worker"
     );
@@ -564,6 +568,9 @@ impl RouterMetrics {
 
     pub fn record_kv_placement_lookup(result: &'static str) {
         counter!("vllm_router_kv_placement_lookups_total", "result" => result).increment(1);
+    }
+    pub fn record_kv_transfer_plan(outcome: &'static str) {
+        counter!("vllm_router_kv_transfer_plans_total", "outcome" => outcome).increment(1);
     }
     pub fn record_kv_routing_input(transport: &'static str, result: &'static str) {
         counter!("vllm_router_kv_routing_inputs_total", "transport" => transport, "result" => result).increment(1);
