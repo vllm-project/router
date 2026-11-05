@@ -15,6 +15,7 @@ the policy is the same for `grpc://host:port`.
 | `power_of_two` | Load-sensitive workloads | No | Yes |
 | `cache_aware` | Prefix caching optimization | Yes (cache-based) | Yes |
 | `kv_aware` | KV reuse and stage-aware load scoring | No | Yes |
+| `sticky_least_loaded` | Many concurrent multi-turn sessions, async RL | Yes | Yes (active sessions) |
 
 ---
 
@@ -117,6 +118,66 @@ curl -X POST http://router:8000/v1/chat/completions \
 - **Unhealthy fallback**: If the target worker is unhealthy, falls back to the first healthy worker
 - **Virtual nodes**: Uses 160 virtual nodes per worker for even distribution
 - **DP-aware routing**: Supports data-parallel worker URLs (e.g., `http://worker:8000@0`)
+
+---
+
+## Sticky Least Loaded
+
+The `sticky_least_loaded` policy keeps every request of a session on one worker, like `consistent_hash`, but places each *new* session on the worker with the fewest active sessions instead of on a hash-determined worker. It is built for workloads with many concurrent multi-turn sessions, such as async RL rollouts, where hashing alone can leave some workers overloaded while others are idle.
+
+### Configuration
+
+```bash
+vllm-router --policy sticky_least_loaded \
+  --worker-urls http://worker1:8000 http://worker2:8000 \
+  --sticky-least-loaded-session-ttl-secs 7200
+```
+
+In P/D mode, use it as `--prefill-policy` and/or `--decode-policy`; prefill and decode track sessions independently.
+
+### Session lifecycle
+
+- **Session id**: resolved from the request's stable identity, the same one `kv_aware` session affinity uses. The first source present wins:
+
+  | Source | Session id |
+  |---|---|
+  | Body `vllm_xargs.agentic_context` | its `task_id`, else its `session_id`, else its `program_id` (all agents of a task share the session) |
+  | Body `agent_hint.session_id` | that value |
+  | Header `x-claude-code-session-id`, `session-id` (Codex) or `X-Session-ID` | the header value |
+  | Body `session_params.session_id`, then `session_id` | that value |
+
+  Values are trimmed. Header, `agent_hint` and `agentic_context` ids are limited to 256 bytes. An invalid identity (an empty id, an id that is neither a string nor an integer, an over-long id, or a malformed `session_params`, `agent_hint` or `agentic_context`) means the request has no session. `user`, `user_id`, `X-User-ID`, `X-Request-ID` and `X-Trace-ID` do not create sessions.
+- **New session**: assigned to the worker with the fewest active sessions; ties are broken by rendezvous hashing.
+- **Existing session**: routed to its worker. If that worker is unhealthy or removed, the session is reassigned.
+- **Finish**: `POST /finish_session` with the same identity headers or body fields as the session's requests releases it. Sessions without a request for `--sticky-least-loaded-session-ttl-secs` (default 2 hours) are released automatically.
+- **No session id**: the request goes to the least-loaded worker and is not tracked.
+
+```bash
+curl -X POST http://router:8000/finish_session -H "X-Session-ID: traj-42"
+
+curl -X POST http://router:8000/finish_session -H "Content-Type: application/json" \
+  -d '{"vllm_xargs": {"agentic_context": {"task_id": "traj-42"}}}'
+# {"status":"ok","session_id":"traj-42","released":true}
+```
+
+`released` is `false` when no policy held the session. A request without an identity, or with an invalid one or a body that is not JSON, gets a 400.
+
+Session state lives in the router process, so it is lost on restart, and multiple router replicas need ingress stickiness.
+
+### Benchmark in SkyRL
+
+Fully async RL on the [Apex Agents](https://www.mercor.com/blog/training-frontier-knowledge-work-agents-a-397b-rl-training-guide-with-skyrl) dataset (multi-turn agentic tasks, about 40 turns) with GLM 4.7 on 4 engines (TP 8, 8xB200 each), `max_concurrency=132` and a simulated 60 s training step. KV cache pressure is varied with `gpu_memory_utilization` (moderate = 0.75). Per-engine generation throughput at moderate pressure:
+
+![Per-engine generation throughput under consistent_hash and sticky_least_loaded](../assets/sticky_least_loaded_moderate_pressure.png)
+
+With `consistent_hash`, some engines sit idle for several minutes while others are saturated; with `sticky_least_loaded` the engines stay close to each other. At moderate pressure with `max_staleness=4`:
+
+| policy | traj/s | preemptions | p90 trajectory latency (s) |
+|---|---|---|---|
+| `consistent_hash` | 0.110 | 32 | 3013 |
+| `sticky_least_loaded` | 0.212 | 6 | 1636 |
+
+With `max_staleness=2`, results are mixed: throughput is about the same at low pressure, higher at moderate pressure (0.183 vs. 0.133 traj/s) and lower at high pressure (0.084 vs. 0.099 traj/s). See [SkyRL PR #1791](https://github.com/NovaSky-AI/SkyRL/pull/1791) for the full results.
 
 ---
 
@@ -317,6 +378,7 @@ Multiple router replicas need ingress stickiness to preserve affinity.
 | Scenario | Recommended Policy |
 |----------|-------------------|
 | Chat applications with conversation history | `consistent_hash` |
+| Many concurrent multi-turn sessions (e.g. async RL rollouts) | `sticky_least_loaded` |
 | Batch inference with no state | `round_robin` |
 | Variable request complexity | `power_of_two` |
 | Repeated system prompts / few-shot | `cache_aware` |

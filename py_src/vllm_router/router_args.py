@@ -31,6 +31,7 @@ class RouterArgs:
     kv_penalty_external: float = 0.6
     kv_penalty_disk: float = 0.3
     kv_aware_session_affinity_ttl_secs: Optional[int] = None
+    sticky_least_loaded_session_ttl_secs: int = 7200
     kv_event_source: List[str] = dataclasses.field(default_factory=list)
     kv_event_replay_source: List[str] = dataclasses.field(default_factory=list)
     kv_event_block_size: int = 16
@@ -236,6 +237,13 @@ class RouterArgs:
             "(1-31536000). P/D uses decode-only soft affinity based on pending "
             "plus active decode requests. Prefill remains token-cost based. "
             "Omit to disable affinity.",
+        )
+        parser.add_argument(
+            f"--{prefix}sticky-least-loaded-session-ttl-secs",
+            type=int,
+            default=RouterArgs.sticky_least_loaded_session_ttl_secs,
+            help="Seconds without a request after which sticky_least_loaded "
+            "releases a session (1-31536000)",
         )
         parser.add_argument(
             f"--{prefix}kv-event-source",
@@ -650,6 +658,10 @@ class RouterArgs:
         ):
             raise ValueError(
                 "kv_aware_session_affinity_ttl_secs must be between 1 and 31536000"
+            )
+        if not 1 <= self.sticky_least_loaded_session_ttl_secs <= 31_536_000:
+            raise ValueError(
+                "sticky_least_loaded_session_ttl_secs must be between 1 and 31536000"
             )
 
         if self.wasm_middleware_sha256 and not self.wasm_middleware:
