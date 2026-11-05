@@ -171,13 +171,8 @@ impl Drop for HybridSubscriberHandle {
     }
 }
 
-/// Attach to one authenticated publisher incarnation using its replay stream.
-///
-/// The caller must verify that `topic` and the replay endpoint identify the
-/// same publisher incarnation, that sequence zero starts with an empty cache,
-/// that replay is continuous, and that its lease is retired on restart or loss
-/// of capability freshness. The first live event acts as a subscription barrier.
-/// The existing vLLM publisher does not provide that contract by itself.
+/// Attach to one publisher incarnation using its replay stream. The first
+/// live event acts as a subscription barrier.
 pub fn spawn_zmq(
     source: EventSource,
     stream: Arc<HybridEventStream>,
@@ -422,10 +417,7 @@ mod tests {
         let stream = HybridEventStream::new(index.clone());
         let first = stream.begin_replay();
         let current = stream.begin_replay();
-        let payload = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/rust/fixtures/kv_cbor/qwen35_vllm028.msgpack"
-        ));
+        let payload = &crate::kv_index::hybrid_events::tests::qwen35_payload();
         let prompt: Vec<u32> = (0..1024).map(|i| 100 + i % 100).collect();
         assert_eq!(
             stream.apply_payload(first, 0, payload),
@@ -511,10 +503,7 @@ mod tests {
             replay.recv_multipart(zmq::DONTWAIT),
             Err(zmq::Error::EAGAIN)
         );
-        let payload = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/rust/fixtures/kv_cbor/qwen35_vllm028.msgpack"
-        ));
+        let payload = &crate::kv_index::hybrid_events::tests::qwen35_payload();
         let seq0 = 0_i64.to_be_bytes();
         let end = (-1_i64).to_be_bytes();
         publisher

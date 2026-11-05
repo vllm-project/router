@@ -36,14 +36,8 @@ pub struct CacheKey {
     pub block_size: u32,
 }
 
-/// One per-DP-rank entry from the KV event source control probe. Mirrors
-/// vLLM's KVEventsConfig.
-///
-/// KV event sources are published through the gRPC Control RPC
-/// (`GetKvEventSources` in `vllm-proto`) and, since vLLM 0.31.0, over the HTTP
-/// `/kv_event_sources` route. v0.29.0 and v0.30.0 serve no such route, so
-/// discovery probes it opportunistically and never treats its absence as an
-/// engine fault.
+/// One per-DP-rank entry from the KV event source control probe (gRPC
+/// `GetKvEventSources` or HTTP `/kv_event_sources`). Mirrors KVEventsConfig.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct KvEventSourceEntry {
     #[serde(default)]
@@ -89,12 +83,8 @@ pub(crate) struct WorkerDiscovery {
     pub(crate) hybrid: Option<HybridCapabilities>,
 }
 
-/// What the optional KV event source control probe found.
-///
-/// KV event sources are exposed by the gRPC `GetKvEventSources` RPC and, since
-/// vLLM 0.31.0, by the HTTP `/kv_event_sources` route. v0.29.0/v0.30.0 serve no
-/// such route, so a 404/405 means "this engine cannot report sources", not
-/// "this engine is broken".
+/// What the optional KV event source control probe found. A 404/405 means the
+/// engine cannot report sources, not that it is broken.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SourcesProbe {
     /// The worker does not implement the extension; re-probing cannot help.
@@ -222,10 +212,8 @@ pub struct KvIndexSupervisor {
     signal_tx: mpsc::Sender<IngestionSignal>,
     /// Per-worker subscriber state.
     workers: Mutex<HashMap<String, WorkerSubs>>,
-    /// Workers whose control plane answered 404/405 (or gRPC `Unimplemented`)
-    /// to the optional KV event source probe. Discovery stops re-probing and
-    /// stops logging for them; removing the worker clears the entry so a
-    /// restarted engine is probed again.
+    /// Workers that do not serve the source probe; cleared when the worker is
+    /// removed.
     unsupported_sources: Mutex<HashSet<String>>,
     /// One-shot explanation of the discovery prerequisites.
     discovery_hint: Mutex<bool>,
@@ -326,10 +314,6 @@ impl KvIndexSupervisor {
     }
 
     /// Explain the discovery prerequisites once per process.
-    ///
-    /// Upstream vLLM serves `/kv_event_sources` since 0.31.0 only; a deployment
-    /// that wants KV-aware routing on 0.29/0.30 must declare its sources.
-    /// Saying that once is actionable; repeating it per worker per pass is not.
     fn note_discovery_prerequisites(&self) {
         if !self.static_sources.is_empty() || !self.static_pd_sources.is_empty() {
             return;
@@ -360,9 +344,7 @@ impl KvIndexSupervisor {
     }
 
     /// Query both endpoints for `worker_url`, spawn one subscriber per rank into
-    /// this worker's identity's indexer. A 404 on the optional KV event source
-    /// control route (vLLM 0.29/0.30, or a frontend without it) is a soft skip
-    /// that discovery remembers for the worker's lifetime.
+    /// this worker's identity's indexer. A missing source route is a soft skip.
     pub async fn on_worker_added(&self, worker_url: &str) -> Result<WorkerKvInfo, String> {
         self.note_discovery_prerequisites();
         // Discovery awaits without the owner lock. A failed/stale re-add must
@@ -666,10 +648,8 @@ impl KvIndexSupervisor {
             if event_sources.is_empty() {
                 return Err("hybrid capability has no event sources".into());
             }
-            // Admit each rank on its own evidence. A rank whose topic, model or
-            // group layout does not match is that rank's miss; it must not
-            // revoke credit from its siblings or be reported as a deployment
-            // layout change.
+            // Admit each rank on its own evidence; one rank's miss does not
+            // revoke its siblings.
             let mut indexes: HashMap<u32, Arc<HybridEventIndex>> = HashMap::new();
             for source in &event_sources {
                 let Some(rank_capability) = capability.rank_capability(source.dp_rank) else {
@@ -1161,11 +1141,6 @@ async fn discover_worker(
 }
 
 /// The data-parallel rank a worker URL pins, as in `http://host:8000@3`.
-///
-/// A DP-aware worker is its own instance: its URL carries the rank, and a
-/// static per-rank event source is keyed by that same URL. The rank must come
-/// from the URL, not from the position of the endpoint in the config, or two
-/// ranks would both claim the same index.
 fn dp_rank_suffix(worker_url: &str) -> Option<u32> {
     let (base, rank) = worker_url.rsplit_once('@')?;
     if base.is_empty() {
@@ -1237,11 +1212,7 @@ fn static_worker_discovery(worker_url: &str, config: &StaticKvEventSources) -> W
     }
 }
 
-/// A declared hybrid layout whose publishers are discovered instead of declared.
-///
-/// The layout carries the cache identity, the groups and the hash block size;
-/// the engine reports the per-rank endpoints (gRPC `GetKvEventSources`, or the
-/// HTTP `/kv_event_sources` route since vLLM 0.31.0).
+/// A declared hybrid layout whose per-rank publishers the engine reports.
 fn layout_only(config: &StaticKvEventSources) -> bool {
     config.hybrid.is_some() && config.endpoints.is_empty()
 }
@@ -1311,11 +1282,7 @@ async fn static_hybrid_sources_match(
     let http_url = dp_rank_suffix(worker_url)
         .and_then(|_| worker_url.rsplit_once('@').map(|(base, _)| base))
         .unwrap_or(worker_url);
-    // A gRPC worker serves its sources over the Control RPC, not over HTTP, so
-    // revalidating it must use the same probe the initial discovery used.
-    // Otherwise every pass failed against the HTTP route, the freshness task
-    // accepted that as `Unavailable`, and a worker that restarted in place onto a
-    // new topic kept its pre-restart subscription and claims alive.
+    // Revalidate with the same probe (gRPC or HTTP) discovery used.
     let observed = if crate::backend::is_grpc_url(worker_url) {
         match tokio::time::timeout(
             Duration::from_secs(2),
@@ -1352,12 +1319,9 @@ async fn static_hybrid_sources_match(
     let Some(host) = worker_host(http_url) else {
         return StaticHybridMatch::Differs;
     };
-    // A layout-only binding declares no endpoints: the engine is authoritative
-    // for the publishers, so the layout and the sources this worker was bound to
-    // are what the observation is checked against. Without this an empty
-    // `expected` map would accept every answer, and a restarted engine that
-    // advertises a new topic (or no sources at all) would keep refreshing the
-    // providers the router subscribed to for the previous boot.
+    // A layout-only binding declares no endpoints, so check the answer
+    // against the layout and the sources it was bound to; a new topic or no
+    // sources means the engine restarted.
     if expected.is_empty() {
         if observed.is_empty() {
             return StaticHybridMatch::Differs;
@@ -1521,12 +1485,8 @@ fn grpc_model_id(
     })
 }
 
-/// Fetch the HTTP KV event source route.
-///
-/// vLLM serves it since 0.31.0 (`entrypoints/serve/instrumentator/basic.py`);
-/// v0.29.0 and v0.30.0 do not. A 404/405 therefore reports
-/// [`SourcesProbe::Unsupported`] (an engine that cannot answer) rather than a
-/// transport failure.
+/// Fetch the HTTP KV event source route. A 404/405 reports
+/// [`SourcesProbe::Unsupported`], not a transport failure.
 async fn fetch_kv_event_sources(
     client: &reqwest::Client,
     worker_url: &str,
@@ -1620,10 +1580,8 @@ fn events_enabled(entry: &KvEventSourceEntry) -> bool {
     if entry.publisher.as_deref() != Some("zmq") {
         return false;
     }
-    // vLLM 0.31+ answers /kv_event_sources without `encoding` or
-    // `schema_version`: a "zmq" publisher already means the msgpack wire format
-    // and schema 1 there. An entry that names another encoding or schema is a
-    // different contract and is rejected.
+    // Omitted `encoding`/`schema_version` mean msgpack schema 1; any other
+    // value is rejected.
     if !matches!(entry.encoding.as_deref(), None | Some("msgpack")) {
         return false;
     }
@@ -2474,10 +2432,7 @@ mod tests {
         let info = supervisor.on_worker_added(&worker_url).await.unwrap();
         let provider = supervisor.match_provider_for_worker(&worker_url).unwrap();
         boundary_subscription(&publisher, "hybrid/epoch-1", false).await;
-        let payload = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/rust/fixtures/kv_cbor/qwen35_vllm028.msgpack"
-        ));
+        let payload = crate::kv_index::hybrid_events::tests::qwen35_payload();
         publisher
             .send_multipart(
                 [

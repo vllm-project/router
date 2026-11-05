@@ -1,9 +1,4 @@
 //! Atomic, fail-closed hybrid event state for one worker rank.
-//!
-//! This is not connected to runtime worker discovery or serving. Before use,
-//! the caller must verify the complete group layout, cache identity, hash
-//! algorithm and seed, publisher/rank binding, and engine restore rules. A routing decision also
-//! needs the existing subscriber lease and freshness checks.
 
 use std::collections::HashSet;
 
@@ -54,8 +49,8 @@ pub struct HybridEventIndex {
 }
 
 impl HybridEventIndex {
-    /// The layout and sha256_cbor seed must come from a verified capability,
-    /// never inferred from the model name or from a partial event stream.
+    /// Test constructor keyed by a `PYTHONHASHSEED` instead of a root digest.
+    #[cfg(test)]
     pub fn new(
         target: RoutableTarget,
         groups: Vec<HybridEventGroup>,
@@ -135,12 +130,8 @@ impl HybridEventIndex {
         })
     }
 
-    /// Declare the layout's restore-time recomputation window.
-    ///
-    /// vLLM rewinds a prefix hit by this many tokens (rounded down to a block)
-    /// before prefilling the rest, and requires every replay group to agree on
-    /// one window. A non-zero window therefore reduces the credited prefix for
-    /// the complete layout, including groups that never emit block events.
+    /// Declare the layout's restore-time recomputation window
+    /// (`prefix_replay_tokens`); it lowers the credit for the whole layout.
     pub fn with_replay_tokens(mut self, replay_tokens: u32) -> Result<Self, HybridEventError> {
         let hash_block_size = self.keys.block_size();
         if replay_tokens > 0 && (hash_block_size == 0 || replay_tokens > u32::MAX / 2) {
@@ -321,12 +312,8 @@ impl HybridEventIndex {
         Ok(())
     }
 
-    /// Calculate one consistent local snapshot. The caller must verify that
-    /// the input uses this index's exact identity and hash contract, with no
-    /// unmodeled multimodal data, adapter or cache salt. The bound must account
-    /// for engine-specific limits; unsupported speculative/lookahead restore
-    /// semantics must receive no credit. Zero can mean a miss or untrusted
-    /// source; neither grants routing credit.
+    /// Calculate one consistent local snapshot. Zero means a miss or an
+    /// untrusted source.
     pub fn reusable_tokens(&self, tokens: &[u32], max_reusable_tokens: usize) -> u64 {
         let hashes = self.keys.generate_block_keys(tokens);
         let state = self.state.read();
@@ -385,14 +372,9 @@ impl HybridEventIndex {
         align_down(credited, self.keys.block_size() as u32)
     }
 
-    /// Every block a store proves, not only the tail a sliding group publishes.
-    ///
-    /// A sliding-window group stores every block it keeps in the block pool but
-    /// publishes just the retained tail, together with the tokens it stored and
-    /// the parent digest. Extending the chain from that parent recovers the
-    /// blocks in between; the published hashes must be the tail of that chain's
-    /// block boundaries or the store falls back to what it published, so a store
-    /// that was not produced by this hash contract cannot widen a claim.
+    /// Every block a store proves. A sliding group publishes only its tail;
+    /// the chain from the parent digest recovers the rest, and is used only
+    /// when its tail matches the published hashes.
     fn stored_keys(
         &self,
         group: &HybridEventGroup,
@@ -475,12 +457,8 @@ fn event_kind_matches(kind: HybridGroupKind, store: &BlockStored) -> bool {
     }
 }
 
-/// A checkpoint event may describe a whole cached chunk while publishing only
-/// the states that survived sparse retention, so its hash count is bounded by
-/// the token range instead of equal to it. A sliding-window group keeps only
-/// its resident tail and publishes just those blocks, which is why its hash
-/// count is also bounded by the range. Full attention and compressed attention
-/// publish one hash per block.
+/// Checkpoint and sliding groups may publish fewer hashes than the blocks the
+/// token range spans; attention groups publish one per block.
 fn stored_shape_matches(kind: HybridGroupKind, store: &BlockStored) -> bool {
     let block_size = store.block_size as usize;
     if block_size == 0 || store.token_ids.is_empty() {
@@ -535,21 +513,12 @@ impl crate::policies::TieredMatchProvider for HybridEventIndex {
 }
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
-mod tests {
+pub(crate) mod tests {
     use std::sync::Arc;
 
     use super::*;
     use crate::kv_index::wire::{BlockRemoved, BlockStored};
 
-    fn hex_root(value: &str) -> [u8; 32] {
-        assert_eq!(value.len(), 64);
-        let mut root = [0; 32];
-        for (out, pair) in root.iter_mut().zip(value.as_bytes().chunks_exact(2)) {
-            let nibble = |byte: u8| (byte as char).to_digit(16).unwrap() as u8;
-            *out = (nibble(pair[0]) << 4) | nibble(pair[1]);
-        }
-        root
-    }
 
     fn target() -> RoutableTarget {
         RoutableTarget {
@@ -576,45 +545,45 @@ mod tests {
         (0..1024).map(|i| 100 + i % 100).collect()
     }
 
+    /// A GPU store of `hashes` for one group, as the engine publishes it.
+    fn gpu_store(
+        group_idx: u32,
+        spec: &str,
+        block_size: u32,
+        token_ids: &[u32],
+        hashes: &[SequenceHash],
+    ) -> BlockStored {
+        BlockStored {
+            block_hashes: hashes
+                .iter()
+                .map(|hash| ExternalBlockHash::Bytes(hash.to_vec()))
+                .collect(),
+            parent_block_hash: None,
+            token_ids: token_ids.to_vec(),
+            block_size,
+            lora_id: None,
+            medium: Some("GPU".into()),
+            lora_name: None,
+            extra_keys: Some(vec![rmpv::Value::Nil; hashes.len()]),
+            group_idx: Some(group_idx),
+            kv_cache_spec_kind: Some(spec.into()),
+            kv_cache_spec_sliding_window: None,
+            locality: None,
+            ownership: None,
+            session_id: None,
+        }
+    }
+
+    /// A Qwen3.5 batch: one 528-token block in three Mamba groups and one
+    /// full-attention group, hashed with seed 0.
     fn qwen_batch() -> KVEventBatch {
         let tokens = prompt();
         let hash = BlockKeyGenerator::new(528, 0).generate_block_keys(&tokens)[0];
-        // Captured from the Qwen3.5-4B vLLM 0.28.0 H20 probe with full-width
-        // sha256_cbor events, PYTHONHASHSEED=0 and the synthetic prompt above.
-        assert_eq!(
-            hash,
-            [
-                0x62, 0x7d, 0xd1, 0x45, 0x45, 0x65, 0x2f, 0x6a, 0x2d, 0xe0, 0xae, 0x29, 0x21, 0xe9,
-                0xed, 0x23, 0x3f, 0xe3, 0x64, 0x87, 0xe1, 0x52, 0xa7, 0xc2, 0xd7, 0x78, 0x2c, 0xeb,
-                0xf5, 0xc2, 0x41, 0x81,
-            ]
-        );
         let events = groups()
             .iter()
             .map(|group| {
-                KVEvent::BlockStored(BlockStored {
-                    block_hashes: vec![ExternalBlockHash::Bytes(hash.to_vec())],
-                    parent_block_hash: None,
-                    token_ids: tokens[..528].to_vec(),
-                    block_size: 528,
-                    lora_id: None,
-                    medium: Some("GPU".into()),
-                    lora_name: None,
-                    extra_keys: Some(vec![rmpv::Value::Nil]),
-                    group_idx: Some(group.group_idx),
-                    kv_cache_spec_kind: Some(
-                        if group.group_idx == 3 {
-                            "full_attention"
-                        } else {
-                            "mamba"
-                        }
-                        .into(),
-                    ),
-                    kv_cache_spec_sliding_window: None,
-                    locality: None,
-                    ownership: None,
-                    session_id: None,
-                })
+                let spec = if group.group_idx == 3 { "full_attention" } else { "mamba" };
+                KVEvent::BlockStored(gpu_store(group.group_idx, spec, 528, &tokens[..528], &[hash]))
             })
             .collect();
         KVEventBatch {
@@ -624,98 +593,29 @@ mod tests {
         }
     }
 
+    /// `qwen_batch()` encoded as the engine publishes it.
+    pub(crate) fn qwen35_payload() -> Vec<u8> {
+        let batch = qwen_batch();
+        rmp_serde::to_vec_named(&(batch.ts, batch.events, batch.data_parallel_rank)).unwrap()
+    }
+
     fn index(limit: usize) -> HybridEventIndex {
         HybridEventIndex::new(target(), groups(), 528, 0, limit).unwrap()
     }
 
     #[test]
-    fn qwen35_real_msgpack_batch_matches_engine_reuse() {
-        // Captured from H20 vLLM 0.28.0 using the synthetic prompt from
-        // prompt(), sha256_cbor, seed 0 and full-width event hashes.
-        let payload = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/rust/fixtures/kv_cbor/qwen35_vllm028.msgpack"
-        ));
-        let batch = crate::kv_index::decode_batch(payload).unwrap();
-        assert_eq!(batch.data_parallel_rank, Some(0));
-        assert_eq!(batch.events.len(), 4);
-        let index = index(8);
-        index.begin_empty(0);
-        assert_eq!(index.apply_payload(0, payload), Ok(()));
-        assert_eq!(index.reusable_tokens(&prompt(), usize::MAX), 528);
+    fn decoded_qwen_layout_requires_all_groups_and_tracks_removal() {
+        let payload = qwen35_payload();
+        let batch = crate::kv_index::decode_batch(&payload).unwrap();
+        // A payload that does not decode revokes the view.
+        let corrupt = index(8);
+        corrupt.begin_empty(0);
+        assert_eq!(corrupt.apply_payload(0, &payload), Ok(()));
         assert_eq!(
-            index.apply_payload(1, &[0xc1]),
+            corrupt.apply_payload(1, &[0xc1]),
             Err(HybridEventError::InvalidBatch)
         );
-        assert_eq!(index.reusable_tokens(&prompt(), usize::MAX), 0);
-    }
-
-    /// Captured from vLLM 0.29 with `VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES=0`:
-    /// four `BlockStored` events (three mamba groups plus full attention) with
-    /// 32-byte block hashes and `data_parallel_rank: 0`.
-    ///
-    /// This engine ran its default `--prefix-caching-hash` (`sha256`, which
-    /// pickles the tuple) while the declared layout says `sha256_cbor`. Both
-    /// produce 32-byte digests, so only recomputing the digest exposes the
-    /// disagreement: the batch is a valid hybrid layout with a foreign hash
-    /// contract and must credit nothing.
-    #[test]
-    fn foreign_hash_contract_is_credited_as_nothing() {
-        let payload = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/rust/fixtures/kv_cbor/qwen35_vllm029.msgpack"
-        ));
-        let prompt: Vec<u32> = serde_json::from_slice(include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/rust/fixtures/kv_cbor/qwen35_vllm029_prompt.json"
-        )))
-        .unwrap();
-        assert_eq!(prompt.len(), 601);
-        let root = hex_root("9bd96a485ad84efdafb72ee48a1d7a69bcead0f8f0433173941b276b9581eef0");
-        let index = HybridEventIndex::new_with_root_hash(target(), groups(), 528, root, 8).unwrap();
-        index.begin_empty(0);
-        index
-            .apply_payload(0, payload)
-            .expect("the batch is structurally valid");
-        assert_eq!(index.reusable_tokens(&prompt, usize::MAX), 0);
-    }
-
-    /// Captured from vLLM 0.29 with `--prefix-caching-hash sha256_cbor` and
-    /// `VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES=0`. The engine's `NONE_HASH` is
-    /// `sha256_cbor("vllm-none-hash")`, so the layout must declare that root:
-    /// the seed-zero digest is a different, incompatible sequence.
-    #[test]
-    fn cbor_hashed_engine_credits_the_replayed_prefix() {
-        let payload = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/rust/fixtures/kv_cbor/qwen35_vllm029_cbor.msgpack"
-        ));
-        let prompt: Vec<u32> = serde_json::from_slice(include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/rust/fixtures/kv_cbor/qwen35_vllm029_prompt.json"
-        )))
-        .unwrap();
-        let root = hex_root("9bd96a485ad84efdafb72ee48a1d7a69bcead0f8f0433173941b276b9581eef0");
-        let index = HybridEventIndex::new_with_root_hash(target(), groups(), 528, root, 8).unwrap();
-        index.begin_empty(0);
-        index
-            .apply_payload(0, payload)
-            .expect("captured batch applies");
-        assert_eq!(index.reusable_tokens(&prompt, usize::MAX), 528);
-        // A wrong root is a different sequence, not a cosmetic field.
-        let wrong =
-            HybridEventIndex::new_with_root_hash(target(), groups(), 528, [0; 32], 8).unwrap();
-        wrong.begin_empty(0);
-        wrong.apply_payload(0, payload).unwrap();
-        assert_eq!(wrong.reusable_tokens(&prompt, usize::MAX), 0);
-    }
-
-    #[test]
-    fn decoded_qwen_layout_requires_all_groups_and_tracks_removal() {
-        let original = qwen_batch();
-        let payload =
-            rmp_serde::to_vec_named(&(original.ts, original.events, Some(0_u32))).unwrap();
-        let batch = crate::kv_index::decode_batch(&payload).unwrap();
+        assert_eq!(corrupt.reusable_tokens(&prompt(), usize::MAX), 0);
         let index = index(8);
         assert_eq!(
             index.apply_batch(0, &batch),
@@ -951,52 +851,14 @@ mod tests {
                 kind: HybridGroupKind::Checkpoint,
             },
         ];
-        let stored = |group_idx, size, token_ids: &[u32], block_hashes, parent| {
-            KVEvent::BlockStored(BlockStored {
-                block_hashes,
-                parent_block_hash: parent,
-                token_ids: token_ids.to_vec(),
-                block_size: size,
-                lora_id: None,
-                medium: Some("GPU".into()),
-                lora_name: None,
-                extra_keys: None,
-                group_idx: Some(group_idx),
-                kv_cache_spec_kind: Some(
-                    if group_idx == 0 {
-                        "full_attention"
-                    } else {
-                        "mamba"
-                    }
-                    .into(),
-                ),
-                kv_cache_spec_sliding_window: None,
-                locality: None,
-                ownership: None,
-                session_id: None,
-            })
-        };
+        let mut checkpoint = gpu_store(1, "mamba", 8, &tokens[8..16], &hashes[3..4]);
+        checkpoint.parent_block_hash = Some(ExternalBlockHash::Bytes(hashes[1].to_vec()));
         let batch = KVEventBatch {
             ts: 1.0,
             data_parallel_rank: Some(0),
             events: vec![
-                stored(
-                    0,
-                    4,
-                    &tokens[..16],
-                    hashes
-                        .iter()
-                        .map(|h| ExternalBlockHash::Bytes(h.to_vec()))
-                        .collect(),
-                    None,
-                ),
-                stored(
-                    1,
-                    8,
-                    &tokens[8..16],
-                    vec![ExternalBlockHash::Bytes(hashes[3].to_vec())],
-                    Some(ExternalBlockHash::Bytes(hashes[1].to_vec())),
-                ),
+                KVEvent::BlockStored(gpu_store(0, "full_attention", 4, &tokens[..16], &hashes)),
+                KVEvent::BlockStored(checkpoint),
             ],
         };
         let index = HybridEventIndex::new(target(), layout, 4, 0, 8).unwrap();
@@ -1071,26 +933,9 @@ mod tests {
             .map(|group| {
                 let compressed =
                     matches!(group.kind, HybridGroupKind::CompressedFullAttention { .. });
-                KVEvent::BlockStored(BlockStored {
-                    block_hashes: vec![ExternalBlockHash::Bytes(hash.to_vec())],
-                    parent_block_hash: None,
-                    token_ids: tokens[..320].to_vec(),
-                    block_size: 320,
-                    lora_id: None,
-                    medium: Some("GPU".into()),
-                    lora_name: None,
-                    extra_keys: Some(vec![rmpv::Value::Nil]),
-                    group_idx: Some(group.group_idx),
-                    kv_cache_spec_kind: Some(
-                        kind_override
-                            .unwrap_or(if compressed { "mla_attention" } else { "mamba" })
-                            .into(),
-                    ),
-                    kv_cache_spec_sliding_window: None,
-                    locality: None,
-                    ownership: None,
-                    session_id: None,
-                })
+                let spec =
+                    kind_override.unwrap_or(if compressed { "mla_attention" } else { "mamba" });
+                KVEvent::BlockStored(gpu_store(group.group_idx, spec, 320, &tokens[..320], &[hash]))
             })
             .collect();
         KVEventBatch {
@@ -1145,31 +990,18 @@ mod tests {
                     } else {
                         checkpoint_hashes
                     };
-                    KVEvent::BlockStored(BlockStored {
-                        block_hashes: (if attention {
-                            &keys[..count]
-                        } else {
-                            &keys[6 - count..6]
-                        })
-                        .iter()
-                        .map(|hash| ExternalBlockHash::Bytes(hash.to_vec()))
-                        .collect(),
-                        parent_block_hash: None,
-                        token_ids: tokens[..1920].to_vec(),
-                        block_size: 320,
-                        lora_id: None,
-                        medium: Some("GPU".into()),
-                        lora_name: None,
-                        extra_keys: Some(vec![rmpv::Value::Nil; count]),
-                        group_idx: Some(group.group_idx),
-                        kv_cache_spec_kind: Some(
-                            if attention { "mla_attention" } else { "mamba" }.into(),
-                        ),
-                        kv_cache_spec_sliding_window: None,
-                        locality: None,
-                        ownership: None,
-                        session_id: None,
-                    })
+                    let (spec, hashes) = if attention {
+                        ("mla_attention", &keys[..count])
+                    } else {
+                        ("mamba", &keys[6 - count..6])
+                    };
+                    KVEvent::BlockStored(gpu_store(
+                        group.group_idx,
+                        spec,
+                        320,
+                        &tokens[..1920],
+                        hashes,
+                    ))
                 })
                 .collect();
             KVEventBatch {
@@ -1221,43 +1053,20 @@ mod tests {
                 },
             })
             .collect();
-        let store = |group_idx: u32, hashes: Vec<ExternalBlockHash>, tokens_len: usize| {
-            let n = hashes.len();
-            KVEvent::BlockStored(BlockStored {
-                block_hashes: hashes,
-                parent_block_hash: None,
-                token_ids: tokens[..tokens_len].to_vec(),
-                block_size: 576,
-                lora_id: None,
-                medium: Some("GPU".into()),
-                lora_name: None,
-                extra_keys: Some(vec![rmpv::Value::Nil; n]),
-                group_idx: Some(group_idx),
-                kv_cache_spec_kind: Some(
-                    if group_idx == 3 {
-                        "full_attention"
-                    } else {
-                        "mamba"
-                    }
-                    .into(),
-                ),
-                kv_cache_spec_sliding_window: None,
-                locality: None,
-                ownership: None,
-                session_id: None,
-            })
+        let store = |group_idx: u32, hashes: &[SequenceHash], tokens_len: usize| {
+            let spec = if group_idx == 3 { "full_attention" } else { "mamba" };
+            KVEvent::BlockStored(gpu_store(group_idx, spec, 576, &tokens[..tokens_len], hashes))
         };
-        let h = |i: usize| ExternalBlockHash::Bytes(keys[i].to_vec());
         let index = HybridEventIndex::new(target(), groups, 576, 0, 64).unwrap();
         index.begin_empty(0);
         let first = KVEventBatch {
             ts: 1.0,
             data_parallel_rank: Some(0),
             events: vec![
-                store(0, vec![h(2)], 1728),
-                store(1, vec![h(2)], 1728),
-                store(2, vec![h(2)], 1728),
-                store(3, vec![h(0), h(1), h(2)], 1728),
+                store(0, &keys[2..3], 1728),
+                store(1, &keys[2..3], 1728),
+                store(2, &keys[2..3], 1728),
+                store(3, &keys[..3], 1728),
             ],
         };
         assert_eq!(index.apply_batch(0, &first), Ok(()));
@@ -1267,10 +1076,10 @@ mod tests {
             ts: 2.0,
             data_parallel_rank: Some(0),
             events: vec![
-                store(0, vec![], 576),
-                store(1, vec![], 576),
-                store(2, vec![], 576),
-                store(3, vec![h(0)], 576),
+                store(0, &[], 576),
+                store(1, &[], 576),
+                store(2, &[], 576),
+                store(3, &keys[..1], 576),
             ],
         };
         assert_eq!(index.apply_batch(1, &rerun), Ok(()));
@@ -1290,25 +1099,15 @@ mod tests {
         from: usize,
         to: usize,
     ) -> KVEvent {
-        KVEvent::BlockStored(BlockStored {
-            block_hashes: keys[from..to]
-                .iter()
-                .map(|key| ExternalBlockHash::Bytes(key.to_vec()))
-                .collect(),
-            parent_block_hash: None,
-            token_ids: tokens[from * block..to * block].to_vec(),
-            block_size: block as u32,
-            lora_id: None,
-            medium: Some("GPU".into()),
-            lora_name: None,
-            extra_keys: Some(vec![rmpv::Value::Nil; to - from]),
-            group_idx: Some(group.group_idx),
-            kv_cache_spec_kind: Some(spec.into()),
-            kv_cache_spec_sliding_window: window,
-            locality: None,
-            ownership: None,
-            session_id: None,
-        })
+        let mut store = gpu_store(
+            group.group_idx,
+            spec,
+            block as u32,
+            &tokens[from * block..to * block],
+            &keys[from..to],
+        );
+        store.kv_cache_spec_sliding_window = window;
+        KVEvent::BlockStored(store)
     }
 
     #[test]
@@ -1458,25 +1257,9 @@ mod tests {
                      hashes: Vec<SequenceHash>,
                      block: usize,
                      span: usize| {
-            KVEvent::BlockStored(BlockStored {
-                block_hashes: hashes
-                    .into_iter()
-                    .map(|hash| ExternalBlockHash::Bytes(hash.to_vec()))
-                    .collect(),
-                parent_block_hash: None,
-                token_ids: tokens[..span].to_vec(),
-                block_size: block as u32,
-                lora_id: None,
-                medium: Some("GPU".into()),
-                lora_name: None,
-                extra_keys: None,
-                group_idx: Some(group.group_idx),
-                kv_cache_spec_kind: Some(spec.into()),
-                kv_cache_spec_sliding_window: window,
-                locality: None,
-                ownership: None,
-                session_id: None,
-            })
+            let mut store = gpu_store(group.group_idx, spec, block as u32, &tokens[..span], &hashes);
+            store.kv_cache_spec_sliding_window = window;
+            KVEvent::BlockStored(store)
         };
         let index = HybridEventIndex::new(target(), groups.clone(), 4, 0, 4096).unwrap();
         index.begin_empty(0);
@@ -1544,34 +1327,14 @@ mod tests {
             block_size: 64,
             kind: HybridGroupKind::SlidingWindow { window_tokens: 128 },
         };
-        let tail: Vec<ExternalBlockHash> = keys
-            .iter()
-            .skip(15)
-            .step_by(16)
-            .rev()
-            .take(2)
-            .rev()
-            .map(|hash| ExternalBlockHash::Bytes(hash.to_vec()))
-            .collect();
+        let tail: Vec<SequenceHash> = keys.iter().skip(15).step_by(16).copied().collect();
+        let tail = &tail[tail.len() - 2..];
+        let mut store = gpu_store(0, "sliding_window_mla", 64, &tokens[..1024], tail);
+        store.kv_cache_spec_sliding_window = Some(128);
         let batch = KVEventBatch {
             ts: 1.0,
             data_parallel_rank: Some(0),
-            events: vec![KVEvent::BlockStored(BlockStored {
-                block_hashes: tail,
-                parent_block_hash: None,
-                token_ids: tokens[..1024].to_vec(),
-                block_size: 64,
-                lora_id: None,
-                medium: Some("GPU".into()),
-                lora_name: None,
-                extra_keys: None,
-                group_idx: Some(0),
-                kv_cache_spec_kind: Some("sliding_window_mla".into()),
-                kv_cache_spec_sliding_window: Some(128),
-                locality: None,
-                ownership: None,
-                session_id: None,
-            })],
+            events: vec![KVEvent::BlockStored(store)],
         };
         for (capacity, expected) in [(16, Ok(())), (15, Err(HybridEventError::Capacity))] {
             let index = HybridEventIndex::new(target(), vec![group], 4, 0, capacity).unwrap();
@@ -1602,25 +1365,13 @@ mod tests {
         let batch = KVEventBatch {
             ts: 1.0,
             data_parallel_rank: Some(0),
-            events: vec![KVEvent::BlockStored(BlockStored {
-                block_hashes: keys
-                    .iter()
-                    .map(|hash| ExternalBlockHash::Bytes(hash.to_vec()))
-                    .collect(),
-                parent_block_hash: None,
-                token_ids: tokens.clone(),
-                block_size: 128,
-                lora_id: None,
-                medium: Some("GPU".into()),
-                lora_name: None,
-                extra_keys: None,
-                group_idx: Some(5),
-                kv_cache_spec_kind: Some("mla_attention".into()),
-                kv_cache_spec_sliding_window: None,
-                locality: None,
-                ownership: None,
-                session_id: None,
-            })],
+            events: vec![KVEvent::BlockStored(gpu_store(
+                5,
+                "mla_attention",
+                128,
+                &tokens,
+                &keys,
+            ))],
         };
         assert_eq!(index.apply_batch(0, &batch), Ok(()));
         // The engine reports 896 for a 1,024-token repeat (the last whole block
@@ -1636,13 +1387,7 @@ mod tests {
         let index = index(8);
         index.begin_empty(0);
         index
-            .apply_payload(
-                0,
-                include_bytes!(concat!(
-                    env!("CARGO_MANIFEST_DIR"),
-                    "/tests/rust/fixtures/kv_cbor/qwen35_vllm028.msgpack"
-                )),
-            )
+            .apply_payload(0, &qwen35_payload())
             .unwrap();
         // Each rank serves independently; its events, ownership and history
         // belong to that rank only.

@@ -2184,11 +2184,8 @@ mod tests {
             );
             indexes.push(index);
         }
-        let payload = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/rust/fixtures/kv_cbor/qwen35_vllm028.msgpack"
-        ));
-        indexes[1].apply_payload(0, payload).unwrap();
+        let payload = crate::kv_index::hybrid_events::tests::qwen35_payload();
+        indexes[1].apply_payload(0, &payload).unwrap();
         let prompt: Vec<u32> = (0..1024).map(|i| 100 + i % 100).collect();
         assert_eq!(
             policy.select_worker_with_token_ids(&workers, Some(&prompt)),

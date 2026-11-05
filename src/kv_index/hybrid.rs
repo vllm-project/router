@@ -1,24 +1,7 @@
 //! Common-prefix calculation for hybrid cache groups.
 //!
-//! The caller must first establish the cache identity, complete group layout,
-//! restore semantics, and one consistent snapshot for the target and its
-//! current incarnation. A placement event is not a reservation: the engine must
-//! still validate reuse at dispatch time.
-//!
-//! A hit in one group is never evidence for another. vLLM measures every
-//! group's hit on its own and keeps the smallest, so this module reports the
-//! same number: each group's longest restorable prefix, rounded to its own
-//! block, and the credited prefix is the smallest of those minus the
-//! restore-time recomputation window the layout declares (vLLM's
-//! `prefix_replay_tokens`). Replay windows belong to the layout, not to a group
-//! that may publish no events at all.
-//!
-//! Cumulative groups (dense, compressed, and checkpointed state) can be
-//! shortened afterwards without losing the rest of their state: the engine
-//! recomputes the missing tail from the oldest state they still hold. A
-//! sliding-window group cannot be shortened, because its resident blocks sit at
-//! its own hit boundary; the engine keeps the smaller hit anyway and does not
-//! re-check the window there.
+//! Like vLLM, each group's hit is measured on its own and the smallest one is
+//! credited. A hit in one group is never evidence for another.
 
 use std::collections::HashSet;
 
@@ -61,14 +44,8 @@ pub fn align_down(tokens: u64, block_size: u32) -> u64 {
 }
 
 /// Return the latest jointly restorable boundary, or zero when none is proven.
-///
-/// `max_reusable_tokens` is the engine-confirmed upper bound, including any
-/// last-token recomputation constraint. Each group contributes the longest
-/// prefix it can restore on its own, rounded down to its block size; the
-/// result is the smallest contribution. Only local GPU claims on `target`
-/// count. Unknown group rules must not be converted into these supported
-/// variants; a caller unable to describe every required group must not invoke
-/// this function to grant credit.
+/// `max_reusable_tokens` is the engine's upper bound; only local GPU claims on
+/// `target` count.
 pub fn common_reusable_tokens(
     target: &RoutableTarget,
     groups: &[HybridGroupView<'_>],
@@ -102,13 +79,8 @@ pub fn common_reusable_tokens(
         boundary = boundary.min(hit);
     }
 
-    // Every group is re-checked at the reduced boundary, sliding windows
-    // included: a smaller boundary needs the run of contiguous blocks that
-    // engine's sliding lookup would still accept there, and that run may sit
-    // below the tail the group last published. The loop restarts whenever a
-    // group pulls the boundary down, which is the fixed point the engine's own
-    // coordinator converges on; a group that can no longer restore the reduced
-    // boundary drops the whole prefix to zero.
+    // Re-check every group at the reduced boundary until it stops moving, as
+    // the engine's coordinator does.
     loop {
         let mut next = boundary;
         for group in groups {
@@ -124,15 +96,9 @@ pub fn common_reusable_tokens(
     }
 }
 
-/// Whether one group can still restore `boundary` after another group reduced
-/// it, in tokens.
-///
-/// A sliding window is special: it only needs a run of
-/// `ceil((window - 1) / block_size)` contiguous blocks anywhere below the
-/// boundary, which is the rule the engine's sliding lookup applies when it scans
-/// back from the candidate length. When no such run exists the engine falls back
-/// to the cached run anchored at block zero, so an evicted window leaves no
-/// shared restore point and the caller drops the credit to zero.
+/// Whether one group can still restore `boundary` (in tokens). A sliding
+/// window needs `ceil((window - 1) / block_size)` contiguous blocks below the
+/// boundary, as the engine's sliding lookup does.
 fn supported_at(group: &HybridGroupView<'_>, target: &RoutableTarget, boundary: u64) -> u64 {
     let HybridGroupKind::SlidingWindow { window_tokens } = group.kind else {
         return longest_supported(group, target, boundary);
