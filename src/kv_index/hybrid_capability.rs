@@ -98,16 +98,43 @@ impl HybridCapabilities {
             .ok_or("invalid root hash")?;
         let hash_block_size = rank.hash_block_size.ok_or("missing hash block size")?;
         let mut groups = Vec::with_capacity(rank.groups.len());
+        let mut replay_tokens = 0;
         for group in &rank.groups {
-            // A restore-time replay window is not modeled: such a layout gets no
-            // credit rather than one the engine cannot honor.
+            // vLLM rewinds a hit by one replay window shared by every replay
+            // group. Disagreeing windows have no single restore point, and a
+            // replay window only exists for sliding-window layouts.
             if group.prefix_replay_tokens > 0 {
-                return Err("unsupported group restore contract");
+                if !matches!(group.kind.as_str(), "sliding_window" | "sliding_window_mla") {
+                    return Err("unsupported group restore contract");
+                }
+                if replay_tokens != 0 && replay_tokens != group.prefix_replay_tokens {
+                    return Err("unsupported group restore contract");
+                }
+                replay_tokens = group.prefix_replay_tokens;
             }
             // Scratch groups such as the Qwen4 QSA key ring hold per-request
             // state, never shareable state, and emit no block events. They are
             // excluded from the index only when their shape proves that.
             if !group.prefix_cacheable {
+                if group.prefix_replay_tokens > 0
+                    && matches!(
+                        (group.kind.as_str(), group.spec_type.as_str()),
+                        ("sliding_window", "SlidingWindowSpec")
+                            | ("sliding_window_mla", "SlidingWindowMLASpec")
+                            | ("mla_attention", "MLAAttentionSpec")
+                    )
+                {
+                    // Bounded replay: the engine rebuilds this group's trailing
+                    // window from the other groups' state. Its own blocks are
+                    // not required to be resident, but the window must still be
+                    // charged to the layout.
+                    if group.sliding_window.is_none_or(|window| {
+                        window == 0 || u64::from(window) != u64::from(group.prefix_replay_tokens)
+                    }) {
+                        return Err("unsupported bounded replay group");
+                    }
+                    continue;
+                }
                 if group.spec_type != "CircularBufferSpec"
                     || group.tokens_per_state.as_deref() != Some("1")
                     || group.block_size == 0
@@ -135,6 +162,16 @@ impl HybridCapabilities {
                         .ok_or("unsupported compressed attention group")?;
                     HybridGroupKind::CompressedFullAttention { tokens_per_state }
                 }
+                ("sliding_window", "SlidingWindowSpec")
+                | ("sliding_window_mla", "SlidingWindowMLASpec") => {
+                    let window = group
+                        .sliding_window
+                        .filter(|window| *window > 0)
+                        .ok_or("unsupported sliding window group")?;
+                    HybridGroupKind::SlidingWindow {
+                        window_tokens: u64::from(window),
+                    }
+                }
                 ("mamba", "MambaSpec")
                     if group.mamba_cache_mode.as_deref() == Some("align")
                         && group.prefill_checkpoint_alignment.is_none_or(|alignment| {
@@ -152,21 +189,33 @@ impl HybridCapabilities {
             });
         }
         // The declared layout, not just the indexed subset, must describe a
-        // hybrid cache: several groups, at least one attention group, and a
-        // checkpoint group that a single attention hit cannot prove.
+        // hybrid cache: several groups, at least one attention group, and some
+        // state that a single attention hit cannot prove (a checkpoint group,
+        // a sliding-window group, or a declared replay window).
         let has_attention = groups.iter().any(|group| {
             matches!(
                 group.kind,
-                HybridGroupKind::FullAttention | HybridGroupKind::CompressedFullAttention { .. }
+                HybridGroupKind::FullAttention
+                    | HybridGroupKind::CompressedFullAttention { .. }
+                    | HybridGroupKind::SlidingWindow { .. }
             )
         });
-        let has_state = groups
-            .iter()
-            .any(|group| matches!(group.kind, HybridGroupKind::Checkpoint));
-        if rank.groups.len() < 2 || groups.is_empty() || !has_attention || !has_state {
+        let has_state = groups.iter().any(|group| {
+            matches!(
+                group.kind,
+                HybridGroupKind::Checkpoint | HybridGroupKind::SlidingWindow { .. }
+            )
+        });
+        if rank.groups.len() < 2
+            || groups.is_empty()
+            || !has_attention
+            || !(has_state || replay_tokens > 0)
+        {
             return Err("not a supported mixed layout");
         }
         HybridEventIndex::new_with_root_hash(target, groups, hash_block_size, root, max_entries)
+            .map_err(|_| "invalid group layout")?
+            .with_replay_tokens(replay_tokens)
             .map_err(|_| "invalid group layout")
     }
 

@@ -59,7 +59,16 @@ impl BlockKeyGenerator {
     /// Return one key per complete block. A trailing partial block is not
     /// cache-addressable and is intentionally omitted.
     pub fn generate_block_keys(&self, token_ids: &[u32]) -> Vec<SequenceHash> {
-        let mut parent = self.none_hash;
+        self.keys_after(self.none_hash, token_ids)
+    }
+
+    /// Extend a chain from an engine-supplied parent digest.
+    ///
+    /// Events carry the parent hash next to the tokens they stored, so a store
+    /// whose hashes cover only a retained tail can still be expanded to every
+    /// block it spans.
+    pub fn keys_after(&self, parent: SequenceHash, token_ids: &[u32]) -> Vec<SequenceHash> {
+        let mut parent = parent;
         token_ids
             .chunks_exact(self.block_size)
             .map(|tokens| {
@@ -69,7 +78,8 @@ impl BlockKeyGenerator {
             .collect()
     }
 
-    #[cfg(all(test, feature = "cpu", feature = "ready"))]
+    /// The chain's initial parent, i.e. the digest the engine uses before any
+    /// block is stored.
     pub(crate) fn none_hash(&self) -> SequenceHash {
         self.none_hash
     }

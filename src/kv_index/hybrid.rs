@@ -18,6 +18,8 @@ pub enum HybridGroupKind {
     CompressedFullAttention { tokens_per_state: u32 },
     /// Only a checkpoint block ending at the boundary is needed.
     Checkpoint,
+    /// All blocks intersecting the preceding `window_tokens` are needed.
+    SlidingWindow { window_tokens: u64 },
 }
 
 /// One required group's placement in a single trusted snapshot.
@@ -53,10 +55,14 @@ pub fn common_reusable_tokens(
         return 0;
     }
     let mut group_ids = HashSet::with_capacity(groups.len());
-    if groups
-        .iter()
-        .any(|group| group.block_size == 0 || !group_ids.insert(group.group_idx))
-    {
+    if groups.iter().any(|group| {
+        group.block_size == 0
+            || !group_ids.insert(group.group_idx)
+            || matches!(
+                group.kind,
+                HybridGroupKind::SlidingWindow { window_tokens: 0 }
+            )
+    }) {
         return 0;
     }
 
@@ -78,7 +84,7 @@ pub fn common_reusable_tokens(
     loop {
         let mut next = boundary;
         for group in groups {
-            next = next.min(longest_supported(group, target, boundary));
+            next = next.min(supported_at(group, target, boundary));
         }
         if next == 0 {
             return 0;
@@ -88,6 +94,40 @@ pub fn common_reusable_tokens(
         }
         boundary = next;
     }
+}
+
+/// Whether one group can still restore `boundary` (in tokens). A sliding
+/// window needs `ceil((window - 1) / block_size)` contiguous blocks below the
+/// boundary, as the engine's sliding lookup does.
+fn supported_at(group: &HybridGroupView<'_>, target: &RoutableTarget, boundary: u64) -> u64 {
+    let HybridGroupKind::SlidingWindow { window_tokens } = group.kind else {
+        return longest_supported(group, target, boundary);
+    };
+    let size = u64::from(group.block_size);
+    if size == 0 || window_tokens == 0 {
+        return 0;
+    }
+    let cap_blocks = boundary / size;
+    let needed = window_tokens.saturating_sub(1).div_ceil(size);
+    let mut fallback = 0;
+    for hit in group.matches.iter().filter(|hit| eligible(hit, target)) {
+        for &(start, end) in &hit.segments {
+            if start >= end {
+                continue;
+            }
+            let (start, end) = (u64::from(start), u64::from(end).min(cap_blocks));
+            if end <= start {
+                continue;
+            }
+            if end - start >= needed {
+                return cap_blocks * size;
+            }
+            if start == 0 {
+                fallback = fallback.max(end * size);
+            }
+        }
+    }
+    fallback
 }
 
 fn eligible(hit: &TierMatch, target: &RoutableTarget) -> bool {
@@ -133,6 +173,18 @@ fn longest_supported(group: &HybridGroupView<'_>, target: &RoutableTarget, cap: 
                 }
                 // A checkpoint is restorable on its own.
                 HybridGroupKind::Checkpoint => end,
+                // The window that ends at the boundary has to fit inside the
+                // resident run, except below block zero: a run anchored at the
+                // root has no earlier state the window could be missing, so the
+                // engine restores it even when it is shorter than the window.
+                HybridGroupKind::SlidingWindow { window_tokens } => {
+                    let needed = window_tokens.saturating_sub(1).div_ceil(size);
+                    if start == 0 || end - start >= needed {
+                        end
+                    } else {
+                        0
+                    }
+                }
             };
             best = best.max(candidate * size);
         }
@@ -204,6 +256,89 @@ mod tests {
     }
 
     #[test]
+    fn sliding_window_needs_only_the_required_local_interval() {
+        let worker = target("w", 0);
+        let full = [hit(&worker, &[(0, 8)])];
+        let window = [hit(&worker, &[(5, 8)])];
+        let groups = [
+            group(0, 16, HybridGroupKind::FullAttention, &full),
+            group(
+                1,
+                16,
+                HybridGroupKind::SlidingWindow { window_tokens: 33 },
+                &window,
+            ),
+        ];
+        assert_eq!(common_reusable_tokens(&worker, &groups, 128), 128);
+        // The last token cannot be reused, so both groups report 7 blocks. The
+        // sliding group still holds two contiguous blocks below that boundary,
+        // which is what its window needs, so the reduced boundary stands.
+        assert_eq!(common_reusable_tokens(&worker, &groups, 127), 112);
+    }
+
+    /// The sliding group's retained tail can sit entirely above a boundary
+    /// another group pulled down. The window that ends at that boundary is then
+    /// absent, so there is no shared restore point and no credit.
+    #[test]
+    fn a_reduced_boundary_that_loses_the_sliding_window_credits_nothing() {
+        let worker = target("w", 0);
+        let full = [hit(&worker, &[(0, 4)])]; // 0..64
+        let window = [hit(&worker, &[(6, 8)])]; // 96..128, a 32-token window
+        let groups = [
+            group(0, 16, HybridGroupKind::FullAttention, &full),
+            group(
+                1,
+                16,
+                HybridGroupKind::SlidingWindow { window_tokens: 32 },
+                &window,
+            ),
+        ];
+        assert_eq!(common_reusable_tokens(&worker, &groups, 143), 0);
+    }
+
+    /// A sliding group whose resident run starts at the root has no earlier
+    /// state the window could be missing, so a prefix shorter than the window is
+    /// still reusable: the engine restores the whole run.
+    #[test]
+    fn a_root_anchored_prefix_shorter_than_the_window_is_reusable() {
+        let worker = target("w", 0);
+        let full = [hit(&worker, &[(0, 1)])];
+        let window = [hit(&worker, &[(0, 1)])];
+        let groups = [
+            group(0, 64, HybridGroupKind::FullAttention, &full),
+            group(
+                1,
+                64,
+                HybridGroupKind::SlidingWindow { window_tokens: 128 },
+                &window,
+            ),
+        ];
+        // A 65-token request keeps one 64-token block, well inside the window.
+        assert_eq!(common_reusable_tokens(&worker, &groups, 64), 64);
+        assert_eq!(common_reusable_tokens(&worker, &groups, 128), 64);
+    }
+
+    /// A sliding group whose run sits below the boundary still supports it,
+    /// because the engine's lookup accepts any run of the window's blocks under
+    /// the candidate length.
+    #[test]
+    fn a_sliding_run_below_the_boundary_keeps_the_credit() {
+        let worker = target("w", 0);
+        let full = [hit(&worker, &[(0, 6)])]; // 0..96
+        let window = [hit(&worker, &[(4, 8)])]; // 64..128, a 32-token window
+        let groups = [
+            group(0, 16, HybridGroupKind::FullAttention, &full),
+            group(
+                1,
+                16,
+                HybridGroupKind::SlidingWindow { window_tokens: 32 },
+                &window,
+            ),
+        ];
+        assert_eq!(common_reusable_tokens(&worker, &groups, 143), 96);
+    }
+
+    #[test]
     fn state_on_another_rank_or_tier_cannot_complete_a_hit() {
         let worker = target("w", 0);
         let full = [hit(&worker, &[(0, 4)])];
@@ -228,9 +363,16 @@ mod tests {
             group(0, 16, HybridGroupKind::FullAttention, &hits),
             group(0, 16, HybridGroupKind::Checkpoint, &hits),
         ];
+        let empty_window = [group(
+            1,
+            16,
+            HybridGroupKind::SlidingWindow { window_tokens: 0 },
+            &hits,
+        )];
         assert_eq!(common_reusable_tokens(&worker, &[], 64), 0);
         assert_eq!(common_reusable_tokens(&worker, &invalid, 64), 0);
         assert_eq!(common_reusable_tokens(&worker, &duplicate, 64), 0);
+        assert_eq!(common_reusable_tokens(&worker, &empty_window, 64), 0);
     }
 
     #[test]
