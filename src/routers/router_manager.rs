@@ -54,6 +54,10 @@ pub struct RouterManager {
     /// Never held during backend discovery or across an await.
     worker_mutation: parking_lot::Mutex<()>,
 
+    /// One-shot scheduling point after registry publication, before invalidation.
+    #[cfg(all(test, feature = "cpu", feature = "ready"))]
+    pub(crate) after_worker_registration: parking_lot::Mutex<Option<Box<dyn FnOnce() + Send>>>,
+
     /// All routers managed by this manager
     /// RouterId examples: "http-regular", "http-pd"
     routers: Arc<DashMap<RouterId, Arc<dyn RouterTrait>>>,
@@ -81,6 +85,8 @@ impl RouterManager {
             worker_registry,
             policy_registry,
             worker_mutation: parking_lot::Mutex::new(()),
+            #[cfg(all(test, feature = "cpu", feature = "ready"))]
+            after_worker_registration: parking_lot::Mutex::new(None),
             routers: Arc::new(DashMap::new()),
             default_router: Arc::new(std::sync::RwLock::new(None)),
             client,
@@ -212,6 +218,14 @@ impl RouterManager {
             .worker_registry
             .register_with_previous(worker_arc.clone());
         let worker_id = registration.worker_id;
+
+        #[cfg(all(test, feature = "cpu", feature = "ready"))]
+        {
+            let callback = self.after_worker_registration.lock().take();
+            if let Some(callback) = callback {
+                callback();
+            }
+        }
 
         if let Some(previous) = registration.previous.as_ref() {
             self.invalidate_child_worker_state(previous.as_ref());
