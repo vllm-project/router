@@ -53,6 +53,7 @@ fn kv_aware() -> PolicyConfig {
         kv_penalty_external: 0.6,
         kv_penalty_disk: 0.3,
         static_kv_event_sources: Box::default(),
+        decode_context_load: false,
     }
 }
 

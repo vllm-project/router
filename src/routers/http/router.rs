@@ -3493,6 +3493,7 @@ mod tests {
                 kv_penalty_external: 0.6,
                 kv_penalty_disk: 0.3,
                 static_kv_event_sources: Default::default(),
+                decode_context_load: false,
             },
             worker_startup_timeout_secs: 5,
             ..Default::default()
@@ -3574,6 +3575,7 @@ mod tests {
                     }}))
                     .unwrap(),
                 ),
+                decode_context_load: false,
             },
             worker_startup_timeout_secs: 5,
             ..Default::default()
@@ -3696,6 +3698,7 @@ mod tests {
                     kv_penalty_external: 0.6,
                     kv_penalty_disk: 0.3,
                     static_kv_event_sources: Default::default(),
+                    decode_context_load: false,
                 },
                 worker_startup_timeout_secs: 5,
                 worker_startup_check_interval_secs: 1,
@@ -4475,6 +4478,7 @@ mod tests {
                     kv_penalty_external: 0.6,
                     kv_penalty_disk: 0.3,
                     static_kv_event_sources: Default::default(),
+                    decode_context_load: false,
                 }
             }));
             router.policy_registry.on_worker_added(
@@ -5330,6 +5334,7 @@ mod tests {
                 kv_penalty_external: 0.6,
                 kv_penalty_disk: 0.3,
                 static_kv_event_sources: Default::default(),
+                decode_context_load: false,
             }));
         router
     }
@@ -5783,6 +5788,7 @@ mod tests {
                 kv_penalty_external: 0.6,
                 kv_penalty_disk: 0.3,
                 static_kv_event_sources: Default::default(),
+                decode_context_load: false,
             }));
         let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
             "messages": [{"role": "user", "content": "hello"}]
@@ -5830,6 +5836,7 @@ mod tests {
                 kv_penalty_external: 0.6,
                 kv_penalty_disk: 0.3,
                 static_kv_event_sources: Default::default(),
+                decode_context_load: false,
             }));
 
         let request = serde_json::json!({"messages": []});
@@ -6607,6 +6614,7 @@ mod tests {
                     kv_penalty_external: 0.6,
                     kv_penalty_disk: 0.3,
                     static_kv_event_sources: Default::default(),
+                    decode_context_load: false,
                 }));
             let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
                 "messages": [{"role": "user", "content": "hello"}], "stream": streaming,
@@ -6672,6 +6680,7 @@ mod tests {
                 kv_penalty_external: 0.6,
                 kv_penalty_disk: 0.3,
                 static_kv_event_sources: Default::default(),
+                decode_context_load: false,
             }));
         router.retry_config.max_retries = 0;
         let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({

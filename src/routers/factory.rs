@@ -147,6 +147,7 @@ mod tests {
                 kv_penalty_external: 0.6,
                 kv_penalty_disk: 0.3,
                 static_kv_event_sources: Default::default(),
+                decode_context_load: false,
             },
             kv_aware_session_affinity_ttl_secs: Some(1800),
             // Worker lists stay empty on purpose: the prefill/decode policies
