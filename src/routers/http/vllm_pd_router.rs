@@ -1122,26 +1122,29 @@ impl VllmPDRouter {
                 "Program decode target left the pool",
             ));
         };
+        let prefill_candidates = self.program_prefill_candidates();
+        let prefill_workers = prefill_candidates
+            .iter()
+            .map(|(_, worker)| worker.clone())
+            .collect::<Vec<_>>();
+        // One selection per turn. The warm-remote attempt consumes this turn's
+        // selection, and a cold fallback dispatches the P it already chose
+        // instead of asking the policy a second time. The selection also takes
+        // the same request inputs as the cold path (prompt text or cache
+        // routing key, plus headers), so hash and cache policies keep their
+        // affinity on the warm path too.
+        let mut selected = None;
         if let Some(warm_remote) = &runtime.warm_remote {
             // The warm-remote protocol has no discovery incarnation fence, and
             // execute() rejects discovery; keep discovery on the native PD path.
             if !self.use_discovery && matches!(self.kv_connector, KvConnector::Nixl) {
-                let prefill_workers = self
-                    .pd_router
-                    .worker_registry
-                    .get_prefill_workers()
-                    .into_iter()
-                    .filter(|w| w.is_available())
-                    .collect::<Vec<_>>();
-                let prefills = prefill_workers
-                    .iter()
-                    .map(pd_program_adapter::worker_target)
-                    .collect::<Vec<_>>();
-                let selection = self
-                    .policy_registry
-                    .get_prefill_policy()
-                    .select_worker(&prefill_workers, None);
-                if let Some(index) = selection {
+                if let Some(index) =
+                    self.select_program_prefill_index(&prefill_workers, &request, path, headers)
+                {
+                    let prefills = prefill_candidates
+                        .iter()
+                        .map(|(_, worker)| pd_program_adapter::worker_target(worker))
+                        .collect::<Vec<_>>();
                     let started = Instant::now();
                     if let Some(result) = super::pd_warm_remote::execute(
                         runtime,
@@ -1178,12 +1181,16 @@ impl VllmPDRouter {
                             }
                         });
                     }
+                    // execute() declined the warm/local protocol for this turn
+                    // (request shape, engine capability): the cold path reuses
+                    // the P selected above rather than consuming a second one.
+                    selected = Some(prefill_candidates[index].clone());
                 }
             }
         }
-        let prefill_candidates = self.program_prefill_candidates();
-        let selected = self.select_program_prefill(&prefill_candidates, &request, path, headers);
-        let Some((prefill_id, prefill_worker)) = selected else {
+        let Some((prefill_id, prefill_worker)) = selected
+            .or_else(|| self.select_program_prefill(&prefill_candidates, &request, path, headers))
+        else {
             RouterMetrics::record_pd_error("server_selection");
             return Some(program_unavailable(
                 &completion,
@@ -1292,11 +1299,31 @@ impl VllmPDRouter {
         if candidates.is_empty() {
             return None;
         }
-        let policy = self.policy_registry.get_prefill_policy();
         let workers = candidates
             .iter()
             .map(|(_, worker)| worker.clone())
             .collect::<Vec<_>>();
+        let index = self.select_program_prefill_index(&workers, request, path, headers)?;
+        candidates.get(index).cloned()
+    }
+
+    /// The single place Program turns ask the prefill policy for an index.
+    ///
+    /// Warm-remote and cold dispatch share it so a turn consumes exactly one
+    /// selection and both paths feed the policy the same inputs: the prompt or
+    /// cache routing key when the policy reads the request, and the request
+    /// headers when it needs affinity.
+    fn select_program_prefill_index(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        request: &Value,
+        path: &str,
+        headers: Option<&HeaderMap>,
+    ) -> Option<usize> {
+        if workers.is_empty() {
+            return None;
+        }
+        let policy = self.policy_registry.get_prefill_policy();
         let request_text = if policy.needs_cache_routing_key() {
             Some(crate::protocols::spec::cache_routing::for_route(
                 request, path,
@@ -1309,12 +1336,7 @@ impl VllmPDRouter {
         let policy_headers = policy
             .needs_headers()
             .then(|| header_utils::to_policy_headers(headers).unwrap_or_default());
-        let index = policy.select_worker_with_headers(
-            &workers,
-            request_text.as_deref(),
-            policy_headers.as_ref(),
-        )?;
-        Some(candidates[index].clone())
+        policy.select_worker_with_headers(workers, request_text.as_deref(), policy_headers.as_ref())
     }
 
     /// Recheck the bound endpoints after a capacity wait: an expired
