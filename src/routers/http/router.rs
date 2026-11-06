@@ -1484,12 +1484,25 @@ impl Router {
                 None
             }
         };
-        let text = match (pool, typed_req.grpc_request()) {
-            (
-                Some(crate::backend::WorkerPoolKind::Grpc),
-                Some(GrpcRequestRef::Completion(completion)),
-            ) if route == "/v1/completions" => completion.extract_text_for_grpc_routing(),
-            _ => typed_req.extract_text_for_routing(),
+        let text = if self.policy_for_model(model_id).needs_request_body() {
+            match serde_json::to_string(typed_req) {
+                Ok(body) => body,
+                Err(error) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Serialization error: {error}"),
+                    )
+                        .into_response();
+                }
+            }
+        } else {
+            match (pool, typed_req.grpc_request()) {
+                (
+                    Some(crate::backend::WorkerPoolKind::Grpc),
+                    Some(GrpcRequestRef::Completion(completion)),
+                ) if route == "/v1/completions" => completion.extract_text_for_grpc_routing(),
+                _ => typed_req.extract_text_for_routing(),
+            }
         };
         let text = &text;
         let prepared = &prepared;

@@ -219,16 +219,26 @@ impl LoadBalancingPolicy for StickyLeastLoadedPolicy {
             .collect();
 
         let session_id = hash_key::extract_session_id(request_text, headers);
-        let now = Instant::now();
-
+        let stateless_tie_break = if session_id.is_none() {
+            request_text.map(|body| {
+                if body.is_empty() {
+                    String::new()
+                } else {
+                    format!("body:{:016x}", ConsistentHashPolicy::fbi_hash(body))
+                }
+            })
+        } else {
+            None
+        };
         let mut state = self.state.lock().unwrap();
+        let now = Instant::now();
         Self::sweep_expired(&mut state, self.session_expiration, now);
 
         // Requests without a session id: load-balance but don't record state.
         let session_id = match session_id {
             Some(id) => id,
             None => {
-                let tie_break = request_text.unwrap_or("");
+                let tie_break = stateless_tie_break.as_deref().unwrap_or("");
                 let idx = Self::select_least_loaded(&state.active_counts, &candidates, tie_break);
                 drop(state);
                 self.record_selection(&workers[idx]);
@@ -316,6 +326,10 @@ impl LoadBalancingPolicy for StickyLeastLoadedPolicy {
     }
 
     fn needs_request_text(&self) -> bool {
+        true
+    }
+
+    fn needs_request_body(&self) -> bool {
         true
     }
 

@@ -155,6 +155,11 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
         false // Default: most policies don't need request text
     }
 
+    /// Whether routing requires the serialized request body rather than prompt text.
+    fn needs_request_body(&self) -> bool {
+        false
+    }
+
     /// Whether request text must use the content-preserving cache routing key.
     fn needs_cache_routing_key(&self) -> bool {
         false
