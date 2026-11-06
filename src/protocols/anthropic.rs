@@ -35,9 +35,12 @@ pub struct MessagesRequest {
     /// Required by the Messages API; a missing field is a 400 from the router.
     pub model: String,
 
+    /// Required and nonempty; invalid bodies are rejected before routing.
+    #[serde(deserialize_with = "nonempty_messages")]
     pub messages: Vec<AnthropicMessage>,
 
-    /// Required by the Messages API; a missing field is a 400 from the router.
+    /// Required and positive; invalid bodies are rejected before routing.
+    #[serde(deserialize_with = "positive_max_tokens")]
     pub max_tokens: u64,
 
     #[serde(
@@ -72,6 +75,30 @@ pub struct MessagesRequest {
     /// Fields the router does not read, forwarded unchanged.
     #[serde(flatten)]
     pub other: Map<String, Value>,
+}
+
+fn nonempty_messages<'de, D>(deserializer: D) -> Result<Vec<AnthropicMessage>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let messages = Vec::<AnthropicMessage>::deserialize(deserializer)?;
+    if messages.is_empty() {
+        return Err(serde::de::Error::custom("messages must not be empty"));
+    }
+    Ok(messages)
+}
+
+fn positive_max_tokens<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let max_tokens = u64::deserialize(deserializer)?;
+    if max_tokens == 0 {
+        return Err(serde::de::Error::custom(
+            "max_tokens must be greater than 0",
+        ));
+    }
+    Ok(max_tokens)
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -255,6 +282,7 @@ pub fn anthropic_error_type(status: u16) -> &'static str {
         401 => "authentication_error",
         403 => "permission_error",
         404 => "not_found_error",
+        408 | 504 => "timeout_error",
         413 => "request_too_large",
         429 => "rate_limit_error",
         503 | 529 => "overloaded_error",
@@ -330,12 +358,16 @@ mod tests {
 
     #[test]
     fn stream_and_model() {
-        let req = parse_with_required(&json!({"stream": true, "messages": []}));
+        let req = parse_with_required(
+            &json!({"stream": true, "messages": [{"role": "user", "content": "hi"}]}),
+        );
         assert!(req.is_stream());
         assert_eq!(req.get_model(), Some("m"));
-        let req = parse_with_required(&json!({"messages": []}));
+        let req = parse_with_required(&json!({"messages": [{"role": "user", "content": "hi"}]}));
         assert!(!req.is_stream());
-        let req = parse_with_required(&json!({"stream": null, "messages": []}));
+        let req = parse_with_required(
+            &json!({"stream": null, "messages": [{"role": "user", "content": "hi"}]}),
+        );
         assert!(!req.is_stream());
     }
 
@@ -388,22 +420,39 @@ mod tests {
     fn metadata_user_id_is_nested_only() {
         let req = parse_with_required(&json!({
             "tools": [{"name": "t", "input_schema": {"properties": {"user_id": "schema"}}}],
-            "messages": []
+            "messages": [{"role": "user", "content": "hi"}]
         }));
         assert_eq!(req.affinity_user_key(), None);
-        let req = parse_with_required(&json!({"metadata": {"user_id": " u1 "}, "messages": []}));
+        let req = parse_with_required(
+            &json!({"metadata": {"user_id": " u1 "}, "messages": [{"role": "user", "content": "hi"}]}),
+        );
         assert_eq!(req.affinity_user_key(), Some("u1"));
-        let req = parse_with_required(&json!({"metadata": {"user_id": ""}, "messages": []}));
+        let req = parse_with_required(
+            &json!({"metadata": {"user_id": ""}, "messages": [{"role": "user", "content": "hi"}]}),
+        );
         assert_eq!(req.affinity_user_key(), None);
     }
 
     #[test]
     fn required_fields_are_enforced() {
-        let ok = json!({"model": "m", "max_tokens": 1, "messages": []});
+        let ok =
+            json!({"model": "m", "max_tokens": 1, "messages": [{"role": "user", "content": "hi"}]});
         assert!(serde_json::from_value::<MessagesRequest>(ok.clone()).is_ok());
         for field in ["model", "max_tokens", "messages"] {
             let mut body = ok.clone();
             body.as_object_mut().unwrap().remove(field);
+            let err = serde_json::from_value::<MessagesRequest>(body).unwrap_err();
+            assert!(err.to_string().contains(field), "{field}: {err}");
+        }
+    }
+
+    #[test]
+    fn empty_messages_and_zero_max_tokens_are_rejected() {
+        let valid = json!({"model": "m", "max_tokens": 1,
+            "messages": [{"role": "user", "content": "hi"}]});
+        for (field, invalid) in [("messages", json!([])), ("max_tokens", json!(0))] {
+            let mut body = valid.clone();
+            body[field] = invalid;
             let err = serde_json::from_value::<MessagesRequest>(body).unwrap_err();
             assert!(err.to_string().contains(field), "{field}: {err}");
         }
@@ -424,8 +473,7 @@ mod tests {
         assert!(!req.is_stream());
         assert_eq!(req.affinity_user_key(), None);
         assert_eq!(serde_json::to_value(&req).unwrap(), body);
-        let body =
-            json!({"model": "m", "max_tokens": 8, "metadata": null, "tools": null, "messages": []});
+        let body = json!({"model": "m", "max_tokens": 8, "metadata": null, "tools": null, "messages": [{"role": "user", "content": "hi"}]});
         assert_eq!(serde_json::to_value(parse(&body)).unwrap(), body);
     }
 
@@ -439,7 +487,9 @@ mod tests {
         assert_eq!(anthropic_error_type(401), "authentication_error");
         assert_eq!(anthropic_error_type(404), "not_found_error");
         assert_eq!(anthropic_error_type(500), "api_error");
-        assert_eq!(anthropic_error_type(408), "invalid_request_error");
+        assert_eq!(anthropic_error_type(408), "timeout_error");
+        assert_eq!(anthropic_error_type(504), "timeout_error");
+        assert_eq!(anthropic_error_type(422), "invalid_request_error");
     }
 
     #[test]
