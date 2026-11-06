@@ -82,6 +82,7 @@ class TestRouterArgs:
         assert args.max_tree_size == 2**25
         assert args.policy == "cache_aware"
         assert args.worker_urls == []
+        assert args.extra_generate_paths == []
         assert args.vllm_pd_disaggregation is False
         assert args.prefill_urls == []
         assert args.decode_urls == []
@@ -577,6 +578,22 @@ class TestParseRouterArgs:
         for stage in ["prefill", "decode"]:
             args = parse_router_args([f"--{stage}-policy", "kv_aware"])
             assert getattr(args, f"{stage}_policy") == "kv_aware"
+
+    def test_parse_extra_generate_paths(self):
+        router_args = parse_router_args(
+            [
+                "--worker-urls",
+                "http://worker1:8000",
+                "--extra-generate-paths",
+                "/custom/v1/generate",
+                "/extension/generate",
+            ]
+        )
+
+        assert router_args.extra_generate_paths == [
+            "/custom/v1/generate",
+            "/extension/generate",
+        ]
 
     def test_parse_program_scheduling_json(self):
         """Keep the opt-in scheduler configuration opaque until Rust validation."""

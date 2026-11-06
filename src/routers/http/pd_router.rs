@@ -118,7 +118,11 @@ fn select_stage(
     policy: &dyn LoadBalancingPolicy,
     context: &PdRequestContext<'_>,
 ) -> Option<StageDecision> {
-    let policy_input = context.legacy_policy_input;
+    let policy_input = if policy.needs_request_body() {
+        context.request_body.or(context.legacy_policy_input)
+    } else {
+        context.legacy_policy_input
+    };
     let kv_aware = kv_aware_ops(policy).is_some();
     // Keep the caller slice order. Static pools pass registry registration
     // order, which is the --prefill / --decode order. Sorting by endpoint URL
@@ -1345,6 +1349,7 @@ impl PdRouterBase {
             prefill_inputs: None,
             model_id: None,
             legacy_policy_input: None,
+            request_body: None,
             prefill_cache: None,
             decode_cache: None,
             headers: None,
@@ -1874,6 +1879,7 @@ mod tests {
             prefill_inputs: None,
             model_id: None,
             legacy_policy_input: None,
+            request_body: None,
             prefill_cache: None,
             decode_cache: None,
             headers: None,
@@ -1902,6 +1908,7 @@ mod tests {
             prefill_inputs: None,
             model_id: None,
             legacy_policy_input: None,
+            request_body: None,
             prefill_cache: None,
             decode_cache: None,
             headers: None,
@@ -2666,6 +2673,7 @@ mod admission_tests {
             prefill_inputs: None,
             model_id: None,
             legacy_policy_input: Some("original request"),
+            request_body: None,
             prefill_cache: None,
             decode_cache: None,
             headers: None,
@@ -2691,6 +2699,7 @@ mod admission_tests {
             prefill_inputs: None,
             model_id: None,
             legacy_policy_input: Some("original request"),
+            request_body: None,
             prefill_cache: None,
             decode_cache: None,
             headers: None,
@@ -3245,6 +3254,7 @@ mod admission_tests {
                 prefill_inputs: None,
                 model_id: Some(model),
                 legacy_policy_input: Some("original request"),
+                request_body: None,
                 prefill_cache: None,
                 decode_cache: None,
                 headers: None,

@@ -5,7 +5,7 @@ use vllm_router_rs::{
     config::RouterConfig,
     otel_trace,
     routers::RouterTrait,
-    server::{build_app_with_wasm_middleware, AppContext, AppState},
+    server::{build_app_with_wasm_middleware_and_generate_paths, AppContext, AppState},
     wasm_middleware::WasmMiddlewareRuntime,
 };
 
@@ -30,6 +30,24 @@ pub fn create_test_app_with_tracing(
     create_test_app_with_wasm(router, client, router_config, enable_request_tracing, None)
 }
 
+#[allow(dead_code)]
+pub fn create_test_app_with_tracing_and_generate_paths(
+    router: Arc<dyn RouterTrait>,
+    client: Client,
+    router_config: &RouterConfig,
+    enable_request_tracing: bool,
+    extra_generate_paths: &[String],
+) -> Router {
+    create_test_app_with_wasm_and_generate_paths(
+        router,
+        client,
+        router_config,
+        enable_request_tracing,
+        None,
+        extra_generate_paths,
+    )
+}
+
 /// Create a test Axum application with optional WASM OnRequest middleware.
 #[allow(dead_code)]
 pub fn create_test_app_with_wasm(
@@ -38,6 +56,25 @@ pub fn create_test_app_with_wasm(
     router_config: &RouterConfig,
     enable_request_tracing: bool,
     wasm_runtime: Option<Arc<WasmMiddlewareRuntime>>,
+) -> Router {
+    create_test_app_with_wasm_and_generate_paths(
+        router,
+        client,
+        router_config,
+        enable_request_tracing,
+        wasm_runtime,
+        &[],
+    )
+}
+
+#[allow(dead_code)]
+pub fn create_test_app_with_wasm_and_generate_paths(
+    router: Arc<dyn RouterTrait>,
+    client: Client,
+    router_config: &RouterConfig,
+    enable_request_tracing: bool,
+    wasm_runtime: Option<Arc<WasmMiddlewareRuntime>>,
+    extra_generate_paths: &[String],
 ) -> Router {
     // Create AppContext
     let app_context = Arc::new(
@@ -57,6 +94,7 @@ pub fn create_test_app_with_wasm(
         router_config,
         enable_request_tracing,
         wasm_runtime,
+        extra_generate_paths,
     )
 }
 
@@ -77,6 +115,7 @@ pub fn create_test_app_with_context(
         router_config,
         otel_trace::is_otel_enabled(),
         None,
+        &[],
     )
 }
 
@@ -86,6 +125,7 @@ fn build_test_app(
     router_config: &RouterConfig,
     enable_request_tracing: bool,
     wasm_runtime: Option<Arc<WasmMiddlewareRuntime>>,
+    extra_generate_paths: &[String],
 ) -> Router {
     // Create AppState with the test router and context
     let app_state = Arc::new(AppState {
@@ -106,7 +146,7 @@ fn build_test_app(
     });
 
     // Use the actual server's build_app function (with optional WASM layer)
-    build_app_with_wasm_middleware(
+    build_app_with_wasm_middleware_and_generate_paths(
         app_state,
         router_config.max_payload_size,
         request_id_headers,
@@ -114,5 +154,6 @@ fn build_test_app(
         true, // enable_transparent_proxy
         enable_request_tracing,
         wasm_runtime,
+        extra_generate_paths,
     )
 }

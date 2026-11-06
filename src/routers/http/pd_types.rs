@@ -145,6 +145,7 @@ pub struct PdRequestContext<'a> {
     pub prefill_inputs: Option<&'a HashMap<String, PdPrefillInput>>,
     pub model_id: Option<&'a str>,
     pub legacy_policy_input: Option<&'a str>,
+    pub request_body: Option<&'a str>,
     pub(crate) prefill_cache: Option<&'a crate::policies::PreparedCacheSelection>,
     pub(crate) decode_cache: Option<&'a crate::policies::PreparedCacheSelection>,
     pub headers: Option<&'a RequestHeaders>,
