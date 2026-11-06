@@ -1,6 +1,6 @@
 [package]
 name = "vllm_router_rs"
-version = "0.1.16"
+version = "0.1.17"
 edition = "2021"
 
 [lib]
@@ -198,6 +198,10 @@ name = "grpc_pd_routing"
 path = "tests/rust/grpc_pd_routing.rs"
 
 [[test]]
+name = "grpc_policy_routing"
+path = "tests/rust/grpc_policy_routing.rs"
+
+[[test]]
 name = "grpc_vs_http_e2e"
 path = "tests/rust/grpc_vs_http_e2e.rs"
 
@@ -264,6 +268,10 @@ path = "tests/rust/routing_edge_cases_test.rs"
 [[test]]
 name = "streaming_tests"
 path = "tests/rust/streaming_tests.rs"
+
+[[test]]
+name = "test_admission_fallback"
+path = "tests/rust/test_admission_fallback.rs"
 
 [[test]]
 name = "test_chat_template"
