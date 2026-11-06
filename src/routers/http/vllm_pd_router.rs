@@ -870,7 +870,7 @@ impl VllmPDRouter {
     ) -> Vec<Arc<dyn Worker>> {
         let mut workers: Vec<Arc<dyn Worker>> = Vec::new();
         for (address, _, registered_dp_size) in instances {
-            let (base, rank) = dp_utils::parse_worker_url(&address);
+            let (base, _) = dp_utils::parse_worker_url(&address);
             let dp_size = match self.kv_connector {
                 // Respect an explicit registration, including an explicit
                 // single-rank size. Preserve the legacy single-rank MoRI-IO default.
@@ -880,7 +880,13 @@ impl VllmPDRouter {
                     .max(self.intra_node_data_parallel_size)
                     .max(1),
             };
-            let ranks = dp_utils::expand_dp_ranks(rank, dp_size);
+            let ranks = match dp_utils::expand_dp_ranks(&address, dp_size) {
+                Ok(ranks) => ranks,
+                Err(error) => {
+                    warn!(%error, "Ignoring invalid discovered DP worker");
+                    continue;
+                }
+            };
             let url = if base.starts_with("http://") || base.starts_with("https://") {
                 base.clone()
             } else {
@@ -4595,6 +4601,20 @@ mod tests {
         assert!(!discovery_is_ready(0, 1));
         assert!(discovery_is_ready(1, 1));
         assert!(discovery_is_ready(2, 3));
+    }
+
+    #[tokio::test]
+    async fn discovered_workers_exclude_out_of_range_pinned_ranks() {
+        let router = test_vllm_pd_router().await;
+        let instances: Vec<_> = [1, 2, 5]
+            .into_iter()
+            .map(|rank| (format!("worker:8000@{rank}"), String::new(), Some(2)))
+            .collect();
+        for service in [ServiceType::Prefill, ServiceType::Decode] {
+            let workers = router.discovery_candidates(instances.clone(), service);
+            assert_eq!(workers.len(), 1);
+            assert_eq!(workers[0].dp_rank(), Some(1));
+        }
     }
 
     #[tokio::test]

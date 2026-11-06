@@ -562,6 +562,43 @@ mod dp_e2e_tests {
     }
 
     #[tokio::test]
+    async fn test_epd_pd_rejects_out_of_range_pinned_ranks() {
+        use vllm_router_rs::config::EpdConfig;
+
+        let (base, seen, server) = epd_server().await;
+        for role in ["p", "d"] {
+            for rank in [2, 5] {
+                let pinned = format!("{base}/{role}@{rank}");
+                let prefill = if role == "p" {
+                    pinned.clone()
+                } else {
+                    format!("{base}/p")
+                };
+                let decode = if role == "d" {
+                    pinned.clone()
+                } else {
+                    format!("{base}/d")
+                };
+                // Both endpoints report DP=2, overriding the configured fallback.
+                let mut config = make_pd_config(vec![(prefill, None)], vec![decode], 4);
+                config.port = 8000;
+                config.epd = Some(EpdConfig {
+                    encoder_urls: vec![format!("{base}/e")],
+                    consumer_zmq_addrs: Default::default(),
+                });
+                let context = common::create_test_context(config);
+                let Err(error) = RouterFactory::create_router(&context).await else {
+                    panic!("P/D must reject a pinned rank outside the discovered DP size");
+                };
+                assert!(error.contains(&pinned), "{error}");
+                assert!(error.contains("DP size 2"), "{error}");
+            }
+        }
+        assert!(seen.lock().unwrap().is_empty());
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn test_epd_address_map_matches_discovered_prefill_ranks() {
         use vllm_router_rs::config::{ConfigValidator, EpdConfig};
 
@@ -1173,6 +1210,13 @@ mod dp_e2e_tests {
         use vllm_router_rs::routers::http::vllm_pd_router::VllmPDRouter;
         let pd_router = router.as_any().downcast_ref::<VllmPDRouter>().unwrap();
 
+        let invalid = format!("{new_prefill_url}@2");
+        let error = pd_router
+            .add_prefill_server(invalid.clone(), None)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("DP size 2"), "{error}");
+        assert!(app_context.worker_registry.get_by_url(&invalid).is_none());
         // Add new prefill server (plain URL, no @rank — mimics service discovery)
         let result = pd_router
             .add_prefill_server(new_prefill_url.clone(), None)
@@ -1262,6 +1306,13 @@ mod dp_e2e_tests {
         use vllm_router_rs::routers::http::vllm_pd_router::VllmPDRouter;
         let pd_router = router.as_any().downcast_ref::<VllmPDRouter>().unwrap();
 
+        let invalid = format!("{new_decode_url}@2");
+        let error = pd_router
+            .add_decode_server(invalid.clone())
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("DP size 2"), "{error}");
+        assert!(app_context.worker_registry.get_by_url(&invalid).is_none());
         // Add new decode server at runtime
         let result = pd_router.add_decode_server(new_decode_url.clone()).await;
         assert!(

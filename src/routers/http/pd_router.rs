@@ -420,8 +420,8 @@ fn build_dp_workers(
     worker_type: WorkerType,
     circuit_breaker_config: &CircuitBreakerConfig,
     health_config: Option<&HealthConfig>,
-) -> Vec<Arc<dyn Worker>> {
-    let (base_url, pinned_rank) = dp_utils::parse_worker_url(url);
+) -> Result<Vec<Arc<dyn Worker>>, String> {
+    let (base_url, _) = dp_utils::parse_worker_url(url);
 
     // DPAwareWorker strips the @rank suffix in endpoint_url(), preventing
     // IPv6+DP URL corruption where HTTP clients read @N as userinfo (RFC 3986).
@@ -435,7 +435,7 @@ fn build_dp_workers(
         Arc::new(worker)
     };
 
-    dp_utils::expand_dp_ranks(pinned_rank, dp_size)
+    Ok(dp_utils::expand_dp_ranks(url, dp_size)?
         .into_iter()
         .map(|rank| match rank {
             Some(rank) => dp_worker(rank),
@@ -450,7 +450,7 @@ fn build_dp_workers(
                 Arc::new(worker) as Arc<dyn Worker>
             }
         })
-        .collect()
+        .collect())
 }
 
 impl PdRouterBase {
@@ -848,7 +848,8 @@ impl PdRouterBase {
             worker_type,
             &self.circuit_breaker_config,
             None,
-        );
+        )
+        .map_err(|reason| PDRouterError::InvalidConfiguration { reason })?;
 
         if workers
             .iter()
@@ -1077,7 +1078,7 @@ impl PdRouterBase {
                 worker_type,
                 &core_cb_config,
                 Some(&health_config),
-            ) {
+            )? {
                 ctx.worker_registry.register(worker);
             }
         }

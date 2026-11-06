@@ -126,8 +126,9 @@ Mooncake assigns replica `r` the control port `ec_port + r * TP`; list each
 replica's first TP shard. The example above assumes TP=1. With separate P/D,
 the map references P replicas, not D, including all discovered ranks when P
 endpoints have different DP sizes. With DP>1, URLs explicitly ending in `@rank`
-remain pinned to that replica rather than being expanded again; a rank must be
-less than the endpoint's DP size. The map is checked against the resolved workers
+remain pinned to that replica rather than being expanded again. Startup and
+worker-add operations reject ranks outside the endpoint's DP size, including
+separate P and D endpoints. The map is checked against the resolved workers
 during router construction, after DP discovery. `ConfigValidator::validate()`
 checks configuration syntax, not map coverage. Missing rank mappings fail before
 encoder dispatch and identify the missing URL. NIXL PULL and
