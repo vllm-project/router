@@ -30,10 +30,10 @@ pub use factory::PolicyFactory;
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
 pub(crate) use kv_aware::kv_aware_policy;
 pub use kv_aware::{
-    cost_components, kv_aware_ops, AffinityKey, AffinityRecord, CandidateView,
-    CircuitBreakerConfig, CircuitBreakerMatchProvider, CostComponents, CostDecision, CostParams,
-    InMemorySlotManager, KvAffinityTable, KvAwareOps, KvAwarePolicy, KvRequestSlot,
-    KvRequestTokens, KvSelectionReceipt, LoadProvider, LoadSample, MatchError,
+    cost_components, kv_aware_ops, AffinityKey, AffinityRecord, AsyncTieredMatchProvider,
+    CandidateView, CircuitBreakerConfig, CircuitBreakerMatchProvider, CostComponents, CostDecision,
+    CostParams, InMemorySlotManager, KvAffinityTable, KvAwareOps, KvAwarePolicy, KvPrefetch,
+    KvRequestSlot, KvRequestTokens, KvSelectionReceipt, LoadProvider, LoadSample, MatchError,
     MultiplicativeScorer, Picker, PrefillWorkEstimate, Scorer, SelectionError, SlotManager,
     StagePick, TemperaturePicker, TieredMatchProvider, TransferCredits, WorkerTokenInputs,
 };

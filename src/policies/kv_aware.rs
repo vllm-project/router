@@ -74,8 +74,20 @@ impl Default for CircuitBreakerConfig {
 /// open it returns an empty match set (so `kv_aware` falls back to load-only
 /// scoring) without issuing a network call to a backend the breaker considers
 /// unhealthy. On a successful half-open probe the circuit closes again.
-pub struct CircuitBreakerMatchProvider {
-    inner: Arc<dyn TieredMatchProvider>,
+/// Async placement port (RFC #414 §3): lets the Conductor `/query` run without
+/// blocking a tokio worker. Only network-backed providers implement it.
+#[async_trait::async_trait]
+pub trait AsyncTieredMatchProvider: Send + Sync {
+    async fn find_tiered_matches_async(
+        &self,
+        query: &MatchQuery<'_>,
+    ) -> Result<Vec<TierMatch>, MatchError>;
+}
+
+/// One circuit breaker for both the sync and the async placement paths, so the
+/// failure budget and the open state are shared instead of duplicated.
+pub struct CircuitBreakerMatchProvider<P> {
+    inner: Arc<P>,
     config: CircuitBreakerConfig,
     state: Mutex<BreakerState>,
 }
@@ -95,12 +107,30 @@ struct BreakerState {
     half_open_seen: u32,
 }
 
-impl CircuitBreakerMatchProvider {
-    pub fn new(inner: Arc<dyn TieredMatchProvider>, mut config: CircuitBreakerConfig) -> Self {
+/// RAII guard for an admitted half-open probe: a cancelled request (client
+/// disconnect) releases the slot instead of wedging the circuit in half-open.
+struct ProbeGuard<'a> {
+    state: &'a Mutex<BreakerState>,
+    is_probe: bool,
+}
+
+impl Drop for ProbeGuard<'_> {
+    fn drop(&mut self) {
+        if self.is_probe {
+            let mut state = self.state.lock();
+            state.half_open_seen = state.half_open_seen.saturating_sub(1);
+        }
+    }
+}
+
+impl<P> CircuitBreakerMatchProvider<P>
+where
+    P: TieredMatchProvider + AsyncTieredMatchProvider,
+{
+    pub fn new(inner: Arc<P>, mut config: CircuitBreakerConfig) -> Self {
         // A zero half-open budget would leave the circuit open forever (no
         // probe could ever close it); a zero failure budget would trip on the
-        // first request. Clamp both so a bad config degrades to the documented
-        // behaviour instead of a deadlock. The validator rejects both as well.
+        // first request. Clamp both; the validator rejects them as well.
         config.max_failures = config.max_failures.max(1);
         config.half_open_max = config.half_open_max.max(1);
         Self {
@@ -110,7 +140,6 @@ impl CircuitBreakerMatchProvider {
         }
     }
 
-    /// Current mode, promoting Open→HalfOpen once the cooldown has elapsed.
     fn mode(&self, state: &BreakerState) -> BreakerMode {
         match state {
             BreakerState {
@@ -124,8 +153,28 @@ impl CircuitBreakerMatchProvider {
         }
     }
 
-    fn record(&self, state: &mut BreakerState, result: &Result<Vec<TierMatch>, MatchError>) {
-        let before = self.mode(state);
+    fn admit(&self) -> Option<ProbeGuard<'_>> {
+        let mut state = self.state.lock();
+        match self.mode(&state) {
+            BreakerMode::Open => None,
+            BreakerMode::Closed => Some(ProbeGuard {
+                state: &self.state,
+                is_probe: false,
+            }),
+            BreakerMode::HalfOpen if state.half_open_seen >= self.config.half_open_max => None,
+            BreakerMode::HalfOpen => {
+                state.half_open_seen += 1;
+                Some(ProbeGuard {
+                    state: &self.state,
+                    is_probe: true,
+                })
+            }
+        }
+    }
+
+    fn record(&self, result: &Result<Vec<TierMatch>, MatchError>) {
+        let mut state = self.state.lock();
+        let before = self.mode(&state);
         // `Rejected` means the backend answered, so it is not a health failure.
         let failure = matches!(result, Err(MatchError::Unavailable));
         match (before, failure) {
@@ -148,7 +197,7 @@ impl CircuitBreakerMatchProvider {
                 state.failures = 0;
             }
         }
-        let after = self.mode(state);
+        let after = self.mode(&state);
         if before != after {
             ConductorMetrics::record_breaker_transition(match after {
                 BreakerMode::Closed => "closed",
@@ -158,43 +207,56 @@ impl CircuitBreakerMatchProvider {
             ConductorMetrics::set_breaker_open(!matches!(after, BreakerMode::Closed));
         }
     }
+}
 
-    /// Query the inner provider through the breaker. Returns an empty set when
-    /// the circuit is open (short-circuit).
-    fn query(&self, q: &MatchQuery<'_>) -> Vec<TierMatch> {
-        enum Allow {
-            Yes,
-            No,
-        }
-        let allow = {
-            let mut st = self.state.lock();
-            match self.mode(&st) {
-                BreakerMode::Open => Allow::No,
-                BreakerMode::Closed => Allow::Yes,
-                BreakerMode::HalfOpen if st.half_open_seen >= self.config.half_open_max => {
-                    Allow::No
-                }
-                BreakerMode::HalfOpen => {
-                    st.half_open_seen += 1;
-                    Allow::Yes
-                }
-            }
-        };
-        let Allow::Yes = allow else {
+impl<P> TieredMatchProvider for CircuitBreakerMatchProvider<P>
+where
+    P: TieredMatchProvider + AsyncTieredMatchProvider,
+{
+    fn find_tiered_matches(&self, query: &MatchQuery<'_>) -> Vec<TierMatch> {
+        let Some(_guard) = self.admit() else {
             return Vec::new();
         };
-        let result = self.inner.try_find_tiered_matches(q);
-        {
-            let mut st = self.state.lock();
-            self.record(&mut st, &result);
-        }
+        let result = self.inner.try_find_tiered_matches(query);
+        self.record(&result);
         result.unwrap_or_default()
     }
 }
 
-impl TieredMatchProvider for CircuitBreakerMatchProvider {
-    fn find_tiered_matches(&self, query: &MatchQuery<'_>) -> Vec<TierMatch> {
-        self.query(query)
+#[async_trait::async_trait]
+impl<P> AsyncTieredMatchProvider for CircuitBreakerMatchProvider<P>
+where
+    P: TieredMatchProvider + AsyncTieredMatchProvider,
+{
+    async fn find_tiered_matches_async(
+        &self,
+        query: &MatchQuery<'_>,
+    ) -> Result<Vec<TierMatch>, MatchError> {
+        let Some(_guard) = self.admit() else {
+            return Ok(Vec::new());
+        };
+        let result = self.inner.find_tiered_matches_async(query).await;
+        self.record(&result);
+        result
+    }
+}
+
+/// Matches gathered before the selection retry loop (RFC #414 §3), keyed by
+/// cache identity so a retried request reuses them instead of re-querying.
+#[derive(Debug, Clone, Default)]
+pub struct KvPrefetch {
+    matches: Option<HashMap<CacheKey, Vec<TierMatch>>>,
+}
+
+impl KvPrefetch {
+    fn from_matches(matches: HashMap<CacheKey, Vec<TierMatch>>) -> Self {
+        Self {
+            matches: Some(matches),
+        }
+    }
+
+    pub(crate) fn snapshot(&self) -> Option<&HashMap<CacheKey, Vec<TierMatch>>> {
+        self.matches.as_ref()
     }
 }
 
@@ -243,6 +305,7 @@ pub struct PrefillWorkEstimate {
 }
 
 /// Optional operations used by adapters with tokenized requests and KV discovery.
+#[async_trait::async_trait]
 pub trait KvAwareOps: Send + Sync {
     /// P/D uses the same placement/credit contract as colocated routing,
     /// but accounts token backlog in the shared P/D admission manager.
@@ -266,6 +329,16 @@ pub trait KvAwareOps: Send + Sync {
     ) -> Option<StagePick>;
     /// Whether the optional session binding is switched on for this policy.
     fn session_affinity_enabled(&self) -> bool;
+    /// Gather placement before the retry loop. Default: no snapshot.
+    async fn prefetch_matches(
+        &self,
+        _model_id: Option<&str>,
+        _tokens: KvRequestTokens<'_>,
+        _lora_name: Option<&str>,
+        _cache_salt: Option<&str>,
+    ) -> KvPrefetch {
+        KvPrefetch::default()
+    }
     fn register_worker(
         &self,
         worker: &dyn Worker,
@@ -343,6 +416,31 @@ pub trait KvAwareOps: Send + Sync {
             cache_salt,
             affinity_key,
             excluded_workers,
+        )
+    }
+
+    /// Selection with placement gathered before the retry loop.
+    #[allow(clippy::too_many_arguments)]
+    fn select_worker_with_prefetch(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        tokens: KvRequestTokens<'_>,
+        lora_name: Option<&str>,
+        cache_salt: Option<&str>,
+        affinity_key: Option<&AffinityKey>,
+        excluded_workers: &[String],
+        eligibility: Option<&[bool]>,
+        prefetch: Option<&KvPrefetch>,
+    ) -> Option<KvSelectionReceipt> {
+        let _ = prefetch;
+        self.select_worker_with_qualified_inputs(
+            workers,
+            tokens,
+            lora_name,
+            cache_salt,
+            affinity_key,
+            excluded_workers,
+            eligibility,
         )
     }
 }
@@ -1103,6 +1201,9 @@ struct SelectionPlan {
 /// placement provider for its cache identity.
 pub struct KvAwarePolicy {
     matches: Arc<dyn TieredMatchProvider>,
+    /// Async view of the same provider, used by `prefetch_matches` so the
+    /// Conductor `/query` never blocks a tokio worker.
+    async_provider: Option<Arc<dyn AsyncTieredMatchProvider>>,
     load: Arc<dyn LoadProvider>,
     slot_manager: Option<Arc<dyn SlotManager>>,
     scorers: Vec<Arc<dyn Scorer>>,
@@ -1182,12 +1283,18 @@ impl KvAwarePolicy {
         let circuit_breaker = options.circuit_breaker;
         let heartbeat_secs = options.heartbeat_secs;
         let conductor_provider = Arc::new(super::ConductorMatchProvider::with_options(options));
-        let matches: Arc<dyn TieredMatchProvider> = match circuit_breaker {
-            Some(config) => Arc::new(CircuitBreakerMatchProvider::new(
-                conductor_provider.clone(),
-                config,
-            )),
-            None => conductor_provider.clone(),
+        let (matches, async_provider): (
+            Arc<dyn TieredMatchProvider>,
+            Arc<dyn AsyncTieredMatchProvider>,
+        ) = match circuit_breaker {
+            Some(config) => {
+                let breaker = Arc::new(CircuitBreakerMatchProvider::new(
+                    conductor_provider.clone(),
+                    config,
+                ));
+                (breaker.clone(), breaker)
+            }
+            None => (conductor_provider.clone(), conductor_provider.clone()),
         };
         let registered: Arc<Mutex<HashMap<String, crate::kv_index::WorkerKvInfo>>> =
             Arc::new(Mutex::new(HashMap::new()));
@@ -1221,10 +1328,88 @@ impl KvAwarePolicy {
         policy.slot_manager = Some(slots);
         policy.prefer_policy_provider = true;
         policy.conductor = Some(conductor_provider);
+        policy.async_provider = Some(async_provider);
         policy.register_enabled = register_enabled;
         policy.registered = registered;
         policy.heartbeat_stop = heartbeat_stop;
         policy
+    }
+
+    /// Gather Conductor placement for every registered identity before the
+    /// retry loop (RFC #414 §3): a retried request reuses this snapshot instead
+    /// of issuing another `/query` per attempt.
+    pub async fn prefetch_matches(
+        &self,
+        model_id: Option<&str>,
+        tokens: KvRequestTokens<'_>,
+        lora_name: Option<&str>,
+        cache_salt: Option<&str>,
+    ) -> KvPrefetch {
+        let Some(provider) = self.async_provider.clone() else {
+            return KvPrefetch::default();
+        };
+        if self.conductor.is_none() {
+            return KvPrefetch::default();
+        }
+        let token_ids = match tokens {
+            KvRequestTokens::Shared(Some(ids)) if !ids.is_empty() => ids,
+            _ => {
+                ConductorMetrics::record_skipped("no_tokens");
+                return KvPrefetch::default();
+            }
+        };
+        let mut seen = HashSet::new();
+        let mut queries = Vec::new();
+        for entry in self.targets.iter() {
+            let binding = entry.value();
+            let Some(cache_key) = binding.cache_key.clone() else {
+                continue;
+            };
+            if model_id.is_some_and(|model| binding.model_id.as_deref() != Some(model)) {
+                continue;
+            }
+            if !seen.insert(cache_key.clone()) {
+                continue;
+            }
+            let Some(model) = binding.model_id.as_ref() else {
+                ConductorMetrics::record_skipped("no_cache_identity");
+                continue;
+            };
+            let query = MatchQuery {
+                group_idx: 0,
+                local_hashes: Vec::new(),
+                tiers_of_interest: Self::tiers_of_interest(),
+                request: Some(MatchRequest {
+                    model_id: Some(model.to_string()),
+                    block_size: binding.block_size,
+                    token_ids,
+                    lora_name: lora_name.map(str::to_owned),
+                    cache_salt: cache_salt.map(str::to_owned),
+                }),
+            };
+            let provider = provider.clone();
+            queries
+                .push(async move { (cache_key, provider.find_tiered_matches_async(&query).await) });
+        }
+        if queries.is_empty() {
+            return KvPrefetch::default();
+        }
+        let mut matches = HashMap::new();
+        for (cache_key, result) in futures::future::join_all(queries).await {
+            match result {
+                Ok(hits) => {
+                    matches.insert(cache_key, hits);
+                }
+                Err(error) => {
+                    ConductorMetrics::record_query_error(match error {
+                        MatchError::Unavailable => "unavailable",
+                        MatchError::Rejected => "rejected",
+                    });
+                    matches.insert(cache_key, Vec::new());
+                }
+            }
+        }
+        KvPrefetch::from_matches(matches)
     }
 
     pub fn with_components(
@@ -1236,6 +1421,7 @@ impl KvAwarePolicy {
     ) -> Self {
         Self {
             matches,
+            async_provider: None,
             load,
             slot_manager: None,
             scorers,
@@ -1451,6 +1637,7 @@ impl KvAwarePolicy {
             },
             lora_name,
             cache_salt,
+            None,
         )?;
         let candidates = self.candidate_views(workers, &plan);
         let (costs, components) = self.score_candidates(&plan, &candidates)?;
@@ -1515,6 +1702,28 @@ impl KvAwarePolicy {
         affinity_key: Option<&AffinityKey>,
         excluded_workers: &[String],
     ) -> Option<KvSelectionReceipt> {
+        self.select_worker_with_prefetch_inner(
+            workers,
+            input,
+            lora_name,
+            cache_salt,
+            affinity_key,
+            excluded_workers,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn select_worker_with_prefetch_inner(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        input: QualifiedKvInput<'_>,
+        lora_name: Option<&str>,
+        cache_salt: Option<&str>,
+        affinity_key: Option<&AffinityKey>,
+        excluded_workers: &[String],
+        prefetch: Option<&KvPrefetch>,
+    ) -> Option<KvSelectionReceipt> {
         let digest = affinity_key.map(|key| key.scoped_digest(lora_name, cache_salt));
         // Re-query at most three times under registration churn. The final
         // attempt snapshots current targets and reserves using live load only.
@@ -1532,7 +1741,7 @@ impl KvAwarePolicy {
                     has_tokens: false,
                 }
             } else {
-                self.prepare_selection(workers, input, lora_name, cache_salt)?
+                self.prepare_selection(workers, input, lora_name, cache_salt, prefetch)?
             };
             let excluded = |position: usize| {
                 excluded_workers
@@ -1746,6 +1955,7 @@ impl KvAwarePolicy {
         input: QualifiedKvInput<'_>,
         lora_name: Option<&str>,
         cache_salt: Option<&str>,
+        prefetch: Option<&KvPrefetch>,
     ) -> Option<SelectionPlan> {
         let (healthy, bindings) = {
             let _guard = self.selection_lock.lock();
@@ -1789,64 +1999,87 @@ impl KvAwarePolicy {
                         total_prefill = total_prefill.saturating_add(ids.len() as u64);
                         continue;
                     }
-                    let hits = query_cache
-                        .entry((binding.cache_key.clone(), ids))
-                        .or_insert_with(|| {
-                            let ids: &[u32] = ids;
-                            let external = self.conductor.is_some();
-                            if external && binding.model_id.is_none() {
-                                // Conductor cannot resolve an empty model, and a
-                                // 400 would also count against the breaker.
-                                crate::metrics::ConductorMetrics::record_skipped(
-                                    "no_cache_identity",
-                                );
-                                return Vec::new();
-                            }
-                            if !external {
-                                if let Some(reason) = credit_fallback {
-                                    crate::metrics::RouterMetrics::record_kv_placement_lookup(
-                                        reason,
+                    let prefetched = prefetch.and_then(KvPrefetch::snapshot).and_then(|matches| {
+                        binding
+                            .cache_key
+                            .as_ref()
+                            .and_then(|key| matches.get(key))
+                            .cloned()
+                    });
+                    let hits: Vec<TierMatch> = if let Some(hits) = prefetched {
+                        crate::metrics::RouterMetrics::record_kv_placement_lookup(
+                            if hits.is_empty() { "miss" } else { "hit" },
+                        );
+                        hits
+                    } else if self.conductor.is_some()
+                        && prefetch.and_then(KvPrefetch::snapshot).is_some()
+                    {
+                        // The async snapshot was supplied but has no entry for
+                        // this identity: never fall back to a blocking query on
+                        // the request path.
+                        crate::metrics::RouterMetrics::record_kv_placement_lookup("miss");
+                        Vec::new()
+                    } else {
+                        query_cache
+                            .entry((binding.cache_key.clone(), ids))
+                            .or_insert_with(|| {
+                                let ids: &[u32] = ids;
+                                let external = self.conductor.is_some();
+                                if external && binding.model_id.is_none() {
+                                    // Conductor cannot resolve an empty model, and a
+                                    // 400 would also count against the breaker.
+                                    crate::metrics::ConductorMetrics::record_skipped(
+                                        "no_cache_identity",
                                     );
                                     return Vec::new();
                                 }
-                            }
-                            // The local indexer hashes tokens itself; Conductor
-                            // reproduces the engine chain from token ids and must
-                            // not receive local hashes.
-                            let local_hashes = if external {
-                                Vec::new()
-                            } else {
-                                Self::local_hashes_with_lora(ids, binding.block_size, lora_name)
-                            };
-                            if !external && local_hashes.is_empty() {
-                                return Vec::new();
-                            }
-                            let hits = binding.matches.find_tiered_matches(&MatchQuery {
-                                group_idx: 0,
-                                local_hashes,
-                                tiers_of_interest: Self::tiers_of_interest(),
-                                request: Some(MatchRequest {
-                                    model_id: binding
-                                        .model_id
-                                        .as_ref()
-                                        .map(|model| model.to_string()),
-                                    block_size: binding.block_size,
-                                    token_ids: ids,
-                                    lora_name: lora_name.map(str::to_owned),
-                                    cache_salt: cache_salt.map(str::to_owned),
-                                }),
-                            });
-                            crate::metrics::RouterMetrics::record_kv_placement_lookup(
-                                if binding.cache_key.is_none() {
-                                    "index_unavailable"
-                                } else if hits.is_empty() {
-                                    "miss"
+                                if !external {
+                                    if let Some(reason) = credit_fallback {
+                                        crate::metrics::RouterMetrics::record_kv_placement_lookup(
+                                            reason,
+                                        );
+                                        return Vec::new();
+                                    }
+                                }
+                                // The local indexer hashes tokens itself; Conductor
+                                // reproduces the engine chain from token ids and must
+                                // not receive local hashes.
+                                let local_hashes = if external {
+                                    Vec::new()
                                 } else {
-                                    "hit"
-                                },
-                            );
-                            hits
-                        });
+                                    Self::local_hashes_with_lora(ids, binding.block_size, lora_name)
+                                };
+                                if !external && local_hashes.is_empty() {
+                                    return Vec::new();
+                                }
+                                let hits = binding.matches.find_tiered_matches(&MatchQuery {
+                                    group_idx: 0,
+                                    local_hashes,
+                                    tiers_of_interest: Self::tiers_of_interest(),
+                                    request: Some(MatchRequest {
+                                        model_id: binding
+                                            .model_id
+                                            .as_ref()
+                                            .map(|model| model.to_string()),
+                                        block_size: binding.block_size,
+                                        token_ids: ids,
+                                        lora_name: lora_name.map(str::to_owned),
+                                        cache_salt: cache_salt.map(str::to_owned),
+                                    }),
+                                });
+                                crate::metrics::RouterMetrics::record_kv_placement_lookup(
+                                    if binding.cache_key.is_none() {
+                                        "index_unavailable"
+                                    } else if hits.is_empty() {
+                                        "miss"
+                                    } else {
+                                        "hit"
+                                    },
+                                );
+                                hits
+                            })
+                            .clone()
+                    };
                     let matches: Vec<_> = hits
                         .iter()
                         .filter(|hit| hit.target == binding.target)
@@ -2156,6 +2389,7 @@ impl LoadBalancingPolicy for KvAwarePolicy {
     }
 }
 
+#[async_trait::async_trait]
 impl KvAwareOps for KvAwarePolicy {
     fn has_affinity(
         &self,
@@ -2452,6 +2686,42 @@ impl KvAwareOps for KvAwarePolicy {
             cache_salt,
             affinity_key,
             excluded_workers,
+        )
+    }
+
+    async fn prefetch_matches(
+        &self,
+        model_id: Option<&str>,
+        tokens: KvRequestTokens<'_>,
+        lora_name: Option<&str>,
+        cache_salt: Option<&str>,
+    ) -> KvPrefetch {
+        KvAwarePolicy::prefetch_matches(self, model_id, tokens, lora_name, cache_salt).await
+    }
+
+    fn select_worker_with_prefetch(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        tokens: KvRequestTokens<'_>,
+        lora_name: Option<&str>,
+        cache_salt: Option<&str>,
+        affinity_key: Option<&AffinityKey>,
+        excluded_workers: &[String],
+        eligibility: Option<&[bool]>,
+        prefetch: Option<&KvPrefetch>,
+    ) -> Option<KvSelectionReceipt> {
+        KvAwarePolicy::select_worker_with_prefetch_inner(
+            self,
+            workers,
+            QualifiedKvInput {
+                tokens,
+                eligibility,
+            },
+            lora_name,
+            cache_salt,
+            affinity_key,
+            excluded_workers,
+            prefetch,
         )
     }
 
@@ -4658,6 +4928,16 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait]
+    impl AsyncTieredMatchProvider for CountingProvider {
+        async fn find_tiered_matches_async(
+            &self,
+            query: &MatchQuery<'_>,
+        ) -> Result<Vec<TierMatch>, MatchError> {
+            self.try_find_tiered_matches(query)
+        }
+    }
+
     fn empty_query() -> MatchQuery<'static> {
         MatchQuery {
             group_idx: 0,
@@ -4723,6 +5003,15 @@ mod tests {
             fn find_tiered_matches(&self, _query: &MatchQuery<'_>) -> Vec<TierMatch> {
                 self.0.fetch_add(1, Ordering::Relaxed);
                 Vec::new()
+            }
+        }
+        #[async_trait::async_trait]
+        impl AsyncTieredMatchProvider for OnlyFind {
+            async fn find_tiered_matches_async(
+                &self,
+                query: &MatchQuery<'_>,
+            ) -> Result<Vec<TierMatch>, MatchError> {
+                Ok(self.find_tiered_matches(query))
             }
         }
         let inner = Arc::new(OnlyFind(AtomicUsize::new(0)));

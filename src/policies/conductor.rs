@@ -42,16 +42,17 @@
 //! scoring and never fails a request because Conductor is unreachable.
 
 use std::collections::HashSet;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use async_trait::async_trait;
 use reqwest::blocking::Client;
-use reqwest::header::{HeaderValue, CONTENT_TYPE};
+use reqwest::header::{HeaderValue, ACCEPT, CONTENT_TYPE};
 
 use crate::config::types::ConductorHashProfile;
 use crate::kv_index::{Locality, MatchQuery, RoutableTarget, StorageTier, TierMatch, WorkerKvInfo};
 use crate::metrics::ConductorMetrics;
-use crate::policies::{MatchError, TieredMatchProvider};
+use crate::policies::{AsyncTieredMatchProvider, MatchError, TieredMatchProvider};
 use rmpv::Value;
 
 /// Practical ceiling so a misbehaving Conductor cannot stall selection.
@@ -101,36 +102,127 @@ impl ConductorQueryError {
             ConductorQueryError::Decode(_) => "decode",
         }
     }
+
+    /// Map a failure onto the circuit breaker's health signal.
+    fn match_error(&self) -> MatchError {
+        match self {
+            // A 4xx is deterministic: the backend is alive but rejects this
+            // request, so it must not open the breaker for everybody.
+            ConductorQueryError::Status(status) if (400..500).contains(status) => {
+                MatchError::Rejected
+            }
+            _ => MatchError::Unavailable,
+        }
+    }
 }
 
-/// Conductor placement provider.
+/// Transport boundary for Conductor calls. HTTP is one implementation; the
+/// coro_rpc transport (P3) implements the same interface, so swapping transports
+/// does not touch the provider or the selection path. Methods move raw request
+/// bytes and return raw response bytes — the msgpack protocol stays in the
+/// provider.
 ///
-/// The base URL is the Conductor HTTP endpoint (e.g. `http://127.0.0.1:13333`).
-/// Block size and model come from each query's `request`, so one client serves
-/// every model/identity group. It also registers/unregisters workers with
-/// Conductor so Conductor can run with zero static configuration.
-///
-/// Two blocking clients are kept on purpose: the `/query` client is bounded by
-/// the request-path budget, while `/register` and `/unregister` get a much
-/// larger control-path budget.
-#[derive(Debug)]
-pub struct ConductorMatchProvider {
-    base_url: String,
-    client: Client,
-    control_client: Client,
-    hash_profile: ConductorHashProfile,
-    /// Every `(instance_id, dp_rank)` this router successfully registered.
-    /// Feeds the `conductor_registered_sources` gauge; re-registering the same
-    /// key is idempotent, so it never double counts.
-    registered: Mutex<HashSet<(String, u32)>>,
+/// Two budgets are supported by construction (the HTTP implementation owns one
+/// client per instance): the provider builds a query transport with the
+/// request-path budget and a control transport with the register budget.
+#[async_trait]
+pub trait ConductorTransport: std::fmt::Debug + Send + Sync {
+    /// POST `body` to `url` (base URL + path) with the msgpack content type.
+    fn post(&self, url: &str, body: Vec<u8>) -> Result<Vec<u8>, ConductorQueryError>;
+
+    /// GET `url` (base URL + path), returning the raw response body.
+    fn get(&self, url: &str) -> Result<Vec<u8>, ConductorQueryError>;
+
+    /// Non-blocking POST. Transports that cannot answer asynchronously keep the
+    /// default, which reports a transport error instead of blocking a runtime.
+    async fn post_async(&self, url: &str, body: Vec<u8>) -> Result<Vec<u8>, ConductorQueryError> {
+        let _ = (url, body);
+        Err(ConductorQueryError::Io(
+            "transport does not support async requests".to_string(),
+        ))
+    }
 }
 
+/// Build a `reqwest::blocking::Client`.
+///
+/// reqwest asserts in debug builds that the blocking client is not constructed
+/// inside a runtime (it builds and drops a temporary runtime); constructing one
+/// from an async context therefore panics in debug builds — which is exactly
+/// where the router builds its policy (`server::startup` is async). Build it on
+/// a plain thread when a runtime is current so dev builds and async startup work.
 fn blocking_client(connect_timeout: Duration, timeout: Duration) -> Client {
-    Client::builder()
-        .connect_timeout(connect_timeout)
-        .timeout(timeout)
-        .build()
-        .expect("blocking HTTP client")
+    if tokio::runtime::Handle::try_current().is_ok() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .name("conductor-client-init".into())
+            .spawn(move || {
+                let client = Client::builder()
+                    .connect_timeout(connect_timeout)
+                    .timeout(timeout)
+                    .build()
+                    .expect("blocking HTTP client");
+                let _ = tx.send(client);
+            })
+            .expect("spawn blocking client init thread");
+        rx.recv().expect("blocking client init thread")
+    } else {
+        Client::builder()
+            .connect_timeout(connect_timeout)
+            .timeout(timeout)
+            .build()
+            .expect("blocking HTTP client")
+    }
+}
+
+/// HTTP/msgpack [`ConductorTransport`] (the RFC#414 transport).
+///
+/// The blocking client is kept in an `Option` so [`Drop`] can move it to a plain
+/// thread: a `reqwest::blocking::Client` owns a tokio runtime, and dropping it
+/// inside an async context panics ("Cannot drop a runtime ...") — which happens
+/// in async tests and during router shutdown.
+pub struct HttpConductorTransport {
+    client: Option<Client>,
+    async_client: reqwest::Client,
+}
+
+impl std::fmt::Debug for HttpConductorTransport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HttpConductorTransport")
+            .finish_non_exhaustive()
+    }
+}
+
+impl HttpConductorTransport {
+    fn new(connect_timeout: Duration, timeout: Duration) -> Self {
+        Self {
+            client: Some(blocking_client(connect_timeout, timeout)),
+            async_client: reqwest::Client::builder()
+                .connect_timeout(connect_timeout)
+                .timeout(timeout)
+                .build()
+                .expect("async HTTP client"),
+        }
+    }
+
+    fn blocking(&self) -> &Client {
+        self.client
+            .as_ref()
+            .expect("blocking client is only taken in Drop")
+    }
+}
+
+impl Drop for HttpConductorTransport {
+    fn drop(&mut self) {
+        if let Some(client) = self.client.take() {
+            if tokio::runtime::Handle::try_current().is_ok() {
+                let _ = std::thread::Builder::new()
+                    .name("conductor-client-drop".into())
+                    .spawn(move || drop(client));
+            } else {
+                drop(client);
+            }
+        }
+    }
 }
 
 fn classify_io(error: &reqwest::Error) -> ConductorQueryError {
@@ -141,7 +233,7 @@ fn classify_io(error: &reqwest::Error) -> ConductorQueryError {
     }
 }
 
-fn read_response(
+fn read_blocking(
     response: Result<reqwest::blocking::Response, reqwest::Error>,
 ) -> Result<Vec<u8>, ConductorQueryError> {
     match response {
@@ -151,6 +243,53 @@ fn read_response(
             .map_err(|e| classify_io(&e)),
         Ok(resp) => Err(ConductorQueryError::Status(resp.status().as_u16())),
         Err(e) => Err(classify_io(&e)),
+    }
+}
+
+#[async_trait]
+impl ConductorTransport for HttpConductorTransport {
+    fn post(&self, url: &str, body: Vec<u8>) -> Result<Vec<u8>, ConductorQueryError> {
+        let response = self
+            .blocking()
+            .post(url)
+            .header(
+                CONTENT_TYPE,
+                HeaderValue::from_static("application/msgpack"),
+            )
+            .body(body)
+            .send();
+        read_blocking(response)
+    }
+
+    fn get(&self, url: &str) -> Result<Vec<u8>, ConductorQueryError> {
+        let response = self
+            .blocking()
+            .get(url)
+            .header(ACCEPT, HeaderValue::from_static("application/msgpack"))
+            .send();
+        read_blocking(response)
+    }
+
+    async fn post_async(&self, url: &str, body: Vec<u8>) -> Result<Vec<u8>, ConductorQueryError> {
+        let response = self
+            .async_client
+            .post(url)
+            .header(
+                CONTENT_TYPE,
+                HeaderValue::from_static("application/msgpack"),
+            )
+            .body(body)
+            .send()
+            .await;
+        match response {
+            Ok(resp) if resp.status().is_success() => resp
+                .bytes()
+                .await
+                .map(|b| b.to_vec())
+                .map_err(|e| classify_io(&e)),
+            Ok(resp) => Err(ConductorQueryError::Status(resp.status().as_u16())),
+            Err(e) => Err(classify_io(&e)),
+        }
     }
 }
 
@@ -194,14 +333,36 @@ fn parse_services(value: &Value) -> HashSet<(String, u32)> {
     out
 }
 
+/// Conductor placement provider.
+///
+/// The base URL is the Conductor HTTP endpoint (e.g. `http://127.0.0.1:13333`).
+/// Block size and model come from each query's `request`, so one provider serves
+/// every model/identity group. It also registers/unregisters workers with
+/// Conductor so Conductor can run with zero static configuration.
+///
+/// Two transports are kept on purpose: the query transport is bounded by the
+/// request-path budget, while `/register`, `/unregister` and `/services` get the
+/// larger control-path budget.
+#[derive(Debug)]
+pub struct ConductorMatchProvider {
+    base_url: String,
+    query_transport: Arc<dyn ConductorTransport>,
+    control_transport: Arc<dyn ConductorTransport>,
+    hash_profile: ConductorHashProfile,
+    /// Every `(instance_id, dp_rank)` this router successfully registered.
+    /// Feeds the `conductor_registered_sources` gauge; re-registering the same
+    /// key is idempotent, so it never double counts.
+    registered: Mutex<HashSet<(String, u32)>>,
+}
+
 impl ConductorMatchProvider {
     /// Build a provider pointing at Conductor's HTTP base URL.
     pub fn new(base_url: impl Into<String>) -> Self {
         Self::with_timeout(base_url, DEFAULT_QUERY_TIMEOUT)
     }
 
-    /// Build a provider whose query/register/connect budgets are all `timeout`.
-    /// Convenience for tests; production code uses [`Self::with_options`].
+    /// Build a provider whose query budget is `timeout`; connect and register
+    /// budgets use the production defaults. Convenience for tests.
     pub fn with_timeout(base_url: impl Into<String>, timeout: Duration) -> Self {
         Self::with_options(ConductorOptions {
             url: base_url.into(),
@@ -217,41 +378,21 @@ impl ConductorMatchProvider {
     /// Build a provider with explicit per-path budgets and the engine hash
     /// profile used when registering workers with Conductor.
     pub fn with_options(options: ConductorOptions) -> Self {
+        let query_transport: Arc<dyn ConductorTransport> = Arc::new(HttpConductorTransport::new(
+            options.connect_timeout,
+            options.query_timeout,
+        ));
+        let control_transport: Arc<dyn ConductorTransport> = Arc::new(HttpConductorTransport::new(
+            options.connect_timeout,
+            options.register_timeout,
+        ));
         Self {
             base_url: options.url.trim_end_matches('/').to_string(),
-            client: blocking_client(options.connect_timeout, options.query_timeout),
-            control_client: blocking_client(options.connect_timeout, options.register_timeout),
+            query_transport,
+            control_transport,
             hash_profile: options.hash_profile,
             registered: Mutex::new(HashSet::new()),
         }
-    }
-
-    fn post(
-        &self,
-        client: &Client,
-        path: &str,
-        body: Vec<u8>,
-    ) -> Result<Vec<u8>, ConductorQueryError> {
-        let response = client
-            .post(format!("{}{}", self.base_url, path))
-            .header(
-                CONTENT_TYPE,
-                HeaderValue::from_static("application/msgpack"),
-            )
-            .body(body)
-            .send();
-        read_response(response)
-    }
-
-    fn get(&self, client: &Client, path: &str) -> Result<Vec<u8>, ConductorQueryError> {
-        let response = client
-            .get(format!("{}{}", self.base_url, path))
-            .header(
-                reqwest::header::ACCEPT,
-                HeaderValue::from_static("application/msgpack"),
-            )
-            .send();
-        read_response(response)
     }
 
     /// Every `(instance_id, dp_rank)` the Conductor currently knows about.
@@ -259,7 +400,9 @@ impl ConductorMatchProvider {
     /// The heartbeat uses it to re-register only what is actually missing
     /// instead of blindly re-posting every service (RFC #414 §4 reconciliation).
     pub fn list_services(&self) -> Result<HashSet<(String, u32)>, ConductorQueryError> {
-        let bytes = self.get(&self.control_client, "/services")?;
+        let bytes = self
+            .control_transport
+            .get(&format!("{}/services", self.base_url))?;
         let value = rmpv::decode::read_value(&mut std::io::Cursor::new(bytes.as_slice()))
             .map_err(|e| ConductorQueryError::Decode(e.to_string()))?;
         Ok(parse_services(&value))
@@ -292,7 +435,10 @@ impl ConductorMatchProvider {
                 &src.pub_endpoint,
                 src.replay_endpoint.clone(),
             );
-            match self.post(&self.control_client, "/register", body) {
+            match self
+                .control_transport
+                .post(&format!("{}/register", self.base_url), body)
+            {
                 Ok(_) => {
                     self.registered
                         .lock()
@@ -316,7 +462,10 @@ impl ConductorMatchProvider {
         let mut last_error = String::new();
         for &rank in dp_ranks {
             let body = encode_unregister(instance_id, rank);
-            match self.post(&self.control_client, "/unregister", body) {
+            match self
+                .control_transport
+                .post(&format!("{}/unregister", self.base_url), body)
+            {
                 Ok(_) => {
                     self.registered
                         .lock()
@@ -346,8 +495,8 @@ impl ConductorMatchProvider {
     }
 
     /// Same as [`query`](Self::query), but distinguishes a successful (possibly
-    /// empty) answer from a transport/status/decode failure. The circuit-breaker
-    /// (a follow-up) needs this to trip on real failures only.
+    /// empty) answer from a transport/status/decode failure. The circuit breaker
+    /// needs this to trip on real failures only.
     pub fn try_query(&self, query: &MatchQuery<'_>) -> Result<Vec<TierMatch>, ConductorQueryError> {
         let Some(request) = query.request.as_ref() else {
             return Ok(Vec::new());
@@ -358,9 +507,10 @@ impl ConductorMatchProvider {
 
         let body = encode_query(request);
         let started = Instant::now();
-        let result = self.post(&self.client, "/query", body);
+        let result = self
+            .query_transport
+            .post(&format!("{}/query", self.base_url), body);
         ConductorMetrics::record_query_duration(started.elapsed());
-
         let bytes = match result {
             Ok(bytes) => bytes,
             Err(error) => {
@@ -368,7 +518,47 @@ impl ConductorMatchProvider {
                 return Err(error);
             }
         };
-        let value = match rmpv::decode::read_value(&mut std::io::Cursor::new(bytes.as_slice())) {
+        self.translate(&bytes, request, &query.tiers_of_interest)
+    }
+
+    /// Non-blocking `/query`. Same msgpack protocol and translation as
+    /// [`try_query`](Self::try_query), but the transport performs the request
+    /// asynchronously so a tokio worker is never blocked.
+    pub async fn try_query_async(
+        &self,
+        query: &MatchQuery<'_>,
+    ) -> Result<Vec<TierMatch>, ConductorQueryError> {
+        let Some(request) = query.request.as_ref() else {
+            return Ok(Vec::new());
+        };
+        if request.token_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let body = encode_query(request);
+        let started = Instant::now();
+        let result = self
+            .query_transport
+            .post_async(&format!("{}/query", self.base_url), body)
+            .await;
+        ConductorMetrics::record_query_duration(started.elapsed());
+        let bytes = match result {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                ConductorMetrics::record_query_error(error.reason());
+                return Err(error);
+            }
+        };
+        self.translate(&bytes, request, &query.tiers_of_interest)
+    }
+
+    fn translate(
+        &self,
+        bytes: &[u8],
+        request: &crate::kv_index::MatchRequest<'_>,
+        tiers_of_interest: &[StorageTier],
+    ) -> Result<Vec<TierMatch>, ConductorQueryError> {
+        let value = match rmpv::decode::read_value(&mut std::io::Cursor::new(bytes)) {
             Ok(value) => value,
             Err(e) => {
                 let error = ConductorQueryError::Decode(e.to_string());
@@ -376,11 +566,7 @@ impl ConductorMatchProvider {
                 return Err(error);
             }
         };
-        Ok(translate_response(
-            &value,
-            request,
-            &query.tiers_of_interest,
-        ))
+        Ok(translate_response(&value, request, tiers_of_interest))
     }
 }
 
@@ -393,14 +579,19 @@ impl TieredMatchProvider for ConductorMatchProvider {
         &self,
         query: &MatchQuery<'_>,
     ) -> Result<Vec<TierMatch>, MatchError> {
-        self.try_query(query).map_err(|error| match error {
-            // A 4xx is deterministic: the backend is alive but rejects this
-            // request, so it must not open the breaker for everybody.
-            ConductorQueryError::Status(status) if (400..500).contains(&status) => {
-                MatchError::Rejected
-            }
-            _ => MatchError::Unavailable,
-        })
+        self.try_query(query).map_err(|error| error.match_error())
+    }
+}
+
+#[async_trait]
+impl AsyncTieredMatchProvider for ConductorMatchProvider {
+    async fn find_tiered_matches_async(
+        &self,
+        query: &MatchQuery<'_>,
+    ) -> Result<Vec<TierMatch>, MatchError> {
+        self.try_query_async(query)
+            .await
+            .map_err(|error| error.match_error())
     }
 }
 
@@ -1087,5 +1278,168 @@ mod tests {
         let services = parse_services(&value);
         assert!(services.contains(&("inst-1".to_string(), 2)));
         assert_eq!(services.len(), 1);
+    }
+
+    /// Transport double: records URLs and replays queued responses. `post` and
+    /// `post_async` share the same queue so either path can be exercised.
+    struct MockTransport {
+        calls: std::sync::Mutex<Vec<String>>,
+        responses: std::sync::Mutex<std::collections::VecDeque<Vec<u8>>>,
+    }
+
+    impl std::fmt::Debug for MockTransport {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("MockTransport")
+        }
+    }
+
+    #[async_trait]
+    impl ConductorTransport for MockTransport {
+        fn post(&self, url: &str, _body: Vec<u8>) -> Result<Vec<u8>, ConductorQueryError> {
+            self.calls.lock().unwrap().push(url.to_string());
+            Ok(self
+                .responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_default())
+        }
+
+        fn get(&self, url: &str) -> Result<Vec<u8>, ConductorQueryError> {
+            self.calls.lock().unwrap().push(url.to_string());
+            Ok(self
+                .responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_default())
+        }
+
+        async fn post_async(
+            &self,
+            url: &str,
+            _body: Vec<u8>,
+        ) -> Result<Vec<u8>, ConductorQueryError> {
+            self.post(url, Vec::new())
+        }
+    }
+
+    fn provider_with_transport(transport: Arc<MockTransport>) -> ConductorMatchProvider {
+        ConductorMatchProvider {
+            base_url: "http://cond:13333".into(),
+            query_transport: transport.clone(),
+            control_transport: transport,
+            hash_profile: ConductorHashProfile::default(),
+            registered: Mutex::new(HashSet::new()),
+        }
+    }
+
+    fn worker_info() -> crate::kv_index::WorkerKvInfo {
+        crate::kv_index::WorkerKvInfo {
+            instance_id: "inst-0".into(),
+            block_size: Some(128),
+            ranks: vec![0],
+            sources: vec![crate::kv_index::discovery::KvSourceEndpoint {
+                dp_rank: 0,
+                pub_endpoint: "tcp://127.0.0.1:5957".into(),
+                replay_endpoint: None,
+            }],
+            cache_key: Some(crate::kv_index::CacheKey {
+                model: Arc::from("model-a"),
+                hash_mode: crate::kv_index::HashMode::Sha256,
+                block_size: 128,
+            }),
+        }
+    }
+
+    fn encoded_hit() -> Vec<u8> {
+        let mut out = Vec::new();
+        rmpv::encode::write_value(&mut out, &resp(vec![("inst-0", hit(256, 256, 256, 256))]))
+            .unwrap();
+        out
+    }
+
+    #[test]
+    fn provider_routes_through_injected_transport() {
+        let transport = Arc::new(MockTransport {
+            calls: std::sync::Mutex::new(Vec::new()),
+            responses: std::sync::Mutex::new(std::collections::VecDeque::from(vec![
+                Vec::new(),
+                Vec::new(),
+                encoded_hit(),
+            ])),
+        });
+        let provider = provider_with_transport(transport.clone());
+
+        provider.register_worker(&worker_info()).unwrap();
+        provider.unregister_worker("inst-0", &[0]).unwrap();
+        let rows = provider
+            .try_query(&MatchQuery {
+                group_idx: 0,
+                local_hashes: Vec::new(),
+                tiers_of_interest: TIERS.to_vec(),
+                request: Some(req(512)),
+            })
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].target.instance_id.as_ref(), "inst-0");
+        assert_eq!(rows[0].segments, vec![(0, 2)]);
+
+        let calls = transport.calls.lock().unwrap();
+        assert_eq!(calls[0], "http://cond:13333/register");
+        assert_eq!(calls[1], "http://cond:13333/unregister");
+        assert_eq!(calls[2], "http://cond:13333/query");
+    }
+
+    #[tokio::test]
+    async fn async_query_uses_the_async_transport_path() {
+        let transport = Arc::new(MockTransport {
+            calls: std::sync::Mutex::new(Vec::new()),
+            responses: std::sync::Mutex::new(std::collections::VecDeque::from(vec![encoded_hit()])),
+        });
+        let provider = provider_with_transport(transport.clone());
+        let rows = provider
+            .try_query_async(&MatchQuery {
+                group_idx: 0,
+                local_hashes: Vec::new(),
+                tiers_of_interest: TIERS.to_vec(),
+                request: Some(req(512)),
+            })
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            transport.calls.lock().unwrap().as_slice(),
+            ["http://cond:13333/query"]
+        );
+    }
+
+    #[tokio::test]
+    async fn query_async_no_request_is_a_noop() {
+        let provider = ConductorMatchProvider::new("http://127.0.0.1:1");
+        let query = MatchQuery {
+            group_idx: 0,
+            local_hashes: Vec::new(),
+            tiers_of_interest: TIERS.to_vec(),
+            request: None,
+        };
+        assert!(provider.try_query_async(&query).await.unwrap().is_empty());
+        let empty = MatchQuery {
+            group_idx: 0,
+            local_hashes: Vec::new(),
+            tiers_of_interest: TIERS.to_vec(),
+            request: Some(req(0)),
+        };
+        assert!(provider.try_query_async(&empty).await.unwrap().is_empty());
+        // Dropping the provider (which owns a blocking HTTP client) inside the
+        // async runtime must not panic.
+        drop(provider);
+    }
+
+    #[tokio::test]
+    async fn dropping_http_transport_inside_runtime_is_safe() {
+        let transport =
+            HttpConductorTransport::new(Duration::from_millis(10), Duration::from_millis(10));
+        drop(transport);
     }
 }
