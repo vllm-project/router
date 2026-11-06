@@ -5,13 +5,68 @@ These tests focus on testing the argument parsing logic in isolation,
 without starting actual router instances.
 """
 
+import argparse
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 from vllm_router.launch_router import RouterArgs, parse_router_args
 from vllm_router.router import Router, policy_from_str
 
 pytestmark = [pytest.mark.ready, pytest.mark.cpu]
+
+
+class TestKvLauncherArgs:
+    def test_defaults(self):
+        args = parse_router_args([])
+        assert args.kv_aware_session_affinity_ttl_secs is None
+        assert args.pd_kv_events == []
+        args.pd_kv_events.append("http://p:8000=tcp://p:5557")
+        assert RouterArgs().pd_kv_events == []
+
+    @pytest.mark.parametrize("use_prefix", [False, True])
+    def test_cli_options(self, use_prefix):
+        sources = [
+            "http://p:8000=tcp://p:5557,tcp://p:5559",
+            "http://p2:8000=tcp://p2:5557",
+        ]
+        prefix = "router-" if use_prefix else ""
+        parser = argparse.ArgumentParser()
+        RouterArgs.add_cli_args(parser, use_router_prefix=use_prefix)
+        namespace = parser.parse_args(
+            [
+                f"--{prefix}policy",
+                "kv_aware",
+                f"--{prefix}kv-aware-session-affinity-ttl-secs",
+                "1800",
+                f"--{prefix}pd-kv-events",
+                sources[0],
+                f"--{prefix}pd-kv-events",
+                sources[1],
+            ]
+        )
+        args = RouterArgs.from_cli_args(namespace, use_router_prefix=use_prefix)
+        assert args.kv_aware_session_affinity_ttl_secs == 1800
+        assert args.pd_kv_events == sources
+
+    def test_native_constructor_forwarding(self):
+        sources = ["http://p:8000=tcp://p:5557,tcp://p:5559"]
+        args = RouterArgs(
+            policy="kv_aware",
+            vllm_pd_disaggregation=True,
+            prefill_urls=[("http://p:8000", None)],
+            decode_urls=["http://d:8000"],
+            kv_aware_session_affinity_ttl_secs=1800,
+            pd_kv_events=sources,
+        )
+        with patch("vllm_router.router._Router") as native_router:
+            router = Router.from_args(args)
+        native_router.assert_called_once()
+        kwargs = native_router.call_args.kwargs
+        assert kwargs["kv_aware_session_affinity_ttl_secs"] == 1800
+        assert kwargs["pd_kv_events"] == sources
+        assert kwargs["policy"] == policy_from_str("kv_aware")
+        assert router._router is native_router.return_value
 
 
 class TestRouterArgs:
@@ -405,7 +460,7 @@ class TestRouterArgs:
         assert router_args.policy == "random"
         assert router_args.vllm_pd_disaggregation is False
 
-    def test_kv_aware_is_rejected_for_effective_pd_policies(self):
+    def test_kv_aware_is_allowed_for_effective_pd_policies(self):
         for kwargs in [
             {"policy": "kv_aware"},
             {"policy": "kv_aware", "enable_igw": True},
@@ -417,8 +472,7 @@ class TestRouterArgs:
                 service_discovery=True,
                 **kwargs,
             )
-            with pytest.raises(ValueError, match="only in regular mode"):
-                args._validate_router_args()
+            args._validate_router_args()
 
     def test_kv_aware_is_allowed_in_regular_mode(self):
         args = RouterArgs(policy="kv_aware")
@@ -519,9 +573,10 @@ class TestParseRouterArgs:
         with pytest.raises(ValueError, match="kv_aware_session_affinity_ttl_secs"):
             RouterArgs(kv_aware_session_affinity_ttl_secs=ttl)._validate_router_args()
 
-    def test_kv_aware_is_not_a_pd_stage_policy(self):
-        with pytest.raises(SystemExit):
-            parse_router_args(["--prefill-policy", "kv_aware"])
+    def test_kv_aware_is_a_pd_stage_policy(self):
+        for stage in ["prefill", "decode"]:
+            args = parse_router_args([f"--{stage}-policy", "kv_aware"])
+            assert getattr(args, f"{stage}_policy") == "kv_aware"
 
     def test_parse_program_scheduling_json(self):
         """Keep the opt-in scheduler configuration opaque until Rust validation."""

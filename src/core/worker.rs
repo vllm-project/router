@@ -288,6 +288,7 @@ pub struct WorkerMetadata {
 #[derive(Clone)]
 pub struct BasicWorker {
     metadata: WorkerMetadata,
+    dp_size: Option<usize>,
     load_counter: Arc<AtomicUsize>,
     processed_counter: Arc<AtomicUsize>,
     healthy: Arc<AtomicBool>,
@@ -300,6 +301,7 @@ impl fmt::Debug for BasicWorker {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("BasicWorker")
             .field("metadata", &self.metadata)
+            .field("dp_size", &self.dp_size)
             .field("healthy", &self.healthy.load(Ordering::Relaxed))
             .field("circuit_breaker", &self.circuit_breaker)
             .finish()
@@ -327,6 +329,7 @@ impl BasicWorker {
 
         Self {
             metadata,
+            dp_size: None,
             load_counter: Arc::new(AtomicUsize::new(0)),
             processed_counter: Arc::new(AtomicUsize::new(0)),
             healthy: Arc::new(AtomicBool::new(true)),
@@ -338,6 +341,12 @@ impl BasicWorker {
 
     pub fn with_labels(mut self, labels: std::collections::HashMap<String, String>) -> Self {
         self.metadata.labels = labels;
+        self
+    }
+
+    /// Attach a known DP group size when this worker represents a single-rank endpoint.
+    pub fn with_dp_size(mut self, dp_size: usize) -> Self {
+        self.dp_size = Some(dp_size.max(1));
         self
     }
 
@@ -463,7 +472,7 @@ impl Worker for BasicWorker {
 
     fn decrement_load(&self) {
         self.load_counter
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 current.checked_sub(1)
             })
             .ok();
@@ -487,6 +496,10 @@ impl Worker for BasicWorker {
 
     fn circuit_breaker(&self) -> &CircuitBreaker {
         &self.circuit_breaker
+    }
+
+    fn dp_size(&self) -> Option<usize> {
+        self.dp_size
     }
 }
 
@@ -826,7 +839,6 @@ pub fn workers_to_urls(workers: &[Box<dyn Worker>]) -> Vec<String> {
 /// RAII guard for worker load management
 pub struct WorkerLoadGuard<'a> {
     workers: Vec<&'a dyn Worker>,
-    owned_worker: Option<Arc<dyn Worker>>,
 }
 
 impl<'a> WorkerLoadGuard<'a> {
@@ -835,7 +847,6 @@ impl<'a> WorkerLoadGuard<'a> {
         worker.increment_load();
         Self {
             workers: vec![worker],
-            owned_worker: None,
         }
     }
 
@@ -845,39 +856,7 @@ impl<'a> WorkerLoadGuard<'a> {
         for worker in &workers {
             worker.increment_load();
         }
-        Self {
-            workers,
-            owned_worker: None,
-        }
-    }
-
-    /// Transfer a single-worker reservation without changing its load counter.
-    pub(crate) fn into_owned(mut self, worker: Arc<dyn Worker>) -> WorkerLoadGuard<'static> {
-        assert!(
-            (self.workers.len() == 1 && std::ptr::addr_eq(self.workers[0], worker.as_ref()))
-                || self
-                    .owned_worker
-                    .as_ref()
-                    .is_some_and(|reserved| Arc::ptr_eq(reserved, &worker)),
-            "the owned worker must match the reserved worker"
-        );
-        self.workers.clear();
-        self.owned_worker.take();
-        WorkerLoadGuard {
-            workers: Vec::new(),
-            owned_worker: Some(worker),
-        }
-    }
-}
-
-impl WorkerLoadGuard<'static> {
-    /// Create an owned guard that can follow a worker into a response body.
-    pub fn new_owned(worker: Arc<dyn Worker>) -> Self {
-        worker.increment_load();
-        Self {
-            workers: Vec::new(),
-            owned_worker: Some(worker),
-        }
+        Self { workers }
     }
 }
 
@@ -885,9 +864,6 @@ impl<'a> Drop for WorkerLoadGuard<'a> {
     fn drop(&mut self) {
         // Decrement load counters for all workers
         for worker in &self.workers {
-            worker.decrement_load();
-        }
-        if let Some(worker) = &self.owned_worker {
             worker.decrement_load();
         }
     }
@@ -1433,24 +1409,6 @@ mod tests {
         }
 
         // Guard dropped, load decremented
-        assert_eq!(worker.load(), 0);
-    }
-
-    #[test]
-    fn test_load_guard_ownership_transfer_preserves_reservation() {
-        let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(
-            "http://test:8080".to_string(),
-            WorkerType::Regular,
-        ));
-        let other = WorkerLoadGuard::new_owned(worker.clone());
-        let borrowed = WorkerLoadGuard::new(worker.as_ref());
-        let owned = borrowed.into_owned(worker.clone());
-        let owned = owned.into_owned(worker.clone());
-        assert_eq!(worker.load(), 2);
-
-        drop(owned);
-        assert_eq!(worker.load(), 1);
-        drop(other);
         assert_eq!(worker.load(), 0);
     }
 

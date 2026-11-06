@@ -15,7 +15,9 @@ import sys
 # Test configuration
 TASK = "gsm8k"
 DEFAULT_FILTER = "exact_match,strict-match"
-RTOL = 0.03  # Relative tolerance for accuracy comparison
+# Subtracted from the model baseline and from LM_EVAL_BASELINE.
+RTOL = 0.03
+BASELINE_ENV = "LM_EVAL_BASELINE"
 
 # Model-specific expected values (from vLLM benchmarks)
 EXPECTED_VALUES = {
@@ -189,6 +191,24 @@ def run_accuracy_evaluation(
         raise
 
 
+def accuracy_lower_bound(expected_value: float) -> float:
+    """Pass threshold for one GSM8K result.
+
+    The model baseline and ``LM_EVAL_BASELINE`` are treated the same way:
+    the lower bound is that value minus ``RTOL``.
+    """
+    raw = os.environ.get(BASELINE_ENV, "").strip()
+    baseline = expected_value
+    if raw:
+        try:
+            baseline = float(raw)
+        except ValueError as exc:
+            raise ValueError(f"{BASELINE_ENV} must be a number, got {raw!r}") from exc
+        if not 0.0 <= baseline <= 1.0:
+            raise ValueError(f"{BASELINE_ENV} must be between 0 and 1, got {baseline}")
+    return baseline - RTOL
+
+
 def validate_accuracy(
     results: dict,
     model_name: str,
@@ -200,6 +220,7 @@ def validate_accuracy(
     Args:
         results: LM-Eval results dictionary
         model_name: Model name being evaluated
+        filter_name: LM-Eval metric key
 
     Returns:
         True if accuracy is within acceptable range, False otherwise
@@ -226,14 +247,14 @@ def validate_accuracy(
         print("=" * 60)
         return True  # Pass if no baseline (assume correct)
 
+    # Higher accuracy is always acceptable, so we only enforce a lower bound.
+    lower_bound = accuracy_lower_bound(expected_value)
+    override = os.environ.get(BASELINE_ENV, "").strip()
+
     print_info(f"  Expected Accuracy:  {expected_value:.4f}")
+    if override:
+        print_info(f"  {BASELINE_ENV}: {float(override):.4f}")
     print_info(f"  Tolerance:          ±{RTOL:.4f}")
-
-    lower_bound = expected_value - RTOL
-    # Higher accuracy is always acceptable, so we only enforce lower bound
-    minimum_threshold = 0.3
-
-    print_info(f"  Minimum Threshold:  {minimum_threshold:.4f}")
     print_info(f"  Lower Bound:        {lower_bound:.4f}")
     print("=" * 60)
     print()
@@ -378,7 +399,12 @@ def main():
             print_info(f"  Filtered: {sample.get('filtered_resps')}")
 
     # Step 3: Validate accuracy
-    if not validate_accuracy(results, model_name, args.filter):
+    try:
+        passed = validate_accuracy(results, model_name, args.filter)
+    except ValueError as exc:
+        print_error(str(exc))
+        return 1
+    if not passed:
         print_error("Accuracy validation failed!")
         return 1
 

@@ -2829,11 +2829,20 @@ pub(crate) mod cache_routing {
     }
 
     pub fn tokens(ids: &[i32]) -> String {
+        token_ids(&ids.iter().map(|id| *id as u32).collect::<Vec<_>>())
+    }
+
+    pub fn token_ids(ids: &[u32]) -> String {
+        token_ids_with_prefix(ids, "")
+    }
+
+    pub fn token_ids_with_prefix(ids: &[u32], prefix: &str) -> String {
         if ids.is_empty() {
             return String::new();
         }
         const HEX: &[u8; 16] = b"0123456789abcdef";
-        let mut key = Vec::with_capacity(TOKENS.len() + ids.len() * TOKEN_WIDTH);
+        let mut key = Vec::with_capacity(prefix.len() + TOKENS.len() + ids.len() * TOKEN_WIDTH);
+        key.extend_from_slice(prefix.as_bytes());
         key.extend_from_slice(TOKENS.as_bytes());
         for id in ids {
             // Preserve all 32 bits, including signed IDs accepted by PromptInput.
@@ -2927,6 +2936,13 @@ pub(crate) mod cache_routing {
         } else {
             "legacy_text"
         }
+    }
+
+    pub fn token_prefix_counts(key: &str, matched: usize) -> (usize, usize) {
+        (
+            matched.saturating_sub(TOKENS.len()) / TOKEN_WIDTH,
+            key.len().saturating_sub(TOKENS.len()) / TOKEN_WIDTH,
+        )
     }
 
     /// Fraction of the full input prefix: complete tokens or Unicode characters.

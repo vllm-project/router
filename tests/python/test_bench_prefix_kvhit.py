@@ -11,6 +11,7 @@ import json
 import threading
 import time
 import unittest
+from unittest import mock
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -193,6 +194,73 @@ class PrefixKvhitSseTests(unittest.TestCase):
         self.assertEqual(summary["frontend_ms"]["max"], 6.0)
         self.assertEqual(summary["encode_reuse"]["avg"], 0.5)
         self.assertNotIn("template_ms", summary)
+
+    def _perf_settings(self) -> dict:
+        return {
+            "router_url": "http://127.0.0.1:9",
+            "model": "m",
+            "model_dir": "m",
+            "tokens": 0,
+            "chars": 40,
+            "max_tokens": 4,
+            "timeout": 5.0,
+            "warmup": True,
+            "backend_label": "t",
+            "output_dir": "",
+            "runs": 1,
+        }
+
+    def _capture_wave(self, **kwargs):
+        seen: list = []
+
+        def fake(_url, _model, messages, _max_tokens, _timeout):
+            seen.append(messages)
+            return {
+                "ttft_ms": 1.0,
+                "e2e_ms": 2.0,
+                "total_duration_ms": 2.0,
+                "last_output_ms": 1.5,
+                "prompt_tokens": 8,
+                "completion_tokens": 1,
+                "chars_out": 1,
+                "decode_tok_s": None,
+                "e2e_tok_s": None,
+                "tpot_ms": None,
+                "stages": None,
+            }
+
+        with mock.patch.object(BENCH_PREFIX_KVHIT, "post_chat", fake):
+            payload = BENCH_PREFIX_KVHIT.run_prefix_kvhit_wave(
+                self._perf_settings(),
+                hit_rate=0.3,
+                concurrency=1,
+                requests=1,
+                **kwargs,
+            )
+        return payload, seen
+
+    def test_run_wave_default_shape_is_one_user_message(self):
+        payload, seen = self._capture_wave()
+        self.assertEqual(payload["shape"], "split")
+        self.assertNotIn("turns", payload)
+        self.assertEqual(len(seen), 3)
+        for messages in seen:
+            self.assertEqual([m["role"] for m in messages], ["user"])
+
+    def test_run_wave_turns_shape_uses_chat_turns(self):
+        payload, seen = self._capture_wave(shape="turns", turns=4)
+        self.assertEqual(payload["shape"], "turns")
+        self.assertEqual(payload["turns"], 4)
+        self.assertEqual(len(seen), 3)
+        roles = [m["role"] for m in seen[0]]
+        self.assertEqual(roles, ["user", "assistant", "user", "assistant", "user"])
+        self.assertEqual(seen[0][:-1], seen[1][:-1])
+        self.assertNotEqual(seen[0][-1], seen[1][-1])
+        self.assertNotEqual(seen[1][-1], seen[2][-1])
+
+    def test_run_wave_rejects_unknown_shape(self):
+        with self.assertRaises(ValueError):
+            self._capture_wave(shape="middle")
 
 
 if __name__ == "__main__":
