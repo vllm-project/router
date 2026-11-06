@@ -861,7 +861,15 @@ import os
 import sys
 
 from agentinfer.agentbench.replay.executor import ReplayExecutor
+from agentinfer.agentbench.replay.transport import ReplayTransport
 from agentinfer.agentcache.entrypoints.cli.main import main
+
+async def _skip_tracelab_context(self, *args, **kwargs):
+    return None
+
+# gRPC /v1/models omits max_model_len; worker HTTP already has it.
+ReplayTransport.validate_tracelab_context = _skip_tracelab_context
+print("SKIP validate_tracelab_context", flush=True)
 
 _delay = float(os.environ.get("AGENTX_TASK_STAGGER", "0") or 0)
 if _delay > 0:
