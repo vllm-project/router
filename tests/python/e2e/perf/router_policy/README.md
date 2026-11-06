@@ -1,6 +1,6 @@
-# router_policy — TraceLab cold replay, router policy × concurrency
+# router_policy — AgentX stress replay, router policy × concurrency
 
-Each **case JSON** under `cases/<policy>/` is self-contained (three policies × concurrency 8/16/32):
+Each **case JSON** under `cases/<policy>/` is self-contained (three policies × `c8` / `c16` / `c32`). The current AgentX stress trace has two sessions, so every file uses session concurrency 2 and `max_inflight` 8; the `cN` name does not change the workload.
 
 - **`runtime`** — paths **relative to vllm-router repo root** where applicable. **Env overrides JSON** (same as `scripts/backend/` and `perf/grpc`): `MODEL`, `VLLM_RS`, `ROUTER_BIN`, `AGENTX_PYTHON` (or `PYTHON`). Resolve `vllm-rs` with [`scripts/backend/check_vllm_rs.sh`](../../../../../scripts/backend/check_vllm_rs.sh).
 - **agentinfer** — install via **`pip install …whl`** (or `uv pip install …whl`) into the **same env as pytest** (no source checkout). Replay YAML is loaded from the installed package when a cell starts. Optional: `runtime.replay_config`; optional `runtime.agent_infer` for source dev.
@@ -54,8 +54,8 @@ Layout matches **`perf/grpc`**: case JSON + [`casekit/case_config.py`](casekit/c
 
 Job **`router-policy-perf-e2e`** in [`.buildkite/test-nightly.yml`](../../../../../.buildkite/test-nightly.yml)
 runs **`cache_aware/c16`**, **`kv_aware/c16`**, **`kv_aware_aff/c16`** on **`h100_4`** (4× H100).
-Case JSON reserves 12 GiB GPU KV per worker, no CPU offload, and `max_model_len=32768`.
+Case JSON reserves 32 GiB GPU KV and 16 GiB host offload per worker, `block_size=64`, and `max_model_len=131072`.
 
 Nightly step runs `pip install agentinfer==0.2.0` then three pytest invocations (`-k …/c16`).
-The trace is `data/tracelab-ci-uniform-28.jsonl` (8 sessions, 28 requests). Optional Buildkite env **`AGENTX_TRACE_JSONL_URL`** replaces that file when set.
+The trace is `data/agentx-stress-68.jsonl` (2 sessions, 68 requests). Optional Buildkite env **`AGENTX_TRACE_JSONL_URL`** replaces that file when set.
 See [`.buildkite/test-nightly.yml`](../../../../../.buildkite/test-nightly.yml) (`router-policy-perf-e2e`).

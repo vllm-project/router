@@ -7,8 +7,8 @@ Flow:
   4. Wait until router passes HTTP /health.
   5. Run agentinfer replay bench against the router.
 
-Workload is the TraceLab 8-session / 28-request subset
-(``data/tracelab-ci-uniform-28.jsonl``). Replay executes that plan and writes
+Workload is the AgentX stress trace (2 sessions, 68 requests) in
+``data/agentx-stress-68.jsonl``. Replay executes that plan and writes
 ``result/requests.jsonl`` (per-request TTFT/latency — analysis output, not the bench input).
 
 Configuration: ``AGENTX_CASE_FILE`` points to one self-contained case JSON
@@ -74,6 +74,8 @@ STALL_SECS: int
 IDLE_SECS: int
 OUT: Path
 SERVED_MODEL_NAME: str
+TRACE_TYPE: str
+ENDPOINT: str
 WORKER_CFG: dict[str, Any]
 ROUTER_CFG: dict[str, Any]
 env: dict[str, str]
@@ -100,6 +102,8 @@ def bootstrap(case_path: Path) -> None:
         IDLE_SECS, \
         OUT, \
         SERVED_MODEL_NAME, \
+        TRACE_TYPE, \
+        ENDPOINT, \
         WORKER_CFG, \
         ROUTER_CFG, \
         env, \
@@ -124,6 +128,8 @@ def bootstrap(case_path: Path) -> None:
     OPENSSL_LIB = runtime.get("openssl_lib_dir") or ""
     TRACE = Path(runtime["trace_path"])
     SERVED_MODEL_NAME = runtime["served_model_name"]
+    TRACE_TYPE = str(runtime.get("trace_type") or "agentX")
+    ENDPOINT = str(runtime.get("endpoint") or "/v1/completions")
 
     ROUTER_POLICY = str(
         ROUTER_CFG.get("policy")
@@ -510,8 +516,7 @@ def engine_command(i):
         "buffer_steps": 10000,
     }
     cpu_bytes = int(pw.get("cpu_kv_bytes", 0))
-    # GiB for --kv-offloading-size. That flag registers vllm:kv_offload_cpu_*.
-    # cpu_kv_bytes == 0 leaves host offload off (this trace fits in GPU KV).
+    # GiB for --kv-offloading-size. cpu_kv_bytes == 0 leaves host offload off.
     offload_gib = cpu_bytes / (1024**3)
     offload_args: list[str] = []
     if cpu_bytes > 0:
@@ -554,6 +559,11 @@ def engine_command(i):
         "--",
         "--tensor-parallel-size",
         str(pw.get("tensor_parallel_size", 1)),
+        *(
+            ["--block-size", str(pw["block_size"])]
+            if pw.get("block_size") is not None
+            else []
+        ),
         "--max-model-len",
         str(pw.get("max_model_len", 262144)),
         "--max-num-seqs",
@@ -651,22 +661,26 @@ def runtime_config():
         metrics_url=f"http://127.0.0.1:{ports['metrics']}/metrics",
         tokenizer_base_url=f"http://127.0.0.1:{ports['http'][0]}",
         model=served,
-        endpoint="/v1/chat/completions",
+        endpoint=ENDPOINT,
     )
-    values["replay"].update(
-        trace_type="tracelab",
-        trace_path=str(TRACE),
-        trace_same_agent_gap_scale=GAP_SCALE,
-        trace_same_agent_gap_offset_seconds=0.0,
-        interval_mode="trace",
-        sample_seed=0,
-        context_adjustment_mode="strict",
-        context_micro_trim_max_tokens=64,
-        context_micro_trim_max_ratio=0.005,
-        prompt_calibration_tolerance_tokens=0,
-        max_inflight_requests=MAX_INFLIGHT,
-        request_timeout_seconds=3600,
-    )
+    replay_fields = {
+        "trace_type": TRACE_TYPE,
+        "trace_path": str(TRACE),
+        "trace_same_agent_gap_scale": GAP_SCALE,
+        "trace_same_agent_gap_offset_seconds": 0.0,
+        "interval_mode": "trace",
+        "max_inflight_requests": MAX_INFLIGHT,
+        "request_timeout_seconds": 3600,
+    }
+    if TRACE_TYPE == "tracelab":
+        replay_fields.update(
+            sample_seed=0,
+            context_adjustment_mode="strict",
+            context_micro_trim_max_tokens=64,
+            context_micro_trim_max_ratio=0.005,
+            prompt_calibration_tolerance_tokens=0,
+        )
+    values["replay"].update(replay_fields)
     path = OUT / "runtime-replay.yaml"
     path.write_text(yaml.safe_dump(values, sort_keys=False))
     return path

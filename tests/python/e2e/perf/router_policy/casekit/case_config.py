@@ -62,8 +62,8 @@ def _resolve_python(case_value: str, repo: Path, *, case_id: str) -> str:
 def packaged_replay_agentx_yaml() -> Path:
     """Replay template from pip-installed ``agentinfer`` (not a source checkout).
 
-    Prefer the TraceLab template. The AgentX template is only a fallback; the
-    cell runner overwrites ``trace_type`` and the chat endpoint either way.
+    Prefer the AgentX template. The cell runner overwrites ``trace_type`` and
+    the backend endpoint from the case JSON either way.
     """
 
     try:
@@ -77,16 +77,16 @@ def packaged_replay_agentx_yaml() -> Path:
 
     package_root = Path(agentinfer.__file__).resolve().parent
     for relative in (
-        Path("agentbench/configs/replay_tracelab.yaml"),
-        Path("agentinfer/agentbench/configs/replay_tracelab.yaml"),
         Path("agentbench/configs/replay_agentX.yaml"),
         Path("agentinfer/agentbench/configs/replay_agentX.yaml"),
+        Path("agentbench/configs/replay_tracelab.yaml"),
+        Path("agentinfer/agentbench/configs/replay_tracelab.yaml"),
     ):
         candidate = package_root / relative
         if candidate.is_file():
             return candidate
     raise FileNotFoundError(
-        f"replay_tracelab.yaml not found under installed agentinfer ({package_root})"
+        f"replay_agentX.yaml not found under installed agentinfer ({package_root})"
     )
 
 
