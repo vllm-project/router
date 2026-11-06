@@ -406,7 +406,7 @@ class RouterArgs:
             type=_parse_log_user_prompts,
             default=RouterArgs.log_user_prompts,
             metavar="{true,false}",
-            help="Log user text from chat completion requests. May contain sensitive data; disabled by default.",
+            help="Log user text from chat and Messages API requests. May contain sensitive data; disabled by default.",
         )
         parser.add_argument(
             f"--{prefix}log-level",

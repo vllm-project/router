@@ -53,7 +53,7 @@ pub struct RouterConfig {
     pub log_dir: Option<String>,
     /// Log level (None = info)
     pub log_level: Option<String>,
-    /// Log user text from chat completion requests. Disabled by default.
+    /// Log user text from chat and Messages API requests. Disabled by default.
     #[serde(default)]
     pub log_user_prompts: bool,
     /// Custom request ID headers to check (defaults to common headers)

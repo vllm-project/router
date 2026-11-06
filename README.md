@@ -214,7 +214,8 @@ vllm-router \
 
 ### Optional User Prompt Logging
 
-User text logging for chat requests is optional and disabled by default.
+User text logging for `/v1/chat/completions` and `POST /v1/messages` requests is
+optional and disabled by default.
 Set `--log-user-prompts=true` to log all user text at INFO level, or explicitly
 set `--log-user-prompts=false` to disable it. See
 [logging options](docs/cli_reference.md#optional-user-prompt-logging) and the

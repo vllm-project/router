@@ -218,7 +218,7 @@ The bootstrap port annotation is fixed to `vllm.ai/bootstrap-port`.
 | Option | Rust value | Rust default | Python value | Python default | Description |
 | --- | --- | --- | --- | --- | --- |
 | `--log-dir` | `string` | `unset` | `string` | `unset` | Log file directory; unset logs only to the console. |
-| `--log-user-prompts` | `true, false` | `false` | `true, false` | `false` | Log text from all user messages after the chat request authorization check at INFO level. |
+| `--log-user-prompts` | `true, false` | `false` | `true, false` | `false` | Log user text from chat and Messages API requests after authorization at INFO level. |
 | `--log-level` | `debug, info, warn, error` | `info` | `debug, info, warning, error, critical` | `info` | Log severity; Rust accepts `warn`, while Python accepts `warning` and `critical`. |
 | `--prometheus-port` | `u16` | `29000` | `integer` | `29000` | Prometheus listener port. Both CLI parsers enable metrics on `29000` by default. |
 | `--prometheus-host` | `string` | `127.0.0.1` | `string` | `127.0.0.1` | Prometheus listener bind address. |
@@ -237,13 +237,18 @@ Both the Rust binary and the Python launcher accept
 raising `--log-level` to `debug` does not enable it. This option applies to the
 Rust router, including the raw-JSON EPD chat handler, not Python `--mini-lb`.
 
-When enabled, `/v1/chat/completions` requests that pass the authorization check
+When enabled, `/v1/chat/completions` and `POST /v1/messages` requests that pass the authorization check
 produce one INFO event on the `vllm_router_rs::prompt` target before routing. The event includes
 the request ID, model, streaming flag, and text from every `role=user` message
 in request order. String contents and `type=text` content parts are included;
-other roles and non-text parts are excluded. Newlines are escaped and user
+other roles and non-text parts are excluded. Messages API system prompts and
+tool-result content are also excluded. Newlines are escaped and user
 message/text-part boundaries are preserved. Streaming requests log once,
 before the response stream starts.
+
+The Messages API event also includes `route="/v1/messages"`. Query parameters
+such as `/v1/messages?beta=true` are supported. `/v1/messages/count_tokens`
+does not produce prompt logs.
 
 These are the texts received by the handler, after any configured WASM
 OnRequest modification, rather than a rendered model chat template. Text is

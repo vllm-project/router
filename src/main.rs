@@ -264,7 +264,7 @@ struct CliArgs {
     #[arg(long, default_value = "info", value_parser = ["debug", "info", "warn", "error"])]
     log_level: String,
 
-    /// Log user text from chat completion requests (may contain sensitive data)
+    /// Log user text from chat and Messages API requests (may contain sensitive data)
     #[arg(long, default_value_t = false, action = ArgAction::Set)]
     log_user_prompts: bool,
 

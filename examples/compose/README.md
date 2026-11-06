@@ -42,9 +42,12 @@ docker compose up -d --force-recreate router
 podman compose up -d --force-recreate router
 ```
 
-Enabled requests emit one INFO event on `vllm_router_rs::prompt`, including
+Enabled `/v1/chat/completions` and `POST /v1/messages` requests emit one INFO
+event on `vllm_router_rs::prompt`, including
 the request ID and all user-message text. System/assistant messages and media
-payloads are excluded. User text is not truncated or redacted. Normal log
+payloads and tool-result content are excluded. `/v1/messages?beta=true` is
+supported; `/v1/messages/count_tokens` does not produce prompt logs.
+User text is not truncated or redacted. Normal log
 filters still apply; keep `ROUTER_LOG_LEVEL=info` to see these events. The
 switch does not enable logging for Python's separate `--mini-lb` debug server.
 

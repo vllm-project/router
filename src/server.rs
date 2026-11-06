@@ -123,7 +123,11 @@ async fn sink_handler() -> Response {
 
 /// Transparent proxy handler for unmatched routes
 /// Routes requests through the router's route_transparent method
-async fn transparent_proxy_handler(State(state): State<Arc<AppState>>, req: Request) -> Response {
+async fn transparent_proxy_handler(
+    State(state): State<Arc<AppState>>,
+    Extension(request_id): Extension<middleware::RequestId>,
+    req: Request,
+) -> Response {
     let headers = req.headers().clone();
 
     // Check authorization
@@ -159,6 +163,13 @@ async fn transparent_proxy_handler(State(state): State<Arc<AppState>>, req: Requ
             }
         }
     };
+
+    if state.context.router_config.log_user_prompts
+        && method == http::Method::POST
+        && path == "/v1/messages"
+    {
+        logging::log_messages_user_prompts(&request_id.0, &body_json);
+    }
 
     // Route through transparent proxy
     state

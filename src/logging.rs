@@ -74,6 +74,20 @@ pub(crate) fn log_raw_chat_user_prompts(request_id: &str, request: &serde_json::
     );
 }
 
+/// Messages API requests use the transparent proxy's raw JSON body. Include only
+/// direct user text parts, excluding system prompts, media, and tool results.
+pub(crate) fn log_messages_user_prompts(request_id: &str, request: &serde_json::Value) {
+    tracing::info!(
+        target: "vllm_router_rs::prompt",
+        request_id,
+        route = "/v1/messages",
+        model = request.get("model").and_then(serde_json::Value::as_str),
+        stream = request.get("stream").and_then(serde_json::Value::as_bool).unwrap_or(false),
+        user_prompts = ?raw_user_prompt_texts(request),
+        "Messages API user prompts"
+    );
+}
+
 /// Configuration for the logging system
 #[derive(Debug, Clone)]
 pub struct LoggingConfig {
