@@ -5,6 +5,8 @@
 
 use super::RequestHeaders;
 use crate::policies::ConsistentHashPolicy;
+use serde::Deserialize;
+use serde_json::Value;
 use tracing::debug;
 
 /// HTTP header names to check for session ID (case-insensitive, checked in order)
@@ -67,6 +69,10 @@ pub(crate) fn extract_hash_key(
 /// 3. Body: user (OpenAI format)
 /// 4. Body: session_id (legacy)
 /// 5. Body: user_id (legacy)
+///
+/// The body is parsed as JSON and only top-level fields are read, so body ids
+/// are decoded JSON strings, the same representation as header values and
+/// `/finish_session?session_id=`. Text that is not a JSON object yields `None`.
 pub(crate) fn extract_session_id(
     request_text: Option<&str>,
     headers: Option<&RequestHeaders>,
@@ -81,19 +87,35 @@ pub(crate) fn extract_session_id(
         }
     }
 
-    let body: serde_json::Value = serde_json::from_str(request_text?).ok()?;
-    let session_id = [
-        body.pointer("/session_params/session_id"),
-        body.get("user"),
-        body.get("session_id"),
-        body.get("user_id"),
-    ]
-    .into_iter()
-    .flatten()
-    .filter_map(serde_json::Value::as_str)
-    .find(|value| !value.is_empty())
-    .map(str::to_owned);
-    session_id
+    // Fields not listed here, such as messages and prompt, are skipped
+    // without being allocated.
+    let fields: SessionIdFields = serde_json::from_str(request_text?).ok()?;
+    let nested = fields
+        .session_params
+        .as_ref()
+        .and_then(|params| params.get("session_id"));
+    session_id_value(nested)
+        .or_else(|| session_id_value(fields.user.as_ref()))
+        .or_else(|| session_id_value(fields.session_id.as_ref()))
+        .or_else(|| session_id_value(fields.user_id.as_ref()))
+}
+
+/// Top-level request body fields that can carry a session id.
+#[derive(Deserialize)]
+struct SessionIdFields {
+    session_params: Option<Value>,
+    user: Option<Value>,
+    session_id: Option<Value>,
+    user_id: Option<Value>,
+}
+
+/// A non-empty string or a number; other JSON types are not session ids.
+fn session_id_value(value: Option<&Value>) -> Option<String> {
+    match value? {
+        Value::String(s) if !s.is_empty() => Some(s.clone()),
+        Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    }
 }
 
 /// Extract hash key from HTTP headers
@@ -564,15 +586,65 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_session_id_preserves_json_escapes() {
-        let id = "session-\"quoted\\path";
-        let body = serde_json::json!({"session_params": {"session_id": id}}).to_string();
-        assert_eq!(extract_session_id(Some(&body), None), Some(id.to_string()));
+    fn test_extract_session_id_decodes_json_strings() {
+        // Escaped characters are decoded, so the id matches the one a client
+        // passes to /finish_session.
+        let body = r#"{"user": "a\"b\\c", "prompt": "hi"}"#;
+        assert_eq!(
+            extract_session_id(Some(body), None),
+            Some(r#"a"b\c"#.to_string())
+        );
+        let body = r#"{"session_id": "café"}"#;
+        assert_eq!(
+            extract_session_id(Some(body), None),
+            Some("café".to_string())
+        );
     }
 
     #[test]
-    fn test_extract_session_id_ignores_unrelated_nested_fields() {
-        let body = r#"{"metadata":{"session_id":"not-a-session"},"user":null}"#;
+    fn test_extract_session_id_reads_top_level_fields_only() {
+        // "role": "user" inside messages is not the top-level user field.
+        let body = r#"{"messages": [{"role": "user", "content": "hi"}], "user": "traj-1"}"#;
+        assert_eq!(
+            extract_session_id(Some(body), None),
+            Some("traj-1".to_string())
+        );
+        // Field names inside prompt or message text are not session ids.
+        let body = r#"{"prompt": "Transcript\nuser: Bob says hi"}"#;
         assert_eq!(extract_session_id(Some(body), None), None);
+        let body = r#"{"messages": [{"role": "user", "content": "session_id: s1"}]}"#;
+        assert_eq!(extract_session_id(Some(body), None), None);
+    }
+
+    #[test]
+    fn test_extract_session_id_non_json_text() {
+        // Regular mode passes the prompt or another routing string, not JSON.
+        assert_eq!(extract_session_id(Some("user: Alice asked"), None), None);
+        assert_eq!(extract_session_id(Some("traj-7"), None), None);
+        assert_eq!(extract_session_id(Some(""), None), None);
+    }
+
+    #[test]
+    fn test_extract_session_id_body_precedence() {
+        let body = r#"{"user_id": "d", "session_id": "c", "user": "b", "session_params": {"session_id": "a"}}"#;
+        assert_eq!(extract_session_id(Some(body), None), Some("a".to_string()));
+        let body = r#"{"user_id": "d", "session_id": "c", "user": "b"}"#;
+        assert_eq!(extract_session_id(Some(body), None), Some("b".to_string()));
+        let body = r#"{"user_id": "d", "session_id": "c"}"#;
+        assert_eq!(extract_session_id(Some(body), None), Some("c".to_string()));
+        let body = r#"{"user_id": "d"}"#;
+        assert_eq!(extract_session_id(Some(body), None), Some("d".to_string()));
+    }
+
+    #[test]
+    fn test_extract_session_id_value_types() {
+        // Numbers are accepted; empty strings, null and other types fall
+        // through to the next field.
+        let body = r#"{"user_id": 42}"#;
+        assert_eq!(extract_session_id(Some(body), None), Some("42".to_string()));
+        let body = r#"{"user": "", "session_id": null, "user_id": "u"}"#;
+        assert_eq!(extract_session_id(Some(body), None), Some("u".to_string()));
+        let body = r#"{"session_params": "s", "user": {"id": 1}, "session_id": "c"}"#;
+        assert_eq!(extract_session_id(Some(body), None), Some("c".to_string()));
     }
 }

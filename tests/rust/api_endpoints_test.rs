@@ -33,6 +33,7 @@ impl TestContext {
             mode: RoutingMode::Regular {
                 worker_urls: vec![],
             },
+            pd_kv_event_sources: Default::default(),
             policy: PolicyConfig::Random,
             host: "127.0.0.1".to_string(),
             port: 3002,
@@ -1180,6 +1181,8 @@ mod router_policy_tests {
                 json!({"input": "hello", "user_id": "responses-user"}),
                 6,
             ),
+            ("/generate", json!({"prompt": "hello", "session_id": 41}), 7),
+            ("/generate", json!({"prompt": "hello", "user_id": 42}), 8),
         ] {
             let request = Request::builder()
                 .method("POST")
@@ -1209,7 +1212,7 @@ mod router_policy_tests {
             app.clone().oneshot(request).await.unwrap().status(),
             StatusCode::OK
         );
-        assert_eq!(policy.active_session_count(), 7);
+        assert_eq!(policy.active_session_count(), 9);
 
         let unauthorized = Request::builder()
             .method("POST")
@@ -1220,12 +1223,14 @@ mod router_policy_tests {
             app.clone().oneshot(unauthorized).await.unwrap().status(),
             StatusCode::UNAUTHORIZED
         );
-        assert_eq!(policy.active_session_count(), 7);
+        assert_eq!(policy.active_session_count(), 9);
 
         for (session, remaining) in [
-            ("ignored-body", 7),
-            ("header-session", 6),
-            ("header-session", 6),
+            ("ignored-body", 9),
+            ("header-session", 8),
+            ("header-session", 8),
+            ("41", 7),
+            ("42", 6),
             ("generate-session", 5),
             ("generate-user", 4),
             ("responses-session", 3),
@@ -1745,6 +1750,7 @@ mod error_tests {
             mode: RoutingMode::Regular {
                 worker_urls: vec![],
             },
+            pd_kv_event_sources: Default::default(),
             policy: PolicyConfig::Random,
             host: "127.0.0.1".to_string(),
             port: 3010,
@@ -2110,6 +2116,7 @@ mod pd_mode_tests {
                 decode_policy: None,
                 discovery_address: None,
             },
+            pd_kv_event_sources: Default::default(),
             policy: PolicyConfig::Random,
             host: "127.0.0.1".to_string(),
             port: 3011,
@@ -2278,6 +2285,7 @@ mod request_id_tests {
             mode: RoutingMode::Regular {
                 worker_urls: vec![],
             },
+            pd_kv_event_sources: Default::default(),
             policy: PolicyConfig::Random,
             host: "127.0.0.1".to_string(),
             port: 3002,

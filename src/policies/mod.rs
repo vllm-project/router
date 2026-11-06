@@ -20,17 +20,19 @@ mod rendezvous_hash;
 mod round_robin;
 mod sticky_least_loaded;
 
+pub(crate) use cache_aware::PreparedCacheSelection;
 pub use cache_aware::{CacheAwareCandidate, CacheAwarePlacement, CacheAwarePolicy};
 pub use consistent_hash::ConsistentHashPolicy;
 pub use consistent_hash::VIRTUAL_NODES_PER_WORKER;
 pub use factory::PolicyFactory;
-pub(crate) use kv_aware::KvAffinityTable;
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
+pub(crate) use kv_aware::kv_aware_policy;
 pub use kv_aware::{
-    cost_components, kv_aware_ops, AffinityKey, CandidateView, CostComponents, CostDecision,
-    CostParams, InMemorySlotManager, KvAwareOps, KvAwarePolicy, KvRequestSlot, KvRequestTokens,
-    KvSelectionReceipt, LoadProvider, LoadSample, MultiplicativeScorer, Picker, Scorer,
-    SelectionError, SlotManager, TemperaturePicker, TieredMatchProvider, TransferCredits,
-    WorkerTokenInputs,
+    cost_components, kv_aware_ops, AffinityKey, AffinityRecord, CandidateView, CostComponents,
+    CostDecision, CostParams, InMemorySlotManager, KvAffinityTable, KvAwareOps, KvAwarePolicy,
+    KvRequestSlot, KvRequestTokens, KvSelectionReceipt, LoadProvider, LoadSample,
+    MultiplicativeScorer, Picker, PrefillWorkEstimate, Scorer, SelectionError, SlotManager,
+    StagePick, TemperaturePicker, TieredMatchProvider, TransferCredits, WorkerTokenInputs,
 };
 pub use power_of_two::PowerOfTwoPolicy;
 pub use random::RandomPolicy;
@@ -139,7 +141,7 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
     /// Mark a session (e.g. an RL trajectory) as finished.
     ///
     /// Session-aware policies (e.g. `sticky_least_loaded`) use this to
-    /// release the active-session assignment. Stateless policies, and
+    /// release the replica capacity held by the session. Stateless policies, and
     /// policies that don't track sessions, ignore this.
     fn finish_session(&self, _session_id: &str) {
         // Default: no-op for policies that don't track sessions
@@ -153,8 +155,7 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
         false // Default: most policies don't need request text
     }
 
-    /// Whether typed routes should supply the serialized body instead of their
-    /// prompt-derived routing key, for policies that inspect structured fields.
+    /// Whether routing requires the serialized request body rather than prompt text.
     fn needs_request_body(&self) -> bool {
         false
     }

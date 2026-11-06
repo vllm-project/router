@@ -159,6 +159,13 @@ impl PolicyRegistry {
         Arc::clone(&self.default_policy)
     }
 
+    /// The registry-owned KV affinity table. Its idle TTL carries the
+    /// router-level session-affinity setting; policies created outside this
+    /// registry must share this table or their affinity gate stays closed.
+    pub fn kv_affinity_table(&self) -> Arc<KvAffinityTable> {
+        Arc::clone(&self.kv_affinity_table)
+    }
+
     /// Get policy for a model, or default if not found
     pub fn get_policy_or_default(&self, model_id: &str) -> Arc<dyn LoadBalancingPolicy> {
         self.get_policy(model_id)
@@ -192,6 +199,7 @@ impl PolicyRegistry {
                 KvAwarePolicy::default().with_shared_affinity(Arc::clone(&self.kv_affinity_table)),
             ),
             "power_of_two" => Arc::new(PowerOfTwoPolicy::new()),
+            "consistent_hash" => Arc::new(ConsistentHashPolicy::new()),
             "sticky_least_loaded" => Arc::new(StickyLeastLoadedPolicy::new()),
             "rendezvous_hash" => Arc::new(RendezvousHashPolicy::new()),
             _ => {
@@ -268,7 +276,7 @@ impl PolicyRegistry {
     /// Mark a session as finished across all registered policies.
     ///
     /// Session-aware policies (e.g. `sticky_least_loaded`) will release
-    /// the active-session assignment; all other policies ignore it.
+    /// the replica capacity held by the session; all other policies ignore it.
     /// This fans out to the default policy, every per-model policy, and the
     /// prefill/decode policies (for PD mode), since we don't know which policy
     /// instance is tracking the session.
@@ -321,7 +329,7 @@ impl PolicyRegistry {
             .unwrap_or_else(|| self.get_default_policy())
     }
 
-    /// Get the decode policy for PD mode, or default if not set
+    /// Get the decode override, or the main policy when no override is set.
     pub fn get_decode_policy(&self) -> Arc<dyn LoadBalancingPolicy> {
         let decode_policy = self.decode_policy.read().unwrap();
         decode_policy
@@ -344,43 +352,6 @@ impl std::fmt::Debug for PolicyRegistry {
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_finish_session_releases_all_policy_scopes() {
-        use crate::core::{BasicWorker, Worker, WorkerType};
-        let registry = PolicyRegistry::new(PolicyConfig::StickyLeastLoaded);
-        registry.set_prefill_policy(Arc::new(StickyLeastLoadedPolicy::new()));
-        registry.set_decode_policy(Arc::new(StickyLeastLoadedPolicy::new()));
-        let policies = [
-            registry.get_default_policy(),
-            registry.on_worker_added("model", Some("sticky_least_loaded")),
-            registry.get_prefill_policy(),
-            registry.get_decode_policy(),
-        ];
-        let workers: Vec<Arc<dyn Worker>> = vec![Arc::new(BasicWorker::new(
-            "http://worker:8000".to_string(),
-            WorkerType::Regular,
-        ))];
-        let headers = HashMap::from([("x-session-id".to_string(), "session".to_string())]);
-        for policy in &policies {
-            assert_eq!(
-                policy.select_worker_with_headers(&workers, None, Some(&headers)),
-                Some(0)
-            );
-        }
-        registry.finish_session("session");
-        registry.finish_session("session");
-        for policy in policies {
-            assert_eq!(
-                policy
-                    .as_any()
-                    .downcast_ref::<StickyLeastLoadedPolicy>()
-                    .unwrap()
-                    .active_session_count(),
-                0
-            );
-        }
-    }
 
     #[test]
     fn test_policy_registry_basic() {

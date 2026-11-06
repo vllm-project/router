@@ -8,7 +8,7 @@ use super::{
     ProgramDispatch, ProgramIdentity, ProgramRef, ProgramRequestHandle, ProgramRequestHints,
     ProgramState, ProgramStatus, ProgramUsageObservation,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 /// Mutable protocol-neutral Program runtime owned by ProgramScheduler.
@@ -19,6 +19,7 @@ pub struct ProgramRuntime {
     released_generations_at: HashMap<RuntimeKey, Instant>,
     request_pool: RequestPool,
     next_placement_epoch: u64,
+    next_attempt_id: u64,
 }
 
 impl ProgramRuntime {
@@ -62,6 +63,7 @@ impl ProgramRuntime {
                     placement_start_request_pending: false,
                     estimated_context_tokens,
                     in_flight_requests: 0,
+                    active_attempts: HashSet::new(),
                 },
             );
             reference
@@ -111,9 +113,15 @@ impl ProgramRuntime {
         program.placement_start_request_pending = false;
         let request = self.request_pool.take_front(handle)?;
         program.status = ProgramStatus::Reasoning;
+        self.next_attempt_id = self
+            .next_attempt_id
+            .checked_add(1)
+            .expect("Program attempt ID exhausted");
+        program.active_attempts.insert(self.next_attempt_id);
         program.in_flight_requests = program.in_flight_requests.saturating_add(1);
         self.request_pool.notify_front(&program.reference);
         Some(ProgramDispatch::new(
+            self.next_attempt_id,
             program.reference.clone(),
             target_id,
             program.placement_epoch,
@@ -124,6 +132,51 @@ impl ProgramRuntime {
             request.routing_text,
             request.hints,
         ))
+    }
+
+    /// Replace a failed pre-output transport attempt without opening a successor's
+    /// serial slot. The scheduler independently rechecks the existing reservation.
+    pub(crate) fn restart_attempt(
+        &mut self,
+        old: &ProgramDispatch,
+        now: Instant,
+    ) -> Option<ProgramDispatch> {
+        if !self.is_live_attempt(old) {
+            return None;
+        }
+        self.next_attempt_id = self.next_attempt_id.checked_add(1)?;
+        let program = self.programs.get_mut(&RuntimeKey::from(old.program()))?;
+        program.active_attempts.remove(&old.attempt_id());
+        program.active_attempts.insert(self.next_attempt_id);
+        let mut replacement = ProgramDispatch::new(
+            self.next_attempt_id,
+            old.program().clone(),
+            old.target_id.clone(),
+            old.placement_epoch(),
+            old.request_arrived_at(),
+            now,
+            old.estimated_context_tokens(),
+            old.placement_start_request(),
+            old.routing_text().map(str::to_string),
+            old.request_hints().clone(),
+        );
+        replacement.attach_prediction_context(
+            old.expected_resume(),
+            old.pending_output_prediction().cloned(),
+        );
+        Some(replacement)
+    }
+
+    /// Test an exact live attempt before accepting PD metadata.
+    pub fn is_live_attempt(&self, dispatch: &ProgramDispatch) -> bool {
+        self.programs
+            .get(&RuntimeKey::from(dispatch.program()))
+            .is_some_and(|p| {
+                p.reference == *dispatch.program()
+                    && p.placement.as_deref() == Some(dispatch.target_id.as_str())
+                    && p.placement_epoch == dispatch.placement_epoch()
+                    && p.active_attempts.contains(&dispatch.attempt_id())
+            })
     }
 
     /// Record one request completion if its generation and placement are current.
@@ -139,6 +192,7 @@ impl ProgramRuntime {
         if &program.reference != dispatch.program()
             || program.placement_epoch != dispatch.placement_epoch()
             || program.in_flight_requests == 0
+            || !program.active_attempts.remove(&dispatch.attempt_id())
         {
             return false;
         }
@@ -281,6 +335,7 @@ impl ProgramRuntime {
         program.placement_epoch = self.next_placement_epoch;
         program.placement_start_request_pending = false;
         program.in_flight_requests = 0;
+        program.active_attempts.clear();
         true
     }
 
@@ -316,6 +371,11 @@ impl ProgramRuntime {
         program_ref: &ProgramRef,
     ) -> Option<&ProgramRequestHints> {
         self.request_pool.front_hints(program_ref)
+    }
+
+    /// Prompt estimate belonging to the Program's front retained turn.
+    pub(crate) fn front_request_context(&self, program_ref: &ProgramRef) -> Option<usize> {
+        self.request_pool.front_context_tokens(program_ref)
     }
 
     /// Immutable lifecycle view used by scheduling decisions under one lock.
@@ -410,6 +470,7 @@ struct RuntimeProgram {
     placement_start_request_pending: bool,
     estimated_context_tokens: usize,
     in_flight_requests: usize,
+    active_attempts: HashSet<u64>,
 }
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
@@ -536,5 +597,27 @@ mod tests {
             runtime.state(dispatch.program()),
             Some((ProgramState::Paused, ProgramStatus::Acting))
         );
+    }
+    #[test]
+    fn duplicate_completion_cannot_settle_a_successor_in_the_same_epoch() {
+        let mut runtime = ProgramRuntime::default();
+        let program = identity("attempts");
+        let a = runtime.retain_request(&program, 100, None, Instant::now());
+        let first = runtime
+            .admit_front(&a, "rank-0".into(), Instant::now())
+            .unwrap();
+        assert!(runtime.complete_request(&first, None.into()));
+        let b = runtime.retain_request(&program, 110, None, Instant::now());
+        let second = runtime
+            .admit_front(&b, "rank-0".into(), Instant::now())
+            .unwrap();
+        assert_eq!(first.placement_epoch(), second.placement_epoch());
+        assert_ne!(first.attempt_id(), second.attempt_id());
+        assert!(!runtime.complete_request(&first, None.into()));
+        assert_eq!(
+            runtime.view(second.program()).unwrap().in_flight_requests,
+            1
+        );
+        assert!(runtime.complete_request(&second, None.into()));
     }
 }

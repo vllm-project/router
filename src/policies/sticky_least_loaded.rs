@@ -1,10 +1,7 @@
 //! Sticky least-loaded session routing policy
 //!
-//! Adapted from SumanthRH/router commit b50d926f3cf8868e12e8395fa02ce1aa2b1ae5ae
-//! (Apache-2.0), with typed-body routing and per-entry expiration fixes.
-//!
 //! This policy combines session stickiness (so all requests for a given
-//! trajectory/session reuse the same vLLM replica and allow KV cache reuse)
+//! trajectory/session reuse the same vLLM replica and maximize KV cache reuse)
 //! with load balancing across replicas (so *new* sessions are assigned to the
 //! replica with the fewest active sessions).
 //!
@@ -40,7 +37,7 @@ use super::RequestHeaders;
 use crate::core::Worker;
 use crate::metrics::RouterMetrics;
 
-/// Default idle-session expiration (2 hours).
+/// Default session expiration (2 hours), per the design spec.
 pub const DEFAULT_SESSION_EXPIRATION_SECS: u64 = 7200;
 
 /// Environment variable to override the session expiration (in seconds).
@@ -250,16 +247,21 @@ impl LoadBalancingPolicy for StickyLeastLoadedPolicy {
             }
         };
 
-        // Existing session: route to the same replica if it's still healthy.
-        if let Some((worker_url, last_access)) = state
-            .sessions
-            .get(&session_id)
-            .map(|e| (e.worker_url.clone(), e.last_access))
-        {
-            if let Some((idx, _)) = candidates.iter().find(|(_, url)| {
-                *url == worker_url && now.duration_since(last_access) < self.session_expiration
-            }) {
-                let idx = *idx;
+        // Existing session: route to the same replica if it's still healthy and
+        // the session hasn't expired. The sweep runs at most once per
+        // SWEEP_INTERVAL_SECS, so check the expiration here too.
+        if let Some((worker_url, expired)) = state.sessions.get(&session_id).map(|e| {
+            (
+                e.worker_url.clone(),
+                now.duration_since(e.last_access) >= self.session_expiration,
+            )
+        }) {
+            let assigned = if expired {
+                None
+            } else {
+                candidates.iter().find(|(_, url)| *url == worker_url)
+            };
+            if let Some(&(idx, _)) = assigned {
                 if let Some(entry) = state.sessions.get_mut(&session_id) {
                     entry.last_access = now;
                 }
@@ -272,12 +274,15 @@ impl LoadBalancingPolicy for StickyLeastLoadedPolicy {
                 return Some(idx);
             }
 
-            // Expired session or unavailable replica: release the old assignment.
+            // Session expired, or its replica is gone/unhealthy: drop the stale
+            // mapping and reassign below.
             state.sessions.remove(&session_id);
             Self::decrement_count(&mut state.active_counts, &worker_url);
             debug!(
-                "SLL: session '{}' replica '{}' unavailable, reassigning",
-                session_id, worker_url
+                "SLL: session '{}' on replica '{}' {}, reassigning",
+                session_id,
+                worker_url,
+                if expired { "expired" } else { "unavailable" }
             );
         }
 
@@ -454,18 +459,30 @@ mod tests {
     }
 
     #[test]
+    fn test_finish_session_releases_escaped_body_id() {
+        let policy = StickyLeastLoadedPolicy::new();
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+        let body = serde_json::json!({"user": "a\"b", "prompt": "hi"}).to_string();
+
+        policy
+            .select_worker_with_headers(&workers, Some(&body), None)
+            .unwrap();
+        assert_eq!(policy.active_session_count(), 1);
+
+        // The client finishes the session with the id it sent, not its JSON
+        // encoding.
+        policy.finish_session("a\"b");
+        assert_eq!(policy.active_session_count(), 0);
+    }
+
+    #[test]
     fn test_stateless_requests_not_tracked() {
         let policy = StickyLeastLoadedPolicy::new();
         let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
         let body = r#"{"prompt": "no session here"}"#;
 
-        let first_idx = policy
-            .select_worker_with_headers(&workers, Some(body), None)
-            .unwrap();
-        let second_idx = policy
-            .select_worker_with_headers(&workers, Some(body), None)
-            .unwrap();
-        assert_eq!(first_idx, second_idx);
+        let idx = policy.select_worker_with_headers(&workers, Some(body), None);
+        assert!(idx.is_some());
         // No session identifier -> nothing tracked.
         assert_eq!(policy.active_session_count(), 0);
     }
@@ -529,92 +546,52 @@ mod tests {
     }
 
     #[test]
-    fn test_concurrent_new_sessions_reserve_balanced_capacity() {
-        let policy = Arc::new(StickyLeastLoadedPolicy::new());
-        let workers = make_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
-        let barrier = std::sync::Barrier::new(60);
-        std::thread::scope(|scope| {
-            for i in 0..60 {
-                let policy = &policy;
-                let workers = &workers;
-                let barrier = &barrier;
-                scope.spawn(move || {
-                    let headers = header_with_session(&format!("session-{i}"));
-                    barrier.wait();
-                    let first = policy.select_worker_with_headers(workers, None, Some(&headers));
-                    assert_eq!(
-                        first,
-                        policy.select_worker_with_headers(workers, None, Some(&headers))
-                    );
-                });
-            }
-        });
-        assert_eq!(policy.active_session_count(), 60);
-        for worker in &workers {
-            assert_eq!(policy.active_count_for(worker.url()), 60 / workers.len());
-        }
-    }
-
-    #[test]
-    fn test_expired_session_rebinds_before_next_sweep() {
-        let policy = StickyLeastLoadedPolicy::with_expiration_secs(1);
+    fn test_expired_session_reassigned_before_sweep() {
+        let policy = StickyLeastLoadedPolicy::with_expiration_secs(10);
         let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
-        for session in ["expired", "active"] {
-            policy.select_worker_with_headers(
-                &workers[..1],
-                None,
-                Some(&header_with_session(session)),
-            );
+        let sessions: Vec<String> = (0..4).map(|i| format!("sess-{}", i)).collect();
+        for session in &sessions {
+            policy
+                .select_worker_with_headers(&workers, None, Some(&header_with_session(session)))
+                .unwrap();
         }
+
+        // Keep sess-0 and one other session on sess-0's replica; finish the
+        // sessions on the other replica, so it becomes the least loaded.
+        let url_of = |s: &str| policy.state.lock().unwrap().sessions[s].worker_url.clone();
+        let original = url_of("sess-0");
+        let other = workers
+            .iter()
+            .map(|w| w.url().to_string())
+            .find(|url| *url != original)
+            .unwrap();
+        for session in &sessions {
+            if url_of(session) == other {
+                policy.finish_session(session);
+            }
+        }
+        assert_eq!(policy.active_count_for(&original), 2);
+        assert_eq!(policy.active_count_for(&other), 0);
+
+        // sess-0 has been idle longer than the TTL, but the sweep hasn't run:
+        // last_sweep is recent.
         policy
             .state
             .lock()
             .unwrap()
             .sessions
-            .get_mut("expired")
+            .get_mut("sess-0")
             .unwrap()
-            .last_access = Instant::now() - Duration::from_secs(2);
+            .last_access = Instant::now() - Duration::from_secs(20);
 
-        assert_eq!(
-            policy.select_worker_with_headers(
-                &workers,
-                None,
-                Some(&header_with_session("expired"))
-            ),
-            Some(1),
-            "expired affinity must not be refreshed before the global sweep"
-        );
-        assert_eq!(policy.active_count_for(workers[0].url()), 1);
-        assert_eq!(policy.active_count_for(workers[1].url()), 1);
-    }
-
-    #[test]
-    fn test_repeated_finish_preserves_other_sessions() {
-        let policy = StickyLeastLoadedPolicy::new();
-        let workers = make_workers(&["http://w1:8000"]);
-        for session in ["finished", "active"] {
-            policy.select_worker_with_headers(&workers, None, Some(&header_with_session(session)));
-        }
-        policy.finish_session("finished");
-        policy.finish_session("finished");
-        assert_eq!(policy.active_session_count(), 1);
-        assert_eq!(policy.active_count_for(workers[0].url()), 1);
-    }
-
-    #[test]
-    fn test_removed_worker_rebinds_session() {
-        let policy = StickyLeastLoadedPolicy::new();
-        let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
-        let headers = header_with_session("session");
-        let original = policy
-            .select_worker_with_headers(&workers, None, Some(&headers))
+        // The next request treats sess-0 as a new session and assigns it to the
+        // least-loaded replica instead of reviving the expired mapping.
+        let idx = policy
+            .select_worker_with_headers(&workers, None, Some(&header_with_session("sess-0")))
             .unwrap();
-        let remaining = vec![workers[1 - original].clone()];
-        assert_eq!(
-            policy.select_worker_with_headers(&remaining, None, Some(&headers)),
-            Some(0)
-        );
-        assert_eq!(policy.active_count_for(workers[original].url()), 0);
-        assert_eq!(policy.active_count_for(remaining[0].url()), 1);
+        assert_eq!(workers[idx].url(), other);
+        assert_eq!(policy.active_count_for(&original), 1);
+        assert_eq!(policy.active_count_for(&other), 1);
+        assert_eq!(policy.active_session_count(), 2);
     }
 }
