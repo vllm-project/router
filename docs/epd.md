@@ -98,6 +98,9 @@ Dynamic P/D discovery is not supported with EPD yet.
 
 ## Data-parallel consumers
 
+E and P/PD instance counts are independent. For example, 2E+1PD or 4E+2PD
+can use different numbers of encoder and worker URLs with DP left at 1/unset.
+
 For combined PD, set `--intra-node-data-parallel-size` to the server's DP size.
 For separate P/D, each endpoint's DP size is discovered from `/metrics`; the flag
 is only a fallback when metrics are unavailable. The router
@@ -123,9 +126,11 @@ Mooncake assigns replica `r` the control port `ec_port + r * TP`; list each
 replica's first TP shard. The example above assumes TP=1. With separate P/D,
 the map references P replicas, not D, including all discovered ranks when P
 endpoints have different DP sizes. With DP>1, URLs explicitly ending in `@rank`
-remain pinned to that replica rather than being expanded again. The map is
-checked against the resolved workers at startup. Missing rank mappings fail before encoder
-dispatch rather than sending embeddings to another replica. NIXL PULL and
+remain pinned to that replica rather than being expanded again; a rank must be
+less than the endpoint's DP size. The map is checked against the resolved workers
+during router construction, after DP discovery. `ConfigValidator::validate()`
+checks configuration syntax, not map coverage. Missing rank mappings fail before
+encoder dispatch and identify the missing URL. NIXL PULL and
 ECExampleConnector need no address map. DP=1 keeps the unsuffixed keys shown above.
 
 ```bash

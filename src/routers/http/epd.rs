@@ -116,12 +116,16 @@ impl EncoderStage {
             return Ok(());
         }
         let urls: HashSet<_> = urls.collect();
-        if urls.is_empty()
-            || config.consumer_zmq_addrs.len() != urls.len()
-            || urls
-                .iter()
-                .any(|url| !config.consumer_zmq_addrs.contains_key(*url))
+        if let Some(url) = urls
+            .iter()
+            .filter(|url| !config.consumer_zmq_addrs.contains_key(**url))
+            .min()
         {
+            return Err(format!(
+                "EPD consumer_zmq_addrs is missing resolved consumer URL: {url}"
+            ));
+        }
+        if urls.is_empty() || config.consumer_zmq_addrs.len() != urls.len() {
             return Err("EPD consumer_zmq_addrs must map every resolved embedding consumer URL exactly once".into());
         }
         Ok(())

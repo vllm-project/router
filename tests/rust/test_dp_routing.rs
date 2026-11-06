@@ -451,10 +451,12 @@ mod dp_e2e_tests {
                         .unwrap()
                         .consumer_zmq_addrs
                         .remove(&format!("{consumer}@1"));
+                    // Map coverage is checked after discovery, not by syntax validation.
                     ConfigValidator::validate(&incomplete).unwrap();
                     let context = common::create_test_context(incomplete);
                     let error = RouterFactory::create_router(&context).await.err().unwrap();
                     assert!(error.contains("consumer_zmq_addrs"), "{error}");
+                    assert!(error.contains(&format!("{consumer}@1")), "{error}");
                 }
                 let context = common::create_test_context(config);
                 let router = RouterFactory::create_router(&context).await.unwrap();
@@ -538,6 +540,28 @@ mod dp_e2e_tests {
     }
 
     #[tokio::test]
+    async fn test_epd_regular_rejects_an_out_of_range_consumer() {
+        use vllm_router_rs::config::EpdConfig;
+
+        let (base, seen, server) = epd_server().await;
+        for rank in [2, 5] {
+            let consumer = format!("{base}/pd@{rank}");
+            let mut config = make_regular_config(vec![consumer.clone()], 2);
+            config.port = 8000;
+            config.epd = Some(EpdConfig {
+                encoder_urls: vec![format!("{base}/e")],
+                consumer_zmq_addrs: [(consumer.clone(), "tcp://127.0.0.1:19001".into())].into(),
+            });
+            let context = common::create_test_context(config);
+            let error = RouterFactory::create_router(&context).await.err().unwrap();
+            assert!(error.contains(&consumer), "{error}");
+            assert!(error.contains("DP size 2"), "{error}");
+        }
+        assert!(seen.lock().unwrap().is_empty());
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn test_epd_address_map_matches_discovered_prefill_ranks() {
         use vllm_router_rs::config::{ConfigValidator, EpdConfig};
 
@@ -577,6 +601,7 @@ mod dp_e2e_tests {
         let context = common::create_test_context(config);
         let error = RouterFactory::create_router(&context).await.err().unwrap();
         assert!(error.contains("consumer_zmq_addrs"), "{error}");
+        assert!(error.contains(&format!("{base}/p1@2")), "{error}");
         server.abort();
     }
 

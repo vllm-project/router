@@ -99,7 +99,12 @@ pub async fn get_dp_aware_workers(
     let mut dp_aware_workers: Vec<String> = Vec::new();
 
     for url in worker_urls {
-        if extract_dp_rank(url).is_ok() {
+        if let Ok((_, rank)) = extract_dp_rank(url) {
+            if rank >= dp_size {
+                return Err(format!(
+                    "Worker {url} has rank {rank} outside DP size {dp_size}"
+                ));
+            }
             dp_aware_workers.push(url.clone());
             continue;
         }
