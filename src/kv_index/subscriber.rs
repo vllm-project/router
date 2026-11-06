@@ -1,7 +1,7 @@
 //! ZMQ SUB + DEALER replay subscriber, one task per (worker, rank).
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, info, warn};
@@ -9,9 +9,12 @@ use tracing::{debug, info, warn};
 use crate::kv_index::admit::{validate_full_attention_batch, FullAttentionBatchRejection};
 use crate::kv_index::binding::SourceLease;
 use crate::kv_index::indexer::KvBlockIndexer;
-use crate::kv_index::types::{ClearScope, ResidencyOwner, SourceId, StorageTier};
+use crate::kv_index::types::{
+    ClearScope, ResidencyOwner, SourceId, SourceRecoveryReason, StorageTier,
+};
 use crate::kv_index::wire::{ExternalBlockHash, KVEvent, KVEventBatch};
 use crate::kv_index::{decode_batch, IngestionSignal};
+use crate::metrics::RouterMetrics;
 
 /// sha256 of each block's token-id bytes, seeded by `lora_name`.
 /// The seed is re-applied per block (no parent chaining here) so identical
@@ -137,6 +140,8 @@ fn spawn_inner(
     let hwm = source.hwm;
     let signals = signal_tx;
 
+    indexer.register_source(&source_id, dp_rank);
+
     tokio::spawn(async move {
         let sub = match ctx.socket(zmq::SUB) {
             Ok(s) => s,
@@ -162,7 +167,6 @@ fn spawn_inner(
 
         let mut last_seq: i64 = -1;
         let mut incarnation: u64 = 0;
-        let mut suspended = false;
         let mut full_attention_rejection_reported = false;
 
         loop {
@@ -186,13 +190,16 @@ fn spawn_inner(
                     }
                     if frames.len() != 3 || frames[1].len() != 8 {
                         if with_binding(binding.as_ref(), |_| {
-                            indexer.invalidate_source(&source_id, dp_rank);
+                            indexer.invalidate_source_for(
+                                &source_id,
+                                dp_rank,
+                                SourceRecoveryReason::InvalidFrame,
+                            );
                         })
                         .is_none()
                         {
                             break;
                         }
-                        suspended = true;
                         tokio::task::yield_now().await;
                         continue;
                     }
@@ -207,13 +214,16 @@ fn spawn_inner(
                             source_id, seq, last_seq, incarnation
                         );
                         if with_binding(binding.as_ref(), |_| {
-                            indexer.invalidate_source(&source_id, dp_rank);
+                            indexer.invalidate_source_for(
+                                &source_id,
+                                dp_rank,
+                                SourceRecoveryReason::IncarnationReset,
+                            );
                         })
                         .is_none()
                         {
                             break;
                         }
-                        suspended = true;
                         last_seq = -1;
                         emit(
                             &signals,
@@ -242,13 +252,16 @@ fn spawn_inner(
                         let from = last_seq + 1;
                         let to = if !valid_rank { seq } else { seq - 1 };
                         if with_binding(binding.as_ref(), |_| {
-                            indexer.suspend_source(&source_id, dp_rank);
+                            indexer.suspend_source_for(
+                                &source_id,
+                                dp_rank,
+                                SourceRecoveryReason::SequenceGap,
+                            );
                         })
                         .is_none()
                         {
                             break;
                         }
-                        suspended = true;
                         emit(
                             &signals,
                             IngestionSignal::Gap {
@@ -257,7 +270,8 @@ fn spawn_inner(
                                 to_seq: to,
                             },
                         );
-                        if let Some(ep) = replay_endpoint.as_deref() {
+                        let recovery_failure_reason = if let Some(ep) = replay_endpoint.as_deref() {
+                            let replay_started = Instant::now();
                             if let Some(last_replay) = replay(
                                 ep,
                                 last_seq,
@@ -275,15 +289,24 @@ fn spawn_inner(
                             )
                             .await
                             {
+                                RouterMetrics::record_kv_replay_outcome(
+                                    &source_id,
+                                    dp_rank,
+                                    "success",
+                                    Some(replay_started.elapsed()),
+                                );
                                 last_seq = last_replay;
                                 if with_binding(binding.as_ref(), |_| {
-                                    indexer.resume_source(&source_id, dp_rank);
+                                    indexer.resume_source_for(
+                                        &source_id,
+                                        dp_rank,
+                                        SourceRecoveryReason::ReplayApplied,
+                                    );
                                 })
                                 .is_none()
                                 {
                                     break;
                                 }
-                                suspended = false;
                                 emit(
                                     &signals,
                                     IngestionSignal::ReplayApplied {
@@ -294,6 +317,12 @@ fn spawn_inner(
                                 tokio::task::yield_now().await;
                                 continue;
                             }
+                            RouterMetrics::record_kv_replay_outcome(
+                                &source_id,
+                                dp_rank,
+                                "failed",
+                                Some(replay_started.elapsed()),
+                            );
                             #[cfg(test)]
                             if let Some(barrier) = binding
                                 .as_ref()
@@ -302,7 +331,16 @@ fn spawn_inner(
                                 barrier.wait().await;
                                 barrier.wait().await;
                             }
-                        }
+                            SourceRecoveryReason::ReplayFailed
+                        } else {
+                            RouterMetrics::record_kv_replay_outcome(
+                                &source_id,
+                                dp_rank,
+                                "unavailable",
+                                None,
+                            );
+                            SourceRecoveryReason::ReplayUnavailable
+                        };
                         // Partial replay can include stores whose later
                         // evictions were lost. Never expose that partial state.
                         //
@@ -311,7 +349,11 @@ fn spawn_inner(
                         // candidates and their leases are dropped as well.
                         crate::kv_index::record_signal_loss();
                         if with_binding(binding.as_ref(), |_| {
-                            indexer.invalidate_source(&source_id, dp_rank);
+                            indexer.invalidate_source_for(
+                                &source_id,
+                                dp_rank,
+                                recovery_failure_reason,
+                            );
                         })
                         .is_none()
                         {
@@ -319,11 +361,16 @@ fn spawn_inner(
                         }
                     }
                     if let Some(batch) = batch {
-                        // After unrecoverable loss, credit only fresh observations
-                        // on the now-clean source; absence is a conservative miss.
+                        // Keep ingesting fresh observations while the source stays
+                        // hidden. Only an authoritative replay, initial sequence,
+                        // or clear barrier can restore placement credit.
                         let applied = with_binding(binding.as_ref(), |strict| {
                             match batch_rank(batch.data_parallel_rank, dp_rank, strict) {
                                 BatchRank::Owned => {
+                                    let clear_barrier = batch
+                                        .events
+                                        .iter()
+                                        .any(|event| matches!(event, KVEvent::AllBlocksCleared(_)));
                                     if let Err(rejection) = apply_batch(
                                         &indexer,
                                         &source_id,
@@ -338,22 +385,46 @@ fn spawn_inner(
                                             dp_rank,
                                             &mut full_attention_rejection_reported,
                                         );
-                                        indexer.invalidate_source(&source_id, dp_rank);
-                                        suspended = true;
+                                        indexer.invalidate_source_for(
+                                            &source_id,
+                                            dp_rank,
+                                            SourceRecoveryReason::ValidationFailed,
+                                        );
                                         return false;
                                     }
-                                    // Promotion/retirement may have invalidated the
-                                    // source outside this task's local state.
-                                    if suspended || binding.is_some() {
-                                        indexer.resume_source(&source_id, dp_rank);
-                                        suspended = false;
+                                    let initial_boundary =
+                                        incarnation == 0 && last_seq == -1 && seq == 0;
+                                    if clear_barrier || initial_boundary {
+                                        indexer.resume_source_for(
+                                            &source_id,
+                                            dp_rank,
+                                            if clear_barrier {
+                                                SourceRecoveryReason::ClearBarrier
+                                            } else {
+                                                SourceRecoveryReason::InitialSequence
+                                            },
+                                        );
                                     }
                                     true
                                 }
-                                BatchRank::Foreign => true,
+                                BatchRank::Foreign => {
+                                    let initial_boundary =
+                                        incarnation == 0 && last_seq == -1 && seq == 0;
+                                    if initial_boundary {
+                                        indexer.resume_source_for(
+                                            &source_id,
+                                            dp_rank,
+                                            SourceRecoveryReason::InitialSequence,
+                                        );
+                                    }
+                                    true
+                                }
                                 BatchRank::Rejected => {
-                                    indexer.invalidate_source(&source_id, dp_rank);
-                                    suspended = true;
+                                    indexer.invalidate_source_for(
+                                        &source_id,
+                                        dp_rank,
+                                        SourceRecoveryReason::ValidationFailed,
+                                    );
                                     false
                                 }
                             }
@@ -1027,7 +1098,7 @@ mod tests {
             &pub_sock,
             &mut sig_rx,
             b"kv",
-            1,
+            0,
             1.0,
             &[KVEvent::BlockStored(BlockStored {
                 extra_keys: None,
@@ -1059,7 +1130,7 @@ mod tests {
             &pub_sock,
             &mut sig_rx,
             b"kv",
-            2,
+            1,
             2.0,
             &[KVEvent::BlockRemoved(BlockRemoved {
                 block_hashes: vec![ExternalBlockHash::Int(100)],
@@ -1080,7 +1151,7 @@ mod tests {
             &pub_sock,
             &mut sig_rx,
             b"kv",
-            3,
+            2,
             3.0,
             &[KVEvent::AllBlocksCleared(AllBlocksCleared {})],
             Some(0),
@@ -1285,7 +1356,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bound_active_frames_preserve_generation_and_external_invalidation_recovers() {
+    async fn bound_external_invalidation_requires_clear_barrier() {
         let ctx = Arc::new(zmq::Context::new());
         let publisher = ctx.socket(zmq::PUB).unwrap();
         let endpoint = "inproc://kv-bound-active-resume";
@@ -1342,8 +1413,8 @@ mod tests {
             assert_eq!(found[0].segments, [(0, 1)]);
         }
 
-        // External promotion/invalidation is not reflected by the subscriber's
-        // local `suspended` flag. Its next owned frame must still restore credit.
+        // External promotion/invalidation removes the source's authority.
+        // A later ordinary Store cannot re-establish the missing history.
         {
             let _guard = strict_rank.lock();
             indexer.invalidate_source(&SourceId::from("w0"), 0);
@@ -1360,11 +1431,26 @@ mod tests {
             Some(0),
         )
         .await;
-        assert_eq!(indexer.source_generation_for_test(), generation + 2);
+        assert_eq!(indexer.source_generation_for_test(), generation + 1);
         assert!(hits(&indexer, &old).is_empty());
         assert!(hits(&indexer, &current).is_empty());
+        assert!(hits(&indexer, &fresh).is_empty());
+        publish_until_advanced(
+            &publisher,
+            &mut signals,
+            b"kv",
+            3,
+            3.0,
+            &[
+                KVEvent::AllBlocksCleared(AllBlocksCleared {}),
+                store_event(102, &fresh),
+            ],
+            Some(0),
+        )
+        .await;
+        assert_eq!(indexer.source_generation_for_test(), generation + 2);
         assert_eq!(hits(&indexer, &fresh)[0].segments, [(0, 1)]);
-        publish_until_advanced(&publisher, &mut signals, b"kv", 3, 3.0, &[], Some(0)).await;
+        publish_until_advanced(&publisher, &mut signals, b"kv", 4, 4.0, &[], Some(0)).await;
         assert_eq!(indexer.source_generation_for_test(), generation + 2);
         assert_eq!(hits(&indexer, &fresh)[0].segments, [(0, 1)]);
         handle.shutdown();
@@ -1431,12 +1517,8 @@ mod tests {
         )
         .await;
         assert_eq!(advances, [2], "foreign sequence created an artificial gap");
-        assert_eq!(
-            hits(&f.indexer, &old).len(),
-            1,
-            "foreign frame revoked history"
-        );
-        assert_eq!(hits(&f.indexer, &fresh).len(), 1);
+        assert!(hits(&f.indexer, &old).is_empty());
+        assert!(hits(&f.indexer, &fresh).is_empty());
 
         // A genuine missing global sequence still revokes history even when
         // the observed frame belongs to another rank.
@@ -1454,6 +1536,20 @@ mod tests {
         )
         .await;
         assert_eq!(advances, [5]);
+        assert!(hits(&f.indexer, &fresh).is_empty());
+        publish_until_advanced(
+            &f.publisher,
+            &mut f.signals,
+            b"kv",
+            6,
+            6.0,
+            &[
+                KVEvent::AllBlocksCleared(AllBlocksCleared {}),
+                store_event(102, &fresh),
+            ],
+            Some(0),
+        )
+        .await;
         assert_eq!(hits(&f.indexer, &fresh).len(), 1);
     }
 
@@ -1527,7 +1623,10 @@ mod tests {
                     usize::from(foreign_rank.is_some())
                 );
             }
-            assert_eq!(hits(&f.indexer, &fresh).len(), 1);
+            assert_eq!(
+                hits(&f.indexer, &fresh).len(),
+                usize::from(foreign_rank.is_some())
+            );
             assert!(hits(&f.indexer, &foreign).is_empty());
         }
     }
@@ -1705,6 +1804,20 @@ mod tests {
             Some(0),
         )
         .await;
+        assert_eq!(hits(&f.indexer, &tokens).len(), 2);
+        publish_until_advanced(
+            &f.publisher,
+            &mut f.signals,
+            b"kv",
+            4,
+            4.0,
+            &[
+                KVEvent::AllBlocksCleared(AllBlocksCleared {}),
+                store_event(101, &tokens),
+            ],
+            Some(0),
+        )
+        .await;
         assert_eq!(hits(&f.indexer, &tokens).len(), 3);
     }
 
@@ -1718,7 +1831,10 @@ mod tests {
             b"kv",
             0,
             0.0,
-            &[store_event(100, &tokens)],
+            &[
+                KVEvent::AllBlocksCleared(AllBlocksCleared {}),
+                store_event(100, &tokens),
+            ],
             Some(0),
         )
         .await;
@@ -1749,7 +1865,10 @@ mod tests {
             b"kv",
             1,
             1.0,
-            &[store_event(100, &tokens)],
+            &[
+                KVEvent::AllBlocksCleared(AllBlocksCleared {}),
+                store_event(100, &tokens),
+            ],
             Some(0),
         )
         .await;
@@ -1826,7 +1945,10 @@ mod tests {
             b"kv",
             1,
             1.0,
-            &[store_event(100, &tokens)],
+            &[
+                KVEvent::AllBlocksCleared(AllBlocksCleared {}),
+                store_event(100, &tokens),
+            ],
             Some(0),
         )
         .await;
@@ -1991,6 +2113,20 @@ mod tests {
             assert!(f.indexer.find_matches(&query(&old)).is_empty());
             assert!(f.indexer.find_matches(&query(&partial)).is_empty());
             assert!(f.indexer.find_matches(&query(&bad)).is_empty());
+            assert!(f.indexer.find_matches(&query(&fresh)).is_empty());
+            publish_until_advanced(
+                &f.publisher,
+                &mut f.signals,
+                b"kv",
+                4,
+                4.0,
+                &[
+                    KVEvent::AllBlocksCleared(AllBlocksCleared {}),
+                    event(400, &fresh, expected),
+                ],
+                Some(0),
+            )
+            .await;
             assert_eq!(f.indexer.find_matches(&query(&fresh)).len(), 1);
         }
     }
@@ -2153,8 +2289,22 @@ mod tests {
         }
         assert_eq!(
             hits(&f.indexer, &fresh).len(),
-            1,
-            "fresh observations restore credit: {case}"
+            usize::from(case == "complete"),
+            "only an authoritative recovery boundary restores credit: {case}"
+        );
+        assert_eq!(
+            f.indexer.source_recovery_status(&SourceId::from("w0"), 0),
+            Some(if case == "complete" {
+                crate::kv_index::SourceRecoveryStatus {
+                    state: crate::kv_index::SourceRecoveryState::Exact,
+                    reason: crate::kv_index::SourceRecoveryReason::ReplayApplied,
+                }
+            } else {
+                crate::kv_index::SourceRecoveryStatus {
+                    state: crate::kv_index::SourceRecoveryState::Fallback,
+                    reason: crate::kv_index::SourceRecoveryReason::ReplayFailed,
+                }
+            })
         );
     }
 
@@ -2191,5 +2341,82 @@ mod tests {
     #[tokio::test]
     async fn replay_wrong_topic_clears_partial_stores() {
         check_replay_case("wrong_topic").await;
+    }
+
+    #[tokio::test]
+    async fn validated_clear_barrier_restores_fallback_source() {
+        let mut fixture = fixture_with_block_size(false, Some(4));
+        let source = SourceId::from("w0");
+        let initial = [1, 2, 3, 4];
+        let hidden = [5, 6, 7, 8];
+        let restored = [9, 10, 11, 12];
+
+        assert_eq!(
+            fixture.indexer.source_recovery_status(&source, 0),
+            Some(crate::kv_index::SourceRecoveryStatus {
+                state: crate::kv_index::SourceRecoveryState::Cold,
+                reason: crate::kv_index::SourceRecoveryReason::Registered,
+            })
+        );
+        publish_until_advanced(
+            &fixture.publisher,
+            &mut fixture.signals,
+            b"kv",
+            0,
+            0.0,
+            &[store_event(100, &initial)],
+            Some(0),
+        )
+        .await;
+        assert_eq!(
+            fixture.indexer.source_recovery_status(&source, 0),
+            Some(crate::kv_index::SourceRecoveryStatus {
+                state: crate::kv_index::SourceRecoveryState::Exact,
+                reason: crate::kv_index::SourceRecoveryReason::InitialSequence,
+            })
+        );
+        assert_eq!(hits(&fixture.indexer, &initial).len(), 1);
+
+        publish_until_advanced(
+            &fixture.publisher,
+            &mut fixture.signals,
+            b"kv",
+            2,
+            2.0,
+            &[store_event(200, &hidden)],
+            Some(0),
+        )
+        .await;
+        assert_eq!(
+            fixture.indexer.source_recovery_status(&source, 0),
+            Some(crate::kv_index::SourceRecoveryStatus {
+                state: crate::kv_index::SourceRecoveryState::Fallback,
+                reason: crate::kv_index::SourceRecoveryReason::ReplayUnavailable,
+            })
+        );
+        assert!(hits(&fixture.indexer, &initial).is_empty());
+        assert!(hits(&fixture.indexer, &hidden).is_empty());
+
+        publish_until_advanced(
+            &fixture.publisher,
+            &mut fixture.signals,
+            b"kv",
+            3,
+            3.0,
+            &[
+                KVEvent::AllBlocksCleared(AllBlocksCleared {}),
+                store_event(300, &restored),
+            ],
+            Some(0),
+        )
+        .await;
+        assert_eq!(
+            fixture.indexer.source_recovery_status(&source, 0),
+            Some(crate::kv_index::SourceRecoveryStatus {
+                state: crate::kv_index::SourceRecoveryState::Exact,
+                reason: crate::kv_index::SourceRecoveryReason::ClearBarrier,
+            })
+        );
+        assert_eq!(hits(&fixture.indexer, &restored).len(), 1);
     }
 }

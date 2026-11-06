@@ -83,6 +83,26 @@ pub fn init_metrics() {
         "vllm_router_kv_placement_lookups_total",
         "KV-aware placement lookups and reasons for skipping them"
     );
+    describe_gauge!(
+        "vllm_router_kv_source_recovery_state",
+        "One-hot recovery state and reason for each KV event source and data-parallel rank"
+    );
+    describe_counter!(
+        "vllm_router_kv_source_recovery_transitions_total",
+        "KV event source recovery state transitions by source, rank, state, and reason"
+    );
+    describe_histogram!(
+        "vllm_router_kv_source_recovery_duration_seconds",
+        "Time from a detected KV event gap until exact recovery or source retirement"
+    );
+    describe_counter!(
+        "vllm_router_kv_replay_outcomes_total",
+        "KV event replay attempts by source, rank, and outcome"
+    );
+    describe_histogram!(
+        "vllm_router_kv_replay_duration_seconds",
+        "Duration of attempted KV event replay operations by source, rank, and outcome"
+    );
     describe_counter!(
         "vllm_router_policy_decisions_total",
         "Total routing policy decisions by policy and worker"
@@ -565,6 +585,100 @@ impl RouterMetrics {
     pub fn record_kv_placement_lookup(result: &'static str) {
         counter!("vllm_router_kv_placement_lookups_total", "result" => result).increment(1);
     }
+
+    pub fn record_kv_source_recovery_transition(
+        source: &str,
+        dp_rank: u32,
+        previous: Option<(&'static str, &'static str)>,
+        state: &'static str,
+        reason: &'static str,
+        recovery_duration: Option<Duration>,
+    ) {
+        let source = source.to_owned();
+        let dp_rank = dp_rank.to_string();
+        if let Some((previous_state, previous_reason)) = previous {
+            gauge!("vllm_router_kv_source_recovery_state",
+                "source" => source.clone(),
+                "dp_rank" => dp_rank.clone(),
+                "state" => previous_state,
+                "reason" => previous_reason)
+            .set(0.0);
+        }
+        gauge!("vllm_router_kv_source_recovery_state",
+            "source" => source.clone(),
+            "dp_rank" => dp_rank.clone(),
+            "state" => state,
+            "reason" => reason)
+        .set(1.0);
+        counter!("vllm_router_kv_source_recovery_transitions_total",
+            "source" => source.clone(),
+            "dp_rank" => dp_rank.clone(),
+            "from" => previous.map_or("unregistered", |(state, _)| state),
+            "to" => state,
+            "reason" => reason)
+        .increment(1);
+        if let Some(duration) = recovery_duration {
+            histogram!("vllm_router_kv_source_recovery_duration_seconds",
+                "source" => source,
+                "dp_rank" => dp_rank,
+                "outcome" => state)
+            .record(duration.as_secs_f64());
+        }
+    }
+
+    pub fn clear_kv_source_recovery_state(
+        source: &str,
+        dp_rank: u32,
+        state: &'static str,
+        reason: &'static str,
+        recovery_duration: Option<Duration>,
+    ) {
+        let source = source.to_owned();
+        let dp_rank = dp_rank.to_string();
+        gauge!("vllm_router_kv_source_recovery_state",
+            "source" => source.clone(),
+            "dp_rank" => dp_rank.clone(),
+            "state" => state,
+            "reason" => reason)
+        .set(0.0);
+        counter!("vllm_router_kv_source_recovery_transitions_total",
+            "source" => source.clone(),
+            "dp_rank" => dp_rank.clone(),
+            "from" => state,
+            "to" => "forgotten",
+            "reason" => "source_retired")
+        .increment(1);
+        if let Some(duration) = recovery_duration {
+            histogram!("vllm_router_kv_source_recovery_duration_seconds",
+                "source" => source,
+                "dp_rank" => dp_rank,
+                "outcome" => "forgotten")
+            .record(duration.as_secs_f64());
+        }
+    }
+
+    pub fn record_kv_replay_outcome(
+        source: &str,
+        dp_rank: u32,
+        outcome: &'static str,
+        duration: Option<Duration>,
+    ) {
+        let source = source.to_owned();
+        let dp_rank = dp_rank.to_string();
+        counter!("vllm_router_kv_replay_outcomes_total",
+            "source" => source.clone(),
+            "dp_rank" => dp_rank.clone(),
+            "outcome" => outcome)
+        .increment(1);
+        if let Some(duration) = duration {
+            histogram!("vllm_router_kv_replay_duration_seconds",
+                "source" => source,
+                "dp_rank" => dp_rank,
+                "outcome" => outcome)
+            .record(duration.as_secs_f64());
+        }
+    }
+
     pub fn record_kv_routing_input(transport: &'static str, result: &'static str) {
         counter!("vllm_router_kv_routing_inputs_total", "transport" => transport, "result" => result).increment(1);
     }
