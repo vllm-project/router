@@ -1,4 +1,7 @@
 use super::completion_route::{placement_eligibility, prepare_completion_route, CompletionRoute};
+use super::kv_observation::{
+    observe_json_response, observe_unavailable, KvRoutePrediction, KvSseObserver,
+};
 use super::program_adapter::ProgramCompletion;
 use crate::backend::preprocess::{prepare_completion_direct_inputs, prepare_http_kv_inputs};
 use crate::backend::{
@@ -108,6 +111,7 @@ struct LoadTrackedBody {
 struct RequestLoadState {
     worker: Option<Arc<dyn Worker>>,
     kv_slot: Option<KvRequestSlot>,
+    kv_prediction: Option<KvRoutePrediction>,
     released: AtomicBool,
 }
 
@@ -124,6 +128,7 @@ impl RequestLoadGuard {
             state: Arc::new(RequestLoadState {
                 worker,
                 kv_slot,
+                kv_prediction: None,
                 released: AtomicBool::new(false),
             }),
         }
@@ -141,14 +146,35 @@ impl RequestLoadGuard {
             }
             RouterMetrics::set_running_requests(worker.url(), worker.load());
         }
-        Self::new(
-            tracked.then_some(worker),
-            receipt.and_then(|receipt| receipt.slot),
-        )
+        let (kv_slot, kv_prediction) = match receipt {
+            Some(receipt) => {
+                let prediction =
+                    receipt
+                        .predicted_cached_tokens
+                        .map(|cached_tokens| KvRoutePrediction {
+                            target: receipt.decision.target.clone(),
+                            cached_tokens,
+                        });
+                (receipt.slot, prediction)
+            }
+            None => (None, None),
+        };
+        Self {
+            state: Arc::new(RequestLoadState {
+                worker: tracked.then_some(worker),
+                kv_slot,
+                kv_prediction,
+                released: AtomicBool::new(false),
+            }),
+        }
     }
 
     fn tracks_worker(&self) -> bool {
         self.state.worker.is_some()
+    }
+
+    fn kv_prediction(&self) -> Option<KvRoutePrediction> {
+        self.state.kv_prediction.clone()
     }
 
     fn begin_decode(&self) {
@@ -1915,6 +1941,8 @@ impl Router {
             return response;
         }
 
+        let kv_prediction = load.kv_prediction();
+
         let (mut request_builder, extracted_dp_rank, request_url) =
             if self.intra_node_data_parallel_size > 1 {
                 let (worker_url_prefix, dp_rank) = match dp_utils::extract_dp_rank(worker_url) {
@@ -2032,6 +2060,9 @@ impl Router {
 
             let response = match res.bytes().await {
                 Ok(body) => {
+                    if let Some(prediction) = &kv_prediction {
+                        observe_json_response(prediction, status, &body);
+                    }
                     if let Some(completion) = &program_completion {
                         completion.observe_json(&body);
                     }
@@ -2041,6 +2072,9 @@ impl Router {
                     response
                 }
                 Err(e) => {
+                    if let Some(prediction) = &kv_prediction {
+                        observe_unavailable(prediction, status, "response_error");
+                    }
                     let error_msg = format!("Failed to get response body: {}", e);
                     (StatusCode::INTERNAL_SERVER_ERROR, error_msg).into_response()
                 }
@@ -2080,6 +2114,8 @@ impl Router {
 
             // Spawn task to forward stream and detect completion
             let producer_load = load.clone();
+            let mut kv_observer =
+                kv_prediction.map(|prediction| KvSseObserver::new(prediction, status));
             let producer = tokio::spawn(async move {
                 let mut stream = stream;
                 let mut first_sse = true;
@@ -2087,6 +2123,9 @@ impl Router {
                 while let Some(chunk) = stream.next().await {
                     match chunk {
                         Ok(bytes) => {
+                            if let Some(observer) = &mut kv_observer {
+                                observer.observe(&bytes);
+                            }
                             if completion_echo.is_none() {
                                 producer_load.begin_decode();
                             }
@@ -2142,6 +2181,9 @@ impl Router {
                 }
                 if let Some(completion) = &completion {
                     completion.finish(stream_succeeded);
+                }
+                if let Some(observer) = &mut kv_observer {
+                    observer.finish(stream_succeeded);
                 }
             });
 
