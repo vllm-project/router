@@ -15,7 +15,7 @@ use tracing::{info, warn};
 use crate::config::StaticKvEventSources;
 use crate::kv_index::indexer::KvBlockIndexer;
 use crate::kv_index::subscriber::{EventSource, SubscriberHandle};
-use crate::kv_index::{HashMode, IngestionSignal, SourceId};
+use crate::kv_index::{HashMode, IngestionSignal, SourceId, SourceRecoveryReason};
 use crate::protocols::worker_spec::ServerInfo;
 
 /// The worker-stable core of a cache identity. One indexer per key.
@@ -478,9 +478,11 @@ impl KvIndexSupervisor {
                     for worker in workers.values() {
                         for live in &worker.live_sources {
                             if live.publisher == source.pub_endpoint && live.topic == source.topic {
-                                worker
-                                    .indexer
-                                    .invalidate_source(&worker.source_id, live.rank);
+                                worker.indexer.invalidate_source_for(
+                                    &worker.source_id,
+                                    live.rank,
+                                    SourceRecoveryReason::RankScopeChanged,
+                                );
                             }
                         }
                     }
@@ -560,7 +562,7 @@ impl KvIndexSupervisor {
         }
         for live in &subs.live_sources {
             let _guard = live.lease.strict_rank.lock();
-            subs.indexer.invalidate_source(&subs.source_id, live.rank);
+            subs.indexer.forget_source(&subs.source_id, live.rank);
         }
         self.release_identity(&subs.key);
     }
@@ -1376,6 +1378,24 @@ mod tests {
         rmp_serde::to_vec(&(1.0, [stored_block(hash, tokens, block_size, medium)], rank)).unwrap()
     }
 
+    fn clear_store_payload(
+        hash: i64,
+        tokens: &[u32],
+        block_size: u32,
+        medium: &str,
+        rank: Option<u32>,
+    ) -> Vec<u8> {
+        rmp_serde::to_vec(&(
+            1.0,
+            [
+                serde_json::json!({"type": "AllBlocksCleared"}),
+                stored_block(hash, tokens, block_size, medium),
+            ],
+            rank,
+        ))
+        .unwrap()
+    }
+
     fn block_query(tokens: &[u32], block_size: u32, tiers: &[StorageTier]) -> MatchQuery {
         MatchQuery {
             group_idx: 0,
@@ -1757,7 +1777,17 @@ mod tests {
         assert_eq!(rejected_sources.len(), 2);
         assert!(provider.find_tiered_matches(&query(2)).is_empty());
         for (sequence, token, rank) in [(1, 3, 0), (2, 4, 1), (3, 5, 0)] {
-            send(sequence, token, Some(rank));
+            let payload = if sequence <= 2 {
+                clear_store_payload(sequence + 1, &[token; 8], 8, "GPU", Some(rank))
+            } else {
+                store_payload(sequence + 1, &[token; 8], 8, "GPU", Some(rank))
+            };
+            publisher
+                .send_multipart(
+                    [b"kv/boundary".as_slice(), &sequence.to_be_bytes(), &payload],
+                    0,
+                )
+                .unwrap();
             let mut advanced_sources = HashSet::new();
             tokio::time::timeout(Duration::from_secs(5), async {
                 while advanced_sources.len() != 2 {
@@ -2669,9 +2699,9 @@ mod tests {
         publisher
             .send_multipart([b"".as_slice(), &0i64.to_be_bytes(), &batch], 0)
             .unwrap();
-        // A subsequent valid frame is a deterministic processing barrier;
-        // a rejected earlier batch must not become visible after resume.
-        let marker = rmp_serde::to_vec(&(2.0, [stored(3, 200, 8)], 0u32)).unwrap();
+        // A validated clear event is the authoritative recovery boundary; the
+        // rejected earlier batch must not become visible after resume.
+        let marker = clear_store_payload(3, &(200..208).collect::<Vec<_>>(), 8, "GPU", Some(0));
         publisher
             .send_multipart([b"".as_slice(), &1i64.to_be_bytes(), &marker], 0)
             .unwrap();

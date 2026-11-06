@@ -127,6 +127,71 @@ pub enum ClearScope {
     All,
 }
 
+/// Trust state for one independently addressed KV event source.
+///
+/// Placement credit is available only in `Exact`. The other states preserve
+/// worker availability while withholding evidence that lacks an authoritative
+/// recovery boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum SourceRecoveryState {
+    Cold,
+    Exact,
+    Degraded,
+    Fallback,
+}
+
+impl SourceRecoveryState {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Cold => "cold",
+            Self::Exact => "exact",
+            Self::Degraded => "degraded",
+            Self::Fallback => "fallback",
+        }
+    }
+}
+
+/// Stable, bounded reasons for source recovery state transitions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum SourceRecoveryReason {
+    Registered,
+    InitialSequence,
+    SequenceGap,
+    ReplayApplied,
+    ReplayUnavailable,
+    ReplayFailed,
+    InvalidFrame,
+    IncarnationReset,
+    RankScopeChanged,
+    ValidationFailed,
+    ClearBarrier,
+}
+
+impl SourceRecoveryReason {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Registered => "registered",
+            Self::InitialSequence => "initial_sequence",
+            Self::SequenceGap => "sequence_gap",
+            Self::ReplayApplied => "replay_applied",
+            Self::ReplayUnavailable => "replay_unavailable",
+            Self::ReplayFailed => "replay_failed",
+            Self::InvalidFrame => "invalid_frame",
+            Self::IncarnationReset => "incarnation_reset",
+            Self::RankScopeChanged => "rank_scope_changed",
+            Self::ValidationFailed => "validation_failed",
+            Self::ClearBarrier => "clear_barrier",
+        }
+    }
+}
+
+/// Current externally observable recovery status for one source/rank.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct SourceRecoveryStatus {
+    pub(crate) state: SourceRecoveryState,
+    pub(crate) reason: SourceRecoveryReason,
+}
+
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use super::*;
