@@ -868,6 +868,19 @@ impl Picker for TemperaturePicker {
     }
 }
 
+/// Picks uniformly among tied candidates.
+///
+/// Equal scores carry no ranking evidence. Keeping the first candidate would
+/// encode slice order as a preference: with an idle pool every cold request of
+/// the same length has one cost, and all of them would land on the same worker.
+fn pick_tied(candidates: &[usize]) -> Option<usize> {
+    match candidates {
+        [] => None,
+        [only] => Some(*only),
+        _ => Some(candidates[rand::rng().random_range(0..candidates.len())]),
+    }
+}
+
 #[derive(Debug, Default)]
 struct EmptyMatchProvider;
 
@@ -1797,14 +1810,22 @@ impl KvAwareOps for KvAwarePolicy {
             return None;
         }
         if self.params.router_temperature <= 0.0 {
-            costs
+            let (best_index, best_cost) = costs
                 .iter()
                 .enumerate()
                 .min_by(|(li, left), (ri, right)| {
                     left.total_cmp(right)
                         .then_with(|| occupancy[*li].cmp(&occupancy[*ri]))
                 })
-                .map(|(index, _)| index)
+                .map(|(index, cost)| (index, *cost))?;
+            // Occupancy is the last ranking signal. Candidates that also match
+            // it are equally good, so spread them instead of taking the first.
+            let tied: Vec<usize> = (0..costs.len())
+                .filter(|&index| {
+                    costs[index] == best_cost && occupancy[index] == occupancy[best_index]
+                })
+                .collect();
+            pick_tied(&tied)
         } else {
             self.picker.pick(costs)
         }
@@ -3755,6 +3776,30 @@ mod tests {
         let first = policy.pick_decode(&[0, 0]).unwrap();
         let second = policy.pick_decode(&[0, 0]).unwrap();
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn pick_prefill_spreads_exact_ties_and_keeps_the_ranking() {
+        let policy = KvAwarePolicy::default();
+        // Equal cost and occupancy: every tied candidate must be reachable.
+        let mut seen = [false; 3];
+        for _ in 0..64 {
+            let index = policy
+                .pick_prefill(&[8_000.0, 8_000.0, 12_000.0], &[0, 0, 0])
+                .unwrap();
+            assert!(index < 2, "a dearer candidate must never win a tie");
+            seen[index] = true;
+        }
+        assert_eq!(seen, [true, true, false]);
+
+        // A cost tie still resolves by occupancy, without introducing chance.
+        for _ in 0..16 {
+            assert_eq!(policy.pick_prefill(&[8_000.0, 8_000.0], &[1, 0]), Some(1));
+        }
+
+        assert_eq!(policy.pick_prefill(&[], &[]), None);
+        assert_eq!(policy.pick_prefill(&[1.0], &[]), None);
+        assert_eq!(policy.pick_prefill(&[f64::NAN], &[0]), None);
     }
 
     fn stage_policy() -> KvAwarePolicy {
