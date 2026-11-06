@@ -28,6 +28,7 @@ def completion(
     *,
     prompts=None,
     extra: dict[str, Any] | None = None,
+    headers: dict[str, str] | None = None,
     timeout: float | None = None,
     max_tokens: int = 1,
     max_workers: int = 1,
@@ -37,8 +38,9 @@ def completion(
 
     One ``prompt`` returns one worker id. ``prompts`` sends that sequence
     concurrently, in order, and returns a list. A token-id list is one prompt,
-    so a batch has to be passed as ``prompts``. ``ignore_errors`` returns None
-    for a failed request instead of raising.
+    so a batch has to be passed as ``prompts``. ``headers`` are sent with every
+    request. ``ignore_errors`` returns None for a failed request instead of
+    raising.
     """
     if (prompt is None) == (prompts is None):
         raise ValueError("pass exactly one of prompt or prompts")
@@ -49,6 +51,7 @@ def completion(
             response = requests.post(
                 url,
                 json=_completion_payload(item, extra, max_tokens),
+                headers=headers,
                 timeout=timeout,
             )
             assert response.status_code == 200, response.text

@@ -132,11 +132,13 @@ def test_merge_consistent_hash_sticks_to_session(router_manager, mock_worker_man
     rh = _router(router_manager, urls, "consistent_hash")
     worker_ids = set(ids)
 
+    # Regular routing hashes the prompt text unless a session header is present,
+    # so the session id travels in X-Session-ID, the documented primary key.
     def session_worker(session_id, turn):
         return completion(
             rh.url,
             f"turn {turn}",
-            extra={"session_params": {"session_id": session_id}},
+            headers={"X-Session-ID": session_id},
         )
 
     placed = {}
@@ -207,23 +209,34 @@ def test_merge_cache_aware_prefix_overrides_load(
 
 
 @pytest.mark.integration
-def test_merge_kv_aware_spreads_equal_load(router_manager, mock_worker_manager):
-    _, urls, ids = mock_worker_manager.start_workers(n=3)
+def test_merge_kv_aware_spreads_concurrent_load(router_manager, mock_worker_manager):
+    # Without KV cache data every worker costs the same, so kv_aware picks the
+    # one with the fewest in-flight requests and breaks ties by position.
+    # Sequential requests always see zero in flight. Overlapping ones have to
+    # spread, so each worker is kept busy long enough to overlap.
+    _, urls, ids = mock_worker_manager.start_workers(n=3, args=["--latency-ms", "300"])
     rh = _router(router_manager, urls, "kv_aware")
 
-    counts = collections.Counter()
-    for i in range(30):
-        worker_id = completion(rh.url, f"p{i}")
-        assert worker_id in ids
-        counts[worker_id] += 1
+    served = completion(
+        rh.url,
+        prompts=(f"p{i}" for i in range(30)),
+        max_workers=3,
+        timeout=10,
+    )
+    counts = collections.Counter(served)
 
+    assert set(counts) == set(ids), counts
     for worker_id in ids:
-        assert 7 <= counts[worker_id] <= 13, counts
+        assert 6 <= counts[worker_id] <= 14, counts
 
 
 @pytest.mark.integration
 def test_merge_kv_aware_affinity_sticks_to_session(router_manager, mock_worker_manager):
-    _, urls, ids = mock_worker_manager.start_workers(n=2)
+    # Idle workers tie, and a tie goes to the first worker. Two sessions only
+    # land apart when the second starts while the first is still in flight.
+    # After that, a session that is not on the first worker can only stay put
+    # through its affinity binding.
+    _, urls, ids = mock_worker_manager.start_workers(n=2, args=["--latency-ms", "500"])
     rh = _router(
         router_manager,
         urls,
@@ -232,22 +245,29 @@ def test_merge_kv_aware_affinity_sticks_to_session(router_manager, mock_worker_m
     )
     worker_ids = set(ids)
 
-    def session_workers(session_id):
-        return [
-            completion(
-                rh.url,
-                f"turn {i}",
-                extra={"session_params": {"session_id": session_id}},
-            )
-            for i in range(8)
-        ]
+    def session_worker(session_id, turn):
+        return completion(
+            rh.url,
+            f"turn {turn}",
+            extra={"session_params": {"session_id": session_id}},
+            timeout=10,
+        )
 
-    alpha = session_workers("alpha")
-    beta = session_workers("beta")
-    assert set(alpha) <= worker_ids and set(beta) <= worker_ids
-    assert len(set(alpha)) == 1, alpha
-    assert len(set(beta)) == 1, beta
-    assert alpha[0] != beta[0], (alpha, beta)
+    first = {}
+    alpha_start = threading.Thread(
+        target=lambda: first.update(alpha=session_worker("alpha", 0)), daemon=True
+    )
+    alpha_start.start()
+    time.sleep(0.2)
+    first["beta"] = session_worker("beta", 0)
+    alpha_start.join(timeout=10)
+
+    assert {first["alpha"], first["beta"]} == worker_ids, first
+
+    alpha = [first["alpha"]] + [session_worker("alpha", turn) for turn in range(1, 5)]
+    beta = [first["beta"]] + [session_worker("beta", turn) for turn in range(1, 5)]
+    assert set(alpha) == {first["alpha"]}, alpha
+    assert set(beta) == {first["beta"]}, beta
 
 
 @pytest.mark.integration
