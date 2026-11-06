@@ -19,16 +19,14 @@ Optional **`model`** in JSON (HF id or local path). For perf runs, set **`export
 (**env overrides JSON**). Do not commit placeholder paths; with no `MODEL`, tests skip until
 you set the env var or add a real `model` in your local case file.
 
-## Binaries (`stack.router_bin`, `stack.vllm_rs_bin`)
+## Binaries (`router.bin`, `worker.bin`)
 
 Optional paths to **`vllm-router`** and **`vllm-rs`**. Relative paths are resolved from the
 repository root (where `Cargo.toml` lives). **`ROUTER_BIN` / `VLLM_RS` env override JSON.**
 
 ```json
-"stack": {
-  "router_bin": "target/release/vllm-router",
-  "vllm_rs_bin": "/path/to/vllm-rs"
-}
+"router": { "bin": "target/release/vllm-router", "port": 16002 },
+"worker": { "bin": "/path/to/vllm-rs", "http_port": 18002 }
 ```
 
 ## Worker (`worker.cli`)

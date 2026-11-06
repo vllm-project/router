@@ -6,7 +6,7 @@ use super::pd_types::{
     Loads, PDRouterError, PdAttempt, PdEndpoint, PdLoadManager, PdPrefillInput, PdRequestContext,
     PdSelection, Stage, StageDecision,
 };
-use crate::backend::preprocess::prepare_http_token_inputs;
+use crate::backend::preprocess::{prepare_http_token_inputs, router_token_inputs, HttpTokenInput};
 use crate::core::worker::WorkerMetadata;
 use crate::core::{
     BasicWorker, CircuitBreaker, CircuitBreakerConfig, ConnectionMode, DPAwareWorker, HealthConfig,
@@ -120,8 +120,10 @@ fn select_stage(
 ) -> Option<StageDecision> {
     let policy_input = context.legacy_policy_input;
     let kv_aware = kv_aware_ops(policy).is_some();
-    let mut selected_indices = indices.to_vec();
-    selected_indices.sort_by(|&left, &right| endpoints[left].cmp(&endpoints[right]));
+    // Keep the caller slice order. Static pools pass registry registration
+    // order, which is the --prefill / --decode order. Sorting by endpoint URL
+    // made round-robin follow port text instead of that order.
+    let selected_indices = indices.to_vec();
     let projected: Vec<Arc<dyn Worker>> = selected_indices
         .iter()
         .map(|&index| {
@@ -452,38 +454,31 @@ fn build_dp_workers(
 }
 
 impl PdRouterBase {
+    /// `router_prompts` are the router's token ids for `grpc://` pools. HTTP
+    /// pools pass `None` and each backend renders the request itself.
     pub(super) async fn prepare_prefill_inputs(
         &self,
         workers: &[Arc<dyn Worker>],
         request: &Value,
         route: &str,
         headers: Option<&HeaderMap>,
+        router_prompts: Option<&Arc<[Vec<u32>]>>,
     ) -> Option<HashMap<String, super::pd_types::PdPrefillInput>> {
         let policy = self.policy_registry.get_prefill_policy();
         if kv_aware_ops(policy.as_ref()).is_some() {
             return Some(
                 self.kv_state
                     .as_ref()?
-                    .prepare(workers, &policy, request, route, headers)
+                    .prepare(workers, &policy, request, route, headers, router_prompts)
                     .await,
             );
         }
         if policy.name() != "cache_aware" {
             return None;
         }
-        let results = prepare_http_token_inputs(
-            &self.client,
-            workers
-                .iter()
-                .map(|worker| worker.base_url().to_owned())
-                .collect(),
-            request,
-            route,
-            headers,
-            self.api_key.as_deref(),
-            Duration::from_secs(1),
-        )
-        .await;
+        let results = self
+            .token_inputs(workers, request, route, headers, router_prompts)
+            .await;
         Some(
             results
                 .into_iter()
@@ -512,23 +507,14 @@ impl PdRouterBase {
         request: &Value,
         route: &str,
         headers: Option<&HeaderMap>,
+        router_prompts: Option<&Arc<[Vec<u32>]>>,
     ) -> Option<WorkerTokenInputs> {
         if self.policy_registry.get_decode_policy().name() != "cache_aware" {
             return None;
         }
-        let results = prepare_http_token_inputs(
-            &self.client,
-            workers
-                .iter()
-                .map(|worker| worker.base_url().to_owned())
-                .collect(),
-            request,
-            route,
-            headers,
-            self.api_key.as_deref(),
-            Duration::from_secs(1),
-        )
-        .await;
+        let results = self
+            .token_inputs(workers, request, route, headers, router_prompts)
+            .await;
         Some(
             results
                 .into_iter()
@@ -541,6 +527,35 @@ impl PdRouterBase {
                 })
                 .collect(),
         )
+    }
+
+    async fn token_inputs(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        request: &Value,
+        route: &str,
+        headers: Option<&HeaderMap>,
+        router_prompts: Option<&Arc<[Vec<u32>]>>,
+    ) -> HashMap<String, Result<HttpTokenInput, &'static str>> {
+        let bases = workers
+            .iter()
+            .map(|worker| worker.base_url().to_owned())
+            .collect::<Vec<_>>();
+        match router_prompts {
+            Some(prompts) => router_token_inputs(bases, request, prompts),
+            None => {
+                prepare_http_token_inputs(
+                    &self.client,
+                    bases,
+                    request,
+                    route,
+                    headers,
+                    self.api_key.as_deref(),
+                    Duration::from_secs(1),
+                )
+                .await
+            }
+        }
     }
 
     /// Shared entry point for static and discovered P/D pools. Selection and
@@ -1089,7 +1104,13 @@ impl PdRouterBase {
 
         let load_monitor_handle =
             if prefill_policy.name() == "power_of_two" || decode_policy.name() == "power_of_two" {
-                let monitor_urls = all_urls.clone();
+                // grpc:// workers serve no HTTP /get_load. A failed probe would
+                // cache load 0 and hide their local in-flight count.
+                let monitor_urls: Vec<String> = all_urls
+                    .iter()
+                    .filter(|url| !crate::backend::is_grpc_url(url))
+                    .cloned()
+                    .collect();
                 let monitor_interval = ctx.router_config.worker_startup_check_interval_secs;
                 let monitor_client = ctx.client.clone();
                 let prefill_policy_clone = Arc::clone(&prefill_policy);
@@ -1289,7 +1310,21 @@ impl PdRouterBase {
         }
     }
 
+    /// First prefill worker of an all-gRPC pool; validation rejects mixed pools.
+    fn first_grpc_prefill_url(&self) -> Option<String> {
+        let workers = self.worker_registry.get_prefill_workers();
+        let url = workers.first()?.url();
+        crate::backend::is_grpc_url(url).then(|| url.to_string())
+    }
+
     pub async fn health_generate(&self, _req: Request<Body>) -> Response {
+        if self.first_grpc_prefill_url().is_some() {
+            return (
+                StatusCode::NOT_IMPLEMENTED,
+                "/health_generate is not implemented for gRPC workers; use /health for gRPC readiness",
+            )
+                .into_response();
+        }
         // Test model generation capability by selecting a random pair and testing them
         // Note: This endpoint actually causes the model to generate tokens, so we only test one pair
         let prefill_workers = self.worker_registry.get_prefill_workers();
@@ -1402,13 +1437,45 @@ impl PdRouterBase {
     }
 
     pub async fn get_server_info(&self, _req: Request<Body>) -> Response {
+        if let Some(worker_url) = self.first_grpc_prefill_url() {
+            return match crate::backend::get_grpc_server_info(&worker_url, Duration::from_secs(2))
+                .await
+            {
+                Ok(info) => (
+                    StatusCode::OK,
+                    Json(crate::backend::server_info_json(&info)),
+                )
+                    .into_response(),
+                Err(e) => (StatusCode::BAD_GATEWAY, e).into_response(),
+            };
+        }
         // Get info from the first decode server to match vllm's server info format
         // Note: We use decode workers for server info to match expected format
         self.proxy_to_first_prefill_worker("get_server_info", None)
             .await
     }
 
+    /// `GetModelInfo` from the first gRPC prefill worker, rendered by `render`.
+    async fn grpc_model_info(
+        &self,
+        render: fn(&crate::backend::pb::ModelInfo) -> Value,
+    ) -> Option<Response> {
+        let worker_url = self.first_grpc_prefill_url()?;
+        Some(
+            match crate::backend::get_grpc_model_info(&worker_url, Duration::from_secs(2)).await {
+                Ok(info) => (StatusCode::OK, Json(render(&info))).into_response(),
+                Err(e) => (StatusCode::BAD_GATEWAY, e).into_response(),
+            },
+        )
+    }
+
     pub async fn get_models(&self, req: Request<Body>) -> Response {
+        if let Some(response) = self
+            .grpc_model_info(crate::backend::openai_models_json)
+            .await
+        {
+            return response;
+        }
         // Extract headers first to avoid Send issues
         let headers = header_utils::copy_request_headers(&req);
 
@@ -1418,6 +1485,9 @@ impl PdRouterBase {
     }
 
     pub async fn get_model_info(&self, req: Request<Body>) -> Response {
+        if let Some(response) = self.grpc_model_info(crate::backend::model_info_json).await {
+            return response;
+        }
         // Extract headers first to avoid Send issues
         let headers = header_utils::copy_request_headers(&req);
 
@@ -1460,6 +1530,13 @@ impl PdRouterBase {
     }
 
     pub async fn flush_cache(&self) -> Response {
+        if self.first_grpc_prefill_url().is_some() {
+            return (
+                StatusCode::NOT_IMPLEMENTED,
+                "/flush_cache is not implemented for gRPC workers: vLLM's gRPC Control service has no cache reset",
+            )
+                .into_response();
+        }
         // Process both prefill and decode workers
         let (prefill_results, prefill_errors) = self
             .process_workers(
@@ -2909,15 +2986,20 @@ mod admission_tests {
     }
 
     #[test]
-    fn equal_load_uses_endpoint_order_not_hashmap_enumeration() {
+    fn equal_load_follows_caller_order() {
         let manager = Arc::new(PdLoadManager::default());
         let mut p = pool("p", 2);
         let mut d = pool("d", 2);
         p.reverse();
         d.reverse();
         let (selection, _) = admit(&manager, &p, &d);
-        assert_eq!(selection.prefill.worker_index, 1);
-        assert_eq!(selection.decode.worker_index, 1);
+        // Tie-break is the slice order. Static callers pass registration
+        // order, so a reversed slice stays reversed instead of being
+        // rewritten into URL order.
+        assert_eq!(selection.prefill.worker_index, 0);
+        assert_eq!(selection.decode.worker_index, 0);
+        assert_eq!(selection.prefill.endpoint.http_url, "http://p1");
+        assert_eq!(selection.decode.endpoint.http_url, "http://d1");
     }
 
     #[test]
@@ -3077,6 +3159,47 @@ mod admission_tests {
         assert_eq!(second.prefill.score, None);
         drop((a, b));
         assert!(manager.snapshot().is_empty());
+    }
+
+    #[test]
+    fn round_robin_follows_registration_order_not_url_order() {
+        let manager = Arc::new(PdLoadManager::default());
+        let prefill = pool("p", 1);
+        let decode = |url: &str| {
+            Arc::new(BasicWorker::new(url.to_string(), WorkerType::Decode)) as Arc<dyn Worker>
+        };
+        // Port text sorts as 35151, 60629, 60773. Registration order is the reverse.
+        let decode_workers = vec![
+            decode("http://127.0.0.1:60773"),
+            decode("http://127.0.0.1:35151"),
+            decode("http://127.0.0.1:60629"),
+        ];
+        let prefill_policy = RoundRobinPolicy::new();
+        let decode_policy = RoundRobinPolicy::new();
+        let cycle = [
+            "http://127.0.0.1:60773",
+            "http://127.0.0.1:35151",
+            "http://127.0.0.1:60629",
+        ];
+        let seen: Vec<String> = (0..6)
+            .map(|_| {
+                let (selection, attempt) = manager
+                    .admit(|loads| {
+                        select_pd_pair(
+                            loads,
+                            &prefill,
+                            &decode_workers,
+                            &prefill_policy,
+                            &decode_policy,
+                            &context(),
+                        )
+                    })
+                    .unwrap();
+                drop(attempt);
+                selection.decode.endpoint.http_url
+            })
+            .collect();
+        assert_eq!(seen, [cycle.as_slice(), cycle.as_slice()].concat());
     }
 
     #[test]

@@ -3,12 +3,14 @@
 //! Completion is the only path that records request-derived rolling factors.
 //! Periodic ticks evaluate existing deadlines and never create request facts.
 
+use super::return_time;
 use super::scheduler::ProgramScheduler;
 use super::scheduler_state::{ProgramPauseReason, ProgramSchedulerState};
 use super::{
     ProgramDispatch, ProgramRef, ProgramState, ProgramStatus, ProgramUsageObservation,
     RequestSample,
 };
+use crate::config::types::PredictionMode;
 use crate::metrics::RouterMetrics;
 use std::time::Instant;
 use tracing::{debug, info};
@@ -51,7 +53,27 @@ impl ProgramScheduler {
         usage: impl Into<ProgramUsageObservation>,
         decode_seconds: Option<f64>,
     ) {
-        let usage = usage.into();
+        self.complete_with_pd_ttl(
+            dispatch,
+            success,
+            terminate,
+            usage.into(),
+            decode_seconds,
+            None,
+        );
+    }
+
+    /// A trusted PD adapter supplies its independently calibrated keep/drop TTL.
+    /// Capacity repair and the existing generation/placement/deadline transaction remain authoritative.
+    pub fn complete_with_pd_ttl(
+        &self,
+        dispatch: &ProgramDispatch,
+        success: bool,
+        terminate: bool,
+        usage: ProgramUsageObservation,
+        decode_seconds: Option<f64>,
+        pd_ttl: Option<std::time::Duration>,
+    ) {
         let now = Instant::now();
         let mut state = self.state.lock();
         let Some(runtime_before) = state.runtime.view(dispatch.program()) else {
@@ -102,13 +124,14 @@ impl ProgramScheduler {
             .unwrap_or(policy_acting_ttl);
         if self.config.pd_mode {
             acting_ttl = if self.config.pd_explicit_ttl {
-                dispatch
-                    .request_hints()
-                    .kv_retention_ttl
+                pd_ttl
+                    .or(dispatch.request_hints().kv_retention_ttl)
                     .unwrap_or_default()
                     .min(self.config.progress_ttl.max_acting_ttl)
             } else {
-                std::time::Duration::ZERO
+                pd_ttl
+                    .unwrap_or_default()
+                    .min(self.config.progress_ttl.max_acting_ttl)
             };
         }
         let ttl_window_samples = state
@@ -173,6 +196,15 @@ impl ProgramScheduler {
         }
 
         let mut request_sample = None;
+        let actual_output_tokens = if success {
+            usage.completion_tokens
+        } else {
+            None
+        };
+        let output_observation = dispatch
+            .pending_output_prediction()
+            .cloned()
+            .zip(actual_output_tokens);
         if let Some(decision) = state.decisions.get_mut(dispatch.program()) {
             let previous_context = decision.last_context_tokens;
             let context_growth_tokens = previous_context.and_then(|previous| {
@@ -222,6 +254,12 @@ impl ProgramScheduler {
                     }
                 }
                 let completion_tokens = usage.completion_tokens.unwrap_or(0);
+                if let Some(actual_tokens) = usage
+                    .completion_tokens
+                    .filter(|_| dispatch.pending_output_prediction().is_some())
+                {
+                    decision.last_output_actual_tokens = Some(actual_tokens);
+                }
                 decision.completed_requests = decision.completed_requests.saturating_add(1);
                 decision.segment_served_rounds = decision.segment_served_rounds.saturating_add(1);
                 decision.rounds_since_activation = decision
@@ -338,6 +376,98 @@ impl ProgramScheduler {
                 if self.config.pd_mode || context_tokens > decision.estimated_context_tokens {
                     decision.estimated_context_tokens = context_tokens;
                     decision.context_shrink_observations = 0;
+                }
+            }
+        }
+        if self.config.prediction_profile.mode != PredictionMode::Off {
+            if let Some((pending, actual_tokens)) = output_observation {
+                RouterMetrics::record_workflow_output_observation(
+                    &target_id,
+                    actual_tokens,
+                    pending.prediction.as_ref().map(|prediction| prediction.p95),
+                    pending.prediction.as_ref().map(|prediction| prediction.p99),
+                );
+                state
+                    .prediction_profiles
+                    .observe_output(&pending.keys, actual_tokens);
+                debug!(
+                    event = "output_length_observed",
+                    program = %dispatch.redacted_program_id(),
+                    actual_tokens,
+                    predicted_tokens = pending
+                        .prediction
+                        .as_ref()
+                        .map(|prediction| prediction.tokens),
+                    predicted_p95 = pending
+                        .prediction
+                        .as_ref()
+                        .map(|prediction| prediction.p95),
+                    predicted_p99 = pending
+                        .prediction
+                        .as_ref()
+                        .map(|prediction| prediction.p99),
+                    "Workflow prediction shadow observation"
+                );
+            }
+
+            if let Some(decision) = state.decisions.get(dispatch.program()) {
+                let keys = return_time::keys_for_decision(
+                    decision,
+                    dispatch.program().model_pool(),
+                    &self.config.prediction_profile,
+                );
+                if completion_action == Some(CompletionAction::Terminate) {
+                    state.prediction_profiles.observe_no_return(&keys);
+                } else if success
+                    && matches!(
+                        completion_action,
+                        Some(CompletionAction::StartActingTtl)
+                            | Some(CompletionAction::Pause(ProgramPauseReason::CapacityRepair))
+                    )
+                {
+                    let prediction = state.prediction_profiles.predict_return(
+                        &keys,
+                        0.0,
+                        self.config.prediction_profile.return_time_horizon_seconds,
+                        self.config.prediction_profile.return_time_min_support,
+                        self.config.prediction_profile.prior_weight,
+                        cache_miss_impact_seconds,
+                        self.config.progress_ttl.max_acting_ttl.as_secs_f64(),
+                    );
+                    debug!(
+                        event = "return_time_prediction",
+                        program = %dispatch.redacted_program_id(),
+                        return_probability = prediction
+                            .as_ref()
+                            .map(|value| value.probability),
+                        predicted_ttl_seconds = prediction
+                            .as_ref()
+                            .map(|value| value.suggested_ttl_seconds),
+                        support = prediction.as_ref().map(|value| value.support),
+                        backoff_level = prediction
+                            .as_ref()
+                            .map(|value| value.backoff_level),
+                        source = prediction
+                            .as_ref()
+                            .map(|value| value.source.as_str())
+                            .unwrap_or("none"),
+                        baseline_ttl_seconds = policy_acting_ttl.as_secs_f64(),
+                        "Workflow prediction shadow result"
+                    );
+                    if let Some(prediction) = prediction.as_ref() {
+                        RouterMetrics::record_workflow_return_prediction(
+                            &target_id,
+                            prediction.source.as_str(),
+                            prediction.probability,
+                            prediction.suggested_ttl_seconds,
+                            prediction.support,
+                            prediction.backoff_level,
+                        );
+                    }
+                    if let Some(decision) = state.decisions.get_mut(dispatch.program()) {
+                        decision.pending_return_prediction =
+                            Some(return_time::PendingReturnPrediction { keys, prediction });
+                    }
                 }
             }
         }
@@ -747,6 +877,145 @@ mod tests {
             state.runtime.state(dispatch.program()),
             Some((ProgramState::Paused, ProgramStatus::Acting))
         );
+    }
+
+    #[tokio::test]
+    async fn return_prediction_does_not_replace_baseline_ttl_in_shadow() {
+        use crate::program_scheduling::prediction_profile::ReturnTimeKey;
+
+        let mut config = ProgramSchedulerConfig::default();
+        config.prediction_profile.return_time_min_support = 1;
+        let scheduler = ProgramScheduler::new(config);
+        {
+            let mut state = scheduler.state.lock();
+            let global = ReturnTimeKey {
+                workflow_profile_id: None,
+                profile_version: None,
+                model_pool: None,
+                agent_role: None,
+                spawn_reason: None,
+                blocks_parent: None,
+                expected_resume: None,
+                step_bucket: None,
+            };
+            state
+                .prediction_profiles
+                .observe_return(std::slice::from_ref(&global), 1.0);
+        }
+        let target = ProgramTarget {
+            id: "rank-0".into(),
+            base_url: "http://rank-0".into(),
+            dp_rank: Some(0),
+        };
+        let dispatch = scheduler
+            .acquire(identity("shadow-return"), 50_000, &[target], None)
+            .await
+            .unwrap();
+        scheduler.complete(
+            &dispatch,
+            true,
+            false,
+            ProgramUsageObservation {
+                prompt_tokens: Some(50_000),
+                completion_tokens: Some(10),
+                cached_prompt_tokens: Some(0),
+            },
+            Some(0.1),
+        );
+        let state = scheduler.state.lock();
+        let decision = &state.decisions[dispatch.program()];
+        let prediction = decision
+            .pending_return_prediction
+            .as_ref()
+            .and_then(|pending| pending.prediction.as_ref())
+            .unwrap();
+        assert!(prediction.suggested_ttl_seconds > 0.0);
+        assert_eq!(decision.ttl_deadline, None);
+        assert_eq!(
+            decision.last_pause_reason,
+            Some(ProgramPauseReason::TtlExpired)
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_terminal_records_no_return_not_censoring() {
+        let scheduler = ProgramScheduler::new(ProgramSchedulerConfig::default());
+        let target = ProgramTarget {
+            id: "rank-0".into(),
+            base_url: "http://rank-0".into(),
+            dp_rank: Some(0),
+        };
+        let dispatch = scheduler
+            .acquire(identity("terminal-profile"), 100, &[target], None)
+            .await
+            .unwrap();
+        scheduler.complete(
+            &dispatch,
+            true,
+            true,
+            ProgramUsageObservation {
+                prompt_tokens: Some(100),
+                completion_tokens: Some(10),
+                cached_prompt_tokens: Some(0),
+            },
+            Some(0.1),
+        );
+        let state = scheduler.state.lock();
+        let (_, snapshot) = state.prediction_profiles.snapshot().unwrap();
+        assert!(snapshot
+            .return_time_profiles
+            .iter()
+            .any(|entry| entry.no_return_count >= 1.0));
+    }
+
+    #[tokio::test]
+    async fn capacity_repair_pause_preserves_return_observation() {
+        let scheduler = ProgramScheduler::new(ProgramSchedulerConfig::default());
+        let target = ProgramTarget {
+            id: "rank-0".into(),
+            base_url: "http://rank-0".into(),
+            dp_rank: Some(0),
+        };
+        let dispatch = scheduler
+            .acquire(
+                identity("capacity-pause-return"),
+                100,
+                std::slice::from_ref(&target),
+                None,
+            )
+            .await
+            .unwrap();
+        scheduler
+            .state
+            .lock()
+            .decisions
+            .get_mut(dispatch.program())
+            .unwrap()
+            .pause_when_idle = true;
+
+        scheduler.complete(&dispatch, true, false, None, None);
+        {
+            let state = scheduler.state.lock();
+            let decision = &state.decisions[dispatch.program()];
+            assert_eq!(
+                decision.last_pause_reason,
+                Some(ProgramPauseReason::CapacityRepair)
+            );
+            assert!(decision.pending_return_prediction.is_some());
+        }
+
+        scheduler
+            .acquire(
+                identity("capacity-pause-return"),
+                100,
+                std::slice::from_ref(&target),
+                None,
+            )
+            .await
+            .unwrap();
+        let state = scheduler.state.lock();
+        let (_, snapshot) = state.prediction_profiles.snapshot().unwrap();
+        assert!(!snapshot.return_time_profiles.is_empty());
     }
 
     #[tokio::test]
