@@ -475,6 +475,7 @@ pub struct CostDecision {
 pub struct KvSelectionReceipt {
     pub worker_index: usize,
     pub new_prefill_tokens: u64,
+    pub predicted_cached_tokens: Option<u64>,
     pub decision: CostDecision,
     pub slot: Option<KvRequestSlot>,
 }
@@ -766,6 +767,41 @@ fn credited_tokens(candidate: &CandidateView<'_>, params: &CostParams) -> f64 {
         .min(candidate.input_tokens.saturating_sub(1) as f64)
 }
 
+fn predicted_cached_tokens(candidate: &CandidateView<'_>, params: &CostParams) -> u64 {
+    let device_blocks = candidate
+        .matches
+        .iter()
+        .filter(|hit| hit.tier == StorageTier::Device)
+        .flat_map(|hit| hit.segments.iter().copied())
+        .filter(|(start, _)| *start == 0)
+        .map(|(_, end)| end)
+        .max()
+        .unwrap_or(0)
+        .min(
+            candidate
+                .input_tokens
+                .saturating_sub(1)
+                .checked_div(params.block_size as usize)
+                .unwrap_or(0)
+                .min(u32::MAX as usize) as u32,
+        );
+
+    let continuation_blocks = candidate
+        .matches
+        .iter()
+        .filter(|hit| hit.tier != StorageTier::Device)
+        .flat_map(|hit| hit.segments.iter().copied())
+        .filter(|(start, end)| *start <= device_blocks && device_blocks < *end)
+        .map(|(_, end)| end - device_blocks)
+        .max()
+        .unwrap_or(0);
+
+    u64::from(device_blocks)
+        .saturating_add(u64::from(continuation_blocks))
+        .saturating_mul(u64::from(params.block_size))
+        .min(candidate.input_tokens.saturating_sub(1) as u64)
+}
+
 fn request_prefill_tokens(candidate: &CandidateView<'_>, params: &CostParams) -> u64 {
     if let Some(tokens) = candidate.prefill_tokens {
         return tokens;
@@ -916,6 +952,7 @@ struct SelectionPlan {
     grouped: Vec<Vec<TierMatch>>,
     input_tokens: Vec<usize>,
     prefill_tokens: Vec<Option<u64>>,
+    predicted_cached_tokens: Vec<Option<u64>>,
     has_tokens: bool,
 }
 
@@ -1246,6 +1283,7 @@ impl KvAwarePolicy {
                     grouped: vec![Vec::new(); count],
                     input_tokens: vec![0; count],
                     prefill_tokens: vec![None; count],
+                    predicted_cached_tokens: vec![None; count],
                     has_tokens: false,
                 }
             } else {
@@ -1359,6 +1397,7 @@ impl KvAwarePolicy {
             return Some(KvSelectionReceipt {
                 worker_index,
                 new_prefill_tokens,
+                predicted_cached_tokens: plan.predicted_cached_tokens[position],
                 decision,
                 slot,
             });
@@ -1449,10 +1488,17 @@ impl KvAwarePolicy {
         let mut grouped = Vec::with_capacity(bindings.len());
         let mut input_tokens = Vec::with_capacity(bindings.len());
         let mut prefill_tokens = Vec::with_capacity(bindings.len());
+        let mut predicted_by_candidate = Vec::with_capacity(bindings.len());
         for ((binding, prompts), &worker_index) in bindings.iter().zip(prompts).zip(&healthy) {
             let mut total_input = 0usize;
             let mut total_prefill = 0u64;
+            let mut total_predicted = 0u64;
             let mut single_matches = Vec::new();
+            let prediction_verified = has_tokens
+                && !prompts.is_empty()
+                && input.allows_credit(worker_index, workers.len())
+                && credit_fallback.is_none()
+                && binding.cache_key.is_some();
             if has_tokens {
                 for ids in &prompts {
                     if !input.allows_credit(worker_index, workers.len()) {
@@ -1497,16 +1543,19 @@ impl KvAwarePolicy {
                         block_size: binding.block_size,
                         ..self.params
                     };
-                    total_prefill = total_prefill.saturating_add(request_prefill_tokens(
-                        &CandidateView {
-                            target: &binding.target,
-                            matches: &matches,
-                            load: LoadSample::default(),
-                            input_tokens: ids.len(),
-                            prefill_tokens: None,
-                        },
-                        &params,
-                    ));
+                    let candidate = CandidateView {
+                        target: &binding.target,
+                        matches: &matches,
+                        load: LoadSample::default(),
+                        input_tokens: ids.len(),
+                        prefill_tokens: None,
+                    };
+                    total_prefill =
+                        total_prefill.saturating_add(request_prefill_tokens(&candidate, &params));
+                    if prediction_verified {
+                        total_predicted = total_predicted
+                            .saturating_add(predicted_cached_tokens(&candidate, &params));
+                    }
                     total_input = total_input.saturating_add(ids.len());
                     if prompts.len() == 1 {
                         single_matches = matches;
@@ -1519,6 +1568,7 @@ impl KvAwarePolicy {
             grouped.push(single_matches);
             input_tokens.push(total_input);
             prefill_tokens.push((has_tokens && prompts.len() > 1).then_some(total_prefill));
+            predicted_by_candidate.push(prediction_verified.then_some(total_predicted));
         }
         Some(SelectionPlan {
             healthy,
@@ -1526,6 +1576,7 @@ impl KvAwarePolicy {
             grouped,
             input_tokens,
             prefill_tokens,
+            predicted_cached_tokens: predicted_by_candidate,
             has_tokens,
         })
     }
@@ -2150,6 +2201,11 @@ mod tests {
             let receipt = select(&mask, &[]);
             assert!(mask[receipt.worker_index], "{case}: ineligible worker");
             assert_eq!(receipt.new_prefill_tokens, 1, "{case}");
+            assert_eq!(
+                receipt.predicted_cached_tokens,
+                Some(u64::from(2 * block_size)),
+                "{case}"
+            );
             assert_eq!(provider.queries.load(Ordering::Relaxed), 1, "{case}");
             assert_eq!(provider.blocks.load(Ordering::Relaxed), 3, "{case}");
             release_receipt(&workers, &receipt);
@@ -2353,6 +2409,7 @@ mod tests {
                 batchsize: 3
             }
         );
+        assert_eq!(predicted_cached_tokens(&candidate, &params), 144);
     }
 
     #[test]
@@ -2767,6 +2824,7 @@ mod tests {
             .unwrap();
         assert_eq!(receipt.worker_index, 0);
         assert_eq!(receipt.new_prefill_tokens, 4);
+        assert_eq!(receipt.predicted_cached_tokens, None);
         release_receipt(&workers, &receipt);
         let receipt = policy
             .select_worker_with_inputs(
@@ -2779,6 +2837,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(receipt.new_prefill_tokens, 12);
+        assert_eq!(receipt.predicted_cached_tokens, None);
         release_receipt(&workers, &receipt);
     }
 
