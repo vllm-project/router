@@ -265,9 +265,9 @@ impl ConfigValidator {
                 })
             }
         };
-        if config.intra_node_data_parallel_size != 1 || config.enable_igw {
+        if config.enable_igw {
             return Err(ConfigError::ValidationFailed {
-                reason: "EPD currently requires DP=1 and proxy mode".into(),
+                reason: "EPD currently requires proxy mode".into(),
             });
         }
         if epd.encoder_urls.is_empty() {
@@ -286,18 +286,6 @@ impl ConfigValidator {
             }
         }
         if !epd.consumer_zmq_addrs.is_empty() {
-            if worker_urls.is_empty()
-                || epd.consumer_zmq_addrs.len() != worker_urls.len()
-                || worker_urls
-                    .iter()
-                    .any(|url| !epd.consumer_zmq_addrs.contains_key(*url))
-            {
-                return Err(ConfigError::ValidationFailed {
-                    reason:
-                        "EPD consumer_zmq_addrs must map every embedding consumer URL exactly once"
-                            .into(),
-                });
-            }
             for addr in epd.consumer_zmq_addrs.values() {
                 let parsed = url::Url::parse(addr).map_err(|e| ConfigError::ValidationFailed {
                     reason: format!("Invalid EC address: {e}"),
