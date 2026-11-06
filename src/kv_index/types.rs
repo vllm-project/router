@@ -127,6 +127,31 @@ pub enum ClearScope {
     All,
 }
 
+/// The request-side identity a placement provider needs to answer a query.
+///
+/// This is the bridge from a tokenized router request to an external index
+/// provider (e.g. the Mooncake Conductor) that reproduces the engine's block
+/// hash from `token_ids`. The in-process `KvBlockIndexer` ignores it (it
+/// hashes blocks itself via `local_hashes`); `ConductorMatchProvider` consumes
+/// it to issue a `/query` against Conductor.
+///
+/// Fields mirror what Conductor's `/query`/`/register` need: model id, block
+/// size, token ids, and the (optional) LoRA / cache-salt keys that scope a KV
+/// cache entry.
+#[derive(Debug, Clone)]
+pub struct MatchRequest<'a> {
+    /// Engine model identity sent in `/query` (`model`).
+    pub model_id: Option<String>,
+    /// Tokens per KV block; must equal the engine's `--block-size`.
+    pub block_size: u32,
+    /// The request's token ids, used to reproduce engine block hashes.
+    pub token_ids: &'a [u32],
+    /// Optional LoRA adapter controlling the KV cache identity.
+    pub lora_name: Option<String>,
+    /// Optional cache-salt controlling the KV cache identity.
+    pub cache_salt: Option<String>,
+}
+
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use super::*;

@@ -466,24 +466,18 @@ impl ConfigValidator {
                     });
                 }
             }
-            PolicyConfig::KvAware {
-                router_temperature,
-                kv_penalty_host,
-                kv_penalty_external,
-                kv_penalty_disk,
-                static_kv_event_sources,
-            } => {
-                if !router_temperature.is_finite() || *router_temperature < 0.0 {
+            PolicyConfig::KvAware(config) => {
+                if !config.router_temperature.is_finite() || config.router_temperature < 0.0 {
                     return Err(ConfigError::InvalidValue {
                         field: "router_temperature".to_string(),
-                        value: router_temperature.to_string(),
+                        value: config.router_temperature.to_string(),
                         reason: "Must be finite and >= 0.0".to_string(),
                     });
                 }
                 for (field, value) in [
-                    ("kv_penalty_host", kv_penalty_host),
-                    ("kv_penalty_external", kv_penalty_external),
-                    ("kv_penalty_disk", kv_penalty_disk),
+                    ("kv_penalty_host", &config.kv_penalty_host),
+                    ("kv_penalty_external", &config.kv_penalty_external),
+                    ("kv_penalty_disk", &config.kv_penalty_disk),
                 ] {
                     if !value.is_finite() || !(0.0..=1.0).contains(value) {
                         return Err(ConfigError::InvalidValue {
@@ -493,7 +487,82 @@ impl ConfigValidator {
                         });
                     }
                 }
-                for (worker, source) in static_kv_event_sources.iter() {
+                match config.kv_index_backend.as_str() {
+                    "local" => {}
+                    "conductor" => {
+                        if config.conductor_url.as_deref().unwrap_or("").is_empty() {
+                            return Err(ConfigError::InvalidValue {
+                                field: "conductor_url".to_string(),
+                                value: String::new(),
+                                reason: "conductor_url is required when kv_index_backend is \
+                                         \"conductor\""
+                                    .to_string(),
+                            });
+                        }
+                        // A wrong (or missing) hash recipe is a silent zero-hit,
+                        // never an error at query time, so refuse to start
+                        // unless it is a value Conductor actually accepts.
+                        // TODO(RFC #414 required change): once Conductor accepts
+                        // an absent `python_hash_seed` for `vllm_v1` (vLLM
+                        // #51875, seed text "vllm-none-hash"), allow `None` here
+                        // and omit the field on the wire.
+                        let profile = config.conductor_hash_profile.clone().unwrap_or_default();
+                        if profile.strategy == "vllm_v1" {
+                            match profile.python_hash_seed.as_deref() {
+                                None => {
+                                    return Err(ConfigError::InvalidValue {
+                                        field: "conductor_hash_python_seed".to_string(),
+                                        value: String::new(),
+                                        reason: "required for vllm_v1: pass the engine's \
+                                                 PYTHONHASHSEED (or \"random\"); Conductor \
+                                                 rejects an absent seed today"
+                                            .to_string(),
+                                    });
+                                }
+                                Some(seed) if !valid_python_hash_seed(seed) => {
+                                    return Err(ConfigError::InvalidValue {
+                                        field: "conductor_hash_python_seed".to_string(),
+                                        value: seed.to_string(),
+                                        reason: "Must be \"random\" or bare ASCII decimal in \
+                                                 0..=4294967295 (Conductor's validation)"
+                                            .to_string(),
+                                    });
+                                }
+                                Some(_) => {}
+                            }
+                        }
+                    }
+                    other => {
+                        return Err(ConfigError::InvalidValue {
+                            field: "kv_index_backend".to_string(),
+                            value: other.to_string(),
+                            reason: "Must be \"local\" or \"conductor\"".to_string(),
+                        });
+                    }
+                }
+                for (field, value) in [
+                    (
+                        "conductor_connect_timeout_ms",
+                        &config.conductor_connect_timeout_ms,
+                    ),
+                    (
+                        "conductor_query_timeout_ms",
+                        &config.conductor_query_timeout_ms,
+                    ),
+                    (
+                        "conductor_register_timeout_ms",
+                        &config.conductor_register_timeout_ms,
+                    ),
+                ] {
+                    if *value == 0 {
+                        return Err(ConfigError::InvalidValue {
+                            field: field.to_string(),
+                            value: value.to_string(),
+                            reason: "Must be > 0".to_string(),
+                        });
+                    }
+                }
+                for (worker, source) in config.static_kv_event_sources.iter() {
                     source.validate(worker)?;
                 }
             }
@@ -786,12 +855,8 @@ impl ConfigValidator {
             return Ok(());
         }
 
-        if let PolicyConfig::KvAware {
-            static_kv_event_sources,
-            ..
-        } = &config.policy
-        {
-            if !static_kv_event_sources.is_empty() {
+        if let PolicyConfig::KvAware(kv_config) = &config.policy {
+            if !kv_config.static_kv_event_sources.is_empty() {
                 let RoutingMode::Regular { worker_urls } = &config.mode else {
                     return Err(ConfigError::IncompatibleConfig {
                         reason: "static --kv-event-source is only supported in regular mode"
@@ -803,7 +868,7 @@ impl ConfigValidator {
                     .as_ref()
                     .is_some_and(|discovery| discovery.enabled)
                 {
-                    for worker in static_kv_event_sources.keys() {
+                    for worker in kv_config.static_kv_event_sources.keys() {
                         if !worker_urls.contains(worker) {
                             return Err(ConfigError::ValidationFailed {
                                 reason: format!(
@@ -1045,6 +1110,18 @@ fn base_url_without_rank(url: &str) -> &str {
         Some((base, rank)) if rank.parse::<usize>().is_ok() => base,
         _ => url,
     }
+}
+
+fn valid_python_hash_seed(seed: &str) -> bool {
+    if seed == "random" {
+        return true;
+    }
+    !seed.is_empty()
+        && seed.bytes().all(|byte| byte.is_ascii_digit())
+        && seed
+            .parse::<u64>()
+            .map(|value| value <= u32::MAX as u64)
+            .unwrap_or(false)
 }
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
@@ -1498,13 +1575,20 @@ mod tests {
                 decode_policy: None,
                 discovery_address: None,
             },
-            PolicyConfig::KvAware {
+            PolicyConfig::KvAware(Box::new(KvAwareConfig {
                 router_temperature: 0.0,
                 kv_penalty_host: 0.8,
                 kv_penalty_external: 0.6,
                 kv_penalty_disk: 0.3,
                 static_kv_event_sources: Default::default(),
-            },
+                kv_index_backend: "local".to_string(),
+                conductor_url: None,
+                conductor_register: true,
+                conductor_connect_timeout_ms: 100,
+                conductor_query_timeout_ms: 10,
+                conductor_register_timeout_ms: 1000,
+                conductor_hash_profile: None,
+            })),
         );
 
         ConfigValidator::validate(&config).unwrap();
@@ -1638,13 +1722,18 @@ mod tests {
                 decode_policy: None,
                 discovery_address: None,
             },
-            PolicyConfig::KvAware {
+            PolicyConfig::KvAware(Box::new(KvAwareConfig {
                 router_temperature: 0.0,
                 kv_penalty_host: 0.8,
                 kv_penalty_external: 0.6,
                 kv_penalty_disk: 0.3,
                 static_kv_event_sources: Default::default(),
-            },
+                kv_index_backend: "local".to_string(),
+                conductor_url: None,
+                conductor_query_timeout_ms: 10,
+                conductor_hash_profile: None,
+                ..Default::default()
+            })),
         );
         config.pd_kv_event_sources.insert(
             "http://prefill:8000".to_string(),
@@ -1758,5 +1847,68 @@ mod tests {
         };
         let err = ConfigValidator::validate(&config).unwrap_err().to_string();
         assert!(err.contains("requires a kv_aware prefill policy"), "{err}");
+    }
+
+    fn kv_aware_conductor_config(profile: Option<ConductorHashProfile>) -> RouterConfig {
+        RouterConfig::new(
+            RoutingMode::Regular {
+                worker_urls: vec!["http://worker:8000".to_string()],
+            },
+            PolicyConfig::KvAware(Box::new(KvAwareConfig {
+                kv_index_backend: "conductor".to_string(),
+                conductor_url: Some("http://conductor:13333".to_string()),
+                conductor_hash_profile: profile,
+                ..KvAwareConfig::default()
+            })),
+        )
+    }
+
+    #[test]
+    fn test_kv_aware_conductor_requires_a_python_hash_seed() {
+        // Conductor rejects an absent or empty seed for vllm_v1 today, so the
+        // router must fail at startup instead of failing every /register later.
+        let config = kv_aware_conductor_config(Some(ConductorHashProfile::default()));
+        let error = ConfigValidator::validate(&config).unwrap_err();
+        assert!(
+            error.to_string().contains("conductor_hash_python_seed"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn test_kv_aware_conductor_rejects_an_invalid_python_hash_seed() {
+        let config = kv_aware_conductor_config(Some(ConductorHashProfile {
+            python_hash_seed: Some("not-a-seed".to_string()),
+            ..ConductorHashProfile::default()
+        }));
+        let error = ConfigValidator::validate(&config).unwrap_err();
+        assert!(
+            error.to_string().contains("4294967295"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn test_kv_aware_conductor_accepts_a_valid_seed() {
+        let config = kv_aware_conductor_config(Some(ConductorHashProfile {
+            python_hash_seed: Some("1450105824".to_string()),
+            ..ConductorHashProfile::default()
+        }));
+        assert!(ConfigValidator::validate(&config).is_ok());
+    }
+
+    #[test]
+    fn test_kv_aware_conductor_requires_url() {
+        let config = RouterConfig::new(
+            RoutingMode::Regular {
+                worker_urls: vec!["http://worker:8000".to_string()],
+            },
+            PolicyConfig::KvAware(Box::new(KvAwareConfig {
+                kv_index_backend: "conductor".to_string(),
+                ..KvAwareConfig::default()
+            })),
+        );
+        let error = ConfigValidator::validate(&config).unwrap_err();
+        assert!(error.to_string().contains("conductor_url"));
     }
 }

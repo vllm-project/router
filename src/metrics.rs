@@ -424,6 +424,35 @@ pub fn init_metrics() {
         "vllm_tokenizer_l1_bytes",
         "Estimated bytes retained by the L1 cache"
     );
+
+    // Conductor placement metrics (RFC #414 §7). These describe the router's
+    // own view of the external index: Conductor exposes no scrape endpoint, so
+    // "did we query it, did it fail, did we register, did we skip" can only be
+    // observed here.
+    describe_histogram!(
+        "vllm_router_conductor_query_duration_seconds",
+        "Conductor /query round-trip latency as seen by the router"
+    );
+    describe_counter!(
+        "vllm_router_conductor_query_errors_total",
+        "Conductor /query failures by reason (timeout/transport/status/decode/invariant)"
+    );
+    describe_counter!(
+        "vllm_router_conductor_register_total",
+        "Conductor worker registration attempts by result (ok/error)"
+    );
+    describe_gauge!(
+        "vllm_router_conductor_registered_sources",
+        "Number of (instance_id, dp_rank) services this router registered with Conductor"
+    );
+    describe_counter!(
+        "vllm_router_conductor_query_skipped_total",
+        "Placement queries skipped before reaching Conductor, by reason"
+    );
+    describe_counter!(
+        "vllm_router_kv_aware_matched_tokens_total",
+        "Tokens matched per storage tier for the selected worker (before transfer credit)"
+    );
 }
 
 pub fn start_prometheus(config: PrometheusConfig) {
@@ -1146,6 +1175,66 @@ impl RouterMetrics {
             "outcome" => outcome.to_string()
         )
         .increment(1);
+    }
+}
+
+/// Conductor placement metrics.
+///
+/// Deliberately label-free apart from small enums: never put an instance id,
+/// worker URL or model name on a label (cardinality would grow with the fleet).
+pub struct ConductorMetrics;
+
+impl ConductorMetrics {
+    pub fn record_query_duration(duration: Duration) {
+        histogram!("vllm_router_conductor_query_duration_seconds").record(duration.as_secs_f64());
+    }
+
+    pub fn record_query_error(reason: &'static str) {
+        counter!(
+            "vllm_router_conductor_query_errors_total",
+            "reason" => reason
+        )
+        .increment(1);
+    }
+
+    /// A response that violated the documented invariants and was dropped.
+    pub fn record_invariant_violation() {
+        Self::record_query_error("invariant");
+    }
+
+    pub fn record_register(success: bool) {
+        counter!(
+            "vllm_router_conductor_register_total",
+            "result" => if success { "ok" } else { "error" }
+        )
+        .increment(1);
+    }
+
+    pub fn set_registered_sources(count: usize) {
+        gauge!("vllm_router_conductor_registered_sources").set(count as f64);
+    }
+
+    /// A placement query that never reached Conductor. `reason` is a small
+    /// enum: `no_tokens`, `no_cache_identity`.
+    pub fn record_skipped(reason: &'static str) {
+        counter!(
+            "vllm_router_conductor_query_skipped_total",
+            "reason" => reason
+        )
+        .increment(1);
+    }
+
+    /// Tokens matched per tier for the worker that was actually selected.
+    /// Recorded once per request for the winner, not per candidate.
+    pub fn record_matched_tokens(tier: &'static str, tokens: u64) {
+        if tokens == 0 {
+            return;
+        }
+        counter!(
+            "vllm_router_kv_aware_matched_tokens_total",
+            "tier" => tier
+        )
+        .increment(tokens);
     }
 }
 

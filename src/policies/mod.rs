@@ -9,6 +9,7 @@ use std::fmt::Debug;
 use std::sync::Arc;
 
 mod cache_aware;
+mod conductor;
 mod consistent_hash;
 mod factory;
 pub(crate) mod hash_key;
@@ -22,6 +23,7 @@ mod sticky_least_loaded;
 
 pub(crate) use cache_aware::PreparedCacheSelection;
 pub use cache_aware::{CacheAwareCandidate, CacheAwarePlacement, CacheAwarePolicy};
+pub use conductor::{ConductorMatchProvider, ConductorOptions};
 pub use consistent_hash::ConsistentHashPolicy;
 pub use consistent_hash::VIRTUAL_NODES_PER_WORKER;
 pub use factory::PolicyFactory;

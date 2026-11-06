@@ -14,12 +14,14 @@ use sha2::{Digest as _, Sha256};
 
 use super::{get_healthy_worker_indices, LoadBalancingPolicy, RequestHeaders};
 use crate::core::Worker;
-use crate::kv_index::{CacheKey, MatchQuery, RoutableTarget, StorageTier, TierMatch, WorkerKvInfo};
+use crate::kv_index::{
+    CacheKey, MatchQuery, MatchRequest, RoutableTarget, StorageTier, TierMatch, WorkerKvInfo,
+};
 use crate::request_identity::StableIdentity;
 
 /// Read-only placement port owned by its policy consumer.
 pub trait TieredMatchProvider: Send + Sync {
-    fn find_tiered_matches(&self, query: &MatchQuery) -> Vec<TierMatch>;
+    fn find_tiered_matches(&self, query: &MatchQuery<'_>) -> Vec<TierMatch>;
 }
 
 /// Exact prompt sequences rendered by each HTTP backend. DP ranks share their
@@ -738,27 +740,50 @@ fn credited_tokens(candidate: &CandidateView<'_>, params: &CostParams) -> f64 {
                 .min(u32::MAX as usize) as u32,
         );
 
-    let mut best_continuation = (0_u32, 0.0_f64);
-    for hit in candidate
-        .matches
-        .iter()
-        .filter(|hit| hit.tier != StorageTier::Device)
-    {
-        for &(start, end) in &hit.segments {
-            if start <= device_blocks && device_blocks < end {
-                let blocks = end - device_blocks;
-                let credit = params.transfer_credits.for_tier(hit.tier);
-                if blocks > best_continuation.0
-                    || (blocks == best_continuation.0 && credit > best_continuation.1)
-                {
-                    best_continuation = (blocks, credit);
+    // Credit a chain of continuation tiers instead of a single one (RFC #414).
+    // Starting at the device prefix boundary, repeatedly take the best-credit
+    // covering segment among non-device tiers, advance to its end, and repeat
+    // until nothing covers the current position. This handles both Conductor's
+    // disjoint per-tier ceilings (device..host..pool..disk) and vLLM's classic
+    // two-segment (device + one external) reuse: when only a single
+    // continuation segment touches the device boundary, the walk credits it
+    // and then stops, matching the pre-chain behaviour.
+    let mut credited_continuation = 0.0_f64;
+    let mut pos = device_blocks;
+    loop {
+        let mut best: Option<(u32, f64)> = None; // (end, credit)
+        for hit in candidate
+            .matches
+            .iter()
+            .filter(|hit| hit.tier != StorageTier::Device)
+        {
+            for &(start, end) in &hit.segments {
+                if start <= pos && pos < end {
+                    let credit = params.transfer_credits.for_tier(hit.tier);
+                    let blocks = end - pos;
+                    let better = match best {
+                        None => true,
+                        Some((best_end, best_credit)) => {
+                            blocks > best_end - pos
+                                || (blocks == best_end - pos && credit > best_credit)
+                        }
+                    };
+                    if better {
+                        best = Some((end, credit));
+                    }
                 }
             }
         }
+        match best {
+            Some((end, credit)) => {
+                credited_continuation += f64::from(end - pos) * credit;
+                pos = end;
+            }
+            None => break,
+        }
     }
 
-    let credited_blocks =
-        f64::from(device_blocks) + f64::from(best_continuation.0) * best_continuation.1;
+    let credited_blocks = f64::from(device_blocks) + credited_continuation;
     // External reuse may have a different alignment, but it cannot eliminate
     // the last-token logits work either.
     (credited_blocks * f64::from(params.block_size))
@@ -872,7 +897,7 @@ impl Picker for TemperaturePicker {
 struct EmptyMatchProvider;
 
 impl TieredMatchProvider for EmptyMatchProvider {
-    fn find_tiered_matches(&self, _query: &MatchQuery) -> Vec<TierMatch> {
+    fn find_tiered_matches(&self, _query: &MatchQuery<'_>) -> Vec<TierMatch> {
         Vec::new()
     }
 }
@@ -884,6 +909,8 @@ struct TargetBinding {
     cache_key: Option<CacheKey>,
     matches: Arc<dyn TieredMatchProvider>,
     block_size: u32,
+    /// Engine model identity, forwarded to an external provider if set.
+    model_id: Option<Arc<str>>,
 }
 
 /// One prepared selection snapshot: KV queries fill `grouped` outside every
@@ -917,6 +944,18 @@ pub struct KvAwarePolicy {
     selection_lock: Mutex<()>,
     /// Every registration gets a new generation, including load-only targets.
     next_generation: AtomicU64,
+    /// When true, worker bindings use the policy-level `matches` provider
+    /// (e.g. the shared ConductorMatchProvider) instead of the per-worker
+    /// provider discovered by the local KV-index supervisor. This is what makes
+    /// `--kv-index-backend conductor` actually consult Conductor for placement.
+    prefer_policy_provider: bool,
+    /// The shared Conductor provider, when `--kv-index-backend conductor` is
+    /// active. Used to dynamically register/unregister workers against
+    /// Conductor so it can run with zero static service configuration.
+    conductor: Option<Arc<super::ConductorMatchProvider>>,
+    /// Whether the router drives Conductor registration itself. False when an
+    /// operator or sidecar owns registration (RFC #414 §4).
+    register_enabled: bool,
 }
 
 impl std::fmt::Debug for KvAwarePolicy {
@@ -950,6 +989,32 @@ impl KvAwarePolicy {
         self
     }
 
+    /// Build a `kv_aware` policy backed by the Mooncake Conductor as its KV
+    /// placement provider (RFC #414). The provider answers `/query` over HTTP,
+    /// degrades to "no placement credit" on any failure (so load scoring always
+    /// remains the floor), and dynamically registers workers so Conductor can be
+    /// configured with zero static services.
+    pub fn new_with_conductor(
+        params: CostParams,
+        options: super::ConductorOptions,
+        register_enabled: bool,
+    ) -> Self {
+        let provider = Arc::new(super::ConductorMatchProvider::with_options(options));
+        let slots = Arc::new(InMemorySlotManager::new());
+        let mut policy = Self::with_components(
+            provider.clone(),
+            slots.clone(),
+            vec![Arc::new(MultiplicativeScorer)],
+            Arc::new(TemperaturePicker::new(params.router_temperature)),
+            params,
+        );
+        policy.slot_manager = Some(slots);
+        policy.prefer_policy_provider = true;
+        policy.conductor = Some(provider);
+        policy.register_enabled = register_enabled;
+        policy
+    }
+
     pub fn with_components(
         matches: Arc<dyn TieredMatchProvider>,
         load: Arc<dyn LoadProvider>,
@@ -969,6 +1034,9 @@ impl KvAwarePolicy {
             affinity: Arc::new(KvAffinityTable::new()),
             selection_lock: Mutex::new(()),
             next_generation: AtomicU64::new(1),
+            prefer_policy_provider: false,
+            conductor: None,
+            register_enabled: false,
         }
     }
 
@@ -982,6 +1050,7 @@ impl KvAwarePolicy {
                 cache_key: None,
                 matches: self.matches.clone(),
                 block_size: self.params.block_size,
+                model_id: None,
             },
         );
     }
@@ -995,6 +1064,17 @@ impl KvAwarePolicy {
     ) {
         let _guard = self.selection_lock.lock();
         let block_size = cache_key.block_size;
+        let model_id = Some(cache_key.model.clone());
+        // In conductor mode (`--kv-index-backend conductor`) placement must be
+        // answered by the shared ConductorMatchProvider, not the local per-worker
+        // indexer that `match_provider_for_worker` normally supplies. `block_size`
+        // and `model_id` still come from the discovered cache identity so the
+        // Conductor /query targets the right hash profile.
+        let matches = if self.prefer_policy_provider {
+            self.matches.clone()
+        } else {
+            matches
+        };
         self.targets.insert(
             worker_url.into(),
             TargetBinding {
@@ -1003,6 +1083,7 @@ impl KvAwarePolicy {
                 cache_key: Some(cache_key),
                 matches,
                 block_size,
+                model_id,
             },
         );
     }
@@ -1063,6 +1144,7 @@ impl KvAwarePolicy {
                 cache_key: None,
                 matches: self.matches.clone(),
                 block_size: self.params.block_size,
+                model_id: None,
             })
     }
 
@@ -1103,10 +1185,18 @@ impl KvAwarePolicy {
         if local_hashes.is_empty() {
             Vec::new()
         } else {
+            let request = token_ids.map(|ids| MatchRequest {
+                model_id: binding.model_id.as_ref().map(|model| model.to_string()),
+                block_size: binding.block_size,
+                token_ids: ids,
+                lora_name: lora_name.map(str::to_owned),
+                cache_salt: None,
+            });
             let hits = binding.matches.find_tiered_matches(&MatchQuery {
                 group_idx: 0,
                 local_hashes,
                 tiers_of_interest: Self::tiers_of_interest(),
+                request,
             });
             crate::metrics::RouterMetrics::record_kv_placement_lookup(
                 if binding.cache_key.is_none() {
@@ -1257,6 +1347,35 @@ impl KvAwarePolicy {
             let candidates = self.candidate_views(workers, &plan);
             let (costs, components) = self.score_candidates(&plan, &candidates)?;
 
+            for (index, candidate) in candidates.iter().enumerate() {
+                let device_blocks: u32 = candidate
+                    .matches
+                    .iter()
+                    .filter(|hit| hit.tier == StorageTier::Device)
+                    .flat_map(|hit| hit.segments.iter())
+                    .map(|(start, end)| end - start)
+                    .sum();
+                let total_matched: u32 = candidate
+                    .matches
+                    .iter()
+                    .flat_map(|hit| hit.segments.iter())
+                    .map(|(start, end)| end - start)
+                    .sum();
+                tracing::info!(
+                    worker = %candidate.target.instance_id,
+                    rank = candidate.target.dp_rank,
+                    token_ids_present = plan.has_tokens,
+                    input_tokens = candidate.input_tokens,
+                    tier_matches = candidate.matches.len(),
+                    device_blocks,
+                    total_matched_blocks = total_matched,
+                    cost = costs[index],
+                    ptoken = components[index].ptoken,
+                    batchsize = components[index].batchsize,
+                    "kv_aware_select: candidate"
+                );
+            }
+
             // Recheck the table inside the critical section.
             let acquired = digest
                 .as_ref()
@@ -1297,6 +1416,20 @@ impl KvAwarePolicy {
 
             let (worker_index, new_prefill_tokens, decision) =
                 self.decision_for_position(&plan, &candidates, &costs, &components, position);
+            tracing::info!(
+                worker = %target.instance_id,
+                rank = target.dp_rank,
+                token_ids_present = plan.has_tokens,
+                input_tokens = plan.input_tokens[position],
+                pick_kind = if plan.has_tokens {
+                    "kv-aware"
+                } else {
+                    "load-fallback"
+                },
+                cost = costs[position],
+                new_prefill_tokens,
+                "kv_aware_select: picked"
+            );
             let outcome = if used_binding {
                 "sticky_hit"
             } else if !plan.has_tokens {
@@ -1423,6 +1556,9 @@ impl KvAwarePolicy {
         let has_tokens = known_input_tokens > 0;
         if !has_tokens {
             crate::metrics::RouterMetrics::record_kv_placement_lookup("missing_tokens");
+            if self.conductor.is_some() {
+                crate::metrics::ConductorMetrics::record_skipped("no_tokens");
+            }
         }
         let mut query_cache: HashMap<(Option<CacheKey>, &[u32]), Vec<TierMatch>> = HashMap::new();
         let mut grouped = Vec::with_capacity(bindings.len());
@@ -1442,19 +1578,49 @@ impl KvAwarePolicy {
                     let hits = query_cache
                         .entry((binding.cache_key.clone(), ids))
                         .or_insert_with(|| {
-                            if let Some(reason) = credit_fallback {
-                                crate::metrics::RouterMetrics::record_kv_placement_lookup(reason);
+                            let ids: &[u32] = ids;
+                            let external = self.conductor.is_some();
+                            if external && binding.model_id.is_none() {
+                                // Conductor cannot resolve an empty model, and a
+                                // 400 would also count against the breaker.
+                                crate::metrics::ConductorMetrics::record_skipped(
+                                    "no_cache_identity",
+                                );
                                 return Vec::new();
                             }
-                            let local_hashes =
-                                Self::local_hashes_with_lora(ids, binding.block_size, lora_name);
-                            if local_hashes.is_empty() {
+                            if !external {
+                                if let Some(reason) = credit_fallback {
+                                    crate::metrics::RouterMetrics::record_kv_placement_lookup(
+                                        reason,
+                                    );
+                                    return Vec::new();
+                                }
+                            }
+                            // The local indexer hashes tokens itself; Conductor
+                            // reproduces the engine chain from token ids and must
+                            // not receive local hashes.
+                            let local_hashes = if external {
+                                Vec::new()
+                            } else {
+                                Self::local_hashes_with_lora(ids, binding.block_size, lora_name)
+                            };
+                            if !external && local_hashes.is_empty() {
                                 return Vec::new();
                             }
                             let hits = binding.matches.find_tiered_matches(&MatchQuery {
                                 group_idx: 0,
                                 local_hashes,
                                 tiers_of_interest: Self::tiers_of_interest(),
+                                request: Some(MatchRequest {
+                                    model_id: binding
+                                        .model_id
+                                        .as_ref()
+                                        .map(|model| model.to_string()),
+                                    block_size: binding.block_size,
+                                    token_ids: ids,
+                                    lora_name: lora_name.map(str::to_owned),
+                                    cache_salt: cache_salt.map(str::to_owned),
+                                }),
                             });
                             crate::metrics::RouterMetrics::record_kv_placement_lookup(
                                 if binding.cache_key.is_none() {
@@ -1920,9 +2086,41 @@ impl KvAwareOps for KvAwarePolicy {
             }
             _ => self.register_target(worker.url(), target),
         }
+        // In conductor mode, register the worker with Conductor so it can run
+        // with zero static service configuration. Failure is logged but never
+        // blocks local admission (placement degrades to load-only).
+        if let (Some(conductor), Some(info)) = (
+            self.conductor.as_ref().filter(|_| self.register_enabled),
+            info,
+        ) {
+            match conductor.register_worker(info) {
+                Ok(()) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        "kv_aware conductor register failed instance_id={} worker={} error={}",
+                        info.instance_id,
+                        worker.url(),
+                        error
+                    );
+                }
+            }
+        }
     }
 
     fn unregister_worker(&self, worker_url: &str) {
+        if let Some(conductor) = self.conductor.as_ref().filter(|_| self.register_enabled) {
+            if let Some(binding) = self.targets.get(worker_url) {
+                let instance_id = binding.target.instance_id.to_string();
+                let dp_rank = binding.target.dp_rank;
+                if let Err(error) = conductor.unregister_worker(&instance_id, &[dp_rank]) {
+                    tracing::warn!(
+                        "kv_aware conductor unregister failed worker={} error={}",
+                        worker_url,
+                        error
+                    );
+                }
+            }
+        }
         self.unregister_target(worker_url);
     }
 
@@ -2041,7 +2239,7 @@ mod tests {
             hits: Vec<TierMatch>,
         }
         impl TieredMatchProvider for Matches {
-            fn find_tiered_matches(&self, query: &MatchQuery) -> Vec<TierMatch> {
+            fn find_tiered_matches(&self, query: &MatchQuery<'_>) -> Vec<TierMatch> {
                 self.queries.fetch_add(1, Ordering::Relaxed);
                 self.blocks
                     .store(query.local_hashes.len(), Ordering::Relaxed);
@@ -2331,6 +2529,57 @@ mod tests {
         assert_eq!(
             cost_components(&candidate, &CostParams::default()).ptoken,
             112
+        );
+    }
+
+    #[test]
+    fn chained_continuation_credits_each_tier_in_sequence() {
+        // RFC #414: credit a chain of continuation tiers, not just one.
+        // device [0,3) then host [3,6) then external [6,9): each block is
+        // credited at its own tier's transfer ratio as the walk advances.
+        let t = target("w", 0);
+        let matches = vec![
+            tier_match(&t, StorageTier::Device, &[(0, 3)]),
+            tier_match(&t, StorageTier::HostPinned, &[(3, 6)]),
+            tier_match(&t, StorageTier::External, &[(6, 9)]),
+        ];
+        let candidate = CandidateView {
+            target: &t,
+            matches: &matches,
+            load: LoadSample::default(),
+            prefill_tokens: None,
+            input_tokens: 160, // 10 blocks at block_size 16
+        };
+        // 3 device + 3*0.8 host + 3*0.6 external = 3 + 2.4 + 1.8 = 7.2 blocks
+        // = 115.2 tokens; ptoken = ceil(160 - 115.2) = ceil(44.8) = 45.
+        assert_eq!(
+            cost_components(&candidate, &CostParams::default()).ptoken,
+            45
+        );
+    }
+
+    #[test]
+    fn chained_walk_stops_at_first_uncovered_position() {
+        // The chain stops at the first position no tier covers: host [3,6)
+        // then a gap before external [8,10) — external is not reached.
+        let t = target("w", 0);
+        let matches = vec![
+            tier_match(&t, StorageTier::Device, &[(0, 3)]),
+            tier_match(&t, StorageTier::HostPinned, &[(3, 6)]),
+            tier_match(&t, StorageTier::External, &[(8, 10)]),
+        ];
+        let candidate = CandidateView {
+            target: &t,
+            matches: &matches,
+            load: LoadSample::default(),
+            prefill_tokens: None,
+            input_tokens: 160,
+        };
+        // 3 device + 3*0.8 host = 5.4 blocks = 86.4 tokens;
+        // ptoken = ceil(160 - 86.4) = ceil(73.6) = 74.
+        assert_eq!(
+            cost_components(&candidate, &CostParams::default()).ptoken,
+            74
         );
     }
 
@@ -3511,7 +3760,7 @@ mod tests {
             hits: Vec<TierMatch>,
         }
         impl TieredMatchProvider for Matches {
-            fn find_tiered_matches(&self, _: &MatchQuery) -> Vec<TierMatch> {
+            fn find_tiered_matches(&self, _: &MatchQuery<'_>) -> Vec<TierMatch> {
                 self.calls.fetch_add(1, Ordering::Relaxed);
                 self.hits.clone()
             }
@@ -3577,7 +3826,7 @@ mod tests {
             AtomicUsize,
         );
         impl TieredMatchProvider for QueryBlocks {
-            fn find_tiered_matches(&self, query: &MatchQuery) -> Vec<TierMatch> {
+            fn find_tiered_matches(&self, query: &MatchQuery<'_>) -> Vec<TierMatch> {
                 self.0.store(query.local_hashes.len(), Ordering::Relaxed);
                 self.2.fetch_add(1, Ordering::Relaxed);
                 if let Some(mutate) = self.1.lock().as_mut() {
@@ -3889,5 +4138,177 @@ mod tests {
                     as Arc<dyn Worker>
             })
             .collect()
+    }
+
+    #[test]
+    fn conductor_mode_maps_hits_by_instance_id_not_order() {
+        /// Returns hits in an order deliberately different from worker
+        /// registration order, so a position-based mapper would mis-assign them.
+        #[derive(Default)]
+        struct ShuffledProvider(HashMap<String, Vec<TierMatch>>);
+        impl TieredMatchProvider for ShuffledProvider {
+            fn find_tiered_matches(&self, _query: &MatchQuery<'_>) -> Vec<TierMatch> {
+                let mut out: Vec<TierMatch> = self.0.values().flatten().cloned().collect();
+                // Reverse by instance_id so w2 surfaces first, w0 second — the
+                // opposite of registration order (w0, w1, w2).
+                out.sort_by(|a, b| b.target.instance_id.cmp(&a.target.instance_id));
+                out
+            }
+        }
+
+        let mut policy = KvAwarePolicy::new_with_conductor(
+            CostParams {
+                block_size: 2,
+                ..CostParams::default()
+            },
+            crate::policies::ConductorOptions {
+                url: "http://127.0.0.1:1".into(),
+                connect_timeout: std::time::Duration::from_millis(10),
+                query_timeout: std::time::Duration::from_millis(10),
+                register_timeout: std::time::Duration::from_millis(10),
+                hash_profile: Default::default(),
+            },
+            true,
+        );
+        let mut map = HashMap::new();
+        map.insert(
+            "w2".into(),
+            vec![tier_match(&target("w2", 0), StorageTier::Device, &[(0, 4)])],
+        );
+        map.insert(
+            "w0".into(),
+            vec![tier_match(&target("w0", 0), StorageTier::Device, &[(0, 2)])],
+        );
+        policy.matches = Arc::new(ShuffledProvider(map));
+
+        let key = CacheKey {
+            model: Arc::from("model-a"),
+            hash_mode: crate::kv_index::HashMode::Sha256,
+            block_size: 2,
+        };
+        // All three workers share one cache identity (single Conductor tree).
+        for (url, name) in [
+            ("http://w0", "w0"),
+            ("http://w1", "w1"),
+            ("http://w2", "w2"),
+        ] {
+            policy.register_target_with_cache_identity(
+                url,
+                target(name, 0),
+                key.clone(),
+                Arc::new(crate::kv_index::KvBlockIndexer::new()),
+            );
+        }
+        let workers: Vec<Arc<dyn Worker>> = vec![
+            Arc::new(BasicWorker::new("http://w0".into(), WorkerType::Regular)),
+            Arc::new(BasicWorker::new("http://w1".into(), WorkerType::Regular)),
+            Arc::new(BasicWorker::new("http://w2".into(), WorkerType::Regular)),
+        ];
+        for w in &workers {
+            w.increment_load();
+        }
+
+        // 8 tokens = 4 blocks. w2 has all 4 device blocks -> zero work.
+        let receipt = policy
+            .select_worker_with_receipt(
+                &workers,
+                Some(&[1, 2, 3, 4, 5, 6, 7, 8]),
+                None,
+                None,
+                None,
+                &[],
+            )
+            .unwrap();
+        assert_eq!(receipt.worker_index, 2);
+        assert_eq!(receipt.decision.target, target("w2", 0));
+    }
+
+    fn conductor_policy(matches: Arc<dyn TieredMatchProvider>) -> KvAwarePolicy {
+        let mut policy = KvAwarePolicy::new_with_conductor(
+            CostParams {
+                block_size: 2,
+                ..CostParams::default()
+            },
+            crate::policies::ConductorOptions {
+                url: "http://127.0.0.1:1".into(),
+                connect_timeout: std::time::Duration::from_millis(10),
+                query_timeout: std::time::Duration::from_millis(10),
+                register_timeout: std::time::Duration::from_millis(10),
+                hash_profile: Default::default(),
+            },
+            true,
+        );
+        policy.matches = matches;
+        policy
+    }
+
+    #[test]
+    fn conductor_skips_query_without_a_cache_identity() {
+        struct Panics;
+        impl TieredMatchProvider for Panics {
+            fn find_tiered_matches(&self, _query: &MatchQuery<'_>) -> Vec<TierMatch> {
+                panic!("must not query Conductor without a cache identity")
+            }
+        }
+
+        let policy = conductor_policy(Arc::new(Panics));
+        // `register_target` has no cache identity, so `model_id` is absent.
+        policy.register_target("http://w0", target("w0", 0));
+        let workers: Vec<Arc<dyn Worker>> = vec![Arc::new(BasicWorker::new(
+            "http://w0".into(),
+            WorkerType::Regular,
+        ))];
+
+        let receipt = policy
+            .select_worker_with_receipt(&workers, Some(&[1, 2, 3, 4]), None, None, None, &[])
+            .expect("selection still falls back to load scoring");
+        assert_eq!(receipt.worker_index, 0);
+    }
+
+    #[test]
+    fn conductor_queries_salted_requests() {
+        struct Counts(AtomicUsize);
+        impl TieredMatchProvider for Counts {
+            fn find_tiered_matches(&self, query: &MatchQuery<'_>) -> Vec<TierMatch> {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                assert_eq!(
+                    query.request.as_ref().and_then(|r| r.cache_salt.as_deref()),
+                    Some("tenant-a")
+                );
+                Vec::new()
+            }
+        }
+
+        let counts = Arc::new(Counts(AtomicUsize::new(0)));
+        let policy = conductor_policy(counts.clone());
+        let key = CacheKey {
+            model: Arc::from("model-a"),
+            hash_mode: crate::kv_index::HashMode::Sha256,
+            block_size: 2,
+        };
+        policy.register_target_with_cache_identity(
+            "http://w0",
+            target("w0", 0),
+            key,
+            Arc::new(crate::kv_index::KvBlockIndexer::new()),
+        );
+        let workers: Vec<Arc<dyn Worker>> = vec![Arc::new(BasicWorker::new(
+            "http://w0".into(),
+            WorkerType::Regular,
+        ))];
+
+        // The salted short-circuit belongs to the local indexer only; Conductor
+        // models `cache_salt` in its hash chain, so it must still be queried.
+        policy
+            .select_worker_with_receipt(
+                &workers,
+                Some(&[1, 2, 3, 4]),
+                None,
+                Some("tenant-a"),
+                None,
+                &[],
+            )
+            .expect("selection succeeds");
+        assert_eq!(counts.0.load(Ordering::Relaxed), 1);
     }
 }

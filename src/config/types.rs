@@ -1022,23 +1022,11 @@ pub enum PolicyConfig {
     },
 
     /// Event-driven, multi-tier KV placement plus live prefill/load scoring.
+    /// The options live in [`KvAwareConfig`]; the variant boxes them so that
+    /// growing the option set does not inflate every other `PolicyConfig`
+    /// consumer (`RoutingMode::VllmPrefillDecode` embeds two of them).
     #[serde(rename = "kv_aware")]
-    KvAware {
-        /// Zero selects the minimum cost; positive values softmax-sample.
-        #[serde(default)]
-        router_temperature: f64,
-        /// Transfer credits in [0, 1]; lower means a costlier tier.
-        #[serde(default = "default_kv_penalty_host")]
-        kv_penalty_host: f64,
-        #[serde(default = "default_kv_penalty_external")]
-        kv_penalty_external: f64,
-        #[serde(default = "default_kv_penalty_disk")]
-        kv_penalty_disk: f64,
-        /// Optional static KV event sources for workers whose HTTP control
-        /// endpoint does not expose /kv_event_sources.
-        #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-        static_kv_event_sources: Box<HashMap<String, StaticKvEventSources>>,
-    },
+    KvAware(Box<KvAwareConfig>),
 
     #[serde(rename = "power_of_two")]
     PowerOfTwo {
@@ -1091,13 +1079,91 @@ impl PolicyConfig {
             PolicyConfig::Random => "random",
             PolicyConfig::RoundRobin => "round_robin",
             PolicyConfig::CacheAware { .. } => "cache_aware",
-            PolicyConfig::KvAware { .. } => "kv_aware",
+            PolicyConfig::KvAware(_) => "kv_aware",
             PolicyConfig::PowerOfTwo { .. } => "power_of_two",
             PolicyConfig::ConsistentHash { .. } => "consistent_hash",
             PolicyConfig::StickyLeastLoaded => "sticky_least_loaded",
             PolicyConfig::RendezvousHash => "rendezvous_hash",
         }
     }
+}
+
+/// Configuration for the `kv_aware` policy (RFC #414 §6).
+///
+/// Only the `local` and `conductor` placement backends are implemented in this
+/// slice; the RFC also proposes a `hybrid` backend.
+// TODO(RFC #414 §5): add `hybrid` + `CompositeMatchProvider`. The RFC review
+// discussion asks for explicit provider-authority/freshness semantics before
+// local and shared-tier credits are combined, so this is deferred rather than
+// half-implemented.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KvAwareConfig {
+    /// Zero selects the minimum cost; positive values softmax-sample.
+    #[serde(default)]
+    pub router_temperature: f64,
+    /// Transfer credits in [0, 1]; lower means a costlier tier.
+    #[serde(default = "default_kv_penalty_host")]
+    pub kv_penalty_host: f64,
+    #[serde(default = "default_kv_penalty_external")]
+    pub kv_penalty_external: f64,
+    #[serde(default = "default_kv_penalty_disk")]
+    pub kv_penalty_disk: f64,
+    /// Optional static KV event sources for workers whose HTTP control
+    /// endpoint does not expose /kv_event_sources.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub static_kv_event_sources: Box<HashMap<String, StaticKvEventSources>>,
+    /// Placement index backend: `local` (built-in, default) or `conductor`
+    /// (external Mooncake Conductor).
+    #[serde(default = "default_kv_index_backend")]
+    pub kv_index_backend: String,
+    /// Conductor HTTP base URL for `kv_index_backend = "conductor"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conductor_url: Option<String>,
+    /// Whether the router drives Conductor registration itself. Set to false
+    /// when an operator or a sidecar already manages registrations (RFC #414
+    /// §4: "Deployments where an operator or sidecar already manages Conductor
+    /// registrations can set `--conductor-register=false`").
+    #[serde(default = "default_true")]
+    pub conductor_register: bool,
+    /// TCP connect timeout for the Conductor HTTP clients (ms).
+    #[serde(default = "default_conductor_connect_timeout_ms")]
+    pub conductor_connect_timeout_ms: u64,
+    /// Per-`/query` timeout (ms). This call sits on the request path, so the
+    /// budget is small.
+    #[serde(default = "default_conductor_query_timeout_ms")]
+    pub conductor_query_timeout_ms: u64,
+    /// Per-`/register` and `/unregister` timeout (ms). Control path only, so it
+    /// can be much larger than the query budget.
+    #[serde(default = "default_conductor_register_timeout_ms")]
+    pub conductor_register_timeout_ms: u64,
+    /// Engine block-hash profile registered with Conductor when
+    /// `kv_index_backend = "conductor"`. A wrong profile is a silent zero-hit,
+    /// so it must match the engine's `PYTHONHASHSEED`/hash configuration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conductor_hash_profile: Option<ConductorHashProfile>,
+}
+
+impl Default for KvAwareConfig {
+    fn default() -> Self {
+        Self {
+            router_temperature: 0.0,
+            kv_penalty_host: default_kv_penalty_host(),
+            kv_penalty_external: default_kv_penalty_external(),
+            kv_penalty_disk: default_kv_penalty_disk(),
+            static_kv_event_sources: Box::default(),
+            kv_index_backend: default_kv_index_backend(),
+            conductor_url: None,
+            conductor_register: true,
+            conductor_connect_timeout_ms: default_conductor_connect_timeout_ms(),
+            conductor_query_timeout_ms: default_conductor_query_timeout_ms(),
+            conductor_register_timeout_ms: default_conductor_register_timeout_ms(),
+            conductor_hash_profile: None,
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_kv_penalty_host() -> f64 {
@@ -1110,6 +1176,75 @@ fn default_kv_penalty_external() -> f64 {
 
 fn default_kv_penalty_disk() -> f64 {
     0.3
+}
+
+fn default_kv_index_backend() -> String {
+    "local".to_string()
+}
+
+fn default_conductor_connect_timeout_ms() -> u64 {
+    100
+}
+
+fn default_conductor_query_timeout_ms() -> u64 {
+    10
+}
+
+fn default_conductor_register_timeout_ms() -> u64 {
+    1000
+}
+
+/// Engine block-hash recipe registered with the Mooncake Conductor. Mirrors the
+/// `hash_profile` object in Conductor's `/register` payload. A wrong recipe is a
+/// silent zero-hit (never a wrong hit), so the operator must supply the
+/// engine's actual `PYTHONHASHSEED` unless the engine runs with vLLM's documented
+/// unset-seed default.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConductorHashProfile {
+    /// Hash strategy. `vllm_v1` for vLLM; `sglang`/`sglang_bigram` are defined
+    /// by Conductor but not drivable by the router yet (the publisher type is
+    /// fixed to `vLLM` in the registration payload).
+    #[serde(default = "default_hash_strategy")]
+    pub strategy: String,
+    /// Hash algorithm. `sha256` (vLLM default) or `sha256_cbor`.
+    #[serde(default = "default_hash_algorithm")]
+    pub algorithm: String,
+    /// How the digest is projected to a prefix index key. `low64_be` for vLLM.
+    #[serde(default = "default_hash_index_projection")]
+    pub index_projection: String,
+    /// Raw `PYTHONHASHSEED` text the engine ran with (`"random"` or bare ASCII
+    /// decimal in `0..=4294967295`), or `None` when the seed is unset.
+    ///
+    /// `None` means "absent on the wire". Today's Conductor still requires the
+    /// field for `vllm_v1`, so the router refuses to start without a value; once
+    /// Conductor accepts an absent seed (RFC #414 required change, vLLM #51875)
+    /// omitting it will select vLLM's `"vllm-none-hash"` root. An empty string
+    /// is never sent: it is neither a valid seed nor a valid "unset" marker.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub python_hash_seed: Option<String>,
+}
+
+impl Default for ConductorHashProfile {
+    fn default() -> Self {
+        Self {
+            strategy: default_hash_strategy(),
+            algorithm: default_hash_algorithm(),
+            index_projection: default_hash_index_projection(),
+            python_hash_seed: None,
+        }
+    }
+}
+
+fn default_hash_strategy() -> String {
+    "vllm_v1".to_string()
+}
+
+fn default_hash_algorithm() -> String {
+    "sha256".to_string()
+}
+
+fn default_hash_index_projection() -> String {
+    "low64_be".to_string()
 }
 
 /// Service discovery configuration
@@ -1468,13 +1603,18 @@ mod tests {
                 decode_policy: None,
                 discovery_address: None,
             },
-            PolicyConfig::KvAware {
+            PolicyConfig::KvAware(Box::new(KvAwareConfig {
                 router_temperature: 0.0,
                 kv_penalty_host: 0.8,
                 kv_penalty_external: 0.6,
                 kv_penalty_disk: 0.4,
                 static_kv_event_sources: Default::default(),
-            },
+                kv_index_backend: "local".to_string(),
+                conductor_url: None,
+                conductor_query_timeout_ms: 10,
+                conductor_hash_profile: None,
+                ..Default::default()
+            })),
         );
         config.pd_kv_event_sources.insert(
             "http://prefill:8000".to_string(),
@@ -2430,5 +2570,57 @@ mod tests {
             PolicyConfig::RoundRobin => {} // Success
             _ => panic!("Expected RoundRobin for regular mode"),
         }
+    }
+
+    #[test]
+    fn kv_aware_config_deserializes_old_and_new_shapes() {
+        // An old config that predates the Conductor fields must keep loading,
+        // with the local backend as the default.
+        let old: PolicyConfig = serde_json::from_str(
+            r#"{"type":"kv_aware","router_temperature":0.0,"kv_penalty_host":0.8}"#,
+        )
+        .expect("old kv_aware config must still deserialize");
+        let PolicyConfig::KvAware(config) = &old else {
+            panic!("expected kv_aware")
+        };
+        assert_eq!(config.kv_index_backend, "local");
+        assert_eq!(config.conductor_url, None);
+        assert!(config.conductor_register);
+        assert_eq!(config.conductor_connect_timeout_ms, 100);
+        assert_eq!(config.conductor_query_timeout_ms, 10);
+        assert_eq!(config.conductor_register_timeout_ms, 1000);
+        assert!(config.conductor_hash_profile.is_none());
+
+        // The boxed variant must flatten back to `type` + the struct fields.
+        let conductor: PolicyConfig = serde_json::from_str(
+            r#"{
+                "type":"kv_aware",
+                "kv_index_backend":"conductor",
+                "conductor_url":"http://conductor:13333",
+                "conductor_register":false,
+                "conductor_hash_profile":{
+                    "strategy":"vllm_v1",
+                    "algorithm":"sha256",
+                    "index_projection":"low64_be",
+                    "python_hash_seed":"1450105824"
+                }
+            }"#,
+        )
+        .expect("conductor kv_aware config must deserialize");
+        let PolicyConfig::KvAware(config) = &conductor else {
+            panic!("expected kv_aware")
+        };
+        assert_eq!(config.kv_index_backend, "conductor");
+        assert_eq!(
+            config.conductor_url.as_deref(),
+            Some("http://conductor:13333")
+        );
+        assert!(!config.conductor_register);
+        let profile = config.conductor_hash_profile.as_ref().unwrap();
+        assert_eq!(profile.python_hash_seed.as_deref(), Some("1450105824"));
+
+        let encoded = serde_json::to_value(&conductor).unwrap();
+        assert_eq!(encoded["type"], "kv_aware");
+        assert_eq!(encoded["kv_index_backend"], "conductor");
     }
 }

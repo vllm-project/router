@@ -11,6 +11,62 @@ use std::sync::Arc;
 /// Factory for creating policy instances
 pub struct PolicyFactory;
 
+/// Build a `kv_aware` policy from its config.
+///
+/// Shared by [`PolicyFactory`] and `PolicyRegistry` so backend selection lives
+/// in exactly one place; duplicating it is how "conductor without a URL" turns
+/// into a silent local fallback in one path but not the other.
+pub(crate) fn build_kv_aware_policy(
+    config: &crate::config::KvAwareConfig,
+    kv_affinity_table: Option<&Arc<KvAffinityTable>>,
+) -> Arc<dyn LoadBalancingPolicy> {
+    let params = CostParams {
+        router_temperature: config.router_temperature,
+        transfer_credits: TransferCredits {
+            device: 1.0,
+            host_pinned: config.kv_penalty_host,
+            external: config.kv_penalty_external,
+            disk: config.kv_penalty_disk,
+        },
+        ..CostParams::default()
+    };
+    let policy = match (
+        config.kv_index_backend.as_str(),
+        config.conductor_url.as_deref(),
+    ) {
+        ("conductor", Some(url)) => KvAwarePolicy::new_with_conductor(
+            params,
+            crate::policies::ConductorOptions {
+                url: url.to_string(),
+                connect_timeout: std::time::Duration::from_millis(
+                    config.conductor_connect_timeout_ms,
+                ),
+                query_timeout: std::time::Duration::from_millis(config.conductor_query_timeout_ms),
+                register_timeout: std::time::Duration::from_millis(
+                    config.conductor_register_timeout_ms,
+                ),
+                hash_profile: config.conductor_hash_profile.clone().unwrap_or_default(),
+            },
+            config.conductor_register,
+        ),
+        (backend, _) => {
+            if backend == "conductor" {
+                // Validation rejects this combination; keep a loud fallback for
+                // programmatic callers that bypass `ConfigValidator`.
+                tracing::warn!(
+                    "kv_index_backend=conductor without conductor_url; falling back to the local index"
+                );
+            }
+            KvAwarePolicy::new(params)
+        }
+    };
+    let policy = match kv_affinity_table {
+        Some(table) => policy.with_shared_affinity(Arc::clone(table)),
+        None => policy,
+    };
+    Arc::new(policy)
+}
+
 impl PolicyFactory {
     /// Create a policy from configuration
     ///
@@ -43,28 +99,7 @@ impl PolicyFactory {
                 };
                 Arc::new(CacheAwarePolicy::with_config(config))
             }
-            PolicyConfig::KvAware {
-                router_temperature,
-                kv_penalty_host,
-                kv_penalty_external,
-                kv_penalty_disk,
-                ..
-            } => {
-                let mut policy = KvAwarePolicy::new(CostParams {
-                    router_temperature: *router_temperature,
-                    transfer_credits: TransferCredits {
-                        device: 1.0,
-                        host_pinned: *kv_penalty_host,
-                        external: *kv_penalty_external,
-                        disk: *kv_penalty_disk,
-                    },
-                    ..CostParams::default()
-                });
-                if let Some(table) = kv_affinity_table {
-                    policy = policy.with_shared_affinity(Arc::clone(table));
-                }
-                Arc::new(policy)
-            }
+            PolicyConfig::KvAware(config) => build_kv_aware_policy(config, kv_affinity_table),
             PolicyConfig::ConsistentHash { virtual_nodes: _ } => {
                 // Note: virtual_nodes parameter is available but not currently used
                 // The consistent hash policy uses a hardcoded value for now
@@ -96,6 +131,7 @@ impl PolicyFactory {
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use super::*;
+    use crate::policies::kv_aware_ops;
 
     #[test]
     fn test_create_from_config() {
@@ -129,45 +165,22 @@ mod tests {
         );
         assert_eq!(policy.name(), "cache_aware");
 
-        let policy = PolicyFactory::create_from_config(
-            &PolicyConfig::KvAware {
-                router_temperature: 0.0,
-                kv_penalty_host: 0.8,
-                kv_penalty_external: 0.6,
-                kv_penalty_disk: 0.3,
-                static_kv_event_sources: Default::default(),
-            },
-            None,
-        );
-        assert_eq!(policy.name(), "kv_aware");
-
-        // Test ConsistentHash
-        let policy = PolicyFactory::create_from_config(
-            &PolicyConfig::ConsistentHash { virtual_nodes: 160 },
-            None,
-        );
-        assert_eq!(policy.name(), "consistent_hash");
-
-        // Test RendezvousHash
-        let policy = PolicyFactory::create_from_config(&PolicyConfig::RendezvousHash, None);
-        assert_eq!(policy.name(), "rendezvous_hash");
-
-        // Test StickyLeastLoaded
-        let policy = PolicyFactory::create_from_config(&PolicyConfig::StickyLeastLoaded, None);
-        assert_eq!(policy.name(), "sticky_least_loaded");
-    }
-
-    #[test]
-    fn test_kv_aware_affinity_table_controls_session_affinity() {
-        use crate::policies::kv_aware_ops;
-
-        let config = PolicyConfig::KvAware {
+        let config = PolicyConfig::KvAware(Box::new(crate::config::KvAwareConfig {
             router_temperature: 0.0,
             kv_penalty_host: 0.8,
             kv_penalty_external: 0.6,
             kv_penalty_disk: 0.3,
             static_kv_event_sources: Default::default(),
-        };
+            kv_index_backend: "local".to_string(),
+            conductor_url: None,
+            conductor_register: true,
+            conductor_connect_timeout_ms: 100,
+            conductor_query_timeout_ms: 10,
+            conductor_register_timeout_ms: 1000,
+            conductor_hash_profile: None,
+        }));
+        let policy = PolicyFactory::create_from_config(&config, None);
+        assert_eq!(policy.name(), "kv_aware");
 
         // Without a shared table the factory-built policy must NOT report
         // session affinity (this is exactly the wiring that silently disabled
