@@ -11,12 +11,11 @@ run_eval = import_run_eval()
 
 
 @pytest.mark.e2e
-def test_mmlu(e2e_router_only_rr, e2e_two_workers_dp2, e2e_model):
+def test_mmlu(router_manager, vllm_worker_manager, e2e_model):
     # Attach two dp=2 workers (total 4 GPUs) to a fresh router-only instance
-    base = e2e_router_only_rr.url
-    for w in e2e_two_workers_dp2:
-        r = requests.post(f"{base}/add_worker", params={"url": w.url}, timeout=180)
-        r.raise_for_status()
+    base = router_manager.start_router(policy="round_robin", timeout=120).url
+    for w in vllm_worker_manager.dp2_pair(e2e_model):
+        router_manager.add_worker(base, w.url, timeout=180)
 
     args = SimpleNamespace(
         base_url=base,
@@ -34,13 +33,13 @@ def test_mmlu(e2e_router_only_rr, e2e_two_workers_dp2, e2e_model):
 
 @pytest.mark.e2e
 def test_genai_bench(
-    e2e_router_only_rr, e2e_two_workers_dp2, e2e_model, genai_bench_runner
+    router_manager, vllm_worker_manager, e2e_model, genai_bench_runner
 ):
     """Attach a worker to the regular router and run a short genai-bench."""
-    base = e2e_router_only_rr.url
-    for w in e2e_two_workers_dp2:
-        r = requests.post(f"{base}/add_worker", params={"url": w.url}, timeout=180)
-        r.raise_for_status()
+    base = router_manager.start_router(policy="round_robin", timeout=120).url
+    workers = vllm_worker_manager.dp2_pair(e2e_model)
+    for w in workers:
+        router_manager.add_worker(base, w.url, timeout=180)
 
     genai_bench_runner(
         router_url=base,
@@ -54,17 +53,16 @@ def test_genai_bench(
             # Enforce GPU utilization p50 >= 99% during the run.
             "gpu_util_p50_min": 99,
         },
-        kill_procs=e2e_two_workers_dp2,
+        kill_procs=workers,
     )
 
 
 @pytest.mark.e2e
-def test_add_and_remove_worker_live(e2e_router_only_rr, e2e_primary_worker, e2e_model):
-    base = e2e_router_only_rr.url
-    worker_url = e2e_primary_worker.url
+def test_add_and_remove_worker_live(router_manager, vllm_worker_manager, e2e_model):
+    base = router_manager.start_router(policy="round_robin", timeout=120).url
+    worker_url = vllm_worker_manager.primary(e2e_model).url
 
-    r = requests.post(f"{base}/add_worker", params={"url": worker_url}, timeout=180)
-    r.raise_for_status()
+    router_manager.add_worker(base, worker_url, timeout=180)
 
     with requests.Session() as s:
         for i in range(8):
@@ -86,12 +84,11 @@ def test_add_and_remove_worker_live(e2e_router_only_rr, e2e_primary_worker, e2e_
 
 
 @pytest.mark.e2e
-def test_lazy_fault_tolerance_live(e2e_router_only_rr, e2e_primary_worker, e2e_model):
-    base = e2e_router_only_rr.url
-    worker = e2e_primary_worker
+def test_lazy_fault_tolerance_live(router_manager, vllm_worker_manager, e2e_model):
+    base = router_manager.start_router(policy="round_robin", timeout=120).url
+    worker = vllm_worker_manager.primary(e2e_model)
 
-    r = requests.post(f"{base}/add_worker", params={"url": worker.url}, timeout=180)
-    r.raise_for_status()
+    router_manager.add_worker(base, worker.url, timeout=180)
 
     def killer():
         time.sleep(10)
@@ -120,8 +117,8 @@ def test_lazy_fault_tolerance_live(e2e_router_only_rr, e2e_primary_worker, e2e_m
 @pytest.mark.e2e
 def test_dp_aware_worker_expansion_and_api_key(
     e2e_model,
-    e2e_router_only_rr_dp_aware_api,
-    e2e_worker_dp2_api,
+    router_manager,
+    vllm_worker_manager,
 ):
     """
     Launch a router-only instance in dp_aware mode and a single worker with dp_size=2
@@ -129,15 +126,16 @@ def test_dp_aware_worker_expansion_and_api_key(
     """
     import os
 
-    router_url = e2e_router_only_rr_dp_aware_api.url
-    worker_url = e2e_worker_dp2_api.url
-    api_key = e2e_router_only_rr_dp_aware_api.api_key
+    api_key = "secret"
+    router_url = router_manager.start_router(
+        policy="round_robin",
+        timeout=180,
+        extra={"intra_node_data_parallel_size": 2, "api_key": api_key},
+    ).url
+    worker_url = vllm_worker_manager.start(e2e_model, dp_size=2, api_key=api_key).url
 
     # Attach worker; router should expand to dp_size logical workers
-    r = requests.post(
-        f"{router_url}/add_worker", params={"url": worker_url}, timeout=180
-    )
-    r.raise_for_status()
+    router_manager.add_worker(router_url, worker_url, timeout=180)
 
     r = requests.get(f"{router_url}/list_workers", timeout=30)
     r.raise_for_status()

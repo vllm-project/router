@@ -5,14 +5,14 @@ pytestmark = [pytest.mark.ready, pytest.mark.cpu]
 
 
 @pytest.mark.integration
-def test_add_and_remove_worker(mock_worker, router_manager, mock_workers):
+def test_add_and_remove_worker(router_manager, mock_worker_manager):
     # Start with a single worker
-    proc1, url1, id1 = mock_worker
+    proc1, url1, id1 = mock_worker_manager.start_worker()
     rh = router_manager.start_router(worker_urls=[url1], policy="round_robin")
 
     # Add a second worker
 
-    procs2, urls2, ids2 = mock_workers(n=1)
+    procs2, urls2, ids2 = mock_worker_manager.start_workers(n=1)
     url2 = urls2[0]
     id2 = ids2[0]
     router_manager.add_worker(rh.url, url2)
@@ -56,4 +56,4 @@ def test_add_and_remove_worker(mock_worker, router_manager, mock_workers):
             assert r.status_code == 200
             wid = r.headers.get("X-Worker-Id") or r.json().get("worker_id")
             assert wid == id1
-    # mock_workers fixture handles cleanup
+    # mock_worker_manager fixture handles cleanup

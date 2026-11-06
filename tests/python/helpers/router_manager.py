@@ -36,6 +36,8 @@ class RouterManager:
         # Prefer the Rust binary when testing features that live in the host crate
         # (e.g. WASM middleware) without requiring a rebuilt Python wheel.
         router_bin: Optional[str] = None,
+        *,
+        timeout: float = 30.0,
     ) -> ProcHandle:
         worker_urls = worker_urls or []
         port = port or find_free_port()
@@ -145,7 +147,7 @@ class RouterManager:
         proc = subprocess.Popen(cmd)
         self._children.append(proc)
         url = f"http://127.0.0.1:{port}"
-        self._wait_health(url)
+        self._wait_health(url, timeout)
         return ProcHandle(process=proc, url=url)
 
     def _wait_health(self, base_url: str, timeout: float = 30.0):
@@ -161,8 +163,12 @@ class RouterManager:
                 time.sleep(0.2)
         raise TimeoutError(f"Router at {base_url} did not become healthy")
 
-    def add_worker(self, base_url: str, worker_url: str) -> None:
-        r = requests.post(f"{base_url}/add_worker", params={"url": worker_url})
+    def add_worker(
+        self, base_url: str, worker_url: str, timeout: Optional[float] = None
+    ) -> None:
+        r = requests.post(
+            f"{base_url}/add_worker", params={"url": worker_url}, timeout=timeout
+        )
         assert r.status_code == 200, f"add_worker failed: {r.status_code} {r.text}"
 
     def remove_worker(self, base_url: str, worker_url: str) -> None:

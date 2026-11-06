@@ -5,7 +5,7 @@ pytestmark = [pytest.mark.ready, pytest.mark.cpu]
 
 
 @pytest.mark.integration
-def test_discovery_shim_add_remove(router_manager, mock_workers):
+def test_discovery_shim_add_remove(router_manager, mock_worker_manager):
     # Start router without workers
     rh = router_manager.start_router(worker_urls=[], policy="round_robin")
 
@@ -14,7 +14,7 @@ def test_discovery_shim_add_remove(router_manager, mock_workers):
     assert urls == []
 
     # Add a worker (simulate discovery event)
-    _, [wurl], [wid] = mock_workers(n=1)
+    _, [wurl], [wid] = mock_worker_manager.start_workers(n=1)
     router_manager.add_worker(rh.url, wurl)
     urls = router_manager.list_workers(rh.url)
     assert wurl in urls
@@ -35,4 +35,4 @@ def test_discovery_shim_add_remove(router_manager, mock_workers):
     router_manager.remove_worker(rh.url, wurl)
     urls = router_manager.list_workers(rh.url)
     assert wurl not in urls
-    # mock_workers fixture handles cleanup
+    # mock_worker_manager fixture handles cleanup
