@@ -3510,6 +3510,16 @@ impl RouterTrait for VllmPDRouter {
                 .into_response();
         }
 
+        // The gRPC frontend has no Messages RPC. Reject before preparing
+        // policy inputs or admitting a P/D pair; gRPC chat uses its typed path.
+        if path == "/v1/messages" && !self.use_discovery && self.uses_grpc_pools() {
+            return (
+                StatusCode::BAD_REQUEST,
+                "Messages requests are not supported by gRPC P/D workers",
+            )
+                .into_response();
+        }
+
         debug!(
             "Transparent proxy: routing {} {} through P/D pipeline",
             method, path

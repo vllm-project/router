@@ -158,6 +158,25 @@ async fn messages_invalid_json_uses_anthropic_error_shape() {
 }
 
 #[tokio::test]
+async fn messages_empty_list_and_zero_max_tokens_rejected_before_worker_selection() {
+    let mut mock = MockWorker::new(worker(0.0));
+    let url = mock.start().await.unwrap();
+    let port = url.rsplit(':').next().unwrap().parse().unwrap();
+    let ctx = Ctx::with_urls(PolicyConfig::RoundRobin, vec![mock], vec![url], |_| {}).await;
+    for (field, invalid) in [("messages", json!([])), ("max_tokens", json!(0))] {
+        let mut body = agent_body(None, "hi");
+        body[field] = invalid;
+        let (status, resp) = ctx.post(&body.to_string(), &[]).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{field}: {resp}");
+        assert_eq!(resp["type"], "error");
+        assert_eq!(resp["error"]["type"], "invalid_request_error");
+        assert!(resp["error"]["message"].as_str().unwrap().contains(field));
+    }
+    assert!(captured_messages(port).is_empty());
+    ctx.shutdown().await;
+}
+
+#[tokio::test]
 async fn messages_no_workers_uses_anthropic_error_shape() {
     let mut ctx = Ctx::new(PolicyConfig::RoundRobin, vec![worker(0.0)], |c| {
         c.disable_retries = true;

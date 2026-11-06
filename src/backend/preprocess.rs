@@ -371,10 +371,15 @@ fn messages_as_chat(body: &serde_json::Value) -> Option<Vec<serde_json::Value>> 
     const BILLING: &str = "x-anthropic-billing-header";
     let mut out = Vec::new();
     if let Some(system) = body.get("system").filter(|value| !value.is_null()) {
-        let text: String = messages_text_parts(system)?
-            .into_iter()
-            .filter(|text| !text.starts_with(BILLING))
-            .collect();
+        // vLLM preserves a string system verbatim; billing metadata is only
+        // removed when converting a list of system text blocks.
+        let text: String = match system {
+            serde_json::Value::String(text) => text.clone(),
+            _ => messages_text_parts(system)?
+                .into_iter()
+                .filter(|text| !text.starts_with(BILLING))
+                .collect(),
+        };
         if !text.is_empty() {
             out.push(serde_json::json!({"role": "system", "content": text}));
         }
@@ -1137,6 +1142,22 @@ mod tests {
         ] {
             assert!(super::http_tokenize_fallback(&body, "/v1/messages").is_none());
         }
+    }
+
+    #[test]
+    fn messages_tokenize_preserves_billing_header_in_string_system() {
+        use serde_json::json;
+        let system = "x-anthropic-billing-header: a\nkeep these instructions";
+        let body = json!({"model": "m", "max_tokens": 4,
+            "system": system,
+            "messages": [{"role": "user", "content": "hi"}]});
+        let requests = super::http_tokenize_fallback(&body, "/v1/messages").unwrap();
+        assert_eq!(
+            requests,
+            vec![json!({"model": "m", "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": "hi"}]})]
+        );
     }
 
     #[tokio::test]
