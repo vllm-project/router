@@ -472,6 +472,7 @@ impl ConfigValidator {
                 kv_penalty_external,
                 kv_penalty_disk,
                 static_kv_event_sources,
+                ..
             } => {
                 if !router_temperature.is_finite() || *router_temperature < 0.0 {
                     return Err(ConfigError::InvalidValue {
@@ -1504,6 +1505,7 @@ mod tests {
                 kv_penalty_external: 0.6,
                 kv_penalty_disk: 0.3,
                 static_kv_event_sources: Default::default(),
+                decode_context_load: false,
             },
         );
 
@@ -1644,6 +1646,7 @@ mod tests {
                 kv_penalty_external: 0.6,
                 kv_penalty_disk: 0.3,
                 static_kv_event_sources: Default::default(),
+                decode_context_load: false,
             },
         );
         config.pd_kv_event_sources.insert(

@@ -4356,6 +4356,7 @@ mod tests {
                     kv_penalty_external: 0.6,
                     kv_penalty_disk: 0.3,
                     static_kv_event_sources: Default::default(),
+                    decode_context_load: false,
                 },
                 worker_startup_timeout_secs: 5,
                 ..RouterConfig::default()

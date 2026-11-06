@@ -203,6 +203,11 @@ struct CliArgs {
     /// Omit to disable session affinity while keeping KV-aware routing enabled.
     #[arg(long, value_parser = clap::value_parser!(u64).range(1..=31_536_000))]
     kv_aware_session_affinity_ttl_secs: Option<u64>,
+    /// Rank P/D Decode candidates by the logical context tokens they already
+    /// hold instead of pending plus active request counts. Off by default; a
+    /// candidate pool with unknown token accounting keeps using request counts.
+    #[arg(long)]
+    kv_aware_decode_context_load: bool,
     /// Static KV event publishers for regular kv_aware workers.
     #[arg(long = "kv-event-source", action = ArgAction::Append, value_name = "WORKER_URL=ENDPOINT[,ENDPOINT...]")]
     kv_event_source: Vec<String>,
@@ -455,6 +460,7 @@ impl CliArgs {
                 kv_penalty_external: self.kv_penalty_external,
                 kv_penalty_disk: self.kv_penalty_disk,
                 static_kv_event_sources: Box::default(),
+                decode_context_load: self.kv_aware_decode_context_load,
             },
             "power_of_two" => PolicyConfig::PowerOfTwo {
                 load_check_interval_secs: 5, // Default value

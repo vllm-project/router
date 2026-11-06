@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
-use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -90,6 +90,11 @@ pub trait KvAwareOps: Send + Sync {
     ) -> Option<StagePick>;
     /// Whether the optional session binding is switched on for this policy.
     fn session_affinity_enabled(&self) -> bool;
+    /// Whether P/D Decode selection expects logical context tokens instead of
+    /// request counts. Implementers without the extension keep counts.
+    fn decode_context_load(&self) -> bool {
+        false
+    }
     fn register_worker(
         &self,
         worker: &dyn Worker,
@@ -917,6 +922,10 @@ pub struct KvAwarePolicy {
     selection_lock: Mutex<()>,
     /// Every registration gets a new generation, including load-only targets.
     next_generation: AtomicU64,
+    /// P/D Decode selection compares logical context tokens instead of request
+    /// counts. The projected values are supplied by the P/D adapter; this flag
+    /// only tells the adapter which unit this policy expects.
+    decode_context_load: AtomicBool,
 }
 
 impl std::fmt::Debug for KvAwarePolicy {
@@ -950,6 +959,13 @@ impl KvAwarePolicy {
         self
     }
 
+    /// Switch P/D Decode selection between request counts (default) and
+    /// logical context tokens.
+    pub(crate) fn with_decode_context_load(self, enabled: bool) -> Self {
+        self.decode_context_load.store(enabled, Ordering::Release);
+        self
+    }
+
     pub fn with_components(
         matches: Arc<dyn TieredMatchProvider>,
         load: Arc<dyn LoadProvider>,
@@ -969,6 +985,7 @@ impl KvAwarePolicy {
             affinity: Arc::new(KvAffinityTable::new()),
             selection_lock: Mutex::new(()),
             next_generation: AtomicU64::new(1),
+            decode_context_load: AtomicBool::new(false),
         }
     }
 
@@ -1898,6 +1915,10 @@ impl KvAwareOps for KvAwarePolicy {
             },
             binding,
         })
+    }
+
+    fn decode_context_load(&self) -> bool {
+        self.decode_context_load.load(Ordering::Acquire)
     }
 
     fn register_worker(

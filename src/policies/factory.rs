@@ -48,6 +48,7 @@ impl PolicyFactory {
                 kv_penalty_host,
                 kv_penalty_external,
                 kv_penalty_disk,
+                decode_context_load,
                 ..
             } => {
                 let mut policy = KvAwarePolicy::new(CostParams {
@@ -59,7 +60,8 @@ impl PolicyFactory {
                         disk: *kv_penalty_disk,
                     },
                     ..CostParams::default()
-                });
+                })
+                .with_decode_context_load(*decode_context_load);
                 if let Some(table) = kv_affinity_table {
                     policy = policy.with_shared_affinity(Arc::clone(table));
                 }
@@ -136,6 +138,7 @@ mod tests {
                 kv_penalty_external: 0.6,
                 kv_penalty_disk: 0.3,
                 static_kv_event_sources: Default::default(),
+                decode_context_load: false,
             },
             None,
         );
@@ -167,6 +170,7 @@ mod tests {
             kv_penalty_external: 0.6,
             kv_penalty_disk: 0.3,
             static_kv_event_sources: Default::default(),
+            decode_context_load: false,
         };
 
         // Without a shared table the factory-built policy must NOT report

@@ -470,6 +470,7 @@ async fn grpc_pd_kv_aware_prefers_the_prefill_holding_the_prefix() {
             kv_penalty_external: 0.6,
             kv_penalty_disk: 0.4,
             static_kv_event_sources: Default::default(),
+            decode_context_load: false,
         };
         let router =
             pd_router_with_kv_sources(&[&prefills[0], &prefills[1]], &decode, 1, policy, sources)

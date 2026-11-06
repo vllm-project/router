@@ -71,6 +71,16 @@ pub struct PdLoadSample {
     pub unknown_prefill_requests: usize,
     pub pending_decode_requests: usize,
     pub active_decode_requests: usize,
+    /// Prompt tokens of Decode requests admitted but not yet dispatched.
+    /// Their KV is not on the engine yet, so they are waiting work.
+    pub pending_decode_tokens: u64,
+    /// Logical context tokens of Decode requests already dispatched.
+    /// Each sequence contributes its full prompt length; shared physical
+    /// prefix blocks still count once per sequence.
+    pub active_decode_tokens: u64,
+    /// Admitted Decode requests whose prompt length the Router does not know.
+    /// Any candidate with such a request is compared by request counts.
+    pub unknown_decode_requests: usize,
 }
 
 impl PdLoadSample {
@@ -106,6 +116,18 @@ impl PdLoadSample {
                     "vllm_router_pd_active_decode_requests",
                     self.active_decode_requests as f64,
                 );
+                record(
+                    "vllm_router_pd_pending_decode_tokens",
+                    self.pending_decode_tokens as f64,
+                );
+                record(
+                    "vllm_router_pd_active_decode_tokens",
+                    self.active_decode_tokens as f64,
+                );
+                record(
+                    "vllm_router_pd_unknown_decode_requests",
+                    self.unknown_decode_requests as f64,
+                );
             }
         }
     }
@@ -117,16 +139,43 @@ impl PdLoadSample {
         }
     }
 
+    /// Decode work in logical context tokens when this sample has no request
+    /// with an unknown prompt length, `None` otherwise. Mixing a known and an
+    /// unknown reservation would compare different units, so the caller falls
+    /// back to request counts for the whole candidate pool.
+    pub(super) fn decode_tokens(self) -> Option<u64> {
+        (self.unknown_decode_requests == 0).then(|| {
+            self.pending_decode_tokens
+                .saturating_add(self.active_decode_tokens)
+        })
+    }
+
     fn idle(self) -> bool {
         self.prefill_requests == 0
             && self.active_prefill_tokens == 0
             && self.unknown_prefill_requests == 0
             && self.pending_decode_requests == 0
             && self.active_decode_requests == 0
+            && self.pending_decode_tokens == 0
+            && self.active_decode_tokens == 0
+            && self.unknown_decode_requests == 0
     }
 }
 
 pub(super) type Loads = HashMap<(Stage, PdEndpoint), PdLoadSample>;
+
+/// Logical Decode context a P/D request will occupy once it is dispatched.
+///
+/// P computes `new_prefill_tokens` and the connector transfers
+/// `credited_prefix_tokens`, so their sum is the prompt length the Decode
+/// sequence starts from. One known and one unknown term leaves the reservation
+/// unknown instead of under-counting it.
+fn decode_context_tokens(prefill: &StageDecision) -> Option<u64> {
+    match (prefill.new_prefill_tokens, prefill.credited_prefix_tokens) {
+        (Some(new), Some(credited)) => Some(new.saturating_add(credited)),
+        _ => None,
+    }
+}
 
 /// Backend-effective tokens prepared outside the admission transaction.
 #[derive(Debug, Clone)]
@@ -201,6 +250,9 @@ impl PdLoadManager {
         let selection = select(&loads)?;
         let prefill = &selection.prefill;
         let decode = &selection.decode;
+        // A decode request's logical context is the prompt it carries; shared
+        // prefix blocks are counted once per sequence, never once per block.
+        let decode_tokens = decode_context_tokens(prefill);
         // Neither stage is charged until both selections have succeeded.
         let p = loads
             .entry((Stage::Prefill, prefill.endpoint.clone()))
@@ -216,6 +268,10 @@ impl PdLoadManager {
             .entry((Stage::Decode, decode.endpoint.clone()))
             .or_default();
         d.pending_decode_requests += 1;
+        match decode_tokens {
+            Some(tokens) => d.pending_decode_tokens += tokens,
+            None => d.unknown_decode_requests += 1,
+        }
         d.publish(Stage::Decode, &decode.endpoint);
         let attempt = PdAttempt(Arc::new(AttemptInner {
             admitted_at: std::time::Instant::now(),
@@ -225,6 +281,7 @@ impl PdLoadManager {
             prefill_worker: Mutex::new(None),
             decode_worker: Mutex::new(None),
             prefill_tokens: selection.prefill.new_prefill_tokens,
+            decode_tokens,
             affinity: selection.decode.affinity.clone(),
             state: Mutex::new(AttemptState {
                 prefill: true,
@@ -255,6 +312,9 @@ impl PdLoadManager {
             p.publish(Stage::Prefill, &prefill);
             let d = loads.entry((Stage::Decode, decode.clone())).or_default();
             d.pending_decode_requests += 1;
+            // The bound pair has no rendered prompt here, so its decode
+            // context length is unknown and the pool falls back to counts.
+            d.unknown_decode_requests += 1;
             d.publish(Stage::Decode, &decode);
         }
         let attempt = PdAttempt(Arc::new(AttemptInner {
@@ -265,6 +325,7 @@ impl PdLoadManager {
             prefill_worker: Mutex::new(None),
             decode_worker: Mutex::new(None),
             prefill_tokens: None,
+            decode_tokens: None,
             affinity: None,
             state: Mutex::new(AttemptState {
                 prefill: true,
@@ -297,6 +358,9 @@ struct AttemptInner {
     prefill_worker: Mutex<Option<Arc<dyn Worker>>>,
     decode_worker: Mutex<Option<Arc<dyn Worker>>>,
     prefill_tokens: Option<u64>,
+    /// Logical context tokens this request adds to the Decode endpoint, when
+    /// its prompt length is known.
+    decode_tokens: Option<u64>,
     /// Decode binding held alive until this attempt finishes.
     affinity: Option<Arc<AffinityRecord>>,
     state: Mutex<AttemptState>,
@@ -339,6 +403,12 @@ impl AttemptInner {
             .expect("admitted decode");
         load.pending_decode_requests -= 1;
         load.active_decode_requests += 1;
+        if let Some(tokens) = self.decode_tokens {
+            // The prompt's KV has reached the engine: the same tokens move from
+            // waiting work to the active context total.
+            load.pending_decode_tokens = load.pending_decode_tokens.saturating_sub(tokens);
+            load.active_decode_tokens += tokens;
+        }
         load.publish(Stage::Decode, &self.decode);
         metrics::histogram!("vllm_router_pd_decode_pending_seconds")
             .record(self.admitted_at.elapsed().as_secs_f64());
@@ -357,6 +427,22 @@ impl AttemptInner {
                 DecodeState::Pending => load.pending_decode_requests -= 1,
                 DecodeState::Active => load.active_decode_requests -= 1,
                 DecodeState::Finished => unreachable!(),
+            }
+            match self.decode_tokens {
+                Some(tokens) => match state.decode {
+                    DecodeState::Pending => {
+                        load.pending_decode_tokens =
+                            load.pending_decode_tokens.saturating_sub(tokens);
+                    }
+                    DecodeState::Active => {
+                        load.active_decode_tokens =
+                            load.active_decode_tokens.saturating_sub(tokens);
+                    }
+                    DecodeState::Finished => unreachable!(),
+                },
+                None => {
+                    load.unknown_decode_requests = load.unknown_decode_requests.saturating_sub(1);
+                }
             }
             load.publish(Stage::Decode, &self.decode);
             if load.idle() {

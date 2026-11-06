@@ -1038,6 +1038,12 @@ pub enum PolicyConfig {
         /// endpoint does not expose /kv_event_sources.
         #[serde(default, skip_serializing_if = "HashMap::is_empty")]
         static_kv_event_sources: Box<HashMap<String, StaticKvEventSources>>,
+        /// P/D only: rank Decode candidates by the logical context tokens they
+        /// already hold instead of their pending plus active request count.
+        /// Off by default; requires a fully known token accounting across the
+        /// candidate pool, otherwise selection keeps using request counts.
+        #[serde(default)]
+        decode_context_load: bool,
     },
 
     #[serde(rename = "power_of_two")]
@@ -1086,6 +1092,18 @@ pub struct StaticKvEventSources {
 }
 
 impl PolicyConfig {
+    /// Whether Decode selection compares logical context tokens rather than
+    /// request counts. Only `kv_aware` implements that comparison.
+    pub fn decode_context_load(&self) -> bool {
+        matches!(
+            self,
+            PolicyConfig::KvAware {
+                decode_context_load: true,
+                ..
+            }
+        )
+    }
+
     pub fn name(&self) -> &'static str {
         match self {
             PolicyConfig::Random => "random",
@@ -1474,6 +1492,7 @@ mod tests {
                 kv_penalty_external: 0.6,
                 kv_penalty_disk: 0.4,
                 static_kv_event_sources: Default::default(),
+                decode_context_load: false,
             },
         );
         config.pd_kv_event_sources.insert(
@@ -1780,6 +1799,20 @@ mod tests {
             load_check_interval_secs: 60,
         };
         assert_eq!(power_of_two.name(), "power_of_two");
+    }
+
+    #[test]
+    fn test_kv_aware_decode_context_load_defaults_off_and_parses_on() {
+        let omitted: PolicyConfig = serde_json::from_str(r#"{"type":"kv_aware"}"#).unwrap();
+        assert!(!omitted.decode_context_load());
+        assert_eq!(omitted.name(), "kv_aware");
+
+        let enabled: PolicyConfig =
+            serde_json::from_str(r#"{"type":"kv_aware","decode_context_load":true}"#).unwrap();
+        assert!(enabled.decode_context_load());
+
+        let round_robin: PolicyConfig = serde_json::from_str(r#"{"type":"round_robin"}"#).unwrap();
+        assert!(!round_robin.decode_context_load());
     }
 
     #[test]

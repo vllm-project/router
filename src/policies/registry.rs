@@ -238,6 +238,7 @@ impl PolicyRegistry {
                 kv_penalty_host,
                 kv_penalty_external,
                 kv_penalty_disk,
+                decode_context_load,
                 ..
             } => Arc::new(
                 KvAwarePolicy::new(CostParams {
@@ -250,7 +251,8 @@ impl PolicyRegistry {
                     },
                     ..CostParams::default()
                 })
-                .with_shared_affinity(Arc::clone(kv_affinity_table)),
+                .with_shared_affinity(Arc::clone(kv_affinity_table))
+                .with_decode_context_load(*decode_context_load),
             ),
             PolicyConfig::PowerOfTwo { .. } => Arc::new(PowerOfTwoPolicy::new()),
             PolicyConfig::ConsistentHash { .. } => Arc::new(ConsistentHashPolicy::new()),

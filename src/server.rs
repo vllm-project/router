@@ -1482,6 +1482,7 @@ mod tests {
                 kv_penalty_external: 0.05,
                 kv_penalty_disk: 0.01,
                 static_kv_event_sources: Default::default(),
+                decode_context_load: false,
             },
             ..Default::default()
         };
