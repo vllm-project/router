@@ -64,6 +64,23 @@ def completion(
         return list(executor.map(send, prompts))
 
 
+def embeddings(
+    base_url: str,
+    model: str,
+    inputs: str | list,
+    *,
+    timeout: float | None = None,
+) -> dict:
+    """POST ``/v1/embeddings`` and return the JSON body."""
+    response = requests.post(
+        f"{base_url.rstrip('/')}/v1/embeddings",
+        json={"model": model, "input": inputs},
+        timeout=timeout,
+    )
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
 def get_load(
     base_url: str,
     timeout: float = 1,

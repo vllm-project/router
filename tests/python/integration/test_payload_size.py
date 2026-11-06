@@ -5,9 +5,9 @@ pytestmark = [pytest.mark.ready, pytest.mark.cpu]
 
 
 @pytest.mark.integration
-def test_payload_size_limit(router_manager, mock_workers):
+def test_payload_size_limit(router_manager, mock_worker_manager):
     # Start one backend and a router with a 1MB payload limit
-    _, urls, _ = mock_workers(n=1)
+    _, urls, _ = mock_worker_manager.start_workers(n=1)
     rh = router_manager.start_router(
         worker_urls=urls,
         policy="round_robin",
