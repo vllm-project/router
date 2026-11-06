@@ -8,6 +8,85 @@ use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, Layer};
 
 use crate::config::TraceConfig;
+use crate::protocols::spec::{ChatCompletionRequest, ChatMessage, UserMessageContent};
+
+fn part_texts(parts: &[serde_json::Value]) -> Vec<&str> {
+    parts
+        .iter()
+        .filter(|part| part.get("type").and_then(serde_json::Value::as_str) == Some("text"))
+        .filter_map(|part| part.get("text").and_then(serde_json::Value::as_str))
+        .collect()
+}
+
+fn user_prompt_texts(messages: &[ChatMessage]) -> Vec<Vec<&str>> {
+    messages
+        .iter()
+        .filter_map(|message| match message {
+            ChatMessage::User { content, .. } => Some(match content {
+                UserMessageContent::Text(text) => vec![text.as_str()],
+                UserMessageContent::Parts(parts) => part_texts(parts),
+            }),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Called only after authorization and an explicit operator opt-in. The log
+/// macro defers extraction when the INFO event is filtered out. Debug formatting
+/// escapes newlines and preserves text-part and user-message boundaries.
+pub(crate) fn log_chat_user_prompts(request_id: &str, request: &ChatCompletionRequest) {
+    tracing::info!(
+        target: "vllm_router_rs::prompt",
+        request_id,
+        model = request.model.as_deref(),
+        stream = request.stream,
+        user_prompts = ?user_prompt_texts(&request.messages),
+        "Chat completion user prompts"
+    );
+}
+
+fn raw_user_prompt_texts(request: &serde_json::Value) -> Vec<Vec<&str>> {
+    request
+        .get("messages")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|message| message.get("role").and_then(serde_json::Value::as_str) == Some("user"))
+        .map(|message| match message.get("content") {
+            Some(serde_json::Value::String(text)) => vec![text.as_str()],
+            Some(serde_json::Value::Array(parts)) => part_texts(parts),
+            // Match ChatMessage deserialization for missing or invalid content.
+            _ => vec![""],
+        })
+        .collect()
+}
+
+/// EPD accepts raw JSON, so inspect it by reference without cloning or
+/// deserializing multimodal payloads just to log their text.
+pub(crate) fn log_raw_chat_user_prompts(request_id: &str, request: &serde_json::Value) {
+    tracing::info!(
+        target: "vllm_router_rs::prompt",
+        request_id,
+        model = request.get("model").and_then(serde_json::Value::as_str),
+        stream = request.get("stream").and_then(serde_json::Value::as_bool).unwrap_or(false),
+        user_prompts = ?raw_user_prompt_texts(request),
+        "Chat completion user prompts"
+    );
+}
+
+/// Messages API requests use the transparent proxy's raw JSON body. Include only
+/// direct user text parts, excluding system prompts, media, and tool results.
+pub(crate) fn log_messages_user_prompts(request_id: &str, request: &serde_json::Value) {
+    tracing::info!(
+        target: "vllm_router_rs::prompt",
+        request_id,
+        route = "/v1/messages",
+        model = request.get("model").and_then(serde_json::Value::as_str),
+        stream = request.get("stream").and_then(serde_json::Value::as_bool).unwrap_or(false),
+        user_prompts = ?raw_user_prompt_texts(request),
+        "Messages API user prompts"
+    );
+}
 
 /// Configuration for the logging system
 #[derive(Debug, Clone)]
@@ -197,5 +276,107 @@ pub fn init_logging(config: LoggingConfig, otel_layer_config: Option<TraceConfig
     // Return the guard to keep the file appender worker thread alive
     LogGuard {
         _file_guard: file_guard,
+    }
+}
+
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn user_prompts_preserve_text_and_skip_other_roles_and_media() {
+        let raw = json!({
+            "messages": [
+                {"role": "system", "content": "system-secret"},
+                {"role": "user", "content": "  第一条\nsecond line  "},
+                {"role": "assistant", "content": "assistant-secret"},
+                {"role": "user", "content": [
+                    {"type": "text", "text": "first part"},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,secret"}},
+                    {"type": "input_audio", "input_audio": {"data": "audio-secret", "format": "wav"}},
+                    {"type": "unknown", "text": "unknown-secret"},
+                    {"type": "text", "text": ""},
+                    {"type": "text", "text": "last part"}
+                ]},
+                {"role": "tool", "tool_call_id": "call-1", "content": "tool-secret"},
+                {"role": "developer", "content": "developer-secret"},
+                {"role": "user", "content": []}
+            ]
+        });
+        let typed: ChatCompletionRequest = serde_json::from_value(raw.clone()).unwrap();
+        let expected = vec![
+            vec!["  第一条\nsecond line  "],
+            vec!["first part", "", "last part"],
+            vec![],
+        ];
+        assert_eq!(user_prompt_texts(&typed.messages), expected);
+        assert_eq!(raw_user_prompt_texts(&raw), expected);
+        assert_eq!(
+            serde_json::to_value(typed).unwrap()["messages"],
+            raw["messages"]
+        );
+    }
+
+    #[test]
+    fn raw_prompt_logging_tolerates_missing_or_non_text_content() {
+        assert!(raw_user_prompt_texts(&json!({})).is_empty());
+        let raw = json!({"messages": [
+            {"role": "user", "content": null},
+            {"role": "user", "content": [{"type": "text", "text": 42}]}
+        ]});
+        assert_eq!(raw_user_prompt_texts(&raw), vec![vec![""], vec![]]);
+    }
+
+    #[test]
+    fn typed_and_raw_user_prompts_match_for_empty_or_invalid_content() {
+        let cases = [
+            ("null", json!({"role": "user", "content": null}), vec![""]),
+            ("missing", json!({"role": "user"}), vec![""]),
+            ("number", json!({"role": "user", "content": 42}), vec![""]),
+            (
+                "boolean",
+                json!({"role": "user", "content": false}),
+                vec![""],
+            ),
+            ("object", json!({"role": "user", "content": {}}), vec![""]),
+            (
+                "empty string",
+                json!({"role": "user", "content": ""}),
+                vec![""],
+            ),
+            (
+                "empty array",
+                json!({"role": "user", "content": []}),
+                vec![],
+            ),
+            (
+                "non-string text part",
+                json!({"role": "user", "content": [{"type": "text", "text": 42}]}),
+                vec![],
+            ),
+            (
+                "media only",
+                json!({"role": "user", "content": [
+                    {"type": "image_url", "image_url": {"url": "image-secret"}}
+                ]}),
+                vec![],
+            ),
+        ];
+
+        for (case, message, expected) in cases {
+            let raw = json!({"messages": [message]});
+            let request: ChatCompletionRequest = serde_json::from_value(raw.clone()).unwrap();
+            let typed_texts = user_prompt_texts(&request.messages);
+            let raw_texts = raw_user_prompt_texts(&raw);
+
+            assert_eq!(typed_texts, vec![expected], "typed content: {case}");
+            assert_eq!(raw_texts, typed_texts, "raw/typed parity: {case}");
+            assert_eq!(
+                format!("{raw_texts:?}"),
+                format!("{typed_texts:?}"),
+                "log payload parity: {case}"
+            );
+        }
     }
 }

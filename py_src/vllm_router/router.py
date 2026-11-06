@@ -56,6 +56,7 @@ class Router:
         api_key: API key for authorization with workers. Required when using data parallel routing (intra_node_data_parallel_size > 1).
             Default: None
         log_dir: Directory to store log files. If None, logs are only output to console. Default: None
+        log_user_prompts: Log user text from chat and Messages API requests. Default: False.
         log_level: Logging level. Options: 'debug', 'info', 'warning', 'error', 'critical'.
         service_discovery: Enable Kubernetes service discovery. When enabled, the router will
             automatically discover worker pods based on the selector. Default: False
