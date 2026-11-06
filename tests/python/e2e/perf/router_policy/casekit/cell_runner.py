@@ -7,9 +7,9 @@ Flow:
   4. Wait until router passes HTTP /health.
   5. Run agentinfer replay bench against the router.
 
-Workload is fixed ahead of time: AgentX session trace JSONL (``AGENTX_TRACE``), generated
-once via ``data/make_trace.py``. Replay executes that plan and writes ``result/requests.jsonl``
-(per-request TTFT/latency — analysis output, not the bench input).
+Workload is the TraceLab 8-session / 28-request subset
+(``data/tracelab-ci-uniform-28.jsonl``). Replay executes that plan and writes
+``result/requests.jsonl`` (per-request TTFT/latency — analysis output, not the bench input).
 
 Configuration: ``AGENTX_CASE_FILE`` points to one self-contained case JSON
 (``cases/<policy>/c<conc>.json`` with ``runtime``, ``workers``, ``router_params``).
@@ -526,19 +526,30 @@ def engine_command(i):
         "replay_endpoint": "tcp://*:0",
         "buffer_steps": 10000,
     }
-    cpu_bytes = int(pw.get("cpu_kv_bytes", 17179869184))
+    cpu_bytes = int(pw.get("cpu_kv_bytes", 0))
     # GiB for --kv-offloading-size. That flag registers vllm:kv_offload_cpu_*.
+    # cpu_kv_bytes == 0 leaves host offload off (this trace fits in GPU KV).
     offload_gib = cpu_bytes / (1024**3)
-    transfer = {
-        "kv_connector": "OffloadingConnector",
-        "kv_role": "kv_both",
-        "kv_connector_extra_config": {
-            "spec_name": "CPUOffloadingSpec",
-            "cpu_bytes_to_use": cpu_bytes,
-            "blocks_per_chunk": 16,
-            "self_describing_kv_events": True,
-        },
-    }
+    offload_args: list[str] = []
+    if cpu_bytes > 0:
+        transfer = {
+            "kv_connector": "OffloadingConnector",
+            "kv_role": "kv_both",
+            "kv_connector_extra_config": {
+                "spec_name": "CPUOffloadingSpec",
+                "cpu_bytes_to_use": cpu_bytes,
+                "blocks_per_chunk": 16,
+                "self_describing_kv_events": True,
+            },
+        }
+        offload_args = [
+            "--kv-offloading-backend",
+            "native",
+            "--kv-offloading-size",
+            f"{offload_gib:g}",
+            "--kv-transfer-config",
+            json.dumps(transfer),
+        ]
     return [
         RS,
         "serve",
@@ -588,16 +599,11 @@ def engine_command(i):
         ),
         "--kv-cache-memory-bytes",
         str(pw.get("kv_cache_memory_bytes", 107374182400)),
-        "--kv-offloading-backend",
-        "native",
-        "--kv-offloading-size",
-        f"{offload_gib:g}",
+        *offload_args,
         "--safetensors-load-strategy",
         "prefetch",
         "--kv-events-config",
         json.dumps(events),
-        "--kv-transfer-config",
-        json.dumps(transfer),
     ]
 
 
@@ -662,14 +668,19 @@ def runtime_config():
         metrics_url=f"http://127.0.0.1:{ports['metrics']}/metrics",
         tokenizer_base_url=f"http://127.0.0.1:{ports['http'][0]}",
         model=served,
-        endpoint="/v1/completions",
+        endpoint="/v1/chat/completions",
     )
     values["replay"].update(
-        trace_type="agentX",
+        trace_type="tracelab",
         trace_path=str(TRACE),
         trace_same_agent_gap_scale=GAP_SCALE,
         trace_same_agent_gap_offset_seconds=0.0,
         interval_mode="trace",
+        sample_seed=0,
+        context_adjustment_mode="strict",
+        context_micro_trim_max_tokens=64,
+        context_micro_trim_max_ratio=0.005,
+        prompt_calibration_tolerance_tokens=0,
         max_inflight_requests=MAX_INFLIGHT,
         request_timeout_seconds=3600,
     )

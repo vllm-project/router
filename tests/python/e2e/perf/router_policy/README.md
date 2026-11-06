@@ -1,4 +1,4 @@
-# router_policy — AgentX replay, router policy × concurrency
+# router_policy — TraceLab cold replay, router policy × concurrency
 
 Each **case JSON** under `cases/<policy>/` is self-contained (three policies × concurrency 8/16/32):
 
@@ -61,8 +61,8 @@ Layout matches **`perf/grpc`**: case JSON + [`casekit/case_config.py`](casekit/c
 
 Job **`router-policy-perf-e2e`** in [`.buildkite/test-nightly.yml`](../../../../../.buildkite/test-nightly.yml)
 runs **`cache_aware/c16`**, **`kv_aware/c16`**, **`kv_aware_aff/c16`** on **`h100_4`** (4× H100).
-Case JSON reserves ~48 GiB KV cache per worker and `max_model_len=196608`; **L4 (24 GB) is not sufficient**.
+Case JSON reserves 12 GiB GPU KV per worker, no CPU offload, and `max_model_len=32768`.
 
 Nightly step runs `pip install agentinfer==0.2.0` then three pytest invocations (`-k …/c16`).
-Optional Buildkite env **`AGENTX_TRACE_JSONL_URL`** to download `data/agentx-128-t4.jsonl` when the file is not in the checkout.
+The trace is `data/tracelab-ci-uniform-28.jsonl` (8 sessions, 28 requests). Optional Buildkite env **`AGENTX_TRACE_JSONL_URL`** replaces that file when set.
 See [`.buildkite/test-nightly.yml`](../../../../../.buildkite/test-nightly.yml) (`router-policy-perf-e2e`).

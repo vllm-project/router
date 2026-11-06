@@ -1,7 +1,16 @@
-# AgentX trace data
+# TraceLab cold-replay subset
 
-Place `agentx-128-t4.jsonl` here, or generate with [`make_trace.py`](make_trace.py), or update `trace_path` in each case JSON.
+`tracelab-ci-uniform-28.jsonl` is eight Codex sessions (28 requests) from
+`UW-SyFI/TraceLab` revision `7256bbf77e76d5cb83f4ddbd5ad31d8faee9dc7a`, file
+`data/v0.0.2/syfi_coding_trace.jsonl.gz`.
 
-Default case `runtime.trace_path` (repo-relative):
+Regenerate it with [`extract_tracelab.py`](extract_tracelab.py):
 
-`tests/python/e2e/perf/router_policy/data/agentx-128-t4.jsonl`
+```bash
+python tests/python/e2e/perf/router_policy/data/extract_tracelab.py syfi_coding_trace.jsonl.gz
+```
+
+The script checks the compressed source SHA-256 and the extracted file SHA-256.
+Case `runtime.trace_path` points at:
+
+`tests/python/e2e/perf/router_policy/data/tracelab-ci-uniform-28.jsonl`
