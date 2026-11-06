@@ -23,6 +23,7 @@ use crate::program_scheduling::{
     BackendObservationProvider, ProgramIdentity, ProgramScheduler, ProgramSchedulerConfig,
     ProgramTarget, ScheduleError, VllmMetricsObservationProvider,
 };
+use crate::protocols::anthropic::MessagesRequest;
 use crate::protocols::spec::{
     ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest, GenerationRequest,
     GrpcRequestRef, InferenceGenerateRequest, RerankRequest, RerankResponse, RerankResult,
@@ -266,6 +267,9 @@ struct TypedDispatch<'a> {
     route: &'a str,
     worker_url: &'a str,
     is_stream: bool,
+    /// A configured worker api_key replaces the client's Authorization
+    /// header, as route_transparent does. Set for `/v1/messages`.
+    worker_key_overrides_auth: bool,
     completion: Option<&'a CompletionRoute>,
     load: RequestLoadGuard,
     prepared: Option<crate::backend::PreparedRequest>,
@@ -275,6 +279,9 @@ struct SelectedWorker {
     worker: Arc<dyn Worker>,
     kv_receipt: Option<KvSelectionReceipt>,
 }
+
+/// Lowercase name of the header that carries the router-selected DP rank.
+const DP_RANK_HEADER: &str = "x-data-parallel-rank";
 
 /// Regular router that uses injected load balancing policies
 #[derive(Debug)]
@@ -1230,7 +1237,7 @@ impl Router {
                     // value so the worker sees exactly one rank (ours).
                     if name_lc != "content-type"
                         && name_lc != "content-length"
-                        && !(dp_rank.is_some() && name_lc == "x-data-parallel-rank")
+                        && !(dp_rank.is_some() && name_lc == DP_RANK_HEADER)
                         && !header_utils::TRACE_HEADER_NAMES.contains(&name_lc.as_str())
                     {
                         request_builder = request_builder.header(name, value);
@@ -1305,6 +1312,24 @@ impl Router {
         }
     }
 
+    /// Add a body level affinity key (for example anthropic
+    /// `metadata.user_id`) to the policy view of the headers, only when no
+    /// session header is present. Headers always win, and nothing is added
+    /// to the headers forwarded to the worker.
+    pub(crate) fn apply_affinity_key(
+        request_headers: Option<crate::policies::RequestHeaders>,
+        affinity_key: Option<&str>,
+    ) -> Option<crate::policies::RequestHeaders> {
+        let Some(key) = affinity_key else {
+            return request_headers;
+        };
+        let mut map = request_headers.unwrap_or_default();
+        if crate::policies::hash_key::extract_hash_key_from_headers(&map).is_none() {
+            map.insert("x-user-id".to_string(), key.to_string());
+        }
+        Some(map)
+    }
+
     fn available_workers(&self, model_id: Option<&str>) -> Vec<Arc<dyn Worker>> {
         let workers = match model_id {
             Some(model) => self.worker_registry.get_by_model_fast(model),
@@ -1317,6 +1342,7 @@ impl Router {
     }
 
     /// Select worker for a specific model considering circuit breaker state
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     fn select_worker_for_model(
         &self,
@@ -1331,6 +1357,38 @@ impl Router {
         affinity_key: Option<&AffinityKey>,
         excluded_workers: &[String],
     ) -> Option<SelectedWorker> {
+        self.select_worker_for_model_with_affinity(
+            model_id,
+            available,
+            text,
+            headers,
+            token_ids,
+            eligibility,
+            lora_name,
+            cache_salt,
+            affinity_key,
+            excluded_workers,
+            None,
+        )
+    }
+
+    /// Like `select_worker_for_model`, plus a body level affinity key (for
+    /// example anthropic `metadata.user_id`) for header based policies.
+    #[allow(clippy::too_many_arguments)]
+    fn select_worker_for_model_with_affinity(
+        &self,
+        model_id: Option<&str>,
+        available: &[Arc<dyn Worker>],
+        text: Option<&str>,
+        headers: Option<&HeaderMap>,
+        token_ids: KvRequestTokens<'_>,
+        eligibility: Option<&[bool]>,
+        lora_name: Option<&str>,
+        cache_salt: Option<&str>,
+        affinity_key: Option<&AffinityKey>,
+        excluded_workers: &[String],
+        body_affinity_key: Option<&str>,
+    ) -> Option<SelectedWorker> {
         if available.is_empty() {
             return None;
         }
@@ -1338,7 +1396,8 @@ impl Router {
         let policy = self.policy_for_model(model_id);
 
         // Convert headers for policies that need them (e.g., consistent_hash)
-        let request_headers = Self::headers_to_request_headers(headers);
+        let request_headers =
+            Self::apply_affinity_key(Self::headers_to_request_headers(headers), body_affinity_key);
 
         if let Some(kv_aware) = kv_aware_ops(policy.as_ref()) {
             // The policy sees the full list: a retry exclusion must not
@@ -1381,10 +1440,12 @@ impl Router {
         route: &str,
         model_id: Option<&str>,
     ) -> Response {
-        self.route_prepared_request(headers, typed_req, route, model_id, None)
+        self.route_prepared_request(headers, typed_req, route, model_id, None, false)
             .await
     }
 
+    /// `worker_key_overrides_auth` makes a configured worker api_key win over
+    /// the client's Authorization; set for `/v1/messages`.
     #[allow(clippy::too_many_arguments)]
     async fn route_prepared_request<T: GenerationRequest + serde::Serialize + Clone>(
         &self,
@@ -1393,6 +1454,7 @@ impl Router {
         route: &str,
         model_id: Option<&str>,
         raw_body: Option<axum::body::Bytes>,
+        worker_key_overrides_auth: bool,
     ) -> Response {
         let start = Instant::now();
         let is_stream = typed_req.is_stream();
@@ -1638,7 +1700,7 @@ impl Router {
                     });
                     Some(SelectedWorker { worker, kv_receipt })
                 } else {
-                    self.select_worker_for_model(
+                    self.select_worker_for_model_with_affinity(
                         model_id,
                         &workers,
                         Some(if policy.needs_cache_routing_key() {
@@ -1653,6 +1715,7 @@ impl Router {
                         cache_salt,
                         affinity_key.as_ref(),
                         &excluded_workers,
+                        typed_req.affinity_user_key(),
                     )
                 };
                 let SelectedWorker { worker, kv_receipt } = match selected_worker {
@@ -1688,6 +1751,7 @@ impl Router {
                             route,
                             worker_url: worker.url(),
                             is_stream,
+                            worker_key_overrides_auth,
                             completion,
                             load,
                             prepared: (*prepared).clone(),
@@ -1871,6 +1935,7 @@ impl Router {
             route,
             worker_url,
             is_stream,
+            worker_key_overrides_auth,
             completion,
             load,
             prepared,
@@ -1965,6 +2030,14 @@ impl Router {
         // Copy all headers from original request if provided, skipping
         // Content-Type/Content-Length (.json() sets them) and trace headers
         // (propagate_trace_headers below injects fresh context).
+        // sanitize_request_headers drops host and hop-by-hop headers. With
+        // worker_key_overrides_auth a configured worker api_key also wins
+        // over the client's Authorization, matching route_transparent.
+        let worker_key = if worker_key_overrides_auth {
+            self.api_key.as_deref()
+        } else {
+            None
+        };
         if let Some(headers) = headers {
             let forwarded = header_utils::sanitize_request_headers(headers);
             for (name, value) in &forwarded {
@@ -1973,10 +2046,18 @@ impl Router {
                     && !header_utils::TRACE_HEADER_NAMES
                         .iter()
                         .any(|&th| name.as_str().eq_ignore_ascii_case(th))
+                    && !(worker_key.is_some() && *name == http::header::AUTHORIZATION)
+                    // The router owns X-data-parallel-rank when it picked a
+                    // rank: reqwest appends and vLLM reads the first value,
+                    // so a client copy would override our choice.
+                    && !(extracted_dp_rank.is_some() && name.as_str() == DP_RANK_HEADER)
                 {
                     request_builder = request_builder.header(name, value);
                 }
             }
+        }
+        if let Some(key) = worker_key {
+            request_builder = request_builder.header("Authorization", format!("Bearer {}", key));
         }
 
         // Add X-data-parallel-rank header for DP-aware routing
@@ -2020,7 +2101,12 @@ impl Router {
             .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
         let http_ttfb_ms = t_send.elapsed().as_secs_f64() * 1000.0;
 
-        if !is_stream {
+        // A worker can reject a streaming `/v1/messages` request with a plain
+        // json error before any sse is sent; pass that through with its own
+        // status, body and content type instead of proxying it as an event
+        // stream. Other routes keep streaming errors so completion load
+        // accounting holds until the body is done.
+        if !is_stream || (route == "/v1/messages" && !status.is_success()) {
             // For non-streaming requests, preserve headers
             let mut response_headers = header_utils::preserve_response_headers(res.headers());
             let first_ms = t_send.elapsed().as_secs_f64() * 1000.0;
@@ -2038,6 +2124,9 @@ impl Router {
                     let mut response = Response::new(axum::body::Body::from(body));
                     *response.status_mut() = status;
                     *response.headers_mut() = response_headers;
+                    response
+                        .extensions_mut()
+                        .insert(crate::routers::UpstreamResponse);
                     response
                 }
                 Err(e) => {
@@ -2777,7 +2866,7 @@ impl RouterTrait for Router {
         body: &CompletionRequest,
         model_id: Option<&str>,
     ) -> Response {
-        self.route_prepared_request(headers, body, "/v1/completions", model_id, None)
+        self.route_prepared_request(headers, body, "/v1/completions", model_id, None, false)
             .await
     }
 
@@ -2801,8 +2890,15 @@ impl RouterTrait for Router {
             drop(raw);
             None
         };
-        self.route_prepared_request(headers, body.as_ref(), "/v1/completions", model_id, raw)
-            .await
+        self.route_prepared_request(
+            headers,
+            body.as_ref(),
+            "/v1/completions",
+            model_id,
+            raw,
+            false,
+        )
+        .await
     }
 
     async fn route_responses(
@@ -2823,6 +2919,16 @@ impl RouterTrait for Router {
     async fn cancel_response(&self, headers: Option<&HeaderMap>, response_id: &str) -> Response {
         let endpoint = format!("v1/responses/{}/cancel", response_id);
         self.route_post_empty_request(headers, &endpoint).await
+    }
+
+    async fn route_messages(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &MessagesRequest,
+        model_id: Option<&str>,
+    ) -> Response {
+        self.route_prepared_request(headers, body, "/v1/messages", model_id, None, true)
+            .await
     }
 
     async fn route_embeddings(
@@ -3224,6 +3330,10 @@ impl RouterTrait for Router {
                     // RequestBuilder::header appends, and vLLM reads the
                     // first Authorization value.
                     if self.api_key.is_some() && name == http::header::AUTHORIZATION {
+                        continue;
+                    }
+                    // Same for the DP rank the router selected for this worker.
+                    if worker.dp_rank().is_some() && name.as_str() == DP_RANK_HEADER {
                         continue;
                     }
                     // reqwest derives these from the body and URL it sends.
@@ -4602,6 +4712,7 @@ mod tests {
                     route: "/v1/chat/completions",
                     worker_url: &worker_url,
                     is_stream: false,
+                    worker_key_overrides_auth: false,
                     completion: None,
                     // No worker is tracked, so this dispatch does not count against
                     // a worker's load — the same state the old `load_incremented:
@@ -4765,6 +4876,143 @@ mod tests {
         serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["worker"]
             .as_u64()
             .unwrap() as usize
+    }
+
+    /// `/v1/messages` prepares tokens through each worker's
+    /// `/v1/messages/render`, or `/tokenize` on the translated chat body when
+    /// render is not served. Repeated conversation prefixes then populate and
+    /// hit the cache aware tree instead of the least loaded fallback.
+    #[tokio::test]
+    async fn messages_cache_aware_routing_uses_prepared_prefixes() {
+        for render_available in [true, false] {
+            use axum::{extract::OriginalUri, routing::post};
+            let mut router = create_test_regular_router();
+            router.worker_registry = Arc::new(WorkerRegistry::new());
+            router.policy_registry = Arc::new(PolicyRegistry::new(
+                crate::config::PolicyConfig::CacheAware {
+                    cache_threshold: 0.5,
+                    balance_abs_threshold: 20,
+                    balance_rel_threshold: 10.0,
+                    eviction_interval_secs: 0,
+                    max_tree_size: 1 << 20,
+                },
+            ));
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let mut servers = Vec::new();
+            let mut workers: Vec<Arc<dyn Worker>> = Vec::new();
+            for worker_index in 0..2usize {
+                let captured = calls.clone();
+                let app = axum::Router::new().fallback(post(
+                    move |OriginalUri(uri): OriginalUri, Json(body): Json<serde_json::Value>| {
+                        let captured = captured.clone();
+                        async move {
+                            let path = uri.path().to_string();
+                            captured
+                                .lock()
+                                .push((worker_index, path.clone(), body.clone()));
+                            if path == "/v1/messages/render" && !render_available {
+                                return StatusCode::NOT_FOUND.into_response();
+                            }
+                            if path == "/tokenize" || path == "/v1/messages/render" {
+                                // One token per byte of the conversation text.
+                                let mut text = if path == "/tokenize" {
+                                    String::new()
+                                } else {
+                                    body["system"].to_string()
+                                };
+                                for m in body["messages"].as_array().unwrap() {
+                                    text.push_str(&format!("{}:{}|", m["role"], m["content"]));
+                                }
+                                let tokens: Vec<u32> = text.bytes().map(u32::from).collect();
+                                return Json(if path == "/tokenize" {
+                                    serde_json::json!({"tokens": tokens, "count": tokens.len()})
+                                } else {
+                                    serde_json::json!({"token_ids": tokens, "features": null})
+                                })
+                                .into_response();
+                            }
+                            Json(serde_json::json!({"worker": worker_index, "content": []}))
+                                .into_response()
+                        }
+                    },
+                ));
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let url = format!("http://{}", listener.local_addr().unwrap());
+                servers.push(tokio::spawn(async move {
+                    axum::serve(listener, app).await.unwrap()
+                }));
+                let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(url, WorkerType::Regular));
+                router.worker_registry.register(worker.clone());
+                workers.push(worker);
+            }
+            let policy = router.policy_registry.get_default_policy();
+            policy
+                .as_any()
+                .downcast_ref::<crate::policies::CacheAwarePolicy>()
+                .unwrap()
+                .init_workers(&workers);
+            let system = "you are a careful assistant; ".repeat(8);
+            let first: MessagesRequest = serde_json::from_value(serde_json::json!({
+                "model": "m", "max_tokens": 8, "system": system,
+                "messages": [{"role": "user", "content": "first question"}],
+            }))
+            .unwrap();
+            let warm = selected_http_worker(router.route_messages(None, &first, None).await).await;
+            {
+                let calls = calls.lock();
+                let count = |path: &str| calls.iter().filter(|(_, p, _)| p == path).count();
+                assert_eq!(
+                    count("/v1/messages/render"),
+                    2,
+                    "each worker renders its own prompt"
+                );
+                if render_available {
+                    assert_eq!(count("/tokenize"), 0);
+                } else {
+                    let tokenize: Vec<_> =
+                        calls.iter().filter(|(_, p, _)| p == "/tokenize").collect();
+                    assert_eq!(tokenize.len(), 2);
+                    assert_eq!(
+                        tokenize[0].2["messages"],
+                        serde_json::json!([
+                            {"role": "system", "content": system},
+                            {"role": "user", "content": "first question"},
+                        ])
+                    );
+                }
+            }
+            // Least loaded would now pick the other worker; only a cache hit on
+            // the shared prefix keeps the next turn on the warm worker.
+            for _ in 0..3 {
+                workers[warm].increment_load();
+            }
+            let second: MessagesRequest = serde_json::from_value(serde_json::json!({
+                "model": "m", "max_tokens": 8, "system": system,
+                "messages": [
+                    {"role": "user", "content": "first question"},
+                    {"role": "assistant", "content": [{"type": "text", "text": "ok"}]},
+                    {"role": "user", "content": "next"},
+                ],
+            }))
+            .unwrap();
+            assert_eq!(
+                selected_http_worker(router.route_messages(None, &second, None).await).await,
+                warm
+            );
+            // An unrelated conversation has no prefix credit and goes least loaded.
+            let other: MessagesRequest = serde_json::from_value(serde_json::json!({
+                "model": "m", "max_tokens": 8,
+                "messages": [{"role": "user", "content": "a different conversation entirely"}],
+            }))
+            .unwrap();
+            assert_eq!(
+                selected_http_worker(router.route_messages(None, &other, None).await).await,
+                1 - warm
+            );
+            for server in servers {
+                server.abort();
+            }
+        }
     }
 
     #[tokio::test]
@@ -5675,6 +5923,77 @@ mod tests {
         server.abort();
     }
 
+    fn dp_router_pointing_at(address: std::net::SocketAddr, dp_rank: usize) -> Router {
+        let mut router = create_test_regular_router();
+        router.intra_node_data_parallel_size = 2;
+        router.worker_registry = Arc::new(WorkerRegistry::new());
+        router
+            .worker_registry
+            .register(Arc::new(crate::core::DPAwareWorker::new(
+                format!("http://{address}"),
+                dp_rank,
+                2,
+                WorkerType::Regular,
+            )));
+        router
+    }
+
+    /// With DP size > 1 the router owns X-data-parallel-rank. reqwest appends
+    /// headers and vLLM reads the first value, so a client copy must not be
+    /// forwarded on the Messages typed-dispatch path.
+    #[tokio::test]
+    async fn messages_dp_rank_header_is_router_owned() {
+        let (address, server) = spawn_header_echo_backend().await;
+        let router = dp_router_pointing_at(address, 1);
+        let mut headers = HeaderMap::new();
+        headers.insert("x-data-parallel-rank", "7".parse().unwrap());
+        headers.insert("x-session-id", "sticky-1".parse().unwrap());
+        let body: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "m",
+            "max_tokens": 8,
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .unwrap();
+
+        let response = router.route_messages(Some(&headers), &body, None).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let echoed: HashMap<String, Vec<String>> = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(echoed["x-data-parallel-rank"], vec!["1"], "{echoed:?}");
+        assert_eq!(echoed["x-session-id"], vec!["sticky-1"]);
+        server.abort();
+    }
+
+    /// The transparent EPD path forwards client headers too, so it applies the
+    /// same rule for the worker's DP rank.
+    #[tokio::test]
+    async fn transparent_epd_dp_rank_header_is_router_owned() {
+        let (address, server) = spawn_header_echo_backend().await;
+        let mut router = dp_router_pointing_at(address, 1);
+        router.epd = Some(super::super::epd::EncoderStage::new(
+            crate::config::EpdConfig {
+                encoder_urls: vec!["http://unused".into()],
+                consumer_zmq_addrs: Default::default(),
+            },
+        ));
+        let mut headers = HeaderMap::new();
+        headers.insert("x-data-parallel-rank", "7".parse().unwrap());
+
+        let response = router
+            .route_transparent(
+                Some(&headers),
+                "/v1/responses",
+                &Method::POST,
+                serde_json::json!({"model": "m"}),
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let echoed: HashMap<String, Vec<String>> = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(echoed["x-data-parallel-rank"], vec!["1"], "{echoed:?}");
+        server.abort();
+    }
+
     #[tokio::test]
     async fn transparent_epd_records_request_metrics() {
         use axum::{routing::post, Json};
@@ -6006,6 +6325,7 @@ mod tests {
                     worker_url: worker.url(),
                     is_stream: true,
                     completion: Some(&completion),
+                    worker_key_overrides_auth: false,
                     load,
                     prepared: None,
                 },
@@ -6189,6 +6509,7 @@ mod tests {
                         worker_url: fixture.worker.url(),
                         is_stream: true,
                         completion: Some(&completion),
+                        worker_key_overrides_auth: false,
                         load,
                         prepared: None,
                     },
