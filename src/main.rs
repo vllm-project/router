@@ -233,6 +233,16 @@ struct CliArgs {
     #[arg(long)]
     conductor_url: Option<String>,
 
+    /// Conductor transport: `http` (HTTP+msgpack) or `coro-rpc` (Mooncake
+    /// native RPC; requires a build with the `conductor-rpc` feature).
+    #[arg(long, value_parser = ["http", "coro-rpc"], default_value = "http")]
+    conductor_transport: String,
+
+    /// `host:port` of Conductor's coro_rpc channel when
+    /// `--conductor-transport=coro-rpc` (Conductor `rpc_server_port`).
+    #[arg(long, default_value = "127.0.0.1:13334")]
+    conductor_rpc_addr: String,
+
     /// Disable router-driven Conductor registration (an operator or sidecar
     /// manages registrations instead). Registration is on by default.
     #[arg(long)]
@@ -526,6 +536,8 @@ impl CliArgs {
                 static_kv_event_sources: Box::default(),
                 kv_index_backend: self.kv_index_backend.clone(),
                 conductor_url: self.conductor_url.clone(),
+                conductor_transport: self.conductor_transport.clone(),
+                conductor_rpc_addr: self.conductor_rpc_addr.clone(),
                 conductor_register: !self.no_conductor_register,
                 conductor_connect_timeout_ms: self.conductor_connect_timeout_ms,
                 conductor_query_timeout_ms: self.conductor_query_timeout_ms,
@@ -585,7 +597,9 @@ impl CliArgs {
                 || self.conductor_circuit_breaker_max_failures != 3
                 || self.conductor_circuit_breaker_cooldown_ms != 5000
                 || self.conductor_circuit_breaker_half_open_max != 1
-                || self.conductor_heartbeat_secs != 10)
+                || self.conductor_heartbeat_secs != 10
+                || self.conductor_transport != "http"
+                || self.conductor_rpc_addr != "127.0.0.1:13334")
         {
             return Err(vllm_router_rs::config::ConfigError::ValidationFailed {
                 reason: "conductor options require --policy kv_aware".to_string(),

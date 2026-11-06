@@ -115,6 +115,9 @@ vllm-text = { git = "https://github.com/vllm-project/vllm", tag = "v0.30.0" }
 # only when its features are passed, for example `--features cpu,ready`.
 cpu = []
 ready = []
+# Optional coro_rpc transport for the Conductor KV backend. build.rs links the
+# Mooncake C++ client when this is enabled and the library is present.
+conductor-rpc = []
 
 [dev-dependencies]
 libc = "0.2"

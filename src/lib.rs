@@ -56,6 +56,8 @@ struct Router {
     kv_event_model: Option<String>,
     kv_index_backend: String,
     conductor_url: Option<String>,
+    conductor_transport: String,
+    conductor_rpc_addr: String,
     conductor_query_timeout_ms: u64,
     conductor_hash_strategy: String,
     conductor_hash_algorithm: String,
@@ -146,7 +148,9 @@ impl Router {
                 || self.conductor_url.is_some()
                 || self.conductor_hash_python_seed.is_some()
                 || !self.conductor_circuit_breaker
-                || self.conductor_heartbeat_secs != 10)
+                || self.conductor_heartbeat_secs != 10
+                || self.conductor_transport != "http"
+                || self.conductor_rpc_addr != "127.0.0.1:13334")
         {
             return Err(config::ConfigError::ValidationFailed {
                 reason: "conductor options require policy=kv_aware".to_string(),
@@ -174,6 +178,8 @@ impl Router {
                         static_kv_event_sources: Box::default(),
                         kv_index_backend: self.kv_index_backend.clone(),
                         conductor_url: self.conductor_url.clone(),
+                        conductor_transport: self.conductor_transport.clone(),
+                        conductor_rpc_addr: self.conductor_rpc_addr.clone(),
                         conductor_register: true,
                         conductor_connect_timeout_ms: 100,
                         conductor_query_timeout_ms: self.conductor_query_timeout_ms,
@@ -425,6 +431,8 @@ impl Router {
         kv_event_model = None,
         kv_index_backend = String::from("local"),
         conductor_url = None,
+        conductor_transport = String::from("http"),
+        conductor_rpc_addr = String::from("127.0.0.1:13334"),
         conductor_query_timeout_ms = 10,
         conductor_hash_strategy = String::from("vllm_v1"),
         conductor_hash_algorithm = String::from("sha256"),
@@ -511,6 +519,8 @@ impl Router {
         kv_event_model: Option<String>,
         kv_index_backend: String,
         conductor_url: Option<String>,
+        conductor_transport: String,
+        conductor_rpc_addr: String,
         conductor_query_timeout_ms: u64,
         conductor_hash_strategy: String,
         conductor_hash_algorithm: String,
@@ -551,6 +561,8 @@ impl Router {
             kv_event_model,
             kv_index_backend,
             conductor_url,
+            conductor_transport,
+            conductor_rpc_addr,
             conductor_query_timeout_ms,
             conductor_hash_strategy,
             conductor_hash_algorithm,

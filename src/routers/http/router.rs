@@ -5841,6 +5841,7 @@ mod tests {
                 conductor_hash_profile: None,
                 conductor_circuit_breaker: None,
                 conductor_heartbeat_secs: 10,
+                ..Default::default()
             })),
         ));
         let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
@@ -5898,6 +5899,7 @@ mod tests {
                 conductor_hash_profile: None,
                 conductor_circuit_breaker: None,
                 conductor_heartbeat_secs: 10,
+                ..Default::default()
             })),
         ));
 
@@ -6678,6 +6680,8 @@ mod tests {
                     static_kv_event_sources: Default::default(),
                     kv_index_backend: "local".to_string(),
                     conductor_url: None,
+                    conductor_transport: "http".to_string(),
+                    conductor_rpc_addr: "127.0.0.1:13334".to_string(),
                     conductor_register: true,
                     conductor_connect_timeout_ms: 100,
                     conductor_query_timeout_ms: 10,
@@ -6753,6 +6757,8 @@ mod tests {
                 static_kv_event_sources: Default::default(),
                 kv_index_backend: "local".to_string(),
                 conductor_url: None,
+                conductor_transport: "http".to_string(),
+                conductor_rpc_addr: "127.0.0.1:13334".to_string(),
                 conductor_register: true,
                 conductor_connect_timeout_ms: 100,
                 conductor_query_timeout_ms: 10,

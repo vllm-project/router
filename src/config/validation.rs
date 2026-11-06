@@ -490,14 +490,50 @@ impl ConfigValidator {
                 match config.kv_index_backend.as_str() {
                     "local" => {}
                     "conductor" => {
-                        if config.conductor_url.as_deref().unwrap_or("").is_empty() {
-                            return Err(ConfigError::InvalidValue {
-                                field: "conductor_url".to_string(),
-                                value: String::new(),
-                                reason: "conductor_url is required when kv_index_backend is \
-                                         \"conductor\""
-                                    .to_string(),
-                            });
+                        // The transport decides which endpoint is required:
+                        // HTTP needs `conductor_url`, coro_rpc needs
+                        // `conductor_rpc_addr` (and a build that linked the C++
+                        // client).
+                        match config.conductor_transport.as_str() {
+                            "http" => {
+                                if config.conductor_url.as_deref().unwrap_or("").is_empty() {
+                                    return Err(ConfigError::InvalidValue {
+                                        field: "conductor_url".to_string(),
+                                        value: String::new(),
+                                        reason: "conductor_url is required when \
+                                                 kv_index_backend is \"conductor\" and \
+                                                 conductor_transport is \"http\""
+                                            .to_string(),
+                                    });
+                                }
+                            }
+                            "coro-rpc" => {
+                                if !cfg!(feature = "conductor-rpc") {
+                                    return Err(ConfigError::InvalidValue {
+                                        field: "conductor_transport".to_string(),
+                                        value: "coro-rpc".to_string(),
+                                        reason: "requires a build with the `conductor-rpc` \
+                                                 feature (links the Mooncake C++ client)"
+                                            .to_string(),
+                                    });
+                                }
+                                if config.conductor_rpc_addr.trim().is_empty() {
+                                    return Err(ConfigError::InvalidValue {
+                                        field: "conductor_rpc_addr".to_string(),
+                                        value: String::new(),
+                                        reason: "conductor_rpc_addr is required when \
+                                                 conductor_transport is \"coro-rpc\""
+                                            .to_string(),
+                                    });
+                                }
+                            }
+                            other => {
+                                return Err(ConfigError::InvalidValue {
+                                    field: "conductor_transport".to_string(),
+                                    value: other.to_string(),
+                                    reason: "Must be \"http\" or \"coro-rpc\"".to_string(),
+                                });
+                            }
                         }
                         // A wrong (or missing) hash recipe is a silent zero-hit,
                         // never an error at query time, so refuse to start
@@ -1601,6 +1637,8 @@ mod tests {
                 static_kv_event_sources: Default::default(),
                 kv_index_backend: "local".to_string(),
                 conductor_url: None,
+                conductor_transport: "http".to_string(),
+                conductor_rpc_addr: "127.0.0.1:13334".to_string(),
                 conductor_register: true,
                 conductor_connect_timeout_ms: 100,
                 conductor_query_timeout_ms: 10,
@@ -1877,6 +1915,8 @@ mod tests {
             PolicyConfig::KvAware(Box::new(KvAwareConfig {
                 kv_index_backend: "conductor".to_string(),
                 conductor_url: Some("http://conductor:13333".to_string()),
+                conductor_transport: "http".to_string(),
+                conductor_rpc_addr: "127.0.0.1:13334".to_string(),
                 conductor_hash_profile: profile,
                 ..KvAwareConfig::default()
             })),
@@ -1944,6 +1984,8 @@ mod tests {
                 PolicyConfig::KvAware(Box::new(KvAwareConfig {
                     kv_index_backend: "conductor".to_string(),
                     conductor_url: Some("http://conductor:13333".to_string()),
+                    conductor_transport: "http".to_string(),
+                    conductor_rpc_addr: "127.0.0.1:13334".to_string(),
                     conductor_hash_profile: Some(ConductorHashProfile {
                         python_hash_seed: Some("1".to_string()),
                         ..ConductorHashProfile::default()
@@ -1961,5 +2003,44 @@ mod tests {
                 "max_failures={max_failures} half_open_max={half_open_max} must be rejected"
             );
         }
+    }
+
+    #[test]
+    fn test_kv_aware_rejects_unknown_conductor_transport() {
+        let config = RouterConfig::new(
+            RoutingMode::Regular {
+                worker_urls: vec!["http://worker:8000".to_string()],
+            },
+            PolicyConfig::KvAware(Box::new(KvAwareConfig {
+                kv_index_backend: "conductor".to_string(),
+                conductor_url: Some("http://conductor:13333".to_string()),
+                conductor_transport: "coro_rpc".to_string(),
+                ..KvAwareConfig::default()
+            })),
+        );
+        let error = ConfigValidator::validate(&config).unwrap_err();
+        assert!(error.to_string().contains("http") && error.to_string().contains("coro-rpc"));
+    }
+
+    #[cfg(not(feature = "conductor-rpc"))]
+    #[test]
+    fn test_kv_aware_coro_transport_requires_the_feature() {
+        let config = RouterConfig::new(
+            RoutingMode::Regular {
+                worker_urls: vec!["http://worker:8000".to_string()],
+            },
+            PolicyConfig::KvAware(Box::new(KvAwareConfig {
+                kv_index_backend: "conductor".to_string(),
+                conductor_url: None,
+                conductor_transport: "coro-rpc".to_string(),
+                conductor_hash_profile: Some(ConductorHashProfile {
+                    python_hash_seed: Some("1".to_string()),
+                    ..ConductorHashProfile::default()
+                }),
+                ..KvAwareConfig::default()
+            })),
+        );
+        let error = ConfigValidator::validate(&config).unwrap_err();
+        assert!(error.to_string().contains("conductor-rpc"));
     }
 }

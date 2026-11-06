@@ -41,7 +41,7 @@
 //! provider returns an empty match set, so `kv_aware` falls back to pure load
 //! scoring and never fails a request because Conductor is unreachable.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -333,6 +333,85 @@ fn parse_services(value: &Value) -> HashSet<(String, u32)> {
     out
 }
 
+/// Worker registration/lease interface shared by every Conductor transport.
+///
+/// `kv_aware` keeps the policy wiring (heartbeat, unregister bookkeeping)
+/// transport agnostic by depending on this trait instead of the HTTP provider.
+pub trait ConductorRegistrar: std::fmt::Debug + Send + Sync {
+    /// Register every cache-identity source endpoint of a worker (per DP rank).
+    fn register_worker(&self, info: &WorkerKvInfo) -> Result<(), String>;
+    /// Unregister the given DP ranks of a worker.
+    fn unregister_worker(&self, instance_id: &str, dp_ranks: &[u32]) -> Result<(), String>;
+    /// `(instance_id, dp_rank)` pairs the Conductor currently knows about, when
+    /// the transport can enumerate them. The heartbeat falls back to blind
+    /// re-registration when this is unsupported.
+    fn list_services(&self) -> Result<HashSet<(String, u32)>, String> {
+        Err("service listing is not supported by this transport".to_string())
+    }
+}
+
+/// One transport-independent `/register` payload (one per source DP rank).
+#[derive(Debug, Clone)]
+pub(crate) struct RegisterPlan {
+    pub instance_id: String,
+    pub dp_rank: u32,
+    pub model: String,
+    pub block_size: u32,
+    pub endpoint: String,
+    pub replay_endpoint: Option<String>,
+}
+
+/// Enumerate one registration per source DP rank.
+///
+/// Empty when the worker has no cache identity, no usable block size, or no
+/// resolved ZMQ endpoint; both transports treat that as "nothing to do".
+pub(crate) fn plan_registrations(info: &WorkerKvInfo) -> Vec<RegisterPlan> {
+    let Some(cache_key) = info.cache_key.as_ref() else {
+        return Vec::new();
+    };
+    let block_size = info.block_size.unwrap_or(cache_key.block_size);
+    if block_size == 0 {
+        return Vec::new();
+    }
+    let model = cache_key.model.to_string();
+    info.sources
+        .iter()
+        .filter(|src| !src.pub_endpoint.is_empty())
+        .map(|src| RegisterPlan {
+            instance_id: info.instance_id.clone(),
+            dp_rank: src.dp_rank,
+            model: model.clone(),
+            block_size,
+            endpoint: src.pub_endpoint.clone(),
+            replay_endpoint: src.replay_endpoint.clone(),
+        })
+        .collect()
+}
+
+/// The set of `(instance_id, dp_rank)` pairs this router successfully
+/// registered, shared by both transports. Also publishes the gauge, so the
+/// coro_rpc path reports the same registered-source count as HTTP.
+#[derive(Debug, Default)]
+pub(crate) struct RegisteredSources {
+    inner: Mutex<HashSet<(String, u32)>>,
+}
+
+impl RegisteredSources {
+    pub(crate) fn insert(&self, instance_id: &str, dp_rank: u32) {
+        if let Ok(mut set) = self.inner.lock() {
+            set.insert((instance_id.to_string(), dp_rank));
+            ConductorMetrics::set_registered_sources(set.len());
+        }
+    }
+
+    pub(crate) fn remove(&self, instance_id: &str, dp_rank: u32) {
+        if let Ok(mut set) = self.inner.lock() {
+            set.remove(&(instance_id.to_string(), dp_rank));
+            ConductorMetrics::set_registered_sources(set.len());
+        }
+    }
+}
+
 /// Conductor placement provider.
 ///
 /// The base URL is the Conductor HTTP endpoint (e.g. `http://127.0.0.1:13333`).
@@ -350,9 +429,8 @@ pub struct ConductorMatchProvider {
     control_transport: Arc<dyn ConductorTransport>,
     hash_profile: ConductorHashProfile,
     /// Every `(instance_id, dp_rank)` this router successfully registered.
-    /// Feeds the `conductor_registered_sources` gauge; re-registering the same
-    /// key is idempotent, so it never double counts.
-    registered: Mutex<HashSet<(String, u32)>>,
+    /// Feeds the `conductor_registered_sources` gauge.
+    registered: RegisteredSources,
 }
 
 impl ConductorMatchProvider {
@@ -391,7 +469,7 @@ impl ConductorMatchProvider {
             query_transport,
             control_transport,
             hash_profile: options.hash_profile,
-            registered: Mutex::new(HashSet::new()),
+            registered: RegisteredSources::default(),
         }
     }
 
@@ -413,43 +491,26 @@ impl ConductorMatchProvider {
     /// under `instance_id`; a no-op when the worker has no cache identity or no
     /// ZMQ sources. Failures are reported but never fatal to the caller.
     pub fn register_worker(&self, info: &WorkerKvInfo) -> Result<(), String> {
-        let Some(cache_key) = info.cache_key.as_ref() else {
-            return Ok(());
-        };
-        let model = cache_key.model.to_string();
-        let block_size = info.block_size.unwrap_or(cache_key.block_size);
-        if block_size == 0 {
-            return Ok(());
-        }
         let mut last_error = String::new();
-        for src in &info.sources {
-            if src.pub_endpoint.is_empty() {
-                continue;
-            }
+        for plan in plan_registrations(info) {
             let body = encode_register(
                 &self.hash_profile,
-                &info.instance_id,
-                src.dp_rank,
-                &model,
-                block_size,
-                &src.pub_endpoint,
-                src.replay_endpoint.clone(),
+                &plan.instance_id,
+                plan.dp_rank,
+                &plan.model,
+                plan.block_size,
+                &plan.endpoint,
+                plan.replay_endpoint.clone(),
             );
             match self
                 .control_transport
                 .post(&format!("{}/register", self.base_url), body)
             {
-                Ok(_) => {
-                    self.registered
-                        .lock()
-                        .unwrap()
-                        .insert((info.instance_id.clone(), src.dp_rank));
-                }
+                Ok(_) => self.registered.insert(&plan.instance_id, plan.dp_rank),
                 Err(error) => last_error = format!("register failed: {error:?}"),
             }
         }
         ConductorMetrics::record_register(last_error.is_empty());
-        ConductorMetrics::set_registered_sources(self.registered_sources());
         if last_error.is_empty() {
             Ok(())
         } else {
@@ -466,25 +527,15 @@ impl ConductorMatchProvider {
                 .control_transport
                 .post(&format!("{}/unregister", self.base_url), body)
             {
-                Ok(_) => {
-                    self.registered
-                        .lock()
-                        .unwrap()
-                        .remove(&(instance_id.to_string(), rank));
-                }
+                Ok(_) => self.registered.remove(instance_id, rank),
                 Err(error) => last_error = format!("unregister failed: {error:?}"),
             }
         }
-        ConductorMetrics::set_registered_sources(self.registered_sources());
         if last_error.is_empty() {
             Ok(())
         } else {
             Err(last_error)
         }
-    }
-
-    fn registered_sources(&self) -> usize {
-        self.registered.lock().map(|set| set.len()).unwrap_or(0)
     }
 
     /// Issue a `/query` against Conductor and translate the response into flat
@@ -580,6 +631,20 @@ impl TieredMatchProvider for ConductorMatchProvider {
         query: &MatchQuery<'_>,
     ) -> Result<Vec<TierMatch>, MatchError> {
         self.try_query(query).map_err(|error| error.match_error())
+    }
+}
+
+impl ConductorRegistrar for ConductorMatchProvider {
+    fn register_worker(&self, info: &WorkerKvInfo) -> Result<(), String> {
+        ConductorMatchProvider::register_worker(self, info)
+    }
+
+    fn unregister_worker(&self, instance_id: &str, dp_ranks: &[u32]) -> Result<(), String> {
+        ConductorMatchProvider::unregister_worker(self, instance_id, dp_ranks)
+    }
+
+    fn list_services(&self) -> Result<HashSet<(String, u32)>, String> {
+        ConductorMatchProvider::list_services(self).map_err(|error| format!("{error:?}"))
     }
 }
 
@@ -742,72 +807,130 @@ fn encode_unregister(instance_id: &str, dp_rank: u32) -> Vec<u8> {
 /// Per-instance per-rank cumulative token ceilings are floored to block
 /// intervals; an invariant violation (descending ceilings, or a ceiling past
 /// the query length) drops the impacted rows rather than over-crediting.
-pub fn translate_response(
-    response: &rmpv::Value,
+/// One `(instance, rank)` row of cumulative token ceilings, as reported by any
+/// Conductor transport.
+#[derive(Debug, Clone)]
+pub(crate) struct RankCeilings {
+    pub instance_id: String,
+    pub rank: u32,
+    pub device: i64,
+    pub cpu_local: i64,
+    pub cpu_share: i64,
+    pub disk: i64,
+    /// `dp[rank]` from the same response when present (RFC #414 §2 check).
+    pub dp_device: Option<i64>,
+}
+
+/// Shared translation for every transport.
+///
+/// Invariant checks, tier segmentation and locality must be identical for
+/// HTTP/msgpack and coro_rpc/FFI, so both decode into [`RankCeilings`] and call
+/// this function instead of reimplementing the rules (which is how the FFI path
+/// lost the `dp` cross-check).
+pub(crate) fn tier_matches_from_ceilings(
+    hits: Vec<RankCeilings>,
     request: &crate::kv_index::MatchRequest<'_>,
     tiers_of_interest: &[StorageTier],
 ) -> Vec<TierMatch> {
     let block_size = request.block_size.max(1) as i64;
     let len = request.token_ids.len() as i64;
     let query_blocks = ((len + block_size - 1) / block_size).max(1);
-    let mut out: Vec<TierMatch> = Vec::new();
 
-    // Top-level "instances": map of instance_id -> hit.
-    let instances = match response.as_map() {
-        Some(map) => map.iter().find(|(k, _)| k.as_str() == Some("instances")),
-        None => None,
+    // Group by instance so a violated rank drops the whole instance.
+    let mut by_instance: BTreeMap<&str, Vec<&RankCeilings>> = BTreeMap::new();
+    for hit in &hits {
+        by_instance
+            .entry(hit.instance_id.as_str())
+            .or_default()
+            .push(hit);
+    }
+
+    let mut out = Vec::new();
+    for (instance_id, ranks) in by_instance {
+        // RFC #414 §2: the aggregate `dp[rank]` must agree with the per-rank
+        // device ceiling. A mismatch means the two maps come from different
+        // index states, so credit nothing for this instance.
+        if ranks
+            .iter()
+            .any(|rank| rank.dp_device.is_some_and(|dp| dp != rank.device))
+        {
+            ConductorMetrics::record_invariant_violation();
+            continue;
+        }
+        let mut rows = Vec::new();
+        let mut failed = false;
+        for rank in &ranks {
+            let target = RoutableTarget {
+                instance_id: instance_id.into(),
+                dp_rank: rank.rank,
+            };
+            if !append_tier(
+                &mut rows,
+                &target,
+                tiers_of_interest,
+                query_blocks,
+                (
+                    rank.device,
+                    rank.cpu_local,
+                    rank.cpu_share,
+                    rank.disk,
+                    block_size,
+                ),
+            ) {
+                failed = true;
+                break;
+            }
+        }
+        if failed {
+            ConductorMetrics::record_invariant_violation();
+        } else {
+            out.extend(rows);
+        }
+    }
+    out
+}
+
+/// Translate Conductor's `/query` response into flat `(target, tier)` rows.
+///
+/// Kept as the public entry point for the HTTP transport and its tests; both
+/// transports end up in [`tier_matches_from_ceilings`].
+pub fn translate_response(
+    response: &rmpv::Value,
+    request: &crate::kv_index::MatchRequest<'_>,
+    tiers_of_interest: &[StorageTier],
+) -> Vec<TierMatch> {
+    let Some(map) = response.as_map() else {
+        return Vec::new();
     };
-    let instances_map = match instances {
-        Some((_, Value::Map(entries))) => entries,
-        _ => return out,
+    let Some((_, Value::Map(instances))) = map
+        .iter()
+        .find(|(key, _)| key.as_str() == Some("instances"))
+    else {
+        return Vec::new();
     };
 
-    for (instance_id_value, hit_value) in instances_map {
-        let instance_id = match instance_id_value.as_str() {
-            Some(s) => s,
-            None => continue,
+    let mut hits = Vec::new();
+    for (instance_value, hit_value) in instances {
+        let Some(instance_id) = instance_value.as_str() else {
+            continue;
         };
         if instance_id.is_empty() {
             continue;
         }
-        // Prefer per-rank rows when present; otherwise fall back to the
-        // aggregate using dp_rank 0.
         let dp_hits = collect_dp_hits(hit_value);
-        let rank_hits = collect_rank_hits(hit_value);
-        let mut violated = false;
-        for (rank, (device, cpu_local, cpu_share, disk)) in rank_hits {
-            // RFC #414 §2 invariant: the aggregate `dp[rank]` must agree with
-            // the per-rank device ceiling. A mismatch means the two maps come
-            // from different index states, so drop the whole instance rather
-            // than credit an untrustworthy split.
-            if let Some(&dp_device) = dp_hits.get(&rank) {
-                if dp_device != device {
-                    violated = true;
-                    break;
-                }
-            }
-            let target = RoutableTarget {
-                instance_id: instance_id.into(),
-                dp_rank: rank,
-            };
-            if !append_tier(
-                &mut out,
-                &target,
-                tiers_of_interest,
-                query_blocks,
-                (device, cpu_local, cpu_share, disk, block_size),
-            ) {
-                violated = true;
-                break;
-            }
-        }
-        if violated {
-            // Do not leave a partial instance in the output.
-            out.retain(|hit| hit.target.instance_id.as_ref() != instance_id);
-            ConductorMetrics::record_invariant_violation();
+        for (rank, (device, cpu_local, cpu_share, disk)) in collect_rank_hits(hit_value) {
+            hits.push(RankCeilings {
+                instance_id: instance_id.to_string(),
+                rank,
+                device,
+                cpu_local,
+                cpu_share,
+                disk,
+                dp_device: dp_hits.get(&rank).copied(),
+            });
         }
     }
-    out
+    tier_matches_from_ceilings(hits, request, tiers_of_interest)
 }
 
 /// Extract the aggregate `dp` map (`rank -> device tokens`). Used only for the
@@ -1330,7 +1453,7 @@ mod tests {
             query_transport: transport.clone(),
             control_transport: transport,
             hash_profile: ConductorHashProfile::default(),
-            registered: Mutex::new(HashSet::new()),
+            registered: RegisteredSources::default(),
         }
     }
 
@@ -1441,5 +1564,35 @@ mod tests {
         let transport =
             HttpConductorTransport::new(Duration::from_millis(10), Duration::from_millis(10));
         drop(transport);
+    }
+
+    #[test]
+    fn plans_one_registration_per_source_rank() {
+        let mut info = worker_info();
+        info.sources
+            .push(crate::kv_index::discovery::KvSourceEndpoint {
+                dp_rank: 1,
+                pub_endpoint: "tcp://127.0.0.1:5958".into(),
+                replay_endpoint: Some("tcp://127.0.0.1:16501".into()),
+            });
+        let plans = plan_registrations(&info);
+        assert_eq!(plans.len(), 2);
+        assert_eq!(plans[0].instance_id, "inst-0");
+        assert_eq!(plans[0].dp_rank, 0);
+        assert_eq!(plans[0].model, "model-a");
+        assert_eq!(plans[0].block_size, 128);
+        assert_eq!(plans[1].dp_rank, 1);
+        assert_eq!(
+            plans[1].replay_endpoint.as_deref(),
+            Some("tcp://127.0.0.1:16501")
+        );
+
+        // No cache identity, or no endpoints, means nothing to register.
+        let mut no_identity = info.clone();
+        no_identity.cache_key = None;
+        assert!(plan_registrations(&no_identity).is_empty());
+        let mut no_endpoints = info;
+        no_endpoints.sources.clear();
+        assert!(plan_registrations(&no_endpoints).is_empty());
     }
 }

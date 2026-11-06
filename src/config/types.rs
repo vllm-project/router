@@ -1116,9 +1116,18 @@ pub struct KvAwareConfig {
     /// (external Mooncake Conductor).
     #[serde(default = "default_kv_index_backend")]
     pub kv_index_backend: String,
-    /// Conductor HTTP base URL for `kv_index_backend = "conductor"`.
+    /// Conductor HTTP base URL for `kv_index_backend = "conductor"` with the
+    /// default `http` transport.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conductor_url: Option<String>,
+    /// Conductor transport: `http` (default, HTTP+msgpack) or `coro-rpc`
+    /// (Mooncake native RPC; requires the `conductor-rpc` build feature).
+    #[serde(default = "default_conductor_transport")]
+    pub conductor_transport: String,
+    /// `host:port` of Conductor's coro_rpc channel when
+    /// `conductor_transport = "coro-rpc"` (Conductor `rpc_server_port`).
+    #[serde(default = "default_conductor_rpc_addr")]
+    pub conductor_rpc_addr: String,
     /// Whether the router drives Conductor registration itself. Set to false
     /// when an operator or a sidecar already manages registrations (RFC #414
     /// §4: "Deployments where an operator or sidecar already manages Conductor
@@ -1199,6 +1208,14 @@ fn default_conductor_heartbeat_secs() -> u64 {
     10
 }
 
+fn default_conductor_transport() -> String {
+    "http".to_string()
+}
+
+fn default_conductor_rpc_addr() -> String {
+    "127.0.0.1:13334".to_string()
+}
+
 /// The breaker is enabled by default; an explicit `null` in the config file
 /// disables it (as does `--no-conductor-circuit-breaker` on the CLI).
 fn default_conductor_circuit_breaker() -> Option<ConductorCircuitBreakerConfig> {
@@ -1215,6 +1232,8 @@ impl Default for KvAwareConfig {
             static_kv_event_sources: Box::default(),
             kv_index_backend: default_kv_index_backend(),
             conductor_url: None,
+            conductor_transport: default_conductor_transport(),
+            conductor_rpc_addr: default_conductor_rpc_addr(),
             conductor_register: true,
             conductor_connect_timeout_ms: default_conductor_connect_timeout_ms(),
             conductor_query_timeout_ms: default_conductor_query_timeout_ms(),
@@ -2654,6 +2673,8 @@ mod tests {
         assert_eq!(config.conductor_query_timeout_ms, 10);
         assert_eq!(config.conductor_register_timeout_ms, 1000);
         assert!(config.conductor_hash_profile.is_none());
+        assert_eq!(config.conductor_transport, "http");
+        assert_eq!(config.conductor_rpc_addr, "127.0.0.1:13334");
         // The breaker is on by default; the heartbeat is 10s.
         assert!(config.conductor_circuit_breaker.is_some());
         assert_eq!(config.conductor_heartbeat_secs, 10);

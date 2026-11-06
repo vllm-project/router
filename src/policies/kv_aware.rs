@@ -1227,7 +1227,7 @@ pub struct KvAwarePolicy {
     /// The shared Conductor provider, when `--kv-index-backend conductor` is
     /// active. Used to dynamically register/unregister workers against
     /// Conductor so it can run with zero static service configuration.
-    conductor: Option<Arc<super::ConductorMatchProvider>>,
+    conductor: Option<Arc<dyn super::ConductorRegistrar>>,
     /// Whether the router drives Conductor registration itself. False when an
     /// operator or sidecar owns registration (RFC #414 §4).
     register_enabled: bool,
@@ -1282,7 +1282,52 @@ impl KvAwarePolicy {
     ) -> Self {
         let circuit_breaker = options.circuit_breaker;
         let heartbeat_secs = options.heartbeat_secs;
-        let conductor_provider = Arc::new(super::ConductorMatchProvider::with_options(options));
+        let provider = Arc::new(super::ConductorMatchProvider::with_options(options));
+        Self::from_conductor_provider(
+            params,
+            provider,
+            circuit_breaker,
+            heartbeat_secs,
+            register_enabled,
+        )
+    }
+
+    /// Conductor placement over the optional coro_rpc transport.
+    ///
+    /// Returns `Err` when the C++ client cannot be initialised so the caller
+    /// can fall back to the local index instead of panicking.
+    #[cfg(feature = "conductor-rpc")]
+    pub fn new_with_cororpc(
+        params: CostParams,
+        options: super::ConductorRpcOptions,
+        register_enabled: bool,
+    ) -> Result<Self, String> {
+        let circuit_breaker = options.circuit_breaker;
+        let heartbeat_secs = options.heartbeat_secs;
+        let provider = Arc::new(super::CoroRpcMatchProvider::new(options)?);
+        Ok(Self::from_conductor_provider(
+            params,
+            provider,
+            circuit_breaker,
+            heartbeat_secs,
+            register_enabled,
+        ))
+    }
+
+    /// Assemble the policy around any Conductor transport: one shared breaker
+    /// for both paths, a registrar handle for registration/heartbeat, and the
+    /// request-scoped registration bookkeeping.
+    fn from_conductor_provider<P>(
+        params: CostParams,
+        conductor_provider: Arc<P>,
+        circuit_breaker: Option<CircuitBreakerConfig>,
+        heartbeat_secs: u64,
+        register_enabled: bool,
+    ) -> Self
+    where
+        P: TieredMatchProvider + AsyncTieredMatchProvider + super::ConductorRegistrar + 'static,
+    {
+        let registrar: Arc<dyn super::ConductorRegistrar> = conductor_provider.clone();
         let (matches, async_provider): (
             Arc<dyn TieredMatchProvider>,
             Arc<dyn AsyncTieredMatchProvider>,
@@ -1300,9 +1345,6 @@ impl KvAwarePolicy {
             Arc::new(Mutex::new(HashMap::new()));
         let heartbeat_stop = Arc::new(AtomicBool::new(false));
         if register_enabled && heartbeat_secs > 0 {
-            // Conductor's default lease is 30s (register_lease_secs); the router
-            // cannot read it, so warn when the operator configures a period that
-            // is likely longer than the lease.
             if heartbeat_secs > 30 {
                 tracing::warn!(
                     heartbeat_secs,
@@ -1311,7 +1353,7 @@ impl KvAwarePolicy {
                 );
             }
             spawn_heartbeat(
-                conductor_provider.clone(),
+                registrar.clone(),
                 registered.clone(),
                 heartbeat_stop.clone(),
                 heartbeat_secs,
@@ -1327,11 +1369,11 @@ impl KvAwarePolicy {
         );
         policy.slot_manager = Some(slots);
         policy.prefer_policy_provider = true;
-        policy.conductor = Some(conductor_provider);
-        policy.async_provider = Some(async_provider);
+        policy.conductor = Some(registrar);
         policy.register_enabled = register_enabled;
         policy.registered = registered;
         policy.heartbeat_stop = heartbeat_stop;
+        policy.async_provider = Some(async_provider);
         policy
     }
 
@@ -2292,7 +2334,7 @@ impl KvAwarePolicy {
 /// `/register` per worker, which Conductor treats as a no-op if the service
 /// still exists.
 fn spawn_heartbeat(
-    provider: Arc<super::ConductorMatchProvider>,
+    provider: Arc<dyn super::ConductorRegistrar>,
     registered: Arc<Mutex<HashMap<String, WorkerKvInfo>>>,
     stop: Arc<AtomicBool>,
     period_secs: u64,

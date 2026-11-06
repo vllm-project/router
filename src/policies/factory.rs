@@ -30,11 +30,70 @@ pub(crate) fn build_kv_aware_policy(
         },
         ..CostParams::default()
     };
-    let policy = match (
-        config.kv_index_backend.as_str(),
-        config.conductor_url.as_deref(),
-    ) {
-        ("conductor", Some(url)) => KvAwarePolicy::new_with_conductor(
+    let policy: KvAwarePolicy = 'build: {
+        if config.kv_index_backend != "conductor" {
+            break 'build KvAwarePolicy::new(params);
+        }
+
+        let breaker = config.conductor_circuit_breaker.as_ref().map(|breaker| {
+            crate::policies::CircuitBreakerConfig {
+                max_failures: breaker.max_failures,
+                cooldown: std::time::Duration::from_millis(breaker.cooldown_ms),
+                half_open_max: breaker.half_open_max,
+            }
+        });
+        let hash_profile = config.conductor_hash_profile.clone().unwrap_or_default();
+
+        if config.conductor_transport == "coro-rpc" {
+            #[cfg(feature = "conductor-rpc")]
+            {
+                let options = crate::policies::ConductorRpcOptions {
+                    addr: config.conductor_rpc_addr.clone(),
+                    connect_timeout: std::time::Duration::from_millis(
+                        config.conductor_connect_timeout_ms,
+                    ),
+                    query_timeout: std::time::Duration::from_millis(
+                        config.conductor_query_timeout_ms,
+                    ),
+                    register_timeout: std::time::Duration::from_millis(
+                        config.conductor_register_timeout_ms,
+                    ),
+                    hash_profile,
+                    circuit_breaker: breaker,
+                    heartbeat_secs: config.conductor_heartbeat_secs,
+                };
+                match KvAwarePolicy::new_with_cororpc(params, options, config.conductor_register) {
+                    Ok(policy) => break 'build policy,
+                    Err(error) => {
+                        // A control-plane setup failure must not take the
+                        // router down: fall back to the local index loudly.
+                        tracing::error!(
+                            %error,
+                            "conductor-rpc setup failed; falling back to the local KV index"
+                        );
+                        break 'build KvAwarePolicy::new(params);
+                    }
+                }
+            }
+            #[cfg(not(feature = "conductor-rpc"))]
+            {
+                tracing::error!(
+                    "conductor_transport=coro-rpc requires a build with the `conductor-rpc` \
+                     feature; falling back to the local KV index"
+                );
+                break 'build KvAwarePolicy::new(params);
+            }
+        }
+
+        let Some(url) = config.conductor_url.as_deref() else {
+            // Validation rejects this combination; keep a loud fallback for
+            // programmatic callers that bypass `ConfigValidator`.
+            tracing::warn!(
+                "kv_index_backend=conductor without conductor_url; falling back to the local index"
+            );
+            break 'build KvAwarePolicy::new(params);
+        };
+        KvAwarePolicy::new_with_conductor(
             params,
             crate::policies::ConductorOptions {
                 url: url.to_string(),
@@ -45,28 +104,12 @@ pub(crate) fn build_kv_aware_policy(
                 register_timeout: std::time::Duration::from_millis(
                     config.conductor_register_timeout_ms,
                 ),
-                hash_profile: config.conductor_hash_profile.clone().unwrap_or_default(),
-                circuit_breaker: config.conductor_circuit_breaker.as_ref().map(|breaker| {
-                    crate::policies::CircuitBreakerConfig {
-                        max_failures: breaker.max_failures,
-                        cooldown: std::time::Duration::from_millis(breaker.cooldown_ms),
-                        half_open_max: breaker.half_open_max,
-                    }
-                }),
+                hash_profile,
+                circuit_breaker: breaker,
                 heartbeat_secs: config.conductor_heartbeat_secs,
             },
             config.conductor_register,
-        ),
-        (backend, _) => {
-            if backend == "conductor" {
-                // Validation rejects this combination; keep a loud fallback for
-                // programmatic callers that bypass `ConfigValidator`.
-                tracing::warn!(
-                    "kv_index_backend=conductor without conductor_url; falling back to the local index"
-                );
-            }
-            KvAwarePolicy::new(params)
-        }
+        )
     };
     let policy = match kv_affinity_table {
         Some(table) => policy.with_shared_affinity(Arc::clone(table)),
@@ -188,6 +231,7 @@ mod tests {
             conductor_hash_profile: None,
             conductor_circuit_breaker: None,
             conductor_heartbeat_secs: 10,
+            ..Default::default()
         }));
         let policy = PolicyFactory::create_from_config(&config, None);
         assert_eq!(policy.name(), "kv_aware");
