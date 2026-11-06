@@ -420,6 +420,7 @@ class TestLaunchValidation:
             ["/:generate"],
             ["/custom/:generate"],
             ["/health"],
+            ["/finish_session"],
             ["/inference/v1/generate"],
             ["/v1/responses"],
             ["/v1/responses/response-id/cancel"],

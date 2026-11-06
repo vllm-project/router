@@ -11,8 +11,12 @@ mod factors;
 mod identity;
 mod lineage;
 mod observations;
+mod output_length;
+pub mod pd_cost;
 mod policy;
+pub(crate) mod prediction_profile;
 mod request_pool;
+mod return_time;
 mod runtime;
 mod scheduler;
 mod scheduler_admission;
@@ -34,6 +38,7 @@ pub use domain::{
 };
 pub use factors::{ContinuitySample, ProgressTtlFactors, RequestSample};
 pub use identity::{ProgramIdentity, ProgramRequestHints, ProgramSchedulingEnableKey};
+pub(crate) use observations::{max_prometheus_gauge, sum_prometheus_gauge};
 pub use observations::{
     BackendObservation, BackendObservationFailure, BackendObservationProvider,
     VllmMetricsObservationProvider,

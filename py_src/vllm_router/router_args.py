@@ -27,6 +27,7 @@ _RESERVED_GENERATE_PATHS = {
     "/flush_cache",
     "/get_loads",
     "/scheduling/diagnostics",
+    "/finish_session",
     "/workers",
 }
 
@@ -45,6 +46,7 @@ class RouterArgs:
         default_factory=list
     )  # List of (url, bootstrap_port)
     decode_urls: List[str] = dataclasses.field(default_factory=list)
+    pd_kv_events: List[str] = dataclasses.field(default_factory=list)
 
     # Routing policy
     policy: str = "cache_aware"
@@ -205,8 +207,9 @@ class RouterArgs:
                 "kv_aware",
                 "power_of_two",
                 "consistent_hash",
+                "sticky_least_loaded",
             ],
-            help="Load balancing policy to use. kv_aware is supported only in regular mode. In PD mode, this is used for both prefill and decode unless overridden",
+            help="Load balancing policy to use. In PD mode, prefill and decode inherit this policy unless overridden",
         )
         parser.add_argument(
             f"--{prefix}prefill-policy",
@@ -216,10 +219,12 @@ class RouterArgs:
                 "random",
                 "round_robin",
                 "cache_aware",
+                "kv_aware",
                 "power_of_two",
                 "consistent_hash",
+                "sticky_least_loaded",
             ],
-            help="Specific policy for prefill nodes in PD mode. kv_aware is not supported in PD mode. If not specified, uses the main policy",
+            help="Specific policy for prefill nodes in PD mode. If not specified, uses the main policy",
         )
         parser.add_argument(
             f"--{prefix}decode-policy",
@@ -229,10 +234,12 @@ class RouterArgs:
                 "random",
                 "round_robin",
                 "cache_aware",
+                "kv_aware",
                 "power_of_two",
                 "consistent_hash",
+                "sticky_least_loaded",
             ],
-            help="Specific policy for decode nodes in PD mode. kv_aware is not supported in PD mode. If not specified, uses the main policy",
+            help="Specific policy for decode nodes in PD mode. Defaults to --policy",
         )
 
         parser.add_argument(
@@ -262,8 +269,11 @@ class RouterArgs:
         parser.add_argument(
             f"--{prefix}kv-aware-session-affinity-ttl-secs",
             type=int,
-            default=None,
-            help="Enable KV-aware session affinity with an idle TTL of 1-31536000 seconds",
+            default=RouterArgs.kv_aware_session_affinity_ttl_secs,
+            help="Enable kv_aware session affinity with an idle TTL in seconds "
+            "(1-31536000). P/D uses decode-only soft affinity based on pending "
+            "plus active decode requests. Prefill remains token-cost based. "
+            "Omit to disable affinity.",
         )
         parser.add_argument(
             f"--{prefix}kv-event-source",
@@ -277,7 +287,7 @@ class RouterArgs:
             action="append",
             default=[],
             metavar="WORKER_URL=ENDPOINT[,ENDPOINT...]",
-            help="Optional ZMQ replay endpoint(s) matching a worker's static event source",
+            help="Optional ZMQ replay endpoints matching a worker's static event source",
         )
         parser.add_argument(
             f"--{prefix}kv-event-block-size",
@@ -291,8 +301,16 @@ class RouterArgs:
             default=None,
             help="Shared model identity for workers with static event sources",
         )
-
         # PD-specific arguments
+        parser.add_argument(
+            f"--{prefix}pd-kv-events",
+            action="append",
+            default=[],
+            metavar="URL=ENDPOINT[,ENDPOINT...]",
+            help="Static KV event sources for a prefill worker in PD mode "
+            "(requires a kv_aware prefill policy). Repeat for multiple workers; "
+            "comma-separated endpoints are ordered by DP rank. Block size is 16.",
+        )
         parser.add_argument(
             f"--{prefix}mini-lb",
             action="store_true",
@@ -696,16 +714,6 @@ class RouterArgs:
                     raise ValueError("PD disaggregation mode requires --prefill")
                 if not self.decode_urls:
                     raise ValueError("PD disaggregation mode requires --decode")
-
-            effective_prefill_policy = self.prefill_policy or self.policy
-            effective_decode_policy = self.decode_policy or self.policy
-            if "kv_aware" in (
-                effective_prefill_policy,
-                effective_decode_policy,
-            ):
-                raise ValueError(
-                    "kv_aware is supported only in regular mode, not PD disaggregation"
-                )
 
             # Warn about policy usage in PD mode
             if self.prefill_policy and self.decode_policy and self.policy:

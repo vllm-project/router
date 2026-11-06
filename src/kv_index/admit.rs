@@ -1,7 +1,7 @@
-//! Device event-shape admission, separate from structural decoding.
+//! Event-shape admission, separate from structural decoding and transport.
 use crate::kv_index::wire::{BlockStored, ExternalBlockHash, KVEvent, KVEventBatch};
 
-/// Validate the narrow normal-dense GPU event shape, preserving the batch rank.
+/// Validate the narrow full-attention GPU event shape, preserving the batch rank.
 /// This does not establish publisher identity, deployment layout, independently
 /// addressable ranks, cache namespace, hash algorithm or freshness. The source
 /// adapter/target layer must bind sources to ranks and establish route eligibility;
@@ -25,7 +25,7 @@ pub fn validate_device_batch(
                 &event.ownership,
             ),
             KVEvent::BlockStored(event) => {
-                if !normal_dense_shape(event, expected_block_size)
+                if !has_expected_complete_blocks(event, expected_block_size)
                     || !no_unsupported_extensions(event)
                 {
                     return Err(
@@ -63,7 +63,7 @@ pub fn validate_device_batch(
     Ok(())
 }
 
-fn normal_dense_shape(event: &BlockStored, expected_block_size: usize) -> bool {
+fn has_expected_complete_blocks(event: &BlockStored, expected_block_size: usize) -> bool {
     event.block_size as usize == expected_block_size
         && event.block_hashes.len().checked_mul(expected_block_size) == Some(event.token_ids.len())
 }
@@ -88,5 +88,217 @@ fn validate_hash(hash: &ExternalBlockHash) -> Result<(), String> {
     match hash {
         ExternalBlockHash::Bytes(bytes) if bytes.len() == 32 => Ok(()),
         _ => Err("KV hash must be 32-byte sha256_cbor bytes".into()),
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum FullAttentionRejectionReason {
+    ExtraKeys,
+    Layout,
+    Residency,
+    Adapter,
+    ZeroBlockSize,
+    BlockSizeMismatch,
+    TokenCountMismatch,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct FullAttentionBatchRejection {
+    pub(super) reason: FullAttentionRejectionReason,
+    pub(super) event_index: usize,
+}
+
+/// Admit full-attention KV layouts, not a dense-versus-MoE model type.
+/// Stores must use the actual source block size and contain complete blocks of
+/// tokens, with only modeled extra keys, named adapters, and residency metadata.
+/// Session annotations, multiple storage tiers, and absent layout metadata remain
+/// compatible. Acceptance is not proof of remote identity or recovery.
+pub(super) fn validate_full_attention_batch(
+    batch: &KVEventBatch,
+    expected_block_size: u32,
+) -> Result<(), FullAttentionBatchRejection> {
+    for (event_index, event) in batch.events.iter().enumerate() {
+        let reason = match event {
+            KVEvent::BlockStored(s) => {
+                // Keep unmodeled salt/MM/layout identities out of this token-only
+                // query space. Named LoRA is already isolated by the hash seed.
+                // session_id annotates the request, not the block's cache identity.
+                if s.extra_keys.as_ref().is_some_and(|keys| {
+                    keys.len() != s.block_hashes.len()
+                        || keys.iter().any(|key| {
+                            !key.is_nil()
+                                && !s.lora_name.as_ref().is_some_and(|name| {
+                                    key.as_array().is_some_and(|parts| {
+                                        parts.len() == 1 && parts[0].as_str() == Some(name.as_str())
+                                    })
+                                })
+                        })
+                }) {
+                    Some(FullAttentionRejectionReason::ExtraKeys)
+                } else if s
+                    .kv_cache_spec_kind
+                    .as_deref()
+                    .is_some_and(|kind| kind != "full_attention")
+                    || s.kv_cache_spec_sliding_window.is_some()
+                {
+                    Some(FullAttentionRejectionReason::Layout)
+                } else if !is_supported_residency(
+                    s.medium.as_deref(),
+                    s.locality.as_deref(),
+                    s.ownership.as_deref(),
+                ) {
+                    Some(FullAttentionRejectionReason::Residency)
+                } else if (s.lora_id.is_some() && s.lora_name.is_none())
+                    || s.lora_name.as_ref().is_some_and(|name| name.is_empty())
+                {
+                    Some(FullAttentionRejectionReason::Adapter)
+                } else if s.block_size == 0 {
+                    Some(FullAttentionRejectionReason::ZeroBlockSize)
+                } else if s.block_size != expected_block_size {
+                    Some(FullAttentionRejectionReason::BlockSizeMismatch)
+                } else if s.block_hashes.len().checked_mul(s.block_size as usize)
+                    != Some(s.token_ids.len())
+                {
+                    Some(FullAttentionRejectionReason::TokenCountMismatch)
+                } else {
+                    None
+                }
+            }
+            KVEvent::BlockRemoved(r) => (!is_supported_residency(
+                r.medium.as_deref(),
+                r.locality.as_deref(),
+                r.ownership.as_deref(),
+            ))
+            .then_some(FullAttentionRejectionReason::Residency),
+            KVEvent::AllBlocksCleared(_) => None,
+        };
+        if let Some(reason) = reason {
+            return Err(FullAttentionBatchRejection {
+                reason,
+                event_index,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn is_supported_residency(
+    medium: Option<&str>,
+    locality: Option<&str>,
+    ownership: Option<&str>,
+) -> bool {
+    let pool = ownership.is_some_and(|owner| !owner.is_empty());
+    locality.is_none_or(|locality| locality == if pool { "REMOTE" } else { "LOCAL" })
+        && medium.is_none_or(|medium| {
+            matches!(
+                medium.to_ascii_uppercase().as_str(),
+                "GPU" | "DEVICE" | "CPU" | "HOST" | "HOST_PINNED" | "STORAGE" | "DISK"
+            )
+        })
+}
+
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn full_attention_shape_matrix_preserves_rejection_reason_and_event_index() {
+        let valid: BlockStored = serde_json::from_value(serde_json::json!({
+            "block_hashes": [1], "parent_block_hash": null,
+            "token_ids": [1, 2, 3, 4], "block_size": 4, "medium": "GPU",
+            "lora_id": null, "lora_name": null
+        }))
+        .unwrap();
+        let mut batch = KVEventBatch {
+            ts: 0.0,
+            events: vec![
+                KVEvent::AllBlocksCleared(Default::default()),
+                KVEvent::BlockStored(valid.clone()),
+            ],
+            data_parallel_rank: Some(0),
+        };
+        assert_eq!(validate_full_attention_batch(&batch, 4), Ok(()));
+        for (case, reason) in [
+            ("remote", FullAttentionRejectionReason::Residency),
+            ("local-pool", FullAttentionRejectionReason::Residency),
+            ("unknown-medium", FullAttentionRejectionReason::Residency),
+            ("layout", FullAttentionRejectionReason::Layout),
+            ("sliding-window", FullAttentionRejectionReason::Layout),
+            (
+                "token-count",
+                FullAttentionRejectionReason::TokenCountMismatch,
+            ),
+        ] {
+            let mut event = valid.clone();
+            match case {
+                "remote" => event.locality = Some("REMOTE".into()),
+                "local-pool" => {
+                    event.locality = Some("LOCAL".into());
+                    event.ownership = Some("pool".into());
+                }
+                "unknown-medium" => event.medium = Some("unknown".into()),
+                "layout" => event.kv_cache_spec_kind = Some("sliding_attention".into()),
+                "sliding-window" => event.kv_cache_spec_sliding_window = Some(8),
+                "token-count" => event.block_hashes.push(ExternalBlockHash::Int(2)),
+                _ => unreachable!(),
+            }
+            batch.events[1] = KVEvent::BlockStored(event);
+            assert_eq!(
+                validate_full_attention_batch(&batch, 4),
+                Err(FullAttentionBatchRejection {
+                    reason,
+                    event_index: 1
+                }),
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
+    fn full_attention_block_size_matrix_preserves_rejection_reason_and_event_index() {
+        for expected in [8, 16, 32] {
+            for actual in [0, 8, 16, 32] {
+                let stored = serde_json::from_value(serde_json::json!({
+                    "type": "BlockStored", "block_hashes": [1, 2],
+                    "parent_block_hash": null, "token_ids": vec![1u32; actual * 2],
+                    "block_size": actual, "medium": "CPU",
+                    "lora_id": null, "lora_name": null
+                }))
+                .unwrap();
+                let mut batch = KVEventBatch {
+                    ts: 1.0,
+                    events: vec![KVEvent::AllBlocksCleared(Default::default()), stored],
+                    data_parallel_rank: Some(3),
+                };
+                let reason = if actual == 0 {
+                    Some(FullAttentionRejectionReason::ZeroBlockSize)
+                } else if actual as u32 != expected {
+                    Some(FullAttentionRejectionReason::BlockSizeMismatch)
+                } else {
+                    None
+                };
+                assert_eq!(
+                    validate_full_attention_batch(&batch, expected),
+                    reason.map_or(Ok(()), |reason| Err(FullAttentionBatchRejection {
+                        reason,
+                        event_index: 1,
+                    })),
+                    "source={expected}, event={actual}"
+                );
+                if reason.is_none() {
+                    let KVEvent::BlockStored(stored) = &mut batch.events[1] else {
+                        unreachable!()
+                    };
+                    stored.token_ids.pop();
+                    assert_eq!(
+                        validate_full_attention_batch(&batch, expected),
+                        Err(FullAttentionBatchRejection {
+                            reason: FullAttentionRejectionReason::TokenCountMismatch,
+                            event_index: 1,
+                        })
+                    );
+                }
+            }
+        }
     }
 }

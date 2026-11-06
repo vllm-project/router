@@ -91,10 +91,10 @@ routing uses the existing two-stage dispatch, which does not add coordinated
 retries or record dispatch outcomes for circuit breaking. Built-in routes keep
 their existing handlers. Workers must expose the configured paths.
 
-Custom PD routes use token IDs as policy input and preserve model selection
-when IGW is enabled. In discovery mode, model-scoped requests require matching
-model and worker-role metadata in the worker registry. They return 503 when no
-matching prefill or decode worker is registered.
+Custom PD routes preserve token-based cache affinity, body session IDs, and
+model selection when IGW is enabled. In discovery mode, model-scoped requests
+require matching model and worker-role metadata in the worker registry. They
+return 503 when no matching prefill or decode worker is registered.
 
 Rust embedders must set `ServerConfig.extra_generate_paths`. Use an empty vector
 to keep only the built-in typed routes.
@@ -271,7 +271,9 @@ curl -X POST http://router:8000/v1/chat/completions \
 
 For detailed configuration options, hash key priorities, and usage examples, see [Load Balancing Documentation](docs/load_balancing/README.md).
 
-For the optional agent metadata contract, scheduling enablement, request-scoped hints, and engine KV-control boundary, see [Program Scheduling](docs/program_scheduling.md).
+For the optional agent metadata contract, scheduling enablement, request-scoped hints, and engine KV-control boundary, see [Program Scheduling](docs/program_scheduling/program-scheduling.md).
+
+For Program-scoped PD scheduling (D-rank affinity, admission, bounded prefill permits) and warm remote KV reuse with automatic TTL, see [PD Program Scheduling](docs/program_scheduling/pd-program-scheduling.md).
 
 ## Advanced Features
 

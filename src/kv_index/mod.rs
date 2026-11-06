@@ -1,6 +1,7 @@
 //! Multi-tier KV cache placement index, fed by engine events.
 
 mod admit;
+mod binding;
 mod decode;
 
 use std::sync::Arc;
@@ -18,6 +19,7 @@ pub use decode::decode_batch;
 pub use discovery::{
     CacheKey, KvEventSourceEntry, KvEventSourcesResponse, KvIndexSupervisor, WorkerKvInfo,
 };
+pub(crate) use endpoints::canonical_endpoint;
 pub use endpoints::{parse_endpoint_mapping, resolve_endpoints};
 pub use indexer::{KvBlockIndexer, MatchQuery, TierMatch};
 pub use subscriber::local_hashes;
@@ -73,10 +75,24 @@ pub(crate) fn local_block_hash_strings(
         .collect()
 }
 
+/// Out-of-band loss fence: advisory queue overflow can never leave warm state trusted.
+static SIGNAL_LOSS_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub fn signal_loss_epoch() -> u64 {
+    SIGNAL_LOSS_EPOCH.load(std::sync::atomic::Ordering::Acquire)
+}
+pub(crate) fn record_signal_loss() {
+    SIGNAL_LOSS_EPOCH.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+}
+
 /// Raw signals ingestion emits; the trust arbiter consumes these. The
 /// `EXACT`/`DEGRADED`/`FALLBACK` state machine is the trust arbiter's contract.
 #[derive(Debug, Clone)]
 pub enum IngestionSignal {
+    Invalidated {
+        source: SourceId,
+        dp_rank: u32,
+        reason: &'static str,
+    },
     Advance {
         source: SourceId,
         last_seq: i64,

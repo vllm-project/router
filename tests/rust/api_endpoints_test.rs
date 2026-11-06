@@ -36,6 +36,7 @@ impl TestContext {
             mode: RoutingMode::Regular {
                 worker_urls: vec![],
             },
+            pd_kv_event_sources: Default::default(),
             policy: PolicyConfig::Random,
             host: "127.0.0.1".to_string(),
             port: 3002,
@@ -1676,6 +1677,7 @@ mod error_tests {
             mode: RoutingMode::Regular {
                 worker_urls: vec![],
             },
+            pd_kv_event_sources: Default::default(),
             policy: PolicyConfig::Random,
             host: "127.0.0.1".to_string(),
             port: 3010,
@@ -2041,6 +2043,7 @@ mod pd_mode_tests {
                 decode_policy: None,
                 discovery_address: None,
             },
+            pd_kv_event_sources: Default::default(),
             policy: PolicyConfig::Random,
             host: "127.0.0.1".to_string(),
             port: 3011,
@@ -2209,6 +2212,7 @@ mod request_id_tests {
             mode: RoutingMode::Regular {
                 worker_urls: vec![],
             },
+            pd_kv_event_sources: Default::default(),
             policy: PolicyConfig::Random,
             host: "127.0.0.1".to_string(),
             port: 3002,

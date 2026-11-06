@@ -88,6 +88,45 @@ pub fn create_test_app_with_wasm_and_generate_paths(
         .expect("Failed to create AppContext in test"),
     );
 
+    build_test_app(
+        router,
+        app_context,
+        router_config,
+        enable_request_tracing,
+        wasm_runtime,
+        extra_generate_paths,
+    )
+}
+
+/// Create a test Axum application that shares `app_context` with the router.
+///
+/// Use this when a test calls endpoints that act on context state the router
+/// also uses, such as `/finish_session` releasing sessions in the router's
+/// `PolicyRegistry`. `create_test_app` builds a fresh context instead.
+#[allow(dead_code)]
+pub fn create_test_app_with_context(
+    router: Arc<dyn RouterTrait>,
+    app_context: Arc<AppContext>,
+    router_config: &RouterConfig,
+) -> Router {
+    build_test_app(
+        router,
+        app_context,
+        router_config,
+        otel_trace::is_otel_enabled(),
+        None,
+        &[],
+    )
+}
+
+fn build_test_app(
+    router: Arc<dyn RouterTrait>,
+    app_context: Arc<AppContext>,
+    router_config: &RouterConfig,
+    enable_request_tracing: bool,
+    wasm_runtime: Option<Arc<WasmMiddlewareRuntime>>,
+    extra_generate_paths: &[String],
+) -> Router {
     // Create AppState with the test router and context
     let app_state = Arc::new(AppState {
         router,
