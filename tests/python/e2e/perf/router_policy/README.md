@@ -25,16 +25,9 @@ export ROUTER_BIN=$PWD/target/release/vllm-router
 pytest tests/python/e2e/perf/router_policy/test_router_policy_scenarios.py -v
 ```
 
-One concurrency / policy:
+One concurrency / policy. `-sv` shows worker and router logs on stderr as they are written; replay stays in `replay.log`:
 
 ```bash
-pytest tests/python/e2e/perf/router_policy/test_router_policy_scenarios.py -sv -k 'kv_aware/c16'
-```
-
-Live worker + router logs during a long cell (replay still file-only):
-
-```bash
-export AGENTX_STREAM_LOGS=1
 pytest tests/python/e2e/perf/router_policy/test_router_policy_scenarios.py -sv -k 'kv_aware/c16'
 ```
 
@@ -51,7 +44,7 @@ Before replay, the cell runner **removes `result/`** if reusing the same `AGENTX
 
 **Ports**: HTTP, gRPC, and the router use OS-assigned ports held until that process starts. KV event PUB/replay use **`tcp://*:0`**: vLLM binds a free port at startup and the router reads the resolved address from `/kv_event_sources`. This needs a vLLM that resolves port 0 (it must not advertise `tcp://*:0` itself). Between pytest cells, default **`AGENTX_CELL_GAP_SEC=5`**; before allocate, **`AGENTX_PORT_SETTLE_SEC=2`**. Do not run multiple matrix jobs on one host in parallel.
 
-Optional **`export AGENTX_STREAM_LOGS=1`**: stream **worker + router** logs to stderr in real time (prefix `[engineN]` / `[router]`); replay stays file-only. Use **pytest `-sv`** so stderr is visible.
+Worker and router logs stream to stderr with prefixes `[engineN]` and `[router]`. Replay stays in `replay.log`. Pytest hides that stream unless the invocation uses **`-sv`**.
 
 When replay exits, the runner appends **`--- cell summary ---`**, **`STATS`**, **`ARTIFACTS`** (includes **`results_summary.json`** when pytest sets `AGENTX_RESULTS_SUMMARY`), **`PORTS`**, and **`LOG_SUMMARY`** to **`replay.log`** immediately after agentinfer's `Replay result` line, and prints the same block on stdout. Workers and the router are stopped after that. `LOG_SUMMARY` is an error scan plus the last N lines of every engine/router/replay log (`AGENTX_LOG_TAIL`, default 50).
 

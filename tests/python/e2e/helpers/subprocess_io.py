@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AgentInfer project
-"""Subprocess stdout streaming for perf stacks (pytest -s / AGENTX_STREAM_LOGS)."""
+"""Subprocess stdout streaming for perf stacks (pytest -s)."""
 
 from __future__ import annotations
 

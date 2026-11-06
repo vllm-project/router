@@ -141,18 +141,10 @@ def bootstrap(case_path: Path) -> None:
 
     OUT = Path(os.environ.get("AGENTX_OUT") or cell_output_dir(CASE))
     OUT.mkdir(parents=True, exist_ok=True)
-    if _stream_logs_enabled():
-        print(
-            "STREAM_LOGS worker+router -> stderr (set AGENTX_STREAM_LOGS=0 to disable)",
-            flush=True,
-        )
-    else:
-        print(
-            "LOGS worker/router/replay -> files under cell_dir only "
-            "(export AGENTX_STREAM_LOGS=1 and use pytest -sv for live "
-            "[engineN]/[router] on stderr)",
-            flush=True,
-        )
+    print(
+        "STREAM_LOGS worker+router -> stderr (pytest -sv); replay stays in replay.log",
+        flush=True,
+    )
 
     env = os.environ.copy()
     py_prefix = str(Path(PY).parent) if ("/" in PY or "\\" in PY) else ""
@@ -195,18 +187,10 @@ _did_cleanup = False
 RESULTS_SUMMARY_ENV = "AGENTX_RESULTS_SUMMARY"
 
 
-def _stream_logs_enabled() -> bool:
-    return os.environ.get("AGENTX_STREAM_LOGS", "").strip().lower() in (
-        "1",
-        "true",
-        "yes",
-    )
-
-
 def start(command, log, extra=None, *, stream_prefix: str | None = None):
     extra_env = env | (extra or {})
     Path(str(log) + ".command.json").write_text(json.dumps(command, indent=2))
-    stream = bool(stream_prefix and _stream_logs_enabled())
+    stream = stream_prefix is not None
     proc, thread, log_fp = start_process_with_log(
         command,
         Path(log),
@@ -477,8 +461,7 @@ def _emit_run_summary(
 
 def print_failure_diagnostics(out: Path, workers: int, *, hint: str = "") -> None:
     cleanup()
-    if _stream_logs_enabled():
-        print("\n--- cell summary (worker/router streams stopped) ---", flush=True)
+    print("\n--- cell summary (worker/router streams stopped) ---", flush=True)
     if hint:
         print(f"DIAGNOSTIC {hint}", flush=True)
     extras = _write_results_summary_from_calibration(out)
