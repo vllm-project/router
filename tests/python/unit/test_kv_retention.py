@@ -892,6 +892,18 @@ class TestReport:
         assert "stock-4x" not in rendered["holds"]
         assert "gpu10-4x" in rendered["holds"]
 
+    def test_every_arm_is_in_the_report(self):
+        spec = importlib.util.spec_from_file_location(
+            "kv_retention_run_eval", MODULE.with_name("run_eval.py")
+        )
+        assert spec and spec.loader
+        run_eval = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = run_eval
+        spec.loader.exec_module(run_eval)
+        assert set(report.ORDER) == set(run_eval.ARMS)
+        assert set(run_eval.REPLAY_ORDER) <= set(run_eval.ARMS)
+        assert {name for pair in report.PAIRS for name in pair} <= set(report.ORDER)
+
     def test_a_cell_is_the_median_and_the_range(self):
         assert report.cell([1.0, 2.0, 9.0]) == "2 (1–9)"
         assert report.cell([0.5], digits=1, scale=100) == "50.0"

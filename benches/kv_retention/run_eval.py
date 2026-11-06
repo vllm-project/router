@@ -55,6 +55,9 @@ class Arm:
 # The hint asks for the same on every arm: what differs is the tier it names and how much the tier acknowledges.
 ARMS = {
     "off-4x": Arm(20),
+    # The same as the arm without the suffix, run in an earlier block: the two on one seed measure run-to-run spread.
+    "off-4x-first": Arm(20),
+    "off-1x-first": Arm(5),
     "gpu10-4x": Arm(20, ("gpu",)),
     "gpu30-4x": Arm(20, ("gpu",), gpu_ttl=30.0, gpu_share=0.5),
     "off-1x": Arm(5),
@@ -65,7 +68,15 @@ ARMS = {
     # vLLM's own connector and LRU: a control on the prototype, which an arm without hints must match.
     "stock-4x": Arm(20, stock=True),
 }
-REPLAY_ORDER = ("off-4x", "gpu10-4x", "gpu30-4x", "off-1x", "cpu-1x", "both-1x")
+REPLAY_ORDER = (
+    "off-1x",
+    "cpu30-1x",
+    "both-1x",
+    "off-4x",
+    "gpu10-4x",
+    "gpu30-4x",
+    "cpu30-4x",
+)
 
 
 def kv_transfer_config(

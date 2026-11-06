@@ -24,21 +24,25 @@ SAMPLE_RATE = 0.05
 STORE_FAILURES = "vllm:kv_offload_allocation_failure_total"
 ORDER = (
     "stock-4x",
+    "off-4x-first",
     "off-4x",
     "gpu10-4x",
     "gpu30-4x",
     "cpu30-4x",
+    "off-1x-first",
     "off-1x",
     "cpu-1x",
     "cpu30-1x",
     "both-1x",
 )
 PAIRS = (
-    ("off-4x", "stock-4x"),
+    ("off-4x-first", "stock-4x"),
+    ("off-4x", "off-4x-first"),
     ("gpu10-4x", "off-4x"),
     ("gpu30-4x", "off-4x"),
     ("cpu30-4x", "off-4x"),
-    ("cpu-1x", "off-1x"),
+    ("off-1x", "off-1x-first"),
+    ("cpu-1x", "off-1x-first"),
     ("cpu30-1x", "off-1x"),
     ("both-1x", "off-1x"),
 )
