@@ -165,11 +165,26 @@ async fn router_with_warm_remote(
     local: bool,
     pd_extra: serde_json::Value,
 ) -> VllmPDRouter {
+    router_with_prefills(&[p], d, PolicyConfig::RoundRobin, local, pd_extra).await
+}
+/// Same router, but with an explicit prefill pool and prefill policy so a test
+/// can observe which P each turn actually lands on.
+async fn router_with_prefills(
+    prefills: &[&Engine],
+    d: &Engine,
+    policy: PolicyConfig,
+    local: bool,
+    pd_extra: serde_json::Value,
+) -> VllmPDRouter {
+    let prefill_urls = prefills
+        .iter()
+        .map(|p| (p.url.clone(), None))
+        .collect::<Vec<_>>();
     let mut cfg = RouterConfig {
         mode: RoutingMode::VllmPrefillDecode {
-            prefill_urls: vec![(p.url.clone(), None)],
+            prefill_urls: prefill_urls.clone(),
             decode_urls: vec![d.url.clone()],
-            prefill_policy: Some(PolicyConfig::RoundRobin),
+            prefill_policy: Some(policy.clone()),
             decode_policy: Some(PolicyConfig::RoundRobin),
             discovery_address: None,
         },
@@ -201,7 +216,7 @@ async fn router_with_warm_remote(
     let kv_affinity_table = ctx.policy_registry.kv_affinity_table();
     ctx.policy_registry.set_prefill_policy(
         vllm_router_rs::policies::PolicyFactory::create_from_config(
-            &PolicyConfig::RoundRobin,
+            &policy,
             Some(&kv_affinity_table),
         ),
     );
@@ -211,7 +226,7 @@ async fn router_with_warm_remote(
             Some(&kv_affinity_table),
         ),
     );
-    VllmPDRouter::new(vec![(p.url.clone(), None)], vec![d.url.clone()], None, &ctx)
+    VllmPDRouter::new(prefill_urls, vec![d.url.clone()], None, &ctx)
         .await
         .unwrap()
 }
@@ -547,4 +562,130 @@ async fn calibrated_local_bypasses_p_and_actual_miss_rejection_retries_remote() 
                 .is_none());
         }
     }
+}
+
+/// A tokenized prompt without `return_token_ids`: the exact-token warm/local
+/// protocol cannot serve it, so the turn always falls back to cold dispatch.
+async fn call_cold_only(router: &VllmPDRouter, prompt: Vec<u32>, program: &str) -> StatusCode {
+    let r = serde_json::from_value(json!({"model":"test","prompt":prompt,"max_tokens":4,
+        "vllm_xargs":{"agentic_context":{"program_id":program,"kv_retention_ttl_seconds":1}}}))
+    .unwrap();
+    let result = router.route_completion(None, &r, Some("test")).await;
+    let status = result.status();
+    axum::body::to_bytes(result.into_body(), 16 * 1048576)
+        .await
+        .unwrap();
+    status
+}
+
+/// Issue #499: a turn that falls back to the cold path must consume exactly one
+/// prefill selection. Before the fix the warm-remote probe asked the policy
+/// first and the cold path asked again, so with `round_robin` and two prefills
+/// every actual prefill landed on the second one.
+#[tokio::test]
+async fn cold_fallback_consumes_one_prefill_selection_per_turn() {
+    let p0 = engine(true, false, false).await;
+    let p1 = engine(true, false, false).await;
+    let d = engine(false, false, false).await;
+    let r = router_with_prefills(&[&p0, &p1], &d, PolicyConfig::RoundRobin, false, json!({})).await;
+    for _ in 0..2 {
+        assert_eq!(
+            call_cold_only(&r, vec![1, 2, 3], "task").await,
+            StatusCode::OK
+        );
+    }
+    let first = p0.state.calls.lock().unwrap().len();
+    let second = p1.state.calls.lock().unwrap().len();
+    assert_eq!(
+        (first, second),
+        (1, 1),
+        "round_robin must alternate across turns, not spend two selections on the cold fallback \
+         (p0={first}, p1={second})"
+    );
+}
+
+/// Same request shape as [`call_with_headers`], but with an explicit Program id
+/// so several Programs can share one router.
+async fn call_program(router: &VllmPDRouter, program: &str, prompt: Vec<u32>) -> StatusCode {
+    let r = serde_json::from_value(json!({"model":"test","prompt":prompt,"max_tokens":4,
+        "return_token_ids":true,"stream":false,"stream_options":{"include_usage":true},
+        "kv_transfer_params":{"remote_host":"client-untrusted"},
+        "vllm_xargs":{"agentic_context":{"program_id":program,"kv_retention_ttl_seconds":1}}}))
+    .unwrap();
+    let result = router.route_completion(None, &r, Some("test")).await;
+    let status = result.status();
+    axum::body::to_bytes(result.into_body(), 16 * 1048576)
+        .await
+        .unwrap();
+    status
+}
+
+/// Prefill calls an engine received for one prompt.
+fn prefill_calls(engine: &Engine, prompt: &[u32]) -> Vec<Value> {
+    engine
+        .state
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|call| call.get("prompt") == Some(&json!(prompt)))
+        .cloned()
+        .collect()
+}
+
+/// Issue #499: the warm-remote path used to call `select_worker(_, None)`, so a
+/// hash policy received no request inputs and every Program turn collapsed onto
+/// the constant fallback key `"request:"`. Distinct requests must be spread by
+/// the request text instead of pinning one prefill.
+#[tokio::test]
+async fn warm_remote_selection_uses_the_request_text() {
+    let p0 = engine(true, false, false).await;
+    let p1 = engine(true, false, false).await;
+    let d = engine(false, false, false).await;
+    let r = router_with_prefills(
+        &[&p0, &p1],
+        &d,
+        PolicyConfig::ConsistentHash { virtual_nodes: 160 },
+        false,
+        json!({}),
+    )
+    .await;
+    let programs = [
+        "alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta",
+    ];
+    for (index, program) in programs.iter().enumerate() {
+        let prompt = vec![3000 + index as u32, 42, 43];
+        // The same request twice: the first turn dispatches cold, the second
+        // reuses the D source on the P this Program is affined to.
+        assert_eq!(
+            call_program(&r, program, prompt.clone()).await,
+            StatusCode::OK
+        );
+        assert_eq!(call_program(&r, program, prompt).await, StatusCode::OK);
+    }
+    let mut pinned = Vec::new();
+    for (index, program) in programs.iter().enumerate() {
+        let prompt = vec![3000 + index as u32, 42, 43];
+        let first = prefill_calls(&p0, &prompt);
+        let second = prefill_calls(&p1, &prompt);
+        let (engine, turns) = match (first.len(), second.len()) {
+            (2, 0) => (0, first),
+            (0, 2) => (1, second),
+            (a, b) => panic!("Program {program} split its two turns (p0={a}, p1={b})"),
+        };
+        assert!(
+            turns[1]
+                .pointer("/kv_transfer_params/remote_engine_id")
+                .is_some(),
+            "turn 2 of {program} did not take the warm read"
+        );
+        if !pinned.contains(&engine) {
+            pinned.push(engine);
+        }
+    }
+    assert_eq!(
+        pinned.len(),
+        2,
+        "every Program turn was pinned to one prefill: the warm-remote path ignored the request text"
+    );
 }
