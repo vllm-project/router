@@ -869,7 +869,7 @@ impl PdRouterBase {
                 cache_aware.init_workers(&model_workers);
             }
         }
-        self.sync_role_policies(&[]);
+        self.sync_role_policies(&[], None);
     }
 
     /// Push the current prefill/decode worker sets into the role-specific
@@ -882,12 +882,15 @@ impl PdRouterBase {
     /// for every PD selection. Re-running is idempotent: policies that need no
     /// initialization are skipped, and the cache-aware trees keep existing
     /// entries apart from the tenants removed here.
-    fn sync_role_policies(&self, removed_urls: &[String]) {
+    fn sync_role_policies(&self, removed_urls: &[String], removed_role: Option<&str>) {
         let prefill_policy = self.policy_registry.get_prefill_policy();
         let decode_policy = self.policy_registry.get_decode_policy();
 
         for url in removed_urls {
-            for policy in [&prefill_policy, &decode_policy] {
+            for (role, policy) in [("prefill", &prefill_policy), ("decode", &decode_policy)] {
+                if removed_role != Some(role) {
+                    continue;
+                }
                 if let Some(cache_aware) = policy
                     .as_any()
                     .downcast_ref::<crate::policies::CacheAwarePolicy>()
@@ -924,6 +927,9 @@ impl PdRouterBase {
         let removed = self.worker_registry.remove_by_url(url);
 
         if removed.is_some() {
+            if let Some(kv) = kv_aware_ops(self.policy_registry.get_prefill_policy().as_ref()) {
+                kv.unregister_worker(url);
+            }
             self.policy_registry.on_worker_removed(&model_id);
             if let Some(policy) = self.policy_registry.get_policy(&model_id) {
                 if policy.name() == "cache_aware" {
@@ -935,7 +941,7 @@ impl PdRouterBase {
                     }
                 }
             }
-            self.sync_role_policies(&[url.to_string()]);
+            self.sync_role_policies(&[url.to_string()], Some("prefill"));
         }
 
         if removed.is_some() {
@@ -982,7 +988,7 @@ impl PdRouterBase {
                     }
                 }
             }
-            self.sync_role_policies(&[url.to_string()]);
+            self.sync_role_policies(&[url.to_string()], Some("decode"));
         }
 
         if removed.is_some() {
@@ -1004,15 +1010,21 @@ impl PdRouterBase {
         let mut removed_count = 0;
         let mut removed_urls = Vec::new();
         for w in all_workers.iter() {
-            if w.url().starts_with(&prefix) {
+            if w.url().starts_with(&prefix)
+                && matches!(
+                    (role, w.worker_type()),
+                    ("prefill", WorkerType::Prefill { .. }) | ("decode", WorkerType::Decode)
+                )
+            {
                 let model_id = w.model_id().to_string();
                 if self.worker_registry.remove_by_url(w.url()).is_some() {
-                    if role == "decode" {
-                        if let Some(kv) =
-                            kv_aware_ops(self.policy_registry.get_decode_policy().as_ref())
-                        {
-                            kv.unregister_worker(w.url());
-                        }
+                    let role_policy = if role == "decode" {
+                        self.policy_registry.get_decode_policy()
+                    } else {
+                        self.policy_registry.get_prefill_policy()
+                    };
+                    if let Some(kv) = kv_aware_ops(role_policy.as_ref()) {
+                        kv.unregister_worker(w.url());
                     }
                     self.policy_registry.on_worker_removed(&model_id);
                     if let Some(policy) = self.policy_registry.get_policy(&model_id) {
@@ -1031,7 +1043,7 @@ impl PdRouterBase {
             }
         }
         if removed_count > 0 {
-            self.sync_role_policies(&removed_urls);
+            self.sync_role_policies(&removed_urls, Some(role));
             info!(
                 "Removed {} DP-expanded {} workers for {}",
                 removed_count, role, url
@@ -2326,6 +2338,94 @@ mod tests {
         assert_eq!(router.worker_registry.get_prefill_workers().len(), 0);
     }
 
+    #[tokio::test]
+    async fn test_removal_unregisters_role_kv_targets() {
+        use crate::kv_index::RoutableTarget;
+        use crate::policies::KvAwarePolicy;
+        for decode in [false, true] {
+            for expanded in [false, true] {
+                let router = create_test_pd_router_with_dp(2);
+                let policy = Arc::new(KvAwarePolicy::default());
+                if decode {
+                    router.policy_registry.set_decode_policy(policy.clone());
+                } else {
+                    router.policy_registry.set_prefill_policy(policy.clone());
+                }
+                let role = if decode {
+                    WorkerType::Decode
+                } else {
+                    WorkerType::Prefill {
+                        bootstrap_port: None,
+                    }
+                };
+                let bare = "http://127.0.0.1:9300";
+                let worker: Arc<dyn Worker> = if expanded {
+                    Arc::new(DPAwareWorker::new(bare.to_string(), 0, 2, role))
+                } else {
+                    Arc::from(create_test_worker(bare.to_string(), role, true))
+                };
+                router.register_and_notify(worker.clone());
+                policy.register_target(
+                    worker.url(),
+                    RoutableTarget {
+                        instance_id: Arc::from("registered-instance"),
+                        dp_rank: 0,
+                    },
+                );
+                assert_eq!(
+                    policy
+                        .target_for_worker(worker.as_ref())
+                        .instance_id
+                        .as_ref(),
+                    "registered-instance"
+                );
+                if decode {
+                    router.remove_decode_server(bare).await.unwrap();
+                } else {
+                    router.remove_prefill_server(bare).await.unwrap();
+                }
+                assert_eq!(
+                    policy
+                        .target_for_worker(worker.as_ref())
+                        .instance_id
+                        .as_ref(),
+                    worker.base_url()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_dp_removal_preserves_other_role_at_same_prefix() {
+        let router = create_test_pd_router_with_dp(2);
+        let bare_url = "http://10.0.0.1:8000";
+        let prefill: Arc<dyn Worker> = Arc::new(DPAwareWorker::new(
+            bare_url.to_string(),
+            0,
+            2,
+            WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+        ));
+        let decode: Arc<dyn Worker> = Arc::new(DPAwareWorker::new(
+            bare_url.to_string(),
+            1,
+            2,
+            WorkerType::Decode,
+        ));
+        router.worker_registry.register(prefill);
+        router.worker_registry.register(decode);
+        router
+            .remove_dp_expanded_workers(bare_url, "prefill")
+            .unwrap();
+        assert!(router.worker_registry.get_prefill_workers().is_empty());
+        assert_eq!(router.worker_registry.get_decode_workers().len(), 1);
+        router
+            .remove_dp_expanded_workers(bare_url, "decode")
+            .unwrap();
+        assert!(router.worker_registry.get_decode_workers().is_empty());
+    }
+
     #[test]
     fn test_remove_dp_expanded_workers_not_found() {
         let router = create_test_pd_router_with_dp(4);
@@ -2498,6 +2598,76 @@ mod tests {
 
         router
             .remove_prefill_server(url)
+            .await
+            .expect("removal should succeed");
+
+        assert_eq!(
+            affinity_for(&cache_aware, &model_id, url, text),
+            0.0,
+            "removed worker kept its affinity in the role policy tree"
+        );
+    }
+    #[tokio::test]
+    async fn test_dynamic_decode_registration_initializes_role_policy_trees() {
+        let router = create_test_pd_router();
+        let cache_aware = Arc::new(CacheAwarePolicy::new());
+        router
+            .policy_registry
+            .set_decode_policy(cache_aware.clone());
+
+        let url = "http://127.0.0.1:9101";
+        router.register_and_notify(Arc::from(create_test_worker(
+            url.to_string(),
+            WorkerType::Decode,
+            true,
+        )));
+
+        let workers = router.worker_registry.get_decode_workers();
+        assert_eq!(workers.len(), 1);
+
+        let text = "a shared tenant prefix used for affinity";
+        let idx = cache_aware
+            .select_worker_with_headers(&workers, Some(text), None)
+            .expect("decode selection should succeed");
+
+        assert!(
+            affinity_for(
+                &cache_aware,
+                workers[idx].model_id(),
+                workers[idx].url(),
+                text
+            ) > 0.0,
+            "role policy tree was not initialized, so the selection could not publish affinity"
+        );
+    }
+
+    /// Removing a discovered worker has to prune the role policy tree as well,
+    /// otherwise a replacement worker inherits affinity meant for a dead URL.
+    #[tokio::test]
+    async fn test_dynamic_decode_removal_prunes_role_policy_trees() {
+        let router = create_test_pd_router();
+        let cache_aware = Arc::new(CacheAwarePolicy::new());
+        router
+            .policy_registry
+            .set_decode_policy(cache_aware.clone());
+
+        let url = "http://127.0.0.1:9102";
+        router.register_and_notify(Arc::from(create_test_worker(
+            url.to_string(),
+            WorkerType::Decode,
+            true,
+        )));
+
+        let workers = router.worker_registry.get_decode_workers();
+        let text = "a shared tenant prefix used for affinity";
+        let idx = cache_aware
+            .select_worker_with_headers(&workers, Some(text), None)
+            .expect("decode selection should succeed");
+        let model_id = workers[idx].model_id().to_string();
+        assert!(affinity_for(&cache_aware, &model_id, url, text) > 0.0);
+
+        router
+            .remove_decode_server(url)
             .await
             .expect("removal should succeed");
 
