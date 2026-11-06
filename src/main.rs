@@ -252,6 +252,28 @@ struct CliArgs {
     #[arg(long, default_value_t = 1000)]
     conductor_register_timeout_ms: u64,
 
+    /// Disable the circuit breaker around Conductor `/query`. It is enabled by
+    /// default so a hung Conductor cannot add its timeout to every request.
+    #[arg(long)]
+    no_conductor_circuit_breaker: bool,
+
+    /// Consecutive Conductor `/query` failures that open the circuit.
+    #[arg(long, default_value_t = 3)]
+    conductor_circuit_breaker_max_failures: u32,
+
+    /// How long (ms) the circuit stays open before a half-open probe.
+    #[arg(long, default_value_t = 5000)]
+    conductor_circuit_breaker_cooldown_ms: u64,
+
+    /// Half-open probes allowed before re-opening. Must be > 0.
+    #[arg(long, default_value_t = 1)]
+    conductor_circuit_breaker_half_open_max: u32,
+
+    /// Heartbeat period (seconds) renewing dynamic registrations; 0 disables
+    /// it. Must be shorter than Conductor's register_lease_secs (default 30s).
+    #[arg(long, default_value_t = 10)]
+    conductor_heartbeat_secs: u64,
+
     /// Engine hash strategy registered with Conductor (vllm_v1).
     #[arg(long, default_value = "vllm_v1")]
     conductor_hash_strategy: String,
@@ -508,6 +530,16 @@ impl CliArgs {
                 conductor_connect_timeout_ms: self.conductor_connect_timeout_ms,
                 conductor_query_timeout_ms: self.conductor_query_timeout_ms,
                 conductor_register_timeout_ms: self.conductor_register_timeout_ms,
+                conductor_circuit_breaker: if self.no_conductor_circuit_breaker {
+                    None
+                } else {
+                    Some(vllm_router_rs::config::ConductorCircuitBreakerConfig {
+                        max_failures: self.conductor_circuit_breaker_max_failures,
+                        cooldown_ms: self.conductor_circuit_breaker_cooldown_ms,
+                        half_open_max: self.conductor_circuit_breaker_half_open_max,
+                    })
+                },
+                conductor_heartbeat_secs: self.conductor_heartbeat_secs,
                 conductor_hash_profile: Some(vllm_router_rs::config::ConductorHashProfile {
                     strategy: self.conductor_hash_strategy.clone(),
                     algorithm: self.conductor_hash_algorithm.clone(),
@@ -548,7 +580,12 @@ impl CliArgs {
         if !self.policy.eq_ignore_ascii_case("kv_aware")
             && (self.kv_index_backend != "local"
                 || self.conductor_url.is_some()
-                || self.conductor_hash_python_seed.is_some())
+                || self.conductor_hash_python_seed.is_some()
+                || self.no_conductor_register
+                || self.conductor_circuit_breaker_max_failures != 3
+                || self.conductor_circuit_breaker_cooldown_ms != 5000
+                || self.conductor_circuit_breaker_half_open_max != 1
+                || self.conductor_heartbeat_secs != 10)
         {
             return Err(vllm_router_rs::config::ConfigError::ValidationFailed {
                 reason: "conductor options require --policy kv_aware".to_string(),

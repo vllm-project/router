@@ -51,7 +51,7 @@ use reqwest::header::{HeaderValue, CONTENT_TYPE};
 use crate::config::types::ConductorHashProfile;
 use crate::kv_index::{Locality, MatchQuery, RoutableTarget, StorageTier, TierMatch, WorkerKvInfo};
 use crate::metrics::ConductorMetrics;
-use crate::policies::TieredMatchProvider;
+use crate::policies::{MatchError, TieredMatchProvider};
 use rmpv::Value;
 
 /// Practical ceiling so a misbehaving Conductor cannot stall selection.
@@ -71,6 +71,10 @@ pub struct ConductorOptions {
     pub query_timeout: Duration,
     pub register_timeout: Duration,
     pub hash_profile: ConductorHashProfile,
+    /// Breaker around `/query`. `None` leaves the provider unwrapped.
+    pub circuit_breaker: Option<crate::policies::CircuitBreakerConfig>,
+    /// Heartbeat period for registration renewal; `0` disables it.
+    pub heartbeat_secs: u64,
 }
 
 /// Why a Conductor call failed. A caller with no request yields an empty
@@ -137,6 +141,59 @@ fn classify_io(error: &reqwest::Error) -> ConductorQueryError {
     }
 }
 
+fn read_response(
+    response: Result<reqwest::blocking::Response, reqwest::Error>,
+) -> Result<Vec<u8>, ConductorQueryError> {
+    match response {
+        Ok(resp) if resp.status().is_success() => resp
+            .bytes()
+            .map(|b| b.to_vec())
+            .map_err(|e| classify_io(&e)),
+        Ok(resp) => Err(ConductorQueryError::Status(resp.status().as_u16())),
+        Err(e) => Err(classify_io(&e)),
+    }
+}
+
+/// Parse the `/services` response into `(instance_id, dp_rank)` pairs.
+///
+/// `/services` uses the exported `ServiceConfig` field names (capitalized),
+/// unlike `/query` (lowercase). Getting this wrong would make reconciliation
+/// believe every service is missing, so it is covered by a unit test.
+fn parse_services(value: &Value) -> HashSet<(String, u32)> {
+    let mut out = HashSet::new();
+    let Some(map) = value.as_map() else {
+        return out;
+    };
+    let Some((_, Value::Array(services))) =
+        map.iter().find(|(key, _)| key.as_str() == Some("services"))
+    else {
+        return out;
+    };
+    for service in services {
+        let Some(fields) = service.as_map() else {
+            continue;
+        };
+        let field = |name: &str| {
+            fields
+                .iter()
+                .find(|(key, _)| key.as_str() == Some(name))
+                .map(|(_, value)| value)
+        };
+        let Some(instance_id) = field("InstanceID").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if instance_id.is_empty() {
+            continue;
+        }
+        let dp_rank = field("DPRank")
+            .and_then(|v| v.as_i64())
+            .filter(|rank| *rank >= 0)
+            .unwrap_or(0) as u32;
+        out.insert((instance_id.to_string(), dp_rank));
+    }
+    out
+}
+
 impl ConductorMatchProvider {
     /// Build a provider pointing at Conductor's HTTP base URL.
     pub fn new(base_url: impl Into<String>) -> Self {
@@ -152,6 +209,8 @@ impl ConductorMatchProvider {
             query_timeout: timeout,
             register_timeout: DEFAULT_REGISTER_TIMEOUT,
             hash_profile: ConductorHashProfile::default(),
+            circuit_breaker: None,
+            heartbeat_secs: 0,
         })
     }
 
@@ -181,14 +240,29 @@ impl ConductorMatchProvider {
             )
             .body(body)
             .send();
-        match response {
-            Ok(resp) if resp.status().is_success() => resp
-                .bytes()
-                .map(|b| b.to_vec())
-                .map_err(|e| classify_io(&e)),
-            Ok(resp) => Err(ConductorQueryError::Status(resp.status().as_u16())),
-            Err(e) => Err(classify_io(&e)),
-        }
+        read_response(response)
+    }
+
+    fn get(&self, client: &Client, path: &str) -> Result<Vec<u8>, ConductorQueryError> {
+        let response = client
+            .get(format!("{}{}", self.base_url, path))
+            .header(
+                reqwest::header::ACCEPT,
+                HeaderValue::from_static("application/msgpack"),
+            )
+            .send();
+        read_response(response)
+    }
+
+    /// Every `(instance_id, dp_rank)` the Conductor currently knows about.
+    ///
+    /// The heartbeat uses it to re-register only what is actually missing
+    /// instead of blindly re-posting every service (RFC #414 §4 reconciliation).
+    pub fn list_services(&self) -> Result<HashSet<(String, u32)>, ConductorQueryError> {
+        let bytes = self.get(&self.control_client, "/services")?;
+        let value = rmpv::decode::read_value(&mut std::io::Cursor::new(bytes.as_slice()))
+            .map_err(|e| ConductorQueryError::Decode(e.to_string()))?;
+        Ok(parse_services(&value))
     }
 
     /// Register a discovered worker (per DP rank) with Conductor so it can run
@@ -313,6 +387,20 @@ impl ConductorMatchProvider {
 impl TieredMatchProvider for ConductorMatchProvider {
     fn find_tiered_matches(&self, query: &MatchQuery<'_>) -> Vec<TierMatch> {
         self.query(query)
+    }
+
+    fn try_find_tiered_matches(
+        &self,
+        query: &MatchQuery<'_>,
+    ) -> Result<Vec<TierMatch>, MatchError> {
+        self.try_query(query).map_err(|error| match error {
+            // A 4xx is deterministic: the backend is alive but rejects this
+            // request, so it must not open the breaker for everybody.
+            ConductorQueryError::Status(status) if (400..500).contains(&status) => {
+                MatchError::Rejected
+            }
+            _ => MatchError::Unavailable,
+        })
     }
 }
 
@@ -972,5 +1060,32 @@ mod tests {
             provider.try_query(&query).unwrap_err(),
             ConductorQueryError::Timeout
         );
+    }
+
+    #[test]
+    fn parses_services_response_with_exported_field_names() {
+        // `/services` uses the exported ServiceConfig names (capitalized),
+        // unlike `/query`. A lowercase parser would silently think every
+        // service is missing and re-register on every heartbeat.
+        let value = Value::Map(vec![
+            (Value::String("count".into()), Value::Integer(1.into())),
+            (
+                Value::String("services".into()),
+                Value::Array(vec![Value::Map(vec![
+                    (
+                        Value::String("InstanceID".into()),
+                        Value::String("inst-1".into()),
+                    ),
+                    (Value::String("DPRank".into()), Value::Integer(2.into())),
+                    (
+                        Value::String("Endpoint".into()),
+                        Value::String("tcp://127.0.0.1:5557".into()),
+                    ),
+                ])]),
+            ),
+        ]);
+        let services = parse_services(&value);
+        assert!(services.contains(&("inst-1".to_string(), 2)));
+        assert_eq!(services.len(), 1);
     }
 }

@@ -5817,6 +5817,8 @@ mod tests {
                 conductor_query_timeout_ms: 10,
                 conductor_register_timeout_ms: 1000,
                 conductor_hash_profile: None,
+                conductor_circuit_breaker: None,
+                conductor_heartbeat_secs: 10,
             })),
         ));
         let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
@@ -5872,6 +5874,8 @@ mod tests {
                 conductor_query_timeout_ms: 10,
                 conductor_register_timeout_ms: 1000,
                 conductor_hash_profile: None,
+                conductor_circuit_breaker: None,
+                conductor_heartbeat_secs: 10,
             })),
         ));
 
@@ -6657,6 +6661,8 @@ mod tests {
                     conductor_query_timeout_ms: 10,
                     conductor_register_timeout_ms: 1000,
                     conductor_hash_profile: None,
+                    conductor_circuit_breaker: None,
+                    conductor_heartbeat_secs: 10,
                 })),
             ));
             let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
@@ -6730,6 +6736,8 @@ mod tests {
                 conductor_query_timeout_ms: 10,
                 conductor_register_timeout_ms: 1000,
                 conductor_hash_profile: None,
+                conductor_circuit_breaker: None,
+                conductor_heartbeat_secs: 10,
             })),
         ));
         router.retry_config.max_retries = 0;

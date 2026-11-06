@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
-use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -17,11 +17,185 @@ use crate::core::Worker;
 use crate::kv_index::{
     CacheKey, MatchQuery, MatchRequest, RoutableTarget, StorageTier, TierMatch, WorkerKvInfo,
 };
+use crate::metrics::ConductorMetrics;
 use crate::request_identity::StableIdentity;
 
 /// Read-only placement port owned by its policy consumer.
 pub trait TieredMatchProvider: Send + Sync {
     fn find_tiered_matches(&self, query: &MatchQuery<'_>) -> Vec<TierMatch>;
+
+    /// Variant that reports whether the placement query actually succeeded.
+    ///
+    /// Providers that do not override this are treated as **always healthy**:
+    /// the circuit breaker has no way to observe a failure through
+    /// [`find_tiered_matches`](Self::find_tiered_matches), so it can never
+    /// trip. Network-backed providers must implement it.
+    fn try_find_tiered_matches(
+        &self,
+        query: &MatchQuery<'_>,
+    ) -> Result<Vec<TierMatch>, MatchError> {
+        Ok(self.find_tiered_matches(query))
+    }
+}
+
+/// Failure of a placement query, as seen by the circuit breaker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MatchError {
+    /// Backend unavailable (timeout, transport error, 5xx). A health signal:
+    /// it counts towards opening the circuit.
+    Unavailable,
+    /// Backend rejected the request (4xx). The backend is alive and the error
+    /// is deterministic, so it must not open the circuit for everybody.
+    Rejected,
+}
+
+/// Tunables for the Conductor-placement circuit-breaker (RFC #414 §3).
+#[derive(Debug, Clone, Copy)]
+pub struct CircuitBreakerConfig {
+    /// Consecutive query failures that open the circuit.
+    pub max_failures: u32,
+    /// How long the circuit stays open before a half-open probe.
+    pub cooldown: Duration,
+    /// Probe requests allowed per half-open window.
+    pub half_open_max: u32,
+}
+
+impl Default for CircuitBreakerConfig {
+    fn default() -> Self {
+        Self {
+            max_failures: 3,
+            cooldown: Duration::from_millis(5000),
+            half_open_max: 1,
+        }
+    }
+}
+
+/// Wraps a [`TieredMatchProvider`] with a circuit-breaker. While the circuit is
+/// open it returns an empty match set (so `kv_aware` falls back to load-only
+/// scoring) without issuing a network call to a backend the breaker considers
+/// unhealthy. On a successful half-open probe the circuit closes again.
+pub struct CircuitBreakerMatchProvider {
+    inner: Arc<dyn TieredMatchProvider>,
+    config: CircuitBreakerConfig,
+    state: Mutex<BreakerState>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum BreakerMode {
+    #[default]
+    Closed,
+    Open,
+    HalfOpen,
+}
+
+#[derive(Debug, Default)]
+struct BreakerState {
+    failures: u32,
+    opened_at: Option<Instant>,
+    half_open_seen: u32,
+}
+
+impl CircuitBreakerMatchProvider {
+    pub fn new(inner: Arc<dyn TieredMatchProvider>, mut config: CircuitBreakerConfig) -> Self {
+        // A zero half-open budget would leave the circuit open forever (no
+        // probe could ever close it); a zero failure budget would trip on the
+        // first request. Clamp both so a bad config degrades to the documented
+        // behaviour instead of a deadlock. The validator rejects both as well.
+        config.max_failures = config.max_failures.max(1);
+        config.half_open_max = config.half_open_max.max(1);
+        Self {
+            inner,
+            config,
+            state: Mutex::new(BreakerState::default()),
+        }
+    }
+
+    /// Current mode, promoting Open→HalfOpen once the cooldown has elapsed.
+    fn mode(&self, state: &BreakerState) -> BreakerMode {
+        match state {
+            BreakerState {
+                opened_at: Some(at),
+                ..
+            } if at.elapsed() >= self.config.cooldown => BreakerMode::HalfOpen,
+            BreakerState {
+                opened_at: Some(_), ..
+            } => BreakerMode::Open,
+            _ => BreakerMode::Closed,
+        }
+    }
+
+    fn record(&self, state: &mut BreakerState, result: &Result<Vec<TierMatch>, MatchError>) {
+        let before = self.mode(state);
+        // `Rejected` means the backend answered, so it is not a health failure.
+        let failure = matches!(result, Err(MatchError::Unavailable));
+        match (before, failure) {
+            (BreakerMode::Open, _) => {}
+            (BreakerMode::Closed, false) => state.failures = 0,
+            (BreakerMode::HalfOpen, false) => {
+                *state = BreakerState::default();
+            }
+            (BreakerMode::Closed, true) => {
+                state.failures += 1;
+                if state.failures >= self.config.max_failures {
+                    state.failures = 0;
+                    state.opened_at = Some(Instant::now());
+                    state.half_open_seen = 0;
+                }
+            }
+            (BreakerMode::HalfOpen, true) => {
+                state.opened_at = Some(Instant::now());
+                state.half_open_seen = 0;
+                state.failures = 0;
+            }
+        }
+        let after = self.mode(state);
+        if before != after {
+            ConductorMetrics::record_breaker_transition(match after {
+                BreakerMode::Closed => "closed",
+                BreakerMode::Open => "open",
+                BreakerMode::HalfOpen => "half_open",
+            });
+            ConductorMetrics::set_breaker_open(!matches!(after, BreakerMode::Closed));
+        }
+    }
+
+    /// Query the inner provider through the breaker. Returns an empty set when
+    /// the circuit is open (short-circuit).
+    fn query(&self, q: &MatchQuery<'_>) -> Vec<TierMatch> {
+        enum Allow {
+            Yes,
+            No,
+        }
+        let allow = {
+            let mut st = self.state.lock();
+            match self.mode(&st) {
+                BreakerMode::Open => Allow::No,
+                BreakerMode::Closed => Allow::Yes,
+                BreakerMode::HalfOpen if st.half_open_seen >= self.config.half_open_max => {
+                    Allow::No
+                }
+                BreakerMode::HalfOpen => {
+                    st.half_open_seen += 1;
+                    Allow::Yes
+                }
+            }
+        };
+        let Allow::Yes = allow else {
+            return Vec::new();
+        };
+        let result = self.inner.try_find_tiered_matches(q);
+        {
+            let mut st = self.state.lock();
+            self.record(&mut st, &result);
+        }
+        result.unwrap_or_default()
+    }
+}
+
+impl TieredMatchProvider for CircuitBreakerMatchProvider {
+    fn find_tiered_matches(&self, query: &MatchQuery<'_>) -> Vec<TierMatch> {
+        self.query(query)
+    }
 }
 
 /// Exact prompt sequences rendered by each HTTP backend. DP ranks share their
@@ -956,6 +1130,12 @@ pub struct KvAwarePolicy {
     /// Whether the router drives Conductor registration itself. False when an
     /// operator or sidecar owns registration (RFC #414 §4).
     register_enabled: bool,
+    /// Last-seen `WorkerKvInfo` per worker URL, kept so the heartbeat can renew
+    /// each registration periodically (keeps idle workers alive).
+    registered: Arc<Mutex<HashMap<String, crate::kv_index::WorkerKvInfo>>>,
+    /// Set on drop so the heartbeat thread exits instead of holding the policy
+    /// state alive for the rest of the process lifetime.
+    heartbeat_stop: Arc<AtomicBool>,
 }
 
 impl std::fmt::Debug for KvAwarePolicy {
@@ -999,10 +1179,40 @@ impl KvAwarePolicy {
         options: super::ConductorOptions,
         register_enabled: bool,
     ) -> Self {
-        let provider = Arc::new(super::ConductorMatchProvider::with_options(options));
+        let circuit_breaker = options.circuit_breaker;
+        let heartbeat_secs = options.heartbeat_secs;
+        let conductor_provider = Arc::new(super::ConductorMatchProvider::with_options(options));
+        let matches: Arc<dyn TieredMatchProvider> = match circuit_breaker {
+            Some(config) => Arc::new(CircuitBreakerMatchProvider::new(
+                conductor_provider.clone(),
+                config,
+            )),
+            None => conductor_provider.clone(),
+        };
+        let registered: Arc<Mutex<HashMap<String, crate::kv_index::WorkerKvInfo>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let heartbeat_stop = Arc::new(AtomicBool::new(false));
+        if register_enabled && heartbeat_secs > 0 {
+            // Conductor's default lease is 30s (register_lease_secs); the router
+            // cannot read it, so warn when the operator configures a period that
+            // is likely longer than the lease.
+            if heartbeat_secs > 30 {
+                tracing::warn!(
+                    heartbeat_secs,
+                    "conductor heartbeat period exceeds the Conductor's default 30s lease; \
+                     registrations may expire between renewals"
+                );
+            }
+            spawn_heartbeat(
+                conductor_provider.clone(),
+                registered.clone(),
+                heartbeat_stop.clone(),
+                heartbeat_secs,
+            );
+        }
         let slots = Arc::new(InMemorySlotManager::new());
         let mut policy = Self::with_components(
-            provider.clone(),
+            matches,
             slots.clone(),
             vec![Arc::new(MultiplicativeScorer)],
             Arc::new(TemperaturePicker::new(params.router_temperature)),
@@ -1010,8 +1220,10 @@ impl KvAwarePolicy {
         );
         policy.slot_manager = Some(slots);
         policy.prefer_policy_provider = true;
-        policy.conductor = Some(provider);
+        policy.conductor = Some(conductor_provider);
         policy.register_enabled = register_enabled;
+        policy.registered = registered;
+        policy.heartbeat_stop = heartbeat_stop;
         policy
     }
 
@@ -1037,6 +1249,8 @@ impl KvAwarePolicy {
             prefer_policy_provider: false,
             conductor: None,
             register_enabled: false,
+            registered: Arc::new(Mutex::new(HashMap::new())),
+            heartbeat_stop: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -1837,6 +2051,82 @@ impl KvAwarePolicy {
     }
 }
 
+/// Renew dynamic Conductor registrations in the background.
+///
+/// Every `period_secs` it reconciles against `GET /services` and re-registers
+/// only the workers whose services are missing (this also covers a Conductor
+/// restart). When `/services` is unavailable it falls back to an identical
+/// `/register` per worker, which Conductor treats as a no-op if the service
+/// still exists.
+fn spawn_heartbeat(
+    provider: Arc<super::ConductorMatchProvider>,
+    registered: Arc<Mutex<HashMap<String, WorkerKvInfo>>>,
+    stop: Arc<AtomicBool>,
+    period_secs: u64,
+) {
+    let spawned = std::thread::Builder::new()
+        .name("conductor-heartbeat".into())
+        .spawn(move || {
+            let period = Duration::from_secs(period_secs);
+            let mut warned = false;
+            loop {
+                std::thread::sleep(period);
+                if stop.load(Ordering::Relaxed) {
+                    return;
+                }
+                let known = provider.list_services().ok();
+                let entries: Vec<(String, WorkerKvInfo)> = registered
+                    .lock()
+                    .iter()
+                    .map(|(url, info)| (url.clone(), info.clone()))
+                    .collect();
+                for (url, info) in entries {
+                    // A concurrent unregister removes the entry before calling
+                    // /unregister; skip anything that disappeared meanwhile.
+                    let still_registered = registered.lock().contains_key(&url);
+                    if !still_registered || info.sources.is_empty() {
+                        continue;
+                    }
+                    if let Some(known) = &known {
+                        let all_present = info.sources.iter().all(|src| {
+                            !src.pub_endpoint.is_empty()
+                                && known.contains(&(info.instance_id.clone(), src.dp_rank))
+                        });
+                        if all_present {
+                            continue;
+                        }
+                    }
+                    match provider.register_worker(&info) {
+                        Ok(()) => warned = false,
+                        Err(error) => {
+                            if !warned {
+                                warned = true;
+                                tracing::warn!(
+                                    worker = %url,
+                                    %error,
+                                    "conductor heartbeat re-register failed; will keep retrying"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    if let Err(error) = spawned {
+        tracing::warn!(
+            %error,
+            "failed to start the conductor heartbeat thread; idle workers may expire on the conductor"
+        );
+    }
+}
+
+impl Drop for KvAwarePolicy {
+    fn drop(&mut self) {
+        // The thread wakes at most one heartbeat period later and exits.
+        self.heartbeat_stop.store(true, Ordering::Relaxed);
+    }
+}
+
 impl Default for KvAwarePolicy {
     fn default() -> Self {
         Self::new(CostParams::default())
@@ -2104,20 +2394,37 @@ impl KvAwareOps for KvAwarePolicy {
                     );
                 }
             }
+            // Remember the discovered info even when registration failed: the
+            // heartbeat retries it, which also covers a Conductor restart.
+            self.registered
+                .lock()
+                .insert(worker.url().to_string(), info.clone());
         }
     }
 
     fn unregister_worker(&self, worker_url: &str) {
+        // Remove the entry *before* calling Conductor: the heartbeat re-checks
+        // membership right before each renewal, so this ordering stops it from
+        // re-registering a worker that is being removed.
+        let removed = self.registered.lock().remove(worker_url);
         if let Some(conductor) = self.conductor.as_ref().filter(|_| self.register_enabled) {
-            if let Some(binding) = self.targets.get(worker_url) {
-                let instance_id = binding.target.instance_id.to_string();
-                let dp_rank = binding.target.dp_rank;
-                if let Err(error) = conductor.unregister_worker(&instance_id, &[dp_rank]) {
-                    tracing::warn!(
-                        "kv_aware conductor unregister failed worker={} error={}",
-                        worker_url,
-                        error
-                    );
+            if let Some(info) = removed {
+                let instance_id = info.instance_id.clone();
+                // TODO(RFC #414 §4, DP > 1): every DP worker of an instance
+                // registers all of its source ranks (registration enumerates
+                // `info.sources`), so unregistering one DP worker also removes
+                // the ranks other DP workers share until their heartbeat
+                // re-registers them. Rank-level ownership is required before
+                // DP engines can be supported without this churn.
+                let ranks: Vec<u32> = info.sources.iter().map(|src| src.dp_rank).collect();
+                if !instance_id.is_empty() && !ranks.is_empty() {
+                    if let Err(error) = conductor.unregister_worker(&instance_id, &ranks) {
+                        tracing::warn!(
+                            "kv_aware conductor unregister failed worker={} error={}",
+                            worker_url,
+                            error
+                        );
+                    }
                 }
             }
         }
@@ -3509,10 +3816,8 @@ mod tests {
 
     #[test]
     fn affinity_releases_reference_without_slot_manager() {
-        let policy = KvAwarePolicy {
-            slot_manager: None,
-            ..KvAwarePolicy::default()
-        };
+        let mut policy = KvAwarePolicy::default();
+        policy.slot_manager = None;
         let table = policy.affinity.clone();
         let workers = registered_worker_pair(&policy);
         let key = affinity_key("session-a");
@@ -4167,6 +4472,8 @@ mod tests {
                 query_timeout: std::time::Duration::from_millis(10),
                 register_timeout: std::time::Duration::from_millis(10),
                 hash_profile: Default::default(),
+                circuit_breaker: None,
+                heartbeat_secs: 0,
             },
             true,
         );
@@ -4235,6 +4542,8 @@ mod tests {
                 query_timeout: std::time::Duration::from_millis(10),
                 register_timeout: std::time::Duration::from_millis(10),
                 hash_profile: Default::default(),
+                circuit_breaker: None,
+                heartbeat_secs: 0,
             },
             true,
         );
@@ -4310,5 +4619,268 @@ mod tests {
             )
             .expect("selection succeeds");
         assert_eq!(counts.0.load(Ordering::Relaxed), 1);
+    }
+
+    /// Provider whose `try_` outcome is controllable, counting every call.
+    struct CountingProvider {
+        calls: AtomicUsize,
+        outcome: Option<MatchError>,
+    }
+
+    impl CountingProvider {
+        fn new(outcome: Option<MatchError>) -> Arc<Self> {
+            Arc::new(Self {
+                calls: AtomicUsize::new(0),
+                outcome,
+            })
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::Relaxed)
+        }
+    }
+
+    impl TieredMatchProvider for CountingProvider {
+        fn find_tiered_matches(&self, _query: &MatchQuery<'_>) -> Vec<TierMatch> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Vec::new()
+        }
+
+        fn try_find_tiered_matches(
+            &self,
+            _query: &MatchQuery<'_>,
+        ) -> Result<Vec<TierMatch>, MatchError> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            match self.outcome {
+                Some(error) => Err(error),
+                None => Ok(Vec::new()),
+            }
+        }
+    }
+
+    fn empty_query() -> MatchQuery<'static> {
+        MatchQuery {
+            group_idx: 0,
+            local_hashes: Vec::new(),
+            tiers_of_interest: Vec::new(),
+            request: None,
+        }
+    }
+
+    #[test]
+    fn breaker_half_open_failure_reopens() {
+        let inner = CountingProvider::new(Some(MatchError::Unavailable));
+        let breaker = CircuitBreakerMatchProvider::new(
+            inner.clone(),
+            CircuitBreakerConfig {
+                max_failures: 1,
+                cooldown: Duration::from_millis(40),
+                half_open_max: 1,
+            },
+        );
+        let q = empty_query();
+        // Failure opens the circuit.
+        breaker.find_tiered_matches(&q);
+        assert_eq!(inner.calls(), 1);
+        // Open: short-circuited.
+        breaker.find_tiered_matches(&q);
+        assert_eq!(inner.calls(), 1);
+        // After cooldown the half-open probe runs and fails -> re-open.
+        std::thread::sleep(Duration::from_millis(60));
+        breaker.find_tiered_matches(&q);
+        assert_eq!(inner.calls(), 2);
+        breaker.find_tiered_matches(&q);
+        assert_eq!(inner.calls(), 2);
+    }
+
+    #[test]
+    fn breaker_does_not_open_on_rejected() {
+        // A 4xx means the backend is alive; it must not disable placement for
+        // every model.
+        let inner = CountingProvider::new(Some(MatchError::Rejected));
+        let breaker = CircuitBreakerMatchProvider::new(
+            inner.clone(),
+            CircuitBreakerConfig {
+                max_failures: 1,
+                cooldown: Duration::from_secs(60),
+                half_open_max: 1,
+            },
+        );
+        let q = empty_query();
+        for _ in 0..3 {
+            breaker.find_tiered_matches(&q);
+        }
+        assert_eq!(inner.calls(), 3);
+    }
+
+    #[test]
+    fn breaker_never_trips_for_providers_without_try_override() {
+        // `try_` defaults to `Ok(find(...))`, so a provider that only
+        // implements `find_tiered_matches` can never look unhealthy. Pinned
+        // here so a future provider split does not assume otherwise.
+        struct OnlyFind(AtomicUsize);
+        impl TieredMatchProvider for OnlyFind {
+            fn find_tiered_matches(&self, _query: &MatchQuery<'_>) -> Vec<TierMatch> {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                Vec::new()
+            }
+        }
+        let inner = Arc::new(OnlyFind(AtomicUsize::new(0)));
+        let breaker = CircuitBreakerMatchProvider::new(
+            inner.clone(),
+            CircuitBreakerConfig {
+                max_failures: 1,
+                cooldown: Duration::from_secs(60),
+                half_open_max: 1,
+            },
+        );
+        let q = empty_query();
+        for _ in 0..3 {
+            breaker.find_tiered_matches(&q);
+        }
+        assert_eq!(inner.0.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn breaker_zero_budgets_are_clamped() {
+        // max_failures=0 / half_open_max=0 would otherwise open on the first
+        // request and never let a probe through. The constructor clamps both.
+        let inner = CountingProvider::new(Some(MatchError::Unavailable));
+        let breaker = CircuitBreakerMatchProvider::new(
+            inner.clone(),
+            CircuitBreakerConfig {
+                max_failures: 0,
+                cooldown: Duration::from_millis(40),
+                half_open_max: 0,
+            },
+        );
+        let q = empty_query();
+        breaker.find_tiered_matches(&q);
+        assert_eq!(inner.calls(), 1);
+        std::thread::sleep(Duration::from_millis(60));
+        // A probe must be allowed despite half_open_max=0.
+        breaker.find_tiered_matches(&q);
+        assert_eq!(inner.calls(), 2);
+    }
+
+    /// Minimal HTTP stub that counts requests and always answers 200 with an
+    /// empty body (so `/services` decode fails and the heartbeat falls back to
+    /// a blind re-register, which is what we want to observe here).
+    fn spawn_stub_server() -> (String, Arc<AtomicUsize>) {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let count = Arc::new(AtomicUsize::new(0));
+        let counter = count.clone();
+        std::thread::spawn(move || {
+            for incoming in listener.incoming() {
+                let Ok(mut stream) = incoming else {
+                    continue;
+                };
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                counter.fetch_add(1, Ordering::Relaxed);
+                let _ = stream.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+            }
+        });
+        (format!("http://{addr}"), count)
+    }
+
+    fn test_worker_info() -> crate::kv_index::WorkerKvInfo {
+        crate::kv_index::WorkerKvInfo {
+            instance_id: "inst-0".into(),
+            block_size: Some(4),
+            ranks: vec![0],
+            sources: vec![crate::kv_index::discovery::KvSourceEndpoint {
+                dp_rank: 0,
+                pub_endpoint: "tcp://127.0.0.1:5557".into(),
+                replay_endpoint: None,
+            }],
+            cache_key: Some(CacheKey {
+                model: Arc::from("model-a"),
+                hash_mode: crate::kv_index::HashMode::Sha256,
+                block_size: 4,
+            }),
+        }
+    }
+
+    #[test]
+    fn heartbeat_renews_and_unregister_removes_every_rank() {
+        let (url, count) = spawn_stub_server();
+        let policy = KvAwarePolicy::new_with_conductor(
+            CostParams::default(),
+            crate::policies::ConductorOptions {
+                url,
+                connect_timeout: Duration::from_millis(100),
+                query_timeout: Duration::from_millis(100),
+                register_timeout: Duration::from_millis(100),
+                hash_profile: crate::config::types::ConductorHashProfile {
+                    python_hash_seed: Some("1".into()),
+                    ..Default::default()
+                },
+                circuit_breaker: None,
+                heartbeat_secs: 1,
+            },
+            true,
+        );
+        let worker: Arc<dyn Worker> =
+            Arc::new(BasicWorker::new("http://w0".into(), WorkerType::Regular));
+        let info = test_worker_info();
+        kv_aware_ops(&policy)
+            .unwrap()
+            .register_worker(worker.as_ref(), Some(&info), None);
+        let after_register = count.load(Ordering::Relaxed);
+        assert_eq!(after_register, 1);
+
+        std::thread::sleep(Duration::from_millis(1300));
+        assert!(
+            count.load(Ordering::Relaxed) > after_register,
+            "heartbeat must renew the registration"
+        );
+
+        let before_unregister = count.load(Ordering::Relaxed);
+        kv_aware_ops(&policy)
+            .unwrap()
+            .unregister_worker("http://w0");
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            before_unregister + 1,
+            "every registered source rank must be unregistered"
+        );
+    }
+
+    #[test]
+    fn heartbeat_is_disabled_when_registration_is_external() {
+        let (url, count) = spawn_stub_server();
+        let policy = KvAwarePolicy::new_with_conductor(
+            CostParams::default(),
+            crate::policies::ConductorOptions {
+                url,
+                connect_timeout: Duration::from_millis(100),
+                query_timeout: Duration::from_millis(100),
+                register_timeout: Duration::from_millis(100),
+                hash_profile: crate::config::types::ConductorHashProfile {
+                    python_hash_seed: Some("1".into()),
+                    ..Default::default()
+                },
+                circuit_breaker: None,
+                heartbeat_secs: 1,
+            },
+            false,
+        );
+        // Registration is owned elsewhere: the policy must neither call
+        // Conductor nor remember the worker for a heartbeat.
+        let worker: Arc<dyn Worker> =
+            Arc::new(BasicWorker::new("http://w0".into(), WorkerType::Regular));
+        let info = test_worker_info();
+        kv_aware_ops(&policy)
+            .unwrap()
+            .register_worker(worker.as_ref(), Some(&info), None);
+        std::thread::sleep(Duration::from_millis(1300));
+        assert_eq!(count.load(Ordering::Relaxed), 0);
+        assert!(policy.registered.lock().is_empty());
     }
 }

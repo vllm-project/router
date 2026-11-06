@@ -540,6 +540,24 @@ impl ConfigValidator {
                         });
                     }
                 }
+                if let Some(breaker) = &config.conductor_circuit_breaker {
+                    if breaker.max_failures == 0 {
+                        return Err(ConfigError::InvalidValue {
+                            field: "conductor_circuit_breaker_max_failures".to_string(),
+                            value: breaker.max_failures.to_string(),
+                            reason: "Must be > 0".to_string(),
+                        });
+                    }
+                    if breaker.half_open_max == 0 {
+                        return Err(ConfigError::InvalidValue {
+                            field: "conductor_circuit_breaker_half_open_max".to_string(),
+                            value: breaker.half_open_max.to_string(),
+                            reason: "Must be > 0: a circuit that never lets a probe through \
+                                     stays open forever"
+                                .to_string(),
+                        });
+                    }
+                }
                 for (field, value) in [
                     (
                         "conductor_connect_timeout_ms",
@@ -1588,6 +1606,8 @@ mod tests {
                 conductor_query_timeout_ms: 10,
                 conductor_register_timeout_ms: 1000,
                 conductor_hash_profile: None,
+                conductor_circuit_breaker: None,
+                conductor_heartbeat_secs: 10,
             })),
         );
 
@@ -1910,5 +1930,36 @@ mod tests {
         );
         let error = ConfigValidator::validate(&config).unwrap_err();
         assert!(error.to_string().contains("conductor_url"));
+    }
+
+    #[test]
+    fn test_kv_aware_rejects_zero_breaker_budgets() {
+        // max_failures=0 trips on the first request; half_open_max=0 leaves
+        // the circuit open forever. Both are configuration bugs, not tunables.
+        for (max_failures, half_open_max) in [(0u32, 1u32), (1u32, 0u32)] {
+            let config = RouterConfig::new(
+                RoutingMode::Regular {
+                    worker_urls: vec!["http://worker:8000".to_string()],
+                },
+                PolicyConfig::KvAware(Box::new(KvAwareConfig {
+                    kv_index_backend: "conductor".to_string(),
+                    conductor_url: Some("http://conductor:13333".to_string()),
+                    conductor_hash_profile: Some(ConductorHashProfile {
+                        python_hash_seed: Some("1".to_string()),
+                        ..ConductorHashProfile::default()
+                    }),
+                    conductor_circuit_breaker: Some(ConductorCircuitBreakerConfig {
+                        max_failures,
+                        cooldown_ms: 5000,
+                        half_open_max,
+                    }),
+                    ..KvAwareConfig::default()
+                })),
+            );
+            assert!(
+                ConfigValidator::validate(&config).is_err(),
+                "max_failures={max_failures} half_open_max={half_open_max} must be rejected"
+            );
+        }
     }
 }

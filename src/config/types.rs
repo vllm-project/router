@@ -1141,6 +1141,68 @@ pub struct KvAwareConfig {
     /// so it must match the engine's `PYTHONHASHSEED`/hash configuration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conductor_hash_profile: Option<ConductorHashProfile>,
+    /// Circuit-breaker around the Conductor `/query` call. `None` disables it;
+    /// the CLI enables it with the defaults below. While open, `kv_aware`
+    /// degrades to load-only scoring and requests still succeed.
+    // No `skip_serializing_if`: `None` must round-trip as `null`, otherwise a
+    // serialized config would silently re-enable a deliberately disabled
+    // breaker (the field defaults to `Some(default)`).
+    #[serde(default = "default_conductor_circuit_breaker")]
+    pub conductor_circuit_breaker: Option<ConductorCircuitBreakerConfig>,
+    /// Seconds between heartbeat renewals of dynamic registrations. `0`
+    /// disables the heartbeat. Must be shorter than the Conductor's
+    /// `register_lease_secs` (default 30s), which the router cannot read.
+    #[serde(default = "default_conductor_heartbeat_secs")]
+    pub conductor_heartbeat_secs: u64,
+}
+
+/// Circuit-breaker for the Conductor placement provider (RFC #414 §3): after
+/// `max_failures` consecutive query failures the router stops querying for
+/// `cooldown_ms`, then lets `half_open_max` probes through.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConductorCircuitBreakerConfig {
+    /// Consecutive failures that open the circuit. Must be > 0.
+    #[serde(default = "default_cb_max_failures")]
+    pub max_failures: u32,
+    /// How long the circuit stays open before a half-open probe (ms).
+    #[serde(default = "default_cb_cooldown_ms")]
+    pub cooldown_ms: u64,
+    /// Probe requests allowed per half-open window. Must be > 0; `0` would
+    /// leave the circuit open forever (no probe can ever close it).
+    #[serde(default = "default_cb_half_open_max")]
+    pub half_open_max: u32,
+}
+
+impl Default for ConductorCircuitBreakerConfig {
+    fn default() -> Self {
+        Self {
+            max_failures: default_cb_max_failures(),
+            cooldown_ms: default_cb_cooldown_ms(),
+            half_open_max: default_cb_half_open_max(),
+        }
+    }
+}
+
+fn default_cb_max_failures() -> u32 {
+    3
+}
+
+fn default_cb_cooldown_ms() -> u64 {
+    5000
+}
+
+fn default_cb_half_open_max() -> u32 {
+    1
+}
+
+fn default_conductor_heartbeat_secs() -> u64 {
+    10
+}
+
+/// The breaker is enabled by default; an explicit `null` in the config file
+/// disables it (as does `--no-conductor-circuit-breaker` on the CLI).
+fn default_conductor_circuit_breaker() -> Option<ConductorCircuitBreakerConfig> {
+    Some(ConductorCircuitBreakerConfig::default())
 }
 
 impl Default for KvAwareConfig {
@@ -1158,6 +1220,8 @@ impl Default for KvAwareConfig {
             conductor_query_timeout_ms: default_conductor_query_timeout_ms(),
             conductor_register_timeout_ms: default_conductor_register_timeout_ms(),
             conductor_hash_profile: None,
+            conductor_circuit_breaker: default_conductor_circuit_breaker(),
+            conductor_heartbeat_secs: default_conductor_heartbeat_secs(),
         }
     }
 }
@@ -2590,6 +2654,9 @@ mod tests {
         assert_eq!(config.conductor_query_timeout_ms, 10);
         assert_eq!(config.conductor_register_timeout_ms, 1000);
         assert!(config.conductor_hash_profile.is_none());
+        // The breaker is on by default; the heartbeat is 10s.
+        assert!(config.conductor_circuit_breaker.is_some());
+        assert_eq!(config.conductor_heartbeat_secs, 10);
 
         // The boxed variant must flatten back to `type` + the struct fields.
         let conductor: PolicyConfig = serde_json::from_str(

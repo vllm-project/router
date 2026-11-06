@@ -46,6 +46,14 @@ pub(crate) fn build_kv_aware_policy(
                     config.conductor_register_timeout_ms,
                 ),
                 hash_profile: config.conductor_hash_profile.clone().unwrap_or_default(),
+                circuit_breaker: config.conductor_circuit_breaker.as_ref().map(|breaker| {
+                    crate::policies::CircuitBreakerConfig {
+                        max_failures: breaker.max_failures,
+                        cooldown: std::time::Duration::from_millis(breaker.cooldown_ms),
+                        half_open_max: breaker.half_open_max,
+                    }
+                }),
+                heartbeat_secs: config.conductor_heartbeat_secs,
             },
             config.conductor_register,
         ),
@@ -178,6 +186,8 @@ mod tests {
             conductor_query_timeout_ms: 10,
             conductor_register_timeout_ms: 1000,
             conductor_hash_profile: None,
+            conductor_circuit_breaker: None,
+            conductor_heartbeat_secs: 10,
         }));
         let policy = PolicyFactory::create_from_config(&config, None);
         assert_eq!(policy.name(), "kv_aware");

@@ -453,6 +453,14 @@ pub fn init_metrics() {
         "vllm_router_kv_aware_matched_tokens_total",
         "Tokens matched per storage tier for the selected worker (before transfer credit)"
     );
+    describe_gauge!(
+        "vllm_router_conductor_breaker_open",
+        "Circuit breaker state around Conductor /query (1=open/half-open, 0=closed)"
+    );
+    describe_counter!(
+        "vllm_router_conductor_breaker_transitions_total",
+        "Circuit breaker transitions by destination state (closed/open/half_open)"
+    );
 }
 
 pub fn start_prometheus(config: PrometheusConfig) {
@@ -1220,6 +1228,18 @@ impl ConductorMetrics {
         counter!(
             "vllm_router_conductor_query_skipped_total",
             "reason" => reason
+        )
+        .increment(1);
+    }
+
+    pub fn set_breaker_open(open: bool) {
+        gauge!("vllm_router_conductor_breaker_open").set(if open { 1.0 } else { 0.0 });
+    }
+
+    pub fn record_breaker_transition(to: &'static str) {
+        counter!(
+            "vllm_router_conductor_breaker_transitions_total",
+            "to" => to
         )
         .increment(1);
     }

@@ -61,6 +61,8 @@ struct Router {
     conductor_hash_algorithm: String,
     conductor_hash_index_projection: String,
     conductor_hash_python_seed: Option<String>,
+    conductor_circuit_breaker: bool,
+    conductor_heartbeat_secs: u64,
     worker_startup_timeout_secs: u64,
     worker_startup_check_interval: u64,
     cache_threshold: f32,
@@ -142,7 +144,9 @@ impl Router {
         if !matches!(self.policy, PolicyType::KvAware)
             && (self.kv_index_backend != "local"
                 || self.conductor_url.is_some()
-                || self.conductor_hash_python_seed.is_some())
+                || self.conductor_hash_python_seed.is_some()
+                || !self.conductor_circuit_breaker
+                || self.conductor_heartbeat_secs != 10)
         {
             return Err(config::ConfigError::ValidationFailed {
                 reason: "conductor options require policy=kv_aware".to_string(),
@@ -174,6 +178,10 @@ impl Router {
                         conductor_connect_timeout_ms: 100,
                         conductor_query_timeout_ms: self.conductor_query_timeout_ms,
                         conductor_register_timeout_ms: 1000,
+                        conductor_circuit_breaker: self
+                            .conductor_circuit_breaker
+                            .then(config::ConductorCircuitBreakerConfig::default),
+                        conductor_heartbeat_secs: self.conductor_heartbeat_secs,
                         conductor_hash_profile: Some(config::ConductorHashProfile {
                             strategy: self.conductor_hash_strategy.clone(),
                             algorithm: self.conductor_hash_algorithm.clone(),
@@ -422,6 +430,8 @@ impl Router {
         conductor_hash_algorithm = String::from("sha256"),
         conductor_hash_index_projection = String::from("low64_be"),
         conductor_hash_python_seed = None,
+        conductor_circuit_breaker = true,
+        conductor_heartbeat_secs = 10,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -506,6 +516,8 @@ impl Router {
         conductor_hash_algorithm: String,
         conductor_hash_index_projection: String,
         conductor_hash_python_seed: Option<String>,
+        conductor_circuit_breaker: bool,
+        conductor_heartbeat_secs: u64,
     ) -> PyResult<Self> {
         if wasm_middleware_sha256
             .as_deref()
@@ -544,6 +556,8 @@ impl Router {
             conductor_hash_algorithm,
             conductor_hash_index_projection,
             conductor_hash_python_seed,
+            conductor_circuit_breaker,
+            conductor_heartbeat_secs,
             worker_startup_timeout_secs,
             worker_startup_check_interval,
             cache_threshold,
