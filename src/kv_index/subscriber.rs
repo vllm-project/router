@@ -788,6 +788,7 @@ mod tests {
                         .map(|hash| Arc::from(hex(hash)))
                         .collect(),
                     tiers_of_interest: vec![StorageTier::Device],
+                    request: None,
                 };
                 assert_eq!(
                     index.find_matches(&query).len(),
@@ -830,6 +831,7 @@ mod tests {
             group_idx: 0,
             local_hashes: pool_locals,
             tiers_of_interest: vec![StorageTier::External],
+            request: None,
         });
         assert_eq!(pool_res.len(), 1);
         assert_eq!(pool_res[0].tier, StorageTier::External);
@@ -845,6 +847,7 @@ mod tests {
             group_idx: 0,
             local_hashes: wkr_locals,
             tiers_of_interest: vec![StorageTier::HostPinned],
+            request: None,
         });
         assert_eq!(wkr_res.len(), 1);
         assert_eq!(wkr_res[0].tier, StorageTier::HostPinned);
@@ -892,6 +895,7 @@ mod tests {
                 group_idx: 0,
                 local_hashes: crate::kv_index::local_block_hash_strings(&[1, 2, 3, 4], 4, None),
                 tiers_of_interest: vec![tier],
+                request: None,
             });
             assert_eq!(matches.len(), 1);
             assert_eq!(matches[0].tier, tier);
@@ -1020,6 +1024,7 @@ mod tests {
             group_idx: 0,
             local_hashes: hashes.to_vec(),
             tiers_of_interest: vec![StorageTier::Device],
+            request: None,
         };
 
         // 1) STORE — one block (seq hash 100) on w0/rank0, GPU/Device.
@@ -1144,6 +1149,7 @@ mod tests {
                 group_idx: 0,
                 local_hashes: crate::kv_index::local_block_hash_strings(&tokens, 4, None),
                 tiers_of_interest: vec![tier],
+                request: None,
             });
             assert_eq!(hits.len(), 1);
             assert_eq!(hits[0].target.instance_id.as_ref(), "generic-worker");
@@ -1281,6 +1287,7 @@ mod tests {
                 .map(|hash| Arc::from(hex(hash)))
                 .collect(),
             tiers_of_interest: vec![StorageTier::Device],
+            request: None,
         })
     }
 
@@ -1505,6 +1512,7 @@ mod tests {
                 group_idx: 0,
                 local_hashes: crate::kv_index::local_block_hash_strings(&old, 4, None),
                 tiers_of_interest: vec![StorageTier::Device],
+                request: None,
             };
             let suspended_queries = [query];
             let (advances, ()) = tokio::join!(
@@ -1955,6 +1963,7 @@ mod tests {
                 group_idx: 0,
                 local_hashes: crate::kv_index::local_block_hash_strings(tokens, expected, None),
                 tiers_of_interest: vec![StorageTier::Device],
+                request: None,
             };
             let old_hits = f.indexer.find_matches(&query(&old));
             assert_eq!(old_hits.len(), 1);
@@ -1999,7 +2008,7 @@ mod tests {
         socket: &zmq::Socket,
         replies: &[(i64, &[u8], Vec<u8>)],
         index: &KvBlockIndexer,
-        suspended_queries: &[MatchQuery],
+        suspended_queries: &[MatchQuery<'_>],
     ) {
         let request = replay_request(socket).await;
         assert_eq!(read_seq(request.last().unwrap()), 1);
@@ -2072,6 +2081,7 @@ mod tests {
             group_idx: 0,
             local_hashes: crate::kv_index::local_block_hash_strings(tokens, 4, None),
             tiers_of_interest: vec![StorageTier::Device],
+            request: None,
         };
         for tokens in [&old, &keep] {
             let matches = f.indexer.find_matches(&query(tokens));

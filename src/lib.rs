@@ -54,6 +54,17 @@ struct Router {
     kv_event_replay_source: Vec<String>,
     kv_event_block_size: u32,
     kv_event_model: Option<String>,
+    kv_index_backend: String,
+    conductor_url: Option<String>,
+    conductor_transport: String,
+    conductor_rpc_addr: String,
+    conductor_query_timeout_ms: u64,
+    conductor_hash_strategy: String,
+    conductor_hash_algorithm: String,
+    conductor_hash_index_projection: String,
+    conductor_hash_python_seed: Option<String>,
+    conductor_circuit_breaker: bool,
+    conductor_heartbeat_secs: u64,
     worker_startup_timeout_secs: u64,
     worker_startup_check_interval: u64,
     cache_threshold: f32,
@@ -131,6 +142,21 @@ impl Router {
             DiscoveryConfig, MetricsConfig, PolicyConfig as ConfigPolicyConfig, RoutingMode,
         };
 
+        // RFC #414 §6: conductor options are only meaningful for kv_aware.
+        if !matches!(self.policy, PolicyType::KvAware)
+            && (self.kv_index_backend != "local"
+                || self.conductor_url.is_some()
+                || self.conductor_hash_python_seed.is_some()
+                || !self.conductor_circuit_breaker
+                || self.conductor_heartbeat_secs != 10
+                || self.conductor_transport != "http"
+                || self.conductor_rpc_addr != "127.0.0.1:13334")
+        {
+            return Err(config::ConfigError::ValidationFailed {
+                reason: "conductor options require policy=kv_aware".to_string(),
+            });
+        }
+
         // Convert policy helper function
         let convert_policy = |policy: &PolicyType| -> ConfigPolicyConfig {
             match policy {
@@ -143,13 +169,33 @@ impl Router {
                     eviction_interval_secs: self.eviction_interval_secs,
                     max_tree_size: self.max_tree_size,
                 },
-                PolicyType::KvAware => ConfigPolicyConfig::KvAware {
-                    router_temperature: self.router_temperature,
-                    kv_penalty_host: self.kv_penalty_host,
-                    kv_penalty_external: self.kv_penalty_external,
-                    kv_penalty_disk: self.kv_penalty_disk,
-                    static_kv_event_sources: Box::default(),
-                },
+                PolicyType::KvAware => {
+                    ConfigPolicyConfig::KvAware(Box::new(config::KvAwareConfig {
+                        router_temperature: self.router_temperature,
+                        kv_penalty_host: self.kv_penalty_host,
+                        kv_penalty_external: self.kv_penalty_external,
+                        kv_penalty_disk: self.kv_penalty_disk,
+                        static_kv_event_sources: Box::default(),
+                        kv_index_backend: self.kv_index_backend.clone(),
+                        conductor_url: self.conductor_url.clone(),
+                        conductor_transport: self.conductor_transport.clone(),
+                        conductor_rpc_addr: self.conductor_rpc_addr.clone(),
+                        conductor_register: true,
+                        conductor_connect_timeout_ms: 100,
+                        conductor_query_timeout_ms: self.conductor_query_timeout_ms,
+                        conductor_register_timeout_ms: 1000,
+                        conductor_circuit_breaker: self
+                            .conductor_circuit_breaker
+                            .then(config::ConductorCircuitBreakerConfig::default),
+                        conductor_heartbeat_secs: self.conductor_heartbeat_secs,
+                        conductor_hash_profile: Some(config::ConductorHashProfile {
+                            strategy: self.conductor_hash_strategy.clone(),
+                            algorithm: self.conductor_hash_algorithm.clone(),
+                            index_projection: self.conductor_hash_index_projection.clone(),
+                            python_hash_seed: self.conductor_hash_python_seed.clone(),
+                        }),
+                    }))
+                }
                 PolicyType::PowerOfTwo => ConfigPolicyConfig::PowerOfTwo {
                     load_check_interval_secs: 5, // Default value
                 },
@@ -188,12 +234,8 @@ impl Router {
             self.kv_event_block_size,
             self.kv_event_model.as_deref(),
         )?;
-        if let ConfigPolicyConfig::KvAware {
-            static_kv_event_sources,
-            ..
-        } = &mut policy
-        {
-            **static_kv_event_sources = static_sources;
+        if let ConfigPolicyConfig::KvAware(config) = &mut policy {
+            *config.static_kv_event_sources = static_sources;
         } else if !static_sources.is_empty() {
             return Err(config::ConfigError::IncompatibleConfig {
                 reason: "--kv-event-source requires the kv_aware policy".to_string(),
@@ -225,7 +267,7 @@ impl Router {
             _ => None,
         };
 
-        Ok(config::RouterConfig {
+        let config = config::RouterConfig {
             epd: None,
             mode,
             pd_kv_event_sources: config::parse_pd_kv_events(&self.pd_kv_events)?,
@@ -294,7 +336,12 @@ impl Router {
                 self.enable_program_scheduling,
                 self.program_scheduling_config_json.as_deref(),
             )?,
-        })
+        };
+        // The Python entry point builds `RouterConfig` programmatically, so it
+        // must run the same validator as the CLI; otherwise a bad
+        // `kv_index_backend` combination silently falls back to the local index.
+        config.validate()?;
+        Ok(config)
     }
 }
 
@@ -382,6 +429,17 @@ impl Router {
         kv_event_replay_source = vec![],
         kv_event_block_size = 16,
         kv_event_model = None,
+        kv_index_backend = String::from("local"),
+        conductor_url = None,
+        conductor_transport = String::from("http"),
+        conductor_rpc_addr = String::from("127.0.0.1:13334"),
+        conductor_query_timeout_ms = 10,
+        conductor_hash_strategy = String::from("vllm_v1"),
+        conductor_hash_algorithm = String::from("sha256"),
+        conductor_hash_index_projection = String::from("low64_be"),
+        conductor_hash_python_seed = None,
+        conductor_circuit_breaker = true,
+        conductor_heartbeat_secs = 10,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -459,6 +517,17 @@ impl Router {
         kv_event_replay_source: Vec<String>,
         kv_event_block_size: u32,
         kv_event_model: Option<String>,
+        kv_index_backend: String,
+        conductor_url: Option<String>,
+        conductor_transport: String,
+        conductor_rpc_addr: String,
+        conductor_query_timeout_ms: u64,
+        conductor_hash_strategy: String,
+        conductor_hash_algorithm: String,
+        conductor_hash_index_projection: String,
+        conductor_hash_python_seed: Option<String>,
+        conductor_circuit_breaker: bool,
+        conductor_heartbeat_secs: u64,
     ) -> PyResult<Self> {
         if wasm_middleware_sha256
             .as_deref()
@@ -490,6 +559,17 @@ impl Router {
             kv_event_replay_source,
             kv_event_block_size,
             kv_event_model,
+            kv_index_backend,
+            conductor_url,
+            conductor_transport,
+            conductor_rpc_addr,
+            conductor_query_timeout_ms,
+            conductor_hash_strategy,
+            conductor_hash_algorithm,
+            conductor_hash_index_projection,
+            conductor_hash_python_seed,
+            conductor_circuit_breaker,
+            conductor_heartbeat_secs,
             worker_startup_timeout_secs,
             worker_startup_check_interval,
             cache_threshold,

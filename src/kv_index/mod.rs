@@ -24,8 +24,8 @@ pub use endpoints::{parse_endpoint_mapping, resolve_endpoints};
 pub use indexer::{KvBlockIndexer, MatchQuery, TierMatch};
 pub use subscriber::local_hashes;
 pub use types::{
-    CacheOwnerId, ClearScope, HashMode, Locality, ResidencyOwner, RoutableTarget, SourceId,
-    StorageTier,
+    CacheOwnerId, ClearScope, HashMode, Locality, MatchRequest, ResidencyOwner, RoutableTarget,
+    SourceId, StorageTier,
 };
 pub use wire::{AllBlocksCleared, BlockRemoved, BlockStored, KVEvent, KVEventBatch};
 

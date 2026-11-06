@@ -9,7 +9,12 @@ use std::fmt::Debug;
 use std::sync::Arc;
 
 mod cache_aware;
+mod conductor;
+// coro_rpc Conductor transport (P3); requires the `conductor-rpc` feature and a
+// built Mooncake Conductor C++ client (see build.rs).
 mod consistent_hash;
+#[cfg(feature = "conductor-rpc")]
+mod cororpc;
 mod factory;
 pub(crate) mod hash_key;
 mod kv_aware;
@@ -22,15 +27,22 @@ mod sticky_least_loaded;
 
 pub(crate) use cache_aware::PreparedCacheSelection;
 pub use cache_aware::{CacheAwareCandidate, CacheAwarePlacement, CacheAwarePolicy};
+pub use conductor::{
+    ConductorMatchProvider, ConductorOptions, ConductorRegistrar, ConductorTransport,
+    HttpConductorTransport,
+};
 pub use consistent_hash::ConsistentHashPolicy;
 pub use consistent_hash::VIRTUAL_NODES_PER_WORKER;
+#[cfg(feature = "conductor-rpc")]
+pub use cororpc::{ConductorRpcOptions, CoroRpcMatchProvider};
 pub use factory::PolicyFactory;
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
 pub(crate) use kv_aware::kv_aware_policy;
 pub use kv_aware::{
-    cost_components, kv_aware_ops, AffinityKey, AffinityRecord, CandidateView, CostComponents,
-    CostDecision, CostParams, InMemorySlotManager, KvAffinityTable, KvAwareOps, KvAwarePolicy,
-    KvRequestSlot, KvRequestTokens, KvSelectionReceipt, LoadProvider, LoadSample,
+    cost_components, kv_aware_ops, AffinityKey, AffinityRecord, AsyncTieredMatchProvider,
+    CandidateView, CircuitBreakerConfig, CircuitBreakerMatchProvider, CostComponents, CostDecision,
+    CostParams, InMemorySlotManager, KvAffinityTable, KvAwareOps, KvAwarePolicy, KvPrefetch,
+    KvRequestSlot, KvRequestTokens, KvSelectionReceipt, LoadProvider, LoadSample, MatchError,
     MultiplicativeScorer, Picker, PrefillWorkEstimate, Scorer, SelectionError, SlotManager,
     StagePick, TemperaturePicker, TieredMatchProvider, TransferCredits, WorkerTokenInputs,
 };
