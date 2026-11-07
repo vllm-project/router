@@ -60,6 +60,10 @@ steps:
               environment:
                 - "CARGO_INCREMENTAL=0"
                 - "RUST_BACKTRACE=1"
+                # Same CI-only overrides as the Rust Release step: setuptools-rust
+                # invokes cargo rustc --release against the same workspace profile.
+                - "CARGO_PROFILE_RELEASE_LTO=false"
+                - "CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16"
               command:
                 - bash
                 - -c
