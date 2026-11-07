@@ -772,3 +772,41 @@ class TestParseRouterArgs:
 
         # SystemExit with code 0 indicates help was displayed
         assert exc_info.value.code == 0
+
+
+class TestPerWorkerAdmissionArgs:
+    def test_disabled_by_default(self):
+        assert parse_router_args([]).max_inflight_requests_per_worker is None
+
+    @pytest.mark.parametrize("use_prefix", [False, True])
+    def test_cli_option(self, use_prefix):
+        prefix = "--router-" if use_prefix else "--"
+        args = RouterArgs.from_cli_args(
+            _parse_with_router_args(
+                [f"{prefix}max-inflight-requests-per-worker", "8"], use_prefix
+            ),
+            use_router_prefix=use_prefix,
+        )
+        assert args.max_inflight_requests_per_worker == 8
+
+    @pytest.mark.parametrize("limit", [0, -1])
+    def test_rejects_non_positive_limits(self, limit):
+        with pytest.raises(ValueError, match="max_inflight_requests_per_worker"):
+            RouterArgs(max_inflight_requests_per_worker=limit)._validate_router_args()
+
+    def test_forwarded_to_rust_router(self, monkeypatch):
+        captured = {}
+
+        class FakeRustRouter:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+        monkeypatch.setattr("vllm_router.router._Router", FakeRustRouter)
+        Router.from_args(RouterArgs(max_inflight_requests_per_worker=16))
+        assert captured["max_inflight_requests_per_worker"] == 16
+
+
+def _parse_with_router_args(argv, use_prefix):
+    parser = argparse.ArgumentParser()
+    RouterArgs.add_cli_args(parser, use_router_prefix=use_prefix)
+    return parser.parse_args(argv)
