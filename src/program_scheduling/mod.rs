@@ -10,6 +10,7 @@ mod domain;
 mod factors;
 mod identity;
 mod lineage;
+mod next_turn_prefetch;
 mod observations;
 mod output_length;
 pub mod pd_cost;
@@ -30,14 +31,18 @@ pub use binding::{
 };
 pub use contracts::ScheduleError;
 pub use diagnostics::{
-    ProgramDiagnostic, ProgramSchedulerDiagnostic, RankDiagnostic, RankRollingDiagnostic,
+    NextTurnPrefetchDiagnostic, ProgramDiagnostic, ProgramSchedulerDiagnostic, RankDiagnostic,
+    RankRollingDiagnostic,
 };
 pub use domain::{
     ProgramDispatch, ProgramRef, ProgramState, ProgramStatus, ProgramTarget,
     ProgramUsageObservation,
 };
 pub use factors::{ContinuitySample, ProgressTtlFactors, RequestSample};
-pub use identity::{ProgramIdentity, ProgramRequestHints, ProgramSchedulingEnableKey};
+pub use identity::{
+    NextTurnHint, NextTurnHintInput, ProgramIdentity, ProgramRequestHints,
+    ProgramSchedulingEnableKey,
+};
 pub(crate) use observations::{max_prometheus_gauge, sum_prometheus_gauge};
 pub use observations::{
     BackendObservation, BackendObservationFailure, BackendObservationProvider,

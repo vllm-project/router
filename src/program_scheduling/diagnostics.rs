@@ -6,9 +6,10 @@
 use super::scheduler::ProgramScheduler;
 use super::scheduler_state::ProgramSchedulerState;
 use super::{ProgramState, ProgramStatus};
-use crate::config::types::PredictionMode;
+use crate::config::types::{NextTurnPrefetchMode, PredictionMode};
 use crate::metrics::RouterMetrics;
 use serde::Serialize;
+use std::collections::BTreeMap;
 use std::time::Instant;
 
 /// One live Program generation and the facts used by scheduling decisions.
@@ -132,7 +133,19 @@ pub struct RankDiagnostic {
     pub observation_fresh: bool,
     pub capacity_accounting_source: &'static str,
     pub rolling: RankRollingDiagnostic,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_turn_prefetch: Option<NextTurnPrefetchDiagnostic>,
     pub programs: Vec<ProgramDiagnostic>,
+}
+
+/// One target's next-turn prefetch shadow counters. Nothing here was executed.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct NextTurnPrefetchDiagnostic {
+    pub plans: BTreeMap<&'static str, u64>,
+    pub skips: BTreeMap<&'static str, u64>,
+    pub outcomes: BTreeMap<&'static str, u64>,
+    pub outcome_tokens: BTreeMap<&'static str, u64>,
+    pub speculative_tokens: usize,
 }
 
 /// Complete read-only diagnostic view returned by an adapter endpoint.
@@ -145,6 +158,7 @@ pub struct ProgramSchedulerDiagnostic {
     pub cross_rank_headroom_ratio: f64,
     pub retained_requests: usize,
     pub prediction_mode: PredictionMode,
+    pub next_turn_prefetch_mode: NextTurnPrefetchMode,
     pub return_time_profile_keys: usize,
     pub output_length_profile_keys: usize,
     pub ranks: Vec<RankDiagnostic>,
@@ -534,6 +548,15 @@ impl ProgramScheduler {
                     .is_some_and(|value| self.observation_is_fresh(value, now)),
                 capacity_accounting_source: capacity_accounting_source.as_str(),
                 rolling,
+                next_turn_prefetch: state.next_turn_prefetch.get(&target.id).map(|ledger| {
+                    NextTurnPrefetchDiagnostic {
+                        speculative_tokens: ledger.speculative_tokens,
+                        plans: ledger.plans.clone(),
+                        skips: ledger.skips.clone(),
+                        outcomes: ledger.outcomes.clone(),
+                        outcome_tokens: ledger.outcome_tokens.clone(),
+                    }
+                }),
                 programs,
             });
         }
@@ -545,6 +568,7 @@ impl ProgramScheduler {
             cross_rank_headroom_ratio: self.config.cross_rank_headroom_ratio,
             retained_requests: state.runtime.retained_request_count(),
             prediction_mode: self.config.prediction_profile.mode,
+            next_turn_prefetch_mode: self.config.next_turn_prefetch.mode,
             return_time_profile_keys: state.prediction_profiles.return_key_count(),
             output_length_profile_keys: state.prediction_profiles.output_key_count(),
             ranks,
@@ -616,6 +640,7 @@ mod tests {
                 kv_cache_usage: Some(0.25),
                 running_requests: Some(1),
                 waiting_requests: Some(0),
+                external_kv_prompt_tokens_total: None,
                 observed_at: Instant::now(),
             }],
         );

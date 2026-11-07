@@ -160,6 +160,38 @@ pub fn init_metrics() {
         "vllm_router_agent_aware_shared_prefix_observed_tokens",
         "Explicit cached-token observation used to refresh a Program shared prefix"
     );
+    describe_counter!(
+        "vllm_router_next_turn_hint_ignored_total",
+        "Next-turn hints ignored by reason; the request is unaffected"
+    );
+    describe_counter!(
+        "vllm_router_next_turn_prefetch_shadow_plans_total",
+        "Tool waits for which a next-turn prefetch would have been planned, by forecast source"
+    );
+    describe_counter!(
+        "vllm_router_next_turn_prefetch_shadow_skips_total",
+        "Tool waits without a plan, by final skip reason and whether a plan would have fit"
+    );
+    describe_counter!(
+        "vllm_router_next_turn_prefetch_shadow_outcomes_total",
+        "What became of each plan; nothing was executed"
+    );
+    describe_counter!(
+        "vllm_router_next_turn_prefetch_shadow_outcome_tokens_total",
+        "Tokens behind each outcome: reported cached tokens for in_time, modeled load size otherwise"
+    );
+    describe_histogram!(
+        "vllm_router_next_turn_prefetch_shadow_margin_seconds",
+        "Time between the modeled load finishing and the next turn arriving, by outcome"
+    );
+    describe_histogram!(
+        "vllm_router_next_turn_prefetch_shadow_plan_kv_cache_usage",
+        "Observed referenced KV usage when each plan was made"
+    );
+    describe_histogram!(
+        "vllm_router_next_turn_prefetch_shadow_evaluation_seconds",
+        "Time one tick spends evaluating waits, under the scheduler lock"
+    );
     for (name, description) in [
         (
             "vllm_router_agent_aware_admission_used_tokens",
@@ -481,6 +513,7 @@ fn set_program_scheduling_buckets(builder: PrometheusBuilder) -> PrometheusBuild
     ];
     const RATIO_BUCKETS: &[f64] = &[0.25, 0.5, 0.75, 0.9, 1.0, 1.1, 1.25, 1.5, 2.0, 3.0, 4.0];
     const REQUEST_BUCKETS: &[f64] = &[0.0, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0];
+    const EVALUATION_SECONDS: &[f64] = &[1e-5, 5e-5, 1e-4, 5e-4, 1e-3, 5e-3, 1e-2, 5e-2, 0.1];
 
     let exact = |name: &str| Matcher::Full(name.to_string());
     let set = |builder: PrometheusBuilder, name: &str, buckets: &[f64]| {
@@ -502,6 +535,21 @@ fn set_program_scheduling_buckets(builder: PrometheusBuilder) -> PrometheusBuild
         builder,
         "vllm_router_agent_aware_armed_ttl_seconds",
         ARMED_TTL_SECONDS,
+    );
+    let builder = set(
+        builder,
+        "vllm_router_next_turn_prefetch_shadow_margin_seconds",
+        INTERVAL_SECONDS,
+    );
+    let builder = set(
+        builder,
+        "vllm_router_next_turn_prefetch_shadow_plan_kv_cache_usage",
+        RATIO_BUCKETS,
+    );
+    let builder = set(
+        builder,
+        "vllm_router_next_turn_prefetch_shadow_evaluation_seconds",
+        EVALUATION_SECONDS,
     );
     let mut builder = set(
         builder,
@@ -891,6 +939,78 @@ impl RouterMetrics {
                 -(1.0 - calibrated).ln()
             });
         }
+    }
+
+    pub fn record_next_turn_hint_ignored(reason: &'static str) {
+        counter!(
+            "vllm_router_next_turn_hint_ignored_total",
+            "reason" => reason
+        )
+        .increment(1);
+    }
+
+    pub fn record_next_turn_prefetch_plan(target: &str, source: &'static str, kv_cache_usage: f64) {
+        counter!(
+            "vllm_router_next_turn_prefetch_shadow_plans_total",
+            "target" => target.to_string(),
+            "source" => source
+        )
+        .increment(1);
+        histogram!(
+            "vllm_router_next_turn_prefetch_shadow_plan_kv_cache_usage",
+            "target" => target.to_string()
+        )
+        .record(kv_cache_usage);
+    }
+
+    pub fn record_next_turn_prefetch_skip(
+        target: &str,
+        reason: &'static str,
+        would_have_fit: bool,
+    ) {
+        counter!(
+            "vllm_router_next_turn_prefetch_shadow_skips_total",
+            "target" => target.to_string(),
+            "reason" => reason,
+            "would_have_fit" => if would_have_fit { "true" } else { "false" }
+        )
+        .increment(1);
+    }
+
+    pub fn record_next_turn_prefetch_outcome(
+        target: &str,
+        source: &'static str,
+        outcome: &'static str,
+        tokens: usize,
+    ) {
+        counter!(
+            "vllm_router_next_turn_prefetch_shadow_outcomes_total",
+            "target" => target.to_string(),
+            "source" => source,
+            "outcome" => outcome
+        )
+        .increment(1);
+        counter!(
+            "vllm_router_next_turn_prefetch_shadow_outcome_tokens_total",
+            "target" => target.to_string(),
+            "source" => source,
+            "outcome" => outcome
+        )
+        .increment(tokens as u64);
+    }
+
+    pub fn record_next_turn_prefetch_margin(target: &str, outcome: &'static str, margin: Duration) {
+        histogram!(
+            "vllm_router_next_turn_prefetch_shadow_margin_seconds",
+            "target" => target.to_string(),
+            "outcome" => outcome
+        )
+        .record(margin.as_secs_f64());
+    }
+
+    pub fn record_next_turn_prefetch_evaluation(elapsed: Duration) {
+        histogram!("vllm_router_next_turn_prefetch_shadow_evaluation_seconds")
+            .record(elapsed.as_secs_f64());
     }
 
     pub fn record_workflow_output_prediction(

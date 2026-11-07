@@ -221,6 +221,19 @@ impl Histogram {
     }
 }
 
+/// Share of a bucket `(lower, upper]` inside the window `(start, end]`. A bucket
+/// with no width holds its count at `upper`.
+fn bucket_share(lower: f64, upper: f64, start: f64, end: f64) -> f64 {
+    if upper <= lower {
+        return if start < upper && upper <= end {
+            1.0
+        } else {
+            0.0
+        };
+    }
+    ((upper.min(end) - lower.max(start)) / (upper - lower)).clamp(0.0, 1.0)
+}
+
 fn sample_quantile(values: &[f64], quantile: f64) -> Option<f64> {
     if values.is_empty() {
         return None;
@@ -270,6 +283,13 @@ pub(crate) struct ReturnPrediction {
     pub online_support: usize,
     pub backoff_level: usize,
     pub source: PredictionSource,
+}
+
+/// Forecast that a wait ends inside one time window.
+#[derive(Debug, Clone)]
+pub(crate) struct ReturnWindowPrediction {
+    pub probability: f64,
+    pub support: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -481,6 +501,56 @@ impl PredictionProfileStore {
         None
     }
 
+    /// Probability that a wait already `elapsed` seconds long ends inside
+    /// `(start, end]`, through the same backoff as [`Self::predict_return`].
+    /// Windows can be narrower than a bucket, so returns are spread uniformly
+    /// within their bucket; the overflow bucket ends at the largest observation.
+    pub(crate) fn predict_return_window(
+        &self,
+        keys: &[ReturnTimeKey],
+        elapsed: f64,
+        start: f64,
+        end: f64,
+        min_support: usize,
+        prior_weight: f64,
+    ) -> Option<ReturnWindowPrediction> {
+        for key in keys {
+            let Some(histogram) = self.return_time.get(key) else {
+                continue;
+            };
+            let support = histogram.effective_support(prior_weight).round() as usize;
+            if support < min_support {
+                continue;
+            }
+            let last_bound = self.return_time_bounds.last().copied().unwrap_or(0.0);
+            let overflow_end = histogram
+                .effective_max_observed(prior_weight)
+                .max(last_bound);
+            let mut survivors = histogram.effective_no_return(prior_weight);
+            let mut in_window = 0.0;
+            let mut lower = 0.0;
+            for (index, count) in histogram.effective_counts(prior_weight).iter().enumerate() {
+                let upper = self
+                    .return_time_bounds
+                    .get(index)
+                    .copied()
+                    .unwrap_or(overflow_end);
+                survivors += count * bucket_share(lower, upper, elapsed, f64::INFINITY);
+                in_window += count * bucket_share(lower, upper, start.max(elapsed), end);
+                lower = upper;
+            }
+            return Some(ReturnWindowPrediction {
+                probability: if survivors > 0.0 {
+                    in_window / survivors
+                } else {
+                    0.0
+                },
+                support,
+            });
+        }
+        None
+    }
+
     pub(crate) fn observe_output(&mut self, keys: &[OutputLengthKey], tokens: usize) {
         for key in keys {
             if !self.output_length.contains_key(key) && self.output_length.len() >= self.max_keys {
@@ -667,6 +737,115 @@ mod tests {
         .unwrap();
 
         assert_eq!(key.profile_role.as_deref(), Some("engineer"));
+    }
+
+    fn window_key() -> ReturnTimeKey {
+        ReturnTimeKey {
+            workflow_profile_id: None,
+            profile_version: None,
+            model_pool: None,
+            agent_role: None,
+            spawn_reason: None,
+            blocks_parent: None,
+            expected_resume: None,
+            step_bucket: None,
+        }
+    }
+
+    /// Four returns in each of (0,2] and (2,4], and two that never came back.
+    fn window_store() -> PredictionProfileStore {
+        let key = window_key();
+        let mut store = PredictionProfileStore::empty(vec![2.0, 4.0], vec![64], 16, 2);
+        for seconds in [0.5, 0.5, 1.5, 1.5, 2.5, 2.5, 3.5, 3.5] {
+            store.observe_return(std::slice::from_ref(&key), seconds);
+        }
+        store.observe_no_return(std::slice::from_ref(&key));
+        store.observe_no_return(std::slice::from_ref(&key));
+        store
+    }
+
+    fn window(store: &PredictionProfileStore, elapsed: f64, start: f64, end: f64) -> f64 {
+        store
+            .predict_return_window(&[window_key()], elapsed, start, end, 1, 1.0)
+            .unwrap()
+            .probability
+    }
+
+    #[test]
+    fn return_window_counts_no_return_as_never_arriving() {
+        let store = window_store();
+        assert!((window(&store, 0.0, 0.0, 4.0) - 0.8).abs() < 1e-9);
+        assert!((window(&store, 0.0, 0.0, 100.0) - 0.8).abs() < 1e-9);
+    }
+
+    #[test]
+    fn return_window_spreads_returns_within_a_bucket() {
+        let store = window_store();
+        // Half of (0,2] plus half of (2,4]: 2 + 2 of 10.
+        assert!((window(&store, 0.0, 1.0, 3.0) - 0.4).abs() < 1e-9);
+        // A window inside one bucket.
+        assert!((window(&store, 0.0, 0.5, 1.0) - 0.1).abs() < 1e-9);
+    }
+
+    #[test]
+    fn return_window_is_conditional_on_the_wait_so_far() {
+        let store = window_store();
+        // At 2 s, 4 returns and 2 never-returns survive; all 4 fall in (2,4].
+        assert!((window(&store, 2.0, 2.0, 4.0) - 4.0 / 6.0).abs() < 1e-9);
+        // A window starting before the elapsed time is clipped to it.
+        assert!((window(&store, 3.0, 0.0, 4.0) - 2.0 / 4.0).abs() < 1e-9);
+        // Past every observation only the never-returns survive.
+        assert_eq!(window(&store, 5.0, 5.0, 100.0), 0.0);
+    }
+
+    #[test]
+    fn return_window_overflow_bucket_ends_at_the_largest_observation() {
+        let key = window_key();
+        let mut store = PredictionProfileStore::empty(vec![2.0], vec![64], 16, 2);
+        store.observe_return(std::slice::from_ref(&key), 12.0);
+        // Spread over (2, 12]: half of it falls by 7 s.
+        assert!((window(&store, 0.0, 0.0, 7.0) - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn return_window_overflow_without_width_stays_at_the_last_bound() {
+        let key = window_key();
+        let profile = PredictionProfileFile {
+            schema_version: PROFILE_SCHEMA_VERSION.to_string(),
+            generated_at: None,
+            return_time_bucket_bounds_seconds: vec![2.0],
+            output_length_bucket_bounds_tokens: vec![64],
+            return_time_profiles: vec![ReturnTimeProfileEntry {
+                key: key.clone(),
+                bucket_counts: vec![0.0, 4.0],
+                no_return_count: 0.0,
+                max_observed_seconds: 0.0,
+            }],
+            output_length_profiles: Vec::new(),
+        };
+        let mut store = PredictionProfileStore::empty(vec![2.0], vec![64], 16, 2);
+        store.load_profile(profile).unwrap();
+        assert_eq!(window(&store, 0.0, 0.0, 1.0), 0.0);
+        assert_eq!(window(&store, 0.0, 1.0, 2.0), 1.0);
+        // A count held at the bound does not survive a wait that passed it.
+        assert_eq!(window(&store, 2.0, 2.0, 100.0), 0.0);
+    }
+
+    #[test]
+    fn return_window_backs_off_past_an_under_supported_key() {
+        let exact = ReturnTimeKey {
+            agent_role: Some("lead".to_string()),
+            ..window_key()
+        };
+        let mut store = window_store();
+        store.observe_return(std::slice::from_ref(&exact), 0.5);
+        let prediction = store
+            .predict_return_window(&[exact, window_key()], 0.0, 0.0, 4.0, 2, 1.0)
+            .unwrap();
+        assert_eq!(prediction.support, 10);
+        assert!(store
+            .predict_return_window(&[window_key()], 0.0, 0.0, 4.0, 11, 1.0)
+            .is_none());
     }
 
     #[test]

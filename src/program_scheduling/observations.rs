@@ -24,6 +24,8 @@ pub struct BackendObservation {
     pub running_requests: Option<usize>,
     /// Native requests waiting inside the engine.
     pub waiting_requests: Option<usize>,
+    /// Cumulative prompt tokens the engine loaded from outside its device cache.
+    pub external_kv_prompt_tokens_total: Option<f64>,
     /// Local monotonic time at which the response was converted.
     pub observed_at: Instant,
 }
@@ -127,6 +129,7 @@ struct VllmEngineMetrics {
     kv_cache_usage: Option<f64>,
     running_requests: Option<usize>,
     waiting_requests: Option<usize>,
+    external_kv_prompt_tokens_total: Option<f64>,
 }
 
 fn observations_from_metrics(targets: &[ProgramTarget], text: &str) -> Vec<BackendObservation> {
@@ -144,6 +147,7 @@ fn observations_from_metrics(targets: &[ProgramTarget], text: &str) -> Vec<Backe
                 kv_cache_usage: metrics.kv_cache_usage,
                 running_requests: metrics.running_requests,
                 waiting_requests: metrics.waiting_requests,
+                external_kv_prompt_tokens_total: metrics.external_kv_prompt_tokens_total,
                 observed_at,
             })
         })
@@ -174,6 +178,11 @@ fn parse_vllm_metrics(text: &str) -> HashMap<usize, VllmEngineMetrics> {
             }
             "vllm:num_requests_waiting" => {
                 entry.waiting_requests = value.parse::<f64>().ok().map(|value| value as usize)
+            }
+            "vllm:prompt_tokens_by_source_total"
+                if labels.get("source").map(String::as_str) == Some("external_kv_transfer") =>
+            {
+                entry.external_kv_prompt_tokens_total = value.parse().ok();
             }
             _ => {}
         }
@@ -290,6 +299,19 @@ vllm:num_requests_running{engine="1",model_name="m"} 4.0
 vllm:num_requests_waiting{engine="1",model_name="m"} 3.0
 unrelated_metric{engine="1",label="escaped\"comma,value"} 99
 "#;
+
+    #[test]
+    fn reads_only_the_external_kv_prompt_token_source() {
+        let parsed = parse_vllm_metrics(
+            r#"vllm:prompt_tokens_by_source_total{engine="0",model_name="m",source="local_compute"} 7.0
+vllm:prompt_tokens_by_source_total{engine="0",model_name="m",source="external_kv_transfer"} 12.0
+vllm:prompt_tokens_by_source_total{engine="0",model_name="m",source="local_cache_hit"} 9.0
+vllm:prompt_tokens_by_source_total{engine="1",model_name="m",source="local_cache_hit"} 3.0
+"#,
+        );
+        assert_eq!(parsed[&0].external_kv_prompt_tokens_total, Some(12.0));
+        assert_eq!(parsed[&1].external_kv_prompt_tokens_total, None);
+    }
 
     #[test]
     fn parses_only_required_series_per_engine() {
