@@ -46,6 +46,12 @@ pub const SESSION_EXPIRATION_ENV: &str = "VLLM_ROUTER_SLL_SESSION_EXPIRATION_IN_
 /// Minimum interval between full expiration sweeps to bound per-request cost.
 const SWEEP_INTERVAL_SECS: u64 = 60;
 
+/// Environment variable enabling bounded overflow for pinned sessions: when the
+/// pinned replica has at least this many more in-flight requests than the
+/// least-loaded healthy replica, the session is re-bound there. 0 (default)
+/// keeps strict pinning.
+pub const OVERFLOW_DELTA_ENV: &str = "VLLM_ROUTER_SLL_OVERFLOW_DELTA";
+
 /// Bookkeeping for a single active session.
 #[derive(Debug)]
 struct SessionEntry {
@@ -70,6 +76,7 @@ struct SllState {
 pub struct StickyLeastLoadedPolicy {
     state: Mutex<SllState>,
     session_expiration: Duration,
+    overflow_delta: usize,
 }
 
 impl StickyLeastLoadedPolicy {
@@ -88,6 +95,10 @@ impl StickyLeastLoadedPolicy {
                 last_sweep: Instant::now(),
             }),
             session_expiration: Duration::from_secs(secs),
+            overflow_delta: std::env::var(OVERFLOW_DELTA_ENV)
+                .ok()
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .unwrap_or(0),
         }
     }
 
@@ -252,6 +263,32 @@ impl LoadBalancingPolicy for StickyLeastLoadedPolicy {
                 candidates.iter().find(|(_, url)| *url == worker_url)
             };
             if let Some(&(idx, _)) = assigned {
+                // Bounded overflow: a pinned replica far busier than the
+                // least-loaded one gives up the session for good.
+                if self.overflow_delta > 0 {
+                    let pinned_load = workers[idx].load();
+                    let (min_idx, min_load) = candidates
+                        .iter()
+                        .map(|(i, _)| (*i, workers[*i].load()))
+                        .min_by_key(|&(_, load)| load)
+                        .unwrap_or((idx, pinned_load));
+                    if min_idx != idx && pinned_load >= min_load + self.overflow_delta {
+                        let new_url = workers[min_idx].url().to_string();
+                        Self::decrement_count(&mut state.active_counts, &worker_url);
+                        *state.active_counts.entry(new_url.clone()).or_insert(0) += 1;
+                        if let Some(entry) = state.sessions.get_mut(&session_id) {
+                            entry.worker_url = new_url.clone();
+                            entry.last_access = now;
+                        }
+                        drop(state);
+                        self.record_selection(&workers[min_idx]);
+                        info!(
+                            "SLL: session '{}' overflow '{}' (load {}) -> '{}' (load {})",
+                            session_id, worker_url, pinned_load, new_url, min_load
+                        );
+                        return Some(min_idx);
+                    }
+                }
                 if let Some(entry) = state.sessions.get_mut(&session_id) {
                     entry.last_access = now;
                 }
@@ -347,6 +384,26 @@ mod tests {
     use super::*;
     use crate::core::{BasicWorker, WorkerType};
     use std::collections::HashMap as StdHashMap;
+
+    #[test]
+    fn overflow_rebinds_session_to_less_loaded_replica() {
+        let mut policy = StickyLeastLoadedPolicy::new();
+        policy.overflow_delta = 2;
+        let workers: Vec<Arc<dyn Worker>> = vec![
+            Arc::new(BasicWorker::new("http://w0:8000".to_string(), WorkerType::Regular)),
+            Arc::new(BasicWorker::new("http://w1:8000".to_string(), WorkerType::Regular)),
+        ];
+        let first = policy.select_worker_for_session(&workers, None, None, Some("s")).unwrap();
+        let other = 1 - first;
+        // Pinned replica busy, other idle: re-bind.
+        for _ in 0..3 { workers[first].increment_load(); }
+        assert_eq!(policy.select_worker_for_session(&workers, None, None, Some("s")), Some(other));
+        // The session now sticks to its new replica.
+        for _ in 0..3 { workers[first].decrement_load(); }
+        assert_eq!(policy.select_worker_for_session(&workers, None, None, Some("s")), Some(other));
+        assert_eq!(policy.active_count_for(workers[other].url()), 1);
+        assert_eq!(policy.active_count_for(workers[first].url()), 0);
+    }
 
     fn make_workers(urls: &[&str]) -> Vec<Arc<dyn Worker>> {
         urls.iter()
