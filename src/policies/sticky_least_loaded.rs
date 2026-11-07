@@ -389,20 +389,48 @@ mod tests {
     fn overflow_rebinds_session_to_less_loaded_replica() {
         let mut policy = StickyLeastLoadedPolicy::new();
         policy.overflow_delta = 2;
-        let workers: Vec<Arc<dyn Worker>> = vec![
-            Arc::new(BasicWorker::new("http://w0:8000".to_string(), WorkerType::Regular)),
-            Arc::new(BasicWorker::new("http://w1:8000".to_string(), WorkerType::Regular)),
-        ];
-        let first = policy.select_worker_for_session(&workers, None, None, Some("s")).unwrap();
+        let workers = make_workers(&["http://w0:8000", "http://w1:8000"]);
+        let headers = header_with_session("s");
+        let first = policy
+            .select_worker_with_headers(&workers, None, Some(&headers))
+            .unwrap();
         let other = 1 - first;
         // Pinned replica busy, other idle: re-bind.
-        for _ in 0..3 { workers[first].increment_load(); }
-        assert_eq!(policy.select_worker_for_session(&workers, None, None, Some("s")), Some(other));
+        for _ in 0..3 {
+            workers[first].increment_load();
+        }
+        assert_eq!(
+            policy.select_worker_with_headers(&workers, None, Some(&headers)),
+            Some(other)
+        );
         // The session now sticks to its new replica.
-        for _ in 0..3 { workers[first].decrement_load(); }
-        assert_eq!(policy.select_worker_for_session(&workers, None, None, Some("s")), Some(other));
+        for _ in 0..3 {
+            workers[first].decrement_load();
+        }
+        assert_eq!(
+            policy.select_worker_with_headers(&workers, None, Some(&headers)),
+            Some(other)
+        );
         assert_eq!(policy.active_count_for(workers[other].url()), 1);
         assert_eq!(policy.active_count_for(workers[first].url()), 0);
+    }
+
+    #[test]
+    fn overflow_disabled_keeps_session_pinned() {
+        let mut policy = StickyLeastLoadedPolicy::new();
+        policy.overflow_delta = 0;
+        let workers = make_workers(&["http://w0:8000", "http://w1:8000"]);
+        let headers = header_with_session("s");
+        let first = policy
+            .select_worker_with_headers(&workers, None, Some(&headers))
+            .unwrap();
+        for _ in 0..8 {
+            workers[first].increment_load();
+        }
+        assert_eq!(
+            policy.select_worker_with_headers(&workers, None, Some(&headers)),
+            Some(first)
+        );
     }
 
     fn make_workers(urls: &[&str]) -> Vec<Arc<dyn Worker>> {
