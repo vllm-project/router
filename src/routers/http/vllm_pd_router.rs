@@ -5,10 +5,13 @@ use super::logprobs_merge;
 use super::pd_cached_tokens;
 use super::pd_program_adapter::{self, PdProgramRuntime};
 use super::pd_router::PdRouterBase;
-use super::pd_types::{error_chain, PDRouterError, PdAttempt, PdEndpoint, PdRequestContext};
+use super::pd_types::{
+    error_chain, PDRouterError, PdAdmitError, PdAttempt, PdEndpoint, PdRequestContext, Stage,
+};
 use super::router::{hold_request_load_until_body_done, prepare_error_status, RequestLoadGuard};
 use super::usage_merge;
 use super::vllm_service_discovery::{MoriIOTransferMode, ServiceRegistry, ServiceType};
+use super::worker_admission::capacity_rejection;
 use crate::config::KvConnector;
 use crate::core::{BasicWorker, DPAwareWorker, Worker, WorkerType};
 use crate::metrics::RouterMetrics;
@@ -72,6 +75,19 @@ fn program_unavailable(
 ) -> Response {
     completion.finish(false);
     (StatusCode::SERVICE_UNAVAILABLE, message.to_string()).into_response()
+}
+
+/// Terminal response for a native P/D request that was not admitted. A full
+/// stage is an overload answer (429 + Retry-After), not a missing pair.
+fn admit_error_response(error: PdAdmitError) -> Response {
+    match error {
+        PdAdmitError::AtCapacity(Stage::Prefill) => capacity_rejection("pd", "prefill"),
+        PdAdmitError::AtCapacity(Stage::Decode) => capacity_rejection("pd", "decode"),
+        PdAdmitError::NoEligiblePair => {
+            RouterMetrics::record_pd_error("server_selection");
+            (StatusCode::SERVICE_UNAVAILABLE, "No eligible P/D pair").into_response()
+        }
+    }
 }
 
 /// vLLM PD Router that extends PdRouterBase with vLLM-specific request handling
@@ -951,7 +967,7 @@ impl VllmPDRouter {
         path: &str,
         headers: Option<&HeaderMap>,
         forward_policy_headers: bool,
-    ) -> Option<(super::pd_types::PdSelection, PdAttempt)> {
+    ) -> Result<(super::pd_types::PdSelection, PdAttempt), PdAdmitError> {
         self.admit_pair_with_tokens(
             prefill_workers,
             decode_workers,
@@ -976,7 +992,7 @@ impl VllmPDRouter {
         headers: Option<&HeaderMap>,
         forward_policy_headers: bool,
         router_prompts: Option<&Arc<[Vec<u32>]>>,
-    ) -> Option<(super::pd_types::PdSelection, PdAttempt)> {
+    ) -> Result<(super::pd_types::PdSelection, PdAttempt), PdAdmitError> {
         let prefill_policy = self.policy_registry.get_prefill_policy();
         let decode_policy = self.policy_registry.get_decode_policy();
         let text = [prefill_policy.as_ref(), decode_policy.as_ref()]
@@ -1365,7 +1381,7 @@ impl VllmPDRouter {
         request: &Value,
         path: &str,
         headers: Option<&HeaderMap>,
-    ) -> Option<(Arc<dyn Worker>, Arc<dyn Worker>, PdAttempt)> {
+    ) -> Result<(Arc<dyn Worker>, Arc<dyn Worker>, PdAttempt), PdAdmitError> {
         let prefill_workers = self.discovery_candidates(
             self.service_registry
                 .get_instance_snapshots(ServiceType::Prefill),
@@ -1386,7 +1402,7 @@ impl VllmPDRouter {
                 true,
             )
             .await?;
-        Some((
+        Ok((
             prefill_workers[selection.prefill.worker_index].clone(),
             decode_workers[selection.decode.worker_index].clone(),
             attempt,
@@ -1400,12 +1416,11 @@ impl VllmPDRouter {
         path: &str,
         headers: Option<&HeaderMap>,
     ) -> Response {
-        let Some((prefill_worker, decode_worker, attempt)) =
-            self.admit_discovered_pair(&request, path, headers).await
-        else {
-            RouterMetrics::record_pd_error("server_selection");
-            return (StatusCode::SERVICE_UNAVAILABLE, "No eligible P/D pair").into_response();
-        };
+        let (prefill_worker, decode_worker, attempt) =
+            match self.admit_discovered_pair(&request, path, headers).await {
+                Ok(admitted) => admitted,
+                Err(error) => return admit_error_response(error),
+            };
         match self
             .process_vllm_two_stage_request(
                 request,
@@ -1574,7 +1589,7 @@ impl VllmPDRouter {
             }
         };
         let router_prompts: Arc<[Vec<u32>]> = Arc::from([prepared.tokenized.token_ids.to_vec()]);
-        let Some((selection, attempt)) = self
+        let (selection, attempt) = match self
             .admit_pair_with_tokens(
                 &prefill_workers,
                 &decode_workers,
@@ -1585,9 +1600,9 @@ impl VllmPDRouter {
                 Some(&router_prompts),
             )
             .await
-        else {
-            RouterMetrics::record_pd_error("server_selection");
-            return (StatusCode::SERVICE_UNAVAILABLE, "No eligible P/D pair").into_response();
+        {
+            Ok(admitted) => admitted,
+            Err(error) => return admit_error_response(error),
         };
         let prefill_worker = prefill_workers[selection.prefill.worker_index].clone();
         let decode_worker = decode_workers[selection.decode.worker_index].clone();
@@ -3038,12 +3053,8 @@ impl RouterTrait for VllmPDRouter {
                 )
                 .await
             {
-                Some(admitted) => admitted,
-                None => {
-                    RouterMetrics::record_pd_error("server_selection");
-                    return (StatusCode::SERVICE_UNAVAILABLE, "No eligible P/D pair")
-                        .into_response();
-                }
+                Ok(admitted) => admitted,
+                Err(error) => return admit_error_response(error),
             };
             let prefill_idx = selection.prefill.worker_index;
             let decode_idx = selection.decode.worker_index;

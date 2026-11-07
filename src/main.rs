@@ -203,6 +203,13 @@ struct CliArgs {
     /// Omit to disable session affinity while keeping KV-aware routing enabled.
     #[arg(long, value_parser = clap::value_parser!(u64).range(1..=31_536_000))]
     kv_aware_session_affinity_ttl_secs: Option<u64>,
+
+    /// Opt-in per-worker admission capacity: the most in-flight requests the
+    /// router dispatches to one worker (or one P/D stage endpoint), held until
+    /// the response body ends. Full pools are rejected with 429 + Retry-After.
+    /// Omit to disable.
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+    max_inflight_requests_per_worker: Option<u64>,
     /// Static KV event publishers for regular kv_aware workers.
     #[arg(long = "kv-event-source", action = ArgAction::Append, value_name = "WORKER_URL=ENDPOINT[,ENDPOINT...]")]
     kv_event_source: Vec<String>,
@@ -670,6 +677,9 @@ impl CliArgs {
             disable_retries: self.disable_retries,
             disable_circuit_breaker: self.disable_circuit_breaker,
             kv_aware_session_affinity_ttl_secs: self.kv_aware_session_affinity_ttl_secs,
+            max_inflight_requests_per_worker: self
+                .max_inflight_requests_per_worker
+                .map(|limit| usize::try_from(limit).unwrap_or(usize::MAX)),
             health_check: HealthCheckConfig {
                 failure_threshold: self.health_failure_threshold,
                 success_threshold: self.health_success_threshold,

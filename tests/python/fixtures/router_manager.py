@@ -122,6 +122,7 @@ class RouterManager:
                 "queue_size": "--queue-size",
                 "queue_timeout_secs": "--queue-timeout-secs",
                 "rate_limit_tokens_per_second": "--rate-limit-tokens-per-second",
+                "max_inflight_requests_per_worker": "--max-inflight-requests-per-worker",
                 # WASM OnRequest middleware
                 "wasm_middleware": "--wasm-middleware",
                 "wasm_middleware_sha256": "--wasm-middleware-sha256",

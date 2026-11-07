@@ -193,6 +193,7 @@ async fn grpc_frontend_cache_parity_metrics_streaming_and_retries() {
         policy: PolicyConfig::RoundRobin,
         disable_circuit_breaker: true,
         kv_aware_session_affinity_ttl_secs: None,
+        max_inflight_requests_per_worker: None,
         retry: RetryConfig {
             max_retries: 2,
             initial_backoff_ms: 1,

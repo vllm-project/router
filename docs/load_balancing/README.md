@@ -283,6 +283,86 @@ Multiple router replicas need ingress stickiness to preserve affinity.
 
 ---
 
+## Per-worker admission capacity
+
+Policies choose *which* worker serves a request; none of them refuses work.
+Under sustained overload every request is still dispatched, and the excess
+waits inside the engines' own queues, where latency grows without bound and
+the backlog must drain before the pool recovers. When workers fail, the
+survivors receive their share too.
+
+`--max-inflight-requests-per-worker N` (Python: `max_inflight_requests_per_worker`)
+is an opt-in hard limit on the requests this router has in flight on one
+worker at a time. It is off by default; when unset nothing is counted and
+routing is unchanged.
+
+```bash
+vllm-router --policy round_robin \
+  --worker-urls http://worker1:8000 http://worker2:8000 \
+  --max-inflight-requests-per-worker 64
+```
+
+### Behavior
+
+- **Admission.** Selection skips full workers. A permit is then reserved with
+  an atomic compare-and-swap, so concurrent arrivals cannot overshoot `N`. If
+  the selected worker filled in the meantime, the attempt is retried with a
+  fresh snapshot and holds no permit while it backs off.
+- **Rejection.** When every eligible worker is full, the router answers
+  immediately with `429 Too Many Requests` and `Retry-After: 1`. The request is
+  not dispatched and not retried inside the router, so the router adds no
+  hidden waiting. These rejections are not worker failures: they never count
+  against circuit breakers.
+- **Lifetime.** A permit is held from dispatch until the response body ends:
+  end of stream, upstream error, client disconnect, timeout or abandoned
+  retry. Each permit is released exactly once, through the same guard that
+  already owns worker load for the request.
+- **P/D.** The limit applies per stage endpoint: a prefill endpoint counts
+  requests until their prefill finishes, and a decode endpoint counts pending
+  plus active decode requests. A full prefill or decode stage gets the same
+  429, and `/health_generate` probes bypass the limit so a busy pool is not
+  reported unhealthy.
+- **Scope.** Inference `POST` routes, including the transparent proxy, are
+  covered. Requests that Program scheduling has already bound to a target are
+  counted but never refused, because Program scheduling remains their
+  admission controller.
+
+### Signals and limitations
+
+- Counts are owned by the router process. They never depend on worker
+  telemetry, so a stale or missing metric cannot open the gate or block a
+  worker permanently. They are also **local to one router replica** and do
+  not see the engine's own queue. With `R` router replicas a worker can
+  receive up to `R × N` requests.
+- The limit counts requests, not tokens or bytes. It does not bound per-request
+  memory such as large prompts; tenant quotas (#419) and token-cost fairness
+  (#420) are separate controls.
+- A worker removed and re-added under the same URL starts from zero, so it can
+  briefly hold up to `2 × N` while requests admitted before the removal drain.
+  It is never locked out.
+- `--max-concurrent-requests` is a separate, router-wide admission token bucket
+  that refills over time; it is not a per-worker limit.
+
+### Metrics
+
+| Metric | Labels | Meaning |
+|--------|--------|---------|
+| `vllm_router_admission_rejections_total` | `router` (`regular`, `pd`), `stage` (`worker`, `prefill`, `decode`), `reason` (`worker_capacity`) | Requests refused because every eligible worker or stage endpoint was full |
+| `vllm_router_worker_admitted_requests` | `worker` | Permits held per regular worker |
+| `vllm_router_pd_prefill_occupancy`, `vllm_router_pd_pending_decode_requests`, `vllm_router_pd_active_decode_requests` | `worker`, `rank` | Existing P/D occupancy that the limit is checked against |
+
+Labels are fixed enums or worker URLs; no request content is recorded.
+
+### Choosing N
+
+Start near the engine's effective concurrent batch size (for vLLM,
+`--max-num-seqs`), or a little above it so the engine's own queue never runs
+dry. Watch `vllm_router_admission_rejections_total` together with latency: a
+rising rejection rate at acceptable latency means the pool needs more
+capacity, not a higher `N`.
+
+---
+
 ## Choosing a Policy
 
 ```

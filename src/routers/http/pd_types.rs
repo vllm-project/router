@@ -180,12 +180,36 @@ pub struct PdSelection {
     pub decode: StageDecision,
 }
 
+/// Why native P/D admission produced no attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PdAdmitError {
+    /// No healthy, compatible prefill/decode pair exists.
+    NoEligiblePair,
+    /// Healthy endpoints exist for this stage, but every one is at
+    /// `max_inflight_requests_per_worker`.
+    AtCapacity(Stage),
+}
+
 #[derive(Debug, Default)]
 pub struct PdLoadManager {
     loads: Arc<Mutex<Loads>>,
+    /// Opt-in per-endpoint, per-stage in-flight limit. P occupancy is
+    /// prefill requests; D occupancy is pending plus active decode requests.
+    max_inflight_per_worker: Option<usize>,
 }
 
 impl PdLoadManager {
+    pub(super) fn with_max_inflight_per_worker(limit: Option<usize>) -> Self {
+        Self {
+            loads: Arc::default(),
+            max_inflight_per_worker: limit,
+        }
+    }
+
+    pub(super) fn max_inflight_per_worker(&self) -> Option<usize> {
+        self.max_inflight_per_worker
+    }
+
     #[cfg(test)]
     pub(super) fn snapshot(&self) -> Loads {
         self.loads.lock().clone()
