@@ -17,22 +17,25 @@ any hint.
 
 - **One prefix, in a probe.** An 8,000-token prompt pushed out of the pool by other prompts came back in
   63 ms with a GPU hold, against 274 ms restored from the CPU tier without one. With a CPU tier the
-  size of the pool, it came back in 277 ms with a lease, against 1,068 ms recomputed without one.
-- **What a repeat moves.** The no-hint arms ran twice on each seed. At a CPU tier four times the pool, the two runs differ
-  by up to 0.4 points of computed tokens, 2.0 of GPU hits and 12% in
-  resume TTFT p90. At a tier the size of the pool, by up to 1.8, 2.2 and
-  10%.
-- **GPU holds in the replay: no gain.** Seed by seed, GPU hits moved +0.7, +0.9 and +0.1 points with a 10 s hold over 25% of the pool, and
-  +0.7, −0.3 and −0.4 points with a 30 s hold over 50% of the pool. Computed tokens moved by at most 0.5 points. Resume TTFT
-  p90 moved +1%, +8% and −7% with the first, and −4%, +35% and +19% with the second, beyond a repeat on two seeds. The holds
-  kept 12.5% and 26.7% of the pool on average.
+  size of the pool, it came back in 276 ms with a lease, against 1,070 ms recomputed without one.
+- **What a repeat moves.** The no-hint arms ran once in each of three rounds, on each seed. At a CPU tier four times the
+  pool, two runs of one seed differ by up to 0.8 points of computed tokens, 2.0 of GPU
+  hits and 38% in resume TTFT p90. At a tier the size of the pool, by up to 2.6,
+  2.2 and 13%.
+- **GPU holds in the replay: no reliable gain.** Seed by seed, GPU hits moved +0.3, −2.7 and +1.6 points with a
+  10 s hold over 25% of the pool, and −0.7, −2.7 and −0.9 points with a 30 s hold over 50% of the pool: never up by more than a repeat moves them, and down by
+  more on seed 12. Computed tokens moved +0.1, +0.6 and −1.1 points with the first and 0.0, +0.2 and −0.1
+  with the second, beyond a repeat only on seed 13 of the first (−1.1). Resume TTFT
+  p90 moved +5%, −8% and −35% and +12%, −10% and −9%, within what a repeat moves. The holds kept 11.1% and
+  29.0% of the pool on average.
 - **CPU leases at a tier the size of the pool: no reliable gain.** A 30 s lease over 90% of the tier raised CPU restores (+1.5, +5.3 and +3.8
   points), beyond a repeat. Computed tokens moved −0.7, +1.3 and −5.3 points and resume TTFT p90 +8%, +19% and −6%. A first
   round's −6.7, −5.0 and −6.2 points did not reproduce: see
   [The 30 s lease, run by run](#the-30-s-lease-run-by-run). A 120 s lease over 50% of the tier moved computed tokens −0.4, +6.4 and +3.6
   points, beyond a repeat on two seeds.
-- **A hold on top of a lease: worse than no hint.** A 30 s hold over 50% of the pool added to the 120 s lease over 50% of the tier (`both-1x`) moved
-  computed tokens +2.1, +8.9 and +5.0 points, each beyond a repeat, and resume TTFT p90 +5%, +54% and +14%.
+- **A hold on top of a lease: worse than no hint on two seeds of three.** A 30 s hold over 50% of the pool added to the
+  120 s lease over 50% of the tier (`both-1x`) moved computed tokens +0.7, +10.0 and +7.4 points and resume TTFT p90 −3%, +29% and +79%: beyond
+  a repeat on seeds 12 and 13, and within one on the other.
 - **The same 30 s lease at a tier four times the pool:** no clear change. Computed tokens moved +0.9, −0.9 and −0.7 points, CPU restores −0.5, +1.3 and 0.0 points and resume TTFT p90 +12%, +3% and +2%. All-turn TTFT p90 moved +48%, +9% and +1%, beyond a repeat on one seed. No leased chunk was evicted in any run.
 - **Capacity.** With no hint, a 4x CPU tier in place of a 1x tier took computed tokens from 40.9% (40.8–62.9) to
   12.5% (10.2–13.6), and resume TTFT p90 from 6,471 (4,738–14,579) to 1,366 (718–3,840) ms. Neither pair of ranges overlaps.
@@ -41,7 +44,7 @@ any hint.
 **What that suggests, which these runs do not measure directly:**
 
 - A GPU hold costs other sessions what it gives one. Used holds had been held for about a second at the median
-  (0.3 to 1.2 s), when LRU would probably still have had those blocks, and the holds that could have mattered were
+  (0.2 to 1.3 s), when LRU would probably still have had those blocks, and the holds that could have mattered were
   refused for lack of budget or gave way to demand. At this load the pool looks close to zero-sum.
 - A lease moves restores more reliably than it moves computation. A 30 s lease outlasts the 1x tier's turnover and not the 4x tier's:
   without a hint, the first evicted its whole capacity about every 14 s, and the second about every
@@ -74,7 +77,7 @@ writes every answer, and how each hold or lease ended, to a JSONL file of receip
 
 ```json
 {
-  "worker_generation": "8d819a24b6ec461096923f9578322750",
+  "worker_generation": "a99f90f2d0c548c1b493aba7d88d3b3e",
   "hint_id": "gpu-probe:1",
   "acks": [
     {
@@ -82,7 +85,7 @@ writes every answer, and how each hold or lease ended, to a JSONL file of receip
       "tier": "gpu",
       "state": "accepted",
       "reason": null,
-      "worker_generation": "8d819a24b6ec461096923f9578322750",
+      "worker_generation": "a99f90f2d0c548c1b493aba7d88d3b3e",
       "ttl_seconds": 300.0,
       "tokens": 8000
     }
@@ -99,7 +102,7 @@ writes every answer, and how each hold or lease ended, to a JSONL file of receip
 | Logical session TTL | Not here: the Router's or the client's own |
 | Requested retention | The hint's `tiers` and `ttl_seconds` |
 | Acknowledged retention | `acks`: `accepted` or `rejected` with a reason, and the tier's own TTL, which can be shorter than the one requested |
-| Observed residency | `observed`: tokens the request found in the GPU pool and in the CPU tier, which `usage.prompt_tokens_details.cached_tokens` cannot tell apart. The receipts total the same prompt tokens as vLLM's counters in every run. Their split matches exactly in the one run with no preemption and drifts with preemptions, by up to 15.0% on GPU hits and 22.0% on CPU restores, as a receipt reports a request's last lookup and vLLM's counters its first. The tables take token shares from vLLM's counters |
+| Observed residency | `observed`: tokens the request found in the GPU pool and in the CPU tier, which `usage.prompt_tokens_details.cached_tokens` cannot tell apart. The receipts total the same prompt tokens as vLLM's counters in every run. Their split matches exactly in the one run with no preemption and drifts with preemptions, by up to 15.0% on GPU hits and 26.4% on CPU restores, as a receipt reports a request's last lookup and vLLM's counters its first. The tables take token shares from vLLM's counters |
 | Eviction notification | A hold's receipt ends `used`, `expired`, `released` or `evicted`; a lease's receipts count its evicted chunks |
 | Idempotency | The same `hint_id` renews a live hold and holds nothing more; a release with nothing to release succeeds |
 | Generation | Per session, an older `generation` is refused. A hint may name the `worker_generation` it expects, and is refused if that is not this worker's |
@@ -118,7 +121,10 @@ between steps, whose CPU cost was not measured.
 
 A hold is hard: held blocks cannot be evicted, and they leave the pool smaller for everyone else. So it yields. A waiting
 request that does not fit releases holds oldest first, and a running request that cannot grow does too, through
-`has_pending_block_frees`, instead of preempting anything. vLLM's proposed eviction priority
+`has_pending_block_frees`, instead of preempting anything. vLLM admits a request only if its whole prompt fits, so a
+session's own hold can keep its next turn out when that turn misses the held prefix, after a compaction say. The
+session's own hold therefore goes last, and only if the request does not hit all of it: the blocks it hits stay cached
+for its next lookup. vLLM's proposed eviction priority
 ([vLLM #59714](https://github.com/vllm-project/vllm/pull/59714)) would leave the blocks evictable, which this prototype
 does not attempt.
 
@@ -134,27 +140,29 @@ turn that outlasted the TTL opens the lease again, so the TTL counts the pause a
 | Engine | vLLM 0.32.0, `Qwen/Qwen3-4B-Instruct-2507-FP8`, one RTX 5060 Ti 16 GB on a PCIe Gen3 x8 link. A 5 GiB pool (36,400 tokens), `max-num-batched-tokens` 512, `long-prefill-token-threshold` 256, priority scheduling, a write-through CPU tier ([`engine.yaml`](../../benches/kv_retention/engine.yaml)) |
 | Load | AIPerf 0.13.0 `agentic_replay` of the SemiAnalysis Claude Code traces, block-scaled 32x to fit a 32k context: 16 session trees, think times capped at 120 s, the recorded output lengths, 10 minutes plus a 60 s grace, straight to the engine. A conversation is a session, and its turn index the generation |
 | Host | Engine on cores 8-15 and AIPerf on cores 0-7 of the same machine, in one private network namespace |
-| Runs | A fresh engine per run. Each of three seeds draws where the sessions enter the traces, so a seed pairs the arms, and the seeds differ from each other by more than any arm moves computed tokens. There are two rounds, on one host: see [Two rounds](#two-rounds). The second started 15 hours after the first's last run, and for each seed ran `off-1x`, `cpu30-1x`, `both-1x`, `off-4x`, `gpu10-4x`, `gpu30-4x` and `cpu30-4x` in that order. The first ran `off-1x-first` and `cpu-1x` round-robin with its other arms, so that each hinted arm started within 40 minutes of its baseline. `stock-4x` ran first, on one seed |
+| Runs | A fresh engine per run. Each of three seeds draws where the sessions enter the traces, so a seed pairs the arms, and the seeds differ from each other by more than any arm moves computed tokens. There are three rounds, on one host: see [Three rounds](#three-rounds). The third started 23 hours after the second's last run, and for each seed ran `off-1x-third`, `both-1x`, `off-4x-third`, `gpu10-4x` and `gpu30-4x` in that order. The second started 15 hours after the first's last run, and ran `off-1x`, `cpu30-1x`, `off-4x` and `cpu30-4x` in that order among its arms. The first ran `off-1x-first` and `cpu-1x` round-robin with its other arms. So each hinted arm started within 40 minutes of its baseline. `stock-4x` ran first, on one seed |
 | Measures | Token shares are vLLM's `prompt_tokens_by_source` over the whole run, warm-up included. TTFT and recomputed tokens are AIPerf's profiling phase. A resume is a turn sent at least 1 s after its conversation's previous turn ended. Recomputed tokens are computed tokens beyond what a turn added to its previous prompt, an upper bound where a prompt is not an extension of the previous one |
-| Validity | The GPU's compute processes are checked before, every 15 s during and after each run. Another process, or a check that cannot be read, invalidates a run, which is set aside and rerun. All 31 runs in the tables, and every other run of both rounds and the control, passed it at the first attempt. Two earlier smoke runs on seed 11 overlapped another process on the GPU, before this check existed: they are in no table, and informed only the choice of the second hold setting |
+| Validity | The GPU's compute processes are checked before, every 15 s during and after each run. Another process, or a check that cannot be read, invalidates a run, which is set aside and rerun. All 37 runs in the tables, and every other run of the three rounds and the control, passed it at the first attempt. Two earlier smoke runs on seed 11 overlapped another process on the GPU, before this check existed: they are in no table, and informed only the choice of the second hold setting |
 
 The only change between arms is the hint and how much each tier acknowledges. Every hint asks for 120 s, the think-time
-cap, on the tiers it names, on every turn but a conversation's last. `off-4x-first` and `off-1x-first` are the same arms as
-`off-4x` and `off-1x`, in the first round: the two on one seed are a repeat.
+cap, on the tiers it names, on every turn but a conversation's last. `off-4x-first`, `off-4x` and `off-4x-third` are one arm, run in the
+first, second and third rounds, and so are the three `off-1x` arms: on one seed, any two of them are a repeat.
 
 | Arm | Round | CPU tier | GPU hold: TTL, budget | CPU lease: TTL, budget |
 |---|---:|---:|---|---|
 | `stock-4x` | 1 | 20 GiB, 4x | vLLM's own connector and LRU: a control, on seed 11 | |
 | `off-4x-first` | 1 | 20 GiB, 4x | none | none |
 | `off-4x` | 2 | 20 GiB, 4x | none | none |
-| `gpu10-4x` | 2 | 20 GiB, 4x | 10 s, 25% of the pool | none |
-| `gpu30-4x` | 2 | 20 GiB, 4x | 30 s, 50% of the pool | none |
+| `off-4x-third` | 3 | 20 GiB, 4x | none | none |
+| `gpu10-4x` | 3 | 20 GiB, 4x | 10 s, 25% of the pool | none |
+| `gpu30-4x` | 3 | 20 GiB, 4x | 30 s, 50% of the pool | none |
 | `cpu30-4x` | 2 | 20 GiB, 4x | none | 30 s, 90% of the tier |
 | `off-1x-first` | 1 | 5 GiB, 1x | none | none |
 | `off-1x` | 2 | 5 GiB, 1x | none | none |
+| `off-1x-third` | 3 | 5 GiB, 1x | none | none |
 | `cpu-1x` | 1 | 5 GiB, 1x | none | 120 s, 50% of the tier |
 | `cpu30-1x` | 2 | 5 GiB, 1x | none | 30 s, 90% of the tier |
-| `both-1x` | 2 | 5 GiB, 1x | 30 s, 50% of the pool | 120 s, 50% of the tier |
+| `both-1x` | 3 | 5 GiB, 1x | 30 s, 50% of the pool | 120 s, 50% of the tier |
 
 The first values were a 10 s hold, Program scheduling's `max_acting_ttl_seconds` default, over a quarter of the pool, and
 a lease as long as the think-time cap over half the tier. Each was changed once after its first results, and both first
@@ -165,19 +173,20 @@ near its budget for the whole of each run, at 98% of it on average.
 ## Live probes
 
 Read from `vllm:prompt_tokens_by_source` around each request, on token-id prompts, one engine per probe, with the code the
-second round ran.
+third round ran.
 
 | Probe | Hint off | Hint on |
 |---|---|---|
 | GPU tier: 8,000 tokens, then 54,600 tokens of other prompts, then the prompt again | 8,000 restored, 274 ms | 7,984 GPU hits and 16 restored, 63 ms |
-| CPU tier of 1x: the same, with 109,200 tokens of other prompts | 8,000 computed, 1,068 ms | 8,000 restored, 277 ms |
+| CPU tier of 1x: the same, with 109,200 tokens of other prompts | 8,000 computed, 1,070 ms | 8,000 restored, 276 ms |
 | Negative control | 0 answers in the receipts | |
 | Expiry: a hold of 3 s on an idle engine, then the filler | | `expired` after 3.0 s, and the prompt then comes back from the CPU tier (8,000 restored) |
 | Overload: three holds of 10,000 tokens, then a 20,000-token prompt | | Served in 4.6 s, computing 20,000 tokens; the 3 holds `evicted`, oldest first |
 | Overload: three new holds, then a running request that grows past the free pool | | 0 preemptions; 1 more hold `evicted` |
 | Refusal: a hold over the budget, and a hint of an unknown version | | The hold is `rejected` with `over_tenant_budget`; the unknown version is ignored. Both requests are served |
 | A conversation's last turn, after a held turn | | The hold ends `used` |
-| A turn longer than its lease: a 30 s lease, a 48 s turn, then 21 s of other prompts | | 8,000 restored. On the code before the fix, the same probe computes all 8,000 |
+| A turn longer than its lease: a 30 s lease, a 48 s turn, then 22 s of other prompts | | 8,000 restored. On the code before the fix, the same probe computes all 8,000 |
+| A next turn that does not fit beside its session's own hold: a 17,800-token prompt held for 30 s, then a 21,000-token next prompt that shares nothing with it, and one that shares its first 2,000 tokens | | Served in 5.0 and 4.8 s. Both holds end `evicted` for their own turn, and the shared head still hits (2,000 GPU hits). On the code before the fix, the holds end `expired`, and the turns take 34.5 and 34.4 s |
 
 ## Replay results
 
@@ -194,14 +203,16 @@ benchmarks](https://github.com/StevenWang-CY/flatshare/blob/v1.22/docs/BENCHMARK
 | `stock-4x` | 1 | 54.5 | 35.2 | 10.3 | 88,413 |
 | `off-4x-first` | 3 | 54.4 (45.6–59.2) | 35.4 (28.0–41.1) | 12.8 (10.2–13.2) | 252,356 (82,501–390,751) |
 | `off-4x` | 3 | 54.2 (45.8–57.2) | 35.5 (30.3–40.6) | 12.5 (10.2–13.6) | 241,532 (84,660–415,428) |
-| `gpu10-4x` | 3 | 54.9 (46.8–57.3) | 34.9 (30.1–40.1) | 12.6 (10.2–13.1) | 244,844 (84,978–388,268) |
-| `gpu30-4x` | 3 | 55.0 (45.5–56.8) | 34.7 (30.4–41.1) | 12.7 (10.3–13.4) | 246,466 (87,288–401,458) |
+| `off-4x-third` | 3 | 55.1 (47.4–57.9) | 34.7 (28.8–39.6) | 13.0 (10.2–13.3) | 274,674 (86,837–384,320) |
+| `gpu10-4x` | 3 | 55.4 (44.7–59.5) | 34.4 (28.2–41.7) | 12.2 (10.3–13.6) | 233,654 (88,909–410,974) |
+| `gpu30-4x` | 3 | 54.3 (44.7–57.0) | 35.4 (29.8–42.0) | 13.2 (10.2–13.2) | 268,380 (85,580–390,088) |
 | `cpu30-4x` | 3 | 53.8 (45.5–57.9) | 35.1 (30.3–41.8) | 11.8 (11.2–12.7) | 211,846 (119,750–355,499) |
 | `off-1x-first` | 3 | 50.1 (22.9–52.1) | 7.3 (6.1–14.9) | 42.6 (41.8–62.2) | 1,130,790 (993,455–2,025,823) |
 | `off-1x` | 3 | 52.3 (22.8–53.5) | 6.9 (5.6–14.3) | 40.9 (40.8–62.9) | 1,088,987 (980,720–2,077,278) |
+| `off-1x-third` | 3 | 50.3 (21.5–53.8) | 6.4 (5.5–13.7) | 43.3 (40.7–64.8) | 1,157,240 (967,749–2,102,507) |
 | `cpu-1x` | 3 | 47.6 (18.2–52.7) | 6.1 (5.9–13.2) | 46.3 (41.3–68.6) | 1,239,738 (996,611–2,086,511) |
 | `cpu30-1x` | 3 | 52.7 (16.3–53.8) | 10.7 (7.1–19.6) | 40.2 (35.6–64.1) | 976,087 (954,713–1,993,001) |
-| `both-1x` | 3 | 47.6 (19.6–50.7) | 6.5 (6.3–8.6) | 45.9 (43.0–71.8) | 1,242,354 (1,046,277–2,021,409) |
+| `both-1x` | 3 | 44.6 (18.6–53.8) | 4.8 (4.8–6.5) | 50.7 (41.4–74.8) | 1,330,501 (994,037–2,110,885) |
 
 ### Time to first token (ms)
 
@@ -210,14 +221,16 @@ benchmarks](https://github.com/StevenWang-CY/flatshare/blob/v1.22/docs/BENCHMARK
 | `stock-4x` | 1 | 137 | 664 | 127 | 761 | 9,252 | 688 |
 | `off-4x-first` | 3 | 177 (141–454) | 1,216 (711–3,896) | 139 (132–343) | 1,246 (836–3,908) | 10,397 (9,256–10,850) | 693 (687–911) |
 | `off-4x` | 3 | 204 (140–444) | 1,366 (718–3,840) | 153 (132–352) | 1,365 (807–3,880) | 9,701 (8,818–11,284) | 692 (688–916) |
-| `gpu10-4x` | 3 | 189 (142–418) | 1,277 (723–4,150) | 149 (131–337) | 1,279 (864–3,973) | 9,655 (7,793–10,525) | 693 (688–918) |
-| `gpu30-4x` | 3 | 190 (143–472) | 1,620 (692–5,171) | 142 (130–389) | 1,576 (794–4,818) | 9,363 (9,344–12,052) | 692 (685–897) |
+| `off-4x-third` | 3 | 188 (142–515) | 1,683 (642–4,312) | 152 (132–383) | 1,701 (852–4,303) | 9,910 (8,788–10,244) | 692 (686–916) |
+| `gpu10-4x` | 3 | 185 (143–461) | 1,087 (677–3,968) | 144 (134–365) | 1,168 (783–4,171) | 9,642 (8,808–11,843) | 694 (687–910) |
+| `gpu30-4x` | 3 | 192 (142–548) | 1,525 (719–3,892) | 147 (131–479) | 1,516 (844–4,250) | 9,869 (8,915–10,661) | 692 (686–896) |
 | `cpu30-4x` | 3 | 189 (145–484) | 1,389 (801–3,938) | 151 (135–423) | 1,377 (1,195–4,242) | 9,131 (8,918–9,587) | 693 (688–911) |
 | `off-1x-first` | 3 | 321 (196–5,892) | 6,817 (4,957–16,199) | 224 (172–5,218) | 7,424 (6,051–15,336) | 20,720 (19,921–26,327) | 665 (652–669) |
 | `off-1x` | 3 | 267 (181–5,710) | 6,471 (4,738–14,579) | 213 (181–5,294) | 6,704 (5,581–14,468) | 19,688 (19,500–26,061) | 665 (657–675) |
+| `off-1x-third` | 3 | 305 (174–6,201) | 6,692 (5,370–15,533) | 225 (169–5,105) | 7,137 (6,178–15,315) | 20,699 (19,973–29,172) | 668 (654–684) |
 | `cpu-1x` | 3 | 516 (192–5,699) | 7,156 (5,218–16,211) | 274 (183–5,256) | 7,833 (6,148–16,081) | 20,528 (18,896–26,182) | 640 (635–665) |
 | `cpu30-1x` | 3 | 252 (194–5,984) | 6,057 (5,100–17,415) | 195 (191–5,638) | 6,568 (5,486–16,235) | 18,657 (18,292–25,237) | 659 (646–666) |
-| `both-1x` | 3 | 498 (222–7,141) | 7,357 (4,973–22,435) | 258 (217–6,790) | 8,281 (6,710–20,868) | 20,130 (18,882–32,150) | 650 (601–662) |
+| `both-1x` | 3 | 831 (182–7,563) | 11,996 (5,206–20,035) | 273 (197–6,699) | 10,893 (6,259–18,709) | 32,096 (20,953–32,242) | 613 (601–662) |
 
 ### Seed by seed, against the baseline
 
@@ -225,21 +238,23 @@ benchmarks](https://github.com/StevenWang-CY/flatshare/blob/v1.22/docs/BENCHMARK
 |---|---|---:|---:|---:|---:|---:|---:|---:|
 | `off-4x-first` | `stock-4x` | -0.1 | +0.3 | -0.2 | +2% | +7% | +10% | -0% |
 | `off-4x` | `off-4x-first` | -0.2 / +0.2 / -2.0 | +0.1 / -0.6 / +2.3 | +0.1 / +0.4 / -0.3 | -0% / -2% / +15% | +1% / -1% / +12% | -3% / -1% / +10% | +0% / +1% / +1% |
-| `gpu10-4x` | `off-4x` | +0.7 / +0.9 / +0.1 | -0.7 / -0.4 / -0.1 | +0.0 / -0.5 / +0.0 | +1% / -6% / -8% | +1% / +8% / -7% | +7% / +2% / -6% | +0% / +0% / -0% |
-| `gpu30-4x` | `off-4x` | +0.7 / -0.3 / -0.4 | -0.8 / +0.5 / +0.2 | +0.1 / -0.2 / +0.2 | +2% / +7% / -7% | -4% / +35% / +19% | -2% / +24% / +15% | -0% / -2% / -1% |
+| `off-4x-third` | `off-4x` | +0.8 / +1.6 / +0.7 | -0.8 / -1.0 / -1.5 | -0.0 / -0.6 / +0.8 | +1% / +16% / -8% | -11% / +12% / +23% | +6% / +11% / +25% | -0% / +0% / -0% |
+| `gpu10-4x` | `off-4x-third` | +0.3 / -2.7 / +1.6 | -0.4 / +2.1 / -0.5 | +0.1 / +0.6 / -1.1 | +1% / -10% / -1% | +5% / -8% / -35% | -8% / -3% / -31% | -1% / -1% / -0% |
+| `gpu30-4x` | `off-4x-third` | -0.7 / -2.7 / -0.9 | +0.7 / +2.5 / +1.0 | +0.0 / +0.2 / -0.1 | +0% / +6% / +2% | +12% / -10% / -9% | -1% / -1% / -11% | -0% / -3% / -0% |
 | `cpu30-4x` | `off-4x` | -0.5 / -0.3 / +0.7 | -0.5 / +1.3 / +0.0 | +0.9 / -0.9 / -0.7 | +3% / +9% / -7% | +12% / +3% / +2% | +48% / +9% / +1% | +0% / +1% / -0% |
 | `off-1x` | `off-1x-first` | +1.4 / -0.1 / +2.2 | -0.5 / -0.5 / -0.4 | -0.9 / +0.7 / -1.8 | -7% / -3% / -17% | -4% / -10% / -5% | -8% / -6% / -10% | -0% / +0% / +3% |
+| `off-1x-third` | `off-1x` | +0.3 / -1.3 / -2.0 | -0.1 / -0.6 / -0.5 | -0.1 / +2.0 / +2.5 | -4% / +9% / +14% | +13% / +7% / +3% | +11% / +6% / +6% | +1% / +0% / -1% |
 | `cpu-1x` | `off-1x-first` | +0.6 / -4.7 / -2.5 | -0.2 / -1.7 / -1.2 | -0.4 / +6.4 / +3.6 | -2% / -3% / +61% | +5% / +0% / +5% | +2% / +5% / +6% | -0% / -4% / -2% |
 | `cpu30-1x` | `off-1x` | -0.8 / -6.5 / +1.5 | +1.5 / +5.3 / +3.8 | -0.7 / +1.3 / -5.3 | +7% / +5% / -6% | +8% / +19% / -6% | -2% / +12% / -2% | +1% / -3% / +1% |
-| `both-1x` | `off-1x` | -2.8 / -3.2 / -4.7 | +0.7 / -5.7 / -0.3 | +2.1 / +8.9 / +5.0 | +22% / +25% / +87% | +5% / +54% / +14% | +20% / +44% / +24% | +1% / -11% / -4% |
+| `both-1x` | `off-1x-third` | +0.0 / -2.9 / -5.8 | -0.7 / -7.2 / -1.6 | +0.7 / +10.0 / +7.4 | +5% / +22% / +172% | -3% / +29% / +79% | +1% / +22% / +53% | -1% / -10% / -14% |
 
 ### GPU holds
 
-| Arm | Runs | Accepted | Refused | Used | Expired | Evicted | Used, % of tokens held | Held when used, p50 (s) | Pool held, mean % |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| `gpu10-4x` | 3 | 380 (356–586) | 313 (300–319) | 250 (249–279) | 32 (19–40) | 69 (66–318) | 66 (38–70) | 1.0 (0.5–1.2) | 12.5 (8.6–13.1) |
-| `gpu30-4x` | 3 | 493 (454–686) | 194 (186–218) | 308 (283–352) | 10 (5–30) | 134 (116–392) | 58 (38–67) | 1.2 (0.3–1.2) | 26.7 (20.2–36.5) |
-| `both-1x` | 3 | 516 (412–522) | 121 (70–238) | 188 (45–306) | 3 (1–20) | 209 (203–474) | 41 (8–49) | 1.1 (1.0–1.6) | 18.7 (10.6–31.7) |
+| Arm | Runs | Accepted | Refused | Used | Expired | Evicted | Evicted for its own turn | Used, % of tokens held | Held when used, p50 (s) | Pool held, mean % |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| `gpu10-4x` | 3 | 399 (366–569) | 308 (282–323) | 252 (230–298) | 28 (17–39) | 75 (72–322) | 0 (0–1) | 66 (36–72) | 1.0 (0.6–1.1) | 11.1 (8.5–13.0) |
+| `gpu30-4x` | 3 | 487 (455–707) | 192 (172–218) | 298 (278–347) | 14 (4–28) | 135 (129–415) | 1 (0–1) | 56 (39–66) | 1.2 (0.2–1.3) | 29.0 (19.7–35.7) |
+| `both-1x` | 3 | 501 (459–512) | 102 (80–191) | 258 (45–258) | 8 (7–20) | 235 (181–460) | 0 (0–1) | 43 (9–47) | 0.9 (0.8–1.4) | 20.0 (12.3–30.7) |
 
 ### CPU leases
 
@@ -248,7 +263,7 @@ benchmarks](https://github.com/StevenWang-CY/flatshare/blob/v1.22/docs/BENCHMARK
 | `cpu30-4x` | 3 | 680 (675–893) | 4,350 (3,936–5,042) | 4,165 (902–6,822) | 0 (0–0) | 1 (0–3) |
 | `cpu-1x` | 3 | 628 (626–652) | 1,119 (1,090–1,119) | 242,578 (218,106–246,830) | 46 (0–463) | 65 (59–76) |
 | `cpu30-1x` | 3 | 646 (637–653) | 1,924 (1,855–1,943) | 113,946 (92,883–147,330) | 2,882 (2,116–8,094) | 46 (26–54) |
-| `both-1x` | 3 | 637 (592–650) | 1,119 (1,106–1,120) | 247,059 (225,122–249,892) | 440 (0–513) | 65 (63–75) |
+| `both-1x` | 3 | 603 (592–650) | 1,116 (1,080–1,121) | 227,047 (220,200–253,292) | 0 (0–509) | 65 (63–72) |
 
 ### Eviction pressure and cost
 
@@ -257,14 +272,16 @@ benchmarks](https://github.com/StevenWang-CY/flatshare/blob/v1.22/docs/BENCHMARK
 | `stock-4x` | 1 | 162 | 10.0 | — | 0 | 165 | 50 | 16 | 0.4 | 0.50 | 1 | 41 |
 | `off-4x-first` | 3 | 172 (163–323) | 10.0 (5.0–10.0) | 35 (22–63) | 0 (0–0) | 167 (155–321) | 68 (50–103) | 17 (16–26) | 0.5 (0.5–1.1) | 0.69 (0.50–1.15) | 1 (0–8) | 48 (41–55) |
 | `off-4x` | 3 | 181 (164–324) | 10.0 (5.0–10.0) | 35 (23–64) | 0 (0–0) | 167 (167–318) | 67 (50–104) | 25 (15–39) | 0.7 (0.5–1.7) | 0.69 (0.52–1.23) | 1 (1–8) | 48 (41–55) |
-| `gpu10-4x` | 3 | 181 (162–319) | 10.0 (5.0–10.0) | 35 (23–64) | 0 (0–0) | 167 (164–315) | 66 (50–104) | 36 (27–46) | 0.7 (0.4–1.6) | 0.68 (0.48–1.22) | 3 (1–9) | 48 (41–55) |
-| `gpu30-4x` | 3 | 180 (160–323) | 10.0 (5.0–10.0) | 37 (23–63) | 0 (0–0) | 169 (162–317) | 70 (50–103) | 49 (47–58) | 0.9 (0.5–1.9) | 0.83 (0.49–1.42) | 3 (1–10) | 48 (41–54) |
+| `off-4x-third` | 3 | 177 (161–314) | 10.0 (5.0–10.0) | 34 (23–63) | 0 (0–0) | 163 (159–307) | 65 (50–103) | 28 (15–39) | 0.7 (0.4–1.6) | 0.73 (0.48–1.17) | 3 (2–8) | 48 (41–55) |
+| `gpu10-4x` | 3 | 170 (159–326) | 10.0 (5.0–10.0) | 34 (23–64) | 0 (0–0) | 161 (157–322) | 66 (50–104) | 35 (26–47) | 0.6 (0.4–1.6) | 0.64 (0.47–1.22) | 2 (2–4) | 48 (41–54) |
+| `gpu30-4x` | 3 | 182 (162–326) | 5.0 (5.0–10.0) | 37 (23–62) | 0 (0–0) | 166 (165–325) | 69 (50–102) | 50 (46–60) | 0.8 (0.5–1.8) | 0.80 (0.49–1.30) | 3 (2–11) | 48 (41–54) |
 | `cpu30-4x` | 3 | 179 (165–324) | 10.0 (5.0–10.0) | 34 (24–61) | 0 (0–0) | 169 (164–322) | 64 (51–100) | 25 (17–37) | 0.6 (0.6–1.5) | 0.62 (0.57–1.19) | 1 (1–2) | 48 (41–55) |
 | `off-1x-first` | 3 | 189 (166–328) | 10.0 (5.0–10.0) | 164 (141–257) | 0 (0–0) | 42 (34–92) | 224 (192–349) | 41 (27–62) | 1.6 (1.3–5.0) | 1.62 (1.37–5.01) | 17 (12–32) | 39 (38–44) |
 | `off-1x` | 3 | 182 (161–330) | 10.0 (5.0–10.0) | 158 (139–260) | 0 (0–0) | 39 (30–92) | 216 (188–356) | 41 (27–61) | 1.5 (1.4–5.0) | 1.48 (1.39–5.00) | 17 (11–40) | 39 (38–45) |
+| `off-1x-third` | 3 | 187 (161–332) | 10.0 (5.0–10.0) | 165 (140–269) | 0 (0–0) | 36 (31–84) | 227 (190–366) | 43 (25–60) | 1.6 (1.3–5.4) | 1.55 (1.37–5.37) | 18 (9–34) | 39 (38–44) |
 | `cpu-1x` | 3 | 196 (162–319) | 10.0 (5.0–10.0) | 216 (161–258) | 0 (0–0) | 34 (29–71) | 292 (218–351) | 44 (27–62) | 1.7 (1.4–5.1) | 1.80 (1.45–5.44) | 17 (13–36) | 39 (36–43) |
 | `cpu30-1x` | 3 | 177 (164–333) | 10.0 (5.0–10.0) | 162 (146–214) | 0 (0–0) | 54 (32–103) | 221 (197–294) | 39 (27–64) | 1.5 (1.3–5.4) | 1.57 (1.33–5.57) | 9 (7–38) | 40 (37–45) |
-| `both-1x` | 3 | 196 (168–296) | 10.0 (10.0–10.0) | 204 (168–257) | 0 (0–0) | 35 (28–45) | 276 (225–349) | 59 (54–67) | 1.6 (1.4–6.2) | 1.68 (1.47–7.03) | 14 (6–25) | 39 (34–43) |
+| `both-1x` | 3 | 186 (157–296) | 10.0 (10.0–10.0) | 193 (163–260) | 0 (0–0) | 26 (23–38) | 272 (220–349) | 62 (52–68) | 2.4 (1.4–6.0) | 2.65 (1.44–6.70) | 16 (7–26) | 38 (34–39) |
 
 ### Restored tokens by the pause before the turn (thousands)
 
@@ -272,14 +289,16 @@ benchmarks](https://github.com/StevenWang-CY/flatshare/blob/v1.22/docs/BENCHMARK
 |---|---:|---:|---:|---:|---:|---:|---:|
 | `off-4x-first` | 3 | 42 (40–767) | 399 (298–905) | 240 (163–245) | 197 (158–231) | 217 (132–310) | 112 (46–136) |
 | `off-4x` | 3 | 51 (46–713) | 417 (299–913) | 243 (168–297) | 191 (157–199) | 245 (156–309) | 112 (5–146) |
-| `gpu10-4x` | 3 | 41 (38–743) | 414 (306–839) | 228 (175–274) | 189 (158–205) | 235 (176–309) | 112 (5–146) |
-| `gpu30-4x` | 3 | 43 (24–782) | 507 (278–903) | 250 (171–264) | 177 (119–211) | 268 (153–287) | 107 (10–132) |
+| `off-4x-third` | 3 | 46 (43–658) | 411 (288–912) | 235 (166–245) | 193 (152–234) | 240 (166–308) | 107 (5–110) |
+| `gpu10-4x` | 3 | 46 (42–759) | 365 (270–941) | 227 (146–232) | 208 (153–238) | 234 (130–312) | 103 (35–157) |
+| `gpu30-4x` | 3 | 54 (24–802) | 472 (281–877) | 254 (194–255) | 209 (128–210) | 243 (160–291) | 107 (5–118) |
 | `cpu30-4x` | 3 | 48 (47–716) | 431 (304–949) | 187 (174–263) | 201 (144–214) | 241 (200–357) | 82 (0–165) |
 | `off-1x-first` | 3 | 45 (19–330) | 227 (160–299) | 19 (15–24) | 3 (0–15) | 0 (0–15) | 4 (2–18) |
 | `off-1x` | 3 | 51 (22–272) | 177 (132–330) | 33 (14–48) | 8 (2–9) | 4 (3–18) | 3 (2–10) |
+| `off-1x-third` | 3 | 52 (17–331) | 196 (134–247) | 18 (5–27) | 2 (0–5) | 2 (0–7) | 10 (0–15) |
 | `cpu-1x` | 3 | 35 (19–196) | 150 (56–254) | 12 (11–51) | 23 (17–26) | 11 (9–20) | 16 (6–22) |
 | `cpu30-1x` | 3 | 38 (25–343) | 281 (115–360) | 14 (10–57) | 31 (17–61) | 1 (0–9) | 0 (0–0) |
-| `both-1x` | 3 | 27 (14–129) | 142 (37–168) | 4 (4–21) | 21 (20–40) | 16 (6–93) | 13 (6–15) |
+| `both-1x` | 3 | 14 (10–141) | 83 (23–110) | 6 (4–10) | 23 (19–37) | 20 (9–73) | 8 (5–13) |
 
 ### Restored tokens by the prompt's share of the pool (thousands)
 
@@ -287,14 +306,16 @@ benchmarks](https://github.com/StevenWang-CY/flatshare/blob/v1.22/docs/BENCHMARK
 |---|---:|---:|---:|---:|
 | `off-4x-first` | 3 | 501 (318–1,173) | 462 (255–654) | 333 (48–893) |
 | `off-4x` | 3 | 510 (358–1,217) | 477 (226–650) | 349 (48–832) |
-| `gpu10-4x` | 3 | 465 (304–1,151) | 480 (249–696) | 381 (24–842) |
-| `gpu30-4x` | 3 | 472 (303–1,138) | 521 (282–661) | 397 (42–869) |
+| `off-4x-third` | 3 | 488 (358–1,159) | 419 (246–651) | 345 (37–816) |
+| `gpu10-4x` | 3 | 474 (281–1,179) | 460 (277–654) | 358 (37–877) |
+| `gpu30-4x` | 3 | 486 (316–1,172) | 502 (267–670) | 362 (42–869) |
 | `cpu30-4x` | 3 | 527 (355–1,249) | 477 (231–623) | 371 (41–847) |
 | `off-1x-first` | 3 | 163 (152–580) | 67 (11–129) | 22 (0–72) |
 | `off-1x` | 3 | 176 (131–567) | 37 (28–100) | 36 (0–61) |
+| `off-1x-third` | 3 | 161 (130–536) | 51 (10–118) | 7 (0–54) |
 | `cpu-1x` | 3 | 162 (127–467) | 69 (12–75) | 6 (0–16) |
 | `cpu30-1x` | 3 | 156 (127–673) | 107 (20–208) | 30 (0–43) |
-| `both-1x` | 3 | 116 (87–293) | 120 (8–134) | 5 (0–13) |
+| `both-1x` | 3 | 126 (56–217) | 38 (27–102) | 21 (0–23) |
 
 
 ## The 30 s lease, run by run
@@ -315,10 +336,10 @@ and 13 in that order. The control is the first round's code, run again after the
 - **The fixes did not lose it.** The control moved computed tokens −1.5 and −1.1 points. Its computed tokens came out
   4.3 and 4.5 points above the first round's, on the same code and the same seed, and 0.9 and 2.4 points below the
   fixed code's, so the fixes moved the arm by less than the same code moved between rounds. A no-hint repeat differs by at
-  most 1.8, so on these two pairs this arm's runs spread further than the no-hint arm's. These runs do
+  most 2.6, so on these two pairs this arm's runs spread further than the no-hint arm's. These runs do
   not say why.
 - **The restores did reproduce.** CPU restores rose in all 8 runs, by +1.5 to +6.5 points, where a no-hint
-  repeat moved them by at most 0.5. In the second round, restored tokens after pauses of 10-30 s were
+  repeat moved them by at most 1.2. In the second round, restored tokens after pauses of 10-30 s were
   61, 17 and 31 thousand, against 9, 2 and 8 thousand without a hint: the range a 30 s lease should reach and LRU on this
   tier mostly does not. The shares sum to 100, so restores that do not replace computation replace GPU hits: those moved
   −0.8, −6.5 and +1.5 points in that round.
@@ -326,18 +347,25 @@ and 13 in that order. The control is the first round's code, run again after the
   −6.7 to +1.3 points across them. A gain smaller than the spread is not excluded. A gain of the first round's size on every seed is not what the
   repeats show.
 
-## Two rounds
+## Three rounds
 
-Review of the first round found two defects in the prototype, and both counted against retention:
+Review found three defects in the prototype, and each counted against retention:
 
 - A conversation's last turn carried no hint, so the connector could not tie it to its session, and the previous turn's hold
   stayed until its TTL or demand.
 - A turn longer than a lease's TTL lost its lease before it ended, so the pause after it had no coverage.
+- A session's own GPU hold never gave way to its next turn, which could then wait for the hold's TTL when it did not fit
+  beside it.
 
-Both are fixed in the code here, and the live probes above cover both. The second round ran on the fixed code, with repeats
-of the no-hint arms. `stock-4x`, `off-4x-first`, `off-1x-first` and `cpu-1x` stay from the first round, as neither fix
-touches them: the first three carry no hint, `cpu-1x` holds nothing, and none of its turns outlasted its 120 s lease. The
-first round's other runs are in no table here, except for the 30 s lease's row above.
+All three are fixed in the code here, and the live probes above cover each. The second round reran every arm the first two
+touch, with repeats of the no-hint arms. The third round reran the arms with GPU holds, again with their baselines.
+`stock-4x`, `off-4x-first`, `off-1x-first` and `cpu-1x` stay from the first round, as no fix touches them: the first three
+carry no hint, `cpu-1x` holds nothing on the GPU, and none of its turns outlasted its 120 s lease. `cpu30-1x` and `cpu30-4x`
+stay from the second round, as they hold nothing on the GPU. The earlier rounds' other runs are in no table here, except
+for the 30 s lease's row above.
+
+In the third round, a hold gave way to its own session's turn at most once per run (1, 0 and 0 in `gpu10-4x`; 0, 1 and 1 in `gpu30-4x`; 0, 1 and 0 in `both-1x`). So the third
+defect explains little of what holds cost here: `both-1x` was still worse than no hint on seeds 12 and 13.
 
 ## What this does not show
 
@@ -350,10 +378,10 @@ first round's other runs are in no table here, except for the 30 s lease's row a
   prediction of who returns when. The lease budget has no per-session cap. A later hint that changes a session's priority
   re-ranks only the lease's new chunks.
 - A CPU tier the size of the pool is a stress point, not a recommended deployment.
-- `both-1x` adds the hold to the first lease, and ran in the other round from the lease alone, so these runs do not separate
-  what the hold added. The hold with the 30 s lease over 90% of the tier was not run.
-- Spread is thinly measured: one repeat per seed of each no-hint arm, and two of the 30 s lease. A gain smaller than that
-  spread would not show here.
+- `both-1x` adds the hold to the first lease, and ran two rounds after the lease alone, so these runs do not separate what
+  the hold added. The hold with the 30 s lease over 90% of the tier was not run.
+- Spread is thinly measured: three runs per seed of each no-hint arm, and two repeats of the 30 s lease. A gain smaller than
+  that spread would not show here.
 - No Router in the path: hints went straight to the engine, and one tenant sent them all, so the tenant budget was the
   engine budget. The prototype trusts the hint's tenant and namespace as sent. Whoever can reach the engine can send a hint,
   so a Router in front would have to set them.
@@ -380,14 +408,15 @@ $RUN probe --out runs/probes
 REPLAY="replay --out runs/replay --corpus weka-x32 --aiperf bench/bin/aiperf"
 $RUN $REPLAY --arms stock-4x --seeds 11
 $RUN $REPLAY --arms off-4x-first off-1x-first cpu-1x --seeds 11 12 13
-$RUN $REPLAY --seeds 11 12 13  # off-1x cpu30-1x both-1x off-4x gpu10-4x gpu30-4x cpu30-4x, in that order per seed
+$RUN $REPLAY --arms off-1x cpu30-1x off-4x cpu30-4x --seeds 11 12 13
+$RUN $REPLAY --seeds 11 12 13  # off-1x-third both-1x off-4x-third gpu10-4x gpu30-4x, in that order per seed
 bench/bin/python benches/kv_retention/report.py runs/replay
 ```
 
 `run_eval.py` starts one engine per probe and per run, with `benches/kv_retention` on its `PYTHONPATH`, and pins the
 engine to cores 8-15 and AIPerf to cores 0-7 (`--engine-cores`, `--load-cores`). `report.py` prints the replay tables. The
-first round's other runs and the control are the same `replay` on the prototype's modules at `30f6d75`, in this PR's
-history. With vLLM's Python, `check_lease_policy.py` runs the policy check, on no GPU. The lifecycle's and the report's
+first round's other runs and the 30 s lease's control are the same `replay` on the prototype's modules at `30f6d75`, in
+this PR's history. With vLLM's Python, `check_lease_policy.py` runs the policy check, on no GPU. The lifecycle's and the report's
 tests need no vLLM:
 
 ```sh
