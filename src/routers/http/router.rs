@@ -1362,8 +1362,14 @@ impl Router {
             .as_any()
             .downcast_ref::<crate::policies::CacheAwarePolicy>()
         {
-            cache.select_worker_with_inputs(
-                available, token_ids, model_id, lora_name, cache_salt, "regular",
+            cache.select_worker_with_inputs_or_text(
+                available,
+                token_ids,
+                || text,
+                model_id,
+                lora_name,
+                cache_salt,
+                "regular",
             )?
         } else {
             policy.select_worker_with_headers(available, text, request_headers.as_ref())?
@@ -3114,9 +3120,14 @@ impl RouterTrait for Router {
             .downcast_ref::<crate::policies::CacheAwarePolicy>()
         {
             cache
-                .select_worker_with_inputs(
+                .select_worker_with_inputs_or_text(
                     &workers,
                     request_tokens,
+                    || {
+                        Some(crate::protocols::spec::cache_routing::for_route(
+                            &body, path,
+                        ))
+                    },
                     model_id,
                     lora_name,
                     cache_salt,
@@ -7263,5 +7274,187 @@ mod tests {
         assert!(registry.revision() > revision_before_recovery);
 
         health_checker.shutdown().await;
+    }
+    /// Issue #501. vLLM 0.30 registers `/v1/chat/completions/render` only with
+    /// `--enable-scale-out`, and `/tokenize` cannot prepare tool-bearing chat
+    /// exactly. Each mock worker records every call and reports its index.
+    struct CacheAwareChatFixture {
+        router: Router,
+        workers: Vec<Arc<dyn Worker>>,
+        servers: Vec<tokio::task::JoinHandle<()>>,
+        calls: Arc<Mutex<Vec<(usize, String)>>>,
+    }
+
+    impl Drop for CacheAwareChatFixture {
+        fn drop(&mut self) {
+            for server in &self.servers {
+                server.abort();
+            }
+        }
+    }
+
+    async fn cache_aware_chat_fixture(render_available: bool) -> CacheAwareChatFixture {
+        use axum::{extract::OriginalUri, routing::post};
+        // Stand-in for a worker's own template: one id per message byte.
+        fn rendered_ids(body: &serde_json::Value) -> Vec<u32> {
+            let mut text = body["tools"].to_string();
+            for message in body["messages"].as_array().into_iter().flatten() {
+                text.push_str(&message.to_string());
+            }
+            text.bytes().map(|byte| u32::from(byte) + 1).collect()
+        }
+        let mut router = create_test_regular_router();
+        router.worker_registry = Arc::new(WorkerRegistry::new());
+        router.policy_registry = Arc::new(PolicyRegistry::new(
+            crate::config::PolicyConfig::CacheAware {
+                cache_threshold: 0.5,
+                balance_abs_threshold: 32,
+                balance_rel_threshold: 1.1,
+                eviction_interval_secs: 0,
+                max_tree_size: 1 << 20,
+            },
+        ));
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut servers = Vec::new();
+        let mut workers: Vec<Arc<dyn Worker>> = Vec::new();
+        for worker_index in 0..2 {
+            let captured = calls.clone();
+            let app = axum::Router::new().fallback(post(
+                move |OriginalUri(uri): OriginalUri, Json(body): Json<serde_json::Value>| {
+                    let captured = captured.clone();
+                    async move {
+                        let path = uri.path().to_string();
+                        captured.lock().push((worker_index, path.clone()));
+                        match path.as_str() {
+                            "/v1/chat/completions/render" if !render_available => {
+                                StatusCode::NOT_FOUND.into_response()
+                            }
+                            "/v1/chat/completions/render" => {
+                                Json(serde_json::json!({"token_ids": rendered_ids(&body)}))
+                                    .into_response()
+                            }
+                            "/tokenize" => {
+                                let ids = rendered_ids(&body);
+                                Json(serde_json::json!({"tokens": ids, "count": ids.len()}))
+                                    .into_response()
+                            }
+                            _ => Json(serde_json::json!({"worker": worker_index, "choices": []}))
+                                .into_response(),
+                        }
+                    }
+                },
+            ));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            servers.push(tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap()
+            }));
+            let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(url, WorkerType::Regular));
+            router.worker_registry.register(worker.clone());
+            workers.push(worker);
+        }
+        CacheAwareChatFixture {
+            router,
+            workers,
+            servers,
+            calls,
+        }
+    }
+
+    /// One agent turn: the full history so far, optionally with tool schemas.
+    fn agent_turn(conversation: &str, turns: usize, tools: bool) -> ChatCompletionRequest {
+        let mut messages = vec![
+            serde_json::json!({"role": "system", "content": "You are a coding agent."}),
+            serde_json::json!({"role": "user", "content": format!("Fix {conversation}. ").repeat(40)}),
+        ];
+        for turn in 1..turns {
+            if tools {
+                messages.push(serde_json::json!({"role": "assistant", "content": null,
+                    "tool_calls": [{"id": format!("call_{turn}"), "type": "function",
+                        "function": {"name": "read_file", "arguments": "{\"path\":\"a.py\"}"}}]}));
+                messages.push(serde_json::json!({"role": "tool",
+                    "tool_call_id": format!("call_{turn}"), "content": "def f(): pass"}));
+            } else {
+                messages.push(serde_json::json!({"role": "assistant", "content": "Looking."}));
+                messages.push(serde_json::json!({"role": "user", "content": "Continue."}));
+            }
+        }
+        let mut body = serde_json::json!({"model": "mock", "messages": messages});
+        if tools {
+            body["tools"] = serde_json::json!([{"type": "function", "function": {
+                "name": "read_file", "description": "Read a repository file.",
+                "parameters": {"type": "object",
+                    "properties": {"path": {"type": "string"}}}}}]);
+            body["tool_choice"] = serde_json::json!("auto");
+        }
+        serde_json::from_value(body).unwrap()
+    }
+
+    /// Route one turn and return the worker index that served it.
+    /// `transparent` uses the untyped proxy path (EPD chat and fallback routes).
+    async fn route_agent_turn(
+        fixture: &CacheAwareChatFixture,
+        request: &ChatCompletionRequest,
+        transparent: bool,
+    ) -> usize {
+        let route = "/v1/chat/completions";
+        let response = if transparent {
+            let body = serde_json::to_value(request).unwrap();
+            fixture
+                .router
+                .route_transparent(None, route, &Method::POST, body)
+                .await
+        } else {
+            fixture
+                .router
+                .route_typed_request(None, request, route, None)
+                .await
+        };
+        selected_http_worker(response).await
+    }
+
+    #[tokio::test]
+    async fn cache_aware_agent_turns_keep_affinity_without_worker_render() {
+        // (render available, tool-bearing agent). The last case is #501:
+        // render 404 and tools present, so no worker can prepare the input.
+        for transparent in [false, true] {
+            for (render_available, tools) in [(true, true), (false, false), (false, true)] {
+                let case = format!(
+                    "render_available={render_available}, tools={tools}, transparent={transparent}"
+                );
+                let fixture = cache_aware_chat_fixture(render_available).await;
+                let turn = |conversation, turns| agent_turn(conversation, turns, tools);
+                let first =
+                    route_agent_turn(&fixture, &turn("conversation-a", 1), transparent).await;
+                // An in-flight request on the warm worker makes load-only
+                // routing prefer the other one; it is far below the imbalance
+                // threshold.
+                fixture.workers[first].increment_load();
+                for turns in 2..=4 {
+                    assert_eq!(
+                        route_agent_turn(&fixture, &turn("conversation-a", turns), transparent)
+                            .await,
+                        first,
+                        "turn {turns} lost prefix affinity ({case})"
+                    );
+                }
+                // An unrelated conversation still balances to the idle worker.
+                assert_eq!(
+                    route_agent_turn(&fixture, &turn("conversation-b", 1), transparent).await,
+                    1 - first,
+                    "{case}"
+                );
+                // Every turn was still forwarded for generation.
+                let calls = fixture.calls.lock();
+                assert_eq!(
+                    calls
+                        .iter()
+                        .filter(|(_, path)| path == "/v1/chat/completions")
+                        .count(),
+                    5,
+                    "{case}"
+                );
+            }
+        }
     }
 }

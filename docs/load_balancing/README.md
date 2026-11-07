@@ -234,6 +234,21 @@ Trees are trimmed to `max_tree_size` during periodic eviction and may grow beyon
    - Route to worker with lowest load (shortest queue)
    - Still updates the tree to maintain cache state
 
+### HTTP inputs
+
+For HTTP workers, `cache_aware` matches the token IDs each worker prepares
+for the request: explicit token prompts directly, text through the worker's
+render endpoint, or `/tokenize` for simple prompts. When any candidate cannot
+prepare them, every candidate is matched on the request's routing text
+instead: tool schemas followed by the conversation, or the session ID. This
+covers tool-bearing chat on workers without a chat render endpoint, which
+`/tokenize` cannot prepare exactly; vLLM 0.30 serves the render endpoints only
+with `--enable-scale-out`. Text matching is a placement heuristic, not a token
+count or a confirmed cache hit.
+`vllm_router_prefix_routing_decisions_total` reports `prefix_hit` and
+`prefix_miss` for token matches, `text_prefix_hit` and `text_prefix_miss` for
+the text fallback, and `missing_tokens` when no key is available.
+
 ### Best For
 
 - Workloads with repeated prompt prefixes (system prompts, few-shot examples)
@@ -253,7 +268,7 @@ vllm-router --policy kv_aware \
   --worker-urls grpc://worker1:8000 grpc://worker2:8000
 ```
 
-Enable KV events on the workers. HTTP text requests also need a render endpoint or, for simple prompts, `/tokenize`. Without usable KV information, routing falls back to load.
+Enable KV events on the workers. HTTP text requests also need a render endpoint or, for simple prompts, `/tokenize`. vLLM 0.30 serves the render endpoints only with `--enable-scale-out`; tool-bearing chat has no `/tokenize` fallback. Without usable KV information, routing falls back to load.
 
 For regular pools without event discovery, configure `--kv-event-source WORKER_URL=tcp://HOST:PORT` per worker, plus matching `--kv-event-model` and `--kv-event-block-size`.
 
