@@ -262,11 +262,20 @@ pub(crate) struct NextTurnWait {
     phase: WaitPhase,
 }
 
+/// One modeled load on a target's stream.
+#[derive(Debug)]
+struct ModeledLoad {
+    program: ProgramRef,
+    planned_at: Instant,
+    start_at: Instant,
+    finish_at: Instant,
+}
+
 /// One target's modeled load stream, its budget, and its counters.
 #[derive(Debug, Default)]
 pub(crate) struct NextTurnPrefetchLedger {
-    /// Finish times of modeled loads, in order; a target serves one at a time.
-    load_stream: VecDeque<Instant>,
+    /// Modeled loads, in order; a target serves one at a time.
+    load_stream: VecDeque<ModeledLoad>,
     /// Tokens of plans not settled yet. A finished load stays charged until then,
     /// because the idle prefixes it displaced are gone either way.
     pub(crate) speculative_tokens: usize,
@@ -278,32 +287,58 @@ pub(crate) struct NextTurnPrefetchLedger {
 
 impl NextTurnPrefetchLedger {
     fn queue_delay_seconds(&self, now: Instant) -> f64 {
-        self.load_stream.back().map_or(0.0, |finish_at| {
-            finish_at.saturating_duration_since(now).as_secs_f64()
+        self.load_stream.back().map_or(0.0, |load| {
+            load.finish_at.saturating_duration_since(now).as_secs_f64()
         })
     }
 
-    fn commit(&mut self, now: Instant, finish_at: Instant, tokens: usize) {
+    fn commit(&mut self, now: Instant, program: &ProgramRef, plan: &PrefetchPlan) {
         while self
             .load_stream
             .front()
-            .is_some_and(|finished_at| *finished_at <= now)
+            .is_some_and(|load| load.finish_at <= now)
         {
             self.load_stream.pop_front();
         }
-        self.load_stream.push_back(finish_at);
-        self.speculative_tokens = self.speculative_tokens.saturating_add(tokens);
+        self.load_stream.push_back(ModeledLoad {
+            program: program.clone(),
+            planned_at: now,
+            start_at: plan.start_at,
+            finish_at: plan.finish_at,
+        });
+        self.speculative_tokens = self.speculative_tokens.saturating_add(plan.tokens);
     }
 
-    /// A load that will not run gives its place back.
-    fn release_load(&mut self, finish_at: Instant) {
-        if let Some(index) = self
+    /// A load that stops at `at` frees the stream from then, or from its start if it
+    /// had not started, so each load queued behind it starts as soon as the stream is
+    /// free and its own plan was made. Returns each moved load's Program and how much
+    /// sooner it now starts and finishes.
+    fn release_load(&mut self, program: &ProgramRef, at: Instant) -> Vec<(ProgramRef, Duration)> {
+        let Some(index) = self
             .load_stream
             .iter()
-            .position(|queued_finish_at| *queued_finish_at == finish_at)
-        {
-            self.load_stream.remove(index);
+            .position(|load| load.program == *program)
+        else {
+            return Vec::new();
+        };
+        let Some(released) = self.load_stream.remove(index) else {
+            return Vec::new();
+        };
+        let mut free_at = released.start_at.max(at).min(released.finish_at);
+        let mut moved = Vec::new();
+        for load in self.load_stream.range_mut(index..) {
+            let start_at = free_at.max(load.planned_at);
+            if start_at >= load.start_at {
+                // Nothing after it moves either.
+                break;
+            }
+            let sooner = load.start_at.duration_since(start_at);
+            load.start_at = start_at;
+            load.finish_at -= sooner;
+            free_at = load.finish_at;
+            moved.push((load.program.clone(), sooner));
         }
+        moved
     }
 }
 
@@ -398,6 +433,7 @@ impl ProgramScheduler {
                     plan.finish_at.saturating_duration_since(arrived_at),
                 );
                 Self::record_outcome(state, &wait.target_id, plan, PrefetchOutcome::Late);
+                Self::release_load(state, &wait.target_id, program, arrived_at);
             }
             WaitPhase::Planned(ref plan) if arrived_at > plan.expires_at => {
                 Self::record_outcome(state, &wait.target_id, plan, PrefetchOutcome::Expired);
@@ -525,7 +561,7 @@ impl ProgramScheduler {
             .get_mut(program)
             .and_then(|decision| decision.next_turn_wait.take())
         {
-            Self::close_next_turn_wait(state, &wait, now);
+            Self::close_next_turn_wait(state, program, &wait, now);
         }
     }
 
@@ -541,22 +577,29 @@ impl ProgramScheduler {
         }
         let waits = state
             .decisions
-            .values_mut()
-            .filter(|decision| {
+            .iter_mut()
+            .filter(|(_, decision)| {
                 decision
                     .next_turn_wait
                     .as_ref()
                     .is_some_and(|wait| wait.target_id == target_id)
             })
-            .filter_map(|decision| decision.next_turn_wait.take())
+            .filter_map(|(program, decision)| {
+                Some((program.clone(), decision.next_turn_wait.take()?))
+            })
             .collect::<Vec<_>>();
-        for wait in &waits {
-            Self::close_next_turn_wait(state, wait, now);
+        for (program, wait) in &waits {
+            Self::close_next_turn_wait(state, program, wait, now);
         }
     }
 
     /// Settle a wait that no next turn will end.
-    fn close_next_turn_wait(state: &mut ProgramSchedulerState, wait: &NextTurnWait, now: Instant) {
+    fn close_next_turn_wait(
+        state: &mut ProgramSchedulerState,
+        program: &ProgramRef,
+        wait: &NextTurnWait,
+        now: Instant,
+    ) {
         match &wait.phase {
             WaitPhase::Undecided(skip) => {
                 Self::record_skip(state, &wait.target_id, *skip, false);
@@ -569,6 +612,7 @@ impl ProgramScheduler {
                     PrefetchOutcome::Cancelled,
                     plan.moved_tokens(now),
                 );
+                Self::release_load(state, &wait.target_id, program, now);
             }
             WaitPhase::Planned(plan) if now > plan.expires_at => {
                 Self::record_outcome(state, &wait.target_id, plan, PrefetchOutcome::Expired);
@@ -666,7 +710,7 @@ impl ProgramScheduler {
                     .next_turn_prefetch
                     .entry(wait.target_id.clone())
                     .or_default();
-                ledger.commit(now, finish_at, plan.tokens);
+                ledger.commit(now, program, &plan);
                 *ledger.plans.entry(plan.source.as_str()).or_default() += 1;
                 let kv_cache_usage = facts.target.map_or(0.0, |target| target.kv_cache_usage);
                 RouterMetrics::record_next_turn_prefetch_plan(
@@ -745,11 +789,45 @@ impl ProgramScheduler {
             .entry(target_id.to_string())
             .or_default();
         ledger.speculative_tokens = ledger.speculative_tokens.saturating_sub(plan.tokens);
-        if matches!(outcome, PrefetchOutcome::Late | PrefetchOutcome::Cancelled) {
-            ledger.release_load(plan.finish_at);
-        }
         *ledger.outcomes.entry(outcome.as_str()).or_default() += 1;
         *ledger.outcome_tokens.entry(outcome.as_str()).or_default() += tokens as u64;
+    }
+
+    /// A load that stopped at `at` gives the rest of its time to the loads queued
+    /// behind it, and their plans move with them.
+    fn release_load(
+        state: &mut ProgramSchedulerState,
+        target_id: &str,
+        program: &ProgramRef,
+        at: Instant,
+    ) {
+        let Some(ledger) = state.next_turn_prefetch.get_mut(target_id) else {
+            return;
+        };
+        let moved = ledger.release_load(program, at);
+        for (program, sooner) in &moved {
+            if let Some(NextTurnWait {
+                phase: WaitPhase::Planned(plan),
+                ..
+            }) = state
+                .decisions
+                .get_mut(program)
+                .and_then(|decision| decision.next_turn_wait.as_mut())
+            {
+                plan.start_at -= *sooner;
+                plan.finish_at -= *sooner;
+                plan.expires_at -= *sooner;
+            }
+        }
+        if let Some((_, sooner)) = moved.first() {
+            debug!(
+                event = "next_turn_prefetch_queue_moved_up",
+                target = %target_id,
+                plans = moved.len(),
+                sooner_seconds = sooner.as_secs_f64(),
+                "Next-turn prefetch shadow loads moved up"
+            );
+        }
     }
 }
 
@@ -1956,5 +2034,135 @@ mod tests {
         assert!(store
             .predict_return_window(&[], 0.0, 0.0, 1.0, 1, 1.0)
             .is_none());
+    }
+
+    fn returning_at_8s(name: &str) -> serde_json::Value {
+        json!({"program_id": name,
+               "next_turn_hint": {"version": "1", "expected_return_seconds": 8.0}})
+    }
+
+    /// Three waits planned on one tick: their 1 s loads finish 1, 2 and 3 s after it.
+    async fn three_queued_loads(scheduler: &ProgramScheduler) -> (Vec<ProgramDispatch>, Instant) {
+        let mut dispatches = Vec::new();
+        for name in ["first", "second", "third"] {
+            dispatches.push(finished_turn(scheduler, returning_at_8s(name)).await);
+        }
+        observe_restoring(scheduler, 0.5);
+        (dispatches, evaluate_after(scheduler, 2.0))
+    }
+
+    fn plan_in(state: &ProgramSchedulerState, program: &ProgramRef) -> PrefetchPlan {
+        match state.decisions[program]
+            .next_turn_wait
+            .as_ref()
+            .map(|wait| &wait.phase)
+        {
+            Some(WaitPhase::Planned(plan)) => plan.clone(),
+            other => panic!("not planned: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_load_that_will_not_run_moves_the_loads_behind_it_up() {
+        let scheduler = profile_scheduler();
+        let (programs, planned_at) = three_queued_loads(&scheduler).await;
+        let (second, third) = (programs[1].program(), programs[2].program());
+        let mut state = scheduler.state.lock();
+        assert_eq!(
+            plan_in(&state, third).finish_at,
+            planned_at + Duration::from_secs(3)
+        );
+        // The second load has not started at 0.5 s, so the third takes its place.
+        scheduler.release_next_turn_wait(
+            &mut state,
+            second,
+            planned_at + Duration::from_millis(500),
+        );
+        assert_eq!(
+            plan_in(&state, third).finish_at,
+            planned_at + Duration::from_secs(2)
+        );
+        scheduler.next_turn_arrived(&mut state, third, planned_at + Duration::from_millis(2500));
+        assert!(matches!(
+            state.decisions[third]
+                .next_turn_wait
+                .as_ref()
+                .map(|wait| &wait.phase),
+            Some(WaitPhase::AwaitingTurn(..))
+        ));
+        assert_eq!(
+            state.next_turn_prefetch["rank-0"].outcomes.get("late"),
+            None
+        );
+        assert_eq!(
+            state.next_turn_prefetch["rank-0"].queue_delay_seconds(planned_at),
+            2.0
+        );
+    }
+
+    #[tokio::test]
+    async fn a_late_load_gives_the_loads_behind_it_only_the_time_it_had_left() {
+        let scheduler = profile_scheduler();
+        let (programs, planned_at) = three_queued_loads(&scheduler).await;
+        let mut state = scheduler.state.lock();
+        // The first load is three quarters done when its turn arrives.
+        scheduler.next_turn_arrived(
+            &mut state,
+            programs[0].program(),
+            planned_at + Duration::from_millis(750),
+        );
+        assert_eq!(
+            state.next_turn_prefetch["rank-0"].outcomes.get("late"),
+            Some(&1)
+        );
+        let second = plan_in(&state, programs[1].program());
+        assert_eq!(
+            (second.start_at, second.finish_at),
+            (
+                planned_at + Duration::from_millis(750),
+                planned_at + Duration::from_millis(1750)
+            )
+        );
+        let third = plan_in(&state, programs[2].program());
+        assert_eq!(third.finish_at, planned_at + Duration::from_millis(2750));
+        assert_eq!(
+            third.expires_at,
+            third.finish_at + Duration::from_secs(10),
+            "its window moves too"
+        );
+    }
+
+    #[test]
+    fn a_moved_load_starts_no_sooner_than_its_own_plan_was_made() {
+        let t = Instant::now();
+        let program = |name: &str| ProgramRef::new("model".into(), name.into(), 1);
+        let plan = |start_at: Instant| PrefetchPlan {
+            source: ForecastSource::Profile,
+            tokens: TOKENS,
+            start_at,
+            finish_at: start_at + Duration::from_secs(1),
+            expires_at: start_at + Duration::from_secs(11),
+        };
+        let mut ledger = NextTurnPrefetchLedger::default();
+        ledger.commit(t, &program("a"), &plan(t));
+        ledger.commit(
+            t + Duration::from_millis(750),
+            &program("b"),
+            &plan(t + Duration::from_secs(1)),
+        );
+        assert!(ledger.release_load(&program("unknown"), t).is_empty());
+        // The stream is free from 0.25 s, but the second plan was made at 0.75 s.
+        assert_eq!(
+            ledger.release_load(&program("a"), t + Duration::from_millis(250)),
+            vec![(program("b"), Duration::from_millis(250))]
+        );
+        assert_eq!(ledger.queue_delay_seconds(t), 1.75);
+        assert!(
+            ledger
+                .release_load(&program("b"), t + Duration::from_secs(1))
+                .is_empty(),
+            "nothing behind it"
+        );
+        assert_eq!(ledger.queue_delay_seconds(t), 0.0);
     }
 }

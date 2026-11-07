@@ -336,7 +336,7 @@ A wait opens when a turn completes successfully, the Program expects another, an
 
 `vllm:kv_cache_usage_perc` counts referenced blocks only. An idle cached prefix is free to the allocator, so this gate cannot see which prefixes a real load would displace.
 
-The useful window starts when the load would finish and lasts `validity_seconds`. `load_cost_model` gives the load time. A target serves one modeled load at a time, oldest wait first, so a queued plan finishes later. The model has no demand restores in it, so read `late` as a lower bound. A wait that ends before `min_idle_seconds` counts as `short_wait`, and one that ends after it but before any tick as `not_evaluated`. The default load cost is a reference from one RTX 5060 Ti over PCIe Gen3 x8; calibrate it for the deployed model and host.
+The useful window starts when the load would finish and lasts `validity_seconds`. `load_cost_model` gives the load time. A target serves one modeled load at a time, oldest wait first, so a queued plan finishes later. A load that stops early, `late` or `cancelled`, frees the stream from then, and the loads queued behind it start sooner, their windows with them. The model has no demand restores in it, so read `late` as a lower bound. A wait that ends before `min_idle_seconds` counts as `short_wait`, and one that ends after it but before any tick as `not_evaluated`. The default load cost is a reference from one RTX 5060 Ti over PCIe Gen3 x8; calibrate it for the deployed model and host.
 
 A wait makes at most one plan, and every plan ends in one outcome. The first request to arrive ends the wait, and only that request settles the plan, so a concurrent request that finishes first changes nothing:
 
