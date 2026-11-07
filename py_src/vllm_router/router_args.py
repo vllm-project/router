@@ -601,7 +601,8 @@ class RouterArgs:
             default=RouterArgs.max_inflight_requests_per_worker,
             help="Opt-in per-worker admission capacity: the most in-flight requests "
             "the router dispatches to one worker (or one P/D stage endpoint), held "
-            "until the response body ends. When every eligible worker is full the "
+            "until the worker finishes the response or the client disconnects. "
+            "When every eligible worker is full the "
             "router returns 429 with Retry-After. Omit to disable.",
         )
         parser.add_argument(

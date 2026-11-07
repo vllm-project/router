@@ -155,7 +155,8 @@ impl RequestLoadGuard {
     }
 
     /// Hand the attempt's admission permit to this guard, so the permit is
-    /// held exactly as long as the worker load: through the response body.
+    /// held exactly as long as the worker load: until the worker finishes the
+    /// response or the client drops the body, whichever comes first.
     fn hold_admission(&self, permit: Option<WorkerAdmissionPermit>) {
         if permit.is_some() {
             *self.state.admission.lock() = permit;
@@ -3261,7 +3262,7 @@ impl RouterTrait for Router {
             }
         };
         // The permit rides the same guard as worker load, so it is held
-        // through the response body and released exactly once.
+        // until the worker finishes or the client leaves, and released once.
         let load = match (load, permit) {
             (Some(load), permit) => {
                 load.hold_admission(permit);

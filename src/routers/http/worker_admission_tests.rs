@@ -265,10 +265,10 @@ async fn burst_is_bounded_per_worker_and_excess_never_reaches_workers() {
     assert_eq!(router.admission.in_flight(&b.url), 0);
 }
 
-/// A streaming permit is held for the whole body, not only until headers,
-/// and a client that disconnects mid-stream returns it immediately.
+/// A streaming permit is held while the worker is still streaming, not only
+/// until headers, and a client that disconnects mid-stream returns it at once.
 #[tokio::test]
-async fn streaming_permit_spans_the_body_and_is_released_on_client_disconnect() {
+async fn streaming_permit_is_held_while_the_worker_streams_and_freed_on_disconnect() {
     let worker = MockWorker::spawn(Behavior::Hold).await;
     let router = admission_router(&[&worker], Some(1));
 
@@ -462,4 +462,66 @@ async fn removed_and_readded_worker_is_not_locked_out() {
     drain(held).await;
     drain(after).await;
     assert_eq!(router.admission.in_flight(&worker.url), 0);
+}
+
+/// Retry abandonment: an attempt that failed and is being retried must not
+/// keep its permit (or worker load) while the retry backs off.
+#[tokio::test]
+async fn failed_attempt_releases_its_permit_before_the_retry_backoff() {
+    let failing = MockWorker::spawn(Behavior::Fail).await;
+    let mut router = admission_router(&[&failing], Some(1));
+    router.retry_config = RetryConfig {
+        max_retries: 2,
+        initial_backoff_ms: 1_000,
+        max_backoff_ms: 1_000,
+        backoff_multiplier: 1.0,
+        jitter_factor: 0.0,
+    };
+    let router = Arc::new(router);
+    let request = tokio::spawn({
+        let router = router.clone();
+        async move {
+            router
+                .route_typed_request(None, &chat(true), "/v1/chat/completions", None)
+                .await
+        }
+    });
+    wait_until("the first attempt to fail", || failing.received() == 1).await;
+    // Now inside the 1s backoff: the failed attempt holds nothing.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(failing.received(), 1, "still in the first backoff");
+    assert_eq!(
+        router.admission.in_flight(&failing.url),
+        0,
+        "the abandoned attempt kept its permit through the backoff"
+    );
+    let response = tokio::time::timeout(WAIT, request).await.unwrap().unwrap();
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    drop(response);
+    assert_eq!(router.admission.in_flight(&failing.url), 0);
+}
+
+/// The permit measures worker occupancy: once the worker has finished, a
+/// client that has not read the buffered tail does not keep the slot.
+#[tokio::test]
+async fn finished_worker_frees_its_slot_even_if_the_client_has_not_read() {
+    let worker = MockWorker::spawn(Behavior::Hold).await;
+    let router = admission_router(&[&worker], Some(1));
+    let unread = send(&router, true).await;
+    assert_eq!(unread.status(), StatusCode::OK);
+    worker.release(1);
+    wait_until("the worker stream to finish", || {
+        router.admission.in_flight(&worker.url) == 0
+    })
+    .await;
+    let next = send(&router, true).await;
+    assert_eq!(next.status(), StatusCode::OK);
+    // The first client can still read its complete response.
+    let body = tokio::time::timeout(WAIT, to_bytes(unread.into_body(), usize::MAX))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(body.ends_with(b"data: [DONE]\n\n"));
+    worker.release(1);
+    drain(next).await;
 }

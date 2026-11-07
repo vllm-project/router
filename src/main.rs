@@ -206,7 +206,8 @@ struct CliArgs {
 
     /// Opt-in per-worker admission capacity: the most in-flight requests the
     /// router dispatches to one worker (or one P/D stage endpoint), held until
-    /// the response body ends. Full pools are rejected with 429 + Retry-After.
+    /// the worker finishes the response or the client disconnects. Full pools
+    /// are rejected with 429 + Retry-After.
     /// Omit to disable.
     #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
     max_inflight_requests_per_worker: Option<u64>,

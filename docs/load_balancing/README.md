@@ -313,10 +313,13 @@ vllm-router --policy round_robin \
   not dispatched and not retried inside the router, so the router adds no
   hidden waiting. These rejections are not worker failures: they never count
   against circuit breakers.
-- **Lifetime.** A permit is held from dispatch until the response body ends:
-  end of stream, upstream error, client disconnect, timeout or abandoned
-  retry. Each permit is released exactly once, through the same guard that
-  already owns worker load for the request.
+- **Lifetime.** A permit tracks *worker* occupancy. It is held from dispatch
+  until the worker finishes the response (end of stream or upstream error) or
+  the client goes away (disconnect, timeout, abandoned retry), whichever comes
+  first. Each permit is released exactly once, through the same guard that
+  already owns worker load for the request. Bytes the router has already
+  buffered for a slow client are not counted; bounding that buffer is a
+  separate concern.
 - **P/D.** The limit applies per stage endpoint: a prefill endpoint counts
   requests until their prefill finishes, and a decode endpoint counts pending
   plus active decode requests. A full prefill or decode stage gets the same
@@ -334,7 +337,8 @@ vllm-router --policy round_robin \
   worker permanently. They are also **local to one router replica** and do
   not see the engine's own queue. With `R` router replicas a worker can
   receive up to `R × N` requests.
-- The limit counts requests, not tokens or bytes. It does not bound per-request
+- The limit counts requests, not tokens or bytes, and it is a logical bound,
+  not a memory bound. It does not bound per-request
   memory such as large prompts; tenant quotas (#419) and token-cost fairness
   (#420) are separate controls.
 - A worker removed and re-added under the same URL starts from zero, so it can

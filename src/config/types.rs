@@ -82,7 +82,8 @@ pub struct RouterConfig {
     pub kv_aware_session_affinity_ttl_secs: Option<u64>,
     /// Opt-in per-worker admission capacity: the most router-dispatched
     /// requests one worker (one P/D stage endpoint) may hold at once, from
-    /// dispatch until its response body ends or is dropped. When every
+    /// dispatch until the worker finishes the response or the client goes
+    /// away, whichever comes first. When every
     /// eligible worker is full the router rejects with 429 instead of
     /// dispatching. `None` (the default) disables the check.
     #[serde(default, skip_serializing_if = "Option::is_none")]
