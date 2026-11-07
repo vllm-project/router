@@ -1,0 +1,15 @@
+# The engine every arm shares: vLLM 0.32.0, Qwen3-4B on one RTX 5060 Ti 16 GB. run_eval.py adds the host, the port and
+# the arm's --kv-transfer-config. The KV pool is fixed at 5 GiB, 36,400 tokens.
+model: Qwen/Qwen3-4B-Instruct-2507-FP8
+revision: 8591804019c8b22094c3b5b4454e0edc05dffc98
+max-model-len: 32768
+disable-uvicorn-access-log: true
+kv-cache-memory: 5368709120
+gpu-memory-utilization: 0.70
+enable-prefix-caching: true
+scheduling-policy: priority
+max-num-batched-tokens: 512
+long-prefill-token-threshold: 256
+enable-prompt-tokens-details: true
+kv-cache-metrics: true
+kv-cache-metrics-sample: 0.05
