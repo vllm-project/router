@@ -33,6 +33,12 @@ steps:
               environment:
                 - "CARGO_INCREMENTAL=0"
                 - "RUST_BACKTRACE=1"
+                # CI-only overrides: skip thin LTO and raise codegen-units so
+                # premerge builds finish in ~4 min instead of ~10 min. The
+                # release pipeline keeps the repository profile (thin LTO,
+                # codegen-units=1) for published binaries.
+                - "CARGO_PROFILE_RELEASE_LTO=false"
+                - "CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16"
               command:
                 - bash
                 - -c
