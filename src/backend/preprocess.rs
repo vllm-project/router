@@ -99,6 +99,26 @@ fn http_cache_identity(
     Ok(())
 }
 
+/// Whether cache-aware routing may match the request's routing key when its
+/// workers cannot prepare token IDs. Fails closed, keeping load-only routing,
+/// when the key cannot stand in for the prompt the worker will process:
+/// - identities token preparation rejects (`lora_path`, `lora_name`,
+///   multimodal or embedding inputs): the policy scopes keys only by
+///   `lora_name` and `cache_salt`, so these would share another identity's
+///   history;
+/// - prompt modifiers that stop token prompts from being used directly
+///   (`truncate_prompt_tokens`, `suffix`): the worker does not process the
+///   prompt the routing key encodes.
+pub(crate) fn http_routing_key_fallback_allowed(body: &serde_json::Value) -> bool {
+    let Some(fields) = body.as_object() else {
+        return false;
+    };
+    http_cache_identity(fields).is_ok()
+        && ["truncate_prompt_tokens", "suffix"]
+            .iter()
+            .all(|field| fields.get(*field).is_none_or(serde_json::Value::is_null))
+}
+
 fn http_kv_input(body: &serde_json::Value, route: &str) -> Result<HttpKvInput, &'static str> {
     if let Some(fields) = body.as_object() {
         http_cache_identity(fields)?;
@@ -1093,6 +1113,71 @@ mod tests {
             assert_eq!(
                 super::http_cache_identity(fields.as_object().unwrap()),
                 expected,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn routing_key_fallback_requires_a_complete_identity_and_unmodified_prompt() {
+        use serde_json::json;
+        let chat = |extra: serde_json::Value| {
+            let mut body = json!({"model":"m","messages":[{"role":"user","content":"hi"}],
+                "tools":[{"type":"function","function":{"name":"f"}}]});
+            body.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            body
+        };
+        for (name, body, allowed) in [
+            ("tool chat", chat(json!({})), true),
+            ("salt", chat(json!({"cache_salt":"tenant"})), true),
+            ("null lora_path", chat(json!({"lora_path":null})), true),
+            (
+                "null modifiers",
+                json!({"prompt":[1,2],"suffix":null,"truncate_prompt_tokens":null}),
+                true,
+            ),
+            ("lora_path", chat(json!({"lora_path":"adapter-a"})), false),
+            (
+                "lora_path batch",
+                json!({"prompt":"hi","lora_path":["a"]}),
+                false,
+            ),
+            ("lora_name", chat(json!({"lora_name":"adapter-a"})), false),
+            ("features", json!({"prompt":[1,2],"features":{}}), false),
+            ("prompt_embeds", json!({"prompt_embeds":"e"}), false),
+            (
+                "prompt adapter",
+                chat(json!({"prompt_adapter_request":{}})),
+                false,
+            ),
+            (
+                "multimodal",
+                json!({"messages":[{"role":"user","content":[{"type":"image_url"}]}]}),
+                false,
+            ),
+            (
+                "truncated tokens",
+                json!({"prompt":[1,2,3],"truncate_prompt_tokens":2}),
+                false,
+            ),
+            (
+                "truncated text",
+                json!({"prompt":"abc","truncate_prompt_tokens":0}),
+                false,
+            ),
+            (
+                "truncated chat",
+                chat(json!({"truncate_prompt_tokens":2})),
+                false,
+            ),
+            ("suffix", json!({"prompt":[1,2],"suffix":"tail"}), false),
+            ("non-object", json!([1, 2]), false),
+        ] {
+            assert_eq!(
+                super::http_routing_key_fallback_allowed(&body),
+                allowed,
                 "{name}"
             );
         }

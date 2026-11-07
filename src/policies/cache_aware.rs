@@ -360,7 +360,9 @@ impl CacheAwarePolicy {
     /// routing by load alone. HTTP workers without a render endpoint cannot
     /// prepare tool-bearing chat, yet its routing key (tool schemas, then the
     /// conversation) still identifies the reusable prefix (issue #501).
-    /// `routing_key` is computed only when that fallback is needed.
+    /// `routing_key` is computed only when that fallback is needed. Callers
+    /// return `None` when `lora_name`/`cache_salt` do not capture the
+    /// request's full cache identity, which keeps load-only routing.
     #[allow(clippy::too_many_arguments)]
     pub fn select_worker_with_inputs_or_text<K: AsRef<str>>(
         &self,
@@ -392,8 +394,11 @@ impl CacheAwarePolicy {
         self.select_prepared(workers, prepared.as_ref(), stage)
     }
 
-    /// One routing-text key for every healthy candidate, in the same tree and
-    /// identity scope as token keys; the key namespaces keep them disjoint.
+    /// One routing-key key for every healthy candidate, in the same tree and
+    /// identity scope as token keys. The routing key can itself encode the
+    /// request's token IDs, which need not be the IDs the worker processed
+    /// (for example after `truncate_prompt_tokens`), so it is nested under an
+    /// explicit fallback namespace that prepared token keys never share.
     fn prepare_text_selection(
         &self,
         workers: &[Arc<dyn Worker>],
@@ -404,17 +409,19 @@ impl CacheAwarePolicy {
     ) -> Option<PreparedCacheSelection> {
         let (healthy, tree, scope_prefix) =
             self.selection_scope(workers, model_id, lora_name, cache_salt)?;
-        let key: Arc<str> = Arc::from(format!("{scope_prefix}{routing_key}"));
+        let namespace = format!("{scope_prefix}{}", cache_routing::FALLBACK);
+        let key: Arc<str> = Arc::from(format!("{namespace}{routing_key}"));
         let input = routing_key.chars().count();
         let candidates = healthy
             .into_iter()
             .map(|index| {
                 let worker = &workers[index];
                 let hit = tree.prefix_match_tenant_char_count(&key, worker.url());
-                // The identity prefix isolates caches but earns no credit.
+                // The identity and fallback prefixes isolate keys but earn no
+                // credit. Both are ASCII, so bytes equal characters.
                 let rate = cache_routing::match_rate(
                     routing_key,
-                    hit.saturating_sub(scope_prefix.len()),
+                    hit.saturating_sub(namespace.len()),
                     input,
                 );
                 (
@@ -961,6 +968,66 @@ mod tests {
                 "regular",
             ),
             Some(1 - first)
+        );
+    }
+
+    #[test]
+    fn token_routing_keys_do_not_share_the_prepared_token_namespace() {
+        // A completion's routing key for a token-array prompt has the same
+        // encoding as a prepared token key. With `truncate_prompt_tokens` the
+        // worker processes different IDs, so fallback history must never be
+        // read back as prepared-token affinity, in either direction.
+        let (policy, workers) = cache_fixture(2, CacheAwareConfig::default());
+        let ids: Vec<u32> = (1..=32).collect();
+        let routing_key = cache_routing::token_ids(&ids);
+        let none = crate::policies::WorkerTokenInputs::new();
+        let first = select_or_text(&policy, &workers, &none, &routing_key, None).unwrap();
+        workers[first].increment_load();
+        let prepared: crate::policies::WorkerTokenInputs = workers
+            .iter()
+            .map(|worker| (worker.base_url().to_owned(), Arc::from(vec![ids.clone()])))
+            .collect();
+        let exact = policy
+            .select_worker_with_inputs(
+                &workers,
+                KvRequestTokens::PerWorker(&prepared),
+                None,
+                None,
+                None,
+                "regular",
+            )
+            .unwrap();
+        assert_eq!(exact, 1 - first, "fallback history earned token credit");
+        // The exact request's own history still earns token affinity, now
+        // against a less loaded worker.
+        workers[exact].increment_load();
+        workers[exact].increment_load();
+        assert_eq!(
+            policy.select_worker_with_inputs(
+                &workers,
+                KvRequestTokens::PerWorker(&prepared),
+                None,
+                None,
+                None,
+                "regular",
+            ),
+            Some(exact)
+        );
+        // Fallback keys keep their own prefix affinity, unaffected by the
+        // exact-token history on the other worker.
+        workers[first].increment_load();
+        workers[first].increment_load();
+        let mut longer = ids.clone();
+        longer.extend(100..108);
+        assert_eq!(
+            select_or_text(
+                &policy,
+                &workers,
+                &none,
+                &cache_routing::token_ids(&longer),
+                None
+            ),
+            Some(first)
         );
     }
 
