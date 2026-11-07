@@ -256,19 +256,21 @@ class RetentionConnector(OffloadingConnector):
             self._receipts.write("ack", request_id=request_id, **ack.to_dict())
 
     def _yield_to(self, request, num_computed_tokens, turn):
-        """Make room for a waiting request that does not fit. A request looked up again with nothing on its way
-        back was not admitted for a reason this estimate misses (vLLM's reservations, for one): each such lookup
-        takes one more hold."""
+        """Make room for a waiting request that does not fit. vLLM admits a request only if its whole prompt fits, so
+        a session's own hold that the request does not hit can keep it out too. A request looked up again with
+        nothing on its way back was not admitted for a reason this estimate misses (vLLM's reservations, for one):
+        each such lookup takes one more hold."""
         needed = math.ceil(
             (request.num_tokens - num_computed_tokens) / self._block_tokens
         )
         releasing = self._ledger.releasing_blocks
         free = self._kv_cache_manager.block_pool.get_num_free_blocks() + releasing
-        exclude = turn.hint.key if turn is not None and turn.hint is not None else None
+        own = turn.hint.key if turn is not None and turn.hint is not None else None
+        hit_blocks = num_computed_tokens // self._block_tokens
         if needed > free:
-            self._ledger.yield_blocks(needed - free, exclude)
+            self._ledger.yield_blocks(needed - free, own, hit_blocks)
         elif turn is not None and turn.lookups > 1 and not releasing:
-            self._ledger.yield_blocks(1, exclude)
+            self._ledger.yield_blocks(1, own, hit_blocks)
 
     def _write_ended(self):
         for end in self._ledger.take_ended():

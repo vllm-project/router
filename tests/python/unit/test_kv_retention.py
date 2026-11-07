@@ -353,11 +353,34 @@ class TestDemand:
         assert [end.outcome for end in ledger.take_ended()] == ["evicted", "evicted"]
         assert ledger.held_blocks == 100
 
-    def test_yield_spares_the_requesters_own_hold(self, ledger):
+    def test_yield_spares_an_own_hold_the_request_hits_in_full(self, ledger):
         ledger.retain(make_hint("a"), "ra", 100, 1600)
         ledger.retain(make_hint("b"), "rb", 100, 1600)
-        assert ledger.yield_blocks(1000, exclude=("t", "default", "a")) == 100
+        assert ledger.yield_blocks(1000, ("t", "default", "a"), 100) == 100
         assert ledger.take_releases() == {"rb"}
+
+    def test_an_own_hold_the_request_does_not_hit_gives_way_last(self, ledger):
+        ledger.retain(make_hint("a"), "ra", 100, 1600)
+        ledger.retain(make_hint("b"), "rb", 100, 1600)
+        assert ledger.yield_blocks(150, ("t", "default", "a"), 40) == 160
+        assert outcomes(ledger) == [
+            ("b:0", "evicted", "demand"),
+            ("a:0", "evicted", "own_turn"),
+        ]
+
+    def test_an_own_hold_alone_gives_way_to_a_turn_that_does_not_fit(self, ledger):
+        """A session's next prompt need not hit its held prefix, after a compaction for one. The hold must not keep
+        that prompt out until its TTL."""
+        ledger.retain(make_hint("a"), "ra", 300, 4800)
+        assert ledger.yield_blocks(20, ("t", "default", "a"), 0) == 300
+        assert outcomes(ledger) == [("a:0", "evicted", "own_turn")]
+        assert ledger.take_releases() == {"ra"}
+
+    def test_an_own_hold_stays_when_the_others_are_enough(self, ledger):
+        ledger.retain(make_hint("a"), "ra", 100, 1600)
+        ledger.retain(make_hint("b"), "rb", 100, 1600)
+        assert ledger.yield_blocks(50, ("t", "default", "a"), 0) == 100
+        assert outcomes(ledger) == [("b:0", "evicted", "demand")]
 
     def test_a_renewed_hold_is_younger(self, ledger):
         ledger.retain(make_hint("a"), "ra", 100, 1600)
@@ -690,6 +713,7 @@ def run_dir(tmp_path):
             "event": "end",
             "tier": "gpu",
             "outcome": "used",
+            "reason": None,
             "tokens": 1000,
             "held_seconds": 2.1,
             "hit_tokens": 900,
@@ -698,6 +722,7 @@ def run_dir(tmp_path):
             "event": "end",
             "tier": "gpu",
             "outcome": "expired",
+            "reason": None,
             "tokens": 3000,
             "held_seconds": 1.0,
             "hit_tokens": 0,
@@ -766,6 +791,18 @@ class TestReport:
         assert receipts["leased_chunks_mean"] == 5
         assert receipts["used_held_p50"] == 2.1
         assert receipts["used_hit_tokens"] == 900
+
+    def test_a_hold_that_gave_way_to_its_own_turn_is_counted(self, run_dir):
+        ends = [
+            {"event": "end", "tier": "gpu", "outcome": "evicted", "reason": reason}
+            | {"tokens": 1000, "held_seconds": 1.0, "hit_tokens": 0}
+            for reason in ("demand", "own_turn")
+        ]
+        (run_dir / "receipts.jsonl").write_text(
+            "\n".join(json.dumps(row) for row in ends)
+        )
+        receipts = report.receipts(run_dir, 10.0)
+        assert (receipts["gpu_evicted"], receipts["gpu_own_turn"]) == (2, 1)
 
     def test_restored_tokens_are_binned_by_pause_and_prompt_size(self, run_dir):
         rows = [

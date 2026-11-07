@@ -247,6 +247,7 @@ def receipts(run: Path, seconds: float) -> dict[str, Any]:
     used_tokens = 0
     used_hit_tokens = 0
     used_held: list[float] = []
+    own_turn = 0
     empty_leases = 0
     tier_rows: list[dict[str, Any]] = []
     observed_gpu = 0
@@ -260,6 +261,7 @@ def receipts(run: Path, seconds: float) -> dict[str, Any]:
             if row["tier"] == "cpu":
                 empty_leases += row["tokens"] == 0
             else:
+                own_turn += row["reason"] == "own_turn"
                 held_token_seconds += row["tokens"] * row["held_seconds"]
                 held_tokens += row["tokens"]
                 if row["outcome"] == "used":
@@ -284,6 +286,7 @@ def receipts(run: Path, seconds: float) -> dict[str, Any]:
         "gpu_used": ends[("gpu", "used")],
         "gpu_expired": ends[("gpu", "expired")],
         "gpu_evicted": ends[("gpu", "evicted")],
+        "gpu_own_turn": own_turn,
         "gpu_released": ends[("gpu", "released")],
         "gpu_used_share": ends[("gpu", "used")] / holds_ended if holds_ended else None,
         "gpu_used_token_share": used_tokens / held_tokens if held_tokens else None,
@@ -497,6 +500,7 @@ def tables(arms: dict[str, list[dict[str, Any]]]) -> dict[str, str]:
                 ("Used", "gpu_used", 0, 1),
                 ("Expired", "gpu_expired", 0, 1),
                 ("Evicted", "gpu_evicted", 0, 1),
+                ("Evicted for its own turn", "gpu_own_turn", 0, 1),
                 ("Used, % of tokens held", "gpu_used_token_share", 0, 100),
                 ("Held when used, p50 (s)", "used_held_p50", 1, 1),
                 ("Pool held, mean %", "held_pool_share", 1, 100),

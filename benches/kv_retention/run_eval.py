@@ -33,6 +33,7 @@ GIB = 1024**3
 POOL_TOKENS = 36_400
 MAX_ATTEMPTS = 3
 LONG_TURN_TTL = 30.0
+OWN_TURN_TTL = 30.0
 BY_SOURCE = "vllm:prompt_tokens_by_source_total"
 SAMPLED = (
     "vllm:kv_cache_usage_perc",
@@ -468,6 +469,37 @@ def probe_cpu_long_turn(engine: Engine) -> dict[str, Any]:
     }
 
 
+def probe_gpu_own_turn(engine: Engine, receipts: Path) -> dict[str, Any]:
+    """A session's next prompt that does not fit beside the session's own hold is not kept out until the hold's TTL:
+    vLLM admits a request only if its whole prompt fits. One next prompt shares nothing with the held one, as after a
+    compaction, and one shares its head, which still hits. Run with the 30 s hold's budget."""
+    probe = Probe(engine)
+    held, following, shared = 17_800, 21_000, 2_000
+    turns = {}
+    for session, head in (("own-turn-a", 0), ("own-turn-b", shared)):
+        first = probe.prompt(held)
+        probe.send(first, hint_body(session, 0, ["gpu"], OWN_TURN_TTL))
+        turns[session] = probe.send(
+            first[:head] + probe.prompt(following - head),
+            hint_body(session, 1, ["gpu"], OWN_TURN_TTL),
+        )
+    ends = {
+        row["hint_id"]: row
+        for row in receipts_of(receipts, "end")
+        if row["session"].startswith("own-turn-")
+    }
+    return {
+        "turns": turns,
+        "ends": ends,
+        "passed": all(
+            turn["seconds"] < OWN_TURN_TTL / 2
+            and (ends.get(f"{session}:0") or {}).get("reason") == "own_turn"
+            for session, turn in turns.items()
+        )
+        and share(turns["own-turn-b"], "local_cache_hit", shared) > 0.9,
+    }
+
+
 def probe_overload(engine: Engine, receipts: Path) -> dict[str, Any]:
     """Holds give way: a waiting request that does not fit releases the oldest, and a running one that cannot grow does
     too, with no preemption. Run with a budget that lets holds fill most of the pool."""
@@ -545,6 +577,7 @@ def probe(args: argparse.Namespace) -> None:
         "expiry",
         "cpu_lease",
         "cpu_long_turn",
+        "gpu_own_turn",
         "overload",
     ]
     hold_ttl = {"retention_gpu_max_ttl_seconds": 300.0}
@@ -567,6 +600,14 @@ def probe(args: argparse.Namespace) -> None:
             5,
             lambda engine, _: probe_cpu_long_turn(engine),
             retention_cpu_max_ttl_seconds=LONG_TURN_TTL,
+        )
+    if "gpu_own_turn" in selected:
+        on_engine(
+            "gpu_own_turn",
+            20,
+            probe_gpu_own_turn,
+            retention_gpu_share=0.5,
+            retention_gpu_max_ttl_seconds=OWN_TURN_TTL,
         )
     if "overload" in selected:
         on_engine("overload", 20, probe_overload, retention_gpu_share=0.9, **hold_ttl)

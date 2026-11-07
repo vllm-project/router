@@ -304,16 +304,25 @@ class RetentionLedger:
         for hold in [hold for hold in self._holds.values() if hold.deadline <= now]:
             self._end(hold, EXPIRED, None)
 
-    def yield_blocks(self, needed: int, exclude: SessionKey | None = None) -> int:
-        """Release holds oldest first until ``needed`` blocks are on their way back. A session's own hold is
-        spared: the request that needs room already counts those blocks as hits."""
+    def yield_blocks(
+        self, needed: int, own: SessionKey | None = None, own_hit_blocks: int = 0
+    ) -> int:
+        """Release holds oldest first until ``needed`` blocks are on their way back. The requesting session's own
+        hold goes last, and only if the request does not hit all of it: the blocks it hits stay cached for its next
+        lookup, so releasing them makes it no room, and its next prompt need not hit the rest."""
         released = 0
+        own_hold = None
         for hold in list(self._holds.values()):
             if released >= needed:
-                break
-            if hold.key != exclude:
-                self._end(hold, EVICTED, "demand")
-                released += hold.blocks
+                return released
+            if hold.key == own:
+                own_hold = hold
+                continue
+            self._end(hold, EVICTED, "demand")
+            released += hold.blocks
+        if released < needed and own_hold is not None and own_hold.blocks > own_hit_blocks:
+            self._end(own_hold, EVICTED, "own_turn")
+            released += own_hold.blocks - own_hit_blocks
         return released
 
     def reset(self) -> None:
