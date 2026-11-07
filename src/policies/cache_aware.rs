@@ -97,6 +97,9 @@ pub struct CacheAwarePlacement {
 pub(crate) struct PreparedCacheSelection {
     tree: Arc<Tree>,
     candidates: HashMap<String, (Vec<Arc<str>>, f64)>,
+    /// Matched on the request's routing text rather than worker-prepared
+    /// token IDs. Text is a placement heuristic, not a token count.
+    text: bool,
 }
 
 /// Cache-aware routing policy
@@ -271,25 +274,8 @@ impl CacheAwarePolicy {
         lora_name: Option<&str>,
         cache_salt: Option<&str>,
     ) -> Option<PreparedCacheSelection> {
-        let healthy = get_healthy_worker_indices(workers);
-        let first = workers.get(*healthy.first()?)?;
-        // PD workers may have no model label. Request model/adapter names must
-        // still isolate their cache history even when every label is unknown.
-        let model = normalize_model_key(model_id.unwrap_or_else(|| first.model_id())).to_owned();
-        // Keep cache identities in the keys so all scopes share the model's
-        // per-worker eviction budget instead of allocating a tree per salt.
-        let scope_prefix = if lora_name.is_some() || cache_salt.is_some() {
-            use sha2::{Digest, Sha256};
-            let identity = serde_json::to_vec(&(lora_name, cache_salt)).ok()?;
-            format!("\0ca:s:{:x}:", Sha256::digest(identity))
-        } else {
-            String::new()
-        };
-        let tree = self
-            .trees
-            .entry(model)
-            .or_insert_with(|| Arc::new(Tree::new()))
-            .clone();
+        let (healthy, tree, scope_prefix) =
+            self.selection_scope(workers, model_id, lora_name, cache_salt)?;
         // Token arrays and DP ranks commonly share prompts. Encode each
         // distinct prompt once rather than allocating eight bytes per token
         // for every candidate.
@@ -332,7 +318,116 @@ impl CacheAwarePolicy {
             };
             candidates.insert(worker.url().to_owned(), (keys, rate));
         }
-        Some(PreparedCacheSelection { tree, candidates })
+        Some(PreparedCacheSelection {
+            tree,
+            candidates,
+            text: false,
+        })
+    }
+
+    /// Healthy candidates, the model's tree and the cache-identity key prefix.
+    fn selection_scope(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        model_id: Option<&str>,
+        lora_name: Option<&str>,
+        cache_salt: Option<&str>,
+    ) -> Option<(Vec<usize>, Arc<Tree>, String)> {
+        let healthy = get_healthy_worker_indices(workers);
+        let first = workers.get(*healthy.first()?)?;
+        // PD workers may have no model label. Request model/adapter names must
+        // still isolate their cache history even when every label is unknown.
+        let model = normalize_model_key(model_id.unwrap_or_else(|| first.model_id())).to_owned();
+        // Keep cache identities in the keys so all scopes share the model's
+        // per-worker eviction budget instead of allocating a tree per salt.
+        let scope_prefix = if lora_name.is_some() || cache_salt.is_some() {
+            use sha2::{Digest, Sha256};
+            let identity = serde_json::to_vec(&(lora_name, cache_salt)).ok()?;
+            format!("\0ca:s:{:x}:", Sha256::digest(identity))
+        } else {
+            String::new()
+        };
+        let tree = self
+            .trees
+            .entry(model)
+            .or_insert_with(|| Arc::new(Tree::new()))
+            .clone();
+        Some((healthy, tree, scope_prefix))
+    }
+
+    /// Like `select_worker_with_inputs`, but when any healthy worker lacks
+    /// prepared token IDs, match every candidate on `routing_key` instead of
+    /// routing by load alone. HTTP workers without a render endpoint cannot
+    /// prepare tool-bearing chat, yet its routing key (tool schemas, then the
+    /// conversation) still identifies the reusable prefix (issue #501).
+    /// `routing_key` is computed only when that fallback is needed.
+    #[allow(clippy::too_many_arguments)]
+    pub fn select_worker_with_inputs_or_text<K: AsRef<str>>(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        tokens: KvRequestTokens<'_>,
+        routing_key: impl FnOnce() -> Option<K>,
+        model_id: Option<&str>,
+        lora_name: Option<&str>,
+        cache_salt: Option<&str>,
+        stage: &'static str,
+    ) -> Option<usize> {
+        let mut prepared = self.prepare_selection(workers, tokens, model_id, lora_name, cache_salt);
+        let complete = prepared.as_ref().is_some_and(|prepared| {
+            get_healthy_worker_indices(workers)
+                .iter()
+                .all(|&index| prepared.candidates.contains_key(workers[index].url()))
+        });
+        if !complete {
+            if let Some(key) = routing_key().filter(|key| !key.as_ref().is_empty()) {
+                prepared = self.prepare_text_selection(
+                    workers,
+                    key.as_ref(),
+                    model_id,
+                    lora_name,
+                    cache_salt,
+                );
+            }
+        }
+        self.select_prepared(workers, prepared.as_ref(), stage)
+    }
+
+    /// One routing-text key for every healthy candidate, in the same tree and
+    /// identity scope as token keys; the key namespaces keep them disjoint.
+    fn prepare_text_selection(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        routing_key: &str,
+        model_id: Option<&str>,
+        lora_name: Option<&str>,
+        cache_salt: Option<&str>,
+    ) -> Option<PreparedCacheSelection> {
+        let (healthy, tree, scope_prefix) =
+            self.selection_scope(workers, model_id, lora_name, cache_salt)?;
+        let key: Arc<str> = Arc::from(format!("{scope_prefix}{routing_key}"));
+        let input = routing_key.chars().count();
+        let candidates = healthy
+            .into_iter()
+            .map(|index| {
+                let worker = &workers[index];
+                let hit = tree.prefix_match_tenant_char_count(&key, worker.url());
+                // The identity prefix isolates caches but earns no credit.
+                let rate = cache_routing::match_rate(
+                    routing_key,
+                    hit.saturating_sub(scope_prefix.len()),
+                    input,
+                );
+                (
+                    worker.url().to_owned(),
+                    (vec![key.clone()], f64::from(rate)),
+                )
+            })
+            .collect();
+        Some(PreparedCacheSelection {
+            tree,
+            candidates,
+            text: true,
+        })
     }
 
     pub(crate) fn select_prepared(
@@ -373,17 +468,18 @@ impl CacheAwarePolicy {
         RouterMetrics::record_prefix_routing_decision(
             "cache_aware",
             stage,
-            if imbalanced {
-                "load_imbalance"
-            } else if use_prefix {
-                "prefix_hit"
-            } else {
-                "prefix_miss"
+            match (imbalanced, use_prefix, prepared.text) {
+                (true, _, _) => "load_imbalance",
+                (false, true, false) => "prefix_hit",
+                (false, false, false) => "prefix_miss",
+                (false, true, true) => "text_prefix_hit",
+                (false, false, true) => "text_prefix_miss",
             },
         );
         debug!(
             stage,
             selected = workers[index].url(),
+            text_key = prepared.text,
             match_rate = matches[position].1,
             batch_prompts = matches[position].0.len(),
             "Cache prefix decision"
@@ -763,6 +859,109 @@ mod tests {
             .collect();
         policy.init_workers(&workers);
         (policy, workers)
+    }
+
+    /// Select with the #501 fallback using one shared optional token prompt.
+    fn select_or_text(
+        policy: &CacheAwarePolicy,
+        workers: &[Arc<dyn Worker>],
+        inputs: &crate::policies::WorkerTokenInputs,
+        key: &str,
+        cache_salt: Option<&str>,
+    ) -> Option<usize> {
+        policy.select_worker_with_inputs_or_text(
+            workers,
+            KvRequestTokens::PerWorker(inputs),
+            || Some(key),
+            None,
+            None,
+            cache_salt,
+            "regular",
+        )
+    }
+
+    #[test]
+    fn missing_worker_inputs_fall_back_to_the_routing_key() {
+        let (policy, workers) = cache_fixture(2, CacheAwareConfig::default());
+        let none = crate::policies::WorkerTokenInputs::new();
+        let turn = |turns: usize| {
+            let history = "assistant:tool_call read_file\ntool:def f(): pass\n".repeat(turns);
+            cache_routing::text(&format!("tool_schema:read_file\nuser:fix bug\n{history}"))
+        };
+        let first = select_or_text(&policy, &workers, &none, &turn(1), None).unwrap();
+        // Load-only routing would now pick the other worker.
+        workers[first].increment_load();
+        for turns in 2..=4 {
+            assert_eq!(
+                select_or_text(&policy, &workers, &none, &turn(turns), None),
+                Some(first)
+            );
+        }
+        // Unrelated content and another cache salt earn no affinity.
+        let other = cache_routing::text("tool_schema:other\nuser:unrelated");
+        assert_eq!(
+            select_or_text(&policy, &workers, &none, &other, None),
+            Some(1 - first)
+        );
+        assert_eq!(
+            select_or_text(&policy, &workers, &none, &turn(5), Some("tenant-b")),
+            Some(1 - first)
+        );
+        // Session keys still require an exact match, not a shared prefix.
+        let session = cache_routing::session(Some("agent-session")).unwrap();
+        let bound = select_or_text(&policy, &workers, &none, &session, None).unwrap();
+        workers[bound].increment_load();
+        assert_eq!(
+            select_or_text(&policy, &workers, &none, &session, None),
+            Some(bound)
+        );
+    }
+
+    #[test]
+    fn complete_worker_inputs_keep_token_routing_and_skip_the_routing_key() {
+        let (policy, workers) = cache_fixture(2, CacheAwareConfig::default());
+        let ids: Arc<[Vec<u32>]> = Arc::from(vec![vec![7; 32]]);
+        let inputs: crate::policies::WorkerTokenInputs = workers
+            .iter()
+            .map(|worker| (worker.base_url().to_owned(), ids.clone()))
+            .collect();
+        let exact = |policy: &CacheAwarePolicy| {
+            policy.select_worker_with_inputs_or_text(
+                &workers,
+                KvRequestTokens::PerWorker(&inputs),
+                || -> Option<&str> { panic!("exact inputs must not build a text key") },
+                None,
+                None,
+                None,
+                "regular",
+            )
+        };
+        let first = exact(&policy).unwrap();
+        workers[first].increment_load();
+        assert_eq!(exact(&policy), Some(first));
+        // Incomplete token evidence switches every candidate to the text key;
+        // token history is not credited to text with the same content.
+        let mut partial = inputs.clone();
+        partial.remove(workers[1 - first].base_url());
+        let text = cache_routing::text("\u{7}".repeat(32).as_str());
+        assert_eq!(
+            select_or_text(&policy, &workers, &partial, &text, None),
+            Some(1 - first),
+            "token-key history must not earn credit in the text namespace"
+        );
+        // Without a routing key the existing load-only fallback is unchanged.
+        assert_eq!(
+            policy.select_worker_with_inputs_or_text(
+                &workers,
+                KvRequestTokens::PerWorker(&partial),
+                || None::<&str>,
+                None,
+                None,
+                None,
+                "regular",
+            ),
+            Some(1 - first)
+        );
     }
 
     #[test]
