@@ -479,7 +479,13 @@ pub(crate) fn http_tokenize_fallback(
             Some(vec![serde_json::Value::Object(payload)])
         }
         "/v1/messages" => {
-            if body.get("thinking").is_some_and(|value| !value.is_null()) {
+            // thinking and output_config change the chat template (reasoning_effort /
+            // enable_thinking on the worker). /tokenize cannot reproduce that, so decline
+            // and wait for /v1/messages/render instead of hashing the wrong prefix.
+            if ["thinking", "output_config"]
+                .iter()
+                .any(|field| body.get(field).is_some_and(|value| !value.is_null()))
+            {
                 return None;
             }
             payload.insert("messages".into(), messages_as_chat(body)?.into());
@@ -1133,10 +1139,13 @@ mod tests {
                 Some("multimodal_input")
             );
         }
-        // No exact chat form: tools, thinking, inline system and non-text blocks.
+        // No exact chat form: tools, thinking, output_config effort, inline system
+        // and non-text blocks. output_config maps to reasoning_effort on the worker.
         for body in [
             json!({"messages": [{"role": "user", "content": "a"}], "tools": [{"name": "f"}]}),
             json!({"messages": [{"role": "user", "content": "a"}], "thinking": {"type": "enabled"}}),
+            json!({"messages": [{"role": "user", "content": "a"}], "output_config": {"effort": "high"}}),
+            json!({"messages": [{"role": "user", "content": "a"}], "output_config": {"effort": "low"}}),
             json!({"messages": [{"role": "system", "content": "s"}, {"role": "user", "content": "a"}]}),
             json!({"messages": [{"role": "assistant", "content": [{"type": "tool_use", "id": "t", "name": "f", "input": {}}]}]}),
         ] {
