@@ -3166,6 +3166,16 @@ mod tests {
                 },
             ),
             (
+                "grpc://prefill:8000".to_string(),
+                MooncakePrefillInfo {
+                    bootstrap_addr: "http://prefill:8998".to_string(),
+                    dp_engine_ids: HashMap::from([
+                        (0, "grpc-engine-0".to_string()),
+                        (1, "grpc-engine-1".to_string()),
+                    ]),
+                },
+            ),
+            (
                 "http://fallback:8000".to_string(),
                 MooncakePrefillInfo {
                     bootstrap_addr: "http://fallback:8998".to_string(),
@@ -3187,12 +3197,14 @@ mod tests {
     async fn mooncake_decode_metadata_preserves_bootstrap_contract() {
         let router = mooncake_test_router().await;
         for (prefill, rank, host, engine) in [
-            ("prefill", None, "prefill", "engine-0"),
-            ("prefill", Some(1), "prefill", "engine-1"),
-            ("fallback", Some(99), "fallback", "engine-7"),
+            ("http://prefill:8000", None, "prefill", "engine-0"),
+            ("http://prefill:8000", Some(1), "prefill", "engine-1"),
+            ("grpc://prefill:8000", None, "prefill", "grpc-engine-0"),
+            ("grpc://prefill:8000", Some(1), "prefill", "grpc-engine-1"),
+            ("http://fallback:8000", Some(99), "fallback", "engine-7"),
         ] {
             let params = router.build_decode_kv_transfer_params(
-                &format!("http://{prefill}:8000"),
+                prefill,
                 None,
                 Some("xfer-test"),
                 Some(2),
