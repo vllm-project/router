@@ -43,6 +43,7 @@ fn cache_aware() -> PolicyConfig {
         balance_rel_threshold: 1.5,
         eviction_interval_secs: 60,
         max_tree_size: 1 << 24,
+        prefill_aware: None,
     }
 }
 

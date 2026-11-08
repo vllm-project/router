@@ -3,7 +3,8 @@ use std::collections::HashMap;
 use vllm_router_rs::config::{
     CircuitBreakerConfig, ConfigError, ConfigResult, ConnectionMode, DiscoveryConfig,
     HealthCheckConfig, HistoryBackend, KvConnector, MetricsConfig, PdKvEventSources, PolicyConfig,
-    ProgramSchedulingConfig, RetryConfig, RouterConfig, RoutingMode, TraceConfig,
+    PrefillAwareConfig, ProgramSchedulingConfig, RetryConfig, RouterConfig, RoutingMode,
+    TraceConfig,
 };
 use vllm_router_rs::metrics::PrometheusConfig;
 use vllm_router_rs::server::{self, ServerConfig};
@@ -193,6 +194,33 @@ struct CliArgs {
     /// Per-worker character budget in each model tree (enforced at cache eviction)
     #[arg(long, default_value_t = 1 << 25)]
     max_tree_size: usize,
+
+    /// cache_aware only: score workers by estimated prefill wait + stalled
+    /// decoders instead of longest prefix match (for engines whose prefill
+    /// blocks the whole data-parallel rank). Off by default.
+    #[arg(long, default_value_t = false)]
+    prefill_aware: bool,
+
+    /// Prefill-aware: assumed prefill throughput per worker (tokens/s).
+    #[arg(long, default_value_t = 8000.0)]
+    prefill_aware_rate: f64,
+
+    /// Prefill-aware: fixed cost per prefill (ms).
+    #[arg(long, default_value_t = 80.0)]
+    prefill_aware_fixed_cost_ms: f64,
+
+    /// Prefill-aware: weight of the stalled-decoders term (0 ignores decoders).
+    #[arg(long, default_value_t = 1.0)]
+    prefill_aware_decoder_weight: f64,
+
+    /// Prefill-aware: characters per token for the prompt-length estimate.
+    #[arg(long, default_value_t = 4.0)]
+    prefill_aware_chars_per_token: f64,
+
+    /// Prefill-aware: prefer workers with fewer in-flight requests than this
+    /// (e.g. the engine's max_num_seqs per DP rank); 0 disables.
+    #[arg(long, default_value_t = 0)]
+    prefill_aware_max_load: usize,
 
     /// Softmax temperature for kv_aware (0 selects the minimum cost).
     #[arg(long, default_value_t = 0.0)]
@@ -448,6 +476,13 @@ impl CliArgs {
                 balance_rel_threshold: self.balance_rel_threshold,
                 eviction_interval_secs: self.eviction_interval,
                 max_tree_size: self.max_tree_size,
+                prefill_aware: self.prefill_aware.then_some(Box::new(PrefillAwareConfig {
+                    prefill_rate_tokens_per_sec: self.prefill_aware_rate,
+                    prefill_fixed_cost_ms: self.prefill_aware_fixed_cost_ms,
+                    decoder_weight: self.prefill_aware_decoder_weight,
+                    chars_per_token: self.prefill_aware_chars_per_token,
+                    max_load: self.prefill_aware_max_load,
+                })),
             },
             "kv_aware" => PolicyConfig::KvAware {
                 router_temperature: self.router_temperature,

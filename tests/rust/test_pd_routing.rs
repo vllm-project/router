@@ -774,6 +774,7 @@ mod test_pd_routing {
                     balance_rel_threshold: 1.2,
                     eviction_interval_secs: 60,
                     max_tree_size: 1000000,
+                    prefill_aware: None,
                 },
             ),
         ];

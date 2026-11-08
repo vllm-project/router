@@ -240,6 +240,49 @@ Trees are trimmed to `max_tree_size` during periodic eviction and may grow beyon
 - When prefix caching is enabled on vLLM workers
 - Multi-tenant deployments with distinct prompt patterns
 
+### Prefill-aware scoring (opt-in)
+
+On engines where a prefill blocks every decode step of its data-parallel rank, a
+request sent to a rank that is mid-prefill waits behind that prefill, and the
+rank's running decoders stall during the new request's own prefill. With
+`--prefill-aware`, `cache_aware` replaces the balanced/imbalanced switch with a
+latency score per worker and picks the cheapest:
+
+```
+uncached = prompt_tokens * (1 - prefix match on that worker)
+cost     = decoder_weight * decoders * (uncached / rate + fixed)
+         + pending / rate + uncached / rate
+```
+
+- `prompt_tokens` = routing-text characters / `--prefill-aware-chars-per-token`.
+- `pending` is the router's estimate of the worker's outstanding prefill: a FIFO
+  of the uncached tokens it routed there, each starting when the previous one ends
+  and draining at `--prefill-aware-rate`. Entries beyond the worker's in-flight
+  count are dropped oldest-first (those requests already finished).
+- `decoders` = in-flight count minus the FIFO length.
+- With `--prefill-aware-max-load N` (e.g. the engine's `max_num_seqs` per DP
+  rank) workers at N in-flight are skipped while another has room.
+
+A cached prefix keeps its worker unless the wait there costs more than
+recomputing the prefix elsewhere. The abs/rel imbalance thresholds are not used in
+this mode. Works with HTTP workers (no engine signals needed).
+
+```bash
+vllm-router --policy cache_aware --prefill-aware \
+  --prefill-aware-rate 8000 --prefill-aware-fixed-cost-ms 80 \
+  --prefill-aware-decoder-weight 1.0 --prefill-aware-max-load 8 \
+  --worker-urls http://worker1:8000 --intra-node-data-parallel-size 4
+```
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `--prefill-aware` | off | Enable prefill-aware scoring |
+| `--prefill-aware-rate` | 8000 | Assumed prefill tokens/s per worker |
+| `--prefill-aware-fixed-cost-ms` | 80 | Fixed cost per prefill |
+| `--prefill-aware-decoder-weight` | 1.0 | Weight of the stalled-decoders term |
+| `--prefill-aware-chars-per-token` | 4.0 | Characters per token for the length estimate |
+| `--prefill-aware-max-load` | 0 (off) | Skip workers at this in-flight count while others have room |
+
 ---
 
 ## KV Aware

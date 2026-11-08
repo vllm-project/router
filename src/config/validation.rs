@@ -421,6 +421,40 @@ impl ConfigValidator {
         Ok(())
     }
 
+    /// Validate the opt-in prefill-aware scoring parameters of cache_aware.
+    fn validate_prefill_aware(pa: &PrefillAwareConfig) -> ConfigResult<()> {
+        let positive = [
+            (
+                "prefill_rate_tokens_per_sec",
+                pa.prefill_rate_tokens_per_sec,
+            ),
+            ("chars_per_token", pa.chars_per_token),
+        ];
+        for (field, value) in positive {
+            if !value.is_finite() || value <= 0.0 {
+                return Err(ConfigError::InvalidValue {
+                    field: field.to_string(),
+                    value: value.to_string(),
+                    reason: "Must be a finite number > 0".to_string(),
+                });
+            }
+        }
+        let non_negative = [
+            ("prefill_fixed_cost_ms", pa.prefill_fixed_cost_ms),
+            ("decoder_weight", pa.decoder_weight),
+        ];
+        for (field, value) in non_negative {
+            if !value.is_finite() || value < 0.0 {
+                return Err(ConfigError::InvalidValue {
+                    field: field.to_string(),
+                    value: value.to_string(),
+                    reason: "Must be a finite number >= 0".to_string(),
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// Validate policy configuration
     fn validate_policy(policy: &PolicyConfig) -> ConfigResult<()> {
         match policy {
@@ -433,7 +467,11 @@ impl ConfigValidator {
                 balance_rel_threshold,
                 eviction_interval_secs,
                 max_tree_size,
+                prefill_aware,
             } => {
+                if let Some(pa) = prefill_aware {
+                    Self::validate_prefill_aware(pa)?;
+                }
                 if !(0.0..=1.0).contains(cache_threshold) {
                     return Err(ConfigError::InvalidValue {
                         field: "cache_threshold".to_string(),
@@ -1314,10 +1352,54 @@ mod tests {
                 balance_rel_threshold: 1.1,
                 eviction_interval_secs: 60,
                 max_tree_size: 1000,
+                prefill_aware: None,
             },
         );
 
         assert!(ConfigValidator::validate(&config).is_err());
+    }
+
+    #[test]
+    fn test_validate_cache_aware_prefill_aware() {
+        let config_with = |pa: PrefillAwareConfig| {
+            RouterConfig::new(
+                RoutingMode::Regular {
+                    worker_urls: vec![
+                        "http://worker1:8000".to_string(),
+                        "http://worker2:8000".to_string(),
+                    ],
+                },
+                PolicyConfig::CacheAware {
+                    cache_threshold: 0.3,
+                    balance_abs_threshold: 2,
+                    balance_rel_threshold: 1.5,
+                    eviction_interval_secs: 60,
+                    max_tree_size: 1000,
+                    prefill_aware: Some(Box::new(pa)),
+                },
+            )
+        };
+        assert!(ConfigValidator::validate(&config_with(PrefillAwareConfig::default())).is_ok());
+        for bad in [
+            PrefillAwareConfig {
+                prefill_rate_tokens_per_sec: 0.0,
+                ..Default::default()
+            },
+            PrefillAwareConfig {
+                chars_per_token: f64::NAN,
+                ..Default::default()
+            },
+            PrefillAwareConfig {
+                decoder_weight: -1.0,
+                ..Default::default()
+            },
+            PrefillAwareConfig {
+                prefill_fixed_cost_ms: f64::INFINITY,
+                ..Default::default()
+            },
+        ] {
+            assert!(ConfigValidator::validate(&config_with(bad)).is_err());
+        }
     }
 
     #[test]
@@ -1333,6 +1415,7 @@ mod tests {
                 balance_rel_threshold: 1.1,
                 eviction_interval_secs: 60,
                 max_tree_size: 1000,
+                prefill_aware: None,
             },
         );
 
@@ -1430,6 +1513,7 @@ mod tests {
                 balance_rel_threshold: 1.1,
                 eviction_interval_secs: 60,
                 max_tree_size: 1000,
+                prefill_aware: None,
             },
         );
 
@@ -1475,6 +1559,7 @@ mod tests {
                     balance_rel_threshold: 1.1,
                     eviction_interval_secs: 60,
                     max_tree_size: 1000,
+                    prefill_aware: None,
                 }),
                 decode_policy: Some(PolicyConfig::PowerOfTwo {
                     load_check_interval_secs: 60,
@@ -1755,6 +1840,7 @@ mod tests {
             balance_rel_threshold: 1.1,
             eviction_interval_secs: 60,
             max_tree_size: 4096,
+            prefill_aware: None,
         };
         let err = ConfigValidator::validate(&config).unwrap_err().to_string();
         assert!(err.contains("requires a kv_aware prefill policy"), "{err}");

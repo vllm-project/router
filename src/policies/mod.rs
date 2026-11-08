@@ -210,6 +210,9 @@ pub struct CacheAwareConfig {
     pub eviction_interval_secs: u64,
     /// Per-worker character budget in each model tree, enforced by periodic eviction.
     pub max_tree_size: usize,
+    /// Opt-in prefill-aware scoring (see `PrefillAwareConfig`); `None` keeps
+    /// the classic prefix-match / imbalance-threshold behaviour.
+    pub prefill_aware: Option<crate::config::PrefillAwareConfig>,
 }
 
 impl Default for CacheAwareConfig {
@@ -220,6 +223,7 @@ impl Default for CacheAwareConfig {
             balance_rel_threshold: 1.1,
             eviction_interval_secs: 30,
             max_tree_size: 1 << 25,
+            prefill_aware: None,
         }
     }
 }

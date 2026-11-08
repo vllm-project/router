@@ -1019,6 +1019,10 @@ pub enum PolicyConfig {
         eviction_interval_secs: u64,
         /// Maximum cache tree size per tenant
         max_tree_size: usize,
+        /// Opt-in prefill-aware scoring; `None` keeps the classic cache_aware behaviour.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        /// Boxed to keep `PolicyConfig` (and `RoutingMode`) small.
+        prefill_aware: Option<Box<PrefillAwareConfig>>,
     },
 
     /// Event-driven, multi-tier KV placement plus live prefill/load scoring.
@@ -1098,6 +1102,71 @@ impl PolicyConfig {
             PolicyConfig::RendezvousHash => "rendezvous_hash",
         }
     }
+}
+
+/// Prefill-aware scoring for `cache_aware`.
+///
+/// On engines where a prefill blocks every decode step of its data-parallel
+/// rank, a request routed to a rank that is mid-prefill waits behind that
+/// prefill, and the rank's running decoders stall for the new request's own
+/// prefill. With this enabled, `cache_aware` scores each worker by the
+/// estimated added latency instead of picking the longest prefix match:
+///
+/// `cost = decoder_weight * decoders * (uncached / rate + fixed)
+///         + pending / rate + uncached / rate`
+///
+/// where `uncached` is the request's prompt tokens minus the worker's
+/// prefix match (from the approximate tree), `pending` is the router's
+/// estimate of the worker's not-yet-prefilled tokens (a FIFO of routed
+/// requests drained at `rate` tokens/s), and `decoders` is the worker's
+/// in-flight count minus its estimated pending prefills. The cheapest worker
+/// wins; the abs/rel imbalance thresholds are not used in this mode.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PrefillAwareConfig {
+    /// Assumed prefill throughput of one worker (tokens/s).
+    #[serde(default = "default_prefill_rate")]
+    pub prefill_rate_tokens_per_sec: f64,
+    /// Fixed cost per prefill (ms), added once per routed request.
+    #[serde(default = "default_prefill_fixed_cost_ms")]
+    pub prefill_fixed_cost_ms: f64,
+    /// Weight of the stalled-decoders term; 0 ignores running decoders.
+    #[serde(default = "default_prefill_decoder_weight")]
+    pub decoder_weight: f64,
+    /// Characters per token used to turn routing text into a token estimate.
+    #[serde(default = "default_prefill_chars_per_token")]
+    pub chars_per_token: f64,
+    /// Prefer workers whose in-flight count is below this (e.g. the engine's
+    /// max_num_seqs per rank). 0 disables the filter.
+    #[serde(default)]
+    pub max_load: usize,
+}
+
+impl Default for PrefillAwareConfig {
+    fn default() -> Self {
+        Self {
+            prefill_rate_tokens_per_sec: default_prefill_rate(),
+            prefill_fixed_cost_ms: default_prefill_fixed_cost_ms(),
+            decoder_weight: default_prefill_decoder_weight(),
+            chars_per_token: default_prefill_chars_per_token(),
+            max_load: 0,
+        }
+    }
+}
+
+fn default_prefill_rate() -> f64 {
+    8000.0
+}
+
+fn default_prefill_fixed_cost_ms() -> f64 {
+    80.0
+}
+
+fn default_prefill_decoder_weight() -> f64 {
+    1.0
+}
+
+fn default_prefill_chars_per_token() -> f64 {
+    4.0
 }
 
 fn default_kv_penalty_host() -> f64 {
@@ -1763,6 +1832,39 @@ mod tests {
     // ============= PolicyConfig Tests =============
 
     #[test]
+    fn test_cache_aware_prefill_aware_serde_defaults() {
+        let classic: PolicyConfig = serde_json::from_str(
+            r#"{"type":"cache_aware","cache_threshold":0.3,"balance_abs_threshold":2,"balance_rel_threshold":1.5,"eviction_interval_secs":120,"max_tree_size":1000}"#,
+        )
+        .unwrap();
+        match &classic {
+            PolicyConfig::CacheAware { prefill_aware, .. } => assert!(prefill_aware.is_none()),
+            other => panic!("unexpected policy {other:?}"),
+        }
+        assert!(!serde_json::to_string(&classic)
+            .unwrap()
+            .contains("prefill_aware"));
+
+        let opted_in: PolicyConfig = serde_json::from_str(
+            r#"{"type":"cache_aware","cache_threshold":0.3,"balance_abs_threshold":2,"balance_rel_threshold":1.5,"eviction_interval_secs":120,"max_tree_size":1000,"prefill_aware":{"max_load":8}}"#,
+        )
+        .unwrap();
+        match opted_in {
+            PolicyConfig::CacheAware {
+                prefill_aware: Some(pa),
+                ..
+            } => assert_eq!(
+                *pa,
+                PrefillAwareConfig {
+                    max_load: 8,
+                    ..Default::default()
+                }
+            ),
+            other => panic!("unexpected policy {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_policy_config_name() {
         assert_eq!(PolicyConfig::Random.name(), "random");
         assert_eq!(PolicyConfig::RoundRobin.name(), "round_robin");
@@ -1773,6 +1875,7 @@ mod tests {
             balance_rel_threshold: 1.5,
             eviction_interval_secs: 300,
             max_tree_size: 1000,
+            prefill_aware: None,
         };
         assert_eq!(cache_aware.name(), "cache_aware");
 
@@ -1796,6 +1899,7 @@ mod tests {
             balance_rel_threshold: 1.5,
             eviction_interval_secs: 300,
             max_tree_size: 1000,
+            prefill_aware: None,
         };
         let json = serde_json::to_string(&cache_aware).unwrap();
         assert!(json.contains("\"type\":\"cache_aware\""));
@@ -1819,6 +1923,7 @@ mod tests {
             balance_rel_threshold: 2.0,
             eviction_interval_secs: 600,
             max_tree_size: 5000,
+            prefill_aware: None,
         };
 
         match cache_aware {
@@ -1828,6 +1933,7 @@ mod tests {
                 balance_rel_threshold,
                 eviction_interval_secs,
                 max_tree_size,
+                prefill_aware: None,
             } => {
                 assert!((cache_threshold - 0.75).abs() < 0.0001);
                 assert_eq!(balance_abs_threshold, 20);
@@ -2152,6 +2258,7 @@ mod tests {
                 balance_rel_threshold: 1.2,
                 eviction_interval_secs: 600,
                 max_tree_size: 10000,
+                prefill_aware: None,
             },
             host: "0.0.0.0".to_string(),
             port: 3001,
@@ -2291,6 +2398,7 @@ mod tests {
                 balance_rel_threshold: 1.1,
                 eviction_interval_secs: 60,
                 max_tree_size: 1000,
+                prefill_aware: None,
             }),
             decode_policy: Some(PolicyConfig::PowerOfTwo {
                 load_check_interval_secs: 60,
@@ -2324,6 +2432,7 @@ mod tests {
                 balance_rel_threshold: 1.1,
                 eviction_interval_secs: 60,
                 max_tree_size: 1000,
+                prefill_aware: None,
             }),
             decode_policy: None,
             discovery_address: None,
@@ -2389,6 +2498,7 @@ mod tests {
             balance_rel_threshold: 1.5,
             eviction_interval_secs: 300,
             max_tree_size: 2000,
+            prefill_aware: None,
         };
 
         // Both stages inherit the main policy.

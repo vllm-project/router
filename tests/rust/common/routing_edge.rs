@@ -40,6 +40,7 @@ pub fn fixture_config() -> CacheAwareConfig {
         balance_rel_threshold: 2.0,
         eviction_interval_secs: 0,
         max_tree_size: 10_000,
+        prefill_aware: None,
     }
 }
 

@@ -13,6 +13,7 @@ fn test_backward_compatibility_with_empty_model_id() {
         balance_rel_threshold: 1.5,
         eviction_interval_secs: 0, // Disable background eviction for testing
         max_tree_size: 100,
+        prefill_aware: None,
     };
 
     let policy = CacheAwarePolicy::with_config(config);
@@ -50,6 +51,7 @@ fn test_mixed_model_ids() {
         balance_rel_threshold: 1.5,
         eviction_interval_secs: 0,
         max_tree_size: 100,
+        prefill_aware: None,
     };
 
     let policy = CacheAwarePolicy::with_config(config);

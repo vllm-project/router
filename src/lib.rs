@@ -142,6 +142,8 @@ impl Router {
                     balance_rel_threshold: self.balance_rel_threshold,
                     eviction_interval_secs: self.eviction_interval_secs,
                     max_tree_size: self.max_tree_size,
+                    // Prefill-aware scoring is exposed on the Rust CLI only.
+                    prefill_aware: None,
                 },
                 PolicyType::KvAware => ConfigPolicyConfig::KvAware {
                     router_temperature: self.router_temperature,
