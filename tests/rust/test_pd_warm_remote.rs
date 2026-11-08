@@ -635,8 +635,15 @@ fn prefill_calls(engine: &Engine, prompt: &[u32]) -> Vec<Value> {
 
 /// Issue #499: the warm-remote path used to call `select_worker(_, None)`, so a
 /// hash policy received no request inputs and every Program turn collapsed onto
-/// the constant fallback key `"request:"`. Distinct requests must be spread by
-/// the request text instead of pinning one prefill.
+/// the constant fallback key `"request:"`. A Program's warm turn must land on
+/// the prefill its cold turn selected for the same request text.
+///
+/// The hash ring is built from the engine URLs and the mocks bind random ports,
+/// so which prefill a given text maps to changes per run: fixed expectations
+/// would be flaky. Calibrate against the ring actually built — keep starting
+/// Programs with distinct prompts until each prefill has one, then assert that
+/// Program's warm turn returns to it. With the old constant key, cold turns used
+/// the same key, so calibration never finds a second prefill.
 #[tokio::test]
 async fn warm_remote_selection_uses_the_request_text() {
     let p0 = engine(true, false, false).await;
@@ -650,42 +657,59 @@ async fn warm_remote_selection_uses_the_request_text() {
         json!({}),
     )
     .await;
-    let programs = [
-        "alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta",
-    ];
-    for (index, program) in programs.iter().enumerate() {
-        let prompt = vec![3000 + index as u32, 42, 43];
-        // The same request twice: the first turn dispatches cold, the second
-        // reuses the D source on the P this Program is affined to.
+    let mut affined: [Option<(String, Vec<u32>)>; 2] = [None, None];
+    for index in 0..32u32 {
+        if affined.iter().all(Option::is_some) {
+            break;
+        }
+        let program = format!("calibrate-{index}");
+        let prompt = vec![3000 + index, 42, 43];
         assert_eq!(
-            call_program(&r, program, prompt.clone()).await,
+            call_program(&r, &program, prompt.clone()).await,
             StatusCode::OK
         );
-        assert_eq!(call_program(&r, program, prompt).await, StatusCode::OK);
-    }
-    let mut pinned = Vec::new();
-    for (index, program) in programs.iter().enumerate() {
-        let prompt = vec![3000 + index as u32, 42, 43];
-        let first = prefill_calls(&p0, &prompt);
-        let second = prefill_calls(&p1, &prompt);
-        let (engine, turns) = match (first.len(), second.len()) {
-            (2, 0) => (0, first),
-            (0, 2) => (1, second),
-            (a, b) => panic!("Program {program} split its two turns (p0={a}, p1={b})"),
+        let engine = match (
+            prefill_calls(&p0, &prompt).is_empty(),
+            prefill_calls(&p1, &prompt).is_empty(),
+        ) {
+            (false, true) => 0,
+            (true, false) => 1,
+            _ => panic!("one cold turn must reach exactly one prefill"),
         };
+        affined[engine].get_or_insert((program, prompt));
+    }
+    let [Some((program0, prompt0)), Some((program1, prompt1))] = affined else {
+        let (first, second) = (
+            p0.state.calls.lock().unwrap().len(),
+            p1.state.calls.lock().unwrap().len(),
+        );
+        panic!(
+            "could not find a request text for both prefills: every Program turn was pinned to \
+             one engine (p0={first}, p1={second})"
+        );
+    };
+    for (engine, program, prompt) in [(0, program0, prompt0), (1, program1, prompt1)] {
+        assert_eq!(
+            call_program(&r, &program, prompt.clone()).await,
+            StatusCode::OK
+        );
+        let (turns0, turns1) = (prefill_calls(&p0, &prompt), prefill_calls(&p1, &prompt));
+        let (affined_turns, other) = if engine == 0 {
+            (&turns0, &turns1)
+        } else {
+            (&turns1, &turns0)
+        };
+        assert_eq!(
+            affined_turns.len(),
+            2,
+            "the warm turn of {program} left its affined prefill: selection ignored the request text"
+        );
+        assert!(other.is_empty(), "{program} reached both prefills");
         assert!(
-            turns[1]
+            affined_turns[1]
                 .pointer("/kv_transfer_params/remote_engine_id")
                 .is_some(),
             "turn 2 of {program} did not take the warm read"
         );
-        if !pinned.contains(&engine) {
-            pinned.push(engine);
-        }
     }
-    assert_eq!(
-        pinned.len(),
-        2,
-        "every Program turn was pinned to one prefill: the warm-remote path ignored the request text"
-    );
 }
