@@ -485,34 +485,6 @@ impl HybridCapabilities {
             || !has_attention
             || !(has_state || replay_tokens > 0 || declared_single_attention)
         {
-        let has_attention = groups.iter().any(|group| {
-            matches!(
-                group.kind,
-                HybridGroupKind::FullAttention
-                    | HybridGroupKind::CompressedFullAttention { .. }
-                    | HybridGroupKind::SlidingWindow { .. }
-            )
-        });
-<<<<<<< HEAD
-        let has_state = groups
-            .iter()
-            .any(|group| matches!(group.kind, HybridGroupKind::Checkpoint));
-        let declared_single_attention =
-            groups.len() == 1 && rank.declared_groups == Some(1) && has_attention;
-        if groups.is_empty() || !has_attention || !(has_state || declared_single_attention) {
-=======
-        let has_state = groups.iter().any(|group| {
-            matches!(
-                group.kind,
-                HybridGroupKind::Checkpoint | HybridGroupKind::SlidingWindow { .. }
-            )
-        });
-        if rank.groups.len() < 2
-            || groups.is_empty()
-            || !has_attention
-            || !(has_state || replay_tokens > 0)
-        {
->>>>>>> 15cb2f6 (feat(kv-index): sliding window and replay window for DeepSeek V4)
             return Err("not a supported mixed layout");
         }
         let adapters = validate_adapters(&self.adapters)?;

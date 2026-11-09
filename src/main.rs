@@ -498,6 +498,42 @@ impl CliArgs {
                 serde_json::from_slice(&data).map_err(|error| ConfigError::ValidationFailed {
                     reason: format!("invalid hybrid layout {}: {error}", path.display()),
                 })?;
+            // A layout keyed by `base@rank` is only reachable when the Router
+            // discovers that exact rank URL. Regular startup expands a base URL
+            // into `base@0..N`, so a rank-pinned key under a plain base URL
+            // would be accepted here and then never applied.
+            if !self.service_discovery && !self.worker_urls.is_empty() {
+                for worker in layouts.keys() {
+                    let exact = self.worker_urls.iter().any(|url| url == worker);
+                    let covers_ranks = self.worker_urls.iter().any(|url| {
+                        url.strip_prefix(worker.as_str())
+                            .is_some_and(|suffix| suffix.starts_with('@'))
+                    });
+                    let rank_pinned_under_base = !exact
+                        && self.worker_urls.iter().any(|url| {
+                            !url.contains('@')
+                                && worker
+                                    .strip_prefix(url.as_str())
+                                    .is_some_and(|suffix| suffix.starts_with('@'))
+                        });
+                    if rank_pinned_under_base {
+                        return Err(ConfigError::ValidationFailed {
+                            reason: format!(
+                                "hybrid layout '{worker}' is rank-pinned but --worker-urls \
+                                 configures only its base URL; declare the layout under that base \
+                                 URL with one entry per rank, or enable discovery"
+                            ),
+                        });
+                    }
+                    if !exact && !covers_ranks {
+                        return Err(ConfigError::ValidationFailed {
+                            reason: format!(
+                                "hybrid layout worker '{worker}' is not in --worker-urls"
+                            ),
+                        });
+                    }
+                }
+            }
             for (worker, layout) in layouts {
                 // A layout without declared endpoints is legal: the engine can
                 // report its own publishers (gRPC GetKvEventSources, or the HTTP

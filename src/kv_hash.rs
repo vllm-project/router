@@ -112,7 +112,9 @@ impl BlockKeyGenerator {
     }
 
     /// The chain's initial parent, i.e. the digest the engine uses before any
-    /// block is stored.
+    /// block is stored. Only the tests need it now that claims come from the
+    /// hashes the engine published.
+    #[cfg(test)]
     pub(crate) fn none_hash(&self) -> SequenceHash {
         self.none_hash
     }

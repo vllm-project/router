@@ -76,12 +76,10 @@ pub(crate) mod tests {
     use super::super::ingest::HybridEventError;
     use super::super::layout::{event_kind_matches, HybridEventGroup, HybridGroupKind};
     use super::super::HybridEventIndex;
-    use super::*;
     use crate::kv_hash::{BlockKeyGenerator, SequenceHash};
     use crate::kv_index::wire::ExternalBlockHash;
-    use crate::kv_index::{KVEvent, KVEventBatch, RoutableTarget};
-
     use crate::kv_index::wire::{BlockRemoved, BlockStored};
+    use crate::kv_index::{KVEvent, KVEventBatch, RoutableTarget};
 
     fn target() -> RoutableTarget {
         RoutableTarget {

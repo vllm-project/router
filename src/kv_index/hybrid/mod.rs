@@ -201,10 +201,6 @@ impl HybridEventIndex {
         state.visible = false;
     }
 
-    /// Decode a wire payload before applying it. Corrupt payloads invalidate
-    /// all groups, including claims from previously accepted batches.
-    ///
-
     /// Calculate one consistent local snapshot. Zero means a miss or an
     /// untrusted source.
     pub fn reusable_tokens(&self, tokens: &[u32], max_reusable_tokens: usize) -> u64 {
