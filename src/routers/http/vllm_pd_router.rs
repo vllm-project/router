@@ -1141,9 +1141,13 @@ impl VllmPDRouter {
                 if let Some(index) =
                     self.select_program_prefill_index(&prefill_workers, &request, path, headers)
                 {
+                    // The target and the worker it charges travel together, so
+                    // execute() derives both from the same index.
                     let prefills = prefill_candidates
                         .iter()
-                        .map(|(_, worker)| pd_program_adapter::worker_target(worker))
+                        .map(|(_, worker)| {
+                            (pd_program_adapter::worker_target(worker), worker.clone())
+                        })
                         .collect::<Vec<_>>();
                     let started = Instant::now();
                     if let Some(result) = super::pd_warm_remote::execute(
@@ -1158,7 +1162,6 @@ impl VllmPDRouter {
                         &decode_targets,
                         index,
                         &self.pd_router.pd_load,
-                        prefill_workers[index].clone(),
                         decode_worker.clone(),
                     )
                     .await
@@ -1188,9 +1191,22 @@ impl VllmPDRouter {
                 }
             }
         }
-        let Some((prefill_id, prefill_worker)) = selected
-            .or_else(|| self.select_program_prefill(&prefill_candidates, &request, path, headers))
-        else {
+        // A warm attempt can spend time in `/pd_capabilities` probes before it
+        // declines, so the snapshot above may be stale by now. If the P this
+        // turn holds has left the pool in the meantime, take one bounded
+        // re-selection from a fresh snapshot instead of reserving capacity on a
+        // dead target and failing the turn at the liveness recheck. This runs
+        // only when the reused target is gone, so it does not reintroduce the
+        // double selection the fix removes.
+        let selection = match selected {
+            Some((prefill_id, _)) if !self.program_prefill_is_live(&prefill_id) => {
+                let candidates = self.program_prefill_candidates();
+                self.select_program_prefill(&candidates, &request, path, headers)
+            }
+            Some(selection) => Some(selection),
+            None => self.select_program_prefill(&prefill_candidates, &request, path, headers),
+        };
+        let Some((prefill_id, prefill_worker)) = selection else {
             RouterMetrics::record_pd_error("server_selection");
             return Some(program_unavailable(
                 &completion,
@@ -1336,48 +1352,55 @@ impl VllmPDRouter {
         let policy_headers = policy
             .needs_headers()
             .then(|| header_utils::to_policy_headers(headers).unwrap_or_default());
-        policy.select_worker_with_headers(workers, request_text.as_deref(), policy_headers.as_ref())
+        // Both callers index the worker slice with this value. A policy that
+        // returns an out-of-range index is a policy bug, but it must degrade to
+        // the same "no feasible P" 503 as an empty pool instead of panicking the
+        // request task.
+        policy
+            .select_worker_with_headers(workers, request_text.as_deref(), policy_headers.as_ref())
+            .filter(|index| *index < workers.len())
     }
 
-    /// Recheck the bound endpoints after a capacity wait: an expired
-    /// registration or a removed worker must not receive the dispatch.
-    fn program_targets_are_live(&self, prefill_id: &str, decode_id: &str) -> bool {
+    /// Whether a P target is still registered and available.
+    fn program_prefill_is_live(&self, prefill_id: &str) -> bool {
         if self.use_discovery {
-            let prefill_live =
-                self.service_registry
-                    .get_prefill_instances()
-                    .iter()
-                    .any(|(address, _)| {
-                        pd_program_adapter::discovered_target(address).id == prefill_id
-                    });
-            let decode_live = pd_program_adapter::discovered_decode_instance_by_id(
-                &self.service_registry,
-                self.intra_node_data_parallel_size,
-                decode_id,
-            )
-            .is_some();
-            prefill_live && decode_live
+            self.service_registry
+                .get_prefill_instances()
+                .iter()
+                .any(|(address, _)| pd_program_adapter::discovered_target(address).id == prefill_id)
         } else {
-            let prefill_live = self
-                .pd_router
+            self.pd_router
                 .worker_registry
                 .get_prefill_workers()
                 .iter()
                 .any(|worker| {
                     worker.is_available()
                         && pd_program_adapter::worker_target(worker).id == prefill_id
-                });
-            let decode_live = self
-                .pd_router
+                })
+        }
+    }
+
+    /// Recheck the bound endpoints after a capacity wait: an expired
+    /// registration or a removed worker must not receive the dispatch.
+    fn program_targets_are_live(&self, prefill_id: &str, decode_id: &str) -> bool {
+        let decode_live = if self.use_discovery {
+            pd_program_adapter::discovered_decode_instance_by_id(
+                &self.service_registry,
+                self.intra_node_data_parallel_size,
+                decode_id,
+            )
+            .is_some()
+        } else {
+            self.pd_router
                 .worker_registry
                 .get_decode_workers()
                 .iter()
                 .any(|worker| {
                     worker.is_available()
                         && pd_program_adapter::worker_target(worker).id == decode_id
-                });
-            prefill_live && decode_live
-        }
+                })
+        };
+        self.program_prefill_is_live(prefill_id) && decode_live
     }
 
     /// Select a P/D pair among the discovered instances. Request headers reach
