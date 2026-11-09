@@ -210,7 +210,7 @@ impl EngineFrontend {
 
     /// Convert + GenerateStream + detok on the selected worker URL.
     pub async fn dispatch(&self, worker_url: &str, prepared: PreparedRequest) -> Response {
-        self.dispatch_with_first_output(worker_url, prepared, None)
+        self.dispatch_with_first_output(worker_url, prepared, None, None)
             .await
     }
 
@@ -219,9 +219,10 @@ impl EngineFrontend {
         worker_url: &str,
         prepared: PreparedRequest,
         on_first_output: Option<FirstOutputCallback>,
+        observer: Option<std::sync::Arc<super::grpc::EngineOutcomeObserver>>,
     ) -> Response {
         self.grpc
-            .dispatch_prepared(worker_url, prepared, on_first_output)
+            .dispatch_prepared(worker_url, prepared, on_first_output, observer)
             .await
     }
 

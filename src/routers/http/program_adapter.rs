@@ -3,6 +3,7 @@
 //! This module understands transport envelopes only. Identity parsing and all
 //! scheduling decisions remain in `program_scheduling`.
 
+use crate::backend::grpc::EngineOutcomeObserver;
 use crate::program_scheduling::{ProgramDispatch, ProgramScheduler, ProgramUsageObservation};
 use crate::token_estimator::{MomentumTokenEstimator, TokenEstimateCalibration};
 use parking_lot::Mutex;
@@ -24,7 +25,9 @@ struct ProgramCompletionInner {
     first_stream_output_at: OnceLock<Instant>,
     token_estimator: Arc<MomentumTokenEstimator>,
     token_estimate_calibration: TokenEstimateCalibration,
+    observer: Arc<EngineOutcomeObserver>,
     finished: AtomicBool,
+    finished_success: AtomicBool,
 }
 
 impl ProgramCompletion {
@@ -42,7 +45,9 @@ impl ProgramCompletion {
                 first_stream_output_at: OnceLock::new(),
                 token_estimator,
                 token_estimate_calibration,
+                observer: Arc::new(EngineOutcomeObserver::default()),
                 finished: AtomicBool::new(false),
+                finished_success: AtomicBool::new(false),
             }),
         }
     }
@@ -65,18 +70,46 @@ impl ProgramCompletion {
     pub(super) fn finish(&self, success: bool) {
         self.inner.finish(success);
     }
+
+    /// Terminal Engine outcome channel for the gRPC producer.
+    pub(super) fn engine_observer(&self) -> Arc<EngineOutcomeObserver> {
+        self.inner.observer.clone()
+    }
+
+    #[cfg(test)]
+    pub(super) fn finished_success(&self) -> bool {
+        self.inner.finished_success.load(Ordering::Acquire)
+    }
 }
 
 impl ProgramCompletionInner {
-    fn finish(&self, success: bool) {
+    fn finish(&self, mut success: bool) {
         if self.finished.swap(true, Ordering::AcqRel) {
             return;
         }
-        let usage = {
+        let (mut usage, wire_error) = {
             let mut accumulator = self.usage.lock();
             accumulator.finish_sse();
-            accumulator.observation
+            (accumulator.observation, accumulator.wire_error)
         };
+        // The gRPC producer knows the Engine's final counts even when the client
+        // did not ask for a wire `usage` chunk; prefer them over missing SSE.
+        if let Some((prompt_tokens, completion_tokens)) = self.observer.usage() {
+            usage.merge(ProgramUsageObservation {
+                prompt_tokens: Some(prompt_tokens),
+                completion_tokens: Some(completion_tokens),
+                cached_prompt_tokens: None,
+            });
+        }
+        if self.observer.failed() {
+            // A producer error frame (timeout, tonic error, premature EOF) is
+            // not a successful completion even though the SSE body ended.
+            success = false;
+        }
+        if wire_error {
+            success = false;
+        }
+        self.finished_success.store(success, Ordering::Release);
         if success {
             self.token_estimator
                 .observe_feedback(&self.token_estimate_calibration, usage.prompt_tokens);
@@ -101,6 +134,9 @@ impl Drop for ProgramCompletionInner {
 struct ProgramUsageAccumulator {
     observation: ProgramUsageObservation,
     sse_buffer: Vec<u8>,
+    /// A wire-level error payload ended the stream; the body-level EOF must not
+    /// be treated as success.
+    wire_error: bool,
 }
 
 impl ProgramUsageAccumulator {
@@ -108,7 +144,19 @@ impl ProgramUsageAccumulator {
 
     fn observe_json(&mut self, body: &[u8]) {
         if let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) {
+            self.observe_error(&value);
             self.observe_value(&value);
+        }
+    }
+
+    /// An `error` payload is the gRPC producer's terminal failure frame and may
+    /// also come from an upstream error body; neither is a completed attempt.
+    fn observe_error(&mut self, value: &serde_json::Value) {
+        if value.get("error").is_some_and(|error| !error.is_null()) {
+            self.wire_error = true;
+        }
+        if value.get("object").and_then(serde_json::Value::as_str) == Some("error") {
+            self.wire_error = true;
         }
     }
 
@@ -145,6 +193,14 @@ impl ProgramUsageAccumulator {
         };
         let data = data.trim();
         let data = data.as_bytes();
+        if data
+            .windows(b"\"error\"".len())
+            .any(|window| window == b"\"error\"")
+        {
+            if let Ok(value) = serde_json::from_slice::<serde_json::Value>(data) {
+                self.observe_error(&value);
+            }
+        }
         if data
             .windows(b"\"usage\"".len())
             .any(|window| window == b"\"usage\"")
@@ -243,6 +299,102 @@ mod tests {
         accumulator.observe_sse_chunk(b"\"completion_tokens\":3}}\n\ndata: [DONE]\n");
         assert_eq!(accumulator.observation.prompt_tokens, Some(12));
         assert_eq!(accumulator.observation.completion_tokens, Some(3));
+    }
+
+    #[tokio::test]
+    async fn engine_usage_from_the_producer_is_used_without_wire_usage() {
+        let (scheduler, dispatch) = settlement_fixture().await;
+        let estimator = Arc::new(MomentumTokenEstimator::default());
+        let (_, calibration) = estimator.estimate(
+            TokenEstimateScope::new("model", "/v1/chat/completions"),
+            "observer usage",
+        );
+        let completion =
+            ProgramCompletion::new(scheduler.clone(), dispatch, estimator, calibration);
+        // The client did not ask for a wire usage chunk; the producer still
+        // knows the Engine's counts.
+        completion.engine_observer().record_usage(123, 7);
+        completion.observe_sse_chunk(b"data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n");
+        completion.finish(true);
+        assert!(completion.finished_success());
+        let snapshot = scheduler.diagnostics();
+        assert_eq!(snapshot.ranks[0].programs[0].context_tokens, 123);
+    }
+
+    #[tokio::test]
+    async fn wire_error_frame_does_not_count_as_a_successful_round() {
+        let (scheduler, dispatch) = settlement_fixture().await;
+        let estimator = Arc::new(MomentumTokenEstimator::default());
+        let (_, calibration) = estimator.estimate(
+            TokenEstimateScope::new("model", "/v1/chat/completions"),
+            "wire error",
+        );
+        let completion =
+            ProgramCompletion::new(scheduler.clone(), dispatch, estimator, calibration);
+        completion
+            .observe_sse_chunk(b"data: {\"error\":\"gRPC stream closed before finish_info\"}\n\n");
+        completion.finish(true);
+        assert!(!completion.finished_success());
+    }
+
+    #[tokio::test]
+    async fn producer_error_outcome_overrides_body_eof_success() {
+        let (scheduler, dispatch) = settlement_fixture().await;
+        let estimator = Arc::new(MomentumTokenEstimator::default());
+        let (_, calibration) = estimator.estimate(
+            TokenEstimateScope::new("model", "/v1/chat/completions"),
+            "producer error",
+        );
+        let completion =
+            ProgramCompletion::new(scheduler.clone(), dispatch, estimator, calibration);
+        completion.engine_observer().record_error();
+        completion.finish(true);
+        assert!(!completion.finished_success());
+    }
+
+    #[tokio::test]
+    async fn error_free_stream_still_succeeds() {
+        let (scheduler, dispatch) = settlement_fixture().await;
+        let estimator = Arc::new(MomentumTokenEstimator::default());
+        let (_, calibration) = estimator.estimate(
+            TokenEstimateScope::new("model", "/v1/chat/completions"),
+            "clean stream",
+        );
+        let completion = ProgramCompletion::new(scheduler, dispatch, estimator, calibration);
+        completion.observe_sse_chunk(b"data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\n");
+        completion.finish(true);
+        assert!(completion.finished_success());
+    }
+
+    async fn settlement_fixture() -> (
+        Arc<ProgramScheduler>,
+        crate::program_scheduling::ProgramDispatch,
+    ) {
+        let scheduler = Arc::new(ProgramScheduler::new(ProgramSchedulerConfig::default()));
+        let target = ProgramTarget {
+            id: "rank-0".into(),
+            base_url: "http://worker".into(),
+            dp_rank: None,
+        };
+        let identity = ProgramIdentity::from_request(
+            None,
+            Some(&serde_json::json!({"vllm_xargs":{"agentic_context":{
+                "program_id":"observer","expected_resume":true
+            }}})),
+            Some("model"),
+        )
+        .unwrap()
+        .unwrap();
+        let dispatch = scheduler
+            .acquire(
+                identity,
+                crate::program_scheduling::ContextTokens::estimated(100),
+                std::slice::from_ref(&target),
+                None,
+            )
+            .await
+            .unwrap();
+        (scheduler, dispatch)
     }
 
     #[tokio::test]

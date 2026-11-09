@@ -162,6 +162,11 @@ impl ProgramDispatch {
         self.context.shadow_tokens()
     }
 
+    /// Prepared counterfactual with provenance, when shadow mode was active.
+    pub fn shadow_context_facts(&self) -> Option<super::TokenFacts> {
+        self.context.shadow_facts()
+    }
+
     /// Whether this is the first request after admission or resume.
     pub fn placement_start_request(&self) -> bool {
         self.placement_start_request

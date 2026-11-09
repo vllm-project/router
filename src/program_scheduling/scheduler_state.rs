@@ -178,7 +178,7 @@ pub(crate) struct ProgramDecisionState {
     /// Provenance of `context_tokens`.
     pub(crate) context_token_source: TokenFactSource,
     /// Prepared counterfactual recorded by shadow mode, if any.
-    pub(crate) shadow_context_tokens: Option<usize>,
+    pub(crate) shadow_context_facts: Option<crate::program_scheduling::TokenFacts>,
     /// Fingerprint of the prepared count that established `context_tokens`.
     pub(crate) context_token_fingerprint: Option<TokenizerFingerprint>,
     pub(crate) output_token_reservation: Option<usize>,
@@ -235,7 +235,7 @@ impl ProgramDecisionState {
             home_target,
             context_tokens: context.tokens(),
             context_token_source: context.source(),
-            shadow_context_tokens: context.shadow_tokens(),
+            shadow_context_facts: context.shadow_facts(),
             context_token_fingerprint: context.fingerprint(),
             output_token_reservation: None,
             context_shrink_observations: 0,
@@ -294,8 +294,9 @@ impl ProgramDecisionState {
         decode_buffer_tokens: usize,
         expected_output_tokens: Option<usize>,
     ) -> Option<f64> {
-        self.shadow_context_tokens.map(|tokens| {
-            tokens
+        self.shadow_context_facts.map(|facts| {
+            facts
+                .tokens()
                 .saturating_sub(self.shared_prefix_tokens)
                 .saturating_add(
                     expected_output_tokens
@@ -391,6 +392,10 @@ pub(crate) struct ProgramSchedulerState {
     /// Ordered by revocation time and bounded so a pathological workload cannot
     /// grow scheduler memory without limit.
     pub(crate) revoked_token_fingerprints: BTreeMap<TokenizerFingerprint, Instant>,
+    /// Set once the revocation set hit its bound. Absence from the set means
+    /// "trusted", so evicting an old fingerprint would fail open; instead every
+    /// prepared fact falls back to estimation until the Router restarts.
+    pub(crate) token_fingerprint_saturated: bool,
     /// Total revocations, including entries evicted from the bounded map.
     pub(crate) token_fingerprint_revocations: u64,
 }
@@ -411,6 +416,7 @@ impl ProgramSchedulerState {
             rank_factors: HashMap::new(),
             lineage: ProgramLineage::default(),
             revoked_token_fingerprints: BTreeMap::new(),
+            token_fingerprint_saturated: false,
             token_fingerprint_revocations: 0,
         }
     }

@@ -58,10 +58,11 @@ impl ProgramScheduler {
         let allowed = self.prepared_token_pool_allowed(model_pool);
         let revoked = {
             let state = self.state.lock();
-            self.fingerprint_revoked(
-                &state,
-                arrival.prepared().and_then(|facts| facts.fingerprint()),
-            )
+            state.token_fingerprint_saturated
+                || self.fingerprint_revoked(
+                    &state,
+                    arrival.prepared().and_then(|facts| facts.fingerprint()),
+                )
         };
         super::resolve_context_tokens(self.config.token_count_mode, arrival, allowed, revoked)
     }
@@ -79,14 +80,28 @@ impl ProgramScheduler {
         target_id: &str,
         now: Instant,
     ) {
+        if let Some(outcome) = self.shadow_admission_outcome(state, program, target_id, now) {
+            RouterMetrics::record_agent_aware_context_token_shadow(target_id, outcome);
+        }
+    }
+
+    /// Counterfactual outcome for one sampled admission, split out so tests can
+    /// assert it without scraping metrics.
+    pub(crate) fn shadow_admission_outcome(
+        &self,
+        state: &ProgramSchedulerState,
+        program: &ProgramRef,
+        target_id: &str,
+        now: Instant,
+    ) -> Option<&'static str> {
         let Some(decision) = state.decisions.get(program) else {
-            return;
+            return None;
         };
         let Some(shadow_required) = decision.shadow_private_tokens_with_output(
             self.config.progress_ttl.decode_buffer_tokens,
             decision.output_token_reservation,
         ) else {
-            return;
+            return None;
         };
         let capacity = self.config.progress_ttl.token_capacity;
         let applied_required = decision.private_tokens_with_output(
@@ -94,32 +109,47 @@ impl ProgramScheduler {
             decision.output_token_reservation,
         );
         let used = self.target_usage(state, target_id, now);
-        let count_fits = state
+        // For a later turn of an already-active Program the usage and the
+        // active count already include this Program. Compare only what its new
+        // demand would add instead of charging the full demand twice.
+        let active_here = state
+            .runtime
+            .view(program)
+            .and_then(|view| view.placement.clone())
+            .is_some_and(|placement| placement == target_id);
+        let used_for_check = if active_here {
+            (used - applied_required).max(0.0)
+        } else {
+            used
+        };
+        let active_count = state
             .runtime
             .iter_views()
             .filter(|other| {
                 other.state == super::ProgramState::Active && other.placement == Some(target_id)
             })
-            .count()
-            .saturating_add(1)
-            <= self.config.max_active_programs_per_target;
+            .count();
+        let count_fits = if active_here {
+            active_count <= self.config.max_active_programs_per_target
+        } else {
+            active_count.saturating_add(1) <= self.config.max_active_programs_per_target
+        };
         let (applied_fits, shadow_fits) = match capacity {
             Some(capacity) => {
                 let low = capacity as f64 * self.config.progress_ttl.low_watermark_ratio;
                 (
-                    count_fits && used + applied_required <= low,
-                    count_fits && used + shadow_required <= low,
+                    count_fits && used_for_check + applied_required <= low,
+                    count_fits && used_for_check + shadow_required <= low,
                 )
             }
             None => (count_fits, count_fits),
         };
-        let outcome = match (applied_fits, shadow_fits) {
+        Some(match (applied_fits, shadow_fits) {
             (true, true) => "both_admit",
             (false, false) => "both_deny",
             (true, false) => "estimate_admits_exact_denies",
             (false, true) => "estimate_denies_exact_admits",
-        };
-        RouterMetrics::record_agent_aware_context_token_shadow(target_id, outcome);
+        })
     }
 
     /// Compare one prepared arrival count with the Engine-observed count.
@@ -154,6 +184,10 @@ impl ProgramScheduler {
         let Some(fingerprint) = fingerprint else {
             return;
         };
+        if state.token_fingerprint_saturated {
+            // Every prepared fact already falls back to estimation.
+            return;
+        }
         if state
             .revoked_token_fingerprints
             .insert(fingerprint, Instant::now())
@@ -173,16 +207,20 @@ impl ProgramScheduler {
                  falling back to estimation for this fingerprint"
             );
         }
-        while state.revoked_token_fingerprints.len() > MAX_REVOKED_FINGERPRINTS {
-            let oldest = state
-                .revoked_token_fingerprints
-                .iter()
-                .min_by_key(|(_, revoked_at)| **revoked_at)
-                .map(|(fingerprint, _)| *fingerprint);
-            let Some(oldest) = oldest else {
-                break;
-            };
-            state.revoked_token_fingerprints.remove(&oldest);
+        if state.revoked_token_fingerprints.len() > MAX_REVOKED_FINGERPRINTS {
+            // Keeping the bound by eviction would make an old, known-bad
+            // fingerprint trusted again. Fail closed instead: the saturation
+            // flag revokes every prepared fact until the Router restarts.
+            state.revoked_token_fingerprints.remove(&fingerprint);
+            state.token_fingerprint_saturated = true;
+            RouterMetrics::record_agent_aware_context_token_revocation("saturation");
+            warn!(
+                event = "token_fact_fingerprint_revocation_saturated",
+                model_pool,
+                bound = MAX_REVOKED_FINGERPRINTS,
+                "revoked-fingerprint set reached its bound; prepared token counts now \
+                 fall back to estimation for every fingerprint until restart"
+            );
         }
     }
 
@@ -238,6 +276,21 @@ mod tests {
         }
     }
 
+    fn identity_named(program: &str) -> super::super::ProgramIdentity {
+        super::super::ProgramIdentity::from_request(
+            None,
+            Some(&json!({
+                "vllm_xargs": {"agentic_context": {
+                    "program_id": program,
+                    "expected_resume": true
+                }}
+            })),
+            Some("model"),
+        )
+        .unwrap()
+        .unwrap()
+    }
+
     fn identity() -> super::super::ProgramIdentity {
         super::super::ProgramIdentity::from_request(
             None,
@@ -276,6 +329,164 @@ mod tests {
         assert_eq!(
             dispatch.context_token_source(),
             TokenFactSource::ClientTokenIds
+        );
+    }
+
+    #[tokio::test]
+    async fn shadow_arrival_reconciles_its_prepared_fact_at_settlement() {
+        // A shadow request applies the estimate but still carries the prepared
+        // fact; settlement must reconcile that fact so drift is visible before
+        // exact mode is enabled.
+        let config = ProgramSchedulerConfig {
+            token_count_mode: TokenCountMode::Shadow,
+            ..ProgramSchedulerConfig::default()
+        };
+        let scheduler = ProgramScheduler::new(config);
+        let fingerprint = TokenizerFingerprint::from_parts(&["model", "shadow"]);
+        let arrival =
+            ArrivalTokenFacts::new(100, Some(TokenFacts::prepared_token_ids(120, fingerprint)));
+        let context = scheduler.resolve_arrival_tokens("model", arrival);
+        assert_eq!(context.tokens(), 100);
+        assert_eq!(context.shadow_tokens(), Some(120));
+        let dispatch = scheduler
+            .acquire(identity(), context, std::slice::from_ref(&target()), None)
+            .await
+            .unwrap();
+        scheduler.complete(
+            &dispatch,
+            true,
+            false,
+            crate::program_scheduling::ProgramUsageObservation {
+                prompt_tokens: Some(121),
+                completion_tokens: Some(3),
+                cached_prompt_tokens: None,
+            },
+            None,
+        );
+        let state = scheduler.state.lock();
+        assert!(state.revoked_token_fingerprints.contains_key(&fingerprint));
+    }
+
+    #[test]
+    fn revocation_saturation_falls_back_instead_of_forgetting() {
+        // Eviction would make an old known-bad fingerprint trusted again; the
+        // bound must fail closed for every prepared fact until restart.
+        let config = ProgramSchedulerConfig {
+            token_count_mode: TokenCountMode::ExactWhenVerified,
+            ..ProgramSchedulerConfig::default()
+        };
+        let scheduler = ProgramScheduler::new(config);
+        let mut state = scheduler.state.lock();
+        for index in 0..MAX_REVOKED_FINGERPRINTS {
+            let label = format!("bad-{index}");
+            state
+                .revoked_token_fingerprints
+                .insert(TokenizerFingerprint::from_parts(&[&label]), Instant::now());
+        }
+        let fresh = TokenizerFingerprint::from_parts(&["fresh"]);
+        scheduler.reconcile_observed_prompt_tokens(
+            &mut state,
+            "model",
+            TokenFactSource::PreparedTokenIds,
+            Some(fresh),
+            Some(10),
+            Some(11),
+        );
+        assert!(state.token_fingerprint_saturated);
+        assert_eq!(
+            state.revoked_token_fingerprints.len(),
+            MAX_REVOKED_FINGERPRINTS
+        );
+        drop(state);
+        let context = scheduler.resolve_arrival_tokens(
+            "model",
+            ArrivalTokenFacts::new(5, Some(TokenFacts::prepared_token_ids(100, fresh))),
+        );
+        assert_eq!(context.tokens(), 5);
+        assert_eq!(
+            context.fallback(),
+            Some(crate::program_scheduling::TokenFactFallback::FingerprintRevoked)
+        );
+    }
+
+    #[tokio::test]
+    async fn shadow_outcome_does_not_charge_an_active_program_twice() {
+        let mut config = ProgramSchedulerConfig {
+            token_count_mode: TokenCountMode::Shadow,
+            ..ProgramSchedulerConfig::default()
+        };
+        config.progress_ttl.token_capacity = Some(100_000);
+        config.max_active_programs_per_target = 1;
+        let scheduler = ProgramScheduler::new(config);
+        let fingerprint = TokenizerFingerprint::from_parts(&["model", "active"]);
+        let arrival = ArrivalTokenFacts::new(
+            60_000,
+            Some(TokenFacts::prepared_token_ids(40_000, fingerprint)),
+        );
+        let context = scheduler.resolve_arrival_tokens("model", arrival);
+        let dispatch = scheduler
+            .acquire(identity(), context, std::slice::from_ref(&target()), None)
+            .await
+            .unwrap();
+        let state = scheduler.state.lock();
+        // Used tokens and the active count both already include this Program.
+        assert_eq!(
+            scheduler.shadow_admission_outcome(
+                &state,
+                dispatch.program(),
+                "rank-0",
+                Instant::now()
+            ),
+            Some("both_admit")
+        );
+    }
+
+    #[tokio::test]
+    async fn shadow_outcome_for_a_new_program_still_charges_its_full_demand() {
+        let mut config = ProgramSchedulerConfig {
+            token_count_mode: TokenCountMode::Shadow,
+            ..ProgramSchedulerConfig::default()
+        };
+        config.progress_ttl.token_capacity = Some(100_000);
+        let scheduler = ProgramScheduler::new(config);
+        let target = target();
+        // Program A holds 60k of the rank.
+        let resident =
+            scheduler.resolve_arrival_tokens("model", ArrivalTokenFacts::estimated_only(60_000));
+        scheduler
+            .acquire(
+                identity_named("resident"),
+                resident,
+                std::slice::from_ref(&target),
+                None,
+            )
+            .await
+            .unwrap();
+        // Program B arrives with an over-estimated 45k and an exact 30k:
+        // 60+45 > 100 denies by estimate, 60+30 <= 100 admits by exact count.
+        let fingerprint = TokenizerFingerprint::from_parts(&["model", "new"]);
+        let context = scheduler.resolve_arrival_tokens(
+            "model",
+            ArrivalTokenFacts::new(
+                45_000,
+                Some(TokenFacts::prepared_token_ids(30_000, fingerprint)),
+            ),
+        );
+        let now = Instant::now();
+        let mut state = scheduler.state.lock();
+        let reference =
+            crate::program_scheduling::ProgramRef::new("model".into(), "new-program".into(), 1);
+        scheduler.ensure_decision_state(
+            &mut state,
+            &identity_named("new-program"),
+            reference.clone(),
+            context,
+            now,
+            None,
+        );
+        assert_eq!(
+            scheduler.shadow_admission_outcome(&state, &reference, "rank-0", now),
+            Some("estimate_denies_exact_admits")
         );
     }
 

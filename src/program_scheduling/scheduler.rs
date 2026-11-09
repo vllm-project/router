@@ -498,21 +498,28 @@ impl ProgramScheduler {
             identity.root_program_id(),
         );
         if let Some(decision) = state.decisions.get_mut(&reference) {
+            let current_tokens = decision.context_tokens;
             let merged = ContextTokens {
                 tokens: decision.context_tokens,
                 source: decision.context_token_source,
                 fingerprint: decision.context_token_fingerprint,
-                shadow_tokens: decision.shadow_context_tokens,
+                shadow: decision.shadow_context_facts,
                 fallback: None,
             }
             .max_with(context);
-            if merged.tokens() >= decision.context_tokens {
+            if merged.tokens() >= current_tokens {
                 decision.context_tokens = merged.tokens();
                 decision.context_token_source = merged.source();
                 if merged.fingerprint().is_some() {
                     decision.context_token_fingerprint = merged.fingerprint();
                 }
-                decision.shadow_context_tokens = merged.shadow_tokens();
+                decision.shadow_context_facts = merged.shadow_facts();
+            }
+            // A shrink confirmation must survive arrivals that demand *less*
+            // context: only growth (or an equal arrival) proves the Program is
+            // still at the larger size. Resetting on every arrival would make
+            // the two-observation shrink rule unreachable after compaction.
+            if context.tokens() >= current_tokens {
                 decision.context_shrink_observations = 0;
             }
             decision.task_id = identity.task_id().map(str::to_string);
@@ -704,6 +711,55 @@ mod tests {
     use crate::program_scheduling::ProgressTtlConfig;
     use crate::program_scheduling::{ProgramBindingStrategy, ProgramIdentity};
     use serde_json::json;
+
+    #[tokio::test]
+    async fn shrink_confirmation_survives_smaller_arrivals() {
+        let mut config = ProgramSchedulerConfig::default();
+        config.progress_ttl.token_capacity = Some(1_000_000);
+        let scheduler = ProgramScheduler::new(config);
+        let target = ProgramTarget {
+            id: "rank-0".into(),
+            base_url: "http://worker".into(),
+            dp_rank: Some(0),
+        };
+        let identity = ProgramIdentity::from_request(
+            None,
+            Some(&json!({"vllm_xargs":{"agentic_context":{
+                "program_id":"program","expected_resume":true
+            }}})),
+            Some("model"),
+        )
+        .unwrap()
+        .unwrap();
+        let first = scheduler
+            .acquire(
+                identity.clone(),
+                crate::program_scheduling::ContextTokens::estimated(100_000),
+                std::slice::from_ref(&target),
+                None,
+            )
+            .await
+            .unwrap();
+        {
+            let mut state = scheduler.state.lock();
+            let decision = state.decisions.get_mut(first.program()).expect("decision");
+            decision.context_shrink_observations = 2;
+        }
+        // A smaller arrival is exactly what compaction looks like; it must not
+        // erase the confirmations that are still being collected.
+        let smaller = scheduler.resolve_arrival_tokens(
+            "model",
+            crate::program_scheduling::ArrivalTokenFacts::estimated_only(20_000),
+        );
+        scheduler
+            .acquire(identity, smaller, std::slice::from_ref(&target), None)
+            .await
+            .unwrap();
+        let state = scheduler.state.lock();
+        let decision = state.decisions.get(first.program()).expect("decision");
+        assert_eq!(decision.context_tokens, 100_000);
+        assert_eq!(decision.context_shrink_observations, 2);
+    }
 
     #[test]
     fn observation_epoch_preserves_post_checkpoint_delta() {

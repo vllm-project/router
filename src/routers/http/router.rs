@@ -1975,9 +1975,12 @@ impl Router {
                 Some(Arc::new(move || load.begin_decode())
                     as crate::backend::grpc::FirstOutputCallback)
             };
+            let engine_observer = program_completion
+                .as_ref()
+                .map(|completion| completion.engine_observer());
             let mut response = self
                 .frontend
-                .dispatch_with_first_output(worker_url, prepared, on_first_output)
+                .dispatch_with_first_output(worker_url, prepared, on_first_output, engine_observer)
                 .await;
             if let Some(completion) = program_completion {
                 // Settlement follows the true terminal state, including usage
@@ -3463,6 +3466,35 @@ mod tests {
             assert_eq!(echoed["authorization"], "Bearer token");
         }
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn stream_error_frame_settles_the_attempt_as_failed() {
+        let (scheduler, dispatch) = settlement_scheduler(100).await;
+        let completion = program_completion(&scheduler, dispatch);
+        let observed = completion.clone();
+        let chunks = vec![Ok::<_, axum::Error>(axum::body::Bytes::from(
+            "data: {\"error\":\"gRPC stream closed before finish_info\"}\n\n",
+        ))];
+        let response = Response::new(Body::from_stream(futures_util::stream::iter(chunks)));
+        let settled = settle_program_completion_on_response(response, true, completion).await;
+        let _ = to_bytes(settled.into_body(), 1_000_000).await.unwrap();
+        assert!(!observed.finished_success());
+    }
+
+    #[tokio::test]
+    async fn producer_error_outcome_settles_the_attempt_as_failed() {
+        let (scheduler, dispatch) = settlement_scheduler(100).await;
+        let completion = program_completion(&scheduler, dispatch);
+        completion.engine_observer().record_error();
+        let observed = completion.clone();
+        let chunks = vec![Ok::<_, axum::Error>(axum::body::Bytes::from(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\n",
+        ))];
+        let response = Response::new(Body::from_stream(futures_util::stream::iter(chunks)));
+        let settled = settle_program_completion_on_response(response, true, completion).await;
+        let _ = to_bytes(settled.into_body(), 1_000_000).await.unwrap();
+        assert!(!observed.finished_success());
     }
 
     fn chat_request_with_identity(program: &str) -> ChatCompletionRequest {

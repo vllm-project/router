@@ -92,6 +92,39 @@ fn grpc_status_code(status: &tonic::Status) -> StatusCode {
     }
 }
 
+/// Terminal Engine outcome that the client-visible SSE may hide.
+///
+/// Two pieces of information are known to the gRPC producer but not necessarily
+/// written to the client stream: the Engine's prompt/completion counts (the SSE
+/// `usage` chunk is emitted only for `stream_options.include_usage: true`) and
+/// whether the stream ended in an error frame. Program settlement reads this
+/// observer so exact-count reconciliation and TTL accounting do not depend on
+/// what the client asked to see.
+#[derive(Debug, Default)]
+pub struct EngineOutcomeObserver {
+    usage: parking_lot::Mutex<Option<(usize, usize)>>,
+    failed: std::sync::atomic::AtomicBool,
+}
+
+impl EngineOutcomeObserver {
+    pub fn record_usage(&self, prompt_tokens: usize, completion_tokens: usize) {
+        *self.usage.lock() = Some((prompt_tokens, completion_tokens));
+    }
+
+    pub fn record_error(&self) {
+        self.failed
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    pub fn usage(&self) -> Option<(usize, usize)> {
+        *self.usage.lock()
+    }
+
+    pub fn failed(&self) -> bool {
+        self.failed.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
 #[derive(Clone)]
 pub struct GrpcEngineBackend {
     clients: Arc<DashMap<String, InferenceClient<Channel>>>,
@@ -157,6 +190,7 @@ impl GrpcEngineBackend {
         worker_url: &str,
         prepared: PreparedRequest,
         on_first_output: Option<FirstOutputCallback>,
+        observer: Option<std::sync::Arc<EngineOutcomeObserver>>,
     ) -> Response {
         let PreparedRequest {
             request,
@@ -269,6 +303,7 @@ impl GrpcEngineBackend {
             stages,
             t_req,
             on_first_output,
+            observer,
         };
         if request.stream {
             stream_openai(stream, reply, n_prompt_tokens).await
@@ -297,6 +332,7 @@ struct ChatReply {
     stages: serde_json::Value,
     t_req: Instant,
     on_first_output: Option<FirstOutputCallback>,
+    observer: Option<std::sync::Arc<EngineOutcomeObserver>>,
 }
 
 fn fill_engine_ms(stages: &mut serde_json::Value) {
@@ -340,6 +376,7 @@ async fn stream_openai(
         mut stages,
         t_req,
         on_first_output: _,
+        observer,
     } = reply;
     let header_stages = stages.clone();
     let stages_on = crate::backend::stages_enabled();
@@ -358,6 +395,9 @@ async fn stream_openai(
                 Ok(Some(item)) => item,
                 Ok(None) => break,
                 Err(_) => {
+                    if let Some(observer) = &observer {
+                        observer.record_error();
+                    }
                     let _ = send_stream_chunk(
                         &tx,
                         &mut producer_output_frame,
@@ -384,6 +424,9 @@ async fn stream_openai(
                         match output_text_and_finish(&msg, &mut detok, prefer_worker_text) {
                             Ok(output) => output,
                             Err(error) => {
+                                if let Some(observer) = &observer {
+                                    observer.record_error();
+                                }
                                 let _ = send_stream_chunk(
                                     &tx,
                                     &mut producer_output_frame,
@@ -450,6 +493,10 @@ async fn stream_openai(
                         first = false;
                     }
                     if finish.is_some() {
+                        if let Some(observer) = &observer {
+                            observer
+                                .record_usage(prompt_tokens as usize, completion_tokens as usize);
+                        }
                         if include_usage {
                             let usage = Usage {
                                 prompt_tokens,
@@ -470,6 +517,9 @@ async fn stream_openai(
                     }
                 }
                 Err(status) => {
+                    if let Some(observer) = &observer {
+                        observer.record_error();
+                    }
                     let _ = send_stream_chunk(
                         &tx,
                         &mut producer_output_frame,
@@ -482,6 +532,9 @@ async fn stream_openai(
                     return;
                 }
             }
+        }
+        if let Some(observer) = &observer {
+            observer.record_error();
         }
         let _ = send_stream_chunk(
             &tx,
@@ -527,6 +580,7 @@ async fn collect_openai(
         mut stages,
         t_req,
         on_first_output,
+        observer,
     } = reply;
     let mut detok = tok
         .as_ref()
@@ -542,6 +596,9 @@ async fn collect_openai(
             Ok(Some(item)) => item,
             Ok(None) => break,
             Err(_) => {
+                if let Some(observer) = &observer {
+                    observer.record_error();
+                }
                 return (
                     StatusCode::GATEWAY_TIMEOUT,
                     "gRPC stream exceeded request timeout",
@@ -562,6 +619,9 @@ async fn collect_openai(
                     match output_text_and_finish(&msg, &mut detok, prefer_worker_text) {
                         Ok(output) => output,
                         Err(error) => {
+                            if let Some(observer) = &observer {
+                                observer.record_error();
+                            }
                             return (StatusCode::BAD_GATEWAY, error).into_response();
                         }
                     };
@@ -589,6 +649,9 @@ async fn collect_openai(
                 }
             }
             Err(status) => {
+                if let Some(observer) = &observer {
+                    observer.record_error();
+                }
                 return (
                     StatusCode::BAD_GATEWAY,
                     format!("grpc stream: {}", status.message()),
@@ -598,11 +661,17 @@ async fn collect_openai(
         }
     }
     if finish.is_none() {
+        if let Some(observer) = &observer {
+            observer.record_error();
+        }
         return (
             StatusCode::BAD_GATEWAY,
             "gRPC stream closed before finish_info",
         )
             .into_response();
+    }
+    if let Some(observer) = &observer {
+        observer.record_usage(prompt_tokens as usize, completion_tokens as usize);
     }
     let mut resp = match shape {
         ResponseShape::Chat => axum::Json(final_response(

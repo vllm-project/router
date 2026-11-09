@@ -261,7 +261,7 @@ pub struct ContextTokens {
     pub(crate) tokens: usize,
     pub(crate) source: TokenFactSource,
     pub(crate) fingerprint: Option<TokenizerFingerprint>,
-    pub(crate) shadow_tokens: Option<usize>,
+    pub(crate) shadow: Option<TokenFacts>,
     pub(crate) fallback: Option<TokenFactFallback>,
 }
 
@@ -271,7 +271,7 @@ impl ContextTokens {
             tokens: tokens.max(1),
             source: TokenFactSource::Estimated,
             fingerprint: None,
-            shadow_tokens: None,
+            shadow: None,
             fallback: None,
         }
     }
@@ -281,13 +281,18 @@ impl ContextTokens {
             tokens: facts.tokens().max(1),
             source: facts.source(),
             fingerprint: facts.fingerprint(),
-            shadow_tokens: None,
+            shadow: None,
             fallback: None,
         }
     }
 
-    pub fn with_shadow(mut self, shadow_tokens: Option<usize>) -> Self {
-        self.shadow_tokens = shadow_tokens.filter(|tokens| *tokens > 0);
+    /// Attach the prepared counterfactual recorded by shadow mode.
+    ///
+    /// The whole fact is kept, not only its count: settlement reconciles this
+    /// prepared count with Engine usage even though the *applied* decision used
+    /// the estimate, so a shadow rollout can detect equivalence drift.
+    pub fn with_shadow(mut self, shadow: Option<TokenFacts>) -> Self {
+        self.shadow = shadow.filter(|facts| facts.tokens() > 0);
         self
     }
 
@@ -309,7 +314,12 @@ impl ContextTokens {
     }
 
     pub fn shadow_tokens(&self) -> Option<usize> {
-        self.shadow_tokens
+        self.shadow.map(|facts| facts.tokens())
+    }
+
+    /// Prepared counterfactual with its provenance, when shadow mode recorded one.
+    pub fn shadow_facts(&self) -> Option<TokenFacts> {
+        self.shadow
     }
 
     pub fn fallback(&self) -> Option<TokenFactFallback> {
@@ -342,8 +352,15 @@ impl ContextTokens {
             tokens,
             source,
             fingerprint,
-            shadow_tokens: match (self.shadow_tokens, other.shadow_tokens) {
-                (Some(left), Some(right)) => Some(left.max(right)),
+            // Both counters describe what the *same* prepared fact would have
+            // decided, so keeping either is enough; prefer the larger count and
+            // let a tie keep the prepared provenance.
+            shadow: match (self.shadow, other.shadow) {
+                (Some(left), Some(right)) => Some(if right.tokens() > left.tokens() {
+                    right
+                } else {
+                    left
+                }),
                 (Some(value), None) | (None, Some(value)) => Some(value),
                 (None, None) => None,
             },
@@ -378,7 +395,7 @@ pub fn resolve_context_tokens(
         TokenCountMode::Estimated => estimated,
         TokenCountMode::Shadow => {
             if usable {
-                estimated.with_shadow(Some(prepared.tokens()))
+                estimated.with_shadow(Some(prepared))
             } else {
                 estimated
             }
@@ -479,7 +496,8 @@ mod tests {
 
     #[test]
     fn max_with_keeps_larger_demand_and_prefers_prepared_on_ties() {
-        let estimated = ContextTokens::estimated(100).with_shadow(Some(900));
+        let estimated = ContextTokens::estimated(100)
+            .with_shadow(Some(TokenFacts::prepared_token_ids(900, fingerprint())));
         let prepared =
             ContextTokens::from_prepared(TokenFacts::client_token_ids(100, fingerprint()));
         let merged = estimated.max_with(prepared);

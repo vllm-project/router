@@ -254,7 +254,9 @@ impl ProgramScheduler {
                     placement: runtime.placement.map(str::to_string),
                     context_tokens: decision.context_tokens,
                     context_token_source: decision.context_token_source.as_str(),
-                    shadow_context_tokens: decision.shadow_context_tokens,
+                    shadow_context_tokens: decision
+                        .shadow_context_facts
+                        .map(|facts| facts.tokens()),
                     context_token_fingerprint: decision
                         .context_token_fingerprint
                         .map(|fingerprint| fingerprint.as_hex()),

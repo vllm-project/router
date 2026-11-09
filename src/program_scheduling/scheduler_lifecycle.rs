@@ -62,15 +62,32 @@ impl ProgramScheduler {
         }
         let target_id = dispatch.target_id.clone();
         let observed_prompt_tokens = usage.prompt_tokens.unwrap_or(dispatch.context_tokens());
+        // Reconcile the prepared fact the attempt carried. In shadow mode the
+        // applied decision used the estimate, so the prepared count lives in the
+        // counterfactual; reconciling it there is what lets a shadow rollout
+        // detect tokenizer/template drift before enabling exact mode.
+        let (reconcile_source, reconcile_fingerprint, reconcile_prepared_tokens) =
+            if dispatch.context_token_source().is_prepared() {
+                (
+                    dispatch.context_token_source(),
+                    dispatch.context_token_fingerprint(),
+                    Some(dispatch.context_tokens()),
+                )
+            } else if let Some(shadow) = dispatch.shadow_context_facts() {
+                (shadow.source(), shadow.fingerprint(), Some(shadow.tokens()))
+            } else {
+                (
+                    dispatch.context_token_source(),
+                    dispatch.context_token_fingerprint(),
+                    None,
+                )
+            };
         self.reconcile_observed_prompt_tokens(
             &mut state,
             dispatch.program().model_pool(),
-            dispatch.context_token_source(),
-            dispatch.context_token_fingerprint(),
-            dispatch
-                .context_token_source()
-                .is_prepared()
-                .then(|| dispatch.context_tokens()),
+            reconcile_source,
+            reconcile_fingerprint,
+            reconcile_prepared_tokens,
             usage.prompt_tokens,
         );
         let fallback_cached_tokens = state
