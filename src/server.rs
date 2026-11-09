@@ -616,6 +616,31 @@ async fn scheduling_diagnostics(
     }
 }
 
+#[derive(Deserialize)]
+struct FinishSessionQuery {
+    session_id: String,
+}
+
+/// POST /finish_session?session_id=<id>
+///
+/// Marks a session (e.g. an RL trajectory) as finished so that session-aware
+/// routing policies (e.g. `sticky_least_loaded`) can release the
+/// replica capacity held by the session. For policies that don't track
+/// sessions, this is a no-op. Unknown session ids are ignored.
+async fn finish_session(
+    State(state): State<Arc<AppState>>,
+    Query(FinishSessionQuery { session_id }): Query<FinishSessionQuery>,
+    headers: http::HeaderMap,
+) -> Response {
+    if let Err(response) = authorize_request(&state, &headers).await {
+        return response;
+    }
+
+    state.context.policy_registry.finish_session(&session_id);
+
+    Json(json!({ "status": "ok", "session_id": session_id })).into_response()
+}
+
 // ---------- Worker management endpoints (RESTful) ----------
 
 /// POST /workers - Add a new worker with full configuration
@@ -908,7 +933,8 @@ pub fn build_app_with_wasm_middleware(
         .route("/list_workers", get(list_workers))
         .route("/flush_cache", post(flush_cache))
         .route("/get_loads", get(get_loads))
-        .route("/scheduling/diagnostics", get(scheduling_diagnostics));
+        .route("/scheduling/diagnostics", get(scheduling_diagnostics))
+        .route("/finish_session", post(finish_session));
 
     // Worker management routes
     let worker_routes = Router::new()
@@ -917,13 +943,21 @@ pub fn build_app_with_wasm_middleware(
         .route("/workers/{url}", get(get_worker))
         .route("/workers/{url}", delete(delete_worker));
 
-    // Build base app with all routes and middleware
+    // Build base app with all routes
     let base_app = Router::new()
         .merge(protected_routes)
         .merge(public_routes)
         .merge(admin_routes)
-        .merge(worker_routes)
-        // Request body size limiting
+        .merge(worker_routes);
+
+    // Choose fallback based on transparent proxy mode
+    let base_app = if enable_transparent_proxy {
+        base_app.fallback(transparent_proxy_handler)
+    } else {
+        base_app.fallback(sink_handler)
+    };
+
+    let base_app = base_app
         .layer(DefaultBodyLimit::max(max_payload_size))
         .layer(tower_http::limit::RequestBodyLimitLayer::new(
             max_payload_size,
@@ -935,18 +969,10 @@ pub fn build_app_with_wasm_middleware(
         base_app
     };
 
-    let base_app = base_app
+    base_app
         .layer(middleware::RequestIdLayer::new(request_id_headers))
-        .layer(create_cors_layer(cors_allowed_origins));
-
-    // Choose fallback based on transparent proxy mode
-    if enable_transparent_proxy {
-        base_app
-            .fallback(transparent_proxy_handler)
-            .with_state(app_state)
-    } else {
-        base_app.fallback(sink_handler).with_state(app_state)
-    }
+        .layer(create_cors_layer(cors_allowed_origins))
+        .with_state(app_state)
 }
 
 pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Error>> {
