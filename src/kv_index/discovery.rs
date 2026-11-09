@@ -14,9 +14,9 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use crate::config::StaticKvEventSources;
-use crate::kv_index::hybrid_capability::HybridCapabilities;
-use crate::kv_index::hybrid_events::HybridEventIndex;
-use crate::kv_index::hybrid_stream::{HybridEventStream, HybridSubscriberHandle};
+use crate::kv_index::hybrid::HybridCapabilities;
+use crate::kv_index::hybrid::HybridEventIndex;
+use crate::kv_index::hybrid::{HybridEventStream, HybridSubscriberHandle};
 use crate::kv_index::indexer::KvBlockIndexer;
 use crate::kv_index::subscriber::{EventSource, SubscriberHandle};
 use crate::kv_index::{HashMode, IngestionSignal, SourceId};
@@ -684,7 +684,7 @@ impl KvIndexSupervisor {
                 // credit an unmodeled hybrid layout.
                 if let Some(index) = indexes.get(&rank) {
                     let stream = Arc::new(HybridEventStream::new(index.clone()));
-                    let handle = super::hybrid_stream::spawn_zmq(ev, stream, self.ctx.clone())
+                    let handle = super::hybrid::spawn_zmq(ev, stream, self.ctx.clone())
                         .expect("hybrid source was validated before registration");
                     hybrid_handles.push(Arc::new(handle));
                 }
@@ -2494,7 +2494,7 @@ mod tests {
         let info = supervisor.on_worker_added(&worker_url).await.unwrap();
         let provider = supervisor.match_provider_for_worker(&worker_url).unwrap();
         boundary_subscription(&publisher, "hybrid/epoch-1", false).await;
-        let payload = crate::kv_index::hybrid_events::tests::qwen35_payload();
+        let payload = crate::kv_index::hybrid::residency::tests::qwen35_payload();
         publisher
             .send_multipart(
                 [
@@ -3822,7 +3822,7 @@ mod tests {
     /// DP ranks never share one index even when both declare one endpoint.
     #[tokio::test]
     async fn rank_pinned_static_source_binds_its_own_rank() {
-        let layout: crate::kv_index::hybrid_capability::HybridCapabilities =
+        let layout: crate::kv_index::hybrid::HybridCapabilities =
             serde_json::from_value(serde_json::json!({
                 "schema_version": 1,
                 "ranks": [{
@@ -3954,7 +3954,7 @@ mod tests {
         block_size: u32,
         model: &str,
     ) -> crate::config::types::StaticKvEventSources {
-        let layout: crate::kv_index::hybrid_capability::HybridCapabilities =
+        let layout: crate::kv_index::hybrid::HybridCapabilities =
             serde_json::from_value(serde_json::json!({
                 "schema_version": 1,
                 "ranks": [{

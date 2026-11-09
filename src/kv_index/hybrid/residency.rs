@@ -14,39 +14,6 @@ pub(super) struct State {
 
 // Install this provider only when the engine contract verifies that recomputing
 // the last token is a sufficient bound (no unmodeled lookahead/replay rules).
-impl crate::policies::TieredMatchProvider for HybridEventIndex {
-    fn find_tiered_matches(&self, _query: &super::MatchQuery) -> Vec<TierMatch> {
-        // A single group's dense lookup is never sufficient for a hybrid hit.
-        Vec::new()
-    }
-
-    fn find_token_matches(
-        &self,
-        tokens: &[u32],
-        block_size: u32,
-        lora_name: Option<&str>,
-        dp_rank: u32,
-    ) -> Option<Vec<TierMatch>> {
-        // Events, ownership and history are bound to one rank. A hit computed
-        // from another rank's stream is never evidence for this one.
-        if lora_name.is_some() || block_size == 0 || dp_rank != self.target.dp_rank {
-            return Some(Vec::new());
-        }
-        let tokens = self.reusable_tokens(tokens, usize::MAX);
-        if tokens == 0 || !tokens.is_multiple_of(u64::from(block_size)) {
-            return Some(Vec::new());
-        }
-        let Ok(blocks) = u32::try_from(tokens / u64::from(block_size)) else {
-            return Some(Vec::new());
-        };
-        Some(vec![TierMatch {
-            target: self.target.clone(),
-            tier: StorageTier::Device,
-            locality: Locality::Local,
-            segments: vec![(0, blocks)],
-        }])
-    }
-}
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
 pub(crate) mod tests {
@@ -533,5 +500,27 @@ pub(crate) mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    /// An adapter publishes under its own hash chain. Such a batch must leave
+    /// the base model's claims intact instead of revoking the whole view.
+    #[test]
+    fn adapter_stores_do_not_revoke_the_base_view() {
+        let index = index(16);
+        index.begin_empty(0);
+        assert_eq!(index.apply_batch(0, &qwen_batch()), Ok(()));
+        assert_eq!(index.reusable_tokens(&prompt(), usize::MAX), 528);
+
+        let mut adapter_batch = qwen_batch();
+        for event in &mut adapter_batch.events {
+            if let KVEvent::BlockStored(store) = event {
+                store.lora_name = Some("lora1".to_string());
+            }
+        }
+        assert_eq!(index.apply_batch(1, &adapter_batch), Ok(()));
+        assert_eq!(index.reusable_tokens(&prompt(), usize::MAX), 528);
+        // The base chain keeps applying afterwards.
+        assert_eq!(index.apply_batch(2, &qwen_batch()), Ok(()));
+        assert_eq!(index.reusable_tokens(&prompt(), usize::MAX), 528);
     }
 }

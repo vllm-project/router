@@ -57,6 +57,14 @@ impl HybridEventIndex {
         for event in &batch.events {
             let result = match event {
                 KVEvent::BlockStored(store) => {
+                    // An adapter caches its pages under its own hash chain,
+                    // seeded by the adapter identity: those pages are no
+                    // evidence for the base model's chain, and failing the batch
+                    // on them would revoke every claim this rank holds the
+                    // moment one adapter request is served.
+                    if store.lora_id.is_some() || store.lora_name.is_some() {
+                        continue;
+                    }
                     // An engine may publish several page sizes for one group
                     // index. Only the declared granularity is addressable by
                     // the layout; the other pages cover the same tokens and
@@ -80,8 +88,6 @@ impl HybridEventIndex {
                     if store.medium.as_deref() != Some("GPU")
                         || store.locality.as_deref().is_some_and(|s| s != "LOCAL")
                         || store.ownership.is_some()
-                        || store.lora_id.is_some()
-                        || store.lora_name.is_some()
                         || !event_kind_matches(group.kind, store)
                         || !stored_shape_matches(group.kind, store)
                         || !extra_keys_match(

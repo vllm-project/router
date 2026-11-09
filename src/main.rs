@@ -491,12 +491,10 @@ impl CliArgs {
             let data = std::fs::read(path).map_err(|error| ConfigError::ValidationFailed {
                 reason: format!("cannot read hybrid layout {}: {error}", path.display()),
             })?;
-            let layouts: HashMap<
-                String,
-                vllm_router_rs::kv_index::hybrid_capability::HybridCapabilities,
-            > = serde_json::from_slice(&data).map_err(|error| ConfigError::ValidationFailed {
-                reason: format!("invalid hybrid layout {}: {error}", path.display()),
-            })?;
+            let layouts: HashMap<String, vllm_router_rs::kv_index::hybrid::HybridCapabilities> =
+                serde_json::from_slice(&data).map_err(|error| ConfigError::ValidationFailed {
+                    reason: format!("invalid hybrid layout {}: {error}", path.display()),
+                })?;
             for (worker, layout) in layouts {
                 // A layout without declared endpoints is legal: the engine can
                 // report its own publishers (gRPC GetKvEventSources, or the HTTP

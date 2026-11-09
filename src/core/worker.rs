@@ -178,6 +178,23 @@ pub trait Worker: Send + Sync + fmt::Debug {
             .unwrap_or("unknown")
     }
 
+    /// Names this worker serves as base models: the model it registered plus
+    /// the `--served-model-name` aliases the engine reported, when known.
+    fn served_base_models(&self) -> Vec<&str> {
+        let mut served = vec![self.model_id()];
+        if let Some(aliases) = self.metadata().labels.get("served_model_aliases") {
+            served.extend(aliases.split(',').filter(|alias| !alias.is_empty()));
+        }
+        served
+    }
+
+    /// Whether `name` selects this worker's base model rather than one of its
+    /// adapters. vLLM selects an adapter through the request's `model`, and an
+    /// adapter name is neither the model id nor a served alias.
+    fn serves_base_model(&self, name: &str) -> bool {
+        self.served_base_models().contains(&name)
+    }
+
     /// Get the priority of this worker (higher value = higher priority)
     fn priority(&self) -> u32 {
         self.metadata()
@@ -963,6 +980,22 @@ mod tests {
     use super::*;
     use std::thread;
     use std::time::Duration;
+
+    #[test]
+    fn adapter_names_are_not_served_base_models() {
+        let mut worker = BasicWorker::new("http://127.0.0.1:8000".to_string(), WorkerType::Regular);
+        worker
+            .metadata
+            .labels
+            .insert("model_id".to_string(), "qwen35".to_string());
+        worker.metadata.labels.insert(
+            "served_model_aliases".to_string(),
+            "alias-a,alias-b".to_string(),
+        );
+        assert!(worker.serves_base_model("qwen35"));
+        assert!(worker.serves_base_model("alias-a"));
+        assert!(!worker.serves_base_model("lora1"));
+    }
 
     // Test WorkerType
     #[test]

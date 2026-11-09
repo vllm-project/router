@@ -5,7 +5,7 @@
 
 mod ingest;
 mod layout;
-mod residency;
+pub(crate) mod residency;
 mod subscriber;
 
 use std::collections::HashSet;
@@ -202,5 +202,39 @@ impl HybridEventIndex {
             &views,
             tokens.len().saturating_sub(1).min(max_reusable_tokens) as u64,
         )
+    }
+}
+
+impl crate::policies::TieredMatchProvider for HybridEventIndex {
+    fn find_tiered_matches(&self, _query: &super::MatchQuery) -> Vec<TierMatch> {
+        // A single group's dense lookup is never sufficient for a hybrid hit.
+        Vec::new()
+    }
+
+    fn find_token_matches(
+        &self,
+        tokens: &[u32],
+        block_size: u32,
+        lora_name: Option<&str>,
+        dp_rank: u32,
+    ) -> Option<Vec<TierMatch>> {
+        // Events, ownership and history are bound to one rank. A hit computed
+        // from another rank's stream is never evidence for this one.
+        if lora_name.is_some() || block_size == 0 || dp_rank != self.target.dp_rank {
+            return Some(Vec::new());
+        }
+        let tokens = self.reusable_tokens(tokens, usize::MAX);
+        if tokens == 0 || !tokens.is_multiple_of(u64::from(block_size)) {
+            return Some(Vec::new());
+        }
+        let Ok(blocks) = u32::try_from(tokens / u64::from(block_size)) else {
+            return Some(Vec::new());
+        };
+        Some(vec![TierMatch {
+            target: self.target.clone(),
+            tier: StorageTier::Device,
+            locality: Locality::Local,
+            segments: vec![(0, blocks)],
+        }])
     }
 }

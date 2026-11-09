@@ -428,8 +428,9 @@ impl Router {
                 (None, None)
             };
         for url in &worker_urls {
-            // TODO: In IGW mode, fetch model_id from worker's /get_model_info endpoint
-            // For now, create worker without model_id
+            // The engine serves this name (and its aliases); adapters selected
+            // through `model` are the names it does not serve.
+            let labels = Self::served_name_labels(ctx.router_config.api_key.as_deref(), url).await;
             let worker_arc: Arc<dyn Worker> = if dp_size > 1 {
                 let (base_url, dp_rank) = dp_utils::parse_worker_url(url);
                 Arc::new(
@@ -445,6 +446,7 @@ impl Router {
             } else {
                 Arc::new(
                     BasicWorker::new(url.clone(), WorkerType::Regular)
+                        .with_labels(labels)
                         .with_circuit_breaker_config(core_cb_config.clone())
                         .with_health_config(health_config.clone()),
                 )
@@ -1501,7 +1503,23 @@ impl Router {
 
         // KV-aware retries may bypass a target without rewriting its binding.
         let failed_workers = Mutex::new(Vec::new());
-        let (lora_name, cache_salt) = typed_req.cache_identity();
+        // vLLM selects adapters through the request's `model`. A name this pool
+        // does not serve as a base model is an adapter, and the engine caches
+        // its blocks under that identity: the base model's chain is no evidence
+        // for it, so it carries the adapter identity into placement credit.
+        let (declared_lora, cache_salt) = typed_req.cache_identity();
+        let lora_name = declared_lora.or_else(|| {
+            let requested = typed_req.get_model()?;
+            let workers = self.worker_registry.get_all();
+            // Without a served name nothing can be classified; keep the
+            // historical behavior instead of guessing.
+            let classified = workers.iter().any(|worker| worker.model_id() != "unknown");
+            (classified
+                && !workers
+                    .iter()
+                    .any(|worker| worker.serves_base_model(requested)))
+            .then_some(requested)
+        });
         let affinity_key = self
             .kv_aware_session_affinity_ttl_secs
             .filter(|_| kv_aware_ops(self.policy_for_model(model_id).as_ref()).is_some())
@@ -2217,6 +2235,58 @@ impl Router {
         }
     }
 
+    /// Labels naming what an HTTP worker serves: its `/v1/models` entry and the
+    /// `--served-model-name` aliases the engine reports. Best effort ?? an engine
+    /// that cannot be asked keeps the historical `unknown` identity.
+    async fn served_name_labels(
+        api_key: Option<&str>,
+        worker_url: &str,
+    ) -> std::collections::HashMap<String, String> {
+        let mut labels = std::collections::HashMap::new();
+        if crate::backend::is_grpc_url(worker_url) {
+            return labels;
+        }
+        let client = match reqwest::Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build()
+        {
+            Ok(client) => client,
+            Err(_) => return labels,
+        };
+        let base = worker_url.trim_end_matches('/');
+        let models_url = format!("{base}/v1/models");
+        let served = match crate::kv_index::discovery::worker_get(&client, &models_url, api_key)
+            .send()
+            .await
+        {
+            Ok(response) if response.status().is_success() => response
+                .json::<serde_json::Value>()
+                .await
+                .ok()
+                .and_then(|body| {
+                    body["data"].as_array().and_then(|entries| {
+                        entries
+                            .iter()
+                            .find_map(|entry| entry["id"].as_str().map(str::to_owned))
+                    })
+                }),
+            _ => None,
+        };
+        let Some(served) = served else {
+            return labels;
+        };
+        labels.insert("model_id".to_string(), served);
+        let aliases =
+            crate::kv_index::discovery::query_pd_server_info(&client, worker_url, api_key)
+                .await
+                .map(|info| info.served_model_aliases)
+                .unwrap_or_default();
+        if !aliases.is_empty() {
+            labels.insert("served_model_aliases".to_string(), aliases.join(","));
+        }
+        labels
+    }
+
     pub async fn add_worker(&self, worker_url: &str) -> Result<String, String> {
         let mut urls = self.get_worker_urls();
         urls.push(worker_url.to_string());
@@ -2320,9 +2390,14 @@ impl Router {
                         let kv_info = self.discover_kv_worker(worker_url).await;
                         info!("Added worker: {}", worker_url);
 
-                        // TODO: In IGW mode, fetch model_id from worker's /get_model_info endpoint
+                        // The registered name is what the engine serves, so an
+                        // adapter selected through `model` stays distinguishable
+                        // from a base-model alias.
+                        let labels =
+                            Self::served_name_labels(self.api_key.as_deref(), worker_url).await;
                         let new_worker =
                             BasicWorker::new(worker_url.to_string(), WorkerType::Regular)
+                                .with_labels(labels)
                                 .with_circuit_breaker_config(self.circuit_breaker_config.clone())
                                 .with_health_config(self.health_config.clone());
 
@@ -3522,11 +3597,18 @@ mod tests {
                 "/get_server_info",
                 "/kv_event_sources",
                 "/metrics",
-                "/server_info"
+                "/server_info",
+                "/v1/models"
             ],
             "metadata requests: {requests:?}"
         );
-        for path in ["/get_server_info", "/kv_event_sources"] {
+        for path in [
+            "/get_server_info",
+            "/kv_event_sources",
+            "/metrics",
+            "/server_info",
+            "/v1/models",
+        ] {
             assert!(
                 requests.iter().any(|(actual_path, authorization)| {
                     actual_path == path && authorization.is_none()
@@ -3734,8 +3816,8 @@ mod tests {
             let provider = supervisor.match_provider_for_worker(&worker).unwrap();
             {
                 let requests = requests.lock();
-                assert_eq!(requests.len(), 2, "metadata requests: {requests:?}");
-                for path in ["/get_server_info", "/kv_event_sources"] {
+                assert_eq!(requests.len(), 3, "metadata requests: {requests:?}");
+                for path in ["/get_server_info", "/kv_event_sources", "/v1/models"] {
                     assert!(
                         requests.iter().any(|(actual_path, authorization)| {
                             actual_path == path
