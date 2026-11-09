@@ -22,7 +22,7 @@
     "sessions": 8
   },
   "workers": {
-    "count": 2,
+    "count": 4,
     "protocol": "grpc",
     "per_worker": {
       "tensor_parallel_size": 1,

@@ -225,7 +225,7 @@ def load_router_policy_case(case_file: Path) -> RouterPolicyCase:
         policy=policy,
         task_num=int(bench.get("task-num", 128)),
         concurrency=int(bench.get("max-concurrency", 8)),
-        worker_count=int(workers.get("count", 2)),
+        worker_count=int(workers.get("count", 4)),
         gap_scale=float(bench.get("gap_scale", 0.0)),
         max_inflight=int(bench.get("max_inflight", 1)),
         stall_secs=int(bench.get("stall_secs", 900)),

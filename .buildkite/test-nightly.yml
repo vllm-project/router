@@ -173,7 +173,7 @@ steps:
 
   # ============================================================================
   # L3 router_policy TraceLab replay — cache_aware / kv_aware / kv_aware_aff @ c16.
-  # 2× vllm-rs + router per cell (12GiB GPU KV/worker, no CPU offload) → L4×2.
+  # 4× vllm-rs + router per cell (12GiB GPU KV/worker, no CPU offload) → L4×4.
   # Optional: AGENTX_TRACE_JSONL_URL to replace data/tracelab-ci-uniform-28.jsonl.
   # ============================================================================
   - label: ":python: router policy perf (c16 × 3 policies)"
@@ -187,7 +187,7 @@ steps:
       manual:
         allowed: true
         reason: "GPU perf cold starts / long replay — retry after checking logs"
-    mirror_hardwares: l4_2
+    mirror_hardwares: l4_4
     depends_on:
       - "upload-nightly-pipeline"
       - "image-build"

@@ -53,7 +53,7 @@ Layout matches **`perf/grpc`**: case JSON + [`case_loader.py`](case_loader.py) +
 ## Buildkite nightly (L3)
 
 Job **`router-policy-perf-e2e`** in [`.buildkite/test-nightly.yml`](../../../../../.buildkite/test-nightly.yml)
-runs **`cache_aware/c16`**, **`kv_aware/c16`**, **`kv_aware_aff/c16`** on **`l4_2`** (2× L4).
+runs **`cache_aware/c16`**, **`kv_aware/c16`**, **`kv_aware_aff/c16`** on **`l4_4`** (4× L4).
 Case JSON reserves 12 GiB GPU KV per worker, no CPU offload, and `max_model_len=32768`.
 
 Nightly step runs `pip install agentinfer==0.2.0` then one pytest invocation (`-k 'cache_aware/c16 or kv_aware/c16 or kv_aware_aff/c16'`).
