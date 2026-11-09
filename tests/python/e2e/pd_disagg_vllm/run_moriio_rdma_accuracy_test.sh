@@ -299,6 +299,17 @@ curl --fail --silent --show-error \
   | tee "${LOG_DIR}/smoke-response.json"
 echo
 
+# HTTP 200 alone does not establish a successful completion. Validate in the
+# pinned image so the coordinator needs no additional Python dependencies.
+docker run --rm \
+  --name "${EVAL_CONTAINER}" \
+  -v "${REPO_ROOT}:/workdir:ro" \
+  -v "${LOG_DIR}:/evidence:ro" \
+  -w /workdir \
+  --entrypoint python3 \
+  "${ROCM_VLLM_IMAGE}" \
+  -m tools.e2e.validate_completion /evidence/smoke-response.json
+
 if [[ "${SMOKE_ONLY}" == "true" ]]; then
   echo "MoRI RDMA cross-node smoke passed (read_mode=${MORIIO_READ_MODE})"
   exit 0
