@@ -8,6 +8,14 @@ from typing import Optional
 import pytest
 import requests
 
+from tools.e2e.vllm_test_compat import (
+    import_run_eval,
+    vllm_worker_command,
+    vllm_worker_popen_env,
+)
+
+run_eval = import_run_eval()
+
 logger = logging.getLogger(__name__)
 
 
@@ -70,26 +78,19 @@ def _popen_launch_prefill_worker(
 ) -> SimpleNamespace:
     port = _find_available_port()
     url = f"http://127.0.0.1:{port}"
-    cmd = [
-        "python3",
-        "-m",
-        "vllm.launch_server",
-        "--model-path",
-        model,
+    extra = [
         "--disaggregation-mode",
         "prefill",
-        "--host",
-        "127.0.0.1",
-        "--port",
-        str(port),
         "--disaggregation-bootstrap-port",
         str(bootstrap_port),
-        "--base-gpu-id",
-        str(base_gpu_id),
     ]
     if ib_device:
-        cmd += ["--disaggregation-ib-device", ib_device]
-    proc = subprocess.Popen(cmd)
+        extra += ["--disaggregation-ib-device", ib_device]
+    cmd = vllm_worker_command(
+        model, "127.0.0.1", port, base_gpu_id=base_gpu_id, extra=extra
+    )
+    env = vllm_worker_popen_env(base_gpu_id=base_gpu_id)
+    proc = subprocess.Popen(cmd, env=env)
     _wait_health(url, timeout=300.0)
     return SimpleNamespace(proc=proc, url=url, bootstrap_port=bootstrap_port)
 
@@ -99,24 +100,14 @@ def _popen_launch_decode_worker(
 ) -> SimpleNamespace:
     port = _find_available_port()
     url = f"http://127.0.0.1:{port}"
-    cmd = [
-        "python3",
-        "-m",
-        "vllm.launch_server",
-        "--model-path",
-        model,
-        "--disaggregation-mode",
-        "decode",
-        "--host",
-        "127.0.0.1",
-        "--port",
-        str(port),
-        "--base-gpu-id",
-        str(base_gpu_id),
-    ]
+    extra = ["--disaggregation-mode", "decode"]
     if ib_device:
-        cmd += ["--disaggregation-ib-device", ib_device]
-    proc = subprocess.Popen(cmd)
+        extra += ["--disaggregation-ib-device", ib_device]
+    cmd = vllm_worker_command(
+        model, "127.0.0.1", port, base_gpu_id=base_gpu_id, extra=extra
+    )
+    env = vllm_worker_popen_env(base_gpu_id=base_gpu_id)
+    proc = subprocess.Popen(cmd, env=env)
     _wait_health(url, timeout=300.0)
     return SimpleNamespace(proc=proc, url=url)
 
@@ -233,8 +224,6 @@ def test_pd_mmlu(e2e_model: str, pd_cluster):
         num_threads=32,
         temperature=0.1,
     )
-    from vllm.test.run_eval import run_eval
-
     metrics = run_eval(args)
     assert metrics["score"] >= 0.65
 

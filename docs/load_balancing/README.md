@@ -14,7 +14,7 @@ the policy is the same for `grpc://host:port`.
 | `consistent_hash` | Multi-turn conversations, KV cache reuse | Yes | No |
 | `power_of_two` | Load-sensitive workloads | No | Yes |
 | `cache_aware` | Prefix caching optimization | Yes (cache-based) | Yes |
-| `kv_aware` | Tiered KV reuse and live-load scoring | No | Yes |
+| `kv_aware` | KV reuse and stage-aware load scoring | No | Yes |
 
 ---
 
@@ -215,18 +215,20 @@ vllm-router --policy cache_aware \
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `cache_threshold` | 0.5 | Minimum prefix match ratio to use cache-based routing |
+| `cache_threshold` | 0.5 | Minimum prefix match ratio over the full input |
 | `balance_abs_threshold` | 32 | Absolute load difference threshold for load balancing |
 | `balance_rel_threshold` | 1.1 | Relative load ratio threshold for load balancing |
 | `eviction_interval_secs` | 30 | Interval for cache eviction |
-| `max_tree_size` | 10000 | Maximum nodes per radix tree |
+| `max_tree_size` | 33,554,432 (`2^25`) | Character budget per worker per model |
+
+Trees are trimmed to `max_tree_size` during periodic eviction and may grow beyond it between cycles. This character budget is not a memory limit; actual memory usage also includes tree overhead and scales with the number of workers and models.
 
 ### Behavior
 
 1. **Balanced mode** (when load is even):
    - Find worker with highest prefix match for the request
    - If match rate > `cache_threshold`: route to that worker (cache hit)
-   - Otherwise: route to worker with smallest tree (most cache capacity)
+   - Otherwise: route to worker with lowest load
 
 2. **Imbalanced mode** (when load is skewed):
    - Route to worker with lowest load (shortest queue)
@@ -242,20 +244,42 @@ vllm-router --policy cache_aware \
 
 ## KV Aware
 
-The `kv_aware` policy scores workers using the request's reusable KV blocks and current load. It is supported in regular, co-located routing mode only; it is not supported with PD disaggregation. In PD mode, the effective prefill and decode policies must use other policies. KV placement credit requires gRPC workers because the gRPC chat route supplies token IDs to the policy. With HTTP workers, the policy degrades to load-only scoring and does not use KV event placement.
+`kv_aware` uses KV cache reuse and worker load to route requests. It suits workloads with repeated prompt prefixes and supports HTTP, [gRPC](../backend/grpc.md), and P/D disaggregation over HTTP or gRPC.
+
+HTTP Completion uses the existing [Direct/Worker input preparation](http_completion_kv.md), without local tokenizer assets. Unmodeled identities and unqualified targets stay routable without cache credit.
 
 ```bash
 vllm-router --policy kv_aware \
-  --router-temperature 0.2 \
-  --kv-penalty-host 0.8 \
-  --kv-penalty-external 0.6 \
-  --kv-penalty-disk 0.3 \
   --worker-urls grpc://worker1:8000 grpc://worker2:8000
 ```
 
-For each candidate, the scorer computes `ptoken = new_prefill_tokens + active_prefill_tokens` and projects the request count as `max(slot_manager.active_requests, Worker::load) + 1`. It multiplies `ptoken` by that projected count, so the score estimates the load after admitting this request and includes its remaining prefill work even when the worker is currently idle. Zero-cost cases, such as a request with no prefill work, are resolved by the KV-work and current-load tie-breaks.
+Enable KV events on the workers. HTTP text requests also need a render endpoint or, for simple prompts, `/tokenize`. Without usable KV information, routing falls back to load.
 
-`--router-temperature 0` selects a minimum-cost worker. A positive temperature samples among candidates by their relative costs. Device reuse has full credit; the host, external, and disk `--kv-penalty-*` flags configure transfer-credit ratios for those tiers. A higher credit means more reuse value and lower transfer cost.
+For regular pools without event discovery, configure `--kv-event-source WORKER_URL=tcp://HOST:PORT` per worker, plus matching `--kv-event-model` and `--kv-event-block-size`.
+
+### P/D disaggregation
+
+```bash
+vllm-router --vllm-pd-disaggregation \
+  --prefill http://prefill:8000 --decode http://decode:8000 \
+  --prefill-policy kv_aware --decode-policy kv_aware
+```
+
+Prefill selection considers reusable KV and current work. Decode selection favors the least busy worker. Both stages inherit `--policy` unless overridden.
+
+Configure the engines' P/D connector and enable prefix caching and KV events on prefill workers. For native Python vLLM metadata discovery, set `VLLM_SERVER_DEV_MODE=1`.
+
+If event discovery is unavailable, add `--pd-kv-events http://prefill:8000=tcp://prefill:5557` for each prefill worker.
+
+### Session affinity
+
+Affinity is off by default. Add `--kv-aware-session-affinity-ttl-secs 1800` to retain bindings for 30 minutes of inactivity.
+
+Send the same `x-session-id` header or `session_params.session_id` on each turn; agent metadata and framework session headers take precedence.
+
+In P/D mode, affinity applies only to decode. A busy decoder may be replaced by a less busy one; prefill is selected independently for each request.
+
+Multiple router replicas need ingress stickiness to preserve affinity.
 
 ---
 
@@ -315,4 +339,9 @@ vllm-router \
 
 This allows optimizing each stage independently:
 - **Prefill**: Use `consistent_hash` for cache locality
-- **Decode**: Use `round_robin` or `power_of_two` for load distribution
+- **Decode**: Inherits the main policy; override with `--decode-policy` (for example `round_robin`)
+
+`grpc://` prefill and decode workers must run vLLM ≥ 0.30.0. The router
+warns at startup when a worker reports an older `engine_version`, and
+`power_of_two` uses the router's local load counts for them. See
+[gRPC P/D disaggregation](../backend/grpc.md#pd-disaggregation).

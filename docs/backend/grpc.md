@@ -105,6 +105,83 @@ L0 shares the existing LRU and `vllm_tokenizer_cache_*` metrics. Rust callers
 can use `EngineFrontend::with_tokenizer_cache(timeout, config)`. See the
 [benchmark guide](../benchmarks/grpc_frontend_l0.md) for measurement details.
 
+## Optional L1 prefix encoding cache
+
+L1 reuses token IDs for the longest previously seen prefix of a rendered
+prompt, so a growing conversation only encodes its new turns. It caches
+router-side tokenizer output and is unrelated to the worker's KV prefix cache
+(`enable_prefix_caching`). It is off by default:
+
+```bash
+VLLM_ROUTER_L1_CACHE=1 vllm-router --worker-urls grpc://127.0.0.1:50051
+```
+
+| Environment variable | Default | Meaning |
+|---|---:|---|
+| `VLLM_ROUTER_L1_CACHE` | `0` | Enable with `1` or `true` |
+| `VLLM_ROUTER_L1_MAX_BYTES` | `268435456` | Estimated heap byte limit across models (contents and containers) |
+| `VLLM_ROUTER_L1_MAX_NODES` | `65536` | Tree node limit across models |
+| `VLLM_ROUTER_L1_MAX_INSERT_BYTES` | `33554432` | Bytes one request may add (at most the total) |
+| `VLLM_ROUTER_L1_MAX_INSERT_SEGMENTS` | `4096` | Boundary segments one request may add |
+| `VLLM_ROUTER_L1_HASH_STRATEGY` | `first_last_64` | Child-key hashing strategy: `first_last_64` or `full` |
+| `VLLM_ROUTER_L1_VERIFY` | `0` | Also run a full encode and compare (debugging) |
+
+`first_last_64` is the default because it avoids hashing an entire long
+segment on the common path. Use `VLLM_ROUTER_L1_HASH_STRATEGY=full` when a
+workload is likely to create many long sibling segments with the same length,
+same first 64 bytes, and same last 64 bytes, for example fixed-size templated
+inputs whose middle changes but whose head and tail are identical.
+
+How it works:
+
+- **Boundaries.** Tokenizers split input on added tokens before normalizing
+  and pre-tokenizing. A prefix that ends right after a *boundary* added token
+  therefore encodes the same alone as inside the full prompt. Cut positions
+  come from an automaton over all added tokens that matches like the
+  tokenizer (leftmost-longest). Boundary tokens have no `lstrip`/`rstrip`/
+  `single_word` flags and no edge whitespace, and no longer added token
+  contains them before its end. If any added token is `single_word`, a
+  boundary must not end in a Unicode `\w` character (letters, digits,
+  combining marks, `_`), the same test Hugging Face uses to accept a
+  `single_word` match. `normalized` tokens qualify only when the
+  normalizer is a no-op and they cannot overlap non-normalized tokens
+  (otherwise fastokens and Hugging Face split differently, and stricter rules
+  apply). For Qwen these are `<|im_start|>`, `<|im_end|>`, `<tool_call>`,
+  `<think>` and the other added tokens. At load, each candidate is probed by
+  comparing split and full encodes; failures are dropped. Rejected tokens are
+  logged with their reason at debug level.
+- **Tree.** A radix tree over rendered text, one namespace per model instance
+  and `cache_salt`. Edges end at boundaries and store their token IDs and the
+  offsets of inner boundaries, so a lookup can stop inside an edge: editing
+  message `k` still reuses messages before it. Text after the last boundary
+  (usually the generation prompt) is not cached.
+- **Encode.** IDs for the matched prefix are copied from the tree. The rest
+  is encoded in one call, and its new boundary segments are inserted as one
+  edge. Lookups take a read lock. Inserts take a write lock and evict
+  least-recently-used leaves until both limits hold again. The byte estimate
+  counts node contents plus the tree's container capacity.
+
+L1 runs after L0 when both are enabled. It is skipped for
+`add_special_tokens=true`, `Prompt::TokenIds`, tiktoken/tekken tokenizers, and
+`tokenizer.json` files with BPE dropout, truncation, padding or Metaspace
+`prepend_scheme: first`. With `VLLM_ROUTER_L1_VERIFY=1`, a mismatch logs an
+error, returns the full encode and disables L1 for that model.
+
+Metrics: `vllm_tokenizer_l1_{lookups,hits,cached_tokens,encoded_tokens,evictions,verify_mismatches}_total`
+and the `vllm_tokenizer_l1_{nodes,bytes}` gauges.
+`vllm_tokenizer_l1_bypasses_total{reason}` counts prompts on an L1-enabled
+model that skipped the tree: `token_ids` (e.g. Harmony), `add_special_tokens`,
+`no_boundary`, or `disabled` after a verify mismatch. A model that cannot use
+L1 at all logs `L1 disabled for this model` with the reason at load. With an
+HTTP worker pool the router does not tokenize, so `VLLM_ROUTER_L0_CACHE` and
+`VLLM_ROUTER_L1_CACHE` are ignored with a warning at startup. With
+`VLLM_ROUTER_STAGES=1`, `x-router-stages` reports `encode_cached_tokens`.
+Rust callers can use `EngineFrontend::with_encoding_caches(timeout, l0, l1)`.
+See the [L1 benchmark guide](../benchmarks/grpc_frontend_l1.md).
+
+Future work: multimodal placeholders (this path is text-only), tiktoken and
+tekken tokenizers, boundaries inside long messages, and HTTP worker pools.
+
 ## Capability Boundaries
 
 Reasoning/tool history, tool definitions, tool choice, template kwargs,
@@ -122,6 +199,40 @@ Multimodal content also currently returns 400 on the gRPC path. The proto has
 `GenerateRequest.media`, but the router does not yet populate it from OpenAI
 chat content. Supporting it requires mapping OpenAI image/media parts into the
 proto media fields and adding parity tests against vLLM HTTP behavior.
+
+## P/D Disaggregation
+
+`--vllm-pd-disaggregation` accepts all-`grpc://` prefill and decode pools.
+The router sends P a unary one-token `Generate` and D a `GenerateStream`, both
+carrying the connector's JSON in `GenerateRequest.kv.kv_transfer_params`.
+P's `FinishInfo.kv_transfer_params` is handed to D. NIXL push mode runs both
+legs concurrently once P's push identity is cached.
+
+**P/D workers must run vLLM ≥ 0.30.0.** v0.29.x passes integer connector
+fields such as ports to the engine as floats, so every decode finishes
+`abort` with no tokens. Those workers still pass the gRPC health probe.
+At startup the router reads each gRPC P/D worker's `engine_version` and
+warns when it is older than 0.30.0. Colocated gRPC serving works on v0.29.
+
+A P or D leg that finishes `abort` fails the request. A streaming decode that
+fails after its stream opened still counts as a decode error. When a leg is
+dropped before it finishes, for example on client disconnect or a failed
+sibling leg, the router sends that worker `Control.Abort` for the engine
+request id, and repeats it once shortly after if the worker had not yet
+answered the RPC.
+
+The info endpoints behave as in colocated gRPC mode: `/v1/models`,
+`/get_model_info`, and `/get_server_info` are answered from the first prefill
+worker's gRPC control service, and `/health_generate` returns `501`.
+`/flush_cache` also returns `501`, because vLLM's gRPC control service has no
+cache reset. `power_of_two` uses the router's own in-flight counts, since
+`grpc://` workers serve no HTTP `/get_load`.
+
+`--prefill-policy kv_aware` and `cache_aware` score the token ids the router
+sends P, so gRPC P/D needs no HTTP `/tokenize`. KV event sources come from
+each prefill's `Control.GetKvEventSources`, or from
+`--pd-kv-events grpc://prefill:50051=tcp://prefill:5557` when the worker does
+not report them.
 
 ## Backend Modules
 

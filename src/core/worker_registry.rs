@@ -2,7 +2,10 @@
 //!
 //! Provides centralized registry for workers with model-based indexing
 
-use crate::core::{ConnectionMode, Worker, WorkerType};
+use crate::{
+    core::{ConnectionMode, Worker, WorkerType},
+    metrics::RouterMetrics,
+};
 use dashmap::DashMap;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
@@ -58,6 +61,10 @@ pub struct WorkerRegistry {
     /// Workers indexed by connection mode
     connection_workers: Arc<DashMap<ConnectionMode, Vec<WorkerId>>>,
 
+    /// Registration order across worker types. Prefill types differ by
+    /// bootstrap port, so the per-type lists cannot reconstruct --prefill order.
+    registration_order: Arc<RwLock<Vec<WorkerId>>>,
+
     /// URL to worker ID mapping (for backward compatibility)
     url_to_id: Arc<DashMap<String, WorkerId>>,
 
@@ -74,6 +81,7 @@ impl WorkerRegistry {
             model_index: Arc::new(DashMap::new()),
             type_workers: Arc::new(DashMap::new()),
             connection_workers: Arc::new(DashMap::new()),
+            registration_order: Arc::new(RwLock::new(Vec::new())),
             url_to_id: Arc::new(DashMap::new()),
             revision: Arc::new(AtomicU64::new(0)),
         }
@@ -81,12 +89,18 @@ impl WorkerRegistry {
 
     /// Register a new worker
     pub fn register(&self, worker: Arc<dyn Worker>) -> WorkerId {
-        let worker_id = if let Some(existing_id) = self.url_to_id.get(worker.url()) {
+        let (worker_id, is_new) = if let Some(existing_id) = self.url_to_id.get(worker.url()) {
             // Worker with this URL already exists, update it
-            existing_id.clone()
+            (existing_id.clone(), false)
         } else {
-            WorkerId::new()
+            (WorkerId::new(), true)
         };
+        if is_new {
+            self.registration_order
+                .write()
+                .expect("RwLock for registration_order is poisoned")
+                .push(worker_id.clone());
+        }
 
         // Store worker
         self.workers.insert(worker_id.clone(), worker.clone());
@@ -122,6 +136,9 @@ impl WorkerRegistry {
             .or_default()
             .push(worker_id.clone());
 
+        // Publish the initial state even if no health transition occurs.
+        RouterMetrics::set_worker_health(worker.url(), worker.is_healthy());
+
         self.notify_worker_state_change();
 
         worker_id
@@ -151,6 +168,10 @@ impl WorkerRegistry {
             if let Some(mut type_workers) = self.type_workers.get_mut(&worker.worker_type()) {
                 type_workers.retain(|id| id != worker_id);
             }
+            self.registration_order
+                .write()
+                .expect("RwLock for registration_order is poisoned")
+                .retain(|id| id != worker_id);
 
             // Remove from connection mode index
             if let Some(mut conn_workers) =
@@ -235,16 +256,15 @@ impl WorkerRegistry {
             .unwrap_or_default()
     }
 
-    /// Get all prefill workers (regardless of bootstrap_port)
+    /// Get all prefill workers (regardless of bootstrap_port), in registration order.
     pub fn get_prefill_workers(&self) -> Vec<Arc<dyn Worker>> {
-        self.workers
+        self.registration_order
+            .read()
+            .expect("RwLock for registration_order is poisoned")
             .iter()
-            .filter_map(|entry| {
-                let worker = entry.value();
-                match worker.worker_type() {
-                    WorkerType::Prefill { .. } => Some(worker.clone()),
-                    _ => None,
-                }
+            .filter_map(|id| {
+                let worker = self.get(id)?;
+                matches!(worker.worker_type(), WorkerType::Prefill { .. }).then_some(worker)
             })
             .collect()
     }
@@ -395,10 +415,6 @@ impl WorkerRegistry {
             let mut interval =
                 tokio::time::interval(tokio::time::Duration::from_secs(check_interval_secs));
 
-            // Counter for periodic load reset (every 10 health check cycles)
-            let mut check_count = 0u64;
-            const LOAD_RESET_INTERVAL: u64 = 10;
-
             loop {
                 interval.tick().await;
 
@@ -420,15 +436,6 @@ impl WorkerRegistry {
                     let _ = worker.check_health_async().await; // Use async version directly
                     if was_available != worker.is_available() {
                         revision.fetch_add(1, Ordering::AcqRel);
-                    }
-                }
-
-                // Reset loads periodically
-                check_count += 1;
-                if check_count.is_multiple_of(LOAD_RESET_INTERVAL) {
-                    tracing::debug!("Resetting worker loads (cycle {})", check_count);
-                    for worker in &workers {
-                        worker.reset_load();
                     }
                 }
             }
@@ -459,8 +466,27 @@ pub struct WorkerRegistryStats {
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use super::*;
-    use crate::core::{CircuitBreakerConfig, WorkerFactory};
+    use crate::core::{BasicWorker, CircuitBreakerConfig, WorkerFactory};
     use std::collections::HashMap;
+
+    #[test]
+    fn prefill_workers_follow_registration_order() {
+        let registry = WorkerRegistry::new();
+        for (url, port) in [("http://z", Some(2u16)), ("http://a", Some(1))] {
+            registry.register(Arc::new(BasicWorker::new(
+                url.to_string(),
+                WorkerType::Prefill {
+                    bootstrap_port: port,
+                },
+            )));
+        }
+        let urls: Vec<_> = registry
+            .get_prefill_workers()
+            .iter()
+            .map(|worker| worker.url().to_string())
+            .collect();
+        assert_eq!(urls, ["http://z", "http://a"]);
+    }
 
     #[test]
     fn test_worker_registry() {

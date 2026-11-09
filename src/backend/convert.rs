@@ -1,22 +1,14 @@
 //! OpenAI chat fields → `vllm-proto` `GenerateRequest`.
 //!
-//! This version always sets `prompt = TokenIds`. Proto also has text /
-//! `media` / KV-transfer fields; they are unused here. Sampling-default
-//! merge still lives in worker `vllm-text`; this only fills proto.
+//! This version always sets `prompt = TokenIds`. Proto also has text and
+//! `media` fields; they are unused here. KV-transfer fields are set only by
+//! the P/D router. Sampling-default merge still lives in worker `vllm-text`;
+//! this only fills proto.
 
 use crate::backend::pb;
 use crate::protocols::spec::{
-    ChatCompletionRequest, CompletionRequest, PromptInput, StringOrArray,
+    ChatCompletionRequest, CompletionRequest, GenerationRequest, PromptInput, StringOrArray,
 };
-
-/// Router-plane keys the HTTP layer consumes before dispatch.
-///
-/// `vllm_xargs` carries the canonical `agentic_context` Program identity. The
-/// proto has no place for it, but dropping a *router* field is not the silent
-/// loss the rest of this allowlist guards against: the identity has already
-/// been read from the typed request when scheduling runs. Accept it here so a
-/// gRPC pool can use the same identity contract as an HTTP pool.
-const ROUTER_PLANE_OTHER: [&str; 1] = ["vllm_xargs"];
 
 /// Passthrough keys the gRPC pipeline forwards to the worker. Anything else is
 /// rejected: a field the adapter cannot express must not be dropped silently.
@@ -33,12 +25,15 @@ const SUPPORTED_OTHER: [&str; 7] = [
 /// Completions-only response option; never part of the chat shape.
 const RETURN_TOKEN_IDS: &str = "return_token_ids";
 
+// Consumed by routing, never sent as generation options.
+const ROUTING_ONLY: [&str; 4] = ["vllm_xargs", "agent_hint", "session_id", "user_id"];
+
 fn ensure_supported_other<'a>(
     keys: impl Iterator<Item = &'a str>,
     endpoint: &str,
 ) -> Result<(), String> {
     let unsupported: Vec<&str> = keys
-        .filter(|key| !SUPPORTED_OTHER.contains(key) && !ROUTER_PLANE_OTHER.contains(key))
+        .filter(|key| !SUPPORTED_OTHER.contains(key) && !ROUTING_ONLY.contains(key))
         .collect();
     if unsupported.is_empty() {
         Ok(())
@@ -94,6 +89,10 @@ pub fn chat_to_generate_request(
     }
     ensure_supported_other(request.other.keys().map(String::as_str), "chat")?;
     other_bool(request, "add_special_tokens")?;
+    // Validate types before using the same scope as routing.
+    other_string(request, "lora_name")?;
+    other_string(request, "cache_salt")?;
+    let (lora_name, cache_salt) = request.cache_identity();
     let max_new_tokens = request
         .max_completion_tokens
         .or(request.max_tokens)
@@ -173,9 +172,7 @@ pub fn chat_to_generate_request(
             ..Default::default()
         }),
         kv: Some(pb::KvCacheParameters {
-            cache_salt: other_string(request, "cache_salt")?
-                .unwrap_or_default()
-                .to_string(),
+            cache_salt: cache_salt.unwrap_or_default().to_string(),
             ..Default::default()
         }),
         truncate_prompt_tokens: other_u32(request, "truncate_prompt_tokens")?.unwrap_or(0),
@@ -187,9 +184,7 @@ pub fn chat_to_generate_request(
             .and_then(serde_json::Value::as_str)
             .filter(|id| !id.is_empty())
             .map(str::to_string),
-        lora_name: other_string(request, "lora_name")?
-            .unwrap_or_default()
-            .to_string(),
+        lora_name: lora_name.unwrap_or_default().to_string(),
         watermarking: other_bool(request, "watermarking")?,
         ..Default::default()
     })
@@ -318,6 +313,90 @@ fn other_i32(request: &ChatCompletionRequest, key: &str) -> Result<Option<i32>, 
         .transpose()
 }
 
+/// Turn a chat request into the prefill leg of a P/D pair: one sampled token,
+/// with the connector's `kv_transfer_params`.
+pub fn limit_to_prefill(proto: &mut pb::GenerateRequest) {
+    let stopping = proto.stopping.get_or_insert_with(Default::default);
+    stopping.max_new_tokens = 1;
+    stopping.min_new_tokens = 1;
+}
+
+pub fn set_kv_transfer_params(
+    proto: &mut pb::GenerateRequest,
+    params: &serde_json::Value,
+) -> Result<(), String> {
+    proto
+        .kv
+        .get_or_insert_with(Default::default)
+        .kv_transfer_params = Some(json_to_proto_struct(params)?);
+    Ok(())
+}
+
+/// protobuf `Struct` numbers are `f64`; integers above 2^53 lose precision.
+pub fn json_to_proto_struct(value: &serde_json::Value) -> Result<prost_types::Struct, String> {
+    match json_to_proto_value(value).kind {
+        Some(prost_types::value::Kind::StructValue(fields)) => Ok(fields),
+        _ => Err("kv_transfer_params must be a JSON object".to_string()),
+    }
+}
+
+fn json_to_proto_value(value: &serde_json::Value) -> prost_types::Value {
+    use prost_types::value::Kind;
+    use serde_json::Value;
+
+    let kind = match value {
+        Value::Null => Kind::NullValue(prost_types::NullValue::NullValue as i32),
+        Value::Bool(value) => Kind::BoolValue(*value),
+        Value::Number(value) => Kind::NumberValue(value.as_f64().unwrap_or_default()),
+        Value::String(value) => Kind::StringValue(value.clone()),
+        Value::Array(items) => Kind::ListValue(prost_types::ListValue {
+            values: items.iter().map(json_to_proto_value).collect(),
+        }),
+        Value::Object(map) => Kind::StructValue(prost_types::Struct {
+            fields: map
+                .iter()
+                .map(|(key, value)| (key.clone(), json_to_proto_value(value)))
+                .collect(),
+        }),
+    };
+    prost_types::Value { kind: Some(kind) }
+}
+
+/// Whole numbers come back as JSON integers, so block ids and ports keep the
+/// shape the HTTP connector JSON uses.
+pub fn proto_struct_to_json(value: &prost_types::Struct) -> serde_json::Value {
+    serde_json::Value::Object(
+        value
+            .fields
+            .iter()
+            .map(|(key, value)| (key.clone(), proto_value_to_json(value)))
+            .collect(),
+    )
+}
+
+fn proto_value_to_json(value: &prost_types::Value) -> serde_json::Value {
+    use prost_types::value::Kind;
+    use serde_json::Value;
+
+    const MAX_EXACT_INTEGER: f64 = 9_007_199_254_740_992.0;
+    match &value.kind {
+        None | Some(Kind::NullValue(_)) => Value::Null,
+        Some(Kind::BoolValue(value)) => Value::Bool(*value),
+        Some(Kind::NumberValue(value)) => {
+            if value.fract() == 0.0 && value.abs() <= MAX_EXACT_INTEGER {
+                Value::from(*value as i64)
+            } else {
+                serde_json::Number::from_f64(*value).map_or(Value::Null, Value::Number)
+            }
+        }
+        Some(Kind::StringValue(value)) => Value::String(value.clone()),
+        Some(Kind::ListValue(list)) => {
+            Value::Array(list.values.iter().map(proto_value_to_json).collect())
+        }
+        Some(Kind::StructValue(fields)) => proto_struct_to_json(fields),
+    }
+}
+
 /// A `/v1/completions` request lowered onto the gRPC pipeline.
 #[derive(Debug)]
 pub struct PreparedCompletion {
@@ -338,6 +417,9 @@ pub fn prepare_grpc_completion(request: &CompletionRequest) -> Result<PreparedCo
             "gRPC /v1/completions requires a single token-id prompt (list[int])".to_string(),
         );
     };
+    if ids.is_empty() {
+        return Err("completion prompt token_ids must not be empty".to_string());
+    }
     let token_ids = ids
         .iter()
         .map(|id| {
@@ -386,7 +468,9 @@ pub fn prepare_grpc_completion(request: &CompletionRequest) -> Result<PreparedCo
     let other = request
         .other
         .iter()
-        .filter(|(key, _)| key.as_str() != RETURN_TOKEN_IDS)
+        .filter(|(key, _)| {
+            key.as_str() != RETURN_TOKEN_IDS && !ROUTING_ONLY.contains(&key.as_str())
+        })
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect();
     let chat = ChatCompletionRequest {
@@ -451,6 +535,53 @@ mod tests {
     }
 
     #[test]
+    fn completion_routing_metadata_preserves_worker_cache_scope() {
+        let request: CompletionRequest = serde_json::from_value(serde_json::json!({
+            "prompt": [1, 2], "lora_name": "adapter", "cache_salt": "tenant",
+            "session_id": "s", "user_id": "u", "agent_hint": {"agent_id": "a"},
+            "vllm_xargs": {"agentic_context": {"session_id": "s"}},
+            "session_params": {"session_id": "typed-session"}, "return_token_ids": true
+        }))
+        .unwrap();
+        let prepared = prepare_grpc_completion(&request).unwrap();
+        assert_eq!(prepared.token_ids, vec![1, 2]);
+        assert!(prepared.emit_token_ids);
+        assert_eq!(prepared.chat.cache_identity(), request.cache_identity());
+        assert_eq!(prepared.chat.session_params, request.session_params);
+        for key in ROUTING_ONLY {
+            assert!(!prepared.chat.other.contains_key(key));
+        }
+        let proto =
+            chat_to_generate_request(&prepared.chat, prepared.token_ids, "r".into()).unwrap();
+        assert_eq!(proto.lora_name, "adapter");
+        assert_eq!(proto.kv.unwrap().cache_salt, "tenant");
+    }
+
+    #[test]
+    fn token_ids_only_no_text_prompt() {
+        // This-version default: convert always emits TokenIds. Not a forever
+        // ban on a text prompt field if that is added later.
+        let req = chat(serde_json::json!({
+            "model": "qwen",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 32,
+            "temperature": 0.2
+        }));
+        let proto = chat_to_generate_request(&req, vec![11, 22, 33], "req-1".into()).unwrap();
+        match proto.prompt.unwrap() {
+            pb::generate_request::Prompt::TokenIds(ids) => {
+                assert_eq!(ids.ids, vec![11, 22, 33]);
+            }
+            other => panic!("expected token_ids, got {other:?}"),
+        }
+        assert_eq!(proto.stopping.unwrap().max_new_tokens, 32);
+        assert_eq!(proto.temperature, Some(0.2));
+        assert_eq!(proto.model, "qwen");
+        assert_eq!(proto.response.unwrap().output_text, Some(false));
+    }
+
+    #[test]
+    #[test]
     fn vllm_xargs_is_accepted_as_router_plane_identity_and_dropped() {
         // The canonical Program identity travels in `vllm_xargs`; the gRPC
         // adapter must accept it for the HTTP layer to read, and must not
@@ -477,29 +608,6 @@ mod tests {
             payload["vllm_xargs"]["agentic_context"]["program_id"],
             "program-a"
         );
-    }
-
-    #[test]
-    fn token_ids_only_no_text_prompt() {
-        // This-version default: convert always emits TokenIds. Not a forever
-        // ban on a text prompt field if that is added later.
-        let req = chat(serde_json::json!({
-            "model": "qwen",
-            "messages": [{"role": "user", "content": "hi"}],
-            "max_tokens": 32,
-            "temperature": 0.2
-        }));
-        let proto = chat_to_generate_request(&req, vec![11, 22, 33], "req-1".into()).unwrap();
-        match proto.prompt.unwrap() {
-            pb::generate_request::Prompt::TokenIds(ids) => {
-                assert_eq!(ids.ids, vec![11, 22, 33]);
-            }
-            other => panic!("expected token_ids, got {other:?}"),
-        }
-        assert_eq!(proto.stopping.unwrap().max_new_tokens, 32);
-        assert_eq!(proto.temperature, Some(0.2));
-        assert_eq!(proto.model, "qwen");
-        assert_eq!(proto.response.unwrap().output_text, Some(false));
     }
 
     #[test]
@@ -606,6 +714,42 @@ mod tests {
         }));
         let proto = chat_to_generate_request(&visible, vec![1], "r".into()).unwrap();
         assert_eq!(proto.response.unwrap().output_text, Some(false));
+    }
+
+    #[test]
+    fn kv_transfer_params_round_trip_through_proto_struct() {
+        let params = serde_json::json!({
+            "do_remote_prefill": true,
+            "do_remote_decode": false,
+            "remote_block_ids": [[7, 8], [9]],
+            "remote_engine_id": "P",
+            "remote_port": 5600,
+            "remote_host": null,
+            "ratio": 0.5,
+        });
+        let proto = json_to_proto_struct(&params).unwrap();
+        assert_eq!(proto_struct_to_json(&proto), params);
+        assert!(json_to_proto_struct(&serde_json::json!([1])).is_err());
+    }
+
+    #[test]
+    fn prefill_leg_samples_one_token_and_carries_kv_params() {
+        let req = chat(serde_json::json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 64,
+            "cache_salt": "salt"
+        }));
+        let mut proto = chat_to_generate_request(&req, vec![1, 2], "r".into()).unwrap();
+        limit_to_prefill(&mut proto);
+        set_kv_transfer_params(&mut proto, &serde_json::json!({"do_remote_decode": true})).unwrap();
+        let stopping = proto.stopping.unwrap();
+        assert_eq!((stopping.max_new_tokens, stopping.min_new_tokens), (1, 1));
+        let kv = proto.kv.unwrap();
+        assert_eq!(kv.cache_salt, "salt");
+        assert_eq!(
+            proto_struct_to_json(kv.kv_transfer_params.as_ref().unwrap()),
+            serde_json::json!({"do_remote_decode": true})
+        );
     }
 
     fn completion(json: serde_json::Value) -> CompletionRequest {

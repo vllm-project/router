@@ -52,6 +52,15 @@ repos:
         types_or: [python, rust]
         files: '^(tests/python/.*\.py|tests/rust/.*\.rs|src/.*\.rs|tests/[^/]+\.rs)$'
 
+      # Keeps docs/cli_reference.md in lockstep with the Rust declarations and
+      # the Python parser. Standard library only, so no build or GPU is needed.
+      - id: check-cli-reference
+        name: Ensure CLI reference matches the CLI
+        entry: python scripts/check_cli_reference.py
+        language: system
+        pass_filenames: false
+        files: '^(docs/cli_reference\.md|scripts/check_cli_reference\.py|py_src/vllm_router/router_args\.py|src/(main|server)\.rs|src/config/types\.rs)$'
+
       - id: mypy
         name: Run mypy
         entry: mypy

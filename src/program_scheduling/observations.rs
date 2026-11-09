@@ -4,6 +4,7 @@
 //! freshness, rolling statistics, logical capacity, and scheduling decisions.
 
 use super::ProgramTarget;
+use crate::protocols::prometheus_text::{parse_series, split_series_value};
 use async_trait::async_trait;
 use futures::future::join_all;
 use std::collections::{BTreeMap, HashMap};
@@ -221,54 +222,49 @@ fn parse_vllm_metrics(text: &str) -> HashMap<usize, VllmEngineMetrics> {
     engines
 }
 
-fn split_series_value(line: &str) -> Option<(&str, &str)> {
-    let split = line.rfind(char::is_whitespace)?;
-    Some((line[..split].trim(), line[split..].trim()))
-}
-
-fn parse_series(series: &str) -> (&str, HashMap<String, String>) {
-    let Some(open) = series.find('{') else {
-        return (series, HashMap::new());
-    };
-    let name = &series[..open];
-    let labels = series
-        .strip_suffix('}')
-        .map(|series| &series[open + 1..])
-        .map(parse_labels)
-        .unwrap_or_default();
-    (name, labels)
-}
-
-fn parse_labels(labels: &str) -> HashMap<String, String> {
-    let mut result = HashMap::new();
-    let mut fields = Vec::new();
-    let mut start = 0;
-    let mut quoted = false;
-    let mut escaped = false;
-    for (index, character) in labels.char_indices() {
-        if escaped {
-            escaped = false;
+/// Maximum value of one Prometheus gauge family across all series.
+pub(crate) fn max_prometheus_gauge(text: &str, family: &str) -> Option<f64> {
+    let mut maximum: Option<f64> = None;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        match character {
-            '\\' if quoted => escaped = true,
-            '"' => quoted = !quoted,
-            ',' if !quoted => {
-                fields.push(&labels[start..index]);
-                start = index + 1;
-            }
-            _ => {}
-        }
-    }
-    fields.push(&labels[start..]);
-    for field in fields {
-        let Some((key, value)) = field.split_once('=') else {
+        let Some((series, value)) = split_series_value(line) else {
             continue;
         };
-        let value = value.trim().trim_matches('"').replace("\\\"", "\"");
-        result.insert(key.trim().to_string(), value);
+        let (name, _labels) = parse_series(series);
+        if name != family {
+            continue;
+        }
+        if let Ok(value) = value.parse::<f64>() {
+            maximum = Some(maximum.map_or(value, |current| current.max(value)));
+        }
     }
-    result
+    maximum
+}
+
+/// Sum one gauge family across its series (per-engine request counts).
+pub(crate) fn sum_prometheus_gauge(text: &str, family: &str) -> Option<u64> {
+    let mut total: Option<u64> = None;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((series, value)) = split_series_value(line) else {
+            continue;
+        };
+        let (name, _labels) = parse_series(series);
+        if name != family {
+            continue;
+        }
+        if let Ok(value) = value.parse::<f64>() {
+            let value = value.max(0.0).round() as u64;
+            total = Some(total.unwrap_or(0).saturating_add(value));
+        }
+    }
+    total
 }
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
@@ -319,6 +315,20 @@ unrelated_metric{engine="1",label="escaped\"comma,value"} 99
         assert_eq!(observations[1].target_id, "worker@1");
         assert_eq!(observations[1].waiting_requests, Some(3));
         assert_eq!(observations[0].observed_at, observations[1].observed_at);
+    }
+
+    #[test]
+    fn max_gauge_picks_the_largest_series() {
+        let text = concat!(
+            "# HELP vllm:kv_cache_usage_perc usage\n",
+            "vllm:kv_cache_usage_perc{engine=\"0\"} 0.25\n",
+            "vllm:kv_cache_usage_perc{engine=\"1\"} 0.75\n",
+        );
+        assert_eq!(
+            max_prometheus_gauge(text, "vllm:kv_cache_usage_perc"),
+            Some(0.75)
+        );
+        assert_eq!(max_prometheus_gauge(text, "missing_gauge"), None);
     }
 
     #[test]

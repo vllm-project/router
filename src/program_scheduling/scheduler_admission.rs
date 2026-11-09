@@ -3,6 +3,7 @@
 //! This module owns request-scoped ordering hints, yield-aware resume order,
 //! and capacity checks. Global Queue placement is implemented separately.
 
+use super::output_length;
 use super::scheduler::ProgramScheduler;
 use super::scheduler_state::{ProgramPauseReason, ProgramResumeOrder, ProgramSchedulerState};
 use super::ContextTokens;
@@ -10,6 +11,7 @@ use super::{
     BatchGainInputs, ContinuitySample, ProgramDispatch, ProgramIdentity, ProgramRef,
     ProgramRequestHandle, ProgramState, ProgramStatus, ProgramTarget, ScheduleError,
 };
+use crate::config::types::PredictionMode;
 use crate::metrics::{AgentAwareAdmissionMetrics, RouterMetrics};
 use std::cmp::Ordering;
 use std::sync::Arc;
@@ -27,16 +29,54 @@ pub(crate) struct RankAdmissionPlan {
 }
 
 impl ProgramScheduler {
+    /// Commit a new pre-output retry attempt with an atomic resource recheck.
+    /// Existing q is counted once. Force deadlines never bypass this gate.
+    pub fn restart_pd_attempt(&self, old: &ProgramDispatch) -> Option<ProgramDispatch> {
+        let now = Instant::now();
+        let mut state = self.state.lock();
+        if !self.config.pd_mode
+            || !state.runtime.is_live_attempt(old)
+            || !state.targets.contains_key(&old.target_id)
+        {
+            return None;
+        }
+        let observation = state.observations.get(&old.target_id)?;
+        if !self.observation_is_fresh(observation, now) || observation.kv_cache_usage.is_none() {
+            return None;
+        }
+        let waiting = observation.waiting_requests?;
+        if self.config.admission_waiting_request_threshold > 0
+            && waiting >= self.config.admission_waiting_request_threshold
+        {
+            return None;
+        }
+        let low = self.config.progress_ttl.token_capacity? as f64
+            * self.config.progress_ttl.low_watermark_ratio;
+        let active = state
+            .runtime
+            .iter_views()
+            .filter(|p| {
+                p.state == ProgramState::Active && p.placement == Some(old.target_id.as_str())
+            })
+            .count();
+        if self.target_usage(&state, &old.target_id, now) > low
+            || active > self.config.max_active_programs_per_target
+        {
+            return None;
+        }
+        state.runtime.restart_attempt(old, now)
+    }
+
     /// Retain one Program request until rank-local admission permits dispatch.
     pub async fn acquire(
         &self,
         identity: ProgramIdentity,
-        context: ContextTokens,
+        context: impl Into<ContextTokens>,
         targets: &[ProgramTarget],
         routing_text: Option<String>,
     ) -> Result<ProgramDispatch, ScheduleError> {
         self.sync_targets(identity.model_pool(), targets);
-        self.acquire_synced(identity, context, targets, routing_text)
+        self.acquire_synced(identity, context.into(), targets, routing_text)
             .await
     }
 
@@ -64,7 +104,8 @@ impl ProgramScheduler {
             return Err(ScheduleError::NoTargets);
         }
         let arrived_at = Instant::now();
-        let handle = {
+        let expected_resume = identity.expected_resume();
+        let (handle, pending_output_prediction) = {
             let mut state = self.state.lock();
             let handle = state.runtime.retain_request(
                 &identity,
@@ -89,30 +130,69 @@ impl ProgramScheduler {
                                     cache_miss_impact_seconds: decision
                                         .last_cache_miss_impact_seconds,
                                 },
+                                decision.pending_return_prediction.clone(),
                             )
                         })
                     })
                 });
-            if let Some((Some(target_id), sample)) = continuity {
+            if let Some((target_id, sample, pending_prediction)) = continuity {
                 if sample.interval_seconds.is_finite() && sample.interval_seconds >= 0.0 {
-                    let factors = state.rank_factors.entry(target_id.clone()).or_default();
-                    debug!(
-                        event = "continuity_sample",
-                        program = %reference.redacted_id(),
-                        target = %target_id,
-                        interval_seconds = sample.interval_seconds,
-                        previous_cache_miss_impact_seconds = sample.cache_miss_impact_seconds,
-                        window_samples_before = factors.continuity_sample_count(),
-                        window_complete_before = factors.continuity_window_complete(
-                            self.config.progress_ttl.stats_window_size
-                        ),
-                        "Program scheduling diagnostic"
-                    );
-                    RouterMetrics::record_agent_aware_request_interval(
-                        &target_id,
-                        sample.interval_seconds,
-                    );
-                    factors.push_continuity(sample, self.config.progress_ttl.stats_window_size);
+                    if let Some(target_id) = target_id.as_deref() {
+                        let factors = state.rank_factors.entry(target_id.to_string()).or_default();
+                        debug!(
+                            event = "continuity_sample",
+                            program = %reference.redacted_id(),
+                            target = %target_id,
+                            interval_seconds = sample.interval_seconds,
+                            previous_cache_miss_impact_seconds = sample.cache_miss_impact_seconds,
+                            window_samples_before = factors.continuity_sample_count(),
+                            window_complete_before = factors.continuity_window_complete(
+                                self.config.progress_ttl.stats_window_size
+                            ),
+                            "Program scheduling diagnostic"
+                        );
+                        RouterMetrics::record_agent_aware_request_interval(
+                            target_id,
+                            sample.interval_seconds,
+                        );
+                        factors.push_continuity(sample, self.config.progress_ttl.stats_window_size);
+                    }
+                    if self.config.prediction_profile.mode != PredictionMode::Off {
+                        if let Some(pending) = pending_prediction {
+                            if let Some(target_id) = target_id.as_deref() {
+                                RouterMetrics::record_workflow_return_observation(
+                                    target_id,
+                                    sample.interval_seconds,
+                                    pending
+                                        .prediction
+                                        .as_ref()
+                                        .map(|prediction| prediction.probability),
+                                    self.config.prediction_profile.return_time_horizon_seconds,
+                                );
+                            }
+                            state
+                                .prediction_profiles
+                                .observe_return(&pending.keys, sample.interval_seconds);
+                            debug!(
+                                event = "return_time_observed",
+                                program = %reference.redacted_id(),
+                                actual_seconds = sample.interval_seconds,
+                                predicted_probability = pending
+                                    .prediction
+                                    .as_ref()
+                                    .map(|prediction| prediction.probability),
+                                predicted_ttl_seconds = pending
+                                    .prediction
+                                    .as_ref()
+                                    .map(|prediction| prediction.suggested_ttl_seconds),
+                                "Workflow prediction shadow observation"
+                            );
+                        }
+                    }
+                    if let Some(decision) = state.decisions.get_mut(&reference) {
+                        decision.pending_return_prediction = None;
+                        decision.last_return_actual_seconds = Some(sample.interval_seconds);
+                    }
                 }
             }
             let previous_tokens = state.decisions.get(&reference).map_or(0.0, |decision| {
@@ -126,6 +206,56 @@ impl ProgramScheduler {
                 arrived_at,
                 routing_text.as_deref(),
             );
+            let mut pending_output_prediction = None;
+            if self.config.prediction_profile.mode != PredictionMode::Off {
+                let keys = output_length::keys_for_request(&identity);
+                let prediction = state.prediction_profiles.predict_output(
+                    &keys,
+                    self.config.prediction_profile.output_length_quantile,
+                    self.config.prediction_profile.output_length_min_support,
+                    self.config.prediction_profile.output_length_tail_samples,
+                    self.config.prediction_profile.prior_weight,
+                    self.config.prediction_profile.stability_window_size,
+                    self.config.prediction_profile.stability_tolerance,
+                );
+                debug!(
+                    event = "output_length_prediction",
+                    program = %reference.redacted_id(),
+                    predicted_tokens = prediction.as_ref().map(|value| value.tokens),
+                    support = prediction.as_ref().map(|value| value.support),
+                    mature = prediction.as_ref().is_some_and(|value| value.mature),
+                    backoff_level = prediction.as_ref().map(|value| value.backoff_level),
+                    source = prediction
+                        .as_ref()
+                        .map(|value| value.source.as_str())
+                        .unwrap_or("none"),
+                    "Workflow prediction shadow result"
+                );
+                if let (Some(target_id), Some(prediction)) = (
+                    state
+                        .decisions
+                        .get(&reference)
+                        .and_then(|decision| decision.last_target.as_deref()),
+                    prediction.as_ref(),
+                ) {
+                    RouterMetrics::record_workflow_output_prediction(
+                        target_id,
+                        prediction.source.as_str(),
+                        prediction.tokens,
+                        prediction.support,
+                        prediction.mature,
+                        prediction.backoff_level,
+                    );
+                }
+                let pending = output_length::PendingOutputPrediction { keys, prediction };
+                if let Some(decision) = state.decisions.get_mut(&reference) {
+                    decision.latest_output_prediction = Some(pending.clone());
+                }
+                pending_output_prediction = Some(pending);
+            }
+
+            // Shadow rollout samples the prepared counterfactual once the
+            // decision state reflects this arrival.
             if context.shadow_tokens().is_some() {
                 if let Some(target_id) = state
                     .decisions
@@ -146,7 +276,10 @@ impl ProgramScheduler {
                     .decisions
                     .get(&reference)
                     .is_some_and(|decision| !decision.pause_when_idle);
-                if account_growth && current_tokens > previous_tokens {
+                if account_growth
+                    && (current_tokens > previous_tokens
+                        || (self.config.pd_mode && current_tokens < previous_tokens))
+                {
                     Self::adjust_usage(&mut state, &placement, current_tokens - previous_tokens);
                 }
             } else {
@@ -176,14 +309,17 @@ impl ProgramScheduler {
             } else {
                 self.run_request_arrival_decisions(&mut state, arrived_at);
             }
-            handle
+            (handle, pending_output_prediction)
         };
         let mut guard = AdmissionGuard::new(self, handle);
+        let mut pending_output_prediction = pending_output_prediction;
         let deadline = arrived_at + self.config.queue_timeout;
         loop {
             let wait_handle = guard.handle().clone();
             let notified = wait_handle.notified();
-            if let Some(dispatch) = self.claim_dispatch(guard.handle()) {
+            if let Some(mut dispatch) = self.claim_dispatch(guard.handle()) {
+                dispatch
+                    .attach_prediction_context(expected_resume, pending_output_prediction.take());
                 guard.disarm();
                 return Ok(dispatch);
             }
@@ -198,7 +334,10 @@ impl ProgramScheduler {
                     .get(guard.handle().program())
                     .and_then(|decision| decision.force_resume_deadline)
             };
-            let wake_at = force_deadline.map_or(deadline, |force| force.min(deadline));
+            let wake_at = force_deadline.filter(|force| *force > now).map_or(
+                (now + self.config.metrics_interval).min(deadline),
+                |force| force.min(deadline),
+            );
             if tokio::time::timeout(wake_at.saturating_duration_since(now), notified)
                 .await
                 .is_err()
@@ -243,8 +382,63 @@ impl ProgramScheduler {
 
     fn claim_dispatch(&self, handle: &ProgramRequestHandle) -> Option<ProgramDispatch> {
         let mut state = self.state.lock();
+        if self.config.pd_mode && state.runtime.view(handle.program())?.in_flight_requests > 0 {
+            return None;
+        }
         let target = state.runtime.placement(handle.program())?.to_string();
+        if self.config.pd_mode {
+            let now = Instant::now();
+            let low = self.config.progress_ttl.token_capacity? as f64
+                * self.config.progress_ttl.low_watermark_ratio;
+            let fresh = state
+                .observations
+                .get(&target)
+                .filter(|o| self.observation_is_fresh(o, now))
+                .filter(|o| o.kv_cache_usage.is_some());
+            let waiting = fresh.and_then(|o| o.waiting_requests).unwrap_or(usize::MAX);
+            if fresh.is_none()
+                || (self.config.admission_waiting_request_threshold > 0
+                    && waiting >= self.config.admission_waiting_request_threshold)
+            {
+                return None;
+            }
+            if self.target_usage(&state, &target, now) > low {
+                // Returning turns must re-admit growth, without adding their q twice.
+                if self.pause_idle(
+                    &mut state,
+                    handle.program(),
+                    ProgramPauseReason::CapacityRepair,
+                    now,
+                ) {
+                    let queue = if self.config.global_queue {
+                        state
+                            .global_queues
+                            .entry(handle.program().model_pool().to_string())
+                            .or_default()
+                    } else {
+                        state.rank_queues.entry(target.clone()).or_default()
+                    };
+                    if !queue.contains(handle.program()) {
+                        queue.push_back(handle.program().clone());
+                    }
+                    if let Some(decision) = state.decisions.get_mut(handle.program()) {
+                        decision.queued_at = Some(now);
+                    }
+                    self.set_force_resume_deadline(&mut state, &target, handle.program(), now);
+                }
+                return None;
+            }
+        }
         let dispatch = state.runtime.admit_front(handle, target, Instant::now())?;
+        // Promote the admitted turn's context estimate: the front request is
+        // now the Program's active turn, and later admission must account for
+        // its real prompt rather than the previous front's smaller one.
+        if let Some(decision) = state.decisions.get_mut(dispatch.program()) {
+            if dispatch.context_tokens() > decision.context_tokens {
+                decision.context_tokens = dispatch.context_tokens();
+                decision.context_shrink_observations = 0;
+            }
+        }
         RouterMetrics::record_agent_aware_queue_wait(
             &dispatch.target_id,
             dispatch
@@ -283,10 +477,37 @@ impl ProgramScheduler {
             return;
         }
         let after = state.runtime.view(handle.program());
-        if let (Some(before), Some(after), Some(tokens), Some(target_id)) = (
+        if self.config.pd_mode
+            && after
+                .as_ref()
+                .is_some_and(|view| view.in_flight_requests == 0)
+        {
+            let next_output = state
+                .runtime
+                .front_request_hints(handle.program())
+                .and_then(|hints| hints.expected_output_tokens);
+            // The next retained turn may have a larger prompt. Charge it
+            // before the next claim_dispatch capacity check.
+            let next_context = state.runtime.front_request_context(handle.program());
+            if let Some(decision) = state.decisions.get_mut(handle.program()) {
+                decision.output_token_reservation = next_output;
+                if let Some(context_tokens) = next_context {
+                    if context_tokens != decision.context_tokens {
+                        decision.context_tokens = context_tokens;
+                        decision.context_shrink_observations = 0;
+                    }
+                }
+            }
+        }
+        let after_tokens = state
+            .decisions
+            .get(handle.program())
+            .map(|decision| decision.private_tokens(self.config.progress_ttl.decode_buffer_tokens));
+        if let (Some(before), Some(after), Some(tokens), Some(next_tokens), Some(target_id)) = (
             before,
             after,
             before_tokens,
+            after_tokens,
             state
                 .decisions
                 .get(handle.program())
@@ -302,6 +523,11 @@ impl ProgramScheduler {
                     decision.pause_when_idle = false;
                     Self::restart_shared_prefix_freshness(decision, now);
                 }
+            } else if self.config.pd_mode
+                && before.state == ProgramState::Active
+                && after.state == ProgramState::Active
+            {
+                Self::adjust_usage(&mut state, &target_id, next_tokens - tokens);
             }
         }
         let program = handle.program();
@@ -508,6 +734,15 @@ impl ProgramScheduler {
         {
             return None;
         }
+        if self.config.pd_mode
+            && !state
+                .observations
+                .get(target_id)
+                .filter(|o| self.observation_is_fresh(o, now))
+                .is_some_and(|o| o.kv_cache_usage.is_some() && o.waiting_requests.is_some())
+        {
+            return None;
+        }
         let forced = decision
             .force_resume_deadline
             .is_some_and(|deadline| deadline <= now);
@@ -534,15 +769,24 @@ impl ProgramScheduler {
             .runtime
             .front_request_hints(program)
             .and_then(|hints| hints.expected_output_tokens);
-        let required_tokens = decision.private_tokens_with_output(
+        // Charge the front turn's own prompt. A later retained turn with a
+        // larger prompt must not inflate the front turn's capacity check.
+        let context_tokens = state
+            .runtime
+            .front_request_context(program)
+            .unwrap_or(decision.context_tokens);
+        let required_tokens = decision.private_tokens_from_context(
+            context_tokens,
             self.config.progress_ttl.decode_buffer_tokens,
             expected_output_tokens,
         );
         let capacity = self.config.progress_ttl.token_capacity;
-        let count_fits =
-            |count: usize| count.saturating_add(1) <= self.config.max_active_programs_per_target;
+        // P KV pressure tightens the cap back to the P prefill permits so the
+        // shared prefill cache is not thrashed by exclusive D admission.
+        let active_cap = self.effective_active_cap(state);
+        let count_fits = |count: usize| count.saturating_add(1) <= active_cap;
         let Some(capacity_tokens) = capacity else {
-            if !forced && !count_fits(active_count) {
+            if (!forced || self.config.pd_mode) && !count_fits(active_count) {
                 return None;
             }
             return Some(RankAdmissionPlan {
@@ -568,6 +812,9 @@ impl ProgramScheduler {
                 .continuous_growth_reserve_tokens(factors, active_remaining)
         });
         let reserve_fits = used_tokens + required_tokens + reserve_tokens <= low;
+        if self.config.pd_mode && (!count_fits(active_count) || !immediate_fits) {
+            return None;
+        }
         if forced || (count_fits(active_count) && immediate_fits && reserve_fits) {
             return Some(RankAdmissionPlan {
                 used_tokens,
@@ -579,6 +826,9 @@ impl ProgramScheduler {
             });
         }
         if !count_fits(active_count) || !immediate_fits {
+            return None;
+        }
+        if self.config.pd_mode {
             return None;
         }
         let factors = factors?;
@@ -645,15 +895,36 @@ impl ProgramScheduler {
             .decisions
             .get(program)
             .and_then(|decision| decision.last_target.clone());
-        let Some(tokens) = state
+        let current_tokens = state
             .decisions
             .get(program)
-            .map(|decision| decision.private_tokens(self.config.progress_ttl.decode_buffer_tokens))
-        else {
+            .map(|decision| decision.private_tokens(self.config.progress_ttl.decode_buffer_tokens));
+        let Some(current_tokens) = current_tokens else {
             return false;
+        };
+        // Account for the budget that `rank_admission_plan` actually checked.
+        // A later queued turn can change the decision's reservation between
+        // planning and committing; re-reading it here would admit against one
+        // budget and charge another. Binding-only plans carry no capacity
+        // check, so keep the current decision value for them.
+        let tokens = if plan.required_tokens > 0.0 {
+            plan.required_tokens
+        } else {
+            current_tokens
         };
         if !state.runtime.activate(program, target_id.to_string()) {
             return false;
+        }
+        // Commit the same front-turn context that rank_admission_plan checked.
+        // PD requests can shrink as well as grow between turns; non-PD keeps
+        // its observed shrink policy.
+        if let Some(context_tokens) = state.runtime.front_request_context(program) {
+            if let Some(decision) = state.decisions.get_mut(program) {
+                if self.config.pd_mode || context_tokens > decision.context_tokens {
+                    decision.context_tokens = context_tokens;
+                    decision.context_shrink_observations = 0;
+                }
+            }
         }
         if let Some(decision) = state.decisions.get_mut(program) {
             decision.last_target = Some(target_id.to_string());
@@ -818,15 +1089,19 @@ impl Drop for AdmissionGuard<'_> {
 mod tests {
     use super::*;
     use crate::program_scheduling::scheduler_state::RankObservationState;
-    use crate::program_scheduling::ProgramSchedulerConfig;
+    use crate::program_scheduling::{ProgramSchedulerConfig, ProgramUsageObservation};
     use serde_json::json;
     use std::time::Duration;
 
     fn identity(program: &str) -> ProgramIdentity {
+        identity_with_expected_resume(program, true)
+    }
+
+    fn identity_with_expected_resume(program: &str, expected_resume: bool) -> ProgramIdentity {
         ProgramIdentity::from_request(
             None,
             Some(&json!({"vllm_xargs":{"agentic_context":{
-                "program_id":program,"task_id":null,"expected_resume":true
+                "program_id":program,"task_id":null,"expected_resume":expected_resume
             }}})),
             Some("model"),
         )
@@ -857,6 +1132,23 @@ mod tests {
                 "task_id":null,
                 "expected_resume":true,
                 "expected_output_length":output_tokens
+            }}})),
+            Some("model"),
+        )
+        .unwrap()
+        .unwrap()
+    }
+
+    fn identity_with_profile_role(program: &str, role: &str) -> ProgramIdentity {
+        ProgramIdentity::from_request(
+            None,
+            Some(&json!({"vllm_xargs":{"agentic_context":{
+                "program_id":program,
+                "task_id":null,
+                "expected_resume":true,
+                "workflow_profile_id":"workflow",
+                "profile_version":"1",
+                "spawn_reason":role
             }}})),
             Some("model"),
         )
@@ -954,6 +1246,126 @@ mod tests {
         assert_eq!(state.rank_factors["rank-0"].continuity_sample_count(), 1);
         drop(state);
         scheduler.complete(&second, true, true, Some(110), Some(0.1));
+    }
+
+    #[tokio::test]
+    async fn output_prediction_is_shadow_only() {
+        use crate::program_scheduling::prediction_profile::OutputLengthKey;
+
+        let mut config = ProgramSchedulerConfig::default();
+        config.prediction_profile.output_length_quantile = 0.5;
+        config.prediction_profile.output_length_min_support = 1;
+        config.prediction_profile.output_length_tail_samples = 1;
+        config.prediction_profile.stability_window_size = 2;
+        config.prediction_profile.stability_tolerance = 10.0;
+        let scheduler = ProgramScheduler::new(config);
+        {
+            let mut state = scheduler.state.lock();
+            let global = OutputLengthKey {
+                workflow_profile_id: None,
+                profile_version: None,
+                model_pool: None,
+                profile_role: None,
+            };
+            state
+                .prediction_profiles
+                .observe_output(std::slice::from_ref(&global), 200);
+            state
+                .prediction_profiles
+                .observe_output(std::slice::from_ref(&global), 220);
+        }
+
+        let dispatch = scheduler
+            .acquire(identity("shadow-output"), 100, &[target()], None)
+            .await
+            .unwrap();
+        let state = scheduler.state.lock();
+        let decision = &state.decisions[dispatch.program()];
+        let prediction = decision
+            .latest_output_prediction
+            .as_ref()
+            .and_then(|pending| pending.prediction.as_ref())
+            .unwrap();
+        assert_eq!(prediction.tokens, 256);
+        assert!(prediction.mature);
+        assert_eq!(decision.output_token_reservation, None);
+        assert_eq!(
+            decision.private_tokens(scheduler.config.progress_ttl.decode_buffer_tokens),
+            200.0
+        );
+    }
+
+    #[tokio::test]
+    async fn overlapping_requests_keep_output_observations_scoped_to_dispatch() {
+        let scheduler = ProgramScheduler::new(ProgramSchedulerConfig::default());
+        let target = target();
+        let first = scheduler
+            .acquire(
+                identity_with_profile_role("overlap", "engineer"),
+                100,
+                std::slice::from_ref(&target),
+                None,
+            )
+            .await
+            .unwrap();
+        let second = scheduler
+            .acquire(
+                identity_with_profile_role("overlap", "reviewer"),
+                100,
+                std::slice::from_ref(&target),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            first.pending_output_prediction().unwrap().keys[0]
+                .profile_role
+                .as_deref(),
+            Some("engineer")
+        );
+        assert_eq!(
+            second.pending_output_prediction().unwrap().keys[0]
+                .profile_role
+                .as_deref(),
+            Some("reviewer")
+        );
+
+        scheduler.complete(
+            &second,
+            true,
+            false,
+            ProgramUsageObservation {
+                completion_tokens: Some(200),
+                ..ProgramUsageObservation::default()
+            },
+            None,
+        );
+        scheduler.complete(
+            &first,
+            true,
+            true,
+            ProgramUsageObservation {
+                completion_tokens: Some(100),
+                ..ProgramUsageObservation::default()
+            },
+            None,
+        );
+
+        let state = scheduler.state.lock();
+        let (_, snapshot) = state.prediction_profiles.snapshot().unwrap();
+        let maximum_for = |role: &str| {
+            snapshot
+                .output_length_profiles
+                .iter()
+                .find(|entry| {
+                    entry.key.workflow_profile_id.as_deref() == Some("workflow")
+                        && entry.key.profile_role.as_deref() == Some(role)
+                })
+                .map(|entry| entry.max_observed_tokens)
+        };
+        assert_eq!(maximum_for("engineer"), Some(100.0));
+        assert_eq!(maximum_for("reviewer"), Some(200.0));
     }
 
     #[test]
@@ -1157,6 +1569,492 @@ mod tests {
     }
 
     #[test]
+    fn two_queued_turns_keep_front_output_budget_through_commit() {
+        let scheduler = pd_scheduler(2_000);
+        let now = Instant::now();
+        let mut state = scheduler.state.lock();
+        let first = identity_with_expected_output("program", 800);
+        let first_handle = state.runtime.retain_request(&first, 100, None, now);
+        scheduler.ensure_decision_state(
+            &mut state,
+            &first,
+            first_handle.program().clone(),
+            100,
+            now,
+            None,
+        );
+        let plan = scheduler
+            .rank_admission_plan(&state, first_handle.program(), "rank-0", now)
+            .expect("first queued turn should be admissible");
+        assert_eq!(plan.required_tokens, 900.0);
+
+        // A second turn arrives before the first is committed. Its smaller
+        // output hint must not overwrite the budget the plan checked.
+        let second = identity_with_expected_output("program", 1);
+        let second_handle = state.runtime.retain_request(&second, 100, None, now);
+        assert_eq!(second_handle.program(), first_handle.program());
+        scheduler.ensure_decision_state(
+            &mut state,
+            &second,
+            second_handle.program().clone(),
+            100,
+            now,
+            None,
+        );
+        assert_eq!(
+            state.decisions[first_handle.program()].output_token_reservation,
+            Some(800)
+        );
+
+        assert!(scheduler.commit_admission(
+            &mut state,
+            first_handle.program(),
+            "rank-0",
+            plan,
+            now
+        ));
+        assert_eq!(scheduler.target_usage(&state, "rank-0", now), 900.0);
+    }
+
+    #[test]
+    fn larger_tail_budget_does_not_block_the_admitted_front_turn() {
+        let scheduler = pd_scheduler(500);
+        let now = Instant::now();
+        let mut state = scheduler.state.lock();
+        let first = identity_with_expected_output("ordered", 100);
+        let first_handle = state.runtime.retain_request(&first, 100, None, now);
+        scheduler.ensure_decision_state(
+            &mut state,
+            &first,
+            first_handle.program().clone(),
+            100,
+            now,
+            None,
+        );
+        let second = identity_with_expected_output("ordered", 500);
+        let second_handle = state.runtime.retain_request(&second, 100, None, now);
+        scheduler.ensure_decision_state(
+            &mut state,
+            &second,
+            second_handle.program().clone(),
+            100,
+            now,
+            None,
+        );
+        assert_eq!(
+            state.decisions[first_handle.program()].output_token_reservation,
+            Some(100)
+        );
+        let plan = scheduler
+            .rank_admission_plan(&state, first_handle.program(), "rank-0", now)
+            .expect("front turn fits even though the tail does not");
+        assert_eq!(plan.required_tokens, 200.0);
+        assert!(scheduler.commit_admission(
+            &mut state,
+            first_handle.program(),
+            "rank-0",
+            plan,
+            now
+        ));
+        drop(state);
+        let dispatch = scheduler
+            .claim_dispatch(&first_handle)
+            .expect("the tail budget must not requeue the front turn");
+        assert_eq!(
+            scheduler.target_usage(&scheduler.state.lock(), "rank-0", now),
+            200.0
+        );
+        scheduler.complete(&dispatch, true, false, None, None);
+        assert_eq!(
+            scheduler.state.lock().decisions[second_handle.program()].output_token_reservation,
+            Some(500)
+        );
+    }
+
+    #[test]
+    fn larger_tail_context_does_not_block_the_queued_front_turn() {
+        let scheduler = pd_scheduler(500);
+        let now = Instant::now();
+        let mut state = scheduler.state.lock();
+        let first = identity_with_expected_output("ctx-scope", 10);
+        let first_handle = state.runtime.retain_request(&first, 100, None, now);
+        scheduler.ensure_decision_state(
+            &mut state,
+            &first,
+            first_handle.program().clone(),
+            100,
+            now,
+            None,
+        );
+        // A tail with a much larger prompt arrives while the front is queued.
+        let second = identity_with_expected_output("ctx-scope", 10);
+        let second_handle = state.runtime.retain_request(&second, 1_000, None, now);
+        scheduler.ensure_decision_state(
+            &mut state,
+            &second,
+            second_handle.program().clone(),
+            1_000,
+            now,
+            None,
+        );
+        assert_eq!(
+            state.decisions[first_handle.program()].context_tokens,
+            100,
+            "the queued tail must not overwrite the front turn's context scope"
+        );
+        let plan = scheduler
+            .rank_admission_plan(&state, first_handle.program(), "rank-0", now)
+            .expect("front turn fits on its own 100 + 10 scope");
+        assert_eq!(plan.required_tokens, 110.0);
+        drop(state);
+
+        // Cancelling the tail keeps the front's request-scoped charge.
+        scheduler.cancel_retained_request(&second_handle);
+        let state = scheduler.state.lock();
+        assert_eq!(state.decisions[first_handle.program()].context_tokens, 100);
+        let plan = scheduler
+            .rank_admission_plan(&state, first_handle.program(), "rank-0", now)
+            .expect("front turn still fits after the tail is cancelled");
+        assert_eq!(plan.required_tokens, 110.0);
+    }
+
+    #[test]
+    fn successor_context_is_promoted_when_it_becomes_the_front() {
+        let scheduler = pd_scheduler(2_000);
+        let now = Instant::now();
+        let first = identity_with_expected_output("promote", 10);
+        let second = identity_with_expected_output("promote", 10);
+        let (first_handle, second_handle) = {
+            let mut state = scheduler.state.lock();
+            let first_handle = state.runtime.retain_request(&first, 100, None, now);
+            scheduler.ensure_decision_state(
+                &mut state,
+                &first,
+                first_handle.program().clone(),
+                100,
+                now,
+                None,
+            );
+            let second_handle = state.runtime.retain_request(&second, 1_000, None, now);
+            scheduler.ensure_decision_state(
+                &mut state,
+                &second,
+                second_handle.program().clone(),
+                1_000,
+                now,
+                None,
+            );
+            let plan = scheduler
+                .rank_admission_plan(&state, first_handle.program(), "rank-0", now)
+                .expect("front turn fits");
+            assert_eq!(plan.required_tokens, 110.0);
+            assert!(scheduler.commit_admission(
+                &mut state,
+                first_handle.program(),
+                "rank-0",
+                plan,
+                now
+            ));
+            (first_handle, second_handle)
+        };
+        let dispatch = scheduler
+            .claim_dispatch(&first_handle)
+            .expect("front turn dispatches");
+        scheduler.complete(&dispatch, true, false, None, None);
+        pd_observe(&scheduler, 0.0);
+
+        // The successor is accounted with its own 1,000-token prompt (plus the
+        // 10-token output budget) rather than the front turn's 100 tokens.
+        let mut state = scheduler.state.lock();
+        let active = state
+            .runtime
+            .view(second_handle.program())
+            .is_some_and(|runtime| runtime.state == ProgramState::Active);
+        if !active {
+            let plan = scheduler
+                .rank_admission_plan(&state, second_handle.program(), "rank-0", now)
+                .expect("successor fits with its own context");
+            assert_eq!(plan.required_tokens, 1_010.0);
+            assert!(scheduler.commit_admission(
+                &mut state,
+                second_handle.program(),
+                "rank-0",
+                plan,
+                now
+            ));
+        }
+        drop(state);
+        let dispatch = scheduler
+            .claim_dispatch(&second_handle)
+            .expect("successor dispatches");
+        assert_eq!(
+            scheduler.state.lock().decisions[second_handle.program()].context_tokens,
+            1_000,
+            "dispatch promotes the admitted turn's context scope"
+        );
+        scheduler.complete(&dispatch, true, false, None, None);
+    }
+
+    #[test]
+    fn over_capacity_successor_is_not_dispatched_on_the_finished_turn() {
+        let scheduler = pd_scheduler(500);
+        let now = Instant::now();
+        let first = identity_with_expected_output("over-capacity", 10);
+        let second = identity_with_expected_output("over-capacity", 10);
+        let (first_handle, second_handle) = {
+            let mut state = scheduler.state.lock();
+            let first_handle = state.runtime.retain_request(&first, 100, None, now);
+            scheduler.ensure_decision_state(
+                &mut state,
+                &first,
+                first_handle.program().clone(),
+                100,
+                now,
+                None,
+            );
+            let plan = scheduler
+                .rank_admission_plan(&state, first_handle.program(), "rank-0", now)
+                .expect("front turn fits");
+            assert_eq!(plan.required_tokens, 110.0);
+            assert!(scheduler.commit_admission(
+                &mut state,
+                first_handle.program(),
+                "rank-0",
+                plan,
+                now
+            ));
+            let second_handle = state.runtime.retain_request(&second, 1_000, None, now);
+            scheduler.ensure_decision_state(
+                &mut state,
+                &second,
+                second_handle.program().clone(),
+                1_000,
+                now,
+                None,
+            );
+            (first_handle, second_handle)
+        };
+        let dispatch = scheduler
+            .claim_dispatch(&first_handle)
+            .expect("front turn dispatches");
+        scheduler.complete(&dispatch, true, false, None, None);
+        pd_observe(&scheduler, 0.0);
+        assert!(
+            scheduler.claim_dispatch(&second_handle).is_none(),
+            "a 1,010-token successor must not dispatch on a 500-token rank"
+        );
+    }
+
+    #[test]
+    fn compacted_returning_turn_commits_its_request_scoped_context() {
+        let scheduler = pd_scheduler_with_low(1_000, 0.9);
+        let now = Instant::now();
+        let first = identity_with_expected_output("compacted-return", 10);
+        let first_handle = {
+            let mut state = scheduler.state.lock();
+            let handle = state.runtime.retain_request(&first, 800, None, now);
+            scheduler.ensure_decision_state(
+                &mut state,
+                &first,
+                handle.program().clone(),
+                800,
+                now,
+                None,
+            );
+            let plan = scheduler
+                .rank_admission_plan(&state, handle.program(), "rank-0", now)
+                .expect("first turn fits");
+            assert_eq!(plan.required_tokens, 810.0);
+            assert!(scheduler.commit_admission(&mut state, handle.program(), "rank-0", plan, now));
+            handle
+        };
+        pd_observe(&scheduler, 0.0);
+        let first_dispatch = scheduler
+            .claim_dispatch(&first_handle)
+            .expect("first turn dispatches");
+        scheduler.complete(&first_dispatch, true, false, None, None);
+        pd_observe(&scheduler, 0.0);
+
+        let second = identity_with_expected_output("compacted-return", 200);
+        let second_handle = {
+            let mut state = scheduler.state.lock();
+            let handle = state.runtime.retain_request(&second, 100, None, now);
+            scheduler.ensure_decision_state(
+                &mut state,
+                &second,
+                handle.program().clone(),
+                100,
+                now,
+                None,
+            );
+            // Exercise the commit boundary with a stale previous-turn estimate:
+            // admission must still commit the front request's checked scope.
+            state
+                .decisions
+                .get_mut(handle.program())
+                .unwrap()
+                .context_tokens = 800;
+            let plan = scheduler
+                .rank_admission_plan(&state, handle.program(), "rank-0", now)
+                .expect("compacted turn fits the 900-token low watermark");
+            assert_eq!(plan.required_tokens, 300.0);
+            assert!(scheduler.commit_admission(&mut state, handle.program(), "rank-0", plan, now));
+            assert_eq!(state.decisions[handle.program()].context_tokens, 100);
+            assert_eq!(state.decisions[handle.program()].private_tokens(10), 300.0);
+            handle
+        };
+        assert!(
+            scheduler.claim_dispatch(&second_handle).is_some(),
+            "the compacted turn must not be requeued using the old 800-token context"
+        );
+    }
+
+    #[test]
+    fn compacted_queued_successor_keeps_its_active_placement() {
+        let scheduler = pd_scheduler_with_low(1_000, 0.9);
+        let now = Instant::now();
+        let first = identity_with_expected_output("compacted-queued", 10);
+        let second = identity_with_expected_output("compacted-queued", 200);
+        let (first_handle, second_handle) = {
+            let mut state = scheduler.state.lock();
+            let first_handle = state.runtime.retain_request(&first, 800, None, now);
+            scheduler.ensure_decision_state(
+                &mut state,
+                &first,
+                first_handle.program().clone(),
+                800,
+                now,
+                None,
+            );
+            let plan = scheduler
+                .rank_admission_plan(&state, first_handle.program(), "rank-0", now)
+                .expect("first turn fits");
+            assert!(scheduler.commit_admission(
+                &mut state,
+                first_handle.program(),
+                "rank-0",
+                plan,
+                now
+            ));
+            let second_handle = state.runtime.retain_request(&second, 100, None, now);
+            scheduler.ensure_decision_state(
+                &mut state,
+                &second,
+                second_handle.program().clone(),
+                100,
+                now,
+                None,
+            );
+            (first_handle, second_handle)
+        };
+        pd_observe(&scheduler, 0.0);
+        let first_dispatch = scheduler
+            .claim_dispatch(&first_handle)
+            .expect("first turn dispatches");
+        scheduler.complete(&first_dispatch, true, false, None, None);
+        pd_observe(&scheduler, 0.0);
+        assert_eq!(
+            scheduler.state.lock().decisions[second_handle.program()].context_tokens,
+            100
+        );
+        assert!(
+            scheduler.claim_dispatch(&second_handle).is_some(),
+            "a queued compacted successor must not be requeued at 1,000 tokens"
+        );
+    }
+
+    #[test]
+    fn cancelling_front_promotes_successor_output_budget() {
+        let scheduler = pd_scheduler(500);
+        let now = Instant::now();
+        let first = identity_with_expected_output("cancel-front", 100);
+        let second = identity_with_expected_output("cancel-front", 500);
+        let (first_handle, second_handle) = {
+            let mut state = scheduler.state.lock();
+            let first_handle = state.runtime.retain_request(&first, 100, None, now);
+            scheduler.ensure_decision_state(
+                &mut state,
+                &first,
+                first_handle.program().clone(),
+                100,
+                now,
+                None,
+            );
+            let second_handle = state.runtime.retain_request(&second, 100, None, now);
+            scheduler.ensure_decision_state(
+                &mut state,
+                &second,
+                second_handle.program().clone(),
+                100,
+                now,
+                None,
+            );
+            (first_handle, second_handle)
+        };
+        scheduler.cancel_retained_request(&first_handle);
+        let state = scheduler.state.lock();
+        assert_eq!(
+            state.decisions[second_handle.program()].output_token_reservation,
+            Some(500)
+        );
+        assert!(scheduler
+            .rank_admission_plan(&state, second_handle.program(), "rank-0", now)
+            .is_none());
+    }
+
+    #[test]
+    fn cancelling_admitted_front_promotes_successor_context_before_dispatch() {
+        let scheduler = pd_scheduler(500);
+        let now = Instant::now();
+        let first = identity_with_expected_output("cancel-admitted-front", 10);
+        let second = identity_with_expected_output("cancel-admitted-front", 10);
+        let (first_handle, second_handle) = {
+            let mut state = scheduler.state.lock();
+            let first_handle = state.runtime.retain_request(&first, 100, None, now);
+            scheduler.ensure_decision_state(
+                &mut state,
+                &first,
+                first_handle.program().clone(),
+                100,
+                now,
+                None,
+            );
+            let plan = scheduler
+                .rank_admission_plan(&state, first_handle.program(), "rank-0", now)
+                .expect("front turn fits");
+            assert_eq!(plan.required_tokens, 110.0);
+            assert!(scheduler.commit_admission(
+                &mut state,
+                first_handle.program(),
+                "rank-0",
+                plan,
+                now
+            ));
+            let second_handle = state.runtime.retain_request(&second, 1_000, None, now);
+            scheduler.ensure_decision_state(
+                &mut state,
+                &second,
+                second_handle.program().clone(),
+                1_000,
+                now,
+                None,
+            );
+            (first_handle, second_handle)
+        };
+
+        scheduler.cancel_retained_request(&first_handle);
+        assert_eq!(
+            scheduler.state.lock().decisions[second_handle.program()].context_tokens,
+            1_000,
+            "cancellation must promote the retained front turn's context"
+        );
+        assert!(
+            scheduler.claim_dispatch(&second_handle).is_none(),
+            "a 1,010-token successor must not dispatch on a 500-token rank"
+        );
+    }
+
+    #[test]
     fn cancelling_unstarted_request_removes_transient_program() {
         let scheduler = ProgramScheduler::new(ProgramSchedulerConfig::default());
         let target = target();
@@ -1279,5 +2177,362 @@ mod tests {
         drop(state);
         scheduler.complete(&first, true, false, Some(100), Some(0.1));
         scheduler.complete(&second, true, true, Some(200), Some(0.1));
+    }
+    fn pd_scheduler(capacity: usize) -> ProgramScheduler {
+        pd_scheduler_with_low(capacity, 1.0)
+    }
+
+    fn pd_scheduler_with_low(capacity: usize, low_watermark_ratio: f64) -> ProgramScheduler {
+        let mut config = ProgramSchedulerConfig {
+            pd_mode: true,
+            pd_explicit_ttl: true,
+            queue_timeout: Duration::from_millis(200),
+            metrics_interval: Duration::from_millis(5),
+            force_resume_timeout: Duration::from_millis(1),
+            ..ProgramSchedulerConfig::default()
+        };
+        config.progress_ttl.token_capacity = Some(capacity);
+        config.progress_ttl.low_watermark_ratio = low_watermark_ratio;
+        config.progress_ttl.decode_buffer_tokens = 10;
+        config.progress_ttl.enable_batch_gain_admission = false;
+        let scheduler = ProgramScheduler::new(config);
+        scheduler.sync_targets("model", &[target()]);
+        pd_observe(&scheduler, 0.0);
+        scheduler
+    }
+
+    fn pd_observe(scheduler: &ProgramScheduler, usage: f64) {
+        let targets = scheduler.all_targets();
+        let epoch = scheduler.begin_observation(&targets);
+        scheduler.apply_observations(
+            epoch,
+            targets
+                .into_iter()
+                .map(|t| super::super::BackendObservation {
+                    target_id: t.id,
+                    base_url: t.base_url,
+                    dp_rank: t.dp_rank,
+                    kv_cache_usage: Some(usage),
+                    running_requests: Some(0),
+                    waiting_requests: Some(0),
+                    observed_at: Instant::now(),
+                }),
+        );
+    }
+
+    #[tokio::test]
+    async fn pd_retry_rechecks_capacity_and_fences_old_completion() {
+        let mut scheduler = pd_scheduler(100);
+        scheduler.config.progress_ttl.low_watermark_ratio = 0.9;
+        let first = scheduler
+            .acquire(
+                identity_with_expected_resume("retry", false),
+                20,
+                &[target()],
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(!first.expected_resume());
+        assert!(first.pending_output_prediction().is_some());
+        let retry = scheduler.restart_pd_attempt(&first).unwrap();
+        assert_ne!(first.attempt_id(), retry.attempt_id());
+        assert!(!retry.expected_resume());
+        assert!(retry.pending_output_prediction().is_some());
+        scheduler.complete(&first, false, false, Some(20), None);
+        assert!(scheduler.dispatch_is_current(&retry));
+        pd_observe(&scheduler, 0.95);
+        assert!(scheduler.restart_pd_attempt(&retry).is_none());
+        assert!(scheduler.dispatch_is_current(&retry));
+        scheduler.complete(&retry, false, false, Some(20), None);
+        assert!(!scheduler.dispatch_is_current(&retry));
+    }
+
+    #[tokio::test]
+    async fn pd_force_timeout_never_bypasses_immediate_capacity() {
+        let scheduler = pd_scheduler(100);
+        let result = scheduler
+            .acquire(identity("too-big"), 101, &[target()], None)
+            .await;
+        assert!(matches!(result, Err(ScheduleError::QueueTimeout)));
+        assert_eq!(scheduler.state.lock().runtime.retained_request_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn pd_serial_turns_wait_for_completion_and_keep_d_affinity() {
+        let scheduler = pd_scheduler(1000);
+        let first = scheduler
+            .acquire(identity("serial"), 100, &[target()], None)
+            .await
+            .unwrap();
+        let targets = [target()];
+        let future = scheduler.acquire(identity("serial"), 110, &targets, None);
+        tokio::pin!(future);
+        assert!(tokio::time::timeout(Duration::from_millis(15), &mut future)
+            .await
+            .is_err());
+        assert_eq!(
+            scheduler
+                .state
+                .lock()
+                .runtime
+                .view(first.program())
+                .unwrap()
+                .in_flight_requests,
+            1
+        );
+        scheduler.complete(&first, true, false, None, None);
+        pd_observe(&scheduler, 0.0);
+        let second = future.await.unwrap();
+        assert_eq!(second.target_id, first.target_id);
+        assert_eq!(second.placement_epoch(), first.placement_epoch());
+        scheduler.complete(&second, true, false, None, None);
+        assert_eq!(
+            scheduler
+                .state
+                .lock()
+                .runtime
+                .view(second.program())
+                .unwrap()
+                .in_flight_requests,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn pd_cancel_waiting_turn_does_not_cancel_in_flight_turn() {
+        let scheduler = pd_scheduler(1000);
+        let first = scheduler
+            .acquire(identity("cancel"), 100, &[target()], None)
+            .await
+            .unwrap();
+        {
+            let targets = [target()];
+            let future = scheduler.acquire(identity("cancel"), 110, &targets, None);
+            tokio::pin!(future);
+            assert!(tokio::time::timeout(Duration::from_millis(10), &mut future)
+                .await
+                .is_err());
+        }
+        let state = scheduler.state.lock();
+        let view = state.runtime.view(first.program()).unwrap();
+        assert_eq!(view.in_flight_requests, 1);
+        assert_eq!(view.waiting_requests, 0);
+        drop(state);
+        scheduler.complete(&first, false, false, None, None);
+    }
+
+    #[tokio::test]
+    async fn pd_returning_turn_rechecks_growth_without_counting_q_twice() {
+        let scheduler = pd_scheduler(300);
+        let initial = ProgramIdentity::from_request(
+            None,
+            Some(&json!({
+            "vllm_xargs":{"agentic_context":{"program_id":"growth","expected_resume":true,
+            "kv_retention_ttl_seconds":2.0}}})),
+            Some("model"),
+        )
+        .unwrap()
+        .unwrap();
+        let first = scheduler
+            .acquire(initial, 100, &[target()], None)
+            .await
+            .unwrap();
+        scheduler.complete(&first, true, false, None, None);
+        pd_observe(&scheduler, 0.0);
+        let second = scheduler
+            .acquire(identity("growth"), 180, &[target()], None)
+            .await
+            .unwrap();
+        assert_eq!(second.placement_epoch(), first.placement_epoch());
+        scheduler.complete(&second, true, false, None, None);
+        pd_observe(&scheduler, 0.0);
+        let result = scheduler
+            .acquire(identity("growth"), 400, &[target()], None)
+            .await;
+        assert!(matches!(result, Err(ScheduleError::QueueTimeout)));
+    }
+
+    #[tokio::test]
+    async fn pd_wire_output_budget_cannot_be_reduced_by_hint() {
+        let scheduler = pd_scheduler(200);
+        let mut request = identity("output");
+        request.reserve_pd_output(160);
+        let result = scheduler.acquire(request, 50, &[target()], None).await;
+        assert!(matches!(result, Err(ScheduleError::QueueTimeout)));
+    }
+
+    #[tokio::test]
+    async fn pd_native_occupancy_blocks_even_after_logical_release() {
+        let scheduler = pd_scheduler(200);
+        pd_observe(&scheduler, 0.95);
+        let result = scheduler
+            .acquire(identity("native-full"), 50, &[target()], None)
+            .await;
+        assert!(matches!(result, Err(ScheduleError::QueueTimeout)));
+    }
+
+    #[tokio::test]
+    async fn pd_scrape_keeps_native_usage_and_unreflected_program_reservation() {
+        let mut scheduler = pd_scheduler(1_000);
+        // Additive accounting is now the explicit opt-out; the shipped default
+        // is exclusive (see `pd_exclusive_accounting_keeps_native_occupancy_as_a_floor`).
+        scheduler.config.pd_exclusive_capacity_accounting = false;
+        pd_observe(&scheduler, 0.5);
+        let first = scheduler
+            .acquire(identity("prefilling"), 290, &[target()], None)
+            .await
+            .unwrap();
+        // The first Program has a 300-token D reservation, but has not yet
+        // entered D; all 500 native tokens belong to other traffic.
+        pd_observe(&scheduler, 0.5);
+        assert_eq!(
+            scheduler.target_usage(&scheduler.state.lock(), "rank-0", Instant::now()),
+            800.0
+        );
+        let second = scheduler
+            .acquire(identity("second"), 290, &[target()], None)
+            .await;
+        assert!(matches!(second, Err(ScheduleError::QueueTimeout)));
+        scheduler.complete(&first, false, false, None, None);
+    }
+
+    #[tokio::test]
+    async fn pd_exclusive_accounting_keeps_native_occupancy_as_a_floor() {
+        let mut scheduler = pd_scheduler(1_000);
+        scheduler.config.pd_exclusive_capacity_accounting = true;
+        pd_observe(&scheduler, 0.5);
+        let first = scheduler
+            .acquire(identity("resident"), 290, &[target()], None)
+            .await
+            .unwrap();
+        // The 500 native tokens already cover the 300-token reservation: the
+        // two figures describe the same KV, so usage stays at the native floor
+        // instead of becoming 800.
+        pd_observe(&scheduler, 0.5);
+        assert_eq!(
+            scheduler.target_usage(&scheduler.state.lock(), "rank-0", Instant::now()),
+            500.0
+        );
+        // Additive accounting would need 800 + 300 > 1000 and keep this turn
+        // queued; exclusive accounting admits it against real free capacity.
+        let second = scheduler
+            .acquire(identity("second"), 290, &[target()], None)
+            .await
+            .unwrap();
+        scheduler.complete(&second, false, false, None, None);
+        scheduler.complete(&first, false, false, None, None);
+    }
+
+    #[tokio::test]
+    async fn pd_prefill_kv_pressure_tightens_the_count_cap_to_the_permits() {
+        let mut scheduler = pd_scheduler(1_000);
+        scheduler.config.max_active_programs_per_target = 2;
+        scheduler.config.pd_prefill_permits = 1;
+        scheduler.config.pd_prefill_kv_high = 0.5;
+        scheduler.config.pd_prefill_kv_window = Duration::from_secs(10);
+        let first = scheduler
+            .acquire(identity("first"), 100, &[target()], None)
+            .await
+            .unwrap();
+        // Under P KV pressure the cap falls back to the single prefill permit,
+        // so a second Program must wait even though the count cap is two.
+        pd_observe(&scheduler, 0.0);
+        scheduler.observe_prefill_kv_usage(0.9);
+        let blocked = scheduler
+            .acquire(identity("second"), 100, &[target()], None)
+            .await;
+        assert!(matches!(blocked, Err(ScheduleError::QueueTimeout)));
+        // Once the P pool drains the configured cap applies again.
+        pd_observe(&scheduler, 0.0);
+        scheduler.observe_prefill_kv_usage(0.1);
+        let second = scheduler
+            .acquire(identity("second"), 100, &[target()], None)
+            .await
+            .unwrap();
+        scheduler.complete(&second, false, false, None, None);
+        scheduler.complete(&first, false, false, None, None);
+    }
+
+    #[tokio::test]
+    async fn pd_stale_or_missing_metrics_fail_closed() {
+        let scheduler = pd_scheduler(200);
+        scheduler.state.lock().observations.clear();
+        let result = scheduler
+            .acquire(identity("unknown"), 50, &[target()], None)
+            .await;
+        assert!(matches!(result, Err(ScheduleError::QueueTimeout)));
+    }
+    #[tokio::test]
+    async fn pd_disabled_ttl_and_received_cache_never_grant_long_term_protection() {
+        let mut scheduler = pd_scheduler(1000);
+        scheduler.config.pd_explicit_ttl = false;
+        let request = ProgramIdentity::from_request(
+            None,
+            Some(&json!({"vllm_xargs":{"agentic_context":{
+            "program_id":"ttl-off","expected_resume":true,"kv_retention_ttl_seconds":60.0}}})),
+            Some("model"),
+        )
+        .unwrap()
+        .unwrap();
+        let dispatch = scheduler
+            .acquire(request, 100, &[target()], None)
+            .await
+            .unwrap();
+        scheduler.complete(
+            &dispatch,
+            true,
+            false,
+            super::super::ProgramUsageObservation {
+                prompt_tokens: Some(100),
+                completion_tokens: Some(1),
+                cached_prompt_tokens: Some(100),
+            },
+            None,
+        );
+        let state = scheduler.state.lock();
+        assert_eq!(
+            state.runtime.view(dispatch.program()).unwrap().state,
+            ProgramState::Paused
+        );
+        assert_eq!(state.decisions[dispatch.program()].shared_prefix_tokens, 0);
+    }
+
+    #[tokio::test]
+    async fn pd_explicit_ttl_is_clipped_to_deployment_maximum() {
+        let mut scheduler = pd_scheduler(1000);
+        scheduler.config.progress_ttl.max_acting_ttl = Duration::from_millis(20);
+        let request = ProgramIdentity::from_request(
+            None,
+            Some(&json!({"vllm_xargs":{"agentic_context":{
+            "program_id":"ttl-clamp","expected_resume":true,"kv_retention_ttl_seconds":60.0}}})),
+            Some("model"),
+        )
+        .unwrap()
+        .unwrap();
+        let dispatch = scheduler
+            .acquire(request, 100, &[target()], None)
+            .await
+            .unwrap();
+        scheduler.complete(&dispatch, true, false, None, None);
+        {
+            let state = scheduler.state.lock();
+            let deadline = state.decisions[dispatch.program()].ttl_deadline.unwrap();
+            assert!(
+                deadline.saturating_duration_since(Instant::now()) <= Duration::from_millis(20)
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        scheduler.tick();
+        assert_eq!(
+            scheduler
+                .state
+                .lock()
+                .runtime
+                .view(dispatch.program())
+                .unwrap()
+                .state,
+            ProgramState::Paused
+        );
     }
 }

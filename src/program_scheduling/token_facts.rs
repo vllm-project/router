@@ -265,6 +265,13 @@ pub struct ContextTokens {
     pub(crate) fallback: Option<TokenFactFallback>,
 }
 
+impl From<usize> for ContextTokens {
+    /// Test and call-site convenience: a bare count is an arrival estimate.
+    fn from(tokens: usize) -> Self {
+        Self::estimated(tokens)
+    }
+}
+
 impl ContextTokens {
     pub fn estimated(tokens: usize) -> Self {
         Self {
