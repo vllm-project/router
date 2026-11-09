@@ -20,6 +20,9 @@ use std::{
     sync::atomic::{AtomicBool, Ordering},
 };
 
+/// Matches the `Client` timeout set in `OpenAIRouter::new`.
+const STREAM_FORWARD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
 /// Router for OpenAI backend
 #[derive(Debug)]
 pub struct OpenAIRouter {
@@ -336,7 +339,12 @@ impl super::super::RouterTrait for OpenAIRouter {
             // the rest of the HTTP path uses: an unbounded hand-off lets this task
             // pull from the worker faster than the client reads.
             let stream = resp.bytes_stream();
-            let (forward, body_stream) = super::router::sse_forward_channel();
+            // The client is built with a 300 s timeout; the forwarder uses the
+            // same bound so a client that stops reading cannot keep the upstream
+            // response open indefinitely.
+            let (forward, body_stream) = super::router::sse_forward_channel(
+                tokio::time::Instant::now() + STREAM_FORWARD_TIMEOUT,
+            );
             tokio::spawn(async move {
                 let mut s = stream;
                 while let Some(chunk) = s.next().await {
