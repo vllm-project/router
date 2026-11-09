@@ -262,7 +262,12 @@ pub fn extract_trace_context_http(headers: &HeaderMap) -> opentelemetry::Context
                 return None;
             }
             let (prefix, flags) = traceparent.rsplit_once('-')?;
-            if flags.len() != 2 {
+            // Do not turn invalid wire syntax into a valid remote parent.
+            if flags.len() != 2
+                || !flags
+                    .bytes()
+                    .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+            {
                 return None;
             }
             let flags = u8::from_str_radix(flags, 16).ok()?;
