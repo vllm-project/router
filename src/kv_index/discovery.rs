@@ -311,7 +311,7 @@ impl KvIndexSupervisor {
             }
             Err(error) => {
                 warn!(
-                    "kv_index {}: GetModelInfo failed: {} — cannot create cache identity",
+                    "kv_index {}: no worker model id: {} — cannot create cache identity; pass --kv-event-model",
                     worker_url, error
                 );
                 None
@@ -322,8 +322,10 @@ impl KvIndexSupervisor {
             Ok(s) => s,
             Err(e) => {
                 warn!(
-                    "kv_index {}: /kv_event_sources: {} — no subscribers",
-                    worker_url, e
+                    "kv_index {}: {}: {} — no subscribers",
+                    worker_url,
+                    event_source_label(worker_url),
+                    e
                 );
                 return Ok(WorkerKvInfo {
                     instance_id,
@@ -336,8 +338,9 @@ impl KvIndexSupervisor {
 
         let Some(block_size) = block_size else {
             warn!(
-                "kv_index {}: no block_size from /get_server_info — cannot index",
-                worker_url
+                "kv_index {}: no cache metadata from {} — cannot index; pass --kv-event-block-size, or enable a metadata source",
+                worker_url,
+                metadata_source_label(worker_url)
             );
             return Ok(WorkerKvInfo {
                 instance_id,
@@ -734,23 +737,25 @@ fn static_worker_discovery(worker_url: &str, config: &StaticKvEventSources) -> W
         model_id: Ok(Some(model)),
     }
 }
-// Only the full-attention HTTP adapter uses this optional control-metadata contract.
-// Generic discovery retains main's behavior and does not assume stock vLLM
-// exposes /get_server_info.
+// The full-attention HTTP adapter reads the optional control-metadata contract,
+// then falls back to the engine config endpoint and the always-on metrics scrape,
+// so a stock vLLM worker needs no static configuration.
 async fn discover_full_attention_http_worker(
     client: &reqwest::Client,
     worker_url: &str,
     api_key: Option<&str>,
 ) -> WorkerDiscovery {
-    let server_info =
-        query_worker_json::<ServerInfo>(client, worker_url, "get_server_info", true, api_key).await;
+    let server_info = query_worker_metadata(client, worker_url, api_key).await;
     let model_id = server_info
         .as_ref()
         .map(|info| Some(server_model_id(info).unwrap_or_else(|| worker_url.to_string())))
         .map_err(Clone::clone);
     WorkerDiscovery {
         server_info,
-        sources: query_worker_json(client, worker_url, "kv_event_sources", true, api_key).await,
+        // Native vLLM omits the fixed ZMQ wire declarations on each source, so
+        // normalize them the way the P/D path does or every source is dropped as
+        // an unsupported encoding.
+        sources: query_pd_kv_event_sources(client, worker_url, api_key).await,
         model_id,
     }
 }
@@ -843,13 +848,13 @@ async fn query_kv_event_sources(
     query_worker_json(client, worker_url, "kv_event_sources", false, None).await
 }
 
-async fn query_worker_json<T: serde::de::DeserializeOwned>(
+async fn query_worker_text(
     client: &reqwest::Client,
     worker_url: &str,
     path: &str,
     authenticated: bool,
     api_key: Option<&str>,
-) -> Result<T, String> {
+) -> Result<String, String> {
     let url = format!("{}/{path}", worker_url.trim_end_matches('/'));
     let request = if authenticated {
         worker_get(client, &url, api_key)
@@ -864,9 +869,20 @@ async fn query_worker_json<T: serde::de::DeserializeOwned>(
         return Err(format!("{path} {url}: status {}", response.status()));
     }
     response
-        .json()
+        .text()
         .await
-        .map_err(|e| format!("{path} parse: {e}"))
+        .map_err(|e| format!("{path} body: {e}"))
+}
+
+async fn query_worker_json<T: serde::de::DeserializeOwned>(
+    client: &reqwest::Client,
+    worker_url: &str,
+    path: &str,
+    authenticated: bool,
+    api_key: Option<&str>,
+) -> Result<T, String> {
+    let body = query_worker_text(client, worker_url, path, authenticated, api_key).await?;
+    serde_json::from_str(&body).map_err(|e| format!("{path} parse: {e}"))
 }
 
 /// A rank emits events only for the one wire format the subscriber decodes.
@@ -883,19 +899,92 @@ fn events_enabled(entry: &KvEventSourceEntry) -> bool {
     !entry.endpoint.is_empty()
 }
 
-pub(crate) async fn query_pd_server_info(
+/// Names the metadata sources that were tried, so a warning matches the
+/// transport the worker actually speaks.
+fn metadata_source_label(worker_url: &str) -> &'static str {
+    if crate::backend::is_grpc_url(worker_url) {
+        "GetServerInfo"
+    } else {
+        "/get_server_info, /server_info or /metrics"
+    }
+}
+
+/// Same for event sources: a gRPC worker only exposes the control RPC.
+fn event_source_label(worker_url: &str) -> &'static str {
+    if crate::backend::is_grpc_url(worker_url) {
+        "GetKvEventSources"
+    } else {
+        "/kv_event_sources"
+    }
+}
+
+/// Worker cache metadata, tried in the order a deployment is likely to answer it:
+/// the multi-backend control contract, the engine config endpoint, then the
+/// always-on `/metrics` scrape.
+///
+/// Every source is optional; the error names what each one said, so an operator
+/// can tell a missing endpoint from an endpoint that answered without a block
+/// size.
+pub(crate) async fn query_worker_metadata(
     client: &reqwest::Client,
     worker_url: &str,
     api_key: Option<&str>,
 ) -> Result<ServerInfo, String> {
-    if let Ok(info) =
-        query_worker_json::<ServerInfo>(client, worker_url, "get_server_info", true, api_key).await
+    let mut attempts: Vec<String> = Vec::new();
+
+    // 1. Multi-backend control metadata. Absent from stock vLLM.
+    match query_worker_json::<ServerInfo>(client, worker_url, "get_server_info", true, api_key)
+        .await
     {
-        if discovered_block_size(&info).is_some() {
+        Ok(info) if discovered_block_size(&info).is_some() => {
+            info!(
+                "kv_index {}: worker cache metadata from /get_server_info (block_size={})",
+                worker_url,
+                discovered_block_size(&info).unwrap_or_default()
+            );
             return Ok(info);
         }
+        Ok(_) => attempts.push("get_server_info: no block_size".to_string()),
+        Err(error) => attempts.push(error),
     }
-    // Native Python vLLM exposes engine configuration through this endpoint.
+
+    // 2. Native engine configuration. Requires VLLM_SERVER_DEV_MODE=1.
+    match query_server_info_json(client, worker_url, api_key).await {
+        Ok(info) if discovered_block_size(&info).is_some() => {
+            info!(
+                "kv_index {}: worker cache metadata from /server_info (block_size={})",
+                worker_url,
+                discovered_block_size(&info).unwrap_or_default()
+            );
+            return Ok(info);
+        }
+        Ok(_) => attempts.push("server_info: no block_size".to_string()),
+        Err(error) => attempts.push(error),
+    }
+
+    // 3. Prometheus scrape. Always on, no dev mode required.
+    match query_metrics_metadata(client, worker_url, api_key).await {
+        Ok(info) if discovered_block_size(&info).is_some() => {
+            info!(
+                "kv_index {}: worker cache metadata from /metrics (block_size={})",
+                worker_url,
+                discovered_block_size(&info).unwrap_or_default()
+            );
+            return Ok(info);
+        }
+        Ok(_) => attempts.push("metrics: no block_size".to_string()),
+        Err(error) => attempts.push(error),
+    }
+
+    Err(attempts.join("; "))
+}
+
+/// Engine configuration exposed by `vllm serve` behind `VLLM_SERVER_DEV_MODE=1`.
+async fn query_server_info_json(
+    client: &reqwest::Client,
+    worker_url: &str,
+    api_key: Option<&str>,
+) -> Result<ServerInfo, String> {
     let body: serde_json::Value = query_worker_json(
         client,
         worker_url,
@@ -916,12 +1005,83 @@ pub(crate) async fn query_pd_server_info(
         .and_then(serde_json::Value::as_u64)
         .and_then(|size| u32::try_from(size).ok())
         .filter(|size| *size > 0);
+    let effective_attention_block_size = config
+        .pointer("/cache_config/effective_attention_block_size")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|size| u32::try_from(size).ok())
+        .filter(|size| *size > 0);
     Ok(ServerInfo {
         model_id: model.clone(),
         model_path: model,
         kv_block_size: block_size,
+        effective_attention_block_size,
         ..Default::default()
     })
+}
+
+/// Cache metadata from the always-on `/metrics` scrape.
+async fn query_metrics_metadata(
+    client: &reqwest::Client,
+    worker_url: &str,
+    api_key: Option<&str>,
+) -> Result<ServerInfo, String> {
+    let text = query_worker_text(client, worker_url, "metrics", true, api_key).await?;
+    let engines = metrics_meta::parse_cache_config_info(&text);
+    let Some((_, first)) = engines.iter().next() else {
+        return Err("metrics: no vllm:cache_config_info series".to_string());
+    };
+    if let Err(units) = metrics_meta::shared_hash_unit(&engines) {
+        return Err(format!(
+            "metrics: engines disagree on block size {units:?} — refusing to index"
+        ));
+    }
+    if let Some(layout) = first.kv_cache_layout.as_deref() {
+        info!(
+            "kv_index {}: engine declares kv_cache_layout={} (hybrid layouts are not derived from metrics yet)",
+            worker_url, layout
+        );
+    }
+    let model_id = query_served_model_id(client, worker_url, api_key).await;
+    Ok(ServerInfo {
+        model_id,
+        kv_block_size: first.block_size,
+        effective_attention_block_size: first.effective_attention_block_size,
+        ..Default::default()
+    })
+}
+
+/// Served model id from the OpenAI-compatible model list.
+async fn query_served_model_id(
+    client: &reqwest::Client,
+    worker_url: &str,
+    api_key: Option<&str>,
+) -> Option<String> {
+    #[derive(serde::Deserialize)]
+    struct Models {
+        data: Vec<ServedModel>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct ServedModel {
+        id: String,
+    }
+
+    let models: Models = query_worker_json(client, worker_url, "v1/models", true, api_key)
+        .await
+        .ok()?;
+    models
+        .data
+        .into_iter()
+        .map(|model| model.id)
+        .find(|id| !id.trim().is_empty())
+}
+
+pub(crate) async fn query_pd_server_info(
+    client: &reqwest::Client,
+    worker_url: &str,
+    api_key: Option<&str>,
+) -> Result<ServerInfo, String> {
+    query_worker_metadata(client, worker_url, api_key).await
 }
 
 pub(crate) async fn query_pd_kv_event_sources(
@@ -996,6 +1156,173 @@ fn discovered_block_size(server_info: &ServerInfo) -> Option<u32> {
                 .effective_attention_block_size
                 .filter(|size| *size > 0)
         })
+}
+
+mod metrics_meta {
+    //! Engine cache-layout metadata carried by vLLM's `/metrics` endpoint.
+    //!
+    //! `vllm:cache_config_info` is an info-style gauge: one series per engine whose
+    //! labels mirror that engine's `CacheConfig`. Unlike `/server_info` it is not
+    //! gated behind `VLLM_SERVER_DEV_MODE`, so it is the metadata channel a stock
+    //! vLLM worker always exposes.
+
+    use std::collections::BTreeMap;
+
+    use crate::protocols::prometheus_text::for_each_sample;
+
+    /// The metric family that carries one engine's `CacheConfig`.
+    pub(crate) const CACHE_CONFIG_INFO: &str = "vllm:cache_config_info";
+
+    /// The parts of one engine's `CacheConfig` the KV index needs.
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub(crate) struct EngineCacheConfig {
+        /// Engine (data-parallel rank) index the series belongs to.
+        pub(crate) engine: u32,
+        /// Tokens per cache block.
+        pub(crate) block_size: Option<u32>,
+        /// Attention block size, which a hybrid layout may report separately.
+        pub(crate) effective_attention_block_size: Option<u32>,
+        /// Tokens per hashed block when it differs from `block_size`.
+        pub(crate) hash_block_size: Option<u32>,
+        /// Engine-declared cache layout, once vLLM populates it.
+        pub(crate) kv_cache_layout: Option<String>,
+    }
+
+    impl EngineCacheConfig {
+        /// Tokens covered by one hashed block, preferring the cache block size.
+        pub(crate) fn hash_unit(&self) -> Option<u32> {
+            self.block_size.or(self.effective_attention_block_size)
+        }
+    }
+
+    /// The hash unit every engine agrees on, or the sizes that conflict.
+    ///
+    /// A scrape that mixes layouts cannot be trusted for indexing: crediting
+    /// blocks at the wrong granularity overstates cache hits, so the caller
+    /// refuses the worker instead of picking one engine's size.
+    pub(crate) fn shared_hash_unit(
+        engines: &BTreeMap<u32, EngineCacheConfig>,
+    ) -> Result<Option<u32>, Vec<u32>> {
+        let units: std::collections::BTreeSet<u32> = engines
+            .values()
+            .filter_map(EngineCacheConfig::hash_unit)
+            .collect();
+        match units.len() {
+            0 => Ok(None),
+            1 => Ok(units.into_iter().next()),
+            _ => Err(units.into_iter().collect()),
+        }
+    }
+
+    /// Every engine that published `vllm:cache_config_info`, ordered by engine index.
+    pub(crate) fn parse_cache_config_info(text: &str) -> BTreeMap<u32, EngineCacheConfig> {
+        let mut engines: BTreeMap<u32, EngineCacheConfig> = BTreeMap::new();
+        for_each_sample(text, |name, labels, _value| {
+            if name != CACHE_CONFIG_INFO {
+                return;
+            }
+            let engine = labels
+                .get("engine")
+                .and_then(|value| value.parse::<u32>().ok())
+                .unwrap_or(0);
+            let entry = engines.entry(engine).or_insert(EngineCacheConfig {
+                engine,
+                ..EngineCacheConfig::default()
+            });
+            entry.block_size = positive(labels.get("block_size"));
+            entry.effective_attention_block_size =
+                positive(labels.get("effective_attention_block_size"));
+            entry.hash_block_size = positive(labels.get("hash_block_size"));
+            entry.kv_cache_layout = labels
+                .get("kv_cache_layout")
+                .filter(|layout| !is_unset(layout))
+                .cloned();
+        });
+        engines
+    }
+
+    fn positive(value: Option<&String>) -> Option<u32> {
+        let value = value?;
+        value.parse::<u32>().ok().filter(|size| *size > 0)
+    }
+
+    /// vLLM serializes an unset `CacheConfig` field as the string `None`.
+    fn is_unset(value: &str) -> bool {
+        let value = value.trim();
+        value.is_empty() || value.eq_ignore_ascii_case("none")
+    }
+
+    #[cfg(all(test, feature = "cpu", feature = "ready"))]
+    mod tests {
+        use super::*;
+
+        const METRICS: &str = r#"
+    # HELP vllm:cache_config_info Information of the LLMEngine CacheConfig
+    # TYPE vllm:cache_config_info gauge
+    vllm:cache_config_info{block_size="16",effective_attention_block_size="16",cache_dtype="auto",num_gpu_blocks="12989",num_cpu_blocks="None",enable_prefix_caching="True",prefix_caching_hash_algo="sha256_cbor",kv_cache_layout="None",hash_block_size="None",prefix_match_unit="None",cache_hit_alignment_tokens="None",swa_bounded_replay="True",mamba_block_size="None",mamba_cache_mode="none",engine="0"} 1.0
+    vllm:num_requests_running{engine="0",model_name="m"} 2
+    "#;
+
+        #[test]
+        fn parses_one_engine() {
+            let engines = parse_cache_config_info(METRICS);
+            assert_eq!(engines.len(), 1);
+            let engine = &engines[&0];
+            assert_eq!(engine.block_size, Some(16));
+            assert_eq!(engine.effective_attention_block_size, Some(16));
+            assert_eq!(engine.hash_block_size, None);
+            assert_eq!(engine.kv_cache_layout, None);
+            assert_eq!(engine.hash_unit(), Some(16));
+        }
+
+        #[test]
+        fn parses_each_dp_engine_separately() {
+            let metrics = r#"
+    vllm:cache_config_info{block_size="16",engine="1"} 1.0
+    vllm:cache_config_info{block_size="32",engine="0"} 1.0
+    "#;
+            let engines = parse_cache_config_info(metrics);
+            assert_eq!(engines.len(), 2);
+            assert_eq!(engines[&0].block_size, Some(32));
+            assert_eq!(engines[&1].block_size, Some(16));
+            assert_eq!(engines[&0].hash_unit(), Some(32));
+        }
+
+        #[test]
+        fn reports_declared_hybrid_layout() {
+            let metrics = r#"
+    vllm:cache_config_info{block_size="64",hash_block_size="4",kv_cache_layout="hybrid-v1",engine="0"} 1.0
+    "#;
+            let engine = &parse_cache_config_info(metrics)[&0];
+            assert_eq!(engine.hash_block_size, Some(4));
+            assert_eq!(engine.kv_cache_layout.as_deref(), Some("hybrid-v1"));
+        }
+
+        #[test]
+        fn refuses_mixed_block_sizes() {
+            let metrics = r#"
+vllm:cache_config_info{block_size="16",engine="0"} 1.0
+vllm:cache_config_info{block_size="32",engine="1"} 1.0
+"#;
+            assert_eq!(
+                shared_hash_unit(&parse_cache_config_info(metrics)),
+                Err(vec![16, 32])
+            );
+            let agreed = parse_cache_config_info(
+                r#"vllm:cache_config_info{block_size="16",engine="0"} 1.0"#,
+            );
+            assert_eq!(shared_hash_unit(&agreed), Ok(Some(16)));
+            assert_eq!(shared_hash_unit(&BTreeMap::new()), Ok(None));
+        }
+
+        #[test]
+        fn missing_family_yields_no_engines() {
+            assert!(
+                parse_cache_config_info("vllm:num_requests_running{engine=\"0\"} 1\n").is_empty()
+            );
+            assert!(parse_cache_config_info("").is_empty());
+        }
+    }
 }
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
@@ -1186,6 +1513,26 @@ mod tests {
         // empty body → defaults, no error.
         let s: ServerInfo = serde_json::from_str("{}").unwrap();
         assert!(s.kv_block_size.is_none());
+    }
+
+    #[test]
+    fn warnings_name_the_transport_that_was_probed() {
+        assert_eq!(
+            metadata_source_label("grpc://127.0.0.1:50051"),
+            "GetServerInfo"
+        );
+        assert_eq!(
+            metadata_source_label("http://127.0.0.1:8000"),
+            "/get_server_info, /server_info or /metrics"
+        );
+        assert_eq!(
+            event_source_label("grpc://127.0.0.1:50051"),
+            "GetKvEventSources"
+        );
+        assert_eq!(
+            event_source_label("http://127.0.0.1:8000"),
+            "/kv_event_sources"
+        );
     }
 
     #[test]
@@ -2701,5 +3048,97 @@ mod tests {
         );
         assert_eq!(index.find_matches(&query(200)).len(), 1);
         supervisor.shutdown();
+    }
+
+    /// A stock vLLM worker exposes no engine config endpoint, only `/metrics`.
+    const METRICS_ONLY: &str = "\
+# HELP vllm:cache_config_info Information of the LLMEngine CacheConfig
+# TYPE vllm:cache_config_info gauge
+vllm:cache_config_info{block_size=\"16\",effective_attention_block_size=\"16\",enable_prefix_caching=\"True\",prefix_caching_hash_algo=\"sha256_cbor\",hash_block_size=\"None\",kv_cache_layout=\"None\",engine=\"0\"} 1.0
+";
+
+    fn metrics_and_models_router() -> axum::Router {
+        use axum::{routing::get, Router};
+
+        async fn metrics() -> &'static str {
+            METRICS_ONLY
+        }
+        Router::new().route("/metrics", get(metrics)).route(
+            "/v1/models",
+            get(|| async { axum::Json(serde_json::json!({"data": [{"id": "mock-model"}]})) }),
+        )
+    }
+
+    /// Spawn a worker that serves only what a plain `vllm serve` exposes.
+    async fn spawn_metrics_only_worker(
+        router: axum::Router,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let worker = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        (worker, server)
+    }
+
+    #[tokio::test]
+    async fn metrics_only_worker_supplies_cache_metadata() {
+        let (worker, server) = spawn_metrics_only_worker(metrics_and_models_router()).await;
+
+        let info = query_worker_metadata(&reqwest::Client::new(), &worker, None)
+            .await
+            .unwrap();
+        assert_eq!(info.kv_block_size, Some(16));
+        assert_eq!(info.effective_attention_block_size, Some(16));
+        assert_eq!(info.model_id.as_deref(), Some("mock-model"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn metrics_only_worker_creates_a_cache_identity() {
+        use axum::routing::get;
+
+        let context = zmq::Context::new();
+        let publisher = context.socket(zmq::XPUB).unwrap();
+        publisher.bind("tcp://127.0.0.1:*").unwrap();
+        let endpoint = publisher.get_last_endpoint().unwrap().unwrap();
+        let sources = serde_json::json!({"0": {
+            "endpoint": endpoint,
+            "topic": "kv/metrics-only",
+            "publisher": "zmq",
+            "encoding": "msgpack",
+            "schema_version": 1,
+            "enable_kv_cache_events": true
+        }});
+        let router = metrics_and_models_router().route(
+            "/kv_event_sources",
+            get(move || {
+                let sources = sources.clone();
+                async move { axum::Json(sources) }
+            }),
+        );
+        let (worker, server) = spawn_metrics_only_worker(router).await;
+
+        let (supervisor, _signals) =
+            KvIndexSupervisor::new_http_full_attention(reqwest::Client::new(), HashMode::Sha256);
+        let info = supervisor.on_worker_added(&worker).await.unwrap();
+        assert_eq!(info.block_size, Some(16));
+        assert!(
+            info.cache_key.is_some(),
+            "metadata should produce a cache identity"
+        );
+        supervisor.shutdown();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn worker_without_metadata_names_every_source() {
+        let (worker, server) = spawn_metrics_only_worker(axum::Router::new()).await;
+
+        let error = query_worker_metadata(&reqwest::Client::new(), &worker, None)
+            .await
+            .unwrap_err();
+        assert!(error.contains("get_server_info"), "{error}");
+        assert!(error.contains("server_info"), "{error}");
+        assert!(error.contains("metrics"), "{error}");
+        server.abort();
     }
 }
