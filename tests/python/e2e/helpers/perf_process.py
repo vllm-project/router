@@ -119,6 +119,12 @@ def graceful_stop_subprocess(
     """Terminate then kill; optional process group (``start_new_session=True``)."""
 
     if proc.poll() is not None:
+        # The session leader can exit while its children still hold GPU or ports.
+        if process_group:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
         return
     if process_group:
         try:

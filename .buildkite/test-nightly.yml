@@ -203,18 +203,15 @@ steps:
       export AGENTX_RUN_SUFFIX="${AGENTX_RUN_SUFFIX:-$(date -u +%Y%m%d%H%M%S)}"
       export AGENTX_CELL_GAP_SEC="${AGENTX_CELL_GAP_SEC:-15}"
       export AGENTX_PORT_SETTLE_SEC="${AGENTX_PORT_SETTLE_SEC:-5}"
-      export AGENTX_PERF_TIMEOUT_SEC="${AGENTX_PERF_TIMEOUT_SEC:-14400}"
 
       trace="tests/python/e2e/perf/router_policy/data/tracelab-ci-uniform-28.jsonl"
       if [[ -n "${AGENTX_TRACE_JSONL_URL:-}" ]]; then
-        mkdir -p "$(dirname "${trace}")"
-        curl -fsSL "${AGENTX_TRACE_JSONL_URL}" -o "${trace}"
+        mkdir -p "$$(dirname "$${trace}")"
+        curl -fsSL "${AGENTX_TRACE_JSONL_URL}" -o "$${trace}"
       fi
-      test -f "${trace}"
+      test -f "$${trace}"
 
-      python -m pytest -sv tests/python/e2e/perf/router_policy/test_router_policy_scenarios.py -k 'cache_aware/c16'
-      python -m pytest -sv tests/python/e2e/perf/router_policy/test_router_policy_scenarios.py -k 'kv_aware/c16'
-      python -m pytest -sv tests/python/e2e/perf/router_policy/test_router_policy_scenarios.py -k 'kv_aware_aff/c16'
+      python -m pytest -sv tests/python/e2e/perf/router_policy/test_router_policy_scenarios.py -k 'cache_aware/c16 or kv_aware/c16 or kv_aware_aff/c16'
 
       BASH
     artifact_paths:

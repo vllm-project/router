@@ -14,6 +14,6 @@ Ported from the [`agentaware`](https://github.com/zhumingjue138/router/tree/agen
 | `replay_run.py` | Validate completed agentinfer replay directories |
 | `paths.py` | `repo_root()`, router binary default path |
 
-**Wired today:** `perf/grpc/stack_launcher.py`, `router_policy/casekit/` (`case_config`, `cell_runner`).
+**Wired today:** `router_policy/case_loader.py` (`binaries`, `paths`). Worker and router launch for `router_policy` uses `perf/process.py`, the same `launch_worker` / `launch_router` path as `perf/grpc`.
 
 Perf suites under `e2e/perf/*` should reuse these for lifecycle and readiness; suite-specific argv (gRPC workers, kv_aware, etc.) belongs in case JSON + a small builder (see `router_policy/cases/`).

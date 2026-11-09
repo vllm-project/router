@@ -10,13 +10,13 @@ SCENARIO_DIR = Path(__file__).resolve().parent
 if str(SCENARIO_DIR) not in sys.path:
     sys.path.insert(0, str(SCENARIO_DIR))
 
-from casekit.case_config import (  # noqa: E402
+from case_loader import (  # noqa: E402
     cell_output_dir,
     cell_results_summary_path,
     cell_run_suffix,
     load_case,
 )
-from casekit.cell_runner import run_router_policy_cell  # noqa: E402
+from stack_launcher import run_router_policy_cell  # noqa: E402
 
 
 def _run_cell(case_file: Path) -> Path:

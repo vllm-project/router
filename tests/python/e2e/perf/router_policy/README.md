@@ -42,13 +42,13 @@ Each run writes a **new** cell directory:
 
 Before replay, the cell runner **removes `result/`** if reusing the same `AGENTX_OUT`. The cell **fails if replay exit code ≠ 0**.
 
-**Ports**: HTTP, gRPC, and the router use OS-assigned ports held until that process starts. KV event PUB/replay use **`tcp://*:0`**: vLLM binds a free port at startup and the router reads the resolved address from `/kv_event_sources`. This needs a vLLM that resolves port 0 (it must not advertise `tcp://*:0` itself). Between pytest cells, default **`AGENTX_CELL_GAP_SEC=5`**; before allocate, **`AGENTX_PORT_SETTLE_SEC=2`**. Do not run multiple matrix jobs on one host in parallel.
+**Ports**: HTTP, gRPC, and the router use OS-assigned ports held until that process starts. KV event PUB/replay use **`tcp://*:0`** so vLLM binds a free port at startup. After each worker is healthy, the runner reads `/kv_event_sources` and fails the cell if an advertised endpoint still uses port 0. Between pytest cells, default **`AGENTX_CELL_GAP_SEC=5`**; before allocate, **`AGENTX_PORT_SETTLE_SEC=2`**. Do not run multiple matrix jobs on one host in parallel.
 
-Worker and router logs stream to stderr with prefixes `[engineN]` and `[router]`. Replay stays in `replay.log`. Pytest hides that stream unless the invocation uses **`-sv`**.
+Worker and router processes are started with `perf/process.py` (`launch_worker` once per worker, then `launch_router`). The same output is streamed to stderr with prefixes `[engineN]` and `[vllm-router]`, and copied to `engineN.log` / `router.log` in the run directory. Replay stays in `replay.log`. Pytest hides the stderr stream unless the invocation uses **`-sv`**.
 
-When replay exits, the runner appends **`--- cell summary ---`**, **`STATS`**, **`ARTIFACTS`** (includes **`results_summary.json`** when pytest sets `AGENTX_RESULTS_SUMMARY`), **`PORTS`**, and **`LOG_SUMMARY`** to **`replay.log`** immediately after agentinfer's `Replay result` line, and prints the same block on stdout. Workers and the router are stopped after that. `LOG_SUMMARY` is an error scan plus the last N lines of every engine/router/replay log (`AGENTX_LOG_TAIL`, default 50).
+When replay exits, [`log_summary.py`](log_summary.py) writes **`calibration.json`** (TTFT, TPOT, JCT, and the other cell stats), then appends **`--- cell summary ---`**, **`STATS`**, and **`ARTIFACTS`** to **`replay.log`** immediately after agentinfer's `Replay result` line, and prints the same block on stdout. **`ARTIFACTS`** lists the run directory and **`results_summary.json`** when pytest sets `AGENTX_RESULTS_SUMMARY`. `calibration.json`, `requests.jsonl`, `ports.json`, `engineN.log`, `router.log`, and `replay.log` stay in the run directory and are not printed. Workers and the router are stopped after that. Worker and router lines already went to stderr while they were running.
 
-Layout matches **`perf/grpc`**: case JSON + [`casekit/case_config.py`](casekit/case_config.py) + stack runner (no separate `scripts/` tree).
+Layout matches **`perf/grpc`**: case JSON + [`case_loader.py`](case_loader.py) + [`stack_launcher.py`](stack_launcher.py). [`log_summary.py`](log_summary.py) writes the stats and prints the cell summary.
 
 ## Buildkite nightly (L3)
 
@@ -56,6 +56,6 @@ Job **`router-policy-perf-e2e`** in [`.buildkite/test-nightly.yml`](../../../../
 runs **`cache_aware/c16`**, **`kv_aware/c16`**, **`kv_aware_aff/c16`** on **`l4_2`** (2× L4).
 Case JSON reserves 12 GiB GPU KV per worker, no CPU offload, and `max_model_len=32768`.
 
-Nightly step runs `pip install agentinfer==0.2.0` then three pytest invocations (`-k …/c16`).
+Nightly step runs `pip install agentinfer==0.2.0` then one pytest invocation (`-k 'cache_aware/c16 or kv_aware/c16 or kv_aware_aff/c16'`).
 The trace is `data/tracelab-ci-uniform-28.jsonl` (8 sessions, 28 requests). Optional Buildkite env **`AGENTX_TRACE_JSONL_URL`** replaces that file when set.
 See [`.buildkite/test-nightly.yml`](../../../../../.buildkite/test-nightly.yml) (`router-policy-perf-e2e`).

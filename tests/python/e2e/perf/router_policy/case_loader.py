@@ -6,11 +6,12 @@ import json
 import os
 import shutil
 import sys
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-_E2E_DIR = Path(__file__).resolve().parents[3]
+_E2E_DIR = Path(__file__).resolve().parents[2]
 _HELPERS = _E2E_DIR / "helpers"
 for _entry in (_HELPERS, _E2E_DIR):
     _path = str(_entry)
@@ -60,11 +61,7 @@ def _resolve_python(case_value: str, repo: Path, *, case_id: str) -> str:
 
 
 def packaged_replay_agentx_yaml() -> Path:
-    """Replay template from pip-installed ``agentinfer`` (not a source checkout).
-
-    Prefer the TraceLab template. The cell runner overwrites ``trace_type`` and
-    the backend endpoint from the case JSON either way.
-    """
+    """TraceLab replay template from pip-installed ``agentinfer``."""
 
     try:
         import agentinfer
@@ -79,8 +76,6 @@ def packaged_replay_agentx_yaml() -> Path:
     for relative in (
         Path("agentbench/configs/replay_tracelab.yaml"),
         Path("agentinfer/agentbench/configs/replay_tracelab.yaml"),
-        Path("agentbench/configs/replay_agentX.yaml"),
-        Path("agentinfer/agentbench/configs/replay_agentX.yaml"),
     ):
         candidate = package_root / relative
         if candidate.is_file():
@@ -163,6 +158,82 @@ def resolve_runtime(case: dict[str, Any]) -> dict[str, Any]:
 
 def require_runtime(case: dict[str, Any]) -> dict[str, Any]:
     return resolve_runtime(case)
+
+
+@dataclass(frozen=True)
+class RouterPolicyCase:
+    """One router_policy case, same role as grpc ``BackendCaseFile``."""
+
+    path: Path
+    id: str
+    model: str
+    served_model_name: str
+    python: str
+    vllm_rs: str
+    router_bin: str
+    perf_work_root: Path
+    trace_path: Path
+    trace_type: str
+    endpoint: str
+    replay_config: Path
+    agent_infer: Path | None
+    openssl_lib_dir: str
+    policy: str
+    task_num: int
+    concurrency: int
+    worker_count: int
+    gap_scale: float
+    max_inflight: int
+    stall_secs: int
+    idle_secs: int
+    task_stagger: float
+    per_worker: dict[str, Any]
+    router: dict[str, Any]
+
+
+def load_router_policy_case(case_file: Path) -> RouterPolicyCase:
+    """Load one case JSON into ``RouterPolicyCase``."""
+
+    raw = load_case(case_file)
+    runtime = resolve_runtime(raw)
+    bench = raw.get("benchmark_params") or {}
+    workers = raw.get("workers") or {}
+    router = dict(raw.get("router_params") or {})
+    case_id = str(raw["id"])
+    policy = str(
+        router.get("policy") or raw.get("router_policy") or case_id.split("-", 1)[1]
+    )
+    replay_path = str(runtime.get("replay_config_path") or "").strip()
+    agent_infer = str(runtime.get("agent_infer") or "").strip()
+    return RouterPolicyCase(
+        path=case_file,
+        id=case_id,
+        model=runtime["model"],
+        served_model_name=runtime["served_model_name"],
+        python=runtime["python"],
+        vllm_rs=runtime["vllm_rs"],
+        router_bin=runtime["router_binary"],
+        perf_work_root=Path(runtime["perf_work_root"]),
+        trace_path=Path(runtime["trace_path"]),
+        trace_type=str(runtime.get("trace_type") or "tracelab"),
+        endpoint=str(runtime.get("endpoint") or "/v1/chat/completions"),
+        replay_config=Path(replay_path)
+        if replay_path
+        else packaged_replay_agentx_yaml(),
+        agent_infer=Path(agent_infer) if agent_infer else None,
+        openssl_lib_dir=str(runtime.get("openssl_lib_dir") or ""),
+        policy=policy,
+        task_num=int(bench.get("task-num", 128)),
+        concurrency=int(bench.get("max-concurrency", 8)),
+        worker_count=int(workers.get("count", 2)),
+        gap_scale=float(bench.get("gap_scale", 0.0)),
+        max_inflight=int(bench.get("max_inflight", 1)),
+        stall_secs=int(bench.get("stall_secs", 900)),
+        idle_secs=int(bench.get("idle_secs", 120)),
+        task_stagger=float(bench.get("task_stagger", 0)),
+        per_worker=dict(workers.get("per_worker") or {}),
+        router=router,
+    )
 
 
 def cell_run_suffix(*, run_suffix: str | None = None) -> str:
