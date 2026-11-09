@@ -196,11 +196,10 @@ async fn router_with_prefills(
     local: bool,
     pd_extra: serde_json::Value,
 ) -> VllmPDRouter {
-    let (config_policy, make) = (policy.clone(), policy);
-    let (cfg, prefill_urls) = warm_router_config(prefills, d, &config_policy, local, pd_extra);
+    let (cfg, prefill_urls) = warm_router_config(prefills, d, &policy, local, pd_extra);
     let ctx = Arc::new(AppContext::new(cfg, reqwest::Client::new(), 64, None, vec![]).unwrap());
     let table = ctx.policy_registry.kv_affinity_table();
-    let select = PolicyFactory::create_from_config(&make, Some(&table));
+    let select = PolicyFactory::create_from_config(&policy, Some(&table));
     router_with_selection(&ctx, select, prefill_urls, d).await
 }
 
@@ -776,16 +775,33 @@ struct RecordingPrefill {
     needs_headers: bool,
     calls: RecordedCalls,
     counter: AtomicUsize,
+    /// Return an index past the end of the pool, like a buggy third-party policy.
+    out_of_range: bool,
 }
 
 impl RecordingPrefill {
     fn new(needs_text: bool, needs_cache_key: bool, needs_headers: bool) -> Arc<Self> {
+        Self::build(needs_text, needs_cache_key, needs_headers, false)
+    }
+
+    /// Same policy, but it reports an index one past the last worker.
+    fn returning_out_of_range() -> Arc<Self> {
+        Self::build(false, false, false, true)
+    }
+
+    fn build(
+        needs_text: bool,
+        needs_cache_key: bool,
+        needs_headers: bool,
+        out_of_range: bool,
+    ) -> Arc<Self> {
         Arc::new(Self {
             needs_text,
             needs_cache_key,
             needs_headers,
             calls: Arc::new(Mutex::new(Vec::new())),
             counter: AtomicUsize::new(0),
+            out_of_range,
         })
     }
 
@@ -805,6 +821,9 @@ impl LoadBalancingPolicy for RecordingPrefill {
             .lock()
             .unwrap()
             .push((request_text.map(str::to_string), headers.cloned()));
+        if self.out_of_range {
+            return Some(workers.len());
+        }
         Some(self.counter.fetch_add(1, Ordering::SeqCst) % workers.len())
     }
 
@@ -972,4 +991,30 @@ async fn prefill_leaving_during_the_attempt_is_reselected() {
         p0.state.calls.lock().unwrap().is_empty(),
         "the removed prefill received the turn"
     );
+}
+
+/// A policy that returns an index past the pool must degrade to the same 503 as
+/// an empty pool: both callers index the worker slice with it, so without the
+/// bounds check this panics the request task instead.
+#[tokio::test]
+async fn an_out_of_range_policy_index_is_a_503_not_a_panic() {
+    let p0 = engine(true, false, false).await;
+    let p1 = engine(true, false, false).await;
+    let d = engine(false, false, false).await;
+    let policy = RecordingPrefill::returning_out_of_range();
+    let r =
+        router_with_custom_prefill_policy(&[&p0, &p1], &d, policy.clone(), false, json!({})).await;
+    let request =
+        serde_json::from_value(program_body("bogus-index", vec![41, 42, 43], false)).unwrap();
+    let response = r.route_completion(None, &request, Some("test")).await;
+    assert_eq!(
+        response.status(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "an out-of-range index must be reported as no feasible P"
+    );
+    // A policy that selects nothing is asked once by the warm attempt and once
+    // by the cold path, exactly as the scheduling doc says.
+    assert_eq!(policy.calls().len(), 2);
+    assert!(p0.state.calls.lock().unwrap().is_empty());
+    assert!(p1.state.calls.lock().unwrap().is_empty());
 }
