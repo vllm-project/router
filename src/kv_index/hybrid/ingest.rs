@@ -57,14 +57,20 @@ impl HybridEventIndex {
         for event in &batch.events {
             let result = match event {
                 KVEvent::BlockStored(store) => {
-                    // An adapter caches its pages under its own hash chain,
-                    // seeded by the adapter identity: those pages are no
-                    // evidence for the base model's chain, and failing the batch
-                    // on them would revoke every claim this rank holds the
-                    // moment one adapter request is served.
-                    if store.lora_id.is_some() || store.lora_name.is_some() {
-                        continue;
-                    }
+                    // An adapter caches its pages under its own chain, seeded
+                    // by `(name, path)`. Index them under that identity and
+                    // never as evidence for the base chain; a page this layout
+                    // cannot address is skipped rather than revoking claims it
+                    // cannot speak for.
+                    let namespace = store.lora_name.clone();
+                    let adapter_path = match namespace.as_deref() {
+                        None => None,
+                        Some(name) => match self.adapter_path(name) {
+                            Some(path) => Some(path),
+                            None => continue,
+                        },
+                    };
+                    let adapter = adapter_path.is_some();
                     // An engine may publish several page sizes for one group
                     // index. Only the declared granularity is addressable by
                     // the layout; the other pages cover the same tokens and
@@ -74,6 +80,9 @@ impl HybridEventIndex {
                         .iter()
                         .find(|group| store.group_idx == Some(group.group_idx))
                     else {
+                        if adapter {
+                            continue;
+                        }
                         return Self::fail(&mut state, HybridEventError::InvalidBatch);
                     };
                     if store.block_size != group.block_size {
@@ -85,43 +94,57 @@ impl HybridEventIndex {
                         );
                         continue;
                     }
+                    // Extra keys are the adapter identity; a base store must
+                    // not carry any, while an adapter store addresses its own
+                    // chain by namespace.
                     if store.medium.as_deref() != Some("GPU")
                         || store.locality.as_deref().is_some_and(|s| s != "LOCAL")
                         || store.ownership.is_some()
                         || !event_kind_matches(group.kind, store)
                         || !stored_shape_matches(group.kind, store)
-                        || !extra_keys_match(
-                            store.extra_keys.as_ref(),
-                            store.block_hashes.len(),
-                            None,
-                        )
+                        || (namespace.is_none()
+                            && !extra_keys_match(
+                                store.extra_keys.as_ref(),
+                                store.block_hashes.len(),
+                                None,
+                            ))
                         || store
                             .parent_block_hash
                             .as_ref()
                             .is_some_and(|hash| sequence_hash(hash).is_none())
                     {
-                        Err(HybridEventError::InvalidBatch)
-                    } else {
-                        let Some(keys) = store
-                            .block_hashes
-                            .iter()
-                            .map(sequence_hash)
-                            .collect::<Option<Vec<_>>>()
-                        else {
-                            return Self::fail(&mut state, HybridEventError::InvalidBatch);
-                        };
-                        let group_idx = group.group_idx;
-                        for hash in keys {
-                            let key = (group_idx, hash);
-                            if !state.claims.contains(&key)
-                                && state.claims.len() >= self.max_entries
-                            {
-                                return Self::fail(&mut state, HybridEventError::Capacity);
-                            }
-                            state.claims.insert(key);
+                        if adapter {
+                            continue;
                         }
-                        Ok(())
+                        return Self::fail(&mut state, HybridEventError::InvalidBatch);
                     }
+                    let Some(keys) = store
+                        .block_hashes
+                        .iter()
+                        .map(sequence_hash)
+                        .collect::<Option<Vec<_>>>()
+                    else {
+                        if adapter {
+                            continue;
+                        }
+                        return Self::fail(&mut state, HybridEventError::InvalidBatch);
+                    };
+                    let group_idx = group.group_idx;
+                    for hash in keys {
+                        if !state.insert_claim(
+                            namespace.as_deref(),
+                            (group_idx, hash),
+                            self.max_entries,
+                        ) {
+                            // An adapter that fills its own budget must not
+                            // revoke the base model's claims; skip the page.
+                            if adapter {
+                                continue;
+                            }
+                            return Self::fail(&mut state, HybridEventError::Capacity);
+                        }
+                    }
+                    Ok(())
                 }
                 KVEvent::BlockRemoved(remove) => {
                     if remove.medium.as_deref() != Some("GPU")
@@ -140,7 +163,7 @@ impl HybridEventIndex {
                             let Some(hash) = sequence_hash(hash) else {
                                 return Self::fail(&mut state, HybridEventError::InvalidBatch);
                             };
-                            state.claims.remove(&(group_idx, hash));
+                            state.remove_claim((group_idx, hash));
                         }
                         Ok(())
                     }

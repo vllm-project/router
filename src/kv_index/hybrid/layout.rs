@@ -172,7 +172,43 @@ use super::HybridEventIndex;
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct HybridCapabilities {
     pub schema_version: u32,
+    /// LoRA adapters this worker serves. The engine hashes an adapter's pages
+    /// with the adapter identity, so the Router can only credit them when the
+    /// layout names them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub adapters: Vec<HybridAdapterCapability>,
     pub ranks: Vec<HybridRankCapability>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct HybridAdapterCapability {
+    pub name: String,
+    /// The path exactly as passed to the engine's `--lora-modules`: the engine
+    /// hashes the verbatim string, so an equivalent but different spelling is
+    /// a different chain and credits nothing.
+    pub path: String,
+}
+
+/// Adapter declarations are the only way to credit adapter pages, so a
+/// malformed declaration must fail the layout instead of binding a chain that
+/// is not the one the engine stores.
+fn validate_adapters(
+    adapters: &[HybridAdapterCapability],
+) -> Result<Vec<(String, String)>, &'static str> {
+    let mut names = HashSet::new();
+    if adapters.len() > 64
+        || adapters.iter().any(|adapter| {
+            adapter.name.is_empty()
+                || adapter.path.is_empty()
+                || !names.insert(adapter.name.as_str())
+        })
+    {
+        return Err("invalid adapter declaration");
+    }
+    Ok(adapters
+        .iter()
+        .map(|adapter| (adapter.name.clone(), adapter.path.clone()))
+        .collect())
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -297,7 +333,9 @@ impl HybridCapabilities {
         if rank.groups.len() < 2 || groups.is_empty() || !has_attention || !has_state {
             return Err("not a supported mixed layout");
         }
+        let adapters = validate_adapters(&self.adapters)?;
         HybridEventIndex::new_with_root_hash(target, groups, hash_block_size, root, max_entries)
+            .map(|index| index.with_adapters(adapters))
             .map_err(|_| "invalid group layout")
     }
 

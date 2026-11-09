@@ -1,6 +1,6 @@
 //! What this rank currently holds: the claim set per cache identity.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::kv_hash::SequenceHash;
 
@@ -9,22 +9,61 @@ pub(super) struct State {
     pub(super) next_seq: Option<u64>,
     /// Partial replay must never be visible to routing.
     pub(super) visible: bool,
-    pub(super) claims: HashSet<(u32, SequenceHash)>,
+    /// Claims per chain: `None` is the base model, a name is one declared
+    /// adapter. The engine seeds an adapter's chain with `(name, path)`, so the
+    /// chains never overlap and none can credit another.
+    pub(super) claims: HashMap<Option<String>, HashSet<(u32, SequenceHash)>>,
 }
 
-// Install this provider only when the engine contract verifies that recomputing
-// the last token is a sufficient bound (no unmodeled lookahead/replay rules).
+impl State {
+    pub(super) fn claims_in(
+        &self,
+        namespace: Option<&str>,
+    ) -> Option<&HashSet<(u32, SequenceHash)>> {
+        self.claims
+            .iter()
+            .find(|(identity, _)| identity.as_deref() == namespace)
+            .map(|(_, claims)| claims)
+    }
+
+    /// Record one claim for `namespace`, refusing only when that chain is full:
+    /// an adapter must never evict the base model's evidence.
+    pub(super) fn insert_claim(
+        &mut self,
+        namespace: Option<&str>,
+        key: (u32, SequenceHash),
+        max_entries: usize,
+    ) -> bool {
+        let claims = self.claims.entry(namespace.map(str::to_owned)).or_default();
+        if claims.contains(&key) {
+            return true;
+        }
+        if claims.len() >= max_entries {
+            return false;
+        }
+        claims.insert(key);
+        true
+    }
+
+    /// A removal names no chain: the engine evicted those blocks whichever
+    /// chain produced them.
+    pub(super) fn remove_claim(&mut self, key: (u32, SequenceHash)) {
+        for claims in self.claims.values_mut() {
+            claims.remove(&key);
+        }
+    }
+}
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
 pub(crate) mod tests {
     use std::sync::Arc;
 
     use super::*;
+    use crate::kv_hash::BlockKeyGenerator;
 
     use super::super::ingest::HybridEventError;
     use super::super::layout::{HybridEventGroup, HybridGroupKind};
     use super::super::HybridEventIndex;
-    use crate::kv_hash::BlockKeyGenerator;
     use crate::kv_index::wire::ExternalBlockHash;
     use crate::kv_index::wire::{BlockRemoved, BlockStored};
     use crate::kv_index::{KVEvent, KVEventBatch, RoutableTarget};
@@ -112,6 +151,33 @@ pub(crate) mod tests {
         }
     }
 
+    /// The same pages stored under one adapter: the engine hashes them with
+    /// the adapter's `(name, path)` extra keys, so this is a different chain.
+    fn adapter_batch(name: &str, path: &str) -> KVEventBatch {
+        let tokens = prompt();
+        let hash =
+            BlockKeyGenerator::new(528, 0).generate_block_keys_for_adapter(&tokens, name, path)[0];
+        let events = groups()
+            .iter()
+            .map(|group| {
+                let spec = if group.group_idx == 3 {
+                    "full_attention"
+                } else {
+                    "mamba"
+                };
+                let mut store = gpu_store(group.group_idx, spec, 528, &tokens[..528], &[hash]);
+                store.lora_name = Some(name.to_string());
+                store.extra_keys = None;
+                KVEvent::BlockStored(store)
+            })
+            .collect();
+        KVEventBatch {
+            ts: 1.0,
+            events,
+            data_parallel_rank: Some(0),
+        }
+    }
+
     /// `qwen_batch()` encoded as the engine publishes it.
     pub(crate) fn qwen35_payload() -> Vec<u8> {
         let batch = qwen_batch();
@@ -163,6 +229,124 @@ pub(crate) mod tests {
         };
         assert_eq!(index.apply_batch(1, &removed), Ok(()));
         assert_eq!(index.reusable_tokens(&prompt(), usize::MAX), 0);
+    }
+
+    /// An adapter publishes under its own hash chain. Such a batch must leave
+    /// the base model's claims intact instead of revoking the whole view.
+    /// An adapter's pages live under their own chain: they are indexed under
+    /// the declared adapter, never credited to the base model, and never to
+    /// another adapter.
+    #[test]
+    fn adapter_pages_are_indexed_under_their_own_chain() {
+        let index = index(16).with_adapters(vec![
+            ("lora1".to_string(), "/adapters/lora1".to_string()),
+            ("lora2".to_string(), "/adapters/lora2".to_string()),
+        ]);
+        index.begin_empty(0);
+        assert_eq!(
+            index.apply_batch(0, &adapter_batch("lora1", "/adapters/lora1")),
+            Ok(())
+        );
+        assert_eq!(index.reusable_tokens(&prompt(), usize::MAX), 0);
+        assert_eq!(
+            index.reusable_tokens_in(Some("lora1"), &prompt(), usize::MAX),
+            528
+        );
+        assert_eq!(
+            index.reusable_tokens_in(Some("lora2"), &prompt(), usize::MAX),
+            0
+        );
+
+        // The base model stores the same tokens under its own chain.
+        assert_eq!(index.apply_batch(1, &qwen_batch()), Ok(()));
+        assert_eq!(index.reusable_tokens(&prompt(), usize::MAX), 528);
+        assert_eq!(
+            index.reusable_tokens_in(Some("lora1"), &prompt(), usize::MAX),
+            528
+        );
+
+        // An eviction names hashes, not a chain: the engine removes the page
+        // from every group, and both views lose it.
+        let adapter_hash = BlockKeyGenerator::new(528, 0).generate_block_keys_for_adapter(
+            &prompt(),
+            "lora1",
+            "/adapters/lora1",
+        )[0]
+        .to_vec();
+        let base_hash = BlockKeyGenerator::new(528, 0).generate_block_keys(&prompt())[0].to_vec();
+        let removed = KVEventBatch {
+            ts: 2.0,
+            data_parallel_rank: Some(0),
+            events: groups()
+                .iter()
+                .map(|group| {
+                    KVEvent::BlockRemoved(BlockRemoved {
+                        block_hashes: vec![
+                            ExternalBlockHash::Bytes(adapter_hash.clone()),
+                            ExternalBlockHash::Bytes(base_hash.clone()),
+                        ],
+                        medium: Some("GPU".to_string()),
+                        group_idx: Some(group.group_idx),
+                        locality: Some("LOCAL".to_string()),
+                        ownership: None,
+                    })
+                })
+                .collect(),
+        };
+        assert_eq!(index.apply_batch(2, &removed), Ok(()));
+        assert_eq!(index.reusable_tokens(&prompt(), usize::MAX), 0);
+        assert_eq!(
+            index.reusable_tokens_in(Some("lora1"), &prompt(), usize::MAX),
+            0
+        );
+    }
+
+    /// A page for an adapter this layout does not declare is skipped: it can
+    /// neither credit the base model nor revoke the claims the rank holds.
+    #[test]
+    fn undeclared_adapter_stores_are_skipped() {
+        use crate::policies::TieredMatchProvider;
+
+        let index = index(16);
+        index.begin_empty(0);
+        assert_eq!(index.apply_batch(0, &qwen_batch()), Ok(()));
+        assert_eq!(index.reusable_tokens(&prompt(), usize::MAX), 528);
+
+        assert_eq!(
+            index.apply_batch(1, &adapter_batch("ghost", "/adapters/ghost")),
+            Ok(())
+        );
+        assert_eq!(index.reusable_tokens(&prompt(), usize::MAX), 528);
+        assert_eq!(
+            index.reusable_tokens_in(Some("ghost"), &prompt(), usize::MAX),
+            0
+        );
+        assert!(index
+            .find_token_matches(&prompt(), 528, Some("ghost"), 0)
+            .is_some_and(|hits| hits.is_empty()));
+        assert!(index
+            .find_token_matches(&prompt(), 528, None, 0)
+            .is_some_and(|hits| hits.len() == 1));
+    }
+
+    #[test]
+    fn adapter_stores_do_not_revoke_the_base_view() {
+        let index = index(16);
+        index.begin_empty(0);
+        assert_eq!(index.apply_batch(0, &qwen_batch()), Ok(()));
+        assert_eq!(index.reusable_tokens(&prompt(), usize::MAX), 528);
+
+        let mut adapter_batch = qwen_batch();
+        for event in &mut adapter_batch.events {
+            if let KVEvent::BlockStored(store) = event {
+                store.lora_name = Some("lora1".to_string());
+            }
+        }
+        assert_eq!(index.apply_batch(1, &adapter_batch), Ok(()));
+        assert_eq!(index.reusable_tokens(&prompt(), usize::MAX), 528);
+        // The base chain keeps applying afterwards.
+        assert_eq!(index.apply_batch(2, &qwen_batch()), Ok(()));
+        assert_eq!(index.reusable_tokens(&prompt(), usize::MAX), 528);
     }
 
     #[test]
@@ -500,27 +684,5 @@ pub(crate) mod tests {
                 .unwrap()
                 .is_empty()
         );
-    }
-
-    /// An adapter publishes under its own hash chain. Such a batch must leave
-    /// the base model's claims intact instead of revoking the whole view.
-    #[test]
-    fn adapter_stores_do_not_revoke_the_base_view() {
-        let index = index(16);
-        index.begin_empty(0);
-        assert_eq!(index.apply_batch(0, &qwen_batch()), Ok(()));
-        assert_eq!(index.reusable_tokens(&prompt(), usize::MAX), 528);
-
-        let mut adapter_batch = qwen_batch();
-        for event in &mut adapter_batch.events {
-            if let KVEvent::BlockStored(store) = event {
-                store.lora_name = Some("lora1".to_string());
-            }
-        }
-        assert_eq!(index.apply_batch(1, &adapter_batch), Ok(()));
-        assert_eq!(index.reusable_tokens(&prompt(), usize::MAX), 528);
-        // The base chain keeps applying afterwards.
-        assert_eq!(index.apply_batch(2, &qwen_batch()), Ok(()));
-        assert_eq!(index.reusable_tokens(&prompt(), usize::MAX), 528);
     }
 }

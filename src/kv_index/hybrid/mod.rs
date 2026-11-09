@@ -1,22 +1,20 @@
 //! Hybrid attention prefix index.
-//!
-//! `HybridIndex` owns the residency lock and is the only type callers see.
-//! Event interpretation lives in `ingest`, cache-group rules in `layout`.
 
 mod ingest;
 mod layout;
 pub(crate) mod residency;
 mod subscriber;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use parking_lot::RwLock;
 
 pub use self::ingest::HybridEventError;
 pub use self::layout::{
-    common_reusable_tokens, HybridCapabilities, HybridEventGroup, HybridGroupCapability,
-    HybridGroupKind, HybridGroupView, HybridRankCapability,
+    common_reusable_tokens, HybridAdapterCapability, HybridCapabilities, HybridEventGroup,
+    HybridGroupCapability, HybridGroupKind, HybridGroupView, HybridRankCapability,
 };
+use self::residency::State;
 pub use self::subscriber::{
     spawn_zmq, HybridEventStream, HybridStreamError, HybridSubscriberHandle,
 };
@@ -24,14 +22,19 @@ pub use crate::kv_index::subscriber::HybridSourceLease;
 
 #[allow(unused_imports)]
 use self::ingest::HybridEventError as _;
-use self::residency::State;
 use super::{Locality, RoutableTarget, StorageTier, TierMatch};
 use crate::kv_hash::{BlockKeyGenerator, SequenceHash};
 
+/// A bounded index for one verified identity, worker, rank and incarnation.
+/// Stores and removals across all groups share one lock and one sequence.
 pub struct HybridEventIndex {
     pub(super) target: RoutableTarget,
     pub(super) groups: Vec<HybridEventGroup>,
     pub(super) keys: BlockKeyGenerator,
+    /// LoRA adapters this worker serves, as `(name, path)`. The engine seeds an
+    /// adapter's chain with both, so a layout that does not declare an adapter
+    /// cannot credit it, and one that declares the wrong path credits nothing.
+    pub(super) adapters: Vec<(String, String)>,
     pub(super) max_entries: usize,
     state: RwLock<State>,
 }
@@ -98,17 +101,33 @@ impl HybridEventIndex {
             target,
             groups,
             keys,
+            adapters: Vec::new(),
             max_entries,
             state: RwLock::new(State {
                 next_seq: None,
                 visible: false,
-                claims: HashSet::new(),
+                claims: HashMap::new(),
             }),
         })
     }
 
     pub fn target(&self) -> &RoutableTarget {
         &self.target
+    }
+
+    /// Declare the LoRA adapters this worker serves. Adapter pages are a
+    /// separate chain keyed by `(name, path)`; without the declaration their
+    /// pages are skipped rather than credited to the base model.
+    pub fn with_adapters(mut self, adapters: Vec<(String, String)>) -> Self {
+        self.adapters = adapters;
+        self
+    }
+
+    fn adapter_path(&self, name: &str) -> Option<&str> {
+        self.adapters
+            .iter()
+            .find(|(declared, _)| declared == name)
+            .map(|(_, path)| path.as_str())
     }
 
     /// Begin tracking from an externally established empty-cache barrier.
@@ -152,11 +171,33 @@ impl HybridEventIndex {
     /// Calculate one consistent local snapshot. Zero means a miss or an
     /// untrusted source.
     pub fn reusable_tokens(&self, tokens: &[u32], max_reusable_tokens: usize) -> u64 {
-        let hashes = self.keys.generate_block_keys(tokens);
+        self.reusable_tokens_in(None, tokens, max_reusable_tokens)
+    }
+
+    /// The same snapshot for one chain: `None` is the base model, a name is a
+    /// declared adapter.
+    fn reusable_tokens_in(
+        &self,
+        namespace: Option<&str>,
+        tokens: &[u32],
+        max_reusable_tokens: usize,
+    ) -> u64 {
+        let hashes = match namespace {
+            None => self.keys.generate_block_keys(tokens),
+            Some(name) => match self.adapter_path(name) {
+                Some(path) => self
+                    .keys
+                    .generate_block_keys_for_adapter(tokens, name, path),
+                None => return 0,
+            },
+        };
         let state = self.state.read();
         if state.next_seq.is_none() || !state.visible {
             return 0;
         }
+        let Some(claims) = state.claims_in(namespace) else {
+            return 0;
+        };
         let matches: Vec<Vec<TierMatch>> = self
             .groups
             .iter()
@@ -167,7 +208,7 @@ impl HybridEventIndex {
                     let Ok(end) = u32::try_from(position.saturating_add(1)) else {
                         break;
                     };
-                    if !state.claims.contains(&(group.group_idx, *hash)) {
+                    if !claims.contains(&(group.group_idx, *hash)) {
                         continue;
                     }
                     let start = end - 1;
@@ -220,10 +261,12 @@ impl crate::policies::TieredMatchProvider for HybridEventIndex {
     ) -> Option<Vec<TierMatch>> {
         // Events, ownership and history are bound to one rank. A hit computed
         // from another rank's stream is never evidence for this one.
-        if lora_name.is_some() || block_size == 0 || dp_rank != self.target.dp_rank {
+        // Events, ownership and history are bound to one rank. A hit computed
+        // from another rank's stream is never evidence for this one.
+        if block_size == 0 || dp_rank != self.target.dp_rank {
             return Some(Vec::new());
         }
-        let tokens = self.reusable_tokens(tokens, usize::MAX);
+        let tokens = self.reusable_tokens_in(lora_name, tokens, usize::MAX);
         if tokens == 0 || !tokens.is_multiple_of(u64::from(block_size)) {
             return Some(Vec::new());
         }
