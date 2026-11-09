@@ -3028,6 +3028,29 @@ mod admission_tests {
     }
 
     #[test]
+    fn cold_prefill_ties_use_every_worker_in_an_idle_pool() {
+        let manager = Arc::new(PdLoadManager::default());
+        let p = pool("p", 3);
+        let d = pool("d", 1);
+        let policy = KvAwarePolicy::default();
+        let tokens: Vec<u32> = (0..33).collect();
+        let inputs = token_inputs(&p, &tokens, &policy);
+        let mut ctx = context();
+        ctx.prefill_inputs = Some(&inputs);
+
+        // Every admission starts from an idle pool again, so the same
+        // equal-cost tie is met on each turn.
+        let mut seen = [false; 3];
+        for _ in 0..32 {
+            let (selection, attempt) = admit_with(&manager, &p, &d, &policy, &ctx);
+            assert_eq!(selection.prefill.new_prefill_tokens, Some(33));
+            seen[selection.prefill.worker_index] = true;
+            drop(attempt);
+        }
+        assert_eq!(seen, [true, true, true], "equal costs must use every P");
+    }
+
+    #[test]
     fn equal_load_follows_caller_order() {
         let manager = Arc::new(PdLoadManager::default());
         let mut p = pool("p", 2);

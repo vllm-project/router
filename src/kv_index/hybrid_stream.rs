@@ -580,10 +580,11 @@ mod tests {
             .send_multipart([b"epoch-1".as_slice(), &1_i64.to_be_bytes(), &clear], 0)
             .unwrap();
         wait_for(&index, &prompt, 0).await;
-        assert_eq!(
-            policy.select_worker_with_token_ids(&workers, Some(&prompt)),
-            Some(0)
-        );
+        // The credit is gone (asserted above); which worker wins is the
+        // tie-break's decision, not the cache's.
+        assert!(policy
+            .select_worker_with_token_ids(&workers, Some(&prompt))
+            .is_some());
         publisher
             .send_multipart(
                 [
