@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use parking_lot::Mutex;
+use std::collections::HashMap;
 use tokio::sync::watch;
 
 use super::hybrid_events::{HybridEventError, HybridEventIndex};
@@ -205,6 +206,10 @@ pub fn spawn_zmq(
                 rank = source.dp_rank,
                 "hybrid subscriber connecting"
             );
+            let mut window = ReplayWindow {
+                required_through: 0,
+                replayed: HashMap::new(),
+            };
             // A SUB socket can connect before its subscription reaches the
             // publisher. Do not expose a replay until a live event proves the
             // subscription is active and replay reaches at least that event.
@@ -245,6 +250,7 @@ pub fn spawn_zmq(
                     return Ok(());
                 }
                 stream.restart_replay(lease).map_err(|_| ())?;
+                window.required_through = required_through;
                 let next = replay_from_empty(
                     &ctx,
                     &replay_endpoint,
@@ -252,7 +258,7 @@ pub fn spawn_zmq(
                     &stream,
                     lease,
                     &shutdown_rx,
-                    required_through,
+                    &mut window,
                 )
                 .await;
                 let Some(mut next) = next else {
@@ -286,11 +292,17 @@ pub fn spawn_zmq(
                             let seq = seq as u64;
                             if seq < next {
                                 // Frames queued during the replay/live overlap
-                                // are harmless duplicates. Once the replay is
-                                // published, a lower sequence can only come
-                                // from a restarted publisher reusing the topic,
-                                // so the whole view belongs to a dead epoch.
-                                if replaying {
+                                // are duplicates only when they carry the same
+                                // bytes the replay applied. A lower sequence with
+                                // different bytes (or one this replay never saw)
+                                // is a restarted publisher reusing the topic, so
+                                // the whole view belongs to a dead epoch and the
+                                // replay has to start over.
+                                let duplicate = replaying
+                                    && window.replayed.get(&seq).is_some_and(|known| {
+                                        *known == payload_fingerprint(&frames[2])
+                                    });
+                                if duplicate {
                                     continue;
                                 }
                                 required_through = seq;
@@ -340,6 +352,13 @@ fn stopped(rx: &watch::Receiver<bool>) -> bool {
     *rx.borrow() || rx.has_changed().is_err()
 }
 
+/// The replay's progress and the payloads it applied, so a frame that
+/// overlaps it can be told apart from a restarted publisher reusing the topic.
+struct ReplayWindow {
+    required_through: u64,
+    replayed: HashMap<u64, u64>,
+}
+
 async fn replay_from_empty(
     ctx: &zmq::Context,
     endpoint: &str,
@@ -347,7 +366,7 @@ async fn replay_from_empty(
     stream: &HybridEventStream,
     lease: HybridSourceLease,
     shutdown: &watch::Receiver<bool>,
-    required_through: u64,
+    window: &mut ReplayWindow,
 ) -> Option<u64> {
     let dealer = ctx.socket(zmq::DEALER).ok()?;
     dealer.set_linger(0).ok()?;
@@ -362,7 +381,7 @@ async fn replay_from_empty(
             Ok(frames) if frames.len() == 4 && frames[0].is_empty() && frames[2].len() == 8 => {
                 let seq = i64::from_be_bytes(frames[2].as_slice().try_into().ok()?);
                 if seq == -1 && frames[1].is_empty() && frames[3].is_empty() {
-                    if next <= required_through {
+                    if next <= window.required_through {
                         return None;
                     }
                     return Some(next);
@@ -371,6 +390,15 @@ async fn replay_from_empty(
                     return None;
                 }
                 stream.apply_payload(lease, next, &frames[3]).ok()?;
+                window
+                    .replayed
+                    .insert(next, payload_fingerprint(&frames[3]));
+                // Keep the overlap window bounded; older frames fall back to
+                // the conservative restart path.
+                if window.replayed.len() > 4096 {
+                    let floor = next.saturating_sub(2048);
+                    window.replayed.retain(|seq, _| *seq >= floor);
+                }
                 next = next.checked_add(1)?;
             }
             Ok(_) => return None,
@@ -379,6 +407,17 @@ async fn replay_from_empty(
         }
     }
     None
+}
+
+/// Cheap content fingerprint used to tell a replayed frame apart from a
+/// different publisher's frame that happens to reuse the same sequence number.
+fn payload_fingerprint(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
 }
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
