@@ -133,6 +133,8 @@ during router construction, after DP discovery. `ConfigValidator::validate()`
 checks configuration syntax, not map coverage. Missing rank mappings fail before
 encoder dispatch and identify the missing URL. NIXL PULL and
 ECExampleConnector need no address map. DP=1 keeps the unsuffixed keys shown above.
+The shared P/D discovery path also rejects invalid candidate snapshots instead
+of routing through a partially filtered pool.
 
 ```bash
 cargo test --features cpu,ready --test test_pd_routing test_epd_handoff
