@@ -15,9 +15,17 @@ use std::sync::{
 };
 use vllm_router_rs::{
     config::{ConfigValidator, PolicyConfig, RouterConfig, RoutingMode},
+    core::Worker,
+    policies::{LoadBalancingPolicy, PolicyFactory, RequestHeaders},
+    protocols::spec::{CompletionRequest, GenerationRequest},
     routers::{http::vllm_pd_router::VllmPDRouter, RouterTrait},
     server::AppContext,
 };
+/// Runs inside `/pd_capabilities`; lets a test change router state mid-turn.
+type CapabilityHook = Arc<Mutex<Option<Arc<dyn Fn() + Send + Sync>>>>;
+/// What a [`RecordingPrefill`] saw: request text and headers per call.
+type RecordedCalls = Arc<Mutex<Vec<(Option<String>, Option<RequestHeaders>)>>>;
+
 #[derive(Clone)]
 struct StateData {
     p: bool,
@@ -32,6 +40,10 @@ struct StateData {
     metrics_kv_milli: Arc<AtomicU64>,
     metrics_running: Arc<AtomicU64>,
     auth_gate: Arc<AtomicBool>,
+    /// Runs inside `/pd_capabilities`, so a test can change router state while a
+    /// turn is already holding a selection.
+    capability_hook: CapabilityHook,
+    fail_capability: Arc<AtomicBool>,
 }
 struct Engine {
     url: String,
@@ -57,6 +69,8 @@ async fn engine(p: bool, fail_warm: bool, partial: bool) -> Engine {
         metrics_kv_milli: Arc::new(AtomicU64::new(0)),
         metrics_running: Arc::new(AtomicU64::new(0)),
         auth_gate: Arc::new(AtomicBool::new(false)),
+        capability_hook: Arc::new(Mutex::new(None)),
+        fail_capability: Arc::new(AtomicBool::new(false)),
     };
     let app=Router::new().route("/health",get(||async{"ok"}))
         .route("/get_server_info",get(||async{Json(json!({"model_id":"test","data_parallel_size":1}))}))
@@ -68,6 +82,12 @@ async fn engine(p: bool, fail_warm: bool, partial: bool) -> Engine {
         }))
         .route("/pd_capabilities",get(|State(s):State<StateData>,headers:HeaderMap|async move{
             s.capability_probes.fetch_add(1,Ordering::SeqCst);
+            if let Some(hook) = s.capability_hook.lock().unwrap().clone() {
+                hook();
+            }
+            if s.fail_capability.load(Ordering::SeqCst) {
+                return (StatusCode::INTERNAL_SERVER_ERROR, "probe failed").into_response();
+            }
             if s.auth_gate.load(Ordering::SeqCst)
                 && headers.get(header::AUTHORIZATION).and_then(|value| value.to_str().ok()) != Some("Bearer op-key")
             {
@@ -176,6 +196,55 @@ async fn router_with_prefills(
     local: bool,
     pd_extra: serde_json::Value,
 ) -> VllmPDRouter {
+    let (config_policy, make) = (policy.clone(), policy);
+    let (cfg, prefill_urls) = warm_router_config(prefills, d, &config_policy, local, pd_extra);
+    let ctx = Arc::new(AppContext::new(cfg, reqwest::Client::new(), 64, None, vec![]).unwrap());
+    let table = ctx.policy_registry.kv_affinity_table();
+    let select = PolicyFactory::create_from_config(&make, Some(&table));
+    router_with_selection(&ctx, select, prefill_urls, d).await
+}
+
+/// Same router, but with a test-supplied prefill policy: the only way to assert
+/// what the policy was handed on each path.
+async fn router_with_custom_prefill_policy(
+    prefills: &[&Engine],
+    d: &Engine,
+    select: Arc<dyn LoadBalancingPolicy>,
+    local: bool,
+    pd_extra: serde_json::Value,
+) -> VllmPDRouter {
+    let (cfg, prefill_urls) =
+        warm_router_config(prefills, d, &PolicyConfig::RoundRobin, local, pd_extra);
+    let ctx = Arc::new(AppContext::new(cfg, reqwest::Client::new(), 64, None, vec![]).unwrap());
+    router_with_selection(&ctx, select, prefill_urls, d).await
+}
+
+async fn router_with_selection(
+    ctx: &Arc<AppContext>,
+    select: Arc<dyn LoadBalancingPolicy>,
+    prefill_urls: Vec<(String, Option<u16>)>,
+    d: &Engine,
+) -> VllmPDRouter {
+    let table = ctx.policy_registry.kv_affinity_table();
+    ctx.policy_registry.set_prefill_policy(select);
+    ctx.policy_registry
+        .set_decode_policy(PolicyFactory::create_from_config(
+            &PolicyConfig::RoundRobin,
+            Some(&table),
+        ));
+    VllmPDRouter::new(prefill_urls, vec![d.url.clone()], None, ctx)
+        .await
+        .unwrap()
+}
+
+/// Config shared by every router in this file; returns the URLs it configured.
+fn warm_router_config(
+    prefills: &[&Engine],
+    d: &Engine,
+    policy: &PolicyConfig,
+    local: bool,
+    pd_extra: serde_json::Value,
+) -> (RouterConfig, Vec<(String, Option<u16>)>) {
     let prefill_urls = prefills
         .iter()
         .map(|p| (p.url.clone(), None))
@@ -212,23 +281,7 @@ async fn router_with_prefills(
             ]})).unwrap());
     }
     ConfigValidator::validate(&cfg).unwrap();
-    let ctx = Arc::new(AppContext::new(cfg, reqwest::Client::new(), 64, None, vec![]).unwrap());
-    let kv_affinity_table = ctx.policy_registry.kv_affinity_table();
-    ctx.policy_registry.set_prefill_policy(
-        vllm_router_rs::policies::PolicyFactory::create_from_config(
-            &policy,
-            Some(&kv_affinity_table),
-        ),
-    );
-    ctx.policy_registry.set_decode_policy(
-        vllm_router_rs::policies::PolicyFactory::create_from_config(
-            &PolicyConfig::RoundRobin,
-            Some(&kv_affinity_table),
-        ),
-    );
-    VllmPDRouter::new(prefill_urls, vec![d.url.clone()], None, &ctx)
-        .await
-        .unwrap()
+    (cfg, prefill_urls)
 }
 async fn call(router: &VllmPDRouter, prompt: Vec<u32>, stream: bool) -> (StatusCode, Vec<u8>) {
     let (status, _, body) = call_with_headers(router, prompt, stream).await;
@@ -712,4 +765,211 @@ async fn warm_remote_selection_uses_the_request_text() {
             "turn 2 of {program} did not take the warm read"
         );
     }
+}
+
+/// Records the inputs the prefill policy is handed on every call, and rotates
+/// the selection so both prefills stay in play.
+#[derive(Debug)]
+struct RecordingPrefill {
+    needs_text: bool,
+    needs_cache_key: bool,
+    needs_headers: bool,
+    calls: RecordedCalls,
+    counter: AtomicUsize,
+}
+
+impl RecordingPrefill {
+    fn new(needs_text: bool, needs_cache_key: bool, needs_headers: bool) -> Arc<Self> {
+        Arc::new(Self {
+            needs_text,
+            needs_cache_key,
+            needs_headers,
+            calls: Arc::new(Mutex::new(Vec::new())),
+            counter: AtomicUsize::new(0),
+        })
+    }
+
+    fn calls(&self) -> Vec<(Option<String>, Option<RequestHeaders>)> {
+        self.calls.lock().unwrap().clone()
+    }
+}
+
+impl LoadBalancingPolicy for RecordingPrefill {
+    fn select_worker_with_headers(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        request_text: Option<&str>,
+        headers: Option<&RequestHeaders>,
+    ) -> Option<usize> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push((request_text.map(str::to_string), headers.cloned()));
+        Some(self.counter.fetch_add(1, Ordering::SeqCst) % workers.len())
+    }
+
+    fn name(&self) -> &'static str {
+        "recording"
+    }
+
+    fn needs_request_text(&self) -> bool {
+        self.needs_text
+    }
+
+    fn needs_cache_routing_key(&self) -> bool {
+        self.needs_cache_key
+    }
+
+    fn needs_headers(&self) -> bool {
+        self.needs_headers
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+fn program_body(program: &str, prompt: Vec<u32>, warm_shape: bool) -> Value {
+    let mut value = json!({"model":"test","prompt":prompt,"max_tokens":4,
+        "vllm_xargs":{"agentic_context":{"program_id":program,"kv_retention_ttl_seconds":1}}});
+    if warm_shape {
+        value["return_token_ids"] = json!(true);
+        value["stream"] = json!(false);
+        value["stream_options"] = json!({"include_usage": true});
+    }
+    value
+}
+
+/// Issue #499: warm and cold dispatch must feed the policy the same request
+/// inputs, and a cold fallback must not ask it a second time. A recording policy
+/// checks both directly, without depending on the hash ring.
+#[tokio::test]
+async fn warm_and_cold_selection_receive_the_same_request_inputs() {
+    let p0 = engine(true, false, false).await;
+    let p1 = engine(true, false, false).await;
+    let d = engine(false, false, false).await;
+    let policy = RecordingPrefill::new(true, false, true);
+    let r =
+        router_with_custom_prefill_policy(&[&p0, &p1], &d, policy.clone(), false, json!({})).await;
+    let mut headers = HeaderMap::new();
+    headers.insert("x-session-id", HeaderValue::from_static("session-abc"));
+
+    // A shape the exact-token protocol cannot serve: one selection, and the cold
+    // path reuses it.
+    let request =
+        serde_json::from_value(program_body("cold-only", vec![11, 12, 13], false)).unwrap();
+    let response = r
+        .route_completion(Some(&headers), &request, Some("test"))
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    axum::body::to_bytes(response.into_body(), 16 * 1048576)
+        .await
+        .unwrap();
+    assert_eq!(
+        policy.calls().len(),
+        1,
+        "the cold fallback asked the policy again"
+    );
+
+    // A shape it can serve: the cold turn, then the warm turn of one Program.
+    for _ in 0..2 {
+        let request =
+            serde_json::from_value(program_body("warm-turn", vec![11, 12, 13], true)).unwrap();
+        let response = r
+            .route_completion(Some(&headers), &request, Some("test"))
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        axum::body::to_bytes(response.into_body(), 16 * 1048576)
+            .await
+            .unwrap();
+    }
+    let calls = policy.calls();
+    assert_eq!(calls.len(), 3, "one selection per turn: {calls:?}");
+    let (cold_text, cold_headers) = &calls[1];
+    let (warm_text, warm_headers) = &calls[2];
+    assert_eq!(
+        cold_text, warm_text,
+        "warm and cold saw a different request text"
+    );
+    assert_eq!(
+        cold_headers, warm_headers,
+        "warm and cold saw different headers"
+    );
+    assert_eq!(
+        cold_headers
+            .as_ref()
+            .and_then(|headers| headers.get("x-session-id"))
+            .map(String::as_str),
+        Some("session-abc"),
+        "needs_headers() did not carry the request headers"
+    );
+}
+
+/// `needs_cache_routing_key()` is a different input from the serialized request;
+/// the policy must receive the content-preserving key.
+#[tokio::test]
+async fn selection_uses_the_cache_routing_key_when_requested() {
+    let p0 = engine(true, false, false).await;
+    let p1 = engine(true, false, false).await;
+    let d = engine(false, false, false).await;
+    let policy = RecordingPrefill::new(true, true, false);
+    let r =
+        router_with_custom_prefill_policy(&[&p0, &p1], &d, policy.clone(), false, json!({})).await;
+    let body = program_body("cache-key", vec![21, 22, 23], false);
+    let expected = serde_json::from_value::<CompletionRequest>(body.clone())
+        .unwrap()
+        .extract_cache_routing_key();
+    let request = serde_json::from_value(body).unwrap();
+    let response = r.route_completion(None, &request, Some("test")).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    axum::body::to_bytes(response.into_body(), 16 * 1048576)
+        .await
+        .unwrap();
+    let calls = policy.calls();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(
+        calls[0].0.as_deref(),
+        Some(expected.as_str()),
+        "needs_cache_routing_key() must receive the cache routing key, not the body"
+    );
+    assert!(
+        calls[0].1.is_none(),
+        "headers were not requested but were attached"
+    );
+}
+
+/// A prefill that leaves the pool while the warm attempt is probing must be
+/// re-selected, not reserved and then rejected by the liveness recheck.
+#[tokio::test]
+async fn prefill_leaving_during_the_attempt_is_reselected() {
+    let p0 = engine(true, false, false).await;
+    let p1 = engine(true, false, false).await;
+    let d = engine(false, false, false).await;
+    let r = router_with_prefills(&[&p0, &p1], &d, PolicyConfig::RoundRobin, false, json!({})).await;
+    // round_robin selects p0 for this turn. Its capability probe then drops p0
+    // from the pool and fails, so execute() declines holding a stale P.
+    let p0_worker = r.worker_registry().get_prefill_workers()[0].clone();
+    p0.state.fail_capability.store(true, Ordering::SeqCst);
+    *p0.state.capability_hook.lock().unwrap() =
+        Some(Arc::new(move || p0_worker.set_healthy(false)));
+    let request =
+        serde_json::from_value(program_body("stale-prefill", vec![31, 32, 33], true)).unwrap();
+    let response = r.route_completion(None, &request, Some("test")).await;
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "the turn must re-select the surviving prefill instead of 503ing on the stale one"
+    );
+    axum::body::to_bytes(response.into_body(), 16 * 1048576)
+        .await
+        .unwrap();
+    assert_eq!(
+        p1.state.calls.lock().unwrap().len(),
+        1,
+        "the surviving prefill served the turn"
+    );
+    assert!(
+        p0.state.calls.lock().unwrap().is_empty(),
+        "the removed prefill received the turn"
+    );
 }
