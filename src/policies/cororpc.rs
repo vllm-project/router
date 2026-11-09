@@ -24,7 +24,7 @@
 
 use std::collections::HashSet;
 use std::ffi::{c_char, c_int, c_long, c_void, CStr, CString};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use super::conductor::{
@@ -496,15 +496,120 @@ unsafe fn read_c_string(ptr: *const c_char) -> String {
         .into_owned()
 }
 
+/// Concurrent `/query` calls the coro_rpc channel serves at once.
+///
+/// Mooncake's `ConductorClient` serialises calls made on one handle: `Invoke`
+/// takes the client's mutex *before* it starts the RPC timeout. Sharing a single
+/// handle would therefore queue callers outside their own deadline — a healthy
+/// Conductor would still show multi-second tail latency under load, and the
+/// circuit breaker would never see a failure to open on. Parallel query capacity
+/// is thus the handle count, kept small because each handle is one connection
+/// and (while a call is in flight) one blocking thread.
+const QUERY_HANDLES: usize = 4;
+
+/// A bounded set of query handles with one admission permit per handle.
+///
+/// `idle` is a plain stack of free handles: a caller only pops after it holds a
+/// permit, and returns the handle before releasing that permit, so admission and
+/// handle availability cannot drift apart.
+#[derive(Debug)]
+struct TransportSlots<T> {
+    idle: Mutex<Vec<Arc<T>>>,
+    permits: Arc<tokio::sync::Semaphore>,
+}
+
+/// One admitted call: owns a handle and its admission permit. Dropping it
+/// returns the handle first and releases the permit second (the permit is a
+/// field, so it drops after `Drop::drop` returns), which keeps admission from
+/// running ahead of handle availability — including when the blocking call
+/// panics.
+struct AdmittedTransport<T> {
+    slots: Arc<TransportSlots<T>>,
+    transport: Option<Arc<T>>,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl<T> TransportSlots<T> {
+    fn new(transports: Vec<Arc<T>>) -> Arc<Self> {
+        Arc::new(Self {
+            permits: Arc::new(tokio::sync::Semaphore::new(transports.len())),
+            idle: Mutex::new(transports),
+        })
+    }
+
+    /// Take a free handle. Only called while holding a permit, which guarantees
+    /// one is available; `None` is returned defensively if that invariant is
+    /// ever broken.
+    fn take_idle(&self) -> Option<Arc<T>> {
+        self.idle
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .pop()
+    }
+
+    /// Admission without waiting, for callers on a blocking selection path that
+    /// must not queue: either a handle is free right now or the placement query
+    /// is reported as unavailable.
+    fn try_admit(self: &Arc<Self>) -> Option<AdmittedTransport<T>> {
+        let permit = self.permits.clone().try_acquire_owned().ok()?;
+        let transport = self.take_idle()?;
+        Some(AdmittedTransport {
+            slots: Arc::clone(self),
+            transport: Some(transport),
+            _permit: permit,
+        })
+    }
+
+    /// Admission bounded by `budget`. `None` means nothing freed up in time, so
+    /// the caller reports a placement miss instead of queueing behind other
+    /// queries.
+    async fn admit(self: &Arc<Self>, budget: Duration) -> Option<AdmittedTransport<T>> {
+        let permit = tokio::time::timeout(budget, self.permits.clone().acquire_owned())
+            .await
+            .ok()?
+            .ok()?;
+        let transport = self.take_idle()?;
+        Some(AdmittedTransport {
+            slots: Arc::clone(self),
+            transport: Some(transport),
+            _permit: permit,
+        })
+    }
+}
+
+impl<T> AdmittedTransport<T> {
+    fn transport(&self) -> &T {
+        self.transport
+            .as_deref()
+            .expect("an admitted call always holds a handle")
+    }
+}
+
+impl<T> Drop for AdmittedTransport<T> {
+    fn drop(&mut self) {
+        if let Some(transport) = self.transport.take() {
+            self.slots
+                .idle
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .push(transport);
+        }
+    }
+}
+
 /// Placement provider over the coro_rpc channel.
 ///
 /// Implements the same traits as the HTTP provider, so the policy wiring
-/// (breaker, async selection, registration/heartbeat) is shared. Two handles are
-/// kept on purpose: the query handle uses the request-path budget, the control
-/// handle the larger register budget (same split as the HTTP transports).
+/// (breaker, async selection, registration/heartbeat) is shared. Queries run on
+/// a small bounded pool of handles ([`QUERY_HANDLES`]) so concurrency is real
+/// rather than queueing behind the client's internal mutex, while
+/// `/register`/`/unregister`/`/services` keep a separate control handle with the
+/// larger register budget (same split as the HTTP transports).
 #[derive(Debug)]
 pub struct CoroRpcMatchProvider {
-    query_transport: Arc<CoroTcpTransport>,
+    query_slots: Arc<TransportSlots<CoroTcpTransport>>,
+    /// Whole budget for one placement query: admission *and* the RPC call.
+    query_budget: Duration,
     control_transport: Arc<CoroTcpTransport>,
     hash_profile: ConductorHashProfile,
     registered: RegisteredSources,
@@ -512,12 +617,16 @@ pub struct CoroRpcMatchProvider {
 
 impl CoroRpcMatchProvider {
     pub fn new(options: ConductorRpcOptions) -> Result<Self, String> {
-        let query_transport = CoroTcpTransport::new(
-            &options.addr,
-            options.connect_timeout,
-            options.query_timeout,
-        )
-        .map_err(|error| format!("conductor rpc setup failed: {error:?}"))?;
+        let mut query_transports = Vec::with_capacity(QUERY_HANDLES);
+        for _ in 0..QUERY_HANDLES {
+            let transport = CoroTcpTransport::new(
+                &options.addr,
+                options.connect_timeout,
+                options.query_timeout,
+            )
+            .map_err(|error| format!("conductor rpc setup failed: {error:?}"))?;
+            query_transports.push(Arc::new(transport));
+        }
         let control_transport = CoroTcpTransport::new(
             &options.addr,
             options.connect_timeout,
@@ -525,7 +634,8 @@ impl CoroRpcMatchProvider {
         )
         .map_err(|error| format!("conductor rpc setup failed: {error:?}"))?;
         Ok(Self {
-            query_transport: Arc::new(query_transport),
+            query_slots: TransportSlots::new(query_transports),
+            query_budget: options.query_timeout,
             control_transport: Arc::new(control_transport),
             hash_profile: options.hash_profile,
             registered: RegisteredSources::default(),
@@ -543,10 +653,15 @@ impl CoroRpcMatchProvider {
         if request.token_ids.is_empty() {
             return Ok(Vec::new());
         }
+        // Synchronous selection cannot await: admit only if a handle is free
+        // right now, so a busy Conductor degrades to load-only instead of
+        // queueing this caller behind other queries.
+        let Some(admitted) = self.query_slots.try_admit() else {
+            ConductorMetrics::record_query_error("admission_timeout");
+            return Err(ConductorQueryError::Timeout);
+        };
         let started = Instant::now();
-        let result = self
-            .query_transport
-            .query(request, &query.tiers_of_interest);
+        let result = admitted.transport().query(request, &query.tiers_of_interest);
         ConductorMetrics::record_query_duration(started.elapsed());
         if let Err(error) = &result {
             ConductorMetrics::record_query_error(error.reason());
@@ -593,9 +708,17 @@ impl AsyncTieredMatchProvider for CoroRpcMatchProvider {
         let cache_salt = request.cache_salt.clone();
         let tokens = request.token_ids.to_vec();
         let tiers = query.tiers_of_interest.clone();
-        let transport = self.query_transport.clone();
+        let budget = self.query_budget;
 
-        tokio::task::spawn_blocking(move || {
+        // One budget covers admission *and* the RPC: the client's own request
+        // timeout only starts once it owns the handle, so without a bound here a
+        // caller could wait for every query queued ahead of it.
+        let Some(admitted) = self.query_slots.admit(budget).await else {
+            ConductorMetrics::record_query_error("admission_timeout");
+            return Err(MatchError::Unavailable);
+        };
+        let started = Instant::now();
+        let blocking = tokio::task::spawn_blocking(move || {
             let request = MatchRequest {
                 model_id,
                 block_size,
@@ -603,20 +726,30 @@ impl AsyncTieredMatchProvider for CoroRpcMatchProvider {
                 lora_name,
                 cache_salt,
             };
-            let started = Instant::now();
-            let result = transport.query(&request, &tiers);
+            let result = admitted.transport().query(&request, &tiers);
             ConductorMetrics::record_query_duration(started.elapsed());
             if let Err(error) = &result {
                 ConductorMetrics::record_query_error(error.reason());
             }
             result
-        })
-        .await
-        .map_err(|error| {
-            tracing::warn!("spawn_blocking coro_rpc query join error: {error}");
-            MatchError::Unavailable
-        })?
-        .map_err(|_| MatchError::Unavailable)
+            // `admitted` drops here: the handle returns to the pool and only
+            // then is the admission permit released.
+        });
+        let remaining = budget.saturating_sub(started.elapsed());
+        match tokio::time::timeout(remaining, blocking).await {
+            Ok(Ok(result)) => result.map_err(|_| MatchError::Unavailable),
+            Ok(Err(join_error)) => {
+                tracing::warn!("spawn_blocking coro_rpc query join error: {join_error}");
+                Err(MatchError::Unavailable)
+            }
+            Err(_deadline) => {
+                // The C call cannot be cancelled and keeps running on the
+                // blocking pool; its handle and permit return when it finishes,
+                // so a timed-out caller never admits extra work.
+                ConductorMetrics::record_query_error("deadline");
+                Err(MatchError::Unavailable)
+            }
+        }
     }
 }
 
@@ -752,5 +885,43 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].rank, 0);
         assert_eq!(rows[0].dp_device, None);
+    }
+    #[test]
+    fn query_admission_is_bounded_by_the_handle_count() {
+        let slots = TransportSlots::new(vec![Arc::new(1_u8), Arc::new(2_u8)]);
+        let first = slots.try_admit().expect("one handle is free");
+        let second = slots.try_admit().expect("two handles are free");
+        // Both callers got distinct handles, and a third is refused rather than
+        // queued behind them.
+        assert_ne!(first.transport(), second.transport());
+        assert!(slots.try_admit().is_none());
+
+        // Releasing one handle admits exactly one more caller.
+        drop(first);
+        let third = slots.try_admit().expect("the released handle is reusable");
+        assert!(slots.try_admit().is_none());
+        drop(second);
+        drop(third);
+        assert!(slots.try_admit().is_some());
+    }
+
+    #[tokio::test]
+    async fn async_admission_gives_up_at_the_deadline() {
+        let slots = TransportSlots::new(vec![Arc::new(1_u8)]);
+        let held = slots.try_admit().expect("the only handle is free");
+
+        let started = Instant::now();
+        assert!(
+            slots.admit(Duration::from_millis(20)).await.is_none(),
+            "a busy pool must refuse instead of blocking past the budget"
+        );
+        assert!(
+            started.elapsed() >= Duration::from_millis(15),
+            "admission waits for the budget before giving up"
+        );
+
+        // The permit is returned with the handle, so the next caller proceeds.
+        drop(held);
+        assert!(slots.admit(Duration::from_millis(20)).await.is_some());
     }
 }

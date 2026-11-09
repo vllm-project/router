@@ -1237,6 +1237,13 @@ pub struct KvAwarePolicy {
     /// Set on drop so the heartbeat thread exits instead of holding the policy
     /// state alive for the rest of the process lifetime.
     heartbeat_stop: Arc<AtomicBool>,
+    /// Serialises Conductor registration mutations (heartbeat renewal, worker
+    /// registration, removal). A renewal holds it for the whole
+    /// "is this worker still registered?" check *and* the `/register` call, so
+    /// it cannot interleave with a removal and resurrect an unregistered
+    /// worker. Held across one control-path call, so the longest a removal
+    /// waits is one `--conductor-register-timeout-ms`.
+    registration_gate: Arc<Mutex<()>>,
 }
 
 impl std::fmt::Debug for KvAwarePolicy {
@@ -1343,6 +1350,7 @@ impl KvAwarePolicy {
         };
         let registered: Arc<Mutex<HashMap<String, crate::kv_index::WorkerKvInfo>>> =
             Arc::new(Mutex::new(HashMap::new()));
+        let registration_gate = Arc::new(Mutex::new(()));
         let heartbeat_stop = Arc::new(AtomicBool::new(false));
         if register_enabled && heartbeat_secs > 0 {
             if heartbeat_secs > 30 {
@@ -1355,6 +1363,7 @@ impl KvAwarePolicy {
             spawn_heartbeat(
                 registrar.clone(),
                 registered.clone(),
+                registration_gate.clone(),
                 heartbeat_stop.clone(),
                 heartbeat_secs,
             );
@@ -1372,6 +1381,7 @@ impl KvAwarePolicy {
         policy.conductor = Some(registrar);
         policy.register_enabled = register_enabled;
         policy.registered = registered;
+        policy.registration_gate = registration_gate;
         policy.heartbeat_stop = heartbeat_stop;
         policy.async_provider = Some(async_provider);
         policy
@@ -1479,6 +1489,7 @@ impl KvAwarePolicy {
             register_enabled: false,
             registered: Arc::new(Mutex::new(HashMap::new())),
             heartbeat_stop: Arc::new(AtomicBool::new(false)),
+            registration_gate: Arc::new(Mutex::new(())),
         }
     }
 
@@ -2326,6 +2337,46 @@ impl KvAwarePolicy {
     }
 }
 
+/// Renew `url`'s Conductor registration if it is still wanted.
+///
+/// Returns `None` when nothing was sent (the worker was removed, has no source
+/// endpoints, or Conductor already knows every rank), `Some(Ok(()))` when the
+/// renewal succeeded, and `Some(Err(_))` when it failed.
+///
+/// The whole decision — membership check *and* the `/register` call — runs
+/// under `registration_gate`, the same lock `register_worker` and
+/// `unregister_worker` take. Without that, a renewal could pass the membership
+/// check, then observe a removal, and finally re-register a worker that no
+/// longer exists locally: the stale Conductor subscription would have no local
+/// entry left to clean it up, and it can block a replacement reusing the same
+/// endpoint. The current `WorkerKvInfo` is re-read under the gate, so a
+/// renewal can never send the snapshot of a worker that has since been
+/// re-registered with different sources.
+fn renew_registration(
+    gate: &Mutex<()>,
+    provider: &dyn super::ConductorRegistrar,
+    registered: &Mutex<HashMap<String, WorkerKvInfo>>,
+    url: &str,
+    known: Option<&HashSet<(String, u32)>>,
+) -> Option<Result<(), String>> {
+    let _gate = gate.lock();
+    let info = registered.lock().get(url).cloned()?;
+    // `/register` creates one service entry per source rank; a worker without
+    // discovered endpoints has nothing to renew.
+    if info.sources.is_empty() {
+        return None;
+    }
+    if let Some(known) = known {
+        let all_present = info.sources.iter().all(|src| {
+            !src.pub_endpoint.is_empty() && known.contains(&(info.instance_id.clone(), src.dp_rank))
+        });
+        if all_present {
+            return None;
+        }
+    }
+    Some(provider.register_worker(&info))
+}
+
 /// Renew dynamic Conductor registrations in the background.
 ///
 /// Every `period_secs` it reconciles against `GET /services` and re-registers
@@ -2336,6 +2387,7 @@ impl KvAwarePolicy {
 fn spawn_heartbeat(
     provider: Arc<dyn super::ConductorRegistrar>,
     registered: Arc<Mutex<HashMap<String, WorkerKvInfo>>>,
+    registration_gate: Arc<Mutex<()>>,
     stop: Arc<AtomicBool>,
     period_secs: u64,
 ) {
@@ -2350,30 +2402,22 @@ fn spawn_heartbeat(
                     return;
                 }
                 let known = provider.list_services().ok();
-                let entries: Vec<(String, WorkerKvInfo)> = registered
-                    .lock()
-                    .iter()
-                    .map(|(url, info)| (url.clone(), info.clone()))
-                    .collect();
-                for (url, info) in entries {
-                    // A concurrent unregister removes the entry before calling
-                    // /unregister; skip anything that disappeared meanwhile.
-                    let still_registered = registered.lock().contains_key(&url);
-                    if !still_registered || info.sources.is_empty() {
-                        continue;
+                // Snapshot the URLs only: membership and the info itself are
+                // re-read under the gate for every worker below.
+                let urls: Vec<String> = registered.lock().keys().cloned().collect();
+                for url in urls {
+                    if stop.load(Ordering::Relaxed) {
+                        return;
                     }
-                    if let Some(known) = &known {
-                        let all_present = info.sources.iter().all(|src| {
-                            !src.pub_endpoint.is_empty()
-                                && known.contains(&(info.instance_id.clone(), src.dp_rank))
-                        });
-                        if all_present {
-                            continue;
-                        }
-                    }
-                    match provider.register_worker(&info) {
-                        Ok(()) => warned = false,
-                        Err(error) => {
+                    match renew_registration(
+                        &registration_gate,
+                        provider.as_ref(),
+                        &registered,
+                        &url,
+                        known.as_ref(),
+                    ) {
+                        Some(Ok(())) => warned = false,
+                        Some(Err(error)) => {
                             if !warned {
                                 warned = true;
                                 tracing::warn!(
@@ -2383,6 +2427,7 @@ fn spawn_heartbeat(
                                 );
                             }
                         }
+                        None => {}
                     }
                 }
             }
@@ -2654,11 +2699,14 @@ impl KvAwareOps for KvAwarePolicy {
         }
         // In conductor mode, register the worker with Conductor so it can run
         // with zero static service configuration. Failure is logged but never
-        // blocks local admission (placement degrades to load-only).
+        // blocks local admission (placement degrades to load-only). The gate
+        // makes the map update and the `/register` call atomic with respect to
+        // a concurrent heartbeat renewal or removal of the same worker.
         if let (Some(conductor), Some(info)) = (
             self.conductor.as_ref().filter(|_| self.register_enabled),
             info,
         ) {
+            let _gate = self.registration_gate.lock();
             match conductor.register_worker(info) {
                 Ok(()) => {}
                 Err(error) => {
@@ -2679,27 +2727,33 @@ impl KvAwareOps for KvAwarePolicy {
     }
 
     fn unregister_worker(&self, worker_url: &str) {
-        // Remove the entry *before* calling Conductor: the heartbeat re-checks
-        // membership right before each renewal, so this ordering stops it from
-        // re-registering a worker that is being removed.
-        let removed = self.registered.lock().remove(worker_url);
-        if let Some(conductor) = self.conductor.as_ref().filter(|_| self.register_enabled) {
-            if let Some(info) = removed {
-                let instance_id = info.instance_id.clone();
-                // TODO(RFC #414 §4, DP > 1): every DP worker of an instance
-                // registers all of its source ranks (registration enumerates
-                // `info.sources`), so unregistering one DP worker also removes
-                // the ranks other DP workers share until their heartbeat
-                // re-registers them. Rank-level ownership is required before
-                // DP engines can be supported without this churn.
-                let ranks: Vec<u32> = info.sources.iter().map(|src| src.dp_rank).collect();
-                if !instance_id.is_empty() && !ranks.is_empty() {
-                    if let Err(error) = conductor.unregister_worker(&instance_id, &ranks) {
-                        tracing::warn!(
-                            "kv_aware conductor unregister failed worker={} error={}",
-                            worker_url,
-                            error
-                        );
+        // Hold the registration gate across { remove, `/unregister` }: a
+        // concurrent heartbeat renewal either finished first — and then this
+        // `/unregister` covers the ranks it registered — or runs afterwards and
+        // finds no local entry, so it skips. Dropping the entry before calling
+        // Conductor also means a failed `/unregister` cannot leave a renewable
+        // entry behind.
+        {
+            let _gate = self.registration_gate.lock();
+            let removed = self.registered.lock().remove(worker_url);
+            if let Some(conductor) = self.conductor.as_ref().filter(|_| self.register_enabled) {
+                if let Some(info) = removed {
+                    let instance_id = info.instance_id.clone();
+                    // TODO(RFC #414 §4, DP > 1): every DP worker of an instance
+                    // registers all of its source ranks (registration enumerates
+                    // `info.sources`), so unregistering one DP worker also removes
+                    // the ranks other DP workers share until their heartbeat
+                    // re-registers them. Rank-level ownership is required before
+                    // DP engines can be supported without this churn.
+                    let ranks: Vec<u32> = info.sources.iter().map(|src| src.dp_rank).collect();
+                    if !instance_id.is_empty() && !ranks.is_empty() {
+                        if let Err(error) = conductor.unregister_worker(&instance_id, &ranks) {
+                            tracing::warn!(
+                                "kv_aware conductor unregister failed worker={} error={}",
+                                worker_url,
+                                error
+                            );
+                        }
                     }
                 }
             }
@@ -4931,6 +4985,126 @@ mod tests {
             )
             .expect("selection succeeds");
         assert_eq!(counts.0.load(Ordering::Relaxed), 1);
+    }
+
+    /// Registrar that records every control-path call, so a test can assert what
+    /// Conductor was told.
+    #[derive(Debug, Default)]
+    struct RecordingRegistrar {
+        registers: Mutex<Vec<String>>,
+        unregisters: Mutex<Vec<(String, Vec<u32>)>>,
+    }
+
+    impl crate::policies::ConductorRegistrar for RecordingRegistrar {
+        fn register_worker(&self, info: &WorkerKvInfo) -> Result<(), String> {
+            self.registers.lock().push(info.instance_id.clone());
+            Ok(())
+        }
+
+        fn unregister_worker(&self, instance_id: &str, dp_ranks: &[u32]) -> Result<(), String> {
+            self.unregisters
+                .lock()
+                .push((instance_id.to_string(), dp_ranks.to_vec()));
+            Ok(())
+        }
+    }
+
+    impl TieredMatchProvider for RecordingRegistrar {
+        fn find_tiered_matches(&self, _query: &MatchQuery<'_>) -> Vec<TierMatch> {
+            Vec::new()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AsyncTieredMatchProvider for RecordingRegistrar {
+        async fn find_tiered_matches_async(
+            &self,
+            _query: &MatchQuery<'_>,
+        ) -> Result<Vec<TierMatch>, MatchError> {
+            Ok(Vec::new())
+        }
+    }
+
+    fn registrar_info() -> WorkerKvInfo {
+        WorkerKvInfo {
+            instance_id: "engine-0".into(),
+            block_size: Some(2),
+            sources: vec![crate::kv_index::KvSourceEndpoint {
+                dp_rank: 0,
+                pub_endpoint: "tcp://w0:5557".into(),
+                replay_endpoint: None,
+            }],
+            ..WorkerKvInfo::default()
+        }
+    }
+
+    /// A heartbeat renewal must never re-register a worker that was removed
+    /// between the renewal's snapshot and its `/register` call: the stale
+    /// Conductor subscription would have no local entry left to clean it up, and
+    /// it can block a replacement reusing the same endpoint.
+    #[test]
+    fn renewal_cannot_resurrect_a_removed_worker() {
+        let registrar = Arc::new(RecordingRegistrar::default());
+        let policy = KvAwarePolicy::from_conductor_provider(
+            CostParams {
+                block_size: 2,
+                ..CostParams::default()
+            },
+            registrar.clone(),
+            None,
+            0,    // heartbeat_secs: renewals are driven by hand
+            true, // register_enabled
+        );
+        let worker: Arc<dyn Worker> =
+            Arc::new(BasicWorker::new("http://w0".into(), WorkerType::Regular));
+        let info = registrar_info();
+        let url = worker.url().to_string();
+
+        policy.register_worker(worker.as_ref(), Some(&info), None);
+        assert_eq!(registrar.registers.lock().len(), 1);
+
+        policy.unregister_worker(&url);
+        assert_eq!(registrar.unregisters.lock().len(), 1);
+        assert!(policy.registered.lock().is_empty());
+
+        // The ordering the heartbeat used to allow: the membership snapshot was
+        // taken while the worker was still registered, then the removal
+        // completed. The renewal must now be a no-op.
+        assert!(
+            renew_registration(
+                &policy.registration_gate,
+                registrar.as_ref(),
+                &policy.registered,
+                &url,
+                None,
+            )
+            .is_none(),
+            "a removed worker must not be renewed"
+        );
+        assert_eq!(
+            registrar.registers.lock().len(),
+            1,
+            "the removal must not be undone by a later renewal"
+        );
+
+        // Complement: when the renewal wins the race, the removal's
+        // `/unregister` still covers the ranks that were just registered.
+        policy.register_worker(worker.as_ref(), Some(&info), None);
+        assert!(
+            renew_registration(
+                &policy.registration_gate,
+                registrar.as_ref(),
+                &policy.registered,
+                &url,
+                None,
+            )
+            .is_some_and(|sent| sent.is_ok()),
+            "a live worker is renewed"
+        );
+        assert_eq!(registrar.registers.lock().len(), 3);
+        policy.unregister_worker(&url);
+        let (instance_id, ranks) = registrar.unregisters.lock()[1].clone();
+        assert_eq!((instance_id.as_str(), ranks), ("engine-0", vec![0]));
     }
 
     /// Provider whose `try_` outcome is controllable, counting every call.
