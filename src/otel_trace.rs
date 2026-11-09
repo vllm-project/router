@@ -246,6 +246,43 @@ pub fn shutdown_otel() {
     }
 }
 
+/// Extract the incoming W3C trace context, including level-2 trace flags.
+///
+/// The OpenTelemetry 0.27 propagator rejects otherwise valid v00 traceparent
+/// headers when non-sampling flag bits are set (for example 03). Preserve
+/// the sampled bit during extraction so the incoming trace identity remains
+/// intact; the propagator continues to validate all remaining fields.
+pub fn extract_trace_context_http(headers: &HeaderMap) -> opentelemetry::Context {
+    let normalized = headers
+        .get("traceparent")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|traceparent| {
+            // The v00 wire layout has exactly four fields and is 55 bytes long.
+            if traceparent.len() != 55 || !traceparent.starts_with("00-") {
+                return None;
+            }
+            let (prefix, flags) = traceparent.rsplit_once('-')?;
+            if flags.len() != 2 {
+                return None;
+            }
+            let flags = u8::from_str_radix(flags, 16).ok()?;
+            if flags & !1 == 0 {
+                return None;
+            }
+            let mut normalized = headers.clone();
+            normalized.insert(
+                "traceparent",
+                HeaderValue::from_str(&format!("{prefix}-{:02x}", flags & 1)).ok()?,
+            );
+            Some(normalized)
+        });
+
+    let input = normalized.as_ref().unwrap_or(headers);
+    global::get_text_map_propagator(|propagator| {
+        propagator.extract(&opentelemetry_http::HeaderExtractor(input))
+    })
+}
+
 /// Inject W3C trace context headers into an HTTP request's HeaderMap.
 ///
 /// When OTel is enabled, this injects the current span's trace context

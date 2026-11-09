@@ -195,6 +195,49 @@ fn test_otel_distributed_tracing() {
     }
 
     // =====================================================================
+    // Section 2b: W3C level-2 flags must preserve the incoming trace identity
+    // =====================================================================
+    {
+        use axum::http::Request;
+        use tower_http::trace::MakeSpan;
+        use vllm_router_rs::middleware::RequestSpan;
+
+        let (exporter, provider, _guard) = setup_test_otel();
+        let upstream_trace_id = "3c9f2e6a7d184b51a6c0e83f951d274b";
+        let upstream_span_id = "8d42fa3e795c61a6";
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header(
+                "traceparent",
+                format!("00-{upstream_trace_id}-{upstream_span_id}-03"),
+            )
+            .body(())
+            .unwrap();
+
+        let mut request_span = RequestSpan;
+        let span = request_span.make_span(&request);
+        {
+            let _enter = span.enter();
+        }
+        drop(span);
+        provider.force_flush();
+
+        let spans = exporter.get_finished_spans().unwrap();
+        assert!(!spans.is_empty(), "expected a traced server span");
+        assert_eq!(
+            spans[0].span_context.trace_id(),
+            TraceId::from_hex(upstream_trace_id).unwrap(),
+            "valid level-2 flags 03 must not create a new trace"
+        );
+        assert_eq!(
+            spans[0].parent_span_id,
+            SpanId::from_hex(upstream_span_id).unwrap(),
+            "router span must keep the incoming parent span"
+        );
+    }
+
+    // =====================================================================
     // Section 3: Baggage survives the enabled path
     // =====================================================================
     {
