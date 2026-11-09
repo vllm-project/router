@@ -1123,10 +1123,6 @@ impl VllmPDRouter {
             ));
         };
         let prefill_candidates = self.program_prefill_candidates();
-        let prefill_workers = prefill_candidates
-            .iter()
-            .map(|(_, worker)| worker.clone())
-            .collect::<Vec<_>>();
         // One selection per turn. The warm-remote attempt consumes this turn's
         // selection, and a cold fallback dispatches the P it already chose
         // instead of asking the policy a second time. The selection also takes
@@ -1138,6 +1134,12 @@ impl VllmPDRouter {
             // The warm-remote protocol has no discovery incarnation fence, and
             // execute() rejects discovery; keep discovery on the native PD path.
             if !self.use_discovery && matches!(self.kv_connector, KvConnector::Nixl) {
+                // Only the warm attempt consumes the bare worker list; the cold
+                // path derives its own from `prefill_candidates`.
+                let prefill_workers = prefill_candidates
+                    .iter()
+                    .map(|(_, worker)| worker.clone())
+                    .collect::<Vec<_>>();
                 if let Some(index) =
                     self.select_program_prefill_index(&prefill_workers, &request, path, headers)
                 {
