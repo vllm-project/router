@@ -121,6 +121,9 @@ All fields below belong to `program_scheduling`. Values omitted from the JSON ob
 ## Canonical request metadata
 
 The canonical contract is `vllm_xargs.agentic_context`. Identity semantics match AgentInfer EngineCore.
+Agent and harness authors implementing workflow-conditioned return-time TTL should also follow the
+[agent integration contract](agent-integration.md), which defines field stability, terminal signaling,
+classification cardinality, and rollout validation.
 
 ```json
 {
@@ -257,6 +260,8 @@ Requests may supply `workflow_profile_id` and `profile_version` inside
 `vllm_xargs.agentic_context`. These values select a compatible offline seed;
 they are never metric labels. Both predictors always maintain a bounded online
 overlay when `prediction_profile.mode` is `shadow` or `active`.
+See [Agent integration for workflow TTL prediction](agent-integration.md) for
+the complete agent-side metadata and lifecycle contract.
 
 ```json
 {
@@ -294,7 +299,7 @@ future offline seed. File serialization and replacement occur outside the
 scheduler mutex.
 
 `off` disables collection and prediction. `shadow` exposes both predictions in
-structured logs, `/scheduling_diagnostics`, and bounded-cardinality metrics
+structured logs, `/scheduling/diagnostics`, and bounded-cardinality metrics
 without changing decisions. In regular HTTP mode, `active` replaces the
 rank-level fitted acting TTL with a mature key-conditioned `suggested_ttl`.
 Request-scoped `kv_retention_ttl_seconds` remains authoritative, and an
