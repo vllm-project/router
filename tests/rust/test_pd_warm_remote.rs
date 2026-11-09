@@ -902,6 +902,35 @@ async fn warm_and_cold_selection_receive_the_same_request_inputs() {
             .await
             .unwrap();
     }
+    // One prefill call per turn: the cold-only dispatch, the cold turn of
+    // `warm-turn`, and its warm read. The warm turn lands on the other P than
+    // its cold turn (the recording policy rotates), which is safe because the
+    // candidate's source is D; a warm read that failed and silently retried cold
+    // would add a fourth call, and no-warm-at-all would leave three without
+    // metadata.
+    let mut prefills = Vec::new();
+    for engine in [&p0, &p1] {
+        prefills.extend(engine.state.calls.lock().unwrap().iter().cloned());
+    }
+    assert_eq!(
+        prefills.len(),
+        3,
+        "expected cold-only dispatch + cold turn + warm read: {prefills:?}"
+    );
+    let warm_reads = prefills
+        .iter()
+        .filter(|call| {
+            // A cold dispatch carries the key with a null value, so test the
+            // value, not the key.
+            call.pointer("/kv_transfer_params/remote_engine_id")
+                .and_then(Value::as_str)
+                .is_some()
+        })
+        .count();
+    assert_eq!(
+        warm_reads, 1,
+        "the second turn must be a real warm read on the cross-P prefill"
+    );
     let calls = policy.calls();
     assert_eq!(calls.len(), 3, "one selection per turn: {calls:?}");
     let (cold_text, cold_headers) = &calls[1];
@@ -974,6 +1003,13 @@ async fn prefill_leaving_during_the_attempt_is_reselected() {
     let request =
         serde_json::from_value(program_body("stale-prefill", vec![31, 32, 33], true)).unwrap();
     let response = r.route_completion(None, &request, Some("test")).await;
+    // Without this the turn may simply have gone to p1: 200, one p1 call and an
+    // empty p0 would all hold while the stale-P path never ran. The counter is
+    // bumped before the hook, so it proves this turn actually held p0.
+    assert!(
+        p0.state.capability_probes.load(Ordering::SeqCst) > 0,
+        "the turn never held p0, so the stale-P re-selection was not exercised"
+    );
     assert_eq!(
         response.status(),
         StatusCode::OK,

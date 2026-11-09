@@ -1123,11 +1123,13 @@ impl VllmPDRouter {
             ));
         };
         let prefill_candidates = self.program_prefill_candidates();
-        // One selection per turn. The warm-remote attempt consumes this turn's
-        // selection, and a cold fallback dispatches the P it already chose
-        // instead of asking the policy a second time. The selection also takes
-        // the same request inputs as the cold path (prompt text or cache
-        // routing key, plus headers), so hash and cache policies keep their
+        // One successful selection per turn, with one exception. The warm-remote
+        // attempt consumes this turn's selection, and a cold fallback dispatches
+        // the P it already chose instead of asking the policy again — unless that
+        // P left the pool while the attempt was running, in which case the cold
+        // path re-selects once from a refreshed pool. The selection also takes
+        // the same request inputs as the cold path (prompt text or cache routing
+        // key, plus headers), so hash and cache-aware policies keep their
         // affinity on the warm path too.
         let mut selected = None;
         if let Some(warm_remote) = &runtime.warm_remote {
