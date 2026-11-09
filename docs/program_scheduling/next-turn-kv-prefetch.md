@@ -200,15 +200,16 @@ Every comparison uses the same model, hardware, trace, and pressure, following [
 | Useful-prefetch rate | Plans whose blocks served the next turn, over all waits that restored | Stage 3; bounded by Stage 1 |
 | Wasted bytes and compute | Tokens in `late`, `expired`, and `unused` plans, plus what `cancelled` plans had already moved, times bytes per token; load seconds | Stage 1 (modeled), Stage 3 (actual) |
 | Tool-return latency | Resume TTFT p50 and p90, and restored tokens per resume | Stage 3 |
+| Other requests' latency | TTFT, ITL, and queue time p90 of the requests the on arm made no plan for, tool resumes included, against the same requests in the off arm. ITL counts each gap between tokens. | Stage 3 |
 | KV pressure | Referenced KV usage at plan time; evictions, displaced tokens, idle-before-evict, decode ITL, queue time | Stage 1 (usage), Stage 3 (all) |
 | Router overhead | Tick time and memory with the shadow on | Stage 1 |
 
 | Stage | What runs | Passing it requires |
 |---|---|---|
 | 0. Offline | Simulator replay with oracle and history forecasts | The oracle's gain exceeds the target's noise at the operating pressure, or the work stops here. |
-| 1. Shadow | `next_turn_prefetch.mode = shadow`: read-only scoring on replay and live traffic | No decision or backend traffic changes, and the [rule below](#stage-1-pass-rule) holds for one forecast source on the target workload. |
+| 1. Shadow | `next_turn_prefetch.mode = shadow`: read-only scoring on replay and live traffic | No decision or backend traffic changes, and the [rule below](#stage-1-pass-rule) holds for one forecast source on the target workload, on the evidence in [Leaving shadow](#leaving-shadow). |
 | 2. Mock active | A fake backend with injected delays, refusals, and failures | Lifecycle conformance: duplicates, cancels, stale acks, deadlines, generations. No KV credit without an event. |
-| 3. One backend | One compatible backend with layer 2, behind an explicit flag, with a small budget | Hint-on against hint-off on the same replay, at two pressures: resume p90 improves beyond run-to-run spread, and decode ITL and queue time do not regress. |
+| 3. One backend | One compatible backend with layer 2, behind an explicit flag, with a small budget | Prefetch on against prefetch off on the same replay, at two pressures: resume p90 improves beyond run-to-run spread, and the other requests' TTFT, ITL, and queue time p90 do not regress beyond it. |
 | 4. Wider | More backends or sources | Stage 3 for each one. Default stays off until a separate decision. |
 
 ### Stage 1 pass rule
@@ -223,4 +224,16 @@ The first condition says loads save more than they spend, valuing a token moved 
 
 `wasted` is an upper bound. A real load fires only for a prefix that has left the GPU, but the shadow cannot see which ones had, so every plan counts at full size. The same share does not discount it, because a plan that expires has waited longest and is more likely than most to have left. With tokens and `kv_aware`, the share can become per-prefix evidence on both sides of the rule.
 
-A history-based forecast may stop here, and that would be a useful answer. In the first replay on a real engine ([#524](https://github.com/vllm-project/router/pull/524)), the return-time profile fails at all three load points, narrowly at one. The post-response forecast and per-prefix evidence are the paths forward.
+A history-based forecast may stop here, and that would be a useful answer. In the first replays on a real engine ([#524](https://github.com/vllm-project/router/pull/524)), the return-time profile fails in all three runs, at two loads, narrowly in one. The post-response forecast and per-prefix evidence are the paths forward.
+
+### Leaving shadow
+
+The rule holding on modeled load times and the per-target share is only a screen. Stage 2 starts when it holds on this evidence, which the replays in [#524](https://github.com/vllm-project/router/pull/524) do not have yet:
+
+| Evidence | Why | What stands in until then |
+|---|---|---|
+| Load times measured on the target backend, model, and host while it serves the target workload: each restore's time from submission to completion, as the engine or connector records it, against the tokens it restored. The rule must hold with `load_cost_model` fitted by quantile regression, once at p50 and once at p90. | `L` sets the forecast gate and where each plan's useful window falls, so which plans count as `late`, `in_time`, or `expired`. Loads share one stream with demand restores, so timing them on an idle engine understates `L`. | The default `load_cost_model`: a fixed intercept and slope from one RTX 5060 Ti over PCIe Gen3 x8, not measured on the replay's host |
+| For each plan, the part of its prefix past the target's contiguous device prefix that a lower tier still held, from `BlockRemoved(GPU)` events and the placement index against the wait's block hashes (see [Prefix identity](#prefix-identity)). The shadow then plans only once that part exists, sized to it, as an active mode would fire. | Both sides of the rule then count only what a real load would have moved. | The restored share on the `useful` side, and every plan at full size on the `wasted` side |
+| For a hint or the post-response update, a replay of the real agent or harness that sends it, on the target workload. | Tests and a scripted end-to-end run show that the path works, not that its forecasts are good. | Nothing: a source without such a replay has no Stage 1 result |
+
+Stage 3 then runs prefetch on against prefetch off on the same workload. Besides the latencies its pass rule reads, it reports the tokens and bytes each arm actually loaded and the seconds those loads took, and the waste: tokens moved by `late`, `expired`, `unused`, and `cancelled` plans, displaced tokens, and how many of those came back within the validity window.
