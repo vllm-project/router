@@ -476,6 +476,7 @@ pub struct KvSelectionReceipt {
     pub worker_index: usize,
     pub new_prefill_tokens: u64,
     pub predicted_cached_tokens: Option<u64>,
+    pub multi_prompt: bool,
     pub decision: CostDecision,
     pub slot: Option<KvRequestSlot>,
 }
@@ -953,6 +954,7 @@ struct SelectionPlan {
     input_tokens: Vec<usize>,
     prefill_tokens: Vec<Option<u64>>,
     predicted_cached_tokens: Vec<Option<u64>>,
+    multi_prompt: Vec<bool>,
     has_tokens: bool,
 }
 
@@ -1284,6 +1286,7 @@ impl KvAwarePolicy {
                     input_tokens: vec![0; count],
                     prefill_tokens: vec![None; count],
                     predicted_cached_tokens: vec![None; count],
+                    multi_prompt: vec![false; count],
                     has_tokens: false,
                 }
             } else {
@@ -1398,6 +1401,7 @@ impl KvAwarePolicy {
                 worker_index,
                 new_prefill_tokens,
                 predicted_cached_tokens: plan.predicted_cached_tokens[position],
+                multi_prompt: plan.multi_prompt[position],
                 decision,
                 slot,
             });
@@ -1489,13 +1493,15 @@ impl KvAwarePolicy {
         let mut input_tokens = Vec::with_capacity(bindings.len());
         let mut prefill_tokens = Vec::with_capacity(bindings.len());
         let mut predicted_by_candidate = Vec::with_capacity(bindings.len());
+        let mut multi_prompt = Vec::with_capacity(bindings.len());
         for ((binding, prompts), &worker_index) in bindings.iter().zip(prompts).zip(&healthy) {
             let mut total_input = 0usize;
+            multi_prompt.push(prompts.len() > 1);
             let mut total_prefill = 0u64;
             let mut total_predicted = 0u64;
             let mut single_matches = Vec::new();
             let prediction_verified = has_tokens
-                && !prompts.is_empty()
+                && prompts.len() == 1
                 && input.allows_credit(worker_index, workers.len())
                 && credit_fallback.is_none()
                 && binding.cache_key.is_some();
@@ -1577,6 +1583,7 @@ impl KvAwarePolicy {
             input_tokens,
             prefill_tokens,
             predicted_cached_tokens: predicted_by_candidate,
+            multi_prompt,
             has_tokens,
         })
     }

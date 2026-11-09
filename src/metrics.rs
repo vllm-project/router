@@ -588,13 +588,16 @@ impl RouterMetrics {
     pub fn record_kv_route_outcome(
         status: &'static str,
         reason: &'static str,
-        predicted_cached_tokens: u64,
+        predicted_cached_tokens: Option<u64>,
         actual_cached_tokens: Option<u64>,
     ) {
         counter!("vllm_router_kv_route_outcomes_total",
             "status" => status,
             "reason" => reason)
         .increment(1);
+        let Some(predicted_cached_tokens) = predicted_cached_tokens else {
+            return;
+        };
         histogram!("vllm_router_kv_predicted_cached_tokens").record(predicted_cached_tokens as f64);
 
         let Some(actual_cached_tokens) = actual_cached_tokens else {

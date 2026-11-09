@@ -1,6 +1,7 @@
 use super::completion_route::{placement_eligibility, prepare_completion_route, CompletionRoute};
 use super::kv_observation::{
-    observe_json_response, observe_unavailable, KvRoutePrediction, KvSseObserver,
+    observe_json_response, observe_unavailable, KvResponseStream, KvRouteAttempt,
+    KvRoutePrediction, KvSseObserver,
 };
 use super::program_adapter::ProgramCompletion;
 use crate::backend::preprocess::{prepare_completion_direct_inputs, prepare_http_kv_inputs};
@@ -111,7 +112,7 @@ struct LoadTrackedBody {
 struct RequestLoadState {
     worker: Option<Arc<dyn Worker>>,
     kv_slot: Option<KvRequestSlot>,
-    kv_prediction: Option<KvRoutePrediction>,
+    kv_attempt: Option<Arc<KvRouteAttempt>>,
     released: AtomicBool,
 }
 
@@ -128,7 +129,7 @@ impl RequestLoadGuard {
             state: Arc::new(RequestLoadState {
                 worker,
                 kv_slot,
-                kv_prediction: None,
+                kv_attempt: None,
                 released: AtomicBool::new(false),
             }),
         }
@@ -146,16 +147,19 @@ impl RequestLoadGuard {
             }
             RouterMetrics::set_running_requests(worker.url(), worker.load());
         }
-        let (kv_slot, kv_prediction) = match receipt {
+        let (kv_slot, kv_attempt) = match receipt {
             Some(receipt) => {
-                let prediction =
-                    receipt
-                        .predicted_cached_tokens
-                        .map(|cached_tokens| KvRoutePrediction {
+                let attempt = receipt
+                    .predicted_cached_tokens
+                    .or(receipt.multi_prompt.then_some(0))
+                    .map(|cached_tokens| {
+                        KvRouteAttempt::new(KvRoutePrediction {
                             target: receipt.decision.target.clone(),
                             cached_tokens,
-                        });
-                (receipt.slot, prediction)
+                            multi_prompt: receipt.multi_prompt,
+                        })
+                    });
+                (receipt.slot, attempt)
             }
             None => (None, None),
         };
@@ -163,7 +167,7 @@ impl RequestLoadGuard {
             state: Arc::new(RequestLoadState {
                 worker: tracked.then_some(worker),
                 kv_slot,
-                kv_prediction,
+                kv_attempt,
                 released: AtomicBool::new(false),
             }),
         }
@@ -173,8 +177,8 @@ impl RequestLoadGuard {
         self.state.worker.is_some()
     }
 
-    fn kv_prediction(&self) -> Option<KvRoutePrediction> {
-        self.state.kv_prediction.clone()
+    fn kv_attempt(&self) -> Option<Arc<KvRouteAttempt>> {
+        self.state.kv_attempt.clone()
     }
 
     fn begin_decode(&self) {
@@ -1951,7 +1955,7 @@ impl Router {
             return response;
         }
 
-        let kv_prediction = load.kv_prediction();
+        let kv_attempt = load.kv_attempt();
 
         let (mut request_builder, extracted_dp_rank, request_url) =
             if self.intra_node_data_parallel_size > 1 {
@@ -2041,6 +2045,13 @@ impl Router {
         {
             Ok(res) => res,
             Err(e) => {
+                if let Some(attempt) = &kv_attempt {
+                    observe_unavailable(
+                        attempt,
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "request_error",
+                    );
+                }
                 error!(
                     "Failed to send typed request worker_url={} route={} error={}",
                     worker_url, route, e
@@ -2070,8 +2081,8 @@ impl Router {
 
             let response = match res.bytes().await {
                 Ok(body) => {
-                    if let Some(prediction) = &kv_prediction {
-                        observe_json_response(prediction, status, &body);
+                    if let Some(attempt) = &kv_attempt {
+                        observe_json_response(attempt, status, &body);
                     }
                     if let Some(completion) = &program_completion {
                         completion.observe_json(&body);
@@ -2082,8 +2093,8 @@ impl Router {
                     response
                 }
                 Err(e) => {
-                    if let Some(prediction) = &kv_prediction {
-                        observe_unavailable(prediction, status, "response_error");
+                    if let Some(attempt) = &kv_attempt {
+                        observe_unavailable(attempt, status, "response_error");
                     }
                     let error_msg = format!("Failed to get response body: {}", e);
                     (StatusCode::INTERNAL_SERVER_ERROR, error_msg).into_response()
@@ -2124,8 +2135,7 @@ impl Router {
 
             // Spawn task to forward stream and detect completion
             let producer_load = load.clone();
-            let mut kv_observer =
-                kv_prediction.map(|prediction| KvSseObserver::new(prediction, status));
+            let mut kv_observer = kv_attempt.map(|attempt| KvSseObserver::new(attempt, status));
             let producer = tokio::spawn(async move {
                 let mut stream = stream;
                 let mut first_sse = true;
@@ -3210,6 +3220,7 @@ impl RouterTrait for Router {
         let load_tracked = policy.tracks_request_load() || program_completion.is_some();
         let load = load_tracked
             .then(|| RequestLoadGuard::from_selection(worker.clone(), kv_receipt, true));
+        let kv_attempt = load.as_ref().and_then(RequestLoadGuard::kv_attempt);
 
         let (body, mut transfers) = if let Some(epd) = &self.epd {
             if *method == Method::POST && path == "/v1/chat/completions" {
@@ -3337,8 +3348,23 @@ impl RouterTrait for Router {
                 }
 
                 if Self::should_proxy_transparent_directly(program_completion.is_some()) {
+                    let stream: Pin<
+                        Box<
+                            dyn futures_util::Stream<Item = Result<bytes::Bytes, reqwest::Error>>
+                                + Send,
+                        >,
+                    > = if let Some(attempt) = kv_attempt.clone() {
+                        Box::pin(KvResponseStream::new(
+                            response.bytes_stream(),
+                            attempt,
+                            status,
+                            is_stream,
+                        ))
+                    } else {
+                        Box::pin(response.bytes_stream())
+                    };
                     response_builder
-                        .body(Body::from_stream(response.bytes_stream()))
+                        .body(Body::from_stream(stream))
                         .unwrap_or_else(|error| {
                             (
                                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -3352,6 +3378,9 @@ impl RouterTrait for Router {
                 ) {
                     match response.bytes().await {
                         Ok(bytes) => {
+                            if let Some(attempt) = &kv_attempt {
+                                observe_json_response(attempt, status, &bytes);
+                            }
                             if status.is_success() {
                                 if let Some(completion) = &program_completion {
                                     completion.observe_json(&bytes);
@@ -3369,6 +3398,9 @@ impl RouterTrait for Router {
                                 })
                         }
                         Err(error) => {
+                            if let Some(attempt) = &kv_attempt {
+                                observe_unavailable(attempt, status, "response_error");
+                            }
                             if status.is_success() {
                                 if let Some(completion) = &program_completion {
                                     completion.finish(false);
@@ -3382,7 +3414,21 @@ impl RouterTrait for Router {
                         }
                     }
                 } else {
-                    let stream = response.bytes_stream();
+                    let stream: Pin<
+                        Box<
+                            dyn futures_util::Stream<Item = Result<bytes::Bytes, reqwest::Error>>
+                                + Send,
+                        >,
+                    > = if let Some(attempt) = kv_attempt.clone() {
+                        Box::pin(KvResponseStream::new(
+                            response.bytes_stream(),
+                            attempt,
+                            status,
+                            is_stream,
+                        ))
+                    } else {
+                        Box::pin(response.bytes_stream())
+                    };
                     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
                     let completion = status.is_success().then_some(program_completion).flatten();
                     tokio::spawn(async move {
@@ -3423,6 +3469,9 @@ impl RouterTrait for Router {
             }
             Err(error) => {
                 // The 502 response below still flows through
+                if let Some(attempt) = &kv_attempt {
+                    observe_unavailable(attempt, StatusCode::BAD_GATEWAY, "request_error");
+                }
                 // hold_load_until_body_done, which releases the load once
                 // its body finishes or is dropped — do not decrement here.
                 if let Some(completion) = &program_completion {
@@ -4746,6 +4795,8 @@ mod tests {
                 let fail_first = fail_first.clone();
                 async move {
                     let path = uri.path().to_string();
+                    let streaming = body.get("stream").and_then(serde_json::Value::as_bool).unwrap_or(false)
+                        && body.get("model").and_then(serde_json::Value::as_str) == Some("kv-observation-test");
                     captured.lock().push((worker_index, path.clone(), body));
                     if path.ends_with("/render") {
                         if prompts.is_empty() {
@@ -4764,7 +4815,11 @@ mod tests {
                     if worker_index == 0 && fail_first.swap(false, Ordering::SeqCst) {
                         return StatusCode::SERVICE_UNAVAILABLE.into_response();
                     }
-                    Json(serde_json::json!({"worker": worker_index, "choices": []})).into_response()
+                    let response = serde_json::json!({"worker": worker_index, "choices": [], "usage": {"prompt_tokens_details": {"cached_tokens": 4}}});
+                    if streaming {
+                        return ([("content-type", "text/event-stream")], format!("data: {response}\n\ndata: [DONE]\n\n")).into_response();
+                    }
+                    Json(response).into_response()
                 }
             }));
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -5214,6 +5269,54 @@ mod tests {
             1
         );
         assert_eq!(fixture.workers[1].load(), 1);
+    }
+
+    #[tokio::test]
+    async fn multi_prompt_json_and_sse_do_not_report_prediction_error() {
+        for streaming in [false, true] {
+            let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+            let handle = recorder.handle();
+            let ids = vec![1, 2, 3, 4, 5, 6];
+            let fixture = http_kv_fixture(
+                [vec![ids.clone(), ids.clone()], vec![ids.clone(), ids]],
+                0,
+                true,
+            )
+            .await;
+            let request: CompletionRequest = serde_json::from_value(serde_json::json!({
+                "model": "kv-observation-test", "prompt": ["one", "two"], "stream": streaming
+            }))
+            .unwrap();
+            let route = fixture
+                .router
+                .route_typed_request(None, &request, "/v1/completions", None);
+            tokio::pin!(route);
+            let response = std::future::poll_fn(|context| {
+                metrics::with_local_recorder(&recorder, || {
+                    std::future::Future::poll(route.as_mut(), context)
+                })
+            })
+            .await;
+            assert!(response.status().is_success());
+            if streaming {
+                assert_eq!(response.headers()[CONTENT_TYPE], "text/event-stream");
+            }
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            if streaming {
+                assert!(std::str::from_utf8(&body).unwrap().contains("data: [DONE]"));
+            } else {
+                assert_eq!(
+                    serde_json::from_slice::<serde_json::Value>(&body).unwrap()["usage"]
+                        ["prompt_tokens_details"]["cached_tokens"],
+                    4
+                );
+            }
+            assert!(!handle
+                .render()
+                .contains("vllm_router_kv_cached_token_absolute_error"));
+        }
     }
 
     #[tokio::test]
@@ -6716,6 +6819,7 @@ mod tests {
                 async move {
                     let body = if fail_body {
                         Body::from_stream(futures_util::stream::once(async {
+                            tokio::time::sleep(Duration::from_millis(20)).await;
                             Err::<bytes::Bytes, _>(std::io::Error::other("broken backend body"))
                         }))
                     } else {

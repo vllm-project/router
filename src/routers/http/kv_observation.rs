@@ -4,13 +4,130 @@ use crate::metrics::RouterMetrics;
 use bytes::Bytes;
 use http::StatusCode;
 use serde_json::Value;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 const MAX_SSE_FRAME_BYTES: usize = 1024 * 1024;
+
+pub(super) struct KvResponseStream<S> {
+    inner: std::pin::Pin<Box<S>>,
+    attempt: Arc<KvRouteAttempt>,
+    sse: Option<KvSseObserver>,
+    status: StatusCode,
+    json: Vec<u8>,
+    oversized: bool,
+    finished: bool,
+}
+
+impl<S> KvResponseStream<S> {
+    pub(super) fn new(
+        inner: S,
+        attempt: Arc<KvRouteAttempt>,
+        status: StatusCode,
+        streaming: bool,
+    ) -> Self {
+        Self {
+            inner: Box::pin(inner),
+            sse: streaming.then(|| KvSseObserver::new(attempt.clone(), status)),
+            attempt,
+            status,
+            json: Vec::new(),
+            oversized: false,
+            finished: false,
+        }
+    }
+}
+
+impl<S, E> futures_util::Stream for KvResponseStream<S>
+where
+    S: futures_util::Stream<Item = Result<Bytes, E>>,
+{
+    type Item = Result<Bytes, E>;
+    fn poll_next(
+        self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        let result = this.inner.as_mut().poll_next(context);
+        match &result {
+            std::task::Poll::Ready(Some(Ok(bytes))) => {
+                if let Some(sse) = &mut this.sse {
+                    sse.observe(bytes);
+                } else if !this.oversized {
+                    if this.json.len().saturating_add(bytes.len()) > MAX_SSE_FRAME_BYTES {
+                        this.oversized = true;
+                        this.json.clear();
+                    } else {
+                        this.json.extend_from_slice(bytes);
+                    }
+                }
+            }
+            std::task::Poll::Ready(Some(Err(_))) => {
+                this.finished = true;
+                if let Some(sse) = &mut this.sse {
+                    sse.finish(false);
+                } else {
+                    observe_unavailable(&this.attempt, this.status, "response_error");
+                }
+            }
+            std::task::Poll::Ready(None) if !this.finished => {
+                this.finished = true;
+                if let Some(sse) = &mut this.sse {
+                    sse.finish(true);
+                } else if this.oversized {
+                    observe_unavailable(&this.attempt, this.status, "oversized_json");
+                } else {
+                    observe_json_response(&this.attempt, this.status, &this.json);
+                }
+            }
+            _ => {}
+        }
+        result
+    }
+}
 
 #[derive(Debug, Clone)]
 pub(super) struct KvRoutePrediction {
     pub(super) target: RoutableTarget,
     pub(super) cached_tokens: u64,
+    pub(super) multi_prompt: bool,
+}
+
+pub(super) struct KvRouteAttempt {
+    prediction: KvRoutePrediction,
+    finished: AtomicBool,
+}
+
+impl KvRouteAttempt {
+    pub(super) fn new(prediction: KvRoutePrediction) -> Arc<Self> {
+        Arc::new(Self {
+            prediction,
+            finished: AtomicBool::new(false),
+        })
+    }
+
+    fn record_once(&self, observation: CacheObservation) {
+        if self
+            .finished
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            record_observation(&self.prediction, observation);
+        }
+    }
+
+    #[cfg(test)]
+    fn is_finished(&self) -> bool {
+        self.finished.load(Ordering::Acquire)
+    }
+}
+
+impl Drop for KvRouteAttempt {
+    fn drop(&mut self) {
+        if !self.finished.load(Ordering::Acquire) {
+            self.record_once(CacheObservation::Unavailable("attempt_cancelled"));
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,6 +156,15 @@ fn response_cached_tokens(value: &Value) -> Option<u64> {
 }
 
 fn record_observation(prediction: &KvRoutePrediction, observation: CacheObservation) {
+    let observation = if prediction.multi_prompt
+        && matches!(
+            observation,
+            CacheObservation::Observed(_) | CacheObservation::Ambiguous
+        ) {
+        CacheObservation::Unavailable("multi_prompt_usage_not_aggregate")
+    } else {
+        observation
+    };
     let (status, reason, actual_cached_tokens) = match observation {
         CacheObservation::Observed(tokens) => ("observed", "none", Some(tokens)),
         CacheObservation::Ambiguous => ("ambiguous", "conflicting_usage", None),
@@ -48,7 +174,7 @@ fn record_observation(prediction: &KvRoutePrediction, observation: CacheObservat
     RouterMetrics::record_kv_route_outcome(
         status,
         reason,
-        prediction.cached_tokens,
+        (!prediction.multi_prompt).then_some(prediction.cached_tokens),
         actual_cached_tokens,
     );
     tracing::debug!(
@@ -56,17 +182,13 @@ fn record_observation(prediction: &KvRoutePrediction, observation: CacheObservat
         reason,
         instance_id = %prediction.target.instance_id,
         dp_rank = prediction.target.dp_rank,
-        predicted_cached_tokens = prediction.cached_tokens,
+        predicted_cached_tokens = ?(!prediction.multi_prompt).then_some(prediction.cached_tokens),
         actual_cached_tokens,
         "KV route prediction outcome"
     );
 }
 
-pub(super) fn observe_json_response(
-    prediction: &KvRoutePrediction,
-    status: StatusCode,
-    body: &[u8],
-) {
+pub(super) fn observe_json_response(attempt: &KvRouteAttempt, status: StatusCode, body: &[u8]) {
     let observation = if !status.is_success() {
         CacheObservation::Unavailable("backend_error")
     } else {
@@ -77,24 +199,24 @@ pub(super) fn observe_json_response(
             Err(_) => CacheObservation::Unavailable("malformed_json"),
         }
     };
-    record_observation(prediction, observation);
+    attempt.record_once(observation);
 }
 
 pub(super) fn observe_unavailable(
-    prediction: &KvRoutePrediction,
+    attempt: &KvRouteAttempt,
     status: StatusCode,
     reason: &'static str,
 ) {
-    let reason = if status.is_success() {
+    let reason = if status.is_success() || reason == "request_error" {
         reason
     } else {
         "backend_error"
     };
-    record_observation(prediction, CacheObservation::Unavailable(reason));
+    attempt.record_once(CacheObservation::Unavailable(reason));
 }
 
 pub(super) struct KvSseObserver {
-    prediction: KvRoutePrediction,
+    attempt: Arc<KvRouteAttempt>,
     successful_status: bool,
     scanner: FrameScanner,
     frame: Vec<u8>,
@@ -106,9 +228,9 @@ pub(super) struct KvSseObserver {
 }
 
 impl KvSseObserver {
-    pub(super) fn new(prediction: KvRoutePrediction, status: StatusCode) -> Self {
+    pub(super) fn new(attempt: Arc<KvRouteAttempt>, status: StatusCode) -> Self {
         Self {
-            prediction,
+            attempt,
             successful_status: status.is_success(),
             scanner: FrameScanner::default(),
             frame: Vec::new(),
@@ -176,6 +298,18 @@ impl KvSseObserver {
         match serde_json::from_slice::<Value>(&data) {
             Ok(value) => {
                 let Some(cached_tokens) = response_cached_tokens(&value) else {
+                    if usage_merge::usage_object(&value).is_some_and(|usage| {
+                        ["prompt_tokens_details", "input_tokens_details"]
+                            .iter()
+                            .any(|key| {
+                                usage
+                                    .get(*key)
+                                    .and_then(|details| details.get("cached_tokens"))
+                                    .is_some_and(|cached| !cached.is_null())
+                            })
+                    }) {
+                        self.fallback_reason = Some("invalid_usage");
+                    }
                     return;
                 };
                 if self
@@ -194,6 +328,10 @@ impl KvSseObserver {
     pub(super) fn finish(&mut self, stream_succeeded: bool) {
         let observation = if !self.successful_status {
             CacheObservation::Unavailable("backend_error")
+        } else if let Some(reason) = self.fallback_reason {
+            CacheObservation::Unavailable(reason)
+        } else if self.frame.iter().any(|byte| !matches!(byte, b'\r' | b'\n')) {
+            CacheObservation::Unavailable("incomplete_sse_frame")
         } else if self.ambiguous {
             CacheObservation::Ambiguous
         } else if let Some(tokens) = self.observed_cached_tokens {
@@ -210,7 +348,7 @@ impl KvSseObserver {
         if std::mem::replace(&mut self.finished, true) {
             return;
         }
-        record_observation(&self.prediction, observation);
+        self.attempt.record_once(observation);
     }
 }
 
@@ -234,6 +372,7 @@ mod tests {
                 dp_rank: 0,
             },
             cached_tokens: 32,
+            multi_prompt: false,
         }
     }
 
@@ -258,8 +397,152 @@ mod tests {
     }
 
     #[test]
+    fn transparent_stream_preserves_bytes_and_records_json_and_sse() {
+        use futures_util::{FutureExt, StreamExt};
+        for streaming in [false, true] {
+            let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+            let handle = recorder.handle();
+            metrics::with_local_recorder(&recorder, || {
+                let payload = if streaming {
+                    Bytes::from_static(b"data: {\"usage\":{\"prompt_tokens_details\":{\"cached_tokens\":32}}}\n\ndata: [DONE]\n\n")
+                } else {
+                    Bytes::from_static(
+                        br#"{"usage":{"prompt_tokens_details":{"cached_tokens":32}}}"#,
+                    )
+                };
+                let chunks = vec![
+                    Ok::<_, std::io::Error>(payload.slice(..7)),
+                    Ok(payload.slice(7..)),
+                ];
+                let mut stream = KvResponseStream::new(
+                    futures_util::stream::iter(chunks),
+                    KvRouteAttempt::new(prediction()),
+                    StatusCode::OK,
+                    streaming,
+                );
+                let mut received = Vec::new();
+                while let Some(chunk) = stream.next().now_or_never().unwrap() {
+                    received.extend_from_slice(&chunk.unwrap());
+                }
+                assert_eq!(received, payload);
+                drop(stream);
+            });
+            assert!(handle.render().lines().any(|line| line
+                .starts_with("vllm_router_kv_route_outcomes_total{")
+                && line.contains("status=\"observed\"")
+                && line.ends_with(" 1")));
+        }
+    }
+
+    #[test]
+    fn transparent_stream_errors_and_cancellation_finalize_once() {
+        use futures_util::{FutureExt, StreamExt};
+        for streaming in [false, true] {
+            for cancelled in [false, true] {
+                let recorder =
+                    metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+                let handle = recorder.handle();
+                metrics::with_local_recorder(&recorder, || {
+                    let chunks = vec![
+                        Ok(Bytes::from_static(b"partial")),
+                        Err(std::io::Error::other("broken body")),
+                    ];
+                    let mut stream = KvResponseStream::new(
+                        futures_util::stream::iter(chunks),
+                        KvRouteAttempt::new(prediction()),
+                        StatusCode::OK,
+                        streaming,
+                    );
+                    assert_eq!(
+                        stream.next().now_or_never().unwrap().unwrap().unwrap(),
+                        Bytes::from_static(b"partial")
+                    );
+                    if !cancelled {
+                        assert!(stream.next().now_or_never().unwrap().unwrap().is_err());
+                        assert!(stream.next().now_or_never().unwrap().is_none());
+                    }
+                    drop(stream);
+                });
+                let exported = handle.render();
+                let outcomes: Vec<_> = exported
+                    .lines()
+                    .filter(|line| line.starts_with("vllm_router_kv_route_outcomes_total{"))
+                    .collect();
+                assert_eq!(outcomes.len(), 1);
+                assert!(outcomes[0].contains("status=\"unavailable\""));
+                assert!(outcomes[0].ends_with(" 1"));
+                let reason = if streaming {
+                    "incomplete_sse_frame"
+                } else if cancelled {
+                    "attempt_cancelled"
+                } else {
+                    "response_error"
+                };
+                assert!(outcomes[0].contains(&format!("reason=\"{reason}\"")));
+                assert!(!exported.contains("vllm_router_kv_cached_token_absolute_error"));
+            }
+        }
+    }
+
+    #[test]
+    fn multi_prompt_usage_is_unavailable_for_json_and_sse() {
+        for streaming in [false, true] {
+            let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+            let handle = recorder.handle();
+            metrics::with_local_recorder(&recorder, || {
+                let mut prediction = prediction();
+                prediction.multi_prompt = true;
+                let attempt = KvRouteAttempt::new(prediction);
+                if streaming {
+                    let mut observer = KvSseObserver::new(attempt, StatusCode::OK);
+                    observer.observe(&Bytes::from_static(b"data: {\"usage\":{\"prompt_tokens_details\":{\"cached_tokens\":32}}}\n\ndata: [DONE]\n\n"));
+                    observer.finish(true);
+                } else {
+                    observe_json_response(
+                        &attempt,
+                        StatusCode::OK,
+                        br#"{"usage":{"prompt_tokens_details":{"cached_tokens":32}}}"#,
+                    );
+                }
+            });
+            let exported = handle.render();
+            assert!(exported.lines().any(|line| line
+                .starts_with("vllm_router_kv_route_outcomes_total{")
+                && line.contains("reason=\"multi_prompt_usage_not_aggregate\"")
+                && line.contains("status=\"unavailable\"")
+                && line.ends_with(" 1")));
+            assert!(!exported.contains("vllm_router_kv_cached_token_absolute_error"));
+        }
+    }
+
+    #[test]
+    fn multi_prompt_preserves_failure_and_cancellation_reasons() {
+        for reason in ["request_error", "backend_error", "attempt_cancelled"] {
+            let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+            let handle = recorder.handle();
+            metrics::with_local_recorder(&recorder, || {
+                let mut prediction = prediction();
+                prediction.multi_prompt = true;
+                let attempt = KvRouteAttempt::new(prediction);
+                if reason != "attempt_cancelled" {
+                    observe_unavailable(&attempt, StatusCode::BAD_GATEWAY, reason);
+                }
+                drop(attempt);
+            });
+            let exported = handle.render();
+            assert!(exported.lines().any(|line| line
+                .starts_with("vllm_router_kv_route_outcomes_total{")
+                && line.contains(&format!("reason=\"{reason}\""))
+                && line.ends_with(" 1")));
+            assert!(!exported.contains("vllm_router_kv_predicted_cached_tokens"));
+            assert!(!exported.contains("vllm_router_kv_cached_token_absolute_error"));
+        }
+    }
+
+    #[test]
     fn observes_fragmented_sse_usage() {
-        let mut observer = KvSseObserver::new(prediction(), StatusCode::OK);
+        let attempt = KvRouteAttempt::new(prediction());
+        let mut observer = KvSseObserver::new(attempt, StatusCode::OK);
         observer.observe(&Bytes::from_static(
             b"data: {\"choices\":[]}\n\ndata: {\"usage\":{\"prompt_tokens_details\":{\"cached_",
         ));
@@ -270,7 +553,8 @@ mod tests {
 
     #[test]
     fn conflicting_sse_usage_is_ambiguous() {
-        let mut observer = KvSseObserver::new(prediction(), StatusCode::OK);
+        let attempt = KvRouteAttempt::new(prediction());
+        let mut observer = KvSseObserver::new(attempt, StatusCode::OK);
         observer.observe(&Bytes::from_static(
             b"data: {\"usage\":{\"prompt_tokens_details\":{\"cached_tokens\":16}}}\n\n",
         ));
@@ -278,5 +562,155 @@ mod tests {
             b"data: {\"usage\":{\"prompt_tokens_details\":{\"cached_tokens\":32}}}\n\n",
         ));
         assert!(observer.ambiguous);
+    }
+
+    #[test]
+    fn incomplete_sse_parsing_does_not_credit_previous_usage() {
+        for oversized in [false, true] {
+            let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+            let handle = recorder.handle();
+            metrics::with_local_recorder(&recorder, || {
+                let mut observer =
+                    KvSseObserver::new(KvRouteAttempt::new(prediction()), StatusCode::OK);
+                observer.observe(&Bytes::from_static(
+                    b"data: {\"usage\":{\"prompt_tokens_details\":{\"cached_tokens\":32}}}\n\n",
+                ));
+                if oversized {
+                    let mut frame = b"data: ".to_vec();
+                    frame.resize(MAX_SSE_FRAME_BYTES + 1, b'x');
+                    frame.extend_from_slice(b"\n\n");
+                    observer.observe(&Bytes::from(frame));
+                } else {
+                    observer.observe(&Bytes::from_static(b"data: {\"usage\":invalid}\n\n"));
+                }
+                observer.finish(true);
+            });
+            let exported = handle.render();
+            let reason = if oversized {
+                "oversized_sse_frame"
+            } else {
+                "malformed_usage"
+            };
+            assert!(exported.lines().any(|line| line
+                .starts_with("vllm_router_kv_route_outcomes_total{")
+                && line.contains("status=\"unavailable\"")
+                && line.contains(&format!("reason=\"{reason}\""))
+                && line.ends_with(" 1")));
+            assert!(!exported.contains("vllm_router_kv_actual_cached_tokens"));
+            assert!(!exported.contains("vllm_router_kv_cached_token_absolute_error"));
+        }
+    }
+
+    #[test]
+    fn invalid_sse_usage_does_not_reuse_previous_count() {
+        for cached in [
+            serde_json::json!(-1),
+            serde_json::json!("32"),
+            serde_json::json!(65),
+            serde_json::json!(1.5),
+        ] {
+            let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+            let handle = recorder.handle();
+            metrics::with_local_recorder(&recorder, || {
+                let mut observer =
+                    KvSseObserver::new(KvRouteAttempt::new(prediction()), StatusCode::OK);
+                observer.observe(&Bytes::from_static(b"data: {\"usage\":{\"prompt_tokens\":64,\"prompt_tokens_details\":{\"cached_tokens\":32}}}\n\n"));
+                let value = serde_json::json!({"usage":{"prompt_tokens":64,"prompt_tokens_details":{"cached_tokens":cached}}});
+                observer.observe(&Bytes::from(format!("data: {value}\n\n")));
+                observer.finish(true);
+            });
+            let exported = handle.render();
+            assert!(exported.lines().any(|line| line
+                .starts_with("vllm_router_kv_route_outcomes_total{")
+                && line.contains("reason=\"invalid_usage\"")
+                && line.ends_with(" 1")));
+            assert!(!exported.contains("vllm_router_kv_actual_cached_tokens"));
+        }
+    }
+
+    #[test]
+    fn unfinished_sse_tail_invalidates_usage_on_eof_error_and_drop() {
+        for ending in ["eof", "error", "drop"] {
+            let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+            let handle = recorder.handle();
+            metrics::with_local_recorder(&recorder, || {
+                let mut observer =
+                    KvSseObserver::new(KvRouteAttempt::new(prediction()), StatusCode::OK);
+                observer.observe(&Bytes::from_static(
+                    b"data: {\"usage\":{\"prompt_tokens_details\":{\"cached_tokens\":32}}}\n\n",
+                ));
+                observer.observe(&Bytes::from_static(
+                    b"data: {\"usage\":{\"prompt_tokens_details\":{\"cached_tokens\":",
+                ));
+                match ending {
+                    "eof" => observer.finish(true),
+                    "error" => observer.finish(false),
+                    _ => {}
+                }
+                drop(observer);
+            });
+            let exported = handle.render();
+            assert!(exported.lines().any(|line| line
+                .starts_with("vllm_router_kv_route_outcomes_total{")
+                && line.contains("reason=\"incomplete_sse_frame\"")
+                && line.contains("status=\"unavailable\"")
+                && line.ends_with(" 1")));
+            assert!(!exported.contains("vllm_router_kv_actual_cached_tokens"));
+            assert!(!exported.contains("vllm_router_kv_cached_token_absolute_error"));
+        }
+    }
+
+    #[test]
+    fn shared_attempt_is_finalized_once_across_response_paths() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            let attempt = KvRouteAttempt::new(prediction());
+            observe_unavailable(&attempt, StatusCode::BAD_GATEWAY, "request_error");
+            observe_json_response(
+                &attempt,
+                StatusCode::OK,
+                br#"{"usage":{"prompt_tokens_details":{"cached_tokens":32}}}"#,
+            );
+            assert!(attempt.is_finished());
+            drop(attempt);
+            let retry = KvRouteAttempt::new(prediction());
+            observe_json_response(
+                &retry,
+                StatusCode::OK,
+                br#"{"usage":{"prompt_tokens_details":{"cached_tokens":32}}}"#,
+            );
+            drop(retry);
+        });
+        let exported = handle.render();
+        let outcomes: Vec<_> = exported
+            .lines()
+            .filter(|line| line.starts_with("vllm_router_kv_route_outcomes_total{"))
+            .collect();
+        assert_eq!(outcomes.len(), 2);
+        assert!(outcomes.iter().all(|line| line.ends_with(" 1")));
+        assert!(outcomes
+            .iter()
+            .any(|line| line.contains("status=\"observed\"")));
+        assert!(outcomes
+            .iter()
+            .any(|line| line.contains("reason=\"request_error\"")));
+    }
+
+    #[test]
+    fn dropping_unfinished_attempt_finalizes_cancellation() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            drop(KvRouteAttempt::new(prediction()));
+        });
+        let exported = handle.render();
+        let outcome = exported
+            .lines()
+            .find(|line| line.starts_with("vllm_router_kv_route_outcomes_total{"))
+            .expect("cancelled attempt outcome metric");
+        assert!(outcome.contains("reason=\"attempt_cancelled\""));
+        assert!(outcome.contains("status=\"unavailable\""));
+        assert!(outcome.ends_with(" 1"));
     }
 }
