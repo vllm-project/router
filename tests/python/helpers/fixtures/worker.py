@@ -1,6 +1,6 @@
 """Worker fixtures for mock HTTP workers and real vLLM workers.
 
-Loaded from ``tests/python/conftest.py``. The mock server is
+Loaded from the repository-root ``conftest.py``. The mock server is
 ``tests/python/helpers/mock_worker.py``. Real workers are launched by
 ``VllmWorkerManager``.
 """

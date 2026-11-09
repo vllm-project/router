@@ -1,8 +1,9 @@
-"""Root pytest entrypoint for the router Python suite.
+"""Path setup for the router Python suite.
 
-``conftest.py`` stays thin: path setup and plugin registration only.
-Importable utilities live under ``tests/python/helpers/``.
-Pytest fixtures live under ``tests/python/helpers/fixtures/``.
+Plugin registration lives in the repository-root ``conftest.py``. Pytest only
+allows ``pytest_plugins`` in that top-level file. Importable utilities live
+under ``tests/python/helpers/``. Fixtures live under
+``tests/python/helpers/fixtures/``.
 """
 
 from __future__ import annotations
@@ -16,10 +17,3 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
-
-pytest_plugins = (
-    "tests.python.helpers.fixtures.hardware",
-    "tests.python.helpers.fixtures.router",
-    "tests.python.helpers.fixtures.worker",
-    "tests.python.helpers.fixtures.bench",
-)
