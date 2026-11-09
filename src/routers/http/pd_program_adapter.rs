@@ -1,9 +1,11 @@
 //! Opt-in, one-way PD Program scheduling and response-lifetime settlement.
 use super::dp_utils;
+use super::pd_router::PdRouterBase;
 use super::pd_warm_remote::{PdResponseContext, PdWarmRemoteRuntime};
 use super::program_adapter::ProgramCompletion;
-use super::vllm_service_discovery::{ServiceRegistry, ServiceType};
-use crate::core::{BasicWorker, DPAwareWorker, Worker, WorkerRegistry, WorkerType};
+use super::vllm_service_discovery::ServiceRegistry;
+use crate::config::RouterConfig;
+use crate::core::{Worker, WorkerRegistry, WorkerType};
 use crate::kv_index::{HashMode, KvIndexSupervisor};
 use crate::program_scheduling::{
     max_prometheus_gauge, sum_prometheus_gauge, BackendObservationProvider, ProgramIdentity,
@@ -69,7 +71,8 @@ impl PdProgramRuntime {
         ));
         let observation_scheduler = scheduler.clone();
         let workers = ctx.worker_registry.clone();
-        let dp_size = ctx.router_config.effective_decode_data_parallel_size();
+        let observer_config = ctx.router_config.clone();
+        let observer_client = ctx.client.clone();
         let provider = VllmMetricsObservationProvider::new(
             ctx.client.clone(),
             ctx.router_config.api_key.clone(),
@@ -206,7 +209,14 @@ impl PdProgramRuntime {
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 interval.tick().await;
-                let targets = decode_targets(&workers, &services, discovery, dp_size);
+                let targets = decode_targets(
+                    &workers,
+                    &services,
+                    discovery,
+                    &observer_config,
+                    &observer_client,
+                )
+                .await;
                 if let Some(warm_remote) = &observer_warm_remote {
                     warm_remote.retain_sources(&targets);
                 }
@@ -483,110 +493,36 @@ pub(super) fn discovered_target(address: &str) -> ProgramTarget {
     }
 }
 
-/// Explicit rank selection keeps discovered internal DP D affinity independent of P.
-pub(super) fn discovered_decode_instances(
-    services: &ServiceRegistry,
-    configured_dp: usize,
-) -> Vec<(String, String)> {
-    services
-        .get_decode_instances()
-        .into_iter()
-        .flat_map(|(address, zmq)| {
-            let (_, rank) = dp_utils::parse_worker_url(&address);
-            let size = decode_instance_size(
-                services.get_reported_dp_size(&address, ServiceType::Decode),
-                configured_dp,
-            );
-            if rank.is_some() || size == 1 {
-                vec![(address, zmq)]
-            } else {
-                (0..size)
-                    .map(|rank| (format!("{address}@{rank}"), zmq.clone()))
-                    .collect()
-            }
-        })
-        .collect()
-}
-
-pub(super) fn discovered_decode_instance_by_id(
-    services: &ServiceRegistry,
-    configured_dp: usize,
-    target_id: &str,
-) -> Option<(String, String)> {
-    decode_instance_entries(services, configured_dp)
-        .into_iter()
-        .find(|(url, _, _)| discovered_target(url).id == target_id)
-        .map(|(url, zmq, _)| (url, zmq))
-}
-
-/// Build the decode worker bound by the scheduler, using the same rank
-/// expansion and DP-size fallback as the candidate list it was chosen from.
-pub(super) fn discovered_decode_worker(
-    services: &ServiceRegistry,
-    configured_dp: usize,
-    target_id: &str,
-) -> Option<Arc<dyn Worker>> {
-    let (address, _, size) = decode_instance_entries(services, configured_dp)
-        .into_iter()
-        .find(|(url, _, _)| discovered_target(url).id == target_id)?;
-    let (base, rank) = dp_utils::parse_worker_url(&address);
-    let url = if base.starts_with("http://") || base.starts_with("https://") {
-        base.clone()
-    } else {
-        format!("http://{base}")
-    };
-    Some(match rank {
-        // DPAwareWorker strips the `@rank` suffix from dispatched URLs, so the
-        // bound rank survives endpoint construction.
-        Some(rank) => Arc::new(DPAwareWorker::new(url, rank, size, WorkerType::Decode)),
-        None => Arc::new(BasicWorker::new(url, WorkerType::Decode).with_dp_size(size)),
-    })
-}
-
-/// Registered decode endpoints expanded to one entry per schedulable DP rank,
-/// carrying the DP size the scheduler will bind against.
-fn decode_instance_entries(
-    services: &ServiceRegistry,
-    configured_dp: usize,
-) -> Vec<(String, String, usize)> {
-    services
-        .get_decode_instances()
-        .into_iter()
-        .flat_map(|(address, zmq)| {
-            let (_, rank) = dp_utils::parse_worker_url(&address);
-            let size = decode_instance_size(
-                services.get_reported_dp_size(&address, ServiceType::Decode),
-                configured_dp,
-            );
-            if rank.is_some() || size == 1 {
-                vec![(address, zmq, size)]
-            } else {
-                (0..size)
-                    .map(|rank| (format!("{address}@{rank}"), zmq.clone(), size))
-                    .collect()
-            }
-        })
-        .collect()
-}
-
-fn decode_instance_size(reported_dp: Option<usize>, configured_dp: usize) -> usize {
-    // An explicit registration wins even when it is smaller than the router
-    // configuration; the configured value is only a fallback for engines that
-    // did not report a DP size.
-    reported_dp.unwrap_or(configured_dp).max(1)
-}
-
-fn decode_targets(
+async fn decode_targets(
     workers: &WorkerRegistry,
     services: &ServiceRegistry,
     discovery: bool,
-    dp_size: usize,
+    config: &RouterConfig,
+    client: &reqwest::Client,
 ) -> Vec<ProgramTarget> {
     if discovery {
-        discovered_decode_instances(services, dp_size)
-            .iter()
-            .map(|(url, _)| discovered_target(url))
-            .collect()
+        let mut targets = Vec::new();
+        for (address, _) in services.get_decode_instances() {
+            let endpoint = discovered_target(&address);
+            let size = PdRouterBase::discover_worker_dp_size(
+                config,
+                client,
+                &endpoint.base_url,
+                &WorkerType::Decode,
+            )
+            .await;
+            for rank in dp_utils::expand_dp_ranks(endpoint.dp_rank, size) {
+                targets.push(ProgramTarget {
+                    id: match rank {
+                        Some(rank) => format!("{}@{rank}", endpoint.base_url),
+                        None => endpoint.base_url.clone(),
+                    },
+                    base_url: endpoint.base_url.clone(),
+                    dp_rank: rank,
+                });
+            }
+        }
+        targets
     } else {
         workers
             .get_decode_workers()
@@ -839,35 +775,119 @@ impl Stream for PdTrackedBody {
 mod tests {
     use super::*;
     use crate::program_scheduling::ProgramSchedulerConfig;
+    use crate::routers::http::vllm_service_discovery::ServiceType;
     use serde_json::json;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    #[test]
-    fn decode_target_is_resolved_from_live_discovery_after_admission() {
+    #[tokio::test]
+    async fn observer_decode_targets_follow_metrics_and_preserve_pinned_rank() {
+        use axum::{routing::get, Router};
+
+        for (metrics_size, reported_size, fallback, pinned_rank, expected_ranks) in [
+            (Some(2), Some(16), 4, None, vec![Some(0), Some(1)]),
+            (Some(1), Some(8), 4, None, vec![None]),
+            (None, Some(16), 2, None, vec![Some(0), Some(1)]),
+            (Some(2), None, 4, Some(1), vec![Some(1)]),
+        ] {
+            let app = Router::new().route(
+                "/metrics",
+                get(move || async move {
+                    match metrics_size {
+                        Some(size) => (0..size)
+                            .map(|rank| {
+                                format!("vllm:num_requests_running{{engine=\"{rank}\"}} 0\n")
+                            })
+                            .collect::<String>()
+                            .into_response(),
+                        None => StatusCode::NOT_FOUND.into_response(),
+                    }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap().to_string();
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let services = ServiceRegistry::new();
+            let registered_address = match pinned_rank {
+                Some(rank) => format!("{address}@{rank}"),
+                None => address.clone(),
+            };
+            services.register_test_instance(
+                registered_address,
+                "decode-zmq".into(),
+                ServiceType::Decode,
+                1,
+                reported_size,
+            );
+            let config = RouterConfig {
+                decode_data_parallel_size: Some(fallback),
+                ..Default::default()
+            };
+            let targets = decode_targets(
+                &WorkerRegistry::new(),
+                &services,
+                true,
+                &config,
+                &reqwest::Client::new(),
+            )
+            .await;
+            assert_eq!(
+                targets
+                    .iter()
+                    .map(|target| target.dp_rank)
+                    .collect::<Vec<_>>(),
+                expected_ranks
+            );
+            for target in targets {
+                assert_eq!(target.base_url, format!("http://{address}"));
+                let expected_id = match target.dp_rank {
+                    Some(rank) => format!("http://{address}@{rank}"),
+                    None => format!("http://{address}"),
+                };
+                assert_eq!(target.id, expected_id);
+            }
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn decode_targets_refresh_live_discovery() {
+        use axum::{routing::get, Router};
+
+        let app = Router::new().route(
+            "/{worker}/metrics",
+            get(|| async { "vllm:num_requests_running{engine=\"0\"} 0\n" }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let services = ServiceRegistry::new();
+        let workers = WorkerRegistry::new();
+        let config = RouterConfig::default();
+        let client = reqwest::Client::new();
         services.register_test_instance(
-            "old-d:8000".into(),
+            format!("{address}/old"),
             "old-zmq".into(),
             ServiceType::Decode,
             1,
             Some(1),
         );
-        let before_admission = discovered_decode_instances(&services, 1);
+        let before_admission = decode_targets(&workers, &services, true, &config, &client).await;
         services.register_test_instance(
-            "new-d:8000".into(),
+            format!("{address}/new"),
             "new-zmq".into(),
             ServiceType::Decode,
             1,
             Some(1),
         );
-        let selected_id = discovered_target("new-d:8000").id;
+        let selected_id = format!("http://{address}/new");
         assert!(!before_admission
             .iter()
-            .any(|(url, _)| discovered_target(url).id == selected_id));
-        assert_eq!(
-            discovered_decode_instance_by_id(&services, 1, &selected_id),
-            Some(("new-d:8000".into(), "new-zmq".into()))
-        );
+            .any(|target| target.id == selected_id));
+        let after_admission = decode_targets(&workers, &services, true, &config, &client).await;
+        assert!(after_admission
+            .iter()
+            .any(|target| target.id == selected_id));
+        server.abort();
     }
 
     #[tokio::test]
@@ -1036,14 +1056,6 @@ mod tests {
             DEFAULT_OUTPUT,
         );
         assert_eq!(request.request_hints().expected_output_tokens, Some(256));
-    }
-
-    #[test]
-    fn explicit_dp_size_wins_over_configured_fallback() {
-        assert_eq!(decode_instance_size(Some(2), 4), 2);
-        assert_eq!(decode_instance_size(Some(1), 4), 1);
-        assert_eq!(decode_instance_size(None, 4), 4);
-        assert_eq!(decode_instance_size(None, 0), 1);
     }
 
     async fn completion() -> (Arc<ProgramScheduler>, ProgramCompletion) {

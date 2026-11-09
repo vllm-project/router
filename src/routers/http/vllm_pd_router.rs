@@ -4371,7 +4371,10 @@ mod tests {
         ) -> Response {
             if gates.discovered {
                 let id = headers["x-request-id"].to_str().unwrap();
-                assert!(id.contains("tcp://P:1") && id.contains("tcp://D:1"));
+                assert!(
+                    id.contains("host:P,handshake:1,notify:2")
+                        && id.contains("host:D,handshake:1,notify:2")
+                );
             }
             gates.entered.send("P").unwrap();
             gates.p.acquire().await.unwrap().forget();
@@ -4465,12 +4468,12 @@ mod tests {
                 router.use_discovery = true;
                 router.service_registry.register_service(
                     p.strip_prefix("http://").unwrap().into(),
-                    "tcp://P:1".into(),
+                    "host:P,handshake:1,notify:2".into(),
                     ServiceType::Prefill,
                 );
                 router.service_registry.register_service(
                     d.strip_prefix("http://").unwrap().into(),
-                    "tcp://D:1".into(),
+                    "host:D,handshake:1,notify:2".into(),
                     ServiceType::Decode,
                 );
             }
@@ -4621,6 +4624,15 @@ mod tests {
     #[tokio::test]
     async fn test_discovery_sticky_least_loaded_pins_sessions_on_both_roles() {
         use crate::policies::StickyLeastLoadedPolicy;
+        use axum::{routing::get, Router};
+
+        let app = Router::new().route(
+            "/{role}/{worker}/metrics",
+            get(|| async { "vllm:num_requests_running{engine=\"0\"} 0\n" }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
         let ctx = Arc::new(
             crate::server::AppContext::new(
@@ -4644,7 +4656,7 @@ mod tests {
         ] {
             for i in 0..2 {
                 router.service_registry.register_service(
-                    format!("{role}-{i}:8000"),
+                    format!("{address}/{role}/{i}"),
                     format!("tcp://{role}-{i}:5557"),
                     service.clone(),
                 );
@@ -4674,11 +4686,12 @@ mod tests {
             assert_eq!(policy.active_session_count(), 4);
             for i in 0..2 {
                 assert_eq!(
-                    policy.active_count_for(&format!("http://{role}-{i}:8000")),
+                    policy.active_count_for(&format!("http://{address}/{role}/{i}")),
                     2
                 );
             }
         }
+        server.abort();
     }
 
     #[test]

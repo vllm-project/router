@@ -305,7 +305,9 @@ mod dp_e2e_tests {
             (4, None, Some(2), None, (4, 2)),
             (2, Some(4), None, None, (4, 2)),
             (1, None, None, Some((4, 2)), (4, 2)),
-            (1, Some(4), Some(2), Some((2, 4)), (4, 2)),
+            (1, Some(4), Some(2), Some((2, 4)), (2, 4)),
+            (8, None, None, Some((4, 2)), (4, 2)),
+            (4, Some(4), Some(2), Some((1, 1)), (1, 1)),
             (1, Some(4), Some(1), None, (4, 1)),
             (1, Some(1), Some(2), None, (1, 2)),
         ] {
@@ -381,14 +383,16 @@ mod dp_e2e_tests {
         );
         let mut added_p = pd_mock(WorkerType::Prefill);
         let mut added_d = pd_mock(WorkerType::Decode);
+        added_p.set_dp_metrics(2).await;
+        added_d.set_dp_metrics(1).await;
         let added_p_url = added_p.start().await.unwrap();
         let added_d_url = added_d.start().await.unwrap();
         pd.add_prefill_server(added_p_url.clone(), None)
             .await
             .unwrap();
         pd.add_decode_server(added_d_url.clone()).await.unwrap();
-        assert_eq!(ctx.worker_registry.get_prefill_workers().len(), 5);
-        assert_eq!(ctx.worker_registry.get_decode_workers().len(), 4);
+        assert_eq!(ctx.worker_registry.get_prefill_workers().len(), 3);
+        assert_eq!(ctx.worker_registry.get_decode_workers().len(), 3);
         pd.remove_prefill_server(&added_p_url).await.unwrap();
         pd.remove_decode_server(&added_d_url).await.unwrap();
         assert_eq!(ctx.worker_registry.get_prefill_workers().len(), 1);
@@ -515,7 +519,7 @@ mod dp_e2e_tests {
             .unwrap();
             assert!(
                 ctx.worker_registry.get_all().is_empty(),
-                "ZMQ discovery must not expand Decode workers"
+                "ZMQ discovery keeps candidates outside the static registry"
             );
             let app = common::test_app::create_test_app(router, Client::new(), &config);
             let should_reject = mode == Some("WRITE")
@@ -556,10 +560,11 @@ mod dp_e2e_tests {
                 };
                 assert_eq!(captured_ranks(worker_port(&p_url)), expected);
             }
-            assert_eq!(
-                captured_ranks(worker_port(&d_url)),
-                pinned_decode.into_iter().collect()
-            );
+            let expected_decode_ranks = match pinned_decode {
+                Some(rank) => [rank].into_iter().collect(),
+                None => (0..2).collect(),
+            };
+            assert_eq!(captured_ranks(worker_port(&d_url)), expected_decode_ranks);
             let p_requests = get_captured_requests(worker_port(&p_url));
             let d_requests = get_captured_requests(worker_port(&d_url));
             assert_eq!(p_requests.len(), requests);
@@ -569,11 +574,11 @@ mod dp_e2e_tests {
                     let p_params = &p_request.body.as_ref().unwrap()["kv_transfer_params"];
                     let d_params = &d_request.body.as_ref().unwrap()["kv_transfer_params"];
                     assert_eq!(p_params["remote_dp_size"], 2);
-                    assert_eq!(
-                        p_params.get("remote_dp_rank"),
-                        pinned_decode.as_ref().map(|rank| json!(rank)).as_ref()
-                    );
                     if mode == Some("WRITE") {
+                        let decode_rank: usize = d_request.headers["x-data-parallel-rank"][0]
+                            .parse()
+                            .unwrap();
+                        assert_eq!(p_params["remote_dp_rank"], decode_rank);
                         assert_eq!(d_params["remote_dp_size"], prefill_size);
                         assert_eq!(d_params["remote_tp_size"], 2);
                         assert!(d_params.get("is_request_leader").is_none());
@@ -598,14 +603,15 @@ mod dp_e2e_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_discovery_rotates_prefill_ranks_per_endpoint() {
-        for prefill_override in [Some(4), None] {
-            let local_sizes = [4, if prefill_override.is_some() { 4 } else { 2 }];
+    async fn test_discovery_preserves_per_endpoint_metrics_over_role_fallbacks() {
+        for prefill_fallback in [Some(8), None] {
+            let local_sizes = [4, 2];
             let mut p1 = pd_mock(WorkerType::Prefill);
             let mut p2 = pd_mock(WorkerType::Prefill);
             let mut d = pd_mock(WorkerType::Decode);
             p1.set_dp_metrics(local_sizes[0]).await;
             p2.set_dp_metrics(local_sizes[1]).await;
+            d.set_dp_metrics(2).await;
             let p1_url = p1.start().await.unwrap();
             let p2_url = p2.start().await.unwrap();
             let d_url = d.start().await.unwrap();
@@ -614,9 +620,9 @@ mod dp_e2e_tests {
             }
             let reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let discovery_address = reservation.local_addr().unwrap().to_string();
-            let mut config = make_pd_config(vec![], vec![], 1);
-            config.prefill_data_parallel_size = prefill_override;
-            config.decode_data_parallel_size = Some(2);
+            let mut config = make_pd_config(vec![], vec![], 8);
+            config.prefill_data_parallel_size = prefill_fallback;
+            config.decode_data_parallel_size = Some(4);
             if let RoutingMode::VllmPrefillDecode {
                 discovery_address: address,
                 ..
@@ -661,14 +667,23 @@ mod dp_e2e_tests {
             .await
             .unwrap();
             let app = common::test_app::create_test_app(router, Client::new(), &config);
-            for _ in 0..16 {
+            let cycles = 2;
+            let request_count = cycles * local_sizes.iter().sum::<usize>();
+            for _ in 0..request_count {
                 send_pd_chat(app.clone()).await;
             }
             for (url, local_size) in [(&p1_url, local_sizes[0]), (&p2_url, local_sizes[1])] {
-                assert_eq!(get_captured_requests(worker_port(url)).len(), 8);
+                assert_eq!(
+                    get_captured_requests(worker_port(url)).len(),
+                    cycles * local_size
+                );
                 assert_eq!(captured_ranks(worker_port(url)), (0..local_size).collect());
             }
-            assert!(captured_ranks(worker_port(&d_url)).is_empty());
+            assert_eq!(
+                get_captured_requests(worker_port(&d_url)).len(),
+                request_count
+            );
+            assert_eq!(captured_ranks(worker_port(&d_url)), (0..2).collect());
             for worker in [&mut p1, &mut p2, &mut d] {
                 worker.stop().await;
             }
