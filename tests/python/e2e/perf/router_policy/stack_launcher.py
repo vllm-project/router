@@ -609,7 +609,22 @@ import os
 import sys
 
 from agentinfer.agentbench.replay.executor import ReplayExecutor
+from agentinfer.agentbench.replay.transport import ReplayTransport
 from agentinfer.agentcache.entrypoints.cli.main import main
+
+_validate_tracelab_context = ReplayTransport.validate_tracelab_context
+
+async def _validate_against_worker_http(self, plan, warmup_tokens):
+    # Router /v1/models for grpc workers omits max_model_len. The library
+    # check reads base_url, so this one call uses tokenizer_base_url.
+    saved = self.upstream
+    self.upstream = self.config.backend.resolved_tokenizer_base_url.rstrip("/")
+    try:
+        return await _validate_tracelab_context(self, plan, warmup_tokens)
+    finally:
+        self.upstream = saved
+
+ReplayTransport.validate_tracelab_context = _validate_against_worker_http
 
 _delay = float(os.environ.get("AGENTX_TASK_STAGGER", "0") or 0)
 if _delay > 0:
