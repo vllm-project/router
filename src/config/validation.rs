@@ -829,8 +829,9 @@ impl ConfigValidator {
                             return Err(ConfigError::ValidationFailed {
                                 reason: format!(
                                     "static KV event source '{worker}' is rank-pinned but \
-                                     --worker-urls configures only its base URL; list the \
-                                     rank-pinned worker URLs (base@rank) or enable discovery"
+                                     --worker-urls configures only its base URL; declare the \
+                                     source under that base URL with one entry per rank, or \
+                                     enable discovery"
                                 ),
                             });
                         }

@@ -449,8 +449,10 @@ impl KvIndexSupervisor {
                         worker_url
                     ),
                     SourcesProbe::Failed => warn!(
-                        "kv_index {}: /kv_event_sources probe failed: {} — will retry",
-                        worker_url, unavailable.detail
+                        "kv_index {}: {} probe failed: {} ? will retry",
+                        worker_url,
+                        event_source_label(worker_url),
+                        unavailable.detail
                     ),
                 }
                 return Ok(WorkerKvInfo {

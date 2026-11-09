@@ -363,7 +363,8 @@ fn parse_hash(value: &str) -> Option<[u8; 32]> {
         }
     }
     let mut root = [0; 32];
-    for (out, pair) in root.iter_mut().zip(value.as_bytes().chunks_exact(2)) {
+    for (index, out) in root.iter_mut().enumerate() {
+        let pair = &value.as_bytes()[index * 2..index * 2 + 2];
         *out = (nibble(pair[0])? << 4) | nibble(pair[1])?;
     }
     Some(root)
