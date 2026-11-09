@@ -58,7 +58,8 @@ pub trait Worker: Send + Sync + fmt::Debug {
     /// Decrement the load counter
     fn decrement_load(&self);
 
-    /// Reset the load counter to 0 (for sync/recovery)
+    /// Reset the load counter to 0 for explicit recovery after active requests drain.
+    /// Health checks must not call this: active guards still own their reservations.
     fn reset_load(&self) {
         // Default implementation - does nothing
         // Workers that track load should override this

@@ -548,4 +548,59 @@ mod tests {
         assert_eq!(idx2, idx3);
         assert!(idx1.is_some());
     }
+
+    #[test]
+    fn test_consistent_hash_distinct_sessions_cover_workers() {
+        let policy = ConsistentHashPolicy::new();
+        let workers: Vec<Arc<dyn Worker>> = vec![
+            Arc::new(BasicWorker::new(
+                "http://worker1:8000".to_string(),
+                WorkerType::Regular,
+            )),
+            Arc::new(BasicWorker::new(
+                "http://worker2:8000".to_string(),
+                WorkerType::Regular,
+            )),
+            Arc::new(BasicWorker::new(
+                "http://worker3:8000".to_string(),
+                WorkerType::Regular,
+            )),
+        ];
+
+        // The ring depends on worker URLs, so probe distinct session ids until
+        // every worker is chosen. A later turn with a different prompt must stay.
+        let mut placed = std::collections::HashMap::new();
+        for session in 0..64 {
+            let request = format!(r#"{{"session_params": {{"session_id": "session-{session}"}}}}"#);
+            let idx = policy
+                .select_worker(&workers, Some(&request))
+                .expect("healthy workers");
+            placed.insert(session, idx);
+            if placed
+                .values()
+                .collect::<std::collections::HashSet<_>>()
+                .len()
+                == workers.len()
+            {
+                break;
+            }
+        }
+        let covered: std::collections::HashSet<_> = placed.values().copied().collect();
+        assert_eq!(
+            covered.len(),
+            workers.len(),
+            "distinct sessions did not cover every worker: {placed:?}"
+        );
+
+        let mut representative = std::collections::HashMap::new();
+        for (session, idx) in &placed {
+            representative.entry(*idx).or_insert(*session);
+        }
+        for (idx, session) in representative {
+            let request = format!(
+                r#"{{"prompt": "turn 1", "session_params": {{"session_id": "session-{session}"}}}}"#
+            );
+            assert_eq!(policy.select_worker(&workers, Some(&request)), Some(idx));
+        }
+    }
 }
