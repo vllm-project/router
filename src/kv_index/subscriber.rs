@@ -70,6 +70,8 @@ struct SubscriberBinding {
     lease: SourceLease,
     #[cfg(test)]
     replay_cleanup_barrier: Option<Arc<tokio::sync::Barrier>>,
+    #[cfg(test)]
+    replay_commit_barrier: Option<Arc<tokio::sync::Barrier>>,
 }
 
 pub(super) fn spawn_bound(
@@ -90,6 +92,8 @@ pub(super) fn spawn_bound(
             lease,
             #[cfg(test)]
             replay_cleanup_barrier: None,
+            #[cfg(test)]
+            replay_commit_barrier: None,
         }),
     )
 }
@@ -251,17 +255,22 @@ fn spawn_inner(
                     if seq > last_seq + 1 || !valid_rank {
                         let from = last_seq + 1;
                         let to = if !valid_rank { seq } else { seq - 1 };
-                        if with_binding(binding.as_ref(), |_| {
+                        let Some(replay_start) = with_binding(binding.as_ref(), |_| {
+                            let replay_start = if indexer.requires_full_replay(&source_id, dp_rank)
+                            {
+                                -1
+                            } else {
+                                last_seq
+                            };
                             indexer.suspend_source_for(
                                 &source_id,
                                 dp_rank,
                                 SourceRecoveryReason::SequenceGap,
                             );
-                        })
-                        .is_none()
-                        {
+                            replay_start
+                        }) else {
                             break;
-                        }
+                        };
                         emit(
                             &signals,
                             IngestionSignal::Gap {
@@ -274,7 +283,7 @@ fn spawn_inner(
                             let replay_started = Instant::now();
                             if let Some(last_replay) = replay(
                                 ep,
-                                last_seq,
+                                replay_start,
                                 seq,
                                 &ctx,
                                 &indexer,
@@ -289,33 +298,37 @@ fn spawn_inner(
                             )
                             .await
                             {
-                                RouterMetrics::record_kv_replay_outcome(
-                                    &source_id,
-                                    dp_rank,
-                                    "success",
-                                    Some(replay_started.elapsed()),
-                                );
-                                last_seq = last_replay;
-                                if with_binding(binding.as_ref(), |_| {
-                                    indexer.resume_source_for(
+                                #[cfg(test)]
+                                if let Some(barrier) = binding
+                                    .as_ref()
+                                    .and_then(|binding| binding.replay_commit_barrier.as_ref())
+                                {
+                                    barrier.wait().await;
+                                    barrier.wait().await;
+                                }
+                                let Some(committed) = with_binding(binding.as_ref(), |_| {
+                                    indexer.resume_replay_if_current(&source_id, dp_rank)
+                                }) else {
+                                    break;
+                                };
+                                if committed {
+                                    RouterMetrics::record_kv_replay_outcome(
                                         &source_id,
                                         dp_rank,
-                                        SourceRecoveryReason::ReplayApplied,
+                                        "success",
+                                        Some(replay_started.elapsed()),
                                     );
-                                })
-                                .is_none()
-                                {
-                                    break;
+                                    last_seq = last_replay;
+                                    emit(
+                                        &signals,
+                                        IngestionSignal::ReplayApplied {
+                                            source: source_id.clone(),
+                                            replay_seq: last_replay,
+                                        },
+                                    );
+                                    tokio::task::yield_now().await;
+                                    continue;
                                 }
-                                emit(
-                                    &signals,
-                                    IngestionSignal::ReplayApplied {
-                                        source: source_id.clone(),
-                                        replay_seq: last_replay,
-                                    },
-                                );
-                                tokio::task::yield_now().await;
-                                continue;
                             }
                             RouterMetrics::record_kv_replay_outcome(
                                 &source_id,
@@ -1468,6 +1481,7 @@ mod tests {
                     active: Arc::new(AtomicBool::new(true)),
                 },
                 replay_cleanup_barrier: None,
+                replay_commit_barrier: None,
             }),
         );
         let old = [1, 2, 3, 4];
@@ -1565,6 +1579,7 @@ mod tests {
                         active: Arc::new(AtomicBool::new(true)),
                     },
                     replay_cleanup_barrier: None,
+                    replay_commit_barrier: None,
                 }),
             );
             let old = [1, 2, 3, 4];
@@ -1645,6 +1660,7 @@ mod tests {
                     active: active.clone(),
                 },
                 replay_cleanup_barrier: Some(cleanup_barrier.clone()),
+                replay_commit_barrier: None,
             }),
         );
         let old = [1, 2, 3, 4];
@@ -2311,6 +2327,269 @@ mod tests {
     #[tokio::test]
     async fn continuous_replay_preserves_valid_prefix_and_applies_lost_eviction() {
         check_replay_case("complete").await;
+    }
+
+    #[tokio::test]
+    async fn failed_replay_requires_full_rebuild_before_later_exact_recovery() {
+        let mut fixture = fixture_with_block_size(true, Some(4));
+        let source = SourceId::from("w0");
+        let tokens = [
+            [1, 2, 3, 4],
+            [5, 6, 7, 8],
+            [9, 10, 11, 12],
+            [13, 14, 15, 16],
+            [17, 18, 19, 20],
+        ];
+        let payloads: Vec<_> = tokens
+            .iter()
+            .enumerate()
+            .map(|(seq, token_ids)| batch_payload(&[store_event(100 + seq as u64, token_ids)], 0))
+            .collect();
+
+        publish_until_advanced(
+            &fixture.publisher,
+            &mut fixture.signals,
+            b"kv",
+            0,
+            0.0,
+            &[store_event(100, &tokens[0])],
+            Some(0),
+        )
+        .await;
+
+        let first_replay = async {
+            let request = replay_request(fixture.replay_server.as_ref().unwrap()).await;
+            assert_eq!(read_seq(request.last().unwrap()), 1);
+            send_replay_replies(
+                fixture.replay_server.as_ref().unwrap(),
+                &request,
+                &[
+                    (1, b"kv".as_slice(), payloads[1].clone()),
+                    (END_SEQ, b"".as_slice(), vec![]),
+                ],
+            );
+        };
+        let seq_two_events = [store_event(102, &tokens[2])];
+        tokio::join!(
+            publish_until_advanced(
+                &fixture.publisher,
+                &mut fixture.signals,
+                b"kv",
+                2,
+                2.0,
+                &seq_two_events,
+                Some(0),
+            ),
+            first_replay,
+        );
+        assert_eq!(
+            fixture.indexer.source_recovery_status(&source, 0),
+            Some(crate::kv_index::SourceRecoveryStatus {
+                state: crate::kv_index::SourceRecoveryState::Fallback,
+                reason: crate::kv_index::SourceRecoveryReason::ReplayFailed,
+            })
+        );
+
+        let second_replay = async {
+            let request = replay_request(fixture.replay_server.as_ref().unwrap()).await;
+            assert_eq!(read_seq(request.last().unwrap()), 0);
+            let replies: Vec<_> = payloads
+                .iter()
+                .enumerate()
+                .map(|(seq, payload)| (seq as i64, b"kv".as_slice(), payload.clone()))
+                .collect();
+            send_replay_replies(fixture.replay_server.as_ref().unwrap(), &request, &replies);
+        };
+        let seq_four_events = [store_event(104, &tokens[4])];
+        tokio::join!(
+            publish_until_advanced(
+                &fixture.publisher,
+                &mut fixture.signals,
+                b"kv",
+                4,
+                4.0,
+                &seq_four_events,
+                Some(0),
+            ),
+            second_replay,
+        );
+
+        assert_eq!(
+            fixture.indexer.source_recovery_status(&source, 0),
+            Some(crate::kv_index::SourceRecoveryStatus {
+                state: crate::kv_index::SourceRecoveryState::Exact,
+                reason: crate::kv_index::SourceRecoveryReason::ReplayApplied,
+            })
+        );
+        for token_ids in &tokens {
+            assert_eq!(hits(&fixture.indexer, token_ids).len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn external_invalidation_requires_full_replay() {
+        let mut fixture = fixture_with_block_size(true, Some(4));
+        let source = SourceId::from("w0");
+        let tokens = [
+            [1, 2, 3, 4],
+            [5, 6, 7, 8],
+            [9, 10, 11, 12],
+            [13, 14, 15, 16],
+        ];
+        let payloads: Vec<_> = tokens
+            .iter()
+            .enumerate()
+            .map(|(seq, token_ids)| batch_payload(&[store_event(100 + seq as u64, token_ids)], 0))
+            .collect();
+
+        for seq in 0..=1 {
+            let events = [store_event(100 + seq as u64, &tokens[seq])];
+            publish_until_advanced(
+                &fixture.publisher,
+                &mut fixture.signals,
+                b"kv",
+                seq as i64,
+                seq as f64,
+                &events,
+                Some(0),
+            )
+            .await;
+        }
+        fixture
+            .indexer
+            .invalidate_source_for(&source, 0, SourceRecoveryReason::RankScopeChanged);
+
+        let replay = async {
+            let request = replay_request(fixture.replay_server.as_ref().unwrap()).await;
+            assert_eq!(read_seq(request.last().unwrap()), 0);
+            let replies: Vec<_> = payloads
+                .iter()
+                .enumerate()
+                .map(|(seq, payload)| (seq as i64, b"kv".as_slice(), payload.clone()))
+                .collect();
+            send_replay_replies(fixture.replay_server.as_ref().unwrap(), &request, &replies);
+        };
+        let seq_three_events = [store_event(103, &tokens[3])];
+        tokio::join!(
+            publish_until_advanced(
+                &fixture.publisher,
+                &mut fixture.signals,
+                b"kv",
+                3,
+                3.0,
+                &seq_three_events,
+                Some(0),
+            ),
+            replay,
+        );
+
+        assert_eq!(
+            fixture.indexer.source_recovery_status(&source, 0),
+            Some(crate::kv_index::SourceRecoveryStatus {
+                state: crate::kv_index::SourceRecoveryState::Exact,
+                reason: crate::kv_index::SourceRecoveryReason::ReplayApplied,
+            })
+        );
+        for token_ids in &tokens {
+            assert_eq!(hits(&fixture.indexer, token_ids).len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn external_invalidation_during_replay_prevents_exact_commit() {
+        let strict_rank = Arc::new(Mutex::new(false));
+        let commit_barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let mut fixture = fixture_with_binding(
+            true,
+            Some(4),
+            Some(SubscriberBinding {
+                lease: SourceLease {
+                    strict_rank: strict_rank.clone(),
+                    active: Arc::new(AtomicBool::new(true)),
+                },
+                replay_cleanup_barrier: None,
+                replay_commit_barrier: Some(commit_barrier.clone()),
+            }),
+        );
+        let source = SourceId::from("w0");
+        let tokens = [[1, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12]];
+
+        publish_until_advanced(
+            &fixture.publisher,
+            &mut fixture.signals,
+            b"kv",
+            0,
+            0.0,
+            &[store_event(100, &tokens[0])],
+            Some(0),
+        )
+        .await;
+
+        let replay = async {
+            let request = replay_request(fixture.replay_server.as_ref().unwrap()).await;
+            assert_eq!(read_seq(request.last().unwrap()), 1);
+            send_replay_replies(
+                fixture.replay_server.as_ref().unwrap(),
+                &request,
+                &[
+                    (
+                        1,
+                        b"kv".as_slice(),
+                        batch_payload(&[store_event(101, &tokens[1])], 0),
+                    ),
+                    (
+                        2,
+                        b"kv".as_slice(),
+                        batch_payload(&[store_event(102, &tokens[2])], 0),
+                    ),
+                ],
+            );
+        };
+        let invalidate = async {
+            commit_barrier.wait().await;
+            {
+                let _guard = strict_rank.lock();
+                fixture.indexer.invalidate_source_for(
+                    &source,
+                    0,
+                    SourceRecoveryReason::RankScopeChanged,
+                );
+            }
+            commit_barrier.wait().await;
+        };
+        let seq_two_events = [store_event(102, &tokens[2])];
+        tokio::join!(
+            publish_until_advanced(
+                &fixture.publisher,
+                &mut fixture.signals,
+                b"kv",
+                2,
+                2.0,
+                &seq_two_events,
+                Some(0),
+            ),
+            replay,
+            invalidate,
+        );
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if fixture.indexer.source_recovery_status(&source, 0)
+                    == Some(crate::kv_index::SourceRecoveryStatus {
+                        state: crate::kv_index::SourceRecoveryState::Fallback,
+                        reason: crate::kv_index::SourceRecoveryReason::ReplayFailed,
+                    })
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        for token_ids in &tokens {
+            assert!(hits(&fixture.indexer, token_ids).is_empty());
+        }
     }
 
     #[tokio::test]

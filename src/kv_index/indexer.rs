@@ -674,6 +674,39 @@ impl KvBlockIndexer {
         }
     }
 
+    /// A cleared or not-yet-established source has no trustworthy incremental
+    /// replay boundary. Recovery must rebuild from the beginning of the stream.
+    pub(crate) fn requires_full_replay(&self, source: &SourceId, dp_rank: u32) -> bool {
+        self.source_states
+            .get(&(source.clone(), dp_rank))
+            .is_none_or(|record| {
+                matches!(
+                    record.status.state,
+                    SourceRecoveryState::Cold | SourceRecoveryState::Fallback
+                )
+            })
+    }
+
+    /// Commit replay only while the source is still in the recovery attempt
+    /// that authorized it. Bound subscribers call this under their source
+    /// lease, so an external invalidation cannot race the check and resume.
+    pub(crate) fn resume_replay_if_current(&self, source: &SourceId, dp_rank: u32) -> bool {
+        let current = self
+            .source_states
+            .get(&(source.clone(), dp_rank))
+            .map(|record| record.status);
+        if current
+            != Some(SourceRecoveryStatus {
+                state: SourceRecoveryState::Degraded,
+                reason: SourceRecoveryReason::SequenceGap,
+            })
+        {
+            return false;
+        }
+        self.resume_source_for(source, dp_rank, SourceRecoveryReason::ReplayApplied);
+        true
+    }
+
     /// Enable observations only after an authoritative initial, replay, or
     /// clear boundary.
     /// Already-active sources must not invalidate concurrent query snapshots.
