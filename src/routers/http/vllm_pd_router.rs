@@ -930,7 +930,7 @@ impl VllmPDRouter {
             return None;
         }
         // Adapter identity is not modeled by the session binding key.
-        if ["lora_name", "lora_path"]
+        if ["lora_name", "lora_path", "prompt_adapter_request"]
             .iter()
             .any(|field| request.get(*field).is_some_and(|value| !value.is_null()))
         {
@@ -4250,7 +4250,7 @@ mod tests {
         let enabled = KvAwarePolicy::default().with_shared_affinity(Arc::new(
             KvAffinityTable::with_ttl(Some(Duration::from_secs(1800))),
         ));
-        for field in ["lora_name", "lora_path"] {
+        for field in ["lora_name", "lora_path", "prompt_adapter_request"] {
             for (case, value, eligible) in [
                 ("absent", None, true),
                 ("null", Some(Value::Null), true),
@@ -4356,9 +4356,16 @@ mod tests {
         assert_eq!(binding.in_flight(), 0);
         assert!(router.pd_router.pd_load.snapshot().is_empty());
 
-        for field in ["lora_name", "lora_path"] {
+        for (field, value) in [
+            ("lora_name", json!("adapter-a")),
+            ("lora_path", json!("adapter-a")),
+            (
+                "prompt_adapter_request",
+                json!({"prompt_adapter_name": "adapter-a"}),
+            ),
+        ] {
             let mut adapter = plain.clone();
-            adapter[field] = json!("adapter-a");
+            adapter[field] = value;
             let (selection, attempt) = router
                 .admit_pair(&prefill, &decode, &adapter, "/v1/completions", None, false)
                 .await
