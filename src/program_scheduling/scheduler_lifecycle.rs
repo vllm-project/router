@@ -7,11 +7,12 @@ use super::return_time;
 use super::scheduler::ProgramScheduler;
 use super::scheduler_state::{ProgramPauseReason, ProgramSchedulerState};
 use super::{
-    ProgramDispatch, ProgramRef, ProgramState, ProgramStatus, ProgramUsageObservation,
-    RequestSample,
+    CapacityRepairPolicy, ProgramDispatch, ProgramRef, ProgramState, ProgramStatus,
+    ProgramUsageObservation, RequestSample,
 };
 use crate::config::types::PredictionMode;
 use crate::metrics::RouterMetrics;
+use std::cmp::Ordering;
 use std::time::Instant;
 use tracing::{debug, info};
 
@@ -29,6 +30,37 @@ struct CapacityVictim {
     status: ProgramStatus,
     score: f64,
     sort_private_tokens: f64,
+    retention_value: f64,
+    retention_ttl_seconds: f64,
+    cache_miss_impact_seconds: f64,
+}
+
+impl CapacityVictim {
+    fn legacy_cmp(left: &Self, right: &Self) -> Ordering {
+        right
+            .score
+            .total_cmp(&left.score)
+            .then_with(|| {
+                right
+                    .sort_private_tokens
+                    .total_cmp(&left.sort_private_tokens)
+            })
+            .then_with(|| {
+                left.reference
+                    .program_id()
+                    .cmp(right.reference.program_id())
+            })
+    }
+
+    fn cmp_for_policy(left: &Self, right: &Self, policy: CapacityRepairPolicy) -> Ordering {
+        match policy {
+            CapacityRepairPolicy::Legacy => Self::legacy_cmp(left, right),
+            CapacityRepairPolicy::RetentionValue => left
+                .retention_value
+                .total_cmp(&right.retention_value)
+                .then_with(|| Self::legacy_cmp(left, right)),
+        }
+    }
 }
 
 impl ProgramScheduler {
@@ -389,6 +421,7 @@ impl ProgramScheduler {
                 });
             }
             if completion_action == Some(CompletionAction::StartActingTtl) {
+                decision.last_applied_acting_ttl = acting_ttl;
                 decision.acting_since = Some(now);
                 decision.ttl_deadline = Some(now + acting_ttl);
                 RouterMetrics::record_agent_aware_armed_ttl(
@@ -778,11 +811,23 @@ impl ProgramScheduler {
                         };
                         let score = elapsed
                             * (1.0 / (input as f64 / average_prompt).max(1e-6).sqrt()).max(0.5);
+                        let retention_ttl_seconds = if program.status == ProgramStatus::Acting {
+                            decision.ttl_deadline.map_or(0.0, |deadline| {
+                                deadline.saturating_duration_since(now).as_secs_f64()
+                            })
+                        } else {
+                            decision.last_applied_acting_ttl.as_secs_f64()
+                        };
+                        let cache_miss_impact_seconds =
+                            decision.last_cache_miss_impact_seconds.max(0.0);
                         victims.push(CapacityVictim {
                             reference: program.reference.clone(),
                             status: program.status,
                             score,
                             sort_private_tokens: private_tokens,
+                            retention_value: retention_ttl_seconds * cache_miss_impact_seconds,
+                            retention_ttl_seconds,
+                            cache_miss_impact_seconds,
                         });
                     }
                 }
@@ -806,21 +851,9 @@ impl ProgramScheduler {
             if projected <= high {
                 continue;
             }
-            victims.sort_by(|left, right| {
-                right
-                    .score
-                    .total_cmp(&left.score)
-                    .then_with(|| {
-                        right
-                            .sort_private_tokens
-                            .total_cmp(&left.sort_private_tokens)
-                    })
-                    .then_with(|| {
-                        left.reference
-                            .program_id()
-                            .cmp(right.reference.program_id())
-                    })
-            });
+            let repair_policy = self.config.progress_ttl.capacity_repair_policy;
+            victims
+                .sort_by(|left, right| CapacityVictim::cmp_for_policy(left, right, repair_policy));
             for victim in victims {
                 if projected <= low {
                     break;
@@ -836,6 +869,21 @@ impl ProgramScheduler {
                     } else {
                         0.0
                     };
+                info!(
+                    event = "capacity_repair_victim",
+                    program = %victim.reference.redacted_id(),
+                    target = %target_id,
+                    policy = repair_policy.as_str(),
+                    status = ?victim.status,
+                    retention_value = victim.retention_value,
+                    retention_ttl_seconds = victim.retention_ttl_seconds,
+                    cache_miss_impact_seconds = victim.cache_miss_impact_seconds,
+                    legacy_score = victim.score,
+                    private_tokens,
+                    projected_tokens = projected,
+                    repair_target_tokens = low,
+                    "Program capacity repair victim"
+                );
                 let relieved = if victim.status == ProgramStatus::Acting {
                     self.pause_idle(
                         state,
@@ -1214,10 +1262,12 @@ mod tests {
             .unwrap();
         scheduler.complete(&dispatch, true, false, Some(100), Some(0.1));
         let state = scheduler.state.lock();
-        let deadline = state.decisions[dispatch.program()].ttl_deadline.unwrap();
+        let decision = &state.decisions[dispatch.program()];
+        let deadline = decision.ttl_deadline.unwrap();
         let remaining = deadline.saturating_duration_since(Instant::now());
         assert!(remaining > Duration::from_secs(6));
         assert!(remaining < Duration::from_secs(8));
+        assert_eq!(decision.last_applied_acting_ttl, Duration::from_secs(7));
     }
 
     #[tokio::test]
@@ -1262,6 +1312,134 @@ mod tests {
         }
         scheduler.complete(&first, true, true, Some(140), Some(0.1));
         scheduler.complete(&second, true, true, Some(140), Some(0.1));
+    }
+
+    #[tokio::test]
+    async fn capacity_repair_policy_preserves_legacy_and_can_prefer_low_retention_value() {
+        let scheduler = ProgramScheduler::new(ProgramSchedulerConfig::default());
+        let target = ProgramTarget {
+            id: "rank-0".into(),
+            base_url: "http://rank-0".into(),
+            dp_rank: Some(0),
+        };
+        let high_legacy_score = scheduler
+            .acquire(
+                identity("high-legacy-score"),
+                100,
+                std::slice::from_ref(&target),
+                None,
+            )
+            .await
+            .unwrap();
+        let low_retention_value = scheduler
+            .acquire(identity("low-retention-value"), 100, &[target], None)
+            .await
+            .unwrap();
+        let make_victims = || {
+            vec![
+                CapacityVictim {
+                    reference: high_legacy_score.program().clone(),
+                    status: ProgramStatus::Acting,
+                    score: 10.0,
+                    sort_private_tokens: 100.0,
+                    retention_value: 5.0,
+                    retention_ttl_seconds: 5.0,
+                    cache_miss_impact_seconds: 1.0,
+                },
+                CapacityVictim {
+                    reference: low_retention_value.program().clone(),
+                    status: ProgramStatus::Acting,
+                    score: 1.0,
+                    sort_private_tokens: 100.0,
+                    retention_value: 0.0,
+                    retention_ttl_seconds: 0.0,
+                    cache_miss_impact_seconds: 1.0,
+                },
+            ]
+        };
+
+        let mut legacy = make_victims();
+        legacy.sort_by(|left, right| {
+            CapacityVictim::cmp_for_policy(left, right, CapacityRepairPolicy::Legacy)
+        });
+        assert_eq!(legacy[0].reference, *high_legacy_score.program());
+
+        let mut retention_value = make_victims();
+        retention_value.sort_by(|left, right| {
+            CapacityVictim::cmp_for_policy(left, right, CapacityRepairPolicy::RetentionValue)
+        });
+        assert_eq!(retention_value[0].reference, *low_retention_value.program());
+    }
+
+    #[tokio::test]
+    async fn retention_value_repair_releases_low_value_and_still_reaches_capacity_target() {
+        let mut config = ProgramSchedulerConfig::default();
+        config.progress_ttl.token_capacity = Some(500);
+        config.progress_ttl.capacity_repair_policy = CapacityRepairPolicy::RetentionValue;
+        let scheduler = ProgramScheduler::new(config);
+        let target = ProgramTarget {
+            id: "rank-0".into(),
+            base_url: "http://rank-0".into(),
+            dp_rank: Some(0),
+        };
+        let identity_with_ttl = |program: &str| {
+            ProgramIdentity::from_request(
+                None,
+                Some(&json!({"vllm_xargs":{"agentic_context":{
+                    "program_id":program,
+                    "task_id":null,
+                    "expected_resume":true,
+                    "kv_retention_ttl_seconds":10.0
+                }}})),
+                Some("model"),
+            )
+            .unwrap()
+            .unwrap()
+        };
+        let high_value = scheduler
+            .acquire(
+                identity_with_ttl("high-value"),
+                100,
+                std::slice::from_ref(&target),
+                None,
+            )
+            .await
+            .unwrap();
+        let low_value = scheduler
+            .acquire(identity_with_ttl("low-value"), 100, &[target], None)
+            .await
+            .unwrap();
+        scheduler.complete(&high_value, true, false, Some(100), Some(0.1));
+        scheduler.complete(&low_value, true, false, Some(100), Some(0.1));
+
+        let now = Instant::now();
+        let mut state = scheduler.state.lock();
+        for dispatch in [&high_value, &low_value] {
+            state
+                .decisions
+                .get_mut(dispatch.program())
+                .unwrap()
+                .estimated_context_tokens = 300;
+        }
+        let high = state.decisions.get_mut(high_value.program()).unwrap();
+        high.ttl_deadline = Some(now + Duration::from_secs(10));
+        high.last_cache_miss_impact_seconds = 2.0;
+        let low = state.decisions.get_mut(low_value.program()).unwrap();
+        low.ttl_deadline = Some(now + Duration::from_secs(1));
+        low.last_cache_miss_impact_seconds = 0.5;
+
+        assert!(scheduler.repair_capacity(&mut state, now));
+        assert_eq!(
+            state.runtime.view(high_value.program()).unwrap().state,
+            ProgramState::Active
+        );
+        assert_eq!(
+            state.runtime.view(low_value.program()).unwrap().state,
+            ProgramState::Paused
+        );
+        let remaining_usage = state.decisions[high_value.program()]
+            .private_tokens(scheduler.config.progress_ttl.decode_buffer_tokens);
+        assert!(remaining_usage <= 500.0);
     }
 
     #[tokio::test]
