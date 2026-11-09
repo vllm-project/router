@@ -214,9 +214,10 @@ def allocate_ports(run: RouterPolicyStack) -> None:
 
     KV event sockets are not reserved here. ``engine_command`` passes
     ``tcp://*:0`` so vLLM binds an OS-assigned port at startup and publishes
-    the resolved endpoint on ``/kv_event_sources``. Pre-picking those ports
-    and releasing them before model load loses the race (``tcp://*:PORT``
-    Address already in use).
+    the resolved endpoint through gRPC ``Control.GetKvEventSources``. The
+    vllm-rs HTTP server does not serve ``/kv_event_sources``. Pre-picking
+    those ports and releasing them before model load loses the race
+    (``tcp://*:PORT`` Address already in use).
     """
 
     release_all_port_holders(run.port_holders)
@@ -372,35 +373,141 @@ def _endpoint_uses_port_zero(value: str) -> bool:
     return text.endswith(":0") or "*:0" in text
 
 
-def _unresolved_kv_endpoints(node: Any) -> list[str]:
+def _proto_fields(payload: bytes):
+    """Yield ``(field_number, value)`` for a protobuf message.
+
+    Varints stay ints. Length-delimited fields stay ``bytes``. Fixed32/64 are
+    skipped as opaque slices. This only needs ``GetKvEventSourcesResponse``.
+    """
+
+    index = 0
+    end = len(payload)
+    while index < end:
+        key, index = _read_varint(payload, index)
+        field, wire = key >> 3, key & 7
+        if wire == 0:
+            value, index = _read_varint(payload, index)
+            yield field, value
+        elif wire == 2:
+            length, index = _read_varint(payload, index)
+            value = payload[index : index + length]
+            index += length
+            yield field, value
+        elif wire == 5:
+            index += 4
+        elif wire == 1:
+            index += 8
+        else:
+            raise ValueError(f"unsupported protobuf wire type {wire}")
+
+
+def _read_varint(payload: bytes, index: int) -> tuple[int, int]:
+    value = 0
+    shift = 0
+    while True:
+        if index >= len(payload):
+            raise ValueError("truncated protobuf varint")
+        byte = payload[index]
+        index += 1
+        value |= (byte & 0x7F) << shift
+        if byte < 0x80:
+            return value, index
+        shift += 7
+        if shift > 63:
+            raise ValueError("protobuf varint is too long")
+
+
+def _kv_event_endpoints_from_proto(payload: bytes) -> list[str]:
+    """Pull ``endpoint`` and ``replay_endpoint`` out of ``GetKvEventSourcesResponse``."""
+
     found: list[str] = []
-    if isinstance(node, dict):
-        for key, child in node.items():
-            if key in {"endpoint", "replay_endpoint"} and isinstance(child, str):
-                if _endpoint_uses_port_zero(child):
-                    found.append(child)
-            else:
-                found.extend(_unresolved_kv_endpoints(child))
-    elif isinstance(node, list):
-        for child in node:
-            found.extend(_unresolved_kv_endpoints(child))
+    for field, value in _proto_fields(payload):
+        if field != 1 or not isinstance(value, (bytes, bytearray)):
+            continue
+        for inner, inner_val in _proto_fields(value):
+            if inner not in (2, 4) or not isinstance(inner_val, (bytes, bytearray)):
+                continue
+            text = bytes(inner_val).decode()
+            if text:
+                found.append(text)
     return found
 
 
-def _require_resolved_kv_events(ports: dict[str, Any]) -> None:
-    """Fail if a worker still advertises a KV event port of 0."""
+def _grpc_kv_endpoints(port: int) -> list[str]:
+    """Read bound KV event addresses from vllm-rs ``Control.GetKvEventSources``."""
 
-    for i, http_port in enumerate(ports["http"]):
-        url = f"http://127.0.0.1:{http_port}/kv_event_sources"
-        try:
-            response = httpx.get(url, timeout=5.0)
-            response.raise_for_status()
-            body = response.json()
-        except (httpx.HTTPError, json.JSONDecodeError) as exc:
-            raise RuntimeError(f"engine{i} {url} unavailable: {exc}") from exc
-        unresolved = _unresolved_kv_endpoints(body)
+    try:
+        import grpc
+    except ImportError as exc:
+        raise RuntimeError("grpc is required to read vllm-rs KV event sources") from exc
+    target = f"127.0.0.1:{port}"
+    channel = grpc.insecure_channel(target)
+    try:
+        call = channel.unary_unary(
+            "/vllm.Control/GetKvEventSources",
+            request_serializer=lambda _request: b"",
+            response_deserializer=_kv_event_endpoints_from_proto,
+        )
+        return list(call(None, timeout=5))
+    except grpc.RpcError as exc:
+        raise RuntimeError(
+            f"GetKvEventSources grpc://{target} failed: {exc.code().name} {exc.details()}"
+        ) from exc
+    finally:
+        channel.close()
+
+
+def _http_kv_endpoints(port: int) -> list[str]:
+    url = f"http://127.0.0.1:{port}/kv_event_sources"
+    try:
+        response = httpx.get(url, timeout=5.0)
+        response.raise_for_status()
+        body = response.json()
+    except (httpx.HTTPError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"{url} unavailable: {exc}") from exc
+    found: list[str] = []
+
+    def walk(node: Any) -> None:
+        if isinstance(node, dict):
+            for key, child in node.items():
+                if (
+                    key in {"endpoint", "replay_endpoint"}
+                    and isinstance(child, str)
+                    and child
+                ):
+                    found.append(child)
+                else:
+                    walk(child)
+        elif isinstance(node, list):
+            for child in node:
+                walk(child)
+
+    walk(body)
+    return found
+
+
+def _require_resolved_kv_events(run: RouterPolicyStack) -> None:
+    """Fail if a worker still advertises a KV event port of 0.
+
+    gRPC workers (this suite) publish the bound address on
+    ``Control.GetKvEventSources``. Their OpenAI HTTP port answers 404 for
+    ``/kv_event_sources``.
+    """
+
+    ports = run.ports
+    scheme = str(run.case.router.get("protocol", "grpc"))
+    for i in range(run.case.worker_count):
+        if scheme == "grpc":
+            label = f"engine{i} grpc://127.0.0.1:{ports['grpc'][i]} GetKvEventSources"
+            endpoints = _grpc_kv_endpoints(ports["grpc"][i])
+        else:
+            label = f"engine{i} http://127.0.0.1:{ports['http'][i]}/kv_event_sources"
+            endpoints = _http_kv_endpoints(ports["http"][i])
+        if not endpoints:
+            raise RuntimeError(f"{label} returned no KV event endpoints")
+        unresolved = [item for item in endpoints if _endpoint_uses_port_zero(item)]
         if unresolved:
-            raise RuntimeError(f"engine{i} {url} still advertises port 0: {unresolved}")
+            raise RuntimeError(f"{label} still advertises port 0: {unresolved}")
 
 
 def snapshot(run: RouterPolicyStack, dest):
@@ -509,7 +616,7 @@ raise SystemExit(main(["vllm", *sys.argv[1:]]))
                         log_path=worker_log,
                     )
                 )
-            _require_resolved_kv_events(ports)
+            _require_resolved_kv_events(run)
             print(f"ENGINES_READY {time.monotonic() - started:.0f}s", flush=True)
             release_router_port_holders(run.port_holders, case.worker_count)
             router_argv = router_command(run)
