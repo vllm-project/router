@@ -722,7 +722,7 @@ impl Router {
             .as_ref()
             .map(ProgramSchedulerConfig::from)
             .map(ProgramScheduler::new)
-            .map(|scheduler| {
+            .inspect(|scheduler| {
                 scheduler.publish_token_count_mode();
                 if scheduler.exact_text_enabled() {
                     let tokenizer_override = std::env::var("VLLM_ROUTER_TOKENIZER").unwrap_or_default();
@@ -738,7 +738,6 @@ impl Router {
                         );
                     }
                 }
-                scheduler
             })
             .map(Arc::new);
         let program_observation_handle = program_scheduler.as_ref().map(|scheduler| {

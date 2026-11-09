@@ -581,7 +581,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn vllm_xargs_is_accepted_as_router_plane_identity_and_dropped() {
         // The canonical Program identity travels in `vllm_xargs`; the gRPC
         // adapter must accept it for the HTTP layer to read, and must not

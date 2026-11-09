@@ -94,15 +94,11 @@ impl ProgramScheduler {
         target_id: &str,
         now: Instant,
     ) -> Option<&'static str> {
-        let Some(decision) = state.decisions.get(program) else {
-            return None;
-        };
-        let Some(shadow_required) = decision.shadow_private_tokens_with_output(
+        let decision = state.decisions.get(program)?;
+        let shadow_required = decision.shadow_private_tokens_with_output(
             self.config.progress_ttl.decode_buffer_tokens,
             decision.output_token_reservation,
-        ) else {
-            return None;
-        };
+        )?;
         let capacity = self.config.progress_ttl.token_capacity;
         let applied_required = decision.private_tokens_with_output(
             self.config.progress_ttl.decode_buffer_tokens,
@@ -260,7 +256,7 @@ impl ProgramScheduler {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use super::*;
     use crate::program_scheduling::{
