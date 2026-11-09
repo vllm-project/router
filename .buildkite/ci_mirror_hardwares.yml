@@ -6,6 +6,7 @@
 #
 #   l4_1       Same pool and image, one L4. 1 GPU = 10 CPU / 40Gi / 24Gi shm.
 #   l4_2       EKS l4-k8s, same l4x4 pool, pod requests 2x L4. 2 GPU = 20 CPU / 80Gi / 48Gi shm.
+#              router_policy nightly: 2 co-located vllm-rs workers.
 #   l4_4       EKS l4-k8s, 4x L4 (vllm.ci/gpu-pool=l4x4). 4 GPU = 40 CPU / 160Gi / 96Gi shm.
 #              Image is the router CI image pushed by image-build:
 #              public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:router-$BUILDKITE_COMMIT
@@ -14,7 +15,7 @@
 #   h100_2     mithril-h100-pool, 2x H100 SXM (node.kubernetes.io/instance-type=gpu-h100-sxm).
 #              Image is the us-west-2 pull-through cache of the router CI image.
 #              Scheduling sets a GPU limit of 2 and does not request CPU, memory, or shm size.
-#   h100_4     mithril-h100-pool, 4x H100 SXM (router_policy: 4 co-located vllm-rs workers).
+#   h100_4     mithril-h100-pool, 4x H100 SXM.
 #              Same pull-through image; 4 GPU limit with CPU/memory/shm requests for large KV.
 #
 # Test-specific env (MORIIO_READ_MODE, LM_EVAL_LIMIT, LOG_DIR) stays on the step.

@@ -1,4 +1,4 @@
-"""Run one router_policy perf cell (4 co-located gRPC workers + router + replay).
+"""Run one router_policy perf cell (2 co-located gRPC workers + router + replay).
 
 Flow:
   1. Start vLLM workers (engines).
@@ -7,8 +7,8 @@ Flow:
   4. Wait until router passes HTTP /health.
   5. Run agentinfer replay bench against the router.
 
-Workload is the AgentX stress trace (2 sessions, 68 requests) in
-``data/agentx-stress-68.jsonl``. Replay executes that plan and writes
+Workload is the TraceLab 8-session / 28-request subset
+(``data/tracelab-ci-uniform-28.jsonl``). Replay executes that plan and writes
 ``result/requests.jsonl`` (per-request TTFT/latency — analysis output, not the bench input).
 
 Configuration: ``AGENTX_CASE_FILE`` points to one self-contained case JSON
@@ -128,8 +128,8 @@ def bootstrap(case_path: Path) -> None:
     OPENSSL_LIB = runtime.get("openssl_lib_dir") or ""
     TRACE = Path(runtime["trace_path"])
     SERVED_MODEL_NAME = runtime["served_model_name"]
-    TRACE_TYPE = str(runtime.get("trace_type") or "agentX")
-    ENDPOINT = str(runtime.get("endpoint") or "/v1/completions")
+    TRACE_TYPE = str(runtime.get("trace_type") or "tracelab")
+    ENDPOINT = str(runtime.get("endpoint") or "/v1/chat/completions")
 
     ROUTER_POLICY = str(
         ROUTER_CFG.get("policy")
@@ -138,7 +138,7 @@ def bootstrap(case_path: Path) -> None:
     )
     TASK_NUM = int(bench.get("task-num", 128))
     CONCURRENCY = int(bench.get("max-concurrency", 8))
-    WORKERS = int(workers.get("count", 4))
+    WORKERS = int(workers.get("count", 2))
     GAP_SCALE = float(bench.get("gap_scale", 0.0))
     MAX_INFLIGHT = int(bench.get("max_inflight", 1))
     STALL_SECS = int(bench.get("stall_secs", 900))

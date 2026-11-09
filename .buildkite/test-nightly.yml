@@ -172,9 +172,9 @@ steps:
       - "tests/python/e2e/perf/grpc/results/**/*.json"
 
   # ============================================================================
-  # L3 router_policy AgentX replay — cache_aware / kv_aware / kv_aware_aff @ c16.
-  # 4× vllm-rs + router per cell (32GiB GPU KV + 16GiB host offload/worker) → H100×4.
-  # Optional: AGENTX_TRACE_JSONL_URL to replace data/agentx-stress-68.jsonl.
+  # L3 router_policy TraceLab replay — cache_aware / kv_aware / kv_aware_aff @ c16.
+  # 2× vllm-rs + router per cell (12GiB GPU KV/worker, no CPU offload) → L4×2.
+  # Optional: AGENTX_TRACE_JSONL_URL to replace data/tracelab-ci-uniform-28.jsonl.
   # ============================================================================
   - label: ":python: router policy perf (c16 × 3 policies)"
     key: "router-policy-perf-e2e"
@@ -187,7 +187,7 @@ steps:
       manual:
         allowed: true
         reason: "GPU perf cold starts / long replay — retry after checking logs"
-    mirror_hardwares: h100_4
+    mirror_hardwares: l4_2
     depends_on:
       - "upload-nightly-pipeline"
       - "image-build"
@@ -205,7 +205,7 @@ steps:
       export AGENTX_PORT_SETTLE_SEC="${AGENTX_PORT_SETTLE_SEC:-5}"
       export AGENTX_PERF_TIMEOUT_SEC="${AGENTX_PERF_TIMEOUT_SEC:-14400}"
 
-      trace="tests/python/e2e/perf/router_policy/data/agentx-stress-68.jsonl"
+      trace="tests/python/e2e/perf/router_policy/data/tracelab-ci-uniform-28.jsonl"
       if [[ -n "${AGENTX_TRACE_JSONL_URL:-}" ]]; then
         mkdir -p "$(dirname "${trace}")"
         curl -fsSL "${AGENTX_TRACE_JSONL_URL}" -o "${trace}"

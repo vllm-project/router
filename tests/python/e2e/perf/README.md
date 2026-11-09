@@ -8,7 +8,7 @@ GPU-backed performance scenarios live in subdirectories (each with its own
 | Directory | Description |
 |-----------|-------------|
 | [`grpc/`](grpc/README.md) | Prefix-KV hit/miss via router + vllm-rs / vllm (rust gRPC, rust HTTP, python HTTP) |
-| [`router_policy/`](router_policy/README.md) | AgentX stress replay: workers → router → bench; cells = 3 policies × 3 concurrency levels |
+| [`router_policy/`](router_policy/README.md) | TraceLab cold replay: workers → router → bench; cells = 3 policies × 3 concurrency levels |
 | [`l1_encode/`](l1_encode/README.md) | L1 prefix encoding cache (`encode_ms`, `encode_reuse`); one worker, router L1 on then L1 off |
 
 ## grpc
