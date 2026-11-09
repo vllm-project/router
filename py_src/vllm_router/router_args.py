@@ -104,7 +104,7 @@ class RouterArgs:
     cb_window_duration_secs: int = 120
     disable_circuit_breaker: bool = False
 
-    # Optional per-role DP replicas per worker URL; appended for positional compatibility.
+    # Optional per-role DP fallbacks per worker URL; appended for positional compatibility.
     prefill_data_parallel_size: Optional[int] = None
     decode_data_parallel_size: Optional[int] = None
 
@@ -385,13 +385,13 @@ class RouterArgs:
             f"--{prefix}prefill-data-parallel-size",
             type=int,
             default=None,
-            help="Prefill DP replicas per worker URL; overrides automatic discovery and the legacy DP fallback.",
+            help="Prefill DP fallback per worker URL when metrics are unavailable; defaults to the legacy DP size.",
         )
         parser.add_argument(
             f"--{prefix}decode-data-parallel-size",
             type=int,
             default=None,
-            help="Decode DP replicas per worker URL; overrides automatic discovery and the legacy DP fallback.",
+            help="Decode DP fallback per worker URL when metrics are unavailable; defaults to the legacy DP size.",
         )
         parser.add_argument(
             f"--{prefix}enable-igw",

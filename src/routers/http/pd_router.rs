@@ -628,7 +628,7 @@ impl PdRouterBase {
         admitted
     }
 
-    /// An explicit role size takes precedence; otherwise keep per-server metrics discovery.
+    /// Discover each endpoint first, then use its role fallback or the legacy size.
     pub(super) async fn discover_worker_dp_size(
         config: &RouterConfig,
         client: &Client,
@@ -646,10 +646,19 @@ impl PdRouterBase {
             ),
             _ => (None, config.intra_node_data_parallel_size),
         };
-        match configured {
-            Some(size) => size,
-            None => dp_utils::discover_dp_size(client, url, fallback).await,
+        let dp_size = dp_utils::discover_dp_size(client, url, fallback).await;
+        if let Some(configured) = configured {
+            if dp_size != configured {
+                warn!(
+                    url,
+                    ?worker_type,
+                    configured_dp_size = configured,
+                    discovered_dp_size = dp_size,
+                    "Using worker metrics instead of the configured DP fallback"
+                );
+            }
         }
+        dp_size
     }
 
     // Private helper method to perform health check on a new server

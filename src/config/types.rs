@@ -40,10 +40,10 @@ pub struct RouterConfig {
     /// Intra-node data parallel size (number of DP replicas per worker URL). When > 1, the router will create multiple worker instances per URL, one for each DP rank.
     #[serde(default = "default_intra_node_data_parallel_size")]
     pub intra_node_data_parallel_size: usize,
-    /// Prefill DP replicas per worker URL. None preserves automatic discovery and the legacy fallback.
+    /// Prefill DP fallback per worker URL when metrics are unavailable. None uses the legacy size.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prefill_data_parallel_size: Option<usize>,
-    /// Decode DP replicas per worker URL. None preserves automatic discovery and the legacy fallback.
+    /// Decode DP fallback per worker URL when metrics are unavailable. None uses the legacy size.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decode_data_parallel_size: Option<usize>,
     /// The api key used for the authorization with the worker

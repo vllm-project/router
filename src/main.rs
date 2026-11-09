@@ -244,11 +244,11 @@ struct CliArgs {
     #[arg(long, default_value_t = 1)]
     intra_node_data_parallel_size: usize,
 
-    /// Prefill DP replicas per worker URL (overrides automatic discovery and the legacy fallback)
+    /// Prefill DP fallback per worker URL when metrics are unavailable (defaults to the legacy size)
     #[arg(long)]
     prefill_data_parallel_size: Option<usize>,
 
-    /// Decode DP replicas per worker URL (overrides automatic discovery and the legacy fallback)
+    /// Decode DP fallback per worker URL when metrics are unavailable (defaults to the legacy size)
     #[arg(long)]
     decode_data_parallel_size: Option<usize>,
 

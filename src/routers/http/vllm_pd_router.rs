@@ -404,7 +404,7 @@ impl VllmPDRouter {
                 None if self.pd_router.config.prefill_data_parallel_size.is_some()
                     || self.pd_router.config.decode_data_parallel_size.is_some() =>
                 {
-                    return Err(format!("MoRI-IO WRITE {role} peer must report its global DP size when role DP overrides are used; an HTTP engine count does not establish the transfer world"));
+                    return Err(format!("MoRI-IO WRITE {role} peer must report its global DP size when role DP fallbacks are configured; an HTTP engine count does not establish the transfer world"));
                 }
                 _ => {} // Keep the existing legacy single-pod configuration contract.
             }
@@ -1128,7 +1128,8 @@ impl VllmPDRouter {
             .unwrap_or(false);
         let decode_targets = if self.use_discovery {
             self.discovery_candidates(
-                self.service_registry.get_instance_snapshots(ServiceType::Decode),
+                self.service_registry
+                    .get_instance_snapshots(ServiceType::Decode),
                 ServiceType::Decode,
             )
             .await
@@ -1283,7 +1284,8 @@ impl VllmPDRouter {
         if self.use_discovery {
             return self
                 .discovery_candidates(
-                    self.service_registry.get_instance_snapshots(ServiceType::Decode),
+                    self.service_registry
+                        .get_instance_snapshots(ServiceType::Decode),
                     ServiceType::Decode,
                 )
                 .await
@@ -1310,7 +1312,10 @@ impl VllmPDRouter {
                 .get_instance_snapshots(ServiceType::Prefill)
             {
                 let id = pd_program_adapter::discovered_target(&snapshot.0).id;
-                for worker in self.discovery_candidates(vec![snapshot], ServiceType::Prefill).await {
+                for worker in self
+                    .discovery_candidates(vec![snapshot], ServiceType::Prefill)
+                    .await
+                {
                     candidates.push((id.clone(), worker));
                 }
             }
@@ -1407,16 +1412,20 @@ impl VllmPDRouter {
         path: &str,
         headers: Option<&HeaderMap>,
     ) -> Option<(Arc<dyn Worker>, Arc<dyn Worker>, PdAttempt)> {
-        let prefill_workers = self.discovery_candidates(
-            self.service_registry
-                .get_instance_snapshots(ServiceType::Prefill),
-            ServiceType::Prefill,
-        ).await;
-        let decode_workers = self.discovery_candidates(
-            self.service_registry
-                .get_instance_snapshots(ServiceType::Decode),
-            ServiceType::Decode,
-        ).await;
+        let prefill_workers = self
+            .discovery_candidates(
+                self.service_registry
+                    .get_instance_snapshots(ServiceType::Prefill),
+                ServiceType::Prefill,
+            )
+            .await;
+        let decode_workers = self
+            .discovery_candidates(
+                self.service_registry
+                    .get_instance_snapshots(ServiceType::Decode),
+                ServiceType::Decode,
+            )
+            .await;
         let (selection, attempt) = self
             .admit_pair(
                 &prefill_workers,
@@ -2070,10 +2079,9 @@ impl VllmPDRouter {
                 )
                 .await;
         }
-        let prefill_params = match self.build_prefill_kv_transfer_params(
-            transfer_id.as_deref(),
-            Some(&decode_base_url),
-        ) {
+        let prefill_params = match self
+            .build_prefill_kv_transfer_params(transfer_id.as_deref(), Some(&decode_base_url))
+        {
             Ok(params) => params,
             Err(reason) => {
                 attempt.release();
@@ -2798,16 +2806,20 @@ impl RouterTrait for VllmPDRouter {
             // pair from the discovered instances and run it through the same
             // admission path as real traffic, so health checks cannot select
             // by different rules (or fail outright on the empty registry).
-            let prefill_workers = self.discovery_candidates(
-                self.service_registry
-                    .get_instance_snapshots(ServiceType::Prefill),
-                ServiceType::Prefill,
-            ).await;
-            let decode_workers = self.discovery_candidates(
-                self.service_registry
-                    .get_instance_snapshots(ServiceType::Decode),
-                ServiceType::Decode,
-            ).await;
+            let prefill_workers = self
+                .discovery_candidates(
+                    self.service_registry
+                        .get_instance_snapshots(ServiceType::Prefill),
+                    ServiceType::Prefill,
+                )
+                .await;
+            let decode_workers = self
+                .discovery_candidates(
+                    self.service_registry
+                        .get_instance_snapshots(ServiceType::Decode),
+                    ServiceType::Decode,
+                )
+                .await;
             return self
                 .pd_router
                 .health_generate_for_workers(&prefill_workers, &decode_workers)
