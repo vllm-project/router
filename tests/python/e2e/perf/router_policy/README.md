@@ -42,7 +42,7 @@ Each run writes a **new** cell directory:
 
 Before replay, the cell runner **removes `result/`** if reusing the same `AGENTX_OUT`. The cell **fails if replay exit code ≠ 0**.
 
-**Ports**: HTTP, gRPC, and the router use OS-assigned ports held until that process starts. KV event PUB/replay use **`tcp://*:0`** so vLLM binds a free port at startup. After each worker is healthy, the runner calls gRPC `Control.GetKvEventSources` (vllm-rs does not serve HTTP `/kv_event_sources`) and fails the cell if an advertised endpoint still uses port 0. Between pytest cells, default **`AGENTX_CELL_GAP_SEC=5`**; before allocate, **`AGENTX_PORT_SETTLE_SEC=2`**. Do not run multiple matrix jobs on one host in parallel.
+**Ports**: HTTP, gRPC, and the router use OS-assigned ports held until that process starts. KV event PUB/replay use a free port in **25100–25299**, also held until that worker starts. This vLLM reports the configured endpoint unchanged, so `tcp://*:0` comes back as port 0 and the router rejects it. After each worker is healthy, the runner calls gRPC `Control.GetKvEventSources` and fails the cell if an advertised endpoint still uses port 0. Between pytest cells, default **`AGENTX_CELL_GAP_SEC=5`**; before allocate, **`AGENTX_PORT_SETTLE_SEC=2`**. Do not run multiple matrix jobs on one host in parallel.
 
 Worker and router processes are started with `perf/process.py` (`launch_worker` once per worker, then `launch_router`). The same output is streamed to stderr with prefixes `[engineN]` and `[vllm-router]`, and copied to `engineN.log` / `router.log` in the run directory. Replay stays in `replay.log`. Pytest hides the stderr stream unless the invocation uses **`-sv`**.
 

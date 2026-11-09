@@ -74,6 +74,7 @@ class RouterPolicyStack:
     replay_proc: subprocess.Popen[Any] | None = None
     replay_log_fp: Any = None
     port_holders: list[socket.socket | None] = field(default_factory=list)
+    kv_port_holders: list[socket.socket | None] = field(default_factory=list)
     did_cleanup: bool = False
 
 
@@ -197,6 +198,7 @@ def cleanup(run: RouterPolicyStack) -> None:
         run.replay_log_fp.close()
         run.replay_log_fp = None
     release_all_port_holders(run.port_holders)
+    release_all_port_holders(run.kv_port_holders)
 
 
 def interrupted(*_):
@@ -209,19 +211,54 @@ signal.signal(signal.SIGTERM, interrupted)
 signal.signal(signal.SIGINT, interrupted)
 
 
-def allocate_ports(run: RouterPolicyStack) -> None:
-    """Reserve HTTP, gRPC, and router ports.
+# Outside the usual ephemeral range, so vLLM's own bind(0) calls during
+# model load do not take the KV event ports after we close the holders.
+_KV_PORT_FIRST = 25100
+_KV_PORT_LAST = 25299
 
-    KV event sockets are not reserved here. ``engine_command`` passes
-    ``tcp://*:0`` so vLLM binds an OS-assigned port at startup and publishes
-    the resolved endpoint through gRPC ``Control.GetKvEventSources``. The
-    vllm-rs HTTP server does not serve ``/kv_event_sources``. Pre-picking
-    those ports and releasing them before model load loses the race
-    (``tcp://*:PORT`` Address already in use).
+
+def _reserve_kv_port(holders: list[socket.socket | None]) -> int:
+    """Bind one free port in ``25100-25299`` and keep the socket in ``holders``."""
+
+    for port in range(_KV_PORT_FIRST, _KV_PORT_LAST + 1):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            sock.bind(("127.0.0.1", port))
+        except OSError:
+            sock.close()
+            continue
+        holders.append(sock)
+        return port
+    raise RuntimeError(f"no free KV event port in {_KV_PORT_FIRST}-{_KV_PORT_LAST}")
+
+
+def _release_kv_port_holders(run: RouterPolicyStack, worker: int) -> None:
+    """Close this worker's PUB and replay holders so the engine can bind them."""
+
+    holders = run.kv_port_holders
+    for index in (worker * 2, worker * 2 + 1):
+        if index >= len(holders) or holders[index] is None:
+            continue
+        try:
+            holders[index].close()
+        except OSError:
+            pass
+        holders[index] = None
+
+
+def allocate_ports(run: RouterPolicyStack) -> None:
+    """Reserve HTTP, gRPC, router, and KV event ports.
+
+    This vLLM build echoes ``kv_events_config`` unchanged. ``tcp://*:0``
+    therefore comes back from ``GetKvEventSources`` as port 0, which the
+    router rejects. PUB and replay use a free port in 25100-25299 instead.
+    Those sockets stay held until the matching worker process is started.
     """
 
     release_all_port_holders(run.port_holders)
+    release_all_port_holders(run.kv_port_holders)
     holders: list[socket.socket | None] = []
+    kv_holders: list[socket.socket | None] = []
     n = run.case.worker_count
 
     def reserve() -> int:
@@ -232,7 +269,15 @@ def allocate_ports(run: RouterPolicyStack) -> None:
     }
     alloc["router"] = reserve()
     alloc["metrics"] = reserve()
+    kv_pub: list[int] = []
+    kv_replay: list[int] = []
+    for _ in range(n):
+        kv_pub.append(_reserve_kv_port(kv_holders))
+        kv_replay.append(_reserve_kv_port(kv_holders))
+    alloc["kv_pub"] = kv_pub
+    alloc["kv_replay"] = kv_replay
     run.port_holders = holders
+    run.kv_port_holders = kv_holders
     run.ports = alloc
 
 
@@ -271,8 +316,8 @@ def engine_command(run: RouterPolicyStack, i: int):
     engine["kv_events_config"] = {
         "enable_kv_cache_events": True,
         "publisher": "zmq",
-        "endpoint": "tcp://*:0",
-        "replay_endpoint": "tcp://*:0",
+        "endpoint": f"tcp://127.0.0.1:{ports['kv_pub'][i]}",
+        "replay_endpoint": f"tcp://127.0.0.1:{ports['kv_replay'][i]}",
         "buffer_steps": 10000,
     }
     return vllm_rs_serve_cmd(
@@ -421,8 +466,8 @@ def _kv_event_endpoints_from_proto(payload: bytes) -> list[str]:
     """Pull ``endpoint`` and ``replay_endpoint`` out of ``GetKvEventSourcesResponse``."""
 
     found: list[str] = []
-    for field, value in _proto_fields(payload):
-        if field != 1 or not isinstance(value, (bytes, bytearray)):
+    for number, value in _proto_fields(payload):
+        if number != 1 or not isinstance(value, (bytes, bytearray)):
             continue
         for inner, inner_val in _proto_fields(value):
             if inner not in (2, 4) or not isinstance(inner_val, (bytes, bytearray)):
@@ -564,15 +609,7 @@ import os
 import sys
 
 from agentinfer.agentbench.replay.executor import ReplayExecutor
-from agentinfer.agentbench.replay.transport import ReplayTransport
 from agentinfer.agentcache.entrypoints.cli.main import main
-
-async def _skip_tracelab_context(self, *args, **kwargs):
-    return None
-
-# gRPC /v1/models omits max_model_len; worker HTTP already has it.
-ReplayTransport.validate_tracelab_context = _skip_tracelab_context
-print("SKIP validate_tracelab_context", flush=True)
 
 _delay = float(os.environ.get("AGENTX_TASK_STAGGER", "0") or 0)
 if _delay > 0:
@@ -600,6 +637,7 @@ raise SystemExit(main(["vllm", *sys.argv[1:]]))
             preflight_router_bin(case.router_bin)
             for i in range(case.worker_count):
                 release_worker_port_holders(run.port_holders, i, case.worker_count)
+                _release_kv_port_holders(run, i)
                 worker_cmd = engine_command(run, i)
                 worker_log = run.out / f"engine{i}.log"
                 Path(str(worker_log) + ".command.json").write_text(
