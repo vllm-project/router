@@ -152,6 +152,8 @@ pub struct PdRequestContext<'a> {
     /// Resolved at request entry, only when the affinity switch is on;
     /// `None` selects per request on both stages.
     pub affinity_key: Option<AffinityKey>,
+    /// Validated named LoRA identity for the decode binding only.
+    pub lora_name: Option<&'a str>,
     /// Request cache salt scoping the binding digest.
     pub cache_salt: Option<&'a str>,
     pub route: &'a str,

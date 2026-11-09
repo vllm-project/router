@@ -224,6 +224,7 @@ fn select_stage(
         let pick = kv.select_decode(
             &projected,
             context.affinity_key.as_ref(),
+            context.lora_name,
             context.cache_salt,
         )?;
         (
@@ -1349,6 +1350,7 @@ impl PdRouterBase {
             decode_cache: None,
             headers: None,
             affinity_key: None,
+            lora_name: None,
             cache_salt: None,
             route: "/health_generate",
         };
@@ -1878,6 +1880,7 @@ mod tests {
             decode_cache: None,
             headers: None,
             affinity_key: None,
+            lora_name: None,
             cache_salt: None,
             route: "/health_generate",
         };
@@ -1906,6 +1909,7 @@ mod tests {
             decode_cache: None,
             headers: None,
             affinity_key: None,
+            lora_name: None,
             cache_salt: None,
             route: "/health_generate",
         };
@@ -2670,6 +2674,7 @@ mod admission_tests {
             decode_cache: None,
             headers: None,
             affinity_key: None,
+            lora_name: None,
             cache_salt: None,
             route: "/v1/completions",
         }
@@ -2695,6 +2700,7 @@ mod admission_tests {
             decode_cache: None,
             headers: None,
             affinity_key: Some(affinity_key(session)),
+            lora_name: None,
             cache_salt: None,
             route: "/v1/completions",
         }
@@ -3249,6 +3255,7 @@ mod admission_tests {
                 decode_cache: None,
                 headers: None,
                 affinity_key: None,
+                lora_name: None,
                 cache_salt: None,
                 route: "/v1/completions",
             }
