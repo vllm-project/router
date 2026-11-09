@@ -13,8 +13,8 @@
 
 use std::sync::Arc;
 
-use super::kv_aware::CandidateView;
-use crate::kv_index::{CacheKey, RoutableTarget, StorageTier, TierMatch};
+use super::kv_aware::{request_prefill_tokens, CandidateView, CostParams};
+use crate::kv_index::{CacheKey, Locality, RoutableTarget, StorageTier, TierMatch};
 
 /// Opt-in planner configuration. `Default` is disabled. Cost constants are
 /// placeholders until calibrated; in PR 1 they only shape shadow-mode plans and
@@ -164,6 +164,10 @@ pub struct TransferPlannerInput<'a> {
     /// lookup; every peer's residency is measured from these. `None` when that
     /// lookup is unavailable.
     pub destination_hits: Option<&'a [TierMatch]>,
+    /// The cost parameters routing scored with (tier credits); the planner
+    /// prices both the fetch and the wait path with them. `block_size` is
+    /// taken from `block_sizes`.
+    pub cost_params: &'a CostParams,
 }
 
 pub trait TransferPlanner: Send + Sync + std::fmt::Debug {
@@ -244,39 +248,151 @@ pub fn plan_transfer(
     };
     let dest_prefix = transferable_prefix_blocks(input.candidates[dest].matches);
 
-    // Largest prefix of the destination's prompt wins; ties go to the less
-    // loaded peer, then the lower position (strict comparison keeps the first
-    // one seen).
-    let mut best: Option<(usize, u32)> = None;
-    for pos in 0..input.candidates.len() {
-        if pos == dest
-            || input.cache_keys[pos] != Some(dest_key)
-            || input.block_sizes[pos] != block_size
-        {
-            continue;
-        }
-        let peer_target = input.candidates[pos].target;
-        let prefix = prefix_blocks(
-            destination_hits
-                .iter()
-                .filter(|hit| hit.target == *peer_target),
-        );
-        let better = match best {
-            None => true,
-            Some((best_pos, best_prefix)) => {
-                prefix > best_prefix
-                    || (prefix == best_prefix
-                        && input.candidates[pos].load.active_requests
-                            < input.candidates[best_pos].load.active_requests)
+    // Rank every peer that shares the destination's identity: largest prefix
+    // of the destination's prompt first, then the less loaded peer, then the
+    // lower position. Each one is then checked in that order and the first
+    // that clears every check is planned, so a peer that cannot serve
+    // (excluded, incompatible, idle, too expensive) never hides a shorter one
+    // that can.
+    let mut peers: Vec<(usize, u32)> = (0..count)
+        .filter(|&pos| {
+            pos != dest
+                && input.cache_keys[pos] == Some(dest_key)
+                && input.block_sizes[pos] == block_size
+        })
+        .map(|pos| {
+            let peer_target = input.candidates[pos].target;
+            let prefix = prefix_blocks(
+                destination_hits
+                    .iter()
+                    .filter(|hit| hit.target == *peer_target),
+            );
+            (pos, prefix)
+        })
+        .collect();
+    peers.sort_by_key(|&(pos, prefix)| {
+        (
+            std::cmp::Reverse(prefix),
+            input.candidates[pos].load.active_requests,
+            pos,
+        )
+    });
+
+    // When no peer qualifies, report the best-ranked peer's reason, preferring
+    // one that could have served at all: a retry exclusion or a layout
+    // mismatch on the longest holder says less about lost transfers than why
+    // the next usable holder was rejected.
+    let mut first_skip = None;
+    let mut first_usable_skip = None;
+    for (src, src_prefix) in peers {
+        match plan_from_source(input, policy, src, src_prefix, dest_prefix, block_size) {
+            Ok(plan) => return Ok(plan),
+            Err(skip) => {
+                first_skip.get_or_insert(skip);
+                if !matches!(
+                    skip,
+                    TransferSkip::SourceExcluded | TransferSkip::Incompatible
+                ) {
+                    first_usable_skip.get_or_insert(skip);
+                }
             }
-        };
-        if better {
-            best = Some((pos, prefix));
         }
     }
-    let Some((src, src_prefix)) = best else {
-        return Err(TransferSkip::NoPeer);
+    Err(first_usable_skip
+        .or(first_skip)
+        .unwrap_or(TransferSkip::NoPeer))
+}
+
+/// Remaining prefill for `candidate` under the router's own cost model (the
+/// same tier credits and last-token rule that scored it), in tokens.
+fn routing_prefill_tokens(
+    candidate: &CandidateView<'_>,
+    cost_params: &CostParams,
+    block_size: u32,
+) -> u64 {
+    let mut params = *cost_params;
+    params.block_size = block_size;
+    request_prefill_tokens(candidate, &params)
+}
+
+/// The two paths the planner compares, in milliseconds, plus what the fetch
+/// saves. Both paths price the remaining prefill with the router's estimate
+/// so a plan never disagrees with the cost model that made the pick.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct CostEstimate {
+    transfer_ms: f64,
+    /// Destination queue + transfer + destination prefill after the fetch.
+    fetch_ms: f64,
+    /// Source queue + the source's normal prefill (all its tier credits).
+    wait_ms: f64,
+    /// Destination prefill without the fetch minus with it.
+    saved_ms: f64,
+    dest_queue_ms: f64,
+    source_wait_ms: f64,
+}
+
+fn estimate_costs(
+    input: &TransferPlannerInput<'_>,
+    policy: &TransferPolicy,
+    src: usize,
+    fetched_end: u32,
+    credited: u64,
+    block_size: u32,
+) -> CostEstimate {
+    let (source, destination) = (&input.candidates[src], &input.candidates[input.picked]);
+    let prefill_ms = |tokens: u64| tokens as f64 * policy.prefill_us_per_token / 1000.0;
+    let transfer_ms =
+        policy.transfer_fixed_ms + credited as f64 * policy.transfer_us_per_token / 1000.0;
+    let dest_queue_ms = prefill_ms(destination.load.active_prefill_tokens);
+    let source_wait_ms = prefill_ms(source.load.active_prefill_tokens);
+
+    // After the fetch the destination holds `[0, fetched_end)` on device, on
+    // top of whatever else it already had.
+    let mut fetched_matches = destination.matches.to_vec();
+    fetched_matches.push(TierMatch {
+        target: destination.target.clone(),
+        tier: StorageTier::Device,
+        segments: vec![(0, fetched_end)],
+        locality: Locality::Local,
+    });
+    let after_fetch = CandidateView {
+        matches: &fetched_matches,
+        ..*destination
     };
+    let rem_dest_before = routing_prefill_tokens(destination, input.cost_params, block_size);
+    let rem_dest_after = routing_prefill_tokens(&after_fetch, input.cost_params, block_size);
+    let rem_src = routing_prefill_tokens(source, input.cost_params, block_size);
+
+    CostEstimate {
+        transfer_ms,
+        fetch_ms: dest_queue_ms + transfer_ms + prefill_ms(rem_dest_after),
+        wait_ms: source_wait_ms + prefill_ms(rem_src),
+        saved_ms: prefill_ms(rem_dest_before.saturating_sub(rem_dest_after)),
+        dest_queue_ms,
+        source_wait_ms,
+    }
+}
+
+/// Every check for one candidate source, in order: can it serve at all, does
+/// it add enough, is it busy, and does fetching from it beat waiting on it.
+fn plan_from_source(
+    input: &TransferPlannerInput<'_>,
+    policy: &TransferPolicy,
+    src: usize,
+    src_prefix: u32,
+    dest_prefix: u32,
+    block_size: u32,
+) -> Result<TransferPlan, TransferSkip> {
+    let dest = input.picked;
+    if input.excluded[src] {
+        return Err(TransferSkip::SourceExcluded);
+    }
+    if policy.require_capability {
+        match (input.capabilities[src], input.capabilities[dest]) {
+            (Some(from), Some(to)) if from.can_send_to(to) => {}
+            _ => return Err(TransferSkip::Incompatible),
+        }
+    }
     if src_prefix <= dest_prefix {
         return Err(TransferSkip::PickedHoldsLongestPrefix);
     }
@@ -284,18 +400,9 @@ pub fn plan_transfer(
     if missing_blocks < policy.min_prefix_blocks {
         return Err(TransferSkip::PrefixTooShort);
     }
-    if input.excluded[src] {
-        return Err(TransferSkip::SourceExcluded);
-    }
     let (source, destination) = (&input.candidates[src], &input.candidates[dest]);
     if source.load.active_requests < policy.source_load_threshold {
         return Err(TransferSkip::SourceNotBusy);
-    }
-    if policy.require_capability {
-        match (input.capabilities[src], input.capabilities[dest]) {
-            (Some(from), Some(to)) if from.can_send_to(to) => {}
-            _ => return Err(TransferSkip::Incompatible),
-        }
     }
 
     // Never credit the final prompt token, matching `credited_tokens` in
@@ -310,45 +417,33 @@ pub fn plan_transfer(
     if credited == 0 {
         return Err(TransferSkip::PrefixTooShort);
     }
+    let credited_blocks = credited.div_ceil(bs).min(u64::from(missing_blocks)) as u32;
+    let fetched_end = dest_prefix + credited_blocks;
 
-    let prefill_ms = |tokens: u64| tokens as f64 * policy.prefill_us_per_token / 1000.0;
-    let transfer_ms =
-        policy.transfer_fixed_ms + credited as f64 * policy.transfer_us_per_token / 1000.0;
-    let dest_queue_ms = prefill_ms(destination.load.active_prefill_tokens);
-    let source_wait_ms = prefill_ms(source.load.active_prefill_tokens);
-    let rem_dest = (destination.input_tokens as u64)
-        .saturating_sub(dest_cached)
-        .saturating_sub(credited);
-    let rem_src = (source.input_tokens as u64)
-        .saturating_sub(u64::from(transferable_prefix_blocks(source.matches)) * bs)
-        .max(1);
-    let saved_ms = prefill_ms(credited);
-    let fetch_beats_waiting =
-        transfer_ms + dest_queue_ms + prefill_ms(rem_dest) < source_wait_ms + prefill_ms(rem_src);
-    if !(fetch_beats_waiting && transfer_ms < saved_ms * policy.margin) {
+    let cost = estimate_costs(input, policy, src, fetched_end, credited, block_size);
+    if !(cost.fetch_ms < cost.wait_ms && cost.transfer_ms < cost.saved_ms * policy.margin) {
         return Err(TransferSkip::CostRule);
     }
 
-    let credited_blocks = credited.div_ceil(bs).min(u64::from(missing_blocks)) as u32;
     Ok(TransferPlan {
         plan_id: 0,
         source: source.target.clone(),
         destination: destination.target.clone(),
-        blocks: (dest_prefix, dest_prefix + credited_blocks),
+        blocks: (dest_prefix, fetched_end),
         block_size,
         credited_tokens: credited,
-        estimated_transfer_ms: transfer_ms,
-        estimated_saved_prefill_ms: saved_ms,
-        estimated_source_wait_ms: source_wait_ms,
-        estimated_destination_queue_ms: dest_queue_ms,
+        estimated_transfer_ms: cost.transfer_ms,
+        estimated_saved_prefill_ms: cost.saved_ms,
+        estimated_source_wait_ms: cost.source_wait_ms,
+        estimated_destination_queue_ms: cost.dest_queue_ms,
     })
 }
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use super::*;
-    use crate::kv_index::{HashMode, Locality};
-    use crate::policies::kv_aware::LoadSample;
+    use crate::kv_index::HashMode;
+    use crate::policies::kv_aware::{LoadSample, Scorer};
 
     fn target(name: &str) -> RoutableTarget {
         RoutableTarget {
@@ -480,6 +575,7 @@ mod tests {
                     excluded: &self.excluded,
                     picked: 0,
                     destination_hits: hits.as_deref(),
+                    cost_params: &CostParams::default(),
                 },
                 policy,
             )
@@ -560,6 +656,7 @@ mod tests {
                     excluded,
                     picked,
                     destination_hits: Some(&[]),
+                    cost_params: &CostParams::default(),
                 },
                 &enabled(),
             )
@@ -806,10 +903,11 @@ mod tests {
             transfer_fixed_ms: 0.0,
             ..enabled()
         };
-        // 124 * 16 = 1984 cached, 1999 - 1984 = 15 creditable, one block missing.
-        let plan = pair.plan(&policy).unwrap();
-        assert_eq!(plan.credited_tokens, 15);
-        assert_eq!(plan.blocks, (124, 125));
+        // 124 * 16 = 1984 cached. 15 tokens would move, but the router never
+        // credits a device block that ends at the prompt boundary, so the
+        // destination still prefills 16 tokens either way: the fetch saves
+        // nothing.
+        assert_eq!(pair.plan(&policy), Err(TransferSkip::CostRule));
     }
 
     #[test]
@@ -840,6 +938,7 @@ mod tests {
                 excluded: &pair.excluded,
                 picked: 0,
                 destination_hits: Some(&concat(&pair.matches)),
+                cost_params: &CostParams::default(),
             },
             &policy,
         );
@@ -902,6 +1001,7 @@ mod tests {
                     excluded: &[false; 4],
                     picked: 0,
                     destination_hits: Some(&concat(&matches)),
+                    cost_params: &CostParams::default(),
                 },
                 &enabled(),
             )
@@ -940,6 +1040,7 @@ mod tests {
                 excluded: &[false; 3],
                 picked: 0,
                 destination_hits: Some(&concat(&matches)),
+                cost_params: &CostParams::default(),
             },
             &enabled(),
         )
@@ -1005,12 +1106,218 @@ mod tests {
             excluded: &pair.excluded,
             picked: 0,
             destination_hits: Some(&hits),
+            cost_params: &CostParams::default(),
         };
         assert_eq!(planner.plan(&input), plan_transfer(&input, &enabled()));
         let off = CostRuleTransferPlanner {
             policy: TransferPolicy::default(),
         };
         assert_eq!(off.plan(&input), Err(TransferSkip::Disabled));
+    }
+
+    /// One candidate for [`plan_many`]: matches on its own prompt (also used as
+    /// the destination lookup), load, retry exclusion and capability.
+    struct Peer {
+        target: RoutableTarget,
+        matches: Vec<TierMatch>,
+        load: (usize, u64),
+        excluded: bool,
+        cap: Option<TransferCapability>,
+    }
+
+    fn peer(name: &str, tiers: &[(StorageTier, (u32, u32))], load: (usize, u64)) -> Peer {
+        let target = target(name);
+        let matches = tiers
+            .iter()
+            .map(|&(tier, segment)| hit(&target, tier, &[segment]))
+            .collect();
+        Peer {
+            target,
+            matches,
+            load,
+            excluded: false,
+            cap: None,
+        }
+    }
+
+    /// Position 0 is the picked destination; the rest are peers.
+    fn plan_many(peers: &[Peer], policy: &TransferPolicy) -> Result<TransferPlan, TransferSkip> {
+        let candidates: Vec<_> = peers
+            .iter()
+            .map(|p| view(&p.target, &p.matches, p.load.0, p.load.1))
+            .collect();
+        let k = key("m");
+        let keys = vec![Some(&k); peers.len()];
+        let caps: Vec<_> = peers.iter().map(|p| p.cap.as_ref()).collect();
+        let excluded: Vec<_> = peers.iter().map(|p| p.excluded).collect();
+        let hits: Vec<TierMatch> = peers.iter().flat_map(|p| p.matches.clone()).collect();
+        plan_transfer(
+            &TransferPlannerInput {
+                candidates: &candidates,
+                cache_keys: &keys,
+                block_sizes: &vec![16; peers.len()],
+                capabilities: &caps,
+                excluded: &excluded,
+                picked: 0,
+                destination_hits: Some(&hits),
+                cost_params: &CostParams::default(),
+            },
+            policy,
+        )
+    }
+
+    const BUSY: (usize, u64) = (4, 10_000);
+
+    #[test]
+    fn excluded_longest_holder_does_not_mask_a_shorter_eligible_peer() {
+        // Review example: an excluded peer holds 100 blocks, an eligible busy
+        // peer 80. 80 clears the 64-block minimum and both cost checks.
+        let mut long = peer("long", &[(StorageTier::Device, (0, 100))], BUSY);
+        long.excluded = true;
+        let peers = [
+            peer("dest", &[], (0, 0)),
+            long,
+            peer("short", &[(StorageTier::Device, (0, 80))], BUSY),
+        ];
+        let plan = plan_many(&peers, &enabled()).unwrap();
+        assert_eq!(plan.source, target("short"));
+        assert_eq!(plan.blocks, (0, 80));
+        assert_eq!(plan.credited_tokens, 80 * 16);
+    }
+
+    #[test]
+    fn incompatible_longest_holder_does_not_mask_a_compatible_peer() {
+        let policy = TransferPolicy {
+            require_capability: true,
+            ..enabled()
+        };
+        let mut dest = peer("dest", &[], (0, 0));
+        dest.cap = Some(cap(true, true, "a"));
+        let mut long = peer("long", &[(StorageTier::Device, (0, 100))], BUSY);
+        long.cap = Some(cap(true, true, "other-layout"));
+        let mut short = peer("short", &[(StorageTier::Device, (0, 80))], BUSY);
+        short.cap = Some(cap(true, true, "a"));
+        let plan = plan_many(&[dest, long, short], &policy).unwrap();
+        assert_eq!(plan.source, target("short"));
+    }
+
+    #[test]
+    fn next_peer_is_tried_when_the_longest_holder_fails_a_soft_check() {
+        // The 100-block holder is busy by count but has nothing queued, so
+        // waiting on it (20 ms) beats fetching from it (33 ms). The 80-block
+        // holder has a long queue, so fetching from it wins.
+        let peers = [
+            peer("dest", &[], (0, 0)),
+            peer("long", &[(StorageTier::Device, (0, 100))], (1, 0)),
+            peer("short", &[(StorageTier::Device, (0, 80))], BUSY),
+        ];
+        assert_eq!(
+            plan_many(&peers, &enabled()).unwrap().source,
+            target("short")
+        );
+
+        // An idle longest holder does not hide a busy shorter one either.
+        let peers = [
+            peer("dest", &[], (0, 0)),
+            peer("long", &[(StorageTier::Device, (0, 100))], (0, 0)),
+            peer("short", &[(StorageTier::Device, (0, 80))], BUSY),
+        ];
+        assert_eq!(
+            plan_many(&peers, &enabled()).unwrap().source,
+            target("short")
+        );
+    }
+
+    #[test]
+    fn skip_reason_prefers_the_best_usable_peer() {
+        // Longest holder excluded, the next one rejected on cost: the counter
+        // says why the usable peer lost, not that a retry excluded one.
+        let mut long = peer("long", &[(StorageTier::Device, (0, 100))], BUSY);
+        long.excluded = true;
+        let peers = [
+            peer("dest", &[], (0, 0)),
+            long,
+            peer("short", &[(StorageTier::Device, (0, 80))], (1, 0)),
+        ];
+        assert_eq!(plan_many(&peers, &enabled()), Err(TransferSkip::CostRule));
+
+        // Only unusable peers: their own reason is reported.
+        let mut only = peer("long", &[(StorageTier::Device, (0, 100))], BUSY);
+        only.excluded = true;
+        let peers = [peer("dest", &[], (0, 0)), only];
+        assert_eq!(
+            plan_many(&peers, &enabled()),
+            Err(TransferSkip::SourceExcluded)
+        );
+    }
+
+    #[test]
+    fn wait_on_source_uses_the_routing_prefill_estimate() {
+        // Review example: 2000-token prompt, block size 16. The source holds
+        // 100 device blocks plus 25 external blocks, has 280 queued tokens and
+        // four active requests; the destination is idle and empty.
+        let peers = [
+            peer("dest", &[], (0, 0)),
+            peer(
+                "src",
+                &[
+                    (StorageTier::Device, (0, 100)),
+                    (StorageTier::External, (100, 125)),
+                ],
+                (4, 280),
+            ),
+        ];
+        let candidates: Vec<_> = peers
+            .iter()
+            .map(|p| view(&p.target, &p.matches, p.load.0, p.load.1))
+            .collect();
+
+        // Routing credits the external hits at 0.6: the source prefills
+        // 2000 - (100 + 25 * 0.6) * 16 = 160 tokens, so its cost is
+        // (160 + 280) * 5 = 2200 against the idle destination's 2000 * 1.
+        let mut costs = [0.0; 2];
+        crate::policies::kv_aware::MultiplicativeScorer
+            .score(&candidates, &CostParams::default(), &mut costs)
+            .unwrap();
+        assert_eq!(costs, [2000.0, 2200.0]);
+
+        let k = key("m");
+        let hits: Vec<TierMatch> = peers.iter().flat_map(|p| p.matches.clone()).collect();
+        let input = TransferPlannerInput {
+            candidates: &candidates,
+            cache_keys: &[Some(&k); 2],
+            block_sizes: &[16; 2],
+            capabilities: &[None; 2],
+            excluded: &[false; 2],
+            picked: 0,
+            destination_hits: Some(&hits),
+            cost_params: &CostParams::default(),
+        };
+        // fetch = 13 ms transfer + prefill(400) = 33 ms
+        // wait  = prefill(280) + prefill(160)   = 22 ms (34 ms if the external
+        //         hits were dropped, which reported a false transfer win)
+        let cost = estimate_costs(&input, &enabled(), 1, 100, 1600, 16);
+        assert_eq!(cost.fetch_ms, 33.0);
+        assert_eq!(cost.wait_ms, 22.0);
+        assert_eq!(
+            plan_transfer(&input, &enabled()),
+            Err(TransferSkip::CostRule)
+        );
+    }
+
+    #[test]
+    fn destination_external_credit_is_not_counted_as_saved() {
+        // The destination already gets 0.6 credit for 125 external blocks, so
+        // routing expects it to prefill 2000 - 75 * 16 = 800 tokens. After a
+        // 100-block fetch it prefills 2000 - (100 + 25 * 0.6) * 16 = 160, so
+        // the fetch saves 640 tokens (32 ms), not the 1600 it moves.
+        let peers = [
+            peer("dest", &[(StorageTier::External, (0, 125))], (0, 0)),
+            peer("src", &[(StorageTier::Device, (0, 100))], BUSY),
+        ];
+        let plan = plan_many(&peers, &enabled()).unwrap();
+        assert_eq!(plan.credited_tokens, 1600);
+        assert_eq!(plan.estimated_saved_prefill_ms, 32.0);
     }
 
     #[test]
