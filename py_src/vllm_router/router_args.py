@@ -82,6 +82,9 @@ class RouterArgs:
     queue_timeout_secs: int = 60
     # Token bucket refill rate (tokens per second). If not set, defaults to max_concurrent_requests
     rate_limit_tokens_per_second: Optional[int] = None
+    # Opt-in per-worker (per P/D stage endpoint) in-flight admission capacity.
+    # None disables it; full pools are rejected with 429 + Retry-After.
+    max_inflight_requests_per_worker: Optional[int] = None
     # CORS allowed origins
     cors_allowed_origins: List[str] = dataclasses.field(default_factory=list)
     # Retry configuration
@@ -593,6 +596,16 @@ class RouterArgs:
             help="Token bucket refill rate (tokens per second). If not set, defaults to max_concurrent_requests",
         )
         parser.add_argument(
+            f"--{prefix}max-inflight-requests-per-worker",
+            type=int,
+            default=RouterArgs.max_inflight_requests_per_worker,
+            help="Opt-in per-worker admission capacity: the most in-flight requests "
+            "the router dispatches to one worker (or one P/D stage endpoint), held "
+            "until the worker finishes the response or the client disconnects. "
+            "When every eligible worker is full the "
+            "router returns 429 with Retry-After. Omit to disable.",
+        )
+        parser.add_argument(
             f"--{prefix}cors-allowed-origins",
             type=str,
             nargs="*",
@@ -651,6 +664,12 @@ class RouterArgs:
             raise ValueError(
                 "kv_aware_session_affinity_ttl_secs must be between 1 and 31536000"
             )
+
+        if (
+            self.max_inflight_requests_per_worker is not None
+            and self.max_inflight_requests_per_worker < 1
+        ):
+            raise ValueError("max_inflight_requests_per_worker must be at least 1")
 
         if self.wasm_middleware_sha256 and not self.wasm_middleware:
             raise ValueError("wasm_middleware_sha256 requires wasm_middleware")

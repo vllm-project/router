@@ -80,6 +80,14 @@ pub struct RouterConfig {
     /// `None` disables affinity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kv_aware_session_affinity_ttl_secs: Option<u64>,
+    /// Opt-in per-worker admission capacity: the most router-dispatched
+    /// requests one worker (one P/D stage endpoint) may hold at once, from
+    /// dispatch until the worker finishes the response or the client goes
+    /// away, whichever comes first. When every
+    /// eligible worker is full the router rejects with 429 instead of
+    /// dispatching. `None` (the default) disables the check.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_inflight_requests_per_worker: Option<usize>,
     /// Health check configuration
     pub health_check: HealthCheckConfig,
     /// Enable Inference Gateway mode (false = proxy mode, true = IGW mode)
@@ -1325,6 +1333,7 @@ impl Default for RouterConfig {
             disable_retries: false,
             disable_circuit_breaker: false,
             kv_aware_session_affinity_ttl_secs: None,
+            max_inflight_requests_per_worker: None,
             health_check: HealthCheckConfig::default(),
             enable_igw: false,
             connection_mode: ConnectionMode::Http,
@@ -2111,6 +2120,7 @@ mod tests {
             disable_retries: false,
             disable_circuit_breaker: false,
             kv_aware_session_affinity_ttl_secs: None,
+            max_inflight_requests_per_worker: None,
             health_check: HealthCheckConfig::default(),
             enable_igw: false,
             queue_size: 100,
@@ -2181,6 +2191,7 @@ mod tests {
             disable_retries: false,
             disable_circuit_breaker: false,
             kv_aware_session_affinity_ttl_secs: None,
+            max_inflight_requests_per_worker: None,
             health_check: HealthCheckConfig::default(),
             enable_igw: false,
             queue_size: 100,
@@ -2247,6 +2258,7 @@ mod tests {
             disable_retries: false,
             disable_circuit_breaker: false,
             kv_aware_session_affinity_ttl_secs: None,
+            max_inflight_requests_per_worker: None,
             health_check: HealthCheckConfig::default(),
             enable_igw: false,
             queue_size: 100,

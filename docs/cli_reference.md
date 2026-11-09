@@ -59,6 +59,7 @@ width. `f32` and `f64` are floating-point values. Python's `integer` and
 | `--queue-size` | — | — | `integer` | `100` | Pending request queue capacity; `0` disables queuing and returns 429 when full. |
 | `--queue-timeout-secs` | — | — | `integer` | `60` | Maximum time in seconds spent waiting in the request queue. |
 | `--rate-limit-tokens-per-second` | — | — | `integer` | `unset` | Token bucket refill rate for request admission; unset uses `max_concurrent_requests`. These are admission tokens, not generated model tokens. |
+| `--max-inflight-requests-per-worker` | `u64` | `unset` | `integer` | `unset` | Opt-in per-worker admission capacity: the most in-flight requests the router dispatches to one worker (one endpoint per P/D stage), held until the worker finishes the response or the client disconnects; unset disables it. |
 | `--cors-allowed-origins` | `string [0..] (repeatable)` | `[]` | `string [0..]` | `[]` | Allowed browser origins, e.g. `https://example.com`; see CORS behavior below. |
 
 With no CORS origins, the server permits any origin. Supplying origins restricts
@@ -67,6 +68,11 @@ launcher; there are no corresponding Rust CLI flags.
 
 Admission tokens refill with elapsed time, so another request can be admitted
 while an earlier request is still running, even with `--max-concurrent-requests 1`.
+
+`--max-inflight-requests-per-worker` is a hard, per-worker limit rather than a
+rate. When every eligible worker is full, the router answers `429` with
+`Retry-After: 1` instead of dispatching; see
+[Per-worker admission capacity](load_balancing/README.md#per-worker-admission-capacity).
 
 ## Workers and backend
 

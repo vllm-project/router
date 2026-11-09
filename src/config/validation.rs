@@ -16,6 +16,13 @@ impl ConfigValidator {
                 });
             }
         }
+        if config.max_inflight_requests_per_worker == Some(0) {
+            return Err(ConfigError::InvalidValue {
+                field: "max_inflight_requests_per_worker".to_string(),
+                value: "0".to_string(),
+                reason: "Must be at least 1; omit it to disable per-worker admission".to_string(),
+            });
+        }
         // Check if service discovery is enabled (either via discovery config or vLLM mode)
         let has_service_discovery = config.discovery.as_ref().is_some_and(|d| d.enabled)
             || matches!(

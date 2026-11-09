@@ -1,5 +1,9 @@
 use super::completion_route::{placement_eligibility, prepare_completion_route, CompletionRoute};
 use super::program_adapter::ProgramCompletion;
+use super::worker_admission::{
+    capacity_rejection, is_admission_rejection, lost_reservation, WorkerAdmission,
+    WorkerAdmissionPermit,
+};
 use crate::backend::preprocess::{prepare_completion_direct_inputs, prepare_http_kv_inputs};
 use crate::backend::{
     stream_output::{output_frame_tracking, OutputFrameConsumer, OutputFrameProducer},
@@ -108,6 +112,8 @@ struct LoadTrackedBody {
 struct RequestLoadState {
     worker: Option<Arc<dyn Worker>>,
     kv_slot: Option<KvRequestSlot>,
+    /// Per-worker admission permit, returned with the other counters.
+    admission: Mutex<Option<WorkerAdmissionPermit>>,
     released: AtomicBool,
 }
 
@@ -124,6 +130,7 @@ impl RequestLoadGuard {
             state: Arc::new(RequestLoadState {
                 worker,
                 kv_slot,
+                admission: Mutex::new(None),
                 released: AtomicBool::new(false),
             }),
         }
@@ -147,8 +154,18 @@ impl RequestLoadGuard {
         )
     }
 
-    fn tracks_worker(&self) -> bool {
-        self.state.worker.is_some()
+    /// Hand the attempt's admission permit to this guard, so the permit is
+    /// held exactly as long as the worker load: until the worker finishes the
+    /// response or the client drops the body, whichever comes first.
+    fn hold_admission(&self, permit: Option<WorkerAdmissionPermit>) {
+        if permit.is_some() {
+            *self.state.admission.lock() = permit;
+        }
+    }
+
+    /// Whether the response body must keep this guard alive until it ends.
+    fn owns_resources(&self) -> bool {
+        self.state.worker.is_some() || self.state.admission.lock().is_some()
     }
 
     fn begin_decode(&self) {
@@ -168,6 +185,7 @@ impl RequestLoadGuard {
             worker.decrement_load();
             RouterMetrics::set_running_requests(worker.url(), worker.load());
         }
+        drop(self.state.admission.lock().take());
     }
 }
 
@@ -300,6 +318,8 @@ pub struct Router {
     _program_observation_handle: Option<Arc<tokio::task::JoinHandle<()>>>,
     program_targets_cache: Mutex<HashMap<String, ProgramTargetCacheEntry>>,
     program_token_estimator: Arc<MomentumTokenEstimator>,
+    /// Opt-in per-worker in-flight capacity (`--max-inflight-requests-per-worker`).
+    admission: Arc<WorkerAdmission>,
 }
 
 #[derive(Debug, Clone)]
@@ -625,6 +645,9 @@ impl Router {
             _program_observation_handle: program_observation_handle,
             program_targets_cache: Mutex::new(HashMap::new()),
             program_token_estimator: Arc::new(MomentumTokenEstimator::default()),
+            admission: Arc::new(WorkerAdmission::new(
+                ctx.router_config.max_inflight_requests_per_worker,
+            )),
         })
     }
 
@@ -1542,7 +1565,26 @@ impl Router {
                 let policy = self.policy_for_model(model_id);
                 let kv_ops = kv_aware_ops(policy.as_ref());
                 let workers = self.available_workers(model_id);
-                let excluded_workers = failed_workers.lock().clone();
+                // Opt-in per-worker admission. The snapshot only steers
+                // selection away from full workers; the reservation after
+                // selection enforces the limit. A Program-bound target was
+                // already admitted by Program scheduling: it is counted, not
+                // refused, so the two controllers never disagree.
+                let saturated = if forced_worker_url.is_none() {
+                    self.admission.saturated(&workers)
+                } else {
+                    Vec::new()
+                };
+                if !saturated.is_empty() && saturated.len() == workers.len() {
+                    // Not a worker failure: return before outcome accounting.
+                    return capacity_rejection("regular", "worker");
+                }
+                let mut excluded_workers = failed_workers.lock().clone();
+                // KV-aware sees the full list so a saturated worker's session
+                // binding is bypassed for this request instead of rewritten.
+                if kv_ops.is_some() {
+                    excluded_workers.extend(saturated.iter().cloned());
+                }
                 let needs_http_input = prepared.is_none()
                     && (kv_ops.is_some() || policy.needs_cache_routing_key());
                 let binding_skips_rpc = needs_http_input && excluded_workers.is_empty()
@@ -1597,6 +1639,16 @@ impl Router {
                     inputs
                         .map(KvRequestTokens::PerWorker)
                         .unwrap_or(KvRequestTokens::Shared(None))
+                };
+                // Other policies simply do not see full workers. Per-worker
+                // token inputs are keyed by URL, so filtering keeps them valid.
+                let workers = if saturated.is_empty() || kv_ops.is_some() {
+                    workers
+                } else {
+                    workers
+                        .into_iter()
+                        .filter(|worker| !saturated.iter().any(|url| url == worker.url()))
+                        .collect()
                 };
                 let eligibility = completion
                     .and_then(|completion| {
@@ -1679,6 +1731,22 @@ impl Router {
                     kv_receipt,
                     policy.tracks_request_load() || program_completion.is_some(),
                 );
+                let permit = if program_completion.is_some() {
+                    self.admission.acquire_unbounded(worker.url())
+                } else {
+                    match self.admission.try_acquire(worker.url()) {
+                        Ok(permit) => permit,
+                        Err(_) => {
+                            // Another request took the last slot after the
+                            // snapshot. Release what selection reserved; the
+                            // retry takes a fresh snapshot and holds nothing
+                            // while it backs off.
+                            drop(load);
+                            return lost_reservation();
+                        }
+                    }
+                };
+                load.hold_admission(permit);
 
                 let response = self
                     .send_typed_request(
@@ -1710,8 +1778,9 @@ impl Router {
 
                 response
             },
-            // should_retry predicate
-            |res, _attempt| is_retryable_status(res.status()),
+            // should_retry predicate. A full pool is answered at once:
+            // retrying it locally would be hidden, unbounded waiting.
+            |res, _attempt| is_retryable_status(res.status()) && !is_admission_rejection(res),
             // on_backoff hook
             |delay, attempt| {
                 RouterMetrics::record_retry(route);
@@ -1876,7 +1945,7 @@ impl Router {
             prepared,
         } = dispatch;
         let completion_echo = completion.map(|input| input.echo);
-        let load_incremented = load.tracks_worker();
+        let load_incremented = load.owns_resources();
         if crate::backend::is_grpc_url(worker_url) {
             // gRPC workers currently support only the chat and completions
             // endpoints. Treat all other routes as client errors so they do not
@@ -2389,6 +2458,7 @@ impl Router {
 
                     if self.worker_registry.remove_by_url(&removed_url).is_some() {
                         self.frontend.remove_worker(&removed_url);
+                        self.admission.forget(&removed_url);
                         info!("Removed worker: {}", removed_url);
                         removed_workers.push(removed_url);
 
@@ -2432,6 +2502,7 @@ impl Router {
 
             if self.worker_registry.remove_by_url(worker_url).is_some() {
                 self.frontend.remove_worker(worker_url);
+                self.admission.forget(worker_url);
                 info!("Removed worker: {}", worker_url);
 
                 // Notify PolicyRegistry about the removed worker
@@ -3079,6 +3150,25 @@ impl RouterTrait for Router {
         } else {
             None
         };
+        // Opt-in per-worker admission for inference (POST) traffic; see
+        // `route_prepared_request` for the snapshot/reservation split.
+        let admits = *method == Method::POST;
+        let saturated = if admits && program_completion.is_none() {
+            self.admission.saturated(&workers)
+        } else {
+            Vec::new()
+        };
+        if !saturated.is_empty() && saturated.len() == workers.len() {
+            return capacity_rejection("regular", "worker");
+        }
+        let workers = if saturated.is_empty() || kv_ops.is_some() {
+            workers
+        } else {
+            workers
+                .into_iter()
+                .filter(|worker| !saturated.iter().any(|url| url == worker.url()))
+                .collect()
+        };
         let selection = if let Some(completion) = &program_completion {
             self.worker_registry
                 .get_by_url(&completion.dispatch().target_id)
@@ -3103,7 +3193,7 @@ impl RouterTrait for Router {
                 lora_name,
                 cache_salt,
                 affinity_key.as_ref(),
-                &[],
+                &saturated,
             )
             .map(|receipt| SelectedWorker {
                 worker: workers[receipt.worker_index].clone(),
@@ -3155,9 +3245,37 @@ impl RouterTrait for Router {
         };
         let url = worker.endpoint_url(path);
 
-        let load_tracked = policy.tracks_request_load() || program_completion.is_some();
-        let load = load_tracked
+        let load = (policy.tracks_request_load() || program_completion.is_some())
             .then(|| RequestLoadGuard::from_selection(worker.clone(), kv_receipt, true));
+        let permit = if !admits {
+            None
+        } else if program_completion.is_some() {
+            self.admission.acquire_unbounded(worker.url())
+        } else {
+            match self.admission.try_acquire(worker.url()) {
+                Ok(permit) => permit,
+                Err(_) => {
+                    // No retry loop on this path: the lost race is final.
+                    drop(load);
+                    return capacity_rejection("regular", "worker");
+                }
+            }
+        };
+        // The permit rides the same guard as worker load, so it is held
+        // until the worker finishes or the client leaves, and released once.
+        let load = match (load, permit) {
+            (Some(load), permit) => {
+                load.hold_admission(permit);
+                Some(load)
+            }
+            (None, Some(permit)) => {
+                let load = RequestLoadGuard::new(None, None);
+                load.hold_admission(Some(permit));
+                Some(load)
+            }
+            (None, None) => None,
+        };
+        let load_tracked = load.is_some();
 
         let (body, mut transfers) = if let Some(epd) = &self.epd {
             if *method == Method::POST && path == "/v1/chat/completions" {
@@ -3404,6 +3522,10 @@ impl RouterTrait for Router {
         }
     }
 }
+
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
+#[path = "worker_admission_tests.rs"]
+mod worker_admission_tests;
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
@@ -5383,6 +5505,7 @@ mod tests {
             _program_observation_handle: None,
             program_targets_cache: Mutex::new(HashMap::new()),
             program_token_estimator: Arc::new(MomentumTokenEstimator::default()),
+            admission: Arc::default(),
         }
     }
 
@@ -5418,6 +5541,7 @@ mod tests {
             _program_observation_handle: None,
             program_targets_cache: Mutex::new(HashMap::new()),
             program_token_estimator: Arc::new(MomentumTokenEstimator::default()),
+            admission: Arc::default(),
         }
     }
 
@@ -6858,6 +6982,7 @@ mod tests {
             _program_observation_handle: None,
             program_targets_cache: Mutex::new(HashMap::new()),
             program_token_estimator: Arc::new(MomentumTokenEstimator::default()),
+            admission: Arc::default(),
         }
     }
 

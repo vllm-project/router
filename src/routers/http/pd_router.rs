@@ -3,8 +3,8 @@
 use super::dp_utils;
 use super::pd_kv_state::PdKvState;
 use super::pd_types::{
-    Loads, PDRouterError, PdAttempt, PdEndpoint, PdLoadManager, PdPrefillInput, PdRequestContext,
-    PdSelection, Stage, StageDecision,
+    Loads, PDRouterError, PdAdmitError, PdAttempt, PdEndpoint, PdLoadManager, PdPrefillInput,
+    PdRequestContext, PdSelection, Stage, StageDecision,
 };
 use crate::backend::preprocess::{prepare_http_token_inputs, router_token_inputs, HttpTokenInput};
 use crate::core::worker::WorkerMetadata;
@@ -29,6 +29,33 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
+
+/// Indices of `workers` whose `stage` occupancy is below `limit`, and whether
+/// some available worker was left out only because it is full.
+fn stage_headroom(
+    loads: &Loads,
+    stage: Stage,
+    workers: &[Arc<dyn Worker>],
+    limit: usize,
+) -> (Vec<usize>, bool) {
+    let mut room = Vec::with_capacity(workers.len());
+    let mut available_room = false;
+    let mut available_full = false;
+    for (index, worker) in workers.iter().enumerate() {
+        let occupancy = loads
+            .get(&(stage, PdEndpoint::for_worker(worker.as_ref())))
+            .copied()
+            .unwrap_or_default()
+            .occupancy(stage);
+        if occupancy < limit {
+            room.push(index);
+            available_room |= worker.is_available();
+        } else {
+            available_full |= worker.is_available();
+        }
+    }
+    (room, available_full && !available_room)
+}
 
 /// Admission decision over the supplied load snapshot. Legacy policies
 /// retain their own selection semantics and text/header inputs.
@@ -565,23 +592,74 @@ impl PdRouterBase {
         prefill_workers: &[Arc<dyn Worker>],
         decode_workers: &[Arc<dyn Worker>],
         context: &PdRequestContext<'_>,
-    ) -> Option<(PdSelection, PdAttempt)> {
+    ) -> Result<(PdSelection, PdAttempt), PdAdmitError> {
+        self.select_and_admit_with_capacity(prefill_workers, decode_workers, context, true)
+    }
+
+    /// `enforce_capacity: false` still charges occupancy but never refuses:
+    /// a health probe must not report a busy pool as unhealthy.
+    fn select_and_admit_with_capacity(
+        &self,
+        prefill_workers: &[Arc<dyn Worker>],
+        decode_workers: &[Arc<dyn Worker>],
+        context: &PdRequestContext<'_>,
+        enforce_capacity: bool,
+    ) -> Result<(PdSelection, PdAttempt), PdAdmitError> {
         let prefill_policy = self.policy_registry.get_prefill_policy();
         let decode_policy = self.policy_registry.get_decode_policy();
+        let limit = self
+            .pd_load
+            .max_inflight_per_worker()
+            .filter(|_| enforce_capacity);
+        let mut at_capacity = None;
         let admitted = self.pd_load.admit(|loads| {
             if let Some(kv) =
                 kv_aware_ops(decode_policy.as_ref()).filter(|kv| kv.session_affinity_enabled())
             {
                 kv.reconcile_decode_workers(decode_workers);
             }
-            select_pd_pair(
+            let Some(limit) = limit else {
+                return select_pd_pair(
+                    loads,
+                    prefill_workers,
+                    decode_workers,
+                    prefill_policy.as_ref(),
+                    decode_policy.as_ref(),
+                    context,
+                );
+            };
+            // Per-stage capacity is checked under the admission lock against
+            // the same occupancy the attempt will charge, so concurrent
+            // arrivals cannot overshoot and release reuses the stage cleanup.
+            let (prefill_room, prefill_full) =
+                stage_headroom(loads, Stage::Prefill, prefill_workers, limit);
+            if prefill_full {
+                at_capacity = Some(Stage::Prefill);
+                return None;
+            }
+            let (decode_room, decode_full) =
+                stage_headroom(loads, Stage::Decode, decode_workers, limit);
+            if decode_full {
+                at_capacity = Some(Stage::Decode);
+                return None;
+            }
+            let pick = |workers: &[Arc<dyn Worker>], room: &[usize]| {
+                room.iter()
+                    .map(|&index| workers[index].clone())
+                    .collect::<Vec<_>>()
+            };
+            let mut selection = select_pd_pair(
                 loads,
-                prefill_workers,
-                decode_workers,
+                &pick(prefill_workers, &prefill_room),
+                &pick(decode_workers, &decode_room),
                 prefill_policy.as_ref(),
                 decode_policy.as_ref(),
                 context,
-            )
+            )?;
+            // Map indices back to the caller's slices.
+            selection.prefill.worker_index = prefill_room[selection.prefill.worker_index];
+            selection.decode.worker_index = decode_room[selection.decode.worker_index];
+            Some(selection)
         });
         if let Some((selection, attempt)) = &admitted {
             if kv_aware_ops(prefill_policy.as_ref()).is_some() {
@@ -623,7 +701,10 @@ impl PdRouterBase {
                 "P/D admission"
             );
         }
-        admitted
+        admitted.ok_or(match at_capacity {
+            Some(stage) => PdAdmitError::AtCapacity(stage),
+            None => PdAdmitError::NoEligiblePair,
+        })
     }
 
     // Private helper method to perform health check on a new server
@@ -1150,7 +1231,9 @@ impl PdRouterBase {
         };
         Ok(PdRouterBase {
             kv_state,
-            pd_load: Arc::new(PdLoadManager::default()),
+            pd_load: Arc::new(PdLoadManager::with_max_inflight_per_worker(
+                ctx.router_config.max_inflight_requests_per_worker,
+            )),
             worker_registry: Arc::clone(&ctx.worker_registry),
             policy_registry: Arc::clone(&ctx.policy_registry),
             worker_startup_timeout_secs: ctx.router_config.worker_startup_timeout_secs,
@@ -1352,17 +1435,21 @@ impl PdRouterBase {
             cache_salt: None,
             route: "/health_generate",
         };
-        let (selection, _attempt) =
-            match self.select_and_admit(prefill_workers, decode_workers, &context) {
-                Some(admitted) => admitted,
-                None => {
-                    return (
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "No healthy worker pair available".to_string(),
-                    )
-                        .into_response();
-                }
-            };
+        let (selection, _attempt) = match self.select_and_admit_with_capacity(
+            prefill_workers,
+            decode_workers,
+            &context,
+            false,
+        ) {
+            Ok(admitted) => admitted,
+            Err(_) => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "No healthy worker pair available".to_string(),
+                )
+                    .into_response();
+            }
+        };
         let prefill = &prefill_workers[selection.prefill.worker_index];
         let decode = &decode_workers[selection.decode.worker_index];
 
@@ -1883,6 +1970,7 @@ mod tests {
         };
         let (selection, attempt) = router
             .select_and_admit(&prefill_workers, &decode_workers, &context)
+            .ok()
             .unwrap();
         let prefill = &prefill_workers[selection.prefill.worker_index];
 
@@ -1909,7 +1997,10 @@ mod tests {
             cache_salt: None,
             route: "/health_generate",
         };
-        assert!(router.select_and_admit(&empty, &empty, &context).is_none());
+        assert_eq!(
+            router.select_and_admit(&empty, &empty, &context).err(),
+            Some(PdAdmitError::NoEligiblePair)
+        );
         assert!(router.pd_load.snapshot().is_empty());
     }
 
@@ -3364,5 +3455,185 @@ mod admission_tests {
             attempt.track_response(axum::response::Response::new(Body::from("prefill error")));
         assert!(manager.snapshot().is_empty());
         drop(response);
+    }
+
+    // ---- Per-stage admission capacity (RFC #435) ----
+
+    fn pd_router_with_limit(limit: Option<usize>) -> PdRouterBase {
+        PdRouterBase {
+            kv_state: None,
+            pd_load: Arc::new(PdLoadManager::with_max_inflight_per_worker(limit)),
+            worker_registry: Arc::new(WorkerRegistry::new()),
+            policy_registry: Arc::new(PolicyRegistry::new(crate::config::PolicyConfig::RoundRobin)),
+            worker_startup_timeout_secs: 5,
+            worker_startup_check_interval_secs: 1,
+            worker_loads: Arc::new(tokio::sync::watch::channel(HashMap::new()).1),
+            load_monitor_handle: None,
+            client: Client::new(),
+            api_key: None,
+            circuit_breaker_config: CircuitBreakerConfig::default(),
+            dp_size: 1,
+        }
+    }
+
+    fn capped_pd_router(limit: usize) -> PdRouterBase {
+        pd_router_with_limit(Some(limit))
+    }
+
+    fn stage_occupancy(router: &PdRouterBase, stage: Stage, url: &str) -> usize {
+        router
+            .pd_load
+            .snapshot()
+            .iter()
+            .filter(|((s, endpoint), _)| *s == stage && endpoint.http_url == url)
+            .map(|(_, load)| load.occupancy(stage))
+            .sum()
+    }
+
+    #[test]
+    fn pd_capacity_is_per_stage_and_released_by_stage_cleanup() {
+        let router = capped_pd_router(1);
+        let (p, d) = (pool("p", 1), pool("d", 2));
+        let ctx = context();
+
+        let (first_sel, first) = router.select_and_admit(&p, &d, &ctx).unwrap();
+        // The only P endpoint is full: refused as overload, not as "no pair".
+        assert_eq!(
+            router.select_and_admit(&p, &d, &ctx).err(),
+            Some(PdAdmitError::AtCapacity(Stage::Prefill))
+        );
+
+        // Prefill completion frees P while D is still serving the first request.
+        first.finish_prefill();
+        let (second_sel, second) = router.select_and_admit(&p, &d, &ctx).unwrap();
+        assert_ne!(
+            first_sel.decode.endpoint, second_sel.decode.endpoint,
+            "a full decode endpoint must not be selected"
+        );
+        second.finish_prefill();
+
+        // Both D endpoints are full now.
+        assert_eq!(
+            router.select_and_admit(&p, &d, &ctx).err(),
+            Some(PdAdmitError::AtCapacity(Stage::Decode))
+        );
+
+        // Decode completion of either attempt reopens exactly that endpoint.
+        first.finish_decode();
+        let (third_sel, third) = router.select_and_admit(&p, &d, &ctx).unwrap();
+        assert_eq!(third_sel.decode.endpoint, first_sel.decode.endpoint);
+
+        drop((first, second, third));
+        assert!(router.pd_load.snapshot().is_empty(), "no leaked occupancy");
+        // Recovery: the pool admits again after the overload drains.
+        assert!(router.select_and_admit(&p, &d, &ctx).is_ok());
+    }
+
+    #[test]
+    fn pd_capacity_counts_pending_and_active_decode() {
+        let router = capped_pd_router(1);
+        let (p, d) = (pool("p", 2), pool("d", 1));
+        let ctx = context();
+        let (_, attempt) = router.select_and_admit(&p, &d, &ctx).unwrap();
+        attempt.finish_prefill();
+        // Pending decode holds the slot ...
+        assert_eq!(
+            router.select_and_admit(&p, &d, &ctx).err(),
+            Some(PdAdmitError::AtCapacity(Stage::Decode))
+        );
+        // ... and so does active decode.
+        attempt.begin_decode();
+        assert_eq!(
+            router.select_and_admit(&p, &d, &ctx).err(),
+            Some(PdAdmitError::AtCapacity(Stage::Decode))
+        );
+        attempt.finish_decode();
+        assert!(router.select_and_admit(&p, &d, &ctx).is_ok());
+    }
+
+    #[test]
+    fn pd_unhealthy_pool_is_no_pair_not_overload() {
+        let router = capped_pd_router(1);
+        let p = pool("p", 1);
+        p[0].set_healthy(false);
+        let d = pool("d", 1);
+        assert_eq!(
+            router.select_and_admit(&p, &d, &context()).err(),
+            Some(PdAdmitError::NoEligiblePair)
+        );
+    }
+
+    #[test]
+    fn pd_full_healthy_worker_reports_capacity_even_with_an_unhealthy_spare() {
+        let router = capped_pd_router(1);
+        let p = pool("p", 2);
+        let d = pool("d", 4);
+        p[1].set_healthy(false);
+        let (_, _held) = router.select_and_admit(&p, &d, &context()).unwrap();
+        assert_eq!(
+            router.select_and_admit(&p, &d, &context()).err(),
+            Some(PdAdmitError::AtCapacity(Stage::Prefill))
+        );
+    }
+
+    #[test]
+    fn pd_health_probe_bypasses_capacity_but_is_counted() {
+        let router = capped_pd_router(1);
+        let (p, d) = (pool("p", 1), pool("d", 1));
+        let (_, held) = router.select_and_admit(&p, &d, &context()).unwrap();
+        let (_, probe) = router
+            .select_and_admit_with_capacity(&p, &d, &context(), false)
+            .expect("a saturated pool is busy, not unhealthy");
+        assert_eq!(stage_occupancy(&router, Stage::Prefill, "http://p0"), 2);
+        drop((held, probe));
+        assert!(router.pd_load.snapshot().is_empty());
+    }
+
+    #[test]
+    fn pd_concurrent_admissions_never_exceed_stage_capacity() {
+        const LIMIT: usize = 2;
+        const THREADS: usize = 48;
+        let router = Arc::new(capped_pd_router(LIMIT));
+        let (p, d) = (Arc::new(pool("p", 2)), Arc::new(pool("d", 8)));
+        let barrier = Arc::new(std::sync::Barrier::new(THREADS));
+        let handles: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let (router, p, d, barrier) =
+                    (router.clone(), p.clone(), d.clone(), barrier.clone());
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    router
+                        .select_and_admit(&p, &d, &context())
+                        .ok()
+                        .map(|(_, attempt)| attempt)
+                })
+            })
+            .collect();
+        let admitted: Vec<_> = handles
+            .into_iter()
+            .filter_map(|handle| handle.join().unwrap())
+            .collect();
+        // Prefill is the bottleneck: 2 endpoints x 2 slots.
+        assert_eq!(admitted.len(), 2 * LIMIT);
+        for url in ["http://p0", "http://p1"] {
+            assert_eq!(stage_occupancy(&router, Stage::Prefill, url), LIMIT);
+        }
+        for i in 0..8 {
+            assert!(stage_occupancy(&router, Stage::Decode, &format!("http://d{i}")) <= LIMIT);
+        }
+        drop(admitted);
+        assert!(router.pd_load.snapshot().is_empty());
+    }
+
+    #[test]
+    fn pd_disabled_capacity_keeps_existing_admission() {
+        let router = pd_router_with_limit(None);
+        let (p, d) = (pool("p", 1), pool("d", 1));
+        let attempts: Vec<_> = (0..16)
+            .map(|_| router.select_and_admit(&p, &d, &context()).unwrap())
+            .collect();
+        assert_eq!(stage_occupancy(&router, Stage::Prefill, "http://p0"), 16);
+        drop(attempts);
+        assert!(router.pd_load.snapshot().is_empty());
     }
 }

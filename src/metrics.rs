@@ -267,6 +267,15 @@ pub fn init_metrics() {
     );
     describe_gauge!("vllm_router_embeddings_queue_size", "Embedding queue size");
 
+    describe_counter!(
+        "vllm_router_admission_rejections_total",
+        "Requests rejected before dispatch because every eligible worker (or P/D stage endpoint) was at its per-worker in-flight capacity, by router kind and stage"
+    );
+    describe_gauge!(
+        "vllm_router_worker_admitted_requests",
+        "Admission permits currently held per regular worker when per-worker admission is enabled"
+    );
+
     // Running requests gauge for cache-aware policy
     describe_gauge!(
         "vllm_router_running_requests",
@@ -1113,6 +1122,24 @@ impl RouterMetrics {
 
     pub fn set_embeddings_queue_size(size: usize) {
         gauge!("vllm_router_embeddings_queue_size").set(size as f64);
+    }
+
+    /// `router` is `regular` or `pd`; `stage` is `worker`, `prefill` or `decode`.
+    /// Both are fixed enums so the label set stays bounded.
+    pub fn record_admission_rejection(router: &'static str, stage: &'static str) {
+        counter!("vllm_router_admission_rejections_total",
+            "router" => router,
+            "stage" => stage,
+            "reason" => "worker_capacity"
+        )
+        .increment(1);
+    }
+
+    pub fn set_worker_admitted_requests(worker: &str, count: usize) {
+        gauge!("vllm_router_worker_admitted_requests",
+            "worker" => worker.to_string()
+        )
+        .set(count as f64);
     }
 
     // Running requests for cache-aware policy

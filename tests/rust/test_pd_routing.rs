@@ -806,6 +806,7 @@ mod test_pd_routing {
                 disable_retries: false,
                 disable_circuit_breaker: false,
                 kv_aware_session_affinity_ttl_secs: None,
+                max_inflight_requests_per_worker: None,
                 health_check: vllm_router_rs::config::HealthCheckConfig::default(),
                 program_scheduling: None,
                 enable_igw: false,

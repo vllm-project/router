@@ -17,6 +17,7 @@ async fn igw_kv_affinity_survives_load_changes_and_rebinds_after_registration() 
     let config = RouterConfig {
         enable_igw: true,
         kv_aware_session_affinity_ttl_secs: Some(60),
+        max_inflight_requests_per_worker: None,
         ..Default::default()
     };
     let workers = Arc::new(WorkerRegistry::new());
