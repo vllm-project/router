@@ -38,7 +38,6 @@ shell. A build-level `HF_TOKEN` would override a pod env entry of the same name.
 | `l4_4` | EKS `l4-k8s`, 4× L4, image `public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:router-$BUILDKITE_COMMIT` |
 | `l4_1` | Same L4 pool and image, 1× L4 |
 | `h100_2` | `mithril-h100-pool`, 2× H100 SXM, us-west-2 pull-through cache of the router CI image, GPU limit 2 |
-| `h100_4` | `mithril-h100-pool`, 4× H100 SXM, same pull-through image, 4 GPU + CPU/memory/shm |
 | `mi300_2` | `router_rocm_mi300_2`, same-host xGMI Docker devices |
 | `mi300_rdma` | `router_rocm_mi300_2` coordinator, no Docker plugin |
 
