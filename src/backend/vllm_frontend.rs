@@ -8,8 +8,8 @@ use anyhow::{bail, Result};
 use serde_json::Value;
 use vllm_chat::{
     load_model_backends, ChatContent, ChatMessage, ChatOptions, ChatRequest, ChatRole, ChatTool,
-    ChatToolChoice, GenerationPromptMode, LoadModelBackendsOptions, LoadedModelBackends,
-    ReasoningEffort, ResolvedToolContext, SamplingParams,
+    ChatToolChoice, EffortValue, GenerationPromptMode, LoadModelBackendsOptions,
+    LoadedModelBackends, ResolvedToolContext, SamplingParams,
 };
 use vllm_text::TextDecodeOptions;
 
@@ -18,7 +18,10 @@ use super::l1_encode_cache::{load_boundary_matcher, L1Cache, L1Encoder};
 use super::tokenizer_determinism::deterministic_model;
 use vllm_tokenizer::{IncrementalDecoder, Tokenizer};
 
+pub use llm_multimodal::Modality as MediaModality;
+pub use vllm_chat::ChatContentPart as UpstreamContentPart;
 pub use vllm_chat::ChatMessage as UpstreamChatMessage;
+pub use vllm_chat::MediaPartSource;
 pub use vllm_tokenizer::DynTokenizer;
 pub use vllm_tokenizer::IncrementalDecoder as IncrementalDecoderTrait;
 
@@ -35,15 +38,32 @@ impl VllmFrontend {
         cache: Option<Arc<FrontendCache>>,
         l1_cache: Option<Arc<L1Cache>>,
     ) -> vllm_chat::Result<Self> {
-        let backends = load_model_backends(
+        // Media parts render through the template only when the model's
+        // multimodal config loads; otherwise keep the text-only backend.
+        let backends = match load_model_backends(
             model_id,
             LoadModelBackendsOptions {
-                language_model_only: true,
-                default_chat_template_kwargs,
+                language_model_only: false,
+                default_chat_template_kwargs: default_chat_template_kwargs.clone(),
                 ..Default::default()
             },
         )
-        .await?;
+        .await
+        {
+            Ok(backends) => backends,
+            Err(error) => {
+                tracing::info!(model_id, %error, "multimodal chat unavailable; loading text-only");
+                load_model_backends(
+                    model_id,
+                    LoadModelBackendsOptions {
+                        language_model_only: true,
+                        default_chat_template_kwargs,
+                        ..Default::default()
+                    },
+                )
+                .await?
+            }
+        };
         let cache = if cache.is_some() {
             match deterministic_model(model_id).await {
                 Ok(true) => cache,
@@ -89,6 +109,24 @@ impl VllmFrontend {
         self.backends.text_backend.tokenizer()
     }
 
+    /// The token ids the chat template renders for one `modality` item, which
+    /// the worker expands in place; `None` when the model has no such input.
+    pub fn media_marker(&self, modality: MediaModality) -> Option<Vec<u32>> {
+        let token = self
+            .backends
+            .chat_backend
+            .multimodal_model_info()?
+            .placeholder_token(modality)?;
+        let tokenizer = self.tokenizer();
+        match tokenizer.token_to_id(token) {
+            Some(id) => Some(vec![id]),
+            None => tokenizer
+                .encode(token, false)
+                .ok()
+                .filter(|ids| !ids.is_empty()),
+        }
+    }
+
     pub fn default_temperature(&self) -> Result<Option<f32>> {
         Ok(self
             .backends
@@ -97,11 +135,13 @@ impl VllmFrontend {
             .default_temperature)
     }
 
-    /// Returns IDs, cached token count, template ms and encode ms.
-    pub fn chat_tokenize_timed(
+    /// Returns IDs, cached token count, template ms, encode ms and the
+    /// renderer's media order (`None` means request order).
+    #[allow(clippy::type_complexity)]
+    pub fn chat_tokenize_with_media_order(
         &self,
         request: &ChatRequest,
-    ) -> vllm_chat::Result<(Arc<[u32]>, usize, f64, f64)> {
+    ) -> vllm_chat::Result<(Arc<[u32]>, usize, f64, f64, Option<Vec<MediaPartSource>>)> {
         let t0 = Instant::now();
         let rendered = self.backends.chat_backend.chat_renderer().render(request)?;
         let template_ms = t0.elapsed().as_secs_f64() * 1000.0;
@@ -115,7 +155,13 @@ impl VllmFrontend {
             )
             .map_err(|error| vllm_chat::Error::ChatTemplate(error.to_string()))?;
         let encode_ms = t1.elapsed().as_secs_f64() * 1000.0;
-        Ok((encoded.ids, encoded.cached_tokens, template_ms, encode_ms))
+        Ok((
+            encoded.ids,
+            encoded.cached_tokens,
+            template_ms,
+            encode_ms,
+            rendered.media_order,
+        ))
     }
 }
 
@@ -128,7 +174,7 @@ pub struct OpenAiChatRequest {
     pub tools: Vec<ChatTool>,
     pub tool_choice: Option<ChatToolChoice>,
     pub parallel_tool_calls: bool,
-    pub reasoning_effort: Option<ReasoningEffort>,
+    pub reasoning_effort: Option<EffortValue>,
     pub response_format: Option<Value>,
     pub add_special_tokens: bool,
     pub documents: Option<Vec<Value>>,
@@ -139,7 +185,7 @@ pub struct OpenAiChatRequest {
 }
 
 pub fn chat_request_from_openai(input: OpenAiChatRequest) -> Result<ChatRequest> {
-    // Keep this lowering aligned with vLLM 0.30
+    // Keep this lowering aligned with vLLM main
     // server/routes/openai/chat_completions/convert.rs::prepare_chat_request.
     // That function is pub(super) and route-owned, so importing it would
     // require vllm-server. Replace this adapter if upstream exposes a public,
@@ -186,6 +232,7 @@ pub fn chat_request_from_openai(input: OpenAiChatRequest) -> Result<ChatRequest>
         data_parallel_rank: input.data_parallel_rank,
         session_id: input.session_id,
         lora_request: None,
+        return_prompt_text: false,
     };
     request.validate()?;
     Ok(request)
@@ -193,6 +240,10 @@ pub fn chat_request_from_openai(input: OpenAiChatRequest) -> Result<ChatRequest>
 
 pub fn user_text(text: impl Into<String>) -> ChatMessage {
     ChatMessage::user(ChatContent::Text(text.into()))
+}
+
+pub fn user_parts(parts: Vec<UpstreamContentPart>) -> ChatMessage {
+    ChatMessage::user(ChatContent::Parts(parts))
 }
 
 pub fn system_text(text: impl Into<String>) -> ChatMessage {

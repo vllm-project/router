@@ -81,6 +81,21 @@ impl MomentumTokenEstimator {
         )
     }
 
+    /// An exactly known prompt length. Its calibration observes nothing: the
+    /// tokens may not come from the text the coefficient models (e.g. media).
+    pub(crate) fn exact(
+        scope: TokenEstimateScope,
+        prompt_tokens: usize,
+    ) -> (usize, TokenEstimateCalibration) {
+        (
+            prompt_tokens.max(1),
+            TokenEstimateCalibration {
+                scope,
+                input_bytes: 0,
+            },
+        )
+    }
+
     pub(crate) fn observe(
         &self,
         calibration: &TokenEstimateCalibration,

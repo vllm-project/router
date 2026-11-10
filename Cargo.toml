@@ -100,15 +100,17 @@ async-channel = "2"
 # tonic 0.12 copy for traces.
 tonic = { version = "0.14", features = ["transport"] }
 tonic-health = "0.14"
-vllm-proto = "0.2"
+# vLLM PR 66094 (https://github.com/vllm-project/vllm/pull/66094).
+# These crates are not published. The branch is herotai214/vllm grpc-epd-handoff,
+# so a checkout of this router builds the same proto and chat frontend the PR serves.
+vllm-proto = { git = "https://github.com/herotai214/vllm", branch = "grpc-epd-handoff" }
 # `kv_transfer_params` is a protobuf `Struct`.
 prost-types = "0.14"
-# Rust crates in the vLLM tree (not pip). Unpublished on crates.io; Cargo
-# finds the package by name under rust/src/. Override with a path patch
-# to a local checkout if you already have the rust workspace.
-vllm-chat = { git = "https://github.com/vllm-project/vllm", tag = "v0.30.0" }
-vllm-tokenizer = { git = "https://github.com/vllm-project/vllm", tag = "v0.30.0" }
-vllm-text = { git = "https://github.com/vllm-project/vllm", tag = "v0.30.0" }
+vllm-chat = { git = "https://github.com/herotai214/vllm", branch = "grpc-epd-handoff" }
+vllm-tokenizer = { git = "https://github.com/herotai214/vllm", branch = "grpc-epd-handoff" }
+vllm-text = { git = "https://github.com/herotai214/vllm", branch = "grpc-epd-handoff" }
+# Same revision the worker workspace pins; only `Modality` is used.
+llm-multimodal = { git = "https://github.com/smg-project/llm-multimodal", rev = "1b6197354e498b1dfb6e2647b2c68e4d11eaf5b5", default-features = false }
 
 [features]
 # Every Rust test file is gated on these. `cargo test` compiles a group

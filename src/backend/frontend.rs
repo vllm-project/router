@@ -11,8 +11,13 @@ use axum::response::Response;
 
 use super::grpc::{FirstOutputCallback, GrpcEngineBackend, KvHandoff};
 use super::l1_encode_cache::{L1CacheConfig, L1CacheStats};
-use super::preprocess::{tokenize_chat_request_timed, FrontendHandle, TokenizeOut, TokenizerCache};
-use crate::protocols::spec::ChatCompletionRequest;
+use super::pb;
+use super::preprocess::{
+    tokenize_chat_request_timed, tokenize_chat_request_with_media, FrontendHandle, TokenizeOut,
+    TokenizerCache,
+};
+pub use super::vllm_frontend::{MediaModality, MediaPartSource};
+use crate::protocols::spec::{ChatCompletionRequest, ChatMessage, UserMessageContent};
 use crate::tokenizer::{TokenizerCacheConfig, TokenizerCacheStats};
 
 /// Client-facing response shape. The internal pipeline is always chat-shaped;
@@ -54,6 +59,76 @@ pub struct PreparedRequest {
     pub shape: ResponseShape,
     /// Client opted in with `return_token_ids`; ids are withheld otherwise.
     pub emit_token_ids: bool,
+    /// Experimental gRPC EPD: `token_ids` hold one unexpanded template marker
+    /// per media item; the encoder stage fills `media` from them.
+    pub media: Option<GrpcMedia>,
+}
+
+impl PreparedRequest {
+    /// The prompt as the worker will see it, for routing and admission: the
+    /// EPD-expanded prompt when known, else the tokenized prompt.
+    pub fn routing_token_ids(&self) -> &[u32] {
+        self.media
+            .as_ref()
+            .and_then(|media| media.routing_token_ids.as_deref())
+            .unwrap_or(&self.tokenized.token_ids)
+    }
+
+    /// The request as an E→P→D decode worker gets it: the prompt layout and
+    /// KV, not P's encoder-cache reservations.
+    pub fn for_decode(mut self) -> Self {
+        if let Some(media) = self.media.as_mut() {
+            media.ec_transfer_params = None;
+        }
+        self
+    }
+
+    /// Exact prompt length, known only once the EPD encoder stage expanded it.
+    pub fn exact_prompt_tokens(&self) -> Option<usize> {
+        self.media
+            .as_ref()
+            .and_then(|media| media.routing_token_ids.as_ref())
+            .map(|ids| ids.len())
+    }
+}
+
+/// Media a gRPC EPD request owes the worker. Filled by the encoder stage
+/// (`routers::http::epd::grpc`), before selection unless Mooncake needs the
+/// consumer first.
+#[derive(Clone, Debug, Default)]
+pub struct GrpcMedia {
+    /// The renderer's media order; `None` is request order.
+    pub order: Option<Vec<MediaPartSource>>,
+    /// Placeholder order: metadata-only features at their expanded range, and
+    /// raw media the worker still preprocesses at its marker.
+    pub items: Vec<pb::MediaItem>,
+    pub ec_transfer_params: Option<serde_json::Value>,
+    /// Set by the encoder stage; dispatch refuses media that skipped it.
+    pub encoded: bool,
+    /// The worker's expanded prompt, spliced from the encoders' placeholder
+    /// ranges; `None` when an item's expansion is unknown.
+    pub routing_token_ids: Option<Arc<[u32]>>,
+    /// The prompt sent to the worker when it differs from the tokenized one:
+    /// feature ranges spliced in, raw items still at their marker.
+    pub prompt_token_ids: Option<Arc<[u32]>>,
+}
+
+impl GrpcMedia {
+    pub(crate) fn apply(&self, proto: &mut pb::GenerateRequest) -> Result<(), String> {
+        if !self.encoded {
+            return Err("gRPC EPD media was not encoded before dispatch".into());
+        }
+        if let Some(ids) = &self.prompt_token_ids {
+            proto.prompt = Some(pb::generate_request::Prompt::TokenIds(pb::TokenIds {
+                ids: ids.to_vec(),
+            }));
+        }
+        proto.media = self.items.clone();
+        if let Some(params) = &self.ec_transfer_params {
+            super::convert::set_ec_transfer_params(proto, params)?;
+        }
+        Ok(())
+    }
 }
 
 /// Load-once tokenizer + tonic client. One replica per router process.
@@ -168,7 +243,48 @@ impl EngineFrontend {
             t_req,
             shape: ResponseShape::Chat,
             emit_token_ids: false,
+            media: None,
         })
+    }
+
+    /// `prepare` for experimental gRPC EPD: media parts render as markers and
+    /// `media` must be filled by the encoder stage before dispatch.
+    pub async fn prepare_with_media(
+        &self,
+        mut request: ChatCompletionRequest,
+    ) -> Result<PreparedRequest, PrepareError> {
+        let (handle, t_req, resolve_ms) = self.resolve_with_defaults(&mut request).await?;
+        let (mut tokenized, order) = tokenize_chat_request_with_media(&request, &handle)
+            .map_err(|e| PrepareError::Invalid(format!("preprocess: {e}")))?;
+        // Text-only chat on an EPD pool still truncates. A positive limit can
+        // cut a marker away from its media item, so only that case is rejected.
+        if media_markers_present(&request, order.as_deref()) {
+            reject_positive_media_truncation(&request)?;
+        } else {
+            truncate_grpc_prompt(&request, &mut tokenized)?;
+        }
+        Ok(PreparedRequest {
+            request: Arc::new(request),
+            tokenized,
+            handle,
+            resolve_ms,
+            t_req,
+            shape: ResponseShape::Chat,
+            emit_token_ids: false,
+            media: Some(GrpcMedia {
+                order,
+                ..Default::default()
+            }),
+        })
+    }
+
+    /// Unary `Generate` on `worker_url` (the encoder call of gRPC EPD).
+    pub async fn generate(
+        &self,
+        worker_url: &str,
+        request: pb::GenerateRequest,
+    ) -> Result<pb::GenerateResponse, Result<tonic::Status, String>> {
+        self.grpc.generate(worker_url, request).await
     }
 
     /// Wire adapter path for `/v1/completions` on the gRPC pool: the client
@@ -198,6 +314,7 @@ impl EngineFrontend {
             t_req,
             shape: ResponseShape::Completion,
             emit_token_ids,
+            media: None,
         })
     }
 
@@ -285,6 +402,80 @@ fn truncate_grpc_prompt(
     Ok(())
 }
 
+/// `Some` is the renderer's placeholder list (`Some([])` dropped every item).
+/// `None` means request order, so the request itself says whether markers exist.
+fn media_markers_present(
+    request: &ChatCompletionRequest,
+    order: Option<&[MediaPartSource]>,
+) -> bool {
+    match order {
+        Some(order) => !order.is_empty(),
+        None => request_has_media_part(request),
+    }
+}
+
+fn request_has_media_part(request: &ChatCompletionRequest) -> bool {
+    request.messages.iter().any(|message| match message {
+        ChatMessage::System { content, .. } | ChatMessage::User { content, .. } => {
+            content_has_media(content)
+        }
+        ChatMessage::Assistant { content, .. } => content.as_ref().is_some_and(content_has_media),
+        ChatMessage::Tool { content, .. } => value_has_media(content),
+        ChatMessage::Function { .. } => false,
+        ChatMessage::Other(value) => value_has_media(value),
+    })
+}
+
+fn content_has_media(content: &UserMessageContent) -> bool {
+    match content {
+        UserMessageContent::Text(_) => false,
+        UserMessageContent::Parts(parts) => parts.iter().any(part_is_media),
+    }
+}
+
+fn part_is_media(part: &serde_json::Value) -> bool {
+    matches!(
+        part.get("type").and_then(serde_json::Value::as_str),
+        Some("image_url" | "video_url" | "audio_url" | "input_audio")
+    )
+}
+
+fn value_has_media(value: &serde_json::Value) -> bool {
+    if part_is_media(value) {
+        return true;
+    }
+    match value {
+        serde_json::Value::Array(items) => items.iter().any(value_has_media),
+        serde_json::Value::Object(object) => object.get("content").is_some_and(value_has_media),
+        _ => false,
+    }
+}
+
+/// Zero is the gRPC no-op. A positive limit is rejected once markers exist.
+fn reject_positive_media_truncation(request: &ChatCompletionRequest) -> Result<(), PrepareError> {
+    let Some(value) = request
+        .other
+        .get("truncate_prompt_tokens")
+        .filter(|value| !value.is_null())
+    else {
+        return Ok(());
+    };
+    let limit = value
+        .as_u64()
+        .and_then(|value| u32::try_from(value).ok())
+        .ok_or_else(|| {
+            PrepareError::Invalid(
+                "truncate_prompt_tokens must be a non-negative 32-bit integer on gRPC".into(),
+            )
+        })?;
+    if limit > 0 {
+        return Err(PrepareError::Invalid(
+            "truncate_prompt_tokens is not supported with gRPC EPD media".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// HTTP pools proxy the request body, so the router never tokenizes and the
 /// L0/L1 switches have no effect. Say so instead of ignoring them silently.
 pub(crate) fn warn_ignored_encoding_caches() {
@@ -323,6 +514,90 @@ mod tests {
             assert_eq!(tokenized.token_ids.as_ref(), &[4, 5, 6]);
             assert_eq!(tokenized.cached_tokens, expected);
         }
+    }
+
+    #[tokio::test]
+    async fn epd_text_only_truncation_still_applies() {
+        let frontend = EngineFrontend::new();
+        frontend.pin_test_token_ids(vec![1, 2, 3, 4, 5, 6]);
+        let text: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "messages": [{"role": "user", "content": "hello"}],
+            "truncate_prompt_tokens": 3
+        }))
+        .unwrap();
+        let prepared = frontend.prepare_with_media(text).await.unwrap();
+        assert_eq!(prepared.tokenized.token_ids.as_ref(), &[4, 5, 6]);
+
+        let zero: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "see"},
+                {"type": "image_url", "image_url": {"url": "http://x/a.png"}}
+            ]}],
+            "truncate_prompt_tokens": 0
+        }))
+        .unwrap();
+        let prepared = frontend.prepare_with_media(zero).await.unwrap();
+        assert_eq!(prepared.tokenized.token_ids.as_ref(), &[1, 2, 3, 4, 5, 6]);
+
+        let media: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "messages": [{"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": "http://x/a.png"}}
+            ]}],
+            "truncate_prompt_tokens": 2
+        }))
+        .unwrap();
+        match frontend.prepare_with_media(media).await {
+            Err(err) => {
+                assert!(err
+                    .to_string()
+                    .contains("not supported with gRPC EPD media"))
+            }
+            Ok(_) => panic!("media truncation was accepted"),
+        }
+    }
+
+    #[tokio::test]
+    async fn decode_keeps_epd_media_but_not_ec_params() {
+        let frontend = EngineFrontend::new();
+        frontend.pin_test_token_ids(vec![1, 2, 3]);
+        let image: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "messages": [{"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": "http://x/a.png"}}
+            ]}]
+        }))
+        .unwrap();
+        let mut prepared = frontend.prepare_with_media(image).await.unwrap();
+        let media = prepared.media.as_mut().unwrap();
+        media.items = vec![pb::MediaItem::default()];
+        media.ec_transfer_params = Some(serde_json::json!({"ec_items": []}));
+        media.encoded = true;
+
+        let media = prepared.for_decode().media.unwrap();
+        assert_eq!(media.items.len(), 1);
+        assert!(media.encoded);
+        assert!(media.ec_transfer_params.is_none());
+    }
+
+    #[test]
+    fn reported_media_order_decides_truncation() {
+        let text: ChatCompletionRequest =
+            serde_json::from_value(serde_json::json!({"messages": []})).unwrap();
+        assert!(!media_markers_present(&text, Some(&[])));
+        assert!(media_markers_present(
+            &text,
+            Some(&[MediaPartSource {
+                message_index: 0,
+                content_part_index: 1,
+            }])
+        ));
+        let image: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "messages": [{"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": "http://x/a.png"}}
+            ]}]
+        }))
+        .unwrap();
+        assert!(media_markers_present(&image, None));
+        assert!(!media_markers_present(&image, Some(&[])));
     }
 
     #[test]

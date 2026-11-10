@@ -276,13 +276,29 @@ impl ConfigValidator {
             });
         }
         Self::validate_urls(&epd.encoder_urls)?;
-        for url in epd.encoder_urls.iter().chain(worker_urls.iter().copied()) {
-            if !url.starts_with("http://") && !url.starts_with("https://") {
-                return Err(ConfigError::InvalidValue {
-                    field: "epd.worker_url".into(),
-                    value: url.clone(),
-                    reason: "EPD requires HTTP(S) encoder and consumer URLs".into(),
+        let all_grpc = epd
+            .encoder_urls
+            .iter()
+            .chain(worker_urls.iter().copied())
+            .all(|url| url.starts_with("grpc://"));
+        if all_grpc {
+            // PodInfo::worker_url registers http:// consumers. grpc_epd()
+            // already selected the typed handler from the encoder URLs, so
+            // those requests would skip the encoder stage.
+            if config.discovery.as_ref().is_some_and(|d| d.enabled) {
+                return Err(ConfigError::ValidationFailed {
+                    reason: "Experimental gRPC EPD cannot be combined with service discovery, which registers http:// workers".into(),
                 });
+            }
+        } else {
+            for url in epd.encoder_urls.iter().chain(worker_urls.iter().copied()) {
+                if !url.starts_with("http://") && !url.starts_with("https://") {
+                    return Err(ConfigError::InvalidValue {
+                        field: "epd.worker_url".into(),
+                        value: url.clone(),
+                        reason: "EPD requires HTTP(S) encoder and consumer URLs, or gRPC for all of them".into(),
+                    });
+                }
             }
         }
         if !epd.consumer_zmq_addrs.is_empty() {
@@ -1285,6 +1301,84 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn test_validate_experimental_grpc_epd_accepts_mooncake() {
+        let epd = || EpdConfig {
+            encoder_urls: vec!["grpc://encoder:9000".into()],
+            consumer_zmq_addrs: Default::default(),
+        };
+        let mut config = RouterConfig::new(
+            RoutingMode::Regular {
+                worker_urls: vec!["grpc://consumer:9000".into()],
+            },
+            PolicyConfig::Random,
+        );
+        config.epd = Some(epd());
+        ConfigValidator::validate(&config).unwrap();
+
+        let mut config = RouterConfig::new(
+            RoutingMode::VllmPrefillDecode {
+                prefill_urls: vec![("grpc://prefill:9000".into(), None)],
+                decode_urls: vec!["grpc://decode:9000".into()],
+                prefill_policy: None,
+                decode_policy: None,
+                discovery_address: None,
+            },
+            PolicyConfig::Random,
+        );
+        config.epd = Some(epd());
+        ConfigValidator::validate(&config).unwrap();
+
+        let mut mooncake = epd();
+        mooncake
+            .consumer_zmq_addrs
+            .insert("grpc://prefill:9000".into(), "tcp://prefill:5555".into());
+        config.epd = Some(mooncake);
+        ConfigValidator::validate(&config).unwrap();
+    }
+
+    #[test]
+    fn test_validate_experimental_grpc_epd_rejects_service_discovery() {
+        let grpc_epd = EpdConfig {
+            encoder_urls: vec!["grpc://encoder:9000".into()],
+            consumer_zmq_addrs: Default::default(),
+        };
+        let discovery = DiscoveryConfig {
+            enabled: true,
+            selector: vec![("app".into(), "worker".into())].into_iter().collect(),
+            ..Default::default()
+        };
+        let mut config = RouterConfig::new(
+            RoutingMode::Regular {
+                worker_urls: vec![],
+            },
+            PolicyConfig::Random,
+        );
+        config.epd = Some(grpc_epd.clone());
+        config.discovery = Some(discovery);
+        let err = ConfigValidator::validate(&config).unwrap_err();
+        assert!(err.to_string().contains("service discovery"), "{err}");
+
+        config.mode = RoutingMode::Regular {
+            worker_urls: vec!["grpc://consumer:9000".into()],
+        };
+        let err = ConfigValidator::validate(&config).unwrap_err();
+        assert!(err.to_string().contains("service discovery"), "{err}");
+
+        config.mode = RoutingMode::Regular {
+            worker_urls: vec![],
+        };
+        config.epd = Some(EpdConfig {
+            encoder_urls: vec!["http://encoder:8000".into()],
+            consumer_zmq_addrs: Default::default(),
+        });
+        ConfigValidator::validate(&config).unwrap();
+
+        config.epd = Some(grpc_epd);
+        config.discovery = None;
+        ConfigValidator::validate(&config).unwrap();
     }
 
     #[test]

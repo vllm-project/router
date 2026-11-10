@@ -265,6 +265,36 @@ impl GrpcEngineBackend {
 
     /// P/D prefill leg as unary `Generate`. Returns the engine's
     /// `FinishInfo.kv_transfer_params`, which the decode leg consumes.
+    /// Unary `Generate`; `Err(Err(_))` means the worker was never reached.
+    pub(crate) async fn generate(
+        &self,
+        worker_url: &str,
+        request: super::pb::GenerateRequest,
+    ) -> Result<super::pb::GenerateResponse, Result<tonic::Status, String>> {
+        let channel = self.channel_for(worker_url).await.map_err(Err)?;
+        // A dropped or timed-out unary RPC (the encoder call) otherwise keeps
+        // running: vLLM notices cancellation only at its next send.
+        let engine_request_id = Some(request.request_id.as_str()).filter(|id| !id.is_empty());
+        let abort = EngineAbortGuard::new(&channel, engine_request_id, self.connect_timeout);
+        let mut client = InferenceClient::new(channel);
+        let mut tonic_req = tonic::Request::new(request);
+        tonic_req.set_timeout(self.request_timeout);
+        if let Some(rank) = parse_dp_rank(worker_url) {
+            tonic_req
+                .metadata_mut()
+                .insert(DP_RANK_METADATA, rank.to_string().parse().unwrap());
+        }
+        match tokio::time::timeout(self.request_timeout, client.generate(tonic_req)).await {
+            Ok(result) => {
+                abort.disarm();
+                result.map(tonic::Response::into_inner).map_err(Ok)
+            }
+            Err(_) => Err(Ok(tonic::Status::deadline_exceeded(
+                "grpc Generate exceeded request timeout",
+            ))),
+        }
+    }
+
     pub(crate) async fn prefill_prepared(
         &self,
         worker_url: &str,
@@ -278,6 +308,11 @@ impl GrpcEngineBackend {
             engine_request_id.clone(),
         )
         .map_err(|error| (StatusCode::BAD_REQUEST, error).into_response())?;
+        if let Some(media) = &prepared.media {
+            media
+                .apply(&mut proto)
+                .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error).into_response())?;
+        }
         limit_to_prefill(&mut proto);
         set_kv_transfer_params(&mut proto, kv_transfer_params)
             .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error).into_response())?;
@@ -347,6 +382,7 @@ impl GrpcEngineBackend {
             t_req,
             shape,
             emit_token_ids,
+            media,
         } = prepared;
         let request = request.as_ref();
         let n_prompt_tokens = tokenized.token_ids.len();
@@ -377,6 +413,11 @@ impl GrpcEngineBackend {
             Ok(proto) => proto,
             Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
         };
+        if let Some(media) = &media {
+            if let Err(error) = media.apply(&mut proto) {
+                return (StatusCode::INTERNAL_SERVER_ERROR, error).into_response();
+            }
+        }
         if let Some(params) = &handoff.kv_transfer_params {
             if let Err(error) = set_kv_transfer_params(&mut proto, params) {
                 return (StatusCode::INTERNAL_SERVER_ERROR, error).into_response();

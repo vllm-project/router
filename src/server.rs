@@ -269,6 +269,14 @@ async fn v1_chat_completions(
     state.router.route_chat(Some(&headers), &body, None).await
 }
 
+fn grpc_epd(config: &RouterConfig) -> bool {
+    config.epd.as_ref().is_some_and(|epd| {
+        epd.encoder_urls
+            .iter()
+            .any(|url| crate::backend::is_grpc_url(url))
+    })
+}
+
 async fn epd_chat_completions(
     State(state): State<Arc<AppState>>,
     headers: http::HeaderMap,
@@ -875,7 +883,11 @@ pub fn build_app_with_wasm_middleware(
         .route("/inference/v1/generate", post(inference_generate))
         .route(
             "/v1/chat/completions",
-            if app_state.context.router_config.epd.is_some() {
+            // HTTP EPD rewrites the raw JSON body; experimental gRPC EPD stays
+            // on the typed handler, whose gRPC path calls the encoders.
+            if app_state.context.router_config.epd.is_some()
+                && !grpc_epd(&app_state.context.router_config)
+            {
                 post(epd_chat_completions)
             } else {
                 post(v1_chat_completions)

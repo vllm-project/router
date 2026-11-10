@@ -12,11 +12,13 @@ use crate::protocols::spec::{
 
 /// Passthrough keys the gRPC pipeline forwards to the worker. Anything else is
 /// rejected: a field the adapter cannot express must not be dropped silently.
-const SUPPORTED_OTHER: [&str; 7] = [
+const SUPPORTED_OTHER: [&str; 9] = [
     "add_special_tokens",
     "cache_salt",
     "documents",
     "lora_name",
+    "media_io_kwargs",
+    "mm_processor_kwargs",
     "priority",
     "truncate_prompt_tokens",
     "watermarking",
@@ -56,7 +58,7 @@ pub fn requires_worker_output_text(request: &ChatCompletionRequest) -> bool {
             .is_some_and(|ids| !ids.is_empty()))
 }
 
-/// Wire adapter: OpenAI chat fields → crates.io `vllm-proto` 0.2.
+/// Wire adapter: OpenAI chat fields → `vllm-proto`.
 pub fn chat_to_generate_request(
     request: &ChatCompletionRequest,
     token_ids: Vec<u32>,
@@ -124,16 +126,8 @@ pub fn chat_to_generate_request(
     };
     decoding.structured_output = structured_output(request)?;
 
-    if let Some(top_k) = request.top_k {
-        if top_k == -1 {
-            return Err(
-                "top_k=-1 is not supported by the vLLM gRPC protocol; omit top_k or use a positive value"
-                    .to_string(),
-            );
-        }
-        if top_k < 0 {
-            return Err("top_k must be positive for the vLLM gRPC protocol".to_string());
-        }
+    if request.top_k.is_some_and(|top_k| top_k < -1) {
+        return Err("top_k must be -1 (disabled) or non-negative".to_string());
     }
 
     Ok(pb::GenerateRequest {
@@ -149,9 +143,11 @@ pub fn chat_to_generate_request(
         temperature: Some(request.temperature.unwrap_or(1.0)),
         sampling: Some(pb::RandomSampling {
             num_sequences: request.n.unwrap_or(0),
-            top_k: request.top_k.unwrap_or(0) as u32,
-            top_p: request.top_p.unwrap_or(0.0),
-            min_p: request.min_p.unwrap_or(0.0),
+            // Omitted fields take the model default on the worker; the
+            // OpenAI `-1` (disable) form is the proto's explicit `0`.
+            top_k: request.top_k.map(|top_k| top_k.max(0) as u32),
+            top_p: request.top_p,
+            min_p: request.min_p,
             seed: request.seed,
         }),
         decoding: Some(decoding),
@@ -162,6 +158,7 @@ pub fn chat_to_generate_request(
             stop_strings,
             include_stop_strings: request.no_stop_trim,
             ignore_eos: request.ignore_eos,
+            thinking_token_budget: None,
         }),
         response: Some(pb::ResponseOptions {
             // Worker text carries the exact character-level trim boundary for
@@ -186,8 +183,22 @@ pub fn chat_to_generate_request(
             .map(str::to_string),
         lora_name: lora_name.unwrap_or_default().to_string(),
         watermarking: other_bool(request, "watermarking")?,
+        mm_processor_kwargs: other_struct(request, "mm_processor_kwargs")?,
+        media_io_kwargs: other_struct(request, "media_io_kwargs")?,
         ..Default::default()
     })
+}
+
+/// A JSON-object field carried as a protobuf `Struct`.
+pub(crate) fn other_struct(
+    request: &ChatCompletionRequest,
+    key: &str,
+) -> Result<Option<prost_types::Struct>, String> {
+    match request.other.get(key) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(value @ serde_json::Value::Object(_)) => json_to_proto_struct(value).map(Some),
+        Some(_) => Err(format!("{key} must be an object")),
+    }
 }
 
 fn structured_output(
@@ -329,6 +340,17 @@ pub fn set_kv_transfer_params(
         .kv
         .get_or_insert_with(Default::default)
         .kv_transfer_params = Some(json_to_proto_struct(params)?);
+    Ok(())
+}
+
+pub fn set_ec_transfer_params(
+    proto: &mut pb::GenerateRequest,
+    params: &serde_json::Value,
+) -> Result<(), String> {
+    proto
+        .kv
+        .get_or_insert_with(Default::default)
+        .ec_transfer_params = Some(json_to_proto_struct(params)?);
     Ok(())
 }
 
@@ -611,20 +633,35 @@ mod tests {
     }
 
     #[test]
-    fn rejects_top_k_minus_one_for_grpc() {
+    fn maps_sampling_defaults_and_disabled_top_k_for_grpc() {
+        let req = chat(serde_json::json!({
+            "messages": [{"role": "user", "content": "hi"}]
+        }));
+        let sampling = chat_to_generate_request(&req, vec![1], "r".into())
+            .unwrap()
+            .sampling
+            .unwrap();
+        assert_eq!(
+            (sampling.top_k, sampling.top_p, sampling.min_p),
+            (None, None, None)
+        );
+
         let req = chat(serde_json::json!({
             "messages": [{"role": "user", "content": "hi"}],
             "top_k": -1
         }));
-        let err = chat_to_generate_request(&req, vec![1], "r".into()).unwrap_err();
-        assert!(err.contains("top_k=-1"));
+        let sampling = chat_to_generate_request(&req, vec![1], "r".into())
+            .unwrap()
+            .sampling
+            .unwrap();
+        assert_eq!(sampling.top_k, Some(0));
 
         let req = chat(serde_json::json!({
             "messages": [{"role": "user", "content": "hi"}],
             "top_k": -2
         }));
         let err = chat_to_generate_request(&req, vec![1], "r".into()).unwrap_err();
-        assert!(err.contains("top_k must be positive"));
+        assert!(err.contains("top_k must be -1"));
     }
 
     #[test]
