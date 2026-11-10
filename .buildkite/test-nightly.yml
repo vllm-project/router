@@ -197,9 +197,7 @@ steps:
 
       python -m pip install --no-cache-dir 'agentinfer==0.2.0'
 
-      export ROUTER_BIN="${ROUTER_BIN:-/usr/local/bin/vllm-router}"
       export MODEL="${MODEL:-Qwen/Qwen3-4B-Instruct-2507}"
-      export VLLM_RS="${VLLM_RS:-$(python -c 'import importlib.util; from pathlib import Path; s=importlib.util.find_spec("vllm"); assert s and s.origin; p=Path(s.origin).resolve().parent/"vllm-rs"; assert p.is_file(); print(p)')}"
       export AGENTX_RUN_SUFFIX="${AGENTX_RUN_SUFFIX:-$(date -u +%Y%m%d%H%M%S)}"
       export AGENTX_CELL_GAP_SEC="${AGENTX_CELL_GAP_SEC:-15}"
       export AGENTX_PORT_SETTLE_SEC="${AGENTX_PORT_SETTLE_SEC:-5}"
