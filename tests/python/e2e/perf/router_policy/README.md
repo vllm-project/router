@@ -2,7 +2,7 @@
 
 Each **scenario JSON** under `cases/` is one policy. `benchmark_params.max-concurrency` lists 8, 16, and 32; pytest expands those into cells `cache_aware/c16` and so on:
 
-- **`runtime`** — paths **relative to vllm-router repo root** where applicable. **Env overrides JSON** (same as `scripts/backend/` and `perf/grpc`): `MODEL`, `VLLM_RS`, `ROUTER_BIN`, `AGENTX_PYTHON` (or `PYTHON`). Resolve `vllm-rs` with [`scripts/backend/check_vllm_rs.sh`](../../../../../scripts/backend/check_vllm_rs.sh).
+- **`runtime`** — paths **relative to vllm-router repo root** where applicable. **`MODEL`** overrides `runtime.model`. **`AGENTX_PYTHON`** (or `PYTHON`) overrides the pytest interpreter. The CI image runs `vllm-router` from `PATH` (`/usr/local/bin`) and `vllm-rs` from the installed `vllm` package.
 - **agentinfer** — install via **`pip install …whl`** (or `uv pip install …whl`) into the **same env as pytest** (no source checkout). Replay YAML is loaded from the installed package when a cell starts. Optional: `runtime.replay_config`; optional `runtime.agent_infer` for source dev.
 - **`workers`** — engine count and per-worker serve args (KV, max_model_len, optional `gpu_memory_utilization`, optional `kv_cache_metrics` / `kv_cache_metrics_sample` → vLLM `--kv-cache-metrics`, …)
 - **`router_params`** — policy, gRPC, penalties, balance thresholds
@@ -10,15 +10,13 @@ Each **scenario JSON** under `cases/` is one policy. `benchmark_params.max-concu
 
 Example: [cases/kv_aware.json](cases/kv_aware.json).
 
-Binary paths come from [`tests/python/e2e/helpers/`](../../helpers/). Worker and router processes use [`perf/process.py`](../process.py), the same launch path as `perf/grpc`.
+Worker and router processes use [`perf/process.py`](../process.py), the same launch path as `perf/grpc`.
 
 ## Run
 
 ```bash
 export MODEL=Qwen/Qwen3-4B-Instruct-2507   # or local model dir
-export VLLM_RS=/path/to/vllm-rs            # check_vllm_rs.sh prints this
-export ROUTER_BIN=$PWD/target/release/vllm-router
-# optional if pytest’s python is not the case default (case "python" → sys.executable):
+# optional if pytest’s python is not the CI image venv:
 # export AGENTX_PYTHON=/path/to/.venv/bin/python
 
 pytest tests/python/e2e/perf/router_policy/test_router_policy_scenarios.py -v

@@ -21,9 +21,7 @@ from stack_launcher import run_router_policy_cell  # noqa: E402
 
 
 def _run_cell(case_file: Path, concurrency: int) -> Path:
-    case = case_at_concurrency(
-        load_case(case_file, scenario_dir=SCENARIO_DIR), concurrency
-    )
+    case = case_at_concurrency(load_case(case_file), concurrency)
     run_suffix = cell_run_suffix()
     out = cell_output_dir(case, run_suffix=run_suffix)
     summary = cell_results_summary_path(case, run_suffix=run_suffix)
