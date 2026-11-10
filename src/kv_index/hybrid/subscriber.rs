@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use tokio::sync::watch;
 
 use super::super::subscriber::EventSource;
+use super::super::subscriber::{payload_fingerprint, ReplayWindow};
 use super::{HybridEventError, HybridEventIndex};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -365,11 +366,6 @@ fn stopped(rx: &watch::Receiver<bool>) -> bool {
 
 /// The replay's progress and the payloads it applied, so a frame that
 /// overlaps it can be told apart from a restarted publisher reusing the topic.
-struct ReplayWindow {
-    required_through: u64,
-    replayed: HashMap<u64, u64>,
-}
-
 async fn replay_from_empty(
     ctx: &zmq::Context,
     endpoint: &str,
@@ -422,15 +418,6 @@ async fn replay_from_empty(
 
 /// Cheap content fingerprint used to tell a replayed frame apart from a
 /// different publisher's frame that happens to reuse the same sequence number.
-fn payload_fingerprint(bytes: &[u8]) -> u64 {
-    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
-    for byte in bytes {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    hash
-}
-
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use super::*;

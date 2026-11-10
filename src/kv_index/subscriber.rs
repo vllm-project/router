@@ -1,5 +1,6 @@
 //! ZMQ SUB + DEALER replay subscriber, one task per (worker, rank).
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -2192,4 +2193,20 @@ mod tests {
     async fn replay_wrong_topic_clears_partial_stores() {
         check_replay_case("wrong_topic").await;
     }
+}
+
+// ---- Replay bookkeeping shared with the hybrid subscriber ----
+
+pub(crate) struct ReplayWindow {
+    pub(crate) required_through: u64,
+    pub(crate) replayed: HashMap<u64, u64>,
+}
+
+pub(crate) fn payload_fingerprint(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
 }
