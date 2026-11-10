@@ -322,12 +322,23 @@ impl KvIndexSupervisor {
         let mut merged = exact
             .or_else(|| per_rank.first().map(|(_, source)| (*source).clone()))
             .expect("per-rank declarations are non-empty");
+        // Every rank publishes its own endpoints: collect them instead of
+        // keeping only the first non-empty list, or the second rank's publisher
+        // and replay channel are silently dropped.
+        let mut endpoints = merged.endpoints.clone();
+        let mut replay_endpoints = merged.replay_endpoints.clone().unwrap_or_default();
         for (rank, source) in per_rank {
-            if merged.endpoints.is_empty() {
-                merged.endpoints = source.endpoints.clone();
+            for endpoint in &source.endpoints {
+                if !endpoints.contains(endpoint) {
+                    endpoints.push(endpoint.clone());
+                }
             }
-            if merged.replay_endpoints.is_none() {
-                merged.replay_endpoints = source.replay_endpoints.clone();
+            if let Some(list) = &source.replay_endpoints {
+                for endpoint in list {
+                    if !replay_endpoints.contains(endpoint) {
+                        replay_endpoints.push(endpoint.clone());
+                    }
+                }
             }
             if merged.topic.is_empty() {
                 merged.topic = source.topic.clone();
@@ -346,6 +357,8 @@ impl KvIndexSupervisor {
                 "merged a rank-pinned hybrid declaration into its base worker"
             );
         }
+        merged.endpoints = endpoints;
+        merged.replay_endpoints = (!replay_endpoints.is_empty()).then_some(replay_endpoints);
         Some(merged)
     }
 
@@ -4518,14 +4531,14 @@ mod rank_merge_tests {
         sources.insert(
             base.to_string(),
             serde_json::json!({
-                "endpoints": [], "topic": "topic-0", "block_size": 16, "model": "m0",
+                "endpoints": ["tcp://base:5557"], "topic": "topic-0", "block_size": 16, "model": "m0",
                 "hybrid": {"schema_version": 1, "ranks": [rank(0, "m0")]},
             }),
         );
         sources.insert(
             format!("{base}@1"),
             serde_json::json!({
-                "endpoints": [], "topic": "topic-1", "block_size": 16, "model": "m1",
+                "endpoints": ["tcp://rank1:5557"], "topic": "topic-1", "block_size": 16, "model": "m1",
                 "hybrid": {"schema_version": 1, "ranks": [rank(1, "m1")]},
             }),
         );
@@ -4542,5 +4555,14 @@ mod rank_merge_tests {
         assert_eq!(hybrid.ranks[0].model, "m0");
         assert_eq!(hybrid.ranks[1].rank, 1);
         assert_eq!(hybrid.ranks[1].model, "m1");
+        // Both ranks keep their publisher: keeping only the first non-empty
+        // list silently drops the second rank's stream.
+        assert_eq!(
+            resolved.endpoints,
+            vec![
+                "tcp://base:5557".to_string(),
+                "tcp://rank1:5557".to_string()
+            ]
+        );
     }
 }
