@@ -1,7 +1,7 @@
-use crate::ChatCompletionRequest;
-use crate::routes::RoutingTreeBuilder;
 use crate::routes::interface::RouteHandle;
+use crate::routes::RoutingTreeBuilder;
 use crate::types::{AppError, ConfigurationError, Request, Response};
+use crate::ChatCompletionRequest;
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper::service::Service;

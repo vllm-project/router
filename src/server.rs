@@ -20,22 +20,29 @@ use crate::{
     service_discovery::{start_service_discovery, ServiceDiscoveryConfig},
 };
 use axum::{
-    extract::{DefaultBodyLimit, Path, Query, Request, State},
+    extract::{DefaultBodyLimit, FromRequest, Path, Query, Request, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{delete, get, post},
-    serve, Json, Router,
+    serve,
+    serve::{Listener, ListenerExt},
+    Json, Router,
 };
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::json;
 use std::{
     collections::HashMap,
+    net::SocketAddr,
     sync::atomic::{AtomicBool, Ordering},
     sync::Arc,
     time::Duration,
 };
-use tokio::{net::TcpListener, signal, spawn, sync::RwLock};
+use tokio::{
+    net::{TcpListener, TcpStream},
+    signal, spawn,
+    sync::RwLock,
+};
 use tracing::{error, info, warn, Level};
 
 #[derive(Clone)]
@@ -59,11 +66,25 @@ impl AppContext {
         rate_limit_tokens_per_second: Option<usize>,
         api_key_validation_urls: Vec<String>,
     ) -> Result<Self, String> {
+        if let crate::config::PolicyConfig::KvAware {
+            static_kv_event_sources,
+            ..
+        } = &router_config.policy
+        {
+            for (worker, source) in static_kv_event_sources.iter() {
+                source.validate(worker).map_err(|error| error.to_string())?;
+            }
+        }
         let rate_limit_tokens = rate_limit_tokens_per_second.unwrap_or(max_concurrent_requests);
         let rate_limiter = Arc::new(TokenBucket::new(max_concurrent_requests, rate_limit_tokens));
 
         let worker_registry = Arc::new(WorkerRegistry::new());
-        let policy_registry = Arc::new(PolicyRegistry::new(router_config.policy.clone()));
+        let policy_registry = Arc::new(PolicyRegistry::new_with_affinity_ttl(
+            router_config.policy.clone(),
+            router_config
+                .kv_aware_session_affinity_ttl_secs
+                .map(std::time::Duration::from_secs),
+        ));
 
         let router_manager = None;
 
@@ -115,15 +136,9 @@ async fn transparent_proxy_handler(State(state): State<Arc<AppState>>, req: Requ
     let method = req.method().clone();
 
     // Read body
-    let body_bytes = match axum::body::to_bytes(req.into_body(), usize::MAX).await {
+    let body_bytes = match axum::body::Bytes::from_request(req, &()).await {
         Ok(bytes) => bytes,
-        Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                format!("Failed to read request body: {}", e),
-            )
-                .into_response()
-        }
+        Err(rejection) => return rejection.into_response(),
     };
 
     // Parse body as JSON
@@ -254,10 +269,29 @@ async fn v1_chat_completions(
     state.router.route_chat(Some(&headers), &body, None).await
 }
 
+async fn epd_chat_completions(
+    State(state): State<Arc<AppState>>,
+    headers: http::HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    if let Err(response) = authorize_request(&state, &headers).await {
+        return response;
+    }
+    state
+        .router
+        .route_transparent(
+            Some(&headers),
+            "/v1/chat/completions",
+            &http::Method::POST,
+            body,
+        )
+        .await
+}
+
 async fn v1_completions(
     State(state): State<Arc<AppState>>,
     headers: http::HeaderMap,
-    Json(body): Json<CompletionRequest>,
+    JsonWithRaw { value: body, raw }: JsonWithRaw<CompletionRequest>,
 ) -> Response {
     if let Err(response) = authorize_request(&state, &headers).await {
         return response;
@@ -265,8 +299,44 @@ async fn v1_completions(
 
     state
         .router
-        .route_completion(Some(&headers), &body, None)
+        .route_completion_raw(Some(&headers), Arc::new(body), raw, None)
         .await
+}
+
+struct JsonWithRaw<T> {
+    value: T,
+    raw: axum::body::Bytes,
+}
+
+impl<T, S> FromRequest<S> for JsonWithRaw<T>
+where
+    T: serde::de::DeserializeOwned,
+    S: Send + Sync,
+{
+    type Rejection = Response;
+
+    async fn from_request(request: Request, state: &S) -> Result<Self, Self::Rejection> {
+        // Axum's MIME predicate is private. Keep this compatibility check at
+        // the same boundary and compare it against the locked Json extractor.
+        let json_content_type = request
+            .headers()
+            .get(http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<mime::Mime>().ok())
+            .is_some_and(|value| {
+                value.type_() == "application"
+                    && (value.subtype() == "json"
+                        || value.suffix().is_some_and(|suffix| suffix == "json"))
+            });
+        if !json_content_type {
+            return Err(axum::extract::rejection::MissingJsonContentType::default().into_response());
+        }
+        let raw = axum::body::Bytes::from_request(request, state)
+            .await
+            .map_err(IntoResponse::into_response)?;
+        let Json(value) = Json::<T>::from_bytes(&raw).map_err(IntoResponse::into_response)?;
+        Ok(Self { value, raw })
+    }
 }
 
 async fn rerank(
@@ -398,6 +468,7 @@ struct UrlQuery {
     url: String,
 }
 
+#[allow(clippy::result_large_err)]
 async fn authorize_request(
     state: &Arc<AppState>,
     headers: &http::HeaderMap,
@@ -517,6 +588,51 @@ async fn get_loads(State(state): State<Arc<AppState>>, headers: http::HeaderMap)
     }
 
     state.router.get_worker_loads().await
+}
+
+async fn scheduling_diagnostics(
+    State(state): State<Arc<AppState>>,
+    headers: http::HeaderMap,
+) -> Response {
+    if let Err(response) = authorize_request(&state, &headers).await {
+        return response;
+    }
+    match state.router.scheduling_diagnostics() {
+        Some(diagnostics) => Json(diagnostics).into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "enabled": false,
+                "error": "This Router does not own Program scheduling"
+            })),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct FinishSessionQuery {
+    session_id: String,
+}
+
+/// POST /finish_session?session_id=<id>
+///
+/// Marks a session (e.g. an RL trajectory) as finished so that session-aware
+/// routing policies (e.g. `sticky_least_loaded`) can release the
+/// replica capacity held by the session. For policies that don't track
+/// sessions, this is a no-op. Unknown session ids are ignored.
+async fn finish_session(
+    State(state): State<Arc<AppState>>,
+    Query(FinishSessionQuery { session_id }): Query<FinishSessionQuery>,
+    headers: http::HeaderMap,
+) -> Response {
+    if let Err(response) = authorize_request(&state, &headers).await {
+        return response;
+    }
+
+    state.context.policy_registry.finish_session(&session_id);
+
+    Json(json!({ "status": "ok", "session_id": session_id })).into_response()
 }
 
 // ---------- Worker management endpoints (RESTful) ----------
@@ -675,16 +791,29 @@ async fn delete_worker(
     }
 }
 
+/// Default idle timeout for pooled backend connections, in seconds.
+/// Kept below vLLM's server-side keep-alive timeout
+/// (`VLLM_HTTP_TIMEOUT_KEEP_ALIVE`, 5s by default) so the router retires a
+/// pooled connection before the backend closes it; reusing a connection the
+/// backend already closed races and surfaces as sporadic transport-error 502s.
+pub const DEFAULT_POOL_IDLE_TIMEOUT_SECS: u64 = 2;
+
 pub struct ServerConfig {
     pub host: String,
     pub port: u16,
     pub router_config: RouterConfig,
     pub max_payload_size: usize,
+    pub wasm_middleware: Option<String>,
+    pub wasm_middleware_sha256: Option<String>,
+    pub wasm_middleware_routes: Vec<String>,
     pub log_dir: Option<String>,
     pub log_level: Option<String>,
     pub service_discovery_config: Option<ServiceDiscoveryConfig>,
     pub prometheus_config: Option<PrometheusConfig>,
     pub request_timeout_secs: u64,
+    /// Idle timeout in seconds for pooled backend connections. A value of 0
+    /// disables connection reuse entirely.
+    pub pool_idle_timeout_secs: u64,
     pub request_id_headers: Option<Vec<String>>,
     pub trace_config: Option<TraceConfig>,
 }
@@ -698,13 +827,14 @@ pub fn build_app(
     cors_allowed_origins: Vec<String>,
     enable_transparent_proxy: bool,
 ) -> Router {
-    build_app_with_request_tracing(
+    build_app_with_wasm_middleware(
         app_state,
         max_payload_size,
         request_id_headers,
         cors_allowed_origins,
         enable_transparent_proxy,
         crate::otel_trace::is_otel_enabled(),
+        None,
     )
 }
 
@@ -717,11 +847,40 @@ pub fn build_app_with_request_tracing(
     enable_transparent_proxy: bool,
     enable_request_tracing: bool,
 ) -> Router {
-    // Create routes
-    let protected_routes = Router::new()
+    build_app_with_wasm_middleware(
+        app_state,
+        max_payload_size,
+        request_id_headers,
+        cors_allowed_origins,
+        enable_transparent_proxy,
+        enable_request_tracing,
+        None,
+    )
+}
+
+/// Build the Axum application with optional WASM OnRequest middleware.
+pub fn build_app_with_wasm_middleware(
+    app_state: Arc<AppState>,
+    max_payload_size: usize,
+    request_id_headers: Vec<String>,
+    cors_allowed_origins: Vec<String>,
+    enable_transparent_proxy: bool,
+    enable_request_tracing: bool,
+    wasm_runtime: Option<Arc<crate::wasm_middleware::WasmMiddlewareRuntime>>,
+) -> Router {
+    // Layer order on the request path (outer → inner):
+    //   concurrency_limit → optional WASM OnRequest → handler
+    let mut protected_routes = Router::new()
         .route("/generate", post(generate))
         .route("/inference/v1/generate", post(inference_generate))
-        .route("/v1/chat/completions", post(v1_chat_completions))
+        .route(
+            "/v1/chat/completions",
+            if app_state.context.router_config.epd.is_some() {
+                post(epd_chat_completions)
+            } else {
+                post(v1_chat_completions)
+            },
+        )
         .route("/v1/completions", post(v1_completions))
         .route("/rerank", post(rerank))
         .route("/v1/rerank", post(v1_rerank))
@@ -736,11 +895,22 @@ pub fn build_app_with_request_tracing(
         .route(
             "/v1/responses/{response_id}/input",
             get(v1_responses_list_input_items),
-        )
-        .route_layer(axum::middleware::from_fn_with_state(
-            app_state.clone(),
-            middleware::concurrency_limit_middleware,
+        );
+
+    if let Some(runtime) = wasm_runtime {
+        protected_routes = protected_routes.route_layer(axum::middleware::from_fn_with_state(
+            crate::wasm_middleware::WasmRouteMiddlewareState {
+                runtime,
+                max_payload_size,
+            },
+            crate::wasm_middleware::wasm_on_request_middleware,
         ));
+    }
+
+    let protected_routes = protected_routes.route_layer(axum::middleware::from_fn_with_state(
+        app_state.clone(),
+        middleware::concurrency_limit_middleware,
+    ));
 
     let public_routes = Router::new()
         .route("/liveness", get(liveness))
@@ -756,7 +926,9 @@ pub fn build_app_with_request_tracing(
         .route("/remove_worker", post(remove_worker))
         .route("/list_workers", get(list_workers))
         .route("/flush_cache", post(flush_cache))
-        .route("/get_loads", get(get_loads));
+        .route("/get_loads", get(get_loads))
+        .route("/scheduling/diagnostics", get(scheduling_diagnostics))
+        .route("/finish_session", post(finish_session));
 
     // Worker management routes
     let worker_routes = Router::new()
@@ -765,13 +937,21 @@ pub fn build_app_with_request_tracing(
         .route("/workers/{url}", get(get_worker))
         .route("/workers/{url}", delete(delete_worker));
 
-    // Build base app with all routes and middleware
+    // Build base app with all routes
     let base_app = Router::new()
         .merge(protected_routes)
         .merge(public_routes)
         .merge(admin_routes)
-        .merge(worker_routes)
-        // Request body size limiting
+        .merge(worker_routes);
+
+    // Choose fallback based on transparent proxy mode
+    let base_app = if enable_transparent_proxy {
+        base_app.fallback(transparent_proxy_handler)
+    } else {
+        base_app.fallback(sink_handler)
+    };
+
+    let base_app = base_app
         .layer(DefaultBodyLimit::max(max_payload_size))
         .layer(tower_http::limit::RequestBodyLimitLayer::new(
             max_payload_size,
@@ -783,18 +963,10 @@ pub fn build_app_with_request_tracing(
         base_app
     };
 
-    let base_app = base_app
+    base_app
         .layer(middleware::RequestIdLayer::new(request_id_headers))
-        .layer(create_cors_layer(cors_allowed_origins));
-
-    // Choose fallback based on transparent proxy mode
-    if enable_transparent_proxy {
-        base_app
-            .fallback(transparent_proxy_handler)
-            .with_state(app_state)
-    } else {
-        base_app.fallback(sink_handler).with_state(app_state)
-    }
+        .layer(create_cors_layer(cors_allowed_origins))
+        .with_state(app_state)
 }
 
 pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Error>> {
@@ -855,13 +1027,19 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     );
 
     println!("DEBUG: Creating HTTP client");
-    let client = Client::builder()
-        .pool_idle_timeout(Some(Duration::from_secs(50)))
+    let mut client_builder = Client::builder()
         .pool_max_idle_per_host(500)
         .timeout(Duration::from_secs(config.request_timeout_secs))
         .connect_timeout(Duration::from_secs(10))
         .tcp_nodelay(true)
-        .tcp_keepalive(Some(Duration::from_secs(30)))
+        .tcp_keepalive(Some(Duration::from_secs(30)));
+    if config.pool_idle_timeout_secs == 0 {
+        client_builder = client_builder.pool_max_idle_per_host(0);
+    } else {
+        client_builder = client_builder
+            .pool_idle_timeout(Some(Duration::from_secs(config.pool_idle_timeout_secs)));
+    }
+    let client = client_builder
         .build()
         .expect("Failed to create HTTP client");
     println!("DEBUG: HTTP client created");
@@ -1023,17 +1201,66 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     // Enable transparent proxy for all routing modes
     let enable_transparent_proxy = true;
 
-    let app = build_app_with_request_tracing(
+    let wasm_runtime = if let Some(path) = config
+        .wasm_middleware
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+    {
+        let mut wasm_config = crate::wasm_middleware::WasmMiddlewareConfig::from_path(path);
+        wasm_config.max_input_bytes = wasm_config.max_input_bytes.min(config.max_payload_size);
+        if let Some(digest) = config
+            .wasm_middleware_sha256
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+        {
+            wasm_config = wasm_config.with_sha256_hex(digest);
+        }
+        if !config.wasm_middleware_routes.is_empty() {
+            wasm_config = wasm_config.with_routes(config.wasm_middleware_routes.clone());
+        }
+        info!(
+            "Loading WASM OnRequest middleware from {} for routes {:?}",
+            wasm_config.component_path.display(),
+            wasm_config.routes
+        );
+        Some(Arc::new(
+            crate::wasm_middleware::WasmMiddlewareRuntime::load(wasm_config).map_err(|err| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("failed to load --wasm-middleware: {err}"),
+                )
+            })?,
+        ))
+    } else {
+        if config
+            .wasm_middleware_sha256
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .is_some()
+        {
+            return Err(Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "--wasm-middleware-sha256 requires --wasm-middleware <path>",
+            )));
+        }
+        None
+    };
+
+    let app = build_app_with_wasm_middleware(
         app_state,
         config.max_payload_size,
         request_id_headers,
         config.router_config.cors_allowed_origins.clone(),
         enable_transparent_proxy,
         crate::otel_trace::is_otel_enabled(),
+        wasm_runtime,
     );
 
     let addr = format!("{}:{}", config.host, config.port);
-    let listener = TcpListener::bind(&addr).await?;
+    let listener = bind_listener(&addr).await?;
     info!("Starting server on {}", addr);
     serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
@@ -1041,6 +1268,22 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
 
     Ok(())
+}
+
+/// Bind the client-facing listener with `TCP_NODELAY` on every accepted connection.
+///
+/// Without it, Nagle's algorithm holds small streamed chunks until the client's
+/// delayed ACK arrives (about 40 ms on Linux), which delays TTFT on keep-alive
+/// connections.
+async fn bind_listener(
+    addr: &str,
+) -> std::io::Result<impl Listener<Io = TcpStream, Addr = SocketAddr>> {
+    let listener = TcpListener::bind(addr).await?;
+    Ok(listener.tap_io(|tcp| {
+        if let Err(err) = tcp.set_nodelay(true) {
+            warn!("Failed to set TCP_NODELAY on incoming connection: {err}");
+        }
+    }))
 }
 
 // Graceful shutdown handler
@@ -1098,4 +1341,267 @@ fn create_cors_layer(allowed_origins: Vec<String>) -> tower_http::cors::CorsLaye
     };
 
     cors.max_age(Duration::from_secs(3600))
+}
+
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn completion_extractor_matches_locked_axum_json() {
+        use axum::body::{to_bytes, Body, Bytes};
+
+        async fn assert_parity(content_type: Option<http::HeaderValue>, raw: &'static str) {
+            let request = || {
+                let mut request = Request::new(Body::from(raw));
+                if let Some(value) = &content_type {
+                    request
+                        .headers_mut()
+                        .insert(http::header::CONTENT_TYPE, value.clone());
+                }
+                request
+            };
+            match (
+                JsonWithRaw::<CompletionRequest>::from_request(request(), &()).await,
+                Json::<CompletionRequest>::from_request(request(), &()).await,
+            ) {
+                (Ok(actual), Ok(Json(expected))) => {
+                    assert_eq!(
+                        serde_json::to_value(actual.value).unwrap(),
+                        serde_json::to_value(expected).unwrap()
+                    );
+                    assert_eq!(actual.raw, Bytes::copy_from_slice(raw.as_bytes()));
+                }
+                (Err(actual), Err(expected)) => {
+                    let expected = expected.into_response();
+                    assert_eq!(
+                        actual.status(),
+                        expected.status(),
+                        "{content_type:?}: {raw}"
+                    );
+                    assert_eq!(actual.headers(), expected.headers());
+                    assert_eq!(
+                        to_bytes(actual.into_body(), 4096).await.unwrap(),
+                        to_bytes(expected.into_body(), 4096).await.unwrap()
+                    );
+                }
+                _ => panic!("extractors disagreed for {content_type:?}: {raw}"),
+            }
+        }
+
+        for content_type in [
+            None,
+            Some(http::HeaderValue::from_static("application/json")),
+            Some(http::HeaderValue::from_static(
+                "application/json; charset=utf-8",
+            )),
+            Some(http::HeaderValue::from_static(
+                "application/problem+json; charset=utf-8",
+            )),
+            Some(http::HeaderValue::from_static("text/json")),
+            Some(http::HeaderValue::from_static("application/json; broken")),
+            Some(http::HeaderValue::from_bytes(b"\xff").unwrap()),
+        ] {
+            assert_parity(
+                content_type,
+                r#" { "max_tokens":1, "prompt":"\u4f60好\n\"" } "#,
+            )
+            .await;
+        }
+        for raw in [
+            r#"{"prompt":[1,2]}"#,
+            r#"{"prompt":[1],"prompt":[2]}"#,
+            r#"{"prompt":{}}"#,
+            r#"{"prompt":"#,
+            "",
+        ] {
+            assert_parity(
+                Some(http::HeaderValue::from_static("application/json")),
+                raw,
+            )
+            .await;
+        }
+        // Invalid MIME takes precedence even when the body is also malformed.
+        assert_parity(
+            Some(http::HeaderValue::from_static("text/json")),
+            r#"{"prompt":"#,
+        )
+        .await;
+
+        let failed_body = || {
+            Request::builder()
+                .header(http::header::CONTENT_TYPE, "application/json")
+                .body(Body::from_stream(futures_util::stream::once(async {
+                    Err::<Bytes, _>(std::io::Error::other("injected body read failure"))
+                })))
+                .unwrap()
+        };
+        let actual = JsonWithRaw::<CompletionRequest>::from_request(failed_body(), &())
+            .await
+            .err()
+            .unwrap();
+        let expected = Json::<CompletionRequest>::from_request(failed_body(), &())
+            .await
+            .unwrap_err()
+            .into_response();
+        assert_eq!(actual.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(actual.status(), expected.status());
+        assert_eq!(actual.headers(), expected.headers());
+        assert_eq!(
+            to_bytes(actual.into_body(), 4096).await.unwrap(),
+            to_bytes(expected.into_body(), 4096).await.unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn completion_handler_preserves_extraction_auth_limits_and_raw_body() {
+        use axum::body::{to_bytes, Body, Bytes};
+        use std::sync::atomic::AtomicUsize;
+        use tower::ServiceExt;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let worker_url = format!("http://{}", listener.local_addr().unwrap());
+        let backend = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route("/v1/completions", post(|raw: Bytes| async { raw })),
+            )
+            .await
+            .unwrap();
+        });
+        let config = RouterConfig {
+            policy: crate::config::PolicyConfig::KvAware {
+                router_temperature: 0.0,
+                kv_penalty_host: 0.3,
+                kv_penalty_external: 0.05,
+                kv_penalty_disk: 0.01,
+                static_kv_event_sources: Default::default(),
+            },
+            ..Default::default()
+        };
+        let context = Arc::new(
+            AppContext::new(
+                config,
+                Client::new(),
+                32,
+                None,
+                vec!["http://unused.invalid".into()],
+            )
+            .unwrap(),
+        );
+        context
+            .api_key_cache
+            .write()
+            .await
+            .insert("valid".into(), true);
+        let router = crate::routers::http::router::Router::new(Vec::new(), &context)
+            .await
+            .unwrap();
+        context
+            .worker_registry
+            .register(Arc::new(crate::core::BasicWorker::new(
+                worker_url,
+                WorkerType::Regular,
+            )));
+        let app = build_app_with_request_tracing(
+            Arc::new(AppState {
+                router: Arc::new(router),
+                context,
+                concurrency_queue_tx: None,
+                router_manager: None,
+            }),
+            128,
+            Vec::new(),
+            Vec::new(),
+            false,
+            false,
+        );
+        let raw = r#" { "max_tokens":1, "prompt":"\u4f60好\n\"" } "#;
+        for (body, status, authorized) in [
+            (raw, StatusCode::OK, true),
+            (raw, StatusCode::UNAUTHORIZED, false),
+            (r#"{"prompt":"#, StatusCode::BAD_REQUEST, false),
+            (
+                r#"{"prompt":[1],"prompt":[2]}"#,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                false,
+            ),
+        ] {
+            let mut request = Request::builder()
+                .method("POST")
+                .uri("/v1/completions")
+                .header(http::header::CONTENT_TYPE, "application/json");
+            if authorized {
+                request = request.header(http::header::AUTHORIZATION, "Bearer valid");
+            }
+            let response = app
+                .clone()
+                .oneshot(request.body(Body::from(body)).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), status);
+            if status == StatusCode::OK {
+                assert_eq!(
+                    to_bytes(response.into_body(), 4096).await.unwrap(),
+                    raw.as_bytes()
+                );
+            }
+        }
+        // MIME boundaries live in the extractor parity table; keep one real
+        // handler request proving rejection does not poll an unfinished body.
+        let polls = Arc::new(AtomicUsize::new(0));
+        let observed = polls.clone();
+        let body = Body::from_stream(futures_util::stream::poll_fn(move |_| {
+            observed.fetch_add(1, Ordering::Relaxed);
+            std::task::Poll::Pending::<Option<Result<Bytes, std::io::Error>>>
+        }));
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/completions")
+            .header(http::header::CONTENT_TYPE, "text/plain")
+            .body(body)
+            .unwrap();
+        let response = tokio::time::timeout(Duration::from_secs(1), app.clone().oneshot(request))
+            .await
+            .expect("invalid header must not wait for an unfinished body")
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        assert_eq!(polls.load(Ordering::Relaxed), 0);
+        for (body, status) in [
+            (Body::from(" ".repeat(129)), StatusCode::PAYLOAD_TOO_LARGE),
+            (
+                Body::from_stream(futures_util::stream::once(async {
+                    Err::<Bytes, _>(std::io::Error::other("injected body read failure"))
+                })),
+                StatusCode::BAD_REQUEST,
+            ),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v1/completions")
+                        .header(http::header::CONTENT_TYPE, "application/json")
+                        .body(body)
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), status);
+        }
+        backend.abort();
+        let _ = backend.await;
+    }
+
+    #[tokio::test]
+    async fn test_bind_listener_sets_tcp_nodelay_on_accepted_connections() {
+        let mut listener = bind_listener("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let _client = TcpStream::connect(addr).await.unwrap();
+        let (accepted, _) = listener.accept().await;
+
+        assert!(accepted.nodelay().unwrap());
+    }
 }

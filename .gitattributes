@@ -1,0 +1,5 @@
+# Keep shell scripts and the hook config LF. The commit hook runs in WSL,
+# which otherwise treats a CRLF worktree copy as an unstaged change.
+*.sh text eol=lf
+.pre-commit-config.yaml text eol=lf
+.gitattributes text eol=lf

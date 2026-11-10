@@ -9,9 +9,11 @@ A high-performance and light-weight request forwarding system for vLLM large sca
 
 - **Core Architecture**: Request routing framework and async processing patterns
 - **Load Balancing**: Multiple algorithms (cache-aware, power of two, consistent hashing, random, round robin)
+- **Program Scheduling**: Optional Program identity, RequestPool admission, Progress-TTL, and Global Queue placement for agent workloads
 - **Prefill-Decode Disaggregation**: Specialized routing for separated processing phases
 - **Service Discovery**: Kubernetes-native worker management and health monitoring
 - **Enterprise Features**: Circuit breakers, retry logic, metrics collection
+- **gRPC workers**: Route to vLLM Rust Inference workers via `grpc://` URLs
 
 ## Quick Start
 
@@ -47,7 +49,7 @@ Install from PyPI
 pip install vllm-router                                                                                                                                                        ```
 
 To build from source:
-```bash    
+```bash
 pip install setuptools-rust wheel build
 python -m build
 pip install dist/*.whl
@@ -79,6 +81,29 @@ vllm-router \
     --policy consistent_hash \
     --intra-node-data-parallel-size 8
 ```
+
+#### Optional WASM OnRequest middleware
+
+Load an independently built WASM Component plugin (see `examples/wasm_middleware/` and [RFC #236](https://github.com/vllm-project/router/issues/236)). By default it attaches only to `POST /v1/chat/completions` and fails closed on plugin errors:
+
+```bash
+./examples/wasm_middleware/build.sh
+
+./target/release/vllm-router \
+    --worker-urls http://localhost:8000 \
+    --wasm-middleware ./examples/wasm_middleware/wasm_middleware_example.component.wasm \
+    --wasm-middleware-route /v1/chat/completions
+```
+
+Additional paths can be attached with repeated `--wasm-middleware-route` flags (must be one of the protected inference routes). Without `--wasm-middleware`, the Router does not initialize Wasmtime.
+
+v0.1 resource / fail-closed defaults on attached routes (not configurable via CLI yet):
+
+- **Input body cap**: `min(10 MiB, --max-payload-size)`. Requests larger than this get **413** before the plugin runs, even if the plugin would only `Continue`. This is intentionally tighter than the Router's default 512 MiB payload limit.
+- **Execution deadline**: **100 ms** per invocation (Wasmtime epoch interruption). Deadline / trap failures fail closed with **500**.
+- **Queue full**: when the bounded worker queue is saturated, matching requests get **503**.
+
+Prometheus metrics for the WASM runtime are deferred to a later revision.
 
 #### Prefill-Decode Disaggregation
 ```bash
@@ -222,6 +247,10 @@ curl -X POST http://router:8000/v1/chat/completions \
 
 For detailed configuration options, hash key priorities, and usage examples, see [Load Balancing Documentation](docs/load_balancing/README.md).
 
+For the optional agent metadata contract, scheduling enablement, request-scoped hints, and engine KV-control boundary, see [Program Scheduling](docs/program_scheduling/program-scheduling.md).
+
+For Program-scoped PD scheduling (D-rank affinity, admission, bounded prefill permits) and warm remote KV reuse with automatic TTL, see [PD Program Scheduling](docs/program_scheduling/pd-program-scheduling.md).
+
 ## Advanced Features
 
 ### Kubernetes Service Discovery
@@ -239,13 +268,50 @@ vllm-router \
 
 ### Command Line Arguments Reference
 
-#### Service Discovery
-- `--service-discovery`: Enable Kubernetes service discovery
-- `--service-discovery-port`: Port for worker URLs (default: 8000)
-- `--service-discovery-namespace`: Kubernetes namespace to watch
-- `--selector`: Label selectors for regular mode (format: `key1=value1 key2=value2`)
+See the [complete CLI reference](docs/cli_reference.md) for server and worker
+configuration, routing policies, PD disaggregation, Program scheduling, service
+discovery, reliability, observability, authentication and middleware options.
+It lists types, accepted values, defaults and repeatable arguments separately
+for the Rust binary and Python launcher, whose supported options differ.
 
 ## Development
+
+For contributor intent and pre-submit self-review, start with
+[Contributing](CONTRIBUTING.md).
+
+### gRPC worker backend
+
+`grpc://` workers speak vLLM’s Rust `Inference` API. HTTP workers remain
+transparent OpenAI reverse proxies; gRPC workers receive router-rendered
+`token_ids` and return a stream that the router adapts back to OpenAI
+chat-completion responses.
+
+See [gRPC backend details](docs/backend/grpc.md) for module boundaries,
+capability limits, vLLM 0.29 launch notes, tests, and troubleshooting.
+
+Quick local launch:
+
+```bash
+./scripts/backend/check_vllm_rs.sh
+# then: export VLLM_RS=...
+"$VLLM_RS" serve "$MODEL" \
+  --host 127.0.0.1 \
+  --port 8000 \
+  --grpc-port 50051 \
+  --tensor-parallel-size 1 \
+  --max-model-len 8192 \
+  --max-num-seqs 16 \
+  --enable-prefix-caching
+vllm-router \
+  --host 127.0.0.1 \
+  --port 30000 \
+  --worker-urls grpc://127.0.0.1:50051
+```
+
+`--max-num-seqs`, `--max-model-len`, and prefix-cache flags are worker
+options. Launch helpers live in [`scripts/backend`](scripts/backend); the
+prefix-KV benchmark client lives at
+[`benches/backend/bench_prefix_kvhit.py`](benches/backend/bench_prefix_kvhit.py).
 
 ### Troubleshooting
 

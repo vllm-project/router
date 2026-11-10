@@ -76,6 +76,14 @@ pub fn init_metrics() {
 
     // Policy metrics
     describe_counter!(
+        "vllm_router_kv_routing_inputs_total",
+        "KV-aware token preparation by transport and result"
+    );
+    describe_counter!(
+        "vllm_router_kv_placement_lookups_total",
+        "KV-aware placement lookups and reasons for skipping them"
+    );
+    describe_counter!(
         "vllm_router_policy_decisions_total",
         "Total routing policy decisions by policy and worker"
     );
@@ -91,6 +99,107 @@ pub fn init_metrics() {
     );
     describe_gauge!("vllm_router_max_load", "Maximum worker load");
     describe_gauge!("vllm_router_min_load", "Minimum worker load");
+
+    describe_gauge!(
+        "vllm_router_agent_aware_rank_queue_size",
+        "Queued Programs attributed to each Program-scheduling target"
+    );
+    describe_gauge!(
+        "vllm_router_agent_aware_rank_active_programs",
+        "Active Programs on each Program-scheduling target"
+    );
+    describe_counter!(
+        "vllm_router_agent_aware_transitions_total",
+        "Committed Program scheduling transitions by target and reason"
+    );
+    describe_histogram!(
+        "vllm_router_agent_aware_queue_wait_seconds",
+        "Time retained in the Program RequestPool before dispatch"
+    );
+    describe_gauge!(
+        "vllm_router_agent_aware_fitted_ttl_seconds",
+        "Representative fitted acting TTL by target"
+    );
+    describe_gauge!(
+        "vllm_router_agent_aware_context_growth_tokens",
+        "Rolling mean Program context growth by target"
+    );
+    describe_gauge!(
+        "vllm_router_agent_aware_rolling_samples",
+        "Retained Program-scheduling samples by target and window"
+    );
+    describe_gauge!(
+        "vllm_router_agent_aware_token_estimate_coefficient",
+        "Current prompt tokens-per-byte coefficient by model pool and endpoint"
+    );
+    describe_counter!(
+        "vllm_router_agent_aware_token_estimate_feedback_total",
+        "Prompt-token estimator feedback outcomes"
+    );
+    describe_histogram!(
+        "vllm_router_agent_aware_cache_miss_impact_seconds",
+        "Estimated cache-miss recovery impact for completed Program requests"
+    );
+    describe_gauge!(
+        "vllm_router_agent_aware_cache_miss_impact_rolling_mean_seconds",
+        "Rolling mean cache-miss recovery impact by Program-scheduling target"
+    );
+    describe_gauge!(
+        "vllm_router_agent_aware_capacity_observation_fresh",
+        "Whether backend capacity accounting is fresh and usable by target"
+    );
+    describe_histogram!(
+        "vllm_router_agent_aware_request_interval_seconds",
+        "Program request intervals used by the Progress-TTL fit"
+    );
+    describe_histogram!(
+        "vllm_router_agent_aware_armed_ttl_seconds",
+        "Final acting TTL armed after a Program request"
+    );
+    describe_histogram!(
+        "vllm_router_agent_aware_shared_prefix_observed_tokens",
+        "Explicit cached-token observation used to refresh a Program shared prefix"
+    );
+    for (name, description) in [
+        (
+            "vllm_router_agent_aware_admission_used_tokens",
+            "Managed target tokens before Program admission",
+        ),
+        (
+            "vllm_router_agent_aware_admission_required_tokens",
+            "Candidate tokens required by a committed Program admission",
+        ),
+        (
+            "vllm_router_agent_aware_admission_growth_reserve_tokens",
+            "Growth reserve included in a committed Program admission",
+        ),
+        (
+            "vllm_router_agent_aware_admission_capacity_pressure_ratio",
+            "Managed capacity pressure before Program admission",
+        ),
+        (
+            "vllm_router_agent_aware_admission_projected_pressure_ratio",
+            "Projected capacity pressure after Program admission and growth reserve",
+        ),
+        (
+            "vllm_router_agent_aware_admission_backend_kv_usage_ratio",
+            "Backend KV usage observed at Program admission",
+        ),
+        (
+            "vllm_router_agent_aware_admission_backend_running_requests",
+            "Backend running requests observed at Program admission",
+        ),
+        (
+            "vllm_router_agent_aware_admission_backend_waiting_requests",
+            "Backend waiting requests observed at Program admission",
+        ),
+        (
+            "vllm_router_agent_aware_admission_capacity_observation_age_seconds",
+            "Age of the backend capacity observation at Program admission",
+        ),
+    ] {
+        describe_histogram!(name, description);
+    }
 
     // PD-specific metrics
     describe_counter!(
@@ -251,6 +360,70 @@ pub fn init_metrics() {
         "vllm_tokenizer_factory_load_duration_seconds",
         "Time to load and initialize tokenizer"
     );
+
+    // Tokenizer encode cache metrics
+    describe_counter!(
+        "vllm_tokenizer_cache_hits_total",
+        "Total tokenizer encode calls served from the exact-match cache"
+    );
+    describe_counter!(
+        "vllm_tokenizer_cache_misses_total",
+        "Total tokenizer encode calls that ran the underlying tokenizer"
+    );
+    describe_counter!(
+        "vllm_tokenizer_cache_evictions_total",
+        "Total tokenizer cache entries evicted to satisfy the entry or byte budget"
+    );
+    describe_counter!(
+        "vllm_tokenizer_cache_oversized_total",
+        "Total tokenizer encode results not cached because they exceeded the per-entry byte limit"
+    );
+    describe_gauge!(
+        "vllm_tokenizer_cache_entries",
+        "Current number of entries in the tokenizer encode cache"
+    );
+    describe_gauge!(
+        "vllm_tokenizer_cache_bytes",
+        "Estimated bytes retained by the tokenizer encode cache"
+    );
+
+    // L1 prefix encoding cache metrics
+    describe_counter!(
+        "vllm_tokenizer_l1_lookups_total",
+        "Total prompts encoded through the L1 cache"
+    );
+    describe_counter!(
+        "vllm_tokenizer_l1_hits_total",
+        "Total L1 lookups that reused at least one cached token"
+    );
+    describe_counter!(
+        "vllm_tokenizer_l1_cached_tokens_total",
+        "Total prompt tokens taken from the L1 cache"
+    );
+    describe_counter!(
+        "vllm_tokenizer_l1_encoded_tokens_total",
+        "Total prompt tokens encoded by the tokenizer on the L1 path"
+    );
+    describe_counter!(
+        "vllm_tokenizer_l1_evictions_total",
+        "Total L1 tree nodes evicted to satisfy the byte or node budget"
+    );
+    describe_counter!(
+        "vllm_tokenizer_l1_verify_mismatches_total",
+        "Total L1 verify-mode mismatches"
+    );
+    describe_counter!(
+        "vllm_tokenizer_l1_bypasses_total",
+        "Total prompts on an L1-enabled model that skipped L1, by reason"
+    );
+    describe_gauge!(
+        "vllm_tokenizer_l1_nodes",
+        "Current number of L1 prefix tree nodes"
+    );
+    describe_gauge!(
+        "vllm_tokenizer_l1_bytes",
+        "Estimated bytes retained by the L1 cache"
+    );
 }
 
 pub fn start_prometheus(config: PrometheusConfig) {
@@ -269,13 +442,108 @@ pub fn start_prometheus(config: PrometheusConfig) {
         .unwrap_or(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)));
     let socket_addr = SocketAddr::new(ip_addr, config.port);
 
-    PrometheusBuilder::new()
+    let builder = PrometheusBuilder::new()
         .with_http_listener(socket_addr)
-        .upkeep_timeout(Duration::from_secs(5 * 60))
+        .upkeep_timeout(Duration::from_secs(5 * 60));
+    let builder = set_program_scheduling_buckets(builder);
+    builder
         .set_buckets_for_metric(duration_matcher, &duration_bucket)
         .expect("failed to set duration bucket")
         .install()
         .expect("failed to install Prometheus metrics exporter");
+}
+
+fn set_program_scheduling_buckets(builder: PrometheusBuilder) -> PrometheusBuilder {
+    const CACHE_MISS_SECONDS: &[f64] =
+        &[0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 30.0, 60.0, 120.0];
+    const INTERVAL_SECONDS: &[f64] = &[
+        0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 30.0, 60.0, 120.0, 300.0, 600.0,
+    ];
+    const ARMED_TTL_SECONDS: &[f64] = &[
+        0.0, 0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 30.0, 60.0, 120.0, 300.0, 600.0,
+    ];
+    const TOKEN_BUCKETS: &[f64] = &[
+        0.0,
+        128.0,
+        256.0,
+        512.0,
+        1_024.0,
+        2_048.0,
+        4_096.0,
+        8_192.0,
+        16_384.0,
+        32_768.0,
+        65_536.0,
+        131_072.0,
+        262_144.0,
+        524_288.0,
+        1_048_576.0,
+    ];
+    const RATIO_BUCKETS: &[f64] = &[0.25, 0.5, 0.75, 0.9, 1.0, 1.1, 1.25, 1.5, 2.0, 3.0, 4.0];
+    const REQUEST_BUCKETS: &[f64] = &[0.0, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0];
+
+    let exact = |name: &str| Matcher::Full(name.to_string());
+    let set = |builder: PrometheusBuilder, name: &str, buckets: &[f64]| {
+        builder
+            .set_buckets_for_metric(exact(name), buckets)
+            .unwrap_or_else(|error| panic!("failed to set buckets for {name}: {error}"))
+    };
+    let builder = set(
+        builder,
+        "vllm_router_agent_aware_cache_miss_impact_seconds",
+        CACHE_MISS_SECONDS,
+    );
+    let builder = set(
+        builder,
+        "vllm_router_agent_aware_request_interval_seconds",
+        INTERVAL_SECONDS,
+    );
+    let builder = set(
+        builder,
+        "vllm_router_agent_aware_armed_ttl_seconds",
+        ARMED_TTL_SECONDS,
+    );
+    let mut builder = set(
+        builder,
+        "vllm_router_agent_aware_shared_prefix_observed_tokens",
+        TOKEN_BUCKETS,
+    );
+    for name in [
+        "vllm_router_agent_aware_admission_used_tokens",
+        "vllm_router_agent_aware_admission_required_tokens",
+        "vllm_router_agent_aware_admission_growth_reserve_tokens",
+    ] {
+        builder = set(builder, name, TOKEN_BUCKETS);
+    }
+    for name in [
+        "vllm_router_agent_aware_admission_capacity_pressure_ratio",
+        "vllm_router_agent_aware_admission_projected_pressure_ratio",
+        "vllm_router_agent_aware_admission_backend_kv_usage_ratio",
+    ] {
+        builder = set(builder, name, RATIO_BUCKETS);
+    }
+    for name in [
+        "vllm_router_agent_aware_admission_backend_running_requests",
+        "vllm_router_agent_aware_admission_backend_waiting_requests",
+    ] {
+        builder = set(builder, name, REQUEST_BUCKETS);
+    }
+    set(
+        builder,
+        "vllm_router_agent_aware_admission_capacity_observation_age_seconds",
+        INTERVAL_SECONDS,
+    )
+}
+
+pub(crate) struct AgentAwareAdmissionMetrics {
+    pub(crate) used_tokens: f64,
+    pub(crate) required_tokens: f64,
+    pub(crate) reserve_tokens: f64,
+    pub(crate) capacity_tokens: Option<usize>,
+    pub(crate) backend_kv_usage_ratio: Option<f64>,
+    pub(crate) backend_running_requests: Option<usize>,
+    pub(crate) backend_waiting_requests: Option<usize>,
+    pub(crate) observation_age: Option<Duration>,
 }
 
 pub struct RouterMetrics;
@@ -283,6 +551,45 @@ pub struct RouterMetrics;
 pub struct TokenizerMetrics;
 
 impl RouterMetrics {
+    /// Separates real prefix decisions, explicit binding, and load fallback.
+    pub fn record_prefix_routing_decision(
+        policy: &'static str,
+        stage: &'static str,
+        outcome: &'static str,
+    ) {
+        counter!("vllm_router_prefix_routing_decisions_total",
+            "policy" => policy, "stage" => stage, "outcome" => outcome)
+        .increment(1);
+    }
+
+    pub fn record_kv_placement_lookup(result: &'static str) {
+        counter!("vllm_router_kv_placement_lookups_total", "result" => result).increment(1);
+    }
+    pub fn record_kv_routing_input(transport: &'static str, result: &'static str) {
+        counter!("vllm_router_kv_routing_inputs_total", "transport" => transport, "result" => result).increment(1);
+    }
+
+    pub fn record_pd_kv_decision(work: Option<u64>, credit: Option<u64>, fallback: Option<&str>) {
+        counter!("vllm_router_pd_prefill_decisions_total",
+            "fallback" => fallback.unwrap_or("none").to_owned())
+        .increment(1);
+        if let Some(work) = work {
+            histogram!("vllm_router_pd_new_prefill_tokens").record(work as f64);
+        }
+        if let Some(credit) = credit {
+            counter!("vllm_router_pd_credited_prefix_tokens_total").increment(credit);
+        }
+    }
+
+    /// Per-stage kv_aware session-affinity outcome: bind / sticky_hit / rebind /
+    /// no_session / capacity_bypass.
+    pub fn record_pd_affinity_decision(stage: &str, outcome: &str) {
+        counter!("vllm_router_pd_affinity_decisions_total",
+            "stage" => stage.to_owned(),
+            "outcome" => outcome.to_owned())
+        .increment(1);
+    }
+
     // Request metrics
     pub fn record_request(route: &str) {
         counter!("vllm_router_requests_total",
@@ -386,6 +693,329 @@ impl RouterMetrics {
         gauge!("vllm_router_min_load").set(min_load as f64);
     }
 
+    pub fn set_agent_aware_rank_state(target: &str, queued: usize, active: usize) {
+        gauge!(
+            "vllm_router_agent_aware_rank_queue_size",
+            "target" => target.to_string()
+        )
+        .set(queued as f64);
+        gauge!(
+            "vllm_router_agent_aware_rank_active_programs",
+            "target" => target.to_string()
+        )
+        .set(active as f64);
+    }
+
+    pub fn record_agent_aware_transition(target: &str, reason: &'static str) {
+        counter!(
+            "vllm_router_agent_aware_transitions_total",
+            "target" => target.to_string(),
+            "reason" => reason
+        )
+        .increment(1);
+    }
+
+    pub fn record_agent_aware_queue_wait(target: &str, duration: Duration) {
+        histogram!(
+            "vllm_router_agent_aware_queue_wait_seconds",
+            "target" => target.to_string()
+        )
+        .record(duration.as_secs_f64());
+    }
+
+    pub fn record_agent_aware_token_estimate_feedback(
+        model_pool: &str,
+        endpoint: &str,
+        observed: bool,
+        coefficient: Option<f64>,
+    ) {
+        counter!(
+            "vllm_router_agent_aware_token_estimate_feedback_total",
+            "model_pool" => model_pool.to_string(),
+            "endpoint" => endpoint.to_string(),
+            "outcome" => if observed { "observed" } else { "missing" }
+        )
+        .increment(1);
+        if let Some(coefficient) = coefficient {
+            gauge!(
+                "vllm_router_agent_aware_token_estimate_coefficient",
+                "model_pool" => model_pool.to_string(),
+                "endpoint" => endpoint.to_string()
+            )
+            .set(coefficient);
+        }
+    }
+
+    pub fn set_agent_aware_adaptive_state(
+        target: &str,
+        fitted_ttl: Duration,
+        context_growth_tokens: f64,
+        request_samples: usize,
+        continuity_samples: usize,
+        cache_miss_impact_rolling_mean_seconds: f64,
+    ) {
+        gauge!("vllm_router_agent_aware_fitted_ttl_seconds", "target" => target.to_string())
+            .set(fitted_ttl.as_secs_f64());
+        gauge!("vllm_router_agent_aware_context_growth_tokens", "target" => target.to_string())
+            .set(context_growth_tokens);
+        gauge!(
+            "vllm_router_agent_aware_rolling_samples",
+            "target" => target.to_string(),
+            "window" => "request"
+        )
+        .set(request_samples as f64);
+        gauge!(
+            "vllm_router_agent_aware_rolling_samples",
+            "target" => target.to_string(),
+            "window" => "continuity"
+        )
+        .set(continuity_samples as f64);
+        gauge!(
+            "vllm_router_agent_aware_cache_miss_impact_rolling_mean_seconds",
+            "target" => target.to_string()
+        )
+        .set(cache_miss_impact_rolling_mean_seconds);
+    }
+
+    pub fn set_agent_aware_capacity_observation_fresh(target: &str, fresh: bool) {
+        gauge!(
+            "vllm_router_agent_aware_capacity_observation_fresh",
+            "target" => target.to_string()
+        )
+        .set(if fresh { 1.0 } else { 0.0 });
+    }
+
+    pub fn set_workflow_prediction_profile_keys(return_time: usize, output_length: usize) {
+        gauge!(
+            "vllm_router_workflow_prediction_profile_keys",
+            "predictor" => "return_time"
+        )
+        .set(return_time as f64);
+        gauge!(
+            "vllm_router_workflow_prediction_profile_keys",
+            "predictor" => "output_length"
+        )
+        .set(output_length as f64);
+    }
+
+    pub fn record_agent_aware_cache_miss_impact(target: &str, seconds: f64) {
+        histogram!(
+            "vllm_router_agent_aware_cache_miss_impact_seconds",
+            "target" => target.to_string()
+        )
+        .record(seconds);
+    }
+
+    pub fn record_agent_aware_request_interval(target: &str, seconds: f64) {
+        histogram!(
+            "vllm_router_agent_aware_request_interval_seconds",
+            "target" => target.to_string()
+        )
+        .record(seconds);
+    }
+
+    pub fn record_agent_aware_armed_ttl(target: &str, source: &'static str, ttl: Duration) {
+        histogram!(
+            "vllm_router_agent_aware_armed_ttl_seconds",
+            "target" => target.to_string(),
+            "source" => source
+        )
+        .record(ttl.as_secs_f64());
+    }
+
+    pub fn record_workflow_return_prediction(
+        target: &str,
+        source: &'static str,
+        probability: f64,
+        ttl_seconds: f64,
+        support: usize,
+        backoff_level: usize,
+    ) {
+        histogram!(
+            "vllm_router_workflow_return_probability",
+            "target" => target.to_string(),
+            "source" => source
+        )
+        .record(probability);
+        histogram!(
+            "vllm_router_workflow_predicted_ttl_seconds",
+            "target" => target.to_string(),
+            "source" => source
+        )
+        .record(ttl_seconds);
+        histogram!(
+            "vllm_router_workflow_return_prediction_support",
+            "target" => target.to_string(),
+            "source" => source
+        )
+        .record(support as f64);
+        counter!(
+            "vllm_router_workflow_return_prediction_total",
+            "target" => target.to_string(),
+            "source" => source,
+            "backoff_level" => backoff_level.to_string()
+        )
+        .increment(1);
+    }
+
+    pub fn record_workflow_return_observation(
+        target: &str,
+        actual_seconds: f64,
+        probability: Option<f64>,
+        horizon_seconds: f64,
+    ) {
+        histogram!(
+            "vllm_router_workflow_return_actual_seconds",
+            "target" => target.to_string()
+        )
+        .record(actual_seconds);
+        if let Some(probability) = probability {
+            let outcome = if actual_seconds <= horizon_seconds {
+                1.0
+            } else {
+                0.0
+            };
+            let calibrated = probability.clamp(1e-9, 1.0 - 1e-9);
+            histogram!(
+                "vllm_router_workflow_return_brier_score",
+                "target" => target.to_string()
+            )
+            .record((probability - outcome).powi(2));
+            histogram!(
+                "vllm_router_workflow_return_nll",
+                "target" => target.to_string()
+            )
+            .record(if outcome > 0.0 {
+                -calibrated.ln()
+            } else {
+                -(1.0 - calibrated).ln()
+            });
+        }
+    }
+
+    pub fn record_workflow_output_prediction(
+        target: &str,
+        source: &'static str,
+        tokens: usize,
+        support: usize,
+        mature: bool,
+        backoff_level: usize,
+    ) {
+        histogram!(
+            "vllm_router_workflow_predicted_output_tokens",
+            "target" => target.to_string(),
+            "source" => source,
+            "mature" => if mature { "true" } else { "false" }
+        )
+        .record(tokens as f64);
+        histogram!(
+            "vllm_router_workflow_output_prediction_support",
+            "target" => target.to_string(),
+            "source" => source
+        )
+        .record(support as f64);
+        counter!(
+            "vllm_router_workflow_output_prediction_total",
+            "target" => target.to_string(),
+            "source" => source,
+            "backoff_level" => backoff_level.to_string()
+        )
+        .increment(1);
+    }
+
+    pub fn record_workflow_output_observation(
+        target: &str,
+        actual_tokens: usize,
+        p95: Option<usize>,
+        p99: Option<usize>,
+    ) {
+        histogram!(
+            "vllm_router_workflow_output_actual_tokens",
+            "target" => target.to_string()
+        )
+        .record(actual_tokens as f64);
+        for (quantile, predicted) in [("p95", p95), ("p99", p99)] {
+            if let Some(predicted) = predicted {
+                let covered = actual_tokens <= predicted;
+                counter!(
+                    "vllm_router_workflow_output_coverage_total",
+                    "target" => target.to_string(),
+                    "quantile" => quantile,
+                    "covered" => if covered { "true" } else { "false" }
+                )
+                .increment(1);
+                histogram!(
+                    "vllm_router_workflow_output_reservation_error_tokens",
+                    "target" => target.to_string(),
+                    "quantile" => quantile,
+                    "direction" => if covered { "over_reserved" } else { "under_reserved" }
+                )
+                .record(predicted.abs_diff(actual_tokens) as f64);
+            }
+        }
+    }
+
+    pub fn record_agent_aware_shared_prefix_observation(target: &str, tokens: usize) {
+        histogram!(
+            "vllm_router_agent_aware_shared_prefix_observed_tokens",
+            "target" => target.to_string()
+        )
+        .record(tokens as f64);
+    }
+
+    pub(crate) fn record_agent_aware_admission(target: &str, sample: AgentAwareAdmissionMetrics) {
+        let record = |name, value| {
+            histogram!(name, "target" => target.to_string()).record(value);
+        };
+        record(
+            "vllm_router_agent_aware_admission_used_tokens",
+            sample.used_tokens,
+        );
+        record(
+            "vllm_router_agent_aware_admission_required_tokens",
+            sample.required_tokens,
+        );
+        record(
+            "vllm_router_agent_aware_admission_growth_reserve_tokens",
+            sample.reserve_tokens,
+        );
+        if let Some(capacity) = sample.capacity_tokens.filter(|capacity| *capacity > 0) {
+            let capacity = capacity as f64;
+            record(
+                "vllm_router_agent_aware_admission_capacity_pressure_ratio",
+                sample.used_tokens / capacity,
+            );
+            record(
+                "vllm_router_agent_aware_admission_projected_pressure_ratio",
+                (sample.used_tokens + sample.required_tokens + sample.reserve_tokens) / capacity,
+            );
+        }
+        if let Some(value) = sample.backend_kv_usage_ratio {
+            record(
+                "vllm_router_agent_aware_admission_backend_kv_usage_ratio",
+                value,
+            );
+        }
+        if let Some(value) = sample.backend_running_requests {
+            record(
+                "vllm_router_agent_aware_admission_backend_running_requests",
+                value as f64,
+            );
+        }
+        if let Some(value) = sample.backend_waiting_requests {
+            record(
+                "vllm_router_agent_aware_admission_backend_waiting_requests",
+                value as f64,
+            );
+        }
+        if let Some(value) = sample.observation_age {
+            record(
+                "vllm_router_agent_aware_admission_capacity_observation_age_seconds",
+                value.as_secs_f64(),
+            );
+        }
+    }
+
     // PD-specific metrics
     pub fn record_pd_request(route: &str) {
         counter!("vllm_router_pd_requests_total",
@@ -432,6 +1062,15 @@ impl RouterMetrics {
     pub fn record_pd_decode_error(worker: &str) {
         counter!("vllm_router_pd_decode_errors_total",
             "worker" => worker.to_string()
+        )
+        .increment(1);
+    }
+
+    /// A router-buffered stage body exceeded the fixed buffer cap and the
+    /// request failed instead of buffering unbounded.
+    pub fn record_pd_body_over_limit(stage: &str) {
+        counter!("vllm_router_pd_body_over_limit_total",
+            "stage" => stage.to_string()
         )
         .increment(1);
     }
@@ -624,9 +1263,64 @@ impl TokenizerMetrics {
         )
         .set(size as f64);
     }
+
+    // Encode cache metrics
+    pub fn record_cache_hit() {
+        counter!("vllm_tokenizer_cache_hits_total").increment(1);
+    }
+
+    pub fn record_cache_miss() {
+        counter!("vllm_tokenizer_cache_misses_total").increment(1);
+    }
+
+    pub fn record_cache_evictions(count: u64) {
+        counter!("vllm_tokenizer_cache_evictions_total").increment(count);
+    }
+
+    pub fn record_cache_oversized() {
+        counter!("vllm_tokenizer_cache_oversized_total").increment(1);
+    }
+
+    pub fn set_cache_entries(entries: usize) {
+        gauge!("vllm_tokenizer_cache_entries").set(entries as f64);
+    }
+
+    pub fn set_cache_bytes(bytes: usize) {
+        gauge!("vllm_tokenizer_cache_bytes").set(bytes as f64);
+    }
+
+    // L1 prefix encoding cache metrics
+    pub fn record_l1_lookup(cached_tokens: usize, encoded_tokens: usize) {
+        counter!("vllm_tokenizer_l1_lookups_total").increment(1);
+        if cached_tokens > 0 {
+            counter!("vllm_tokenizer_l1_hits_total").increment(1);
+        }
+        counter!("vllm_tokenizer_l1_cached_tokens_total").increment(cached_tokens as u64);
+        counter!("vllm_tokenizer_l1_encoded_tokens_total").increment(encoded_tokens as u64);
+    }
+
+    pub fn record_l1_evictions(count: u64) {
+        counter!("vllm_tokenizer_l1_evictions_total").increment(count);
+    }
+
+    pub fn record_l1_verify_mismatch() {
+        counter!("vllm_tokenizer_l1_verify_mismatches_total").increment(1);
+    }
+
+    pub fn record_l1_bypass(reason: &'static str) {
+        counter!("vllm_tokenizer_l1_bypasses_total", "reason" => reason).increment(1);
+    }
+
+    pub fn set_l1_nodes(nodes: usize) {
+        gauge!("vllm_tokenizer_l1_nodes").set(nodes as f64);
+    }
+
+    pub fn set_l1_bytes(bytes: usize) {
+        gauge!("vllm_tokenizer_l1_bytes").set(bytes as f64);
+    }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use super::*;
     use std::net::TcpListener;
