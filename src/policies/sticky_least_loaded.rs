@@ -14,34 +14,30 @@
 //!   consistent hashing (rendezvous / highest-random-weight) so that, given the
 //!   same set of least-loaded replicas, a session is always assigned to the same
 //!   replica.
-//! - Sessions expire after a configurable TTL (default 2 hours, overridable via
-//!   the `VLLM_ROUTER_SLL_SESSION_EXPIRATION_IN_S` environment variable). This
-//!   protects against leaked sessions when a `finish_session` call is never
-//!   received (e.g. a cancelled trajectory).
+//! - Sessions expire after a configurable TTL (`PolicyConfig::StickyLeastLoaded`
+//!   `session_ttl_secs`, default 2 hours). This protects against leaked
+//!   sessions when a `finish_session` call is never received (e.g. a cancelled
+//!   trajectory).
 //! - Sessions can be released explicitly via [`finish_session`].
 //!
-//! Requests without any session identifier are still load-balanced to the
-//! least-loaded replica, but are *not* recorded as active sessions.
+//! The router resolves the session id with
+//! [`crate::request_identity::resolve_session_key`] and passes it to
+//! [`LoadBalancingPolicy::select_worker_for_session`]. Requests without a
+//! session id are still load-balanced to the least-loaded replica, but are
+//! *not* recorded as active sessions.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use super::get_healthy_worker_indices;
-use super::hash_key;
 use super::ConsistentHashPolicy;
 use super::LoadBalancingPolicy;
 use super::RequestHeaders;
 use crate::core::Worker;
 use crate::metrics::RouterMetrics;
-
-/// Default session expiration (2 hours), per the design spec.
-pub const DEFAULT_SESSION_EXPIRATION_SECS: u64 = 7200;
-
-/// Environment variable to override the session expiration (in seconds).
-pub const SESSION_EXPIRATION_ENV: &str = "VLLM_ROUTER_SLL_SESSION_EXPIRATION_IN_S";
 
 /// Minimum interval between full expiration sweeps to bound per-request cost.
 const SWEEP_INTERVAL_SECS: u64 = 60;
@@ -73,10 +69,12 @@ pub struct StickyLeastLoadedPolicy {
 }
 
 impl StickyLeastLoadedPolicy {
-    /// Create a new policy, reading the session expiration from the environment
-    /// (falling back to [`DEFAULT_SESSION_EXPIRATION_SECS`]).
+    /// Default session TTL (2 hours).
+    pub const DEFAULT_SESSION_TTL_SECS: u64 = 7200;
+
+    /// Create a new policy with the default session TTL.
     pub fn new() -> Self {
-        Self::with_expiration_secs(Self::expiration_secs_from_env())
+        Self::with_expiration_secs(Self::DEFAULT_SESSION_TTL_SECS)
     }
 
     /// Create a new policy with an explicit session expiration (in seconds).
@@ -88,22 +86,6 @@ impl StickyLeastLoadedPolicy {
                 last_sweep: Instant::now(),
             }),
             session_expiration: Duration::from_secs(secs),
-        }
-    }
-
-    fn expiration_secs_from_env() -> u64 {
-        match std::env::var(SESSION_EXPIRATION_ENV) {
-            Ok(val) => match val.trim().parse::<u64>() {
-                Ok(secs) => secs,
-                Err(_) => {
-                    warn!(
-                        "Invalid {} value '{}', using default {}s",
-                        SESSION_EXPIRATION_ENV, val, DEFAULT_SESSION_EXPIRATION_SECS
-                    );
-                    DEFAULT_SESSION_EXPIRATION_SECS
-                }
-            },
-            Err(_) => DEFAULT_SESSION_EXPIRATION_SECS,
         }
     }
 
@@ -208,6 +190,16 @@ impl LoadBalancingPolicy for StickyLeastLoadedPolicy {
         request_text: Option<&str>,
         headers: Option<&RequestHeaders>,
     ) -> Option<usize> {
+        self.select_worker_for_session(workers, request_text, headers, None)
+    }
+
+    fn select_worker_for_session(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        request_text: Option<&str>,
+        _headers: Option<&RequestHeaders>,
+        session_id: Option<&str>,
+    ) -> Option<usize> {
         let healthy_indices = get_healthy_worker_indices(workers);
         if healthy_indices.is_empty() {
             return None;
@@ -218,7 +210,14 @@ impl LoadBalancingPolicy for StickyLeastLoadedPolicy {
             .map(|&idx| (idx, workers[idx].url().to_string()))
             .collect();
 
-        let session_id = hash_key::extract_session_id(request_text, headers);
+        // The request text can be large, so hash it once before taking the
+        // lock instead of once per candidate inside it.
+        let stateless_tie_break = session_id.is_none().then(|| {
+            format!(
+                "{:016x}",
+                ConsistentHashPolicy::fbi_hash(request_text.unwrap_or(""))
+            )
+        });
         let now = Instant::now();
 
         let mut state = self.state.lock().unwrap();
@@ -226,9 +225,9 @@ impl LoadBalancingPolicy for StickyLeastLoadedPolicy {
 
         // Requests without a session id: load-balance but don't record state.
         let session_id = match session_id {
-            Some(id) => id,
+            Some(id) => id.to_owned(),
             None => {
-                let tie_break = request_text.unwrap_or("");
+                let tie_break = stateless_tie_break.as_deref().unwrap_or_default();
                 let idx = Self::select_least_loaded(&state.active_counts, &candidates, tie_break);
                 drop(state);
                 self.record_selection(&workers[idx]);
@@ -298,17 +297,18 @@ impl LoadBalancingPolicy for StickyLeastLoadedPolicy {
         Some(idx)
     }
 
-    fn finish_session(&self, session_id: &str) {
+    fn finish_session(&self, session_id: &str) -> bool {
         let mut state = self.state.lock().unwrap();
-        if let Some(entry) = state.sessions.remove(session_id) {
-            Self::decrement_count(&mut state.active_counts, &entry.worker_url);
-            info!(
-                "SLL: finished session '{}' on replica '{}'",
-                session_id, entry.worker_url
-            );
-        } else {
+        let Some(entry) = state.sessions.remove(session_id) else {
             debug!("SLL: finish_session for unknown session '{}'", session_id);
-        }
+            return false;
+        };
+        Self::decrement_count(&mut state.active_counts, &entry.worker_url);
+        info!(
+            "SLL: finished session '{}' on replica '{}'",
+            session_id, entry.worker_url
+        );
+        true
     }
 
     fn name(&self) -> &'static str {
@@ -319,7 +319,7 @@ impl LoadBalancingPolicy for StickyLeastLoadedPolicy {
         true
     }
 
-    fn needs_headers(&self) -> bool {
+    fn needs_session_id(&self) -> bool {
         true
     }
 
@@ -346,7 +346,6 @@ impl Default for StickyLeastLoadedPolicy {
 mod tests {
     use super::*;
     use crate::core::{BasicWorker, WorkerType};
-    use std::collections::HashMap as StdHashMap;
 
     fn make_workers(urls: &[&str]) -> Vec<Arc<dyn Worker>> {
         urls.iter()
@@ -356,21 +355,23 @@ mod tests {
             .collect()
     }
 
-    fn header_with_session(session_id: &str) -> RequestHeaders {
-        let mut headers: RequestHeaders = StdHashMap::new();
-        headers.insert("x-session-id".to_string(), session_id.to_string());
-        headers
+    fn select(
+        policy: &StickyLeastLoadedPolicy,
+        workers: &[Arc<dyn Worker>],
+        session_id: &str,
+    ) -> Option<usize> {
+        policy.select_worker_for_session(workers, None, None, Some(session_id))
     }
 
     #[test]
     fn test_same_session_sticky() {
         let policy = StickyLeastLoadedPolicy::new();
         let workers = make_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
-        let headers = header_with_session("sess-1");
+        let session = "sess-1";
 
-        let idx1 = policy.select_worker_with_headers(&workers, None, Some(&headers));
-        let idx2 = policy.select_worker_with_headers(&workers, None, Some(&headers));
-        let idx3 = policy.select_worker_with_headers(&workers, None, Some(&headers));
+        let idx1 = select(&policy, &workers, session);
+        let idx2 = select(&policy, &workers, session);
+        let idx3 = select(&policy, &workers, session);
 
         assert!(idx1.is_some());
         assert_eq!(idx1, idx2);
@@ -388,10 +389,8 @@ mod tests {
         // Assign three distinct sessions; each should land on a distinct replica
         // because new sessions go to the least-loaded replica.
         for i in 0..3 {
-            let headers = header_with_session(&format!("sess-{}", i));
-            policy
-                .select_worker_with_headers(&workers, None, Some(&headers))
-                .unwrap();
+            let session = format!("sess-{}", i);
+            select(&policy, &workers, &session).unwrap();
         }
 
         assert_eq!(policy.active_session_count(), 3);
@@ -409,10 +408,8 @@ mod tests {
         let policy = StickyLeastLoadedPolicy::new();
         let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
 
-        let headers = header_with_session("sess-x");
-        let idx = policy
-            .select_worker_with_headers(&workers, None, Some(&headers))
-            .unwrap();
+        let session = "sess-x";
+        let idx = select(&policy, &workers, session).unwrap();
         let assigned_url = workers[idx].url().to_string();
         assert_eq!(policy.active_count_for(&assigned_url), 1);
 
@@ -430,46 +427,30 @@ mod tests {
     }
 
     #[test]
-    fn test_session_id_from_body() {
-        let policy = StickyLeastLoadedPolicy::new();
-        let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
-        let body = r#"{"session_id": "body-sess", "prompt": "hi"}"#;
-
-        let idx1 = policy.select_worker_with_headers(&workers, Some(body), None);
-        let idx2 = policy.select_worker_with_headers(&workers, Some(body), None);
-        assert_eq!(idx1, idx2);
-        assert_eq!(policy.active_session_count(), 1);
-
-        policy.finish_session("body-sess");
-        assert_eq!(policy.active_session_count(), 0);
-    }
-
-    #[test]
-    fn test_finish_session_releases_escaped_body_id() {
-        let policy = StickyLeastLoadedPolicy::new();
-        let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
-        let body = serde_json::json!({"user": "a\"b", "prompt": "hi"}).to_string();
-
-        policy
-            .select_worker_with_headers(&workers, Some(&body), None)
-            .unwrap();
-        assert_eq!(policy.active_session_count(), 1);
-
-        // The client finishes the session with the id it sent, not its JSON
-        // encoding.
-        policy.finish_session("a\"b");
-        assert_eq!(policy.active_session_count(), 0);
-    }
-
-    #[test]
     fn test_stateless_requests_not_tracked() {
         let policy = StickyLeastLoadedPolicy::new();
         let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
         let body = r#"{"prompt": "no session here"}"#;
 
-        let idx = policy.select_worker_with_headers(&workers, Some(body), None);
+        let idx = policy.select_worker_for_session(&workers, Some(body), None, None);
         assert!(idx.is_some());
         // No session identifier -> nothing tracked.
+        assert_eq!(policy.active_session_count(), 0);
+    }
+
+    #[test]
+    fn test_request_text_and_headers_are_not_session_sources() {
+        // The router resolves the session id; a JSON prompt or a raw header
+        // must not create a session on its own.
+        let policy = StickyLeastLoadedPolicy::new();
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+        let headers = RequestHeaders::from([("x-session-id".to_string(), "s".to_string())]);
+
+        policy.select_worker_with_headers(
+            &workers,
+            Some(r#"{"session_id": "s", "user": "u"}"#),
+            Some(&headers),
+        );
         assert_eq!(policy.active_session_count(), 0);
     }
 
@@ -477,19 +458,15 @@ mod tests {
     fn test_reassign_when_replica_unhealthy() {
         let policy = StickyLeastLoadedPolicy::new();
         let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
-        let headers = header_with_session("sess-move");
+        let session = "sess-move";
 
-        let idx = policy
-            .select_worker_with_headers(&workers, None, Some(&headers))
-            .unwrap();
+        let idx = select(&policy, &workers, session).unwrap();
         let original_url = workers[idx].url().to_string();
 
         // Mark the assigned replica unhealthy; the session must be reassigned to
         // the remaining healthy replica.
         workers[idx].set_healthy(false);
-        let new_idx = policy
-            .select_worker_with_headers(&workers, None, Some(&headers))
-            .unwrap();
+        let new_idx = select(&policy, &workers, session).unwrap();
         assert_ne!(workers[new_idx].url(), original_url);
         assert!(workers[new_idx].is_healthy());
 
@@ -505,11 +482,9 @@ mod tests {
         // back-dating last_sweep.
         let policy = StickyLeastLoadedPolicy::with_expiration_secs(0);
         let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
-        let headers = header_with_session("sess-ttl");
+        let session = "sess-ttl";
 
-        policy
-            .select_worker_with_headers(&workers, None, Some(&headers))
-            .unwrap();
+        select(&policy, &workers, session).unwrap();
         assert_eq!(policy.active_session_count(), 1);
 
         {
@@ -519,10 +494,8 @@ mod tests {
 
         // A subsequent request triggers the sweep, removing the expired session
         // and creating a fresh one.
-        let other = header_with_session("sess-other");
-        policy
-            .select_worker_with_headers(&workers, None, Some(&other))
-            .unwrap();
+        let other = "sess-other";
+        select(&policy, &workers, other).unwrap();
         // The expired session was swept; only the freshly created one remains.
         assert_eq!(policy.active_session_count(), 1);
         assert_eq!(
@@ -537,9 +510,7 @@ mod tests {
         let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
         let sessions: Vec<String> = (0..4).map(|i| format!("sess-{}", i)).collect();
         for session in &sessions {
-            policy
-                .select_worker_with_headers(&workers, None, Some(&header_with_session(session)))
-                .unwrap();
+            select(&policy, &workers, session).unwrap();
         }
 
         // Keep sess-0 and one other session on sess-0's replica; finish the
@@ -572,9 +543,7 @@ mod tests {
 
         // The next request treats sess-0 as a new session and assigns it to the
         // least-loaded replica instead of reviving the expired mapping.
-        let idx = policy
-            .select_worker_with_headers(&workers, None, Some(&header_with_session("sess-0")))
-            .unwrap();
+        let idx = select(&policy, &workers, "sess-0").unwrap();
         assert_eq!(workers[idx].url(), other);
         assert_eq!(policy.active_count_for(&original), 1);
         assert_eq!(policy.active_count_for(&other), 1);

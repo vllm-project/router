@@ -121,6 +121,28 @@ pub fn resolve_affinity_identity(
     }))
 }
 
+/// Session id for session-aware load balancing: the placement key of the
+/// request's stable identity.
+pub fn resolve_session_key(
+    headers: Option<&HeaderMap>,
+    fields: IdentityFields<'_>,
+) -> Result<Option<String>, IdentityError> {
+    Ok(resolve_affinity_identity(headers, fields)?
+        .map(|identity| identity.placement_key().to_owned()))
+}
+
+/// Session id to route with when a policy `needs_session_id`. Invalid identity
+/// metadata routes the request without a session, as affinity routing does.
+pub fn routing_session_key(
+    needed: bool,
+    headers: Option<&HeaderMap>,
+    fields: IdentityFields<'_>,
+) -> Option<String> {
+    needed
+        .then(|| resolve_session_key(headers, fields).ok().flatten())
+        .flatten()
+}
+
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
 pub(crate) fn resolve_stable_identity(
     headers: Option<&HeaderMap>,
@@ -399,5 +421,65 @@ pub(crate) fn scoped_program_id(session_id: &str, actor_id: Option<&str>) -> Str
         actor_id.to_string()
     } else {
         format!("{prefix}{actor_id}")
+    }
+}
+
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
+mod tests {
+    use super::*;
+
+    fn headers(pairs: &[(&'static str, &str)]) -> HeaderMap {
+        pairs
+            .iter()
+            .map(|(name, value)| {
+                (
+                    http::header::HeaderName::from_static(name),
+                    value.parse().unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn session_key_is_the_id_the_client_sent() {
+        // /finish_session receives the raw id, so the key must not carry the
+        // ":lead" or ":<agent>" suffix of the program id.
+        let key = |h: Option<&HeaderMap>, body: Option<&JsonValue>| {
+            resolve_session_key(h, body.map(IdentityFields::from_body).unwrap_or_default()).unwrap()
+        };
+        assert_eq!(
+            key(Some(&headers(&[("x-session-id", "abc")])), None).as_deref(),
+            Some("abc")
+        );
+        assert_eq!(
+            key(
+                Some(&headers(&[
+                    ("x-claude-code-session-id", "claude"),
+                    ("x-claude-code-agent-id", "researcher"),
+                ])),
+                None,
+            )
+            .as_deref(),
+            Some("claude")
+        );
+        let body = serde_json::json!({"session_params": {"session_id": "params"}});
+        assert_eq!(key(None, Some(&body)).as_deref(), Some("params"));
+        // An agentic context keys on its task, so every agent of the task
+        // shares the session; without a task it keys on the session.
+        let context = |c: JsonValue| serde_json::json!({"vllm_xargs": {"agentic_context": c}});
+        let body = context(serde_json::json!({"session_id": "s", "task_id": "t", "agent_id": "a"}));
+        assert_eq!(key(None, Some(&body)).as_deref(), Some("t"));
+        let body = context(serde_json::json!({"session_id": "s"}));
+        assert_eq!(key(None, Some(&body)).as_deref(), Some("s"));
+    }
+
+    #[test]
+    fn session_key_ignores_request_scoped_and_user_ids() {
+        let request_scoped = headers(&[("x-request-id", "r"), ("x-trace-id", "t")]);
+        let body = serde_json::json!({"user": "u", "user_id": "u", "prompt": "p"});
+        assert_eq!(
+            resolve_session_key(Some(&request_scoped), IdentityFields::from_body(&body)).unwrap(),
+            None
+        );
     }
 }
