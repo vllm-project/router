@@ -29,6 +29,7 @@ use super::openai::{
     completion_final_response, final_response, finish_reason_name, now_secs, sse_chunk,
     sse_usage_chunk, SSE_DONE,
 };
+use super::outcome::EngineOutcomeObserver;
 use super::pb::control_client::ControlClient;
 use super::pb::finish_info::FinishReason;
 use super::pb::inference_client::InferenceClient;
@@ -201,43 +202,6 @@ fn grpc_status_code(status: &tonic::Status) -> StatusCode {
         tonic::Code::DeadlineExceeded => StatusCode::GATEWAY_TIMEOUT,
         tonic::Code::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
         _ => StatusCode::BAD_GATEWAY,
-    }
-}
-
-/// Terminal Engine outcome that the client-visible SSE may hide.
-///
-/// Two pieces of information are known to the gRPC producer but not necessarily
-/// written to the client stream: the Engine's prompt/completion counts (the SSE
-/// `usage` chunk is emitted only for `stream_options.include_usage: true`) and
-/// whether the stream ended in an error frame. Program settlement reads this
-/// observer so exact-count reconciliation and TTL accounting do not depend on
-/// what the client asked to see.
-#[derive(Debug, Default)]
-pub struct EngineOutcomeObserver {
-    usage: parking_lot::Mutex<Option<(Option<usize>, usize)>>,
-    failed: std::sync::atomic::AtomicBool,
-}
-
-impl EngineOutcomeObserver {
-    /// Record the Engine's own counts. `prompt_tokens` stays `None` when the
-    /// Engine did not report `prompt_info`: the Router's prepared count must
-    /// not masquerade as Engine usage, or reconciliation would compare it with
-    /// itself and never detect tokenizer drift.
-    pub fn record_usage(&self, prompt_tokens: Option<usize>, completion_tokens: usize) {
-        *self.usage.lock() = Some((prompt_tokens, completion_tokens));
-    }
-
-    pub fn record_error(&self) {
-        self.failed
-            .store(true, std::sync::atomic::Ordering::Release);
-    }
-
-    pub fn usage(&self) -> Option<(Option<usize>, usize)> {
-        *self.usage.lock()
-    }
-
-    pub fn failed(&self) -> bool {
-        self.failed.load(std::sync::atomic::Ordering::Acquire)
     }
 }
 

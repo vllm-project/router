@@ -40,6 +40,13 @@ pub struct ProgramDiagnostic {
     pub placement: Option<String>,
     /// Input-token demand currently reserved in the rank ledger.
     pub context_tokens: usize,
+    /// Deprecated compatibility alias for `context_tokens`.
+    ///
+    /// Kept in the serialized snapshot so existing diagnostics consumers keep
+    /// working after the field was renamed; new code should use
+    /// `context_tokens`.
+    #[serde(rename = "estimated_context_tokens")]
+    pub legacy_estimated_context_tokens: usize,
     /// Provenance of `context_tokens`.
     pub context_token_source: &'static str,
     /// Prepared counterfactual recorded by shadow mode, if any.
@@ -282,6 +289,7 @@ impl ProgramScheduler {
                     last_target: decision.last_target.clone(),
                     placement: runtime.placement.map(str::to_string),
                     context_tokens: decision.context_tokens,
+                    legacy_estimated_context_tokens: decision.context_tokens,
                     context_token_source: decision.context_token_source.as_str(),
                     shadow_context_tokens: decision
                         .shadow_context_facts
@@ -606,6 +614,17 @@ mod tests {
         assert_eq!(snapshot.ranks[0].target_id, "rank-0");
         assert_eq!(snapshot.ranks[0].router_active_reasoning_programs, 1);
         assert_eq!(snapshot.ranks[0].programs[0].context_tokens, 123);
+        assert_eq!(
+            snapshot.ranks[0].programs[0].legacy_estimated_context_tokens,
+            123
+        );
+        // The serialized snapshot keeps the legacy key for compatibility.
+        let serialized = serde_json::to_value(&snapshot).unwrap();
+        assert_eq!(serialized["ranks"][0]["programs"][0]["context_tokens"], 123);
+        assert_eq!(
+            serialized["ranks"][0]["programs"][0]["estimated_context_tokens"],
+            123
+        );
         assert_eq!(
             snapshot.ranks[0].programs[0].context_token_source,
             "estimated"

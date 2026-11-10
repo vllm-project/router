@@ -234,7 +234,7 @@ impl EngineFrontend {
         worker_url: &str,
         prepared: PreparedRequest,
         on_first_output: Option<FirstOutputCallback>,
-        observer: Option<std::sync::Arc<super::grpc::EngineOutcomeObserver>>,
+        observer: Option<std::sync::Arc<super::outcome::EngineOutcomeObserver>>,
     ) -> Response {
         self.grpc
             .dispatch_prepared(

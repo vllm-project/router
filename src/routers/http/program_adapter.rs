@@ -3,7 +3,7 @@
 //! This module understands transport envelopes only. Identity parsing and all
 //! scheduling decisions remain in `program_scheduling`.
 
-use crate::backend::grpc::EngineOutcomeObserver;
+use crate::backend::EngineOutcomeObserver;
 use crate::program_scheduling::{ProgramDispatch, ProgramScheduler, ProgramUsageObservation};
 use crate::token_estimator::{MomentumTokenEstimator, TokenEstimateCalibration};
 use parking_lot::Mutex;

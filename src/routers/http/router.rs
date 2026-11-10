@@ -391,13 +391,6 @@ fn hold_request_load_with_output_frame(
     Response::from_parts(parts, Body::from_stream(stream))
 }
 
-/// Upper bound for the body bytes a settlement wrapper keeps to parse usage.
-///
-/// The bytes are forwarded to the client as they arrive; this only bounds the
-/// observation copy, so an unexpectedly large response stops being parsed for
-/// usage instead of failing the request.
-const MAX_PROGRAM_SETTLEMENT_OBSERVATION_BYTES: usize = 16 * 1024 * 1024;
-
 /// Settle one Program attempt on the response's true terminal state.
 ///
 /// A gRPC dispatch returns a streaming body, so finishing at header time would
@@ -415,18 +408,20 @@ async fn settle_program_completion_on_response(
         completion.finish(false);
         return response;
     }
-    // The body is forwarded to the client as it arrives; the wrapper only
-    // observes it (SSE lines or the buffered JSON body) for settlement. A
-    // non-streaming response must not be delayed until the whole body has been
-    // buffered, and a failed observation copy must not turn a successful
-    // Engine response into an error.
+    if !is_stream {
+        // The gRPC buffered adapter has already read the Engine response and
+        // recorded its usage in the completion observer, so the attempt settles
+        // at header time exactly as before. The body passes through untouched.
+        completion.finish(true);
+        return response;
+    }
+    // Streaming attempts settle on the stream's terminal state: forward every
+    // chunk while observing SSE usage/error frames, and finish once at EOF (or
+    // failure). The body is never buffered ahead of the client.
     let (parts, body) = response.into_parts();
     let stream = ProgramSettlementBody {
         inner: Box::pin(body.into_data_stream()),
         completion: Some(completion),
-        is_sse: is_stream,
-        buffered: Vec::new(),
-        observation_overflow: false,
     };
     Response::from_parts(parts, Body::from_stream(stream))
 }
@@ -435,11 +430,6 @@ async fn settle_program_completion_on_response(
 struct ProgramSettlementBody {
     inner: Pin<Box<dyn futures_util::Stream<Item = Result<axum::body::Bytes, axum::Error>> + Send>>,
     completion: Option<ProgramCompletion>,
-    /// Streams are observed as SSE lines; non-streaming bodies are observed as
-    /// one buffered JSON document.
-    is_sse: bool,
-    buffered: Vec<u8>,
-    observation_overflow: bool,
 }
 
 impl futures_util::Stream for ProgramSettlementBody {
@@ -450,15 +440,7 @@ impl futures_util::Stream for ProgramSettlementBody {
         match this.inner.as_mut().poll_next(cx) {
             Poll::Ready(Some(Ok(chunk))) => {
                 if let Some(completion) = &this.completion {
-                    if this.is_sse {
-                        completion.observe_sse_chunk(&chunk);
-                    } else if !this.observation_overflow {
-                        this.buffered.extend_from_slice(&chunk);
-                        if this.buffered.len() > MAX_PROGRAM_SETTLEMENT_OBSERVATION_BYTES {
-                            this.observation_overflow = true;
-                            this.buffered.clear();
-                        }
-                    }
+                    completion.observe_sse_chunk(&chunk);
                 }
                 Poll::Ready(Some(Ok(chunk)))
             }
@@ -470,10 +452,6 @@ impl futures_util::Stream for ProgramSettlementBody {
             }
             Poll::Ready(None) => {
                 if let Some(completion) = this.completion.take() {
-                    if !this.is_sse && !this.observation_overflow {
-                        completion.observe_json(&this.buffered);
-                    }
-                    this.buffered.clear();
                     completion.finish(true);
                 }
                 Poll::Ready(None)
@@ -5862,9 +5840,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn buffered_program_attempt_settles_after_the_body() {
+    async fn buffered_program_attempt_settles_at_header_time_with_producer_usage() {
         let (scheduler, dispatch) = settlement_scheduler(100).await;
         let completion = program_completion(&scheduler, dispatch);
+        // The gRPC collect path recorded the Engine counts before returning.
+        completion.engine_observer().record_usage(Some(177), 3);
         let response = Response::new(Body::from(
             "{\"usage\":{\"prompt_tokens\":177,\"completion_tokens\":3}}",
         ));
