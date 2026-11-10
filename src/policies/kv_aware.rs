@@ -1023,6 +1023,12 @@ impl KvAwarePolicy {
         self
     }
 
+    /// Whether a shadow transfer planner is installed.
+    #[cfg(test)]
+    pub(crate) fn has_transfer_planner(&self) -> bool {
+        self.transfer_planner.is_some()
+    }
+
     /// Declare what a worker can do for KV transfer. Replaced on re-register
     /// and dropped by `unregister_target`.
     pub fn register_transfer_capability(
