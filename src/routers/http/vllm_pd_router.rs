@@ -1628,13 +1628,29 @@ impl VllmPDRouter {
         };
         // Tokenize before admission so kv_aware and cache_aware score the
         // exact ids P will prefill.
-        let prepared = match self.grpc_frontend.prepare(body.clone()).await {
+        let prepared = if self.epd.is_some() {
+            self.grpc_frontend.prepare_with_media(body.clone()).await
+        } else {
+            self.grpc_frontend.prepare(body.clone()).await
+        };
+        let mut prepared = match prepared {
             Ok(prepared) => prepared,
             Err(error) => {
                 return (prepare_error_status(&error), error.to_string()).into_response();
             }
         };
-        let router_prompts: Arc<[Vec<u32>]> = Arc::from([prepared.tokenized.token_ids.to_vec()]);
+        // Experimental gRPC E→P→D: encode before admission, so the pair is
+        // scored on P's expanded prompt. Validation rules out Mooncake here.
+        if let Some(epd) = &self.epd {
+            if let Err(error) = epd
+                .prepare_grpc(&self.grpc_frontend, &mut prepared, "", headers)
+                .await
+            {
+                RouterMetrics::record_request_error(path, "encoder_error");
+                return error.into_response();
+            }
+        }
+        let router_prompts: Arc<[Vec<u32>]> = Arc::from([prepared.routing_token_ids().to_vec()]);
         let Some((selection, attempt)) = self
             .admit_pair_with_tokens(
                 &prefill_workers,
@@ -2138,7 +2154,12 @@ impl VllmPDRouter {
         attempt.begin_decode();
         let response = self
             .grpc_frontend
-            .dispatch_decode(decode_worker.url(), prepared, request_id, decode_params)
+            .dispatch_decode(
+                decode_worker.url(),
+                prepared.for_decode(),
+                request_id,
+                decode_params,
+            )
             .await;
         let decode_outcome = grpc_decode_outcome(&response);
         let response = own_grpc_decode(response, attempt);
@@ -2199,7 +2220,7 @@ impl VllmPDRouter {
                 .grpc_frontend
                 .dispatch_decode(
                     decode_worker.url(),
-                    prepared.clone(),
+                    prepared.clone().for_decode(),
                     request_id,
                     Some(decode_params),
                 )

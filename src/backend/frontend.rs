@@ -11,7 +11,12 @@ use axum::response::Response;
 
 use super::grpc::{FirstOutputCallback, GrpcEngineBackend, KvHandoff};
 use super::l1_encode_cache::{L1CacheConfig, L1CacheStats};
-use super::preprocess::{tokenize_chat_request_timed, FrontendHandle, TokenizeOut, TokenizerCache};
+use super::pb;
+use super::preprocess::{
+    tokenize_chat_request_timed, tokenize_chat_request_with_media, FrontendHandle, TokenizeOut,
+    TokenizerCache,
+};
+pub use super::vllm_frontend::MediaPartSource;
 use crate::protocols::spec::ChatCompletionRequest;
 use crate::tokenizer::{TokenizerCacheConfig, TokenizerCacheStats};
 
@@ -54,6 +59,67 @@ pub struct PreparedRequest {
     pub shape: ResponseShape,
     /// Client opted in with `return_token_ids`; ids are withheld otherwise.
     pub emit_token_ids: bool,
+    /// Experimental gRPC EPD: `token_ids` hold one unexpanded template marker
+    /// per media item; the worker expands them from `media.items`.
+    pub media: Option<GrpcMedia>,
+}
+
+impl PreparedRequest {
+    /// The prompt as the worker will see it, for routing and admission: the
+    /// EPD-expanded prompt when known, else the tokenized prompt.
+    pub fn routing_token_ids(&self) -> &[u32] {
+        self.media
+            .as_ref()
+            .and_then(|media| media.routing_token_ids.as_deref())
+            .unwrap_or(&self.tokenized.token_ids)
+    }
+
+    /// The request as an E→P→D decode worker gets it: media for the prompt
+    /// layout, without P's encoder-cache reservations.
+    pub fn for_decode(mut self) -> Self {
+        if let Some(media) = self.media.as_mut() {
+            media.ec_transfer_params = None;
+        }
+        self
+    }
+
+    /// Exact prompt length, known only once the EPD encoder stage expanded it.
+    pub fn exact_prompt_tokens(&self) -> Option<usize> {
+        self.media
+            .as_ref()
+            .and_then(|media| media.routing_token_ids.as_ref())
+            .map(|ids| ids.len())
+    }
+}
+
+/// Media a gRPC EPD request owes the worker. Filled by the encoder stage
+/// (`routers::http::epd::grpc`), before selection unless Mooncake needs the
+/// consumer first.
+#[derive(Clone, Debug, Default)]
+pub struct GrpcMedia {
+    /// The renderer's media order; `None` is request order.
+    pub order: Option<Vec<MediaPartSource>>,
+    /// Raw media in placeholder order, each with its identity uuid pinned.
+    pub items: Vec<pb::MediaItem>,
+    pub ec_transfer_params: Option<serde_json::Value>,
+    /// Set by the encoder stage; dispatch refuses media that skipped it.
+    pub encoded: bool,
+    /// The worker's expanded prompt, spliced from the encoders' prompt ids.
+    /// Routing only: dispatch still sends markers plus `items`.
+    pub routing_token_ids: Option<Arc<[u32]>>,
+}
+
+impl GrpcMedia {
+    pub(crate) fn apply(&self, proto: &mut pb::GenerateRequest) -> Result<(), String> {
+        if !self.encoded {
+            return Err("gRPC EPD media was not encoded before dispatch".into());
+        }
+        proto.media = self.items.clone();
+        if let Some(params) = &self.ec_transfer_params {
+            super::convert::set_ec_transfer_params(proto, params)?;
+        }
+        Ok(())
+    }
 }
 
 /// Load-once tokenizer + tonic client. One replica per router process.
@@ -168,7 +234,66 @@ impl EngineFrontend {
             t_req,
             shape: ResponseShape::Chat,
             emit_token_ids: false,
+            media: None,
         })
+    }
+
+    /// `prepare` for experimental gRPC EPD: media parts render as markers and
+    /// `media` must be filled by the encoder stage before dispatch.
+    pub async fn prepare_with_media(
+        &self,
+        mut request: ChatCompletionRequest,
+    ) -> Result<PreparedRequest, PrepareError> {
+        let (handle, t_req, resolve_ms) = self.resolve_with_defaults(&mut request).await?;
+        if request
+            .other
+            .get("truncate_prompt_tokens")
+            .is_some_and(|value| !value.is_null())
+        {
+            // Truncation could cut a marker away from its media item.
+            return Err(PrepareError::Invalid(
+                "truncate_prompt_tokens is not supported with gRPC EPD media".into(),
+            ));
+        }
+        let (tokenized, order) = tokenize_chat_request_with_media(&request, &handle)
+            .map_err(|e| PrepareError::Invalid(format!("preprocess: {e}")))?;
+        Ok(PreparedRequest {
+            request: Arc::new(request),
+            tokenized,
+            handle,
+            resolve_ms,
+            t_req,
+            shape: ResponseShape::Chat,
+            emit_token_ids: false,
+            media: Some(GrpcMedia {
+                order,
+                ..Default::default()
+            }),
+        })
+    }
+
+    /// Encoder-stage helper: template + tokenize a chat on this model.
+    pub async fn tokenize_with_media(
+        &self,
+        request: &ChatCompletionRequest,
+    ) -> Result<Vec<u32>, PrepareError> {
+        let handle = self
+            .tokenizer
+            .resolve(request.model.as_deref())
+            .await
+            .map_err(|e| PrepareError::Unavailable(format!("tokenizer: {e}")))?;
+        let (tokenized, _) = tokenize_chat_request_with_media(request, &handle)
+            .map_err(|e| PrepareError::Invalid(format!("preprocess: {e}")))?;
+        Ok(tokenized.token_ids.to_vec())
+    }
+
+    /// Unary `Generate` on `worker_url` (the encoder call of gRPC EPD).
+    pub async fn generate(
+        &self,
+        worker_url: &str,
+        request: pb::GenerateRequest,
+    ) -> Result<pb::GenerateResponse, Result<tonic::Status, String>> {
+        self.grpc.generate(worker_url, request).await
     }
 
     /// Wire adapter path for `/v1/completions` on the gRPC pool: the client
@@ -198,6 +323,7 @@ impl EngineFrontend {
             t_req,
             shape: ResponseShape::Completion,
             emit_token_ids,
+            media: None,
         })
     }
 

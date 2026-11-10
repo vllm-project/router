@@ -20,7 +20,8 @@ use super::l1_encode_cache::{L1Cache, L1CacheConfig, L1CacheStats};
 use crate::tokenizer::{TokenizerCacheConfig, TokenizerCacheStats};
 
 use super::vllm_frontend::{
-    chat_request_from_openai, system_text, tool_text, user_text, OpenAiChatRequest, VllmFrontend,
+    chat_request_from_openai, system_text, tool_text, user_parts, user_text, MediaPartSource,
+    OpenAiChatRequest, UpstreamContentPart, VllmFrontend,
 };
 use crate::protocols::spec::{
     ChatCompletionRequest, ChatMessage as SpecChatMessage, CompletionRequest, LoRAPath,
@@ -692,11 +693,30 @@ pub fn tokenize_chat_request_timed(
                 cached_tokens: 0,
             })
         }
-        Frontend::Vllm(vllm) => tokenize_vllm(request, vllm),
+        Frontend::Vllm(vllm) => tokenize_vllm(request, vllm, false).map(|(out, _)| out),
     }
 }
 
-fn tokenize_vllm(request: &ChatCompletionRequest, frontend: &VllmFrontend) -> Result<TokenizeOut> {
+/// gRPC EPD only: user media parts render as the template's markers, one per
+/// item, which the worker expands from the raw media sent alongside. Also
+/// returns the renderer's media order (`None` = request order).
+pub fn tokenize_chat_request_with_media(
+    request: &ChatCompletionRequest,
+    frontend: &FrontendHandle,
+) -> Result<(TokenizeOut, Option<Vec<MediaPartSource>>)> {
+    match &frontend.0 {
+        Frontend::TestIds(_) => {
+            tokenize_chat_request_timed(request, frontend).map(|out| (out, None))
+        }
+        Frontend::Vllm(vllm) => tokenize_vllm(request, vllm, true),
+    }
+}
+
+fn tokenize_vllm(
+    request: &ChatCompletionRequest,
+    frontend: &VllmFrontend,
+    allow_media: bool,
+) -> Result<(TokenizeOut, Option<Vec<MediaPartSource>>)> {
     if request
         .tools
         .as_ref()
@@ -752,7 +772,7 @@ fn tokenize_vllm(request: &ChatCompletionRequest, frontend: &VllmFrontend) -> Re
         .map(str::to_string);
     let upstream = chat_request_from_openai(OpenAiChatRequest {
         request_id: format!("router-{}", request.model.as_deref().unwrap_or("model")),
-        messages: spec_messages_to_upstream(&request.messages)?,
+        messages: spec_messages_to_upstream(&request.messages, allow_media)?,
         add_generation_prompt: request.add_generation_prompt,
         continue_final_message: request.continue_final_message,
         template_kwargs: kwargs,
@@ -781,30 +801,38 @@ fn tokenize_vllm(request: &ChatCompletionRequest, frontend: &VllmFrontend) -> Re
         session_id,
     })?;
     let adapt_ms = t0.elapsed().as_secs_f64() * 1000.0;
-    let (token_ids, cached_tokens, template_ms, encode_ms) = frontend
-        .chat_tokenize_timed(&upstream)
+    let (token_ids, cached_tokens, template_ms, encode_ms, media_order) = frontend
+        .chat_tokenize_with_media_order(&upstream)
         .map_err(|e| anyhow!("vllm-chat tokenize: {e}"))?;
     if token_ids.is_empty() {
         return Err(anyhow!("vllm-chat produced empty token_ids"));
     }
-    Ok(TokenizeOut {
-        token_ids,
-        adapt_ms,
-        template_ms,
-        encode_ms,
-        encode_backend: "vllm-tokenizer",
-        cached_tokens,
-    })
+    Ok((
+        TokenizeOut {
+            token_ids,
+            adapt_ms,
+            template_ms,
+            encode_ms,
+            encode_backend: "vllm-tokenizer",
+            cached_tokens,
+        },
+        media_order,
+    ))
 }
 
 fn spec_messages_to_upstream(
     messages: &[SpecChatMessage],
+    allow_media: bool,
 ) -> Result<Vec<super::vllm_frontend::UpstreamChatMessage>> {
     messages
         .iter()
         .map(|message| {
             Ok(match message {
                 SpecChatMessage::System { content, .. } => system_text(user_content_text(content)?),
+                SpecChatMessage::User {
+                    content: UserMessageContent::Parts(parts),
+                    ..
+                } if allow_media => user_parts(user_content_parts(parts)?),
                 SpecChatMessage::User { content, .. } => user_text(user_content_text(content)?),
                 SpecChatMessage::Assistant {
                     content,
@@ -931,6 +959,47 @@ fn spec_reasoning_effort(request: &ChatCompletionRequest) -> Result<Option<VllmR
             serde_json::from_value(value).map_err(Into::into)
         })
         .transpose()
+}
+
+/// Template view of user media for gRPC EPD; the payload itself travels as
+/// `MediaItem`s (see `routers::http::epd::grpc`).
+fn user_content_parts(parts: &[serde_json::Value]) -> Result<Vec<UpstreamContentPart>> {
+    let url = |part: &serde_json::Value, kind: &str| -> Result<String> {
+        part.get(kind)
+            .and_then(|value| value.get("url"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| anyhow!("{kind} content part is missing `{kind}.url`"))
+    };
+    parts
+        .iter()
+        .map(|part| {
+            Ok(match part.get("type").and_then(serde_json::Value::as_str) {
+                Some("text") => UpstreamContentPart::text(
+                    part.get("text")
+                        .and_then(serde_json::Value::as_str)
+                        .ok_or_else(|| {
+                            anyhow!("text content part is missing a string `text` field")
+                        })?,
+                ),
+                Some("image_url") => UpstreamContentPart::image_url(url(part, "image_url")?),
+                Some("video_url") => UpstreamContentPart::video_url(url(part, "video_url")?),
+                Some("audio_url") => UpstreamContentPart::audio_url(url(part, "audio_url")?),
+                Some("input_audio") => UpstreamContentPart::input_audio(
+                    part.pointer("/input_audio/data")
+                        .and_then(serde_json::Value::as_str)
+                        .ok_or_else(|| anyhow!("input_audio content part is missing data"))?,
+                    None,
+                ),
+                Some(other) => {
+                    return Err(anyhow!(
+                        "content part `{other}` is not supported by experimental gRPC EPD"
+                    ))
+                }
+                None => return Err(anyhow!("content part is missing type")),
+            })
+        })
+        .collect()
 }
 
 fn user_content_text(content: &UserMessageContent) -> Result<String> {
@@ -1426,8 +1495,9 @@ mod tests {
             "add_generation_prompt": true
         }))
         .unwrap();
-        tokenize_vllm(&req, &frontend)
+        tokenize_vllm(&req, &frontend, false)
             .expect("vllm-chat tokenize")
+            .0
             .token_ids
             .to_vec()
     }
@@ -1451,7 +1521,7 @@ mod tests {
         }))
         .unwrap();
 
-        let messages = spec_messages_to_upstream(&request.messages).unwrap();
+        let messages = spec_messages_to_upstream(&request.messages, false).unwrap();
         let vllm_chat::ChatMessage::Assistant { content } = &messages[0] else {
             panic!("expected assistant message");
         };
@@ -1483,7 +1553,7 @@ mod tests {
             }))
             .unwrap();
 
-            let error = spec_messages_to_upstream(&request.messages).unwrap_err();
+            let error = spec_messages_to_upstream(&request.messages, false).unwrap_err();
             assert_eq!(
                 error.to_string(),
                 format!("chat message role `{role}` is not supported by the router gRPC frontend")
@@ -1510,7 +1580,7 @@ mod tests {
         }))
         .unwrap();
 
-        let messages = spec_messages_to_upstream(&request.messages).unwrap();
+        let messages = spec_messages_to_upstream(&request.messages, false).unwrap();
         let tools = spec_tools_to_upstream(&request).unwrap();
         let choice = spec_tool_choice_to_upstream(request.tool_choice.as_ref()).unwrap();
         let chat = chat_request_from_openai(OpenAiChatRequest {

@@ -880,6 +880,7 @@ impl Router {
         typed_req: &T,
         model_id: Option<&str>,
         endpoint: &str,
+        exact_prompt_tokens: Option<usize>,
     ) -> Result<Option<ProgramCompletion>, ScheduleError> {
         let Some(scheduler) = &self.program_scheduler else {
             return Ok(None);
@@ -902,6 +903,7 @@ impl Router {
             &model_pool,
             endpoint,
             &input_text,
+            exact_prompt_tokens,
         )
         .await
     }
@@ -933,6 +935,7 @@ impl Router {
             &model_pool,
             endpoint,
             input_text,
+            None,
         )
         .await
     }
@@ -944,11 +947,13 @@ impl Router {
         model_pool: &ResolvedProgramModelPool,
         endpoint: &str,
         input_text: &str,
+        exact_prompt_tokens: Option<usize>,
     ) -> Result<Option<ProgramCompletion>, ScheduleError> {
-        let (estimated_context_tokens, calibration) = self.program_token_estimator.estimate(
-            TokenEstimateScope::new(&model_pool.scheduler_key, endpoint),
-            input_text,
-        );
+        let scope = TokenEstimateScope::new(&model_pool.scheduler_key, endpoint);
+        let (estimated_context_tokens, calibration) = match exact_prompt_tokens {
+            Some(tokens) => MomentumTokenEstimator::exact(scope, tokens),
+            None => self.program_token_estimator.estimate(scope, input_text),
+        };
         let targets = self.program_targets_for_model(model_pool);
         let routing_text = scheduler
             .uses_cache_aware_binding()
@@ -1444,11 +1449,18 @@ impl Router {
         // The concrete request comes from `GenerationRequest::grpc_request`
         // rather than a `serde_json::Value` roundtrip: the only two routes a
         // gRPC pool admits are exactly the two concrete request types.
-        let prepared = match (pool, typed_req.grpc_request()) {
+        let mut prepared = match (pool, typed_req.grpc_request()) {
             (Some(crate::backend::WorkerPoolKind::Grpc), Some(GrpcRequestRef::Chat(chat)))
                 if route == "/v1/chat/completions" =>
             {
-                match self.frontend.prepare(chat.clone()).await {
+                // Experimental gRPC EPD: media render as markers, expanded by
+                // the encoder stage below.
+                let prepared = if self.epd.is_some() {
+                    self.frontend.prepare_with_media(chat.clone()).await
+                } else {
+                    self.frontend.prepare(chat.clone()).await
+                };
+                match prepared {
                     Ok(prepared) => Some(prepared),
                     Err(error) => {
                         return (prepare_error_status(&error), error.to_string()).into_response();
@@ -1483,6 +1495,20 @@ impl Router {
             }
             _ => None,
         };
+        // Experimental gRPC EPD: encode before admission and selection so both
+        // see PD's exact prompt. Mooncake needs the consumer first; dispatch
+        // encodes then.
+        if let (Some(epd), Some(prepared)) = (&self.epd, prepared.as_mut()) {
+            if !epd.encodes_after_selection() {
+                if let Err(error) = epd
+                    .prepare_grpc(&self.frontend, prepared, "", headers)
+                    .await
+                {
+                    RouterMetrics::record_request_error(route, "encoder_error");
+                    return error.into_response();
+                }
+            }
+        }
 
         let completion = match (pool, typed_req.grpc_request()) {
             (
@@ -1540,7 +1566,13 @@ impl Router {
                 // previous ProgramCompletion finishes exactly once before a
                 // retry invokes this closure again.
                 let program_completion = match self
-                    .acquire_program_completion(headers, typed_req, model_id, route)
+                    .acquire_program_completion(
+                        headers,
+                        typed_req,
+                        model_id,
+                        route,
+                        prepared.as_ref().and_then(|p| p.exact_prompt_tokens()),
+                    )
                     .await
                 {
                     Ok(completion) => completion,
@@ -1602,7 +1634,7 @@ impl Router {
                     if kv_ops.is_some() {
                         RouterMetrics::record_kv_routing_input("grpc", "prepared");
                     }
-                    KvRequestTokens::Shared(Some(prepared.tokenized.token_ids.as_ref()))
+                    KvRequestTokens::Shared(Some(prepared.routing_token_ids()))
                 } else {
                     inputs
                         .map(KvRequestTokens::PerWorker)
@@ -1709,6 +1741,13 @@ impl Router {
                 // Client errors (4xx) are not worker failures - only server errors (5xx)
                 // should count against the circuit breaker.
                 let status = response.status();
+                if response
+                    .extensions()
+                    .get::<super::epd::EncoderStageFailure>()
+                    .is_some()
+                {
+                    return response;
+                }
                 let was_available = worker.is_available();
                 worker.record_outcome(status.is_success() || status.is_client_error());
                 if was_available != worker.is_available() {
@@ -1721,7 +1760,13 @@ impl Router {
                 response
             },
             // should_retry predicate
-            |res, _attempt| is_retryable_status(res.status()),
+            |res, _attempt| {
+                is_retryable_status(res.status())
+                    && res
+                        .extensions()
+                        .get::<super::epd::EncoderStageFailure>()
+                        .is_none()
+            },
             // on_backoff hook
             |delay, attempt| {
                 RouterMetrics::record_retry(route);
@@ -1736,7 +1781,12 @@ impl Router {
             let duration = start.elapsed();
             RouterMetrics::record_request(route);
             RouterMetrics::record_generate_duration(duration);
-        } else if !is_retryable_status(response.status()) {
+        } else if !is_retryable_status(response.status())
+            && response
+                .extensions()
+                .get::<super::epd::EncoderStageFailure>()
+                .is_none()
+        {
             RouterMetrics::record_request_error(route, "non_retryable_error");
         }
 
@@ -1905,6 +1955,27 @@ impl Router {
                 )
                     .into_response();
             };
+            let mut prepared = prepared;
+            let mut transfers = None;
+            if let Some(epd) = &self.epd {
+                match epd
+                    .prepare_grpc(&self.frontend, &mut prepared, worker_url, headers)
+                    .await
+                {
+                    Ok(guard) => transfers = guard,
+                    Err(error) => {
+                        RouterMetrics::record_request_error(route, "encoder_error");
+                        if let Some(completion) = &program_completion {
+                            completion.finish(false);
+                        }
+                        let mut response = error.into_response();
+                        response
+                            .extensions_mut()
+                            .insert(super::epd::EncoderStageFailure);
+                        return response;
+                    }
+                }
+            }
             let on_first_output = if is_stream {
                 None
             } else {
@@ -1916,6 +1987,12 @@ impl Router {
                 .frontend
                 .dispatch_with_first_output(worker_url, prepared, on_first_output)
                 .await;
+            // As HTTP EPD: PD owns the transfers once it accepted the request.
+            if response.status().is_success() {
+                if let Some(transfers) = transfers.as_mut() {
+                    transfers.disarm();
+                }
+            }
             if is_stream && response.status().is_success() {
                 response = hold_request_load_until_body_done(response, load);
             }

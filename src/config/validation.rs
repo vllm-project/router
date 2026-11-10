@@ -276,13 +276,30 @@ impl ConfigValidator {
             });
         }
         Self::validate_urls(&epd.encoder_urls)?;
-        for url in epd.encoder_urls.iter().chain(worker_urls.iter().copied()) {
-            if !url.starts_with("http://") && !url.starts_with("https://") {
-                return Err(ConfigError::InvalidValue {
-                    field: "epd.worker_url".into(),
-                    value: url.clone(),
-                    reason: "EPD requires HTTP(S) encoder and consumer URLs".into(),
+        let all_grpc = epd
+            .encoder_urls
+            .iter()
+            .chain(worker_urls.iter().copied())
+            .all(|url| url.starts_with("grpc://"));
+        if all_grpc {
+            // Experimental gRPC E→P→D encodes before pair admission; Mooncake
+            // EC would need P selected first.
+            if !matches!(config.mode, RoutingMode::Regular { .. })
+                && !epd.consumer_zmq_addrs.is_empty()
+            {
+                return Err(ConfigError::ValidationFailed {
+                    reason: "Experimental gRPC E→P→D does not support Mooncake EC yet".into(),
                 });
+            }
+        } else {
+            for url in epd.encoder_urls.iter().chain(worker_urls.iter().copied()) {
+                if !url.starts_with("http://") && !url.starts_with("https://") {
+                    return Err(ConfigError::InvalidValue {
+                        field: "epd.worker_url".into(),
+                        value: url.clone(),
+                        reason: "EPD requires HTTP(S) encoder and consumer URLs, or gRPC for all of them".into(),
+                    });
+                }
             }
         }
         if !epd.consumer_zmq_addrs.is_empty() {
@@ -1285,6 +1302,45 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn test_validate_experimental_grpc_epd_pd_rejects_mooncake() {
+        let epd = || EpdConfig {
+            encoder_urls: vec!["grpc://encoder:9000".into()],
+            consumer_zmq_addrs: Default::default(),
+        };
+        let mut config = RouterConfig::new(
+            RoutingMode::Regular {
+                worker_urls: vec!["grpc://consumer:9000".into()],
+            },
+            PolicyConfig::Random,
+        );
+        config.epd = Some(epd());
+        ConfigValidator::validate(&config).unwrap();
+
+        let mut config = RouterConfig::new(
+            RoutingMode::VllmPrefillDecode {
+                prefill_urls: vec![("grpc://prefill:9000".into(), None)],
+                decode_urls: vec!["grpc://decode:9000".into()],
+                prefill_policy: None,
+                decode_policy: None,
+                discovery_address: None,
+            },
+            PolicyConfig::Random,
+        );
+        config.epd = Some(epd());
+        ConfigValidator::validate(&config).unwrap();
+
+        let mut mooncake = epd();
+        mooncake
+            .consumer_zmq_addrs
+            .insert("grpc://prefill:9000".into(), "tcp://prefill:5555".into());
+        config.epd = Some(mooncake);
+        assert!(ConfigValidator::validate(&config)
+            .unwrap_err()
+            .to_string()
+            .contains("Mooncake"));
     }
 
     #[test]
