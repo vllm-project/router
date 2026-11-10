@@ -798,6 +798,10 @@ impl KvIndexSupervisor {
         let mut ranks = Vec::with_capacity(event_sources.len());
         let mut handles = Vec::with_capacity(event_sources.len());
         let mut hybrid_handles = Vec::new();
+        let mut hybrid_targets: Vec<(
+            crate::kv_index::subscriber::EventSource,
+            Arc<HybridEventIndex>,
+        )> = Vec::new();
         for (ev, live) in event_sources.into_iter().zip(&live_sources) {
             let rank = ev.dp_rank;
             if let Some(indexes) = &hybrid_indexes {
@@ -818,6 +822,7 @@ impl KvIndexSupervisor {
                         ranks.push(rank);
                         continue;
                     }
+                    hybrid_targets.push((ev.clone(), index.clone()));
                     let stream = Arc::new(HybridEventStream::new(index.clone()));
                     let handle = super::hybrid::spawn_zmq(ev, stream, self.ctx.clone())
                         .expect("hybrid source was validated before registration");
@@ -854,7 +859,10 @@ impl KvIndexSupervisor {
         });
         if let Some(provider) = &hybrid {
             let provider = Arc::downgrade(provider);
-            let handles = hybrid_handles.clone();
+            let mut handles = hybrid_handles.clone();
+            let mut expired = false;
+            let targets = hybrid_targets.clone();
+            let probe_ctx = self.ctx.clone();
             let client = self.client.clone();
             let worker = worker_url.to_owned();
             let api_key = self.api_key.clone();
@@ -866,15 +874,19 @@ impl KvIndexSupervisor {
                     let Some(provider) = provider.upgrade() else {
                         break;
                     };
-                    if !provider.active.load(Ordering::Acquire) {
+                    if !provider.active.load(Ordering::Acquire) && !expired {
+                        // Retired by the owner, not by this task's own expiry.
                         break;
                     }
-                    if provider.verified_at.lock().elapsed() > Duration::from_secs(5) {
+                    if provider.verified_at.lock().elapsed() > Duration::from_secs(5) && !expired {
+                        // Expire the view but keep probing: a recovered control
+                        // endpoint must be able to re-admit this worker instead
+                        // of staying dark until a restart.
                         provider.active.store(false, Ordering::Release);
                         for handle in &handles {
                             handle.shutdown();
                         }
-                        break;
+                        expired = true;
                     }
                     let outcome = if let Some(config) = &static_config {
                         static_hybrid_sources_match(
@@ -897,8 +909,23 @@ impl KvIndexSupervisor {
                         }
                         break;
                     }
-                    if probe_renews_trust(&outcome) {
-                        *provider.verified_at.lock() = Instant::now();
+                    if probe_keeps_trust(&outcome) {
+                        if expired {
+                            handles.clear();
+                            for (ev, index) in &targets {
+                                let stream = Arc::new(HybridEventStream::new(index.clone()));
+                                if let Ok(handle) =
+                                    super::hybrid::spawn_zmq(ev.clone(), stream, probe_ctx.clone())
+                                {
+                                    handles.push(Arc::new(handle));
+                                }
+                            }
+                            expired = false;
+                            provider.active.store(true, Ordering::Release);
+                        }
+                        if probe_renews_trust(&outcome) {
+                            *provider.verified_at.lock() = Instant::now();
+                        }
                     }
                 }
             });
