@@ -1,6 +1,6 @@
 use crate::config::EpdConfig;
 use axum::http::{HeaderMap, StatusCode};
-use futures_util::future::join_all;
+use futures_util::future::try_join_all;
 use reqwest::{Client, RequestBuilder};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
@@ -221,7 +221,10 @@ impl EncoderStage {
                 groups.push((encoder, vec![index]));
             }
         }
-        let replies = join_all(groups.iter().map(|(encoder, indices)| {
+        // A failed encoder must not leave the other calls running. Dropping
+        // those futures aborts their HTTP requests. `EcTransferGuard` still
+        // cancels transfers that were already published when this returns.
+        let replies = try_join_all(groups.iter().map(|(encoder, indices)| {
             let encoder_url = &self.config.encoder_urls[*encoder];
             let mut request = client
                 .post(format!(
@@ -248,8 +251,7 @@ impl EncoderStage {
                 consumer_addr.map(String::as_str),
             )
         }))
-        .await;
-        let replies: Vec<Value> = replies.into_iter().collect::<Result<_, _>>()?;
+        .await?;
         let mut handles = Map::new();
         // Sort transfers by content position, including caller-supplied embeds.
         let mut transfers = Vec::new();
@@ -538,7 +540,9 @@ fn flatten_metadata(metadata: &Map<String, Value>) -> Result<Map<String, Value>,
 mod tests {
     use super::*;
     use axum::{extract::State, routing::post, Json, Router};
+    use std::sync::atomic::AtomicBool;
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     #[derive(Clone)]
     struct MockEncoder {
@@ -856,6 +860,71 @@ mod tests {
             .unwrap();
         assert_eq!(error.0, StatusCode::SERVICE_UNAVAILABLE);
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn failed_encoder_cancels_a_blocked_sibling() {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let slow = Router::new()
+            .route("/v1/chat/completions", post(slow_encode))
+            .with_state(cancelled.clone());
+        let fail = Router::new().route("/v1/chat/completions", post(fail_encode));
+        let slow_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let fail_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let slow_url = format!("http://{}", slow_listener.local_addr().unwrap());
+        let fail_url = format!("http://{}", fail_listener.local_addr().unwrap());
+        let slow_server =
+            tokio::spawn(async move { axum::serve(slow_listener, slow).await.unwrap() });
+        let fail_server =
+            tokio::spawn(async move { axum::serve(fail_listener, fail).await.unwrap() });
+        let stage = EncoderStage::new(EpdConfig {
+            encoder_urls: vec![fail_url, slow_url],
+            consumer_zmq_addrs: Default::default(),
+        });
+        let input = json!({
+            "model": "test",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": "http://example.test/a.png"}},
+                    {"type": "image_url", "image_url": {"url": "http://example.test/b.png"}},
+                ],
+            }],
+        });
+        let started = Instant::now();
+        let error = stage
+            .prepare(&Client::new(), input, "pd", None, None)
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(error.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(started.elapsed() < Duration::from_secs(2));
+        let became_cancelled = tokio::time::timeout(Duration::from_secs(2), async {
+            while !cancelled.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        assert!(became_cancelled.is_ok());
+        slow_server.abort();
+        fail_server.abort();
+    }
+
+    async fn slow_encode(State(cancelled): State<Arc<AtomicBool>>) -> StatusCode {
+        struct Mark(Arc<AtomicBool>);
+        impl Drop for Mark {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let _mark = Mark(cancelled);
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        StatusCode::OK
+    }
+
+    async fn fail_encode() -> StatusCode {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        StatusCode::SERVICE_UNAVAILABLE
     }
 
     #[tokio::test]
