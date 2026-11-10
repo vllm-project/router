@@ -6,8 +6,8 @@
 /// When the last worker of a model is removed, the policy mapping is cleaned up.
 use super::{
     CacheAwareConfig, CacheAwarePolicy, ConsistentHashPolicy, CostParams, KvAffinityTable,
-    KvAwarePolicy, LoadBalancingPolicy, PowerOfTwoPolicy, RandomPolicy, RendezvousHashPolicy,
-    RoundRobinPolicy, StickyLeastLoadedPolicy, TransferCredits,
+    KvAwarePolicy, LoadBalancingPolicy, PolicyFactory, PowerOfTwoPolicy, RandomPolicy,
+    RendezvousHashPolicy, RoundRobinPolicy, StickyLeastLoadedPolicy, TransferCredits,
 };
 use crate::config::types::PolicyConfig;
 use std::collections::HashMap;
@@ -238,8 +238,9 @@ impl PolicyRegistry {
                 kv_penalty_host,
                 kv_penalty_external,
                 kv_penalty_disk,
+                kv_transfer,
                 ..
-            } => Arc::new(
+            } => Arc::new(PolicyFactory::apply_kv_transfer(
                 KvAwarePolicy::new(CostParams {
                     router_temperature: *router_temperature,
                     transfer_credits: TransferCredits {
@@ -251,7 +252,8 @@ impl PolicyRegistry {
                     ..CostParams::default()
                 })
                 .with_shared_affinity(Arc::clone(kv_affinity_table)),
-            ),
+                kv_transfer.as_deref(),
+            )),
             PolicyConfig::PowerOfTwo { .. } => Arc::new(PowerOfTwoPolicy::new()),
             PolicyConfig::ConsistentHash { .. } => Arc::new(ConsistentHashPolicy::new()),
             PolicyConfig::StickyLeastLoaded => Arc::new(StickyLeastLoadedPolicy::new()),

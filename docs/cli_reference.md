@@ -104,6 +104,14 @@ and the Rust OpenAI backend use different configuration paths. See
 | `--kv-penalty-host` | `f64` | `0.8` | `float` | `0.8` | Host-tier KV transfer credit for kv_aware. |
 | `--kv-penalty-external` | `f64` | `0.6` | `float` | `0.6` | External-tier KV transfer credit for kv_aware. |
 | `--kv-penalty-disk` | `f64` | `0.3` | `float` | `0.3` | Disk-tier KV transfer credit for kv_aware. |
+| `--kv-transfer-mode` | `off, shadow, active` | `off` | — | — | KV transfer planner for kv_aware. `shadow` plans and reports only; `active` is not available yet and is rejected. |
+| `--kv-transfer-min-prefix-blocks` | `u32` | `64` | — | — | Minimum blocks the source must hold beyond the destination for a transfer plan. |
+| `--kv-transfer-source-load-threshold` | `usize` | `1` | — | — | Source counts as busy at this many active requests. |
+| `--kv-transfer-margin` | `f64` | `0.8` | — | — | Transfer must cost less than this fraction (0, 1] of the prefill it saves. |
+| `--kv-transfer-prefill-us-per-token` | `f64` | `50.0` | — | — | Estimated prefill cost in microseconds per token. |
+| `--kv-transfer-fixed-ms` | `f64` | `5.0` | — | — | Estimated fixed transfer cost in milliseconds. |
+| `--kv-transfer-us-per-token` | `f64` | `5.0` | — | — | Estimated transfer cost in microseconds per token. |
+| `--kv-transfer-require-capability` | `flag` | `false` | — | — | Require declared worker capability before planning a transfer. |
 | `--kv-aware-session-affinity-ttl-secs` | `u64` | `unset` | `integer` | `unset` | Idle affinity TTL in seconds (1–31536000); unset disables affinity. In PD mode, applies only to decode. |
 | `--cache-threshold` | `f32` | `0.3` | `float` | `0.3` | Cache-match threshold from 0.0 to 1.0 for cache-aware routing. |
 | `--balance-abs-threshold` | `usize` | `64` | `integer` | `64` | Cache-aware load balancing absolute threshold; used together with the relative threshold. |

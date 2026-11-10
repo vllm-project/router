@@ -4501,4 +4501,118 @@ mod tests {
         assert!(load_only.transfer.is_none());
         release_receipt(&workers, &load_only);
     }
+
+    fn kv_aware_config(
+        kv_transfer: Option<crate::config::types::KvTransferConfig>,
+    ) -> crate::config::PolicyConfig {
+        crate::config::PolicyConfig::KvAware {
+            router_temperature: 0.0,
+            kv_penalty_host: 0.8,
+            kv_penalty_external: 0.6,
+            kv_penalty_disk: 0.3,
+            static_kv_event_sources: Default::default(),
+            kv_transfer: kv_transfer.map(Box::new),
+        }
+    }
+
+    fn transfer_block(
+        mode: crate::config::types::KvTransferMode,
+    ) -> crate::config::types::KvTransferConfig {
+        crate::config::types::KvTransferConfig {
+            mode,
+            min_prefix_blocks: 4,
+            transfer_fixed_ms: 0.0,
+            ..Default::default()
+        }
+    }
+
+    fn built_policy(
+        config: &crate::config::PolicyConfig,
+    ) -> Arc<dyn crate::policies::LoadBalancingPolicy> {
+        crate::policies::PolicyFactory::create_from_config(config, None)
+    }
+
+    #[test]
+    fn factory_builds_a_planner_only_for_shadow_mode() {
+        use crate::config::types::KvTransferMode::{Off, Shadow};
+        for (config, expect_planner) in [
+            (kv_aware_config(None), false),
+            (kv_aware_config(Some(transfer_block(Off))), false),
+            (kv_aware_config(Some(transfer_block(Shadow))), true),
+        ] {
+            let policy = built_policy(&config);
+            let policy = policy.as_any().downcast_ref::<KvAwarePolicy>().unwrap();
+            assert_eq!(policy.transfer_planner.is_some(), expect_planner);
+        }
+
+        // The registry path shares the helper.
+        let registry_policy =
+            crate::policies::PolicyRegistry::new(kv_aware_config(Some(transfer_block(Shadow))))
+                .get_default_policy();
+        let registry_policy = registry_policy
+            .as_any()
+            .downcast_ref::<KvAwarePolicy>()
+            .unwrap();
+        assert!(registry_policy.transfer_planner.is_some());
+    }
+
+    #[test]
+    fn configured_capabilities_reach_the_policy_only_in_shadow_mode() {
+        use crate::config::types::KvTransferMode::{Off, Shadow};
+        let capabilities = HashMap::from([(
+            "http://a".to_string(),
+            crate::policies::kv_transfer_capability::StaticTransferCapability {
+                can_export: true,
+                can_import: false,
+                connector: "nixl".into(),
+                connector_version: "1".into(),
+                layout_fingerprint: "fp".into(),
+            },
+        )]);
+        for (mode, expected) in [(Shadow, true), (Off, false)] {
+            let mut block = transfer_block(mode);
+            block.capabilities = capabilities.clone();
+            let policy = built_policy(&kv_aware_config(Some(block)));
+            let policy = policy.as_any().downcast_ref::<KvAwarePolicy>().unwrap();
+            let registered = policy.transfer_capabilities.get("http://a");
+            assert_eq!(registered.is_some(), expected);
+            if let Some(capability) = registered {
+                assert!(capability.can_export && !capability.can_import);
+                assert_eq!(&*capability.layout_fingerprint, "fp");
+            }
+        }
+    }
+
+    #[test]
+    fn shadow_mode_from_config_picks_exactly_what_off_picks() {
+        use crate::config::types::KvTransferMode::{Off, Shadow};
+        let ids = transfer_ids();
+        let mut picks = Vec::new();
+        for mode in [Off, Shadow] {
+            let (base, workers, _) = transfer_fixture(false);
+            let policy = crate::policies::PolicyFactory::apply_kv_transfer(
+                base,
+                Some(&transfer_block(mode)),
+            );
+            let mut sequence = Vec::new();
+            for _ in 0..3 {
+                let receipt = policy
+                    .select_worker_with_receipt(&workers, Some(&ids), None, None, None, &[])
+                    .unwrap();
+                sequence.push((
+                    receipt.worker_index,
+                    receipt.new_prefill_tokens,
+                    receipt.decision.clone(),
+                    receipt.transfer.is_some(),
+                ));
+                release_receipt(&workers, &receipt);
+            }
+            picks.push(sequence);
+        }
+        // Same worker, tokens and decision; only the shadow run carries a plan.
+        for (off, shadow) in picks[0].iter().zip(&picks[1]) {
+            assert_eq!((off.0, off.1, &off.2), (shadow.0, shadow.1, &shadow.2));
+            assert!(!off.3 && shadow.3);
+        }
+    }
 }

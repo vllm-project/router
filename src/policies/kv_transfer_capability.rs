@@ -9,12 +9,12 @@
 
 use std::collections::HashMap;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use super::kv_transfer::TransferCapability;
 
 /// One worker's declared capability, as written in config.
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct StaticTransferCapability {
     #[serde(default = "default_true")]

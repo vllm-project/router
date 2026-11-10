@@ -1,5 +1,7 @@
 use super::ConfigResult;
 use crate::config::validation::ConfigValidator;
+use crate::policies::kv_transfer_capability::StaticTransferCapability;
+use crate::policies::TransferPolicy;
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
 
@@ -1038,6 +1040,9 @@ pub enum PolicyConfig {
         /// endpoint does not expose /kv_event_sources.
         #[serde(default, skip_serializing_if = "HashMap::is_empty")]
         static_kv_event_sources: Box<HashMap<String, StaticKvEventSources>>,
+        /// Optional KV transfer planning. Absent means off.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kv_transfer: Option<Box<KvTransferConfig>>,
     },
 
     #[serde(rename = "power_of_two")]
@@ -1062,6 +1067,71 @@ pub enum PolicyConfig {
 
     #[serde(rename = "rendezvous_hash")]
     RendezvousHash,
+}
+
+/// KV transfer planner mode.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KvTransferMode {
+    /// No planner is built.
+    #[default]
+    Off,
+    /// Plans are computed and reported; routing and requests are unchanged.
+    Shadow,
+    /// Reserved: plans are acted on. Rejected by validation for now.
+    Active,
+}
+
+/// Settings for the KV transfer planner. Defaults equal `TransferPolicy::default()`
+/// (apart from `enabled`, which is derived from `mode`, and `require_capability`,
+/// which is `false` here so shadow measurement works without declared capabilities).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct KvTransferConfig {
+    pub mode: KvTransferMode,
+    pub min_prefix_blocks: u32,
+    pub source_load_threshold: usize,
+    pub margin: f64,
+    pub prefill_us_per_token: f64,
+    pub transfer_fixed_ms: f64,
+    pub transfer_us_per_token: f64,
+    pub require_capability: bool,
+    /// Declared per-worker capability, keyed by worker URL.
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
+    pub capabilities: HashMap<String, StaticTransferCapability>,
+}
+
+impl Default for KvTransferConfig {
+    fn default() -> Self {
+        Self {
+            mode: KvTransferMode::Off,
+            min_prefix_blocks: 64,
+            source_load_threshold: 1,
+            margin: 0.8,
+            prefill_us_per_token: 50.0,
+            transfer_fixed_ms: 5.0,
+            transfer_us_per_token: 5.0,
+            require_capability: false,
+            capabilities: HashMap::new(),
+        }
+    }
+}
+
+impl KvTransferConfig {
+    /// The planner policy for this block. `enabled` follows `mode`.
+    pub fn transfer_policy(&self) -> TransferPolicy {
+        TransferPolicy {
+            enabled: self.mode != KvTransferMode::Off,
+            min_prefix_blocks: self.min_prefix_blocks,
+            source_load_threshold: self.source_load_threshold,
+            // Active transfers must never run on a shared cache identity alone.
+            require_capability: self.require_capability || self.mode == KvTransferMode::Active,
+            prefill_us_per_token: self.prefill_us_per_token,
+            transfer_fixed_ms: self.transfer_fixed_ms,
+            transfer_us_per_token: self.transfer_us_per_token,
+            margin: self.margin,
+        }
+    }
 }
 
 /// Manually configured KV event publishers for one regular-mode worker.
@@ -1474,6 +1544,7 @@ mod tests {
                 kv_penalty_external: 0.6,
                 kv_penalty_disk: 0.4,
                 static_kv_event_sources: Default::default(),
+                kv_transfer: None,
             },
         );
         config.pd_kv_event_sources.insert(
@@ -2430,5 +2501,63 @@ mod tests {
             PolicyConfig::RoundRobin => {} // Success
             _ => panic!("Expected RoundRobin for regular mode"),
         }
+    }
+
+    #[test]
+    fn kv_transfer_is_off_by_default_and_round_trips() {
+        let policy: PolicyConfig = serde_json::from_str(r#"{"type":"kv_aware"}"#).unwrap();
+        let PolicyConfig::KvAware { kv_transfer, .. } = &policy else {
+            panic!("expected kv_aware");
+        };
+        assert!(kv_transfer.is_none());
+        // No block is emitted when absent, so old and new configs match.
+        assert!(!serde_json::to_string(&policy)
+            .unwrap()
+            .contains("kv_transfer"));
+
+        let defaults: KvTransferConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(defaults, KvTransferConfig::default());
+        assert_eq!(defaults.mode, KvTransferMode::Off);
+        let derived = defaults.transfer_policy();
+        let reference = TransferPolicy::default();
+        assert!(!derived.enabled);
+        assert_eq!(
+            (
+                derived.min_prefix_blocks,
+                derived.source_load_threshold,
+                derived.prefill_us_per_token,
+                derived.transfer_fixed_ms,
+                derived.transfer_us_per_token,
+                derived.margin
+            ),
+            (
+                reference.min_prefix_blocks,
+                reference.source_load_threshold,
+                reference.prefill_us_per_token,
+                reference.transfer_fixed_ms,
+                reference.transfer_us_per_token,
+                reference.margin
+            )
+        );
+
+        let json = r#"{"type":"kv_aware","kv_transfer":{"mode":"shadow","min_prefix_blocks":8,
+            "margin":0.5,"capabilities":{"http://a":{"connector":"nixl",
+            "connector_version":"1","layout_fingerprint":"fp"}}}}"#;
+        let parsed: PolicyConfig = serde_json::from_str(json).unwrap();
+        let again: PolicyConfig =
+            serde_json::from_str(&serde_json::to_string(&parsed).unwrap()).unwrap();
+        for config in [parsed, again] {
+            let PolicyConfig::KvAware { kv_transfer, .. } = config else {
+                panic!("expected kv_aware");
+            };
+            let block = kv_transfer.unwrap();
+            assert_eq!(block.mode, KvTransferMode::Shadow);
+            assert_eq!((block.min_prefix_blocks, block.margin), (8, 0.5));
+            assert_eq!(block.capabilities["http://a"].layout_fingerprint, "fp");
+            assert!(block.transfer_policy().enabled);
+        }
+
+        assert!(serde_json::from_str::<KvTransferConfig>(r#"{"mode":"shadow","typo":1}"#).is_err());
+        assert!(serde_json::from_str::<KvTransferConfig>(r#"{"mode":"loud"}"#).is_err());
     }
 }
