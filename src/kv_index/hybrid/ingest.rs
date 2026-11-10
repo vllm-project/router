@@ -6,6 +6,7 @@ use super::layout::{event_kind_matches, stored_shape_matches};
 use super::residency::State;
 use super::HybridEventIndex;
 use crate::kv_hash::SequenceHash;
+use crate::kv_index::wire::extra_keys_match;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HybridEventError {
@@ -83,10 +84,11 @@ impl HybridEventIndex {
                         || store.lora_name.is_some()
                         || !event_kind_matches(group.kind, store)
                         || !stored_shape_matches(group.kind, store)
-                        || store.extra_keys.as_ref().is_some_and(|keys| {
-                            keys.len() != store.block_hashes.len()
-                                || keys.iter().any(|key| !key.is_nil())
-                        })
+                        || !extra_keys_match(
+                            store.extra_keys.as_ref(),
+                            store.block_hashes.len(),
+                            None,
+                        )
                         || store
                             .parent_block_hash
                             .as_ref()

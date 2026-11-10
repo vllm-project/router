@@ -268,3 +268,24 @@ mod tests {
         assert_eq!(back.data_parallel_rank, Some(1));
     }
 }
+
+/// Validate the publisher's per-block `extra_keys` against the cache identity.
+/// Absent keys are fine; present keys must line up one per block and be either
+/// null or the adapter's single-element key.
+pub(crate) fn extra_keys_match(
+    extra_keys: Option<&Vec<rmpv::Value>>,
+    block_hashes: usize,
+    lora_name: Option<&str>,
+) -> bool {
+    extra_keys.is_none_or(|keys| {
+        keys.len() == block_hashes
+            && keys.iter().all(|key| {
+                key.is_nil()
+                    || lora_name.is_some_and(|name| {
+                        key.as_array().is_some_and(|parts| {
+                            parts.len() == 1 && parts[0].as_str() == Some(name)
+                        })
+                    })
+            })
+    })
+}
