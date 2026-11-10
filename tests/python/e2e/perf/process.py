@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import signal
 import socket
 import subprocess
 import sys
@@ -113,7 +114,43 @@ def _wait_http(
     raise TimeoutError(f"{label} not ready at {url} within {timeout}s")
 
 
-def graceful_stop(proc: subprocess.Popen, timeout: float = 120.0) -> None:
+def graceful_stop(
+    proc: subprocess.Popen,
+    timeout: float = 120.0,
+    *,
+    process_group: bool = False,
+    kill_grace: float = 15.0,
+) -> None:
+    """Terminate, then kill. ``process_group`` signals the whole session.
+
+    Replay is started with ``start_new_session=True``. If its leader has
+    already exited, the children can still hold ports, so that path still
+    sends ``SIGKILL`` to the group.
+    """
+
+    if process_group:
+        if proc.poll() is not None:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            return
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            return
+        try:
+            proc.wait(timeout=timeout)
+            return
+        except subprocess.TimeoutExpired:
+            pass
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            return
+        proc.wait(timeout=kill_grace)
+        return
+
     if proc.poll() is not None:
         return
     proc.terminate()

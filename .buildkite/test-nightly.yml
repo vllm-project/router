@@ -174,7 +174,7 @@ steps:
   # ============================================================================
   # L3 router_policy TraceLab replay — cache_aware / kv_aware / kv_aware_aff @ c16.
   # 4× vllm-rs + router per cell (12GiB GPU KV/worker, no CPU offload) → L4×4.
-  # Optional: AGENTX_TRACE_JSONL_URL to replace data/tracelab-ci-uniform-28.jsonl.
+  # Optional: TRACELAB_JSONL_URL to replace data/tracelab-ci-uniform-28.jsonl.
   # ============================================================================
   - label: ":python: router policy perf (c16 × 3 policies)"
     key: "router-policy-perf-e2e"
@@ -205,9 +205,9 @@ steps:
       export AGENTX_PORT_SETTLE_SEC="${AGENTX_PORT_SETTLE_SEC:-5}"
 
       trace="tests/python/e2e/perf/router_policy/data/tracelab-ci-uniform-28.jsonl"
-      if [[ -n "${AGENTX_TRACE_JSONL_URL:-}" ]]; then
+      if [[ -n "${TRACELAB_JSONL_URL:-}" ]]; then
         mkdir -p "$$(dirname "$${trace}")"
-        curl -fsSL "${AGENTX_TRACE_JSONL_URL}" -o "$${trace}"
+        curl -fsSL "${TRACELAB_JSONL_URL}" -o "$${trace}"
       fi
       test -f "$${trace}"
 

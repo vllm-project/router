@@ -52,6 +52,7 @@ from tests.python.e2e.perf.process import (  # noqa: E402
     RunningProc,
     launch_router,
     launch_worker,
+    graceful_stop,
     release_all_port_holders,
     release_router_port_holders,
     release_worker_port_holders,
@@ -158,39 +159,12 @@ def _start_replay(
     )
 
 
-def _stop_replay(
-    proc: subprocess.Popen[Any], timeout: float = 45.0, kill_grace: float = 15.0
-) -> None:
-    """Stop the replay session leader and any children still holding ports."""
-
-    if proc.poll() is not None:
-        try:
-            os.killpg(proc.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        return
-    try:
-        os.killpg(proc.pid, signal.SIGTERM)
-    except ProcessLookupError:
-        return
-    try:
-        proc.wait(timeout=timeout)
-        return
-    except subprocess.TimeoutExpired:
-        pass
-    try:
-        os.killpg(proc.pid, signal.SIGKILL)
-    except ProcessLookupError:
-        return
-    proc.wait(timeout=kill_grace)
-
-
 def cleanup(run: RouterPolicyStack) -> None:
     if run.did_cleanup:
         return
     run.did_cleanup = True
     if run.replay_proc is not None:
-        _stop_replay(run.replay_proc)
+        graceful_stop(run.replay_proc, 45.0, process_group=True, kill_grace=15)
         run.replay_proc = None
     for proc in reversed(run.stack):
         proc.stop()
@@ -766,7 +740,7 @@ raise SystemExit(main(["vllm", *sys.argv[1:]]))
                         flush=True,
                     )
                 if stalled:
-                    _stop_replay(replay, timeout=60, kill_grace=15)
+                    graceful_stop(replay, 60, process_group=True, kill_grace=15)
                     break
             if tick % 6 == 0:
                 try:
@@ -790,7 +764,7 @@ raise SystemExit(main(["vllm", *sys.argv[1:]]))
         try:
             replay.wait(timeout=120)
         except subprocess.TimeoutExpired:
-            _stop_replay(replay, timeout=30, kill_grace=15)
+            graceful_stop(replay, 30, process_group=True, kill_grace=15)
         snapshot(run, run.out / "after")
         replay_rc = replay.returncode
         if replay_rc not in (0, None):

@@ -56,5 +56,5 @@ runs **`cache_aware/c16`**, **`kv_aware/c16`**, **`kv_aware_aff/c16`** on **`l4_
 Case JSON reserves 12 GiB GPU KV per worker, no CPU offload, and `max_model_len=32768`.
 
 Nightly step runs `pip install agentinfer==0.2.0` then one pytest invocation (`-k 'cache_aware/c16 or kv_aware/c16 or kv_aware_aff/c16'`).
-The trace is `data/tracelab-ci-uniform-28.jsonl` (8 sessions, 28 requests). Optional Buildkite env **`AGENTX_TRACE_JSONL_URL`** replaces that file when set.
+The trace is `data/tracelab-ci-uniform-28.jsonl` (8 sessions, 28 requests). Optional Buildkite env **`TRACELAB_JSONL_URL`** replaces that file when set.
 See [`.buildkite/test-nightly.yml`](../../../../../.buildkite/test-nightly.yml) (`router-policy-perf-e2e`).
