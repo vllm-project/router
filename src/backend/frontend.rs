@@ -176,9 +176,12 @@ impl EngineFrontend {
         mut request: ChatCompletionRequest,
     ) -> Result<PreparedRequest, PrepareError> {
         let (handle, t_req, resolve_ms) = self.resolve_with_defaults(&mut request).await?;
-        let tokenized =
+        let mut tokenized =
             crate::backend::preprocess::tokenize_chat_request_for_count_timed(&request, &handle)
                 .map_err(|e| PrepareError::Invalid(format!("preprocess: {e}")))?;
+        // The Engine applies the same left truncation, so counting the
+        // untruncated rendering would overstate the Engine input.
+        truncate_grpc_prompt(&request, &mut tokenized)?;
         Ok(PreparedRequest {
             request: Arc::new(request),
             tokenized,

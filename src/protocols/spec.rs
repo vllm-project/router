@@ -952,11 +952,22 @@ impl GenerationRequest for CompletionRequest {
             .get("add_special_tokens")
             .and_then(serde_json::Value::as_bool)
             == Some(false);
-        if rewrites_disabled {
-            self.prompt.token_array_len()
-        } else {
-            None
+        if !rewrites_disabled {
+            return None;
         }
+        let tokens = self.prompt.token_array_len()?;
+        // The Engine keeps only the last N tokens when truncation is enabled;
+        // an untruncated count would overstate the Engine input and then be
+        // revoked as a mismatch. `0` and an absent value mean no truncation.
+        let truncate = match self.other.get("truncate_prompt_tokens") {
+            None => None,
+            Some(value) if value.is_null() => None,
+            Some(value) => Some(usize::try_from(value.as_u64()?).ok()?),
+        };
+        Some(match truncate {
+            Some(limit) if limit > 0 && tokens > limit => limit,
+            _ => tokens,
+        })
     }
 
     fn extract_program_identity_payload(&self) -> Option<serde_json::Value> {
@@ -3278,6 +3289,47 @@ pub(crate) mod cache_routing {
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn token_id_prompt_count_applies_engine_truncation() {
+        let request = |truncate: serde_json::Value, prompt: serde_json::Value| {
+            serde_json::from_value::<CompletionRequest>(serde_json::json!({
+                "model": "model-a",
+                "prompt": prompt,
+                "add_special_tokens": false,
+                "truncate_prompt_tokens": truncate,
+                "max_tokens": 4
+            }))
+            .unwrap()
+        };
+        assert_eq!(
+            request(serde_json::json!(2), serde_json::json!([1, 2, 3, 4]))
+                .exact_input_token_count(),
+            Some(2)
+        );
+        assert_eq!(
+            request(serde_json::json!(8), serde_json::json!([1, 2, 3, 4]))
+                .exact_input_token_count(),
+            Some(4)
+        );
+        assert_eq!(
+            request(serde_json::json!(0), serde_json::json!([1, 2, 3, 4]))
+                .exact_input_token_count(),
+            Some(4)
+        );
+        // Invalid or negative limits fall back to the estimator rather than
+        // guessing an Engine-side truncation rule.
+        assert_eq!(
+            request(serde_json::json!("2"), serde_json::json!([1, 2, 3, 4]))
+                .exact_input_token_count(),
+            None
+        );
+        assert_eq!(
+            request(serde_json::json!(null), serde_json::json!([1, 2, 3, 4]))
+                .exact_input_token_count(),
+            Some(4)
+        );
+    }
 
     #[test]
     fn token_id_prompt_is_exact_only_when_special_tokens_are_disabled() {

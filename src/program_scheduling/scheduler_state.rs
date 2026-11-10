@@ -500,10 +500,11 @@ pub(crate) struct ProgramSchedulerState {
     /// Ordered by revocation time and bounded so a pathological workload cannot
     /// grow scheduler memory without limit.
     pub(crate) revoked_token_fingerprints: BTreeMap<TokenizerFingerprint, Instant>,
-    /// Set once the revocation set hit its bound. Absence from the set means
-    /// "trusted", so evicting an old fingerprint would fail open; instead every
-    /// prepared fact falls back to estimation until the Router restarts.
-    pub(crate) token_fingerprint_saturated: bool,
+    /// Model pools whose revocation set hit its bound. Absence from the set
+    /// means "trusted", so evicting old fingerprints would fail open; instead
+    /// prepared facts for a saturated pool fall back to estimation until the
+    /// Router restarts, while other pools keep their exact facts.
+    pub(crate) token_fingerprint_saturated_pools: BTreeSet<String>,
     /// Total revocations, including entries evicted from the bounded map.
     pub(crate) token_fingerprint_revocations: u64,
     /// Most recent P-side KV-cache pressure sample.
@@ -557,7 +558,7 @@ impl ProgramSchedulerState {
                 + Duration::from_secs_f64(config.prediction_profile.snapshot_interval_seconds),
             lineage: ProgramLineage::default(),
             revoked_token_fingerprints: BTreeMap::new(),
-            token_fingerprint_saturated: false,
+            token_fingerprint_saturated_pools: BTreeSet::new(),
             token_fingerprint_revocations: 0,
             prefill_pressure: None,
             prefill_targets: HashMap::new(),

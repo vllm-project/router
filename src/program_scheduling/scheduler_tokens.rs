@@ -58,7 +58,7 @@ impl ProgramScheduler {
         let allowed = self.prepared_token_pool_allowed(model_pool);
         let revoked = {
             let state = self.state.lock();
-            state.token_fingerprint_saturated
+            state.token_fingerprint_saturated_pools.contains(model_pool)
                 || self.fingerprint_revoked(
                     &state,
                     arrival.prepared().and_then(|facts| facts.fingerprint()),
@@ -107,14 +107,17 @@ impl ProgramScheduler {
         let used = self.target_usage(state, target_id, now);
         // For a later turn of an already-active Program the usage and the
         // active count already include this Program. Compare only what its new
-        // demand would add instead of charging the full demand twice.
+        // demand would add instead of charging the full demand twice. The
+        // subtraction uses the Router ledger, not a native usage sample: the
+        // sample measures real KV, so subtracting an estimated demand from it
+        // would bias the counterfactual whenever the estimate is off.
         let active_here = state
             .runtime
             .view(program)
             .and_then(|view| view.placement.clone())
             .is_some_and(|placement| placement == target_id);
         let used_for_check = if active_here {
-            (used - applied_required).max(0.0)
+            (self.ledger_target_usage(state, target_id) - applied_required).max(0.0)
         } else {
             used
         };
@@ -146,6 +149,23 @@ impl ProgramScheduler {
             (true, false) => "estimate_admits_exact_denies",
             (false, true) => "estimate_denies_exact_admits",
         })
+    }
+
+    /// Router-ledger usage on one target, excluding native KV samples.
+    ///
+    /// Shadow counterfactuals compare like with like: both sides are Router
+    /// demand, so the baseline must be the ledger rather than a usage sample
+    /// that measures the Engine's real KV.
+    fn ledger_target_usage(&self, state: &ProgramSchedulerState, target_id: &str) -> f64 {
+        state
+            .runtime
+            .iter_views()
+            .filter(|program| {
+                program.state == super::ProgramState::Active && program.placement == Some(target_id)
+            })
+            .filter_map(|program| state.decisions.get(program.reference))
+            .map(|decision| decision.private_tokens(self.config.progress_ttl.decode_buffer_tokens))
+            .sum()
     }
 
     /// Compare one prepared arrival count with the Engine-observed count.
@@ -180,8 +200,8 @@ impl ProgramScheduler {
         let Some(fingerprint) = fingerprint else {
             return;
         };
-        if state.token_fingerprint_saturated {
-            // Every prepared fact already falls back to estimation.
+        if state.token_fingerprint_saturated_pools.contains(model_pool) {
+            // Every prepared fact for this pool already falls back to estimation.
             return;
         }
         if state
@@ -205,10 +225,13 @@ impl ProgramScheduler {
         }
         if state.revoked_token_fingerprints.len() > MAX_REVOKED_FINGERPRINTS {
             // Keeping the bound by eviction would make an old, known-bad
-            // fingerprint trusted again. Fail closed instead: the saturation
-            // flag revokes every prepared fact until the Router restarts.
+            // fingerprint trusted again. Fail closed instead, but only for the
+            // pool that overflowed: its prepared facts fall back to estimation
+            // until the Router restarts, while other pools stay exact.
             state.revoked_token_fingerprints.remove(&fingerprint);
-            state.token_fingerprint_saturated = true;
+            state
+                .token_fingerprint_saturated_pools
+                .insert(model_pool.to_string());
             RouterMetrics::record_agent_aware_context_token_revocation("saturation");
             warn!(
                 event = "token_fact_fingerprint_revocation_saturated",
@@ -243,9 +266,9 @@ impl ProgramScheduler {
         self.config.metrics_base_urls.clone()
     }
 
-    /// Number of fingerprints currently revoked, for diagnostics.
-    pub fn revoked_token_fingerprint_count(&self) -> usize {
-        self.state.lock().token_fingerprint_revocations as usize
+    /// Lifetime count of fingerprint revocations, for diagnostics.
+    pub fn token_fingerprint_revocations(&self) -> u64 {
+        self.state.lock().token_fingerprint_revocations
     }
 }
 
@@ -388,7 +411,7 @@ mod tests {
             Some(10),
             Some(11),
         );
-        assert!(state.token_fingerprint_saturated);
+        assert!(state.token_fingerprint_saturated_pools.contains("model"));
         assert_eq!(
             state.revoked_token_fingerprints.len(),
             MAX_REVOKED_FINGERPRINTS
@@ -403,6 +426,13 @@ mod tests {
             context.fallback(),
             Some(crate::program_scheduling::TokenFactFallback::FingerprintRevoked)
         );
+        // Another pool keeps its exact facts: saturation is per model pool.
+        let other = scheduler.resolve_arrival_tokens(
+            "other-model",
+            ArrivalTokenFacts::new(5, Some(TokenFacts::prepared_token_ids(100, fresh))),
+        );
+        assert_eq!(other.tokens(), 100);
+        assert_eq!(other.source(), TokenFactSource::PreparedTokenIds);
     }
 
     #[tokio::test]

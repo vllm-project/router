@@ -669,9 +669,9 @@ impl ProgramScheduler {
                     .max_with(context);
                     decision.context_tokens = merged.tokens();
                     decision.context_token_source = merged.source();
-                    if merged.fingerprint().is_some() {
-                        decision.context_token_fingerprint = merged.fingerprint();
-                    }
+                    // Assign unconditionally: an estimate that wins must not
+                    // keep the fingerprint of an older prepared count.
+                    decision.context_token_fingerprint = merged.fingerprint();
                     decision.shadow_context_facts = merged.shadow_facts();
                     // A shrink confirmation must survive arrivals that demand
                     // *less* context: only growth (or an equal arrival) proves

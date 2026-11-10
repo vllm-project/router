@@ -175,10 +175,21 @@ fn exact_prompt_tokens_from_json(request: Option<&serde_json::Value>) -> Option<
     if array.is_empty() {
         return None;
     }
-    array
-        .iter()
-        .all(|value| value.as_u64().is_some())
-        .then_some(array.len())
+    if !array.iter().all(|value| value.as_u64().is_some()) {
+        return None;
+    }
+    // The Engine keeps only the last N tokens; `0`/absent means no truncation.
+    // An invalid limit falls back to the estimator instead of guessing.
+    let truncate = match request.get("truncate_prompt_tokens") {
+        None => None,
+        Some(value) if value.is_null() => None,
+        Some(value) => Some(usize::try_from(value.as_u64()?).ok()?),
+    };
+    let tokens = array.len();
+    Some(match truncate {
+        Some(limit) if limit > 0 && tokens > limit => limit,
+        _ => tokens,
+    })
 }
 
 fn insert_router_stages(headers: &mut HeaderMap, stages: &serde_json::Value) {
@@ -380,8 +391,12 @@ fn hold_request_load_with_output_frame(
     Response::from_parts(parts, Body::from_stream(stream))
 }
 
-/// Maximum buffered body for non-streaming Program settlement.
-const MAX_PROGRAM_SETTLEMENT_BODY_BYTES: usize = 64 * 1024 * 1024;
+/// Upper bound for the body bytes a settlement wrapper keeps to parse usage.
+///
+/// The bytes are forwarded to the client as they arrive; this only bounds the
+/// observation copy, so an unexpectedly large response stops being parsed for
+/// usage instead of failing the request.
+const MAX_PROGRAM_SETTLEMENT_OBSERVATION_BYTES: usize = 16 * 1024 * 1024;
 
 /// Settle one Program attempt on the response's true terminal state.
 ///
@@ -400,28 +415,18 @@ async fn settle_program_completion_on_response(
         completion.finish(false);
         return response;
     }
-    if !is_stream {
-        let (parts, body) = response.into_parts();
-        return match to_bytes(body, MAX_PROGRAM_SETTLEMENT_BODY_BYTES).await {
-            Ok(bytes) => {
-                completion.observe_json(&bytes);
-                completion.finish(true);
-                Response::from_parts(parts, Body::from(bytes))
-            }
-            Err(error) => {
-                completion.finish(false);
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Failed to buffer response body: {error}"),
-                )
-                    .into_response()
-            }
-        };
-    }
+    // The body is forwarded to the client as it arrives; the wrapper only
+    // observes it (SSE lines or the buffered JSON body) for settlement. A
+    // non-streaming response must not be delayed until the whole body has been
+    // buffered, and a failed observation copy must not turn a successful
+    // Engine response into an error.
     let (parts, body) = response.into_parts();
     let stream = ProgramSettlementBody {
         inner: Box::pin(body.into_data_stream()),
         completion: Some(completion),
+        is_sse: is_stream,
+        buffered: Vec::new(),
+        observation_overflow: false,
     };
     Response::from_parts(parts, Body::from_stream(stream))
 }
@@ -430,6 +435,11 @@ async fn settle_program_completion_on_response(
 struct ProgramSettlementBody {
     inner: Pin<Box<dyn futures_util::Stream<Item = Result<axum::body::Bytes, axum::Error>> + Send>>,
     completion: Option<ProgramCompletion>,
+    /// Streams are observed as SSE lines; non-streaming bodies are observed as
+    /// one buffered JSON document.
+    is_sse: bool,
+    buffered: Vec<u8>,
+    observation_overflow: bool,
 }
 
 impl futures_util::Stream for ProgramSettlementBody {
@@ -440,7 +450,15 @@ impl futures_util::Stream for ProgramSettlementBody {
         match this.inner.as_mut().poll_next(cx) {
             Poll::Ready(Some(Ok(chunk))) => {
                 if let Some(completion) = &this.completion {
-                    completion.observe_sse_chunk(&chunk);
+                    if this.is_sse {
+                        completion.observe_sse_chunk(&chunk);
+                    } else if !this.observation_overflow {
+                        this.buffered.extend_from_slice(&chunk);
+                        if this.buffered.len() > MAX_PROGRAM_SETTLEMENT_OBSERVATION_BYTES {
+                            this.observation_overflow = true;
+                            this.buffered.clear();
+                        }
+                    }
                 }
                 Poll::Ready(Some(Ok(chunk)))
             }
@@ -452,6 +470,10 @@ impl futures_util::Stream for ProgramSettlementBody {
             }
             Poll::Ready(None) => {
                 if let Some(completion) = this.completion.take() {
+                    if !this.is_sse && !this.observation_overflow {
+                        completion.observe_json(&this.buffered);
+                    }
+                    this.buffered.clear();
                     completion.finish(true);
                 }
                 Poll::Ready(None)
@@ -5853,6 +5875,34 @@ mod tests {
         // keep the two-observation shrink rule instead.
         let snapshot = scheduler.diagnostics();
         assert_eq!(snapshot.ranks[0].programs[0].context_tokens, 177);
+    }
+
+    #[test]
+    fn exact_prompt_tokens_applies_transparent_truncation() {
+        let with_truncate = serde_json::json!({
+            "prompt": [1, 2, 3, 4, 5],
+            "add_special_tokens": false,
+            "truncate_prompt_tokens": 2
+        });
+        assert_eq!(exact_prompt_tokens_from_json(Some(&with_truncate)), Some(2));
+        let above_len = serde_json::json!({
+            "prompt": [1, 2, 3],
+            "add_special_tokens": false,
+            "truncate_prompt_tokens": 9
+        });
+        assert_eq!(exact_prompt_tokens_from_json(Some(&above_len)), Some(3));
+        let zero = serde_json::json!({
+            "prompt": [1, 2, 3],
+            "add_special_tokens": false,
+            "truncate_prompt_tokens": 0
+        });
+        assert_eq!(exact_prompt_tokens_from_json(Some(&zero)), Some(3));
+        let invalid = serde_json::json!({
+            "prompt": [1, 2, 3],
+            "add_special_tokens": false,
+            "truncate_prompt_tokens": "2"
+        });
+        assert_eq!(exact_prompt_tokens_from_json(Some(&invalid)), None);
     }
 
     #[test]

@@ -112,7 +112,10 @@ impl ProgramCompletionInner {
         // did not ask for a wire `usage` chunk; prefer them over missing SSE.
         if let Some((prompt_tokens, completion_tokens)) = self.observer.usage() {
             usage.merge(ProgramUsageObservation {
-                prompt_tokens: Some(prompt_tokens),
+                // `None` means the Engine did not report `prompt_info`; the
+                // wire usage (if any) and the arrival fact remain the only
+                // evidence, and reconciliation must not invent a match.
+                prompt_tokens,
                 completion_tokens: Some(completion_tokens),
                 cached_prompt_tokens: None,
             });
@@ -443,12 +446,34 @@ mod tests {
             ProgramCompletion::new(scheduler.clone(), dispatch, estimator, calibration);
         // The client did not ask for a wire usage chunk; the producer still
         // knows the Engine's counts.
-        completion.engine_observer().record_usage(123, 7);
+        completion.engine_observer().record_usage(Some(123), 7);
         completion.observe_sse_chunk(b"data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n");
         completion.finish(true);
         assert!(completion.finished_success());
         let snapshot = scheduler.diagnostics();
         assert_eq!(snapshot.ranks[0].programs[0].context_tokens, 123);
+    }
+
+    #[tokio::test]
+    async fn missing_engine_prompt_info_does_not_fabricate_a_prompt_count() {
+        let (scheduler, dispatch) = settlement_fixture().await;
+        let estimator = Arc::new(MomentumTokenEstimator::default());
+        let (_, calibration) = estimator.estimate(
+            TokenEstimateScope::new("model", "/v1/chat/completions"),
+            "no prompt info",
+        );
+        let completion =
+            ProgramCompletion::new(scheduler.clone(), dispatch, estimator, calibration);
+        // The producer saw completion tokens but the Engine never reported
+        // `prompt_info`; only wire usage may supply prompt tokens.
+        completion.engine_observer().record_usage(None, 7);
+        completion.observe_sse_chunk(
+            b"data: {\"usage\":{\"prompt_tokens\":155,\"completion_tokens\":7}}\n",
+        );
+        completion.finish(true);
+        assert!(completion.finished_success());
+        let snapshot = scheduler.diagnostics();
+        assert_eq!(snapshot.ranks[0].programs[0].context_tokens, 155);
     }
 
     #[tokio::test]

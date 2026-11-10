@@ -36,8 +36,6 @@ pub enum TokenFactSource {
     ClientTokenIds,
     /// Token IDs produced by Router request preparation (render + encode).
     PreparedTokenIds,
-    /// Engine-reported prompt usage observed at settlement.
-    EngineUsage,
 }
 
 impl TokenFactSource {
@@ -46,7 +44,6 @@ impl TokenFactSource {
             Self::Estimated => "estimated",
             Self::ClientTokenIds => "client_token_ids",
             Self::PreparedTokenIds => "prepared_token_ids",
-            Self::EngineUsage => "engine_usage",
         }
     }
 
@@ -65,11 +62,13 @@ impl fmt::Display for TokenFactSource {
 
 /// Stable identity of the token-equivalence context a prepared count belongs to.
 ///
-/// The fingerprint deliberately covers everything that can change how a count
-/// relates to the Engine's own accounting: model pool, request model, Router
-/// frontend asset overrides, chat-template rendering options, cache salt, and
-/// the encode backend. A mismatch between two fingerprints is never compared as
-/// a "close enough" count; each fingerprint is verified or revoked on its own.
+/// The fingerprint covers the inputs that change how a count relates to the
+/// Engine's own accounting: request model, Router frontend asset overrides,
+/// chat-template rendering options, and the encode backend. Per-request
+/// identity, sampling knobs, and credentials are excluded so one equivalence
+/// class is not split per request. A mismatch between two fingerprints is never
+/// compared as a "close enough" count; each fingerprint is verified or revoked
+/// on its own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub struct TokenizerFingerprint([u8; 16]);
 
@@ -199,8 +198,6 @@ pub enum TokenFactFallback {
     FingerprintRevoked,
     /// No pre-dispatch count was available for this request shape.
     NoPreparedFact,
-    /// Router-side text preparation failed, so the estimate was used.
-    PreparationFailed,
 }
 
 impl TokenFactFallback {
@@ -209,7 +206,6 @@ impl TokenFactFallback {
             Self::PoolNotAllowed => "pool_not_allowed",
             Self::FingerprintRevoked => "fingerprint_revoked",
             Self::NoPreparedFact => "no_prepared_fact",
-            Self::PreparationFailed => "preparation_failed",
         }
     }
 }

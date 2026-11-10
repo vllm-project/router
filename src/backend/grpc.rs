@@ -214,12 +214,16 @@ fn grpc_status_code(status: &tonic::Status) -> StatusCode {
 /// what the client asked to see.
 #[derive(Debug, Default)]
 pub struct EngineOutcomeObserver {
-    usage: parking_lot::Mutex<Option<(usize, usize)>>,
+    usage: parking_lot::Mutex<Option<(Option<usize>, usize)>>,
     failed: std::sync::atomic::AtomicBool,
 }
 
 impl EngineOutcomeObserver {
-    pub fn record_usage(&self, prompt_tokens: usize, completion_tokens: usize) {
+    /// Record the Engine's own counts. `prompt_tokens` stays `None` when the
+    /// Engine did not report `prompt_info`: the Router's prepared count must
+    /// not masquerade as Engine usage, or reconciliation would compare it with
+    /// itself and never detect tokenizer drift.
+    pub fn record_usage(&self, prompt_tokens: Option<usize>, completion_tokens: usize) {
         *self.usage.lock() = Some((prompt_tokens, completion_tokens));
     }
 
@@ -228,7 +232,7 @@ impl EngineOutcomeObserver {
             .store(true, std::sync::atomic::Ordering::Release);
     }
 
-    pub fn usage(&self) -> Option<(usize, usize)> {
+    pub fn usage(&self) -> Option<(Option<usize>, usize)> {
         *self.usage.lock()
     }
 
@@ -597,6 +601,7 @@ async fn stream_openai(
             let mut first = true;
             let mut first_token_logged = false;
             let mut prompt_tokens = n_prompt_tokens as u32;
+            let mut engine_prompt_tokens: Option<u32> = None;
             let mut completion_tokens = 0u32;
             loop {
                 let item = match tokio::time::timeout(request_timeout, stream.next()).await {
@@ -624,6 +629,7 @@ async fn stream_openai(
                         }
                         if let Some(info) = &msg.prompt_info {
                             prompt_tokens = info.num_prompt_tokens;
+                            engine_prompt_tokens = Some(info.num_prompt_tokens);
                         }
                         if let Some(outputs) = &msg.outputs {
                             completion_tokens =
@@ -704,7 +710,7 @@ async fn stream_openai(
                         if finish.is_some() {
                             if let Some(observer) = &observer {
                                 observer.record_usage(
-                                    prompt_tokens as usize,
+                                    engine_prompt_tokens.map(|tokens| tokens as usize),
                                     completion_tokens as usize,
                                 );
                             }
@@ -812,6 +818,7 @@ async fn collect_openai(
     let mut token_ids: Vec<u32> = Vec::new();
     let mut finish = None;
     let mut prompt_tokens = prompt_ids.len() as u32;
+    let mut engine_prompt_tokens: Option<u32> = None;
     let mut completion_tokens = 0u32;
     let mut first_output_seen = false;
     loop {
@@ -837,6 +844,7 @@ async fn collect_openai(
                 }
                 if let Some(info) = &msg.prompt_info {
                     prompt_tokens = info.num_prompt_tokens;
+                    engine_prompt_tokens = Some(info.num_prompt_tokens);
                 }
                 let (delta, reason) =
                     match output_text_and_finish(&msg, &mut detok, prefer_worker_text) {
@@ -894,7 +902,10 @@ async fn collect_openai(
             .into_response();
     }
     if let Some(observer) = &observer {
-        observer.record_usage(prompt_tokens as usize, completion_tokens as usize);
+        observer.record_usage(
+            engine_prompt_tokens.map(|tokens| tokens as usize),
+            completion_tokens as usize,
+        );
     }
     abort.disarm();
     if fail_on_abort && finish.as_deref() == Some("abort") {
