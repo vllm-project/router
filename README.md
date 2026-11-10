@@ -151,6 +151,69 @@ cargo run --release -- \
     --intra-node-data-parallel-size 1
 ```
 
+The optional `--prefill-data-parallel-size` and `--decode-data-parallel-size`
+set independent DP fallbacks per worker URL when metrics are unavailable:
+
+```bash
+vllm-router --vllm-pd-disaggregation \
+    --prefill http://127.0.0.1:8081 \
+    --decode http://127.0.0.1:8082 \
+    --prefill-data-parallel-size 4 \
+    --decode-data-parallel-size 2
+```
+
+The router first discovers each endpoint's engine count from `/metrics`. When
+discovery fails, it uses the corresponding role fallback, then
+`--intra-node-data-parallel-size` if the role fallback is unset. If metrics disagree
+with a configured role fallback, the router logs a warning and uses metrics. For example,
+legacy size 4 with only `--decode-data-parallel-size 2` gives Prefill 4 / Decode 2
+in the fallback path. The new sizes must be positive. Python exposes the same
+options as `prefill_data_parallel_size` and `decode_data_parallel_size`.
+
+ZMQ discovery caches each endpoint's engine count for the lifetime of its live
+registration. Native requests, health generation, and Program scheduling share
+this result. If metrics are unavailable, requests temporarily use the configured
+local fallback; the next request after five seconds retries discovery. Initial
+probes run concurrently, and concurrent requests share the same probe.
+Each probe, including its response body, is limited to two seconds; a shorter
+configured HTTP timeout still applies. Cancelled probes also retain the retry
+interval. Heartbeats keep the discovery state; a changed sender, transfer
+address, TP/DP topology, or expired registration causes discovery to run again.
+Results from superseded registrations are discarded.
+
+MoRI-IO registrations report the **global** transfer DP size. The router still
+checks endpoint metrics to distinguish this from the engines reachable at one
+HTTP endpoint. If metrics are unavailable, a configured role size or a non-default
+legacy shared size supplies the local fallback. With no role size and the shared
+default of one, the registered DP preserves the historical single-pod fallback.
+An explicit role size of one can override that assumption. The fallback is not
+cached as a confirmed engine count. The raw global topology remains separate
+for WRITE validation and READ metadata forwarding. Multi-pod deployments need
+endpoint metrics or correct local sizes; registration alone cannot establish
+their local engine count.
+
+Static URLs, Kubernetes worker additions, and ZMQ discovery expand each endpoint
+using its own engine count. An explicit `@rank` URL remains one pinned worker.
+Prefill and Decode ranks follow their respective routing policies; Decode never
+inherits the selected Prefill rank. The role fallbacks are local to each HTTP
+endpoint; they do not describe a multi-pod transfer world.
+
+MoRI-IO READ forwards the producer's transfer metadata unchanged, including
+global/local sizes, ranks, and ownership flags. MoRI-IO WRITE retains the existing
+single-pod contract: every rank of each peer world must be reachable using that
+peer's registered host and base handshake/notify ports. Before either request is
+sent, WRITE rejects a reported global DP size that differs from the selected
+endpoint's engine count. With either new role fallback, both peers must report
+their global DP sizes so the router can check this contract. Legacy configurations
+without the new flags keep their single-pod fallback when DP is unreported.
+Registration itself is still accepted when DP is absent.
+
+WRITE supplies the actual Prefill producer rank to Decode without injecting
+`is_request_leader` or `remote_dp_rank_override`. Under the connector's normal
+single-pod master initialization, Decode's allocation notification identifies its
+actual rank for the write session and completion notification. This does not add
+multi-pod host/rank discovery or establish GPU/RDMA end-to-end compatibility.
+
 ## Configuration
 
 ### Authentication

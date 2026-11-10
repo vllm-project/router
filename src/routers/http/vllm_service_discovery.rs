@@ -2,16 +2,20 @@
 // This module implements service discovery for vLLM P2P NCCL and MoRI-IO
 // connector coordination
 
-use crate::config::KvConnector;
+use super::dp_utils;
+use crate::config::{KvConnector, RouterConfig};
+use futures_util::future::join_all;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::sync::broadcast;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio::sync::{broadcast, Mutex as AsyncMutex};
 use tracing::{debug, info, warn};
 
 /// Default ping timeout in seconds
 const DEFAULT_PING_SECONDS: u64 = 5;
+const DP_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(2);
+const DP_DISCOVERY_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Service type for registration
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -77,14 +81,37 @@ pub struct ServiceInstance {
     pub zmq_address: String,
     pub expires_at: u64, // Unix timestamp
     pub tp_size: usize,
+    /// Raw registration DP; MoRI-IO uses the global transfer world size.
     pub dp_size: Option<usize>,
+}
+
+#[derive(Debug, Default)]
+struct EndpointDpSize {
+    confirmed: Option<usize>,
+    retry_at: Option<Instant>,
+}
+
+#[derive(Debug, Clone)]
+struct RegisteredService {
+    instance: ServiceInstance,
+    // MoRI-IO reports global DP above. Keep the HTTP engine count separate.
+    endpoint_dp_size: Arc<AsyncMutex<EndpointDpSize>>,
+    registration_id: Vec<u8>,
+}
+
+impl std::ops::Deref for RegisteredService {
+    type Target = ServiceInstance;
+
+    fn deref(&self) -> &Self::Target {
+        &self.instance
+    }
 }
 
 /// Service registry maintaining prefill and decode instances
 #[derive(Debug)]
 pub struct ServiceRegistry {
-    prefill_instances: Arc<Mutex<HashMap<String, ServiceInstance>>>,
-    decode_instances: Arc<Mutex<HashMap<String, ServiceInstance>>>,
+    prefill_instances: Arc<Mutex<HashMap<String, RegisteredService>>>,
+    decode_instances: Arc<Mutex<HashMap<String, RegisteredService>>>,
     shutdown_tx: Option<broadcast::Sender<()>>,
     /// Set on first MoRI-IO registration; subsequent mismatches are rejected.
     pub moriio_transfer_mode: Arc<OnceLock<MoriIOTransferMode>>,
@@ -125,6 +152,10 @@ fn parse_registration(
                 return None;
             }
         };
+        if reg.tp_size == 0 || reg.dp_size == Some(0) {
+            warn!("MoRI-IO registration TP and DP sizes must be > 0");
+            return None;
+        }
         // Check for mismatch against already-committed mode without committing yet.
         if let Some(stored) = stored_transfer_mode {
             if stored != mode {
@@ -247,8 +278,8 @@ impl ServiceRegistry {
     async fn handle_registration_message(
         message_data: &[u8],
         remote_address: &[u8],
-        prefill_instances: &Arc<Mutex<HashMap<String, ServiceInstance>>>,
-        decode_instances: &Arc<Mutex<HashMap<String, ServiceInstance>>>,
+        prefill_instances: &Arc<Mutex<HashMap<String, RegisteredService>>>,
+        decode_instances: &Arc<Mutex<HashMap<String, RegisteredService>>>,
         kv_connector: KvConnector,
         moriio_transfer_mode: &Arc<OnceLock<MoriIOTransferMode>>,
     ) {
@@ -267,11 +298,15 @@ impl ServiceRegistry {
             .unwrap()
             .as_secs();
 
-        let instance = ServiceInstance {
-            zmq_address: data.zmq_address.clone(),
-            expires_at: current_time + DEFAULT_PING_SECONDS,
-            tp_size,
-            dp_size,
+        let instance = RegisteredService {
+            instance: ServiceInstance {
+                zmq_address: data.zmq_address.clone(),
+                expires_at: current_time + DEFAULT_PING_SECONDS,
+                tp_size,
+                dp_size,
+            },
+            endpoint_dp_size: Arc::new(AsyncMutex::new(EndpointDpSize::default())),
+            registration_id: remote_address.to_vec(),
         };
 
         let remote_addr_str = String::from_utf8_lossy(remote_address);
@@ -291,8 +326,12 @@ impl ServiceRegistry {
         match data.service_type.as_str() {
             "P" => {
                 let mut prefill = prefill_instances.lock().unwrap();
-                let is_new = !prefill.contains_key(&data.http_address);
-                prefill.insert(data.http_address.clone(), instance);
+                let is_new = Self::upsert_instance(
+                    &mut prefill,
+                    data.http_address.clone(),
+                    instance,
+                    current_time,
+                );
 
                 if is_new {
                     info!(
@@ -308,8 +347,12 @@ impl ServiceRegistry {
             }
             "D" => {
                 let mut decode = decode_instances.lock().unwrap();
-                let is_new = !decode.contains_key(&data.http_address);
-                decode.insert(data.http_address.clone(), instance);
+                let is_new = Self::upsert_instance(
+                    &mut decode,
+                    data.http_address.clone(),
+                    instance,
+                    current_time,
+                );
 
                 if is_new {
                     info!(
@@ -332,10 +375,32 @@ impl ServiceRegistry {
         }
     }
 
+    /// Heartbeats retain discovery; a new sender, topology, or expired lease does not.
+    fn upsert_instance(
+        instances: &mut HashMap<String, RegisteredService>,
+        address: String,
+        mut instance: RegisteredService,
+        now: u64,
+    ) -> bool {
+        let is_new = !instances.contains_key(&address);
+        if let Some(previous) = instances.get(&address) {
+            if previous.expires_at > now
+                && previous.registration_id == instance.registration_id
+                && previous.zmq_address == instance.zmq_address
+                && previous.tp_size == instance.tp_size
+                && previous.dp_size == instance.dp_size
+            {
+                instance.endpoint_dp_size = previous.endpoint_dp_size.clone();
+            }
+        }
+        instances.insert(address, instance);
+        is_new
+    }
+
     /// Clean up expired service instances
     async fn cleanup_expired_instances(
-        prefill_instances: &Arc<Mutex<HashMap<String, ServiceInstance>>>,
-        decode_instances: &Arc<Mutex<HashMap<String, ServiceInstance>>>,
+        prefill_instances: &Arc<Mutex<HashMap<String, RegisteredService>>>,
+        decode_instances: &Arc<Mutex<HashMap<String, RegisteredService>>>,
     ) {
         let current_time = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -393,11 +458,15 @@ impl ServiceRegistry {
             .unwrap()
             .as_secs();
 
-        let instance = ServiceInstance {
-            zmq_address: zmq_address.clone(),
-            expires_at: current_time + DEFAULT_PING_SECONDS,
-            tp_size: 1,
-            dp_size: Some(1),
+        let instance = RegisteredService {
+            instance: ServiceInstance {
+                zmq_address: zmq_address.clone(),
+                expires_at: current_time + DEFAULT_PING_SECONDS,
+                tp_size: 1,
+                dp_size: None,
+            },
+            endpoint_dp_size: Arc::new(AsyncMutex::new(EndpointDpSize::default())),
+            registration_id: Vec::new(),
         };
 
         match service_type {
@@ -433,8 +502,25 @@ impl ServiceRegistry {
             .unwrap_or((1, 1))
     }
 
-    /// Snapshot all registered endpoints and their optional DP sizes under a
-    /// single registry lock for request-path candidate construction.
+    /// Reported connector topology, kept separate from HTTP engine counts.
+    pub(super) fn registered_peer_sizes(
+        &self,
+        http_address: &str,
+        service_type: ServiceType,
+    ) -> Option<(usize, Option<usize>)> {
+        let instances = match service_type {
+            ServiceType::Prefill => &self.prefill_instances,
+            ServiceType::Decode => &self.decode_instances,
+        };
+        instances
+            .lock()
+            .unwrap()
+            .get(http_address)
+            .map(|instance| (instance.tp_size, instance.dp_size))
+    }
+
+    /// Snapshot raw registrations, including their unmodified connector DP.
+    /// HTTP candidate construction uses `get_routing_snapshots` instead.
     pub fn get_instance_snapshots(
         &self,
         service_type: ServiceType,
@@ -447,6 +533,131 @@ impl ServiceRegistry {
         guard
             .iter()
             .map(|(http, instance)| (http.clone(), instance.zmq_address.clone(), instance.dp_size))
+            .collect()
+    }
+
+    /// Share confirmed HTTP engine counts across native admission, health
+    /// generation, and Program scheduling. Unavailable metrics are retried after
+    /// a short interval. Unconfigured MoRI-IO endpoints retain the legacy
+    /// single-pod registration fallback without treating it as confirmed local DP.
+    pub(super) async fn get_routing_snapshots(
+        &self,
+        service_type: ServiceType,
+        config: &RouterConfig,
+        client: &reqwest::Client,
+    ) -> Vec<(String, String, usize)> {
+        let instances = match service_type {
+            ServiceType::Prefill => &self.prefill_instances,
+            ServiceType::Decode => &self.decode_instances,
+        };
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let snapshots = {
+            let guard = instances.lock().unwrap();
+            guard
+                .iter()
+                .filter(|(_, instance)| instance.expires_at > now)
+                .map(|(http, instance)| {
+                    (
+                        http.clone(),
+                        instance.zmq_address.clone(),
+                        instance.dp_size,
+                        instance.endpoint_dp_size.clone(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let (configured, fallback) = match service_type {
+            ServiceType::Prefill => (
+                config.prefill_data_parallel_size,
+                config.effective_prefill_data_parallel_size(),
+            ),
+            ServiceType::Decode => (
+                config.decode_data_parallel_size,
+                config.effective_decode_data_parallel_size(),
+            ),
+        };
+        let fallback = fallback.max(1);
+        let resolved = join_all(snapshots.into_iter().map(
+            |(http, zmq, reported_dp_size, cached)| async move {
+                // Preserve MoRI's historical single-pod default only when this role
+                // has no local override. Configured local sizes must still expose
+                // global/local mismatches to WRITE validation.
+                let fallback = if configured.is_none()
+                    && fallback == 1
+                    && matches!(config.kv_connector, KvConnector::MoriIO)
+                {
+                    reported_dp_size.unwrap_or(fallback)
+                } else {
+                    fallback
+                };
+                let (base, _) = dp_utils::parse_worker_url(&http);
+                let url = if base.contains("://") {
+                    base
+                } else {
+                    format!("http://{base}")
+                };
+                let size = {
+                    let mut cache = cached.lock().await;
+                    if cache.confirmed.is_none()
+                        && cache.retry_at.is_none_or(|at| Instant::now() >= at)
+                    {
+                        // Record the retry before awaiting so a cancelled caller
+                        // cannot make every waiter start a fresh probe.
+                        cache.retry_at = Some(Instant::now() + DP_DISCOVERY_RETRY_INTERVAL);
+                        cache.confirmed = match tokio::time::timeout(
+                            DP_DISCOVERY_TIMEOUT,
+                            dp_utils::probe_dp_size(client, &url),
+                        )
+                        .await
+                        {
+                            Ok(size) => size,
+                            Err(_) => {
+                                warn!(url, "DP discovery timed out after two seconds");
+                                None
+                            }
+                        };
+                        if let (Some(configured), Some(discovered)) = (configured, cache.confirmed)
+                        {
+                            if discovered != configured {
+                                warn!(
+                                    url,
+                                    configured_dp_size = configured,
+                                    discovered_dp_size = discovered,
+                                    "Using worker metrics instead of the configured DP fallback"
+                                );
+                            }
+                        }
+                        if cache.confirmed.is_none() {
+                            info!(
+                                url,
+                                fallback_dp_size = fallback,
+                                "No engine metrics; using DP fallback until the next probe"
+                            );
+                        }
+                    }
+                    cache.confirmed.unwrap_or(fallback)
+                };
+                (http, zmq, size, cached)
+            },
+        ))
+        .await;
+        // A probe may outlive its registration. Never publish its old count for
+        // an expired endpoint or a replacement registered at the same address.
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let guard = instances.lock().unwrap();
+        resolved
+            .into_iter()
+            .filter_map(|(http, zmq, size, cached)| {
+                let current = guard.get(&http)?;
+                (current.expires_at > now && Arc::ptr_eq(&current.endpoint_dp_size, &cached))
+                    .then_some((http, zmq, size))
+            })
             .collect()
     }
 
@@ -469,9 +680,8 @@ impl ServiceRegistry {
             .collect()
     }
 
-    /// DP size the registration supplied, if any. Distinguishes an explicit
-    /// `dp_size=1` from an unreported size so callers fall back to the router
-    /// configuration only when the engine said nothing.
+    /// Raw DP size supplied by registration, if any. For MoRI-IO this is the
+    /// global transfer world, not a discovered HTTP engine count.
     pub fn get_reported_dp_size(
         &self,
         http_address: &str,
@@ -494,11 +704,15 @@ impl ServiceRegistry {
         tp_size: usize,
         dp_size: Option<usize>,
     ) {
-        let instance = ServiceInstance {
-            zmq_address,
-            expires_at: u64::MAX,
-            tp_size,
-            dp_size,
+        let instance = RegisteredService {
+            instance: ServiceInstance {
+                zmq_address,
+                expires_at: u64::MAX,
+                tp_size,
+                dp_size,
+            },
+            endpoint_dp_size: Arc::new(AsyncMutex::new(EndpointDpSize::default())),
+            registration_id: Vec::new(),
         };
         match service_type {
             ServiceType::Prefill => {
