@@ -219,14 +219,16 @@ def load_router_policy_case(
         if isinstance(levels, list) and len(levels) == 1:
             concurrency = int(levels[0])
         elif isinstance(levels, list) and levels:
-            raise RuntimeError(
-                f"{case_file}: pass concurrency; file lists {levels}"
-            )
+            raise RuntimeError(f"{case_file}: pass concurrency; file lists {levels}")
         else:
-            concurrency = int((raw.get("benchmark_params") or {}).get("max-concurrency", 8))
-    elif isinstance(levels, list) and levels and int(concurrency) not in {
-        int(level) for level in levels
-    }:
+            concurrency = int(
+                (raw.get("benchmark_params") or {}).get("max-concurrency", 8)
+            )
+    elif (
+        isinstance(levels, list)
+        and levels
+        and int(concurrency) not in {int(level) for level in levels}
+    ):
         raise RuntimeError(f"{case_file}: concurrency {concurrency} not in {levels}")
     raw = case_at_concurrency(raw, int(concurrency))
     runtime = resolve_runtime(raw)
@@ -234,7 +236,9 @@ def load_router_policy_case(
     workers = raw.get("workers") or {}
     router = dict(raw.get("router_params") or {})
     case_id = str(raw["id"])
-    policy = str(router.get("policy") or raw.get("router_policy") or case_id.split("-", 1)[-1])
+    policy = str(
+        router.get("policy") or raw.get("router_policy") or case_id.split("-", 1)[-1]
+    )
     replay_path = str(runtime.get("replay_config_path") or "").strip()
     agent_infer = str(runtime.get("agent_infer") or "").strip()
     return RouterPolicyCase(
