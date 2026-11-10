@@ -214,6 +214,10 @@ name = "kv_endpoint_worker_hosts"
 path = "tests/rust/kv_endpoint_worker_hosts.rs"
 
 [[test]]
+name = "kv_transfer_shadow"
+path = "tests/rust/kv_transfer_shadow.rs"
+
+[[test]]
 name = "kv_index_prefix_contiguity"
 path = "tests/rust/kv_index_prefix_contiguity.rs"
 
