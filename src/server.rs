@@ -136,15 +136,9 @@ async fn transparent_proxy_handler(State(state): State<Arc<AppState>>, req: Requ
     let method = req.method().clone();
 
     // Read body
-    let body_bytes = match axum::body::to_bytes(req.into_body(), usize::MAX).await {
+    let body_bytes = match axum::body::Bytes::from_request(req, &()).await {
         Ok(bytes) => bytes,
-        Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                format!("Failed to read request body: {}", e),
-            )
-                .into_response()
-        }
+        Err(rejection) => return rejection.into_response(),
     };
 
     // Parse body as JSON
@@ -943,13 +937,21 @@ pub fn build_app_with_wasm_middleware(
         .route("/workers/{url}", get(get_worker))
         .route("/workers/{url}", delete(delete_worker));
 
-    // Build base app with all routes and middleware
+    // Build base app with all routes
     let base_app = Router::new()
         .merge(protected_routes)
         .merge(public_routes)
         .merge(admin_routes)
-        .merge(worker_routes)
-        // Request body size limiting
+        .merge(worker_routes);
+
+    // Choose fallback based on transparent proxy mode
+    let base_app = if enable_transparent_proxy {
+        base_app.fallback(transparent_proxy_handler)
+    } else {
+        base_app.fallback(sink_handler)
+    };
+
+    let base_app = base_app
         .layer(DefaultBodyLimit::max(max_payload_size))
         .layer(tower_http::limit::RequestBodyLimitLayer::new(
             max_payload_size,
@@ -961,18 +963,10 @@ pub fn build_app_with_wasm_middleware(
         base_app
     };
 
-    let base_app = base_app
+    base_app
         .layer(middleware::RequestIdLayer::new(request_id_headers))
-        .layer(create_cors_layer(cors_allowed_origins));
-
-    // Choose fallback based on transparent proxy mode
-    if enable_transparent_proxy {
-        base_app
-            .fallback(transparent_proxy_handler)
-            .with_state(app_state)
-    } else {
-        base_app.fallback(sink_handler).with_state(app_state)
-    }
+        .layer(create_cors_layer(cors_allowed_origins))
+        .with_state(app_state)
 }
 
 pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Error>> {

@@ -175,10 +175,12 @@ steps:
         commands:
           - "DOCKER_BUILDKIT=1 docker build --tag vllm/vllm-router:nightly-x86_64 --progress plain -f docker/Dockerfile.router ."
           - "docker push vllm/vllm-router:nightly-x86_64"
+        secrets:
+          RELEASE_DOCKERHUB_TOKEN: ROUTER_DOCKERHUB_TOKEN
         plugins:
           - docker-login#v3.0.0:
-              username: vllmbot
-              password-env: DOCKERHUB_TOKEN
+              username: "vllm"
+              password-env: RELEASE_DOCKERHUB_TOKEN
         env:
           DOCKER_BUILDKIT: "1"
 
@@ -190,10 +192,12 @@ steps:
         commands:
           - "DOCKER_BUILDKIT=1 docker build --tag vllm/vllm-router:nightly-aarch64 --progress plain -f docker/Dockerfile.router ."
           - "docker push vllm/vllm-router:nightly-aarch64"
+        secrets:
+          RELEASE_DOCKERHUB_TOKEN: ROUTER_DOCKERHUB_TOKEN
         plugins:
           - docker-login#v3.0.0:
-              username: vllmbot
-              password-env: DOCKERHUB_TOKEN
+              username: "vllm"
+              password-env: RELEASE_DOCKERHUB_TOKEN
         env:
           DOCKER_BUILDKIT: "1"
 
@@ -212,12 +216,14 @@ steps:
           - "bash .buildkite/scripts/publish-release-images.sh nightly"
           # Clean up old nightly builds (keep only last 14)
           - "bash .buildkite/scripts/cleanup-nightly-router-builds.sh"
+        secrets:
+          RELEASE_DOCKERHUB_TOKEN: ROUTER_DOCKERHUB_TOKEN
         plugins:
           - docker-login#v3.0.0:
-              username: vllmbot
-              password-env: DOCKERHUB_TOKEN
+              username: "vllm"
+              password-env: RELEASE_DOCKERHUB_TOKEN
         env:
-          DOCKERHUB_USERNAME: "vllmbot"
+          DOCKERHUB_USERNAME: "vllm"
 
   # ============================================================================
   # Versioned Docker release (when NIGHTLY != 1)
@@ -262,10 +268,12 @@ steps:
             --progress plain \
             -f docker/Dockerfile.router .
           docker push "vllm/vllm-router:v$${RELEASE_VERSION}-x86_64"
+        secrets:
+          RELEASE_DOCKERHUB_TOKEN: ROUTER_DOCKERHUB_TOKEN
         plugins:
           - docker-login#v3.0.0:
-              username: vllmbot
-              password-env: DOCKERHUB_TOKEN
+              username: "vllm"
+              password-env: RELEASE_DOCKERHUB_TOKEN
         env:
           DOCKER_BUILDKIT: "1"
 
@@ -287,10 +295,12 @@ steps:
             --progress plain \
             -f docker/Dockerfile.router .
           docker push "vllm/vllm-router:v$${RELEASE_VERSION}-aarch64"
+        secrets:
+          RELEASE_DOCKERHUB_TOKEN: ROUTER_DOCKERHUB_TOKEN
         plugins:
           - docker-login#v3.0.0:
-              username: vllmbot
-              password-env: DOCKERHUB_TOKEN
+              username: "vllm"
+              password-env: RELEASE_DOCKERHUB_TOKEN
         env:
           DOCKER_BUILDKIT: "1"
 
@@ -307,12 +317,14 @@ steps:
     if: build.env("NIGHTLY") != "1"
     depends_on: block-publish-release-images
     command: bash .buildkite/scripts/publish-release-images.sh release
+    secrets:
+      RELEASE_DOCKERHUB_TOKEN: ROUTER_DOCKERHUB_TOKEN
     plugins:
       - docker-login#v3.0.0:
-          username: vllmbot
-          password-env: DOCKERHUB_TOKEN
+          username: "vllm"
+          password-env: RELEASE_DOCKERHUB_TOKEN
     agents:
       queue: cpu_queue_release
     env:
       DOCKER_BUILDKIT: "1"
-      DOCKERHUB_USERNAME: "vllmbot"
+      DOCKERHUB_USERNAME: "vllm"

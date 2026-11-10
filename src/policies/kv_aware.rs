@@ -838,11 +838,7 @@ impl Picker for TemperaturePicker {
             return None;
         }
         if self.temperature <= 0.0 || !self.temperature.is_finite() {
-            return costs
-                .iter()
-                .enumerate()
-                .min_by(|left, right| left.1.total_cmp(right.1))
-                .map(|(index, _)| index);
+            return pick_minimum(costs);
         }
 
         let min = costs.iter().copied().reduce(f64::min)?;
@@ -852,11 +848,7 @@ impl Picker for TemperaturePicker {
             .collect();
         let total: f64 = weights.iter().sum();
         if !total.is_finite() || total <= 0.0 {
-            return costs
-                .iter()
-                .enumerate()
-                .min_by(|left, right| left.1.total_cmp(right.1))
-                .map(|(index, _)| index);
+            return pick_minimum(costs);
         }
         let mut draw = rand::rng().random::<f64>() * total;
         for (index, weight) in weights.into_iter().enumerate() {
@@ -867,6 +859,34 @@ impl Picker for TemperaturePicker {
         }
         Some(costs.len() - 1)
     }
+}
+
+/// Picks uniformly among tied candidates.
+///
+/// Equal scores carry no ranking evidence. Keeping the first candidate would
+/// encode slice order as a preference: with an idle pool every cold request of
+/// the same length has one cost, and all of them would land on the same worker.
+fn pick_tied(candidates: &[usize]) -> Option<usize> {
+    match candidates {
+        [] => None,
+        [only] => Some(*only),
+        _ => Some(candidates[rand::rng().random_range(0..candidates.len())]),
+    }
+}
+
+/// Picks uniformly among the candidates that share the lowest cost.
+///
+/// The ranking still decides which candidates are eligible; chance only
+/// resolves scores that are exactly equal.
+fn pick_minimum(costs: &[f64]) -> Option<usize> {
+    let min = *costs.iter().min_by(|left, right| left.total_cmp(right))?;
+    let tied: Vec<usize> = costs
+        .iter()
+        .enumerate()
+        .filter(|(_, cost)| **cost == min)
+        .map(|(index, _)| index)
+        .collect();
+    pick_tied(&tied)
 }
 
 #[derive(Debug, Default)]
@@ -1624,17 +1644,25 @@ impl KvAwarePolicy {
         if costs.iter().all(|cost| *cost == 0.0)
             || (self.params.router_temperature <= 0.0 && costs.contains(&0.0))
         {
-            components
+            let rank = |component: &CostComponents| {
+                (
+                    if has_tokens { component.ptoken } else { 0 },
+                    component.batchsize,
+                )
+            };
+            let best = components
                 .iter()
                 .enumerate()
                 .filter(|(index, _)| costs[*index] == 0.0)
-                .min_by_key(|(_, component)| {
-                    (
-                        if has_tokens { component.ptoken } else { 0 },
-                        component.batchsize,
-                    )
-                })
+                .min_by_key(|(_, component)| rank(component))
+                .map(|(_, component)| rank(component))?;
+            let tied: Vec<usize> = components
+                .iter()
+                .enumerate()
+                .filter(|(index, component)| costs[*index] == 0.0 && rank(component) == best)
                 .map(|(index, _)| index)
+                .collect();
+            pick_tied(&tied)
         } else {
             self.picker.pick(costs)
         }
@@ -1798,14 +1826,22 @@ impl KvAwareOps for KvAwarePolicy {
             return None;
         }
         if self.params.router_temperature <= 0.0 {
-            costs
+            let (best_index, best_cost) = costs
                 .iter()
                 .enumerate()
                 .min_by(|(li, left), (ri, right)| {
                     left.total_cmp(right)
                         .then_with(|| occupancy[*li].cmp(&occupancy[*ri]))
                 })
-                .map(|(index, _)| index)
+                .map(|(index, cost)| (index, *cost))?;
+            // Occupancy is the last ranking signal. Candidates that also match
+            // it are equally good, so spread them instead of taking the first.
+            let tied: Vec<usize> = (0..costs.len())
+                .filter(|&index| {
+                    costs[index] == best_cost && occupancy[index] == occupancy[best_index]
+                })
+                .collect();
+            pick_tied(&tied)
         } else {
             self.picker.pick(costs)
         }
@@ -2107,7 +2143,7 @@ mod tests {
                     .unwrap_or_else(|| panic!("{case}: no worker selected for {mask:?}"))
             };
             let receipt = select(&mask, &[]);
-            assert_eq!(receipt.worker_index, 0, "{case}");
+            assert!(mask[receipt.worker_index], "{case}: ineligible worker");
             assert_eq!(receipt.new_prefill_tokens, 1, "{case}");
             assert_eq!(provider.queries.load(Ordering::Relaxed), 1, "{case}");
             assert_eq!(provider.blocks.load(Ordering::Relaxed), 3, "{case}");
@@ -2619,8 +2655,44 @@ mod tests {
     }
 
     #[test]
-    fn argmin_picker_is_deterministic() {
-        assert_eq!(TemperaturePicker::new(0.0).pick(&[5.0, 2.0, 2.0]), Some(1));
+    fn argmin_picker_spreads_exact_ties_and_keeps_the_ranking() {
+        let picker = TemperaturePicker::new(0.0);
+        let mut seen = [false; 3];
+        for _ in 0..64 {
+            let index = picker.pick(&[5.0, 2.0, 2.0]).unwrap();
+            assert_ne!(index, 0, "a dearer candidate must never win a tie");
+            seen[index] = true;
+        }
+        assert_eq!(seen, [false, true, true]);
+        assert_eq!(picker.pick(&[]), None);
+    }
+
+    #[test]
+    fn zero_cost_ties_spread_across_equivalent_workers() {
+        let policy = KvAwarePolicy::default();
+        let components = [
+            CostComponents {
+                ptoken: 8,
+                batchsize: 1,
+            },
+            CostComponents {
+                ptoken: 8,
+                batchsize: 1,
+            },
+            CostComponents {
+                ptoken: 8,
+                batchsize: 2,
+            },
+        ];
+        let mut seen = [false; 3];
+        for _ in 0..64 {
+            let index = policy
+                .pick_among(true, &[0.0, 0.0, 0.0], &components)
+                .unwrap();
+            assert_ne!(index, 2, "a busier worker must not win a full tie");
+            seen[index] = true;
+        }
+        assert_eq!(seen, [true, true, false]);
     }
 
     #[test]
@@ -3170,36 +3242,39 @@ mod tests {
     fn affinity_rebinds_on_unregistration_and_reregistration() {
         let policy = KvAwarePolicy::default();
         let workers = registered_worker_pair(&policy);
-        let first_target = target("instance-a", 0);
-        let second_target = target("instance-b", 0);
+        let targets = [target("instance-a", 0), target("instance-b", 0)];
+        let urls = ["http://a", "http://b"];
         let key = affinity_key("session-a");
 
-        // First placement binds to the idle worker a.
+        // The idle pair is an exact tie, so the first placement may bind
+        // either worker; keep the rest of the test relative to that choice.
         let bound = policy
             .select_worker_with_receipt(&workers, None, None, None, Some(&key), &[])
             .unwrap();
-        assert_eq!(bound.decision.target, first_target);
+        let first = bound.worker_index;
+        let second = 1 - first;
+        assert_eq!(bound.decision.target, targets[first]);
         release_receipt(&workers, &bound);
 
         // Removal invalidates the binding; under load the next request rebinds.
-        workers[0].increment_load();
-        policy.unregister_target("http://a");
-        policy.register_target("http://a", first_target.clone());
+        workers[first].increment_load();
+        policy.unregister_target(urls[first]);
+        policy.register_target(urls[first], targets[first].clone());
         let rebound = policy
             .select_worker_with_receipt(&workers, None, None, None, Some(&key), &[])
             .unwrap();
-        assert_eq!(rebound.decision.target, second_target);
+        assert_eq!(rebound.decision.target, targets[second]);
         release_receipt(&workers, &rebound);
 
         // Re-registering the same target bumps its registration generation,
         // so the stale record rebinds through fresh selection.
-        workers[1].increment_load();
-        workers[1].increment_load();
-        policy.register_target("http://b", second_target.clone());
+        workers[second].increment_load();
+        workers[second].increment_load();
+        policy.register_target(urls[second], targets[second].clone());
         let fresh = policy
             .select_worker_with_receipt(&workers, None, None, None, Some(&key), &[])
             .unwrap();
-        assert_eq!(fresh.decision.target, first_target);
+        assert_eq!(fresh.decision.target, targets[first]);
     }
 
     #[test]
@@ -3756,6 +3831,53 @@ mod tests {
         let first = policy.pick_decode(&[0, 0]).unwrap();
         let second = policy.pick_decode(&[0, 0]).unwrap();
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn pick_prefill_spreads_exact_ties_and_keeps_the_ranking() {
+        let policy = KvAwarePolicy::default();
+        // Equal cost and occupancy: every tied candidate must be reachable.
+        let mut seen = [false; 3];
+        for _ in 0..64 {
+            let index = policy
+                .pick_prefill(&[8_000.0, 8_000.0, 12_000.0], &[0, 0, 0])
+                .unwrap();
+            assert!(index < 2, "a dearer candidate must never win a tie");
+            seen[index] = true;
+        }
+        assert_eq!(seen, [true, true, false]);
+
+        // A cost tie still resolves by occupancy, without introducing chance.
+        for _ in 0..16 {
+            assert_eq!(policy.pick_prefill(&[8_000.0, 8_000.0], &[1, 0]), Some(1));
+        }
+
+        assert_eq!(policy.pick_prefill(&[], &[]), None);
+        assert_eq!(policy.pick_prefill(&[1.0], &[]), None);
+        assert_eq!(policy.pick_prefill(&[f64::NAN], &[0]), None);
+    }
+
+    #[test]
+    fn colocated_equal_costs_spread_across_idle_workers() {
+        let index = Arc::new(crate::kv_index::KvBlockIndexer::new());
+        let policy = policy_with_index(index, CostParams::default());
+        let workers: Vec<Arc<dyn Worker>> = vec![
+            Arc::new(BasicWorker::new("http://cold0".into(), WorkerType::Regular)),
+            Arc::new(BasicWorker::new("http://cold1".into(), WorkerType::Regular)),
+        ];
+        policy.register_target(workers[0].url(), target("cold0", 0));
+        policy.register_target(workers[1].url(), target("cold1", 0));
+
+        let ids: Vec<u32> = (0..32).collect();
+        let mut seen = [false; 2];
+        for _ in 0..32 {
+            let receipt = policy
+                .select_worker_with_receipt(&workers, Some(&ids), None, None, None, &[])
+                .unwrap();
+            seen[receipt.worker_index] = true;
+            release_receipt(&workers, &receipt);
+        }
+        assert_eq!(seen, [true, true], "equal costs must use every worker");
     }
 
     fn stage_policy() -> KvAwarePolicy {
