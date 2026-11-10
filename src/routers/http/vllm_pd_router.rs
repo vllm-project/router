@@ -1500,7 +1500,6 @@ impl VllmPDRouter {
         RouterMetrics::record_pd_decode_request(decode_http);
         if !decode_response.status().is_success() {
             RouterMetrics::record_pd_decode_error(decode_http);
-            attempt.finish_decode();
         }
         let is_streaming = request
             .get("stream")
@@ -4984,6 +4983,103 @@ mod tests {
             );
         }
     }
+
+    #[tokio::test]
+    async fn decode_error_body_preserves_other_requests_load() {
+        use axum::routing::post;
+        use std::convert::Infallible;
+
+        for concurrent in [false, true] {
+            for shape in ["streaming", "buffered", "oversized"] {
+                let body_started = Arc::new(tokio::sync::Notify::new());
+                let started = body_started.clone();
+                let prefill_url = spawn_test_server(
+                    axum::Router::new()
+                        .fallback(|| async { axum::Json(json!({"kv_transfer_params": {}})) }),
+                )
+                .await;
+                let decode_url = spawn_test_server(axum::Router::new().route(
+                    "/v1/chat/completions",
+                    post(move || {
+                        let started = started.clone();
+                        async move {
+                            let stream = futures_util::stream::once(async move {
+                                started.notify_one();
+                                Ok::<_, Infallible>(Bytes::from_static(b"{"))
+                            })
+                            .chain(futures_util::stream::pending());
+                            let mut response = Response::builder()
+                                .status(StatusCode::BAD_REQUEST)
+                                .header("content-type", "application/json");
+                            if shape == "oversized" {
+                                response = response
+                                    .header("content-length", PD_BUFFERED_BODY_LIMIT_BYTES + 1);
+                            }
+                            response.body(Body::from_stream(stream)).unwrap()
+                        }
+                    }),
+                ))
+                .await;
+                let prefill: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+                    prefill_url,
+                    WorkerType::Prefill {
+                        bootstrap_port: None,
+                    },
+                ));
+                let decode: Arc<dyn Worker> =
+                    Arc::new(BasicWorker::new(decode_url, WorkerType::Decode));
+                let unrelated = crate::core::WorkerLoadGuard::new(decode.as_ref());
+                let router = test_vllm_pd_router().await;
+                if concurrent {
+                    router.store_nixl_info(
+                        prefill.base_url(),
+                        None,
+                        json!({
+                            "transfer_mode": "push", "remote_engine_id": "test-prefill",
+                            "remote_host": "127.0.0.1", "remote_port": 1234,
+                        }),
+                    );
+                }
+                router.pd_router.worker_registry.register(prefill.clone());
+                router.pd_router.worker_registry.register(decode.clone());
+                let mut request = tokio::spawn(async move {
+                    router
+                        .route_transparent(
+                            None,
+                            "/v1/chat/completions",
+                            &Method::POST,
+                            json!({"model": "test", "messages": [], "stream": shape == "streaming"}),
+                        )
+                        .await
+                });
+                tokio::time::timeout(std::time::Duration::from_secs(5), body_started.notified())
+                    .await
+                    .expect("decode must start its error body");
+
+                let response =
+                    tokio::time::timeout(std::time::Duration::from_millis(100), &mut request).await;
+                assert_eq!(
+                    decode.load(),
+                    2,
+                    "the error body still owns its reservation: {concurrent} {shape}"
+                );
+                if shape == "buffered" {
+                    assert!(response.is_err(), "the stalled body must remain pending");
+                    request.abort();
+                    assert!(request.await.unwrap_err().is_cancelled());
+                } else {
+                    let response = response.expect("passthrough headers must arrive").unwrap();
+                    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+                    drop(response);
+                }
+                assert_eq!(decode.load(), 1, "another request's load must survive");
+                drop(unrelated);
+                assert_eq!(decode.load(), 0);
+                assert_eq!(prefill.load(), 0);
+            }
+        }
+    }
+
     #[test]
     fn test_decode_reservation_serializes_concurrent_admission() {
         let context = crate::policies::SelectionContext::default();
@@ -5361,7 +5457,11 @@ mod tests {
                     "{path} {mode}: {}",
                     response.status()
                 );
-                assert_eq!(decode.load(), 1, "{path} {mode}");
+                assert_eq!(
+                    decode.load(),
+                    if mode == "decode_http" { 2 } else { 1 },
+                    "{path} {mode}"
+                );
                 drop(response);
                 assert_eq!(
                     decode.load(),
