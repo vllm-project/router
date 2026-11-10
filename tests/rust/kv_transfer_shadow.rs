@@ -57,6 +57,8 @@ use vllm_router_rs::server::AppContext;
 
 const BLOCK_SIZE: u32 = 16;
 const COUNTER: &str = "vllm_router_kv_transfer_plans_total";
+const SAVED_MS: &str = "vllm_router_kv_transfer_estimated_saved_ms";
+const COST_MS: &str = "vllm_router_kv_transfer_estimated_cost_ms";
 
 // ---------------------------------------------------------------------------
 // Metrics and serialization
@@ -91,6 +93,74 @@ fn plan_counts() -> BTreeMap<String, u64> {
         counts.insert(outcome.to_owned(), value as u64);
     }
     counts
+}
+
+/// Observation count and sum of every histogram series this PR adds, keyed by
+/// `saved`, `cost:fetch` and `cost:wait`. The test recorder has no buckets
+/// configured, so the exporter renders these as summaries; `_count` and `_sum`
+/// are present either way.
+fn cost_histograms() -> BTreeMap<String, (u64, f64)> {
+    let mut series: BTreeMap<String, (u64, f64)> = BTreeMap::new();
+    for line in metrics().render().lines() {
+        for (name, base) in [(SAVED_MS, "saved"), (COST_MS, "cost")] {
+            for (suffix, is_count) in [("_count", true), ("_sum", false)] {
+                let Some(rest) = line.strip_prefix(&format!("{name}{suffix}")) else {
+                    continue;
+                };
+                let key = match rest.strip_prefix('{') {
+                    Some(labels) => {
+                        let path = labels
+                            .split("path=\"")
+                            .nth(1)
+                            .and_then(|tail| tail.split('"').next())
+                            .expect("path label");
+                        format!("{base}:{path}")
+                    }
+                    None => base.to_owned(),
+                };
+                let value: f64 = line
+                    .rsplit(' ')
+                    .next()
+                    .and_then(|value| value.parse().ok())
+                    .expect("histogram value");
+                let entry = series.entry(key).or_default();
+                if is_count {
+                    entry.0 = value as u64;
+                } else {
+                    entry.1 = value;
+                }
+            }
+        }
+    }
+    series
+}
+
+/// Per-series change in `(count, sum)` between two scrapes (only series whose
+/// count changed).
+fn cost_delta(
+    before: &BTreeMap<String, (u64, f64)>,
+    after: &BTreeMap<String, (u64, f64)>,
+) -> BTreeMap<String, (u64, f64)> {
+    after
+        .iter()
+        .filter_map(|(key, &(count, sum))| {
+            let (old_count, old_sum) = before.get(key).copied().unwrap_or((0, 0.0));
+            (count > old_count).then(|| (key.clone(), (count - old_count, sum - old_sum)))
+        })
+        .collect()
+}
+
+/// Assert the cost histogram delta has exactly the expected series, each with
+/// the expected observation count and a sum within 0.01 ms of `sum`.
+fn assert_cost_observations(actual: &BTreeMap<String, (u64, f64)>, expected: &[(&str, u64, f64)]) {
+    let keys: Vec<_> = actual.keys().map(String::as_str).collect();
+    let want: Vec<_> = expected.iter().map(|(key, _, _)| *key).collect();
+    assert_eq!(keys, want, "series observed: {actual:?}");
+    for &(key, count, sum) in expected {
+        let (got_count, got_sum) = actual[key];
+        assert_eq!(got_count, count, "{key} count");
+        assert!((got_sum - sum).abs() < 0.01, "{key} sum {got_sum} != {sum}");
+    }
 }
 
 /// What changed between two scrapes (only non-zero entries).
@@ -355,6 +425,23 @@ async fn outcomes_of<F: std::future::Future>(request: F) -> (F::Output, BTreeMap
     (result, delta(&before, &plan_counts()))
 }
 
+/// Like [`outcomes_of`], also returning the cost histogram delta.
+async fn observed_of<F: std::future::Future>(
+    request: F,
+) -> (
+    F::Output,
+    BTreeMap<String, u64>,
+    BTreeMap<String, (u64, f64)>,
+) {
+    let (before, hist_before) = (plan_counts(), cost_histograms());
+    let result = request.await;
+    (
+        result,
+        delta(&before, &plan_counts()),
+        cost_delta(&hist_before, &cost_histograms()),
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Scenarios (design doc section 3.4). Block size 16, min_prefix_blocks 64.
 //
@@ -382,10 +469,19 @@ async fn s1_busy_source_with_long_prefix_is_planned() {
     fx.make_busy("a", &prompt[..1600], 300, 2).await;
 
     let (b_before, a_before) = (fx.mock("b").completions(), fx.mock("a").completions());
-    let (status, delta) = outcomes_of(fx.complete(&prompt, None)).await;
+    let (status, delta, costs) = observed_of(fx.complete(&prompt, None)).await;
 
     assert_eq!(status, 200);
     assert_eq!(delta, outcomes(&[("planned", 1)]));
+    // Saved prefill: 1600 credited tokens * 0.05 ms = 80 ms.
+    assert_cost_observations(
+        &costs,
+        &[
+            ("cost:fetch", 1, 18.0),
+            ("cost:wait", 1, 35.0),
+            ("saved", 1, 80.0),
+        ],
+    );
     assert_eq!(fx.mock("b").completions() - b_before, 1, "B was the pick");
     assert_eq!(
         fx.mock("a").completions(),
@@ -482,10 +578,12 @@ async fn s3_short_prefix_is_not_worth_fetching() {
     fx.make_busy("a", &prompt[..640], 100, 2).await;
 
     let b_before = fx.mock("b").completions();
-    let (status, delta) = outcomes_of(fx.complete(&prompt, None)).await;
+    let (status, delta, costs) = observed_of(fx.complete(&prompt, None)).await;
 
     assert_eq!(status, 200);
     assert_eq!(delta, outcomes(&[("prefix_too_short", 1)]));
+    // Skipped before the cost rule: nothing is observed.
+    assert_cost_observations(&costs, &[]);
     assert_eq!(fx.mock("b").completions() - b_before, 1, "B was the pick");
     fx.finish().await;
 }
@@ -578,10 +676,13 @@ async fn s5_external_tier_makes_waiting_cheaper_than_fetching() {
     fx.make_busy("a", &prompt[..1600], 70, 4).await;
 
     let b_before = fx.mock("b").completions();
-    let (status, delta) = outcomes_of(fx.complete(&prompt, None)).await;
+    let (status, delta, costs) = observed_of(fx.complete(&prompt, None)).await;
 
     assert_eq!(status, 200);
     assert_eq!(delta, outcomes(&[("cost_rule", 1)]));
+    // The estimates survive the failed rule; nothing is saved because no plan
+    // was made.
+    assert_cost_observations(&costs, &[("cost:fetch", 1, 33.0), ("cost:wait", 1, 22.0)]);
     assert_eq!(fx.mock("b").completions() - b_before, 1, "B was the pick");
     fx.finish().await;
 }

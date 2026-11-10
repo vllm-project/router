@@ -170,8 +170,27 @@ pub struct TransferPlannerInput<'a> {
     pub cost_params: &'a CostParams,
 }
 
+/// What the planner returns: the plan or skip, plus the cost estimate whenever
+/// the cost rule was evaluated for the peer whose result is returned (the
+/// planned peer, or the peer whose `CostRule` skip is reported). `None` for
+/// skips that happen before the cost rule.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TransferOutcome {
+    pub result: Result<TransferPlan, TransferSkip>,
+    pub estimate: Option<CostEstimate>,
+}
+
+impl TransferOutcome {
+    pub(crate) fn skip(skip: TransferSkip) -> Self {
+        Self {
+            result: Err(skip),
+            estimate: None,
+        }
+    }
+}
+
 pub trait TransferPlanner: Send + Sync + std::fmt::Debug {
-    fn plan(&self, input: &TransferPlannerInput<'_>) -> Result<TransferPlan, TransferSkip>;
+    fn plan(&self, input: &TransferPlannerInput<'_>) -> TransferOutcome;
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -180,7 +199,7 @@ pub struct CostRuleTransferPlanner {
 }
 
 impl TransferPlanner for CostRuleTransferPlanner {
-    fn plan(&self, input: &TransferPlannerInput<'_>) -> Result<TransferPlan, TransferSkip> {
+    fn plan(&self, input: &TransferPlannerInput<'_>) -> TransferOutcome {
         plan_transfer(input, &self.policy)
     }
 }
@@ -217,12 +236,9 @@ fn prefix_blocks<'a>(matches: impl Iterator<Item = &'a TierMatch> + Clone) -> u3
 }
 
 /// Pure: no locks, no I/O, no clock. Deterministic for the same input.
-pub fn plan_transfer(
-    input: &TransferPlannerInput<'_>,
-    policy: &TransferPolicy,
-) -> Result<TransferPlan, TransferSkip> {
+pub fn plan_transfer(input: &TransferPlannerInput<'_>, policy: &TransferPolicy) -> TransferOutcome {
     if !policy.enabled || !policy.valid() {
-        return Err(TransferSkip::Disabled);
+        return TransferOutcome::skip(TransferSkip::Disabled);
     }
     // Misaligned input is a caller bug; refuse to plan rather than panic on
     // the routing path.
@@ -233,18 +249,18 @@ pub fn plan_transfer(
         || input.capabilities.len() != count
         || input.excluded.len() != count
     {
-        return Err(TransferSkip::Disabled);
+        return TransferOutcome::skip(TransferSkip::Disabled);
     }
     let dest = input.picked;
     let Some(dest_key) = input.cache_keys[dest] else {
-        return Err(TransferSkip::UnverifiedIdentity);
+        return TransferOutcome::skip(TransferSkip::UnverifiedIdentity);
     };
     let block_size = input.block_sizes[dest];
     if block_size == 0 {
-        return Err(TransferSkip::UnverifiedIdentity);
+        return TransferOutcome::skip(TransferSkip::UnverifiedIdentity);
     }
     let Some(destination_hits) = input.destination_hits else {
-        return Err(TransferSkip::UnknownDestinationInput);
+        return TransferOutcome::skip(TransferSkip::UnknownDestinationInput);
     };
     let dest_prefix = transferable_prefix_blocks(input.candidates[dest].matches);
 
@@ -282,25 +298,30 @@ pub fn plan_transfer(
     // one that could have served at all: a retry exclusion or a layout
     // mismatch on the longest holder says less about lost transfers than why
     // the next usable holder was rejected.
-    let mut first_skip = None;
-    let mut first_usable_skip = None;
+    let mut first_skip: Option<(TransferSkip, Option<CostEstimate>)> = None;
+    let mut first_usable_skip: Option<(TransferSkip, Option<CostEstimate>)> = None;
     for (src, src_prefix) in peers {
-        match plan_from_source(input, policy, src, src_prefix, dest_prefix, block_size) {
-            Ok(plan) => return Ok(plan),
+        let outcome = plan_from_source(input, policy, src, src_prefix, dest_prefix, block_size);
+        match outcome.result {
+            Ok(_) => return outcome,
             Err(skip) => {
-                first_skip.get_or_insert(skip);
+                first_skip.get_or_insert((skip, outcome.estimate));
                 if !matches!(
                     skip,
                     TransferSkip::SourceExcluded | TransferSkip::Incompatible
                 ) {
-                    first_usable_skip.get_or_insert(skip);
+                    first_usable_skip.get_or_insert((skip, outcome.estimate));
                 }
             }
         }
     }
-    Err(first_usable_skip
-        .or(first_skip)
-        .unwrap_or(TransferSkip::NoPeer))
+    match first_usable_skip.or(first_skip) {
+        Some((skip, estimate)) => TransferOutcome {
+            result: Err(skip),
+            estimate,
+        },
+        None => TransferOutcome::skip(TransferSkip::NoPeer),
+    }
 }
 
 /// Remaining prefill for `candidate` under the router's own cost model (the
@@ -319,16 +340,16 @@ fn routing_prefill_tokens(
 /// saves. Both paths price the remaining prefill with the router's estimate
 /// so a plan never disagrees with the cost model that made the pick.
 #[derive(Debug, Clone, Copy, PartialEq)]
-struct CostEstimate {
-    transfer_ms: f64,
+pub struct CostEstimate {
+    pub transfer_ms: f64,
     /// Destination queue + transfer + destination prefill after the fetch.
-    fetch_ms: f64,
+    pub fetch_ms: f64,
     /// Source queue + the source's normal prefill (all its tier credits).
-    wait_ms: f64,
+    pub wait_ms: f64,
     /// Destination prefill without the fetch minus with it.
-    saved_ms: f64,
-    dest_queue_ms: f64,
-    source_wait_ms: f64,
+    pub saved_ms: f64,
+    pub dest_queue_ms: f64,
+    pub source_wait_ms: f64,
 }
 
 fn estimate_costs(
@@ -382,27 +403,27 @@ fn plan_from_source(
     src_prefix: u32,
     dest_prefix: u32,
     block_size: u32,
-) -> Result<TransferPlan, TransferSkip> {
+) -> TransferOutcome {
     let dest = input.picked;
     if input.excluded[src] {
-        return Err(TransferSkip::SourceExcluded);
+        return TransferOutcome::skip(TransferSkip::SourceExcluded);
     }
     if policy.require_capability {
         match (input.capabilities[src], input.capabilities[dest]) {
             (Some(from), Some(to)) if from.can_send_to(to) => {}
-            _ => return Err(TransferSkip::Incompatible),
+            _ => return TransferOutcome::skip(TransferSkip::Incompatible),
         }
     }
     if src_prefix <= dest_prefix {
-        return Err(TransferSkip::PickedHoldsLongestPrefix);
+        return TransferOutcome::skip(TransferSkip::PickedHoldsLongestPrefix);
     }
     let missing_blocks = src_prefix - dest_prefix;
     if missing_blocks < policy.min_prefix_blocks {
-        return Err(TransferSkip::PrefixTooShort);
+        return TransferOutcome::skip(TransferSkip::PrefixTooShort);
     }
     let (source, destination) = (&input.candidates[src], &input.candidates[dest]);
     if source.load.active_requests < policy.source_load_threshold {
-        return Err(TransferSkip::SourceNotBusy);
+        return TransferOutcome::skip(TransferSkip::SourceNotBusy);
     }
 
     // Never credit the final prompt token, matching `credited_tokens` in
@@ -415,17 +436,20 @@ fn plan_from_source(
             .saturating_sub(dest_cached),
     );
     if credited == 0 {
-        return Err(TransferSkip::PrefixTooShort);
+        return TransferOutcome::skip(TransferSkip::PrefixTooShort);
     }
     let credited_blocks = credited.div_ceil(bs).min(u64::from(missing_blocks)) as u32;
     let fetched_end = dest_prefix + credited_blocks;
 
     let cost = estimate_costs(input, policy, src, fetched_end, credited, block_size);
     if !(cost.fetch_ms < cost.wait_ms && cost.transfer_ms < cost.saved_ms * policy.margin) {
-        return Err(TransferSkip::CostRule);
+        return TransferOutcome {
+            result: Err(TransferSkip::CostRule),
+            estimate: Some(cost),
+        };
     }
 
-    Ok(TransferPlan {
+    let plan = TransferPlan {
         plan_id: 0,
         source: source.target.clone(),
         destination: destination.target.clone(),
@@ -436,7 +460,11 @@ fn plan_from_source(
         estimated_saved_prefill_ms: cost.saved_ms,
         estimated_source_wait_ms: cost.source_wait_ms,
         estimated_destination_queue_ms: cost.dest_queue_ms,
-    })
+    };
+    TransferOutcome {
+        result: Ok(plan),
+        estimate: Some(cost),
+    }
 }
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
@@ -546,6 +574,10 @@ mod tests {
         }
 
         fn plan(&self, policy: &TransferPolicy) -> Result<TransferPlan, TransferSkip> {
+            self.outcome(policy).result
+        }
+
+        fn outcome(&self, policy: &TransferPolicy) -> TransferOutcome {
             let candidates = [
                 view(
                     &self.targets[0],
@@ -660,6 +692,7 @@ mod tests {
                 },
                 &enabled(),
             )
+            .result
         };
         assert_eq!(input(1, &[16], &[false]), Err(TransferSkip::Disabled));
         assert_eq!(input(0, &[16, 16], &[false]), Err(TransferSkip::Disabled));
@@ -941,7 +974,8 @@ mod tests {
                 cost_params: &CostParams::default(),
             },
             &policy,
-        );
+        )
+        .result;
         assert_eq!(result, Err(TransferSkip::PrefixTooShort));
     }
 
@@ -1005,6 +1039,7 @@ mod tests {
                 },
                 &enabled(),
             )
+            .result
             .unwrap()
             .source
         };
@@ -1044,6 +1079,7 @@ mod tests {
             },
             &enabled(),
         )
+        .result
         .unwrap();
         assert_eq!(plan.source, targets[2]);
         assert_eq!(plan.blocks, (0, 100));
@@ -1112,7 +1148,7 @@ mod tests {
         let off = CostRuleTransferPlanner {
             policy: TransferPolicy::default(),
         };
-        assert_eq!(off.plan(&input), Err(TransferSkip::Disabled));
+        assert_eq!(off.plan(&input).result, Err(TransferSkip::Disabled));
     }
 
     /// One candidate for [`plan_many`]: matches on its own prompt (also used as
@@ -1142,6 +1178,10 @@ mod tests {
 
     /// Position 0 is the picked destination; the rest are peers.
     fn plan_many(peers: &[Peer], policy: &TransferPolicy) -> Result<TransferPlan, TransferSkip> {
+        plan_many_outcome(peers, policy).result
+    }
+
+    fn plan_many_outcome(peers: &[Peer], policy: &TransferPolicy) -> TransferOutcome {
         let candidates: Vec<_> = peers
             .iter()
             .map(|p| view(&p.target, &p.matches, p.load.0, p.load.1))
@@ -1300,9 +1340,13 @@ mod tests {
         assert_eq!(cost.fetch_ms, 33.0);
         assert_eq!(cost.wait_ms, 22.0);
         assert_eq!(
-            plan_transfer(&input, &enabled()),
+            plan_transfer(&input, &enabled()).result,
             Err(TransferSkip::CostRule)
         );
+        let outcome = plan_transfer(&input, &enabled());
+        let estimate = outcome.estimate.expect("cost rule evaluated");
+        assert_eq!(estimate.fetch_ms, 33.0);
+        assert_eq!(estimate.wait_ms, 22.0);
     }
 
     #[test]
@@ -1343,5 +1387,74 @@ mod tests {
             TransferSkip::UnknownDestinationInput.label(),
             "unknown_destination_input"
         );
+    }
+
+    #[test]
+    fn estimate_is_present_on_a_planned_outcome() {
+        // Idle empty destination, source with 100 blocks, 4 active requests and
+        // 10_000 queued tokens; 2000-token prompt at 50 us/token.
+        // credited = 1600; transfer = 5 + 1600 * 5 / 1000 = 13 ms;
+        // fetch = 0 + 13 + prefill(400) = 33 ms;
+        // wait = prefill(10_000) + prefill(400) = 520 ms; saved = prefill(1600) = 80 ms.
+        let outcome = Pair::new(0, 100).outcome(&enabled());
+        let plan = outcome.result.expect("planned");
+        let estimate = outcome.estimate.expect("estimate on a plan");
+        assert_eq!(estimate.fetch_ms, 33.0);
+        assert_eq!(estimate.wait_ms, 520.0);
+        assert_eq!(estimate.saved_ms, 80.0);
+        assert_eq!(plan.estimated_saved_prefill_ms, estimate.saved_ms);
+        assert_eq!(plan.estimated_transfer_ms, estimate.transfer_ms);
+    }
+
+    #[test]
+    fn estimate_is_present_on_a_cost_rule_skip() {
+        let policy = TransferPolicy {
+            prefill_us_per_token: 1.0,
+            ..enabled()
+        };
+        let outcome = Pair::new(0, 100).outcome(&policy);
+        assert_eq!(outcome.result, Err(TransferSkip::CostRule));
+        let estimate = outcome.estimate.expect("estimate on a cost_rule skip");
+        // transfer 13 ms; prefill(400) = 0.4 ms; fetch = 13.4 ms; wait = 10.4 ms.
+        assert!((estimate.fetch_ms - 13.4).abs() < 1e-9);
+        assert!((estimate.wait_ms - 10.4).abs() < 1e-9);
+
+        // The reported peer's estimate: the first usable skip is a cost rule
+        // for the busy-but-expensive peer below.
+        let peers = [
+            peer("dest", &[], (0, 0)),
+            peer("short", &[(StorageTier::Device, (0, 80))], (1, 0)),
+        ];
+        let outcome = plan_many_outcome(&peers, &enabled());
+        assert_eq!(outcome.result, Err(TransferSkip::CostRule));
+        assert!(outcome.estimate.is_some());
+    }
+
+    #[test]
+    fn estimate_is_absent_for_skips_before_the_cost_rule() {
+        assert_eq!(Pair::new(0, 63).outcome(&enabled()).estimate, None);
+        assert_eq!(Pair::new(100, 100).outcome(&enabled()).estimate, None);
+        let mut idle = Pair::new(0, 100);
+        idle.load[1] = (0, 0);
+        let outcome = idle.outcome(&enabled());
+        assert_eq!(outcome.result, Err(TransferSkip::SourceNotBusy));
+        assert_eq!(outcome.estimate, None);
+        let mut excluded = Pair::new(0, 100);
+        excluded.excluded[1] = true;
+        assert_eq!(excluded.outcome(&enabled()).estimate, None);
+        let outcome = Pair::new(0, 100).outcome(&TransferPolicy::default());
+        assert_eq!(outcome.result, Err(TransferSkip::Disabled));
+        assert_eq!(outcome.estimate, None);
+
+        // Reported reason is a pre-cost-rule skip even though a later peer
+        // reached the cost rule: the estimate belongs to the reported peer.
+        let peers = [
+            peer("dest", &[], (0, 0)),
+            peer("longest", &[(StorageTier::Device, (0, 100))], (0, 0)),
+            peer("short", &[(StorageTier::Device, (0, 80))], (1, 0)),
+        ];
+        let outcome = plan_many_outcome(&peers, &enabled());
+        assert_eq!(outcome.result, Err(TransferSkip::SourceNotBusy));
+        assert_eq!(outcome.estimate, None);
     }
 }

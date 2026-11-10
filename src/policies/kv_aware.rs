@@ -13,7 +13,8 @@ use rand::Rng;
 use sha2::{Digest as _, Sha256};
 
 use super::kv_transfer::{
-    TransferCapability, TransferPlan, TransferPlanner, TransferPlannerInput, TransferSkip,
+    TransferCapability, TransferOutcome, TransferPlan, TransferPlanner, TransferPlannerInput,
+    TransferSkip,
 };
 use super::{get_healthy_worker_indices, LoadBalancingPolicy, RequestHeaders};
 use crate::core::Worker;
@@ -1453,11 +1454,11 @@ impl KvAwarePolicy {
         used_binding: bool,
         excluded: &dyn Fn(usize) -> bool,
     ) -> Option<TransferPlan> {
-        let result = if used_binding {
-            Err(TransferSkip::SessionBinding)
+        let outcome = if used_binding {
+            TransferOutcome::skip(TransferSkip::SessionBinding)
         } else if !plan.has_tokens {
             // Also covers the load-only fallback attempt.
-            Err(TransferSkip::MissingTokens)
+            TransferOutcome::skip(TransferSkip::MissingTokens)
         } else {
             let capabilities: Vec<Option<TransferCapability>> = plan
                 .healthy
@@ -1492,10 +1493,23 @@ impl KvAwarePolicy {
                 cost_params: &self.params,
             })
         };
-        match result {
+        if let Some(estimate) = &outcome.estimate {
+            crate::metrics::RouterMetrics::record_kv_transfer_estimated_cost_ms(
+                "fetch",
+                estimate.fetch_ms,
+            );
+            crate::metrics::RouterMetrics::record_kv_transfer_estimated_cost_ms(
+                "wait",
+                estimate.wait_ms,
+            );
+        }
+        match outcome.result {
             Ok(mut transfer) => {
                 transfer.plan_id = self.next_transfer_plan_id.fetch_add(1, Ordering::Relaxed);
                 crate::metrics::RouterMetrics::record_kv_transfer_plan("planned");
+                crate::metrics::RouterMetrics::record_kv_transfer_estimated_saved_ms(
+                    transfer.estimated_saved_prefill_ms,
+                );
                 tracing::debug!(
                     plan_id = transfer.plan_id,
                     source = %transfer.source.instance_id,
