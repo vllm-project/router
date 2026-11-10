@@ -5,6 +5,7 @@
 //! `PYTHONHASHSEED` in `0..=u32::MAX`, supplied as an unsigned integer. The
 //! Worker environment must use its canonical decimal spelling (e.g. `42`,
 //! not `00042`): vLLM hashes the verbatim seed string for the initial parent.
+//! Alternatively, callers can provide the engine's verified root digest.
 //! This utility then hashes the canonical CBOR
 //! value `(parent_hash, tuple(token_ids), None)` for each complete block.
 
@@ -42,6 +43,15 @@ impl BlockKeyGenerator {
         }
     }
 
+    /// Use the engine's authenticated root digest without exposing its seed.
+    pub fn from_root_hash(block_size: usize, root_hash: SequenceHash) -> Self {
+        assert!(block_size > 0, "block_size must be greater than zero");
+        Self {
+            block_size,
+            none_hash: root_hash,
+        }
+    }
+
     pub fn block_size(&self) -> usize {
         self.block_size
     }
@@ -49,7 +59,16 @@ impl BlockKeyGenerator {
     /// Return one key per complete block. A trailing partial block is not
     /// cache-addressable and is intentionally omitted.
     pub fn generate_block_keys(&self, token_ids: &[u32]) -> Vec<SequenceHash> {
-        let mut parent = self.none_hash;
+        self.keys_after(self.none_hash, token_ids)
+    }
+
+    /// Extend a chain from an engine-supplied parent digest.
+    ///
+    /// Events carry the parent hash next to the tokens they stored, so a store
+    /// whose hashes cover only a retained tail can still be expanded to every
+    /// block it spans.
+    pub fn keys_after(&self, parent: SequenceHash, token_ids: &[u32]) -> Vec<SequenceHash> {
+        let mut parent = parent;
         token_ids
             .chunks_exact(self.block_size)
             .map(|tokens| {
@@ -59,7 +78,8 @@ impl BlockKeyGenerator {
             .collect()
     }
 
-    #[cfg(all(test, feature = "cpu", feature = "ready"))]
+    /// The chain's initial parent, i.e. the digest the engine uses before any
+    /// block is stored.
     pub(crate) fn none_hash(&self) -> SequenceHash {
         self.none_hash
     }
