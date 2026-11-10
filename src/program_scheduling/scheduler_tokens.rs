@@ -255,21 +255,6 @@ mod tests {
         }
     }
 
-    fn identity_named(program: &str) -> super::super::ProgramIdentity {
-        super::super::ProgramIdentity::from_request(
-            None,
-            Some(&json!({
-                "vllm_xargs": {"agentic_context": {
-                    "program_id": program,
-                    "expected_resume": true
-                }}
-            })),
-            Some("model"),
-        )
-        .unwrap()
-        .unwrap()
-    }
-
     fn identity() -> super::super::ProgramIdentity {
         super::super::ProgramIdentity::from_request(
             None,
