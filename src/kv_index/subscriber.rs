@@ -2210,3 +2210,20 @@ pub(crate) fn payload_fingerprint(bytes: &[u8]) -> u64 {
     }
     hash
 }
+
+// ---- Source lease and replay state shared with the hybrid subscriber ----
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HybridSourceLease(pub(crate) u64);
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Phase {
+    Retired,
+    Replaying,
+    Live,
+}
+
+pub(crate) struct SourceState {
+    pub(crate) generation: u64,
+    pub(crate) phase: Phase,
+}

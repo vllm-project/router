@@ -18,8 +18,9 @@ pub use self::layout::{
     HybridGroupKind, HybridGroupView, HybridRankCapability,
 };
 pub use self::subscriber::{
-    spawn_zmq, HybridEventStream, HybridSourceLease, HybridStreamError, HybridSubscriberHandle,
+    spawn_zmq, HybridEventStream, HybridStreamError, HybridSubscriberHandle,
 };
+pub use crate::kv_index::subscriber::HybridSourceLease;
 
 #[allow(unused_imports)]
 use self::ingest::HybridEventError as _;

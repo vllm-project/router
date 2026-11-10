@@ -12,28 +12,14 @@ use tokio::sync::watch;
 
 use super::super::subscriber::EventSource;
 use super::super::subscriber::{payload_fingerprint, ReplayWindow};
+use super::super::subscriber::{HybridSourceLease, Phase, SourceState};
 use super::{HybridEventError, HybridEventIndex};
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct HybridSourceLease(u64);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HybridStreamError {
     StaleLease,
     InvalidState,
     Index(HybridEventError),
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Phase {
-    Retired,
-    Replaying,
-    Live,
-}
-
-struct SourceState {
-    generation: u64,
-    phase: Phase,
 }
 
 /// Serializes lease changes and index mutations, so a retired subscriber
