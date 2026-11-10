@@ -246,6 +246,10 @@ name = "policy_registry_integration"
 path = "tests/rust/policy_registry_integration.rs"
 
 [[test]]
+name = "prompt_logging_test"
+path = "tests/rust/prompt_logging_test.rs"
+
+[[test]]
 name = "request_formats_test"
 path = "tests/rust/request_formats_test.rs"
 

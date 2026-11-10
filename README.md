@@ -212,6 +212,15 @@ vllm-router \
 
 **Retry Policy:** Retries on HTTP status codes 408/429/500/502/503/504, with backoff/jitter between attempts.
 
+### Optional User Prompt Logging
+
+User text logging for `/v1/chat/completions` and `POST /v1/messages` requests is
+optional and disabled by default.
+Set `--log-user-prompts=true` to log all user text at INFO level, or explicitly
+set `--log-user-prompts=false` to disable it. See
+[logging options](docs/cli_reference.md#optional-user-prompt-logging) and the
+[Docker/Podman Compose example](examples/compose/README.md).
+
 ### Request ID Tracking
 
 Track requests across distributed systems with configurable headers:

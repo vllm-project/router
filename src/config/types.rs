@@ -53,6 +53,9 @@ pub struct RouterConfig {
     pub log_dir: Option<String>,
     /// Log level (None = info)
     pub log_level: Option<String>,
+    /// Log user text from chat and Messages API requests. Disabled by default.
+    #[serde(default)]
+    pub log_user_prompts: bool,
     /// Custom request ID headers to check (defaults to common headers)
     pub request_id_headers: Option<Vec<String>>,
     /// Maximum concurrent requests allowed (for rate limiting)
@@ -1315,6 +1318,7 @@ impl Default for RouterConfig {
             metrics: None,
             log_dir: None,
             log_level: None,
+            log_user_prompts: false,
             request_id_headers: None,
             max_concurrent_requests: 32768,
             queue_size: 100,
@@ -1404,6 +1408,26 @@ mod tests {
     // ============= RouterConfig Tests =============
 
     #[test]
+    fn user_prompt_logging_config_defaults_and_roundtrips() {
+        let mut json = serde_json::to_value(RouterConfig::default()).unwrap();
+        json.as_object_mut().unwrap().remove("log_user_prompts");
+        let legacy: RouterConfig = serde_json::from_value(json.clone()).unwrap();
+        assert!(!legacy.log_user_prompts);
+
+        for enabled in [true, false] {
+            json["log_user_prompts"] = serde_json::json!(enabled);
+            let config: RouterConfig = serde_json::from_value(json.clone()).unwrap();
+            assert_eq!(config.log_user_prompts, enabled);
+            assert_eq!(
+                serde_json::to_value(config).unwrap()["log_user_prompts"],
+                enabled
+            );
+        }
+        json["log_user_prompts"] = serde_json::json!("false");
+        assert!(serde_json::from_value::<RouterConfig>(json).is_err());
+    }
+
+    #[test]
     fn test_router_config_default() {
         let config = RouterConfig::default();
 
@@ -1421,6 +1445,7 @@ mod tests {
         assert!(config.metrics.is_none());
         assert!(config.log_dir.is_none());
         assert!(config.log_level.is_none());
+        assert!(!config.log_user_prompts);
     }
 
     #[test]
@@ -1527,6 +1552,7 @@ mod tests {
             port: 8080,
             log_dir: Some("/var/log".to_string()),
             log_level: Some("debug".to_string()),
+            log_user_prompts: false,
             ..Default::default()
         };
 
@@ -2054,6 +2080,7 @@ mod tests {
             host: "".to_string(),
             log_dir: Some("".to_string()),
             log_level: Some("".to_string()),
+            log_user_prompts: false,
             ..Default::default()
         };
 
@@ -2104,6 +2131,7 @@ mod tests {
             }),
             log_dir: Some("/var/log/vllm".to_string()),
             log_level: Some("info".to_string()),
+            log_user_prompts: false,
             request_id_headers: None,
             max_concurrent_requests: 64,
             cors_allowed_origins: vec![],
@@ -2174,6 +2202,7 @@ mod tests {
             metrics: Some(MetricsConfig::default()),
             log_dir: None,
             log_level: Some("debug".to_string()),
+            log_user_prompts: false,
             request_id_headers: None,
             max_concurrent_requests: 64,
             cors_allowed_origins: vec![],
@@ -2240,6 +2269,7 @@ mod tests {
             }),
             log_dir: Some("/opt/logs/vllm".to_string()),
             log_level: Some("trace".to_string()),
+            log_user_prompts: false,
             request_id_headers: None,
             max_concurrent_requests: 64,
             cors_allowed_origins: vec![],

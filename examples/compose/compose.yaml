@@ -1,0 +1,19 @@
+services:
+  router:
+    build:
+      context: ../..
+      dockerfile: docker/Dockerfile.router
+    image: ${ROUTER_IMAGE:-localhost/vllm-router:prompt-logging}
+    ports:
+      - "${ROUTER_PORT:-30000}:8080"
+    command:
+      - vllm-router
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8080"
+      - --worker-urls
+      - "${WORKER_URL:?Set WORKER_URL to a worker URL reachable from the router container}"
+      - "--log-user-prompts=${ROUTER_LOG_USER_PROMPTS:-false}"
+      - --log-level
+      - "${ROUTER_LOG_LEVEL:-info}"
