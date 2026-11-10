@@ -179,6 +179,12 @@ The `build` group in `pipeline.yml` creates release artifacts:
 - Rust binary (`target/release/vllm-router`)
 - Python wheels and source distribution
 
+Each step has a premerge variant and a nightly variant. Premerge builds
+skip thin LTO and raise `codegen-units` to 16 for faster CI turnaround.
+Nightly builds (triggered by `NIGHTLY=1` or the `nightly-test` label)
+keep the repository release profile so that perf baselines match the
+published binary. Only one variant of each pair runs per build.
+
 L1, L2, and L3 uploads depend on this group. L2 and L3 do not depend on the L1 upload.
 
 ### Tests
