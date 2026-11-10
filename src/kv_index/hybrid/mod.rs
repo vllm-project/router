@@ -6,13 +6,23 @@
 mod ingest;
 mod layout;
 mod residency;
+mod subscriber;
 
 use std::collections::HashSet;
 
 use parking_lot::RwLock;
 
-use self::ingest::HybridEventError;
-use self::layout::{common_reusable_tokens, HybridEventGroup, HybridGroupView};
+pub use self::ingest::HybridEventError;
+pub use self::layout::{
+    common_reusable_tokens, HybridCapabilities, HybridEventGroup, HybridGroupCapability,
+    HybridGroupKind, HybridGroupView, HybridRankCapability,
+};
+pub use self::subscriber::{
+    spawn_zmq, HybridEventStream, HybridSourceLease, HybridStreamError, HybridSubscriberHandle,
+};
+
+#[allow(unused_imports)]
+use self::ingest::HybridEventError as _;
 use self::residency::State;
 use super::{Locality, RoutableTarget, StorageTier, TierMatch};
 use crate::kv_hash::{BlockKeyGenerator, SequenceHash};

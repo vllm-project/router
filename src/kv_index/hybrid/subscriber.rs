@@ -10,8 +10,8 @@ use parking_lot::Mutex;
 use std::collections::HashMap;
 use tokio::sync::watch;
 
-use super::hybrid_events::{HybridEventError, HybridEventIndex};
-use super::subscriber::EventSource;
+use super::super::subscriber::EventSource;
+use super::{HybridEventError, HybridEventIndex};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HybridSourceLease(u64);
@@ -423,8 +423,8 @@ fn payload_fingerprint(bytes: &[u8]) -> u64 {
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use super::*;
+    use crate::kv_index::hybrid::layout::HybridEventGroup;
     use crate::kv_index::hybrid::HybridGroupKind;
-    use crate::kv_index::hybrid_events::HybridEventGroup;
     use crate::kv_index::RoutableTarget;
 
     #[test]
@@ -456,7 +456,7 @@ mod tests {
         let stream = HybridEventStream::new(index.clone());
         let first = stream.begin_replay();
         let current = stream.begin_replay();
-        let payload = &crate::kv_index::hybrid_events::tests::qwen35_payload();
+        let payload = &crate::kv_index::hybrid::residency::tests::qwen35_payload();
         let prompt: Vec<u32> = (0..1024).map(|i| 100 + i % 100).collect();
         assert_eq!(
             stream.apply_payload(first, 0, payload),
@@ -542,7 +542,7 @@ mod tests {
             replay.recv_multipart(zmq::DONTWAIT),
             Err(zmq::Error::EAGAIN)
         );
-        let payload = &crate::kv_index::hybrid_events::tests::qwen35_payload();
+        let payload = &crate::kv_index::hybrid::residency::tests::qwen35_payload();
         let seq0 = 0_i64.to_be_bytes();
         let end = (-1_i64).to_be_bytes();
         publisher
