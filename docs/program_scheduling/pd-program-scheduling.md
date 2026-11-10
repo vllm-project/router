@@ -104,7 +104,7 @@ Rules enforced by the Router:
 
 1. Resolve the Program identity from the request; without one the request takes the native path.
 2. Admit the turn: the Program's preferred D rank is checked against accounted capacity, the configured active-Program bound, and backend waiting-request thresholds. The turn waits in the Router queue if it does not fit.
-3. Select P: the normal prefill policy picks a P target; a per-target permit bounds concurrent prefill bodies. The permit is released when the P body completes, not when D finishes.
+3. Select P: the normal prefill policy picks a P target, and it receives the same inputs on every path — the prompt or cache routing key when the policy reads the request, and the request headers when it needs them. A turn spends at most one successful selection: a warm/local attempt that then falls back to cold reuses the P it already picked instead of asking the policy again. (A policy that returns `None` — for example because no prefill is healthy — is asked again by the cold path, but that call selects nothing.) A per-target permit bounds concurrent prefill bodies; the permit is released when the P body completes, not when D finishes.
 4. Hand off P→D and finish the Program turn when the full D response is delivered. A successful completion settles usage and decides whether the Program keeps its seat (`Acting` TTL) or is released.
 5. When warm remote reuse is enabled: on completion the Router publishes a candidate describing the exact verified prefix and its source lease. A successor turn claims the candidate exclusively, re-checks the source epoch, and may read the KV instead of recomputing it.
 

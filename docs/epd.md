@@ -40,7 +40,11 @@ re-preprocesses into the same mm_hash and can still reuse the published
 embedding. Repeated images keep their original positions and independent
 transfer IDs.
 Other request fields, including sampling options, pass through unchanged.
-Text-only and existing embeds inputs do not call the encoders. PD responses,
+Text-only and existing embeds inputs do not call the encoders. Mooncake consumers
+with rank-qualified URLs reject caller-provided nonempty `ec_transfer_params`
+with HTTP 400: those handles may belong to a different consumer. Send raw media
+through the router instead. Unranked DP=1 and address-map-free NIXL/Example inputs
+retain their existing behavior. PD responses,
 including SSE streams, use the existing transparent forwarding path.
 
 Encoder failures are returned without submitting a partially prepared PD
@@ -53,9 +57,9 @@ owns request completion/abort cleanup.
 ## Scope
 
 - Native binary CLI only; the Python launcher does not expose `--epd-config` yet.
-- Regular E+PD or static vLLM E/P/D mode, DP=1, no IGW.
+- Regular E+PD or static vLLM E/P/D mode, including consumer DP>1, no IGW.
 - HTTP(S) backends only; gRPC encoder and consumer URLs are rejected at startup.
-- Keep the existing backend's TP/PP constraints; this does not add parallelism support.
+- Encoder TP/PP constraints remain backend-specific and unchanged.
 - Static E URLs; E health-aware routing and dynamic consumer discovery are not added.
   The service registry has no encoder role, and vLLM does not publish EC control
   addresses, so Mooncake PUSH cannot resolve a newly registered consumer. Dynamic
@@ -91,6 +95,46 @@ The router selects P/D, prepares E metadata for P, then uses the existing KV
 handoff. D receives the same placeholder layout with KV transfer parameters,
 without P's EC handles. P errors or missing NIXL KV handles stop the pipeline.
 Dynamic P/D discovery is not supported with EPD yet.
+
+## Data-parallel consumers
+
+E and P/PD instance counts are independent. For example, 2E+1PD or 4E+2PD
+can use different numbers of encoder and worker URLs with DP left at 1/unset.
+
+For combined PD, set `--intra-node-data-parallel-size` to the server's DP size.
+For separate P/D, each endpoint's DP size is discovered from `/metrics`; the flag
+is only a fallback when metrics are unavailable. The router
+selects a replica before encoding and pins the HTTP request to that replica
+using `X-data-parallel-rank`. Encoders remain separate instances; this flag does
+not expand encoder URLs or override the EC backend's producer constraints.
+
+For Mooncake PUSH, provide one control address per replica using `@rank` keys:
+
+```bash
+target/release/vllm-router --host 0.0.0.0 --port 8000 \
+  --worker-urls http://pd0:8000 --intra-node-data-parallel-size 2 \
+  --epd-config '{
+    "encoder_urls": ["http://e0:8000", "http://e1:8000"],
+    "consumer_zmq_addrs": {
+      "http://pd0:8000@0": "tcp://pd0:14579",
+      "http://pd0:8000@1": "tcp://pd0:14580"
+    }
+  }'
+```
+
+Mooncake assigns replica `r` the control port `ec_port + r * TP`; list each
+replica's first TP shard. The example above assumes TP=1. With separate P/D,
+the map references P replicas, not D, including all discovered ranks when P
+endpoints have different DP sizes. With DP>1, URLs explicitly ending in `@rank`
+remain pinned to that replica rather than being expanded again. Startup and
+worker-add operations reject ranks outside the endpoint's DP size, including
+separate P and D endpoints. The map is checked against the resolved workers
+during router construction, after DP discovery. `ConfigValidator::validate()`
+checks configuration syntax, not map coverage. Missing rank mappings fail before
+encoder dispatch and identify the missing URL. NIXL PULL and
+ECExampleConnector need no address map. DP=1 keeps the unsuffixed keys shown above.
+The shared P/D discovery path also rejects invalid candidate snapshots instead
+of routing through a partially filtered pool.
 
 ```bash
 cargo test --features cpu,ready --test test_pd_routing test_epd_handoff
