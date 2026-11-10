@@ -717,9 +717,6 @@ pub trait Picker: Send + Sync + std::fmt::Debug {
     fn pick(&self, costs: &[f64]) -> Option<usize>;
 }
 
-/// Device prefix plus one external continuation, matching vLLM's two-segment
-/// reuse rule. The return value is in tokens and can be fractional because a
-/// transfer penalty is a credit ratio.
 fn device_prefix_blocks(candidate: &CandidateView<'_>, params: &CostParams) -> u32 {
     candidate
         .matches
@@ -743,7 +740,12 @@ fn device_prefix_blocks(candidate: &CandidateView<'_>, params: &CostParams) -> u
         )
 }
 
-fn credited_tokens(candidate: &CandidateView<'_>, params: &CostParams) -> f64 {
+struct PrefixEstimate {
+    predicted_cached_tokens: u64,
+    credited_tokens: f64,
+}
+
+fn prefix_estimate(candidate: &CandidateView<'_>, params: &CostParams) -> PrefixEstimate {
     let device_blocks = device_prefix_blocks(candidate, params);
     let mut best_continuation = (0_u32, 0.0_f64);
     for hit in candidate
@@ -766,14 +768,20 @@ fn credited_tokens(candidate: &CandidateView<'_>, params: &CostParams) -> f64 {
 
     let credited_blocks =
         f64::from(device_blocks) + f64::from(best_continuation.0) * best_continuation.1;
-    // External reuse may have a different alignment, but it cannot eliminate
-    // the last-token logits work either.
-    (credited_blocks * f64::from(params.block_size))
-        .min(candidate.input_tokens.saturating_sub(1) as f64)
+    let block_size = u64::from(params.block_size);
+    let raw_blocks = u64::from(device_blocks) + u64::from(best_continuation.0);
+    PrefixEstimate {
+        // Engine usage counts local and external hits before applying transfer costs.
+        predicted_cached_tokens: (raw_blocks * block_size).min(candidate.input_tokens as u64),
+        credited_tokens: (credited_blocks * f64::from(params.block_size))
+            .min(candidate.input_tokens.saturating_sub(1) as f64),
+    }
 }
 
-fn predicted_cached_tokens(candidate: &CandidateView<'_>, params: &CostParams) -> u64 {
-    u64::from(device_prefix_blocks(candidate, params)) * u64::from(params.block_size)
+impl PrefixEstimate {
+    fn remaining_work(&self, input_tokens: usize) -> u64 {
+        ((input_tokens as f64 - self.credited_tokens).max(0.0)).ceil() as u64
+    }
 }
 
 fn request_prefill_tokens(candidate: &CandidateView<'_>, params: &CostParams) -> u64 {
@@ -782,7 +790,7 @@ fn request_prefill_tokens(candidate: &CandidateView<'_>, params: &CostParams) ->
     }
     // Round remaining work up: a fractional transfer credit never erases a
     // whole token of compute that was not fully credited.
-    ((candidate.input_tokens as f64 - credited_tokens(candidate, params)).max(0.0)).ceil() as u64
+    prefix_estimate(candidate, params).remaining_work(candidate.input_tokens)
 }
 
 pub fn cost_components(candidate: &CandidateView<'_>, params: &CostParams) -> CostComponents {
@@ -1529,11 +1537,12 @@ impl KvAwarePolicy {
                         input_tokens: ids.len(),
                         prefill_tokens: None,
                     };
+                    let prefix = prefix_estimate(&candidate, &params);
                     total_prefill =
-                        total_prefill.saturating_add(request_prefill_tokens(&candidate, &params));
+                        total_prefill.saturating_add(prefix.remaining_work(candidate.input_tokens));
                     if prediction_verified {
-                        total_predicted = total_predicted
-                            .saturating_add(predicted_cached_tokens(&candidate, &params));
+                        total_predicted =
+                            total_predicted.saturating_add(prefix.predicted_cached_tokens);
                     }
                     total_input = total_input.saturating_add(ids.len());
                     if prompts.len() == 1 {
@@ -1846,13 +1855,11 @@ impl KvAwareOps for KvAwarePolicy {
                         input_tokens: tokens.len(),
                         prefill_tokens: None,
                     };
+                    let prefix = prefix_estimate(&candidate, &params);
                     new_prefill_tokens = new_prefill_tokens
-                        .saturating_add(request_prefill_tokens(&candidate, &params));
+                        .saturating_add(prefix.remaining_work(candidate.input_tokens));
                     if verified && prompts.len() == 1 {
-                        prediction = Some((
-                            binding.target.clone(),
-                            predicted_cached_tokens(&candidate, &params),
-                        ));
+                        prediction = Some((binding.target.clone(), prefix.predicted_cached_tokens));
                     }
                 }
                 PrefillWorkEstimate {
@@ -2396,7 +2403,10 @@ mod tests {
                 batchsize: 3
             }
         );
-        assert_eq!(predicted_cached_tokens(&candidate, &params), 80);
+        assert_eq!(
+            prefix_estimate(&candidate, &params).predicted_cached_tokens,
+            144
+        );
     }
 
     #[test]
@@ -2413,6 +2423,10 @@ mod tests {
             prefill_tokens: None,
             input_tokens: 160,
         };
+        assert_eq!(
+            prefix_estimate(&candidate, &CostParams::default()).predicted_cached_tokens,
+            48
+        );
         assert_eq!(
             cost_components(&candidate, &CostParams::default()).ptoken,
             112
@@ -2459,7 +2473,7 @@ mod tests {
                 input_tokens: tokens,
             };
             assert_eq!(
-                credited_tokens(&candidate, &params),
+                prefix_estimate(&candidate, &params).credited_tokens,
                 cached as f64,
                 "tokens={tokens}"
             );

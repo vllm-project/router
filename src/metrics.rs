@@ -89,7 +89,7 @@ pub fn init_metrics() {
     );
     describe_histogram!(
         "vllm_router_kv_predicted_cached_tokens",
-        "Predicted device prefix tokens on paired HTTP attempts"
+        "Predicted total cached prefix tokens on paired HTTP attempts"
     );
     describe_histogram!(
         "vllm_router_kv_actual_cached_tokens",

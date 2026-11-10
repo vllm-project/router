@@ -36,10 +36,10 @@ real-Worker acceptance requirements.
 ## Reading KV prediction metrics
 
 For HTTP workers, the predicted and actual cached-token histograms count the
-same attempts. The prediction counts the verified device-resident prefix.
-The actual count comes from the engine's usage report, which can include reuse
-from other tiers depending on the backend. Routing costs still apply the
-configured transfer discounts. Use the outcomes counter to check how much
+same attempts. The prediction counts the device prefix plus the longest indexed
+continuation that touches its end, counting overlapping tokens once. This
+estimates vLLM's total local and external cached tokens. Transfer discounts
+apply only to routing costs. Use the outcomes counter to check how much
 traffic contributed to the comparison.
 
 Streaming clients should set `stream_options.include_usage=true` and the engine
@@ -49,11 +49,11 @@ Multi-prompt comparisons require aggregate usage. Regular HTTP Program requests
 can be compared when the bound target is the selected worker handling the
 request. If attribution is uncertain the outcome is `pd_usage_not_comparable`.
 
-Native HTTP P/D admission can carry a verified single-prompt device-prefix
+Native HTTP P/D admission can carry a verified single-prompt total-prefix
 prediction for the selected prefill worker and rank. The Router compares it
 with the cached-token count in the merged JSON response or rewritten SSE usage
 when that count agrees with the same attempt's prefill report. Missing prefill
 usage never falls back to decode usage. Opaque responses do not supply accuracy
 samples. Program-bound P/D paths that bypass KV prediction and gRPC workers do
-not supply these pairs. The comparison measures device-prefix prediction versus
-engine-reported reuse; an engine can include external reuse in that total.
+not supply these pairs. The metric assumes the backend reports total cached tokens. A local-only
+backend counter has different semantics.
