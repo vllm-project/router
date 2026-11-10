@@ -32,3 +32,21 @@ Observed placement estimates are not actual APC hit counts or complete
 bootstrap/generation/recovery guarantees. See
 [the HTTP consumer RFC](https://github.com/vllm-project/router/issues/405) for the
 real-Worker acceptance requirements.
+
+## Reading KV prediction metrics
+
+For HTTP workers, the predicted and actual cached-token histograms count the
+same attempts. The prediction counts the verified device-resident prefix.
+The actual count comes from the engine's usage report, which can include reuse
+from other tiers depending on the backend. Routing costs still apply the
+configured transfer discounts. Use the outcomes counter to check how much
+traffic contributed to the comparison.
+
+Streaming clients should set `stream_options.include_usage=true` and the engine
+must return cached-token details. A completed stream without those details
+counts as `missing_usage`. The Router forwards the client's stream options.
+Multi-prompt usage without an aggregate and Program responses where the
+reporting worker may differ from the selected target are excluded from the
+histograms. Successful Program responses count as `pd_usage_not_comparable`.
+gRPC workers emit no KV route observation samples. An empty series can therefore
+coexist with active KV-aware routing.

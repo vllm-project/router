@@ -719,8 +719,8 @@ pub trait Picker: Send + Sync + std::fmt::Debug {
 /// Device prefix plus one external continuation, matching vLLM's two-segment
 /// reuse rule. The return value is in tokens and can be fractional because a
 /// transfer penalty is a credit ratio.
-fn credited_tokens(candidate: &CandidateView<'_>, params: &CostParams) -> f64 {
-    let device_blocks = candidate
+fn device_prefix_blocks(candidate: &CandidateView<'_>, params: &CostParams) -> u32 {
+    candidate
         .matches
         .iter()
         .filter(|hit| hit.tier == StorageTier::Device)
@@ -739,8 +739,11 @@ fn credited_tokens(candidate: &CandidateView<'_>, params: &CostParams) -> f64 {
                 .checked_div(params.block_size as usize)
                 .unwrap_or(0)
                 .min(u32::MAX as usize) as u32,
-        );
+        )
+}
 
+fn credited_tokens(candidate: &CandidateView<'_>, params: &CostParams) -> f64 {
+    let device_blocks = device_prefix_blocks(candidate, params);
     let mut best_continuation = (0_u32, 0.0_f64);
     for hit in candidate
         .matches
@@ -769,38 +772,7 @@ fn credited_tokens(candidate: &CandidateView<'_>, params: &CostParams) -> f64 {
 }
 
 fn predicted_cached_tokens(candidate: &CandidateView<'_>, params: &CostParams) -> u64 {
-    let device_blocks = candidate
-        .matches
-        .iter()
-        .filter(|hit| hit.tier == StorageTier::Device)
-        .flat_map(|hit| hit.segments.iter().copied())
-        .filter(|(start, _)| *start == 0)
-        .map(|(_, end)| end)
-        .max()
-        .unwrap_or(0)
-        .min(
-            candidate
-                .input_tokens
-                .saturating_sub(1)
-                .checked_div(params.block_size as usize)
-                .unwrap_or(0)
-                .min(u32::MAX as usize) as u32,
-        );
-
-    let continuation_blocks = candidate
-        .matches
-        .iter()
-        .filter(|hit| hit.tier != StorageTier::Device)
-        .flat_map(|hit| hit.segments.iter().copied())
-        .filter(|(start, end)| *start <= device_blocks && device_blocks < *end)
-        .map(|(_, end)| end - device_blocks)
-        .max()
-        .unwrap_or(0);
-
-    u64::from(device_blocks)
-        .saturating_add(u64::from(continuation_blocks))
-        .saturating_mul(u64::from(params.block_size))
-        .min(candidate.input_tokens.saturating_sub(1) as u64)
+    u64::from(device_prefix_blocks(candidate, params)) * u64::from(params.block_size)
 }
 
 fn request_prefill_tokens(candidate: &CandidateView<'_>, params: &CostParams) -> u64 {
@@ -2416,7 +2388,7 @@ mod tests {
                 batchsize: 3
             }
         );
-        assert_eq!(predicted_cached_tokens(&candidate, &params), 144);
+        assert_eq!(predicted_cached_tokens(&candidate, &params), 80);
     }
 
     #[test]

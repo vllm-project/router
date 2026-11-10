@@ -89,11 +89,11 @@ pub fn init_metrics() {
     );
     describe_histogram!(
         "vllm_router_kv_predicted_cached_tokens",
-        "Router-predicted cached prompt tokens"
+        "Predicted device prefix tokens on paired HTTP attempts"
     );
     describe_histogram!(
         "vllm_router_kv_actual_cached_tokens",
-        "Backend-observed cached prompt tokens"
+        "Engine-reported cached prompt tokens on paired HTTP attempts"
     );
     describe_histogram!(
         "vllm_router_kv_cached_token_absolute_error",
@@ -595,14 +595,12 @@ impl RouterMetrics {
             "status" => status,
             "reason" => reason)
         .increment(1);
-        let Some(predicted_cached_tokens) = predicted_cached_tokens else {
+        let (Some(predicted_cached_tokens), Some(actual_cached_tokens)) =
+            (predicted_cached_tokens, actual_cached_tokens)
+        else {
             return;
         };
         histogram!("vllm_router_kv_predicted_cached_tokens").record(predicted_cached_tokens as f64);
-
-        let Some(actual_cached_tokens) = actual_cached_tokens else {
-            return;
-        };
         histogram!("vllm_router_kv_actual_cached_tokens").record(actual_cached_tokens as f64);
         let (direction, absolute_error) = if actual_cached_tokens > predicted_cached_tokens {
             (

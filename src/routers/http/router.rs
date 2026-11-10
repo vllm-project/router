@@ -1,7 +1,7 @@
 use super::completion_route::{placement_eligibility, prepare_completion_route, CompletionRoute};
 use super::kv_observation::{
-    observe_json_response, observe_unavailable, KvResponseStream, KvRouteAttempt,
-    KvRoutePrediction, KvSseObserver,
+    comparable_attempt, observe_json_response, observe_unavailable, KvResponseStream,
+    KvRouteAttempt, KvRoutePrediction, KvSseObserver, UnavailableReason,
 };
 use super::program_adapter::ProgramCompletion;
 use crate::backend::preprocess::{prepare_completion_direct_inputs, prepare_http_kv_inputs};
@@ -149,17 +149,15 @@ impl RequestLoadGuard {
         }
         let (kv_slot, kv_attempt) = match receipt {
             Some(receipt) => {
-                let attempt = receipt
-                    .predicted_cached_tokens
-                    .or(receipt.multi_prompt.then_some(0))
-                    .filter(|_| !crate::backend::is_grpc_url(worker.url()))
-                    .map(|cached_tokens| {
-                        KvRouteAttempt::new(KvRoutePrediction {
-                            target: receipt.decision.target.clone(),
-                            cached_tokens,
-                            multi_prompt: receipt.multi_prompt,
-                        })
-                    });
+                let attempt = ((receipt.predicted_cached_tokens.is_some() || receipt.multi_prompt)
+                    && !crate::backend::is_grpc_url(worker.url()))
+                .then(|| {
+                    KvRouteAttempt::new(KvRoutePrediction {
+                        target: receipt.decision.target.clone(),
+                        cached_tokens: receipt.predicted_cached_tokens,
+                        multi_prompt: receipt.multi_prompt,
+                    })
+                });
                 (receipt.slot, attempt)
             }
             None => (None, None),
@@ -2050,7 +2048,7 @@ impl Router {
                     observe_unavailable(
                         attempt,
                         StatusCode::INTERNAL_SERVER_ERROR,
-                        "request_error",
+                        UnavailableReason::RequestError,
                     );
                 }
                 error!(
@@ -2068,6 +2066,7 @@ impl Router {
 
         let status = StatusCode::from_u16(res.status().as_u16())
             .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        let kv_attempt = comparable_attempt(kv_attempt, status, program_completion.is_some());
         let http_ttfb_ms = t_send.elapsed().as_secs_f64() * 1000.0;
 
         if !is_stream {
@@ -2095,7 +2094,7 @@ impl Router {
                 }
                 Err(e) => {
                     if let Some(attempt) = &kv_attempt {
-                        observe_unavailable(attempt, status, "response_error");
+                        observe_unavailable(attempt, status, UnavailableReason::ResponseError);
                     }
                     let error_msg = format!("Failed to get response body: {}", e);
                     (StatusCode::INTERNAL_SERVER_ERROR, error_msg).into_response()
@@ -3218,7 +3217,8 @@ impl RouterTrait for Router {
         };
         let url = worker.endpoint_url(path);
 
-        let load_tracked = policy.tracks_request_load() || program_completion.is_some();
+        let load_tracked =
+            policy.tracks_request_load() || program_completion.is_some() || kv_receipt.is_some();
         let load = load_tracked
             .then(|| RequestLoadGuard::from_selection(worker.clone(), kv_receipt, true));
         let kv_attempt = load.as_ref().and_then(RequestLoadGuard::kv_attempt);
@@ -3321,6 +3321,8 @@ impl RouterTrait for Router {
         {
             Ok(response) => {
                 let status = response.status();
+                let kv_attempt =
+                    comparable_attempt(kv_attempt, status, program_completion.is_some());
                 // Keep the circuit breaker informed, as the typed path does:
                 // 2xx/4xx count as success, 5xx as worker failure.
                 let was_available = worker.is_available();
@@ -3400,7 +3402,11 @@ impl RouterTrait for Router {
                         }
                         Err(error) => {
                             if let Some(attempt) = &kv_attempt {
-                                observe_unavailable(attempt, status, "response_error");
+                                observe_unavailable(
+                                    attempt,
+                                    status,
+                                    UnavailableReason::ResponseError,
+                                );
                             }
                             if status.is_success() {
                                 if let Some(completion) = &program_completion {
@@ -3471,7 +3477,11 @@ impl RouterTrait for Router {
             Err(error) => {
                 // The 502 response below still flows through
                 if let Some(attempt) = &kv_attempt {
-                    observe_unavailable(attempt, StatusCode::BAD_GATEWAY, "request_error");
+                    observe_unavailable(
+                        attempt,
+                        StatusCode::BAD_GATEWAY,
+                        UnavailableReason::RequestError,
+                    );
                 }
                 // hold_load_until_body_done, which releases the load once
                 // its body finishes or is dropped — do not decrement here.
@@ -6840,14 +6850,17 @@ mod tests {
         ));
         let mode = Arc::new(Mutex::new((StatusCode::OK, false)));
         let handler_mode = mode.clone();
+        let fail_stream = Arc::new(tokio::sync::Notify::new());
+        let handler_signal = fail_stream.clone();
         let app = axum::Router::new().route(
             "/v1/chat/completions",
             post(move || {
                 let (status, fail_body) = *handler_mode.lock();
+                let signal = handler_signal.clone();
                 async move {
                     let body = if fail_body {
-                        Body::from_stream(futures_util::stream::once(async {
-                            tokio::time::sleep(Duration::from_millis(20)).await;
+                        Body::from_stream(futures_util::stream::once(async move {
+                            signal.notified().await;
                             Err::<bytes::Bytes, _>(std::io::Error::other("broken backend body"))
                         }))
                     } else {
@@ -6872,10 +6885,6 @@ mod tests {
                 static_kv_event_sources: Default::default(),
             }));
         router.retry_config.max_retries = 0;
-        let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
-            "messages": [{"role": "user", "content": "hello"}],
-        }))
-        .unwrap();
         worker.increment_load(); // An unrelated request must remain counted.
         for (status, fail_body) in [
             (StatusCode::OK, false),
@@ -6884,21 +6893,64 @@ mod tests {
             (StatusCode::OK, true),
         ] {
             *mode.lock() = (status, fail_body);
+            let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": fail_body
+            }))
+            .unwrap();
             let response = router
                 .route_typed_request(None, &request, "/v1/chat/completions", None)
                 .await;
-            let expected_status = if fail_body {
-                StatusCode::INTERNAL_SERVER_ERROR
+            assert_eq!(response.status(), status);
+            if fail_body {
+                assert_eq!(worker.load(), 2);
+                fail_stream.notify_one();
+                assert!(to_bytes(response.into_body(), usize::MAX).await.is_err());
             } else {
-                status
-            };
-            assert_eq!(response.status(), expected_status);
-            assert_eq!(worker.load(), 1, "status={status}, fail_body={fail_body}");
-            to_bytes(response.into_body(), usize::MAX).await.unwrap();
+                to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            }
             assert_eq!(worker.load(), 1);
         }
         worker.decrement_load();
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn truncated_nonstreaming_body_releases_the_selected_worker() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+            format!("http://{}", listener.local_addr().unwrap()),
+            WorkerType::Regular,
+        ));
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            assert!(socket.read(&mut buf).await.unwrap() > 0);
+            // EOF after valid HTTP headers but before the advertised body length.
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\nConnection: close\r\n\r\n{")
+                .await
+                .unwrap();
+            socket.shutdown().await.unwrap();
+            while socket.read(&mut buf).await.unwrap_or(0) != 0 {}
+        });
+        let mut router = create_test_regular_router();
+        router.worker_registry = Arc::new(WorkerRegistry::new());
+        router.worker_registry.register(worker.clone());
+        router.retry_config.max_retries = 0;
+        let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "messages": [{"role": "user", "content": "hello"}]
+        }))
+        .unwrap();
+        let response = router
+            .route_typed_request(None, &request, "/v1/chat/completions", None)
+            .await;
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("Failed to get response body"));
+        assert_eq!(worker.load(), 0);
+        server.await.unwrap();
     }
 
     #[tokio::test]

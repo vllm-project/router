@@ -7,7 +7,7 @@ use serde_json::Value;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-const MAX_SSE_FRAME_BYTES: usize = 1024 * 1024;
+const MAX_OBSERVATION_BYTES: usize = 1024 * 1024;
 
 pub(super) struct KvResponseStream<S> {
     inner: std::pin::Pin<Box<S>>,
@@ -54,7 +54,7 @@ where
                 if let Some(sse) = &mut this.sse {
                     sse.observe(bytes);
                 } else if !this.oversized {
-                    if this.json.len().saturating_add(bytes.len()) > MAX_SSE_FRAME_BYTES {
+                    if this.json.len().saturating_add(bytes.len()) > MAX_OBSERVATION_BYTES {
                         this.oversized = true;
                         this.json.clear();
                     } else {
@@ -67,7 +67,11 @@ where
                 if let Some(sse) = &mut this.sse {
                     sse.finish(false);
                 } else {
-                    observe_unavailable(&this.attempt, this.status, "response_error");
+                    observe_unavailable(
+                        &this.attempt,
+                        this.status,
+                        UnavailableReason::ResponseError,
+                    );
                 }
             }
             std::task::Poll::Ready(None) if !this.finished => {
@@ -75,7 +79,11 @@ where
                 if let Some(sse) = &mut this.sse {
                     sse.finish(true);
                 } else if this.oversized {
-                    observe_unavailable(&this.attempt, this.status, "oversized_json");
+                    observe_unavailable(
+                        &this.attempt,
+                        this.status,
+                        UnavailableReason::OversizedJson,
+                    );
                 } else {
                     observe_json_response(&this.attempt, this.status, &this.json);
                 }
@@ -89,7 +97,7 @@ where
 #[derive(Debug, Clone)]
 pub(super) struct KvRoutePrediction {
     pub(super) target: RoutableTarget,
-    pub(super) cached_tokens: u64,
+    pub(super) cached_tokens: Option<u64>,
     pub(super) multi_prompt: bool,
 }
 
@@ -125,7 +133,50 @@ impl KvRouteAttempt {
 impl Drop for KvRouteAttempt {
     fn drop(&mut self) {
         if !self.finished.load(Ordering::Acquire) {
-            self.record_once(CacheObservation::Unavailable("attempt_cancelled"));
+            self.record_once(CacheObservation::Unavailable(
+                UnavailableReason::AttemptCancelled,
+            ));
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum UnavailableReason {
+    AttemptCancelled,
+    BackendError,
+    RequestRejected,
+    RequestError,
+    ResponseError,
+    MissingUsage,
+    MultiPromptUsageNotAggregate,
+    MalformedJson,
+    OversizedJson,
+    OversizedSseFrame,
+    IncompleteSseFrame,
+    InvalidUsage,
+    MalformedUsage,
+    StreamError,
+    PdUsageNotComparable,
+}
+
+impl UnavailableReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::AttemptCancelled => "attempt_cancelled",
+            Self::BackendError => "backend_error",
+            Self::RequestRejected => "request_rejected",
+            Self::RequestError => "request_error",
+            Self::ResponseError => "response_error",
+            Self::MissingUsage => "missing_usage",
+            Self::MultiPromptUsageNotAggregate => "multi_prompt_usage_not_aggregate",
+            Self::MalformedJson => "malformed_json",
+            Self::OversizedJson => "oversized_json",
+            Self::OversizedSseFrame => "oversized_sse_frame",
+            Self::IncompleteSseFrame => "incomplete_sse_frame",
+            Self::InvalidUsage => "invalid_usage",
+            Self::MalformedUsage => "malformed_usage",
+            Self::StreamError => "stream_error",
+            Self::PdUsageNotComparable => "pd_usage_not_comparable",
         }
     }
 }
@@ -134,7 +185,7 @@ impl Drop for KvRouteAttempt {
 enum CacheObservation {
     Observed(u64),
     Ambiguous,
-    Unavailable(&'static str),
+    Unavailable(UnavailableReason),
 }
 
 fn response_cached_tokens(value: &Value) -> Option<u64> {
@@ -161,20 +212,20 @@ fn record_observation(prediction: &KvRoutePrediction, observation: CacheObservat
             observation,
             CacheObservation::Observed(_) | CacheObservation::Ambiguous
         ) {
-        CacheObservation::Unavailable("multi_prompt_usage_not_aggregate")
+        CacheObservation::Unavailable(UnavailableReason::MultiPromptUsageNotAggregate)
     } else {
         observation
     };
     let (status, reason, actual_cached_tokens) = match observation {
         CacheObservation::Observed(tokens) => ("observed", "none", Some(tokens)),
         CacheObservation::Ambiguous => ("ambiguous", "conflicting_usage", None),
-        CacheObservation::Unavailable(reason) => ("unavailable", reason, None),
+        CacheObservation::Unavailable(reason) => ("unavailable", reason.as_str(), None),
     };
 
     RouterMetrics::record_kv_route_outcome(
         status,
         reason,
-        (!prediction.multi_prompt).then_some(prediction.cached_tokens),
+        prediction.cached_tokens,
         actual_cached_tokens,
     );
     tracing::debug!(
@@ -182,21 +233,49 @@ fn record_observation(prediction: &KvRoutePrediction, observation: CacheObservat
         reason,
         instance_id = %prediction.target.instance_id,
         dp_rank = prediction.target.dp_rank,
-        predicted_cached_tokens = ?(!prediction.multi_prompt).then_some(prediction.cached_tokens),
+        predicted_cached_tokens = ?prediction.cached_tokens,
         actual_cached_tokens,
         "KV route prediction outcome"
     );
 }
 
+fn http_failure(status: StatusCode) -> Option<UnavailableReason> {
+    if status.is_client_error() {
+        Some(UnavailableReason::RequestRejected)
+    } else if !status.is_success() {
+        Some(UnavailableReason::BackendError)
+    } else {
+        None
+    }
+}
+
+/// A Program response may report reuse for a different worker than the selection.
+pub(super) fn comparable_attempt(
+    attempt: Option<Arc<KvRouteAttempt>>,
+    status: StatusCode,
+    has_program: bool,
+) -> Option<Arc<KvRouteAttempt>> {
+    if has_program {
+        if let Some(attempt) = attempt {
+            observe_unavailable(&attempt, status, UnavailableReason::PdUsageNotComparable);
+        }
+        None
+    } else {
+        attempt
+    }
+}
+
 pub(super) fn observe_json_response(attempt: &KvRouteAttempt, status: StatusCode, body: &[u8]) {
-    let observation = if !status.is_success() {
-        CacheObservation::Unavailable("backend_error")
+    let observation = if let Some(reason) = http_failure(status) {
+        CacheObservation::Unavailable(reason)
     } else {
         match serde_json::from_slice::<Value>(body) {
             Ok(value) => response_cached_tokens(&value)
                 .map(CacheObservation::Observed)
-                .unwrap_or(CacheObservation::Unavailable("missing_usage")),
-            Err(_) => CacheObservation::Unavailable("malformed_json"),
+                .unwrap_or(CacheObservation::Unavailable(
+                    UnavailableReason::MissingUsage,
+                )),
+            Err(_) => CacheObservation::Unavailable(UnavailableReason::MalformedJson),
         }
     };
     attempt.record_once(observation);
@@ -205,25 +284,25 @@ pub(super) fn observe_json_response(attempt: &KvRouteAttempt, status: StatusCode
 pub(super) fn observe_unavailable(
     attempt: &KvRouteAttempt,
     status: StatusCode,
-    reason: &'static str,
+    reason: UnavailableReason,
 ) {
-    let reason = if status.is_success() || reason == "request_error" {
+    let reason = if reason == UnavailableReason::RequestError {
         reason
     } else {
-        "backend_error"
+        http_failure(status).unwrap_or(reason)
     };
     attempt.record_once(CacheObservation::Unavailable(reason));
 }
 
 pub(super) struct KvSseObserver {
     attempt: Arc<KvRouteAttempt>,
-    successful_status: bool,
+    status: StatusCode,
     scanner: FrameScanner,
     frame: Vec<u8>,
     discarding_frame: bool,
     observed_cached_tokens: Option<u64>,
     ambiguous: bool,
-    fallback_reason: Option<&'static str>,
+    fallback_reason: Option<UnavailableReason>,
     finished: bool,
 }
 
@@ -231,7 +310,7 @@ impl KvSseObserver {
     pub(super) fn new(attempt: Arc<KvRouteAttempt>, status: StatusCode) -> Self {
         Self {
             attempt,
-            successful_status: status.is_success(),
+            status,
             scanner: FrameScanner::default(),
             frame: Vec::new(),
             discarding_frame: false,
@@ -243,7 +322,7 @@ impl KvSseObserver {
     }
 
     pub(super) fn observe(&mut self, chunk: &Bytes) {
-        if !self.successful_status || self.finished {
+        if !self.status.is_success() || self.finished {
             return;
         }
 
@@ -252,10 +331,10 @@ impl KvSseObserver {
             let frame_end = self.scanner.frame_end(remaining);
             let consumed = frame_end.unwrap_or(remaining.len());
             if !self.discarding_frame {
-                if self.frame.len().saturating_add(consumed) > MAX_SSE_FRAME_BYTES {
+                if self.frame.len().saturating_add(consumed) > MAX_OBSERVATION_BYTES {
                     self.frame.clear();
                     self.discarding_frame = true;
-                    self.fallback_reason = Some("oversized_sse_frame");
+                    self.fallback_reason = Some(UnavailableReason::OversizedSseFrame);
                 } else {
                     self.frame.extend_from_slice(&remaining[..consumed]);
                 }
@@ -308,7 +387,7 @@ impl KvSseObserver {
                                     .is_some_and(|cached| !cached.is_null())
                             })
                     }) {
-                        self.fallback_reason = Some("invalid_usage");
+                        self.fallback_reason = Some(UnavailableReason::InvalidUsage);
                     }
                     return;
                 };
@@ -321,25 +400,25 @@ impl KvSseObserver {
                     self.observed_cached_tokens = Some(cached_tokens);
                 }
             }
-            Err(_) => self.fallback_reason = Some("malformed_usage"),
+            Err(_) => self.fallback_reason = Some(UnavailableReason::MalformedUsage),
         }
     }
 
     pub(super) fn finish(&mut self, stream_succeeded: bool) {
-        let observation = if !self.successful_status {
-            CacheObservation::Unavailable("backend_error")
+        let observation = if let Some(reason) = http_failure(self.status) {
+            CacheObservation::Unavailable(reason)
         } else if let Some(reason) = self.fallback_reason {
             CacheObservation::Unavailable(reason)
         } else if self.frame.iter().any(|byte| !matches!(byte, b'\r' | b'\n')) {
-            CacheObservation::Unavailable("incomplete_sse_frame")
+            CacheObservation::Unavailable(UnavailableReason::IncompleteSseFrame)
         } else if self.ambiguous {
             CacheObservation::Ambiguous
         } else if let Some(tokens) = self.observed_cached_tokens {
             CacheObservation::Observed(tokens)
         } else if !stream_succeeded {
-            CacheObservation::Unavailable("stream_error")
+            CacheObservation::Unavailable(UnavailableReason::StreamError)
         } else {
-            CacheObservation::Unavailable(self.fallback_reason.unwrap_or("missing_usage"))
+            CacheObservation::Unavailable(UnavailableReason::MissingUsage)
         };
         self.record_once(observation);
     }
@@ -371,8 +450,49 @@ mod tests {
                 instance_id: Arc::from("worker-a"),
                 dp_rank: 0,
             },
-            cached_tokens: 32,
+            cached_tokens: Some(32),
             multi_prompt: false,
+        }
+    }
+
+    #[test]
+    fn program_usage_and_http_rejections_do_not_enter_accuracy_histograms() {
+        for (status, reason) in [
+            (StatusCode::OK, "pd_usage_not_comparable"),
+            (StatusCode::BAD_REQUEST, "request_rejected"),
+            (StatusCode::BAD_GATEWAY, "backend_error"),
+        ] {
+            let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+            let handle = recorder.handle();
+            metrics::with_local_recorder(&recorder, || {
+                let attempt = KvRouteAttempt::new(prediction());
+                assert!(comparable_attempt(Some(attempt), status, true).is_none());
+            });
+            let metrics = handle.render();
+            assert!(metrics.contains(&format!("reason=\"{reason}\"")));
+            assert!(!metrics.contains("vllm_router_kv_predicted_cached_tokens"));
+            assert!(!metrics.contains("vllm_router_kv_actual_cached_tokens"));
+        }
+    }
+
+    #[test]
+    fn accuracy_histograms_count_only_pairs_and_preserve_error_direction() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            for actual in [16, 32, 48] {
+                record_observation(&prediction(), CacheObservation::Observed(actual));
+            }
+            drop(KvRouteAttempt::new(prediction()));
+        });
+        let metrics = handle.render();
+        for name in ["predicted", "actual"] {
+            assert!(metrics
+                .lines()
+                .any(|line| line == format!("vllm_router_kv_{name}_cached_tokens_count 3")));
+        }
+        for (direction, error) in [("underpredicted", 16), ("exact", 0), ("overpredicted", 16)] {
+            assert!(metrics.lines().any(|line| line == format!("vllm_router_kv_cached_token_absolute_error_sum{{direction=\"{direction}\"}} {error}")));
         }
     }
 
@@ -492,6 +612,7 @@ mod tests {
             metrics::with_local_recorder(&recorder, || {
                 let mut prediction = prediction();
                 prediction.multi_prompt = true;
+                prediction.cached_tokens = None;
                 let attempt = KvRouteAttempt::new(prediction);
                 if streaming {
                     let mut observer = KvSseObserver::new(attempt, StatusCode::OK);
@@ -517,18 +638,24 @@ mod tests {
 
     #[test]
     fn multi_prompt_preserves_failure_and_cancellation_reasons() {
-        for reason in ["request_error", "backend_error", "attempt_cancelled"] {
+        for reason in [
+            UnavailableReason::RequestError,
+            UnavailableReason::BackendError,
+            UnavailableReason::AttemptCancelled,
+        ] {
             let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
             let handle = recorder.handle();
             metrics::with_local_recorder(&recorder, || {
                 let mut prediction = prediction();
                 prediction.multi_prompt = true;
+                prediction.cached_tokens = None;
                 let attempt = KvRouteAttempt::new(prediction);
-                if reason != "attempt_cancelled" {
+                if reason != UnavailableReason::AttemptCancelled {
                     observe_unavailable(&attempt, StatusCode::BAD_GATEWAY, reason);
                 }
                 drop(attempt);
             });
+            let reason = reason.as_str();
             let exported = handle.render();
             assert!(exported.lines().any(|line| line
                 .starts_with("vllm_router_kv_route_outcomes_total{")
@@ -577,7 +704,7 @@ mod tests {
                 ));
                 if oversized {
                     let mut frame = b"data: ".to_vec();
-                    frame.resize(MAX_SSE_FRAME_BYTES + 1, b'x');
+                    frame.resize(MAX_OBSERVATION_BYTES + 1, b'x');
                     frame.extend_from_slice(b"\n\n");
                     observer.observe(&Bytes::from(frame));
                 } else {
@@ -666,7 +793,11 @@ mod tests {
         let handle = recorder.handle();
         metrics::with_local_recorder(&recorder, || {
             let attempt = KvRouteAttempt::new(prediction());
-            observe_unavailable(&attempt, StatusCode::BAD_GATEWAY, "request_error");
+            observe_unavailable(
+                &attempt,
+                StatusCode::BAD_GATEWAY,
+                UnavailableReason::RequestError,
+            );
             observe_json_response(
                 &attempt,
                 StatusCode::OK,
