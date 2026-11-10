@@ -14,16 +14,25 @@ Opt in to authoritative-history recovery using `--kv-event-strict-recovery`
 the corresponding RouterConfig boolean. It defaults to false in old JSON
 configurations as well. The setting applies to regular and P/D event subscribers.
 
-Strict mode credits all covered tiers in `exact`. After a gap, a validated
-`AllBlocksCleared` establishes a boundary for worker-owned blocks only. The
-state becomes `worker_exact`: worker-owned placements can earn credit, while
-external pool placements remain hidden until complete history is recovered.
-A clear on an already exact stream preserves external placements. Compatibility
-mode credits fresh observations as `observed` after loss. In strict mode,
-ordinary stores cannot promote a source to exact. A contiguous authoritative
-replay or a new stream observed from sequence zero establishes full history. A publisher
-restart detected through a decreasing sequence resets the local cursor; a
-validated new sequence zero can establish Exact again.
+Strict recovery preserves the scope of its baseline:
+
+| Evidence | Scope after successful recovery |
+|---|---|
+| Validated worker sequence zero, live or replayed from zero | `worker_exact`: worker-owned tiers only, under the worker reset assumption below |
+| Validated worker clear after loss | `worker_exact`; the clear does not cover shared pools |
+| Contiguous replay of a gap on an intact baseline in the same stream | Preserve that baseline: `worker_exact` stays worker-only; an already `exact` baseline stays exact |
+| Worker clear on an uninterrupted exact stream | Preserve exact: the clear only changes worker-owned records |
+
+These conditions apply on initial attachment as well as after detected sequence
+rollback. A new subscriber cannot tell whether a pool predates its stream.
+An external pool can retain X across worker restart and only announce Y after
+zero. Replaying that stream cannot reconstruct X. Strict mode therefore hides
+external credit, including fresh pool stores, until there is a proven pool
+baseline. The current wire protocol supplies no pool-wide baseline. A pool
+snapshot or complete inventory with a consistent watermark, or a certified
+pool clear followed by contiguous updates, could establish one. None of these
+is implied by a worker clear or sequence zero. Compatibility mode retains its
+existing fresh-observation and sequence-zero behavior.
 
 The current wire protocol has no snapshot/watermark or producer-issued boot ID.
 After Router restart, worker re-add, or replay-buffer rollover, sequence zero
@@ -40,7 +49,8 @@ follow-up work under #426, not implemented by this flag.
 Strict recovery is conservative within the existing event contract, not an
 unconditional guarantee about physical KV residency. It assumes one ordered
 publisher stream per binding and that sequence zero represents the beginning
-of the cache history covered by that stream. Sequence rollback is a local
+of worker-owned cache history (worker KV reset or a complete re-announcement).
+Router cannot independently verify that precondition. Sequence rollback is a local
 restart observation, not a producer-authenticated identity. A publisher-only
 restart that retains cache state, or a replacement whose sequence has already
 passed the old cursor, cannot be fully identified by the current wire format.

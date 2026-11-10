@@ -510,7 +510,7 @@ struct SourceRecoveryRecord {
     status: SourceRecoveryStatus,
     recovery_started: Option<Instant>,
     attempt: u64,
-    replay_exact: bool,
+    replay_state: SourceRecoveryState,
 }
 
 impl KvBlockIndexer {
@@ -574,7 +574,7 @@ impl KvBlockIndexer {
                     status,
                     recovery_started,
                     attempt: self.recovery_attempt.fetch_add(1, Ordering::Relaxed),
-                    replay_exact: false,
+                    replay_state: SourceRecoveryState::Observed,
                 });
                 (Some(previous.status), recovery_duration)
             }
@@ -588,7 +588,7 @@ impl KvBlockIndexer {
                     status,
                     recovery_started,
                     attempt: self.recovery_attempt.fetch_add(1, Ordering::Relaxed),
-                    replay_exact: false,
+                    replay_state: SourceRecoveryState::Observed,
                 });
                 (None, None)
             }
@@ -664,7 +664,7 @@ impl KvBlockIndexer {
         reason: SourceRecoveryReason,
     ) -> u64 {
         let _guard = self.source_mutations.lock();
-        self.suspend_source_locked(source, dp_rank, reason, true)
+        self.suspend_source_locked(source, dp_rank, reason, SourceRecoveryState::Exact)
     }
 
     fn suspend_source_locked(
@@ -672,7 +672,7 @@ impl KvBlockIndexer {
         source: &SourceId,
         dp_rank: u32,
         reason: SourceRecoveryReason,
-        replay_exact: bool,
+        replay_state: SourceRecoveryState,
     ) -> u64 {
         self.transition_source(source, dp_rank, SourceRecoveryState::Degraded, reason);
         self.source_generation.fetch_add(1, Ordering::AcqRel);
@@ -682,7 +682,7 @@ impl KvBlockIndexer {
             .get_mut(&(source.clone(), dp_rank))
             .unwrap();
         record.attempt = attempt;
-        record.replay_exact = replay_exact;
+        record.replay_state = replay_state;
         attempt
     }
 
@@ -694,16 +694,24 @@ impl KvBlockIndexer {
         strict: bool,
     ) -> (i64, u64) {
         let _guard = self.source_mutations.lock();
-        let exact = self
+        use SourceRecoveryState::{Exact, Observed, WorkerExact};
+        let baseline = self
             .source_states
             .get(&(source.clone(), dp_rank))
-            .is_some_and(|record| record.status.state == SourceRecoveryState::Exact);
-        let start = if strict && !exact { -1 } else { last_seq };
+            .map(|r| r.status.state);
+        // A suffix can preserve a trusted baseline, but cannot expand its scope.
+        // Without one, strict recovery rebuilds the publisher's worker history from zero.
+        let (start, replay_state) = match (last_seq, baseline) {
+            (cursor, Some(state @ (Exact | WorkerExact))) if cursor >= 0 => (cursor, state),
+            _ if strict => (-1, WorkerExact),
+            (-1, _) => (-1, Exact), // legacy compatibility mode
+            _ => (last_seq, Observed),
+        };
         let attempt = self.suspend_source_locked(
             source,
             dp_rank,
             SourceRecoveryReason::SequenceGap,
-            start == -1 || exact,
+            replay_state,
         );
         (start, attempt)
     }
@@ -745,10 +753,10 @@ impl KvBlockIndexer {
         source: &SourceId,
         dp_rank: u32,
         attempt: u64,
-        operation: impl FnOnce(bool) -> T,
+        operation: impl FnOnce(SourceRecoveryState) -> T,
     ) -> Option<T> {
         let _guard = self.source_mutations.lock();
-        let replay_exact = {
+        let replay_state = {
             let record = self.source_states.get(&(source.clone(), dp_rank))?;
             if record.attempt != attempt
                 || record.status.state != SourceRecoveryState::Degraded
@@ -756,9 +764,9 @@ impl KvBlockIndexer {
             {
                 return None;
             }
-            record.replay_exact
+            record.replay_state
         };
-        Some(operation(replay_exact))
+        Some(operation(replay_state))
     }
 
     pub(crate) fn finish_replay_if_current(
@@ -768,18 +776,14 @@ impl KvBlockIndexer {
         attempt: u64,
         failure: Option<SourceRecoveryReason>,
     ) -> bool {
-        self.with_current_replay(source, dp_rank, attempt, |replay_exact| {
+        self.with_current_replay(source, dp_rank, attempt, |replay_state| {
             if let Some(reason) = failure {
                 self.invalidate_source_locked(source, dp_rank, reason);
             } else {
                 self.resume_source_locked(
                     source,
                     dp_rank,
-                    if replay_exact {
-                        SourceRecoveryState::Exact
-                    } else {
-                        SourceRecoveryState::Observed
-                    },
+                    replay_state,
                     SourceRecoveryReason::ReplayApplied,
                 );
             }
@@ -839,6 +843,22 @@ impl KvBlockIndexer {
         self.resume_source_for(source, dp_rank, SourceRecoveryReason::ReplayApplied);
     }
 
+    pub(super) fn resume_initial_sequence(&self, source: &SourceId, dp_rank: u32, strict: bool) {
+        let _guard = self.source_mutations.lock();
+        let state = if strict {
+            SourceRecoveryState::WorkerExact
+        } else {
+            SourceRecoveryState::Exact
+        };
+        self.resume_source_locked(
+            source,
+            dp_rank,
+            state,
+            SourceRecoveryReason::InitialSequence,
+        );
+    }
+
+    #[cfg(test)]
     pub(crate) fn resume_source_for(
         &self,
         source: &SourceId,
@@ -1103,8 +1123,27 @@ mod tests {
         assert!(indexer.finish_replay_if_current(&source, 0, attempt, None));
         assert_eq!(
             indexer.source_recovery_status(&source, 0).unwrap().state,
+            SourceRecoveryState::WorkerExact
+        );
+        // A full-domain checkpoint is a precondition, not something seq=0 supplies.
+        indexer.resume_source(&source, 0);
+        indexer.store(
+            0,
+            pool("shared", "w0"),
+            StorageTier::External,
+            None,
+            &[(h("seq"), h("x"))],
+        );
+        let external = query(&["x"], &[StorageTier::External]);
+        let (start, attempt) = indexer.begin_replay(&source, 0, 23, true);
+        assert_eq!(start, 23);
+        assert!(indexer.find_matches(&external).is_empty());
+        assert!(indexer.finish_replay_if_current(&source, 0, attempt, None));
+        assert_eq!(
+            indexer.source_recovery_status(&source, 0).unwrap().state,
             SourceRecoveryState::Exact
         );
+        assert_eq!(indexer.find_matches(&external).len(), 1);
         indexer.invalidate_source_for(&source, 0, SourceRecoveryReason::RankScopeChanged);
         assert_eq!(indexer.begin_replay(&source, 0, 24, true).0, -1);
     }

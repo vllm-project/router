@@ -134,7 +134,7 @@ pub enum ClearScope {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum SourceRecoveryState {
     Cold,
-    /// Strict recovery after a worker-domain clear with incomplete pool history.
+    /// Worker history is complete; the external pool has no proven baseline.
     WorkerExact,
     Exact,
     Observed,

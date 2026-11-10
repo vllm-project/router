@@ -420,10 +420,10 @@ fn spawn_inner(
                                     let initial_boundary = last_seq == -1 && seq == 0;
                                     if initial_boundary {
                                         retries.reset();
-                                        indexer.resume_source_for(
+                                        indexer.resume_initial_sequence(
                                             &source_id,
                                             dp_rank,
-                                            SourceRecoveryReason::InitialSequence,
+                                            strict_recovery,
                                         );
                                     } else if clear_barrier {
                                         retries.reset();
@@ -441,10 +441,10 @@ fn spawn_inner(
                                     let initial_boundary = last_seq == -1 && seq == 0;
                                     if initial_boundary {
                                         retries.reset();
-                                        indexer.resume_source_for(
+                                        indexer.resume_initial_sequence(
                                             &source_id,
                                             dp_rank,
-                                            SourceRecoveryReason::InitialSequence,
+                                            strict_recovery,
                                         );
                                     }
                                     true
@@ -1258,7 +1258,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn generic_subscriber_preserves_nonzero_rank_and_nondevice_tiers() {
+    async fn compatibility_subscriber_preserves_nonzero_rank_and_nondevice_tiers() {
         let ctx = Arc::new(zmq::Context::new());
         let publisher = ctx.socket(zmq::PUB).unwrap();
         publisher.bind("inproc://generic-rank-tier").unwrap();
@@ -1272,7 +1272,7 @@ mod tests {
                 replay_endpoint: None,
                 topic: "kv/generic".into(),
                 hwm: Some(64),
-                strict_recovery: true,
+                strict_recovery: false,
             },
             indexer.clone(),
             Some(tx),
@@ -2407,7 +2407,7 @@ mod tests {
             f.indexer.source_recovery_status(&SourceId::from("w0"), 0),
             Some(if case == "complete" {
                 crate::kv_index::SourceRecoveryStatus {
-                    state: crate::kv_index::SourceRecoveryState::Exact,
+                    state: crate::kv_index::SourceRecoveryState::WorkerExact,
                     reason: crate::kv_index::SourceRecoveryReason::ReplayApplied,
                 }
             } else {
@@ -2425,7 +2425,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_replay_requires_full_rebuild_before_later_exact_recovery() {
+    async fn failed_replay_requires_full_rebuild_before_worker_credit_returns() {
         let mut fixture = fixture_with_block_size(true, Some(4));
         let source = SourceId::from("w0");
         let tokens = [
@@ -2513,7 +2513,7 @@ mod tests {
         assert_eq!(
             fixture.indexer.source_recovery_status(&source, 0),
             Some(crate::kv_index::SourceRecoveryStatus {
-                state: crate::kv_index::SourceRecoveryState::Exact,
+                state: crate::kv_index::SourceRecoveryState::WorkerExact,
                 reason: crate::kv_index::SourceRecoveryReason::ReplayApplied,
             })
         );
@@ -2582,7 +2582,7 @@ mod tests {
         assert_eq!(
             fixture.indexer.source_recovery_status(&source, 0),
             Some(crate::kv_index::SourceRecoveryStatus {
-                state: crate::kv_index::SourceRecoveryState::Exact,
+                state: crate::kv_index::SourceRecoveryState::WorkerExact,
                 reason: crate::kv_index::SourceRecoveryReason::ReplayApplied,
             })
         );
@@ -2829,7 +2829,8 @@ mod tests {
         let source = SourceId::from("w0");
         use crate::kv_index::SourceRecoveryState::{Exact, Observed, WorkerExact};
         for (strict, gap, expected) in [
-            (true, false, Exact),
+            (true, false, WorkerExact),
+            (false, false, Exact),
             (true, true, WorkerExact),
             (false, true, Observed),
         ] {
@@ -2894,8 +2895,8 @@ mod tests {
                     })
                     .len()
             };
-            assert_eq!(pool_hits(&old), usize::from(!gap));
-            assert_eq!(pool_hits(&fresh), usize::from(!strict || !gap));
+            assert_eq!(pool_hits(&old), usize::from(!strict && !gap));
+            assert_eq!(pool_hits(&fresh), usize::from(!strict));
             if strict && gap {
                 let server = f.replay_server.as_ref().unwrap();
                 tokio::join!(
@@ -2910,31 +2911,20 @@ mod tests {
                     ),
                     async {
                         let request = replay_request(server).await;
-                        assert_eq!(read_seq(request.last().unwrap()), 0);
-                        let history = [
-                            vec![pool_store(100, &old)],
-                            vec![],
-                            clear_events.to_vec(),
-                            vec![pool_store(102, &fresh)],
-                            vec![],
-                            vec![],
+                        assert_eq!(read_seq(request.last().unwrap()), 4);
+                        let replies = [
+                            (4, b"kv".as_slice(), batch_payload(&[], 0)),
+                            (5, b"kv".as_slice(), batch_payload(&[], 0)),
                         ];
-                        let replies: Vec<_> = history
-                            .iter()
-                            .enumerate()
-                            .map(|(seq, events)| {
-                                (seq as i64, b"kv".as_slice(), batch_payload(events, 0))
-                            })
-                            .collect();
                         send_replay_replies(server, &request, &replies);
                     },
                 );
                 assert_eq!(
                     f.indexer.source_recovery_status(&source, 0).unwrap().state,
-                    Exact
+                    WorkerExact
                 );
-                assert_eq!(pool_hits(&old), 1);
-                assert_eq!(pool_hits(&fresh), 1);
+                assert_eq!(pool_hits(&old), 0);
+                assert_eq!(pool_hits(&fresh), 0);
                 assert_eq!(hits(&f.indexer, &local).len(), 1);
             }
         }
@@ -2976,7 +2966,7 @@ mod tests {
         assert_eq!(
             fixture.indexer.source_recovery_status(&source, 0),
             Some(crate::kv_index::SourceRecoveryStatus {
-                state: crate::kv_index::SourceRecoveryState::Exact,
+                state: crate::kv_index::SourceRecoveryState::WorkerExact,
                 reason: crate::kv_index::SourceRecoveryReason::InitialSequence,
             })
         );
@@ -3076,40 +3066,109 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn publisher_restart_at_zero_restores_exact_after_incarnation_reset() {
-        let mut f = fixture(false);
+    async fn publisher_restart_restores_only_worker_credit_live_or_replayed() {
         let source = SourceId::from("w0");
-        for seq in [0, 1] {
-            publish_until_advanced(
-                &f.publisher,
-                &mut f.signals,
-                b"kv",
-                seq,
-                0.0,
-                &[store_event(100 + seq as u64, &[1, 2, 3, 4])],
-                Some(0),
-            )
-            .await;
+        let pool_store = |id, tokens: &[u32]| {
+            KVEvent::BlockStored(stored(
+                vec![ExternalBlockHash::Int(id)],
+                tokens.to_vec(),
+                Some("GPU"),
+                Some("pool"),
+            ))
+        };
+        for use_replay in [false, true] {
+            let mut f = fixture_with_block_size(use_replay, Some(4));
+            let old_local = [13, 14, 15, 16];
+            let old_pool = [1, 2, 3, 4];
+            let new_pool = [5, 6, 7, 8];
+            let new_local = [9, 10, 11, 12];
+            let pool_query = |tokens: &[u32]| MatchQuery {
+                group_idx: 0,
+                local_hashes: crate::kv_index::local_block_hash_strings(tokens, 4, None),
+                tiers_of_interest: vec![StorageTier::External],
+            };
+            for seq in 0..=2 {
+                let events = if seq == 0 {
+                    vec![pool_store(100, &old_pool), store_event(99, &old_local)]
+                } else {
+                    vec![]
+                };
+                publish_until_advanced(
+                    &f.publisher,
+                    &mut f.signals,
+                    b"kv",
+                    seq,
+                    0.0,
+                    &events,
+                    Some(0),
+                )
+                .await;
+            }
+            // Give the old generation a known full baseline. The new generation
+            // does not re-announce the surviving pool block.
+            f.indexer.resume_source(&source, 0);
+            assert_eq!(f.indexer.find_matches(&pool_query(&old_pool)).len(), 1);
+            let initial = [pool_store(101, &new_pool), store_event(200, &new_local)];
+            let reason = if let Some(server) = &f.replay_server {
+                tokio::join!(
+                    publish_until_advanced(
+                        &f.publisher,
+                        &mut f.signals,
+                        b"kv",
+                        1,
+                        0.0,
+                        &[],
+                        Some(0)
+                    ),
+                    async {
+                        let request = replay_request(server).await;
+                        assert_eq!(read_seq(request.last().unwrap()), 0);
+                        send_replay_replies(
+                            server,
+                            &request,
+                            &[
+                                (0, b"kv".as_slice(), batch_payload(&initial, 0)),
+                                (1, b"kv".as_slice(), batch_payload(&[], 0)),
+                            ],
+                        );
+                    },
+                );
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while let Some(signal) = f.signals.recv().await {
+                        if matches!(signal, IngestionSignal::ReplayApplied { replay_seq: 1, .. }) {
+                            return;
+                        }
+                    }
+                    panic!("subscriber closed before replay committed");
+                })
+                .await
+                .unwrap();
+                SourceRecoveryReason::ReplayApplied
+            } else {
+                publish_until_advanced(
+                    &f.publisher,
+                    &mut f.signals,
+                    b"kv",
+                    0,
+                    0.0,
+                    &initial,
+                    Some(0),
+                )
+                .await;
+                SourceRecoveryReason::InitialSequence
+            };
+            assert_eq!(
+                f.indexer.source_recovery_status(&source, 0),
+                Some(crate::kv_index::SourceRecoveryStatus {
+                    state: crate::kv_index::SourceRecoveryState::WorkerExact,
+                    reason,
+                })
+            );
+            assert!(hits(&f.indexer, &old_local).is_empty());
+            assert_eq!(hits(&f.indexer, &new_local).len(), 1);
+            assert!(f.indexer.find_matches(&pool_query(&old_pool)).is_empty());
+            assert!(f.indexer.find_matches(&pool_query(&new_pool)).is_empty());
         }
-        publish_until_advanced(
-            &f.publisher,
-            &mut f.signals,
-            b"kv",
-            0,
-            0.0,
-            &[store_event(200, &[5, 6, 7, 8])],
-            Some(0),
-        )
-        .await;
-        assert_eq!(
-            f.indexer.source_recovery_status(&source, 0),
-            Some(crate::kv_index::SourceRecoveryStatus {
-                state: crate::kv_index::SourceRecoveryState::Exact,
-                reason: SourceRecoveryReason::InitialSequence,
-            })
-        );
-        assert!(hits(&f.indexer, &[1, 2, 3, 4]).is_empty());
-        assert_eq!(hits(&f.indexer, &[5, 6, 7, 8]).len(), 1);
     }
 
     #[tokio::test]
