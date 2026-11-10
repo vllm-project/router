@@ -14,6 +14,7 @@ use tracing::{debug, info, warn};
 
 /// Default ping timeout in seconds
 const DEFAULT_PING_SECONDS: u64 = 5;
+const DP_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(2);
 const DP_DISCOVERY_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Service type for registration
@@ -537,7 +538,8 @@ impl ServiceRegistry {
 
     /// Share confirmed HTTP engine counts across native admission, health
     /// generation, and Program scheduling. Unavailable metrics are retried after
-    /// a short interval; MoRI-IO's global DP is never used as a local fallback.
+    /// a short interval. Unconfigured MoRI-IO endpoints retain the legacy
+    /// single-pod registration fallback without treating it as confirmed local DP.
     pub(super) async fn get_routing_snapshots(
         &self,
         service_type: ServiceType,
@@ -561,6 +563,7 @@ impl ServiceRegistry {
                     (
                         http.clone(),
                         instance.zmq_address.clone(),
+                        instance.dp_size,
                         instance.endpoint_dp_size.clone(),
                     )
                 })
@@ -577,41 +580,69 @@ impl ServiceRegistry {
             ),
         };
         let fallback = fallback.max(1);
-        let resolved = join_all(snapshots.into_iter().map(|(http, zmq, cached)| async move {
-            let (base, _) = dp_utils::parse_worker_url(&http);
-            let url = if base.contains("://") {
-                base
-            } else {
-                format!("http://{base}")
-            };
-            let size = {
-                let mut cache = cached.lock().await;
-                if cache.confirmed.is_none() && cache.retry_at.is_none_or(|at| Instant::now() >= at)
+        let resolved = join_all(snapshots.into_iter().map(
+            |(http, zmq, reported_dp_size, cached)| async move {
+                // Preserve MoRI's historical single-pod default only when this role
+                // has no local override. Configured local sizes must still expose
+                // global/local mismatches to WRITE validation.
+                let fallback = if configured.is_none()
+                    && fallback == 1
+                    && matches!(config.kv_connector, KvConnector::MoriIO)
                 {
-                    cache.confirmed = dp_utils::probe_dp_size(client, &url).await;
-                    cache.retry_at = Some(Instant::now() + DP_DISCOVERY_RETRY_INTERVAL);
-                    if let (Some(configured), Some(discovered)) = (configured, cache.confirmed) {
-                        if discovered != configured {
-                            warn!(
+                    reported_dp_size.unwrap_or(fallback)
+                } else {
+                    fallback
+                };
+                let (base, _) = dp_utils::parse_worker_url(&http);
+                let url = if base.contains("://") {
+                    base
+                } else {
+                    format!("http://{base}")
+                };
+                let size = {
+                    let mut cache = cached.lock().await;
+                    if cache.confirmed.is_none()
+                        && cache.retry_at.is_none_or(|at| Instant::now() >= at)
+                    {
+                        // Record the retry before awaiting so a cancelled caller
+                        // cannot make every waiter start a fresh probe.
+                        cache.retry_at = Some(Instant::now() + DP_DISCOVERY_RETRY_INTERVAL);
+                        cache.confirmed = match tokio::time::timeout(
+                            DP_DISCOVERY_TIMEOUT,
+                            dp_utils::probe_dp_size(client, &url),
+                        )
+                        .await
+                        {
+                            Ok(size) => size,
+                            Err(_) => {
+                                warn!(url, "DP discovery timed out after two seconds");
+                                None
+                            }
+                        };
+                        if let (Some(configured), Some(discovered)) = (configured, cache.confirmed)
+                        {
+                            if discovered != configured {
+                                warn!(
+                                    url,
+                                    configured_dp_size = configured,
+                                    discovered_dp_size = discovered,
+                                    "Using worker metrics instead of the configured DP fallback"
+                                );
+                            }
+                        }
+                        if cache.confirmed.is_none() {
+                            info!(
                                 url,
-                                configured_dp_size = configured,
-                                discovered_dp_size = discovered,
-                                "Using worker metrics instead of the configured DP fallback"
+                                fallback_dp_size = fallback,
+                                "No engine metrics; using DP fallback until the next probe"
                             );
                         }
                     }
-                    if cache.confirmed.is_none() {
-                        info!(
-                            url,
-                            fallback_dp_size = fallback,
-                            "No engine metrics; using local DP fallback until the next probe"
-                        );
-                    }
-                }
-                cache.confirmed.unwrap_or(fallback)
-            };
-            (http, zmq, size, cached)
-        }))
+                    cache.confirmed.unwrap_or(fallback)
+                };
+                (http, zmq, size, cached)
+            },
+        ))
         .await;
         // A probe may outlive its registration. Never publish its old count for
         // an expired endpoint or a replacement registered at the same address.

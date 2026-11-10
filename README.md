@@ -174,18 +174,22 @@ ZMQ discovery caches each endpoint's engine count for the lifetime of its live
 registration. Native requests, health generation, and Program scheduling share
 this result. If metrics are unavailable, requests temporarily use the configured
 local fallback; the next request after five seconds retries discovery. Initial
-probes run concurrently, and concurrent requests share the same probe. Heartbeats
-keep the discovery state; a changed sender, transfer address, TP/DP topology, or
-expired registration causes discovery to run again. Results from superseded
-registrations are discarded.
+probes run concurrently, and concurrent requests share the same probe.
+Each probe, including its response body, is limited to two seconds; a shorter
+configured HTTP timeout still applies. Cancelled probes also retain the retry
+interval. Heartbeats keep the discovery state; a changed sender, transfer
+address, TP/DP topology, or expired registration causes discovery to run again.
+Results from superseded registrations are discarded.
 
 MoRI-IO registrations report the **global** transfer DP size. The router still
 checks endpoint metrics to distinguish this from the engines reachable at one
-HTTP endpoint. If metrics are unavailable, the role size or legacy shared size
-supplies the local fallback. The reported global DP never overrides either local
-configuration. The raw global topology remains separate from the cached HTTP
-count for WRITE validation and READ metadata forwarding. Multi-pod deployments
-need endpoint metrics or correct local sizes; registration alone cannot establish
+HTTP endpoint. If metrics are unavailable, a configured role size or a non-default
+legacy shared size supplies the local fallback. With no role size and the shared
+default of one, the registered DP preserves the historical single-pod fallback.
+An explicit role size of one can override that assumption. The fallback is not
+cached as a confirmed engine count. The raw global topology remains separate
+for WRITE validation and READ metadata forwarding. Multi-pod deployments need
+endpoint metrics or correct local sizes; registration alone cannot establish
 their local engine count.
 
 Static URLs, Kubernetes worker additions, and ZMQ discovery expand each endpoint
