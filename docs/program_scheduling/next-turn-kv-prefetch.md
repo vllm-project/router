@@ -144,7 +144,7 @@ A prefetch is not a request. It never enters the RequestPool, never takes a Prog
 
 A reservation must not reach the Router's own capacity checks. `apply_observations` builds its estimate from observed KV usage, and `rank_admission_plan` and `repair_capacity` read that estimate, so the Router subtracts its accepted, in-flight tokens first. Without that, a speculative load could hold back a turn in the Router's queue, where the engine's reclaim (layer 2 below) cannot help it.
 
-Refusal is cheap: the wait stays open, and the next tick evaluates it again. Under overload the Router stops planning, because the gates fail. It does not queue speculative work for later. A hint is untrusted client input: it can make a plan more or less likely, and the budget bounds what that costs. Each Router replica budgets alone until multi-Router state exists ([#429](https://github.com/vllm-project/router/issues/429)), and the engine's rule remains the bound.
+Refusal is cheap: the wait stays open, and the next tick evaluates it again. Under overload the Router stops planning, because the gates fail. It does not queue speculative work for later. A hint is untrusted client input: it can make a plan more or less likely, and the budget bounds what that costs. Before a hint can move a real load, an operator must allow its tenant, named by an authenticated credential and never by the request body. Other tenants' hints stay in shadow. Each Router replica budgets alone until multi-Router state exists ([#429](https://github.com/vllm-project/router/issues/429)), and the engine's rule remains the bound.
 
 ## Cancellation and fallback
 
@@ -195,7 +195,7 @@ Every comparison uses the same model, hardware, trace, and pressure, following [
 
 | Metric | Definition | Available from |
 |---|---|---|
-| Precision | `in_time` and `unverified` over all settled plans except `cancelled` | Stage 1 |
+| Precision | `in_time` over all settled plans except `cancelled` and `unverified` | Stage 1 |
 | Missed opportunities | Waits skipped for a forecast reason where a plan would have landed in time | Stage 1 |
 | Useful-prefetch rate | Plans whose blocks served the next turn, over all waits that restored | Stage 3; bounded by Stage 1 |
 | Wasted bytes and compute | Tokens in `late`, `expired`, and `unused` plans, plus what `cancelled` plans had already moved, times bytes per token; load seconds | Stage 1 (modeled), Stage 3 (actual) |
@@ -216,9 +216,11 @@ Every comparison uses the same model, hardware, trace, and pressure, following [
 
 `in_time` says a load would have landed in time, not that the prefix had left the GPU, so Stage 1 discounts it by how much the target actually restores. Over one replay or window, for one forecast source:
 
-- `useful` = `in_time` and `unverified` tokens × the target's restored share, where that share is `external_kv_transfer` over `external_kv_transfer` + `local_cache_hit` in `vllm:prompt_tokens_by_source_total`.
+- `useful` = `in_time` tokens × the target's restored share, where that share is `external_kv_transfer` over `external_kv_transfer` + `local_cache_hit` in `vllm:prompt_tokens_by_source_total`.
 - `wasted` = `late` + `expired` + `unused` tokens, plus what `cancelled` plans had already moved.
 - Pass when `useful` exceeds `wasted`, and `useful` reaches at least 10% of the tokens the target restored.
+
+`unverified` plans count on neither side. They show that a load would have landed in time, not that the next turn reused the prefix, so a target whose next turns report no `cached_tokens` cannot pass.
 
 The first condition says loads save more than they spend, valuing a token moved on the critical path the same as a token moved off it. The second says enough is at stake: a smaller share cannot move resume latency beyond run-to-run noise. Both thresholds are starting points for review.
 
