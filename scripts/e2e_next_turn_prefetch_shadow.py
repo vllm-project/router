@@ -26,22 +26,28 @@ from typing import Any
 MODEL = "shadow-e2e-model"
 PREFIX_TOKENS = 8000
 TICK_SECONDS = 0.1
-# Timing: a plan fires at the first tick after the idle floor (0.2-0.3 s), its load takes 0.4 s, so
-# it finishes by 0.7 s and stays useful for 1 s after that.
-RETURN_IN_TIME = 1.0
-RETURN_LATE = 0.45
-RETURN_AFTER_WINDOW = 2.2
+# Three ticks: the Router scrapes the mock and evaluates its waits at least twice.
+SETTLE_SECONDS = 3 * TICK_SECONDS
+# Longer than restore_evidence_window_seconds, so restores from before a scenario that stops them
+# no longer count, and several scrapes see the scenario's gauges.
+CONFIGURE_SECONDS = 0.7
+# Timing: a plan fires at the first tick after the idle floor (0.5-0.6 s) and its load takes 1 s, so
+# it finishes at 1.5-1.6 s and stays useful until 4.5-4.6 s. Every scripted return is at least
+# 0.4 s from the nearest of those boundaries.
 RETURN_SHORT = 0.05
+RETURN_LATE = 1.0
+RETURN_IN_TIME = 2.5
+RETURN_AFTER_WINDOW = 5.5
 SHADOW_CONFIG = {
     "mode": "shadow",
-    "min_idle_seconds": 0.2,
-    "validity_seconds": 1.0,
+    "min_idle_seconds": 0.5,
+    "validity_seconds": 3.0,
     "min_useful_probability": 0.5,
     "min_prefix_tokens": 1024,
     "max_kv_cache_usage": 0.9,
     "max_speculative_tokens_per_target": 1_000_000,
     "restore_evidence_window_seconds": 0.5,
-    "load_cost_model": {"intercept_seconds": 0.4, "seconds_per_1k_tokens": 0.0},
+    "load_cost_model": {"intercept_seconds": 1.0, "seconds_per_1k_tokens": 0.0},
 }
 
 
@@ -236,7 +242,11 @@ def _turn(port: int, scenario: Scenario, resume: bool, cached: int) -> int:
 
 
 def _write_profile(path: Path) -> None:
-    """A global profile that always returns inside the useful window, so unhinted waits can plan."""
+    """A global profile that returns inside the useful window.
+
+    A lookup uses the most specific key with enough support, so after the first scenarios the
+    waits' own key, fed by their live returns, decides; this profile only covers the start.
+    """
     global_key = {
         key: None
         for key in (
@@ -254,14 +264,14 @@ def _write_profile(path: Path) -> None:
         json.dumps(
             {
                 "schema_version": "1",
-                "return_time_bucket_bounds_seconds": [0.8, 1.2, 5.0],
+                "return_time_bucket_bounds_seconds": [2.0, 3.0, 8.0],
                 "output_length_bucket_bounds_tokens": [64],
                 "return_time_profiles": [
                     {
                         "key": global_key,
                         "bucket_counts": [0.0, 100.0, 0.0, 0.0],
                         "no_return_count": 0.0,
-                        "max_observed_seconds": 1.2,
+                        "max_observed_seconds": 3.0,
                     }
                 ],
                 "output_length_profiles": [],
@@ -286,7 +296,7 @@ def _run(router_bin: Path, output_dir: Path, shadow: bool) -> dict[str, Any]:
         "prediction_profile": {
             "mode": "shadow",
             "profile_path": str(profile_path.resolve()),
-            "return_time_bucket_bounds_seconds": [0.8, 1.2, 5.0],
+            "return_time_bucket_bounds_seconds": [2.0, 3.0, 8.0],
             "output_length_bucket_bounds_tokens": [64],
             "return_time_min_support": 1,
         },
@@ -323,12 +333,11 @@ def _run(router_bin: Path, output_dir: Path, shadow: bool) -> dict[str, Any]:
             statuses = []
             for scenario in SCENARIOS:
                 backend.configure(**scenario.backend)
-                # Let the gates observe this scenario's backend, and let old evidence age out.
-                time.sleep(0.7 if scenario.backend else 3 * TICK_SECONDS)
+                time.sleep(CONFIGURE_SECONDS if scenario.backend else SETTLE_SECONDS)
                 statuses.append(_turn(router_port, scenario, True, PREFIX_TOKENS))
                 time.sleep(scenario.wait_seconds)
                 statuses.append(_turn(router_port, scenario, False, scenario.next_cached_tokens))
-            time.sleep(3 * TICK_SECONDS)
+            time.sleep(SETTLE_SECONDS)
             diagnostics = json.loads(_get(f"http://127.0.0.1:{router_port}/scheduling/diagnostics"))
             metrics = _get(f"http://127.0.0.1:{metrics_port}/metrics")
         finally:

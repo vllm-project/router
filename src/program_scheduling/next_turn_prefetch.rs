@@ -27,7 +27,10 @@ enum PrefetchSkip {
     /// The wait ended after that floor, but no tick evaluated it in between.
     NotEvaluated,
     PrefixTooSmall,
+    /// No fresh observation describes the target.
     ObservationStale,
+    /// A fresh observation lacks the target's KV usage or waiting-request count.
+    ObservationIncomplete,
     NoRestoreEvidence,
     CapacityPressure,
     DemandWaiting,
@@ -43,6 +46,7 @@ impl PrefetchSkip {
             Self::NotEvaluated => "not_evaluated",
             Self::PrefixTooSmall => "prefix_too_small",
             Self::ObservationStale => "observation_stale",
+            Self::ObservationIncomplete => "observation_incomplete",
             Self::NoRestoreEvidence => "no_restore_evidence",
             Self::CapacityPressure => "capacity_pressure",
             Self::DemandWaiting => "demand_waiting",
@@ -130,8 +134,8 @@ struct TargetFacts {
 struct PlanFacts {
     elapsed_seconds: f64,
     prefix_tokens: usize,
-    /// `None` when no fresh observation describes the target.
-    target: Option<TargetFacts>,
+    /// Why the target has no usable facts, when it has none.
+    target: Result<TargetFacts, PrefetchSkip>,
     speculative_tokens: usize,
     queue_delay_seconds: f64,
 }
@@ -161,7 +165,7 @@ fn choose_plan(
     facts: &PlanFacts,
     forecast: impl FnOnce(f64, f64) -> Option<Forecast>,
 ) -> Result<PlanChoice, PrefetchSkip> {
-    let target = facts.target.ok_or(PrefetchSkip::ObservationStale)?;
+    let target = facts.target?;
     if !target.restored_recently {
         return Err(PrefetchSkip::NoRestoreEvidence);
     }
@@ -231,8 +235,12 @@ struct PrefetchPlan {
 }
 
 impl PrefetchPlan {
-    /// Tokens the modeled load would have moved by `now`.
+    /// Tokens the modeled load would have moved by `now`. Nothing moves before it starts,
+    /// whatever the load costs.
     fn moved_tokens(&self, now: Instant) -> usize {
+        if now < self.start_at {
+            return 0;
+        }
         let load = self.finish_at.saturating_duration_since(self.start_at);
         let moved = now.saturating_duration_since(self.start_at);
         if moved >= load {
@@ -259,6 +267,8 @@ pub(crate) struct NextTurnWait {
     prefix_tokens: usize,
     keys: Vec<ReturnTimeKey>,
     hint: Option<NextTurnHint>,
+    /// Seconds after the turn finished at which a tick first evaluated the wait.
+    first_evaluated_seconds: Option<f64>,
     phase: WaitPhase,
 }
 
@@ -366,6 +376,15 @@ impl ProgramScheduler {
                 None
             }
         };
+        // A wait whose ending request never completed here, such as one served on a rank that
+        // was then removed, is settled before it is replaced, so its plan gives its budget back.
+        if let Some(previous) = state
+            .decisions
+            .get_mut(dispatch.program())
+            .and_then(|decision| decision.next_turn_wait.take())
+        {
+            Self::close_next_turn_wait(state, dispatch.program(), &previous, now);
+        }
         if prefix_tokens < self.config.next_turn_prefetch.min_prefix_tokens {
             // No later tick can change this, so no wait is kept for it.
             Self::record_skip(
@@ -394,6 +413,7 @@ impl ProgramScheduler {
             prefix_tokens,
             keys,
             hint,
+            first_evaluated_seconds: None,
             phase: WaitPhase::Undecided(PrefetchSkip::NotEvaluated),
         });
     }
@@ -423,7 +443,7 @@ impl ProgramScheduler {
                 } else {
                     skip
                 };
-                let fit = self.would_have_fit(wait.prefix_tokens, waited);
+                let fit = self.would_have_fit(&wait, waited);
                 Self::record_skip(state, &wait.target_id, skip, fit);
             }
             WaitPhase::Planned(ref plan) if arrived_at < plan.finish_at => {
@@ -635,13 +655,18 @@ impl ProgramScheduler {
         if elapsed_seconds < config.min_idle_seconds {
             return;
         }
+        wait.first_evaluated_seconds.get_or_insert(elapsed_seconds);
         let target = state
             .observations
             .get(&wait.target_id)
             .filter(|observation| self.observation_is_fresh(observation, now))
+            .ok_or(PrefetchSkip::ObservationStale)
             .and_then(|observation| {
-                let kv_cache_usage = observation.kv_cache_usage?;
-                let waiting_requests = observation.waiting_requests?;
+                let (Some(kv_cache_usage), Some(waiting_requests)) =
+                    (observation.kv_cache_usage, observation.waiting_requests)
+                else {
+                    return Err(PrefetchSkip::ObservationIncomplete);
+                };
                 // Read after the fresh usage above: this is what keeps it a lookup,
                 // not a scan of every Program, on the scheduler's lock.
                 let paused_headroom_tokens = self
@@ -656,7 +681,7 @@ impl ProgramScheduler {
                         capacity as f64 * self.config.progress_ttl.low_watermark_ratio
                             - self.target_usage(state, &wait.target_id, now)
                     });
-                Some(TargetFacts {
+                Ok(TargetFacts {
                     kv_cache_usage,
                     waiting_requests,
                     restored_recently: observation.last_restore_at.is_some_and(|restored_at| {
@@ -738,11 +763,15 @@ impl ProgramScheduler {
         }
     }
 
-    /// Whether a plan made at the idle floor would have finished before the
-    /// wait ended and still been useful when it did.
-    fn would_have_fit(&self, prefix_tokens: usize, waited_seconds: f64) -> bool {
+    /// Whether a plan made at the wait's first evaluation, with no load queued ahead
+    /// of it, would have finished before the wait ended and still been useful when
+    /// it did. A wait that no tick evaluated had no chance of a plan.
+    fn would_have_fit(&self, wait: &NextTurnWait, waited_seconds: f64) -> bool {
+        let Some(evaluated_seconds) = wait.first_evaluated_seconds else {
+            return false;
+        };
         let config = &self.config.next_turn_prefetch;
-        let finish = config.min_idle_seconds + load_seconds(&config.load_cost_model, prefix_tokens);
+        let finish = evaluated_seconds + load_seconds(&config.load_cost_model, wait.prefix_tokens);
         waited_seconds >= finish && waited_seconds <= finish + config.validity_seconds
     }
 
@@ -858,7 +887,7 @@ mod tests {
         PlanFacts {
             elapsed_seconds: 2.0,
             prefix_tokens: TOKENS,
-            target: Some(TargetFacts {
+            target: Ok(TargetFacts {
                 kv_cache_usage: 0.5,
                 waiting_requests: 0,
                 restored_recently: true,
@@ -893,7 +922,9 @@ mod tests {
     fn each_gate_refuses_with_its_own_reason() {
         type Change = fn(&mut PlanFacts);
         let cases: [(PrefetchSkip, Change); 5] = [
-            (PrefetchSkip::ObservationStale, |facts| facts.target = None),
+            (PrefetchSkip::ObservationStale, |facts| {
+                facts.target = Err(PrefetchSkip::ObservationStale)
+            }),
             (PrefetchSkip::NoRestoreEvidence, |facts| {
                 facts.target.as_mut().unwrap().restored_recently = false
             }),
@@ -2018,14 +2049,142 @@ mod tests {
         assert_eq!(ledger["speculative_tokens"], TOKENS);
     }
 
+    fn wait_first_evaluated_at(seconds: Option<f64>) -> NextTurnWait {
+        NextTurnWait {
+            started_at: Instant::now(),
+            target_id: "rank-0".into(),
+            prefix_tokens: TOKENS,
+            keys: Vec::new(),
+            hint: None,
+            first_evaluated_seconds: seconds,
+            phase: WaitPhase::Undecided(PrefetchSkip::LowProbability),
+        }
+    }
+
     #[test]
-    fn would_have_fit_spans_the_useful_window() {
+    fn would_have_fit_spans_the_useful_window_from_the_first_evaluation() {
         let scheduler = profile_scheduler();
-        // Idle floor 1 s, load 1 s, validity 10 s.
-        assert!(!scheduler.would_have_fit(TOKENS, 1.9));
-        assert!(scheduler.would_have_fit(TOKENS, 2.0));
-        assert!(scheduler.would_have_fit(TOKENS, 12.0));
-        assert!(!scheduler.would_have_fit(TOKENS, 12.1));
+        // First evaluated 1.5 s after the turn, past the 1 s idle floor; load 1 s, validity 10 s.
+        let wait = wait_first_evaluated_at(Some(1.5));
+        assert!(!scheduler.would_have_fit(&wait, 2.4));
+        assert!(scheduler.would_have_fit(&wait, 2.5));
+        assert!(scheduler.would_have_fit(&wait, 12.5));
+        assert!(!scheduler.would_have_fit(&wait, 12.6));
+        assert!(
+            !scheduler.would_have_fit(&wait_first_evaluated_at(None), 5.0),
+            "a wait that no tick evaluated had no chance of a plan"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_wait_remembers_only_its_first_evaluation_past_the_idle_floor() {
+        let scheduler = profile_scheduler();
+        let dispatch = finished_turn(&scheduler, hinted()).await;
+        let first_evaluated = |scheduler: &ProgramScheduler| {
+            scheduler.state.lock().decisions[dispatch.program()]
+                .next_turn_wait
+                .as_ref()
+                .unwrap()
+                .first_evaluated_seconds
+        };
+        evaluate_after(&scheduler, 0.5);
+        assert_eq!(first_evaluated(&scheduler), None, "before the idle floor");
+        evaluate_after(&scheduler, 3.0);
+        let first = first_evaluated(&scheduler).unwrap();
+        assert!((3.0..3.5).contains(&first), "{first}");
+        evaluate_after(&scheduler, 6.0);
+        assert_eq!(first_evaluated(&scheduler), Some(first));
+    }
+
+    #[tokio::test]
+    async fn a_fresh_observation_without_a_gauge_is_incomplete_not_stale() {
+        for (kv_cache_usage, waiting_requests) in [(None, Some(0)), (Some(0.5), None)] {
+            let scheduler = profile_scheduler();
+            let dispatch = finished_turn(&scheduler, hinted()).await;
+            let targets = scheduler.all_targets();
+            let epoch = scheduler.begin_observation(&targets);
+            scheduler.apply_observations(
+                epoch,
+                targets.into_iter().map(|target| BackendObservation {
+                    target_id: target.id,
+                    base_url: target.base_url,
+                    dp_rank: target.dp_rank,
+                    kv_cache_usage,
+                    running_requests: Some(0),
+                    waiting_requests,
+                    external_kv_prompt_tokens_total: Some(100.0),
+                    observed_at: Instant::now(),
+                }),
+            );
+            evaluate_after(&scheduler, 2.0);
+            assert_eq!(
+                phase(&scheduler, dispatch.program()),
+                Some(WaitPhase::Undecided(PrefetchSkip::ObservationIncomplete))
+            );
+        }
+        let scheduler = profile_scheduler();
+        let dispatch = finished_turn(&scheduler, hinted()).await;
+        evaluate_after(&scheduler, 2.0);
+        assert_eq!(
+            phase(&scheduler, dispatch.program()),
+            Some(WaitPhase::Undecided(PrefetchSkip::ObservationStale)),
+            "no observation at all is still stale"
+        );
+    }
+
+    fn begin_again(scheduler: &ProgramScheduler, dispatch: &ProgramDispatch) {
+        let mut state = scheduler.state.lock();
+        scheduler.begin_next_turn_wait(&mut state, dispatch, TOKENS, Instant::now());
+    }
+
+    #[tokio::test]
+    async fn a_new_wait_settles_the_one_it_replaces() {
+        // A turn arrived for this plan, but its request never completed here, as when the rank
+        // that served it is removed.
+        let scheduler = profile_scheduler();
+        let (dispatch, _turn) = arrived_in_time(&scheduler).await;
+        assert!(matches!(
+            phase(&scheduler, dispatch.program()),
+            Some(WaitPhase::AwaitingTurn(..))
+        ));
+        begin_again(&scheduler, &dispatch);
+        assert_eq!(outcomes(&scheduler), BTreeMap::from([("unused", 1)]));
+        assert_eq!(
+            scheduler.state.lock().next_turn_prefetch["rank-0"].speculative_tokens,
+            0
+        );
+        assert_eq!(
+            phase(&scheduler, dispatch.program()),
+            Some(WaitPhase::Undecided(PrefetchSkip::NotEvaluated))
+        );
+
+        // A replaced wait without a plan records its skip.
+        let scheduler = profile_scheduler();
+        let dispatch = finished_turn(&scheduler, hinted()).await;
+        evaluate_after(&scheduler, 2.0);
+        begin_again(&scheduler, &dispatch);
+        assert_eq!(
+            skips(&scheduler),
+            BTreeMap::from([("observation_stale", 1)])
+        );
+        assert_eq!(
+            phase(&scheduler, dispatch.program()),
+            Some(WaitPhase::Undecided(PrefetchSkip::NotEvaluated))
+        );
+    }
+
+    #[test]
+    fn nothing_moves_before_a_load_starts_even_at_zero_cost() {
+        let start = Instant::now() + Duration::from_secs(1);
+        let plan = PrefetchPlan {
+            source: ForecastSource::Profile,
+            tokens: TOKENS,
+            start_at: start,
+            finish_at: start,
+            expires_at: start + Duration::from_secs(10),
+        };
+        assert_eq!(plan.moved_tokens(start - Duration::from_millis(1)), 0);
+        assert_eq!(plan.moved_tokens(start), TOKENS);
     }
 
     #[test]
