@@ -7,6 +7,7 @@ use super::residency::State;
 use super::HybridEventIndex;
 use crate::kv_hash::SequenceHash;
 use crate::kv_index::wire::extra_keys_match;
+use crate::kv_index::StorageTier;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HybridEventError {
@@ -91,9 +92,18 @@ impl HybridEventIndex {
                     // block hash, and an adapter store carries its own identity
                     // as extra keys: neither makes the page foreign. A base
                     // store must carry no extra keys at all.
-                    if store.medium.as_deref() != Some("GPU")
-                        || store.locality.as_deref().is_some_and(|s| s != "LOCAL")
-                        || store.ownership.is_some()
+                    // The medium names a cache tier, not a different cache
+                    // identity: a host or storage copy of the same page is
+                    // restorable (at a transfer cost), so it is claimed at that
+                    // tier instead of rejecting the batch. External owners are
+                    // not this rank's residency and are skipped.
+                    let tier = StorageTier::from_medium(store.medium.as_deref());
+                    // A copy owned by another domain is not this rank's
+                    // residency; skip it instead of revoking the view.
+                    if store.ownership.is_some() || matches!(tier, StorageTier::External) {
+                        continue;
+                    }
+                    if store.locality.as_deref().is_some_and(|s| s != "LOCAL")
                         || (namespace.is_none()
                             && !extra_keys_match(
                                 store.extra_keys.as_ref(),
@@ -171,6 +181,7 @@ impl HybridEventIndex {
                         if !state.insert_claim(
                             namespace.as_deref(),
                             (group_idx, hash),
+                            tier,
                             self.max_entries,
                         ) {
                             // An adapter that fills its own budget must not
@@ -184,8 +195,10 @@ impl HybridEventIndex {
                     Ok(())
                 }
                 KVEvent::BlockRemoved(remove) => {
-                    if remove.medium.as_deref() != Some("GPU")
-                        || remove.locality.as_deref().is_some_and(|s| s != "LOCAL")
+                    if matches!(
+                        StorageTier::from_medium(remove.medium.as_deref()),
+                        StorageTier::External
+                    ) || remove.locality.as_deref().is_some_and(|s| s != "LOCAL")
                         || remove.ownership.is_some()
                         || !self
                             .groups
@@ -196,11 +209,12 @@ impl HybridEventIndex {
                         Err(HybridEventError::InvalidBatch)
                     } else {
                         let group_idx = remove.group_idx.expect("validated group");
+                        let tier = StorageTier::from_medium(remove.medium.as_deref());
                         for hash in &remove.block_hashes {
                             let Some(hash) = sequence_hash(hash) else {
                                 return Self::fail(&mut state, HybridEventError::InvalidBatch);
                             };
-                            state.remove_claim((group_idx, hash));
+                            state.remove_claim((group_idx, hash), tier);
                         }
                         Ok(())
                     }

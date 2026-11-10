@@ -207,20 +207,20 @@ impl HybridEventIndex {
         self.reusable_tokens_in(None, tokens, max_reusable_tokens)
     }
 
-    /// The same snapshot for one cache identity: `None` is the base model's
-    /// chain, a name is that adapter's chain.
-    fn reusable_tokens_in(
+    /// The credited prefix and the tier it is credited at. A page held in host
+    /// memory or on storage is still restorable, but the policy weighs it by the
+    /// transfer credit of its tier, so the boundary is reported at the slowest
+    /// tier that any group needs to satisfy it.
+    fn credit_parts(
         &self,
         namespace: Option<&str>,
         tokens: &[u32],
         max_reusable_tokens: usize,
-    ) -> u64 {
-        // A never-begun, invalidated or replay-hidden view can never credit a
-        // prefix, so refuse before paying for the whole prompt's hash chain.
+    ) -> (u64, Option<TierMatch>) {
         {
             let state = self.state.read();
             if state.next_seq.is_none() || !state.visible {
-                return 0;
+                return (0, None);
             }
         }
         let hashes = match namespace {
@@ -229,15 +229,15 @@ impl HybridEventIndex {
                 Some(path) => self
                     .keys
                     .generate_block_keys_for_adapter(tokens, name, path),
-                None => return 0,
+                None => return (0, None),
             },
         };
         let state = self.state.read();
         if state.next_seq.is_none() || !state.visible {
-            return 0;
+            return (0, None);
         }
         let Some(claims) = state.claims_in(namespace) else {
-            return 0;
+            return (0, None);
         };
         let page_evidence = state.page_evidence_in(namespace);
         let matches: Vec<Vec<TierMatch>> = self
@@ -250,7 +250,7 @@ impl HybridEventIndex {
                     let Ok(end) = u32::try_from(position.saturating_add(1)) else {
                         break;
                     };
-                    if !claims.contains(&(group.group_idx, *hash)) {
+                    if !claims.contains_key(&(group.group_idx, *hash)) {
                         continue;
                     }
                     let start = end - 1;
@@ -287,11 +287,52 @@ impl HybridEventIndex {
             &views,
             tokens.len().saturating_sub(1).min(max_reusable_tokens) as u64,
         );
-        // The engine replays the layout's trailing window before prefilling the
-        // rest, and rounds the remaining hit down to a block. Charging the same
-        // way keeps Router's estimate from exceeding the engine's own cache hit.
         let credited = boundary.saturating_sub(u64::from(self.replay_tokens));
-        align_down(credited, self.keys.block_size() as u32)
+        let credited = align_down(credited, self.keys.block_size() as u32);
+        if credited == 0 {
+            return (0, None);
+        }
+        // Report the slowest tier any group needs at the credited boundary: the
+        // nearest resident page at or below it is the one that completes it.
+        let mut worst = StorageTier::Device;
+        for group in &self.groups {
+            let stride = group.block_size as usize / self.keys.block_size();
+            let blocks = (credited / u64::from(group.block_size)) as usize;
+            for position in (0..blocks).rev() {
+                let Some(hash) = hashes.get(stride * (position + 1) - 1) else {
+                    break;
+                };
+                if let Some(tier) = claims
+                    .get(&(group.group_idx, *hash))
+                    .and_then(|resident| resident.best())
+                {
+                    if tier_rank(tier) > tier_rank(worst) {
+                        worst = tier;
+                    }
+                    break;
+                }
+            }
+        }
+        let Ok(blocks) = u32::try_from(credited / u64::from(self.keys.block_size() as u32)) else {
+            return (0, None);
+        };
+        (
+            credited,
+            Some(TierMatch {
+                target: self.target.clone(),
+                tier: worst,
+                locality: Locality::Local,
+                segments: vec![(0, blocks)],
+            }),
+        )
+    }
+    fn reusable_tokens_in(
+        &self,
+        namespace: Option<&str>,
+        tokens: &[u32],
+        max_reusable_tokens: usize,
+    ) -> u64 {
+        self.credit_parts(namespace, tokens, max_reusable_tokens).0
     }
 
     /// Every block a store proves. A sliding group publishes only its tail;
@@ -311,6 +352,16 @@ impl HybridEventIndex {
             .iter()
             .map(|hash| sequence_hash(hash).ok_or(()))
             .collect()
+    }
+}
+
+/// Prefer the fastest copy when several tiers hold the same page.
+fn tier_rank(tier: StorageTier) -> u8 {
+    match tier {
+        StorageTier::Device => 0,
+        StorageTier::HostPinned => 1,
+        StorageTier::Disk => 2,
+        StorageTier::External => 3,
     }
 }
 
@@ -335,21 +386,22 @@ impl crate::policies::TieredMatchProvider for HybridEventIndex {
         // The policy's page size can be coarser than the hash granularity: the
         // engine restores the aligned prefix, so round down instead of dropping
         // a recoverable hit.
-        let tokens = align_down(
-            self.reusable_tokens_in(lora_name, tokens, usize::MAX),
-            block_size,
-        );
+        let (tokens, credit) = self.credit_parts(lora_name, tokens, usize::MAX);
+        let tokens = align_down(tokens, block_size);
         if tokens == 0 {
             return Some(Vec::new());
         }
         let Ok(blocks) = u32::try_from(tokens / u64::from(block_size)) else {
             return Some(Vec::new());
         };
+        // The engine restores at the tier that completes the boundary; the policy
+        // weighs that tier by its transfer credit.
+        let Some(credit) = credit else {
+            return Some(Vec::new());
+        };
         Some(vec![TierMatch {
-            target: self.target.clone(),
-            tier: StorageTier::Device,
-            locality: Locality::Local,
             segments: vec![(0, blocks)],
+            ..credit
         }])
     }
 }

@@ -155,7 +155,14 @@ fn supported_at(group: &HybridGroupView<'_>, target: &RoutableTarget, boundary: 
 }
 
 fn eligible(hit: &TierMatch, target: &RoutableTarget) -> bool {
-    hit.target == *target && hit.tier == StorageTier::Device && hit.locality == Locality::Local
+    // A page held in host memory or on storage is still restorable; the policy
+    // weighs it by the transfer credit of its tier. External residencies belong
+    // to another owner and are never claimed by this index.
+    matches!(
+        hit.tier,
+        StorageTier::Device | StorageTier::HostPinned | StorageTier::Disk
+    ) && hit.locality == Locality::Local
+        && hit.target == *target
 }
 
 /// The longest boundary at most `cap` that one group's own restore rule
@@ -674,19 +681,33 @@ mod tests {
     }
 
     #[test]
-    fn state_on_another_rank_or_tier_cannot_complete_a_hit() {
+    fn state_on_another_rank_or_remote_locality_cannot_complete_a_hit() {
         let worker = target("w", 0);
         let full = [hit(&worker, &[(0, 4)])];
         let mut remote = hit(&worker, &[(0, 4)]);
-        remote.tier = StorageTier::HostPinned;
-        let mut external = hit(&worker, &[(0, 4)]);
-        external.locality = Locality::Remote;
-        let state = [hit(&target("w", 1), &[(0, 4)]), remote, external];
+        remote.locality = Locality::Remote;
+        let state = [hit(&target("w", 1), &[(0, 4)]), remote];
         let groups = [
             group(0, 16, HybridGroupKind::FullAttention, &full),
             group(1, 16, HybridGroupKind::Checkpoint, &state),
         ];
         assert_eq!(common_reusable_tokens(&worker, &groups, 64), 0);
+    }
+
+    /// A host or storage copy of a checkpoint still completes the hit: the page
+    /// is restorable, only its transfer cost differs.
+    #[test]
+    fn a_host_resident_checkpoint_completes_the_hit() {
+        let worker = target("w", 0);
+        let full = [hit(&worker, &[(0, 4)])];
+        let mut host = hit(&worker, &[(0, 4)]);
+        host.tier = StorageTier::HostPinned;
+        let state = [host];
+        let groups = [
+            group(0, 16, HybridGroupKind::FullAttention, &full),
+            group(1, 16, HybridGroupKind::Checkpoint, &state),
+        ];
+        assert_eq!(common_reusable_tokens(&worker, &groups, 64), 64);
     }
 
     #[test]

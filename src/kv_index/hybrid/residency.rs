@@ -3,6 +3,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::kv_hash::SequenceHash;
+use crate::kv_index::StorageTier;
 
 pub(super) struct State {
     /// The next sequence in a continuous, source-bound event stream.
@@ -13,11 +14,62 @@ pub(super) struct State {
     /// that adapter's chain. The engine seeds block hashes with the adapter
     /// identity, so the two never share a chain and neither can credit the
     /// other.
-    pub(super) claims: HashMap<Option<String>, HashSet<(u32, SequenceHash)>>,
+    pub(super) claims: HashMap<Option<String>, HashMap<(u32, SequenceHash), TierSet>>,
     /// Groups that have published at least one page hash, per identity. A group
     /// that only publishes key-only stores reports no addressable page, so it
     /// cannot bound the shared prefix.
     pub(super) page_evidence: HashMap<Option<String>, HashSet<u32>>,
+}
+
+/// The tiers one page is resident on. A store adds a tier, a removal clears
+/// only the tier it names, and the best remaining tier is what the page is
+/// credited at.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct TierSet(u8);
+
+impl TierSet {
+    const DEVICE: u8 = 1 << 0;
+    const HOST: u8 = 1 << 1;
+    const DISK: u8 = 1 << 2;
+    const EXTERNAL: u8 = 1 << 3;
+
+    fn bit(tier: StorageTier) -> u8 {
+        match tier {
+            StorageTier::Device => Self::DEVICE,
+            StorageTier::HostPinned => Self::HOST,
+            StorageTier::Disk => Self::DISK,
+            StorageTier::External => Self::EXTERNAL,
+        }
+    }
+
+    pub(super) fn with(mut self, tier: StorageTier) -> Self {
+        self.0 |= Self::bit(tier);
+        self
+    }
+
+    pub(super) fn without(mut self, tier: StorageTier) -> Self {
+        self.0 &= !Self::bit(tier);
+        self
+    }
+
+    pub(super) fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    /// The tier a hit is credited at: the fastest copy the page still has.
+    pub(super) fn best(self) -> Option<StorageTier> {
+        if self.0 & Self::DEVICE != 0 {
+            Some(StorageTier::Device)
+        } else if self.0 & Self::HOST != 0 {
+            Some(StorageTier::HostPinned)
+        } else if self.0 & Self::DISK != 0 {
+            Some(StorageTier::Disk)
+        } else if self.0 & Self::EXTERNAL != 0 {
+            Some(StorageTier::External)
+        } else {
+            None
+        }
+    }
 }
 
 impl State {
@@ -26,7 +78,7 @@ impl State {
     pub(super) fn claims_in(
         &self,
         namespace: Option<&str>,
-    ) -> Option<&HashSet<(u32, SequenceHash)>> {
+    ) -> Option<&HashMap<(u32, SequenceHash), TierSet>> {
         self.claims
             .iter()
             .find(|(identity, _)| identity.as_deref() == namespace)
@@ -47,24 +99,32 @@ impl State {
         &mut self,
         namespace: Option<&str>,
         key: (u32, SequenceHash),
+        tier: StorageTier,
         max_entries: usize,
     ) -> bool {
         let claims = self.claims.entry(namespace.map(str::to_owned)).or_default();
-        if claims.contains(&key) {
+        if let Some(resident) = claims.get_mut(&key) {
+            *resident = resident.with(tier);
             return true;
         }
         if claims.len() >= max_entries {
             return false;
         }
-        claims.insert(key);
+        claims.insert(key, TierSet::default().with(tier));
         true
     }
 
-    /// A removal names no identity: the engine evicted those blocks whichever
-    /// chain produced them.
-    pub(super) fn remove_claim(&mut self, key: (u32, SequenceHash)) {
+    /// A removal names one tier and no identity: the engine evicted that copy
+    /// whichever chain produced it. A page that still has another copy stays
+    /// claimed at the better remaining tier.
+    pub(super) fn remove_claim(&mut self, key: (u32, SequenceHash), tier: StorageTier) {
         for claims in self.claims.values_mut() {
-            claims.remove(&key);
+            if let Some(resident) = claims.get_mut(&key) {
+                *resident = resident.without(tier);
+                if resident.is_empty() {
+                    claims.remove(&key);
+                }
+            }
         }
     }
 }
@@ -215,6 +275,78 @@ pub(crate) mod tests {
         };
         assert_eq!(index.apply_batch(1, &removed), Ok(()));
         assert_eq!(index.reusable_tokens(&prompt(), usize::MAX), 0);
+    }
+
+    fn host_store(
+        batch: &crate::kv_index::KVEventBatch,
+        medium: &str,
+    ) -> crate::kv_index::KVEventBatch {
+        let mut batch = batch.clone();
+        for event in &mut batch.events {
+            if let KVEvent::BlockStored(store) = event {
+                store.medium = Some(medium.to_string());
+            }
+        }
+        batch
+    }
+
+    #[test]
+    fn host_resident_pages_are_credited_at_their_tier() {
+        use crate::policies::TieredMatchProvider;
+
+        let index = index(16);
+        index.begin_empty(0);
+        assert_eq!(
+            index.apply_batch(0, &host_store(&qwen_batch(), "CPU")),
+            Ok(())
+        );
+        assert_eq!(index.reusable_tokens(&prompt(), usize::MAX), 528);
+        let matches = index
+            .find_token_matches(&prompt(), 528, None, 0)
+            .expect("hybrid provider");
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].tier, crate::kv_index::StorageTier::HostPinned);
+    }
+
+    #[test]
+    fn evicting_the_device_copy_keeps_the_host_credit() {
+        let index = index(16);
+        index.begin_empty(0);
+        assert_eq!(index.apply_batch(0, &qwen_batch()), Ok(()));
+        assert_eq!(
+            index.apply_batch(1, &host_store(&qwen_batch(), "CPU")),
+            Ok(())
+        );
+
+        let mut removed = qwen_batch();
+        for event in &mut removed.events {
+            if let KVEvent::BlockStored(store) = event {
+                *event = KVEvent::BlockRemoved(BlockRemoved {
+                    block_hashes: store.block_hashes.clone(),
+                    medium: Some("GPU".into()),
+                    group_idx: store.group_idx,
+                    locality: None,
+                    ownership: None,
+                });
+            }
+        }
+        assert_eq!(index.apply_batch(2, &removed), Ok(()));
+        assert_eq!(index.reusable_tokens(&prompt(), usize::MAX), 528);
+    }
+
+    #[test]
+    fn a_foreign_owner_is_skipped_without_revoking_the_view() {
+        let index = index(16);
+        index.begin_empty(0);
+        assert_eq!(index.apply_batch(0, &qwen_batch()), Ok(()));
+        let mut foreign = qwen_batch();
+        for event in &mut foreign.events {
+            if let KVEvent::BlockStored(store) = event {
+                store.ownership = Some("offload".into());
+            }
+        }
+        assert_eq!(index.apply_batch(1, &foreign), Ok(()));
+        assert_eq!(index.reusable_tokens(&prompt(), usize::MAX), 528);
     }
 
     /// An adapter publishes under its own hash chain. Such a batch must leave
