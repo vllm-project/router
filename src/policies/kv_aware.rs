@@ -772,7 +772,7 @@ fn credited_tokens(candidate: &CandidateView<'_>, params: &CostParams) -> f64 {
         .min(candidate.input_tokens.saturating_sub(1) as f64)
 }
 
-fn request_prefill_tokens(candidate: &CandidateView<'_>, params: &CostParams) -> u64 {
+pub(super) fn request_prefill_tokens(candidate: &CandidateView<'_>, params: &CostParams) -> u64 {
     if let Some(tokens) = candidate.prefill_tokens {
         return tokens;
     }
@@ -1471,6 +1471,7 @@ impl KvAwarePolicy {
                 excluded: &excluded,
                 picked: position,
                 destination_hits: plan.peer_hits[position].as_deref(),
+                cost_params: &self.params,
             })
         };
         match result {
