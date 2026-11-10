@@ -1123,11 +1123,9 @@ impl VllmPDRouter {
             ));
         };
         let prefill_candidates = self.program_prefill_candidates();
-        // One successful selection per turn, with one exception. The warm-remote
-        // attempt consumes this turn's selection, and a cold fallback dispatches
-        // the P it already chose instead of asking the policy again — unless that
-        // P left the pool while the attempt was running, in which case the cold
-        // path re-selects once from a refreshed pool. The selection also takes
+        // One selection per turn. The warm-remote attempt consumes this turn's
+        // selection, and a cold fallback dispatches the P it already chose
+        // instead of asking the policy a second time. The selection also takes
         // the same request inputs as the cold path (prompt text or cache routing
         // key, plus headers), so hash and cache-aware policies keep their
         // affinity on the warm path too.
@@ -1195,22 +1193,9 @@ impl VllmPDRouter {
                 }
             }
         }
-        // A warm attempt can spend time in `/pd_capabilities` probes before it
-        // declines, so the snapshot above may be stale by now. If the P this
-        // turn holds has left the pool in the meantime, take one bounded
-        // re-selection from a fresh snapshot instead of reserving capacity on a
-        // dead target and failing the turn at the liveness recheck. This runs
-        // only when the reused target is gone, so it does not reintroduce the
-        // double selection the fix removes.
-        let selection = match selected {
-            Some((prefill_id, _)) if !self.program_prefill_is_live(&prefill_id) => {
-                let candidates = self.program_prefill_candidates();
-                self.select_program_prefill(&candidates, &request, path, headers)
-            }
-            Some(selection) => Some(selection),
-            None => self.select_program_prefill(&prefill_candidates, &request, path, headers),
-        };
-        let Some((prefill_id, prefill_worker)) = selection else {
+        let Some((prefill_id, prefill_worker)) = selected
+            .or_else(|| self.select_program_prefill(&prefill_candidates, &request, path, headers))
+        else {
             RouterMetrics::record_pd_error("server_selection");
             return Some(program_unavailable(
                 &completion,
@@ -1365,9 +1350,10 @@ impl VllmPDRouter {
             .filter(|index| *index < workers.len())
     }
 
-    /// Whether a P target is still registered and available.
-    fn program_prefill_is_live(&self, prefill_id: &str) -> bool {
-        if self.use_discovery {
+    /// Recheck the bound endpoints after a capacity wait: an expired
+    /// registration or a removed worker must not receive the dispatch.
+    fn program_targets_are_live(&self, prefill_id: &str, decode_id: &str) -> bool {
+        let prefill_live = if self.use_discovery {
             self.service_registry
                 .get_prefill_instances()
                 .iter()
@@ -1381,12 +1367,7 @@ impl VllmPDRouter {
                     worker.is_available()
                         && pd_program_adapter::worker_target(worker).id == prefill_id
                 })
-        }
-    }
-
-    /// Recheck the bound endpoints after a capacity wait: an expired
-    /// registration or a removed worker must not receive the dispatch.
-    fn program_targets_are_live(&self, prefill_id: &str, decode_id: &str) -> bool {
+        };
         let decode_live = if self.use_discovery {
             pd_program_adapter::discovered_decode_instance_by_id(
                 &self.service_registry,
@@ -1404,7 +1385,7 @@ impl VllmPDRouter {
                         && pd_program_adapter::worker_target(worker).id == decode_id
                 })
         };
-        self.program_prefill_is_live(prefill_id) && decode_live
+        prefill_live && decode_live
     }
 
     /// Select a P/D pair among the discovered instances. Request headers reach

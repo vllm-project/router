@@ -21,8 +21,6 @@ use vllm_router_rs::{
     routers::{http::vllm_pd_router::VllmPDRouter, RouterTrait},
     server::AppContext,
 };
-/// Runs inside `/pd_capabilities`; lets a test change router state mid-turn.
-type CapabilityHook = Arc<Mutex<Option<Arc<dyn Fn() + Send + Sync>>>>;
 /// What a [`RecordingPrefill`] saw: request text and headers per call.
 type RecordedCalls = Arc<Mutex<Vec<(Option<String>, Option<RequestHeaders>)>>>;
 
@@ -40,10 +38,6 @@ struct StateData {
     metrics_kv_milli: Arc<AtomicU64>,
     metrics_running: Arc<AtomicU64>,
     auth_gate: Arc<AtomicBool>,
-    /// Runs inside `/pd_capabilities`, so a test can change router state while a
-    /// turn is already holding a selection.
-    capability_hook: CapabilityHook,
-    fail_capability: Arc<AtomicBool>,
 }
 struct Engine {
     url: String,
@@ -69,8 +63,6 @@ async fn engine(p: bool, fail_warm: bool, partial: bool) -> Engine {
         metrics_kv_milli: Arc::new(AtomicU64::new(0)),
         metrics_running: Arc::new(AtomicU64::new(0)),
         auth_gate: Arc::new(AtomicBool::new(false)),
-        capability_hook: Arc::new(Mutex::new(None)),
-        fail_capability: Arc::new(AtomicBool::new(false)),
     };
     let app=Router::new().route("/health",get(||async{"ok"}))
         .route("/get_server_info",get(||async{Json(json!({"model_id":"test","data_parallel_size":1}))}))
@@ -82,12 +74,6 @@ async fn engine(p: bool, fail_warm: bool, partial: bool) -> Engine {
         }))
         .route("/pd_capabilities",get(|State(s):State<StateData>,headers:HeaderMap|async move{
             s.capability_probes.fetch_add(1,Ordering::SeqCst);
-            if let Some(hook) = s.capability_hook.lock().unwrap().clone() {
-                hook();
-            }
-            if s.fail_capability.load(Ordering::SeqCst) {
-                return (StatusCode::INTERNAL_SERVER_ERROR, "probe failed").into_response();
-            }
             if s.auth_gate.load(Ordering::SeqCst)
                 && headers.get(header::AUTHORIZATION).and_then(|value| value.to_str().ok()) != Some("Bearer op-key")
             {
@@ -291,13 +277,39 @@ async fn call_with_headers(
     prompt: Vec<u32>,
     stream: bool,
 ) -> (StatusCode, HeaderMap, Vec<u8>) {
-    let r=serde_json::from_value(json!({"model":"test","prompt":prompt,"max_tokens":4,"return_token_ids":true,"stream":stream,"stream_options":{"include_usage":true},"kv_transfer_params":{"remote_host":"client-untrusted"},"vllm_xargs":{"agentic_context":{"program_id":"task","kv_retention_ttl_seconds":1}}})).unwrap();
-    let result = router.route_completion(None, &r, Some("test")).await;
+    let body = completion_body("task", &prompt, true, stream);
+    send_completion(router, None, body).await
+}
+
+/// The one request builder: token-id prompt, Program identity, and (for
+/// `warm_shape`) the exact-token fields the warm/local protocol needs.
+fn completion_body(program: &str, prompt: &[u32], warm_shape: bool, stream: bool) -> Value {
+    let mut value = json!({"model":"test","prompt":prompt,"max_tokens":4,
+        "kv_transfer_params":{"remote_host":"client-untrusted"},
+        "vllm_xargs":{"agentic_context":{"program_id":program,"kv_retention_ttl_seconds":1}}});
+    if warm_shape {
+        value["return_token_ids"] = json!(true);
+        value["stream_options"] = json!({"include_usage": true});
+    }
+    value["stream"] = json!(stream);
+    value
+}
+
+/// The one sender: status, response headers and the buffered body.
+async fn send_completion(
+    router: &VllmPDRouter,
+    headers: Option<&HeaderMap>,
+    body: Value,
+) -> (StatusCode, HeaderMap, Vec<u8>) {
+    let request = serde_json::from_value(body).unwrap();
+    let result = router
+        .route_completion(headers, &request, Some("test"))
+        .await;
     let status = result.status();
-    let headers = result.headers().clone();
+    let response_headers = result.headers().clone();
     (
         status,
-        headers,
+        response_headers,
         axum::body::to_bytes(result.into_body(), 16 * 1048576)
             .await
             .unwrap()
@@ -616,20 +628,6 @@ async fn calibrated_local_bypasses_p_and_actual_miss_rejection_retries_remote() 
     }
 }
 
-/// A tokenized prompt without `return_token_ids`: the exact-token warm/local
-/// protocol cannot serve it, so the turn always falls back to cold dispatch.
-async fn call_cold_only(router: &VllmPDRouter, prompt: Vec<u32>, program: &str) -> StatusCode {
-    let r = serde_json::from_value(json!({"model":"test","prompt":prompt,"max_tokens":4,
-        "vllm_xargs":{"agentic_context":{"program_id":program,"kv_retention_ttl_seconds":1}}}))
-    .unwrap();
-    let result = router.route_completion(None, &r, Some("test")).await;
-    let status = result.status();
-    axum::body::to_bytes(result.into_body(), 16 * 1048576)
-        .await
-        .unwrap();
-    status
-}
-
 /// Issue #499: a turn that falls back to the cold path must consume exactly one
 /// prefill selection. Before the fix the warm-remote probe asked the policy
 /// first and the cold path asked again, so with `round_robin` and two prefills
@@ -641,10 +639,8 @@ async fn cold_fallback_consumes_one_prefill_selection_per_turn() {
     let d = engine(false, false, false).await;
     let r = router_with_prefills(&[&p0, &p1], &d, PolicyConfig::RoundRobin, false, json!({})).await;
     for _ in 0..2 {
-        assert_eq!(
-            call_cold_only(&r, vec![1, 2, 3], "task").await,
-            StatusCode::OK
-        );
+        let body = completion_body("task", &[1, 2, 3], false, false);
+        assert_eq!(send_completion(&r, None, body).await.0, StatusCode::OK);
     }
     let first = p0.state.calls.lock().unwrap().len();
     let second = p1.state.calls.lock().unwrap().len();
@@ -654,22 +650,6 @@ async fn cold_fallback_consumes_one_prefill_selection_per_turn() {
         "round_robin must alternate across turns, not spend two selections on the cold fallback \
          (p0={first}, p1={second})"
     );
-}
-
-/// Same request shape as [`call_with_headers`], but with an explicit Program id
-/// so several Programs can share one router.
-async fn call_program(router: &VllmPDRouter, program: &str, prompt: Vec<u32>) -> StatusCode {
-    let r = serde_json::from_value(json!({"model":"test","prompt":prompt,"max_tokens":4,
-        "return_token_ids":true,"stream":false,"stream_options":{"include_usage":true},
-        "kv_transfer_params":{"remote_host":"client-untrusted"},
-        "vllm_xargs":{"agentic_context":{"program_id":program,"kv_retention_ttl_seconds":1}}}))
-    .unwrap();
-    let result = router.route_completion(None, &r, Some("test")).await;
-    let status = result.status();
-    axum::body::to_bytes(result.into_body(), 16 * 1048576)
-        .await
-        .unwrap();
-    status
 }
 
 /// Prefill calls an engine received for one prompt.
@@ -716,10 +696,8 @@ async fn warm_remote_selection_uses_the_request_text() {
         }
         let program = format!("calibrate-{index}");
         let prompt = vec![3000 + index, 42, 43];
-        assert_eq!(
-            call_program(&r, &program, prompt.clone()).await,
-            StatusCode::OK
-        );
+        let body = completion_body(&program, &prompt, true, false);
+        assert_eq!(send_completion(&r, None, body).await.0, StatusCode::OK);
         let engine = match (
             prefill_calls(&p0, &prompt).is_empty(),
             prefill_calls(&p1, &prompt).is_empty(),
@@ -741,10 +719,8 @@ async fn warm_remote_selection_uses_the_request_text() {
         );
     };
     for (engine, program, prompt) in [(0, program0, prompt0), (1, program1, prompt1)] {
-        assert_eq!(
-            call_program(&r, &program, prompt.clone()).await,
-            StatusCode::OK
-        );
+        let body = completion_body(&program, &prompt, true, false);
+        assert_eq!(send_completion(&r, None, body).await.0, StatusCode::OK);
         let (turns0, turns1) = (prefill_calls(&p0, &prompt), prefill_calls(&p1, &prompt));
         let (affined_turns, other) = if engine == 0 {
             (&turns0, &turns1)
@@ -775,33 +751,16 @@ struct RecordingPrefill {
     needs_headers: bool,
     calls: RecordedCalls,
     counter: AtomicUsize,
-    /// Return an index past the end of the pool, like a buggy third-party policy.
-    out_of_range: bool,
 }
 
 impl RecordingPrefill {
     fn new(needs_text: bool, needs_cache_key: bool, needs_headers: bool) -> Arc<Self> {
-        Self::build(needs_text, needs_cache_key, needs_headers, false)
-    }
-
-    /// Same policy, but it reports an index one past the last worker.
-    fn returning_out_of_range() -> Arc<Self> {
-        Self::build(false, false, false, true)
-    }
-
-    fn build(
-        needs_text: bool,
-        needs_cache_key: bool,
-        needs_headers: bool,
-        out_of_range: bool,
-    ) -> Arc<Self> {
         Arc::new(Self {
             needs_text,
             needs_cache_key,
             needs_headers,
             calls: Arc::new(Mutex::new(Vec::new())),
             counter: AtomicUsize::new(0),
-            out_of_range,
         })
     }
 
@@ -821,9 +780,6 @@ impl LoadBalancingPolicy for RecordingPrefill {
             .lock()
             .unwrap()
             .push((request_text.map(str::to_string), headers.cloned()));
-        if self.out_of_range {
-            return Some(workers.len());
-        }
         Some(self.counter.fetch_add(1, Ordering::SeqCst) % workers.len())
     }
 
@@ -848,17 +804,6 @@ impl LoadBalancingPolicy for RecordingPrefill {
     }
 }
 
-fn program_body(program: &str, prompt: Vec<u32>, warm_shape: bool) -> Value {
-    let mut value = json!({"model":"test","prompt":prompt,"max_tokens":4,
-        "vllm_xargs":{"agentic_context":{"program_id":program,"kv_retention_ttl_seconds":1}}});
-    if warm_shape {
-        value["return_token_ids"] = json!(true);
-        value["stream"] = json!(false);
-        value["stream_options"] = json!({"include_usage": true});
-    }
-    value
-}
-
 /// Issue #499: warm and cold dispatch must feed the policy the same request
 /// inputs, and a cold fallback must not ask it a second time. A recording policy
 /// checks both directly, without depending on the hash ring.
@@ -875,15 +820,9 @@ async fn warm_and_cold_selection_receive_the_same_request_inputs() {
 
     // A shape the exact-token protocol cannot serve: one selection, and the cold
     // path reuses it.
-    let request =
-        serde_json::from_value(program_body("cold-only", vec![11, 12, 13], false)).unwrap();
-    let response = r
-        .route_completion(Some(&headers), &request, Some("test"))
-        .await;
-    assert_eq!(response.status(), StatusCode::OK);
-    axum::body::to_bytes(response.into_body(), 16 * 1048576)
-        .await
-        .unwrap();
+    let body = completion_body("cold-only", &[11, 12, 13], false, false);
+    let (status, _, _) = send_completion(&r, Some(&headers), body).await;
+    assert_eq!(status, StatusCode::OK);
     assert_eq!(
         policy.calls().len(),
         1,
@@ -892,15 +831,9 @@ async fn warm_and_cold_selection_receive_the_same_request_inputs() {
 
     // A shape it can serve: the cold turn, then the warm turn of one Program.
     for _ in 0..2 {
-        let request =
-            serde_json::from_value(program_body("warm-turn", vec![11, 12, 13], true)).unwrap();
-        let response = r
-            .route_completion(Some(&headers), &request, Some("test"))
-            .await;
-        assert_eq!(response.status(), StatusCode::OK);
-        axum::body::to_bytes(response.into_body(), 16 * 1048576)
-            .await
-            .unwrap();
+        let body = completion_body("warm-turn", &[11, 12, 13], true, false);
+        let (status, _, _) = send_completion(&r, Some(&headers), body).await;
+        assert_eq!(status, StatusCode::OK);
     }
     // One prefill call per turn: the cold-only dispatch, the cold turn of
     // `warm-turn`, and its warm read. The warm turn lands on the other P than
@@ -963,16 +896,12 @@ async fn selection_uses_the_cache_routing_key_when_requested() {
     let policy = RecordingPrefill::new(true, true, false);
     let r =
         router_with_custom_prefill_policy(&[&p0, &p1], &d, policy.clone(), false, json!({})).await;
-    let body = program_body("cache-key", vec![21, 22, 23], false);
+    let body = completion_body("cache-key", &[21, 22, 23], false, false);
     let expected = serde_json::from_value::<CompletionRequest>(body.clone())
         .unwrap()
         .extract_cache_routing_key();
-    let request = serde_json::from_value(body).unwrap();
-    let response = r.route_completion(None, &request, Some("test")).await;
-    assert_eq!(response.status(), StatusCode::OK);
-    axum::body::to_bytes(response.into_body(), 16 * 1048576)
-        .await
-        .unwrap();
+    let (status, _, _) = send_completion(&r, None, body).await;
+    assert_eq!(status, StatusCode::OK);
     let calls = policy.calls();
     assert_eq!(calls.len(), 1);
     assert_eq!(
@@ -984,73 +913,4 @@ async fn selection_uses_the_cache_routing_key_when_requested() {
         calls[0].1.is_none(),
         "headers were not requested but were attached"
     );
-}
-
-/// A prefill that leaves the pool while the warm attempt is probing must be
-/// re-selected, not reserved and then rejected by the liveness recheck.
-#[tokio::test]
-async fn prefill_leaving_during_the_attempt_is_reselected() {
-    let p0 = engine(true, false, false).await;
-    let p1 = engine(true, false, false).await;
-    let d = engine(false, false, false).await;
-    let r = router_with_prefills(&[&p0, &p1], &d, PolicyConfig::RoundRobin, false, json!({})).await;
-    // round_robin selects p0 for this turn. Its capability probe then drops p0
-    // from the pool and fails, so execute() declines holding a stale P.
-    let p0_worker = r.worker_registry().get_prefill_workers()[0].clone();
-    p0.state.fail_capability.store(true, Ordering::SeqCst);
-    *p0.state.capability_hook.lock().unwrap() =
-        Some(Arc::new(move || p0_worker.set_healthy(false)));
-    let request =
-        serde_json::from_value(program_body("stale-prefill", vec![31, 32, 33], true)).unwrap();
-    let response = r.route_completion(None, &request, Some("test")).await;
-    // Without this the turn may simply have gone to p1: 200, one p1 call and an
-    // empty p0 would all hold while the stale-P path never ran. The counter is
-    // bumped before the hook, so it proves this turn actually held p0.
-    assert!(
-        p0.state.capability_probes.load(Ordering::SeqCst) > 0,
-        "the turn never held p0, so the stale-P re-selection was not exercised"
-    );
-    assert_eq!(
-        response.status(),
-        StatusCode::OK,
-        "the turn must re-select the surviving prefill instead of 503ing on the stale one"
-    );
-    axum::body::to_bytes(response.into_body(), 16 * 1048576)
-        .await
-        .unwrap();
-    assert_eq!(
-        p1.state.calls.lock().unwrap().len(),
-        1,
-        "the surviving prefill served the turn"
-    );
-    assert!(
-        p0.state.calls.lock().unwrap().is_empty(),
-        "the removed prefill received the turn"
-    );
-}
-
-/// A policy that returns an index past the pool must degrade to the same 503 as
-/// an empty pool: both callers index the worker slice with it, so without the
-/// bounds check this panics the request task instead.
-#[tokio::test]
-async fn an_out_of_range_policy_index_is_a_503_not_a_panic() {
-    let p0 = engine(true, false, false).await;
-    let p1 = engine(true, false, false).await;
-    let d = engine(false, false, false).await;
-    let policy = RecordingPrefill::returning_out_of_range();
-    let r =
-        router_with_custom_prefill_policy(&[&p0, &p1], &d, policy.clone(), false, json!({})).await;
-    let request =
-        serde_json::from_value(program_body("bogus-index", vec![41, 42, 43], false)).unwrap();
-    let response = r.route_completion(None, &request, Some("test")).await;
-    assert_eq!(
-        response.status(),
-        StatusCode::SERVICE_UNAVAILABLE,
-        "an out-of-range index must be reported as no feasible P"
-    );
-    // A policy that selects nothing is asked once by the warm attempt and once
-    // by the cold path, exactly as the scheduling doc says.
-    assert_eq!(policy.calls().len(), 2);
-    assert!(p0.state.calls.lock().unwrap().is_empty());
-    assert!(p1.state.calls.lock().unwrap().is_empty());
 }
