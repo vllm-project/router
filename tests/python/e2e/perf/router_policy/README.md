@@ -1,14 +1,12 @@
 # router_policy — TraceLab cold replay, router policy × concurrency
 
-Each **scenario JSON** under `cases/` is one policy. `concurrencies` lists 8, 16, and 32; pytest expands those into cells `cache_aware/c16` and so on:
+Each **scenario JSON** under `cases/` is one policy. `benchmark_params.max-concurrency` lists 8, 16, and 32; pytest expands those into cells `cache_aware/c16` and so on:
 
 - **`runtime`** — paths **relative to vllm-router repo root** where applicable. **Env overrides JSON** (same as `scripts/backend/` and `perf/grpc`): `MODEL`, `VLLM_RS`, `ROUTER_BIN`, `AGENTX_PYTHON` (or `PYTHON`). Resolve `vllm-rs` with [`scripts/backend/check_vllm_rs.sh`](../../../../../scripts/backend/check_vllm_rs.sh).
 - **agentinfer** — install via **`pip install …whl`** (or `uv pip install …whl`) into the **same env as pytest** (no source checkout). Replay YAML is loaded from the installed package when a cell starts. Optional: `runtime.replay_config`; optional `runtime.agent_infer` for source dev.
 - **`workers`** — engine count and per-worker serve args (KV, max_model_len, optional `gpu_memory_utilization`, optional `kv_cache_metrics` / `kv_cache_metrics_sample` → vLLM `--kv-cache-metrics`, …)
 - **`router_params`** — policy, gRPC, penalties, balance thresholds
-- **`concurrencies`** — max-concurrency values pytest runs for this policy
-- **`benchmark_params`** — task-num and the rest of the replay settings
-- **`workload`** — optional notes (e.g. `sessions`); pytest asserts **all** replay rows in `requests.jsonl` are `success` (no fixed request count)
+- **`benchmark_params`** — `max-concurrency` (8, 16, 32), task-num, and the rest of the replay settings. pytest asserts **all** replay rows in `requests.jsonl` are `success` (no fixed request count)
 
 Example: [cases/kv_aware.json](cases/kv_aware.json).
 

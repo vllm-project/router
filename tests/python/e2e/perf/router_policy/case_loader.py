@@ -191,6 +191,17 @@ class RouterPolicyCase:
     router: dict[str, Any]
 
 
+def concurrency_levels(case: dict[str, Any]) -> list[int]:
+    """``benchmark_params.max-concurrency`` as a list, or one integer."""
+
+    raw = (case.get("benchmark_params") or {}).get("max-concurrency", 8)
+    if isinstance(raw, list):
+        if not raw:
+            raise RuntimeError("benchmark_params.max-concurrency is empty")
+        return [int(level) for level in raw]
+    return [int(raw)]
+
+
 def case_at_concurrency(case: dict[str, Any], concurrency: int) -> dict[str, Any]:
     """Copy a scenario JSON and pin one concurrency.
 
@@ -214,21 +225,13 @@ def load_router_policy_case(
     """Load one case JSON into ``RouterPolicyCase``."""
 
     raw = load_case(case_file)
-    levels = raw.get("concurrencies")
+    levels = concurrency_levels(raw)
     if concurrency is None:
-        if isinstance(levels, list) and len(levels) == 1:
-            concurrency = int(levels[0])
-        elif isinstance(levels, list) and levels:
-            raise RuntimeError(f"{case_file}: pass concurrency; file lists {levels}")
+        if len(levels) == 1:
+            concurrency = levels[0]
         else:
-            concurrency = int(
-                (raw.get("benchmark_params") or {}).get("max-concurrency", 8)
-            )
-    elif (
-        isinstance(levels, list)
-        and levels
-        and int(concurrency) not in {int(level) for level in levels}
-    ):
+            raise RuntimeError(f"{case_file}: pass concurrency; file lists {levels}")
+    elif int(concurrency) not in levels:
         raise RuntimeError(f"{case_file}: concurrency {concurrency} not in {levels}")
     raw = case_at_concurrency(raw, int(concurrency))
     runtime = resolve_runtime(raw)

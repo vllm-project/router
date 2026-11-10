@@ -29,15 +29,14 @@ def _router_policy_cell_gap():
 
 
 def _scenario_cells() -> list[tuple[Path, int]]:
-    """One JSON per policy; expand its concurrency list into cells."""
+    """One JSON per policy; expand benchmark_params.max-concurrency into cells."""
+
+    from case_loader import concurrency_levels
 
     cells: list[tuple[Path, int]] = []
     for path in sorted(CASES_DIR.glob("*.json")):
         raw = json.loads(path.read_text(encoding="utf-8-sig"))
-        levels = raw.get("concurrencies")
-        if not isinstance(levels, list) or not levels:
-            levels = [(raw.get("benchmark_params") or {}).get("max-concurrency", 8)]
-        cells.extend((path, int(level)) for level in levels)
+        cells.extend((path, level) for level in concurrency_levels(raw))
     return cells
 
 

@@ -13,7 +13,7 @@ Workload is the TraceLab 8-session / 28-request subset
 
 Configuration: ``AGENTX_CASE_FILE`` points to one self-contained case JSON
 (``cases/<policy>.json`` with ``runtime``, ``workers``, ``router_params``,
-and a ``concurrencies`` list).
+and ``benchmark_params.max-concurrency``).
 """
 
 from __future__ import annotations
