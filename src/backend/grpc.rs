@@ -46,6 +46,11 @@ const ENGINE_ABORT_RETRY_DELAY: Duration = Duration::from_millis(500);
 /// The same depth the HTTP forwarder uses. It is a hand-off bound, not a
 /// process RSS cap. A client that keeps up finds a free slot immediately.
 const GRPC_SSE_QUEUE_CHUNKS: usize = 8;
+/// Emitted after the chunks that already fit, when the client stays connected
+/// and does not read within `request_timeout`. Not a normal token frame, and
+/// not `data: [DONE]`.
+const GRPC_SSE_STALL_ERROR: &str =
+    "data: {\"error\":\"gRPC stream stalled because the client stopped reading\"}\n\n";
 
 pub(crate) type FirstOutputCallback = Arc<dyn Fn() + Send + Sync + 'static>;
 
@@ -203,8 +208,8 @@ enum Enqueue {
     Queued,
     Closed,
     /// The client stayed connected and did not read within `request_timeout`.
-    /// The chunk was not queued. It is held aside so the body can emit it
-    /// after the chunks that already fit.
+    /// The chunk was not queued. The body emits a stall error after the
+    /// chunks that already fit, instead of ending on this token.
     Stalled,
 }
 
@@ -216,8 +221,6 @@ async fn enqueue_sse(
     has_generated_output: bool,
     request_timeout: Duration,
 ) -> Enqueue {
-    // `select` drops the send on the timeout path, and that send owns `chunk`.
-    let pending = chunk.clone();
     tokio::select! {
         biased;
         sent = send_stream_chunk(tx, output, chunk, has_generated_output) => {
@@ -228,7 +231,7 @@ async fn enqueue_sse(
             }
         }
         _ = tokio::time::sleep(request_timeout) => {
-            terminal.send_replace(Some(pending));
+            terminal.send_replace(Some(GRPC_SSE_STALL_ERROR.to_string()));
             Enqueue::Stalled
         }
     }
@@ -821,9 +824,10 @@ where
     response
 }
 
-/// Bounded SSE body. Chunks already queued are delivered first. A chunk that
-/// could not be queued, because the client stopped reading, is emitted once
-/// the producer has dropped the sender.
+/// Bounded SSE body. Chunks already queued are delivered first. If the
+/// producer stopped because the client was not reading, the stall error
+/// follows those chunks. The frame that was waiting for a slot is not
+/// emitted as a normal token, and the body does not end with `[DONE]`.
 struct GrpcSseBody {
     rx: mpsc::Receiver<Result<String, std::io::Error>>,
     terminal: watch::Receiver<Option<String>>,
@@ -1202,6 +1206,47 @@ mod tests {
             "GenerateStream kept being polled after the hand-off stalled"
         );
         drop(response);
+    }
+
+    #[tokio::test]
+    async fn resumed_reader_sees_a_stall_error_after_buffered_frames() {
+        let pulled = Arc::new(AtomicUsize::new(0));
+        let total = 100;
+        let stream = ReadyFrames {
+            left: total,
+            total,
+            pulled: pulled.clone(),
+        };
+        let response = stream_openai(stream, reply_for(Duration::from_millis(200)), 0).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(pulled.load(Ordering::Relaxed), GRPC_SSE_QUEUE_CHUNKS + 1);
+
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("sse body");
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        for index in 0..GRPC_SSE_QUEUE_CHUNKS {
+            assert!(
+                text.contains(&format!("tok-{index}")),
+                "missing buffered tok-{index} in {text}"
+            );
+        }
+        let last_buffered = text
+            .rfind(&format!("tok-{}", GRPC_SSE_QUEUE_CHUNKS - 1))
+            .expect("last buffered token");
+        let error_at = text
+            .find("gRPC stream stalled because the client stopped reading")
+            .expect("stall error");
+        assert!(
+            error_at > last_buffered,
+            "the stall error must follow the buffered frames"
+        );
+        assert!(
+            !text.contains(&format!("tok-{GRPC_SSE_QUEUE_CHUNKS}")),
+            "the frame that was waiting for a slot was emitted as a normal token: {text}"
+        );
+        assert!(!text.contains("[DONE]"), "{text}");
+        assert_eq!(pulled.load(Ordering::Relaxed), GRPC_SSE_QUEUE_CHUNKS + 1);
     }
 
     #[tokio::test]
