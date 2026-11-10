@@ -688,6 +688,16 @@ impl Router {
             }
         }
 
+        if let Some(config) = &ctx.router_config.epd {
+            super::epd::EncoderStage::validate_consumers(
+                config,
+                ctx.worker_registry
+                    .get_by_type(&WorkerType::Regular)
+                    .iter()
+                    .map(|worker| worker.url()),
+            )?;
+        }
+
         // Setup load monitoring for PowerOfTwo policy
         let (tx, rx) = tokio::sync::watch::channel(HashMap::new());
         let worker_loads = Arc::new(rx);
@@ -3626,6 +3636,7 @@ impl RouterTrait for Router {
                     // reqwest derives these from the body and URL it sends.
                     if name == http::header::CONTENT_LENGTH
                         || name == http::header::CONTENT_TYPE
+                        || (worker.dp_rank().is_some() && name == "x-data-parallel-rank")
                         || header_utils::TRACE_HEADER_NAMES.contains(&name.as_str())
                     {
                         continue;
