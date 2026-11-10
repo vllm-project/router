@@ -209,6 +209,9 @@ impl HybridEventIndex {
                     {
                         Err(HybridEventError::InvalidBatch)
                     } else {
+                        if remove.ownership.is_some() {
+                            return Ok(());
+                        }
                         let group_idx = remove.group_idx.expect("validated group");
                         // An unknown medium names no tier, so the removal
                         // applies to every copy of the page: dropping more

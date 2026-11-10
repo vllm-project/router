@@ -358,6 +358,21 @@ pub(crate) mod tests {
         assert_eq!(index.reusable_tokens(&prompt(), usize::MAX), 528);
     }
 
+    /// A required group that never published a page caps reuse at zero: its
+    /// silence is not evidence that the page is unnecessary.
+    #[test]
+    fn a_required_group_without_page_evidence_caps_reuse_at_zero() {
+        let index = index(16);
+        index.begin_empty(0);
+        let mut batch = qwen_batch();
+        batch.events.retain(|event| match event {
+            KVEvent::BlockStored(store) => store.group_idx == Some(3),
+            _ => false,
+        });
+        assert_eq!(index.apply_batch(0, &batch), Ok(()));
+        assert_eq!(index.reusable_tokens(&prompt(), usize::MAX), 0);
+    }
+
     /// An adapter publishes under its own hash chain. Such a batch must leave
     /// the base model's claims intact instead of revoking the whole view.
     #[test]

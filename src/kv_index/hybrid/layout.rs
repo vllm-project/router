@@ -80,11 +80,16 @@ pub fn common_reusable_tokens(
         return 0;
     }
 
-    // A group that never published pages cannot contradict another group's
-    // evidence: V4-class layouts store sliding state only as key-only events
-    // next to the compressed group that names the pages.
-    let constraining: Vec<&HybridGroupView<'_>> =
-        groups.iter().filter(|group| group.page_evidence).collect();
+    // A sliding group may be key-only: V4-class layouts store its state as
+    // key-only events next to the compressed group that names the pages, so its
+    // silence cannot contradict another group's evidence. Every other kind must
+    // publish pages to count; until it does, its absence caps reuse at zero.
+    let constraining: Vec<&HybridGroupView<'_>> = groups
+        .iter()
+        .filter(|group| {
+            group.page_evidence || !matches!(group.kind, HybridGroupKind::SlidingWindow { .. })
+        })
+        .collect();
     if constraining.is_empty() {
         return 0;
     }

@@ -298,7 +298,21 @@ impl HybridEventIndex {
         for group in &self.groups {
             let stride = group.block_size as usize / self.keys.block_size();
             let blocks = (credited / u64::from(group.block_size)) as usize;
-            for position in (0..blocks).rev() {
+            // Every page the group needs to complete the boundary counts: a
+            // dense prefix needs all of them, a checkpoint only the boundary
+            // page, and a sliding group the trailing window.
+            let required = match group.kind {
+                HybridGroupKind::FullAttention
+                | HybridGroupKind::CompressedFullAttention { .. } => blocks.max(1),
+                HybridGroupKind::Checkpoint => 1,
+                HybridGroupKind::SlidingWindow { window_tokens } => {
+                    let window_blocks =
+                        window_tokens.div_ceil(u64::from(group.block_size)).max(1) as usize;
+                    blocks.min(window_blocks).max(1)
+                }
+            };
+            let floor = blocks.saturating_sub(required);
+            for position in (floor..blocks.max(1)).rev() {
                 let Some(hash) = hashes.get(stride * (position + 1) - 1) else {
                     break;
                 };
@@ -309,7 +323,9 @@ impl HybridEventIndex {
                     if tier_rank(tier) > tier_rank(worst) {
                         worst = tier;
                     }
-                    break;
+                    if matches!(group.kind, HybridGroupKind::Checkpoint) {
+                        break;
+                    }
                 }
             }
         }
