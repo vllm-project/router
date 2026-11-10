@@ -65,8 +65,8 @@ impl TransferPolicy {
     }
 }
 
-/// What a worker declares it can do for KV transfer. No production caller
-/// registers these yet (the handshake is later work).
+/// What a worker can do for KV transfer. Declared per worker in router config
+/// (`kv_transfer_capability`); engine-reported capability is later work.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransferCapability {
     pub can_export: bool,

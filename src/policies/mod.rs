@@ -14,6 +14,7 @@ mod factory;
 pub(crate) mod hash_key;
 mod kv_aware;
 mod kv_transfer;
+pub mod kv_transfer_capability;
 mod power_of_two;
 mod random;
 mod registry;

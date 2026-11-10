@@ -1034,6 +1034,18 @@ impl KvAwarePolicy {
             .insert(worker_url.into(), capability);
     }
 
+    /// Register a pre-validated capability table (see
+    /// `kv_transfer_capability::parse_static_capabilities`). Workers not in the
+    /// table keep whatever they had.
+    pub fn register_static_capabilities(
+        &self,
+        capabilities: impl IntoIterator<Item = (String, TransferCapability)>,
+    ) {
+        for (url, capability) in capabilities {
+            self.register_transfer_capability(url, capability);
+        }
+    }
+
     pub fn register_target(&self, worker_url: impl Into<String>, target: RoutableTarget) {
         let _guard = self.selection_lock.lock();
         self.targets.insert(

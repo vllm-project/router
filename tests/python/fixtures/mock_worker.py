@@ -48,6 +48,14 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--max-payload-bytes", type=int, default=10 * 1024 * 1024)
     p.add_argument("--stream", action="store_true")
     p.add_argument("--dp-size", type=int, default=1)
+    # KV transfer capability record, returned from /get_server_info as
+    # `kv_transfer_capability` (same fields as the router's static config).
+    # Omitted unless --kv-layout-fingerprint is given.
+    p.add_argument("--kv-connector", default="nixl")
+    p.add_argument("--kv-connector-version", default="1")
+    p.add_argument("--kv-layout-fingerprint", default=None)
+    p.add_argument("--kv-no-export", action="store_true")
+    p.add_argument("--kv-no-import", action="store_true")
     p.add_argument("--crash-on-request", action="store_true")
     p.add_argument("--health-fail-after-ms", type=int, default=0)
     return p.parse_args()
@@ -143,14 +151,21 @@ def create_app(args: argparse.Namespace) -> FastAPI:
     async def get_server_info(request: Request):
         # Enforce API key on server info when required (used by router for worker discovery)
         check_api_key(request)
-        return JSONResponse(
-            {
-                "worker_id": worker_id,
-                "load_in_flight": _inflight,
-                "cache": {"size": 0, "hit_rate": 0.0},
-                "dp_size": int(args.dp_size),
+        info = {
+            "worker_id": worker_id,
+            "load_in_flight": _inflight,
+            "cache": {"size": 0, "hit_rate": 0.0},
+            "dp_size": int(args.dp_size),
+        }
+        if args.kv_layout_fingerprint:
+            info["kv_transfer_capability"] = {
+                "can_export": not args.kv_no_export,
+                "can_import": not args.kv_no_import,
+                "connector": args.kv_connector,
+                "connector_version": args.kv_connector_version,
+                "layout_fingerprint": args.kv_layout_fingerprint,
             }
-        )
+        return JSONResponse(info)
 
     @app.get("/get_load")
     async def get_load():
