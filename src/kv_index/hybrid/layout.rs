@@ -214,6 +214,11 @@ fn validate_adapters(
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct HybridRankCapability {
     pub rank: u32,
+    /// Total cache groups the engine declares, including groups that never
+    /// publish block events (V4.1 keeps its sparse state in such backends).
+    /// `None` means the listed groups are the whole layout.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub declared_groups: Option<u32>,
     pub model: String,
     pub weight_version: String,
     pub weight_identity: Option<String>,
@@ -322,15 +327,20 @@ impl HybridCapabilities {
             });
         }
         // The declared layout, not just the indexed subset, must describe a
-        // hybrid cache: several groups, at least one attention group, and a
-        // checkpoint group that a single attention hit cannot prove.
+        // hybrid cache: at least one attention group, and some state a single
+        // attention hit cannot prove (a checkpoint group or a replay window).
+        // One attention group is enough when the layout says it is the whole
+        // layout: a model whose sparse state never publishes block events (V4.1)
+        // has no group whose checkpoint the credit could contradict.
         let has_attention = groups
             .iter()
             .any(|group| matches!(group.kind, HybridGroupKind::FullAttention));
         let has_state = groups
             .iter()
             .any(|group| matches!(group.kind, HybridGroupKind::Checkpoint));
-        if rank.groups.len() < 2 || groups.is_empty() || !has_attention || !has_state {
+        let declared_single_attention =
+            groups.len() == 1 && rank.declared_groups == Some(1) && has_attention;
+        if groups.is_empty() || !has_attention || !(has_state || declared_single_attention) {
             return Err("not a supported mixed layout");
         }
         let adapters = validate_adapters(&self.adapters)?;
@@ -504,6 +514,57 @@ mod tests {
     mod declarations {
         use super::super::*;
         use std::sync::Arc;
+
+        #[test]
+        fn a_declared_single_attention_layout_is_admitted() {
+            let group = serde_json::json!({
+                "group_idx": 5, "kind": "full_attention", "spec_type": "FullAttentionSpec",
+                "block_size": 128, "sliding_window": null, "prefix_cacheable": true,
+                "prefix_replay_tokens": 0, "mamba_cache_mode": null,
+                "prefill_checkpoint_alignment": null,
+            });
+            let mut value = serde_json::json!({"schema_version": 1, "ranks": [{
+                "rank": 0, "model": "v41", "weight_version": "default",
+                "weight_identity": "model-sha256", "publisher_topic": "epoch-1",
+                "instance_topic": true, "hash_algorithm": "sha256_cbor",
+                "full_hashes": true,
+                "root_hash": "4e1195df020de59e0d65a33a4279f1183e7ae4e5d980e309f8b55adff2e61c3e",
+                "hash_block_size": 128, "hash_lookahead_tokens": 0,
+                "speculative_tokens": 0, "prefix_caching": true,
+                "declared_groups": 1,
+                "groups": [group]
+            }]});
+            let source = EventSource {
+                source: Arc::from("worker"),
+                dp_rank: 0,
+                pub_endpoint: "inproc://publisher".into(),
+                replay_endpoint: Some("inproc://replay".into()),
+                topic: "epoch-1".into(),
+                hwm: None,
+            };
+            let target = RoutableTarget {
+                instance_id: Arc::from("worker"),
+                dp_rank: 0,
+            };
+            let make = |value: &serde_json::Value| {
+                serde_json::from_value::<HybridCapabilities>(value.clone()).unwrap()
+            };
+            assert!(make(&value)
+                .index_for_source(&source, target.clone(), 8)
+                .is_ok());
+            // Without the explicit total the same layout is indistinguishable
+            // from a truncated multi-group declaration, so it stays rejected.
+            value["ranks"][0]["declared_groups"] = serde_json::Value::Null;
+            assert!(make(&value)
+                .index_for_source(&source, target.clone(), 8)
+                .is_err());
+            // A declared single group that is not an attention group is useless.
+            value["ranks"][0]["groups"][0]["kind"] = serde_json::json!("mamba");
+            value["ranks"][0]["groups"][0]["spec_type"] = serde_json::json!("MambaSpec");
+            value["ranks"][0]["groups"][0]["mamba_cache_mode"] = serde_json::json!("align");
+            value["ranks"][0]["declared_groups"] = serde_json::json!(1);
+            assert!(make(&value).index_for_source(&source, target, 8).is_err());
+        }
 
         #[test]
         fn capability_requires_complete_supported_layout_and_same_publisher() {
