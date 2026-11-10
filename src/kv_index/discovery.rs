@@ -738,31 +738,24 @@ impl KvIndexSupervisor {
                         }
                         break;
                     }
-                    let valid = if let Some(config) = &static_config {
-                        // An engine without the control endpoint cannot
-                        // contradict a declared layout; only a contradicting
-                        // answer retires the provider.
-                        matches!(
-                            static_hybrid_sources_match(
-                                &client,
-                                &worker,
-                                api_key.as_deref(),
-                                config
-                            )
-                            .await,
-                            StaticHybridMatch::Matches | StaticHybridMatch::Unavailable(_)
-                        )
+                    let outcome = if let Some(config) = &static_config {
+                        static_hybrid_sources_match(&client, &worker, api_key.as_deref(), config)
+                            .await
                     } else {
-                        false
+                        StaticHybridMatch::Differs
                     };
-                    if !valid || provider.verified_at.lock().elapsed() > Duration::from_secs(5) {
+                    if !probe_keeps_trust(&outcome)
+                        || provider.verified_at.lock().elapsed() > Duration::from_secs(5)
+                    {
                         provider.active.store(false, Ordering::Release);
                         for handle in &handles {
                             handle.shutdown();
                         }
                         break;
                     }
-                    *provider.verified_at.lock() = Instant::now();
+                    if probe_renews_trust(&outcome) {
+                        *provider.verified_at.lock() = Instant::now();
+                    }
                 }
             });
         }
@@ -1109,6 +1102,27 @@ enum StaticHybridMatch {
     /// The engine has no control endpoint to ask (stock vLLM serves none over
     /// HTTP, and the extension may be off), or it is unreachable.
     Unavailable(SourcesProbe),
+}
+
+/// Whether a probe result keeps the provider alive. A transient failure is not
+/// a contradiction: the worker stays routable and only its credit expires.
+fn probe_keeps_trust(outcome: &StaticHybridMatch) -> bool {
+    matches!(
+        outcome,
+        StaticHybridMatch::Matches | StaticHybridMatch::Unavailable(_)
+    )
+}
+
+/// Whether a probe result may extend the freshness window. A confirming probe
+/// does, and so does an engine that has no control endpoint at all (the static
+/// declaration is authoritative there). A failing probe must let the window
+/// expire, otherwise a worker that restarts at the same URL while the endpoint
+/// returns 503 would keep crediting claims from before the restart.
+fn probe_renews_trust(outcome: &StaticHybridMatch) -> bool {
+    matches!(
+        outcome,
+        StaticHybridMatch::Matches | StaticHybridMatch::Unavailable(SourcesProbe::Unsupported)
+    )
 }
 
 async fn static_hybrid_sources_match(
@@ -1852,6 +1866,24 @@ vllm:cache_config_info{block_size="32",engine="1"} 1.0
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
+
+    #[test]
+    fn only_confirming_probes_renew_trust() {
+        assert!(probe_renews_trust(&StaticHybridMatch::Matches));
+        assert!(probe_renews_trust(&StaticHybridMatch::Unavailable(
+            SourcesProbe::Unsupported
+        )));
+        assert!(!probe_renews_trust(&StaticHybridMatch::Unavailable(
+            SourcesProbe::Failed
+        )));
+        assert!(!probe_renews_trust(&StaticHybridMatch::Differs));
+        // A failed probe keeps the worker routable; only the credit expires.
+        assert!(probe_keeps_trust(&StaticHybridMatch::Unavailable(
+            SourcesProbe::Failed
+        )));
+        assert!(!probe_keeps_trust(&StaticHybridMatch::Differs));
+    }
+
     use super::*;
     use crate::kv_index::{MatchQuery, StorageTier};
 
