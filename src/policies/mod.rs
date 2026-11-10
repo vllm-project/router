@@ -170,6 +170,21 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
         false // Default: most policies don't need headers
     }
 
+    /// Whether the Decode decision can be re-run when the Decode request is
+    /// dispatched, instead of at admission.
+    ///
+    /// True only when every input the policy scores with is still valid after
+    /// a Prefill, or is carried into the commitment. Policies whose answer
+    /// depends on admission-time request text or on a per-pool counter keep
+    /// their admission decision.
+    ///
+    /// `decode_cache_ready` reports whether the caller carries the prefix
+    /// selection prepared at admission, which `cache_aware` needs to score
+    /// again without the request body.
+    fn can_redecide_at_dispatch(&self, _decode_cache_ready: bool) -> bool {
+        false
+    }
+
     /// Update worker load information
     ///
     /// This is called periodically with current load information for load-aware policies.

@@ -622,6 +622,12 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         "cache_aware"
     }
 
+    /// Re-running needs the prefix selection prepared at admission; without it
+    /// the request body would have to be carried across the Prefill.
+    fn can_redecide_at_dispatch(&self, decode_cache_ready: bool) -> bool {
+        decode_cache_ready
+    }
+
     fn needs_cache_routing_key(&self) -> bool {
         true
     }
