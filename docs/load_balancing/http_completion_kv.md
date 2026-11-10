@@ -45,8 +45,15 @@ traffic contributed to the comparison.
 Streaming clients should set `stream_options.include_usage=true` and the engine
 must return cached-token details. A completed stream without those details
 counts as `missing_usage`. The Router forwards the client's stream options.
-Multi-prompt usage without an aggregate and Program responses where the
-reporting worker may differ from the selected target are excluded from the
-histograms. Successful Program responses count as `pd_usage_not_comparable`.
-gRPC workers emit no KV route observation samples. An empty series can therefore
-coexist with active KV-aware routing.
+Multi-prompt comparisons require aggregate usage. Regular HTTP Program requests
+can be compared when the bound target is the selected worker handling the
+request. If attribution is uncertain the outcome is `pd_usage_not_comparable`.
+
+Native HTTP P/D admission can carry a verified single-prompt device-prefix
+prediction for the selected prefill worker and rank. The Router compares it
+with the cached-token count in the merged JSON response or rewritten SSE usage
+when that count agrees with the same attempt's prefill report. Missing prefill
+usage never falls back to decode usage. Opaque responses do not supply accuracy
+samples. Program-bound P/D paths that bypass KV prediction and gRPC workers do
+not supply these pairs. The comparison measures device-prefix prediction versus
+engine-reported reuse; an engine can include external reuse in that total.

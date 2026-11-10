@@ -60,8 +60,9 @@ impl<'a> KvRequestTokens<'a> {
 }
 
 /// Immutable P work estimate from one placement snapshot.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PrefillWorkEstimate {
+    pub prediction: Option<(RoutableTarget, u64)>,
     pub new_prefill_tokens: u64,
     pub placement_verified: bool,
 }
@@ -1821,6 +1822,7 @@ impl KvAwareOps for KvAwarePolicy {
                     ..self.params
                 };
                 let mut new_prefill_tokens = 0u64;
+                let mut prediction = None;
                 for tokens in prompts {
                     let hits = if verified {
                         query_cache
@@ -1837,19 +1839,25 @@ impl KvAwareOps for KvAwarePolicy {
                         .filter(|hit| hit.target == binding.target)
                         .cloned()
                         .collect();
-                    new_prefill_tokens = new_prefill_tokens.saturating_add(request_prefill_tokens(
-                        &CandidateView {
-                            target: &binding.target,
-                            matches: &matches,
-                            load: LoadSample::default(),
-                            input_tokens: tokens.len(),
-                            prefill_tokens: None,
-                        },
-                        &params,
-                    ));
+                    let candidate = CandidateView {
+                        target: &binding.target,
+                        matches: &matches,
+                        load: LoadSample::default(),
+                        input_tokens: tokens.len(),
+                        prefill_tokens: None,
+                    };
+                    new_prefill_tokens = new_prefill_tokens
+                        .saturating_add(request_prefill_tokens(&candidate, &params));
+                    if verified && prompts.len() == 1 {
+                        prediction = Some((
+                            binding.target.clone(),
+                            predicted_cached_tokens(&candidate, &params),
+                        ));
+                    }
                 }
                 PrefillWorkEstimate {
                     new_prefill_tokens,
+                    prediction,
                     placement_verified: verified,
                 }
             })

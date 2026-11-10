@@ -180,6 +180,22 @@ impl RequestLoadGuard {
         self.state.kv_attempt.clone()
     }
 
+    fn response_observation(
+        &self,
+        status: StatusCode,
+        sent_to: &str,
+        program_target: Option<&str>,
+    ) -> Option<Arc<KvRouteAttempt>> {
+        let attempt = self.kv_attempt()?;
+        let unattributed = program_target.is_some_and(|bound| {
+            bound != sent_to
+                || !self.state.worker.as_ref().is_some_and(|worker| {
+                    worker.url() == sent_to && worker.worker_type() == WorkerType::Regular
+                })
+        });
+        comparable_attempt(Some(attempt), status, unattributed)
+    }
+
     fn begin_decode(&self) {
         if let Some(slot) = &self.state.kv_slot {
             slot.begin_decode();
@@ -2066,7 +2082,13 @@ impl Router {
 
         let status = StatusCode::from_u16(res.status().as_u16())
             .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-        let kv_attempt = comparable_attempt(kv_attempt, status, program_completion.is_some());
+        let kv_attempt = load.response_observation(
+            status,
+            worker_url,
+            program_completion
+                .as_ref()
+                .map(|c| c.dispatch().target_id.as_str()),
+        );
         let http_ttfb_ms = t_send.elapsed().as_secs_f64() * 1000.0;
 
         if !is_stream {
@@ -3321,8 +3343,15 @@ impl RouterTrait for Router {
         {
             Ok(response) => {
                 let status = response.status();
-                let kv_attempt =
-                    comparable_attempt(kv_attempt, status, program_completion.is_some());
+                let kv_attempt = load.as_ref().and_then(|guard| {
+                    guard.response_observation(
+                        status,
+                        worker.url(),
+                        program_completion
+                            .as_ref()
+                            .map(|c| c.dispatch().target_id.as_str()),
+                    )
+                });
                 // Keep the circuit breaker informed, as the typed path does:
                 // 2xx/4xx count as success, 5xx as worker failure.
                 let was_available = worker.is_available();
@@ -3562,6 +3591,44 @@ mod tests {
         assert_eq!(worker.load(), 1);
         drop(guard);
         assert_eq!(worker.load(), 0);
+    }
+
+    #[test]
+    fn program_observation_requires_the_bound_regular_worker() {
+        let url = "http://worker-a:8000";
+        for (kind, bound, comparable) in [
+            (WorkerType::Regular, url, true),
+            (WorkerType::Regular, "http://worker-b:8000", false),
+            (WorkerType::Decode, url, false),
+        ] {
+            let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(url.into(), kind));
+            worker.increment_load();
+            let guard = RequestLoadGuard::from_selection(
+                worker,
+                Some(KvSelectionReceipt {
+                    worker_index: 0,
+                    new_prefill_tokens: 4,
+                    predicted_cached_tokens: Some(16),
+                    multi_prompt: false,
+                    slot: None,
+                    decision: crate::policies::CostDecision {
+                        target: crate::kv_index::RoutableTarget {
+                            instance_id: url.into(),
+                            dp_rank: 0,
+                        },
+                        cost: 4.0,
+                        components: Default::default(),
+                    },
+                }),
+                true,
+            );
+            assert_eq!(
+                guard
+                    .response_observation(StatusCode::OK, url, Some(bound))
+                    .is_some(),
+                comparable
+            );
+        }
     }
 
     async fn completion_response_fixture() -> CompletionResponseFixture {

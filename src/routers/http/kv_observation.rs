@@ -16,6 +16,7 @@ pub(super) struct KvResponseStream<S> {
     status: StatusCode,
     json: Vec<u8>,
     oversized: bool,
+
     finished: bool,
 }
 
@@ -33,8 +34,21 @@ impl<S> KvResponseStream<S> {
             status,
             json: Vec::new(),
             oversized: false,
+
             finished: false,
         }
+    }
+    pub(super) fn merged_pd_sse(
+        inner: S,
+        attempt: Arc<KvRouteAttempt>,
+        status: StatusCode,
+        cached: u64,
+    ) -> Self {
+        let mut stream = Self::new(inner, attempt, status, true);
+        if let Some(observer) = &mut stream.sse {
+            observer.merged_prefill = Some(cached);
+        }
+        stream
     }
 }
 
@@ -253,9 +267,9 @@ fn http_failure(status: StatusCode) -> Option<UnavailableReason> {
 pub(super) fn comparable_attempt(
     attempt: Option<Arc<KvRouteAttempt>>,
     status: StatusCode,
-    has_program: bool,
+    unattributed: bool,
 ) -> Option<Arc<KvRouteAttempt>> {
-    if has_program {
+    if unattributed {
         if let Some(attempt) = attempt {
             observe_unavailable(&attempt, status, UnavailableReason::PdUsageNotComparable);
         }
@@ -281,6 +295,24 @@ pub(super) fn observe_json_response(attempt: &KvRouteAttempt, status: StatusCode
     attempt.record_once(observation);
 }
 
+pub(super) fn observe_merged_json(attempt: &KvRouteAttempt, merged: &Value, prefill: u64) {
+    let observation = response_cached_tokens(merged)
+        .map(CacheObservation::Observed)
+        .unwrap_or(CacheObservation::Unavailable(
+            UnavailableReason::MissingUsage,
+        ));
+    attempt.record_once(check_merged_usage(observation, Some(prefill)));
+}
+
+fn check_merged_usage(observation: CacheObservation, expected: Option<u64>) -> CacheObservation {
+    match (observation, expected) {
+        (CacheObservation::Observed(actual), Some(prefill)) if actual != prefill => {
+            CacheObservation::Unavailable(UnavailableReason::PdUsageNotComparable)
+        }
+        _ => observation,
+    }
+}
+
 pub(super) fn observe_unavailable(
     attempt: &KvRouteAttempt,
     status: StatusCode,
@@ -295,6 +327,7 @@ pub(super) fn observe_unavailable(
 }
 
 pub(super) struct KvSseObserver {
+    merged_prefill: Option<u64>,
     attempt: Arc<KvRouteAttempt>,
     status: StatusCode,
     scanner: FrameScanner,
@@ -312,6 +345,7 @@ impl KvSseObserver {
             attempt,
             status,
             scanner: FrameScanner::default(),
+            merged_prefill: None,
             frame: Vec::new(),
             discarding_frame: false,
             observed_cached_tokens: None,
@@ -427,7 +461,8 @@ impl KvSseObserver {
         if std::mem::replace(&mut self.finished, true) {
             return;
         }
-        self.attempt.record_once(observation);
+        self.attempt
+            .record_once(check_merged_usage(observation, self.merged_prefill));
     }
 }
 

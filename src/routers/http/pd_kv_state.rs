@@ -657,7 +657,7 @@ mod kv_input_tests {
                 inputs[&base].prompts.as_deref(),
                 Some([vec![7, 8, 9]].as_slice())
             );
-            let work = kv_aware_ops(policy.as_ref())
+            let work = &kv_aware_ops(policy.as_ref())
                 .unwrap()
                 .estimate_prefill_work(&[(workers[0].as_ref(), &[vec![7, 8, 9]], true)])[0];
             assert_eq!(work.new_prefill_tokens, 3);
@@ -767,7 +767,7 @@ mod kv_input_tests {
                         .send_multipart([b"".as_slice(), seq.as_slice(), payload.as_slice()], 0)
                         .unwrap();
                     tokio::time::sleep(Duration::from_millis(10)).await;
-                    let work = ops.estimate_prefill_work(&[(
+                    let work = &ops.estimate_prefill_work(&[(
                         workers[0].as_ref(),
                         std::slice::from_ref(&tokens),
                         true,

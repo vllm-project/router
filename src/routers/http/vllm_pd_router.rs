@@ -1,6 +1,9 @@
 // vLLM PD (Prefill-Decode) Router Implementation
 // This module extends PdRouterBase to handle vLLM-specific two-stage processing
 use super::dp_utils;
+use super::kv_observation::{
+    observe_merged_json, observe_unavailable, KvResponseStream, KvRouteAttempt, UnavailableReason,
+};
 use super::logprobs_merge;
 use super::pd_cached_tokens;
 use super::pd_program_adapter::{self, PdProgramRuntime};
@@ -355,6 +358,7 @@ fn finalize_decode_stream(
     decode_response: reqwest::Response,
     prefill_response_json: Option<&Value>,
     path: &str,
+    observation: Option<&Arc<KvRouteAttempt>>,
 ) -> Result<Response, String> {
     let status = decode_response.status();
     let is_encoded = response_is_encoded(decode_response.headers());
@@ -371,12 +375,30 @@ fn finalize_decode_stream(
         && is_sse
         && !is_encoded
     {
-        Body::from_stream(pd_cached_tokens::rewrite_sse_stream(
+        let cached = pd_cached_tokens::prefill_cached_tokens(prefill_response_json);
+        let rewritten = pd_cached_tokens::rewrite_sse_stream(
             stream,
-            pd_cached_tokens::prefill_cached_tokens(prefill_response_json),
+            cached,
             prefill_response_json.and_then(usage_merge::usage_snapshot),
-        ))
+        );
+        match (observation, cached) {
+            (Some(attempt), Some(count)) => Body::from_stream(KvResponseStream::merged_pd_sse(
+                rewritten,
+                attempt.clone(),
+                status,
+                count,
+            )),
+            (observation, _) => {
+                if let Some(attempt) = observation {
+                    observe_unavailable(attempt, status, UnavailableReason::MissingUsage);
+                }
+                Body::from_stream(rewritten)
+            }
+        }
     } else {
+        if let Some(attempt) = observation {
+            observe_unavailable(attempt, status, UnavailableReason::PdUsageNotComparable);
+        }
         Body::from_stream(stream)
     };
     response_with_body(status, &headers, body)
@@ -400,6 +422,7 @@ fn finalize_decode_body(
     prefill_response_json: Option<&Value>,
     path: &str,
     needs_logprobs: bool,
+    observation: Option<&Arc<KvRouteAttempt>>,
 ) -> Result<Response, String> {
     let is_encoded = response_is_encoded(&headers);
     let mut headers = header_utils::preserve_response_headers(&headers);
@@ -410,12 +433,18 @@ fn finalize_decode_body(
         || original.len() > MAX_JSON_REWRITE_BYTES
         || (!reconcile_cache && !needs_logprobs)
     {
+        if let Some(attempt) = observation {
+            observe_unavailable(attempt, status, UnavailableReason::PdUsageNotComparable);
+        }
         return response_with_body(status, &headers, Body::from(original));
     }
     let cached = pd_cached_tokens::prefill_cached_tokens(prefill_response_json);
     let mut json: Value = match serde_json::from_slice(&original) {
         Ok(json) => json,
         Err(error) if reconcile_cache => {
+            if let Some(attempt) = observation {
+                observe_unavailable(attempt, status, UnavailableReason::MalformedJson);
+            }
             warn!("Cannot parse successful PD Decode response for cached-token reconciliation: {error}");
             return response_with_body(status, &headers, Body::from(original));
         }
@@ -435,8 +464,22 @@ fn finalize_decode_body(
             changed |= usage_merge::merge_pd_usage(prefill, &mut json);
         }
         match pd_cached_tokens::reconcile_usage(&mut json, cached, prefill_response_json) {
-            Ok(rewritten) => changed |= rewritten,
-            Err(reason) => warn!("Cannot reconcile PD cached tokens: {reason}"),
+            Ok(rewritten) => {
+                changed |= rewritten;
+                if let Some(attempt) = observation {
+                    if let Some(count) = cached {
+                        observe_merged_json(attempt, &json, count);
+                    } else {
+                        observe_unavailable(attempt, status, UnavailableReason::MissingUsage);
+                    }
+                }
+            }
+            Err(reason) => {
+                if let Some(attempt) = observation {
+                    observe_unavailable(attempt, status, UnavailableReason::PdUsageNotComparable);
+                }
+                warn!("Cannot reconcile PD cached tokens: {reason}");
+            }
         }
     }
 
@@ -1894,7 +1937,12 @@ impl VllmPDRouter {
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
         if is_streaming {
-            finalize_decode_stream(decode_response, prefill_response_json, path)
+            finalize_decode_stream(
+                decode_response,
+                prefill_response_json,
+                path,
+                attempt.kv_observation(),
+            )
         } else {
             let status = decode_response.status();
             let headers = decode_response.headers().clone();
@@ -1912,9 +1960,13 @@ impl VllmPDRouter {
                         prefill_response_json,
                         path,
                         needs_logprobs,
+                        attempt.kv_observation(),
                     )
                 }
                 ResponseBody::Passthrough(body) => {
+                    if let Some(observation) = attempt.kv_observation() {
+                        observe_unavailable(observation, status, UnavailableReason::OversizedJson);
+                    }
                     let mut headers = header_utils::preserve_response_headers(&headers);
                     headers.remove(http::header::CONTENT_LENGTH);
                     response_with_body(status, &headers, body)
@@ -2059,6 +2111,47 @@ impl VllmPDRouter {
         attempt: PdAttempt,
         prefill_permit: Option<OwnedSemaphorePermit>,
         commit: Option<&DecodeCommitInput>,
+    ) -> Result<Response, PDRouterError> {
+        let observation = attempt.kv_observation().cloned();
+        let result = self
+            .dispatch_http_pair(
+                original_request,
+                prefill_worker,
+                decode_worker,
+                path,
+                headers,
+                attempt,
+                prefill_permit,
+            )
+            .await;
+        if let Some(observer) = observation {
+            match &result {
+                Ok(response) if !response.status().is_success() => observe_unavailable(
+                    &observer,
+                    response.status(),
+                    UnavailableReason::BackendError,
+                ),
+                Err(_) => observe_unavailable(
+                    &observer,
+                    StatusCode::BAD_GATEWAY,
+                    UnavailableReason::RequestError,
+                ),
+                _ => {}
+            }
+        }
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn dispatch_http_pair(
+        &self,
+        original_request: Value,
+        prefill_worker: Arc<dyn Worker>,
+        decode_worker: Arc<dyn Worker>,
+        path: &str,
+        headers: Option<&HeaderMap>,
+        attempt: PdAttempt,
+        prefill_permit: Option<OwnedSemaphorePermit>,
     ) -> Result<Response, PDRouterError> {
         debug!("ENTERED process_vllm_two_stage_request method");
         let start_time = Instant::now();
@@ -3660,7 +3753,7 @@ mod tests {
         logprobs: bool,
     ) -> Result<Response, String> {
         if streaming {
-            finalize_decode_stream(response, prefill, path)
+            finalize_decode_stream(response, prefill, path, None)
         } else {
             let status = response.status();
             let headers = response.headers().clone();
@@ -3669,7 +3762,7 @@ mod tests {
                 .map_err(|error| format!("Failed to read response body: {error}"))?
             {
                 ResponseBody::Buffered(bytes) => {
-                    finalize_decode_body(status, headers, bytes, prefill, path, logprobs)
+                    finalize_decode_body(status, headers, bytes, prefill, path, logprobs, None)
                 }
                 ResponseBody::Passthrough(body) => {
                     let mut headers = header_utils::preserve_response_headers(&headers);
@@ -3702,6 +3795,70 @@ mod tests {
     }
 
     use super::*;
+
+    #[tokio::test]
+    async fn merged_pd_observation_compares_prefill_usage_for_json_and_sse() {
+        use super::super::kv_observation::KvRoutePrediction;
+        let decode =
+            json!({"usage":{"prompt_tokens":96,"prompt_tokens_details":{"cached_tokens":0}}});
+        let event = format!("data: {decode}\n\ndata: [DONE]\n\n");
+        let server = spawn_test_server(axum::Router::new().fallback(move || {
+            let event = event.clone();
+            async move { ([("content-type", "text/event-stream")], event) }
+        }))
+        .await;
+        for streaming in [false, true] {
+            for actual in [Some(64), Some(0), None] {
+                let recorder =
+                    metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+                let handle = recorder.handle();
+                let _recorder = metrics::set_default_local_recorder(&recorder);
+                let attempt = KvRouteAttempt::new(KvRoutePrediction {
+                    target: crate::kv_index::RoutableTarget {
+                        instance_id: Arc::from("prefill-A"),
+                        dp_rank: 0,
+                    },
+                    cached_tokens: Some(80),
+                    multi_prompt: false,
+                });
+                let prefill = json!({"usage":{"prompt_tokens":96,"prompt_tokens_details":{"cached_tokens":actual}}});
+                let path = "/v1/chat/completions";
+                let response = if streaming {
+                    let res = reqwest::get(&server).await.unwrap();
+                    finalize_decode_stream(res, Some(&prefill), path, Some(&attempt)).unwrap()
+                } else {
+                    finalize_decode_body(
+                        StatusCode::OK,
+                        HeaderMap::new(),
+                        Bytes::from(decode.to_string()),
+                        Some(&prefill),
+                        path,
+                        false,
+                        Some(&attempt),
+                    )
+                    .unwrap()
+                };
+                let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                let body = std::str::from_utf8(&bytes).unwrap();
+                drop(attempt);
+                let metrics = handle.render();
+                if let Some(count) = actual {
+                    assert!(body.contains(&format!("\"cached_tokens\":{count}")));
+                    assert!(metrics
+                        .lines()
+                        .any(|l| l == format!("vllm_router_kv_actual_cached_tokens_sum {count}")));
+                    assert!(metrics.lines().any(|l| l == format!("vllm_router_kv_cached_token_absolute_error_sum{{direction=\"overpredicted\"}} {}",80-count)));
+                    assert!(metrics.contains("vllm_router_kv_predicted_cached_tokens_count 1"));
+                } else {
+                    assert!(!body.contains("cached_tokens"));
+                    assert!(metrics.contains("reason=\"missing_usage\""));
+                    assert!(!metrics.contains("vllm_router_kv_actual_cached_tokens_count"));
+                }
+            }
+        }
+    }
 
     #[tokio::test]
     async fn prefill_body_limit_rejects_oversized_responses() {
@@ -4773,6 +4930,7 @@ mod tests {
             Some(&json!({"prompt_logprobs":[1]})),
             "/v1/completions",
             true,
+            None,
         )
         .unwrap();
         let bytes = axum::body::to_bytes(response.into_body(), raw.len())

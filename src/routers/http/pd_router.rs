@@ -250,7 +250,7 @@ fn select_stage(
                 Some((
                     input,
                     input.prompts.as_deref()?,
-                    *input.work_by_rank.get(&worker.dp_rank())?,
+                    input.work_by_rank.get(&worker.dp_rank())?,
                 ))
             })
             .collect();
@@ -289,6 +289,7 @@ fn select_stage(
                     "kv_aware", "prefill", outcome,
                 );
                 return Some(StageDecision {
+                    prediction: estimate.prediction.clone(),
                     worker_index: selected_indices[picked],
                     endpoint: endpoints[selected_indices[picked]].clone(),
                     score: Some(costs[picked]),
@@ -391,16 +392,21 @@ fn select_stage(
         }
         return None;
     };
-    let selected_tokens = (stage == Stage::Prefill)
-        .then(|| {
-            context
-                .prefill_inputs
-                .and_then(|inputs| inputs.get(worker.base_url()))
-                .and_then(|input| input.prompts.as_ref())
-                .map(|prompts| prompts.iter().map(|ids| ids.len() as u64).sum())
-        })
-        .flatten();
+    let selected_input = if stage == Stage::Prefill {
+        context
+            .prefill_inputs
+            .and_then(|inputs| inputs.get(worker.base_url()))
+    } else {
+        None
+    };
+    let selected_tokens = selected_input
+        .and_then(|input| input.prompts.as_ref())
+        .map(|prompts| prompts.iter().map(|ids| ids.len() as u64).sum());
     Some(StageDecision {
+        // Occupancy fallback can still have verified placement for the winner.
+        prediction: selected_input
+            .and_then(|input| input.work_by_rank.get(&worker.dp_rank()))
+            .and_then(|estimate| estimate.prediction.clone()),
         fallback_reason: if stage == Stage::Prefill && kv_aware {
             Some(if unknown_backlog {
                 "unknown_prefill_backlog"
@@ -2680,7 +2686,8 @@ mod admission_tests {
                                 worker.as_ref(),
                                 &[tokens.to_vec()],
                                 true,
-                            )])[0],
+                            )])[0]
+                                .clone(),
                         )]),
                         allow_credit: true,
                         fallback_reason: None,
@@ -2711,6 +2718,10 @@ mod admission_tests {
         assert_eq!(first.prefill.worker_index, 1); // Warm P wins over the first idle P.
         assert_eq!(first.prefill.new_prefill_tokens, Some(1));
         assert_eq!(first.prefill.credited_prefix_tokens, Some(32));
+        let (target, tokens) = first.prefill.prediction.as_ref().unwrap();
+        assert_eq!(target.instance_id.as_ref(), p[1].base_url());
+        assert_eq!(*tokens, 32);
+        assert!(a.kv_observation().is_some());
         assert_eq!(first.prefill.fallback_reason, None);
         let (second, b) = manager
             .admit(|loads| select_pd_pair(loads, &p, &d, &policy, &policy, &context, true))
@@ -2795,6 +2806,15 @@ mod admission_tests {
         );
         assert_eq!(selection.prefill.new_prefill_tokens, Some(33));
         assert_eq!(selection.prefill.credited_prefix_tokens, Some(0));
+        assert_eq!(
+            selection
+                .prefill
+                .prediction
+                .as_ref()
+                .map(|(_, count)| *count),
+            Some(32)
+        );
+        assert!(unknown.kv_observation().is_none());
         drop((unknown, known));
         assert!(manager.snapshot().is_empty());
     }
