@@ -1,7 +1,12 @@
 use metrics::{counter, describe_counter, describe_gauge, describe_histogram, gauge, histogram};
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::LazyLock;
 use std::time::Duration;
+
+/// Metadata reused with the cached per-worker gauge key.
+static WORKER_LOAD_METADATA: LazyLock<metrics::Metadata<'static>> =
+    LazyLock::new(|| metrics::Metadata::new("vllm_router_worker_load", metrics::Level::INFO, None));
 
 #[derive(Debug, Clone)]
 pub struct PrometheusConfig {
@@ -646,11 +651,26 @@ impl RouterMetrics {
         .set(if healthy { 1.0 } else { 0.0 });
     }
 
-    pub fn set_worker_load(worker_url: &str, load: usize) {
-        gauge!("vllm_router_worker_load",
-            "worker" => worker_url.to_string()
+    /// Build the gauge key for a worker once, then reuse it on every load
+    /// transition of that worker.
+    pub fn worker_load_key(worker_url: &str) -> metrics::Key {
+        metrics::Key::from_parts(
+            "vllm_router_worker_load",
+            vec![metrics::Label::new("worker", worker_url.to_string())],
         )
-        .set(load as f64);
+    }
+
+    /// Publish a worker's in-flight load through a cached key.
+    pub fn set_worker_load_by_key(key: &metrics::Key, load: usize) {
+        metrics::with_recorder(|recorder| {
+            recorder
+                .register_gauge(key, &WORKER_LOAD_METADATA)
+                .set(load as f64);
+        });
+    }
+
+    pub fn set_worker_load(worker_url: &str, load: usize) {
+        Self::set_worker_load_by_key(&Self::worker_load_key(worker_url), load);
     }
 
     pub fn record_processed_request(worker_url: &str) {
