@@ -191,18 +191,50 @@ class RouterPolicyCase:
     router: dict[str, Any]
 
 
-def load_router_policy_case(case_file: Path) -> RouterPolicyCase:
+def case_at_concurrency(case: dict[str, Any], concurrency: int) -> dict[str, Any]:
+    """Copy a scenario JSON and pin one concurrency.
+
+    The cell id stays ``c<n>-<policy>`` so three levels from one file do not
+    share an output directory.
+    """
+
+    stamped = dict(case)
+    bench = dict(case.get("benchmark_params") or {})
+    bench["max-concurrency"] = int(concurrency)
+    stamped["benchmark_params"] = bench
+    router = case.get("router_params") or {}
+    policy = str(router.get("policy") or case.get("id") or "router_policy")
+    stamped["id"] = f"c{int(concurrency)}-{policy}"
+    return stamped
+
+
+def load_router_policy_case(
+    case_file: Path, *, concurrency: int | None = None
+) -> RouterPolicyCase:
     """Load one case JSON into ``RouterPolicyCase``."""
 
     raw = load_case(case_file)
+    levels = raw.get("concurrencies")
+    if concurrency is None:
+        if isinstance(levels, list) and len(levels) == 1:
+            concurrency = int(levels[0])
+        elif isinstance(levels, list) and levels:
+            raise RuntimeError(
+                f"{case_file}: pass concurrency; file lists {levels}"
+            )
+        else:
+            concurrency = int((raw.get("benchmark_params") or {}).get("max-concurrency", 8))
+    elif isinstance(levels, list) and levels and int(concurrency) not in {
+        int(level) for level in levels
+    }:
+        raise RuntimeError(f"{case_file}: concurrency {concurrency} not in {levels}")
+    raw = case_at_concurrency(raw, int(concurrency))
     runtime = resolve_runtime(raw)
     bench = raw.get("benchmark_params") or {}
     workers = raw.get("workers") or {}
     router = dict(raw.get("router_params") or {})
     case_id = str(raw["id"])
-    policy = str(
-        router.get("policy") or raw.get("router_policy") or case_id.split("-", 1)[1]
-    )
+    policy = str(router.get("policy") or raw.get("router_policy") or case_id.split("-", 1)[-1])
     replay_path = str(runtime.get("replay_config_path") or "").strip()
     agent_infer = str(runtime.get("agent_infer") or "").strip()
     return RouterPolicyCase(

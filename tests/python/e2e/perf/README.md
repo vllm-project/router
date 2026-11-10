@@ -23,7 +23,7 @@ python -m pytest -sv tests/python/e2e/perf/grpc --perf-case=rust_grpc
 
 ## router_policy
 
-Configure paths in each case JSON under `router_policy/cases/<policy>/` (see
+Configure paths in each scenario JSON under `router_policy/cases/` (see
 [`router_policy/README.md`](router_policy/README.md)). Run only that file (manual
 GPU benchmark; nightly runs the three c16 cells):
 

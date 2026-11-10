@@ -1,5 +1,6 @@
 {
-  "id": "c32-cache_aware",
+  "id": "kv_aware",
+  "concurrencies": [8, 16, 32],
   "runtime": {
     "perf_work_root": "test-results/router_policy",
     "python": "python",
@@ -13,7 +14,6 @@
   },
   "benchmark_params": {
     "task-num": 8,
-    "max-concurrency": 32,
     "gap_scale": 1.0,
     "max_inflight": 1,
     "task_stagger": 0
@@ -47,6 +47,6 @@
     "kv_penalty_external": 0.6,
     "kv_penalty_disk": 0.3,
     "worker_startup_timeout_secs": 60,
-    "policy": "cache_aware"
+    "policy": "kv_aware"
   }
 }

@@ -1,4 +1,4 @@
-"""Router policy perf: one pytest per self-contained case JSON in cases/<policy>/."""
+"""Router policy perf: one pytest cell per concurrency in cases/<policy>.json."""
 
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ if str(SCENARIO_DIR) not in sys.path:
     sys.path.insert(0, str(SCENARIO_DIR))
 
 from case_loader import (  # noqa: E402
+    case_at_concurrency,
     cell_output_dir,
     cell_results_summary_path,
     cell_run_suffix,
@@ -19,13 +20,16 @@ from case_loader import (  # noqa: E402
 from stack_launcher import run_router_policy_cell  # noqa: E402
 
 
-def _run_cell(case_file: Path) -> Path:
-    case = load_case(case_file, scenario_dir=SCENARIO_DIR)
+def _run_cell(case_file: Path, concurrency: int) -> Path:
+    case = case_at_concurrency(
+        load_case(case_file, scenario_dir=SCENARIO_DIR), concurrency
+    )
     run_suffix = cell_run_suffix()
     out = cell_output_dir(case, run_suffix=run_suffix)
     summary = cell_results_summary_path(case, run_suffix=run_suffix)
     cell_out = run_router_policy_cell(
         case_file,
+        concurrency=concurrency,
         out_dir=out,
         run_suffix=run_suffix,
         results_summary=summary,
@@ -34,9 +38,9 @@ def _run_cell(case_file: Path) -> Path:
     return cell_out
 
 
-def test_router_policy_replay_cell(case_file: Path):
-    """Workers → router → replay; single self-contained case JSON."""
-    out = _run_cell(case_file)
+def test_router_policy_replay_cell(case_file: Path, concurrency: int):
+    """Workers → router → replay; one concurrency from a scenario JSON."""
+    out = _run_cell(case_file, concurrency)
     req_path = out / "result" / "requests.jsonl"
     assert req_path.is_file(), f"missing replay output {req_path}"
     rows = [

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 import time
@@ -27,11 +28,24 @@ def _router_policy_cell_gap():
         time.sleep(gap)
 
 
+def _scenario_cells() -> list[tuple[Path, int]]:
+    """One JSON per policy; expand its concurrency list into cells."""
+
+    cells: list[tuple[Path, int]] = []
+    for path in sorted(CASES_DIR.glob("*.json")):
+        raw = json.loads(path.read_text(encoding="utf-8-sig"))
+        levels = raw.get("concurrencies")
+        if not isinstance(levels, list) or not levels:
+            levels = [(raw.get("benchmark_params") or {}).get("max-concurrency", 8)]
+        cells.extend((path, int(level)) for level in levels)
+    return cells
+
+
 def pytest_generate_tests(metafunc):
-    if "case_file" in metafunc.fixturenames:
-        files = sorted(CASES_DIR.glob("*/*.json"))
+    if "case_file" in metafunc.fixturenames and "concurrency" in metafunc.fixturenames:
+        cells = _scenario_cells()
         metafunc.parametrize(
-            "case_file",
-            files,
-            ids=[f"{p.parent.name}/{p.stem}" for p in files],
+            ("case_file", "concurrency"),
+            cells,
+            ids=[f"{path.stem}/c{level}" for path, level in cells],
         )

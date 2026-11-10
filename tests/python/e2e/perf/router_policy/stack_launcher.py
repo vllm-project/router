@@ -12,7 +12,8 @@ Workload is the TraceLab 8-session / 28-request subset
 ``result/requests.jsonl`` (per-request TTFT/latency — analysis output, not the bench input).
 
 Configuration: ``AGENTX_CASE_FILE`` points to one self-contained case JSON
-(``cases/<policy>/c<conc>.json`` with ``runtime``, ``workers``, ``router_params``).
+(``cases/<policy>.json`` with ``runtime``, ``workers``, ``router_params``,
+and a ``concurrencies`` list).
 """
 
 from __future__ import annotations
@@ -570,6 +571,7 @@ def snapshot(run: RouterPolicyStack, dest):
 def run_router_policy_cell(
     case_file: Path,
     *,
+    concurrency: int | None = None,
     out_dir: Path | None = None,
     run_suffix: str | None = None,
     results_summary: Path | None = None,
@@ -585,7 +587,7 @@ def run_router_policy_cell(
         os.environ["AGENTX_OUT"] = str(out_dir)
     if results_summary is not None:
         os.environ[RESULTS_SUMMARY_ENV] = str(results_summary)
-    case = load_router_policy_case(case_path)
+    case = load_router_policy_case(case_path, concurrency=concurrency)
     run = open_cell(case, out_dir=out_dir)
     _active = run
     try:
