@@ -1,0 +1,513 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "vLLM Router Runtime Architecture",
+    "locale": "en",
+    "output": "vllm-router.architecture.html",
+    "quality_profile": "showcase",
+    "repository": {
+      "url": "https://github.com/vllm-project/router.git",
+      "revision": "485e7e24559c111353df9aefabdbbc03f24cd947"
+    }
+  },
+  "components": [
+    {
+      "id": "clients",
+      "type": "external",
+      "label": "Clients",
+      "sublabel": "OpenAI-compatible HTTP",
+      "pos": [
+        40,
+        240
+      ],
+      "size": [
+        150,
+        64
+      ],
+      "sources": [
+        {
+          "path": "README.md",
+          "line": 6,
+          "end_line": 16,
+          "label": "request forwarding"
+        },
+        {
+          "path": "src/main.rs",
+          "line": 90,
+          "end_line": 94,
+          "label": "usage modes"
+        }
+      ]
+    },
+    {
+      "id": "api-key-validator",
+      "type": "security",
+      "label": "API Key Validator",
+      "sublabel": "optional Bearer check",
+      "pos": [
+        40,
+        40
+      ],
+      "size": [
+        160,
+        64
+      ],
+      "sources": [
+        {
+          "path": "src/server.rs",
+          "line": 472,
+          "end_line": 534,
+          "label": "authorize_request"
+        },
+        {
+          "path": "README.md",
+          "line": 158,
+          "end_line": 166,
+          "label": "validation URLs"
+        }
+      ]
+    },
+    {
+      "id": "http-api",
+      "type": "backend",
+      "label": "HTTP API",
+      "sublabel": "Axum :30000",
+      "pos": [
+        300,
+        240
+      ],
+      "size": [
+        150,
+        64
+      ],
+      "sources": [
+        {
+          "path": "src/server.rs",
+          "line": 260,
+          "end_line": 270,
+          "label": "route_chat entry"
+        },
+        {
+          "path": "src/server.rs",
+          "line": 874,
+          "end_line": 913,
+          "label": "routes + limits"
+        },
+        {
+          "path": "src/server.rs",
+          "line": 1262,
+          "end_line": 1267,
+          "label": "bind and serve"
+        }
+      ]
+    },
+    {
+      "id": "router",
+      "type": "backend",
+      "label": "Router",
+      "sublabel": "RouterTrait",
+      "pos": [
+        540,
+        240
+      ],
+      "size": [
+        150,
+        64
+      ],
+      "sources": [
+        {
+          "path": "src/routers/factory.rs",
+          "line": 17,
+          "end_line": 45,
+          "label": "RouterFactory"
+        },
+        {
+          "path": "src/routers/http/router.rs",
+          "line": 2774,
+          "end_line": 2781,
+          "label": "regular route_chat"
+        },
+        {
+          "path": "src/routers/http/vllm_pd_router.rs",
+          "line": 1457,
+          "end_line": 1485,
+          "label": "PD request path"
+        }
+      ]
+    },
+    {
+      "id": "regular-workers",
+      "type": "external",
+      "label": "vLLM Workers",
+      "sublabel": "http(s) or grpc://",
+      "pos": [
+        800,
+        240
+      ],
+      "size": [
+        160,
+        64
+      ],
+      "sources": [
+        {
+          "path": "src/backend/detect.rs",
+          "line": 15,
+          "end_line": 45,
+          "label": "HTTP vs gRPC pool"
+        },
+        {
+          "path": "src/routers/http/router.rs",
+          "line": 1915,
+          "end_line": 1925,
+          "label": "gRPC dispatch"
+        },
+        {
+          "path": "src/routers/http/router.rs",
+          "line": 1962,
+          "end_line": 2013,
+          "label": "HTTP proxy"
+        }
+      ]
+    },
+    {
+      "id": "service-discovery",
+      "type": "cloud",
+      "label": "Service Discovery",
+      "sublabel": "K8s / ZMQ",
+      "pos": [
+        300,
+        450
+      ],
+      "size": [
+        150,
+        64
+      ],
+      "sources": [
+        {
+          "path": "src/service_discovery.rs",
+          "line": 226,
+          "end_line": 244,
+          "label": "K8s watcher"
+        },
+        {
+          "path": "src/routers/http/vllm_service_discovery.rs",
+          "line": 169,
+          "end_line": 198,
+          "label": "ZMQ listener"
+        },
+        {
+          "path": "src/service_discovery.rs",
+          "line": 23,
+          "end_line": 35,
+          "label": "discovery config"
+        }
+      ]
+    },
+    {
+      "id": "policies",
+      "type": "backend",
+      "label": "Policies",
+      "sublabel": "cache_aware default",
+      "pos": [
+        540,
+        450
+      ],
+      "size": [
+        150,
+        64
+      ],
+      "sources": [
+        {
+          "path": "src/policies/factory.rs",
+          "line": 22,
+          "end_line": 75,
+          "label": "PolicyFactory"
+        },
+        {
+          "path": "src/policies/mod.rs",
+          "line": 61,
+          "end_line": 79,
+          "label": "LoadBalancingPolicy"
+        },
+        {
+          "path": "src/routers/http/router.rs",
+          "line": 1331,
+          "end_line": 1384,
+          "label": "select worker"
+        }
+      ]
+    },
+    {
+      "id": "worker-registry",
+      "type": "backend",
+      "label": "Worker Registry",
+      "sublabel": "in-memory + health",
+      "pos": [
+        300,
+        650
+      ],
+      "size": [
+        150,
+        64
+      ],
+      "sources": [
+        {
+          "path": "src/core/worker_registry.rs",
+          "line": 48,
+          "end_line": 55,
+          "label": "WorkerRegistry"
+        },
+        {
+          "path": "src/core/worker.rs",
+          "line": 220,
+          "end_line": 230,
+          "label": "WorkerType"
+        },
+        {
+          "path": "src/core/worker_registry.rs",
+          "line": 405,
+          "end_line": 416,
+          "label": "health checker"
+        }
+      ]
+    },
+    {
+      "id": "kv-index",
+      "type": "database",
+      "label": "KV Index",
+      "sublabel": "kv_aware events",
+      "pos": [
+        540,
+        650
+      ],
+      "size": [
+        150,
+        64
+      ],
+      "sources": [
+        {
+          "path": "src/kv_index/mod.rs",
+          "line": 1,
+          "end_line": 30,
+          "label": "KV placement index"
+        },
+        {
+          "path": "src/kv_index/discovery.rs",
+          "line": 164,
+          "end_line": 171,
+          "label": "supervisor"
+        },
+        {
+          "path": "src/routers/http/router.rs",
+          "line": 335,
+          "end_line": 350,
+          "label": "kv_aware startup"
+        }
+      ]
+    },
+    {
+      "id": "prefill-workers",
+      "type": "external",
+      "label": "Prefill Workers",
+      "sublabel": "http(s) or grpc://",
+      "pos": [
+        800,
+        800
+      ],
+      "size": [
+        160,
+        64
+      ],
+      "sources": [
+        {
+          "path": "src/routers/http/vllm_pd_router.rs",
+          "line": 1575,
+          "end_line": 1587,
+          "label": "HTTP vs gRPC P/D pools"
+        },
+        {
+          "path": "src/routers/http/vllm_pd_router.rs",
+          "line": 1770,
+          "end_line": 1846,
+          "label": "Stage 1 prefill"
+        },
+        {
+          "path": "src/core/worker_registry.rs",
+          "line": 260,
+          "end_line": 269,
+          "label": "prefill pool"
+        }
+      ]
+    },
+    {
+      "id": "decode-workers",
+      "type": "external",
+      "label": "Decode Workers",
+      "sublabel": "http(s) or grpc://",
+      "pos": [
+        1000,
+        800
+      ],
+      "size": [
+        160,
+        64
+      ],
+      "sources": [
+        {
+          "path": "src/routers/http/vllm_pd_router.rs",
+          "line": 1575,
+          "end_line": 1587,
+          "label": "HTTP vs gRPC P/D pools"
+        },
+        {
+          "path": "src/routers/http/vllm_pd_router.rs",
+          "line": 1925,
+          "end_line": 1961,
+          "label": "Stage 2 decode"
+        },
+        {
+          "path": "src/core/worker_registry.rs",
+          "line": 272,
+          "end_line": 274,
+          "label": "decode pool"
+        }
+      ]
+    }
+  ],
+  "boundaries": [
+    {
+      "kind": "region",
+      "label": "vLLM Router process",
+      "wraps": [
+        "http-api",
+        "router",
+        "service-discovery",
+        "policies",
+        "worker-registry",
+        "kv-index"
+      ]
+    }
+  ],
+  "connections": [
+    {
+      "id": "clients-to-http",
+      "from": "clients",
+      "to": "http-api",
+      "label": "HTTPS",
+      "variant": "emphasis"
+    },
+    {
+      "id": "http-to-auth",
+      "from": "http-api",
+      "to": "api-key-validator",
+      "label": "validate Bearer",
+      "variant": "security"
+    },
+    {
+      "id": "http-to-router",
+      "from": "http-api",
+      "to": "router",
+      "label": "route_chat",
+      "variant": "emphasis"
+    },
+    {
+      "id": "router-to-policies",
+      "from": "router",
+      "to": "policies",
+      "label": "select / admit"
+    },
+    {
+      "id": "policies-to-registry",
+      "from": "policies",
+      "to": "worker-registry",
+      "label": "available workers"
+    },
+    {
+      "id": "policies-to-kv",
+      "from": "policies",
+      "to": "kv-index",
+      "label": "tier match",
+      "variant": "dashed"
+    },
+    {
+      "id": "router-to-regular",
+      "from": "router",
+      "to": "regular-workers",
+      "label": "HTTP or gRPC",
+      "variant": "emphasis"
+    },
+    {
+      "id": "router-to-prefill",
+      "from": "router",
+      "to": "prefill-workers",
+      "label": "Stage 1 HTTP or gRPC"
+    },
+    {
+      "id": "router-to-decode",
+      "from": "router",
+      "to": "decode-workers",
+      "label": "Stage 2 HTTP or gRPC"
+    },
+    {
+      "id": "prefill-to-decode",
+      "from": "prefill-workers",
+      "to": "decode-workers",
+      "label": "KV transfer",
+      "variant": "dashed"
+    },
+    {
+      "id": "discovery-to-registry",
+      "from": "service-discovery",
+      "to": "worker-registry",
+      "label": "register workers"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "Primary path (Regular mode)",
+      "items": [
+        "POST /v1/chat/completions is authorized (if configured), then RouterTrait.route_chat selects one worker and proxies the request.",
+        "RouterFactory builds Router, VllmPDRouter, or OpenAIRouter from RoutingMode. A worker pool is all HTTP or all grpc://; mixed schemes are rejected.",
+        "gRPC workers receive tokenizer-prepared token_ids; HTTP workers are reverse-proxied as OpenAI/vLLM JSON. Default listen address is 127.0.0.1:30000."
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "Prefill / Decode disaggregation",
+      "items": [
+        "In vLLM PD mode the router admits a P/D pair, then runs Stage 1 prefill and Stage 2 decode over HTTP or gRPC, injecting kv_transfer_params. A P/D pool is all HTTP or all grpc://; mixed schemes are rejected.",
+        "NIXL is the default connector; Mooncake and MoRI-IO are also supported. When a NIXL push identity is cached, or MoRI-IO WRITE is used, P and D may be dispatched concurrently.",
+        "KV cache bytes move worker-to-worker. The router only coordinates identities and transfer metadata."
+      ]
+    },
+    {
+      "dot": "violet",
+      "title": "Policies and KV Index",
+      "items": [
+        "Default policy is cache_aware. Also supported: random, round_robin, power_of_two, kv_aware, consistent_hash, sticky_least_loaded, rendezvous_hash.",
+        "PD mode can override prefill and decode policies independently. kv_aware consults the KV Index (engine events, SHA-256 block hashes) for tiered placement.",
+        "The dashed Policy-to-KV-Index edge applies only when the selected policy is kv_aware."
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "Control plane",
+      "items": [
+        "Workers can be static (--worker-urls, --prefill, --decode) or discovered at runtime.",
+        "Kubernetes service discovery watches pods and registers Regular / Prefill / Decode workers. vLLM ZMQ discovery (NCCL / MoRI-IO) registers HTTP and ZMQ addresses for PD.",
+        "WorkerRegistry runs periodic health checks. Optional intra-node data-parallel expansion addresses workers as host:port@dp_rank."
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "Security and supporting features",
+      "items": [
+        "Bearer validation runs only when API_KEY_VALIDATION_URLS / --api-key-validation-urls is set; otherwise the HTTP API does not require a token. Successful tokens are cached in process.",
+        "Workers have retries and circuit breakers. Prometheus metrics default to 0.0.0.0:29000. OpenTelemetry tracing is optional.",
+        "Not drawn: optional WASM OnRequest middleware, Program scheduling, E+PD encoder orchestration, IGW RouterManager, and the OpenAI-backend single-base-URL mode."
+      ]
+    }
+  ]
+}
