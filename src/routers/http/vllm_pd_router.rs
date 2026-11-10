@@ -1124,26 +1124,43 @@ impl VllmPDRouter {
                 "Program decode target left the pool",
             ));
         };
+        // Snapshot once per turn: upstream returns a Result now, and the
+        // cold fallback below reuses the selection made from this snapshot.
+        let prefill_candidates = match self.program_prefill_candidates() {
+            Ok(candidates) => candidates,
+            Err(error) => {
+                RouterMetrics::record_pd_error("server_selection");
+                return Some(program_unavailable(&completion, &error));
+            }
+        };
+        // One selection per turn. The warm-remote attempt consumes this turn's
+        // selection, and a cold fallback dispatches the P it already chose
+        // instead of asking the policy a second time. The selection also takes
+        // the same request inputs as the cold path (prompt text or cache routing
+        // key, plus headers), so hash and cache-aware policies keep their
+        // affinity on the warm path too.
+        let mut selected = None;
         if let Some(warm_remote) = &runtime.warm_remote {
             // The warm-remote protocol has no discovery incarnation fence, and
             // execute() rejects discovery; keep discovery on the native PD path.
             if !self.use_discovery && matches!(self.kv_connector, KvConnector::Nixl) {
-                let prefill_workers = self
-                    .pd_router
-                    .worker_registry
-                    .get_prefill_workers()
-                    .into_iter()
-                    .filter(|w| w.is_available())
-                    .collect::<Vec<_>>();
-                let prefills = prefill_workers
+                // Only the warm attempt consumes the bare worker list; the cold
+                // path derives its own from `prefill_candidates`.
+                let prefill_workers = prefill_candidates
                     .iter()
-                    .map(pd_program_adapter::worker_target)
+                    .map(|(_, worker)| worker.clone())
                     .collect::<Vec<_>>();
-                let selection = self
-                    .policy_registry
-                    .get_prefill_policy()
-                    .select_worker(&prefill_workers, None);
-                if let Some(index) = selection {
+                if let Some(index) =
+                    self.select_program_prefill_index(&prefill_workers, &request, path, headers)
+                {
+                    // The target and the worker it charges travel together, so
+                    // execute() derives both from the same index.
+                    let prefills = prefill_candidates
+                        .iter()
+                        .map(|(_, worker)| {
+                            (pd_program_adapter::worker_target(worker), worker.clone())
+                        })
+                        .collect::<Vec<_>>();
                     let started = Instant::now();
                     if let Some(result) = super::pd_warm_remote::execute(
                         runtime,
@@ -1157,7 +1174,6 @@ impl VllmPDRouter {
                         &decode_targets,
                         index,
                         &self.pd_router.pd_load,
-                        prefill_workers[index].clone(),
                         decode_worker.clone(),
                     )
                     .await
@@ -1180,18 +1196,16 @@ impl VllmPDRouter {
                             }
                         });
                     }
+                    // execute() declined the warm/local protocol for this turn
+                    // (request shape, engine capability): the cold path reuses
+                    // the P selected above rather than consuming a second one.
+                    selected = Some(prefill_candidates[index].clone());
                 }
             }
         }
-        let prefill_candidates = match self.program_prefill_candidates() {
-            Ok(candidates) => candidates,
-            Err(error) => {
-                RouterMetrics::record_pd_error("server_selection");
-                return Some(program_unavailable(&completion, &error));
-            }
-        };
-        let selected = self.select_program_prefill(&prefill_candidates, &request, path, headers);
-        let Some((prefill_id, prefill_worker)) = selected else {
+        let Some((prefill_id, prefill_worker)) = selected
+            .or_else(|| self.select_program_prefill(&prefill_candidates, &request, path, headers))
+        else {
             RouterMetrics::record_pd_error("server_selection");
             return Some(program_unavailable(
                 &completion,
@@ -1301,11 +1315,31 @@ impl VllmPDRouter {
         if candidates.is_empty() {
             return None;
         }
-        let policy = self.policy_registry.get_prefill_policy();
         let workers = candidates
             .iter()
             .map(|(_, worker)| worker.clone())
             .collect::<Vec<_>>();
+        let index = self.select_program_prefill_index(&workers, request, path, headers)?;
+        candidates.get(index).cloned()
+    }
+
+    /// The single place Program turns ask the prefill policy for an index.
+    ///
+    /// Warm-remote and cold dispatch share it so a turn consumes exactly one
+    /// selection and both paths feed the policy the same inputs: the prompt or
+    /// cache routing key when the policy reads the request, and the request
+    /// headers when it needs affinity.
+    fn select_program_prefill_index(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        request: &Value,
+        path: &str,
+        headers: Option<&HeaderMap>,
+    ) -> Option<usize> {
+        if workers.is_empty() {
+            return None;
+        }
+        let policy = self.policy_registry.get_prefill_policy();
         let request_text = if policy.needs_cache_routing_key() {
             Some(crate::protocols::spec::cache_routing::for_route(
                 request, path,
@@ -1318,53 +1352,51 @@ impl VllmPDRouter {
         let policy_headers = policy
             .needs_headers()
             .then(|| header_utils::to_policy_headers(headers).unwrap_or_default());
-        let index = policy.select_worker_with_headers(
-            &workers,
-            request_text.as_deref(),
-            policy_headers.as_ref(),
-        )?;
-        Some(candidates[index].clone())
+        // Both callers index the worker slice with this value. A policy that
+        // returns an out-of-range index is a policy bug, but it must degrade to
+        // the same "no feasible P" 503 as an empty pool instead of panicking the
+        // request task.
+        policy
+            .select_worker_with_headers(workers, request_text.as_deref(), policy_headers.as_ref())
+            .filter(|index| *index < workers.len())
     }
 
     /// Recheck the bound endpoints after a capacity wait: an expired
     /// registration or a removed worker must not receive the dispatch.
     fn program_targets_are_live(&self, prefill_id: &str, decode_id: &str) -> bool {
-        if self.use_discovery {
-            let prefill_live =
-                self.service_registry
-                    .get_prefill_instances()
-                    .iter()
-                    .any(|(address, _)| {
-                        pd_program_adapter::discovered_target(address).id == prefill_id
-                    });
-            let decode_live = pd_program_adapter::discovered_decode_instance_by_id(
-                &self.service_registry,
-                self.intra_node_data_parallel_size,
-                decode_id,
-            )
-            .is_some();
-            prefill_live && decode_live
+        let prefill_live = if self.use_discovery {
+            self.service_registry
+                .get_prefill_instances()
+                .iter()
+                .any(|(address, _)| pd_program_adapter::discovered_target(address).id == prefill_id)
         } else {
-            let prefill_live = self
-                .pd_router
+            self.pd_router
                 .worker_registry
                 .get_prefill_workers()
                 .iter()
                 .any(|worker| {
                     worker.is_available()
                         && pd_program_adapter::worker_target(worker).id == prefill_id
-                });
-            let decode_live = self
-                .pd_router
+                })
+        };
+        let decode_live = if self.use_discovery {
+            pd_program_adapter::discovered_decode_instance_by_id(
+                &self.service_registry,
+                self.intra_node_data_parallel_size,
+                decode_id,
+            )
+            .is_some()
+        } else {
+            self.pd_router
                 .worker_registry
                 .get_decode_workers()
                 .iter()
                 .any(|worker| {
                     worker.is_available()
                         && pd_program_adapter::worker_target(worker).id == decode_id
-                });
-            prefill_live && decode_live
-        }
+                })
+        };
+        prefill_live && decode_live
     }
 
     /// Select a P/D pair among the discovered instances. Request headers reach
