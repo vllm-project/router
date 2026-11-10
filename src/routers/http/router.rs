@@ -428,11 +428,14 @@ impl Router {
                 (None, None)
             };
         for url in &worker_urls {
+            let (base_url, dp_rank) = dp_utils::parse_worker_url(url);
             // The engine serves this name (and its aliases); adapters selected
-            // through `model` are the names it does not serve.
-            let labels = Self::served_name_labels(ctx.router_config.api_key.as_deref(), url).await;
+            // through `model` are the names it does not serve. Every rank of a
+            // DP endpoint shares the served names of its base URL, so the probe
+            // runs once per endpoint and the labels follow the ranks.
+            let labels =
+                Self::served_name_labels(ctx.router_config.api_key.as_deref(), &base_url).await;
             let worker_arc: Arc<dyn Worker> = if dp_size > 1 {
-                let (base_url, dp_rank) = dp_utils::parse_worker_url(url);
                 Arc::new(
                     DPAwareWorker::new(
                         base_url,
@@ -440,6 +443,7 @@ impl Router {
                         dp_size,
                         WorkerType::Regular,
                     )
+                    .with_labels(labels)
                     .with_circuit_breaker_config(core_cb_config.clone())
                     .with_health_config(health_config.clone()),
                 )

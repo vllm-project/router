@@ -559,6 +559,13 @@ impl DPAwareWorker {
         self.base_worker = self.base_worker.with_health_config(config);
         self
     }
+
+    /// Copy the served-model labels of the base URL onto every DP rank: the
+    /// ranks share one engine, so they serve the same names.
+    pub fn with_labels(mut self, labels: std::collections::HashMap<String, String>) -> Self {
+        self.base_worker = self.base_worker.with_labels(labels);
+        self
+    }
 }
 
 #[async_trait]
@@ -1992,5 +1999,23 @@ mod tests {
             }
         );
         assert_eq!(workers[5].worker_type(), WorkerType::Decode);
+    }
+
+    #[test]
+    fn dp_aware_workers_keep_their_served_model_labels() {
+        // Every rank of a DP endpoint answers for the same engine, so the
+        // served-model labels probed from the base URL must survive onto each
+        // rank. Without them model_id stays "unknown" and an adapter name in
+        // `model` is mistaken for the base model.
+        let mut labels = std::collections::HashMap::new();
+        labels.insert("model_id".to_string(), "Qwen3.5-4B".to_string());
+        labels.insert("served_model_aliases".to_string(), "qwen".to_string());
+        let worker = DPAwareWorker::new("http://host:8000".to_string(), 1, 2, WorkerType::Regular)
+            .with_labels(labels);
+
+        assert_eq!(worker.model_id(), "Qwen3.5-4B");
+        assert!(worker.serves_base_model("Qwen3.5-4B"));
+        assert!(worker.serves_base_model("qwen"));
+        assert!(!worker.serves_base_model("lora1"));
     }
 }
